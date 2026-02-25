@@ -1,0 +1,192 @@
+{
+  "summary": {
+    "doc_count": 79,
+    "query_count": 3,
+    "labeled_query_count": 3,
+    "baseline_latency_ms_p95": 34.23837500000001,
+    "baseline_latency_ms_p99": 34.23837500000001,
+    "pageindex_local_latency_ms_p95": 27.305208999999998,
+    "pageindex_local_latency_ms_p99": 27.305208999999998,
+    "fallback_error_rate": 0.0,
+    "operational_complexity": {
+      "baseline": "low",
+      "pageindex_local_structure": "medium",
+      "pageindex_api_augmented": "high"
+    }
+  },
+  "quality": {
+    "baseline_p_at_k": 0.06666666666666667,
+    "pageindex_local_p_at_k": 0.0,
+    "baseline_mrr": 0.22474747474747475,
+    "pageindex_local_mrr": 0.054022668153102936,
+    "baseline_ndcg": 0.1289509357448472,
+    "pageindex_local_ndcg": 0.0,
+    "precision_uplift_percent": -100.0
+  },
+  "decision": "NO-GO",
+  "rows": [
+    {
+      "query": "retrieval status and fallback behavior",
+      "baseline_top": [
+        [
+          "doc::docs/research/cross-model-consensus.md",
+          18.02497103139568
+        ],
+        [
+          "doc::docs/spec/RUST-CANONICAL-CONTRACT.md",
+          15.653393066914685
+        ],
+        [
+          "doc::docs/research/TERMINAL-LAYER-ANALYSIS.md",
+          14.036618865139312
+        ],
+        [
+          "doc::docs/research/cli-language-analysis.md",
+          13.251098364448353
+        ],
+        [
+          "doc::docs/session-logs/ralph-loop-s5-critique.md",
+          13.108548596299572
+        ]
+      ],
+      "pageindex_local_top": [
+        [
+          "doc::docs/research/cross-model-consensus.md",
+          313.425
+        ],
+        [
+          "doc::docs/research/cli-language-analysis.md",
+          240.45000000000002
+        ],
+        [
+          "doc::docs/research/TERMINAL-LAYER-ANALYSIS.md",
+          149.1
+        ],
+        [
+          "doc::docs/session-logs/ralph-loop-s5-critique.md",
+          124.42500000000001
+        ],
+        [
+          "doc::docs/research/deep-research-compaction.md",
+          113.4
+        ]
+      ],
+      "baseline_p_at_k": 0.2,
+      "pageindex_local_p_at_k": 0.0,
+      "baseline_mrr": 0.5,
+      "pageindex_local_mrr": 0.07692307692307693,
+      "baseline_ndcg": 0.38685280723454163,
+      "pageindex_local_ndcg": 0.0
+    },
+    {
+      "query": "semantic search backend and vector availability",
+      "baseline_top": [
+        [
+          "doc::docs/research/cross-model-consensus.md",
+          20.1154624092621
+        ],
+        [
+          "doc::docs/research/impulse-memory-architecture.md",
+          20.012946845736508
+        ],
+        [
+          "doc::docs/research/SEARCH-LAYER-ANALYSIS.md",
+          18.374417523315742
+        ],
+        [
+          "doc::docs/research/MEMORY-EXTRACTION-ANALYSIS.md",
+          17.708067876102124
+        ],
+        [
+          "doc::docs/research/reference-patterns/MEM0-FACT-EXTRACTION.md",
+          16.52565301448117
+        ]
+      ],
+      "pageindex_local_top": [
+        [
+          "doc::docs/research/cross-model-consensus.md",
+          339.675
+        ],
+        [
+          "doc::docs/research/cli-language-analysis.md",
+          237.82500000000002
+        ],
+        [
+          "doc::docs/research/SEARCH-LAYER-ANALYSIS.md",
+          211.05
+        ],
+        [
+          "doc::docs/research/impulse-memory-architecture.md",
+          174.3
+        ],
+        [
+          "doc::docs/research/MEMORY-EXTRACTION-ANALYSIS.md",
+          167.475
+        ]
+      ],
+      "baseline_p_at_k": 0.0,
+      "pageindex_local_p_at_k": 0.0,
+      "baseline_mrr": 0.08333333333333333,
+      "pageindex_local_mrr": 0.043478260869565216,
+      "baseline_ndcg": 0.0,
+      "pageindex_local_ndcg": 0.0
+    },
+    {
+      "query": "session lifecycle commands and hooks",
+      "baseline_top": [
+        [
+          "doc::docs/research/AGENT-HARNESS-ANALYSIS.md",
+          23.27824122005312
+        ],
+        [
+          "doc::docs/research/TERMINAL-LAYER-ANALYSIS.md",
+          20.789191503964943
+        ],
+        [
+          "doc::docs/research/cross-model-consensus.md",
+          18.911489604936165
+        ],
+        [
+          "doc::docs/session-logs/ralph-loop-s5-critique.md",
+          17.396498097470733
+        ],
+        [
+          "doc::docs/spec/PRODUCT-SPEC-v2.md",
+          16.9656042986605
+        ]
+      ],
+      "pageindex_local_top": [
+        [
+          "doc::docs/research/AGENT-HARNESS-ANALYSIS.md",
+          408.975
+        ],
+        [
+          "doc::docs/research/cross-model-consensus.md",
+          393.75
+        ],
+        [
+          "doc::docs/research/cli-language-analysis.md",
+          264.075
+        ],
+        [
+          "doc::docs/spec/PRODUCT-SPEC-v2.md",
+          218.925
+        ],
+        [
+          "doc::docs/research/TERMINAL-LAYER-ANALYSIS.md",
+          211.05
+        ]
+      ],
+      "baseline_p_at_k": 0.0,
+      "pageindex_local_p_at_k": 0.0,
+      "baseline_mrr": 0.09090909090909091,
+      "pageindex_local_mrr": 0.041666666666666664,
+      "baseline_ndcg": 0.0,
+      "pageindex_local_ndcg": 0.0
+    }
+  ],
+  "notes": [
+    "This harness is local-first and does not call PageIndex cloud APIs.",
+    "For api-augmented mode, run a separate gated experiment with explicit API credentials and budget."
+  ]
+}

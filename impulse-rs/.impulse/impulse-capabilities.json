@@ -1,0 +1,209 @@
+{
+  "version": "1.0",
+  "impulse_version": "0.1.0",
+  "generated_at": "2026-02-25T06:35:30.500382+00:00",
+  "capabilities": {
+    "tools": [
+      {
+        "id": "session_query",
+        "name": "Session Query",
+        "description": "Search session history for cross-session awareness",
+        "category": "analysis",
+        "params": [
+          {
+            "name": "query",
+            "param_type": "string",
+            "required": false,
+            "description": "Text to search for"
+          },
+          {
+            "name": "limit",
+            "param_type": "integer",
+            "required": false,
+            "description": "Max results (default: 10)"
+          }
+        ],
+        "example": "impulse-rs tooling-run --tool-id session_query --params '{\"query\": \"rust\"}'"
+      },
+      {
+        "id": "memory_search",
+        "name": "Memory Search",
+        "description": "Search Impulse's long-term memory (genome)",
+        "category": "analysis",
+        "params": [
+          {
+            "name": "query",
+            "param_type": "string",
+            "required": true,
+            "description": "Search query"
+          }
+        ],
+        "example": "impulse-rs tooling-run --tool-id memory_search --params '{\"query\": \"architecture\"}'"
+      },
+      {
+        "id": "config_get",
+        "name": "Config Get",
+        "description": "Get Impulse configuration values",
+        "category": "utility",
+        "params": [
+          {
+            "name": "key",
+            "param_type": "string",
+            "required": true,
+            "description": "Config key to retrieve"
+          }
+        ],
+        "example": "impulse-rs config log_level"
+      },
+      {
+        "id": "calculator",
+        "name": "Calculator",
+        "description": "Evaluate mathematical expressions",
+        "category": "utility",
+        "params": [
+          {
+            "name": "expression",
+            "param_type": "string",
+            "required": true,
+            "description": "Mathematical expression"
+          }
+        ],
+        "example": "impulse-rs calc --expression '2^10'"
+      },
+      {
+        "id": "python_exec",
+        "name": "Python Execute",
+        "description": "Execute Python code",
+        "category": "utility",
+        "params": [
+          {
+            "name": "code",
+            "param_type": "string",
+            "required": true,
+            "description": "Python code to execute"
+          }
+        ],
+        "example": "impulse-rs exec --code 'print(\"hello\")'"
+      }
+    ],
+    "features": [
+      {
+        "id": "retrieval",
+        "name": "Semantic Retrieval",
+        "description": "Search across session history and genome with semantic similarity",
+        "enabled": true
+      },
+      {
+        "id": "context_injection",
+        "name": "Context Injection",
+        "description": "Automatically inject relevant context into agent sessions",
+        "enabled": true
+      },
+      {
+        "id": "stewardship",
+        "name": "Token Stewardship",
+        "description": "Monitor and manage context window usage",
+        "enabled": true
+      },
+      {
+        "id": "build_hygiene",
+        "name": "Build Hygiene",
+        "description": "Clean up Rust build artifacts to save disk space",
+        "enabled": true
+      },
+      {
+        "id": "office",
+        "name": "Office Documents",
+        "description": "Parse and extract data from Excel, Word documents",
+        "enabled": true
+      },
+      {
+        "id": "monty",
+        "name": "Monty Routing",
+        "description": "Computed routing between platforms using AI",
+        "enabled": true
+      }
+    ],
+    "context_injection": {
+      "enabled": true,
+      "modes": [
+        "off",
+        "review",
+        "apply"
+      ],
+      "max_chars": 2000,
+      "sources": [
+        "history",
+        "genome"
+      ]
+    },
+    "sessions": {
+      "supported": true,
+      "platforms": [
+        "claude-code",
+        "opencode"
+      ],
+      "tracking": {
+        "files": true,
+        "tools": true,
+        "activity": true
+      }
+    },
+    "storage": {
+      "backend": "sqlite",
+      "semantic_search": true,
+      "history_retention_days": 90
+    }
+  },
+  "routing": {
+    "claude_code": {
+      "description": "Complex architecture, planning, debugging, code review",
+      "keywords": [
+        "architecture",
+        "design",
+        "review",
+        "refactor",
+        "debug"
+      ],
+      "example_tasks": [
+        "Design a new system",
+        "Review this PR",
+        "Debug this crash"
+      ]
+    },
+    "codex": {
+      "description": "Rapid execution, implementation, deployment",
+      "keywords": [
+        "build",
+        "implement",
+        "deploy",
+        "create"
+      ],
+      "example_tasks": [
+        "Build this feature",
+        "Create a new API",
+        "Deploy to production"
+      ]
+    },
+    "opencode": {
+      "description": "Lightweight tasks, verification, quick fixes",
+      "keywords": [
+        "verify",
+        "check",
+        "fix",
+        "quick"
+      ],
+      "example_tasks": [
+        "Verify tests pass",
+        "Quick bug fix",
+        "Check for errors"
+      ]
+    }
+  },
+  "patterns": {
+    "tool_invocation": "Use `impulse-rs tooling-run --tool-id <tool> --params '<json>'` to invoke tools",
+    "context_injection": "Context is automatically injected based on session activity. Use `impulse-rs compute-injection` to compute what would be injected.",
+    "handoff": "Use `impulse-rs handoff --tool <platform> --task '<task>'` to hand off to another platform",
+    "history_query": "Use `impulse-rs search-history --query '<query>'` to search past sessions"
+  }
+}

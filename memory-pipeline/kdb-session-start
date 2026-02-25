@@ -1,0 +1,12 @@
+#!/bin/bash
+# kdb-session-start — Auto-bootstrap for coding agent sessions
+#
+# Replaces: kdb --check && kdb "topic" && kdb --decisions && kdb --risks
+#
+# Usage:
+#   kdb-session-start                          # Human-readable output
+#   kdb-session-start --task "hooks impl"      # Include task-relevant search
+#   kdb-session-start --json                   # JSON output for agents
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+python3 "$SCRIPT_DIR/session_start.py" "$@"

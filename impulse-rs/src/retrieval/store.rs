@@ -1,0 +1,1124 @@
+use anyhow::{bail, Context, Result};
+use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use crate::retrieval::types::SearchResult;
+
+pub struct RetrievalStore {
+    conn: Connection,
+    db_path: PathBuf,
+}
+
+impl RetrievalStore {
+    pub fn open(base_path: &Path) -> Result<Self> {
+        std::fs::create_dir_all(base_path)?;
+        let db_path = base_path.join("retrieval.db");
+        let conn = Connection::open(&db_path).context("failed to open retrieval.db")?;
+
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        let _ = conn.pragma_update(None, "journal_mode", "WAL");
+        let _ = conn.pragma_update(None, "synchronous", "NORMAL");
+        conn.busy_timeout(Duration::from_secs(5))?;
+
+        Ok(Self { conn, db_path })
+    }
+
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
+    }
+
+    fn table_exists(&self, table_name: &str) -> Result<bool> {
+        let mut stmt = self.conn.prepare(
+            "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?1 LIMIT 1",
+        )?;
+        Ok(stmt
+            .query_row(params![table_name], |row| row.get::<_, i64>(0))
+            .optional()?
+            .is_some())
+    }
+
+    fn ensure_column(&self, table: &str, column: &str, ddl: &str) -> Result<()> {
+        // Allowlist check: only known tables may be passed to ensure_column.
+        // This prevents SQL injection via interpolated table names in PRAGMA.
+        const ALLOWED_TABLES: &[&str] = &["history_entries", "genome_decisions"];
+        if !ALLOWED_TABLES.contains(&table) {
+            bail!(
+                "ensure_column called with unexpected table '{}'; allowed: {:?}",
+                table,
+                ALLOWED_TABLES
+            );
+        }
+
+        let mut stmt = self
+            .conn
+            .prepare(&format!("PRAGMA table_info({})", table))
+            .with_context(|| format!("failed to inspect schema for {}", table))?;
+
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut found = false;
+        for row in rows {
+            if row?.as_str() == column {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            self.conn.execute(ddl, [])?;
+        }
+        Ok(())
+    }
+
+    pub fn init_schema(&self) -> Result<()> {
+        self.conn.execute_batch(
+            r#"
+CREATE TABLE IF NOT EXISTS history_entries (
+  session_id TEXT PRIMARY KEY,
+  session_name TEXT NOT NULL,
+  platform TEXT,
+  started_at TEXT NOT NULL,
+  ended_at TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  files_touched_json TEXT NOT NULL,
+  tools_used_json TEXT NOT NULL,
+  search_text TEXT NOT NULL,
+  content_hash TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS genome_decisions (
+  decision_id TEXT PRIMARY KEY,
+  date TEXT NOT NULL,
+  description TEXT NOT NULL,
+  rationale TEXT,
+  tags_json TEXT NOT NULL,
+  search_text TEXT NOT NULL,
+  content_hash TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS retrieval_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(
+  session_id,
+  search_text
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS genome_fts USING fts5(
+  decision_id,
+  search_text
+);
+
+CREATE TABLE IF NOT EXISTS history_vec (
+  session_id TEXT PRIMARY KEY,
+  vector_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS genome_vec (
+  decision_id TEXT PRIMARY KEY,
+  vector_json TEXT NOT NULL
+);
+"#,
+        )?;
+
+        self.ensure_column(
+            "history_entries",
+            "content_hash",
+            "ALTER TABLE history_entries ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''",
+        )?;
+        self.ensure_column(
+            "genome_decisions",
+            "content_hash",
+            "ALTER TABLE genome_decisions ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''",
+        )?;
+
+        self.set_meta("schema_version", "2")?;
+        Ok(())
+    }
+
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            r#"INSERT INTO retrieval_meta(key, value) VALUES (?1, ?2)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value"#,
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT value FROM retrieval_meta WHERE key=?1")?;
+        let value = stmt.query_row(params![key], |row| row.get(0)).optional()?;
+        Ok(value)
+    }
+
+    pub fn quick_check(&self) -> Result<String> {
+        let mut stmt = self.conn.prepare("PRAGMA quick_check(1)")?;
+        let out: String = stmt.query_row([], |row| row.get(0))?;
+        Ok(out)
+    }
+
+    pub fn try_load_vec_extension(&self) -> Result<bool> {
+        let ext_path = match std::env::var("IMPULSE_SQLITE_VEC_EXT")
+            .or_else(|_| std::env::var("COCKPIT_SQLITE_VEC_EXT"))
+        {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => return Ok(false),
+        };
+
+        // Validate extension path before unsafe load
+        let ext_path_buf = std::path::PathBuf::from(&ext_path);
+        if !ext_path_buf.is_absolute() {
+            bail!(
+                "IMPULSE_SQLITE_VEC_EXT must be an absolute path, got: {}",
+                ext_path
+            );
+        }
+        for component in ext_path_buf.components() {
+            if matches!(component, std::path::Component::ParentDir) {
+                bail!("IMPULSE_SQLITE_VEC_EXT must not contain '..': {}", ext_path);
+            }
+        }
+        let valid_extensions = ["so", "dylib", "dll"];
+        match ext_path_buf.extension().and_then(|e| e.to_str()) {
+            Some(ext) if valid_extensions.contains(&ext) => {}
+            _ => {
+                bail!(
+                    "IMPULSE_SQLITE_VEC_EXT must have a .so, .dylib, or .dll extension: {}",
+                    ext_path
+                );
+            }
+        }
+        if !ext_path_buf.exists() {
+            return Ok(false);
+        }
+
+        unsafe {
+            self.conn.load_extension_enable()?;
+            let result = self.conn.load_extension(&ext_path, None).is_ok();
+            self.conn.load_extension_disable()?;
+            Ok(result)
+        }
+    }
+
+    fn create_history_vec0_table(&self, dim: usize) -> Result<()> {
+        if dim == 0 {
+            bail!("history vec0 dimension must be greater than zero");
+        }
+        let sql = format!(
+            "CREATE VIRTUAL TABLE history_vec0 USING vec0(session_id TEXT, embedding float[{}])",
+            dim
+        );
+        self.conn.execute("DROP TABLE IF EXISTS history_vec0", [])?;
+        self.conn
+            .execute(&sql, [])
+            .context("failed to create history_vec0 table")?;
+        self.set_meta("history_vec0_dim", &dim.to_string())?;
+        Ok(())
+    }
+
+    fn create_genome_vec0_table(&self, dim: usize) -> Result<()> {
+        if dim == 0 {
+            bail!("genome vec0 dimension must be greater than zero");
+        }
+        let sql = format!(
+            "CREATE VIRTUAL TABLE genome_vec0 USING vec0(decision_id TEXT, embedding float[{}])",
+            dim
+        );
+        self.conn.execute("DROP TABLE IF EXISTS genome_vec0", [])?;
+        self.conn
+            .execute(&sql, [])
+            .context("failed to create genome_vec0 table")?;
+        self.set_meta("genome_vec0_dim", &dim.to_string())?;
+        Ok(())
+    }
+
+    pub fn ensure_history_vec0_table(&self, dim: usize) -> Result<()> {
+        let current_dim = self
+            .get_meta("history_vec0_dim")?
+            .and_then(|v| v.parse::<usize>().ok());
+        let exists = self.table_exists("history_vec0")?;
+        if current_dim != Some(dim) || !exists {
+            self.create_history_vec0_table(dim)?;
+        }
+        Ok(())
+    }
+
+    pub fn ensure_genome_vec0_table(&self, dim: usize) -> Result<()> {
+        let current_dim = self
+            .get_meta("genome_vec0_dim")?
+            .and_then(|v| v.parse::<usize>().ok());
+        let exists = self.table_exists("genome_vec0")?;
+        if current_dim != Some(dim) || !exists {
+            self.create_genome_vec0_table(dim)?;
+        }
+        Ok(())
+    }
+
+    pub fn clear_all(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM history_entries", [])?;
+        self.conn.execute("DELETE FROM genome_decisions", [])?;
+        self.conn.execute("DELETE FROM history_fts", [])?;
+        self.conn.execute("DELETE FROM genome_fts", [])?;
+        self.conn.execute("DELETE FROM history_vec", [])?;
+        self.conn.execute("DELETE FROM genome_vec", [])?;
+        let _ = self.conn.execute("DELETE FROM history_vec0", []);
+        let _ = self.conn.execute("DELETE FROM genome_vec0", []);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_history(
+        &self,
+        session_id: &str,
+        session_name: &str,
+        platform: Option<&str>,
+        started_at: &str,
+        ended_at: &str,
+        summary: &str,
+        files_touched_json: &str,
+        tools_used_json: &str,
+        search_text: &str,
+        content_hash: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"
+INSERT INTO history_entries (
+  session_id, session_name, platform, started_at, ended_at, summary,
+  files_touched_json, tools_used_json, search_text, content_hash
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+ON CONFLICT(session_id) DO UPDATE SET
+  session_name=excluded.session_name,
+  platform=excluded.platform,
+  started_at=excluded.started_at,
+  ended_at=excluded.ended_at,
+  summary=excluded.summary,
+  files_touched_json=excluded.files_touched_json,
+  tools_used_json=excluded.tools_used_json,
+  search_text=excluded.search_text,
+  content_hash=excluded.content_hash
+"#,
+            params![
+                session_id,
+                session_name,
+                platform,
+                started_at,
+                ended_at,
+                summary,
+                files_touched_json,
+                tools_used_json,
+                search_text,
+                content_hash
+            ],
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_genome(
+        &self,
+        decision_id: &str,
+        date: &str,
+        description: &str,
+        rationale: Option<&str>,
+        tags_json: &str,
+        search_text: &str,
+        content_hash: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"
+INSERT INTO genome_decisions (
+  decision_id, date, description, rationale, tags_json, search_text, content_hash
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+ON CONFLICT(decision_id) DO UPDATE SET
+  date=excluded.date,
+  description=excluded.description,
+  rationale=excluded.rationale,
+  tags_json=excluded.tags_json,
+  search_text=excluded.search_text,
+  content_hash=excluded.content_hash
+"#,
+            params![
+                decision_id,
+                date,
+                description,
+                rationale,
+                tags_json,
+                search_text,
+                content_hash
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_history_hash(&self, session_id: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT content_hash FROM history_entries WHERE session_id=?1")?;
+        Ok(stmt
+            .query_row(params![session_id], |row| row.get(0))
+            .optional()?)
+    }
+
+    pub fn get_genome_hash(&self, decision_id: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT content_hash FROM genome_decisions WHERE decision_id=?1")?;
+        Ok(stmt
+            .query_row(params![decision_id], |row| row.get(0))
+            .optional()?)
+    }
+
+    pub fn has_history_vector(&self, session_id: &str) -> Result<bool> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT 1 FROM history_vec WHERE session_id=?1 LIMIT 1")?;
+        Ok(stmt
+            .query_row(params![session_id], |_| Ok(1_i64))
+            .optional()?
+            .is_some())
+    }
+
+    pub fn has_history_vec0(&self, session_id: &str) -> Result<bool> {
+        let mut stmt = match self
+            .conn
+            .prepare("SELECT 1 FROM history_vec0 WHERE session_id=?1 LIMIT 1")
+        {
+            Ok(s) => s,
+            Err(_) => return Ok(false),
+        };
+        Ok(stmt
+            .query_row(params![session_id], |_| Ok(1_i64))
+            .optional()?
+            .is_some())
+    }
+
+    pub fn has_genome_vector(&self, decision_id: &str) -> Result<bool> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT 1 FROM genome_vec WHERE decision_id=?1 LIMIT 1")?;
+        Ok(stmt
+            .query_row(params![decision_id], |_| Ok(1_i64))
+            .optional()?
+            .is_some())
+    }
+
+    pub fn has_genome_vec0(&self, decision_id: &str) -> Result<bool> {
+        let mut stmt = match self
+            .conn
+            .prepare("SELECT 1 FROM genome_vec0 WHERE decision_id=?1 LIMIT 1")
+        {
+            Ok(s) => s,
+            Err(_) => return Ok(false),
+        };
+        Ok(stmt
+            .query_row(params![decision_id], |_| Ok(1_i64))
+            .optional()?
+            .is_some())
+    }
+
+    /// Delete all history entries except those with the given session IDs.
+    /// WARNING: This does NOT update the FTS tables. Caller MUST call `refresh_fts()`
+    /// after this method to keep keyword search consistent.
+    pub fn delete_history_except(&self, keep_ids: &HashSet<String>) -> Result<()> {
+        if keep_ids.is_empty() {
+            self.conn.execute("DELETE FROM history_entries", [])?;
+            self.conn.execute("DELETE FROM history_vec", [])?;
+            let _ = self.conn.execute("DELETE FROM history_vec0", []);
+            return Ok(());
+        }
+
+        let placeholders = std::iter::repeat_n("?", keep_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql_entries = format!(
+            "DELETE FROM history_entries WHERE session_id NOT IN ({})",
+            placeholders
+        );
+        let sql_vec = format!(
+            "DELETE FROM history_vec WHERE session_id NOT IN ({})",
+            placeholders
+        );
+        let sql_vec0 = format!(
+            "DELETE FROM history_vec0 WHERE session_id NOT IN ({})",
+            placeholders
+        );
+        self.conn
+            .execute(&sql_entries, rusqlite::params_from_iter(keep_ids.iter()))?;
+        self.conn
+            .execute(&sql_vec, rusqlite::params_from_iter(keep_ids.iter()))?;
+        let _ = self
+            .conn
+            .execute(&sql_vec0, rusqlite::params_from_iter(keep_ids.iter()));
+        Ok(())
+    }
+
+    /// Delete all genome decisions except those with the given decision IDs.
+    /// WARNING: This does NOT update the FTS tables. Caller MUST call `refresh_fts()`
+    /// after this method to keep keyword search consistent.
+    pub fn delete_genome_except(&self, keep_ids: &HashSet<String>) -> Result<()> {
+        if keep_ids.is_empty() {
+            self.conn.execute("DELETE FROM genome_decisions", [])?;
+            self.conn.execute("DELETE FROM genome_vec", [])?;
+            let _ = self.conn.execute("DELETE FROM genome_vec0", []);
+            return Ok(());
+        }
+
+        let placeholders = std::iter::repeat_n("?", keep_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql_entries = format!(
+            "DELETE FROM genome_decisions WHERE decision_id NOT IN ({})",
+            placeholders
+        );
+        let sql_vec = format!(
+            "DELETE FROM genome_vec WHERE decision_id NOT IN ({})",
+            placeholders
+        );
+        let sql_vec0 = format!(
+            "DELETE FROM genome_vec0 WHERE decision_id NOT IN ({})",
+            placeholders
+        );
+        self.conn
+            .execute(&sql_entries, rusqlite::params_from_iter(keep_ids.iter()))?;
+        self.conn
+            .execute(&sql_vec, rusqlite::params_from_iter(keep_ids.iter()))?;
+        let _ = self
+            .conn
+            .execute(&sql_vec0, rusqlite::params_from_iter(keep_ids.iter()));
+        Ok(())
+    }
+
+    pub fn refresh_fts(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM history_fts", [])?;
+        self.conn.execute(
+            "INSERT INTO history_fts(session_id, search_text) SELECT session_id, search_text FROM history_entries",
+            [],
+        )?;
+
+        self.conn.execute("DELETE FROM genome_fts", [])?;
+        self.conn.execute(
+            "INSERT INTO genome_fts(decision_id, search_text) SELECT decision_id, search_text FROM genome_decisions",
+            [],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_history_vector(&self, session_id: &str, vector_json: &str) -> Result<()> {
+        self.conn.execute(
+            r#"INSERT INTO history_vec(session_id, vector_json) VALUES (?1, ?2)
+               ON CONFLICT(session_id) DO UPDATE SET vector_json=excluded.vector_json"#,
+            params![session_id, vector_json],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_history_vector_vec0(&self, session_id: &str, vector_json: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM history_vec0 WHERE session_id=?1",
+            params![session_id],
+        )?;
+        self.conn.execute(
+            "INSERT INTO history_vec0(session_id, embedding) VALUES (?1, ?2)",
+            params![session_id, vector_json],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_genome_vector(&self, decision_id: &str, vector_json: &str) -> Result<()> {
+        self.conn.execute(
+            r#"INSERT INTO genome_vec(decision_id, vector_json) VALUES (?1, ?2)
+               ON CONFLICT(decision_id) DO UPDATE SET vector_json=excluded.vector_json"#,
+            params![decision_id, vector_json],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_genome_vector_vec0(&self, decision_id: &str, vector_json: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM genome_vec0 WHERE decision_id=?1",
+            params![decision_id],
+        )?;
+        self.conn.execute(
+            "INSERT INTO genome_vec0(decision_id, embedding) VALUES (?1, ?2)",
+            params![decision_id, vector_json],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_history_vector(&self, session_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM history_vec WHERE session_id=?1",
+            params![session_id],
+        )?;
+        let _ = self.conn.execute(
+            "DELETE FROM history_vec0 WHERE session_id=?1",
+            params![session_id],
+        );
+        Ok(())
+    }
+
+    pub fn delete_genome_vector(&self, decision_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM genome_vec WHERE decision_id=?1",
+            params![decision_id],
+        )?;
+        let _ = self.conn.execute(
+            "DELETE FROM genome_vec0 WHERE decision_id=?1",
+            params![decision_id],
+        );
+        Ok(())
+    }
+
+    fn sanitize_fts_query(query: &str) -> String {
+        let q = query.trim();
+        if q.is_empty() {
+            return String::new();
+        }
+        format!("\"{}\"", q.replace('"', "\"\""))
+    }
+
+    pub fn search_history_keyword(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+        let fts_query = Self::sanitize_fts_query(query);
+        if fts_query.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut stmt = match self.conn.prepare(
+            r#"
+SELECT h.session_id, h.session_name, h.summary, bm25(history_fts) AS rank
+FROM history_fts
+JOIN history_entries h ON h.session_id = history_fts.session_id
+WHERE history_fts MATCH ?1
+ORDER BY rank
+LIMIT ?2
+"#,
+        ) {
+            Ok(s) => s,
+            Err(_) => return self.search_history_keyword_like(query, limit),
+        };
+
+        let rows = stmt.query_map(params![fts_query, limit as i64], |row| {
+            Ok(SearchResult {
+                source: "history".to_string(),
+                id: row.get(0)?,
+                title: row.get(1)?,
+                snippet: row.get(2)?,
+                score: row.get::<_, f64>(3)?,
+            })
+        });
+
+        match rows {
+            Ok(rows) => {
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row?);
+                }
+                Ok(out)
+            }
+            Err(_) => self.search_history_keyword_like(query, limit),
+        }
+    }
+
+    fn search_history_keyword_like(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+        let like = format!("%{}%", query.to_lowercase());
+        let mut stmt = self.conn.prepare(
+            r#"
+SELECT session_id, session_name, summary
+FROM history_entries
+WHERE lower(search_text) LIKE ?1
+ORDER BY ended_at DESC
+LIMIT ?2
+"#,
+        )?;
+
+        let rows = stmt.query_map(params![like, limit as i64], |row| {
+            Ok(SearchResult {
+                source: "history".to_string(),
+                id: row.get(0)?,
+                title: row.get(1)?,
+                snippet: row.get(2)?,
+                score: 0.0,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn search_genome_keyword(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+        let fts_query = Self::sanitize_fts_query(query);
+        if fts_query.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut stmt = match self.conn.prepare(
+            r#"
+SELECT g.decision_id, g.description, COALESCE(g.rationale, ''), bm25(genome_fts) AS rank
+FROM genome_fts
+JOIN genome_decisions g ON g.decision_id = genome_fts.decision_id
+WHERE genome_fts MATCH ?1
+ORDER BY rank
+LIMIT ?2
+"#,
+        ) {
+            Ok(s) => s,
+            Err(_) => return self.search_genome_keyword_like(query, limit),
+        };
+
+        let rows = stmt.query_map(params![fts_query, limit as i64], |row| {
+            Ok(SearchResult {
+                source: "genome".to_string(),
+                id: row.get(0)?,
+                title: row.get(1)?,
+                snippet: row.get(2)?,
+                score: row.get::<_, f64>(3)?,
+            })
+        });
+
+        match rows {
+            Ok(rows) => {
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row?);
+                }
+                Ok(out)
+            }
+            Err(_) => self.search_genome_keyword_like(query, limit),
+        }
+    }
+
+    fn search_genome_keyword_like(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+        let like = format!("%{}%", query.to_lowercase());
+        let mut stmt = self.conn.prepare(
+            r#"
+SELECT decision_id, description, COALESCE(rationale, '')
+FROM genome_decisions
+WHERE lower(search_text) LIKE ?1
+ORDER BY date DESC
+LIMIT ?2
+"#,
+        )?;
+
+        let rows = stmt.query_map(params![like, limit as i64], |row| {
+            Ok(SearchResult {
+                source: "genome".to_string(),
+                id: row.get(0)?,
+                title: row.get(1)?,
+                snippet: row.get(2)?,
+                score: 0.0,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn read_history_vectors(&self) -> Result<Vec<(String, Vec<f32>)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT session_id, vector_json FROM history_vec")?;
+        let rows = stmt.query_map([], |row| {
+            let id: String = row.get(0)?;
+            let raw: String = row.get(1)?;
+            Ok((id, raw))
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, raw) = row?;
+            let vec: Vec<f32> = serde_json::from_str(&raw).unwrap_or_default();
+            if !vec.is_empty() {
+                out.push((id, vec));
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn search_history_vec_knn(
+        &self,
+        query_vector_json: &str,
+        candidate_limit: usize,
+    ) -> Result<Vec<(String, f64)>> {
+        if candidate_limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            r#"
+SELECT session_id, distance
+FROM history_vec0
+WHERE embedding MATCH ?1
+ORDER BY distance
+LIMIT ?2
+"#,
+        )?;
+        let rows = stmt.query_map(params![query_vector_json, candidate_limit as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn read_genome_vectors(&self) -> Result<Vec<(String, Vec<f32>)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT decision_id, vector_json FROM genome_vec")?;
+        let rows = stmt.query_map([], |row| {
+            let id: String = row.get(0)?;
+            let raw: String = row.get(1)?;
+            Ok((id, raw))
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, raw) = row?;
+            let vec: Vec<f32> = serde_json::from_str(&raw).unwrap_or_default();
+            if !vec.is_empty() {
+                out.push((id, vec));
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn search_genome_vec_knn(
+        &self,
+        query_vector_json: &str,
+        candidate_limit: usize,
+    ) -> Result<Vec<(String, f64)>> {
+        if candidate_limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            r#"
+SELECT decision_id, distance
+FROM genome_vec0
+WHERE embedding MATCH ?1
+ORDER BY distance
+LIMIT ?2
+"#,
+        )?;
+        let rows = stmt.query_map(params![query_vector_json, candidate_limit as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn get_history_by_id(&self, session_id: &str) -> Result<Option<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT session_name, summary FROM history_entries WHERE session_id=?1")?;
+        let mut rows = stmt.query(params![session_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some((row.get(0)?, row.get(1)?)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_genome_by_id(&self, decision_id: &str) -> Result<Option<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT description, COALESCE(rationale, '') FROM genome_decisions WHERE decision_id=?1",
+        )?;
+        let mut rows = stmt.query(params![decision_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some((row.get(0)?, row.get(1)?)))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_test_store() -> (tempfile::TempDir, RetrievalStore) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RetrievalStore::open(tmp.path()).unwrap();
+        store.init_schema().unwrap();
+        (tmp, store)
+    }
+
+    #[test]
+    fn test_open_and_init_schema() {
+        let (_tmp, store) = open_test_store();
+        assert!(store.table_exists("history_entries").unwrap());
+        assert!(store.table_exists("genome_decisions").unwrap());
+        assert!(store.table_exists("retrieval_meta").unwrap());
+        assert!(store.table_exists("history_fts").unwrap());
+        assert!(store.table_exists("genome_fts").unwrap());
+        assert!(store.table_exists("history_vec").unwrap());
+        assert!(store.table_exists("genome_vec").unwrap());
+        assert_eq!(
+            store.get_meta("schema_version").unwrap(),
+            Some("2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_upsert_and_get_history() {
+        let (_tmp, store) = open_test_store();
+        store
+            .upsert_history(
+                "s1",
+                "Session One",
+                Some("claude"),
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T01:00:00Z",
+                "built retrieval",
+                "[]",
+                "[]",
+                "session one built retrieval",
+                "hash1",
+            )
+            .unwrap();
+
+        let result = store.get_history_by_id("s1").unwrap();
+        assert!(result.is_some());
+        let (name, summary) = result.unwrap();
+        assert_eq!(name, "Session One");
+        assert_eq!(summary, "built retrieval");
+    }
+
+    #[test]
+    fn test_upsert_and_get_genome() {
+        let (_tmp, store) = open_test_store();
+        store
+            .upsert_genome(
+                "d1",
+                "2026-01-01",
+                "Use Rust for CLI",
+                Some("performance and safety"),
+                "[\"arch\"]",
+                "use rust cli performance",
+                "ghash1",
+            )
+            .unwrap();
+
+        let result = store.get_genome_by_id("d1").unwrap();
+        assert!(result.is_some());
+        let (desc, rationale) = result.unwrap();
+        assert_eq!(desc, "Use Rust for CLI");
+        assert_eq!(rationale, "performance and safety");
+    }
+
+    #[test]
+    fn test_content_hash_tracking() {
+        let (_tmp, store) = open_test_store();
+        store
+            .upsert_history(
+                "s1",
+                "Sess",
+                None,
+                "2026-01-01",
+                "2026-01-01",
+                "summary",
+                "[]",
+                "[]",
+                "text",
+                "abc123",
+            )
+            .unwrap();
+
+        let hash = store.get_history_hash("s1").unwrap();
+        assert_eq!(hash, Some("abc123".to_string()));
+
+        let missing = store.get_history_hash("nonexistent").unwrap();
+        assert!(missing.is_none());
+    }
+
+    #[test]
+    fn test_search_history_keyword() {
+        let (_tmp, store) = open_test_store();
+        for i in 0..3 {
+            store
+                .upsert_history(
+                    &format!("s{}", i),
+                    &format!("Session {}", i),
+                    None,
+                    "2026-01-01",
+                    "2026-01-01",
+                    &format!("summary {}", i),
+                    "[]",
+                    "[]",
+                    &format!("retrieval testing session {}", i),
+                    "",
+                )
+                .unwrap();
+        }
+        store.refresh_fts().unwrap();
+
+        let results = store.search_history_keyword("retrieval", 10).unwrap();
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|r| r.source == "history"));
+    }
+
+    #[test]
+    fn test_search_genome_keyword() {
+        let (_tmp, store) = open_test_store();
+        store
+            .upsert_genome(
+                "d1",
+                "2026-01-01",
+                "Use Rust",
+                None,
+                "[]",
+                "rust performance safety",
+                "",
+            )
+            .unwrap();
+        store
+            .upsert_genome(
+                "d2",
+                "2026-01-02",
+                "Use SQLite",
+                None,
+                "[]",
+                "sqlite embedded database",
+                "",
+            )
+            .unwrap();
+        store.refresh_fts().unwrap();
+
+        let results = store.search_genome_keyword("rust", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "d1");
+    }
+
+    #[test]
+    fn test_search_empty_query() {
+        let (_tmp, store) = open_test_store();
+        let results = store.search_history_keyword("", 10).unwrap();
+        assert!(results.is_empty());
+
+        let results = store.search_history_keyword("   ", 10).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_clear_all() {
+        let (_tmp, store) = open_test_store();
+        store
+            .upsert_history("s1", "Sess", None, "d", "d", "sum", "[]", "[]", "text", "")
+            .unwrap();
+        store
+            .upsert_genome("d1", "d", "desc", None, "[]", "text", "")
+            .unwrap();
+
+        store.clear_all().unwrap();
+
+        assert!(store.get_history_by_id("s1").unwrap().is_none());
+        assert!(store.get_genome_by_id("d1").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_delete_history_except() {
+        let (_tmp, store) = open_test_store();
+        for i in 0..3 {
+            store
+                .upsert_history(
+                    &format!("s{}", i),
+                    "Sess",
+                    None,
+                    "d",
+                    "d",
+                    "sum",
+                    "[]",
+                    "[]",
+                    "text",
+                    "",
+                )
+                .unwrap();
+        }
+
+        let keep: HashSet<String> = ["s1".to_string()].into_iter().collect();
+        store.delete_history_except(&keep).unwrap();
+
+        assert!(store.get_history_by_id("s0").unwrap().is_none());
+        assert!(store.get_history_by_id("s1").unwrap().is_some());
+        assert!(store.get_history_by_id("s2").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_refresh_fts() {
+        let (_tmp, store) = open_test_store();
+        store
+            .upsert_history(
+                "s1",
+                "Sess",
+                None,
+                "d",
+                "d",
+                "sum",
+                "[]",
+                "[]",
+                "unique_keyword_xyz",
+                "",
+            )
+            .unwrap();
+
+        // Before refresh, FTS should be empty
+        let before = store
+            .search_history_keyword("unique_keyword_xyz", 10)
+            .unwrap();
+        assert!(before.is_empty());
+
+        store.refresh_fts().unwrap();
+
+        let after = store
+            .search_history_keyword("unique_keyword_xyz", 10)
+            .unwrap();
+        assert_eq!(after.len(), 1);
+    }
+
+    #[test]
+    fn test_extension_path_rejects_relative() {
+        let (_tmp, store) = open_test_store();
+        std::env::set_var("IMPULSE_SQLITE_VEC_EXT", "relative/path/vec.so");
+        let result = store.try_load_vec_extension();
+        std::env::remove_var("IMPULSE_SQLITE_VEC_EXT");
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("absolute path"),
+            "should mention absolute path requirement"
+        );
+    }
+
+    #[test]
+    fn test_extension_path_rejects_traversal() {
+        let (_tmp, store) = open_test_store();
+        std::env::set_var("IMPULSE_SQLITE_VEC_EXT", "/usr/lib/../etc/vec.so");
+        let result = store.try_load_vec_extension();
+        std::env::remove_var("IMPULSE_SQLITE_VEC_EXT");
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains(".."),
+            "should mention path traversal"
+        );
+    }
+
+    #[test]
+    fn test_extension_path_missing_file_returns_false() {
+        let (_tmp, store) = open_test_store();
+        std::env::set_var("IMPULSE_SQLITE_VEC_EXT", "/nonexistent/path/vec.so");
+        let result = store.try_load_vec_extension().unwrap();
+        std::env::remove_var("IMPULSE_SQLITE_VEC_EXT");
+        assert!(!result, "missing extension file should return Ok(false)");
+    }
+}

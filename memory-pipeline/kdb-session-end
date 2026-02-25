@@ -1,0 +1,12 @@
+#!/bin/bash
+# kdb-session-end — Auto-wrap-up for coding agent sessions
+#
+# Replaces: kdb --log "name" "summary" && kdb --rebuild && kdb --check
+#
+# Usage:
+#   kdb-session-end --session "s7" --summary "Built automation tools"
+#   kdb-session-end --session "s7" --summary "Built tools" --rebuild
+#   kdb-session-end --session "s7" --summary "Built tools" --json
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+python3 "$SCRIPT_DIR/session_end.py" "$@"

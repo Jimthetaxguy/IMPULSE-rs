@@ -1,0 +1,11 @@
+#!/bin/bash
+# kdb-contribute — Bulk JSON contribution tool for coding agents
+#
+# Replaces: multiple kdb --add-finding/risk/concept calls
+#
+# Usage:
+#   echo '{"findings":[{"severity":"HIGH","title":"Bug"}]}' | kdb-contribute
+#   kdb-contribute --inline '{"risks":[{"severity":"LOW","description":"Minor"}]}'
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+python3 "$SCRIPT_DIR/bulk_contribute.py" "$@"

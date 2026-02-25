@@ -1,0 +1,109 @@
+---
+title: Documentation Summary
+description: Unified navigation structure for Impulse documentation
+version: '2.1'
+updated: '2026-02-24'
+schema_version: '1.0'
+type: navigation
+category: docs
+---
+# Navigation Tree
+
+quick_reference:
+  - name: RUST-CANONICAL-CONTRACT.md
+    description: Authoritative product contract
+    path: spec/RUST-CANONICAL-CONTRACT.md
+    start: true
+
+  - name: AGENTS.md
+    description: AI agent guidelines
+    path: ../../AGENTS.md
+    start: true
+
+  - name: INDEX.md
+    description: Master navigation
+    path: INDEX.md
+    start: true
+
+  - name: HONEST-ROADMAP.md
+    description: Reality check
+    path: HONEST-ROADMAP.md
+    start: true
+
+phases:
+  phase1:
+    - name: Phase 1 Checklist
+      path: phases/PHASE1-CHECKLIST.md
+    - name: Phase 1.5 Coordination
+      path: phases/PHASE1.5-COORDINATION.md
+
+  phase2:
+    - name: Phase 2 Persistence
+      path: phases/PHASE2-PERSISTENCE.md
+    - name: Phase 2 Migration Plan
+      path: phases/PHASE2-MIGRATION-PLAN.md
+
+categories:
+  specifications:
+    - spec/RUST-CANONICAL-CONTRACT.md
+    - spec/COMPETITIVE-POSITIONING.md
+    - spec/PERFORMANCE-TARGETS.md
+
+  architecture:
+    - vision/CLI-ARCHITECTURE.md
+    - vision/DATA-MODELS.md
+    - vision/DYNAMIC-CLI-VISION.md
+    - vision/DASHBOARD-DESIGN.md
+    - vision/BENCHMARKS.md
+
+  research:
+    - research/README.md
+    - research/SEARCH-LAYER-ANALYSIS.md
+    - research/TERMINAL-LAYER-ANALYSIS.md
+    - research/MEMORY-EXTRACTION-ANALYSIS.md
+    - research/LLM-CODING-PROBLEMS.md
+    - research/PAGEINDEX-FEASIBILITY-DECISION.md
+    - research/TOKEN-TRACKING-ALGORITHM.md
+
+  reference_patterns:
+    - research/reference-patterns/CLAUDE-HISTORIAN-PATTERNS.md
+    - research/reference-patterns/SQLITE-VEC-PATTERNS.md
+    - research/reference-patterns/OPENCODE-PLUGIN-SDK.md
+    - research/reference-patterns/MEM0-FACT-EXTRACTION.md
+
+  guides:
+    - guides/TEAM-ONBOARDING.md
+    - guides/BEST-PRACTICES.md
+    - guides/ERROR-HANDLING-GUIDE.md
+    - guides/DATABASE-GUIDE.md
+    - guides/INTEGRATION-COOKBOOK.md
+    - guides/DEPLOYMENT-FRAMEWORK.md
+
+  decisions:
+    - decisions/README.md
+    - decisions/0001-claude-code-primary.md
+    - decisions/0002-file-first-memory.md
+    - decisions/0003-progressive-search.md
+    - decisions/0004-extraction-strategy.md
+    - decisions/0005-distribution-model.md
+
+  session_logs:
+    - session-logs/DEVELOPMENT-HISTORY.md
+
+  archive:
+    - archive/README.md
+    - archive/SPEC-v1.1.md
+    - archive/ARCHITECTURE.md
+    - archive/STEWARD.md
+    - archive/phases/IMPLEMENTATION-ROADMAP.md
+    - archive/spec/PRODUCT-SPEC-v2.md
+    - archive/research/PRD-v1.md
+    - archive/research/REALISTIC-FRAMEWORK.md
+    - archive/research/cockpit-feature-plan.md
+
+metadata:
+  total_documents: 76
+  categories: 8
+  decisions: 5
+  phases: 3
+  status: active_development

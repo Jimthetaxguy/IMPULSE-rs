@@ -1,0 +1,27 @@
+#!/bin/bash
+# kdb - Impulse Knowledge Database query tool
+#
+# Usage:
+#   kdb "search terms"          # Full-text search
+#   kdb --decisions              # List active ADRs
+#   kdb --risks                  # List open risks
+#   kdb --concepts               # List all concepts
+#   kdb --concepts technology    # Filter by category
+#   kdb --stats                  # Database statistics
+#   kdb --rebuild                # Rebuild database from docs/
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+DB_PATH="$SCRIPT_DIR/knowledge.db"
+
+if [ "$1" = "--rebuild" ]; then
+    echo "Rebuilding knowledge database..."
+    python3 "$SCRIPT_DIR/extract.py"
+    exit $?
+fi
+
+if [ ! -f "$DB_PATH" ]; then
+    echo "Knowledge database not found. Building..."
+    python3 "$SCRIPT_DIR/extract.py"
+fi
+
+python3 "$SCRIPT_DIR/query.py" "$@"

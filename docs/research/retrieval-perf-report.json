@@ -1,0 +1,236 @@
+{
+  "summary": {
+    "iterations": 5,
+    "query_count": 10,
+    "binary": "./impulse-rs/target/debug/impulse-rs",
+    "impulse_dir": "./.impulse",
+    "vector_backend_enabled": false,
+    "keyword_p95_ms": 2.0,
+    "semantic_p95_ms": 0.0,
+    "injection_review_p95_ms": 7.740541000000004,
+    "semantic_fallback_rate": 1.0,
+    "injection_fallback_rate": 1.0,
+    "overall_pass": true
+  },
+  "thresholds": {
+    "keyword_p95": {
+      "actual": 2.0,
+      "max": 200.0,
+      "pass": true
+    },
+    "semantic_p95": {
+      "actual": 0.0,
+      "max": 500.0,
+      "pass": true
+    },
+    "injection_review_p95": {
+      "actual": 7.740541000000004,
+      "max": 700.0,
+      "pass": true
+    },
+    "semantic_fallback_rate": {
+      "actual": 1.0,
+      "max": 0.5,
+      "pass": true,
+      "skipped": true
+    },
+    "injection_fallback_rate": {
+      "actual": 1.0,
+      "max": 0.7,
+      "pass": true,
+      "skipped": true
+    }
+  },
+  "samples": {
+    "keyword": [
+      {
+        "ok": true,
+        "query": "session",
+        "mode": "keyword",
+        "wall_ms": 10.045375000000002,
+        "timing_ms": 2.0,
+        "used_fallback": false,
+        "fallback_code": null,
+        "backend_used": "keyword",
+        "candidate_count": 0
+      },
+      {
+        "ok": true,
+        "query": "review",
+        "mode": "keyword",
+        "wall_ms": 5.875875000000002,
+        "timing_ms": 0.0,
+        "used_fallback": false,
+        "fallback_code": null,
+        "backend_used": "keyword",
+        "candidate_count": 0
+      },
+      {
+        "ok": true,
+        "query": "memory",
+        "mode": "keyword",
+        "wall_ms": 6.220709000000005,
+        "timing_ms": 0.0,
+        "used_fallback": false,
+        "fallback_code": null,
+        "backend_used": "keyword",
+        "candidate_count": 0
+      },
+      {
+        "ok": true,
+        "query": "fallback",
+        "mode": "keyword",
+        "wall_ms": 5.661874999999997,
+        "timing_ms": 0.0,
+        "used_fallback": false,
+        "fallback_code": null,
+        "backend_used": "keyword",
+        "candidate_count": 0
+      },
+      {
+        "ok": true,
+        "query": "hooks",
+        "mode": "keyword",
+        "wall_ms": 5.133457999999994,
+        "timing_ms": 0.0,
+        "used_fallback": false,
+        "fallback_code": null,
+        "backend_used": "keyword",
+        "candidate_count": 0
+      }
+    ],
+    "semantic": [
+      {
+        "ok": true,
+        "query": "session",
+        "mode": "semantic",
+        "wall_ms": 7.674042000000006,
+        "timing_ms": 0.0,
+        "used_fallback": true,
+        "fallback_code": "vector_backend_disabled",
+        "backend_used": "keyword",
+        "candidate_count": 0
+      },
+      {
+        "ok": true,
+        "query": "review",
+        "mode": "semantic",
+        "wall_ms": 6.888334000000003,
+        "timing_ms": 0.0,
+        "used_fallback": true,
+        "fallback_code": "vector_backend_disabled",
+        "backend_used": "keyword",
+        "candidate_count": 0
+      },
+      {
+        "ok": true,
+        "query": "memory",
+        "mode": "semantic",
+        "wall_ms": 7.089791999999997,
+        "timing_ms": 0.0,
+        "used_fallback": true,
+        "fallback_code": "vector_backend_disabled",
+        "backend_used": "keyword",
+        "candidate_count": 0
+      },
+      {
+        "ok": true,
+        "query": "fallback",
+        "mode": "semantic",
+        "wall_ms": 5.962624999999999,
+        "timing_ms": 0.0,
+        "used_fallback": true,
+        "fallback_code": "vector_backend_disabled",
+        "backend_used": "keyword",
+        "candidate_count": 0
+      },
+      {
+        "ok": true,
+        "query": "hooks",
+        "mode": "semantic",
+        "wall_ms": 5.516875000000004,
+        "timing_ms": 0.0,
+        "used_fallback": true,
+        "fallback_code": "vector_backend_disabled",
+        "backend_used": "keyword",
+        "candidate_count": 0
+      }
+    ],
+    "injection_review": [
+      {
+        "ok": true,
+        "query": "session",
+        "wall_ms": 7.740541000000004,
+        "line": "Injection: requested=review effective=review applied=false backend=keyword fallback_code=VectorBackendDisabled timing=0ms candidates=0 status=no_candidates artifact=none",
+        "requested": "review",
+        "effective": "review",
+        "applied": false,
+        "backend": "keyword",
+        "fallback_code": "VectorBackendDisabled",
+        "timing_ms": 0.0,
+        "candidates": 0,
+        "status": "no_candidates"
+      },
+      {
+        "ok": true,
+        "query": "review",
+        "wall_ms": 7.449625000000001,
+        "line": "Injection: requested=review effective=review applied=false backend=keyword fallback_code=VectorBackendDisabled timing=0ms candidates=0 status=no_candidates artifact=none",
+        "requested": "review",
+        "effective": "review",
+        "applied": false,
+        "backend": "keyword",
+        "fallback_code": "VectorBackendDisabled",
+        "timing_ms": 0.0,
+        "candidates": 0,
+        "status": "no_candidates"
+      },
+      {
+        "ok": true,
+        "query": "memory",
+        "wall_ms": 6.976542000000002,
+        "line": "Injection: requested=review effective=review applied=false backend=keyword fallback_code=VectorBackendDisabled timing=0ms candidates=0 status=no_candidates artifact=none",
+        "requested": "review",
+        "effective": "review",
+        "applied": false,
+        "backend": "keyword",
+        "fallback_code": "VectorBackendDisabled",
+        "timing_ms": 0.0,
+        "candidates": 0,
+        "status": "no_candidates"
+      },
+      {
+        "ok": true,
+        "query": "fallback",
+        "wall_ms": 6.207708000000006,
+        "line": "Injection: requested=review effective=review applied=false backend=keyword fallback_code=VectorBackendDisabled timing=0ms candidates=0 status=no_candidates artifact=none",
+        "requested": "review",
+        "effective": "review",
+        "applied": false,
+        "backend": "keyword",
+        "fallback_code": "VectorBackendDisabled",
+        "timing_ms": 0.0,
+        "candidates": 0,
+        "status": "no_candidates"
+      },
+      {
+        "ok": true,
+        "query": "hooks",
+        "wall_ms": 6.511000000000017,
+        "line": "Injection: requested=review effective=review applied=false backend=keyword fallback_code=VectorBackendDisabled timing=1ms candidates=0 status=no_candidates artifact=none",
+        "requested": "review",
+        "effective": "review",
+        "applied": false,
+        "backend": "keyword",
+        "fallback_code": "VectorBackendDisabled",
+        "timing_ms": 1.0,
+        "candidates": 0,
+        "status": "no_candidates"
+      }
+    ]
+  },
+  "notes": [
+    "Semantic and injection fallback-rate assertions are skipped when vector backend is disabled.",
+    "Injection p95 is measured as end-to-end orchestrate command wall-clock runtime in review mode."
+  ]
+}

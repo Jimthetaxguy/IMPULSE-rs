@@ -1,0 +1,10 @@
+Impulse - Terminal Multiplexer for AI Coding Agents
+Copyright 2024-2026 James Pustorino
+
+This product includes software developed by the community.
+See the source code for details.
+
+Third-party licenses:
+- This software uses rusqlite, which is in the public domain (SQLite)
+- This software uses tokio, ratatui, crossterm, and other Rust crates
+  under their respective licenses (MIT/Apache-2.0)

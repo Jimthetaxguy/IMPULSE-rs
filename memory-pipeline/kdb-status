@@ -1,0 +1,12 @@
+#!/bin/bash
+# kdb-status — One-line health summary for the knowledge database
+#
+# Usage:
+#   kdb-status              # Human-readable one-liner
+#   kdb-status --porcelain  # Machine-parseable (space-separated, no labels)
+#   kdb-status --json       # Full stats as JSON
+#
+# Exit codes: 0=CURRENT, 1=STALE, 2=MISSING
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+python3 "$SCRIPT_DIR/status.py" "$@"

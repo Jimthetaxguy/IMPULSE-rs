@@ -1,0 +1,163 @@
+---
+title: Impulse Project Metadata
+description: Centralized metadata for Impulse project
+version: "2.0"
+updated: 2026-02-23
+type: metadata
+---
+
+# Impulse Project Metadata
+
+## Project Identity
+
+| Field | Value |
+|-------|-------|
+| Name | Impulse |
+| Tagline | "Your AI remembers. Silently." |
+| Type | Terminal-native AI coding agent sidecar |
+| Language | Rust |
+| Status | Active Development |
+
+## Core Metrics
+
+| Metric | Value |
+|--------|-------|
+| Total Source Files | 14 |
+| Total Lines (Rust) | ~3,200 |
+| Total Documents | 68 |
+| Categories | 8 |
+| Decisions (ADRs) | 5 |
+
+## Architecture
+
+dual_mode:
+  direct:
+    description: "Per-action, stateless"
+    use_case: "CLI hooks for Claude Code/OpenCode"
+    flow: "read → process → write → exit"
+    
+  daemon:
+    description: "Long-running"
+    use_case: "TUI, interactive chat"
+    socket_path: ".impulse/sockets/impulse.sock"
+    features:
+      - "In-memory state"
+      - "Periodic file sync"
+      - "Unix socket IPC"
+
+data_files:
+  - name: LIVE_STATE.json
+    purpose: "Active sessions, files, tools"
+    persistence: "Ephemeral (gitignored)"
+    
+  - name: HISTORY.jsonl
+    purpose: "Session history (append-only)"
+    persistence: "Git-committed"
+    
+  - name: GENOME.md
+    purpose: "Permanent decisions, preferences"
+    persistence: "Git-committed"
+
+## Technology Stack
+
+| Component | Technology | Version |
+|----------|------------|---------|
+| Language | Rust | stable |
+| CLI Parser | clap | 4.x |
+| TUI | ratatui | 0.28 |
+| Async | tokio | 1.x |
+| HTTP Client | reqwest | 0.11 |
+| Error Handling | thiserror, anyhow | latest |
+
+## Providers
+
+llm_providers:
+  - name: Anthropic
+    status: implemented
+    models:
+      - claude-3-5-sonnet-20241022
+      - claude-3-opus-20240229
+      
+  - name: OpenAI
+    status: implemented
+    models:
+      - gpt-4o
+      - gpt-4o-mini
+      
+  - name: Minimax
+    status: implemented
+    models:
+      - MiniMax-M2.1
+
+## Roadmap Phases
+
+phases:
+  - name: Phase 1
+    focus: "Core CLI + Direct Mode + Daemon + TUI"
+    status: complete
+    
+  - name: Phase 2
+    focus: "Claude Code/OpenCode Hooks + Chat"
+    status: pending
+    
+  - name: Phase 3
+    focus: "Semantic Search + Vector Similarity"
+    status: planned
+
+## Commands
+
+cli_commands:
+  session:
+    - session-start
+    - session-end
+    - session-info
+    - list-sessions
+    
+  tracking:
+    - track-write
+    - track-tool
+    
+  info:
+    - status
+    - genome
+    - history
+    - list-providers
+    
+  system:
+    - init
+    - daemon
+    - run
+
+## File Structure
+
+```
+impulse-rs/
+├── src/
+│   ├── main.rs           # CLI entry
+│   ├── state/mod.rs     # State management
+│   ├── daemon/mod.rs    # Unix socket server
+│   ├── client/mod.rs   # Daemon client
+│   ├── storage/mod.rs  # Atomic file ops
+│   ├── ui/mod.rs       # Ratatui TUI
+│   ├── memory/mod.rs   # GENOME system
+│   ├── agent/          # LLM providers
+│   └── error.rs        # Error types
+└── .impulse/           # Runtime data
+    ├── LIVE_STATE.json
+    ├── HISTORY.jsonl
+    ├── GENOME.md
+    └── sockets/
+```
+
+## Authors
+
+| Name | Role |
+|------|------|
+| James Pustorino | Creator (james.s.pustorino@gmail.com, github.com/jamespustorino) |
+
+## Version History
+
+| Version | Date | Changes |
+|---------|------|---------|
+| 2.0 | 2026-02-23 | Rust rewrite, dual mode architecture |
+| 1.0 | 2024 | Initial TypeScript prototype |

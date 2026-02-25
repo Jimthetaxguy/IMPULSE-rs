@@ -1,0 +1,99 @@
+# mise.toml — Tool Version Management for Impulse/SWARM
+
+# Tool installation and version management
+[tools]
+bun = "latest"              # Runtime for TypeScript harness
+python = "3.12"             # Memory pipeline, embeddings, mem0
+rust = "latest"             # Zellij plugins (WASM target)
+nodejs = "20"               # For compatibility, tools
+
+# Mise tasks
+[tasks.swarm-status]
+run = """
+if [ -f LIVE.md ]; then
+  echo "=== SWARM Session Status ==="
+  head -20 LIVE.md
+else
+  echo "No active SWARM session"
+fi
+"""
+description = "Show current SWARM session status"
+
+[tasks.install-deps]
+run = """
+echo "Installing dependencies..."
+cd harness && bun install
+cd ../zellij-plugins && cargo update
+cd ../memory-pipeline && pip install -r requirements.txt
+"""
+description = "Install all project dependencies"
+
+[tasks.validate-tools]
+run = """
+echo "=== Tool Validation ==="
+echo "Checking required tools..."
+
+echo -n "zellij: "
+zellij --version || echo "MISSING"
+
+echo -n "bun: "
+bun --version || echo "MISSING"
+
+echo -n "rustc: "
+rustc --version || echo "MISSING"
+
+echo -n "python3: "
+python3 --version || echo "MISSING"
+
+echo -n "sqlite3: "
+sqlite3 --version || echo "MISSING"
+
+echo -n "Zellij version check (need >=0.42): "
+zellij --version | grep -E '0\.[4-9][2-9]|[1-9]\.' || echo "NEEDS UPDATE"
+
+echo ""
+echo "Cargo targets for WASM:"
+rustup target list | grep wasm32-wasip1 || echo "MISSING (run: rustup target add wasm32-wasip1)"
+"""
+description = "Validate all required tools are available"
+
+[tasks.test-basic]
+run = """
+echo "=== Basic Smoke Tests ==="
+echo "Testing TypeScript compilation..."
+cd harness && bun run --bun src/index.ts --version || echo "FAIL"
+
+echo "Testing Rust build..."
+cd zellij-plugins && cargo build --target wasm32-wasip1 2>&1 | head -5 || echo "FAIL"
+
+echo "Testing Python imports..."
+python3 -c "import sentence_transformers; print('✓ sentence-transformers available')" 2>&1 || echo "✗ MISSING: pip install sentence-transformers"
+
+echo "Testing sqlite-vec..."
+python3 -c "import sqlite_vec; print('✓ sqlite-vec available')" 2>&1 || echo "✗ MISSING: pip install sqlite-vec"
+"""
+description = "Run basic smoke tests"
+
+[tasks.docs-validate]
+run = """
+python3 docs/validate_docs.py
+"""
+description = "Validate documentation front matter and metadata"
+
+[tasks.docs-contract]
+run = """
+python3 docs/validate_docs.py --contract
+"""
+description = "Validate Rust-canonical documentation contract and detect drift"
+
+# Environment variables
+[env]
+RUST_BACKTRACE = "1"
+RUST_LOG = "debug"
+BUN_DEBUG = "1"
+PYTHONUNBUFFERED = "1"
+
+# Paths
+[paths]
+IMPULSE_HOME = "~/.impulse"
+LIVE_STATE_DB = "~/.impulse/live_state.db"

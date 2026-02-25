@@ -1,0 +1,22 @@
+[
+  {
+    "query": "retrieval status and fallback behavior",
+    "relevant_doc_ids": [
+      "doc::docs/spec/RUST-CANONICAL-CONTRACT.md",
+      "doc::docs/INDEX.md"
+    ]
+  },
+  {
+    "query": "semantic search backend and vector availability",
+    "relevant_doc_ids": [
+      "doc::docs/spec/RUST-CANONICAL-CONTRACT.md"
+    ]
+  },
+  {
+    "query": "session lifecycle commands and hooks",
+    "relevant_doc_ids": [
+      "doc::docs/spec/RUST-CANONICAL-CONTRACT.md",
+      "doc::docs/INDEX.md"
+    ]
+  }
+]

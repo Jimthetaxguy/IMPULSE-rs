@@ -1,0 +1,66 @@
+#!/bin/bash
+# kdb — Unified Impulse Knowledge Database CLI
+#
+# All KDB tools accessible from project root.
+#
+# Query commands (pass-through to memory-pipeline/kdb):
+#   kdb "search terms"              Full-text search
+#   kdb --decisions                 Active ADR decisions
+#   kdb --risks                    Open risks by severity
+#   kdb --concepts                 All tracked concepts
+#   kdb --stats                    Database statistics
+#   kdb --summary                  Quick project overview
+#   kdb --json "search terms"      JSON output for agents
+#   kdb --rebuild                  Rebuild database from docs/
+#   kdb --check                    Check staleness
+#
+# Automation commands:
+#   kdb session-start [--task "..."] [--json]    Session bootstrap
+#   kdb session-end --session "..." --summary "..." [--rebuild] [--json]
+#   kdb contribute [--inline '...']              Bulk JSON contributions (or pipe)
+#   kdb status [--porcelain] [--json]            Quick health check
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PIPELINE_DIR="$SCRIPT_DIR/memory-pipeline"
+
+case "$1" in
+    session-start)
+        shift
+        "$PIPELINE_DIR/kdb-session-start" "$@"
+        ;;
+    session-end)
+        shift
+        "$PIPELINE_DIR/kdb-session-end" "$@"
+        ;;
+    contribute)
+        shift
+        "$PIPELINE_DIR/kdb-contribute" "$@"
+        ;;
+    status)
+        shift
+        "$PIPELINE_DIR/kdb-status" "$@"
+        ;;
+    help|--help|-h)
+        echo "Usage: kdb <command> [options]"
+        echo ""
+        echo "Automation commands:"
+        echo "  session-start  Session bootstrap (staleness, ADRs, risks, search)"
+        echo "  session-end    Session wrap-up (log, rebuild, stats)"
+        echo "  contribute     Bulk JSON contributions (pipe or --inline)"
+        echo "  status         Quick one-line health check"
+        echo ""
+        echo "Query commands (pass-through):"
+        echo "  \"search terms\"   Full-text search"
+        echo "  --decisions       Active ADR decisions"
+        echo "  --risks           Open risks by severity"
+        echo "  --concepts        All tracked concepts"
+        echo "  --stats           Database statistics"
+        echo "  --json \"terms\"    JSON output for agents"
+        echo "  --rebuild         Rebuild database from docs/"
+        echo "  --check           Check staleness"
+        ;;
+    *)
+        # Pass through to original kdb (query commands: flags and search terms)
+        "$PIPELINE_DIR/kdb" "$@"
+        ;;
+esac

@@ -1,0 +1,102 @@
+[package]
+name = "impulse-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Terminal-native AI coding agent sidecar with multi-agent monitoring"
+authors = ["James Pustorino"]
+license = "MIT"
+
+[[bin]]
+name = "impulse-rs"
+path = "src/main.rs"
+
+[package.metadata.bundle]
+name = "Impulse"
+identifier = "com.impulse.ai"
+category = "Developer Tool"
+short_description = "AI coding agent sidecar"
+long_description = "Your AI remembers. Silently. Terminal-native AI coding agent sidecar with cross-session memory."
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Terminal UI
+ratatui = "0.28"
+crossterm = "0.28"
+
+# HTTP/API calls
+reqwest = { version = "0.12", features = ["json"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+rusqlite = { version = "0.32", features = ["bundled", "load_extension"] }
+sha2 = "0.10"
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# UUID for session IDs
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# File operations
+dirs = "6"
+glob = "0.3"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+
+# Async traits
+async-trait = "0.1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Dynamic command execution
+portable-pty = "0.9"
+vt100 = "0.15"
+which = "7"
+
+# Monty Python interpreter integration (optional)
+# Uses pyo3 to call pydantic-monty for computed routing
+# Enable with --features monty-support
+pyo3 = { version = "0.22", optional = true, features = ["extension-module"] }
+
+# DataFusion for advanced analytics (optional)
+# Enable with --features datafusion-support
+datafusion = { version = "43", optional = true }
+
+# Office document handling (optional)
+# Enable with --features office-support
+calamine = { version = "0.26", optional = true }
+rust_xlsxwriter = { version = "0.7", optional = true }
+docx = { version = "0.4", optional = true, package = "docx-rs" }
+
+[features]
+default = []
+# Monty support enables computed routing and dynamic context injection
+# Requires: pip install pydantic-monty
+monty-support = ["dep:pyo3"]
+# DataFusion support enables advanced analytics and aggregation
+datafusion-support = ["dep:datafusion"]
+# Office support enables document parsing and generation
+# Supports: Excel (.xlsx), Word (.docx), CSV
+office-support = ["dep:calamine", "dep:rust_xlsxwriter", "dep:docx"]
+
+[dev-dependencies]
+tempfile = "3"
+filetime = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

@@ -1,0 +1,15 @@
+{
+  "matchers": [
+    {"type": "session_start"},
+    {"type": "session_end"},
+    {"type": "tool", "name": "Write"},
+    {"type": "tool", "name": "Edit"},
+    {"type": "tool", "name": "Bash"}
+  ],
+  "hooks": [
+    {"type": "command", "command": "impulse-rs session-start -n '$CLAUDE_PROJECT_NAME' -p claude-code"},
+    {"type": "command", "command": "impulse-rs session-end --session-id $IMPULSE_SESSION_ID --summary '$CLAUDE_SESSION_SUMMARY'"},
+    {"type": "command", "command": "impulse-rs track-write --file $CLAUDE_FILE --session-id $IMPULSE_SESSION_ID"},
+    {"type": "command", "command": "impulse-rs track-tool --tool $CLAUDE_TOOL_NAME --session-id $IMPULSE_SESSION_ID"}
+  ]
+}

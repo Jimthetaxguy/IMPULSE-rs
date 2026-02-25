@@ -1,0 +1,7 @@
+{
+  "log_level": "info",
+  "default_platform": null,
+  "verbose": false,
+  "sync_interval_secs": 30,
+  "max_history_entries": 1000
+}
