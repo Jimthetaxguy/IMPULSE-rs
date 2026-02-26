@@ -3,6 +3,8 @@
 pub mod genome;
 pub mod search;
 pub mod sessions;
+pub mod settings;
+pub mod terminal_search;
 pub mod terminals;
 
 use eframe::egui;
@@ -16,6 +18,7 @@ pub enum ViewId {
     Sessions,
     Genome,
     Search,
+    Settings,
 }
 
 impl ViewId {
@@ -25,6 +28,7 @@ impl ViewId {
             ViewId::Sessions,
             ViewId::Genome,
             ViewId::Search,
+            ViewId::Settings,
         ]
     }
 
@@ -34,6 +38,7 @@ impl ViewId {
             ViewId::Sessions => "Sessions",
             ViewId::Genome => "Genome",
             ViewId::Search => "Search",
+            ViewId::Settings => "Settings",
         }
     }
 
@@ -43,6 +48,7 @@ impl ViewId {
             ViewId::Sessions => "\u{1f4cb}", // 📋
             ViewId::Genome => "\u{1f9ec}",   // 🧬
             ViewId::Search => "\u{1f50d}",   // 🔍
+            ViewId::Settings => "\u{2699}",  // ⚙
         }
     }
 
@@ -52,6 +58,7 @@ impl ViewId {
             ViewId::Sessions => "Ctrl+2",
             ViewId::Genome => "Ctrl+3",
             ViewId::Search => "Ctrl+4",
+            ViewId::Settings => "Ctrl+6",
         }
     }
 }

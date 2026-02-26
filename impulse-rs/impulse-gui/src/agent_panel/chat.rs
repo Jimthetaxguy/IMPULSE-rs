@@ -4,9 +4,8 @@
 //! Agent messages: left-aligned, surface background.
 //! System messages: centered, muted italic.
 
-use std::time::Instant;
-
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 
 use crate::theme::colors;
 
@@ -15,7 +14,8 @@ use crate::theme::colors;
 // ---------------------------------------------------------------------------
 
 /// Who sent a chat message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ChatRole {
     User,
     Agent,
@@ -23,12 +23,11 @@ pub enum ChatRole {
 }
 
 /// A single message in the agent chat.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: ChatRole,
     pub content: String,
-    #[allow(dead_code)]
-    pub timestamp: Instant,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
 impl ChatMessage {
@@ -36,7 +35,7 @@ impl ChatMessage {
         Self {
             role: ChatRole::User,
             content: content.to_string(),
-            timestamp: Instant::now(),
+            timestamp: chrono::Utc::now(),
         }
     }
 
@@ -44,7 +43,7 @@ impl ChatMessage {
         Self {
             role: ChatRole::Agent,
             content: content.to_string(),
-            timestamp: Instant::now(),
+            timestamp: chrono::Utc::now(),
         }
     }
 
@@ -52,14 +51,16 @@ impl ChatMessage {
         Self {
             role: ChatRole::System,
             content: content.to_string(),
-            timestamp: Instant::now(),
+            timestamp: chrono::Utc::now(),
         }
     }
 
     /// Seconds since this message was created.
     #[allow(dead_code)]
-    pub fn age_secs(&self) -> u64 {
-        self.timestamp.elapsed().as_secs()
+    pub fn age_secs(&self) -> i64 {
+        chrono::Utc::now()
+            .signed_duration_since(self.timestamp)
+            .num_seconds()
     }
 }
 
@@ -240,7 +241,16 @@ mod tests {
     fn test_chat_message_age() {
         let msg = ChatMessage::user("test");
         // Age should be very small (< 1 second).
-        assert!(msg.age_secs() < 2);
+        assert!(msg.age_secs() < 2, "age_secs was {}", msg.age_secs());
+    }
+
+    #[test]
+    fn test_chat_message_serialization_roundtrip() {
+        let msg = ChatMessage::user("hello world");
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: ChatMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.role, ChatRole::User);
+        assert_eq!(parsed.content, "hello world");
     }
 
     #[test]

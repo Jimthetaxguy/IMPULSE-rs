@@ -381,6 +381,16 @@ impl TerminalPanel {
         self.backend.write_input(data)
     }
 
+    /// Get the full visible screen text (for search, context extraction).
+    pub fn screen_text(&self) -> String {
+        self.backend.screen_text()
+    }
+
+    /// Usage history for sparkline visualization.
+    pub fn usage_history(&self) -> &std::collections::VecDeque<(std::time::Instant, f32)> {
+        self.context.usage_history()
+    }
+
     /// Kill the child process.
     pub fn kill(&self) {
         self.backend.kill();

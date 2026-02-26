@@ -21,6 +21,15 @@ pub struct SessionsView {
     tab: Tab,
     selected_id: Option<String>,
     filter: String,
+    /// New session dialog state.
+    show_new_dialog: bool,
+    new_name: String,
+    new_platform: String,
+    /// End session dialog state (for selected active session).
+    show_end_dialog: bool,
+    end_summary: String,
+    /// Status message after create/end action.
+    action_status: Option<(String, bool)>,
 }
 
 impl SessionsView {
@@ -29,7 +38,47 @@ impl SessionsView {
             tab: Tab::Active,
             selected_id: None,
             filter: String::new(),
+            show_new_dialog: false,
+            new_name: String::new(),
+            new_platform: "claude-code".to_string(),
+            show_end_dialog: false,
+            end_summary: String::new(),
+            action_status: None,
         }
+    }
+
+    /// Dispatch session creation on a background thread.
+    fn create_session(&mut self, name: String, platform: String) {
+        self.show_new_dialog = false;
+        self.action_status = Some(("Creating session...".to_string(), true));
+        std::thread::spawn(move || {
+            let mut client = crate::ipc::DaemonClient::discover();
+            match client.create_session(&name, Some(&platform)) {
+                Ok(session) => {
+                    log::info!("Created session: {} ({})", session.name, session.id);
+                }
+                Err(e) => {
+                    log::warn!("Failed to create session: {}", e);
+                }
+            }
+        });
+    }
+
+    /// Dispatch session end on a background thread.
+    fn end_session(&mut self, session_id: String, summary: String) {
+        self.show_end_dialog = false;
+        self.action_status = Some(("Ending session...".to_string(), true));
+        std::thread::spawn(move || {
+            let mut client = crate::ipc::DaemonClient::discover();
+            match client.end_session(&session_id, &summary) {
+                Ok(()) => {
+                    log::info!("Ended session: {}", session_id);
+                }
+                Err(e) => {
+                    log::warn!("Failed to end session {}: {}", session_id, e);
+                }
+            }
+        });
     }
 }
 
@@ -87,7 +136,106 @@ impl View for SessionsView {
                 .hint_text("Filter sessions...")
                 .desired_width(160.0);
             ui.add(filter_edit);
+
+            // Action buttons (right-aligned).
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add(egui::Button::new(
+                        egui::RichText::new("+ New Session").color(colors::GREEN),
+                    ))
+                    .clicked()
+                {
+                    self.show_new_dialog = !self.show_new_dialog;
+                    if self.show_new_dialog {
+                        self.new_name.clear();
+                        self.new_platform = "claude-code".to_string();
+                    }
+                }
+
+                if let Some((ref msg, ok)) = self.action_status {
+                    let color = if ok { colors::GREEN } else { colors::RED };
+                    ui.label(egui::RichText::new(msg).small().color(color));
+                }
+            });
         });
+
+        // --- New Session dialog (inline) ---
+        if self.show_new_dialog {
+            egui::Frame::new()
+                .fill(colors::SURFACE)
+                .corner_radius(egui::CornerRadius::same(6))
+                .inner_margin(egui::Margin::symmetric(12, 8))
+                .stroke(egui::Stroke::new(1.0, colors::ACCENT))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("New Session")
+                                .strong()
+                                .color(colors::ACCENT),
+                        );
+                    });
+                    ui.add_space(4.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label("Name:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.new_name)
+                                .hint_text("session-name")
+                                .desired_width(200.0),
+                        );
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Platform:");
+                        egui::ComboBox::from_id_salt("new_session_platform")
+                            .selected_text(&self.new_platform)
+                            .width(200.0)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.new_platform,
+                                    "claude-code".to_string(),
+                                    "Claude Code",
+                                );
+                                ui.selectable_value(
+                                    &mut self.new_platform,
+                                    "opencode".to_string(),
+                                    "OpenCode",
+                                );
+                                ui.selectable_value(
+                                    &mut self.new_platform,
+                                    "codex".to_string(),
+                                    "Codex",
+                                );
+                                ui.selectable_value(
+                                    &mut self.new_platform,
+                                    "other".to_string(),
+                                    "Other",
+                                );
+                            });
+                    });
+
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let can_create = !self.new_name.trim().is_empty();
+                        if ui
+                            .add_enabled(
+                                can_create,
+                                egui::Button::new(
+                                    egui::RichText::new("Create").color(colors::GREEN),
+                                ),
+                            )
+                            .clicked()
+                        {
+                            let name = self.new_name.trim().to_string();
+                            let platform = self.new_platform.clone();
+                            self.create_session(name, platform);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.show_new_dialog = false;
+                        }
+                    });
+                });
+        }
 
         ui.separator();
 
@@ -224,6 +372,60 @@ impl View for SessionsView {
                         Tab::Active => {
                             if let Some(session) = state.sessions.iter().find(|s| &s.id == sel_id) {
                                 detail_session(ui, session);
+
+                                // End session action.
+                                ui.add_space(12.0);
+                                ui.separator();
+                                ui.add_space(8.0);
+
+                                if self.show_end_dialog {
+                                    ui.label(
+                                        egui::RichText::new("End Session")
+                                            .strong()
+                                            .color(colors::YELLOW),
+                                    );
+                                    ui.add_space(4.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label("Summary:");
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut self.end_summary)
+                                                .hint_text("Brief session summary...")
+                                                .desired_width(250.0),
+                                        );
+                                    });
+                                    ui.add_space(4.0);
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .add(egui::Button::new(
+                                                egui::RichText::new("End Session")
+                                                    .color(colors::RED),
+                                            ))
+                                            .clicked()
+                                        {
+                                            let id = session.id.clone();
+                                            let summary = if self.end_summary.trim().is_empty() {
+                                                "Session ended via GUI".to_string()
+                                            } else {
+                                                self.end_summary.trim().to_string()
+                                            };
+                                            self.end_session(id, summary);
+                                            self.selected_id = None;
+                                        }
+                                        if ui.button("Cancel").clicked() {
+                                            self.show_end_dialog = false;
+                                        }
+                                    });
+                                } else if session.status == "active"
+                                    && ui
+                                        .add(egui::Button::new(
+                                            egui::RichText::new("End Session...")
+                                                .color(colors::YELLOW),
+                                        ))
+                                        .clicked()
+                                {
+                                    self.show_end_dialog = true;
+                                    self.end_summary.clear();
+                                }
                             } else {
                                 ui.label("Session not found.");
                             }

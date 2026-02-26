@@ -3,12 +3,14 @@
 //! Uses `impulse_term::TerminalPanel` for full PTY read/write access,
 //! context lifecycle integration, and vt100-based rendering.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;
 
 use eframe::egui;
+use impulse_term::context::ContextHealth;
 use impulse_term::TerminalPanel;
 
+use super::terminal_search::TerminalSearch;
 use super::{View, ViewId};
 use crate::state::SharedState;
 use crate::theme;
@@ -39,6 +41,8 @@ pub struct TerminalsView {
     pub agents: Vec<AgentInfo>,
     max_tabs: usize,
     last_check: Option<Instant>,
+    /// Terminal transcript search state.
+    pub search: TerminalSearch,
 }
 
 impl TerminalsView {
@@ -77,6 +81,7 @@ impl TerminalsView {
             agents,
             max_tabs: 10,
             last_check: Some(Instant::now()),
+            search: TerminalSearch::new(),
         }
     }
 
@@ -115,6 +120,30 @@ impl TerminalsView {
                 if let Some(id) = self.active_tab {
                     self.close_tab(id);
                 }
+            }
+            // Ctrl+F: Toggle search overlay.
+            else if ctrl && input.key_pressed(egui::Key::F) {
+                if self.search.active {
+                    self.search.close();
+                } else {
+                    self.search.open();
+                }
+            }
+            // F3: Next match.  Shift+F3: Previous match.
+            else if input.key_pressed(egui::Key::F3) {
+                if shift {
+                    self.search.prev_match();
+                } else {
+                    self.search.next_match();
+                }
+                // Focus the tab containing the current match.
+                if let Some(m) = self.search.current() {
+                    self.active_tab = Some(m.tab_id);
+                }
+            }
+            // Escape closes search when active.
+            else if input.key_pressed(egui::Key::Escape) && self.search.active {
+                self.search.close();
             }
         });
     }
@@ -247,6 +276,47 @@ impl TerminalsView {
         insights
     }
 
+    /// Inject context into a terminal pane via its ContextBridge.
+    pub fn inject_to_tab(&mut self, tab_id: u64, content: &str) -> bool {
+        if let Some(tab) = self.tabs.get_mut(&tab_id) {
+            match tab.panel.context_bridge().inject_context(content) {
+                Ok(()) => return true,
+                Err(e) => {
+                    log::warn!("Inject to tab {} failed: {}", tab_id, e);
+                    return false;
+                }
+            }
+        }
+        log::warn!("Tab {} not found for inject", tab_id);
+        false
+    }
+
+    /// Send raw input to a terminal pane's PTY.
+    pub fn send_to_tab(&self, tab_id: u64, content: &str) -> bool {
+        if let Some(tab) = self.tabs.get(&tab_id) {
+            match tab.panel.write_input(content.as_bytes()) {
+                Ok(()) => return true,
+                Err(e) => {
+                    log::warn!("Send to tab {} failed: {}", tab_id, e);
+                    return false;
+                }
+            }
+        }
+        log::warn!("Tab {} not found for send", tab_id);
+        false
+    }
+
+    /// Switch the active terminal tab by ID.
+    pub fn focus_tab(&mut self, tab_id: u64) -> bool {
+        if self.tabs.contains_key(&tab_id) {
+            self.active_tab = Some(tab_id);
+            true
+        } else {
+            log::warn!("Tab {} not found for focus", tab_id);
+            false
+        }
+    }
+
     /// Run context extraction tick on all alive panels.
     pub fn context_tick(&mut self) {
         for tab in self.tabs.values_mut() {
@@ -263,6 +333,22 @@ impl View for TerminalsView {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _state: &SharedState, _ctx: &egui::Context) {
+        // --- Search overlay (Ctrl+F) ---
+        if self.search.active {
+            // Collect pane texts (borrow tabs only, not search).
+            let panes: Vec<(u64, &str, String)> = self
+                .tabs
+                .iter()
+                .map(|(&id, tab)| (id, tab.agent_name, tab.panel.screen_text()))
+                .collect();
+            self.search.search(&panes);
+
+            if let Some(focus_tab_id) = self.search.ui(ui) {
+                self.active_tab = Some(focus_tab_id);
+            }
+            ui.add_space(2.0);
+        }
+
         // --- Tab bar ---
         ui.horizontal(|ui| {
             let tab_ids: Vec<u64> = self.tabs.keys().copied().collect();
@@ -305,8 +391,7 @@ impl View for TerminalsView {
 
                     // Context health indicator for alive panels.
                     if let Some((usage_fraction, estimated_tokens)) = health_info {
-                        let (tier_icon, tier_color) =
-                            context_tier_display_from(usage_fraction);
+                        let (tier_icon, tier_color) = context_tier_display_from(usage_fraction);
                         let resp =
                             ui.label(egui::RichText::new(tier_icon).small().color(tier_color));
                         resp.on_hover_text(format!(
@@ -314,6 +399,18 @@ impl View for TerminalsView {
                             usage_fraction * 100.0,
                             estimated_tokens
                         ));
+                    }
+
+                    // Search match count badge.
+                    if self.search.active {
+                        let tab_matches = self.search.matches_in_tab(*id);
+                        if tab_matches > 0 {
+                            ui.label(
+                                egui::RichText::new(format!("[{}]", tab_matches))
+                                    .small()
+                                    .color(colors::YELLOW),
+                            );
+                        }
                     }
 
                     if ui.small_button("\u{00d7}").clicked() {
@@ -354,6 +451,18 @@ impl View for TerminalsView {
         });
 
         ui.separator();
+
+        // --- Token budget bar for active terminal ---
+        if let Some(active_id) = self.active_tab {
+            if let Some(tab) = self.tabs.get(&active_id) {
+                if tab.panel.is_alive() {
+                    let health = tab.panel.context_health();
+                    let history = tab.panel.usage_history();
+                    render_token_budget(ui, &health, history);
+                    ui.add_space(2.0);
+                }
+            }
+        }
 
         // --- Terminal or welcome ---
         if let Some(active_id) = self.active_tab {
@@ -458,30 +567,148 @@ impl View for TerminalsView {
     }
 }
 
-/// Map context health to a display icon and color for the tab bar.
-fn context_tier_display(
-    health: &impulse_term::context::ContextHealth,
-) -> (&'static str, egui::Color32) {
-    use impulse_term::context::ContextTier;
-    match health.tier {
-        ContextTier::None | ContextTier::Full => ("\u{25CF}", colors::GREEN), // ● green = low usage
-        ContextTier::Essential => ("\u{25D0}", colors::YELLOW),               // ◐ yellow = 45-59%
-        ContextTier::Critical => ("\u{25D1}", colors::RED),                   // ◑ red = 60-79%
-        ContextTier::Minimal => ("\u{25CB}", colors::RED),                    // ○ red = 80%+
-        ContextTier::PostCompaction => ("\u{21BB}", colors::ACCENT), // ↻ purple = compacted
-    }
+/// Render a compact token budget bar + sparkline for the active terminal.
+fn render_token_budget(
+    ui: &mut egui::Ui,
+    health: &ContextHealth,
+    history: &VecDeque<(Instant, f32)>,
+) {
+    let bar_height = 16.0;
+    let available_width = ui.available_width();
+
+    egui::Frame::new()
+        .fill(colors::SURFACE)
+        .inner_margin(egui::Margin::symmetric(8, 2))
+        .corner_radius(egui::CornerRadius::same(4))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                // --- Label ---
+                ui.label(
+                    egui::RichText::new("Context:")
+                        .small()
+                        .color(colors::TEXT_DIM),
+                );
+
+                // --- Progress bar ---
+                let bar_width = (available_width * 0.35).clamp(80.0, 200.0);
+                let (bar_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(bar_width, bar_height), egui::Sense::hover());
+
+                // Filled portion.
+                let fill_fraction = health.usage_fraction.clamp(0.0, 1.0);
+                let fill_color = if fill_fraction < 0.45 {
+                    colors::GREEN
+                } else if fill_fraction < 0.60 {
+                    colors::YELLOW
+                } else if fill_fraction < 0.80 {
+                    egui::Color32::from_rgb(0xff, 0x7b, 0x72) // red
+                } else {
+                    egui::Color32::from_rgb(0xff, 0x45, 0x45) // bright red
+                };
+
+                let fill_rect = egui::Rect::from_min_size(
+                    bar_rect.min,
+                    egui::vec2(bar_rect.width() * fill_fraction, bar_rect.height()),
+                );
+
+                // Paint the bar (scoped to avoid holding painter across ui mutations).
+                {
+                    let painter = ui.painter();
+                    painter.rect_filled(bar_rect, 3.0, colors::BG);
+                    painter.rect_filled(fill_rect, 3.0, fill_color);
+                    painter.rect_stroke(
+                        bar_rect,
+                        3.0,
+                        egui::Stroke::new(0.5, colors::BORDER),
+                        egui::StrokeKind::Outside,
+                    );
+                }
+
+                // --- Percentage text ---
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{:.0}% ({}/{}K)",
+                        fill_fraction * 100.0,
+                        health.estimated_tokens / 1000,
+                        health.window_tokens / 1000
+                    ))
+                    .small()
+                    .color(colors::TEXT_MUTED),
+                );
+
+                // --- Sparkline (mini chart of usage over time) ---
+                if history.len() >= 2 {
+                    ui.separator();
+                    let sparkline_width = (available_width * 0.2).clamp(40.0, 120.0);
+                    let sparkline_height = bar_height;
+                    let (spark_rect, _) = ui.allocate_exact_size(
+                        egui::vec2(sparkline_width, sparkline_height),
+                        egui::Sense::hover(),
+                    );
+
+                    // Paint sparkline (scoped).
+                    {
+                        let painter = ui.painter();
+                        painter.rect_filled(spark_rect, 2.0, colors::BG);
+
+                        // Draw sparkline as connected line segments.
+                        let points: Vec<egui::Pos2> = history
+                            .iter()
+                            .enumerate()
+                            .map(|(i, (_, frac))| {
+                                let x = spark_rect.min.x
+                                    + (i as f32 / (history.len() - 1).max(1) as f32)
+                                        * spark_rect.width();
+                                let y =
+                                    spark_rect.max.y - frac.clamp(0.0, 1.0) * spark_rect.height();
+                                egui::pos2(x, y)
+                            })
+                            .collect();
+
+                        if points.len() >= 2 {
+                            let stroke = egui::Stroke::new(1.5, fill_color.gamma_multiply(0.8));
+                            for window in points.windows(2) {
+                                painter.line_segment([window[0], window[1]], stroke);
+                            }
+                        }
+                    }
+                }
+
+                // --- Compaction/injection counters ---
+                if health.compaction_count > 0 || health.injection_count > 0 {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if health.injection_count > 0 {
+                            ui.label(
+                                egui::RichText::new(format!("\u{2193}{}", health.injection_count))
+                                    .small()
+                                    .color(colors::ACCENT),
+                            )
+                            .on_hover_text("Injections");
+                        }
+                        if health.compaction_count > 0 {
+                            ui.label(
+                                egui::RichText::new(format!("\u{21BB}{}", health.compaction_count))
+                                    .small()
+                                    .color(colors::YELLOW),
+                            )
+                            .on_hover_text("Compactions");
+                        }
+                    });
+                }
+            });
+        });
 }
 
-/// Map usage_fraction to display icon and color (for use when health struct isn't available).
+/// Map usage_fraction to display icon and color.
 fn context_tier_display_from(usage_fraction: f32) -> (&'static str, egui::Color32) {
     if usage_fraction < 0.45 {
-        ("\u{25CF}", colors::GREEN)  // ● green
+        ("\u{25CF}", colors::GREEN) // ● green
     } else if usage_fraction < 0.60 {
         ("\u{25D0}", colors::YELLOW) // ◐ yellow
     } else if usage_fraction < 0.80 {
-        ("\u{25D1}", colors::RED)    // ◑ red
+        ("\u{25D1}", colors::RED) // ◑ red
     } else {
-        ("\u{25CB}", colors::RED)    // ○ red
+        ("\u{25CB}", colors::RED) // ○ red
     }
 }
 

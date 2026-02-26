@@ -4,6 +4,7 @@
 //! from `impulse-rs/src/context_lifecycle/` into a self-contained module that
 //! avoids depending on the full impulse-rs crate.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -199,6 +200,9 @@ pub struct ContextBridge {
 
     // Diff-based extraction.
     previous_screen_text: String,
+
+    // Usage history for sparkline visualization (last 100 samples at 3s intervals = ~5 minutes).
+    usage_history: VecDeque<(Instant, f32)>,
 }
 
 impl ContextBridge {
@@ -219,6 +223,7 @@ impl ContextBridge {
             last_injection_at: None,
             last_compaction_scan_at: None,
             previous_screen_text: String::new(),
+            usage_history: VecDeque::with_capacity(100),
         }
     }
 
@@ -236,6 +241,12 @@ impl ContextBridge {
             compaction_count: self.compaction_count,
             injection_count: self.injection_count,
         }
+    }
+
+    /// Usage history as (fraction) values for sparkline visualization.
+    /// Returns up to 100 recent samples (oldest first).
+    pub fn usage_history(&self) -> &VecDeque<(Instant, f32)> {
+        &self.usage_history
     }
 
     /// Run one extraction tick. Call every ~3 seconds.
@@ -256,6 +267,17 @@ impl ContextBridge {
         }
 
         let now = Instant::now();
+
+        // Record usage history for sparkline (bounded to 100 samples).
+        let fraction = if self.window_tokens > 0 {
+            self.estimated_tokens as f32 / self.window_tokens as f32
+        } else {
+            0.0
+        };
+        if self.usage_history.len() >= 100 {
+            self.usage_history.pop_front();
+        }
+        self.usage_history.push_back((now, fraction));
         let screen_text = self.backend.screen_text();
 
         // Compaction detection (debounced).

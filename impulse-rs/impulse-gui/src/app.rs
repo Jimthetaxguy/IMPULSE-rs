@@ -15,13 +15,16 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 
+use crate::agent_panel::actions::PanelAction;
 use crate::agent_panel::AgentPanel;
 use crate::state::{self, PollerCommand, StateHandle};
 use crate::views::genome::GenomeView;
 use crate::views::search::SearchView;
 use crate::views::sessions::SessionsView;
+use crate::views::settings::SettingsView;
 use crate::views::terminals::TerminalsView;
 use crate::views::{View, ViewId};
+use crate::widgets::notifications::{NotificationManager, Severity};
 use crate::widgets::{sidebar, status_bar};
 
 /// Main application state — thin coordinator.
@@ -31,6 +34,7 @@ pub struct ImpulseApp {
     sessions: SessionsView,
     genome: GenomeView,
     search: SearchView,
+    settings: SettingsView,
     active_view: ViewId,
 
     // Sidebar.
@@ -48,6 +52,9 @@ pub struct ImpulseApp {
 
     // Context lifecycle.
     last_context_tick: Instant,
+
+    // Notifications.
+    notifications: NotificationManager,
 }
 
 impl ImpulseApp {
@@ -60,11 +67,12 @@ impl ImpulseApp {
             sessions: SessionsView::new(),
             genome: GenomeView::new(),
             search: SearchView::new(poller_cmd.clone()),
+            settings: SettingsView::new(),
             active_view: ViewId::Terminals,
 
             sidebar_expanded: true,
 
-            agent_panel: AgentPanel::new(),
+            agent_panel: AgentPanel::new(Some(shared_state.clone())),
             agent_visible: false,
             last_context_inject: Instant::now(),
 
@@ -73,6 +81,8 @@ impl ImpulseApp {
             _poller_thread: Some(poller_thread),
 
             last_context_tick: Instant::now(),
+
+            notifications: NotificationManager::new(),
         }
     }
 
@@ -95,8 +105,10 @@ impl ImpulseApp {
             } else if input.key_pressed(egui::Key::Num4) {
                 self.active_view = ViewId::Search;
             }
-            // Ctrl+5: Toggle agent panel.
-            else if input.key_pressed(egui::Key::Num5) {
+            // Ctrl+5: Toggle agent panel.  Ctrl+6: Settings.
+            else if input.key_pressed(egui::Key::Num6) {
+                self.active_view = ViewId::Settings;
+            } else if input.key_pressed(egui::Key::Num5) {
                 self.agent_visible = !self.agent_visible;
             }
             // Ctrl+B: Toggle sidebar.
@@ -307,6 +319,45 @@ impl eframe::App for ImpulseApp {
                 });
         }
 
+        // --- Dispatch agent panel actions ---
+        for action in self.agent_panel.take_actions() {
+            match action {
+                PanelAction::InjectTo { tab_id, content } => {
+                    if self.terminals.inject_to_tab(tab_id, &content) {
+                        self.notifications
+                            .notify(Severity::Success, format!("Injected into tab {}", tab_id));
+                    } else {
+                        self.notifications
+                            .notify(Severity::Error, format!("Tab {} not found", tab_id));
+                    }
+                }
+                PanelAction::SendTo { tab_id, content } => {
+                    if self.terminals.send_to_tab(tab_id, &content) {
+                        self.notifications
+                            .notify(Severity::Info, format!("Sent to tab {}", tab_id));
+                    } else {
+                        self.notifications
+                            .notify(Severity::Error, format!("Tab {} not found", tab_id));
+                    }
+                }
+                PanelAction::FocusTab { tab_id } => {
+                    if self.terminals.focus_tab(tab_id) {
+                        self.active_view = ViewId::Terminals;
+                    } else {
+                        self.notifications
+                            .notify(Severity::Warning, format!("Tab {} not found", tab_id));
+                    }
+                }
+                PanelAction::SearchTerm { query } => {
+                    // For now, switch to search view with the query.
+                    // Terminal-level search will be implemented in Task 2.1.
+                    self.active_view = ViewId::Search;
+                    self.notifications
+                        .notify(Severity::Info, format!("Search: {}", query));
+                }
+            }
+        }
+
         // --- Status bar ---
         let active_agents = self.terminals.active_agent_info();
         status_bar::show(ctx, &state, self.terminals.tab_count(), &active_agents);
@@ -325,7 +376,16 @@ impl eframe::App for ImpulseApp {
             ViewId::Search => {
                 self.search.ui(ui, &state, ctx);
             }
+            ViewId::Settings => {
+                self.settings.ui(ui, &state, ctx);
+            }
         });
+
+        // Release the state lock before rendering overlays.
+        drop(state);
+
+        // --- Toast notifications (overlay, above all content) ---
+        self.notifications.show(ctx);
     }
 
     fn on_exit(&mut self, _context: Option<&eframe::glow::Context>) {

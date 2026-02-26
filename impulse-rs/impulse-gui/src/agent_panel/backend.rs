@@ -5,6 +5,8 @@
 
 use std::sync::mpsc;
 
+use crate::state::{ConnectionStatus, StateHandle};
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -18,6 +20,8 @@ pub struct AgentResponse {
 /// Which backend to use for agent queries.
 #[derive(Clone)]
 pub enum AgentBackend {
+    /// Routes through the daemon's Chat endpoint (includes injection + context).
+    DaemonChat,
     /// Uses `claude --print -p <prompt>` subprocess.
     Harness {
         /// Session ID for `--resume` continuity (if supported).
@@ -38,6 +42,8 @@ impl AgentBackend {
     /// Detect the best available backend.
     ///
     /// Priority: claude in PATH > ANTHROPIC_API_KEY env var > Unavailable.
+    /// Note: DaemonChat is added dynamically when the daemon is connected;
+    /// it's not part of the static detection.
     pub fn detect() -> Self {
         if which::which("claude").is_ok() {
             return Self::Harness { session_id: None };
@@ -57,11 +63,27 @@ impl AgentBackend {
     /// Human-readable label for the current backend.
     pub fn label(&self) -> &'static str {
         match self {
+            Self::DaemonChat => "Daemon Chat",
             Self::Harness { .. } => "Claude Code",
             Self::Api { .. } => "API",
             Self::Unavailable => "Unavailable",
         }
     }
+}
+
+/// Resolve the effective backend at query time.
+///
+/// If the daemon is connected, prefer DaemonChat. Otherwise fall back
+/// to the statically-detected backend.
+pub fn resolve_backend(static_backend: &AgentBackend, state: &Option<StateHandle>) -> AgentBackend {
+    if let Some(ref handle) = state {
+        if let Ok(s) = handle.lock() {
+            if s.connection == ConnectionStatus::Connected {
+                return AgentBackend::DaemonChat;
+            }
+        }
+    }
+    static_backend.clone()
 }
 
 // ---------------------------------------------------------------------------
@@ -251,6 +273,46 @@ fn parse_api_response(body: &str) -> AgentResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Daemon Chat backend
+// ---------------------------------------------------------------------------
+
+/// Run a query via the daemon's AgentAssist endpoint.
+///
+/// Creates a fresh `DaemonClient` per query — the client holds a `UnixStream`
+/// which isn't `Send`, so we discover + connect on the background thread.
+fn query_daemon_chat(prompt: &str, context: &str) -> AgentResponse {
+    use crate::ipc::DaemonClient;
+
+    let mut client = DaemonClient::discover();
+
+    let ctx_opt = if context.is_empty() {
+        None
+    } else {
+        Some(context)
+    };
+
+    match client.agent_assist(prompt, ctx_opt) {
+        Ok(response) => {
+            if response.is_empty() {
+                AgentResponse {
+                    content: "(empty response)".to_string(),
+                    is_error: false,
+                }
+            } else {
+                AgentResponse {
+                    content: response,
+                    is_error: false,
+                }
+            }
+        }
+        Err(e) => AgentResponse {
+            content: format!("Daemon chat failed: {}", e),
+            is_error: true,
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Background dispatch
 // ---------------------------------------------------------------------------
 
@@ -279,6 +341,7 @@ pub fn dispatch_query(
 
     std::thread::spawn(move || {
         let response = match &backend_clone {
+            AgentBackend::DaemonChat => query_daemon_chat(&prompt, &context),
             AgentBackend::Harness { session_id } => {
                 query_harness(&prompt, &context, session_id.as_deref())
             }
@@ -337,6 +400,7 @@ mod tests {
 
     #[test]
     fn test_backend_label() {
+        assert_eq!(AgentBackend::DaemonChat.label(), "Daemon Chat");
         assert_eq!(
             AgentBackend::Harness { session_id: None }.label(),
             "Claude Code"
@@ -351,6 +415,43 @@ mod tests {
             "API"
         );
         assert_eq!(AgentBackend::Unavailable.label(), "Unavailable");
+    }
+
+    #[test]
+    fn test_resolve_backend_without_state_returns_static() {
+        let static_backend = AgentBackend::Harness { session_id: None };
+        let resolved = resolve_backend(&static_backend, &None);
+        assert_eq!(resolved.label(), "Claude Code");
+    }
+
+    #[test]
+    fn test_resolve_backend_connected_returns_daemon_chat() {
+        use crate::state::SharedState;
+        use std::sync::{Arc, Mutex};
+
+        let state: StateHandle = Arc::new(Mutex::new(SharedState::default()));
+        // Set connected.
+        state.lock().unwrap().connection = ConnectionStatus::Connected;
+
+        let static_backend = AgentBackend::Harness { session_id: None };
+        let resolved = resolve_backend(&static_backend, &Some(state));
+        assert_eq!(resolved.label(), "Daemon Chat");
+    }
+
+    #[test]
+    fn test_resolve_backend_disconnected_returns_static() {
+        use crate::state::SharedState;
+        use std::sync::{Arc, Mutex};
+
+        let state: StateHandle = Arc::new(Mutex::new(SharedState::default()));
+        // Default is Disconnected.
+        let static_backend = AgentBackend::Api {
+            api_key: "key".into(),
+            model: "model".into(),
+            history: vec![],
+        };
+        let resolved = resolve_backend(&static_backend, &Some(state));
+        assert_eq!(resolved.label(), "API");
     }
 
     #[test]
