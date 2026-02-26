@@ -77,23 +77,23 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: impulse-rs/src-tauri
+          workspaces: impulse-rs
 
       - name: Install frontend dependencies
-        working-directory: impulse-rs/src-tauri
+        working-directory: impulse-rs/impulse-gui
         run: npm install
 
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2"
 
       - name: Build Tauri app
-        working-directory: impulse-rs/src-tauri
+        working-directory: impulse-rs/impulse-gui
         run: cargo tauri build
 
       - name: Find and rename DMG
         id: dmg
         run: |
-          DMG_PATH=$(find impulse-rs/src-tauri/target/release/bundle -name "*.dmg" | head -1)
+          DMG_PATH=$(find impulse-rs/impulse-gui/target/release/bundle -name "*.dmg" | head -1)
           VERSION=${GITHUB_REF_NAME#v}
           DEST="Impulse-${VERSION}-macos-aarch64.dmg"
           cp "$DMG_PATH" "$DEST"

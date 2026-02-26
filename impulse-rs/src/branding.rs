@@ -4,38 +4,46 @@
 /// and TUI engine-state indicators.
 /// Full banner - for status, init, and splash contexts.
 pub const BANNER: &str = "\
- ██╗███╗   ███╗██████╗ ██╗   ██╗██╗     ███████╗███████╗
- ██║████╗ ████║██╔══██╗██║   ██║██║     ██╔════╝██╔════╝
- ██║██╔████╔██║██████╔╝██║   ██║██║     ███████╗█████╗
- ██║██║╚██╔╝██║██╔═══╝ ██║   ██║██║     ╚════██║██╔══╝
- ██║██║ ╚═╝ ██║██║     ╚██████╔╝███████╗███████║███████╗
- ╚═╝╚═╝     ╚═╝╚═╝      ╚═════╝ ╚══════╝╚══════╝╚══════╝
-          ━━━━━✈  your AI remembers";
+ ┌─[ IMPULSE ]────────────────────────────────┐
+ │ ▧  your AI remembers                       │
+ └────────────────────────────────────────────┘";
 
 /// Compact one-liner — for config, verification, and tight contexts.
 pub const TAGLINE: &str = "━━━━━✈  IMPULSE · your AI remembers";
 
 /// TUI engine-state ASCII art.
 pub const ENGINE_IDLE: &str = "\
- ▗▄▄▖
-▗████▖
-▗██  ██▖
-████████
-▝▀ ██ ▀▘";
+    ▄▄    
+   ████   
+  ▗████▖  
+  ██  ██  
+ ▄██  ██▄ 
+██████████
+▀██ ██ ██▀
+ ▀  ▀▀  ▀ 
+          ";
 
 pub const ENGINE_THINKING: &str = "\
- ▗▄▄▖
-▗████▖
-▗██▀▀██▖
-████████
-▝▀ ██ ▀▘";
+    ▄▄    
+   ████   
+  ▗████▖  
+  ██▀▀██  
+ ▄██████▄ 
+██████████
+▀██ ██ ██▀
+ ▀  ▀▀  ▀ 
+          ";
 
 pub const ENGINE_SUCCESS: &str = "\
- ▗▄▄▖
-▗████▖
-▗██  ██▖
-████████
-▝▀ ▀▀ ▀▘";
+    ▄▄    
+   ████   
+  ▗████▖  
+  ██  ██  
+ ▄██  ██▄ 
+██████████
+▀██ ██ ██▀
+ ▀ ▄██▄ ▀ 
+   ▀██▀   ";
 
 /// Engine state for TUI rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,7 +71,7 @@ pub fn print_banner() {
 ///
 /// Example output:
 /// ```text
-/// ━━━━━✈  IMPULSE · your AI remembers
+/// ━━━━━◆  IMPULSE · your AI remembers
 /// Configuration
 /// ```
 pub fn print_header(title: &str) {
@@ -96,8 +104,8 @@ mod tests {
     fn test_banner_lines_count() {
         let lines = banner_lines();
         assert!(
-            lines.len() >= 6,
-            "Banner should have at least 6 lines (5 block rows + tagline), got {}",
+            lines.len() >= 3,
+            "Banner should have at least 3 lines, got {}",
             lines.len()
         );
     }

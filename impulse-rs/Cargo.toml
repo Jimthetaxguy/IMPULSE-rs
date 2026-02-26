@@ -1,3 +1,10 @@
+[workspace]
+members = [
+    ".",
+    "impulse-term",
+    "impulse-gui",
+]
+
 [package]
 name = "impulse-rs"
 version = "0.1.0"

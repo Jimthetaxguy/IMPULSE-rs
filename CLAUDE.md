@@ -54,9 +54,15 @@ Before implementing, consider alternative approaches. Choose the simplest soluti
 
 ## Architecture
 
+**Workspace (3 crates):**
+- `impulse-rs/` — main CLI + daemon + TUI (30 modules, ~41K lines)
+- `impulse-rs/impulse-term/` — custom terminal widget (PTY + vt100 + context bridge, ~2K lines, 39 tests)
+- `impulse-rs/impulse-gui/` — egui native workbench (4 views + sidebar + status bar)
+
 **Dual mode:**
 - **Direct mode** — stateless, per-action (for hooks). Read → process → write → exit.
-- **Daemon mode** — long-running, Unix socket IPC (for TUI/chat). In-memory state with periodic sync.
+- **Daemon mode** — long-running, Unix socket IPC (for TUI/GUI). In-memory state with periodic sync.
+- **GUI mode** — `impulse-gui` binary, connects to daemon via IPC, hosts terminal panes with context lifecycle.
 
 **Data lives in `.impulse/`:**
 - `HISTORY.jsonl` — append-only session log (committed)
@@ -76,7 +82,7 @@ Before implementing, consider alternative approaches. Choose the simplest soluti
 | State | `RwLock` + dirty flag + sync on Drop |
 | Naming | `PascalCase` structs, `snake_case` functions, `SCREAMING_SNAKE` constants |
 | Testing | Unit tests in `mod tests` per file, integration tests with `DaemonGuard` RAII |
-| Feature flags | `office-support` (default), `monty-support`, `datafusion-support` |
+| Feature flags | `office-support`, `monty-support`, `datafusion-support` (all opt-in) |
 
 ---
 
@@ -84,10 +90,16 @@ Before implementing, consider alternative approaches. Choose the simplest soluti
 
 ```bash
 cd impulse-rs
+
+# Full workspace
 cargo build
 cargo test
 cargo clippy -- -D warnings
 cargo fmt --check
+
+# Individual crates
+cd impulse-term && cargo build && cargo test && cargo clippy -- -D warnings
+cd impulse-gui && cargo build && cargo clippy -- -D warnings
 ```
 
 ---

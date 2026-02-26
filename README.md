@@ -77,10 +77,10 @@ See `cargo run -- --help` for the full command list.
 
 - **Language:** Rust
 - **TUI:** ratatui + crossterm
+- **GUI:** egui (impulse-gui crate)
 - **Storage:** SQLite (FTS5) + JSONL + Markdown
 - **IPC:** Unix domain sockets
 - **LLM:** Anthropic, OpenAI, Minimax (for daemon chat)
-- **Desktop:** Tauri (macOS app with embedded terminal)
 
 ## Project Structure
 
@@ -118,7 +118,7 @@ memory-pipeline/     # Python research tooling
 
 ```bash
 cd impulse-rs
-cargo test    # 383 passing, 1 ignored
+cargo test    # 486 passing
 ```
 
 ## License

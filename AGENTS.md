@@ -79,7 +79,7 @@ Choose the simplest solution that works. Prefer editing existing files over crea
 | State | `RwLock` + dirty flag + sync on Drop |
 | Naming | `PascalCase` types, `snake_case` functions, `SCREAMING_SNAKE` constants |
 | Tests | Unit tests in `mod tests`, integration tests use `DaemonGuard` RAII |
-| Features | `office-support` (default), `monty-support`, `datafusion-support` |
+| Features | `office-support`, `monty-support`, `datafusion-support` (all opt-in) |
 
 ---
 

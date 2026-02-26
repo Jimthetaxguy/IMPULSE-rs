@@ -27,7 +27,7 @@ cargo run -- agent-query "Review cross-pane activity"
 ## Testing
 
 ```bash
-cargo test               # Run all tests (475 passing, 1 ignored)
+cargo test               # Run all tests (486 passing)
 cargo test -- --nocapture  # With stdout
 cargo test storage       # Run storage tests only
 cargo test daemon        # Run daemon tests only
@@ -77,15 +77,13 @@ cargo test daemon        # Run daemon tests only
 - **Concurrency:** `tokio::sync::RwLock` (async), `std::sync::RwLock` (sync)
 - **No panics:** Always return `Result<T>`
 
-## Tauri Desktop App
+## Native Desktop App (impulse-gui)
 
 ```bash
-cd src-tauri
-cargo build --release
-open target/release/impulse-tauri
+cargo run -p impulse-gui
 ```
 
-Embeds xterm.js terminal in a native macOS window.
+A standalone, pure-Rust native GUI using `egui` and embedded terminals. Remembers agent environments and protects against nested session loops.
 
 ## Environment Variables
 
