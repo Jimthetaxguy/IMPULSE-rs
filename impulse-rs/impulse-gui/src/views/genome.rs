@@ -1,12 +1,13 @@
 //! Genome view — displays decisions, preferences, and constraints.
 //!
-//! Shows a timeline of decisions with cards. Read-only in the first pass;
-//! editing planned as a future enhancement.
+//! Shows a timeline of decisions with cards. Includes filter search,
+//! decision cards with date headers, tags, and rationale.
 
 use eframe::egui;
 
 use super::{View, ViewId};
 use crate::state::{ConnectionStatus, SharedState};
+use crate::theme::colors;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -16,12 +17,14 @@ enum Tab {
 
 pub struct GenomeView {
     tab: Tab,
+    filter: String,
 }
 
 impl GenomeView {
     pub fn new() -> Self {
         Self {
             tab: Tab::Decisions,
+            filter: String::new(),
         }
     }
 }
@@ -42,28 +45,51 @@ impl View for GenomeView {
             None => {
                 ui.vertical_centered(|ui| {
                     ui.add_space(ui.available_height() / 3.0);
-                    ui.label(
-                        egui::RichText::new("Loading genome data...")
-                            .color(egui::Color32::from_rgb(0x6e, 0x76, 0x81)),
-                    );
+                    ui.label(egui::RichText::new("Loading genome data...").color(colors::TEXT_DIM));
                 });
                 return;
             }
         };
 
-        // --- Tab selector ---
+        // --- Tab selector + filter ---
         ui.horizontal(|ui| {
+            let dec_count = genome.decisions.len();
             if ui
                 .selectable_label(
                     self.tab == Tab::Decisions,
-                    format!("Decisions ({})", genome.decisions.len()),
+                    egui::RichText::new(format!("Decisions ({})", dec_count)).color(
+                        if self.tab == Tab::Decisions {
+                            colors::ACCENT
+                        } else {
+                            colors::TEXT_MUTED
+                        },
+                    ),
                 )
                 .clicked()
             {
                 self.tab = Tab::Decisions;
             }
-            if ui.selectable_label(self.tab == Tab::Raw, "Raw").clicked() {
+            if ui
+                .selectable_label(
+                    self.tab == Tab::Raw,
+                    egui::RichText::new("Raw").color(if self.tab == Tab::Raw {
+                        colors::ACCENT
+                    } else {
+                        colors::TEXT_MUTED
+                    }),
+                )
+                .clicked()
+            {
                 self.tab = Tab::Raw;
+            }
+
+            ui.separator();
+
+            if self.tab == Tab::Decisions {
+                let filter_edit = egui::TextEdit::singleline(&mut self.filter)
+                    .hint_text("Filter decisions...")
+                    .desired_width(160.0);
+                ui.add(filter_edit);
             }
 
             if !genome.last_updated.is_empty() {
@@ -71,7 +97,7 @@ impl View for GenomeView {
                     ui.label(
                         egui::RichText::new(format!("Updated: {}", genome.last_updated))
                             .small()
-                            .color(egui::Color32::from_rgb(0x6e, 0x76, 0x81)),
+                            .color(colors::TEXT_DIM),
                     );
                 });
             }
@@ -89,31 +115,44 @@ impl View for GenomeView {
                             ui.vertical_centered(|ui| {
                                 ui.label(
                                     egui::RichText::new("No decisions recorded yet.")
-                                        .color(egui::Color32::from_rgb(0x6e, 0x76, 0x81)),
+                                        .color(colors::TEXT_DIM),
                                 );
                             });
                             return;
                         }
 
-                        for decision in &genome.decisions {
-                            ui.add_space(8.0);
+                        let filter_lower = self.filter.to_lowercase();
+                        let mut shown = 0;
 
-                            // Decision card.
+                        for decision in &genome.decisions {
+                            // Filter by description, rationale, or tags.
+                            if !self.filter.is_empty()
+                                && !decision.description.to_lowercase().contains(&filter_lower)
+                                && !decision.rationale.to_lowercase().contains(&filter_lower)
+                                && !decision
+                                    .tags
+                                    .iter()
+                                    .any(|t| t.to_lowercase().contains(&filter_lower))
+                            {
+                                continue;
+                            }
+
+                            shown += 1;
+                            ui.add_space(6.0);
+
+                            // Decision card with accent border.
                             egui::Frame::new()
-                                .fill(egui::Color32::from_rgb(0x16, 0x1b, 0x22))
-                                .corner_radius(6.0)
-                                .inner_margin(12.0)
-                                .stroke(egui::Stroke::new(
-                                    0.5,
-                                    egui::Color32::from_rgb(0x30, 0x36, 0x3d),
-                                ))
+                                .fill(colors::SURFACE)
+                                .corner_radius(egui::CornerRadius::same(6))
+                                .inner_margin(egui::Margin::symmetric(12, 10))
+                                .stroke(egui::Stroke::new(0.5, colors::BORDER))
                                 .show(ui, |ui| {
-                                    // Date header.
+                                    // Date header with accent color.
                                     if !decision.date.is_empty() {
                                         ui.label(
                                             egui::RichText::new(&decision.date)
                                                 .small()
-                                                .color(egui::Color32::from_rgb(0x8b, 0x5c, 0xf6)),
+                                                .color(colors::ACCENT),
                                         );
                                         ui.add_space(4.0);
                                     }
@@ -121,7 +160,7 @@ impl View for GenomeView {
                                     // Description.
                                     ui.label(
                                         egui::RichText::new(&decision.description)
-                                            .color(egui::Color32::from_rgb(0xc9, 0xd1, 0xd9)),
+                                            .color(colors::TEXT),
                                     );
 
                                     // Rationale.
@@ -133,26 +172,43 @@ impl View for GenomeView {
                                                 decision.rationale
                                             ))
                                             .small()
-                                            .color(egui::Color32::from_rgb(0x8b, 0x94, 0x9e)),
+                                            .color(colors::TEXT_MUTED),
                                         );
                                     }
 
-                                    // Tags.
+                                    // Tags as inline badges.
                                     if !decision.tags.is_empty() {
                                         ui.add_space(4.0);
                                         ui.horizontal(|ui| {
                                             for tag in &decision.tags {
-                                                ui.label(
-                                                    egui::RichText::new(format!("[{}]", tag))
-                                                        .small()
-                                                        .color(egui::Color32::from_rgb(
-                                                            0x58, 0xa6, 0xff,
-                                                        )),
-                                                );
+                                                egui::Frame::new()
+                                                    .fill(colors::BLUE.gamma_multiply(0.12))
+                                                    .corner_radius(egui::CornerRadius::same(3))
+                                                    .inner_margin(egui::Margin::symmetric(4, 1))
+                                                    .show(ui, |ui| {
+                                                        ui.label(
+                                                            egui::RichText::new(tag)
+                                                                .small()
+                                                                .color(colors::BLUE),
+                                                        );
+                                                    });
                                             }
                                         });
                                     }
                                 });
+                        }
+
+                        if shown == 0 && !self.filter.is_empty() {
+                            ui.add_space(32.0);
+                            ui.vertical_centered(|ui| {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "No decisions match \"{}\"",
+                                        self.filter
+                                    ))
+                                    .color(colors::TEXT_DIM),
+                                );
+                            });
                         }
                     });
             }
@@ -163,14 +219,20 @@ impl View for GenomeView {
                         if genome.raw_text.is_empty() {
                             ui.label(
                                 egui::RichText::new("No raw genome content available.")
-                                    .color(egui::Color32::from_rgb(0x6e, 0x76, 0x81)),
+                                    .color(colors::TEXT_DIM),
                             );
                         } else {
-                            ui.label(
-                                egui::RichText::new(&genome.raw_text)
-                                    .monospace()
-                                    .color(egui::Color32::from_rgb(0xc9, 0xd1, 0xd9)),
-                            );
+                            egui::Frame::new()
+                                .fill(colors::SURFACE)
+                                .corner_radius(egui::CornerRadius::same(4))
+                                .inner_margin(egui::Margin::symmetric(10, 8))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        egui::RichText::new(&genome.raw_text)
+                                            .monospace()
+                                            .color(colors::TEXT),
+                                    );
+                                });
                         }
                     });
             }
@@ -182,14 +244,13 @@ fn empty_state(ui: &mut egui::Ui) {
     ui.vertical_centered(|ui| {
         ui.add_space(ui.available_height() / 3.0);
         ui.label(
-            egui::RichText::new("Genome data requires a running daemon.")
-                .color(egui::Color32::from_rgb(0x6e, 0x76, 0x81)),
+            egui::RichText::new("Genome data requires a running daemon.").color(colors::TEXT_DIM),
         );
         ui.add_space(8.0);
         ui.label(
             egui::RichText::new("Run `impulse daemon` to start the background service.")
                 .small()
-                .color(egui::Color32::from_rgb(0x48, 0x4f, 0x58)),
+                .color(colors::TEXT_FAINT),
         );
     });
 }

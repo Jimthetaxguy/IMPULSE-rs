@@ -12,6 +12,7 @@ use impulse_term::TerminalPanel;
 use super::{View, ViewId};
 use crate::state::SharedState;
 use crate::theme;
+use crate::theme::colors;
 
 /// An AI coding agent that Impulse can spawn.
 #[derive(Clone)]
@@ -46,7 +47,7 @@ impl TerminalsView {
             AgentInfo {
                 name: "Claude Code",
                 command: "claude",
-                args: &["-p"],
+                args: &[],
                 available: which::which("claude").is_ok(),
             },
             AgentInfo {
@@ -206,10 +207,44 @@ impl TerminalsView {
         self.tabs.len()
     }
 
+    /// Active agent info for the status bar.
+    pub fn active_agent_info(&self) -> Vec<crate::widgets::status_bar::ActiveAgent> {
+        self.tabs
+            .values()
+            .map(|tab| crate::widgets::status_bar::ActiveAgent {
+                name: tab.agent_name,
+                alive: tab.panel.is_alive(),
+            })
+            .collect()
+    }
+
     /// Count of alive tabs.
     #[allow(dead_code)]
     pub fn alive_count(&self) -> usize {
         self.tabs.values().filter(|t| t.panel.is_alive()).count()
+    }
+
+    /// Collect recent insights from all alive terminal panes.
+    ///
+    /// Returns formatted strings like `[Claude Code] Modified src/main.rs`
+    /// suitable for injecting into the agent panel as cross-pane context.
+    pub fn collected_insights(&mut self) -> Vec<String> {
+        let mut insights = Vec::new();
+        for tab in self.tabs.values_mut() {
+            if tab.panel.is_alive() {
+                let bridge = tab.panel.context_bridge();
+                for insight in bridge.insights().iter().rev().take(5) {
+                    insights.push(format!(
+                        "[{}] {}: {}",
+                        tab.label,
+                        insight.insight_type.as_str(),
+                        insight.content
+                    ));
+                }
+            }
+        }
+        insights.dedup();
+        insights
     }
 
     /// Run context extraction tick on all alive panels.
@@ -234,28 +269,51 @@ impl View for TerminalsView {
             let mut close_id = None;
 
             for id in &tab_ids {
-                let tab = &self.tabs[id];
+                let tab = self.tabs.get_mut(id).unwrap();
                 let is_active = self.active_tab == Some(*id);
                 let color = theme::agent_color(tab.agent_name);
 
+                // Capture values we need before entering the closure.
+                let is_alive = tab.panel.is_alive();
+                let label = tab.label.clone();
+                let health_info = if is_alive {
+                    let health = tab.panel.context_bridge().health();
+                    Some((health.usage_fraction, health.estimated_tokens))
+                } else {
+                    None
+                };
+
                 ui.horizontal(|ui| {
                     // Alive dot.
-                    let dot_color = if tab.panel.is_alive() {
-                        egui::Color32::from_rgb(0x3f, 0xb9, 0x50)
+                    let dot_color = if is_alive {
+                        colors::GREEN
                     } else {
-                        egui::Color32::from_rgb(0x6e, 0x76, 0x81)
+                        colors::TEXT_DIM
                     };
                     let dot_rect = ui.allocate_space(egui::vec2(8.0, 8.0));
                     ui.painter()
                         .circle_filled(dot_rect.1.center(), 3.5, dot_color);
 
-                    let text = egui::RichText::new(&tab.label).color(if is_active {
+                    let text = egui::RichText::new(&label).color(if is_active {
                         color
                     } else {
-                        egui::Color32::from_rgb(0x8b, 0x94, 0x9e)
+                        colors::TEXT_MUTED
                     });
                     if ui.selectable_label(is_active, text).clicked() {
                         self.active_tab = Some(*id);
+                    }
+
+                    // Context health indicator for alive panels.
+                    if let Some((usage_fraction, estimated_tokens)) = health_info {
+                        let (tier_icon, tier_color) =
+                            context_tier_display_from(usage_fraction);
+                        let resp =
+                            ui.label(egui::RichText::new(tier_icon).small().color(tier_color));
+                        resp.on_hover_text(format!(
+                            "Context: {:.0}% ({} tokens)",
+                            usage_fraction * 100.0,
+                            estimated_tokens
+                        ));
                     }
 
                     if ui.small_button("\u{00d7}").clicked() {
@@ -278,7 +336,7 @@ impl View for TerminalsView {
                         if agent.available {
                             theme::agent_color(agent.name)
                         } else {
-                            egui::Color32::from_rgb(0x48, 0x4f, 0x58)
+                            colors::TEXT_FAINT
                         },
                     ))
                     .small();
@@ -305,24 +363,125 @@ impl View for TerminalsView {
             }
         } else {
             ui.vertical_centered(|ui| {
-                ui.add_space(ui.available_height() / 4.0);
+                ui.add_space(ui.available_height() / 6.0);
                 ui.heading(
                     egui::RichText::new(WELCOME_BANNER)
                         .monospace()
-                        .color(egui::Color32::from_rgb(0x8b, 0x5c, 0xf6)),
-                );
-                ui.add_space(12.0);
-                ui.label(
-                    egui::RichText::new("Persistent memory for AI coding agents")
-                        .color(egui::Color32::from_rgb(0x8b, 0x94, 0x9e)),
+                        .color(colors::ACCENT),
                 );
                 ui.add_space(8.0);
                 ui.label(
-                    egui::RichText::new("Click a spawn button above to open a terminal.")
-                        .color(egui::Color32::from_rgb(0x6e, 0x76, 0x81)),
+                    egui::RichText::new("Persistent memory for AI coding agents")
+                        .color(colors::TEXT_MUTED),
                 );
+
+                ui.add_space(24.0);
+
+                // Quick action buttons for available agents.
+                ui.label(
+                    egui::RichText::new("Quick Launch")
+                        .strong()
+                        .color(colors::TEXT),
+                );
+                ui.add_space(8.0);
+
+                let agents = self.agents.clone();
+                let available: Vec<_> = agents.iter().filter(|a| a.available).collect();
+
+                if available.is_empty() {
+                    ui.label(
+                        egui::RichText::new("No agents found on PATH.").color(colors::TEXT_DIM),
+                    );
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.add_space(
+                            (ui.available_width()
+                                - (available.len() as f32 * 100.0)
+                                - ((available.len() as f32 - 1.0) * 8.0))
+                                .max(0.0)
+                                / 2.0,
+                        );
+                        for agent in &available {
+                            let color = theme::agent_color(agent.name);
+                            let btn =
+                                egui::Button::new(egui::RichText::new(agent.name).color(color))
+                                    .min_size(egui::vec2(90.0, 32.0))
+                                    .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.4)));
+
+                            if ui.add(btn).clicked() {
+                                self.spawn_tab(agent, _ctx);
+                            }
+                            ui.add_space(4.0);
+                        }
+                    });
+                }
+
+                ui.add_space(24.0);
+
+                // Shortcuts reference.
+                egui::Frame::new()
+                    .fill(colors::SURFACE)
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .inner_margin(egui::Margin::symmetric(16, 10))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new("Keyboard Shortcuts")
+                                .small()
+                                .strong()
+                                .color(colors::TEXT_MUTED),
+                        );
+                        ui.add_space(4.0);
+                        for (key, action) in [
+                            ("Ctrl+N", "New terminal tab"),
+                            ("Ctrl+W", "Close active tab"),
+                            ("Ctrl+Tab", "Next tab"),
+                            ("Ctrl+L", "Focus agent panel"),
+                            ("Ctrl+5", "Toggle agent panel"),
+                            ("Ctrl+B", "Toggle sidebar"),
+                            ("Ctrl+K", "Search"),
+                        ] {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(key)
+                                        .small()
+                                        .monospace()
+                                        .color(colors::ACCENT),
+                                );
+                                ui.label(
+                                    egui::RichText::new(action).small().color(colors::TEXT_DIM),
+                                );
+                            });
+                        }
+                    });
             });
         }
+    }
+}
+
+/// Map context health to a display icon and color for the tab bar.
+fn context_tier_display(
+    health: &impulse_term::context::ContextHealth,
+) -> (&'static str, egui::Color32) {
+    use impulse_term::context::ContextTier;
+    match health.tier {
+        ContextTier::None | ContextTier::Full => ("\u{25CF}", colors::GREEN), // ● green = low usage
+        ContextTier::Essential => ("\u{25D0}", colors::YELLOW),               // ◐ yellow = 45-59%
+        ContextTier::Critical => ("\u{25D1}", colors::RED),                   // ◑ red = 60-79%
+        ContextTier::Minimal => ("\u{25CB}", colors::RED),                    // ○ red = 80%+
+        ContextTier::PostCompaction => ("\u{21BB}", colors::ACCENT), // ↻ purple = compacted
+    }
+}
+
+/// Map usage_fraction to display icon and color (for use when health struct isn't available).
+fn context_tier_display_from(usage_fraction: f32) -> (&'static str, egui::Color32) {
+    if usage_fraction < 0.45 {
+        ("\u{25CF}", colors::GREEN)  // ● green
+    } else if usage_fraction < 0.60 {
+        ("\u{25D0}", colors::YELLOW) // ◐ yellow
+    } else if usage_fraction < 0.80 {
+        ("\u{25D1}", colors::RED)    // ◑ red
+    } else {
+        ("\u{25CB}", colors::RED)    // ○ red
     }
 }
 

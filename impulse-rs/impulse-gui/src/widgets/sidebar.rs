@@ -6,19 +6,32 @@
 use eframe::egui;
 
 use crate::state::{ConnectionStatus, SharedState};
+use crate::theme::colors;
 use crate::views::ViewId;
 
 const COLLAPSED_WIDTH: f32 = 48.0;
 const EXPANDED_WIDTH: f32 = 160.0;
 
-/// Render the sidebar and return the newly-selected view (if changed).
+/// Actions returned by the sidebar.
+pub struct SidebarAction {
+    /// A new view was selected (if any).
+    pub new_view: Option<ViewId>,
+    /// The agent panel toggle was clicked.
+    pub toggle_agent: bool,
+}
+
+/// Render the sidebar and return any actions taken.
 pub fn show(
     ctx: &egui::Context,
     active: ViewId,
     expanded: bool,
+    agent_visible: bool,
     state: &SharedState,
-) -> Option<ViewId> {
-    let mut selected = None;
+) -> SidebarAction {
+    let mut action = SidebarAction {
+        new_view: None,
+        toggle_agent: false,
+    };
     let width = if expanded {
         EXPANDED_WIDTH
     } else {
@@ -34,18 +47,11 @@ pub fn show(
             // Logo / brand.
             if expanded {
                 ui.horizontal(|ui| {
-                    ui.strong(
-                        egui::RichText::new("IMPULSE")
-                            .color(egui::Color32::from_rgb(0x8b, 0x5c, 0xf6)),
-                    );
+                    ui.strong(egui::RichText::new("IMPULSE").color(colors::ACCENT));
                 });
             } else {
                 ui.vertical_centered(|ui| {
-                    ui.strong(
-                        egui::RichText::new("I")
-                            .color(egui::Color32::from_rgb(0x8b, 0x5c, 0xf6))
-                            .size(18.0),
-                    );
+                    ui.strong(egui::RichText::new("I").color(colors::ACCENT).size(18.0));
                 });
             }
 
@@ -64,14 +70,14 @@ pub fn show(
                 };
 
                 let color = if is_active {
-                    egui::Color32::from_rgb(0x8b, 0x5c, 0xf6)
+                    colors::ACCENT
                 } else {
-                    egui::Color32::from_rgb(0x8b, 0x94, 0x9e)
+                    colors::TEXT_MUTED
                 };
 
                 let btn = egui::Button::new(egui::RichText::new(&text).color(color))
                     .fill(if is_active {
-                        egui::Color32::from_rgb(0x1c, 0x1c, 0x2e)
+                        colors::ACTIVE_BG
                     } else {
                         egui::Color32::TRANSPARENT
                     })
@@ -79,7 +85,7 @@ pub fn show(
 
                 let resp = ui.add(btn);
                 if resp.clicked() {
-                    selected = Some(view_id);
+                    action.new_view = Some(view_id);
                 }
                 if !expanded {
                     resp.on_hover_text(format!(
@@ -90,36 +96,59 @@ pub fn show(
                 }
             }
 
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(8.0);
+
+            // Agent panel toggle button.
+            let agent_text = if expanded {
+                "\u{25CF}  Agent".to_string()
+            } else {
+                "AG".to_string()
+            };
+
+            let agent_color = if agent_visible {
+                colors::GREEN
+            } else {
+                colors::TEXT_MUTED
+            };
+
+            let agent_btn = egui::Button::new(egui::RichText::new(&agent_text).color(agent_color))
+                .fill(if agent_visible {
+                    colors::ACTIVE_AGENT_BG
+                } else {
+                    egui::Color32::TRANSPARENT
+                })
+                .min_size(egui::vec2(width - 16.0, 32.0));
+
+            let agent_resp = ui.add(agent_btn);
+            if agent_resp.clicked() {
+                action.toggle_agent = true;
+            }
+            if !expanded {
+                agent_resp.on_hover_text("Agent Panel (Ctrl+5)");
+            }
+
             // Push remaining content to bottom.
             ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                 ui.add_space(8.0);
 
                 // Connection status indicator.
                 let (dot_color, label) = match state.connection {
-                    ConnectionStatus::Connected => {
-                        (egui::Color32::from_rgb(0x3f, 0xb9, 0x50), "Online")
-                    }
-                    ConnectionStatus::Connecting => {
-                        (egui::Color32::from_rgb(0xd2, 0x99, 0x22), "Connecting")
-                    }
-                    ConnectionStatus::Disconnected => {
-                        (egui::Color32::from_rgb(0x6e, 0x76, 0x81), "Offline")
-                    }
+                    ConnectionStatus::Connected => (colors::GREEN, "Online"),
+                    ConnectionStatus::Connecting => (colors::YELLOW, "Connecting"),
+                    ConnectionStatus::Disconnected => (colors::TEXT_DIM, "Offline"),
                 };
 
                 ui.horizontal(|ui| {
                     let dot = ui.allocate_space(egui::vec2(10.0, 10.0));
                     ui.painter().circle_filled(dot.1.center(), 4.0, dot_color);
                     if expanded {
-                        ui.label(
-                            egui::RichText::new(label)
-                                .small()
-                                .color(egui::Color32::from_rgb(0x6e, 0x76, 0x81)),
-                        );
+                        ui.label(egui::RichText::new(label).small().color(colors::TEXT_DIM));
                     }
                 });
             });
         });
 
-    selected
+    action
 }

@@ -5,8 +5,9 @@
 //! - `SessionsView` — daemon session list + detail
 //! - `GenomeView` — genome decisions viewer
 //! - `SearchView` — daemon search
+//! - `AgentPanel` — interactive chat with the Impulse coordinator agent
 //!
-//! Layout: Sidebar (left) | Active View (center) | Status Bar (bottom)
+//! Layout: Sidebar (left) | Agent Panel (left, optional) | Active View (center) | Status Bar (bottom)
 
 use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
@@ -14,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 
+use crate::agent_panel::AgentPanel;
 use crate::state::{self, PollerCommand, StateHandle};
 use crate::views::genome::GenomeView;
 use crate::views::search::SearchView;
@@ -33,6 +35,11 @@ pub struct ImpulseApp {
 
     // Sidebar.
     sidebar_expanded: bool,
+
+    // Agent panel.
+    agent_panel: AgentPanel,
+    agent_visible: bool,
+    last_context_inject: Instant,
 
     // Daemon IPC.
     shared_state: StateHandle,
@@ -56,6 +63,10 @@ impl ImpulseApp {
             active_view: ViewId::Terminals,
 
             sidebar_expanded: true,
+
+            agent_panel: AgentPanel::new(),
+            agent_visible: false,
+            last_context_inject: Instant::now(),
 
             shared_state,
             poller_cmd,
@@ -84,6 +95,10 @@ impl ImpulseApp {
             } else if input.key_pressed(egui::Key::Num4) {
                 self.active_view = ViewId::Search;
             }
+            // Ctrl+5: Toggle agent panel.
+            else if input.key_pressed(egui::Key::Num5) {
+                self.agent_visible = !self.agent_visible;
+            }
             // Ctrl+B: Toggle sidebar.
             else if input.key_pressed(egui::Key::B) {
                 self.sidebar_expanded = !self.sidebar_expanded;
@@ -95,6 +110,20 @@ impl ImpulseApp {
             // Ctrl+K: Focus search.
             else if input.key_pressed(egui::Key::K) {
                 self.active_view = ViewId::Search;
+            }
+            // Ctrl+T / Ctrl+N: New terminal tab.
+            else if input.key_pressed(egui::Key::T) || input.key_pressed(egui::Key::N) {
+                if let Some(agent) = self.terminals.agents.first().cloned() {
+                    self.active_view = ViewId::Terminals;
+                    self.terminals.spawn_tab(&agent, ctx);
+                }
+            }
+            // Ctrl+L: Focus agent panel (open if hidden).
+            else if input.key_pressed(egui::Key::L) {
+                if !self.agent_visible {
+                    self.agent_visible = true;
+                }
+                self.agent_panel.request_focus();
             }
         });
     }
@@ -122,6 +151,12 @@ impl ImpulseApp {
                 ui.menu_button("View", |ui| {
                     if ui
                         .checkbox(&mut self.sidebar_expanded, "Show Sidebar (Ctrl+B)")
+                        .clicked()
+                    {
+                        ui.close_menu();
+                    }
+                    if ui
+                        .checkbox(&mut self.agent_visible, "Agent Panel (Ctrl+5)")
                         .clicked()
                     {
                         ui.close_menu();
@@ -189,7 +224,27 @@ impl eframe::App for ImpulseApp {
         if now.duration_since(self.last_context_tick) >= Duration::from_secs(3) {
             self.last_context_tick = now;
             self.terminals.context_tick();
+
+            // Update activity feed display (every tick, ~3s — cheap Vec swap).
+            if self.agent_visible {
+                let insights = self.terminals.collected_insights();
+                self.agent_panel.update_activity(insights);
+            }
         }
+
+        // Inject cross-pane context into agent panel (every 60 seconds).
+        if self.agent_visible
+            && now.duration_since(self.last_context_inject) >= Duration::from_secs(60)
+        {
+            self.last_context_inject = now;
+            let insights = self.terminals.collected_insights();
+            if !insights.is_empty() {
+                self.agent_panel.inject_context(&insights);
+            }
+        }
+
+        // Poll agent responses (non-blocking).
+        self.agent_panel.tick();
 
         // Terminal-specific shortcuts (only when terminal view is active).
         if self.active_view == ViewId::Terminals {
@@ -227,13 +282,34 @@ impl eframe::App for ImpulseApp {
         }
 
         // --- Sidebar ---
-        if let Some(new_view) = sidebar::show(ctx, self.active_view, self.sidebar_expanded, &state)
-        {
+        let sidebar_action = sidebar::show(
+            ctx,
+            self.active_view,
+            self.sidebar_expanded,
+            self.agent_visible,
+            &state,
+        );
+        if let Some(new_view) = sidebar_action.new_view {
             self.active_view = new_view;
+        }
+        if sidebar_action.toggle_agent {
+            self.agent_visible = !self.agent_visible;
+        }
+
+        // --- Agent Panel (second left SidePanel, shown when toggled) ---
+        if self.agent_visible {
+            egui::SidePanel::left("agent_panel")
+                .resizable(true)
+                .default_width(340.0)
+                .width_range(280.0..=500.0)
+                .show(ctx, |ui| {
+                    self.agent_panel.ui(ui, ctx);
+                });
         }
 
         // --- Status bar ---
-        status_bar::show(ctx, &state, self.terminals.tab_count());
+        let active_agents = self.terminals.active_agent_info();
+        status_bar::show(ctx, &state, self.terminals.tab_count(), &active_agents);
 
         // --- Central panel: active view ---
         egui::CentralPanel::default().show(ctx, |ui| match self.active_view {

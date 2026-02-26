@@ -5,6 +5,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod agent_panel;
 mod app;
 mod ipc;
 mod state;
@@ -33,6 +34,7 @@ fn main() -> eframe::Result {
         println!();
         println!("Keyboard shortcuts:");
         println!("  Ctrl+1-4        Switch views (Terminals/Sessions/Genome/Search)");
+        println!("  Ctrl+5          Toggle Agent panel");
         println!("  Ctrl+B          Toggle sidebar");
         println!("  Ctrl+T          New terminal tab");
         println!("  Ctrl+W          Close current terminal tab");

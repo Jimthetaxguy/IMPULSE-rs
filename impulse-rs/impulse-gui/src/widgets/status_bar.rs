@@ -1,36 +1,37 @@
-//! Bottom status bar — daemon connection, session counts, hints.
+//! Bottom status bar — daemon connection, session counts, active agents, hints.
 
 use eframe::egui;
 
 use crate::state::{ConnectionStatus, SharedState};
+use crate::theme;
+use crate::theme::colors;
 
-pub fn show(ctx: &egui::Context, state: &SharedState, terminal_tabs: usize) {
+/// Info about an active terminal for status bar display.
+pub struct ActiveAgent {
+    pub name: &'static str,
+    pub alive: bool,
+}
+
+pub fn show(
+    ctx: &egui::Context,
+    state: &SharedState,
+    terminal_tabs: usize,
+    active_agents: &[ActiveAgent],
+) {
     egui::TopBottomPanel::bottom("status_bar")
         .exact_height(24.0)
         .show(ctx, |ui| {
             ui.horizontal_centered(|ui| {
                 // Connection status.
                 let (dot, label) = match state.connection {
-                    ConnectionStatus::Connected => (
-                        egui::Color32::from_rgb(0x3f, 0xb9, 0x50),
-                        "Daemon: connected",
-                    ),
-                    ConnectionStatus::Connecting => (
-                        egui::Color32::from_rgb(0xd2, 0x99, 0x22),
-                        "Daemon: connecting...",
-                    ),
-                    ConnectionStatus::Disconnected => {
-                        (egui::Color32::from_rgb(0x6e, 0x76, 0x81), "Daemon: offline")
-                    }
+                    ConnectionStatus::Connected => (colors::GREEN, "Daemon: connected"),
+                    ConnectionStatus::Connecting => (colors::YELLOW, "Daemon: connecting..."),
+                    ConnectionStatus::Disconnected => (colors::TEXT_DIM, "Daemon: offline"),
                 };
 
                 let dot_rect = ui.allocate_space(egui::vec2(8.0, 8.0));
                 ui.painter().circle_filled(dot_rect.1.center(), 3.0, dot);
-                ui.label(
-                    egui::RichText::new(label)
-                        .small()
-                        .color(egui::Color32::from_rgb(0x6e, 0x76, 0x81)),
-                );
+                ui.label(egui::RichText::new(label).small().color(colors::TEXT_DIM));
 
                 ui.separator();
 
@@ -38,21 +39,36 @@ pub fn show(ctx: &egui::Context, state: &SharedState, terminal_tabs: usize) {
                 if let Some(ref status) = state.daemon_status {
                     ui.label(
                         egui::RichText::new(format!(
-                            "Sessions: {} active / {} total",
+                            "Sessions: {} / {}",
                             status.active, status.sessions
                         ))
                         .small()
-                        .color(egui::Color32::from_rgb(0x6e, 0x76, 0x81)),
+                        .color(colors::TEXT_DIM),
                     );
                     ui.separator();
                 }
 
-                // Terminal tabs.
-                ui.label(
-                    egui::RichText::new(format!("Terminals: {}", terminal_tabs))
-                        .small()
-                        .color(egui::Color32::from_rgb(0x6e, 0x76, 0x81)),
-                );
+                // Terminal tabs with active agent badges.
+                if !active_agents.is_empty() {
+                    for agent in active_agents {
+                        let agent_color = if agent.alive {
+                            theme::agent_color(agent.name)
+                        } else {
+                            colors::TEXT_FAINT
+                        };
+                        let dot_rect = ui.allocate_space(egui::vec2(6.0, 6.0));
+                        ui.painter()
+                            .circle_filled(dot_rect.1.center(), 2.5, agent_color);
+                        ui.label(egui::RichText::new(agent.name).small().color(agent_color));
+                        ui.add_space(2.0);
+                    }
+                } else {
+                    ui.label(
+                        egui::RichText::new(format!("Terminals: {}", terminal_tabs))
+                            .small()
+                            .color(colors::TEXT_DIM),
+                    );
+                }
 
                 // Right-aligned hint.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -60,13 +76,13 @@ pub fn show(ctx: &egui::Context, state: &SharedState, terminal_tabs: usize) {
                         ui.label(
                             egui::RichText::new("Run `impulse daemon` to connect")
                                 .small()
-                                .color(egui::Color32::from_rgb(0xd2, 0x99, 0x22)),
+                                .color(colors::YELLOW),
                         );
                     } else {
                         ui.label(
-                            egui::RichText::new("Ctrl+B: toggle sidebar")
+                            egui::RichText::new("Ctrl+N: new tab  Ctrl+L: agent  Ctrl+B: sidebar")
                                 .small()
-                                .color(egui::Color32::from_rgb(0x48, 0x4f, 0x58)),
+                                .color(colors::TEXT_FAINT),
                         );
                     }
                 });

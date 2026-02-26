@@ -1,6 +1,6 @@
 //! Sessions view — active sessions and history timeline.
 //!
-//! Left panel: scrollable session list (active + history).
+//! Left panel: scrollable session list with cards (active + history).
 //! Right panel: detail view for the selected item.
 
 use chrono::{DateTime, Utc};
@@ -9,6 +9,7 @@ use eframe::egui;
 use super::{View, ViewId};
 use crate::state::{ConnectionStatus, SharedState};
 use crate::theme;
+use crate::theme::colors;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -45,15 +46,35 @@ impl View for SessionsView {
 
         // --- Tab selector + filter ---
         ui.horizontal(|ui| {
+            let active_count = state.sessions.len();
+            let history_count = state.history.len();
+
+            let active_label = format!("Active ({})", active_count);
+            let history_label = format!("History ({})", history_count);
+
             if ui
-                .selectable_label(self.tab == Tab::Active, "Active")
+                .selectable_label(
+                    self.tab == Tab::Active,
+                    egui::RichText::new(active_label).color(if self.tab == Tab::Active {
+                        colors::ACCENT
+                    } else {
+                        colors::TEXT_MUTED
+                    }),
+                )
                 .clicked()
             {
                 self.tab = Tab::Active;
                 self.selected_id = None;
             }
             if ui
-                .selectable_label(self.tab == Tab::History, "History")
+                .selectable_label(
+                    self.tab == Tab::History,
+                    egui::RichText::new(history_label).color(if self.tab == Tab::History {
+                        colors::ACCENT
+                    } else {
+                        colors::TEXT_MUTED
+                    }),
+                )
                 .clicked()
             {
                 self.tab = Tab::History;
@@ -61,8 +82,11 @@ impl View for SessionsView {
             }
 
             ui.separator();
-            ui.label("Filter:");
-            ui.text_edit_singleline(&mut self.filter);
+
+            let filter_edit = egui::TextEdit::singleline(&mut self.filter)
+                .hint_text("Filter sessions...")
+                .desired_width(160.0);
+            ui.add(filter_edit);
         });
 
         ui.separator();
@@ -89,50 +113,50 @@ impl View for SessionsView {
                                     }
 
                                     let selected = self.selected_id.as_deref() == Some(&session.id);
-                                    let color = platform_color(&session.platform);
+                                    session_card(ui, selected, |ui| {
+                                        ui.horizontal(|ui| {
+                                            // Active dot.
+                                            let dot = ui.allocate_space(egui::vec2(8.0, 8.0));
+                                            ui.painter().circle_filled(
+                                                dot.1.center(),
+                                                3.5,
+                                                if session.status == "active" {
+                                                    colors::GREEN
+                                                } else {
+                                                    colors::TEXT_DIM
+                                                },
+                                            );
 
-                                    ui.horizontal(|ui| {
-                                        // Active dot.
-                                        let dot = ui.allocate_space(egui::vec2(8.0, 8.0));
-                                        ui.painter().circle_filled(
-                                            dot.1.center(),
-                                            3.5,
-                                            if session.status == "active" {
-                                                egui::Color32::from_rgb(0x3f, 0xb9, 0x50)
-                                            } else {
-                                                egui::Color32::from_rgb(0x6e, 0x76, 0x81)
-                                            },
-                                        );
+                                            let color = platform_color(&session.platform);
+                                            let text = egui::RichText::new(&session.name)
+                                                .color(if selected { color } else { colors::TEXT });
+                                            if ui.selectable_label(selected, text).clicked() {
+                                                self.selected_id = Some(session.id.clone());
+                                            }
+                                        });
 
-                                        let text =
-                                            egui::RichText::new(&session.name).color(if selected {
-                                                color
-                                            } else {
-                                                egui::Color32::from_rgb(0xc9, 0xd1, 0xd9)
-                                            });
-                                        if ui.selectable_label(selected, text).clicked() {
-                                            self.selected_id = Some(session.id.clone());
-                                        }
+                                        // Platform badge + metadata.
+                                        ui.horizontal(|ui| {
+                                            ui.add_space(16.0);
+                                            platform_badge(ui, &session.platform);
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "{} files \u{00b7} {}",
+                                                    session.active_files.len(),
+                                                    format_relative_time(&session.created_at)
+                                                ))
+                                                .small()
+                                                .color(colors::TEXT_DIM),
+                                            );
+                                        });
                                     });
-
-                                    // Subtitle.
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "  {} \u{00b7} {} files \u{00b7} {}",
-                                            session.platform,
-                                            session.active_files.len(),
-                                            format_relative_time(&session.created_at)
-                                        ))
-                                        .small()
-                                        .color(egui::Color32::from_rgb(0x6e, 0x76, 0x81)),
-                                    );
                                     ui.add_space(4.0);
                                 }
 
                                 if state.sessions.is_empty() {
                                     ui.label(
                                         egui::RichText::new("No active sessions")
-                                            .color(egui::Color32::from_rgb(0x6e, 0x76, 0x81)),
+                                            .color(colors::TEXT_DIM),
                                     );
                                 }
                             }
@@ -151,35 +175,39 @@ impl View for SessionsView {
 
                                     let selected =
                                         self.selected_id.as_deref() == Some(&entry.session_id);
+                                    session_card(ui, selected, |ui| {
+                                        let text = egui::RichText::new(&entry.session_name).color(
+                                            if selected {
+                                                platform_color(&entry.platform)
+                                            } else {
+                                                colors::TEXT
+                                            },
+                                        );
+                                        if ui.selectable_label(selected, text).clicked() {
+                                            self.selected_id = Some(entry.session_id.clone());
+                                        }
 
-                                    let text = egui::RichText::new(&entry.session_name).color(
-                                        if selected {
-                                            platform_color(&entry.platform)
-                                        } else {
-                                            egui::Color32::from_rgb(0xc9, 0xd1, 0xd9)
-                                        },
-                                    );
-                                    if ui.selectable_label(selected, text).clicked() {
-                                        self.selected_id = Some(entry.session_id.clone());
-                                    }
-
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "  {} \u{00b7} {} files \u{00b7} {}",
-                                            entry.platform,
-                                            entry.files_touched.len(),
-                                            format_relative_time(&entry.ended_at)
-                                        ))
-                                        .small()
-                                        .color(egui::Color32::from_rgb(0x6e, 0x76, 0x81)),
-                                    );
+                                        ui.horizontal(|ui| {
+                                            ui.add_space(4.0);
+                                            platform_badge(ui, &entry.platform);
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "{} files \u{00b7} {}",
+                                                    entry.files_touched.len(),
+                                                    format_relative_time(&entry.ended_at)
+                                                ))
+                                                .small()
+                                                .color(colors::TEXT_DIM),
+                                            );
+                                        });
+                                    });
                                     ui.add_space(4.0);
                                 }
 
                                 if state.history.is_empty() {
                                     ui.label(
                                         egui::RichText::new("No history entries")
-                                            .color(egui::Color32::from_rgb(0x6e, 0x76, 0x81)),
+                                            .color(colors::TEXT_DIM),
                                     );
                                 }
                             }
@@ -215,7 +243,7 @@ impl View for SessionsView {
                         ui.add_space(ui.available_height() / 3.0);
                         ui.label(
                             egui::RichText::new("Select a session to view details")
-                                .color(egui::Color32::from_rgb(0x6e, 0x76, 0x81)),
+                                .color(colors::TEXT_DIM),
                         );
                     });
                 }
@@ -224,81 +252,153 @@ impl View for SessionsView {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Render a session card with a subtle background frame.
+fn session_card(ui: &mut egui::Ui, selected: bool, content: impl FnOnce(&mut egui::Ui)) {
+    let fill = if selected {
+        colors::ACTIVE_BG
+    } else {
+        colors::SURFACE
+    };
+    egui::Frame::new()
+        .fill(fill)
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .stroke(egui::Stroke::new(
+            if selected { 1.0 } else { 0.5 },
+            if selected {
+                colors::ACCENT
+            } else {
+                colors::BORDER
+            },
+        ))
+        .show(ui, |ui| {
+            content(ui);
+        });
+}
+
+/// Render a small colored platform badge.
+fn platform_badge(ui: &mut egui::Ui, platform: &str) {
+    let color = platform_color(platform);
+    let short = match platform {
+        "claude-code" => "Claude",
+        "opencode" => "OC",
+        "codex" => "Codex",
+        _ => platform,
+    };
+    egui::Frame::new()
+        .fill(color.gamma_multiply(0.15))
+        .corner_radius(egui::CornerRadius::same(3))
+        .inner_margin(egui::Margin::symmetric(4, 1))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(short).small().color(color));
+        });
+}
+
 fn detail_session(ui: &mut egui::Ui, s: &crate::ipc::Session) {
-    ui.heading(&s.name);
+    ui.heading(egui::RichText::new(&s.name).color(colors::TEXT));
     ui.add_space(4.0);
 
     ui.horizontal(|ui| {
-        ui.label("Platform:");
-        ui.colored_label(platform_color(&s.platform), &s.platform);
+        ui.label(egui::RichText::new("Platform:").color(colors::TEXT_MUTED));
+        platform_badge(ui, &s.platform);
     });
     ui.horizontal(|ui| {
-        ui.label("Status:");
-        ui.label(&s.status);
+        ui.label(egui::RichText::new("Status:").color(colors::TEXT_MUTED));
+        let status_color = if s.status == "active" {
+            colors::GREEN
+        } else {
+            colors::TEXT_DIM
+        };
+        ui.colored_label(status_color, &s.status);
     });
     if !s.created_at.is_empty() {
         ui.horizontal(|ui| {
-            ui.label("Started:");
-            ui.label(&s.created_at);
+            ui.label(egui::RichText::new("Started:").color(colors::TEXT_MUTED));
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} ({})",
+                    &s.created_at,
+                    format_relative_time(&s.created_at)
+                ))
+                .color(colors::TEXT_DIM),
+            );
         });
     }
 
     ui.add_space(8.0);
     if !s.active_files.is_empty() {
-        ui.label(egui::RichText::new("Files:").strong());
+        ui.label(egui::RichText::new("Files:").strong().color(colors::TEXT));
         for f in &s.active_files {
-            ui.label(format!("  {}", f));
+            ui.label(egui::RichText::new(format!("  {}", f)).color(colors::TEXT_MUTED));
         }
     }
 
     ui.add_space(4.0);
     if !s.recent_tools.is_empty() {
-        ui.label(egui::RichText::new("Tools:").strong());
+        ui.label(egui::RichText::new("Tools:").strong().color(colors::TEXT));
         for t in &s.recent_tools {
-            ui.label(format!("  {}", t));
+            ui.label(egui::RichText::new(format!("  {}", t)).color(colors::TEXT_MUTED));
         }
     }
 }
 
 fn detail_history(ui: &mut egui::Ui, h: &crate::ipc::HistoryEntry) {
-    ui.heading(&h.session_name);
+    ui.heading(egui::RichText::new(&h.session_name).color(colors::TEXT));
     ui.add_space(4.0);
 
     ui.horizontal(|ui| {
-        ui.label("Platform:");
-        ui.colored_label(platform_color(&h.platform), &h.platform);
+        ui.label(egui::RichText::new("Platform:").color(colors::TEXT_MUTED));
+        platform_badge(ui, &h.platform);
     });
     if !h.started_at.is_empty() {
         ui.horizontal(|ui| {
-            ui.label("Started:");
-            ui.label(&h.started_at);
+            ui.label(egui::RichText::new("Started:").color(colors::TEXT_MUTED));
+            ui.label(egui::RichText::new(&h.started_at).color(colors::TEXT_DIM));
         });
     }
     if !h.ended_at.is_empty() {
         ui.horizontal(|ui| {
-            ui.label("Ended:");
-            ui.label(&h.ended_at);
+            ui.label(egui::RichText::new("Ended:").color(colors::TEXT_MUTED));
+            ui.label(egui::RichText::new(&h.ended_at).color(colors::TEXT_DIM));
         });
     }
     if !h.summary.is_empty() {
         ui.add_space(4.0);
-        ui.label(egui::RichText::new("Summary:").strong());
-        ui.label(&h.summary);
+        ui.label(egui::RichText::new("Summary:").strong().color(colors::TEXT));
+        egui::Frame::new()
+            .fill(colors::SURFACE)
+            .corner_radius(egui::CornerRadius::same(4))
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new(&h.summary).color(colors::TEXT_MUTED));
+            });
     }
 
     ui.add_space(8.0);
     if !h.files_touched.is_empty() {
-        ui.label(egui::RichText::new("Files touched:").strong());
+        ui.label(
+            egui::RichText::new(format!("Files touched ({}):", h.files_touched.len()))
+                .strong()
+                .color(colors::TEXT),
+        );
         for f in &h.files_touched {
-            ui.label(format!("  {}", f));
+            ui.label(egui::RichText::new(format!("  {}", f)).color(colors::TEXT_MUTED));
         }
     }
 
     ui.add_space(4.0);
     if !h.tools_used.is_empty() {
-        ui.label(egui::RichText::new("Tools used:").strong());
+        ui.label(
+            egui::RichText::new(format!("Tools used ({}):", h.tools_used.len()))
+                .strong()
+                .color(colors::TEXT),
+        );
         for t in &h.tools_used {
-            ui.label(format!("  {}", t));
+            ui.label(egui::RichText::new(format!("  {}", t)).color(colors::TEXT_MUTED));
         }
     }
 }
@@ -308,19 +408,19 @@ fn platform_color(platform: &str) -> egui::Color32 {
         "claude-code" => theme::agent_color("Claude Code"),
         "opencode" => theme::agent_color("OpenCode"),
         "codex" => theme::agent_color("Codex"),
-        _ => egui::Color32::from_rgb(0xc9, 0xd1, 0xd9),
+        _ => colors::TEXT,
     }
 }
 
 fn empty_state(ui: &mut egui::Ui, message: &str) {
     ui.vertical_centered(|ui| {
         ui.add_space(ui.available_height() / 3.0);
-        ui.label(egui::RichText::new(message).color(egui::Color32::from_rgb(0x6e, 0x76, 0x81)));
+        ui.label(egui::RichText::new(message).color(colors::TEXT_DIM));
         ui.add_space(8.0);
         ui.label(
             egui::RichText::new("Run `impulse daemon` to start the background service.")
                 .small()
-                .color(egui::Color32::from_rgb(0x48, 0x4f, 0x58)),
+                .color(colors::TEXT_FAINT),
         );
     });
 }
@@ -329,7 +429,6 @@ fn format_relative_time(timestamp: &str) -> String {
     if timestamp.is_empty() {
         return "unknown".to_string();
     }
-    // Try to parse ISO 8601 / RFC 3339
     if let Ok(dt) = DateTime::parse_from_rfc3339(timestamp) {
         let now = Utc::now();
         let duration = now.signed_duration_since(dt.with_timezone(&Utc));
