@@ -15,6 +15,7 @@ pub mod credentials;
 pub mod daemon;
 pub mod docs;
 pub mod error;
+pub mod guardrail;
 pub mod impulse_agent;
 pub mod injection;
 pub mod integration_tests;
