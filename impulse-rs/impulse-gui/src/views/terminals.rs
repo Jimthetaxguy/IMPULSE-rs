@@ -46,7 +46,7 @@ impl TerminalsView {
             AgentInfo {
                 name: "Claude Code",
                 command: "claude",
-                args: &["-p"],
+                args: &[],
                 available: which::which("claude").is_ok(),
             },
             AgentInfo {

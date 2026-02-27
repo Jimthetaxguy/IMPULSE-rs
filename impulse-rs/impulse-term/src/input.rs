@@ -79,16 +79,9 @@ pub fn key_to_pty_bytes(
         _ => {}
     }
 
-    // Printable characters (not modified by Ctrl).
-    if !modifiers.ctrl {
-        if let Some(ch) = key_to_char(key) {
-            let ch = if modifiers.shift { shift_char(ch) } else { ch };
-            let mut buf = [0u8; 4];
-            let s = ch.encode_utf8(&mut buf);
-            return Some(s.as_bytes().to_vec());
-        }
-    }
-
+    // Printable characters are handled exclusively by Event::Text in panel.rs.
+    // Processing them here would cause doubled keystrokes since egui fires
+    // both Event::Key and Event::Text for every printable keypress.
     None
 }
 
@@ -165,6 +158,9 @@ fn modifier_param(modifiers: &egui::Modifiers) -> u8 {
 }
 
 /// Map an egui Key to a printable character (lowercase).
+///
+/// Used ONLY for Alt+key combos (ESC prefix) — NOT for direct printable output.
+/// Direct printable input is handled by Event::Text in panel.rs.
 fn key_to_char(key: &egui::Key) -> Option<char> {
     match key {
         egui::Key::A => Some('a'),
@@ -205,7 +201,7 @@ fn key_to_char(key: &egui::Key) -> Option<char> {
         egui::Key::Num9 => Some('9'),
         egui::Key::Space => Some(' '),
         egui::Key::Minus => Some('-'),
-        egui::Key::Plus => Some('='), // unshifted is '='
+        egui::Key::Plus => Some('='),
         egui::Key::OpenBracket => Some('['),
         egui::Key::CloseBracket => Some(']'),
         egui::Key::Backslash => Some('\\'),
@@ -220,34 +216,8 @@ fn key_to_char(key: &egui::Key) -> Option<char> {
     }
 }
 
-/// Apply shift to a character (US keyboard layout).
-fn shift_char(ch: char) -> char {
-    match ch {
-        'a'..='z' => ch.to_ascii_uppercase(),
-        '0' => ')',
-        '1' => '!',
-        '2' => '@',
-        '3' => '#',
-        '4' => '$',
-        '5' => '%',
-        '6' => '^',
-        '7' => '&',
-        '8' => '*',
-        '9' => '(',
-        '-' => '_',
-        '=' => '+',
-        '[' => '{',
-        ']' => '}',
-        '\\' => '|',
-        ';' => ':',
-        '\'' => '"',
-        ',' => '<',
-        '.' => '>',
-        '/' => '?',
-        '`' => '~',
-        _ => ch,
-    }
-}
+// NOTE: shift_char() was removed — shift handling for printable characters
+// is done by the OS/egui via Event::Text, not by our key mapping.
 
 #[cfg(test)]
 mod tests {
@@ -347,23 +317,18 @@ mod tests {
     }
 
     #[test]
-    fn test_printable_char() {
-        assert_eq!(
-            key_to_pty_bytes(&egui::Key::A, &no_mods(), false),
-            Some(b"a".to_vec())
-        );
+    fn test_printable_char_returns_none() {
+        // Printable characters must return None from key_to_pty_bytes —
+        // they are handled by Event::Text in panel.rs to avoid doubled input.
+        assert_eq!(key_to_pty_bytes(&egui::Key::A, &no_mods(), false), None);
+        assert_eq!(key_to_pty_bytes(&egui::Key::A, &shift(), false), None);
+        assert_eq!(key_to_pty_bytes(&egui::Key::Num5, &no_mods(), false), None);
     }
 
     #[test]
-    fn test_shift_char() {
-        assert_eq!(
-            key_to_pty_bytes(&egui::Key::A, &shift(), false),
-            Some(b"A".to_vec())
-        );
-    }
-
-    #[test]
-    fn test_alt_char() {
+    fn test_alt_char_still_works() {
+        // Alt+key produces ESC prefix — this is a modifier combo, not printable text,
+        // so it must still be handled in key_to_pty_bytes.
         assert_eq!(
             key_to_pty_bytes(&egui::Key::A, &alt(), false),
             Some(vec![0x1B, b'a'])
