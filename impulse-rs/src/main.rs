@@ -464,6 +464,9 @@ enum Commands {
         /// Disable a rule by ID
         #[arg(long)]
         disable: Option<String>,
+        /// Output results as JSON (matches daemon IPC format)
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -734,8 +737,8 @@ fn build_opencode_hook_config() -> serde_json::Value {
                 "pre_tool_use": "impulse-rs guard --action \"$INPUT\" --target bash",
                 "session_start": "impulse-rs session-start -n '$OPENCODE_PROJECT_NAME' -p opencode",
                 "session_end": "impulse-rs session-end --session-id $IMPULSE_SESSION_ID --summary '$OPENCODE_SESSION_SUMMARY' --verify",
-                "file_write": "impulse-rs track-write --file $OPENCODE_FILE --session-id $IMPULSE_SESSION_ID",
-                "tool_use": "impulse-rs track-tool --tool $OPENCODE_TOOL_NAME --session-id $IMPULSE_SESSION_ID"
+                "file_write": "impulse-rs track-write --file \"$OPENCODE_FILE\" --session-id \"$IMPULSE_SESSION_ID\"",
+                "tool_use": "impulse-rs track-tool --tool \"$OPENCODE_TOOL_NAME\" --session-id \"$IMPULSE_SESSION_ID\""
             }
         }
     })
@@ -1051,6 +1054,29 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
                     Ok(_) => println!("Tracked: {}", file),
                     Err(e) => eprintln!("Error: {}", e),
                 }
+                // Post-observation: evaluate Warn/Log guardrails on the tracked file
+                if let Ok(config) = state.config_snapshot() {
+                    if config.guardrails.enabled {
+                        if let Ok(results) =
+                            guardrail::evaluate_action(&file, "file", &config.guardrails)
+                        {
+                            for result in &results {
+                                match result.action {
+                                    guardrail::GuardAction::Warn => {
+                                        eprintln!("{}", result.format_human());
+                                    }
+                                    guardrail::GuardAction::Log => {
+                                        // Tag the session for audit trail
+                                        let _ = state
+                                            .add_tag(&sid, &format!("guard:{}", result.rule_id))
+                                            .await;
+                                    }
+                                    guardrail::GuardAction::Block => {} // handled pre-execution
+                                }
+                            }
+                        }
+                    }
+                }
             } else {
                 eprintln!("Error: No session_id. Use --session-id or IMPULSE_SESSION_ID");
             }
@@ -1060,6 +1086,29 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
                 match state.track_tool(&sid, &tool).await {
                     Ok(_) => println!("Tracked: {}", tool),
                     Err(e) => eprintln!("Error: {}", e),
+                }
+                // Post-observation: evaluate Warn/Log guardrails on the tracked tool
+                if let Ok(config) = state.config_snapshot() {
+                    if config.guardrails.enabled {
+                        if let Ok(results) =
+                            guardrail::evaluate_action(&tool, "tool", &config.guardrails)
+                        {
+                            for result in &results {
+                                match result.action {
+                                    guardrail::GuardAction::Warn => {
+                                        eprintln!("{}", result.format_human());
+                                    }
+                                    guardrail::GuardAction::Log => {
+                                        // Tag the session for audit trail
+                                        let _ = state
+                                            .add_tag(&sid, &format!("guard:{}", result.rule_id))
+                                            .await;
+                                    }
+                                    guardrail::GuardAction::Block => {} // handled pre-execution
+                                }
+                            }
+                        }
+                    }
                 }
             } else {
                 eprintln!("Error: No session_id. Use --session-id or IMPULSE_SESSION_ID");
@@ -1320,7 +1369,9 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
                             eprintln!("Error serializing hook config: {}", e);
                             String::from("{}")
                         });
-                    if let Err(e) = std::fs::write(".claude/hooks/hooks.json", hook_json) {
+                    let hook_path = std::path::Path::new(".claude/hooks/hooks.json");
+                    if let Err(e) = stewardship::atomic_write_file(hook_path, hook_json.as_bytes())
+                    {
                         eprintln!("Error writing hooks: {}", e);
                     } else {
                         println!("  \u{2713} Created .claude/hooks/hooks.json");
@@ -1340,7 +1391,10 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
                             eprintln!("Error serializing OpenCode config: {}", e);
                             String::from("{}")
                         });
-                    if let Err(e) = std::fs::write(".opencode/impulse.json", opencode_json) {
+                    let opencode_path = std::path::Path::new(".opencode/impulse.json");
+                    if let Err(e) =
+                        stewardship::atomic_write_file(opencode_path, opencode_json.as_bytes())
+                    {
                         eprintln!("Error writing OpenCode config: {}", e);
                     } else {
                         println!("  \u{2713} Created .opencode/impulse.json");
@@ -3233,30 +3287,24 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
             list,
             enable,
             disable,
+            json,
         } => {
             let config = state.config_snapshot()?;
 
             if list {
                 let rules = guardrail::list_active_rules(&config.guardrails);
-                if rules.is_empty() {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({ "rules": rules }))
+                            .unwrap_or_else(|_| "{}".to_string())
+                    );
+                } else if rules.is_empty() {
                     println!("No active guardrail rules.");
                 } else {
                     println!("Active guardrail rules ({}):\n", rules.len());
                     for rule in &rules {
-                        let icon = match rule.action {
-                            guardrail::GuardAction::Block => "\u{1f6d1}",
-                            guardrail::GuardAction::Warn => "\u{26a0}\u{fe0f}",
-                            guardrail::GuardAction::Log => "\u{1f4dd}",
-                        };
-                        println!(
-                            "  {} [{}] target={} action={}",
-                            icon, rule.id, rule.target, rule.action
-                        );
-                        println!("     Reason: {}", rule.reason);
-                        if let Some(ref suggestion) = rule.suggestion {
-                            println!("     Suggestion: {}", suggestion);
-                        }
-                        println!();
+                        println!("{}\n", rule.format_human());
                     }
                 }
             } else if let Some(ref rule_id) = enable {
@@ -3289,23 +3337,25 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
             } else if let Some(ref action_str) = action {
                 match guardrail::evaluate_action(action_str, &target, &config.guardrails) {
                     Ok(results) => {
-                        if results.is_empty() {
+                        if json {
+                            let has_block = guardrail::GuardEngine::has_blocking(&results);
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "blocked": has_block,
+                                    "results": results,
+                                }))
+                                .unwrap_or_else(|_| "{}".to_string())
+                            );
+                            if has_block {
+                                std::process::exit(1);
+                            }
+                        } else if results.is_empty() {
                             eprintln!("PASS: No guardrail rules matched.");
                         } else {
                             let has_block = guardrail::GuardEngine::has_blocking(&results);
                             for result in &results {
-                                let icon = match result.action {
-                                    guardrail::GuardAction::Block => "\u{1f6d1}",
-                                    guardrail::GuardAction::Warn => "\u{26a0}\u{fe0f}",
-                                    guardrail::GuardAction::Log => "\u{1f4dd}",
-                                };
-                                eprintln!(
-                                    "{} [{}] {}: {}",
-                                    icon, result.action, result.rule_id, result.reason
-                                );
-                                if let Some(ref suggestion) = result.suggestion {
-                                    eprintln!("   Suggestion: {}", suggestion);
-                                }
+                                eprintln!("{}", result.format_human());
                             }
                             if has_block {
                                 std::process::exit(1);
@@ -3323,6 +3373,8 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
                 println!("  impulse-rs guard --action \"<cmd>\" --target bash  Evaluate a command");
                 println!("  impulse-rs guard --enable <rule-id>              Enable a rule");
                 println!("  impulse-rs guard --disable <rule-id>             Disable a rule");
+                println!("  impulse-rs guard --list --json                   List rules as JSON");
+                println!("  impulse-rs guard --action \"<cmd>\" --json         Evaluate as JSON");
             }
         }
     }

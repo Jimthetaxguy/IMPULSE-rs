@@ -823,7 +823,14 @@ async fn process_request(
         }
 
         DaemonRequest::GuardEvaluate { target, action } => {
-            let config = state.config_snapshot().unwrap_or_default();
+            let config = match state.config_snapshot() {
+                Ok(c) => c,
+                Err(e) => {
+                    return DaemonResponse::Error {
+                        message: format!("Failed to read config: {}", e),
+                    }
+                }
+            };
             match crate::guardrail::evaluate_action(&action, &target, &config.guardrails) {
                 Ok(results) => {
                     let has_block = crate::guardrail::GuardEngine::has_blocking(&results);
@@ -841,7 +848,14 @@ async fn process_request(
         }
 
         DaemonRequest::GuardList => {
-            let config = state.config_snapshot().unwrap_or_default();
+            let config = match state.config_snapshot() {
+                Ok(c) => c,
+                Err(e) => {
+                    return DaemonResponse::Error {
+                        message: format!("Failed to read config: {}", e),
+                    }
+                }
+            };
             let rules = crate::guardrail::list_active_rules(&config.guardrails);
             DaemonResponse::Ok {
                 result: serde_json::json!({ "rules": rules }),

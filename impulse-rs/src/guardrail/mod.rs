@@ -7,12 +7,16 @@ pub use config::merge_rules;
 pub use engine::GuardEngine;
 pub use types::{GuardAction, GuardConfig, GuardResult, GuardRule, GuardTarget};
 
-/// Parse a target string into a GuardTarget
-fn parse_target(target: &str) -> GuardTarget {
+/// Parse a target string into a GuardTarget.
+///
+/// Accepts canonical forms, hyphenated, underscored, and short aliases
+/// so that hooks, CLI flags, and config files all resolve correctly.
+pub fn parse_target(target: &str) -> GuardTarget {
     match target {
-        "bash" => GuardTarget::Bash,
-        "tool-call" | "toolcall" => GuardTarget::ToolCall,
-        "file-write" | "filewrite" => GuardTarget::FileWrite,
+        "bash" | "shell" => GuardTarget::Bash,
+        "tool-call" | "toolcall" | "tool_call" | "tool" => GuardTarget::ToolCall,
+        "file-write" | "filewrite" | "file_write" | "file" => GuardTarget::FileWrite,
+        "any" => GuardTarget::Any,
         _ => GuardTarget::Any,
     }
 }
@@ -59,6 +63,51 @@ mod tests {
         let results = evaluate_action("deploy production", "unknown-target", &config).unwrap();
         // "deploy" matches log-deploy-commands with target=Any (since unknown maps to Any)
         assert!(!results.is_empty());
+    }
+
+    #[test]
+    fn test_parse_target_bash_aliases() {
+        assert_eq!(parse_target("bash"), GuardTarget::Bash);
+        assert_eq!(parse_target("shell"), GuardTarget::Bash);
+    }
+
+    #[test]
+    fn test_parse_target_tool_call_aliases() {
+        assert_eq!(parse_target("tool-call"), GuardTarget::ToolCall);
+        assert_eq!(parse_target("toolcall"), GuardTarget::ToolCall);
+        assert_eq!(parse_target("tool_call"), GuardTarget::ToolCall);
+        assert_eq!(parse_target("tool"), GuardTarget::ToolCall);
+    }
+
+    #[test]
+    fn test_parse_target_file_write_aliases() {
+        assert_eq!(parse_target("file-write"), GuardTarget::FileWrite);
+        assert_eq!(parse_target("filewrite"), GuardTarget::FileWrite);
+        assert_eq!(parse_target("file_write"), GuardTarget::FileWrite);
+        assert_eq!(parse_target("file"), GuardTarget::FileWrite);
+    }
+
+    #[test]
+    fn test_parse_target_any_and_fallback() {
+        assert_eq!(parse_target("any"), GuardTarget::Any);
+        assert_eq!(parse_target("unknown-target"), GuardTarget::Any);
+        assert_eq!(parse_target(""), GuardTarget::Any);
+    }
+
+    #[test]
+    fn test_parse_target_file_alias_matches_filewrite_rules() {
+        // This is the critical bug fix: hooks pass --target file, which must
+        // resolve to FileWrite so that FileWrite-targeted rules match.
+        let config = GuardConfig::default();
+        let target = parse_target("file");
+        assert_eq!(target, GuardTarget::FileWrite);
+
+        // Verify FileWrite target does NOT match Bash-only rules
+        let rules = list_active_rules(&config);
+        let engine = GuardEngine::new(&rules).unwrap();
+        let results = engine.evaluate("git push --force", &target);
+        // Force-push rule targets Bash, so it should not match FileWrite
+        assert!(results.is_empty());
     }
 
     #[test]

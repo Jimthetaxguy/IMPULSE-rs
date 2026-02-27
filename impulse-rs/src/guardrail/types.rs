@@ -24,6 +24,15 @@ impl GuardAction {
             Self::Log => "log",
         }
     }
+
+    /// Returns a human-readable icon for this action level.
+    pub fn icon(&self) -> &'static str {
+        match self {
+            Self::Block => "\u{1f6d1}",
+            Self::Warn => "\u{26a0}\u{fe0f}",
+            Self::Log => "\u{1f4dd}",
+        }
+    }
 }
 
 impl std::fmt::Display for GuardAction {
@@ -101,6 +110,24 @@ pub struct GuardRule {
     pub builtin: bool,
 }
 
+impl GuardRule {
+    /// Format this rule as a human-readable block for CLI list output.
+    pub fn format_human(&self) -> String {
+        let mut out = format!(
+            "  {} [{}] target={} action={}",
+            self.action.icon(),
+            self.id,
+            self.target,
+            self.action
+        );
+        out.push_str(&format!("\n     Reason: {}", self.reason));
+        if let Some(ref suggestion) = self.suggestion {
+            out.push_str(&format!("\n     Suggestion: {}", suggestion));
+        }
+        out
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -152,6 +179,21 @@ impl GuardResult {
     /// Returns true if this result blocks the operation
     pub fn is_blocked(&self) -> bool {
         self.action == GuardAction::Block
+    }
+
+    /// Format this result as a human-readable line for CLI output.
+    pub fn format_human(&self) -> String {
+        let mut out = format!(
+            "{} [{}] {}: {}",
+            self.action.icon(),
+            self.action,
+            self.rule_id,
+            self.reason
+        );
+        if let Some(ref suggestion) = self.suggestion {
+            out.push_str(&format!("\n   Suggestion: {}", suggestion));
+        }
+        out
     }
 }
 
@@ -262,5 +304,62 @@ mod tests {
             suggestion: None,
         };
         assert!(!logged.is_blocked());
+    }
+
+    #[test]
+    fn test_guard_action_icon() {
+        assert!(GuardAction::Block.icon().contains('\u{1f6d1}'));
+        assert!(GuardAction::Warn.icon().contains('\u{26a0}'));
+        assert!(GuardAction::Log.icon().contains('\u{1f4dd}'));
+    }
+
+    #[test]
+    fn test_guard_result_format_human() {
+        let result = GuardResult {
+            rule_id: "no-force-push".to_string(),
+            action: GuardAction::Block,
+            matched_input: "git push --force".to_string(),
+            reason: "Force pushes are dangerous".to_string(),
+            suggestion: Some("Use --force-with-lease".to_string()),
+        };
+        let formatted = result.format_human();
+        assert!(formatted.contains("[block]"));
+        assert!(formatted.contains("no-force-push"));
+        assert!(formatted.contains("Force pushes are dangerous"));
+        assert!(formatted.contains("--force-with-lease"));
+    }
+
+    #[test]
+    fn test_guard_result_format_human_no_suggestion() {
+        let result = GuardResult {
+            rule_id: "test".to_string(),
+            action: GuardAction::Warn,
+            matched_input: "test".to_string(),
+            reason: "Warning only".to_string(),
+            suggestion: None,
+        };
+        let formatted = result.format_human();
+        assert!(formatted.contains("[warn]"));
+        assert!(!formatted.contains("Suggestion"));
+    }
+
+    #[test]
+    fn test_guard_rule_format_human() {
+        let rule = GuardRule {
+            id: "no-rm-rf".to_string(),
+            pattern: "rm -rf".to_string(),
+            action: GuardAction::Block,
+            target: GuardTarget::Bash,
+            reason: "Dangerous delete".to_string(),
+            suggestion: Some("Use trash-put".to_string()),
+            enabled: true,
+            builtin: true,
+        };
+        let formatted = rule.format_human();
+        assert!(formatted.contains("[no-rm-rf]"));
+        assert!(formatted.contains("target=bash"));
+        assert!(formatted.contains("action=block"));
+        assert!(formatted.contains("Dangerous delete"));
+        assert!(formatted.contains("trash-put"));
     }
 }

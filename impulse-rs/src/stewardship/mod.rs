@@ -19,9 +19,21 @@ pub mod types;
 pub use types::*;
 
 /// Atomic write helper: temp file + rename for crash safety
+/// Atomically write content to a file outside `.impulse/`.
+///
+/// Uses a PID+timestamp-unique temp file to avoid collisions when
+/// multiple processes write concurrently (e.g. parallel hook installs).
 pub(crate) fn atomic_write_file(path: &std::path::Path, content: &[u8]) -> anyhow::Result<()> {
     use std::io::Write;
-    let temp_path = path.with_extension("tmp");
+    let unique_suffix = format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos()
+    );
+    let temp_path = path.with_extension(unique_suffix);
     let mut file = std::fs::File::create(&temp_path)
         .with_context(|| format!("Failed to create temp file {:?}", temp_path))?;
     file.write_all(content)
