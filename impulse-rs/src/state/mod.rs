@@ -123,6 +123,9 @@ pub struct Config {
     pub impulse_agent_auto_review: bool,
     /// Impulse Agent: enable automatic cross-pane coordination
     pub impulse_agent_auto_coordinate: bool,
+    /// Guardrail configuration
+    #[serde(default)]
+    pub guardrails: crate::guardrail::GuardConfig,
 }
 
 impl Default for Config {
@@ -183,6 +186,7 @@ impl Default for Config {
             impulse_agent_harness: None,
             impulse_agent_auto_review: false,
             impulse_agent_auto_coordinate: false,
+            guardrails: crate::guardrail::GuardConfig::default(),
         }
     }
 }
@@ -283,6 +287,7 @@ impl Config {
             "impulse_agent_harness" => self.impulse_agent_harness.clone(),
             "impulse_agent_auto_review" => Some(self.impulse_agent_auto_review.to_string()),
             "impulse_agent_auto_coordinate" => Some(self.impulse_agent_auto_coordinate.to_string()),
+            "guardrails_enabled" => Some(self.guardrails.enabled.to_string()),
             _ => None,
         }
     }
@@ -736,6 +741,10 @@ impl Config {
             }
             "impulse_agent_auto_coordinate" => {
                 self.impulse_agent_auto_coordinate = value.parse().unwrap_or(false);
+                true
+            }
+            "guardrails_enabled" => {
+                self.guardrails.enabled = value.parse().unwrap_or(true);
                 true
             }
             _ => false,
