@@ -734,7 +734,7 @@ fn build_opencode_hook_config() -> serde_json::Value {
             "enabled": true,
             "session_tracking": true,
             "hooks": {
-                "pre_tool_use": "impulse-rs guard --action \"$INPUT\" --target bash",
+                "pre_tool_use": "impulse-rs guard --action \"$INPUT\" --target any",
                 "session_start": "impulse-rs session-start -n '$OPENCODE_PROJECT_NAME' -p opencode",
                 "session_end": "impulse-rs session-end --session-id $IMPULSE_SESSION_ID --summary '$OPENCODE_SESSION_SUMMARY' --verify",
                 "file_write": "impulse-rs track-write --file \"$OPENCODE_FILE\" --session-id \"$IMPULSE_SESSION_ID\"",
@@ -1054,11 +1054,12 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
                     Ok(_) => println!("Tracked: {}", file),
                     Err(e) => eprintln!("Error: {}", e),
                 }
-                // Post-observation: evaluate Warn/Log guardrails on the tracked file
+                // Post-observation: evaluate Warn/Log guardrails on the tracked file.
+                // Uses "any" target so all rules (bash, file, tool) are checked.
                 if let Ok(config) = state.config_snapshot() {
                     if config.guardrails.enabled {
                         if let Ok(results) =
-                            guardrail::evaluate_action(&file, "file", &config.guardrails)
+                            guardrail::evaluate_action(&file, "any", &config.guardrails)
                         {
                             for result in &results {
                                 match result.action {
@@ -1087,11 +1088,12 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
                     Ok(_) => println!("Tracked: {}", tool),
                     Err(e) => eprintln!("Error: {}", e),
                 }
-                // Post-observation: evaluate Warn/Log guardrails on the tracked tool
+                // Post-observation: evaluate Warn/Log guardrails on the tracked tool.
+                // Uses "any" target so all rules (bash, file, tool) are checked.
                 if let Ok(config) = state.config_snapshot() {
                     if config.guardrails.enabled {
                         if let Ok(results) =
-                            guardrail::evaluate_action(&tool, "tool", &config.guardrails)
+                            guardrail::evaluate_action(&tool, "any", &config.guardrails)
                         {
                             for result in &results {
                                 match result.action {
@@ -3308,8 +3310,19 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
                     }
                 }
             } else if let Some(ref rule_id) = enable {
-                // Remove any disabled override for this rule
+                // Validate the rule ID exists in built-in or user rules
+                let all_rules = guardrail::defaults::builtin_rules();
                 let mut config = state.config_snapshot()?;
+                let known = all_rules.iter().any(|r| r.id == *rule_id)
+                    || config.guardrails.rules.iter().any(|r| r.id == *rule_id);
+                if !known {
+                    eprintln!(
+                        "Error: rule '{}' not found. Use --list to see available rules.",
+                        rule_id
+                    );
+                    std::process::exit(1);
+                }
+                // Remove any disabled override for this rule
                 config
                     .guardrails
                     .rules
@@ -3317,8 +3330,18 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
                 state.update_guardrail_rules(config.guardrails.rules.clone())?;
                 println!("Enabled rule: {}", rule_id);
             } else if let Some(ref rule_id) = disable {
-                // Add a disabled override rule
+                // Validate the rule ID exists in built-in or user rules
+                let all_rules = guardrail::defaults::builtin_rules();
                 let mut config = state.config_snapshot()?;
+                let known = all_rules.iter().any(|r| r.id == *rule_id)
+                    || config.guardrails.rules.iter().any(|r| r.id == *rule_id);
+                if !known {
+                    eprintln!(
+                        "Error: rule '{}' not found. Use --list to see available rules.",
+                        rule_id
+                    );
+                    std::process::exit(1);
+                }
                 // Remove any existing override for this rule first
                 config.guardrails.rules.retain(|r| r.id != *rule_id);
                 // Add a disabled override

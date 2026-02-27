@@ -376,7 +376,14 @@ async fn process_request(
             inject_mode,
             inject_explain,
         } => {
-            let config = state.config_snapshot().unwrap_or_default();
+            let config = match state.config_snapshot() {
+                Ok(c) => c,
+                Err(e) => {
+                    return DaemonResponse::Error {
+                        message: format!("Failed to read config: {}", e),
+                    }
+                }
+            };
             let api_key = std::env::var("ANTHROPIC_API_KEY")
                 .or_else(|_| std::env::var("CLAUDE_API_KEY"))
                 .unwrap_or_else(|_| "".to_string());
@@ -510,7 +517,14 @@ async fn process_request(
             use crate::stewardship;
 
             let base = state.storage().base_path();
-            let config = state.config_snapshot().unwrap_or_default();
+            let config = match state.config_snapshot() {
+                Ok(c) => c,
+                Err(e) => {
+                    return DaemonResponse::Error {
+                        message: format!("Failed to read config: {}", e),
+                    }
+                }
+            };
             let stew_config = stewardship::StewardshipConfig::from_config(&config);
 
             let proposals = stewardship::approval::list_pending(base).unwrap_or_default();
