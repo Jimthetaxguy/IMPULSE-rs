@@ -447,6 +447,24 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Evaluate an action against guardrail rules
+    Guard {
+        /// The action/command to evaluate
+        #[arg(long)]
+        action: Option<String>,
+        /// Target type: bash, tool-call, file-write, any
+        #[arg(long, default_value = "bash")]
+        target: String,
+        /// List all active rules
+        #[arg(long)]
+        list: bool,
+        /// Enable a rule by ID
+        #[arg(long)]
+        enable: Option<String>,
+        /// Disable a rule by ID
+        #[arg(long)]
+        disable: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -2995,6 +3013,104 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
                 println!("{}", response);
+            }
+        }
+        Commands::Guard {
+            action,
+            target,
+            list,
+            enable,
+            disable,
+        } => {
+            let config = state.config_snapshot()?;
+
+            if list {
+                let rules = guardrail::list_active_rules(&config.guardrails);
+                if rules.is_empty() {
+                    println!("No active guardrail rules.");
+                } else {
+                    println!("Active guardrail rules ({}):\n", rules.len());
+                    for rule in &rules {
+                        let icon = match rule.action {
+                            guardrail::GuardAction::Block => "\u{1f6d1}",
+                            guardrail::GuardAction::Warn => "\u{26a0}\u{fe0f}",
+                            guardrail::GuardAction::Log => "\u{1f4dd}",
+                        };
+                        println!(
+                            "  {} [{}] target={} action={}",
+                            icon, rule.id, rule.target, rule.action
+                        );
+                        println!("     Reason: {}", rule.reason);
+                        if let Some(ref suggestion) = rule.suggestion {
+                            println!("     Suggestion: {}", suggestion);
+                        }
+                        println!();
+                    }
+                }
+            } else if let Some(ref rule_id) = enable {
+                // Remove any disabled override for this rule
+                let mut config = state.config_snapshot()?;
+                config
+                    .guardrails
+                    .rules
+                    .retain(|r| r.id != *rule_id || r.enabled);
+                state.update_guardrail_rules(config.guardrails.rules.clone())?;
+                println!("Enabled rule: {}", rule_id);
+            } else if let Some(ref rule_id) = disable {
+                // Add a disabled override rule
+                let mut config = state.config_snapshot()?;
+                // Remove any existing override for this rule first
+                config.guardrails.rules.retain(|r| r.id != *rule_id);
+                // Add a disabled override
+                config.guardrails.rules.push(guardrail::GuardRule {
+                    id: rule_id.clone(),
+                    pattern: String::new(),
+                    action: guardrail::GuardAction::Log,
+                    target: guardrail::GuardTarget::Any,
+                    reason: "Disabled by user".to_string(),
+                    suggestion: None,
+                    enabled: false,
+                    builtin: false,
+                });
+                state.update_guardrail_rules(config.guardrails.rules.clone())?;
+                println!("Disabled rule: {}", rule_id);
+            } else if let Some(ref action_str) = action {
+                match guardrail::evaluate_action(action_str, &target, &config.guardrails) {
+                    Ok(results) => {
+                        if results.is_empty() {
+                            eprintln!("PASS: No guardrail rules matched.");
+                        } else {
+                            let has_block = guardrail::GuardEngine::has_blocking(&results);
+                            for result in &results {
+                                let icon = match result.action {
+                                    guardrail::GuardAction::Block => "\u{1f6d1}",
+                                    guardrail::GuardAction::Warn => "\u{26a0}\u{fe0f}",
+                                    guardrail::GuardAction::Log => "\u{1f4dd}",
+                                };
+                                eprintln!(
+                                    "{} [{}] {}: {}",
+                                    icon, result.action, result.rule_id, result.reason
+                                );
+                                if let Some(ref suggestion) = result.suggestion {
+                                    eprintln!("   Suggestion: {}", suggestion);
+                                }
+                            }
+                            if has_block {
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Guardrail evaluation error: {}", e);
+                        std::process::exit(2);
+                    }
+                }
+            } else {
+                println!("Usage:");
+                println!("  impulse-rs guard --list                         List all active rules");
+                println!("  impulse-rs guard --action \"<cmd>\" --target bash  Evaluate a command");
+                println!("  impulse-rs guard --enable <rule-id>              Enable a rule");
+                println!("  impulse-rs guard --disable <rule-id>             Disable a rule");
             }
         }
     }

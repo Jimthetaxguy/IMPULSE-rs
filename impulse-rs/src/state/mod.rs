@@ -1391,6 +1391,17 @@ impl State {
             .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
         Ok(config.clone())
     }
+
+    /// Update guardrail rules in config and persist to disk
+    pub fn update_guardrail_rules(&self, rules: Vec<crate::guardrail::GuardRule>) -> Result<()> {
+        let mut config = self
+            .config
+            .try_write()
+            .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
+        config.guardrails.rules = rules;
+        self.storage.write_json(CONFIG_FILE, &*config)?;
+        Ok(())
+    }
 }
 
 pub type SharedState = Arc<State>;
