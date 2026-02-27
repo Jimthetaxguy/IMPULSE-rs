@@ -171,6 +171,11 @@ mod tests {
                 prompt: "Review pane activity".to_string(),
                 context: Some("Two panes active".to_string()),
             },
+            DaemonRequest::GuardEvaluate {
+                target: "bash".to_string(),
+                action: "git push --force main".to_string(),
+            },
+            DaemonRequest::GuardList,
         ];
 
         for request in requests {
@@ -178,6 +183,44 @@ mod tests {
             let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
             assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
         }
+    }
+
+    /// Test GuardEvaluate and GuardList request serde roundtrip
+    #[test]
+    fn test_guard_evaluate_request_serde() {
+        // Test GuardEvaluate from JSON
+        let json =
+            r#"{"type":"GuardEvaluate","data":{"target":"bash","action":"git push --force main"}}"#;
+        let request: DaemonRequest = serde_json::from_str(json).unwrap();
+        assert!(matches!(request, DaemonRequest::GuardEvaluate { .. }));
+
+        // Verify field values
+        if let DaemonRequest::GuardEvaluate { target, action } = &request {
+            assert_eq!(target, "bash");
+            assert_eq!(action, "git push --force main");
+        }
+
+        // Test GuardList from JSON
+        let json2 = r#"{"type":"GuardList"}"#;
+        let request2: DaemonRequest = serde_json::from_str(json2).unwrap();
+        assert!(matches!(request2, DaemonRequest::GuardList));
+
+        // Test struct-to-JSON roundtrip for GuardEvaluate
+        let guard_eval = DaemonRequest::GuardEvaluate {
+            target: "file-write".to_string(),
+            action: "write /etc/passwd".to_string(),
+        };
+        let serialized = serde_json::to_string(&guard_eval).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(value["type"], "GuardEvaluate");
+        assert_eq!(value["data"]["target"], "file-write");
+        assert_eq!(value["data"]["action"], "write /etc/passwd");
+
+        // Test struct-to-JSON roundtrip for GuardList
+        let guard_list = DaemonRequest::GuardList;
+        let serialized2 = serde_json::to_string(&guard_list).unwrap();
+        let value2: serde_json::Value = serde_json::from_str(&serialized2).unwrap();
+        assert_eq!(value2["type"], "GuardList");
     }
 
     /// Test malformed request handling

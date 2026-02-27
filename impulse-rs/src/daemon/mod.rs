@@ -78,6 +78,13 @@ pub enum DaemonRequest {
         prompt: String,
         context: Option<String>,
     },
+    /// Evaluate an action against guardrail rules
+    GuardEvaluate {
+        target: String,
+        action: String,
+    },
+    /// List active guardrail rules
+    GuardList,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -812,6 +819,32 @@ async fn process_request(
                     success: false,
                     response: format!("Agent query failed: {}", e),
                 },
+            }
+        }
+
+        DaemonRequest::GuardEvaluate { target, action } => {
+            let config = state.config_snapshot().unwrap_or_default();
+            match crate::guardrail::evaluate_action(&action, &target, &config.guardrails) {
+                Ok(results) => {
+                    let has_block = crate::guardrail::GuardEngine::has_blocking(&results);
+                    DaemonResponse::Ok {
+                        result: serde_json::json!({
+                            "blocked": has_block,
+                            "results": results,
+                        }),
+                    }
+                }
+                Err(e) => DaemonResponse::Error {
+                    message: format!("Guardrail evaluation failed: {}", e),
+                },
+            }
+        }
+
+        DaemonRequest::GuardList => {
+            let config = state.config_snapshot().unwrap_or_default();
+            let rules = crate::guardrail::list_active_rules(&config.guardrails);
+            DaemonResponse::Ok {
+                result: serde_json::json!({ "rules": rules }),
             }
         }
     }
