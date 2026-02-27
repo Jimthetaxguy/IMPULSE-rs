@@ -28,7 +28,7 @@ impl GuardAction {
 
 impl std::fmt::Display for GuardAction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
+        f.write_str(self.as_str())
     }
 }
 
@@ -69,7 +69,7 @@ impl GuardTarget {
 
 impl std::fmt::Display for GuardTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
+        f.write_str(self.as_str())
     }
 }
 
@@ -91,6 +91,7 @@ pub struct GuardRule {
     /// Human-readable reason for this rule
     pub reason: String,
     /// Optional suggestion for what to do instead
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suggestion: Option<String>,
     /// Whether this rule is active
     #[serde(default = "default_true")]
@@ -143,6 +144,7 @@ pub struct GuardResult {
     /// Human-readable reason for the match
     pub reason: String,
     /// Optional suggestion for what to do instead
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suggestion: Option<String>,
 }
 
