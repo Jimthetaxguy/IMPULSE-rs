@@ -18,10 +18,55 @@ pub enum DaemonRequest {
     GetSession {
         session_id: String,
     },
+    CreateSession {
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        platform: Option<String>,
+    },
+    EndSession {
+        session_id: String,
+        summary: String,
+    },
+    TrackFile {
+        session_id: String,
+        file_path: String,
+    },
+    TrackTool {
+        session_id: String,
+        tool_name: String,
+    },
+    Chat {
+        session_id: String,
+        message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        inject_mode: Option<String>,
+        #[serde(default)]
+        inject_explain: bool,
+    },
+    StewardStatus,
+    StewardProposals {
+        action: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
+    StewardMemory,
+    ListTools {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        category: Option<String>,
+    },
+    DescribeTool {
+        name: String,
+    },
     InvokeTool {
         name: String,
         #[serde(default)]
         params: serde_json::Value,
+    },
+    ToolSchema,
+    AgentAssist {
+        prompt: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context: Option<String>,
     },
 }
 
@@ -293,5 +338,230 @@ impl SearchResult {
                 .unwrap_or("unknown")
                 .to_string(),
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 forward-declared types (consumed when Stewardship/Tools views land)
+// ---------------------------------------------------------------------------
+
+/// A daemon tool descriptor (from ListTools response).
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct ToolInfo {
+    pub name: String,
+    pub description: String,
+    pub category: String,
+    pub params: Vec<ToolParam>,
+}
+
+/// A parameter for a daemon tool.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct ToolParam {
+    pub name: String,
+    pub param_type: String,
+    pub required: bool,
+    pub description: String,
+}
+
+#[allow(dead_code)]
+impl ToolInfo {
+    pub fn from_value(v: &serde_json::Value) -> Option<Self> {
+        Some(Self {
+            name: v.get("name").and_then(|s| s.as_str())?.to_string(),
+            description: v
+                .get("description")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string(),
+            category: v
+                .get("category")
+                .and_then(|s| s.as_str())
+                .unwrap_or("uncategorized")
+                .to_string(),
+            params: v
+                .get("params")
+                .or_else(|| v.get("parameters"))
+                .and_then(|p| p.as_array())
+                .map(|arr| arr.iter().filter_map(ToolParam::from_value).collect())
+                .unwrap_or_default(),
+        })
+    }
+}
+
+#[allow(dead_code)]
+impl ToolParam {
+    pub fn from_value(v: &serde_json::Value) -> Option<Self> {
+        Some(Self {
+            name: v.get("name").and_then(|s| s.as_str())?.to_string(),
+            param_type: v
+                .get("type")
+                .and_then(|s| s.as_str())
+                .unwrap_or("string")
+                .to_string(),
+            required: v.get("required").and_then(|b| b.as_bool()).unwrap_or(false),
+            description: v
+                .get("description")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stewardship types
+// ---------------------------------------------------------------------------
+
+/// Stewardship system status.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct StewardshipStatus {
+    pub mode: String,
+    pub monitor_threshold: f32,
+    pub surgical_threshold: f32,
+    pub thoughtful_threshold: f32,
+    pub emergency_threshold: f32,
+    pub pending_proposals: usize,
+}
+
+#[allow(dead_code)]
+impl StewardshipStatus {
+    pub fn from_value(v: &serde_json::Value) -> Self {
+        Self {
+            mode: v
+                .get("mode")
+                .and_then(|s| s.as_str())
+                .unwrap_or("review")
+                .to_string(),
+            monitor_threshold: v
+                .get("monitor_threshold")
+                .and_then(|n| n.as_f64())
+                .unwrap_or(0.30) as f32,
+            surgical_threshold: v
+                .get("surgical_threshold")
+                .and_then(|n| n.as_f64())
+                .unwrap_or(0.45) as f32,
+            thoughtful_threshold: v
+                .get("thoughtful_threshold")
+                .and_then(|n| n.as_f64())
+                .unwrap_or(0.60) as f32,
+            emergency_threshold: v
+                .get("emergency_threshold")
+                .and_then(|n| n.as_f64())
+                .unwrap_or(0.80) as f32,
+            pending_proposals: v
+                .get("pending_proposals")
+                .or_else(|| v.get("pending"))
+                .and_then(|n| n.as_u64())
+                .unwrap_or(0) as usize,
+        }
+    }
+}
+
+/// A stewardship proposal (compaction/cleanup action).
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct Proposal {
+    pub id: String,
+    pub action: String,
+    pub description: String,
+    pub status: String,
+    pub created_at: String,
+}
+
+#[allow(dead_code)]
+impl Proposal {
+    pub fn from_value(v: &serde_json::Value) -> Option<Self> {
+        Some(Self {
+            id: v.get("id").and_then(|s| s.as_str())?.to_string(),
+            action: v
+                .get("action")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string(),
+            description: v
+                .get("description")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string(),
+            status: v
+                .get("status")
+                .and_then(|s| s.as_str())
+                .unwrap_or("pending")
+                .to_string(),
+            created_at: v
+                .get("created_at")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string(),
+        })
+    }
+}
+
+/// Cross-project memory patterns from stewardship.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default)]
+pub struct CrossProjectMemory {
+    pub patterns: Vec<String>,
+    pub learnings: Vec<String>,
+}
+
+#[allow(dead_code)]
+impl CrossProjectMemory {
+    pub fn from_value(v: &serde_json::Value) -> Self {
+        fn strings_from(v: &serde_json::Value, key: &str) -> Vec<String> {
+            v.get(key)
+                .and_then(|a| a.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|s| s.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+        Self {
+            patterns: strings_from(v, "patterns"),
+            learnings: strings_from(v, "learnings"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chat response types
+// ---------------------------------------------------------------------------
+
+/// Parsed response from the daemon Chat endpoint.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct ChatResponse {
+    pub content: String,
+    pub injection_applied: bool,
+    pub injection_surface: Option<String>,
+}
+
+#[allow(dead_code)]
+impl ChatResponse {
+    pub fn from_value(v: &serde_json::Value) -> Self {
+        Self {
+            content: v
+                .get("content")
+                .or_else(|| v.get("response"))
+                .or_else(|| v.get("text"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string(),
+            injection_applied: v
+                .get("injection_applied")
+                .or_else(|| v.get("applied"))
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false),
+            injection_surface: v
+                .get("injection_surface")
+                .or_else(|| v.get("surface"))
+                .and_then(|s| s.as_str())
+                .map(String::from),
+        }
     }
 }
