@@ -630,6 +630,233 @@ fn print_verification_report(report: &verify::VerificationReport) {
 }
 
 // ============================================================================
+// Hook Configuration Builders
+// ============================================================================
+
+/// Build the Claude Code hook configuration JSON value.
+///
+/// Includes both PreToolUse guard hooks (for pre-execution guardrail evaluation)
+/// and PostToolUse tracking hooks (for post-observation recording).
+fn build_claude_hook_config() -> serde_json::Value {
+    serde_json::json!({
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "matcher": "Bash",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "impulse-rs guard --action \"$INPUT\" --target bash"
+                        }
+                    ]
+                },
+                {
+                    "matcher": "Write",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "impulse-rs guard --action \"$INPUT\" --target file"
+                        }
+                    ]
+                },
+                {
+                    "matcher": "Edit",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "impulse-rs guard --action \"$INPUT\" --target file"
+                        }
+                    ]
+                }
+            ],
+            "PostToolUse": [
+                {
+                    "matcher": "Bash",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "impulse-rs track-tool --tool Bash --session-id $IMPULSE_SESSION_ID"
+                        }
+                    ]
+                },
+                {
+                    "matcher": "Write",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "impulse-rs track-write --file \"$INPUT\" --session-id $IMPULSE_SESSION_ID"
+                        }
+                    ]
+                },
+                {
+                    "matcher": "Edit",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "impulse-rs track-write --file \"$INPUT\" --session-id $IMPULSE_SESSION_ID"
+                        }
+                    ]
+                }
+            ],
+            "SessionStart": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "impulse-rs session-start -n '$CLAUDE_PROJECT_NAME' -p claude-code"
+                        }
+                    ]
+                }
+            ],
+            "SessionEnd": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "impulse-rs session-end --session-id $IMPULSE_SESSION_ID --summary '$CLAUDE_SESSION_SUMMARY' --verify"
+                        }
+                    ]
+                }
+            ]
+        }
+    })
+}
+
+/// Build the OpenCode hook configuration JSON value.
+///
+/// Includes pre_tool_use guard hook alongside existing tracking hooks.
+fn build_opencode_hook_config() -> serde_json::Value {
+    serde_json::json!({
+        "impulse": {
+            "enabled": true,
+            "session_tracking": true,
+            "hooks": {
+                "pre_tool_use": "impulse-rs guard --action \"$INPUT\" --target bash",
+                "session_start": "impulse-rs session-start -n '$OPENCODE_PROJECT_NAME' -p opencode",
+                "session_end": "impulse-rs session-end --session-id $IMPULSE_SESSION_ID --summary '$OPENCODE_SESSION_SUMMARY' --verify",
+                "file_write": "impulse-rs track-write --file $OPENCODE_FILE --session-id $IMPULSE_SESSION_ID",
+                "tool_use": "impulse-rs track-tool --tool $OPENCODE_TOOL_NAME --session-id $IMPULSE_SESSION_ID"
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+mod hook_config_tests {
+    use super::*;
+
+    #[test]
+    fn test_claude_hook_config_includes_guard() {
+        let config = build_claude_hook_config();
+
+        // Verify top-level "hooks" key exists
+        assert!(
+            config.get("hooks").is_some(),
+            "config must have 'hooks' key"
+        );
+
+        let hooks = &config["hooks"];
+
+        // Verify PreToolUse section exists with guard commands
+        let pre_tool_use = hooks
+            .get("PreToolUse")
+            .expect("hooks must have 'PreToolUse' key");
+        assert!(pre_tool_use.is_array(), "PreToolUse must be an array");
+
+        let pre_arr = pre_tool_use.as_array().unwrap();
+        assert!(
+            !pre_arr.is_empty(),
+            "PreToolUse must have at least one entry"
+        );
+
+        // Check that the Bash matcher guard is present
+        let bash_guard = pre_arr
+            .iter()
+            .find(|entry| entry.get("matcher").and_then(|m| m.as_str()) == Some("Bash"))
+            .expect("PreToolUse must have a Bash matcher");
+        let bash_hooks = bash_guard["hooks"].as_array().unwrap();
+        let bash_cmd = bash_hooks[0]["command"].as_str().unwrap();
+        assert!(
+            bash_cmd.contains("impulse-rs guard"),
+            "Bash PreToolUse hook must invoke 'impulse-rs guard', got: {}",
+            bash_cmd
+        );
+
+        // Verify PostToolUse section still exists for tracking
+        let post_tool_use = hooks
+            .get("PostToolUse")
+            .expect("hooks must have 'PostToolUse' key");
+        assert!(post_tool_use.is_array(), "PostToolUse must be an array");
+
+        let post_arr = post_tool_use.as_array().unwrap();
+        let bash_track = post_arr
+            .iter()
+            .find(|entry| entry.get("matcher").and_then(|m| m.as_str()) == Some("Bash"))
+            .expect("PostToolUse must have a Bash matcher");
+        let track_cmd = bash_track["hooks"].as_array().unwrap()[0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(
+            track_cmd.contains("impulse-rs track-tool"),
+            "Bash PostToolUse hook must invoke 'impulse-rs track-tool', got: {}",
+            track_cmd
+        );
+
+        // Verify SessionStart and SessionEnd exist
+        assert!(
+            hooks.get("SessionStart").is_some(),
+            "hooks must have 'SessionStart' key"
+        );
+        assert!(
+            hooks.get("SessionEnd").is_some(),
+            "hooks must have 'SessionEnd' key"
+        );
+    }
+
+    #[test]
+    fn test_opencode_hook_config_includes_guard() {
+        let config = build_opencode_hook_config();
+
+        let impulse = config
+            .get("impulse")
+            .expect("config must have 'impulse' key");
+        assert_eq!(impulse["enabled"], true);
+        assert_eq!(impulse["session_tracking"], true);
+
+        let hooks = impulse.get("hooks").expect("impulse must have 'hooks' key");
+
+        // Verify pre_tool_use guard is present
+        let pre_tool = hooks
+            .get("pre_tool_use")
+            .expect("hooks must have 'pre_tool_use' key");
+        let pre_tool_str = pre_tool.as_str().unwrap();
+        assert!(
+            pre_tool_str.contains("impulse-rs guard"),
+            "pre_tool_use must invoke 'impulse-rs guard', got: {}",
+            pre_tool_str
+        );
+
+        // Verify existing tracking hooks are still present
+        assert!(
+            hooks.get("session_start").is_some(),
+            "hooks must have 'session_start'"
+        );
+        assert!(
+            hooks.get("session_end").is_some(),
+            "hooks must have 'session_end'"
+        );
+        assert!(
+            hooks.get("file_write").is_some(),
+            "hooks must have 'file_write'"
+        );
+        assert!(
+            hooks.get("tool_use").is_some(),
+            "hooks must have 'tool_use'"
+        );
+    }
+}
+
+// ============================================================================
 // Daemon Mode
 // ============================================================================
 
@@ -1087,25 +1314,16 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
                 if let Err(e) = std::fs::create_dir_all(hooks_dir) {
                     eprintln!("Error creating .claude/hooks: {}", e);
                 } else {
-                    let hook_config = r#"{
-  "matchers": [
-    {"type": "session_start"},
-    {"type": "session_end"},
-    {"type": "tool", "name": "Write"},
-    {"type": "tool", "name": "Edit"},
-    {"type": "tool", "name": "Bash"}
-  ],
-  "hooks": [
-    {"type": "command", "command": "impulse-rs session-start -n '$CLAUDE_PROJECT_NAME' -p claude-code"},
-    {"type": "command", "command": "impulse-rs session-end --session-id $IMPULSE_SESSION_ID --summary '$CLAUDE_SESSION_SUMMARY' --verify"},
-    {"type": "command", "command": "impulse-rs track-write --file $CLAUDE_FILE --session-id $IMPULSE_SESSION_ID"},
-    {"type": "command", "command": "impulse-rs track-tool --tool $CLAUDE_TOOL_NAME --session-id $IMPULSE_SESSION_ID"}
-  ]
-}"#;
-                    if let Err(e) = std::fs::write(".claude/hooks/hooks.json", hook_config) {
+                    let hook_config = build_claude_hook_config();
+                    let hook_json =
+                        serde_json::to_string_pretty(&hook_config).unwrap_or_else(|e| {
+                            eprintln!("Error serializing hook config: {}", e);
+                            String::from("{}")
+                        });
+                    if let Err(e) = std::fs::write(".claude/hooks/hooks.json", hook_json) {
                         eprintln!("Error writing hooks: {}", e);
                     } else {
-                        println!("  ✓ Created .claude/hooks/hooks.json");
+                        println!("  \u{2713} Created .claude/hooks/hooks.json");
                     }
                 }
             }
@@ -1116,22 +1334,16 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
                 if let Err(e) = std::fs::create_dir_all(opencode_dir) {
                     eprintln!("Error creating .opencode: {}", e);
                 } else {
-                    let opencode_config = r#"{
-  "impulse": {
-    "enabled": true,
-    "session_tracking": true,
-    "hooks": {
-      "session_start": "impulse-rs session-start -n '$OPENCODE_PROJECT_NAME' -p opencode",
-      "session_end": "impulse-rs session-end --session-id $IMPULSE_SESSION_ID --summary '$OPENCODE_SESSION_SUMMARY' --verify",
-      "file_write": "impulse-rs track-write --file $OPENCODE_FILE --session-id $IMPULSE_SESSION_ID",
-      "tool_use": "impulse-rs track-tool --tool $OPENCODE_TOOL_NAME --session-id $IMPULSE_SESSION_ID"
-    }
-  }
-}"#;
-                    if let Err(e) = std::fs::write(".opencode/impulse.json", opencode_config) {
+                    let opencode_config = build_opencode_hook_config();
+                    let opencode_json = serde_json::to_string_pretty(&opencode_config)
+                        .unwrap_or_else(|e| {
+                            eprintln!("Error serializing OpenCode config: {}", e);
+                            String::from("{}")
+                        });
+                    if let Err(e) = std::fs::write(".opencode/impulse.json", opencode_json) {
                         eprintln!("Error writing OpenCode config: {}", e);
                     } else {
-                        println!("  ✓ Created .opencode/impulse.json");
+                        println!("  \u{2713} Created .opencode/impulse.json");
                     }
                 }
             }
