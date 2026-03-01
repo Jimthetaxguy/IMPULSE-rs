@@ -702,7 +702,7 @@ impl Config {
             "impulse_agent_provider" => {
                 if value.is_empty() || value == "none" {
                     self.impulse_agent_provider = None;
-                } else if crate::impulse_agent::ImpulseProvider::parse(value).is_some() {
+                } else if crate::agent::ImpulseProvider::parse(value).is_some() {
                     self.impulse_agent_provider = Some(value.to_string());
                 } else {
                     return false;
@@ -728,7 +728,7 @@ impl Config {
             "impulse_agent_harness" => {
                 if value.is_empty() || value == "none" {
                     self.impulse_agent_harness = None;
-                } else if crate::impulse_agent::ImpulseHarness::parse(value).is_some() {
+                } else if crate::agent::ImpulseHarness::parse(value).is_some() {
                     self.impulse_agent_harness = Some(value.to_string());
                 } else {
                     return false;

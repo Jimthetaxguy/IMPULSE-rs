@@ -16,10 +16,9 @@ pub mod daemon;
 pub mod docs;
 pub mod error;
 pub mod guardrail;
-pub mod impulse_agent;
 pub mod injection;
 pub mod integration_tests;
-pub mod intent;
+pub mod llm_backends;
 pub mod mcp;
 pub mod memory;
 pub mod monty;
@@ -3199,7 +3198,7 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
 
             // Show resulting agent status
             let config = state.config_snapshot()?;
-            let agent = impulse_agent::resolve_from_config(
+            let agent = agent::resolve_from_config(
                 config.impulse_agent_provider.as_deref(),
                 config.impulse_agent_api_key.as_deref(),
                 config.impulse_agent_model.as_deref(),
@@ -3213,7 +3212,7 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
         Commands::AgentStatus { json } => {
             let config = state.config_snapshot()?;
 
-            let agent = impulse_agent::resolve_from_config(
+            let agent = agent::resolve_from_config(
                 config.impulse_agent_provider.as_deref(),
                 config.impulse_agent_api_key.as_deref(),
                 config.impulse_agent_model.as_deref(),
@@ -3256,7 +3255,7 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
         Commands::AgentQuery { prompt, json } => {
             let config = state.config_snapshot()?;
 
-            let mut agent = impulse_agent::resolve_from_config(
+            let mut agent = agent::resolve_from_config(
                 config.impulse_agent_provider.as_deref(),
                 config.impulse_agent_api_key.as_deref(),
                 config.impulse_agent_model.as_deref(),
@@ -3269,7 +3268,7 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
             }
 
             let response = agent
-                .query(impulse_agent::prompts::CODE_REVIEW_SYSTEM, &prompt)
+                .query(agent::prompts::CODE_REVIEW_SYSTEM, &prompt)
                 .await
                 .map_err(|e| anyhow::anyhow!("Agent query failed: {}", e))?;
 

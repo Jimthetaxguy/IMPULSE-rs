@@ -33,6 +33,15 @@ pub enum ConnectionStatus {
     Connected,
 }
 
+/// A live insight search result from the current session's LIVE_INSIGHTS.jsonl.
+#[derive(Debug, Clone)]
+pub struct LiveSearchResult {
+    pub title: String,
+    pub agent: String,
+    #[allow(dead_code)]
+    pub timestamp: String,
+}
+
 /// All daemon data cached for the UI.
 pub struct SharedState {
     pub connection: ConnectionStatus,
@@ -45,6 +54,8 @@ pub struct SharedState {
     pub search_in_progress: bool,
     pub last_poll: Option<Instant>,
     pub error: Option<String>,
+    /// Live insight search results from current session (populated by app.rs).
+    pub live_search_results: Vec<LiveSearchResult>,
 }
 
 impl Default for SharedState {
@@ -60,6 +71,7 @@ impl Default for SharedState {
             search_in_progress: false,
             last_poll: None,
             error: None,
+            live_search_results: Vec::new(),
         }
     }
 }
@@ -218,6 +230,7 @@ fn set_connection(state: &StateHandle, status: ConnectionStatus) {
 fn run_search(client: &mut DaemonClient, state: &StateHandle, query: &str) {
     if let Ok(mut s) = state.lock() {
         s.search_in_progress = true;
+        s.search_query = query.to_string();
     }
 
     let results = client.search(query);

@@ -1667,7 +1667,7 @@ mod tests {
     /// Test (d): Agent resolve from config — set provider + api_key + model, call resolve_from_config()
     #[test]
     fn test_impulse_agent_resolve_from_config_api_mode() {
-        use crate::impulse_agent::{resolve_from_config, AgentMode, ImpulseProvider};
+        use crate::agent::{resolve_from_config, AgentMode, ImpulseProvider};
 
         // Resolve with provider + key + model
         let agent = resolve_from_config(
@@ -1717,7 +1717,7 @@ mod tests {
     /// Test (e): Agent resolve with harness — set harness to "claude_code", verify harness mode
     #[test]
     fn test_impulse_agent_resolve_from_config_harness_mode() {
-        use crate::impulse_agent::{resolve_from_config, AgentMode, ImpulseHarness};
+        use crate::agent::{resolve_from_config, AgentMode, ImpulseHarness};
 
         // Resolve with claude-code harness
         let agent = resolve_from_config(None, None, None, Some("claude-code"));
@@ -1755,7 +1755,7 @@ mod tests {
     /// Test (f): Agent disabled by default — with no config set, resolve returns None
     #[test]
     fn test_impulse_agent_disabled_by_default() {
-        use crate::impulse_agent::{resolve_from_config, AgentMode, ImpulseAgentConfig};
+        use crate::agent::{resolve_from_config, AgentMode, ImpulseAgentConfig};
 
         // No parameters: should return None (disabled)
         let agent = resolve_from_config(None, None, None, None);
@@ -1781,8 +1781,8 @@ mod tests {
     /// Test (g): Coordinator end-to-end — mixed insights produce correct recommendations
     #[test]
     fn test_impulse_agent_coordinator_end_to_end() {
+        use crate::agent::coordinator::{self, RecommendationType};
         use crate::context_lifecycle::types::{AgentKind, ExtractedInsight, InsightType};
-        use crate::impulse_agent::coordinator::{self, RecommendationType};
 
         let now = chrono::Utc::now();
 
@@ -1798,6 +1798,7 @@ mod tests {
                 timestamp: now,
                 insight_type: InsightType::FileModified,
                 content: "src/lib.rs".to_string(),
+                intent: None,
             },
             ExtractedInsight {
                 pane_id: 1,
@@ -1805,6 +1806,7 @@ mod tests {
                 timestamp: now,
                 insight_type: InsightType::FileModified,
                 content: "src/main.rs".to_string(),
+                intent: None,
             },
             // Pane 2 modifies the same file as pane 1 (conflict)
             ExtractedInsight {
@@ -1813,6 +1815,7 @@ mod tests {
                 timestamp: now,
                 insight_type: InsightType::FileModified,
                 content: "src/lib.rs".to_string(),
+                intent: None,
             },
             // Pane 2 encounters an error close in time to pane 1's modification
             ExtractedInsight {
@@ -1821,6 +1824,7 @@ mod tests {
                 timestamp: now,
                 insight_type: InsightType::ErrorEncountered,
                 content: "error[E0433]: failed to resolve: use of undeclared crate".to_string(),
+                intent: None,
             },
             // Pane 3 works on different files (no conflict)
             ExtractedInsight {
@@ -1829,6 +1833,7 @@ mod tests {
                 timestamp: now,
                 insight_type: InsightType::FileModified,
                 content: "tests/integration.rs".to_string(),
+                intent: None,
             },
             ExtractedInsight {
                 pane_id: 3,
@@ -1836,6 +1841,7 @@ mod tests {
                 timestamp: now,
                 insight_type: InsightType::TaskCompleted,
                 content: "all tests passing".to_string(),
+                intent: None,
             },
         ];
 
@@ -1893,8 +1899,8 @@ mod tests {
     /// Test (g continued): Coordinator with no conflicts produces empty recommendations
     #[test]
     fn test_impulse_agent_coordinator_no_conflicts() {
+        use crate::agent::coordinator;
         use crate::context_lifecycle::types::{AgentKind, ExtractedInsight, InsightType};
-        use crate::impulse_agent::coordinator;
 
         let now = chrono::Utc::now();
 
@@ -1906,6 +1912,7 @@ mod tests {
                 timestamp: now,
                 insight_type: InsightType::FileModified,
                 content: "src/auth.rs".to_string(),
+                intent: None,
             },
             ExtractedInsight {
                 pane_id: 2,
@@ -1913,6 +1920,7 @@ mod tests {
                 timestamp: now,
                 insight_type: InsightType::FileModified,
                 content: "src/database.rs".to_string(),
+                intent: None,
             },
             ExtractedInsight {
                 pane_id: 3,
@@ -1920,6 +1928,7 @@ mod tests {
                 timestamp: now,
                 insight_type: InsightType::TaskCompleted,
                 content: "refactoring complete".to_string(),
+                intent: None,
             },
         ];
 
@@ -1933,8 +1942,8 @@ mod tests {
     /// Test (g continued): Coordinator with multiple file conflicts
     #[test]
     fn test_impulse_agent_coordinator_multiple_file_conflicts() {
+        use crate::agent::coordinator::{self, RecommendationType};
         use crate::context_lifecycle::types::{AgentKind, ExtractedInsight, InsightType};
-        use crate::impulse_agent::coordinator::{self, RecommendationType};
 
         let now = chrono::Utc::now();
 
@@ -1946,6 +1955,7 @@ mod tests {
                 timestamp: now,
                 insight_type: InsightType::FileModified,
                 content: "Cargo.toml".to_string(),
+                intent: None,
             },
             ExtractedInsight {
                 pane_id: 2,
@@ -1953,6 +1963,7 @@ mod tests {
                 timestamp: now,
                 insight_type: InsightType::FileModified,
                 content: "Cargo.toml".to_string(),
+                intent: None,
             },
             ExtractedInsight {
                 pane_id: 3,
@@ -1960,6 +1971,7 @@ mod tests {
                 timestamp: now,
                 insight_type: InsightType::FileModified,
                 content: "Cargo.toml".to_string(),
+                intent: None,
             },
             ExtractedInsight {
                 pane_id: 1,
@@ -1967,6 +1979,7 @@ mod tests {
                 timestamp: now,
                 insight_type: InsightType::FileModified,
                 content: "src/config.rs".to_string(),
+                intent: None,
             },
             ExtractedInsight {
                 pane_id: 2,
@@ -1974,6 +1987,7 @@ mod tests {
                 timestamp: now,
                 insight_type: InsightType::FileModified,
                 content: "src/config.rs".to_string(),
+                intent: None,
             },
         ];
 
@@ -2003,8 +2017,8 @@ mod tests {
     /// Test (g continued): Coordinator ImpulseAgent.coordinate_local() accumulates recommendations
     #[test]
     fn test_impulse_agent_coordinate_local_accumulates() {
+        use crate::agent::{ImpulseAgent, ImpulseAgentConfig, ImpulseProvider};
         use crate::context_lifecycle::types::{AgentKind, ExtractedInsight, InsightType};
-        use crate::impulse_agent::{ImpulseAgent, ImpulseAgentConfig, ImpulseProvider};
 
         let config =
             ImpulseAgentConfig::api(ImpulseProvider::Anthropic).with_api_key("test-key-accumulate");
@@ -2024,6 +2038,7 @@ mod tests {
                 timestamp: now,
                 insight_type: InsightType::FileModified,
                 content: "src/a.rs".to_string(),
+                intent: None,
             },
             ExtractedInsight {
                 pane_id: 2,
@@ -2031,6 +2046,7 @@ mod tests {
                 timestamp: now,
                 insight_type: InsightType::FileModified,
                 content: "src/a.rs".to_string(),
+                intent: None,
             },
         ];
         let recs1 = agent.coordinate_local(&batch1);
@@ -2045,6 +2061,7 @@ mod tests {
                 timestamp: now,
                 insight_type: InsightType::FileModified,
                 content: "src/b.rs".to_string(),
+                intent: None,
             },
             ExtractedInsight {
                 pane_id: 4,
@@ -2052,6 +2069,7 @@ mod tests {
                 timestamp: now,
                 insight_type: InsightType::FileModified,
                 content: "src/b.rs".to_string(),
+                intent: None,
             },
         ];
         let recs2 = agent.coordinate_local(&batch2);
@@ -2066,7 +2084,7 @@ mod tests {
     /// Test (h): Prompt builder formatting — build_coordination_prompt() with multi-pane summaries
     #[test]
     fn test_impulse_agent_coordination_prompt_format() {
-        use crate::impulse_agent::prompts::build_coordination_prompt;
+        use crate::agent::prompts::build_coordination_prompt;
 
         let summaries = vec![
             (
@@ -2124,7 +2142,7 @@ mod tests {
     /// Test (h continued): build_review_prompt() format verification
     #[test]
     fn test_impulse_agent_review_prompt_format() {
-        use crate::impulse_agent::prompts::build_review_prompt;
+        use crate::agent::prompts::build_review_prompt;
 
         let insights = vec![
             "Modified src/main.rs: added error handling".to_string(),
@@ -2145,7 +2163,7 @@ mod tests {
     /// Test (h continued): build_error_prompt() format verification
     #[test]
     fn test_impulse_agent_error_prompt_format() {
-        use crate::impulse_agent::prompts::build_error_prompt;
+        use crate::agent::prompts::build_error_prompt;
 
         let error_text = "error[E0308]: mismatched types\n  --> src/lib.rs:42:5\n  |\n42 |     foo()\n  |     ^^^^^ expected `i32`, found `String`";
         let prompt = build_error_prompt("opencode-2", error_text);
@@ -2158,7 +2176,7 @@ mod tests {
     /// Test (h continued): build_summary_prompt() truncation behavior
     #[test]
     fn test_impulse_agent_summary_prompt_truncation() {
-        use crate::impulse_agent::prompts::build_summary_prompt;
+        use crate::agent::prompts::build_summary_prompt;
 
         // Short output: should not be truncated
         let short = "cargo test\n  Running 10 tests\n  10 passed, 0 failed";
@@ -2185,8 +2203,8 @@ mod tests {
     /// Test: aggregate_pane_summaries groups correctly across panes
     #[test]
     fn test_impulse_agent_aggregate_pane_summaries() {
+        use crate::agent::coordinator::aggregate_pane_summaries;
         use crate::context_lifecycle::types::{AgentKind, ExtractedInsight, InsightType};
-        use crate::impulse_agent::coordinator::aggregate_pane_summaries;
 
         let now = chrono::Utc::now();
         let insights = vec![
@@ -2196,6 +2214,7 @@ mod tests {
                 timestamp: now,
                 insight_type: InsightType::FileModified,
                 content: "src/main.rs".to_string(),
+                intent: None,
             },
             ExtractedInsight {
                 pane_id: 1,
@@ -2203,6 +2222,7 @@ mod tests {
                 timestamp: now,
                 insight_type: InsightType::DecisionMade,
                 content: "use async runtime".to_string(),
+                intent: None,
             },
             ExtractedInsight {
                 pane_id: 2,
@@ -2210,6 +2230,7 @@ mod tests {
                 timestamp: now,
                 insight_type: InsightType::ErrorEncountered,
                 content: "build failed".to_string(),
+                intent: None,
             },
             ExtractedInsight {
                 pane_id: 3,
@@ -2217,6 +2238,7 @@ mod tests {
                 timestamp: now,
                 insight_type: InsightType::TaskCompleted,
                 content: "refactor done".to_string(),
+                intent: None,
             },
         ];
 
@@ -2311,9 +2333,7 @@ mod tests {
     /// Test: ImpulseAgent.status_summary() correctness for each mode
     #[test]
     fn test_impulse_agent_status_summary_all_modes() {
-        use crate::impulse_agent::{
-            ImpulseAgent, ImpulseAgentConfig, ImpulseHarness, ImpulseProvider,
-        };
+        use crate::agent::{ImpulseAgent, ImpulseAgentConfig, ImpulseHarness, ImpulseProvider};
 
         // Disabled
         let config = ImpulseAgentConfig::default();
