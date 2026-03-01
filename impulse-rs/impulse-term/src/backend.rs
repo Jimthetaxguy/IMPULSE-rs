@@ -226,6 +226,17 @@ impl TerminalBackend {
         self.working_dir.as_deref()
     }
 
+    /// Number of scrollback lines available above the visible screen.
+    pub fn scrollback_len(&self) -> usize {
+        let parser = self.parser.lock();
+        parser.screen().scrollback()
+    }
+
+    /// Number of visible rows in the terminal.
+    pub fn visible_rows(&self) -> usize {
+        self.rows as usize
+    }
+
     /// Check if there's been new output since a given byte count.
     pub fn has_new_output_since(&self, previous_bytes: u64) -> bool {
         self.output_bytes.load(Ordering::Relaxed) > previous_bytes

@@ -4,7 +4,8 @@
 //! context lifecycle integration, and vt100-based rendering.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::time::Instant;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use impulse_term::context::ContextHealth;
@@ -32,6 +33,15 @@ struct Tab {
     label: String,
     agent_name: &'static str,
     panel: TerminalPanel,
+    #[allow(dead_code)]
+    target_dir: PathBuf,
+}
+
+/// A pending context injection — waiting for agent startup.
+struct PendingInjection {
+    tab_id: u64,
+    inject_at: Instant,
+    target_dir: PathBuf,
 }
 
 pub struct TerminalsView {
@@ -43,6 +53,10 @@ pub struct TerminalsView {
     last_check: Option<Instant>,
     /// Terminal transcript search state.
     pub search: TerminalSearch,
+    /// When set, the project selector should open for this agent name.
+    pending_spawn_agent: Option<String>,
+    /// Pending context injections waiting for agent startup.
+    pending_injections: Vec<PendingInjection>,
 }
 
 impl TerminalsView {
@@ -82,6 +96,8 @@ impl TerminalsView {
             max_tabs: 10,
             last_check: Some(Instant::now()),
             search: TerminalSearch::new(),
+            pending_spawn_agent: None,
+            pending_injections: Vec::new(),
         }
     }
 
@@ -148,8 +164,8 @@ impl TerminalsView {
         });
     }
 
-    /// Spawn a new terminal tab for an agent.
-    pub fn spawn_tab(&mut self, agent: &AgentInfo, _ctx: &egui::Context) {
+    /// Spawn a new terminal tab for an agent in the given target directory.
+    pub fn spawn_tab(&mut self, agent: &AgentInfo, target_dir: &Path, _ctx: &egui::Context) {
         if self.tabs.len() >= self.max_tabs {
             log::warn!("Max tabs reached ({})", self.max_tabs);
             return;
@@ -159,28 +175,98 @@ impl TerminalsView {
         self.next_id += 1;
 
         let args: Vec<String> = agent.args.iter().map(|s| s.to_string()).collect();
-        let working_dir = std::env::current_dir().ok();
 
         match TerminalPanel::spawn(
             agent.command,
             &args,
-            working_dir.as_deref(),
+            Some(target_dir),
             agent.name,
             id as usize,
         ) {
             Ok(panel) => {
+                // Tab label: "AgentName: project-folder"
+                let project_name = target_dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "~".to_string());
+                let label = format!("{}: {}", agent.name, project_name);
+
                 let tab = Tab {
                     id,
-                    label: agent.name.to_string(),
+                    label,
                     agent_name: agent.name,
                     panel,
+                    target_dir: target_dir.to_path_buf(),
                 };
                 self.tabs.insert(id, tab);
                 self.active_tab = Some(id);
-                log::info!("Spawned tab {} for {}", id, agent.name);
+                log::info!(
+                    "Spawned tab {} for {} in {}",
+                    id,
+                    agent.name,
+                    target_dir.display()
+                );
+
+                // Schedule init context injection after startup delay.
+                let delay = match agent.name {
+                    "Claude Code" => Duration::from_secs(3),
+                    "OpenCode" | "Codex" => Duration::from_secs(2),
+                    _ => Duration::from_millis(500),
+                };
+                self.pending_injections.push(PendingInjection {
+                    tab_id: id,
+                    inject_at: Instant::now() + delay,
+                    target_dir: target_dir.to_path_buf(),
+                });
             }
             Err(e) => {
                 log::error!("Failed to spawn {}: {}", agent.name, e);
+            }
+        }
+    }
+
+    /// Take the pending spawn agent request (consumed by app.rs to open the project selector).
+    pub fn take_pending_spawn(&mut self) -> Option<String> {
+        self.pending_spawn_agent.take()
+    }
+
+    /// Process pending init injections (called from app.rs update loop).
+    pub fn process_pending_injections(&mut self, impulse_home: &Path) {
+        let now = Instant::now();
+
+        // Drain ready injections (stable alternative to nightly drain_filter).
+        let mut i = 0;
+        while i < self.pending_injections.len() {
+            if now >= self.pending_injections[i].inject_at {
+                let pending = self.pending_injections.remove(i);
+
+                if let Some(tab) = self.tabs.get_mut(&pending.tab_id) {
+                    let identity = crate::identity::load_identity(impulse_home).unwrap_or_default();
+
+                    let project_name = pending
+                        .target_dir
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+
+                    let context =
+                        build_init_context(&identity, &pending.target_dir, tab.agent_name);
+
+                    match tab.panel.context_bridge().inject_context(&context) {
+                        Ok(()) => log::info!(
+                            "Injected init context into tab {} ({})",
+                            pending.tab_id,
+                            project_name
+                        ),
+                        Err(e) => log::warn!(
+                            "Failed to inject init context into tab {}: {}",
+                            pending.tab_id,
+                            e
+                        ),
+                    }
+                }
+            } else {
+                i += 1;
             }
         }
     }
@@ -440,7 +526,7 @@ impl View for TerminalsView {
 
                     let resp = ui.add_enabled(agent.available, btn);
                     if resp.clicked() {
-                        self.spawn_tab(agent, _ctx);
+                        self.pending_spawn_agent = Some(agent.name.to_string());
                     }
                     if !agent.available {
                         resp.on_hover_text(format!("{} not found on PATH", agent.name));
@@ -518,7 +604,7 @@ impl View for TerminalsView {
                                     .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.4)));
 
                             if ui.add(btn).clicked() {
-                                self.spawn_tab(agent, _ctx);
+                                self.pending_spawn_agent = Some(agent.name.to_string());
                             }
                             ui.add_space(4.0);
                         }
@@ -724,6 +810,70 @@ fn default_shell() -> &'static str {
     }
 }
 
+/// Build the enriched init context payload for a newly-spawned agent pane.
+///
+/// Includes identity, project info, standing GENOME decisions, last session
+/// summary, and a tools reference. Sections are omitted when data is absent.
+fn build_init_context(identity: &str, target_dir: &Path, agent_name: &str) -> String {
+    let project_impulse_dir = target_dir.join(".impulse");
+
+    let decisions = crate::project_context::load_recent_decisions(&project_impulse_dir, 5);
+    let last_session = crate::project_context::load_last_session(&project_impulse_dir);
+
+    let mut sections = Vec::new();
+
+    // Identity (from ~/.impulse/CLAUDE.md).
+    sections.push(identity.trim().to_string());
+
+    // Project info.
+    sections.push(format!(
+        "## Your Project\nWorking directory: {}\nPane: {}",
+        target_dir.display(),
+        agent_name
+    ));
+
+    // Standing decisions from GENOME.
+    if !decisions.is_empty() {
+        let mut text = String::from("## Standing Decisions (from GENOME)");
+        for d in &decisions {
+            let ts = d.timestamp.as_deref().unwrap_or("unknown");
+            text.push_str(&format!("\n- {} ({})", d.description, ts));
+        }
+        sections.push(text);
+    }
+
+    // Last session summary from HISTORY.
+    if let Some(session) = last_session {
+        let mut text = String::from("## Last Session Summary");
+        if let Some(ref summary) = session.summary {
+            text.push_str(&format!("\n- {}", summary));
+        }
+        if !session.files_touched.is_empty() {
+            let files: Vec<&str> = session
+                .files_touched
+                .iter()
+                .take(10)
+                .map(|s| s.as_str())
+                .collect();
+            text.push_str(&format!("\n- Modified: {}", files.join(", ")));
+        }
+        sections.push(text);
+    }
+
+    // Tools reference (always included).
+    sections.push(
+        "## Available Tools\n\
+         Run `impulse-rs sync-context` to refresh context at any time.\n\
+         Run `impulse-rs add-decision \"description\" --rationale \"why\"` to record decisions."
+            .to_string(),
+    );
+
+    format!(
+        "<impulse-context type=\"init\" version=\"3\">\n{}\n</impulse-context>",
+        sections.join("\n\n")
+    )
+}
+
 const WELCOME_BANNER: &str = r"
   ___ __  __ ____  _   _ _     ____  _____
  |_ _|  \/  |  _ \| | | | |   / ___|| ____|
@@ -731,3 +881,67 @@ const WELCOME_BANNER: &str = r"
   | || |  | |  __/| |_| | |___ ___) | |___
  |___|_|  |_|_|    \___/|_____|____/|_____|
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_build_init_context_minimal() {
+        let dir = TempDir::new().unwrap();
+        let result = build_init_context("# Identity", dir.path(), "Claude Code");
+        assert!(result.contains("version=\"3\""));
+        assert!(result.contains("# Identity"));
+        assert!(result.contains("Pane: Claude Code"));
+        assert!(result.contains("## Available Tools"));
+        // No GENOME or HISTORY => no Standing Decisions or Last Session.
+        assert!(!result.contains("Standing Decisions"));
+        assert!(!result.contains("Last Session"));
+    }
+
+    #[test]
+    fn test_build_init_context_with_genome() {
+        let dir = TempDir::new().unwrap();
+        let impulse_dir = dir.path().join(".impulse");
+        std::fs::create_dir_all(&impulse_dir).unwrap();
+        std::fs::write(
+            impulse_dir.join("GENOME.md"),
+            r#"{"decisions":[
+                {"date":"2026-02-01T00:00:00Z","description":"Use Rust","rationale":null,"tags":[]},
+                {"date":"2026-02-02T00:00:00Z","description":"Use egui","rationale":null,"tags":[]}
+            ],"preferences":[],"constraints":[],"last_updated":null}"#,
+        )
+        .unwrap();
+
+        let result = build_init_context("identity", dir.path(), "test");
+        assert!(result.contains("Standing Decisions"));
+        assert!(result.contains("Use Rust"));
+        assert!(result.contains("Use egui"));
+    }
+
+    #[test]
+    fn test_build_init_context_with_history() {
+        let dir = TempDir::new().unwrap();
+        let impulse_dir = dir.path().join(".impulse");
+        std::fs::create_dir_all(&impulse_dir).unwrap();
+        std::fs::write(
+            impulse_dir.join("HISTORY.jsonl"),
+            r#"{"session_id":"s1","session_name":"test","summary":"Fixed auth bug","files_touched":["src/auth.rs","src/main.rs"],"tools_used":[],"started_at":"2026-01-01T00:00:00Z","ended_at":"2026-01-01T01:00:00Z"}"#,
+        )
+        .unwrap();
+
+        let result = build_init_context("identity", dir.path(), "test");
+        assert!(result.contains("Last Session Summary"));
+        assert!(result.contains("Fixed auth bug"));
+        assert!(result.contains("src/auth.rs"));
+    }
+
+    #[test]
+    fn test_build_init_context_version_3() {
+        let dir = TempDir::new().unwrap();
+        let result = build_init_context("id", dir.path(), "agent");
+        assert!(result.starts_with("<impulse-context type=\"init\" version=\"3\">"));
+        assert!(result.ends_with("</impulse-context>"));
+    }
+}

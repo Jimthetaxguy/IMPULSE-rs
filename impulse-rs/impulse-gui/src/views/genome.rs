@@ -35,8 +35,9 @@ impl View for GenomeView {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, state: &SharedState, _ctx: &egui::Context) {
+        // When disconnected, show file-based genome data from the current project.
         if state.connection == ConnectionStatus::Disconnected {
-            empty_state(ui);
+            self.show_offline_genome(ui);
             return;
         }
 
@@ -240,17 +241,101 @@ impl View for GenomeView {
     }
 }
 
-fn empty_state(ui: &mut egui::Ui) {
-    ui.vertical_centered(|ui| {
-        ui.add_space(ui.available_height() / 3.0);
-        ui.label(
-            egui::RichText::new("Genome data requires a running daemon.").color(colors::TEXT_DIM),
-        );
-        ui.add_space(8.0);
-        ui.label(
-            egui::RichText::new("Run `impulse daemon` to start the background service.")
-                .small()
-                .color(colors::TEXT_FAINT),
-        );
-    });
+impl GenomeView {
+    /// Show genome data read directly from the project's `.impulse/GENOME.md` file.
+    fn show_offline_genome(&mut self, ui: &mut egui::Ui) {
+        // Header (always visible).
+        ui.horizontal(|ui| {
+            ui.heading(egui::RichText::new("Genome").color(colors::ACCENT));
+            ui.separator();
+            ui.label(
+                egui::RichText::new("(offline — reading from project files)")
+                    .small()
+                    .color(colors::TEXT_DIM),
+            );
+        });
+        ui.separator();
+
+        // Load from current project.
+        let config = crate::global_config::GlobalConfig::load(
+            &crate::global_config::GlobalConfig::impulse_home(),
+        )
+        .unwrap_or_default();
+
+        let project_dir = match config.last_project {
+            Some(ref p) => p.join(".impulse"),
+            None => {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(32.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "No project selected. Open a project to view its genome.",
+                        )
+                        .color(colors::TEXT_DIM),
+                    );
+                });
+                return;
+            }
+        };
+
+        let decisions = crate::project_context::load_recent_decisions(&project_dir, 100);
+
+        if decisions.is_empty() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(32.0);
+                ui.label(
+                    egui::RichText::new("No decisions recorded in this project's genome.")
+                        .color(colors::TEXT_DIM),
+                );
+            });
+            return;
+        }
+
+        // Filter.
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!("{} decisions", decisions.len()))
+                    .small()
+                    .color(colors::TEXT_MUTED),
+            );
+            ui.separator();
+            ui.add(
+                egui::TextEdit::singleline(&mut self.filter)
+                    .hint_text("Filter decisions...")
+                    .desired_width(160.0),
+            );
+        });
+
+        ui.add_space(4.0);
+
+        // Display decisions.
+        egui::ScrollArea::vertical()
+            .id_salt("offline_genome")
+            .show(ui, |ui| {
+                let filter_lower = self.filter.to_lowercase();
+                for decision in &decisions {
+                    if !self.filter.is_empty()
+                        && !decision.description.to_lowercase().contains(&filter_lower)
+                    {
+                        continue;
+                    }
+
+                    ui.add_space(4.0);
+                    egui::Frame::new()
+                        .fill(colors::SURFACE)
+                        .corner_radius(egui::CornerRadius::same(6))
+                        .inner_margin(egui::Margin::symmetric(12, 8))
+                        .stroke(egui::Stroke::new(0.5, colors::BORDER))
+                        .show(ui, |ui| {
+                            if let Some(ref ts) = decision.timestamp {
+                                ui.label(egui::RichText::new(ts).small().color(colors::ACCENT));
+                                ui.add_space(2.0);
+                            }
+                            ui.label(
+                                egui::RichText::new(&decision.description).color(colors::TEXT),
+                            );
+                        });
+                }
+            });
+    }
 }

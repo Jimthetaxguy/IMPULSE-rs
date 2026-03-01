@@ -75,16 +75,24 @@ impl TerminalRenderer {
 
     /// Render the terminal screen into the given egui UI.
     ///
-    /// Returns the response and the size of the rendered area in cells (cols, rows).
+    /// When `scroll_offset > 0`, uses `parser.set_scrollback()` to shift the
+    /// viewport into the scrollback buffer, renders normally, then resets.
+    ///
+    /// Returns the egui Response for the rendered area.
     pub fn render(
         &mut self,
         ui: &mut egui::Ui,
-        parser: &vt100::Parser,
+        parser: &mut vt100::Parser,
         theme: &TerminalTheme,
         focused: bool,
         scroll_offset: usize,
     ) -> egui::Response {
         self.ensure_metrics(ui);
+
+        // Shift viewport into scrollback if needed.
+        if scroll_offset > 0 {
+            parser.set_scrollback(scroll_offset);
+        }
 
         let screen = parser.screen();
         let (rows, cols) = screen.size();
@@ -103,51 +111,10 @@ impl TerminalRenderer {
         for row in 0..rows {
             let y = origin.y + row as f32 * self.cell_height;
             let runs = self.build_runs(screen, row, cols, theme);
-
-            for run in &runs {
-                let x_start = origin.x + run.col_start as f32 * self.cell_width;
-                let x_end = origin.x + run.col_end as f32 * self.cell_width;
-
-                // Background rect (only if different from terminal bg).
-                if run.bg != theme.bg {
-                    let rect = egui::Rect::from_min_max(
-                        egui::pos2(x_start, y),
-                        egui::pos2(x_end, y + self.cell_height),
-                    );
-                    painter.rect_filled(rect, 0.0, run.bg);
-                }
-
-                // Foreground text.
-                if !run.text.trim().is_empty() {
-                    let font_id = if run.bold {
-                        egui::FontId::new(self.font_size, egui::FontFamily::Monospace)
-                    } else {
-                        egui::FontId::monospace(self.font_size)
-                    };
-
-                    let pos = egui::pos2(x_start, y);
-
-                    // For italics, we apply a slight slant via the galley approach.
-                    // egui doesn't natively support italic monospace, so we just use
-                    // the regular font and note this as a known limitation.
-                    painter.text(pos, egui::Align2::LEFT_TOP, &run.text, font_id, run.fg);
-
-                    // Underline.
-                    if run.underline {
-                        let underline_y = y + self.cell_height - 1.0;
-                        painter.line_segment(
-                            [
-                                egui::pos2(x_start, underline_y),
-                                egui::pos2(x_end, underline_y),
-                            ],
-                            egui::Stroke::new(1.0, run.fg),
-                        );
-                    }
-                }
-            }
+            self.paint_runs(&painter, &runs, origin.x, y, theme);
         }
 
-        // Cursor rendering (only when focused and no scroll offset).
+        // Cursor rendering (only when focused and not scrolled into history).
         if focused && scroll_offset == 0 {
             let cursor_pos = screen.cursor_position();
             let cx = origin.x + cursor_pos.1 as f32 * self.cell_width;
@@ -156,7 +123,6 @@ impl TerminalRenderer {
                 egui::pos2(cx, cy),
                 egui::vec2(self.cell_width, self.cell_height),
             );
-            // Block cursor with semi-transparent fill.
             painter.rect_filled(
                 cursor_rect,
                 0.0,
@@ -164,7 +130,60 @@ impl TerminalRenderer {
             );
         }
 
+        // Reset scrollback viewport.
+        if scroll_offset > 0 {
+            parser.set_scrollback(0);
+        }
+
         response
+    }
+
+    /// Paint a slice of runs to the screen.
+    fn paint_runs(
+        &self,
+        painter: &egui::Painter,
+        runs: &[CellRun],
+        origin_x: f32,
+        y: f32,
+        theme: &TerminalTheme,
+    ) {
+        for run in runs {
+            let x_start = origin_x + run.col_start as f32 * self.cell_width;
+            let x_end = origin_x + run.col_end as f32 * self.cell_width;
+
+            // Background rect (only if different from terminal bg).
+            if run.bg != theme.bg {
+                let rect = egui::Rect::from_min_max(
+                    egui::pos2(x_start, y),
+                    egui::pos2(x_end, y + self.cell_height),
+                );
+                painter.rect_filled(rect, 0.0, run.bg);
+            }
+
+            // Foreground text.
+            if !run.text.trim().is_empty() {
+                let font_id = if run.bold {
+                    egui::FontId::new(self.font_size, egui::FontFamily::Monospace)
+                } else {
+                    egui::FontId::monospace(self.font_size)
+                };
+
+                let pos = egui::pos2(x_start, y);
+                painter.text(pos, egui::Align2::LEFT_TOP, &run.text, font_id, run.fg);
+
+                // Underline.
+                if run.underline {
+                    let underline_y = y + self.cell_height - 1.0;
+                    painter.line_segment(
+                        [
+                            egui::pos2(x_start, underline_y),
+                            egui::pos2(x_end, underline_y),
+                        ],
+                        egui::Stroke::new(1.0, run.fg),
+                    );
+                }
+            }
+        }
     }
 
     /// Build runs for a single row by grouping cells with matching attributes.

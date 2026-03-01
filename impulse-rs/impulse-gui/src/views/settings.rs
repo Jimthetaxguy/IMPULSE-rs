@@ -9,7 +9,7 @@
 use eframe::egui;
 
 use super::{View, ViewId};
-use crate::state::{ConnectionStatus, SharedState};
+use crate::state::SharedState;
 use crate::theme::colors;
 
 // ---------------------------------------------------------------------------
@@ -224,24 +224,23 @@ pub struct SettingsView {
     expanded: [bool; 5],
     /// Status message after save attempt.
     status_msg: Option<(String, bool)>,
+    /// Whether values have been modified since last save.
+    dirty: bool,
 }
 
 impl SettingsView {
     pub fn new() -> Self {
-        // Initialize with sensible defaults.
+        // Load saved settings from GlobalConfig, falling back to defaults.
+        let impulse_home = crate::global_config::GlobalConfig::impulse_home();
+        let config = crate::global_config::GlobalConfig::load(&impulse_home).unwrap_or_default();
+
         let mut values = std::collections::HashMap::new();
         for cat in CATEGORIES {
             for setting in cat.settings {
-                let default = match &setting.kind {
-                    SettingKind::Text { placeholder } => placeholder.to_string(),
-                    SettingKind::Enum { options } => options.first().unwrap_or(&"").to_string(),
-                    SettingKind::IntSlider { min, max } => {
-                        // Default to midpoint.
-                        ((*min + *max) / 2).to_string()
-                    }
-                    SettingKind::Toggle => "false".to_string(),
-                };
-                values.insert(setting.key.to_string(), default);
+                let default = default_for_setting(setting);
+                // Use saved value if present, otherwise use default.
+                let value = config.settings.get(setting.key).cloned().unwrap_or(default);
+                values.insert(setting.key.to_string(), value);
             }
         }
 
@@ -249,7 +248,48 @@ impl SettingsView {
             values,
             expanded: [true; 5],
             status_msg: None,
+            dirty: false,
         }
+    }
+
+    /// Save current settings to `~/.impulse/config.json`.
+    fn save_settings(&mut self) {
+        let impulse_home = crate::global_config::GlobalConfig::impulse_home();
+        let mut config =
+            crate::global_config::GlobalConfig::load(&impulse_home).unwrap_or_default();
+
+        config.settings = self.values.clone();
+
+        match config.save(&impulse_home) {
+            Ok(()) => {
+                self.status_msg = Some(("Settings saved".to_string(), true));
+                self.dirty = false;
+            }
+            Err(e) => {
+                self.status_msg = Some((format!("Save failed: {}", e), false));
+            }
+        }
+    }
+
+    /// Reset all settings in a category to their defaults.
+    fn reset_category(&mut self, cat_idx: usize) {
+        if let Some(category) = CATEGORIES.get(cat_idx) {
+            for setting in category.settings {
+                let default = default_for_setting(setting);
+                self.values.insert(setting.key.to_string(), default);
+            }
+            self.dirty = true;
+        }
+    }
+}
+
+/// Get the default value for a setting definition.
+fn default_for_setting(setting: &SettingDef) -> String {
+    match &setting.kind {
+        SettingKind::Text { placeholder } => placeholder.to_string(),
+        SettingKind::Enum { options } => options.first().unwrap_or(&"").to_string(),
+        SettingKind::IntSlider { min, max } => ((*min + *max) / 2).to_string(),
+        SettingKind::Toggle => "false".to_string(),
     }
 }
 
@@ -258,28 +298,40 @@ impl View for SettingsView {
         ViewId::Settings
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, state: &SharedState, _ctx: &egui::Context) {
-        if state.connection == ConnectionStatus::Disconnected {
-            empty_state(ui);
-            return;
-        }
-
+    fn ui(&mut self, ui: &mut egui::Ui, _state: &SharedState, _ctx: &egui::Context) {
         // --- Header ---
         ui.horizontal(|ui| {
             ui.strong(egui::RichText::new("\u{2699} Settings").color(colors::ACCENT));
             ui.separator();
             ui.label(
-                egui::RichText::new("Daemon configuration")
+                egui::RichText::new("Application configuration")
                     .small()
                     .color(colors::TEXT_DIM),
             );
 
-            if let Some((ref msg, is_ok)) = self.status_msg {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Status message.
+                if let Some((ref msg, is_ok)) = self.status_msg {
                     let color = if is_ok { colors::GREEN } else { colors::RED };
                     ui.label(egui::RichText::new(msg).small().color(color));
-                });
-            }
+                }
+
+                // Save button (highlighted when dirty).
+                let save_color = if self.dirty {
+                    colors::ACCENT
+                } else {
+                    colors::TEXT_DIM
+                };
+                if ui
+                    .add_enabled(
+                        self.dirty,
+                        egui::Button::new(egui::RichText::new("Save").color(save_color)),
+                    )
+                    .clicked()
+                {
+                    self.save_settings();
+                }
+            });
         });
 
         ui.separator();
@@ -288,31 +340,46 @@ impl View for SettingsView {
         egui::ScrollArea::vertical()
             .id_salt("settings_scroll")
             .show(ui, |ui| {
+                let mut reset_cat: Option<usize> = None;
+
                 for (cat_idx, category) in CATEGORIES.iter().enumerate() {
                     ui.add_space(8.0);
 
-                    // Category header (collapsible).
-                    let arrow = if self.expanded[cat_idx] {
-                        "\u{25BC}" // ▼
-                    } else {
-                        "\u{25B6}" // ▶
-                    };
-                    let header_text = format!("{} {} {}", arrow, category.icon, category.name);
+                    // Category header (collapsible) with reset button.
+                    ui.horizontal(|ui| {
+                        let arrow = if self.expanded[cat_idx] {
+                            "\u{25BC}" // ▼
+                        } else {
+                            "\u{25B6}" // ▶
+                        };
+                        let header_text = format!("{} {} {}", arrow, category.icon, category.name);
 
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new(&header_text)
-                                    .strong()
-                                    .color(colors::TEXT),
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(&header_text)
+                                        .strong()
+                                        .color(colors::TEXT),
+                                )
+                                .fill(egui::Color32::TRANSPARENT)
+                                .frame(false),
                             )
-                            .fill(egui::Color32::TRANSPARENT)
-                            .frame(false),
-                        )
-                        .clicked()
-                    {
-                        self.expanded[cat_idx] = !self.expanded[cat_idx];
-                    }
+                            .clicked()
+                        {
+                            self.expanded[cat_idx] = !self.expanded[cat_idx];
+                        }
+
+                        if self.expanded[cat_idx] {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("Reset").clicked() {
+                                        reset_cat = Some(cat_idx);
+                                    }
+                                },
+                            );
+                        }
+                    });
 
                     if self.expanded[cat_idx] {
                         egui::Frame::new()
@@ -327,6 +394,10 @@ impl View for SettingsView {
                                 }
                             });
                     }
+                }
+
+                if let Some(idx) = reset_cat {
+                    self.reset_category(idx);
                 }
 
                 ui.add_space(16.0);
@@ -361,6 +432,7 @@ impl SettingsView {
                         .desired_width(200.0);
                     if ui.add(edit).changed() {
                         self.values.insert(setting.key.to_string(), text);
+                        self.dirty = true;
                     }
                 }
                 SettingKind::Enum { options } => {
@@ -375,6 +447,7 @@ impl SettingsView {
                         });
                     if selected != value {
                         self.values.insert(setting.key.to_string(), selected);
+                        self.dirty = true;
                     }
                 }
                 SettingKind::IntSlider { min, max } => {
@@ -388,6 +461,7 @@ impl SettingsView {
                     {
                         self.values
                             .insert(setting.key.to_string(), int_val.to_string());
+                        self.dirty = true;
                     }
                 }
                 SettingKind::Toggle => {
@@ -395,24 +469,12 @@ impl SettingsView {
                     if ui.checkbox(&mut toggled, "").changed() {
                         self.values
                             .insert(setting.key.to_string(), toggled.to_string());
+                        self.dirty = true;
                     }
                 }
             }
         });
     }
-}
-
-fn empty_state(ui: &mut egui::Ui) {
-    ui.vertical_centered(|ui| {
-        ui.add_space(ui.available_height() / 3.0);
-        ui.label(egui::RichText::new("Settings require a running daemon.").color(colors::TEXT_DIM));
-        ui.add_space(8.0);
-        ui.label(
-            egui::RichText::new("Run `impulse daemon` to start the background service.")
-                .small()
-                .color(colors::TEXT_FAINT),
-        );
-    });
 }
 
 // ---------------------------------------------------------------------------
@@ -455,6 +517,44 @@ mod tests {
         for (key, val) in &view.values {
             assert!(!val.is_empty(), "Setting '{}' has empty default", key);
         }
+    }
+
+    #[test]
+    fn test_settings_not_dirty_on_init() {
+        let view = SettingsView::new();
+        assert!(!view.dirty);
+    }
+
+    #[test]
+    fn test_reset_category_marks_dirty() {
+        let mut view = SettingsView::new();
+        assert!(!view.dirty);
+        view.reset_category(0);
+        assert!(view.dirty);
+    }
+
+    #[test]
+    fn test_default_for_setting_text() {
+        let setting = SettingDef {
+            key: "test_text",
+            label: "Test",
+            description: "A test",
+            kind: SettingKind::Text {
+                placeholder: "hello",
+            },
+        };
+        assert_eq!(default_for_setting(&setting), "hello");
+    }
+
+    #[test]
+    fn test_default_for_setting_toggle() {
+        let setting = SettingDef {
+            key: "test_toggle",
+            label: "Test",
+            description: "A test",
+            kind: SettingKind::Toggle,
+        };
+        assert_eq!(default_for_setting(&setting), "false");
     }
 
     #[test]

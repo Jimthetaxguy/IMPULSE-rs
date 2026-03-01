@@ -5,7 +5,7 @@
 
 use std::sync::mpsc;
 
-use crate::state::{ConnectionStatus, StateHandle};
+use crate::state::ConnectionStatus;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -75,23 +75,26 @@ impl AgentBackend {
 ///
 /// If the daemon is connected, prefer DaemonChat. Otherwise fall back
 /// to the statically-detected backend.
-pub fn resolve_backend(static_backend: &AgentBackend, state: &Option<StateHandle>) -> AgentBackend {
-    if let Some(ref handle) = state {
-        if let Ok(s) = handle.lock() {
-            if s.connection == ConnectionStatus::Connected {
-                return AgentBackend::DaemonChat;
-            }
-        }
+///
+/// Accepts a `ConnectionStatus` value rather than a `StateHandle` to avoid
+/// re-entrant locking — callers extract the status before entering any lock scope.
+pub fn resolve_backend(
+    static_backend: &AgentBackend,
+    connection: ConnectionStatus,
+) -> AgentBackend {
+    if connection == ConnectionStatus::Connected {
+        AgentBackend::DaemonChat
+    } else {
+        static_backend.clone()
     }
-    static_backend.clone()
 }
 
 // ---------------------------------------------------------------------------
 // Agent persona (system prompt)
 // ---------------------------------------------------------------------------
 
-/// The system prompt / persona for the Impulse Agent.
-const AGENT_PERSONA: &str = "\
+/// Fallback persona if `~/.impulse/CLAUDE.md` can't be read.
+const DEFAULT_PERSONA: &str = "\
 You are the Impulse Agent — a coordinator for AI coding sessions.
 
 ## Your Role
@@ -106,6 +109,19 @@ You are the Impulse Agent — a coordinator for AI coding sessions.
 - When you detect a conflict or error, state it clearly with the specific files and panes involved.
 - Prefer actionable advice over general suggestions.
 - You receive periodic context updates from worker panes via <impulse-context> blocks.";
+
+/// Cached agent persona loaded from `~/.impulse/CLAUDE.md`.
+///
+/// Falls back to `DEFAULT_PERSONA` if the file can't be read.
+fn agent_persona() -> &'static str {
+    use std::sync::OnceLock;
+    static PERSONA: OnceLock<String> = OnceLock::new();
+    PERSONA.get_or_init(|| {
+        let impulse_home = crate::global_config::GlobalConfig::impulse_home();
+        crate::identity::load_identity(&impulse_home)
+            .unwrap_or_else(|_| DEFAULT_PERSONA.to_string())
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Subprocess (harness) backend
@@ -177,10 +193,11 @@ fn query_api(
     user_message: &str,
     context: &str,
 ) -> AgentResponse {
+    let persona = agent_persona();
     let system_prompt = if context.is_empty() {
-        AGENT_PERSONA.to_string()
+        persona.to_string()
     } else {
-        format!("{}\n\n{}", AGENT_PERSONA, context)
+        format!("{}\n\n{}", persona, context)
     };
 
     // Build messages array including history + new user message.
@@ -418,39 +435,27 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_backend_without_state_returns_static() {
+    fn test_resolve_backend_disconnected_returns_static() {
         let static_backend = AgentBackend::Harness { session_id: None };
-        let resolved = resolve_backend(&static_backend, &None);
+        let resolved = resolve_backend(&static_backend, ConnectionStatus::Disconnected);
         assert_eq!(resolved.label(), "Claude Code");
     }
 
     #[test]
     fn test_resolve_backend_connected_returns_daemon_chat() {
-        use crate::state::SharedState;
-        use std::sync::{Arc, Mutex};
-
-        let state: StateHandle = Arc::new(Mutex::new(SharedState::default()));
-        // Set connected.
-        state.lock().unwrap().connection = ConnectionStatus::Connected;
-
         let static_backend = AgentBackend::Harness { session_id: None };
-        let resolved = resolve_backend(&static_backend, &Some(state));
+        let resolved = resolve_backend(&static_backend, ConnectionStatus::Connected);
         assert_eq!(resolved.label(), "Daemon Chat");
     }
 
     #[test]
-    fn test_resolve_backend_disconnected_returns_static() {
-        use crate::state::SharedState;
-        use std::sync::{Arc, Mutex};
-
-        let state: StateHandle = Arc::new(Mutex::new(SharedState::default()));
-        // Default is Disconnected.
+    fn test_resolve_backend_connecting_returns_static() {
         let static_backend = AgentBackend::Api {
             api_key: "key".into(),
             model: "model".into(),
             history: vec![],
         };
-        let resolved = resolve_backend(&static_backend, &Some(state));
+        let resolved = resolve_backend(&static_backend, ConnectionStatus::Connecting);
         assert_eq!(resolved.label(), "API");
     }
 
@@ -530,7 +535,14 @@ mod tests {
 
     #[test]
     fn test_agent_persona_is_nonempty() {
-        assert!(!AGENT_PERSONA.is_empty());
-        assert!(AGENT_PERSONA.contains("Impulse Agent"));
+        let persona = agent_persona();
+        assert!(!persona.is_empty());
+        assert!(persona.contains("Impulse"));
+    }
+
+    #[test]
+    fn test_default_persona_contains_impulse() {
+        assert!(!DEFAULT_PERSONA.is_empty());
+        assert!(DEFAULT_PERSONA.contains("Impulse Agent"));
     }
 }

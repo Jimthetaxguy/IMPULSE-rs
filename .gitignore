@@ -38,3 +38,6 @@ cloned-repos/
 # Environment
 .env
 .env.local
+
+# Agent coordination lock
+.agent-lock

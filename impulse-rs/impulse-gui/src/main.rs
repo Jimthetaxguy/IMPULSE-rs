@@ -7,7 +7,11 @@
 
 mod agent_panel;
 mod app;
+mod global_config;
+mod identity;
 mod ipc;
+mod project_context;
+mod project_scaffold;
 mod state;
 mod theme;
 mod views;

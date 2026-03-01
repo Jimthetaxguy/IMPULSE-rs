@@ -80,12 +80,7 @@ impl TerminalPanel {
             std::env::set_var("IMPULSE_VERSION", env!("CARGO_PKG_VERSION"));
         }
 
-        let env_vars: Vec<(&str, String)> = vec![
-            ("TERM", "xterm-256color".to_string()),
-            ("COLORTERM", "truecolor".to_string()),
-            ("IMPULSE_PANE_ID", pane_id.to_string()),
-            ("IMPULSE_PANE_NAME", agent_name.to_string()),
-        ];
+        let env_vars = build_env_vars(working_dir, agent_name, pane_id);
 
         let result = TerminalBackend::spawn(command, args, working_dir, &env_vars, 24, 80, None);
 
@@ -123,34 +118,101 @@ impl TerminalPanel {
         if current_bytes != self.last_repaint_bytes {
             self.last_repaint_bytes = current_bytes;
             ui.ctx().request_repaint();
+            // Reset scroll to bottom on new output.
+            if self.scroll_offset > 0 {
+                self.scroll_offset = 0;
+            }
         }
 
         // Handle keyboard input.
         self.handle_input(ui);
 
-        // Allocate the full available space.
-        let available = ui.available_size();
-        let status_bar_height = 20.0;
-        let terminal_height = (available.y - status_bar_height).max(0.0);
+        // Wrap terminal in a frame with padding for readability.
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(8, 4))
+            .fill(self.theme.bg)
+            .show(ui, |ui| {
+                // Allocate the full available space.
+                let available = ui.available_size();
+                let status_bar_height = 20.0;
+                let scroll_badge_height = if self.scroll_offset > 0 { 18.0 } else { 0.0 };
+                let terminal_height =
+                    (available.y - status_bar_height - scroll_badge_height).max(0.0);
 
-        // Terminal grid.
-        let terminal_response = ui.allocate_ui(egui::vec2(available.x, terminal_height), |ui| {
-            self.backend.with_parser(|parser| {
-                self.renderer
-                    .render(ui, parser, &self.theme, self.focused, self.scroll_offset)
-            })
-        });
+                // Handle mouse wheel scrolling.
+                let scroll_delta = ui.input(|i| i.raw_scroll_delta.y);
+                if scroll_delta != 0.0 {
+                    let cell_h = self.renderer.cell_size().1;
+                    let line_delta = if cell_h > 0.0 {
+                        (scroll_delta / cell_h).round() as i32
+                    } else {
+                        (scroll_delta / 13.0).round() as i32
+                    };
+                    let max_scroll = self.backend.scrollback_len();
+                    self.scroll_offset = (self.scroll_offset as i32 - line_delta)
+                        .clamp(0, max_scroll as i32)
+                        as usize;
+                }
 
-        // Check focus — clicked on the terminal area means focused.
-        let response = &terminal_response.inner;
-        self.focused = response.has_focus()
-            || (ui.input(|i| i.pointer.any_click())
-                && response
-                    .rect
-                    .contains(ui.input(|i| i.pointer.interact_pos().unwrap_or_default())));
+                // Handle Shift+PageUp/PageDown for scrolling.
+                let page_scroll: Option<i32> = ui.input(|input| {
+                    let shift = input.modifiers.shift;
+                    if shift && input.key_pressed(egui::Key::PageUp) {
+                        Some(-24) // scroll up one page
+                    } else if shift && input.key_pressed(egui::Key::PageDown) {
+                        Some(24) // scroll down one page
+                    } else {
+                        None
+                    }
+                });
+                if let Some(delta) = page_scroll {
+                    let max_scroll = self.backend.scrollback_len();
+                    self.scroll_offset =
+                        (self.scroll_offset as i32 - delta).clamp(0, max_scroll as i32) as usize;
+                }
 
-        // Status bar.
-        self.render_status_bar(ui);
+                // Terminal grid.
+                let terminal_response =
+                    ui.allocate_ui(egui::vec2(available.x - 16.0, terminal_height), |ui| {
+                        self.backend.with_parser_mut(|parser| {
+                            self.renderer.render(
+                                ui,
+                                parser,
+                                &self.theme,
+                                self.focused,
+                                self.scroll_offset,
+                            )
+                        })
+                    });
+
+                // Check focus — clicked on the terminal area means focused.
+                let response = &terminal_response.inner;
+                self.focused = response.has_focus()
+                    || (ui.input(|i| i.pointer.any_click())
+                        && response
+                            .rect
+                            .contains(ui.input(|i| i.pointer.interact_pos().unwrap_or_default())));
+
+                // Scroll badge (when scrolled up).
+                if self.scroll_offset > 0 {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Scrolled: {} lines up",
+                                self.scroll_offset
+                            ))
+                            .small()
+                            .color(egui::Color32::from_rgb(0xd2, 0x99, 0x22)),
+                        );
+                        if ui.small_button("Jump to bottom").clicked() {
+                            self.scroll_offset = 0;
+                        }
+                    });
+                }
+
+                // Status bar.
+                self.render_status_bar(ui);
+            });
 
         // Context overlay (Ctrl+Shift+C toggle).
         if self.show_context_overlay {
@@ -446,5 +508,99 @@ fn truncate_display(s: &str, max_len: usize) -> String {
             end -= 1;
         }
         format!("{}..", &s[..end])
+    }
+}
+
+/// Build environment variables for a spawned terminal pane.
+///
+/// Extracted for testability. Sets TERM, COLORTERM, IMPULSE_PANE_ID,
+/// IMPULSE_PANE_NAME, IMPULSE_HOME, and IMPULSE_SESSION_ID.
+fn build_env_vars<'a>(
+    working_dir: Option<&Path>,
+    agent_name: &'a str,
+    pane_id: usize,
+) -> Vec<(&'a str, String)> {
+    vec![
+        ("TERM", "xterm-256color".to_string()),
+        ("COLORTERM", "truecolor".to_string()),
+        ("IMPULSE_PANE_ID", pane_id.to_string()),
+        ("IMPULSE_PANE_NAME", agent_name.to_string()),
+        (
+            "IMPULSE_HOME",
+            working_dir
+                .map(|d| d.join(".impulse").display().to_string())
+                .unwrap_or_default(),
+        ),
+        (
+            "IMPULSE_SESSION_ID",
+            format!(
+                "{:x}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+            ),
+        ),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_build_env_vars_includes_impulse_home() {
+        let dir = PathBuf::from("/tmp/test-project");
+        let vars = build_env_vars(Some(&dir), "Claude Code", 0);
+        let home = vars.iter().find(|(k, _)| *k == "IMPULSE_HOME").unwrap();
+        assert_eq!(home.1, "/tmp/test-project/.impulse");
+    }
+
+    #[test]
+    fn test_build_env_vars_impulse_home_empty_without_dir() {
+        let vars = build_env_vars(None, "Shell", 0);
+        let home = vars.iter().find(|(k, _)| *k == "IMPULSE_HOME").unwrap();
+        assert!(home.1.is_empty());
+    }
+
+    #[test]
+    fn test_build_env_vars_session_id_is_hex() {
+        let vars = build_env_vars(None, "Claude Code", 1);
+        let sid = vars
+            .iter()
+            .find(|(k, _)| *k == "IMPULSE_SESSION_ID")
+            .unwrap();
+        assert!(!sid.1.is_empty(), "Session ID should not be empty");
+        assert!(
+            u128::from_str_radix(&sid.1, 16).is_ok(),
+            "Session ID '{}' should be valid hex",
+            sid.1
+        );
+    }
+
+    #[test]
+    fn test_build_env_vars_has_all_expected_keys() {
+        let vars = build_env_vars(Some(Path::new("/tmp")), "test", 42);
+        let keys: Vec<&str> = vars.iter().map(|(k, _)| *k).collect();
+        assert!(keys.contains(&"TERM"));
+        assert!(keys.contains(&"COLORTERM"));
+        assert!(keys.contains(&"IMPULSE_PANE_ID"));
+        assert!(keys.contains(&"IMPULSE_PANE_NAME"));
+        assert!(keys.contains(&"IMPULSE_HOME"));
+        assert!(keys.contains(&"IMPULSE_SESSION_ID"));
+    }
+
+    #[test]
+    fn test_format_tokens() {
+        assert_eq!(format_tokens(500), "500");
+        assert_eq!(format_tokens(1500), "2K");
+        assert_eq!(format_tokens(1_500_000), "1.5M");
+    }
+
+    #[test]
+    fn test_truncate_display() {
+        assert_eq!(truncate_display("hello", 10), "hello");
+        assert_eq!(truncate_display("hello world", 5), "hello..");
     }
 }

@@ -98,8 +98,39 @@ cargo fmt --check
 ## Contributing
 
 1. All changes must pass `cargo test`, `cargo clippy -- -D warnings`, and `cargo fmt --check`
-2. New modules need unit tests in a `#[cfg(test)] mod tests` block
+2. New modules need unit tests in a `mod tests` block
 3. New CLI commands go in `src/main.rs` with clap derive
 4. New dynamic tools implement the `DynamicTool` trait in `src/tooling/`
 5. File operations must use atomic writes
 6. Error handling must use `Result<T>` — never `unwrap()` on user-facing paths
+
+---
+
+## Worktree Safety
+
+This project uses git worktrees for parallel development. A pre-commit hook warns about:
+
+- Force pushes (requires confirmation)
+- Mass deletions (10+ files, requires confirmation)
+- Unpushed commits in worktrees
+- Uncommitted changes (50+ files)
+
+### Before Any Mass Removal
+
+**STOP and verify first:**
+
+1. Check what's being deleted: `git diff --cached --name-status`
+2. Check if files exist elsewhere (worktrees, branches)
+3. Create a backup branch: `git branch backup-pre-delete`
+4. If uncertain, restore first: `git restore <path>` instead of deleting
+
+**Never run these without explicit user confirmation:**
+- `rm -rf` on project directories
+- `git clean -fd`
+- `git reset --hard`
+- Force push to main/master
+
+**Before force pushing, always:**
+```bash
+git branch backup-pre-force  # Create backup
+```

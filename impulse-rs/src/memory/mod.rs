@@ -48,6 +48,13 @@ impl Genome {
         rationale: Option<String>,
         tags: Vec<String>,
     ) {
+        // Dedup guard: skip if the last decision has the same description.
+        if let Some(last) = self.decisions.last() {
+            if last.description == description {
+                return;
+            }
+        }
+
         self.decisions.push(Decision {
             date: Utc::now(),
             description,
@@ -127,4 +134,37 @@ pub struct HistoryEntry {
     pub summary: String,
     pub files_touched: Vec<String>,
     pub tools_used: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_add_decision_dedup() {
+        let mut genome = Genome::new();
+        genome.add_decision("Test decision".into(), None, vec![]);
+        genome.add_decision("Test decision".into(), None, vec![]);
+        genome.add_decision("Test decision".into(), None, vec![]);
+        // Should only keep one — dedup blocks consecutive identical descriptions
+        assert_eq!(genome.decisions.len(), 1);
+    }
+
+    #[test]
+    fn test_add_decision_different_descriptions_allowed() {
+        let mut genome = Genome::new();
+        genome.add_decision("Decision A".into(), None, vec![]);
+        genome.add_decision("Decision B".into(), None, vec![]);
+        assert_eq!(genome.decisions.len(), 2);
+    }
+
+    #[test]
+    fn test_add_decision_same_after_different_allowed() {
+        let mut genome = Genome::new();
+        genome.add_decision("Decision A".into(), None, vec![]);
+        genome.add_decision("Decision B".into(), None, vec![]);
+        genome.add_decision("Decision A".into(), None, vec![]);
+        // A-B-A is fine — dedup only blocks consecutive duplicates
+        assert_eq!(genome.decisions.len(), 3);
+    }
 }

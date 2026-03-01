@@ -27,7 +27,7 @@ use std::sync::mpsc;
 
 use eframe::egui;
 
-use crate::state::StateHandle;
+use crate::state::{ConnectionStatus, StateHandle};
 use crate::theme::colors;
 
 use actions::PanelAction;
@@ -84,6 +84,9 @@ pub struct AgentPanel {
     history_path: PathBuf,
     /// Actions queued for dispatch by app.rs (drained each frame).
     pending_actions: Vec<PanelAction>,
+    /// Cached connection status — updated each frame by app.rs before ui() is called.
+    /// Avoids re-entrant locking of SharedState from within the agent panel.
+    connection_status: ConnectionStatus,
 }
 
 impl AgentPanel {
@@ -142,6 +145,7 @@ impl AgentPanel {
             focus_requested: false,
             history_path,
             pending_actions: Vec::new(),
+            connection_status: ConnectionStatus::Disconnected,
         }
     }
 
@@ -168,7 +172,7 @@ impl AgentPanel {
         self.scroll_to_bottom = true;
 
         // Resolve effective backend (DaemonChat when connected, else static).
-        let mut effective = backend::resolve_backend(&self.backend, &self.daemon_state);
+        let mut effective = backend::resolve_backend(&self.backend, self.connection_status);
         let context = self.pending_context.take().unwrap_or_default();
         let rx = backend::dispatch_query(&mut effective, trimmed, &context);
         self.response_rx = Some(rx);
@@ -210,7 +214,7 @@ impl AgentPanel {
             }
             "/status" => {
                 let static_label = self.backend.label();
-                let effective = backend::resolve_backend(&self.backend, &self.daemon_state);
+                let effective = backend::resolve_backend(&self.backend, self.connection_status);
                 let effective_label = effective.label();
                 let msg_count = self.messages.len();
                 let activity_count = self.activity_items.len();
@@ -464,7 +468,7 @@ impl AgentPanel {
             ui.add_space(4.0);
             ui.strong(egui::RichText::new("Agent").color(colors::ACCENT));
             ui.separator();
-            let effective = backend::resolve_backend(&self.backend, &self.daemon_state);
+            let effective = backend::resolve_backend(&self.backend, self.connection_status);
             ui.label(
                 egui::RichText::new(effective.label())
                     .small()
@@ -616,6 +620,13 @@ impl AgentPanel {
             let text = std::mem::take(&mut self.input_buf);
             self.send_message(&text);
         }
+    }
+
+    /// Update the cached connection status. Called each frame by app.rs
+    /// *before* entering the SharedState lock scope, so that ui() and
+    /// send_message() can resolve the backend without re-locking.
+    pub fn set_connection_status(&mut self, status: ConnectionStatus) {
+        self.connection_status = status;
     }
 
     /// Request that the input field receives keyboard focus on the next frame.
@@ -946,6 +957,18 @@ mod tests {
         panel.send_message("/search");
         assert!(panel.pending_actions.is_empty());
         assert!(panel.messages.last().unwrap().content.contains("Usage"));
+    }
+
+    #[test]
+    fn test_set_connection_status_updates_field() {
+        use crate::state::ConnectionStatus;
+
+        let mut panel = AgentPanel::new(None);
+        assert_eq!(panel.connection_status, ConnectionStatus::Disconnected);
+        panel.set_connection_status(ConnectionStatus::Connected);
+        assert_eq!(panel.connection_status, ConnectionStatus::Connected);
+        panel.set_connection_status(ConnectionStatus::Disconnected);
+        assert_eq!(panel.connection_status, ConnectionStatus::Disconnected);
     }
 
     #[test]
