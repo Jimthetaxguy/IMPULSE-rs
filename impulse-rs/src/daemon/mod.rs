@@ -6,8 +6,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::RwLock;
 
-use crate::agent::{AnthropicProvider, ChatRequest, LlmProvider, Message, Role};
 use crate::injection::{run_injection, InjectionMode, InjectionSurface};
+use crate::llm_backends::{AnthropicProvider, ChatRequest, LlmProvider, Message, Role};
 use crate::state::SharedState;
 
 const SOCKET_NAME: &str = "impulse.sock";
@@ -790,7 +790,7 @@ async fn process_request(
                 }
             };
 
-            let mut agent = match crate::impulse_agent::resolve_from_config(
+            let mut agent = match crate::agent::resolve_from_config(
                 config.impulse_agent_provider.as_deref(),
                 config.impulse_agent_api_key.as_deref(),
                 config.impulse_agent_model.as_deref(),
@@ -819,10 +819,7 @@ async fn process_request(
             };
 
             match agent
-                .query(
-                    crate::impulse_agent::prompts::COORDINATION_SYSTEM,
-                    &full_prompt,
-                )
+                .query(crate::agent::prompts::COORDINATION_SYSTEM, &full_prompt)
                 .await
             {
                 Ok(response) => DaemonResponse::AgentAssistResult {

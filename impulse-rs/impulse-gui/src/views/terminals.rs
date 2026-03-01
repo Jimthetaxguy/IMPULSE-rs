@@ -4,10 +4,13 @@
 //! context lifecycle integration, and vt100-based rendering.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::fs::OpenOptions;
+use std::io::Write as IoWrite;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use eframe::egui;
-use impulse_term::context::ContextHealth;
+use impulse_term::context::{ContextHealth, ContextTier, ExtractedInsight};
 use impulse_term::TerminalPanel;
 
 use super::terminal_search::TerminalSearch;
@@ -43,6 +46,10 @@ pub struct TerminalsView {
     last_check: Option<Instant>,
     /// Terminal transcript search state.
     pub search: TerminalSearch,
+    /// Path to LIVE_INSIGHTS.jsonl for the active project.
+    live_insights_path: Option<PathBuf>,
+    /// Last injected tier per tab, for detecting tier crossings.
+    last_injected_tiers: BTreeMap<u64, ContextTier>,
 }
 
 impl TerminalsView {
@@ -74,6 +81,11 @@ impl TerminalsView {
             },
         ];
 
+        // Discover project .impulse/ dir from cwd.
+        let live_insights_path = std::env::current_dir()
+            .ok()
+            .map(|cwd| cwd.join(".impulse").join("LIVE_INSIGHTS.jsonl"));
+
         Self {
             tabs: BTreeMap::new(),
             active_tab: None,
@@ -82,6 +94,8 @@ impl TerminalsView {
             max_tabs: 10,
             last_check: Some(Instant::now()),
             search: TerminalSearch::new(),
+            live_insights_path,
+            last_injected_tiers: BTreeMap::new(),
         }
     }
 
@@ -186,10 +200,13 @@ impl TerminalsView {
     }
 
     fn close_tab(&mut self, id: u64) {
+        // Merge this tab's insights into HISTORY.jsonl before closing.
         if let Some(tab) = self.tabs.get(&id) {
+            self.merge_tab_insights_to_history(id, tab.agent_name, tab.label.clone());
             tab.panel.kill();
         }
         self.tabs.remove(&id);
+        self.last_injected_tiers.remove(&id);
         if self.active_tab == Some(id) {
             self.active_tab = self
                 .tabs
@@ -223,11 +240,24 @@ impl TerminalsView {
     }
 
     /// Clean up all tabs (called on exit).
+    ///
+    /// Merges all remaining pane insights into HISTORY.jsonl before killing.
     pub fn shutdown(&mut self) {
+        let tab_info: Vec<(u64, &'static str, String)> = self
+            .tabs
+            .iter()
+            .map(|(&id, tab)| (id, tab.agent_name, tab.label.clone()))
+            .collect();
+
+        for (id, agent_name, label) in tab_info {
+            self.merge_tab_insights_to_history(id, agent_name, label);
+        }
+
         for tab in self.tabs.values() {
             tab.panel.kill();
         }
         self.tabs.clear();
+        self.last_injected_tiers.clear();
         self.active_tab = None;
     }
 
@@ -318,13 +348,268 @@ impl TerminalsView {
     }
 
     /// Run context extraction tick on all alive panels.
+    ///
+    /// Collects newly extracted insights and persists them to LIVE_INSIGHTS.jsonl.
     pub fn context_tick(&mut self) {
+        let mut new_insights: Vec<ExtractedInsight> = Vec::new();
+
         for tab in self.tabs.values_mut() {
             if tab.panel.is_alive() {
-                let _ = tab.panel.context_bridge().extract_tick();
+                let extracted = tab.panel.context_bridge().extract_tick();
+                if !extracted.is_empty() {
+                    new_insights.extend(extracted);
+                }
+            }
+        }
+
+        if !new_insights.is_empty() {
+            self.persist_insights(&new_insights);
+        }
+    }
+
+    /// Append insights to LIVE_INSIGHTS.jsonl.
+    fn persist_insights(&self, insights: &[ExtractedInsight]) {
+        let Some(path) = &self.live_insights_path else {
+            return;
+        };
+
+        // Ensure parent directory exists.
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+            log::warn!("Failed to open {:?} for insight persistence", path);
+            return;
+        };
+
+        for insight in insights {
+            if let Ok(json) = serde_json::to_string(insight) {
+                let _ = writeln!(file, "{}", json);
             }
         }
     }
+
+    /// Check tier crossings and inject refresh context on threshold changes.
+    ///
+    /// Tracks `last_injected_tier` per tab. When a tier crossing is detected,
+    /// builds refresh context with tier info, cross-pane insights, and recent
+    /// GENOME decisions, then injects via the ContextBridge.
+    pub fn check_threshold_injections(&mut self, genome_decisions: &[String]) {
+        // Phase 1: Collect info immutably — which tabs need injection and what context.
+        let mut injections: Vec<(u64, String)> = Vec::new();
+
+        let tab_ids: Vec<u64> = self.tabs.keys().copied().collect();
+
+        for &id in &tab_ids {
+            let Some(tab) = self.tabs.get(&id) else {
+                continue;
+            };
+            if !tab.panel.is_alive() {
+                continue;
+            }
+            let current_tier = tab.panel.current_tier();
+
+            // Only inject on meaningful tiers (not None, not PostCompaction).
+            let should_inject = matches!(
+                current_tier,
+                ContextTier::Essential | ContextTier::Critical | ContextTier::Minimal
+            );
+            if !should_inject {
+                continue;
+            }
+
+            // Check if this is a new tier crossing.
+            let last_tier = self.last_injected_tiers.get(&id).copied();
+            if last_tier == Some(current_tier) {
+                continue;
+            }
+            self.last_injected_tiers.insert(id, current_tier);
+
+            // Build refresh context.
+            let tier_desc = match current_tier {
+                ContextTier::Essential => "Context at ~50%. Prioritizing essential information.",
+                ContextTier::Critical => "Context at ~70%. Only critical context follows.",
+                ContextTier::Minimal => {
+                    "Context at ~80%+. Minimal context — highest priority only."
+                }
+                _ => continue,
+            };
+
+            // Collect cross-pane insights from other alive panes (immutable access).
+            let mut cross_pane = Vec::new();
+            for (&other_id, other_tab) in &self.tabs {
+                if other_id == id || !other_tab.panel.is_alive() {
+                    continue;
+                }
+                for insight in other_tab.panel.insights().iter().rev().take(3) {
+                    cross_pane.push(format!(
+                        "  - [{}] {}: {}",
+                        other_tab.label,
+                        insight.insight_type.as_str(),
+                        insight.content
+                    ));
+                }
+            }
+
+            let mut refresh = format!("{}\n", tier_desc);
+            if !cross_pane.is_empty() {
+                refresh.push_str("\nCross-pane activity:\n");
+                for line in &cross_pane {
+                    refresh.push_str(line);
+                    refresh.push('\n');
+                }
+            }
+            if !genome_decisions.is_empty() {
+                refresh.push_str("\nRecent decisions:\n");
+                for d in genome_decisions.iter().take(5) {
+                    refresh.push_str("  - ");
+                    refresh.push_str(d);
+                    refresh.push('\n');
+                }
+            }
+
+            injections.push((id, refresh));
+        }
+
+        // Phase 2: Inject via ContextBridge (requires &mut).
+        for (id, refresh) in injections {
+            if let Some(tab) = self.tabs.get_mut(&id) {
+                match tab.panel.context_bridge().inject_context(&refresh) {
+                    Ok(()) => {
+                        log::info!("Injected refresh context into tab {}", id);
+                    }
+                    Err(e) => {
+                        log::warn!("Threshold injection failed for tab {}: {}", id, e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Merge a closing tab's insights into HISTORY.jsonl.
+    fn merge_tab_insights_to_history(&self, pane_id: u64, agent_name: &str, label: String) {
+        let Some(insights_path) = &self.live_insights_path else {
+            return;
+        };
+
+        // Read LIVE_INSIGHTS.jsonl and filter for this pane.
+        let pane_insights = load_live_insights_for_pane(insights_path, pane_id);
+        if pane_insights.is_empty() {
+            return;
+        }
+
+        // Build a HISTORY.jsonl entry.
+        let files: Vec<String> = pane_insights
+            .iter()
+            .filter(|i| i.insight_type == impulse_term::context::InsightType::FileModified)
+            .map(|i| i.content.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        let summary = format!(
+            "GUI session: {} ({} insights, {} files)",
+            label,
+            pane_insights.len(),
+            files.len()
+        );
+
+        let entry = serde_json::json!({
+            "session_id": format!("gui-pane-{}", pane_id),
+            "session_name": label,
+            "platform": agent_name,
+            "started_at": pane_insights.first().map(|i| i.timestamp.to_rfc3339()).unwrap_or_default(),
+            "ended_at": chrono::Utc::now().to_rfc3339(),
+            "summary": summary,
+            "files_touched": files,
+            "tools_used": [],
+            "insight_count": pane_insights.len(),
+        });
+
+        // Append to HISTORY.jsonl (sibling of LIVE_INSIGHTS.jsonl).
+        let history_path = insights_path
+            .parent()
+            .map(|p| p.join("HISTORY.jsonl"))
+            .unwrap_or_default();
+
+        if !history_path.as_os_str().is_empty() {
+            if let Ok(mut file) = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&history_path)
+            {
+                if let Ok(json) = serde_json::to_string(&entry) {
+                    let _ = writeln!(file, "{}", json);
+                    log::info!(
+                        "Merged {} insights from pane {} to HISTORY",
+                        pane_insights.len(),
+                        pane_id
+                    );
+                }
+            }
+        }
+    }
+
+    /// Load and search live insights for a query (keyword match).
+    ///
+    /// Returns matching insights as search-result-like tuples: (title, snippet, timestamp).
+    pub fn search_live_insights(&self, query: &str) -> Vec<LiveInsightResult> {
+        let Some(path) = &self.live_insights_path else {
+            return Vec::new();
+        };
+        let query_lower = query.to_lowercase();
+        let mut results = Vec::new();
+
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return Vec::new();
+        };
+
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(insight) = serde_json::from_str::<ExtractedInsight>(line) else {
+                continue;
+            };
+            if insight.content.to_lowercase().contains(&query_lower)
+                || insight
+                    .insight_type
+                    .as_str()
+                    .to_lowercase()
+                    .contains(&query_lower)
+            {
+                results.push(LiveInsightResult {
+                    title: format!("[{}] {}", insight.insight_type.as_str(), insight.content),
+                    agent: insight.agent_kind.label().to_string(),
+                    timestamp: insight.timestamp.to_rfc3339(),
+                });
+            }
+        }
+
+        results
+    }
+}
+
+/// A search result from live insights.
+pub struct LiveInsightResult {
+    pub title: String,
+    pub agent: String,
+    pub timestamp: String,
+}
+
+/// Load insights from LIVE_INSIGHTS.jsonl filtered by pane ID.
+fn load_live_insights_for_pane(path: &std::path::Path, pane_id: u64) -> Vec<ExtractedInsight> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+
+    content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<ExtractedInsight>(line).ok())
+        .filter(|i| i.pane_id as u64 == pane_id)
+        .collect()
 }
 
 impl View for TerminalsView {

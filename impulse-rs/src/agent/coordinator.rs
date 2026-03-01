@@ -154,6 +154,7 @@ mod tests {
             timestamp: Utc::now(),
             insight_type,
             content: content.to_string(),
+            intent: None,
         }
     }
 
@@ -192,6 +193,7 @@ mod tests {
                 timestamp: now,
                 insight_type: InsightType::FileModified,
                 content: "src/lib.rs".to_string(),
+                intent: None,
             },
             ExtractedInsight {
                 pane_id: 2,
@@ -199,6 +201,7 @@ mod tests {
                 timestamp: now,
                 insight_type: InsightType::ErrorEncountered,
                 content: "cannot find module lib".to_string(),
+                intent: None,
             },
         ];
         let errors = detect_cross_pane_errors(&insights);

@@ -118,12 +118,12 @@ pub struct TuiState {
     pub last_context_tick: std::time::Instant,
     pub context_lifecycle_enabled: bool,
     // MIER pipeline state
-    pub impulse_agent: Option<crate::impulse_agent::ImpulseAgent>,
-    pub mier_recommendations: Vec<crate::impulse_agent::coordinator::Recommendation>,
+    pub impulse_agent: Option<crate::agent::ImpulseAgent>,
+    pub mier_recommendations: Vec<crate::agent::coordinator::Recommendation>,
     pub mier_activity_feed: Vec<MierFeedEntry>,
     pub notification_bus: std::sync::Arc<crate::notification::NotificationBus>,
     // Intent detection
-    pub intent_store: crate::intent::IntentStore,
+    pub intent_store: crate::context_lifecycle::IntentStore,
 }
 
 /// Represents a terminal tab (running agent session)
@@ -165,7 +165,7 @@ impl TuiState {
 
         // Resolve ImpulseAgent from config before moving state into struct
         let impulse_agent = state.config_snapshot().ok().and_then(|c| {
-            crate::impulse_agent::resolve_from_config(
+            crate::agent::resolve_from_config(
                 c.impulse_agent_provider.as_deref(),
                 c.impulse_agent_api_key.as_deref(),
                 c.impulse_agent_model.as_deref(),
@@ -223,7 +223,7 @@ impl TuiState {
             mier_recommendations: Vec::new(),
             mier_activity_feed: Vec::new(),
             notification_bus: std::sync::Arc::new(crate::notification::NotificationBus::new()),
-            intent_store: crate::intent::IntentStore::new(),
+            intent_store: crate::context_lifecycle::IntentStore::new(),
         }
     }
 }
@@ -954,24 +954,24 @@ fn context_lifecycle_tick(state: &mut TuiState) {
             // Feed insights to intent detection
             for insight in &all_insights {
                 let agent_type = match insight.agent_kind {
-                    AgentKind::ClaudeCode => crate::intent::AgentType::Claude,
-                    AgentKind::Codex => crate::intent::AgentType::Codex,
-                    AgentKind::OpenCode => crate::intent::AgentType::OpenCode,
-                    AgentKind::GenericShell => crate::intent::AgentType::Shell,
+                    AgentKind::ClaudeCode => crate::context_lifecycle::AgentType::Claude,
+                    AgentKind::Codex => crate::context_lifecycle::AgentType::Codex,
+                    AgentKind::OpenCode => crate::context_lifecycle::AgentType::OpenCode,
+                    AgentKind::GenericShell => crate::context_lifecycle::AgentType::Shell,
                 };
                 let activity_type = match insight.insight_type {
                     crate::context_lifecycle::types::InsightType::FileModified => {
-                        crate::intent::ActivityType::FileEdit
+                        crate::context_lifecycle::ActivityType::FileEdit
                     }
                     crate::context_lifecycle::types::InsightType::ErrorEncountered => {
-                        crate::intent::ActivityType::Error
+                        crate::context_lifecycle::ActivityType::Error
                     }
                     crate::context_lifecycle::types::InsightType::TaskCompleted
                     | crate::context_lifecycle::types::InsightType::DecisionMade => {
-                        crate::intent::ActivityType::Output
+                        crate::context_lifecycle::ActivityType::Output
                     }
                 };
-                let activity = crate::intent::Activity::new(
+                let activity = crate::context_lifecycle::Activity::new(
                     format!("pane-{}", insight.pane_id),
                     agent_type,
                     activity_type,
@@ -2342,18 +2342,10 @@ fn render_mier_panel(f: &mut Frame, area: Rect, state: &TuiState) {
         )));
         for rec in state.mier_recommendations.iter().rev().take(3) {
             let (icon, color) = match rec.recommendation_type {
-                crate::impulse_agent::coordinator::RecommendationType::FileConflict => {
-                    ("!", COLOR_ERROR)
-                }
-                crate::impulse_agent::coordinator::RecommendationType::ErrorAssist => {
-                    ("?", COLOR_WARNING)
-                }
-                crate::impulse_agent::coordinator::RecommendationType::CrossPaneSync => {
-                    ("~", COLOR_ACCENT)
-                }
-                crate::impulse_agent::coordinator::RecommendationType::TaskComplete => {
-                    ("v", COLOR_SUCCESS)
-                }
+                crate::agent::coordinator::RecommendationType::FileConflict => ("!", COLOR_ERROR),
+                crate::agent::coordinator::RecommendationType::ErrorAssist => ("?", COLOR_WARNING),
+                crate::agent::coordinator::RecommendationType::CrossPaneSync => ("~", COLOR_ACCENT),
+                crate::agent::coordinator::RecommendationType::TaskComplete => ("v", COLOR_SUCCESS),
             };
             let desc = if rec.description.len() > 50 {
                 format!("{}...", &rec.description[..50])

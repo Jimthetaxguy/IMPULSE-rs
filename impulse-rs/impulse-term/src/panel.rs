@@ -19,7 +19,7 @@ use std::sync::Arc;
 use eframe::egui;
 
 use crate::backend::TerminalBackend;
-use crate::context::{AgentKind, ContextBridge, ContextHealth, ContextTier};
+use crate::context::{AgentKind, ContextBridge, ContextHealth, ContextTier, ExtractedInsight};
 use crate::input;
 use crate::renderer::TerminalRenderer;
 use crate::theme::TerminalTheme;
@@ -399,6 +399,16 @@ impl TerminalPanel {
     /// Get context health for status bar display.
     pub fn context_health(&self) -> ContextHealth {
         self.context.health()
+    }
+
+    /// Get current context tier (immutable).
+    pub fn current_tier(&self) -> ContextTier {
+        self.context.current_tier()
+    }
+
+    /// Get accumulated insights (immutable).
+    pub fn insights(&self) -> &[ExtractedInsight] {
+        self.context.insights()
     }
 
     /// Set focus state.

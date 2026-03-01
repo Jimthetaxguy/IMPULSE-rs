@@ -53,6 +53,9 @@ pub struct ImpulseApp {
     // Context lifecycle.
     last_context_tick: Instant,
 
+    // Search tracking (for live insight search).
+    last_search_query: String,
+
     // Notifications.
     notifications: NotificationManager,
 }
@@ -81,6 +84,8 @@ impl ImpulseApp {
             _poller_thread: Some(poller_thread),
 
             last_context_tick: Instant::now(),
+
+            last_search_query: String::new(),
 
             notifications: NotificationManager::new(),
         }
@@ -237,6 +242,24 @@ impl eframe::App for ImpulseApp {
             self.last_context_tick = now;
             self.terminals.context_tick();
 
+            // Check tier crossings and inject refresh context.
+            let genome_decisions: Vec<String> = self
+                .shared_state
+                .lock()
+                .ok()
+                .and_then(|s| {
+                    s.genome.as_ref().map(|g| {
+                        g.decisions
+                            .iter()
+                            .rev()
+                            .take(5)
+                            .map(|d| d.description.clone())
+                            .collect()
+                    })
+                })
+                .unwrap_or_default();
+            self.terminals.check_threshold_injections(&genome_decisions);
+
             // Update activity feed display (every tick, ~3s — cheap Vec swap).
             if self.agent_visible {
                 let insights = self.terminals.collected_insights();
@@ -317,6 +340,27 @@ impl eframe::App for ImpulseApp {
                 .show(ctx, |ui| {
                     self.agent_panel.ui(ui, ctx);
                 });
+        }
+
+        // --- Live search: populate live results when search query changes ---
+        {
+            let current_query = state.search_query.clone();
+            if current_query != self.last_search_query {
+                self.last_search_query = current_query.clone();
+                if current_query.is_empty() {
+                    state.live_search_results.clear();
+                } else {
+                    let live = self.terminals.search_live_insights(&current_query);
+                    state.live_search_results = live
+                        .into_iter()
+                        .map(|r| crate::state::LiveSearchResult {
+                            title: r.title,
+                            agent: r.agent,
+                            timestamp: r.timestamp,
+                        })
+                        .collect();
+                }
+            }
         }
 
         // --- Dispatch agent panel actions ---

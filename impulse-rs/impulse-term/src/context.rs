@@ -382,6 +382,11 @@ impl ContextBridge {
         self.pane_id
     }
 
+    /// The current context tier.
+    pub fn current_tier(&self) -> ContextTier {
+        self.current_tier
+    }
+
     /// Wrap content in agent-appropriate delimiters.
     fn wrap_injection(&self, content: &str) -> String {
         let tier = self.current_tier.as_str();

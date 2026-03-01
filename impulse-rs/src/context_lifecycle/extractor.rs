@@ -30,6 +30,7 @@ impl OutputExtractor {
                     timestamp: Utc::now(),
                     insight_type: InsightType::FileModified,
                     content: path,
+                    intent: None,
                 });
             }
 
@@ -41,6 +42,7 @@ impl OutputExtractor {
                     timestamp: Utc::now(),
                     insight_type: InsightType::ErrorEncountered,
                     content: err,
+                    intent: None,
                 });
             }
 
@@ -52,6 +54,7 @@ impl OutputExtractor {
                     timestamp: Utc::now(),
                     insight_type: InsightType::DecisionMade,
                     content: decision,
+                    intent: None,
                 });
             }
 
@@ -63,6 +66,7 @@ impl OutputExtractor {
                     timestamp: Utc::now(),
                     insight_type: InsightType::TaskCompleted,
                     content: task,
+                    intent: None,
                 });
             }
         }

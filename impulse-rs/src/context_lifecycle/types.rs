@@ -7,6 +7,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
+use super::intent::IntentCategory;
+
 /// The kind of AI agent running in a terminal pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -121,6 +123,9 @@ pub struct ExtractedInsight {
     pub timestamp: DateTime<Utc>,
     pub insight_type: InsightType,
     pub content: String,
+    /// Optional classified intent category for this insight.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intent: Option<IntentCategory>,
 }
 
 /// Tracks the context lifecycle state for a single pane.
@@ -288,6 +293,7 @@ mod tests {
                 timestamp: Utc::now(),
                 insight_type: InsightType::FileModified,
                 content: format!("file-{}.rs", i),
+                intent: None,
             });
         }
         assert_eq!(state.extracted_insights.len(), MAX_INSIGHTS_PER_PANE);

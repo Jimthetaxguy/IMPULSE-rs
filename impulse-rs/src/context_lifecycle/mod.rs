@@ -15,10 +15,15 @@
 pub mod detector;
 pub mod extractor;
 pub mod injector;
+pub mod intent;
 pub mod monitor;
 pub mod templates;
 pub mod types;
 
+pub use intent::{
+    Activity, ActivityType, AgentIntent, AgentType, Complexity, IntentCategory, IntentConflict,
+    IntentContext, IntentStore, RuleBasedClassifier,
+};
 pub use types::{
     AgentKind, ContextTier, ExtractedInsight, InsightType, MonitorAction, PaneContextState,
     PendingInjection,
