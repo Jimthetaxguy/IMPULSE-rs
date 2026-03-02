@@ -19,7 +19,7 @@ use eframe::egui;
 use crate::agent_panel::actions::PanelAction;
 use crate::agent_panel::AgentPanel;
 use crate::global_config::GlobalConfig;
-use crate::state::{self, PollerCommand, StateHandle};
+use crate::state::{self, ConnectionStatus, PollerCommand, StateHandle};
 use crate::views::genome::GenomeView;
 use crate::views::search::SearchView;
 use crate::views::sessions::SessionsView;
@@ -398,10 +398,24 @@ impl eframe::App for ImpulseApp {
         // --- Shared State Locking & UI Layout ---
         // Extract connection status BEFORE the lock scope so that
         // agent_panel.ui() can resolve the backend without re-locking.
-        let connection = self.shared_state.lock().unwrap().connection;
+        // Use .ok() to handle mutex poisoning gracefully instead of panicking.
+        let connection = self
+            .shared_state
+            .lock()
+            .map(|s| s.connection)
+            .unwrap_or(ConnectionStatus::Disconnected);
         self.agent_panel.set_connection_status(connection);
 
-        let mut state = self.shared_state.lock().unwrap();
+        let Ok(mut state) = self.shared_state.lock() else {
+            // Mutex poisoned (poller thread panicked) — show error, skip frame.
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.colored_label(
+                    egui::Color32::RED,
+                    "Internal error: state lock poisoned. Please restart Impulse.",
+                );
+            });
+            return;
+        };
 
         // --- Error Banner ---
         let mut clear_error = false;

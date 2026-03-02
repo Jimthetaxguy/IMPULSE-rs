@@ -7,6 +7,7 @@
 
 mod agent_panel;
 mod app;
+mod error;
 mod global_config;
 mod identity;
 mod ipc;

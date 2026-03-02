@@ -70,7 +70,9 @@ impl DaemonClient {
             self.stream = Some(stream);
         }
 
-        Ok(self.stream.as_mut().unwrap())
+        self.stream
+            .as_mut()
+            .ok_or_else(|| "stream not initialized after connect".to_string())
     }
 
     /// Send a request and read one response line.

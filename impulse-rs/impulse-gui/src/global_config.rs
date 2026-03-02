@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::GuiError;
+
 const MAX_RECENT_PROJECTS: usize = 10;
 
 /// Application-level configuration stored at `~/.impulse/config.json`.
@@ -31,7 +33,7 @@ impl GlobalConfig {
     }
 
     /// Load from `<dir>/config.json`. Returns default if file doesn't exist.
-    pub fn load(impulse_dir: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn load(impulse_dir: &Path) -> Result<Self, GuiError> {
         let path = impulse_dir.join("config.json");
         if !path.exists() {
             return Ok(Self::default());
@@ -42,7 +44,7 @@ impl GlobalConfig {
     }
 
     /// Save to `<dir>/config.json` using atomic write (temp + rename).
-    pub fn save(&self, impulse_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn save(&self, impulse_dir: &Path) -> Result<(), GuiError> {
         std::fs::create_dir_all(impulse_dir)?;
         let path = impulse_dir.join("config.json");
         let content = serde_json::to_string_pretty(self)?;
