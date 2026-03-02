@@ -161,12 +161,15 @@ CREATE TABLE IF NOT EXISTS genome_vec (
         Ok(out)
     }
 
-    pub fn try_load_vec_extension(&self) -> Result<bool> {
-        let ext_path = match std::env::var("IMPULSE_SQLITE_VEC_EXT")
-            .or_else(|_| std::env::var("COCKPIT_SQLITE_VEC_EXT"))
-        {
-            Ok(v) if !v.trim().is_empty() => v,
-            _ => return Ok(false),
+    pub fn try_load_vec_extension(&self, ext_path_override: Option<&str>) -> Result<bool> {
+        let ext_path = match ext_path_override {
+            Some(p) => p.to_string(),
+            None => match std::env::var("IMPULSE_SQLITE_VEC_EXT")
+                .or_else(|_| std::env::var("COCKPIT_SQLITE_VEC_EXT"))
+            {
+                Ok(v) if !v.trim().is_empty() => v,
+                _ => return Ok(false),
+            },
         };
 
         // Validate extension path before unsafe load
@@ -1090,9 +1093,7 @@ mod tests {
     #[test]
     fn test_extension_path_rejects_relative() {
         let (_tmp, store) = open_test_store();
-        std::env::set_var("IMPULSE_SQLITE_VEC_EXT", "relative/path/vec.so");
-        let result = store.try_load_vec_extension();
-        std::env::remove_var("IMPULSE_SQLITE_VEC_EXT");
+        let result = store.try_load_vec_extension(Some("relative/path/vec.so"));
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("absolute path"),
@@ -1103,9 +1104,7 @@ mod tests {
     #[test]
     fn test_extension_path_rejects_traversal() {
         let (_tmp, store) = open_test_store();
-        std::env::set_var("IMPULSE_SQLITE_VEC_EXT", "/usr/lib/../etc/vec.so");
-        let result = store.try_load_vec_extension();
-        std::env::remove_var("IMPULSE_SQLITE_VEC_EXT");
+        let result = store.try_load_vec_extension(Some("/usr/lib/../etc/vec.so"));
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains(".."),
@@ -1116,9 +1115,9 @@ mod tests {
     #[test]
     fn test_extension_path_missing_file_returns_false() {
         let (_tmp, store) = open_test_store();
-        std::env::set_var("IMPULSE_SQLITE_VEC_EXT", "/nonexistent/path/vec.so");
-        let result = store.try_load_vec_extension().unwrap();
-        std::env::remove_var("IMPULSE_SQLITE_VEC_EXT");
+        let result = store
+            .try_load_vec_extension(Some("/nonexistent/path/vec.so"))
+            .unwrap();
         assert!(!result, "missing extension file should return Ok(false)");
     }
 }

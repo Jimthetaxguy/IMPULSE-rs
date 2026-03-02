@@ -375,6 +375,7 @@ impl eframe::App for ImpulseApp {
             self.global_config.add_recent_project(selected_dir.clone());
             self.global_config.last_project = Some(selected_dir.clone());
             self.current_project = Some(selected_dir.clone());
+            self.terminals.set_project_dir(&selected_dir);
             let _ = self.global_config.save(&GlobalConfig::impulse_home());
             self.project_selector
                 .update_recents(self.global_config.recent_projects.clone());

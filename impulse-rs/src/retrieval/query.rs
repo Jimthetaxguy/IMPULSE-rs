@@ -658,7 +658,7 @@ pub fn search_history(
     for backend in backends {
         match backend {
             SearchBackend::SqliteVec => {
-                if !store.try_load_vec_extension().unwrap_or(false) {
+                if !store.try_load_vec_extension(None).unwrap_or(false) {
                     notes.push("sqlite-vec unavailable".to_string());
                     continue;
                 }
@@ -817,7 +817,7 @@ pub fn search_genome(
     for backend in backends {
         match backend {
             SearchBackend::SqliteVec => {
-                if !store.try_load_vec_extension().unwrap_or(false) {
+                if !store.try_load_vec_extension(None).unwrap_or(false) {
                     notes.push("sqlite-vec unavailable".to_string());
                     continue;
                 }

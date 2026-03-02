@@ -1,6 +1,7 @@
 //! View abstraction — each workbench panel implements `View`.
 
 pub mod genome;
+pub mod memory_persistence;
 pub mod search;
 pub mod sessions;
 pub mod settings;

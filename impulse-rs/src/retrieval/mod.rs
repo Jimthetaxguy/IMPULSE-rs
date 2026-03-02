@@ -92,7 +92,7 @@ pub fn status(base_path: &Path, config: &Config, check: bool) -> Result<Retrieva
         RetrievalStore::open(base_path)
             .and_then(|store| {
                 store.init_schema()?;
-                store.try_load_vec_extension()
+                store.try_load_vec_extension(None)
             })
             .unwrap_or(false)
     } else {

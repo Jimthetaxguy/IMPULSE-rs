@@ -227,7 +227,7 @@ pub fn index_memory(
     let vector_enabled = config.retrieval_vector_enabled && config.retrieval_backend == "fts+vec";
     let mut vector_available = false;
     if vector_enabled {
-        vector_available = store.try_load_vec_extension().unwrap_or(false);
+        vector_available = store.try_load_vec_extension(None).unwrap_or(false);
         if !vector_available {
             notes.push(
                 "sqlite-vec extension unavailable; semantic sqlite path will fall back to rust-cosine/keyword"
@@ -402,7 +402,7 @@ pub fn index_memory_from_storage(
     let vector_enabled = config.retrieval_vector_enabled && config.retrieval_backend == "fts+vec";
     let mut vector_available = false;
     if vector_enabled {
-        vector_available = store.try_load_vec_extension().unwrap_or(false);
+        vector_available = store.try_load_vec_extension(None).unwrap_or(false);
         if !vector_available {
             notes.push(
                 "sqlite-vec extension unavailable; semantic sqlite path will fall back to rust-cosine/keyword"
