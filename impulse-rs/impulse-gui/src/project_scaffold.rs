@@ -2,6 +2,8 @@
 
 use std::path::Path;
 
+use crate::error::GuiError;
+
 const GENOME_TEMPLATE: &str = r#"{
   "decisions": [],
   "preferences": [],
@@ -17,7 +19,7 @@ pub fn needs_scaffold(target: &Path) -> bool {
 }
 
 /// Create `.impulse/` with starter files in a target project directory.
-pub fn scaffold_impulse_dir(target: &Path) -> Result<(), Box<dyn std::error::Error>> {
+pub fn scaffold_impulse_dir(target: &Path) -> Result<(), GuiError> {
     let impulse_dir = target.join(".impulse");
     std::fs::create_dir_all(&impulse_dir)?;
 
@@ -39,8 +41,10 @@ pub fn scaffold_impulse_dir(target: &Path) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-fn atomic_write(path: &Path, content: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let parent = path.parent().ok_or("no parent directory")?;
+fn atomic_write(path: &Path, content: &str) -> Result<(), GuiError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| GuiError::Scaffold("no parent directory".to_string()))?;
     let tmp_path = parent.join(format!(
         ".tmp.{}.{}",
         std::process::id(),

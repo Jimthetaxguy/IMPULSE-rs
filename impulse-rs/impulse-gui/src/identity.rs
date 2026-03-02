@@ -5,6 +5,8 @@
 
 use std::path::Path;
 
+use crate::error::GuiError;
+
 /// The Impulse agent's identity (CLAUDE.md content).
 const IMPULSE_CLAUDE_MD: &str = r#"# Impulse — AI Agent Coordinator
 
@@ -95,7 +97,7 @@ These injections appear as system messages. They are from Impulse, not from the 
 
 /// Ensure identity files exist in the given directory.
 /// Does NOT overwrite existing files (user may have customized them).
-pub fn ensure_identity_files(impulse_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+pub fn ensure_identity_files(impulse_dir: &Path) -> Result<(), GuiError> {
     std::fs::create_dir_all(impulse_dir)?;
 
     let claude_md = impulse_dir.join("CLAUDE.md");
@@ -112,7 +114,7 @@ pub fn ensure_identity_files(impulse_dir: &Path) -> Result<(), Box<dyn std::erro
 }
 
 /// Load the Impulse agent identity from CLAUDE.md.
-pub fn load_identity(impulse_dir: &Path) -> Result<String, Box<dyn std::error::Error>> {
+pub fn load_identity(impulse_dir: &Path) -> Result<String, GuiError> {
     let claude_md = impulse_dir.join("CLAUDE.md");
     if claude_md.exists() {
         Ok(std::fs::read_to_string(&claude_md)?)

@@ -600,7 +600,9 @@ impl View for TerminalsView {
             let mut close_id = None;
 
             for id in &tab_ids {
-                let tab = self.tabs.get_mut(id).unwrap();
+                let Some(tab) = self.tabs.get_mut(id) else {
+                    continue;
+                };
                 let is_active = self.active_tab == Some(*id);
                 let color = theme::agent_color(tab.agent_name);
 
