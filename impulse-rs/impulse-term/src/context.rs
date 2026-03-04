@@ -587,7 +587,7 @@ fn extract_task_completed(line: &str) -> Option<String> {
 }
 
 /// Truncate a string to max_len, adding "..." if truncated. UTF-8 safe.
-fn truncate_insight(s: &str, max_len: usize) -> String {
+pub fn truncate_insight(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
     } else {

@@ -366,13 +366,22 @@ impl eframe::App for ImpulseApp {
                 }
             }
 
-            // Sync tab badges for rendering.
-            self.terminals.tab_badges = self.signal_bus.all_tab_badges().clone();
+            // Sync tab badges for rendering (only when changed).
+            if self.signal_bus.badges_dirty() {
+                self.terminals
+                    .set_tab_badges(self.signal_bus.all_tab_badges().clone());
+                self.signal_bus.mark_badges_clean();
+            }
         }
 
         // Handle badge acknowledgment from tab clicks.
-        if let Some(tab_id) = self.terminals.badge_acknowledged_tab.take() {
+        if let Some(tab_id) = self.terminals.take_badge_ack() {
             self.signal_bus.acknowledge_tab(tab_id);
+        }
+
+        // Clean up signal bus state for closed tabs.
+        for tab_id in self.terminals.take_closed_tabs() {
+            self.signal_bus.remove_tab(tab_id);
         }
 
         // Process pending init injections.

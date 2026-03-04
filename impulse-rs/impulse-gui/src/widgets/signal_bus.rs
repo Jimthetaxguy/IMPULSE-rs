@@ -116,12 +116,20 @@ fn debounce_key(kind: &SignalKind, tab_id: Option<u64>) -> String {
 // SignalBus
 // ---------------------------------------------------------------------------
 
+/// Maximum debounce window across all signal kinds (seconds).
+const MAX_DEBOUNCE_SECS: u64 = 60;
+
+/// How often to prune stale debounce entries (seconds).
+const PRUNE_INTERVAL_SECS: u64 = 60;
+
 /// Collects, debounces, and routes signals to visual surfaces.
 pub struct SignalBus {
     pending: Vec<GuiSignal>,
     tab_badges: BTreeMap<u64, TabBadge>,
     debounce: HashMap<String, Instant>,
     summary: SignalSummary,
+    badges_dirty: bool,
+    last_prune: Instant,
 }
 
 impl SignalBus {
@@ -131,11 +139,16 @@ impl SignalBus {
             tab_badges: BTreeMap::new(),
             debounce: HashMap::new(),
             summary: SignalSummary::default(),
+            badges_dirty: false,
+            last_prune: Instant::now(),
         }
     }
 
     /// Emit a signal into the bus. Returns `true` if accepted (not debounced).
     pub fn emit(&mut self, signal: GuiSignal) -> bool {
+        // Periodically prune stale debounce entries.
+        self.prune_stale_debounce();
+
         let key = debounce_key(&signal.kind, signal.tab_id);
         let window = debounce_window(&signal.kind);
 
@@ -154,12 +167,31 @@ impl SignalBus {
         // Update tab badge.
         if let Some(tab_id) = signal.tab_id {
             let badge = self.tab_badges.entry(tab_id).or_default();
-            match &signal.kind {
-                SignalKind::ErrorEncountered => badge.has_error = true,
-                SignalKind::TaskCompleted => badge.has_task_complete = true,
-                SignalKind::CompactionDetected => badge.has_compaction = true,
-                SignalKind::FileConflict { .. } => badge.has_conflict = true,
-                SignalKind::ContextThreshold { .. } => {} // no badge, handled by tier icon
+            let changed = match &signal.kind {
+                SignalKind::ErrorEncountered => {
+                    let was = badge.has_error;
+                    badge.has_error = true;
+                    !was
+                }
+                SignalKind::TaskCompleted => {
+                    let was = badge.has_task_complete;
+                    badge.has_task_complete = true;
+                    !was
+                }
+                SignalKind::CompactionDetected => {
+                    let was = badge.has_compaction;
+                    badge.has_compaction = true;
+                    !was
+                }
+                SignalKind::FileConflict { .. } => {
+                    let was = badge.has_conflict;
+                    badge.has_conflict = true;
+                    !was
+                }
+                SignalKind::ContextThreshold { .. } => false, // no badge, handled by tier icon
+            };
+            if changed {
+                self.badges_dirty = true;
             }
         }
 
@@ -198,11 +230,11 @@ impl SignalBus {
             }
             // Reset badge.
             *badge = TabBadge::default();
+            self.badges_dirty = true;
         }
     }
 
     /// Remove a tab's badge state on tab close.
-    #[allow(dead_code)]
     pub fn remove_tab(&mut self, id: u64) {
         if let Some(badge) = self.tab_badges.remove(&id) {
             // Decrement summary counters.
@@ -212,7 +244,18 @@ impl SignalBus {
             if badge.has_conflict {
                 self.summary.active_conflicts = self.summary.active_conflicts.saturating_sub(1);
             }
+            self.badges_dirty = true;
         }
+    }
+
+    /// Whether badge state has changed since the last `mark_badges_clean()` call.
+    pub fn badges_dirty(&self) -> bool {
+        self.badges_dirty
+    }
+
+    /// Mark badge state as synced (caller has cloned the badges).
+    pub fn mark_badges_clean(&mut self) {
+        self.badges_dirty = false;
     }
 
     /// Aggregate summary for the status bar.
@@ -223,6 +266,19 @@ impl SignalBus {
     /// All tab badges (for syncing to the terminals view).
     pub fn all_tab_badges(&self) -> &BTreeMap<u64, TabBadge> {
         &self.tab_badges
+    }
+
+    /// Remove debounce entries older than 2× the max debounce window.
+    /// Called from `emit()` at most once per `PRUNE_INTERVAL_SECS`.
+    fn prune_stale_debounce(&mut self) {
+        let now = Instant::now();
+        if now.duration_since(self.last_prune) < Duration::from_secs(PRUNE_INTERVAL_SECS) {
+            return;
+        }
+        self.last_prune = now;
+        let cutoff = Duration::from_secs(MAX_DEBOUNCE_SECS * 2);
+        self.debounce
+            .retain(|_, ts| now.duration_since(*ts) < cutoff);
     }
 }
 
@@ -550,5 +606,57 @@ mod tests {
             ..Default::default()
         };
         assert!(!badge.is_empty());
+    }
+
+    #[test]
+    fn test_debounce_prune_removes_stale_entries() {
+        let mut bus = SignalBus::new();
+        let old = Instant::now() - Duration::from_secs(300); // 5 minutes ago
+
+        // Manually insert a stale debounce entry.
+        bus.debounce.insert("stale:1".into(), old);
+        bus.debounce.insert("fresh:2".into(), Instant::now());
+        assert_eq!(bus.debounce.len(), 2);
+
+        // Force prune by setting last_prune far in the past.
+        bus.last_prune = old;
+        bus.prune_stale_debounce();
+
+        // Stale entry (300s old, cutoff is 120s) should be removed.
+        assert_eq!(bus.debounce.len(), 1);
+        assert!(bus.debounce.contains_key("fresh:2"));
+    }
+
+    #[test]
+    fn test_badges_dirty_flag() {
+        let mut bus = SignalBus::new();
+        assert!(!bus.badges_dirty());
+
+        bus.emit(make_signal(
+            SignalKind::ErrorEncountered,
+            SignalUrgency::Important,
+            Some(1),
+        ));
+        assert!(bus.badges_dirty());
+
+        bus.mark_badges_clean();
+        assert!(!bus.badges_dirty());
+
+        // Acknowledging also sets dirty.
+        bus.acknowledge_tab(1);
+        assert!(bus.badges_dirty());
+
+        bus.mark_badges_clean();
+        assert!(!bus.badges_dirty());
+
+        // Removing also sets dirty.
+        bus.emit(make_signal(
+            SignalKind::ErrorEncountered,
+            SignalUrgency::Important,
+            Some(2),
+        ));
+        bus.mark_badges_clean();
+        bus.remove_tab(2);
+        assert!(bus.badges_dirty());
     }
 }

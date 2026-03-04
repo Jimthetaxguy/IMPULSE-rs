@@ -3,7 +3,7 @@
 //! Uses `impulse_term::TerminalPanel` for full PTY read/write access,
 //! context lifecycle integration, and vt100-based rendering.
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -74,10 +74,12 @@ pub struct TerminalsView {
     last_injected_tiers: BTreeMap<u64, ContextTier>,
     /// State snapshots for signal change detection.
     tab_snapshots: BTreeMap<u64, TabSnapshot>,
-    /// Tab badges synced from SignalBus each frame.
-    pub tab_badges: BTreeMap<u64, TabBadge>,
+    /// Tab badges synced from SignalBus.
+    tab_badges: BTreeMap<u64, TabBadge>,
     /// Tab whose badges should be acknowledged (set by tab click, consumed by app.rs).
-    pub badge_acknowledged_tab: Option<u64>,
+    badge_acknowledged_tab: Option<u64>,
+    /// Tabs closed this frame, pending signal_bus.remove_tab() in app.rs.
+    closed_tabs: Vec<u64>,
 }
 
 impl TerminalsView {
@@ -129,6 +131,7 @@ impl TerminalsView {
             tab_snapshots: BTreeMap::new(),
             tab_badges: BTreeMap::new(),
             badge_acknowledged_tab: None,
+            closed_tabs: Vec::new(),
         }
     }
 
@@ -317,6 +320,7 @@ impl TerminalsView {
         self.last_injected_tiers.remove(&id);
         self.tab_snapshots.remove(&id);
         self.tab_badges.remove(&id);
+        self.closed_tabs.push(id);
         if self.active_tab == Some(id) {
             self.active_tab = self
                 .tabs
@@ -376,6 +380,21 @@ impl TerminalsView {
     /// Tab count for status bar display.
     pub fn tab_count(&self) -> usize {
         self.tabs.len()
+    }
+
+    /// Set tab badges from SignalBus (replaces direct field access).
+    pub fn set_tab_badges(&mut self, badges: BTreeMap<u64, TabBadge>) {
+        self.tab_badges = badges;
+    }
+
+    /// Consume the badge acknowledgment (set by tab click).
+    pub fn take_badge_ack(&mut self) -> Option<u64> {
+        self.badge_acknowledged_tab.take()
+    }
+
+    /// Consume closed tab IDs (for signal_bus.remove_tab calls).
+    pub fn take_closed_tabs(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.closed_tabs)
     }
 
     /// Active agent info for the status bar.
@@ -487,6 +506,9 @@ impl TerminalsView {
     /// - Context tier crossings (60%, 80%)
     /// - Cross-tab file conflicts from modified_files set intersection
     pub fn collect_signals(&mut self) -> Vec<GuiSignal> {
+        if self.tabs.is_empty() {
+            return Vec::new();
+        }
         let mut signals = Vec::new();
         let now = Instant::now();
         let tab_ids: Vec<u64> = self.tabs.keys().copied().collect();
@@ -517,7 +539,7 @@ impl TerminalsView {
                                 message: format!(
                                     "[{}] Error: {}",
                                     tab.label,
-                                    truncate_message(&insight.content, 80)
+                                    impulse_term::context::truncate_insight(&insight.content, 80)
                                 ),
                                 created_at: now,
                             });
@@ -530,7 +552,7 @@ impl TerminalsView {
                                 message: format!(
                                     "[{}] Task completed: {}",
                                     tab.label,
-                                    truncate_message(&insight.content, 60)
+                                    impulse_term::context::truncate_insight(&insight.content, 60)
                                 ),
                                 created_at: now,
                             });
@@ -594,43 +616,54 @@ impl TerminalsView {
             }
         }
 
-        // Phase 2: Cross-tab file conflict detection.
-        // For each tab's modified files, check if any other tab also modified that file.
+        // Phase 2: Single-pass conflict detection via file→owners map.
+        let mut file_owners: HashMap<&str, Vec<(u64, &str)>> = HashMap::new();
         for &id in &tab_ids {
-            let Some(snapshot) = self.tab_snapshots.get(&id) else {
-                continue;
-            };
-            let files: Vec<String> = snapshot.modified_files.iter().cloned().collect();
-
-            for &other_id in &tab_ids {
-                if other_id == id {
-                    continue;
+            if let Some(snap) = self.tab_snapshots.get(&id) {
+                let label = self.tabs.get(&id).map(|t| t.label.as_str()).unwrap_or("");
+                for file in &snap.modified_files {
+                    file_owners
+                        .entry(file.as_str())
+                        .or_default()
+                        .push((id, label));
                 }
-                let Some(other_snapshot) = self.tab_snapshots.get(&other_id) else {
-                    continue;
-                };
-                let other_label = self
-                    .tabs
-                    .get(&other_id)
-                    .map(|t| t.label.clone())
-                    .unwrap_or_default();
-
-                for file in &files {
-                    if other_snapshot.modified_files.contains(file) {
-                        signals.push(GuiSignal {
-                            kind: SignalKind::FileConflict {
-                                path: file.clone(),
-                                other_tab: other_label.clone(),
-                            },
-                            urgency: SignalUrgency::Urgent,
-                            tab_id: Some(id),
-                            message: format!(
-                                "Conflict: {} edited in both tabs (also in {})",
-                                file, other_label
-                            ),
-                            created_at: now,
-                        });
-                    }
+            }
+        }
+        for (file, owners) in &file_owners {
+            if owners.len() < 2 {
+                continue;
+            }
+            for i in 0..owners.len() {
+                for j in (i + 1)..owners.len() {
+                    let (id_a, label_a) = owners[i];
+                    let (id_b, label_b) = owners[j];
+                    // Emit one signal per direction (A sees B, B sees A).
+                    signals.push(GuiSignal {
+                        kind: SignalKind::FileConflict {
+                            path: file.to_string(),
+                            other_tab: label_b.to_string(),
+                        },
+                        urgency: SignalUrgency::Urgent,
+                        tab_id: Some(id_a),
+                        message: format!(
+                            "Conflict: {} edited in both tabs (also in {})",
+                            file, label_b
+                        ),
+                        created_at: now,
+                    });
+                    signals.push(GuiSignal {
+                        kind: SignalKind::FileConflict {
+                            path: file.to_string(),
+                            other_tab: label_a.to_string(),
+                        },
+                        urgency: SignalUrgency::Urgent,
+                        tab_id: Some(id_b),
+                        message: format!(
+                            "Conflict: {} edited in both tabs (also in {})",
+                            file, label_a
+                        ),
+                        created_at: now,
+                    });
                 }
             }
         }
@@ -1164,20 +1197,6 @@ fn context_tier_display_from(usage_fraction: f32) -> (&'static str, egui::Color3
         ("\u{25D1}", colors::RED) // ◑ red
     } else {
         ("\u{25CB}", colors::RED) // ○ red
-    }
-}
-
-/// Truncate a message to a maximum length with ellipsis.
-fn truncate_message(s: &str, max_len: usize) -> &str {
-    if s.len() <= max_len {
-        s
-    } else {
-        // Find a safe char boundary.
-        let mut end = max_len;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        &s[..end]
     }
 }
 
