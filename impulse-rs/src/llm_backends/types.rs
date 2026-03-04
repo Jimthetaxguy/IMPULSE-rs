@@ -146,7 +146,7 @@ impl AgentConfig {
     ) -> Self {
         Self::new(id, name, AgentType::Anthropic)
             .with_api_key(api_key)
-            .with_model("claude-sonnet-4-20250514")
+            .with_model("claude-sonnet-4-6")
     }
 
     /// Create config for OpenAI API

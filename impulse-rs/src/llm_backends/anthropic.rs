@@ -106,11 +106,7 @@ pub struct AnthropicProvider(BaseProvider);
 
 impl AnthropicProvider {
     pub fn new(api_key: String) -> Self {
-        Self(BaseProvider::new(
-            "anthropic",
-            api_key,
-            "claude-sonnet-4-20250514",
-        ))
+        Self(BaseProvider::new("anthropic", api_key, "claude-sonnet-4-6"))
     }
 }
 
@@ -197,12 +193,12 @@ impl LlmProvider for AnthropicProvider {
 
     fn supported_models(&self) -> Vec<&str> {
         vec![
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5",
             "claude-opus-4-5-20250514",
             "claude-sonnet-4-20250514",
-            "claude-haiku-3-5-20250514",
             "claude-3-5-sonnet-20241022",
-            "claude-3-opus-20240229",
-            "claude-3-sonnet-20240229",
         ]
     }
 }

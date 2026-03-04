@@ -45,6 +45,8 @@ pub struct TerminalPanel {
     title: String,
     agent_name: &'static str,
     scroll_offset: usize,
+    /// True when new PTY output arrived while the user is scrolled up.
+    has_new_output_while_scrolled: bool,
     /// Tracks bytes at last repaint to avoid redundant repaints.
     last_repaint_bytes: u64,
 }
@@ -107,6 +109,7 @@ impl TerminalPanel {
             title: agent_name.to_string(),
             agent_name,
             scroll_offset: 0,
+            has_new_output_while_scrolled: false,
             last_repaint_bytes: 0,
         })
     }
@@ -118,10 +121,16 @@ impl TerminalPanel {
         if current_bytes != self.last_repaint_bytes {
             self.last_repaint_bytes = current_bytes;
             ui.ctx().request_repaint();
-            // Reset scroll to bottom on new output.
+            // If the user is scrolled up, flag that new output is available
+            // below — don't force-snap them to the bottom.
             if self.scroll_offset > 0 {
-                self.scroll_offset = 0;
+                self.has_new_output_while_scrolled = true;
             }
+        }
+
+        // Clear the new-output flag when user returns to the bottom.
+        if self.scroll_offset == 0 {
+            self.has_new_output_while_scrolled = false;
         }
 
         // Handle keyboard input.
@@ -172,8 +181,9 @@ impl TerminalPanel {
                 }
 
                 // Terminal grid.
+                let grid_width = available.x - 16.0;
                 let terminal_response =
-                    ui.allocate_ui(egui::vec2(available.x - 16.0, terminal_height), |ui| {
+                    ui.allocate_ui(egui::vec2(grid_width, terminal_height), |ui| {
                         self.backend.with_parser_mut(|parser| {
                             self.renderer.render(
                                 ui,
@@ -184,6 +194,19 @@ impl TerminalPanel {
                             )
                         })
                     });
+
+                // Dynamic PTY resize — match terminal dimensions to panel size.
+                let (cell_w, cell_h) = self.renderer.cell_size();
+                if cell_w > 0.0 && cell_h > 0.0 {
+                    let new_cols = (grid_width / cell_w).floor().max(10.0) as u16;
+                    let new_rows = (terminal_height / cell_h).floor().max(1.0) as u16;
+                    let (cur_cols, cur_rows) = self.backend.size();
+                    if new_cols != cur_cols || new_rows != cur_rows {
+                        if let Err(e) = self.backend.resize(new_cols, new_rows) {
+                            log::warn!("PTY resize to {}x{} failed: {}", new_cols, new_rows, e);
+                        }
+                    }
+                }
 
                 // Check focus — clicked on the terminal area means focused.
                 let response = &terminal_response.inner;
@@ -196,13 +219,18 @@ impl TerminalPanel {
                 // Scroll badge (when scrolled up).
                 if self.scroll_offset > 0 {
                     ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "Scrolled: {} lines up",
+                        let badge_text = if self.has_new_output_while_scrolled {
+                            format!(
+                                "\u{2193} New output \u{2014} {} lines up",
                                 self.scroll_offset
-                            ))
-                            .small()
-                            .color(egui::Color32::from_rgb(0xd2, 0x99, 0x22)),
+                            )
+                        } else {
+                            format!("Scrolled: {} lines up", self.scroll_offset)
+                        };
+                        ui.label(
+                            egui::RichText::new(badge_text)
+                                .small()
+                                .color(egui::Color32::from_rgb(0xd2, 0x99, 0x22)),
                         );
                         if ui.small_button("Jump to bottom").clicked() {
                             self.scroll_offset = 0;
@@ -211,7 +239,11 @@ impl TerminalPanel {
                 }
 
                 // Status bar.
-                self.render_status_bar(ui);
+                let copy_clicked = self.render_status_bar(ui);
+                if copy_clicked {
+                    let text = self.backend.screen_text();
+                    ui.ctx().copy_text(text);
+                }
             });
 
         // Context overlay (Ctrl+Shift+C toggle).
@@ -250,6 +282,13 @@ impl TerminalPanel {
             // Ctrl+Shift+C: toggle context overlay.
             if modifiers.ctrl && modifiers.shift && *key == egui::Key::C {
                 self.show_context_overlay = !self.show_context_overlay;
+                continue;
+            }
+
+            // Ctrl+Shift+X: copy visible screen text to clipboard.
+            if modifiers.ctrl && modifiers.shift && *key == egui::Key::X {
+                let text = self.backend.screen_text();
+                ui.ctx().copy_text(text);
                 continue;
             }
 
@@ -299,8 +338,10 @@ impl TerminalPanel {
     }
 
     /// Render the status bar at the bottom of the panel.
-    fn render_status_bar(&self, ui: &mut egui::Ui) {
+    /// Returns true if the Copy button was clicked.
+    fn render_status_bar(&self, ui: &mut egui::Ui) -> bool {
         let health = self.context.health();
+        let mut copy_clicked = false;
 
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
@@ -350,7 +391,24 @@ impl TerminalPanel {
                 .small()
                 .color(egui::Color32::from_rgb(0x6e, 0x76, 0x81)),
             );
+
+            ui.separator();
+
+            // Copy button — copies visible screen text to clipboard.
+            if ui
+                .small_button(
+                    egui::RichText::new("Copy")
+                        .small()
+                        .color(egui::Color32::from_rgb(0x8b, 0x94, 0x9e)),
+                )
+                .on_hover_text("Copy screen text (Ctrl+Shift+X)")
+                .clicked()
+            {
+                copy_clicked = true;
+            }
         });
+
+        copy_clicked
     }
 
     /// Render the context overlay (toggled by Ctrl+Shift+C).
@@ -596,10 +654,104 @@ mod tests {
     }
 
     #[test]
+    fn test_format_tokens_boundary_values() {
+        // Verify format_tokens handles the copy-display boundaries correctly.
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(1000), "1K");
+        assert_eq!(format_tokens(999_999), "1000K");
+        assert_eq!(format_tokens(1_000_000), "1.0M");
+    }
+
+    #[test]
     fn test_truncate_insight_reuse() {
         use crate::context::truncate_insight;
         assert_eq!(truncate_insight("hello", 10), "hello");
         // truncate_insight keeps up to max_len bytes then appends "...".
         assert_eq!(truncate_insight("hello world", 8), "hello wo...");
+    }
+
+    /// Simulates the scroll-guard state machine without needing a real PTY.
+    /// Mirrors the logic in `TerminalPanel::show()`.
+    struct ScrollState {
+        scroll_offset: usize,
+        has_new_output_while_scrolled: bool,
+        last_repaint_bytes: u64,
+    }
+
+    impl ScrollState {
+        fn new() -> Self {
+            Self {
+                scroll_offset: 0,
+                has_new_output_while_scrolled: false,
+                last_repaint_bytes: 0,
+            }
+        }
+
+        /// Simulate new PTY output arriving.
+        fn on_new_output(&mut self, current_bytes: u64) {
+            if current_bytes != self.last_repaint_bytes {
+                self.last_repaint_bytes = current_bytes;
+                if self.scroll_offset > 0 {
+                    self.has_new_output_while_scrolled = true;
+                }
+            }
+            if self.scroll_offset == 0 {
+                self.has_new_output_while_scrolled = false;
+            }
+        }
+
+        /// Simulate user scrolling up.
+        fn scroll_up(&mut self, lines: usize) {
+            self.scroll_offset += lines;
+        }
+
+        /// Simulate user jumping to bottom.
+        fn jump_to_bottom(&mut self) {
+            self.scroll_offset = 0;
+        }
+    }
+
+    #[test]
+    fn test_scroll_offset_preserved_on_new_output() {
+        let mut state = ScrollState::new();
+        state.scroll_up(50);
+        assert_eq!(state.scroll_offset, 50);
+
+        // New output arrives — scroll offset should NOT be reset.
+        state.on_new_output(1000);
+        assert_eq!(
+            state.scroll_offset, 50,
+            "scroll_offset must be preserved when user is scrolled up"
+        );
+    }
+
+    #[test]
+    fn test_new_output_indicator_set_when_scrolled() {
+        let mut state = ScrollState::new();
+        state.scroll_up(10);
+        assert!(!state.has_new_output_while_scrolled);
+
+        // New output arrives while scrolled.
+        state.on_new_output(500);
+        assert!(
+            state.has_new_output_while_scrolled,
+            "indicator must be set when new output arrives while scrolled"
+        );
+    }
+
+    #[test]
+    fn test_new_output_indicator_cleared_at_bottom() {
+        let mut state = ScrollState::new();
+        state.scroll_up(10);
+        state.on_new_output(500);
+        assert!(state.has_new_output_while_scrolled);
+
+        // User jumps to bottom.
+        state.jump_to_bottom();
+        state.on_new_output(500); // same bytes, but the clear logic runs
+        assert!(
+            !state.has_new_output_while_scrolled,
+            "indicator must be cleared when user returns to bottom"
+        );
     }
 }

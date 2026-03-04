@@ -86,7 +86,7 @@ pub fn fetch_anthropic_models() -> Vec<ModelInfo> {
             is_latest: true,
         },
         ModelInfo {
-            id: "claude-sonnet-4-20250514".to_string(),
+            id: "claude-sonnet-4-6".to_string(),
             name: "Claude Sonnet 4.5".to_string(),
             provider: "anthropic".to_string(),
             description: Some("Balanced model for most tasks".to_string()),

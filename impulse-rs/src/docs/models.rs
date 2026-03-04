@@ -33,7 +33,7 @@ impl Default for ModelConfig {
         providers.insert(
             "anthropic".to_string(),
             ProviderModelConfig {
-                default_model: "claude-sonnet-4-20250514".to_string(),
+                default_model: "claude-sonnet-4-6".to_string(),
                 enabled: true,
                 api_key: None,
             },

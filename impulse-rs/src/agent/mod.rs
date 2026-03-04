@@ -46,11 +46,21 @@ impl ImpulseProvider {
         }
     }
 
-    pub fn default_model(self) -> &'static str {
+    /// Default model for this provider.
+    ///
+    /// Checks `IMPULSE_MODEL` env var first (user override), then falls back
+    /// to a compiled default. Returns an owned `String` because the env var
+    /// path produces heap-allocated data.
+    pub fn default_model(self) -> String {
+        if let Ok(model) = std::env::var("IMPULSE_MODEL") {
+            if !model.is_empty() {
+                return model;
+            }
+        }
         match self {
-            Self::Anthropic => "claude-sonnet-4-20250514",
-            Self::OpenAi => "gpt-4o",
-            Self::Minimax => "abab6.5s-chat",
+            Self::Anthropic => "claude-sonnet-4-6".to_string(),
+            Self::OpenAi => "gpt-4o".to_string(),
+            Self::Minimax => "abab6.5s-chat".to_string(),
         }
     }
 
@@ -236,9 +246,7 @@ impl ImpulseAgent {
                     ImpulseProvider::Minimax => Box::new(MinimaxProvider::new(api_key)),
                 };
 
-                let model_name = model
-                    .clone()
-                    .unwrap_or_else(|| provider.default_model().to_string());
+                let model_name = model.clone().unwrap_or_else(|| provider.default_model());
 
                 Some(Agent::new(
                     "impulse-agent".to_string(),
@@ -419,7 +427,8 @@ impl ImpulseAgent {
     pub fn status_summary(&self) -> String {
         match &self.config.mode {
             AgentMode::Api { provider, model } => {
-                let model_name = model.as_deref().unwrap_or(provider.default_model());
+                let default = provider.default_model();
+                let model_name = model.as_deref().unwrap_or(&default);
                 let ready = if self.is_ready() {
                     "ready"
                 } else {
@@ -633,12 +642,23 @@ mod tests {
 
     #[test]
     fn test_provider_default_model() {
+        // When IMPULSE_MODEL is not set, returns the compiled default.
+        std::env::remove_var("IMPULSE_MODEL");
         assert_eq!(
             ImpulseProvider::Anthropic.default_model(),
-            "claude-sonnet-4-20250514"
+            "claude-sonnet-4-6"
         );
         assert_eq!(ImpulseProvider::OpenAi.default_model(), "gpt-4o");
         assert_eq!(ImpulseProvider::Minimax.default_model(), "abab6.5s-chat");
+    }
+
+    #[test]
+    fn test_provider_default_model_env_override() {
+        // IMPULSE_MODEL env var takes priority over compiled default.
+        std::env::set_var("IMPULSE_MODEL", "claude-opus-4-6");
+        let model = ImpulseProvider::Anthropic.default_model();
+        std::env::remove_var("IMPULSE_MODEL");
+        assert_eq!(model, "claude-opus-4-6");
     }
 
     #[test]

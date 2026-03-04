@@ -1673,7 +1673,7 @@ mod tests {
         let agent = resolve_from_config(
             Some("anthropic"),
             Some("sk-test-key-for-resolve"),
-            Some("claude-sonnet-4-20250514"),
+            Some("claude-sonnet-4-6"),
             None,
         );
         assert!(agent.is_some(), "resolve should create an agent");
@@ -1685,7 +1685,7 @@ mod tests {
                 ref model,
             } => {
                 assert_eq!(provider, ImpulseProvider::Anthropic);
-                assert_eq!(model.as_deref(), Some("claude-sonnet-4-20250514"));
+                assert_eq!(model.as_deref(), Some("claude-sonnet-4-6"));
             }
             _ => panic!("Expected API mode"),
         }
@@ -2275,7 +2275,7 @@ mod tests {
             .set_config("impulse_agent_api_key", "sk-test-all-fields")
             .unwrap());
         assert!(state
-            .set_config("impulse_agent_model", "claude-sonnet-4-20250514")
+            .set_config("impulse_agent_model", "claude-sonnet-4-6")
             .unwrap());
         assert!(state
             .set_config("impulse_agent_harness", "opencode")
@@ -2299,7 +2299,7 @@ mod tests {
         );
         assert_eq!(
             state.get_config("impulse_agent_model").unwrap(),
-            Some("claude-sonnet-4-20250514".to_string())
+            Some("claude-sonnet-4-6".to_string())
         );
         assert_eq!(
             state.get_config("impulse_agent_harness").unwrap(),
@@ -2323,7 +2323,7 @@ mod tests {
         );
         assert_eq!(
             config.impulse_agent_model,
-            Some("claude-sonnet-4-20250514".to_string())
+            Some("claude-sonnet-4-6".to_string())
         );
         assert_eq!(config.impulse_agent_harness, Some("opencode".to_string()));
         assert!(config.impulse_agent_auto_review);

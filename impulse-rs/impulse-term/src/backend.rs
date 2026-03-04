@@ -7,12 +7,12 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use parking_lot::{FairMutex, Mutex};
-use portable_pty::{native_pty_system, Child, CommandBuilder, PtySize};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
 /// Default scrollback buffer size.
 const DEFAULT_SCROLLBACK_LINES: usize = 10_000;
@@ -25,13 +25,14 @@ const PTY_READ_BUFFER_SIZE: usize = 4096;
 pub struct TerminalBackend {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     parser: Arc<FairMutex<vt100::Parser>>,
+    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     output_bytes: Arc<AtomicU64>,
     output_lines: Arc<AtomicU64>,
     alive: Arc<AtomicBool>,
     _reader_thread: JoinHandle<()>,
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
-    cols: u16,
-    rows: u16,
+    cols: AtomicU16,
+    rows: AtomicU16,
     command: String,
     working_dir: Option<PathBuf>,
 }
@@ -85,6 +86,9 @@ impl TerminalBackend {
 
         let reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
+        // Store the master handle for resize() — try_clone_reader() clones
+        // (doesn't consume), take_writer() takes but leaves the handle alive.
+        let master: Arc<Mutex<Box<dyn MasterPty + Send>>> = Arc::new(Mutex::new(pair.master));
 
         let parser = Arc::new(FairMutex::new(vt100::Parser::new(rows, cols, scrollback)));
         let alive = Arc::new(AtomicBool::new(true));
@@ -108,13 +112,14 @@ impl TerminalBackend {
         Ok(Self {
             writer: Arc::new(Mutex::new(writer)),
             parser,
+            master,
             output_bytes,
             output_lines,
             alive,
             _reader_thread: reader_thread,
             child: Arc::new(Mutex::new(child)),
-            cols,
-            rows,
+            cols: AtomicU16::new(cols),
+            rows: AtomicU16::new(rows),
             command: command.to_string(),
             working_dir: working_dir.map(|p| p.to_path_buf()),
         })
@@ -124,6 +129,15 @@ impl TerminalBackend {
     pub fn screen_text(&self) -> String {
         let parser = self.parser.lock();
         parser.screen().contents()
+    }
+
+    /// Count visible characters on screen (ANSI-stripped by vt100).
+    ///
+    /// Uses `screen().contents()` which returns only visible text —
+    /// no escape sequences, no control chars. Suitable for token estimation.
+    pub fn visible_char_count(&self) -> usize {
+        let parser = self.parser.lock();
+        parser.screen().contents().len()
     }
 
     /// Get screen text including scrollback lines.
@@ -176,18 +190,37 @@ impl TerminalBackend {
 
     /// Current terminal dimensions.
     pub fn size(&self) -> (u16, u16) {
-        (self.cols, self.rows)
+        (
+            self.cols.load(Ordering::Relaxed),
+            self.rows.load(Ordering::Relaxed),
+        )
     }
 
     /// Resize the PTY and update the parser dimensions.
-    pub fn resize(&mut self, cols: u16, rows: u16) -> Result<(), Box<dyn std::error::Error>> {
-        // vt100 parser resize.
+    ///
+    /// Sends SIGWINCH to the child process via the PTY master handle,
+    /// then updates the vt100 parser to match. Takes `&self` (not `&mut self`)
+    /// so it can be called through `Arc<TerminalBackend>`.
+    pub fn resize(&self, cols: u16, rows: u16) -> Result<(), Box<dyn std::error::Error>> {
+        // 1. Resize the PTY master (sends SIGWINCH to child process).
+        {
+            let master = self.master.lock();
+            master.resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })?;
+        }
+
+        // 2. Resize the vt100 parser to match.
         {
             let mut parser = self.parser.lock();
             parser.set_size(rows, cols);
         }
-        self.cols = cols;
-        self.rows = rows;
+
+        self.cols.store(cols, Ordering::Relaxed);
+        self.rows.store(rows, Ordering::Relaxed);
         Ok(())
     }
 
@@ -234,7 +267,7 @@ impl TerminalBackend {
 
     /// Number of visible rows in the terminal.
     pub fn visible_rows(&self) -> usize {
-        self.rows as usize
+        self.rows.load(Ordering::Relaxed) as usize
     }
 
     /// Check if there's been new output since a given byte count.

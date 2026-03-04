@@ -29,8 +29,10 @@ const INJECTION_DEBOUNCE_SECS: u64 = 60;
 /// Minimum seconds between compaction scans.
 const COMPACTION_DEBOUNCE_SECS: u64 = 60;
 
-/// Token estimation: PTY output is ~40% of total context.
-const OUTPUT_TO_CONTEXT_MULTIPLIER: f64 = 2.5;
+/// Token estimation: visible text is ~60% of total context.
+/// The remaining ~40% is system prompt, tool call JSON, and user turns.
+/// Applied to ANSI-stripped visible chars, not raw PTY bytes.
+const VISIBLE_TO_CONTEXT_MULTIPLIER: f64 = 1.6;
 
 /// Characters per token.
 const CHARS_PER_TOKEN: f64 = 4.0;
@@ -259,10 +261,11 @@ impl ContextBridge {
     pub fn extract_tick(&mut self) -> Vec<ExtractedInsight> {
         let current_bytes = self.backend.output_bytes();
 
-        // Update token estimate.
+        // Update token estimate using visible chars (ANSI-stripped).
         if current_bytes != self.last_output_bytes {
             self.last_output_bytes = current_bytes;
-            self.estimated_tokens = estimate_tokens(current_bytes);
+            let visible_chars = self.backend.visible_char_count();
+            self.estimated_tokens = estimate_tokens(visible_chars);
             self.current_tier = usage_tier(self.estimated_tokens, self.window_tokens);
         }
 
@@ -405,9 +408,13 @@ impl ContextBridge {
 // Standalone helpers
 // ---------------------------------------------------------------------------
 
-/// Estimate tokens from output bytes.
-fn estimate_tokens(output_bytes: u64) -> usize {
-    ((output_bytes as f64) * OUTPUT_TO_CONTEXT_MULTIPLIER / CHARS_PER_TOKEN) as usize
+/// Estimate tokens from visible character count (ANSI-stripped).
+///
+/// Uses visible chars (not raw PTY bytes) to avoid inflating the estimate
+/// with ANSI escape sequences. The multiplier accounts for context that
+/// isn't visible in PTY output (system prompt, tool call JSON, user turns).
+fn estimate_tokens(visible_chars: usize) -> usize {
+    (visible_chars as f64 * VISIBLE_TO_CONTEXT_MULTIPLIER / CHARS_PER_TOKEN) as usize
 }
 
 /// Map token usage to a tier.
@@ -627,9 +634,36 @@ mod tests {
 
     #[test]
     fn test_estimate_tokens() {
+        // Formula: visible_chars * 1.6 / 4.0 = visible_chars * 0.4
         assert_eq!(estimate_tokens(0), 0);
-        assert_eq!(estimate_tokens(1000), 625);
-        assert_eq!(estimate_tokens(800_000), 500_000);
+        assert_eq!(estimate_tokens(1000), 400);
+        assert_eq!(estimate_tokens(800_000), 320_000);
+    }
+
+    #[test]
+    fn test_estimate_tokens_lower_than_old_formula() {
+        // The old formula was output_bytes * 2.5 / 4.0 = 0.625x.
+        // The new formula is visible_chars * 1.6 / 4.0 = 0.4x.
+        // For the same input, the new estimate should be lower.
+        let old_result = (1000_f64 * 2.5 / 4.0) as usize; // 625
+        let new_result = estimate_tokens(1000); // 400
+        assert!(
+            new_result < old_result,
+            "new estimate ({}) should be lower than old ({})",
+            new_result,
+            old_result
+        );
+    }
+
+    #[test]
+    fn test_estimate_tokens_realistic_session() {
+        // A Claude Code session with ~68K actual tokens might show
+        // ~170K visible chars on screen. The estimate should be closer
+        // to 68K than the old formula's ~106K.
+        let visible_chars = 170_000;
+        let estimated = estimate_tokens(visible_chars);
+        // 170_000 * 0.4 = 68_000
+        assert_eq!(estimated, 68_000);
     }
 
     #[test]
