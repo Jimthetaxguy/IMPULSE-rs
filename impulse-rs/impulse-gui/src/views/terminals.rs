@@ -370,6 +370,7 @@ impl TerminalsView {
         for tab in self.tabs.values() {
             tab.panel.kill();
         }
+        // No need to populate closed_tabs — process exits after shutdown.
         self.tabs.clear();
         self.last_injected_tiers.clear();
         self.tab_snapshots.clear();
@@ -633,37 +634,28 @@ impl TerminalsView {
             if owners.len() < 2 {
                 continue;
             }
+            let mut push_conflict = |tab_id: u64, other_label: &str| {
+                signals.push(GuiSignal {
+                    kind: SignalKind::FileConflict {
+                        path: file.to_string(),
+                        other_tab: other_label.to_string(),
+                    },
+                    urgency: SignalUrgency::Urgent,
+                    tab_id: Some(tab_id),
+                    message: format!(
+                        "Conflict: {} edited in both tabs (also in {})",
+                        file, other_label
+                    ),
+                    created_at: now,
+                });
+            };
             for i in 0..owners.len() {
                 for j in (i + 1)..owners.len() {
                     let (id_a, label_a) = owners[i];
                     let (id_b, label_b) = owners[j];
                     // Emit one signal per direction (A sees B, B sees A).
-                    signals.push(GuiSignal {
-                        kind: SignalKind::FileConflict {
-                            path: file.to_string(),
-                            other_tab: label_b.to_string(),
-                        },
-                        urgency: SignalUrgency::Urgent,
-                        tab_id: Some(id_a),
-                        message: format!(
-                            "Conflict: {} edited in both tabs (also in {})",
-                            file, label_b
-                        ),
-                        created_at: now,
-                    });
-                    signals.push(GuiSignal {
-                        kind: SignalKind::FileConflict {
-                            path: file.to_string(),
-                            other_tab: label_a.to_string(),
-                        },
-                        urgency: SignalUrgency::Urgent,
-                        tab_id: Some(id_b),
-                        message: format!(
-                            "Conflict: {} edited in both tabs (also in {})",
-                            file, label_a
-                        ),
-                        created_at: now,
-                    });
+                    push_conflict(id_a, label_b);
+                    push_conflict(id_b, label_a);
                 }
             }
         }

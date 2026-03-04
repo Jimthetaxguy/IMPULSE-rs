@@ -108,7 +108,7 @@ fn debounce_key(kind: &SignalKind, tab_id: Option<u64>) -> String {
         SignalKind::ErrorEncountered => format!("error:{}", tab_str),
         SignalKind::TaskCompleted => format!("task:{}", tab_str),
         SignalKind::CompactionDetected => format!("compact:{}", tab_str),
-        SignalKind::FileConflict { path, .. } => format!("conflict:{}", path),
+        SignalKind::FileConflict { path, .. } => format!("conflict:{}:{}", path, tab_str),
     }
 }
 
@@ -147,7 +147,7 @@ impl SignalBus {
     /// Emit a signal into the bus. Returns `true` if accepted (not debounced).
     pub fn emit(&mut self, signal: GuiSignal) -> bool {
         // Periodically prune stale debounce entries.
-        self.prune_stale_debounce();
+        self.prune_stale_debounce(signal.created_at);
 
         let key = debounce_key(&signal.kind, signal.tab_id);
         let window = debounce_window(&signal.kind);
@@ -270,8 +270,7 @@ impl SignalBus {
 
     /// Remove debounce entries older than 2× the max debounce window.
     /// Called from `emit()` at most once per `PRUNE_INTERVAL_SECS`.
-    fn prune_stale_debounce(&mut self) {
-        let now = Instant::now();
+    fn prune_stale_debounce(&mut self, now: Instant) {
         if now.duration_since(self.last_prune) < Duration::from_secs(PRUNE_INTERVAL_SECS) {
             return;
         }
@@ -559,7 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn test_file_conflict_debounce_by_path() {
+    fn test_file_conflict_debounce_by_path_and_tab() {
         let mut bus = SignalBus::new();
         let now = Instant::now();
 
@@ -576,16 +575,28 @@ mod tests {
         let sig2 = GuiSignal {
             kind: SignalKind::FileConflict {
                 path: "src/main.rs".into(),
-                other_tab: "Tab 3".into(),
+                other_tab: "Tab 1".into(),
             },
             urgency: SignalUrgency::Urgent,
             tab_id: Some(2),
-            message: "same file conflict".into(),
-            created_at: now + Duration::from_secs(1), // within 30s window
+            message: "reverse direction".into(),
+            created_at: now + Duration::from_secs(1),
+        };
+        // Same tab re-emitting same path IS debounced.
+        let sig3 = GuiSignal {
+            kind: SignalKind::FileConflict {
+                path: "src/main.rs".into(),
+                other_tab: "Tab 2".into(),
+            },
+            urgency: SignalUrgency::Urgent,
+            tab_id: Some(1),
+            message: "duplicate".into(),
+            created_at: now + Duration::from_secs(2),
         };
 
         assert!(bus.emit(sig1));
-        assert!(!bus.emit(sig2)); // same path — debounced
+        assert!(bus.emit(sig2)); // different tab — not debounced
+        assert!(!bus.emit(sig3)); // same tab + same path — debounced
     }
 
     #[test]
@@ -620,7 +631,7 @@ mod tests {
 
         // Force prune by setting last_prune far in the past.
         bus.last_prune = old;
-        bus.prune_stale_debounce();
+        bus.prune_stale_debounce(Instant::now());
 
         // Stale entry (300s old, cutoff is 120s) should be removed.
         assert_eq!(bus.debounce.len(), 1);

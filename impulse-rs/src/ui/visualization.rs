@@ -119,14 +119,22 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// Truncate text with ellipsis
+/// Truncate text with ellipsis. UTF-8 safe — never slices mid-character.
 pub fn truncate(text: &str, max_len: usize) -> String {
     if text.len() <= max_len {
         text.to_string()
     } else if max_len > 3 {
-        format!("{}...", &text[..max_len - 3])
+        let mut end = max_len - 3;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &text[..end])
     } else {
-        text[..max_len].to_string()
+        let mut end = max_len;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text[..end].to_string()
     }
 }
 
@@ -431,6 +439,23 @@ mod tests {
     fn test_truncate() {
         assert_eq!(truncate("hello", 10), "hello");
         assert_eq!(truncate("hello world", 8), "hello...");
+    }
+
+    #[test]
+    fn test_truncate_utf8_safe() {
+        // 2-byte chars: "café" — 'é' is 2 bytes at offset 3-4.
+        let result = truncate("café latte", 7);
+        assert!(!result.is_empty());
+        // Should not panic on multi-byte boundary.
+
+        // 4-byte chars: emoji.
+        let emoji = "hello 🌍 world";
+        let result = truncate(emoji, 8);
+        assert!(result.ends_with("..."));
+
+        // Very short max_len (≤3 path).
+        let result = truncate("café", 2);
+        assert!(!result.is_empty());
     }
 
     #[test]

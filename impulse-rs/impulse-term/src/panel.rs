@@ -405,7 +405,7 @@ impl TerminalPanel {
                         ui.label(format!(
                             "  [{}] {} ({}m ago)",
                             insight.insight_type.as_str(),
-                            truncate_display(&insight.content, 50),
+                            crate::context::truncate_insight(&insight.content, 50),
                             elapsed
                         ));
                     }
@@ -508,19 +508,6 @@ fn format_tokens(tokens: usize) -> String {
     }
 }
 
-/// Truncate a string for display.
-fn truncate_display(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        let mut end = max_len;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}..", &s[..end])
-    }
-}
-
 /// Build environment variables for a spawned terminal pane.
 ///
 /// Extracted for testability. Sets TERM, COLORTERM, IMPULSE_PANE_ID,
@@ -609,8 +596,10 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_display() {
-        assert_eq!(truncate_display("hello", 10), "hello");
-        assert_eq!(truncate_display("hello world", 5), "hello..");
+    fn test_truncate_insight_reuse() {
+        use crate::context::truncate_insight;
+        assert_eq!(truncate_insight("hello", 10), "hello");
+        // truncate_insight keeps up to max_len bytes then appends "...".
+        assert_eq!(truncate_insight("hello world", 8), "hello wo...");
     }
 }
