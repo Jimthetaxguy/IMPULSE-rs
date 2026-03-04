@@ -134,6 +134,30 @@ impl DaemonClient {
         }
     }
 
+    pub async fn check_conflict(
+        &self,
+        session_id: String,
+        file_path: String,
+    ) -> Result<(bool, Vec<String>)> {
+        let response = self
+            .send(DaemonRequest::CheckConflict {
+                session_id,
+                file_path,
+            })
+            .await?;
+
+        match response {
+            DaemonResponse::ConflictCheck {
+                has_conflict,
+                conflicting_sessions,
+            } => Ok((has_conflict, conflicting_sessions)),
+            DaemonResponse::Error { message } => {
+                anyhow::bail!("Check conflict failed: {}", message)
+            }
+            _ => anyhow::bail!("Check conflict: unexpected response type"),
+        }
+    }
+
     pub async fn track_tool(&self, session_id: String, tool_name: String) -> Result<()> {
         let response = self
             .send(DaemonRequest::TrackTool {

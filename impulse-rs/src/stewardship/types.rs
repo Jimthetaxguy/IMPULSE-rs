@@ -301,6 +301,17 @@ pub enum ProposalStatus {
     Rejected,
 }
 
+impl ProposalStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProposalStatus::Pending => "pending",
+            ProposalStatus::Approved => "approved",
+            ProposalStatus::Applied => "applied",
+            ProposalStatus::Rejected => "rejected",
+        }
+    }
+}
+
 /// A cleanup proposal with strategy and target regions
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CleanupProposal {

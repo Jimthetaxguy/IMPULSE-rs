@@ -80,7 +80,7 @@ pub struct SearchResult {
     pub score: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SearchResponse {
     pub mode: String,
     pub used_fallback: bool,
@@ -89,6 +89,8 @@ pub struct SearchResponse {
     pub backend_used: String,
     pub timing_ms: u64,
     pub candidate_count: usize,
+    #[serde(default)]
+    pub total_count: Option<usize>,
     #[serde(default)]
     pub engine_notes: Vec<String>,
     pub results: Vec<SearchResult>,
@@ -107,6 +109,23 @@ pub enum FallbackCode {
     RetrievalDbError,
     RetrievalDbCorrupt,
     IndexLockActive,
+}
+
+impl FallbackCode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FallbackCode::VectorBackendDisabled => "vector_backend_disabled",
+            FallbackCode::SqliteVecUnavailable => "sqlite_vec_unavailable",
+            FallbackCode::EmbeddingTimeout => "embedding_timeout",
+            FallbackCode::EmbeddingSpawnFailed => "embedding_spawn_failed",
+            FallbackCode::EmbeddingProcessFailed => "embedding_process_failed",
+            FallbackCode::EmbeddingNoVector => "embedding_no_vector",
+            FallbackCode::EmbeddingDimensionMismatch => "embedding_dimension_mismatch",
+            FallbackCode::RetrievalDbError => "retrieval_db_error",
+            FallbackCode::RetrievalDbCorrupt => "retrieval_db_corrupt",
+            FallbackCode::IndexLockActive => "index_lock_active",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,4 +211,11 @@ impl Default for InjectionStatus {
             last_staged_artifact: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RetrievalHealth {
+    pub sqlite_vec: bool,
+    pub rust_cosine: bool,
+    pub keyword_fts: bool,
 }

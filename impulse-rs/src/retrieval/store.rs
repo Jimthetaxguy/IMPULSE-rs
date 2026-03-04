@@ -29,7 +29,7 @@ impl RetrievalStore {
         &self.db_path
     }
 
-    fn table_exists(&self, table_name: &str) -> Result<bool> {
+    pub fn table_exists(&self, table_name: &str) -> Result<bool> {
         let mut stmt = self.conn.prepare(
             "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?1 LIMIT 1",
         )?;

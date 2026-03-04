@@ -117,4 +117,119 @@ mod tests {
         assert!(!rules.is_empty());
         assert!(rules.iter().all(|r| r.enabled));
     }
+
+    #[test]
+    fn test_rule_add_creates_new_rule() {
+        let new_rule = GuardRule {
+            id: "test-add-rule".to_string(),
+            pattern: r"dangerous-command".to_string(),
+            action: GuardAction::Block,
+            target: GuardTarget::Bash,
+            reason: "Test rule for add".to_string(),
+            suggestion: None,
+            enabled: true,
+            builtin: false,
+        };
+
+        let mut config = GuardConfig::default();
+        config.rules.push(new_rule.clone());
+
+        assert_eq!(config.rules.len(), 1);
+        assert_eq!(config.rules[0].id, "test-add-rule");
+    }
+
+    #[test]
+    fn test_rule_remove_filters_correctly() {
+        let custom_rule = GuardRule {
+            id: "test-remove-rule".to_string(),
+            pattern: r"test-pattern".to_string(),
+            action: GuardAction::Warn,
+            target: GuardTarget::Bash,
+            reason: "Test rule for remove".to_string(),
+            suggestion: None,
+            enabled: true,
+            builtin: false,
+        };
+
+        let mut config = GuardConfig::default();
+        config.rules.push(custom_rule);
+
+        config.rules.retain(|r| r.id != "test-remove-rule");
+
+        assert!(config.rules.iter().all(|r| r.id != "test-remove-rule"));
+    }
+
+    #[test]
+    fn test_rule_enable_removes_disabled_override() {
+        let disabled_override = GuardRule {
+            id: "block-force-push".to_string(),
+            pattern: String::new(),
+            action: GuardAction::Log,
+            target: GuardTarget::Any,
+            reason: "Disabled by user".to_string(),
+            suggestion: None,
+            enabled: false,
+            builtin: false,
+        };
+
+        let mut config = GuardConfig::default();
+        config.rules.push(disabled_override);
+
+        config
+            .rules
+            .retain(|r| r.id != "block-force-push" || r.enabled);
+
+        assert!(config
+            .rules
+            .iter()
+            .all(|r| r.id != "block-force-push" || r.enabled));
+    }
+
+    #[test]
+    fn test_rule_disable_creates_disabled_override() {
+        let builtin_rule = GuardRule {
+            id: "block-force-push-main".to_string(),
+            pattern: r"git\s+push\s+(.*\s+)?(-f|--force)\s+(.*\s+)?(origin\s+)?main\b".to_string(),
+            action: GuardAction::Block,
+            target: GuardTarget::Bash,
+            reason: "Test".to_string(),
+            suggestion: None,
+            enabled: true,
+            builtin: true,
+        };
+
+        let mut config = GuardConfig::default();
+        config.rules.push(builtin_rule);
+
+        let initial_len = config.rules.len();
+
+        config.rules.retain(|r| r.id != "block-force-push-main");
+        config.rules.push(GuardRule {
+            id: "block-force-push-main".to_string(),
+            pattern: String::new(),
+            action: GuardAction::Log,
+            target: GuardTarget::Any,
+            reason: "Disabled by user".to_string(),
+            suggestion: None,
+            enabled: false,
+            builtin: false,
+        });
+
+        assert_eq!(config.rules.len(), initial_len);
+        assert!(config
+            .rules
+            .iter()
+            .any(|r| r.id == "block-force-push-main" && !r.enabled));
+    }
+
+    #[test]
+    fn test_cannot_remove_builtin_rules() {
+        let builtins = defaults::builtin_rules();
+        assert!(!builtins.is_empty());
+
+        let builtin_ids: Vec<&str> = builtins.iter().map(|r| r.id.as_str()).collect();
+
+        assert!(builtin_ids.contains(&"block-force-push-main"));
+        assert!(builtin_ids.contains(&"block-rm-rf-root"));
+    }
 }

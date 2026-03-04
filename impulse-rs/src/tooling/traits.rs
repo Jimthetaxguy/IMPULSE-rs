@@ -17,6 +17,18 @@ pub enum Capability {
     SystemInfo,
 }
 
+impl Capability {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Capability::FileSystemRead => "filesystem_read",
+            Capability::FileSystemWrite => "filesystem_write",
+            Capability::Network => "network",
+            Capability::PythonExec => "python_exec",
+            Capability::SystemInfo => "system_info",
+        }
+    }
+}
+
 /// Category for organizing tools in listings
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolCategory {
@@ -46,6 +58,19 @@ pub enum ParamType {
     Bool,
     FilePath,
     Json,
+}
+
+impl ParamType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ParamType::String => "string",
+            ParamType::Integer => "integer",
+            ParamType::Float => "float",
+            ParamType::Bool => "bool",
+            ParamType::FilePath => "file_path",
+            ParamType::Json => "json",
+        }
+    }
 }
 
 /// Describes a single parameter a tool accepts

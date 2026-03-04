@@ -54,6 +54,7 @@ glob = "0.3"
 
 # Pattern matching
 regex = "1"
+levenshtein = "1"
 
 # Error handling
 thiserror = "2"

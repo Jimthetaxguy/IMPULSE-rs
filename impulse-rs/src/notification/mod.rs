@@ -10,6 +10,7 @@
 //! - Event bus for real-time notifications
 //! - Notification persistence to file
 //! - Session-aware context for agents
+//! - Webhook notifications for conflicts
 //!
 //! ## Design
 //!
@@ -18,6 +19,7 @@
 //! - `Notification` - a formatted notification with metadata
 //! - `NotificationBus` - pub/sub system for notifications
 //! - `NotificationStore` - persists notifications to disk
+//! - `WebhookNotifier` - sends conflict notifications to external systems
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -31,6 +33,12 @@ const MAX_IN_MEMORY_NOTIFICATIONS: usize = 1000;
 
 /// Maximum notifications to persist to disk
 const MAX_PERSISTED_NOTIFICATIONS: usize = 10000;
+
+/// Maximum webhook retry attempts
+const WEBHOOK_MAX_RETRIES: u32 = 3;
+
+/// Webhook retry delay in milliseconds
+const WEBHOOK_RETRY_DELAY_MS: u64 = 500;
 
 /// Represents an event that can trigger notifications
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +106,17 @@ pub enum NotificationEvent {
         tier: String,
         size_chars: usize,
     },
+    /// A file conflict was detected between agents
+    ConflictDetected {
+        file_path: String,
+        panes_involved: Vec<String>,
+        description: String,
+    },
+    /// A file conflict was resolved
+    ConflictResolved {
+        file_path: String,
+        resolution: String,
+    },
 }
 
 impl NotificationEvent {
@@ -122,6 +141,8 @@ impl NotificationEvent {
             NotificationEvent::ContextThresholdCrossed { .. } => NotificationSeverity::Info,
             NotificationEvent::CompactionDetected { .. } => NotificationSeverity::Warning,
             NotificationEvent::ContextRefreshed { .. } => NotificationSeverity::Debug,
+            NotificationEvent::ConflictDetected { .. } => NotificationSeverity::Warning,
+            NotificationEvent::ConflictResolved { .. } => NotificationSeverity::Info,
         }
     }
 
@@ -145,6 +166,10 @@ impl NotificationEvent {
             NotificationEvent::ContextThresholdCrossed { pane_name, .. } => Some(pane_name),
             NotificationEvent::CompactionDetected { pane_name, .. } => Some(pane_name),
             NotificationEvent::ContextRefreshed { pane_name, .. } => Some(pane_name),
+            NotificationEvent::ConflictDetected { panes_involved, .. } => {
+                panes_involved.first().map(String::as_str)
+            }
+            NotificationEvent::ConflictResolved { .. } => None,
         }
     }
 
@@ -240,6 +265,24 @@ impl NotificationEvent {
                     "Context refreshed ({}, {} chars) for pane '{}'",
                     tier, size_chars, pane_name
                 )
+            }
+            NotificationEvent::ConflictDetected {
+                file_path,
+                panes_involved,
+                description,
+            } => {
+                format!(
+                    "Conflict detected: {} [{}] - {}",
+                    file_path,
+                    panes_involved.join(", "),
+                    description
+                )
+            }
+            NotificationEvent::ConflictResolved {
+                file_path,
+                resolution,
+            } => {
+                format!("Conflict resolved: {} ({})", file_path, resolution)
             }
         }
     }
@@ -459,7 +502,8 @@ impl NotificationStore {
         Ok(notifications)
     }
 
-    /// Trim the notifications file if it exceeds the limit
+    /// Trim the notifications file if it exceeds the limit.
+    /// Uses atomic temp-file + rename to prevent data loss on crash.
     fn trim(&self) -> std::io::Result<()> {
         let path = self.notifications_path();
         if !path.exists() {
@@ -478,14 +522,105 @@ impl NotificationStore {
                 .collect();
 
             let trimmed = to_keep.into_iter().rev().collect::<Vec<_>>().join("\n");
-            std::fs::write(&path, trimmed)?;
+
+            // Atomic write: temp file + rename
+            let tmp_path = path.with_extension(format!(
+                "tmp.{}.{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            std::fs::write(&tmp_path, &trimmed)?;
+            std::fs::rename(&tmp_path, &path)?;
         }
 
         Ok(())
     }
 }
 
-/// Helper to emit common notification events
+/// Payload sent to webhook for conflict notifications
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConflictWebhookPayload {
+    pub event_type: String,
+    pub timestamp: DateTime<Utc>,
+    pub file_path: String,
+    pub panes_involved: Vec<String>,
+    pub description: String,
+}
+
+/// Webhook notifier for sending conflict notifications to external systems
+pub struct WebhookNotifier {
+    client: reqwest::Client,
+}
+
+impl Default for WebhookNotifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WebhookNotifier {
+    pub fn new() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+        }
+    }
+
+    /// Send conflict notification to webhook URL with retry logic
+    pub async fn notify_conflict(
+        &self,
+        webhook_url: &str,
+        file_path: &str,
+        panes_involved: Vec<String>,
+        description: &str,
+    ) -> Result<(), String> {
+        let payload = ConflictWebhookPayload {
+            event_type: "conflict_detected".to_string(),
+            timestamp: Utc::now(),
+            file_path: file_path.to_string(),
+            panes_involved,
+            description: description.to_string(),
+        };
+
+        let mut last_error = None;
+
+        for attempt in 1..=WEBHOOK_MAX_RETRIES {
+            match self.send_webhook(webhook_url, &payload).await {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    last_error = Some(e);
+                    if attempt < WEBHOOK_MAX_RETRIES {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(
+                            WEBHOOK_RETRY_DELAY_MS * attempt as u64,
+                        ))
+                        .await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| "Unknown webhook error".to_string()))
+    }
+
+    async fn send_webhook(
+        &self,
+        webhook_url: &str,
+        payload: &ConflictWebhookPayload,
+    ) -> Result<(), String> {
+        self.client
+            .post(webhook_url)
+            .json(payload)
+            .send()
+            .await
+            .map_err(|e| format!("Request failed: {}", e))?
+            .error_for_status()
+            .map_err(|e| format!("HTTP error: {}", e))?;
+
+        Ok(())
+    }
+}
 pub async fn emit_agent_started(
     bus: &NotificationBus,
     agent_id: &str,
@@ -564,6 +699,46 @@ pub async fn emit_agent_handoff(
 pub async fn emit_multi_agent_detected(bus: &NotificationBus, agents: Vec<String>) {
     bus.publish(NotificationEvent::MultiAgentDetected { agents })
         .await;
+}
+
+pub async fn emit_conflict_detected(
+    bus: &NotificationBus,
+    file_path: &str,
+    panes_involved: Vec<String>,
+    description: &str,
+) {
+    bus.publish(NotificationEvent::ConflictDetected {
+        file_path: file_path.to_string(),
+        panes_involved,
+        description: description.to_string(),
+    })
+    .await;
+}
+
+pub async fn emit_conflict_resolved(bus: &NotificationBus, file_path: &str, resolution: &str) {
+    bus.publish(NotificationEvent::ConflictResolved {
+        file_path: file_path.to_string(),
+        resolution: resolution.to_string(),
+    })
+    .await;
+}
+
+/// Send conflict notification to webhook if configured
+pub async fn send_conflict_webhook(
+    webhook_url: Option<&str>,
+    file_path: &str,
+    panes_involved: Vec<String>,
+    description: &str,
+) {
+    if let Some(url) = webhook_url {
+        let notifier = WebhookNotifier::new();
+        if let Err(e) = notifier
+            .notify_conflict(url, file_path, panes_involved, description)
+            .await
+        {
+            tracing::warn!("Failed to send conflict webhook: {}", e);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -690,5 +865,45 @@ mod tests {
         let loaded = store.load_recent(10).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].agent_ids, vec!["store-test".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_webhook_notifier_creates_client() {
+        let notifier = WebhookNotifier::new();
+        // Verify the client can be used to build requests
+        let _request = notifier
+            .client
+            .request(reqwest::Method::GET, "http://localhost");
+    }
+
+    #[tokio::test]
+    async fn test_webhook_payload_serialization() {
+        let payload = ConflictWebhookPayload {
+            event_type: "conflict_detected".to_string(),
+            timestamp: Utc::now(),
+            file_path: "/path/to/file.rs".to_string(),
+            panes_involved: vec!["pane-1".to_string(), "pane-2".to_string()],
+            description: "File modified by multiple agents".to_string(),
+        };
+
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains("conflict_detected"));
+        assert!(json.contains("/path/to/file.rs"));
+    }
+
+    #[tokio::test]
+    async fn test_webhook_fails_for_invalid_url() {
+        let notifier = WebhookNotifier::new();
+
+        let result = notifier
+            .notify_conflict(
+                "http://invalid-domain-that-does-not-exist.local",
+                "/test/file.rs",
+                vec!["pane-1".to_string()],
+                "Test conflict",
+            )
+            .await;
+
+        assert!(result.is_err());
     }
 }

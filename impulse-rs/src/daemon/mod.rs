@@ -85,14 +85,30 @@ pub enum DaemonRequest {
     },
     /// List active guardrail rules
     GuardList,
+    /// Check if a file is being modified by another session
+    CheckConflict {
+        session_id: String,
+        file_path: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum DaemonResponse {
-    Ok { result: serde_json::Value },
-    Error { message: String },
-    AgentAssistResult { success: bool, response: String },
+    Ok {
+        result: serde_json::Value,
+    },
+    Error {
+        message: String,
+    },
+    AgentAssistResult {
+        success: bool,
+        response: String,
+    },
+    ConflictCheck {
+        has_conflict: bool,
+        conflicting_sessions: Vec<String>,
+    },
 }
 
 pub struct Daemon {
@@ -343,6 +359,19 @@ async fn process_request(
             },
         },
 
+        DaemonRequest::CheckConflict {
+            session_id,
+            file_path,
+        } => match state.check_file_conflict(&session_id, &file_path).await {
+            Ok(conflicting) => DaemonResponse::ConflictCheck {
+                has_conflict: !conflicting.is_empty(),
+                conflicting_sessions: conflicting,
+            },
+            Err(e) => DaemonResponse::Error {
+                message: format!("Conflict check failed: {}", e),
+            },
+        },
+
         DaemonRequest::GetSession { session_id } => match state.get_session(&session_id).await {
             Ok(Some(session)) => match serde_json::to_value(session) {
                 Ok(result) => DaemonResponse::Ok { result },
@@ -532,7 +561,7 @@ async fn process_request(
 
             DaemonResponse::Ok {
                 result: serde_json::json!({
-                    "mode": format!("{:?}", stew_config.mode),
+                    "mode": stew_config.mode.as_str(),
                     "thresholds": {
                         "monitor": stew_config.monitor_threshold,
                         "surgical": stew_config.surgical_threshold,
@@ -561,7 +590,7 @@ async fn process_request(
                                 serde_json::json!({
                                     "id": p.id,
                                     "strategy": p.strategy.as_str(),
-                                    "threshold": format!("{:?}", p.threshold),
+                                    "threshold": p.threshold.as_str(),
                                     "estimated_tokens_freed": p.estimated_tokens_freed,
                                     "regions": p.regions.len(),
                                 })
@@ -673,12 +702,12 @@ async fn process_request(
                         "params": desc.params.iter().map(|p| serde_json::json!({
                             "name": p.name,
                             "description": p.description,
-                            "type": format!("{:?}", p.param_type),
+                            "type": p.param_type.as_str(),
                             "required": p.required,
                             "default": p.default,
                         })).collect::<Vec<_>>(),
                         "capabilities": tool.required_capabilities().iter()
-                            .map(|c| format!("{:?}", c))
+                            .map(|c| c.as_str())
                             .collect::<Vec<_>>(),
                     }),
                 }
