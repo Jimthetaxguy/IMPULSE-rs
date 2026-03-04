@@ -28,6 +28,7 @@ use crate::views::terminals::TerminalsView;
 use crate::views::{View, ViewId};
 use crate::widgets::notifications::{NotificationManager, Severity};
 use crate::widgets::project_selector::ProjectSelector;
+use crate::widgets::signal_bus::{SignalBus, SignalKind, SignalUrgency};
 use crate::widgets::{sidebar, status_bar};
 
 /// Main application state — thin coordinator.
@@ -68,6 +69,9 @@ pub struct ImpulseApp {
 
     // Notifications.
     notifications: NotificationManager,
+
+    // Signal bus — collects and routes signals to visual surfaces.
+    signal_bus: SignalBus,
 }
 
 impl ImpulseApp {
@@ -112,6 +116,7 @@ impl ImpulseApp {
             last_search_query: String::new(),
 
             notifications: NotificationManager::new(),
+            signal_bus: SignalBus::new(),
         }
     }
 
@@ -329,6 +334,45 @@ impl eframe::App for ImpulseApp {
                 let insights = self.terminals.collected_insights();
                 self.agent_panel.update_activity(insights);
             }
+
+            // Collect signals from terminal state changes.
+            let signals = self.terminals.collect_signals();
+            for signal in signals {
+                self.signal_bus.emit(signal);
+            }
+        }
+
+        // Drain signals and route to visual surfaces (every frame).
+        {
+            let drained = self.signal_bus.drain();
+            for signal in &drained {
+                match signal.urgency {
+                    SignalUrgency::Urgent => {
+                        self.notifications.notify_with_duration(
+                            Severity::Error,
+                            &signal.message,
+                            10.0,
+                        );
+                    }
+                    SignalUrgency::Important => {
+                        let severity = match &signal.kind {
+                            SignalKind::TaskCompleted => Severity::Success,
+                            SignalKind::ErrorEncountered => Severity::Error,
+                            _ => Severity::Warning,
+                        };
+                        self.notifications.notify(severity, &signal.message);
+                    }
+                    SignalUrgency::Ambient => {} // badges + activity only
+                }
+            }
+
+            // Sync tab badges for rendering.
+            self.terminals.tab_badges = self.signal_bus.all_tab_badges().clone();
+        }
+
+        // Handle badge acknowledgment from tab clicks.
+        if let Some(tab_id) = self.terminals.badge_acknowledged_tab.take() {
+            self.signal_bus.acknowledge_tab(tab_id);
         }
 
         // Process pending init injections.
@@ -526,7 +570,13 @@ impl eframe::App for ImpulseApp {
 
         // --- Status bar ---
         let active_agents = self.terminals.active_agent_info();
-        status_bar::show(ctx, &state, self.terminals.tab_count(), &active_agents);
+        status_bar::show(
+            ctx,
+            &state,
+            self.terminals.tab_count(),
+            &active_agents,
+            self.signal_bus.summary(),
+        );
 
         // --- Central panel: active view ---
         egui::CentralPanel::default().show(ctx, |ui| match self.active_view {

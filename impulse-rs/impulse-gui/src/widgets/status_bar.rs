@@ -5,6 +5,7 @@ use eframe::egui;
 use crate::state::{ConnectionStatus, SharedState};
 use crate::theme;
 use crate::theme::colors;
+use crate::widgets::signal_bus::SignalSummary;
 
 /// Info about an active terminal for status bar display.
 pub struct ActiveAgent {
@@ -17,6 +18,7 @@ pub fn show(
     state: &SharedState,
     terminal_tabs: usize,
     active_agents: &[ActiveAgent],
+    signal_summary: &SignalSummary,
 ) {
     egui::TopBottomPanel::bottom("status_bar")
         .exact_height(24.0)
@@ -68,6 +70,35 @@ pub fn show(
                             .small()
                             .color(colors::TEXT_DIM),
                     );
+                }
+
+                // Signal counters.
+                if signal_summary.active_conflicts > 0 || signal_summary.unread_errors > 0 {
+                    ui.separator();
+                }
+                if signal_summary.active_conflicts > 0 {
+                    ui.label(
+                        egui::RichText::new(format!("\u{26A0}{}", signal_summary.active_conflicts))
+                            .small()
+                            .color(colors::RED),
+                    )
+                    .on_hover_text("Active file conflicts between panes");
+                }
+                if signal_summary.unread_errors > 0 {
+                    ui.label(
+                        egui::RichText::new(format!("\u{2718}{}", signal_summary.unread_errors))
+                            .small()
+                            .color(colors::RED),
+                    )
+                    .on_hover_text("Unread agent errors");
+                }
+                if signal_summary.tasks_completed > 0 {
+                    ui.label(
+                        egui::RichText::new(format!("\u{2713}{}", signal_summary.tasks_completed))
+                            .small()
+                            .color(colors::GREEN),
+                    )
+                    .on_hover_text("Tasks completed this session");
                 }
 
                 // Right-aligned hint.

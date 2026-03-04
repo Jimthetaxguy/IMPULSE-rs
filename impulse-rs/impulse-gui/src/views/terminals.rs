@@ -3,13 +3,15 @@
 //! Uses `impulse_term::TerminalPanel` for full PTY read/write access,
 //! context lifecycle integration, and vt100-based rendering.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use impulse_term::context::{ContextHealth, ContextTier, ExtractedInsight};
+use impulse_term::context::{ContextHealth, ContextTier, ExtractedInsight, InsightType};
 use impulse_term::TerminalPanel;
+
+use crate::widgets::signal_bus::{GuiSignal, SignalKind, SignalUrgency, TabBadge};
 
 use super::terminal_search::TerminalSearch;
 use super::{View, ViewId};
@@ -44,6 +46,15 @@ struct PendingInjection {
     target_dir: PathBuf,
 }
 
+/// State snapshot of a tab for detecting changes between context ticks.
+#[derive(Default)]
+struct TabSnapshot {
+    insight_count: usize,
+    compaction_count: u32,
+    tier: Option<ContextTier>,
+    modified_files: HashSet<String>,
+}
+
 pub struct TerminalsView {
     tabs: BTreeMap<u64, Tab>,
     active_tab: Option<u64>,
@@ -61,6 +72,12 @@ pub struct TerminalsView {
     live_insights_path: Option<PathBuf>,
     /// Last injected tier per tab, for detecting tier crossings.
     last_injected_tiers: BTreeMap<u64, ContextTier>,
+    /// State snapshots for signal change detection.
+    tab_snapshots: BTreeMap<u64, TabSnapshot>,
+    /// Tab badges synced from SignalBus each frame.
+    pub tab_badges: BTreeMap<u64, TabBadge>,
+    /// Tab whose badges should be acknowledged (set by tab click, consumed by app.rs).
+    pub badge_acknowledged_tab: Option<u64>,
 }
 
 impl TerminalsView {
@@ -109,6 +126,9 @@ impl TerminalsView {
             pending_injections: Vec::new(),
             live_insights_path,
             last_injected_tiers: BTreeMap::new(),
+            tab_snapshots: BTreeMap::new(),
+            tab_badges: BTreeMap::new(),
+            badge_acknowledged_tab: None,
         }
     }
 
@@ -295,6 +315,8 @@ impl TerminalsView {
         }
         self.tabs.remove(&id);
         self.last_injected_tiers.remove(&id);
+        self.tab_snapshots.remove(&id);
+        self.tab_badges.remove(&id);
         if self.active_tab == Some(id) {
             self.active_tab = self
                 .tabs
@@ -346,6 +368,8 @@ impl TerminalsView {
         }
         self.tabs.clear();
         self.last_injected_tiers.clear();
+        self.tab_snapshots.clear();
+        self.tab_badges.clear();
         self.active_tab = None;
     }
 
@@ -453,6 +477,165 @@ impl TerminalsView {
         if !new_insights.is_empty() {
             self.persist_insights(&new_insights);
         }
+    }
+
+    /// Compare tab states against snapshots and emit signals for changes.
+    ///
+    /// Called after `context_tick()` in the 3-second tick block. Detects:
+    /// - New errors/task completions from insight diffs
+    /// - Compaction events from compaction count changes
+    /// - Context tier crossings (60%, 80%)
+    /// - Cross-tab file conflicts from modified_files set intersection
+    pub fn collect_signals(&mut self) -> Vec<GuiSignal> {
+        let mut signals = Vec::new();
+        let now = Instant::now();
+        let tab_ids: Vec<u64> = self.tabs.keys().copied().collect();
+
+        // Phase 1: Collect per-tab signals by comparing against snapshots.
+        for &id in &tab_ids {
+            let Some(tab) = self.tabs.get(&id) else {
+                continue;
+            };
+            if !tab.panel.is_alive() {
+                continue;
+            }
+
+            let health = tab.panel.context_health();
+            let insights = tab.panel.insights();
+            let snapshot = self.tab_snapshots.entry(id).or_default();
+
+            // Check for new insights since last snapshot.
+            if insights.len() > snapshot.insight_count {
+                let new_insights = &insights[snapshot.insight_count..];
+                for insight in new_insights {
+                    match insight.insight_type {
+                        InsightType::ErrorEncountered => {
+                            signals.push(GuiSignal {
+                                kind: SignalKind::ErrorEncountered,
+                                urgency: SignalUrgency::Important,
+                                tab_id: Some(id),
+                                message: format!(
+                                    "[{}] Error: {}",
+                                    tab.label,
+                                    truncate_message(&insight.content, 80)
+                                ),
+                                created_at: now,
+                            });
+                        }
+                        InsightType::TaskCompleted => {
+                            signals.push(GuiSignal {
+                                kind: SignalKind::TaskCompleted,
+                                urgency: SignalUrgency::Important,
+                                tab_id: Some(id),
+                                message: format!(
+                                    "[{}] Task completed: {}",
+                                    tab.label,
+                                    truncate_message(&insight.content, 60)
+                                ),
+                                created_at: now,
+                            });
+                        }
+                        InsightType::FileModified => {
+                            snapshot.modified_files.insert(insight.content.clone());
+                        }
+                        InsightType::DecisionMade => {}
+                    }
+                }
+                snapshot.insight_count = insights.len();
+            }
+
+            // Check compaction count changes.
+            if health.compaction_count > snapshot.compaction_count {
+                signals.push(GuiSignal {
+                    kind: SignalKind::CompactionDetected,
+                    urgency: SignalUrgency::Important,
+                    tab_id: Some(id),
+                    message: format!(
+                        "[{}] Context compacted \u{2014} some memory was lost",
+                        tab.label
+                    ),
+                    created_at: now,
+                });
+                snapshot.compaction_count = health.compaction_count;
+            }
+
+            // Check tier crossings.
+            let current_tier = health.tier;
+            let previous_tier = snapshot.tier;
+            if previous_tier != Some(current_tier) {
+                match current_tier {
+                    ContextTier::Critical => {
+                        signals.push(GuiSignal {
+                            kind: SignalKind::ContextThreshold { pct: 60 },
+                            urgency: SignalUrgency::Important,
+                            tab_id: Some(id),
+                            message: format!(
+                                "[{}] Context at 60% \u{2014} consider compacting soon",
+                                tab.label
+                            ),
+                            created_at: now,
+                        });
+                    }
+                    ContextTier::Minimal => {
+                        signals.push(GuiSignal {
+                            kind: SignalKind::ContextThreshold { pct: 80 },
+                            urgency: SignalUrgency::Urgent,
+                            tab_id: Some(id),
+                            message: format!(
+                                "[{}] Context at 80% \u{2014} compact or start fresh",
+                                tab.label
+                            ),
+                            created_at: now,
+                        });
+                    }
+                    _ => {}
+                }
+                snapshot.tier = Some(current_tier);
+            }
+        }
+
+        // Phase 2: Cross-tab file conflict detection.
+        // For each tab's modified files, check if any other tab also modified that file.
+        for &id in &tab_ids {
+            let Some(snapshot) = self.tab_snapshots.get(&id) else {
+                continue;
+            };
+            let files: Vec<String> = snapshot.modified_files.iter().cloned().collect();
+
+            for &other_id in &tab_ids {
+                if other_id == id {
+                    continue;
+                }
+                let Some(other_snapshot) = self.tab_snapshots.get(&other_id) else {
+                    continue;
+                };
+                let other_label = self
+                    .tabs
+                    .get(&other_id)
+                    .map(|t| t.label.clone())
+                    .unwrap_or_default();
+
+                for file in &files {
+                    if other_snapshot.modified_files.contains(file) {
+                        signals.push(GuiSignal {
+                            kind: SignalKind::FileConflict {
+                                path: file.clone(),
+                                other_tab: other_label.clone(),
+                            },
+                            urgency: SignalUrgency::Urgent,
+                            tab_id: Some(id),
+                            message: format!(
+                                "Conflict: {} edited in both tabs (also in {})",
+                                file, other_label
+                            ),
+                            created_at: now,
+                        });
+                    }
+                }
+            }
+        }
+
+        signals
     }
 
     /// Append insights to LIVE_INSIGHTS.jsonl.
@@ -615,6 +798,7 @@ impl View for TerminalsView {
                 } else {
                     None
                 };
+                let badge = self.tab_badges.get(id).cloned().unwrap_or_default();
 
                 ui.horizontal(|ui| {
                     // Alive dot.
@@ -634,6 +818,7 @@ impl View for TerminalsView {
                     });
                     if ui.selectable_label(is_active, text).clicked() {
                         self.active_tab = Some(*id);
+                        self.badge_acknowledged_tab = Some(*id);
                     }
 
                     // Context health indicator for alive panels.
@@ -646,6 +831,29 @@ impl View for TerminalsView {
                             usage_fraction * 100.0,
                             estimated_tokens
                         ));
+                    }
+
+                    // Signal badges (from signal bus, synced each frame).
+                    if badge.has_conflict {
+                        ui.label(egui::RichText::new("\u{26A0}").small().color(colors::RED))
+                            .on_hover_text("File conflict with another pane");
+                    }
+                    if badge.has_error {
+                        let (_, dot_rect) = ui.allocate_space(egui::vec2(6.0, 6.0));
+                        ui.painter()
+                            .circle_filled(dot_rect.center(), 2.5, colors::RED);
+                    }
+                    if badge.has_task_complete {
+                        ui.label(egui::RichText::new("\u{2713}").small().color(colors::GREEN))
+                            .on_hover_text("Task completed");
+                    }
+                    if badge.has_compaction {
+                        ui.label(
+                            egui::RichText::new("\u{21BB}")
+                                .small()
+                                .color(colors::YELLOW),
+                        )
+                        .on_hover_text("Context was compacted");
                     }
 
                     // Search match count badge.
@@ -956,6 +1164,20 @@ fn context_tier_display_from(usage_fraction: f32) -> (&'static str, egui::Color3
         ("\u{25D1}", colors::RED) // ◑ red
     } else {
         ("\u{25CB}", colors::RED) // ○ red
+    }
+}
+
+/// Truncate a message to a maximum length with ellipsis.
+fn truncate_message(s: &str, max_len: usize) -> &str {
+    if s.len() <= max_len {
+        s
+    } else {
+        // Find a safe char boundary.
+        let mut end = max_len;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        &s[..end]
     }
 }
 
