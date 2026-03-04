@@ -95,6 +95,13 @@ enum Commands {
     SessionInfo {
         id: String,
     },
+    /// Check for cross-session file conflicts
+    SessionConflicts {
+        #[arg(long)]
+        file: Option<String>,
+        #[arg(long)]
+        session_id: Option<String>,
+    },
     Status,
     Chat {
         #[arg(short, long)]
@@ -203,6 +210,12 @@ enum Commands {
         #[arg(short, long)]
         limit: Option<usize>,
         #[arg(long)]
+        offset: Option<usize>,
+        #[arg(short, long)]
+        page: Option<usize>,
+        #[arg(long)]
+        total: bool,
+        #[arg(long)]
         explain: bool,
         #[arg(long)]
         json: bool,
@@ -216,6 +229,12 @@ enum Commands {
         backend: Option<String>,
         #[arg(short, long)]
         limit: Option<usize>,
+        #[arg(long)]
+        offset: Option<usize>,
+        #[arg(short, long)]
+        page: Option<usize>,
+        #[arg(long)]
+        total: bool,
         #[arg(long)]
         explain: bool,
         #[arg(long)]
@@ -467,6 +486,18 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Show conflict analytics and statistics
+    Analytics {
+        /// Analytics type: conflicts
+        #[arg(default_value = "conflicts")]
+        subcommand: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+        /// Time period: day, week, month, all
+        #[arg(long, default_value = "all")]
+        period: String,
+    },
 }
 
 #[tokio::main]
@@ -577,7 +608,7 @@ fn print_injection_explain(result: &injection::types::InjectionRunResult) {
         result
             .explain
             .fallback_code
-            .map(|c| format!("{:?}", c))
+            .map(|c| c.as_str().to_string())
             .unwrap_or_else(|| "none".to_string()),
         result.explain.timing_ms,
         result.explain.candidate_count,
@@ -955,6 +986,70 @@ async fn run_daemon_mode(cli: Cli) -> Result<()> {
             Ok(s) => println!("{}", serde_json::to_string_pretty(&s).unwrap()),
             Err(e) => eprintln!("Error: {}", e),
         },
+        Commands::SessionConflicts { file, session_id } => {
+            let sid = match get_session_id(session_id) {
+                Some(s) => s,
+                None => {
+                    eprintln!("Error: No session_id. Use --session-id or IMPULSE_SESSION_ID");
+                    return Ok(());
+                }
+            };
+            match file {
+                Some(f) => match client.check_conflict(sid, f).await {
+                    Ok((has_conflict, sessions)) => {
+                        if has_conflict {
+                            println!("⚠️  CONFLICT DETECTED");
+                            println!("File is being edited by: {}", sessions.join(", "));
+                        } else {
+                            println!("✓ No conflicts detected");
+                        }
+                    }
+                    Err(e) => eprintln!("Error: {}", e),
+                },
+                None => match client.list_sessions().await {
+                    Ok(sessions) => {
+                        let mut all_files: std::collections::HashSet<String> =
+                            std::collections::HashSet::new();
+                        let mut file_to_session: std::collections::HashMap<String, Vec<String>> =
+                            std::collections::HashMap::new();
+
+                        for s in &sessions {
+                            if let Some(files) = s.get("active_files").and_then(|v| v.as_array()) {
+                                for f in files {
+                                    if let Some(path) = f.as_str() {
+                                        all_files.insert(path.to_string());
+                                        file_to_session.entry(path.to_string()).or_default().push(
+                                            s.get("name")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("?")
+                                                .to_string(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        if all_files.is_empty() {
+                            println!("No active file modifications across sessions");
+                        } else {
+                            println!("Active file modifications across sessions:");
+                            for (file, sessions) in &file_to_session {
+                                if sessions.len() > 1 {
+                                    println!(
+                                        "  ⚠️  {} - being edited by: {}",
+                                        file,
+                                        sessions.join(", ")
+                                    );
+                                } else {
+                                    println!("  {} - edited by: {}", file, sessions.join(", "));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("Error: {}", e),
+                },
+            }
+        }
         Commands::Status => match client.status().await {
             Ok(s) => println!("{}", serde_json::to_string_pretty(&s).unwrap()),
             Err(e) => eprintln!("Error: {}", e),
@@ -1139,6 +1234,60 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
             Ok(None) => println!("Session not found: {}", id),
             Err(e) => eprintln!("Error: {}", e),
         },
+        Commands::SessionConflicts { file, session_id } => {
+            let sid = match get_session_id(session_id) {
+                Some(s) => s,
+                None => {
+                    eprintln!("Error: No session_id. Use --session-id or IMPULSE_SESSION_ID");
+                    return Ok(());
+                }
+            };
+            match file {
+                Some(f) => {
+                    let conflicting = state.check_file_conflict(&sid, &f).await?;
+                    if !conflicting.is_empty() {
+                        println!("⚠️  CONFLICT DETECTED");
+                        println!("File is being edited by: {}", conflicting.join(", "));
+                    } else {
+                        println!("✓ No conflicts detected");
+                    }
+                }
+                None => {
+                    let sessions = state.list_sessions().await?;
+                    let mut all_files: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    let mut file_to_session: std::collections::HashMap<String, Vec<String>> =
+                        std::collections::HashMap::new();
+
+                    for s in &sessions {
+                        for f in &s.active_files {
+                            all_files.insert(f.clone());
+                            file_to_session
+                                .entry(f.clone())
+                                .or_default()
+                                .push(s.name.clone());
+                        }
+                    }
+
+                    if all_files.is_empty() {
+                        println!("No active file modifications across sessions");
+                    } else {
+                        println!("Active file modifications across sessions:");
+                        for (file, sessions) in &file_to_session {
+                            if sessions.len() > 1 {
+                                println!(
+                                    "  ⚠️  {} - being edited by: {}",
+                                    file,
+                                    sessions.join(", ")
+                                );
+                            } else {
+                                println!("  {} - edited by: {}", file, sessions.join(", "));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         Commands::Chat { .. } => {
             println!("Chat requires daemon mode. Use: impulse-rs --daemon chat --session-id <id> --message <msg>");
         }
@@ -1635,6 +1784,9 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
             mode,
             backend,
             limit,
+            offset,
+            page,
+            total,
             explain,
             json,
         } => {
@@ -1653,6 +1805,11 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
             } else {
                 None
             };
+            let page_limit = limit.unwrap_or(10);
+            let page_offset = offset.unwrap_or(0)
+                + page
+                    .map(|p| (p.saturating_sub(1)) * page_limit)
+                    .unwrap_or(0);
             let config = state.config_snapshot()?;
             let resp = retrieval::search_history(
                 state.storage().base_path(),
@@ -1661,10 +1818,16 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
                 mode,
                 backend,
                 limit,
+                Some(page_offset),
             )?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&resp)?);
             } else {
+                if total {
+                    if let Some(tc) = resp.total_count {
+                        println!("Total matches: {}", tc);
+                    }
+                }
                 if resp.used_fallback {
                     println!(
                         "Mode: {} (fallback) [{}] - {}",
@@ -1696,7 +1859,7 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
                         resp.timing_ms,
                         resp.candidate_count,
                         resp.fallback_code
-                            .map(|c| format!("{:?}", c))
+                            .map(|c| c.as_str().to_string())
                             .unwrap_or_else(|| "none".to_string())
                     );
                     for note in resp.engine_notes {
@@ -1710,6 +1873,9 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
             mode,
             backend,
             limit,
+            offset,
+            page,
+            total,
             explain,
             json,
         } => {
@@ -1728,6 +1894,11 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
             } else {
                 None
             };
+            let page_limit = limit.unwrap_or(10);
+            let page_offset = offset.unwrap_or(0)
+                + page
+                    .map(|p| (p.saturating_sub(1)) * page_limit)
+                    .unwrap_or(0);
             let config = state.config_snapshot()?;
             let resp = retrieval::search_genome(
                 state.storage().base_path(),
@@ -1736,10 +1907,16 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
                 mode,
                 backend,
                 limit,
+                Some(page_offset),
             )?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&resp)?);
             } else {
+                if total {
+                    if let Some(tc) = resp.total_count {
+                        println!("Total matches: {}", tc);
+                    }
+                }
                 if resp.used_fallback {
                     println!(
                         "Mode: {} (fallback) [{}] - {}",
@@ -1771,7 +1948,7 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
                         resp.timing_ms,
                         resp.candidate_count,
                         resp.fallback_code
-                            .map(|c| format!("{:?}", c))
+                            .map(|c| c.as_str().to_string())
                             .unwrap_or_else(|| "none".to_string())
                     );
                     for note in resp.engine_notes {
@@ -2382,7 +2559,7 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
 
                     if json {
                         let status = serde_json::json!({
-                            "mode": format!("{:?}", stew_config.mode),
+                            "mode": stew_config.mode.as_str(),
                             "thresholds": {
                                 "monitor": stew_config.monitor_threshold,
                                 "surgical": stew_config.surgical_threshold,
@@ -2478,10 +2655,10 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
                                 serde_json::json!({
                                     "id": p.id,
                                     "strategy": p.strategy.as_str(),
-                                    "threshold": format!("{:?}", p.threshold),
+                                    "threshold": p.threshold.as_str(),
                                     "estimated_tokens_freed": p.estimated_tokens_freed,
                                     "regions": p.regions.len(),
-                                    "status": format!("{:?}", p.status),
+                                    "status": p.status.as_str(),
                                 })
                             })
                             .collect();
@@ -3397,6 +3574,91 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
                 println!("  impulse-rs guard --disable <rule-id>             Disable a rule");
                 println!("  impulse-rs guard --list --json                   List rules as JSON");
                 println!("  impulse-rs guard --action \"<cmd>\" --json         Evaluate as JSON");
+            }
+        }
+        Commands::Analytics {
+            subcommand,
+            json,
+            period,
+        } => {
+            if subcommand == "conflicts" {
+                let history = state.get_conflict_analytics()?;
+                let analytics = history.get_analytics();
+
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&analytics)
+                            .unwrap_or_else(|_| "{}".to_string())
+                    );
+                } else {
+                    println!("\n=== Conflict Analytics ===\n");
+                    println!("Total Conflicts: {}", analytics.total_conflicts);
+                    println!(
+                        "Resolved: {} ({:.1}%)",
+                        analytics.resolved_count, analytics.resolution_rate
+                    );
+                    println!("Unresolved: {}", analytics.unresolved_count);
+                    println!(
+                        "Avg Time to Resolution: {}",
+                        analytics.format_time_to_resolution()
+                    );
+
+                    if !analytics.most_common_files.is_empty() {
+                        println!("\n--- Most Common Conflict Files ---");
+                        for (file, count) in analytics.most_common_files.iter().take(5) {
+                            println!("  {} ({} times)", file, count);
+                        }
+                    }
+
+                    if !analytics.resolution_methods.is_empty() {
+                        println!("\n--- Resolution Methods ---");
+                        for (method, count) in &analytics.resolution_methods {
+                            println!("  {}: {}", method, count);
+                        }
+                    }
+
+                    match period.as_str() {
+                        "day" => {
+                            if !analytics.conflicts_by_day.is_empty() {
+                                println!("\n--- Conflicts by Day ---");
+                                let mut days: Vec<_> = analytics.conflicts_by_day.iter().collect();
+                                days.sort_by(|a, b| a.0.cmp(b.0));
+                                for (day, count) in days.iter().rev().take(7) {
+                                    println!("  {}: {}", day, count);
+                                }
+                            }
+                        }
+                        "week" => {
+                            if !analytics.conflicts_by_week.is_empty() {
+                                println!("\n--- Conflicts by Week ---");
+                                let mut weeks: Vec<_> =
+                                    analytics.conflicts_by_week.iter().collect();
+                                weeks.sort_by(|a, b| a.0.cmp(b.0));
+                                for (week, count) in weeks.iter().rev().take(8) {
+                                    println!("  {}: {}", week, count);
+                                }
+                            }
+                        }
+                        "month" => {
+                            if !analytics.conflicts_by_month.is_empty() {
+                                println!("\n--- Conflicts by Month ---");
+                                let mut months: Vec<_> =
+                                    analytics.conflicts_by_month.iter().collect();
+                                months.sort_by(|a, b| a.0.cmp(b.0));
+                                for (month, count) in months.iter().rev().take(6) {
+                                    println!("  {}: {}", month, count);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            } else {
+                println!(
+                    "Unknown analytics type: {}. Available: conflicts",
+                    subcommand
+                );
             }
         }
     }

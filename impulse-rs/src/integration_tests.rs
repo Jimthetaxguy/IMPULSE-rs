@@ -1219,7 +1219,7 @@ mod tests {
         );
         let stdout = stdout_str(&out);
         assert!(
-            stdout.contains("fallback_code=VectorBackendDisabled"),
+            stdout.contains("fallback_code=vector_backend_disabled"),
             "expected vector-disabled fallback metadata, got: {}",
             stdout
         );

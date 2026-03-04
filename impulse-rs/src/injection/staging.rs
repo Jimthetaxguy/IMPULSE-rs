@@ -101,7 +101,7 @@ fn render_markdown(bundle: &InjectionBundle) -> String {
         "- Fallback Code: {}\n",
         bundle
             .fallback_code
-            .map(|c| format!("{:?}", c))
+            .map(|c| c.as_str().to_string())
             .unwrap_or_else(|| "none".to_string())
     ));
     out.push_str(&format!("- Timing (ms): {}\n", bundle.timing_ms));
@@ -164,7 +164,7 @@ pub fn stage_bundle(base_path: &Path, bundle: &InjectionBundle) -> Result<StageR
             retrieval_mode: bundle.retrieval_mode.clone(),
             backend_used: bundle.backend_used.clone(),
             used_fallback: bundle.used_fallback,
-            fallback_code: bundle.fallback_code.map(|c| format!("{:?}", c)),
+            fallback_code: bundle.fallback_code.map(|c| c.as_str().to_string()),
             timing_ms: bundle.timing_ms,
             candidate_count: bundle.candidate_count,
             bundle_hash: bundle.bundle_hash.clone(),
@@ -197,7 +197,7 @@ pub fn stage_bundle(base_path: &Path, bundle: &InjectionBundle) -> Result<StageR
         retrieval_mode: bundle.retrieval_mode.clone(),
         backend_used: bundle.backend_used.clone(),
         used_fallback: bundle.used_fallback,
-        fallback_code: bundle.fallback_code.map(|c| format!("{:?}", c)),
+        fallback_code: bundle.fallback_code.map(|c| c.as_str().to_string()),
         timing_ms: bundle.timing_ms,
         candidate_count: bundle.candidate_count,
         bundle_hash: bundle.bundle_hash.clone(),

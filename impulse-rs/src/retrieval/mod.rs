@@ -1,4 +1,5 @@
 pub mod embedding;
+pub mod fuzzy;
 pub mod indexer;
 pub mod pageindex;
 pub mod query;
@@ -14,19 +15,26 @@ use crate::memory::Genome;
 use crate::retrieval::indexer::{index_memory, index_memory_from_storage};
 use crate::retrieval::store::RetrievalStore;
 use crate::retrieval::types::{
-    IndexScope, IndexState, InjectionStatus, RetrievalMode, RetrievalStatus, SearchBackend,
-    SearchResponse,
+    IndexScope, IndexState, InjectionStatus, RetrievalHealth, RetrievalMode, RetrievalStatus,
+    SearchBackend, SearchResponse,
 };
 use crate::state::{Config, HistoryEntry};
 use crate::storage::Storage;
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let temp_path = path.with_extension("tmp");
+    let temp_path = path.with_extension(format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
     let mut file = File::create(&temp_path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     drop(file);
-    std::fs::rename(temp_path, path)?;
+    std::fs::rename(&temp_path, path)?;
     Ok(())
 }
 
@@ -57,8 +65,9 @@ pub fn search_history(
     mode: Option<RetrievalMode>,
     backend: Option<SearchBackend>,
     limit: Option<usize>,
+    offset: Option<usize>,
 ) -> Result<SearchResponse> {
-    query::search_history(base_path, config, query, mode, backend, limit)
+    query::search_history(base_path, config, query, mode, backend, limit, offset)
 }
 
 pub fn search_genome(
@@ -68,8 +77,9 @@ pub fn search_genome(
     mode: Option<RetrievalMode>,
     backend: Option<SearchBackend>,
     limit: Option<usize>,
+    offset: Option<usize>,
 ) -> Result<SearchResponse> {
-    query::search_genome(base_path, config, query, mode, backend, limit)
+    query::search_genome(base_path, config, query, mode, backend, limit, offset)
 }
 
 pub fn status(base_path: &Path, config: &Config, check: bool) -> Result<RetrievalStatus> {
@@ -193,6 +203,25 @@ pub fn status(base_path: &Path, config: &Config, check: bool) -> Result<Retrieva
     })
 }
 
+pub fn check_retrieval_health(base_path: &Path, config: &Config) -> RetrievalHealth {
+    let mut health = RetrievalHealth::default();
+
+    if let Ok(store) = RetrievalStore::open(base_path) {
+        if store.init_schema().is_ok() {
+            health.keyword_fts = store.search_history_keyword("test", 1).is_ok();
+
+            health.sqlite_vec = store.try_load_vec_extension(None).unwrap_or(false);
+            if health.sqlite_vec {
+                health.sqlite_vec = store.table_exists("history_vec0").unwrap_or(false);
+            }
+
+            health.rust_cosine = embedding::embed_texts(config, &["test".to_string()], 5).is_ok();
+        }
+    }
+
+    health
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
@@ -291,7 +320,8 @@ mod tests {
         .unwrap();
 
         // Search for the entry
-        let result = search_history(tmp.path(), &config, "search", None, None, Some(5)).unwrap();
+        let result =
+            search_history(tmp.path(), &config, "search", None, None, Some(5), None).unwrap();
         assert!(result.candidate_count > 0);
         assert!(!result.results.is_empty());
     }
@@ -318,11 +348,56 @@ mod tests {
         let _idx = index(tmp.path(), &[], &genome, &config, IndexScope::Genome, true).unwrap();
 
         // Search for the entry
-        let result = search_genome(tmp.path(), &config, "sqlite", None, None, Some(5)).unwrap();
+        let result =
+            search_genome(tmp.path(), &config, "sqlite", None, None, Some(5), None).unwrap();
         assert!(result.candidate_count > 0);
         assert!(!result.results.is_empty());
         // Verify we found the SQLite decision
         let found_sqlite = result.results.iter().any(|r| r.snippet.contains("SQLite"));
         assert!(found_sqlite);
+    }
+
+    #[test]
+    fn test_check_retrieval_health() {
+        let tmp = TempDir::new().unwrap();
+        let config = Config::default();
+        let health = check_retrieval_health(tmp.path(), &config);
+        assert!(!health.sqlite_vec);
+    }
+
+    #[test]
+    fn test_check_retrieval_health_with_index() {
+        let tmp = TempDir::new().unwrap();
+        let config = Config::default();
+
+        let history_entry = HistoryEntry {
+            session_id: "health-test-001".to_string(),
+            session_name: "Health Test".to_string(),
+            platform: Some(Platform::ClaudeCode),
+            started_at: DateTime::parse_from_rfc3339("2026-01-01T10:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            ended_at: DateTime::parse_from_rfc3339("2026-01-01T11:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            summary: "Test session for health check".to_string(),
+            files_touched: vec!["src/main.rs".to_string()],
+            tools_used: vec!["Write".to_string()],
+        };
+
+        let genome = Genome::default();
+        let _idx = index(
+            tmp.path(),
+            &[history_entry],
+            &genome,
+            &config,
+            IndexScope::All,
+            true,
+        )
+        .unwrap();
+
+        let health = check_retrieval_health(tmp.path(), &config);
+        assert!(!health.sqlite_vec);
+        assert!(health.keyword_fts);
     }
 }

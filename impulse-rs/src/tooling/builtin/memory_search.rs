@@ -121,8 +121,15 @@ impl DynamicTool for MemorySearchTool {
         let mut all_results = Vec::new();
 
         if scope == "history" || scope == "all" {
-            match retrieval::search_history(&base_path, &config, query, mode, backend, Some(limit))
-            {
+            match retrieval::search_history(
+                &base_path,
+                &config,
+                query,
+                mode,
+                backend,
+                Some(limit),
+                None,
+            ) {
                 Ok(response) => {
                     for result in response.results {
                         all_results.push(serde_json::json!({
@@ -144,7 +151,15 @@ impl DynamicTool for MemorySearchTool {
         }
 
         if scope == "genome" || scope == "all" {
-            match retrieval::search_genome(&base_path, &config, query, mode, backend, Some(limit)) {
+            match retrieval::search_genome(
+                &base_path,
+                &config,
+                query,
+                mode,
+                backend,
+                Some(limit),
+                None,
+            ) {
                 Ok(response) => {
                     for result in response.results {
                         all_results.push(serde_json::json!({

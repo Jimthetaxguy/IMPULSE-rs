@@ -13,6 +13,10 @@ use crate::retrieval::types::{
 use crate::state::{Config, HistoryEntry};
 use crate::storage::Storage;
 
+pub fn highlight_matches(text: &str, _query: &str) -> String {
+    text.to_string()
+}
+
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
@@ -82,6 +86,7 @@ fn keyword_response(
         candidate_count: results.len(),
         engine_notes,
         results,
+        total_count: None,
     }
 }
 
@@ -194,6 +199,7 @@ fn semantic_history_rust(
                 backend_used: SearchBackend::Keyword.as_str().to_string(),
                 timing_ms: started.elapsed().as_millis() as u64,
                 candidate_count: 0,
+                total_count: None,
                 engine_notes,
                 results: store
                     .search_history_keyword(query, limit)
@@ -209,6 +215,7 @@ fn semantic_history_rust(
                 backend_used: SearchBackend::Keyword.as_str().to_string(),
                 timing_ms: started.elapsed().as_millis() as u64,
                 candidate_count: 0,
+                total_count: None,
                 engine_notes,
                 results: store
                     .search_history_keyword(query, limit)
@@ -266,6 +273,7 @@ fn semantic_history_rust(
         candidate_count,
         engine_notes,
         results,
+        total_count: None,
     })
 }
 
@@ -295,6 +303,7 @@ fn semantic_history_sqlite_vec(
                 backend_used: SearchBackend::Keyword.as_str().to_string(),
                 timing_ms: started.elapsed().as_millis() as u64,
                 candidate_count: 0,
+                total_count: None,
                 engine_notes,
                 results: store
                     .search_history_keyword(query, limit)
@@ -310,6 +319,7 @@ fn semantic_history_sqlite_vec(
                 backend_used: SearchBackend::Keyword.as_str().to_string(),
                 timing_ms: started.elapsed().as_millis() as u64,
                 candidate_count: 0,
+                total_count: None,
                 engine_notes,
                 results: store
                     .search_history_keyword(query, limit)
@@ -354,6 +364,7 @@ fn semantic_history_sqlite_vec(
         candidate_count,
         engine_notes,
         results,
+        total_count: None,
     })
 }
 
@@ -383,6 +394,7 @@ fn semantic_genome_rust(
                 backend_used: SearchBackend::Keyword.as_str().to_string(),
                 timing_ms: started.elapsed().as_millis() as u64,
                 candidate_count: 0,
+                total_count: None,
                 engine_notes,
                 results: store
                     .search_genome_keyword(query, limit)
@@ -398,6 +410,7 @@ fn semantic_genome_rust(
                 backend_used: SearchBackend::Keyword.as_str().to_string(),
                 timing_ms: started.elapsed().as_millis() as u64,
                 candidate_count: 0,
+                total_count: None,
                 engine_notes,
                 results: store
                     .search_genome_keyword(query, limit)
@@ -455,6 +468,7 @@ fn semantic_genome_rust(
         candidate_count,
         engine_notes,
         results,
+        total_count: None,
     })
 }
 
@@ -484,6 +498,7 @@ fn semantic_genome_sqlite_vec(
                 backend_used: SearchBackend::Keyword.as_str().to_string(),
                 timing_ms: started.elapsed().as_millis() as u64,
                 candidate_count: 0,
+                total_count: None,
                 engine_notes,
                 results: store
                     .search_genome_keyword(query, limit)
@@ -499,6 +514,7 @@ fn semantic_genome_sqlite_vec(
                 backend_used: SearchBackend::Keyword.as_str().to_string(),
                 timing_ms: started.elapsed().as_millis() as u64,
                 candidate_count: 0,
+                total_count: None,
                 engine_notes,
                 results: store
                     .search_genome_keyword(query, limit)
@@ -543,6 +559,7 @@ fn semantic_genome_sqlite_vec(
         candidate_count,
         engine_notes,
         results,
+        total_count: None,
     })
 }
 
@@ -553,9 +570,12 @@ pub fn search_history(
     mode_override: Option<RetrievalMode>,
     backend_override: Option<SearchBackend>,
     limit_override: Option<usize>,
+    offset_override: Option<usize>,
 ) -> Result<SearchResponse> {
     let started = Instant::now();
     let limit = limit_override.unwrap_or(config.retrieval_default_limit.max(1));
+    let offset = offset_override.unwrap_or(0);
+    let _ = offset; // offset parameter reserved for future use
     let mode = resolve_mode(config, mode_override);
 
     if query.trim().is_empty() {
@@ -712,9 +732,12 @@ pub fn search_genome(
     mode_override: Option<RetrievalMode>,
     backend_override: Option<SearchBackend>,
     limit_override: Option<usize>,
+    offset_override: Option<usize>,
 ) -> Result<SearchResponse> {
     let started = Instant::now();
     let limit = limit_override.unwrap_or(config.retrieval_default_limit.max(1));
+    let offset = offset_override.unwrap_or(0);
+    let _ = offset; // offset parameter reserved for future use
     let mode = resolve_mode(config, mode_override);
 
     if query.trim().is_empty() {

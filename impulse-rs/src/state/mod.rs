@@ -35,6 +35,8 @@ pub struct Config {
     pub retrieval_similarity_threshold: f32,
     /// Embedding provider identifier
     pub retrieval_embedding_provider: String,
+    /// Embedding model to use for semantic retrieval
+    pub embedding_model: String,
     /// Python command used for embedding subprocess
     pub retrieval_python_cmd: String,
     /// Feature flag for vector retrieval
@@ -49,6 +51,10 @@ pub struct Config {
     pub retrieval_batch_size: usize,
     /// Candidate pool size for semantic reranking
     pub retrieval_candidate_pool: usize,
+    /// Enable deduplication of search results
+    pub retrieval_deduplicate_enabled: bool,
+    /// Enable fuzzy matching for typo-tolerant search
+    pub retrieval_fuzzy_matching_enabled: bool,
     /// Experimental PageIndex capability flag
     pub retrieval_experimental_pageindex_enabled: bool,
     /// PageIndex mode (local-structure or api-augmented)
@@ -123,6 +129,12 @@ pub struct Config {
     pub impulse_agent_auto_review: bool,
     /// Impulse Agent: enable automatic cross-pane coordination
     pub impulse_agent_auto_coordinate: bool,
+    /// Enable real-time conflict notifications
+    pub notifications_enabled: bool,
+    /// Conflict webhook URL for external notifications
+    pub conflict_webhook_url: Option<String>,
+    /// Enable conflict webhook notifications
+    pub conflict_webhook_enabled: bool,
     /// Guardrail configuration
     #[serde(default)]
     pub guardrails: crate::guardrail::GuardConfig,
@@ -141,6 +153,7 @@ impl Default for Config {
             retrieval_default_limit: 10,
             retrieval_similarity_threshold: 0.75,
             retrieval_embedding_provider: "python-st".to_string(),
+            embedding_model: "all-MiniLM-L6-v2".to_string(),
             retrieval_python_cmd: "python3".to_string(),
             retrieval_vector_enabled: false,
             retrieval_semantic_strategy: "auto".to_string(),
@@ -148,6 +161,8 @@ impl Default for Config {
             retrieval_index_timeout_secs: 60,
             retrieval_batch_size: 64,
             retrieval_candidate_pool: 200,
+            retrieval_deduplicate_enabled: true,
+            retrieval_fuzzy_matching_enabled: false,
             retrieval_experimental_pageindex_enabled: false,
             retrieval_pageindex_mode: "local-structure".to_string(),
             context_injection_mode: "review".to_string(),
@@ -186,6 +201,9 @@ impl Default for Config {
             impulse_agent_harness: None,
             impulse_agent_auto_review: false,
             impulse_agent_auto_coordinate: false,
+            notifications_enabled: true,
+            conflict_webhook_url: None,
+            conflict_webhook_enabled: false,
             guardrails: crate::guardrail::GuardConfig::default(),
         }
     }
@@ -196,9 +214,7 @@ impl Config {
     pub fn get(&self, key: &str) -> Option<String> {
         match key {
             "log_level" => Some(self.log_level.clone()),
-            "default_platform" => self
-                .default_platform
-                .map(|p| format!("{:?}", p).to_lowercase()),
+            "default_platform" => self.default_platform.map(|p| p.as_str().to_string()),
             "verbose" => Some(self.verbose.to_string()),
             "sync_interval_secs" => Some(self.sync_interval_secs.to_string()),
             "max_history_entries" => Some(self.max_history_entries.to_string()),
@@ -209,6 +225,7 @@ impl Config {
                 Some(self.retrieval_similarity_threshold.to_string())
             }
             "retrieval_embedding_provider" => Some(self.retrieval_embedding_provider.clone()),
+            "embedding_model" => Some(self.embedding_model.clone()),
             "retrieval_python_cmd" => Some(self.retrieval_python_cmd.clone()),
             "retrieval_vector_enabled" => Some(self.retrieval_vector_enabled.to_string()),
             "retrieval_semantic_strategy" => Some(self.retrieval_semantic_strategy.clone()),
@@ -216,6 +233,10 @@ impl Config {
             "retrieval_index_timeout_secs" => Some(self.retrieval_index_timeout_secs.to_string()),
             "retrieval_batch_size" => Some(self.retrieval_batch_size.to_string()),
             "retrieval_candidate_pool" => Some(self.retrieval_candidate_pool.to_string()),
+            "retrieval_deduplicate_enabled" => Some(self.retrieval_deduplicate_enabled.to_string()),
+            "retrieval_fuzzy_matching_enabled" => {
+                Some(self.retrieval_fuzzy_matching_enabled.to_string())
+            }
             "retrieval_experimental_pageindex_enabled" => {
                 Some(self.retrieval_experimental_pageindex_enabled.to_string())
             }
@@ -287,6 +308,9 @@ impl Config {
             "impulse_agent_harness" => self.impulse_agent_harness.clone(),
             "impulse_agent_auto_review" => Some(self.impulse_agent_auto_review.to_string()),
             "impulse_agent_auto_coordinate" => Some(self.impulse_agent_auto_coordinate.to_string()),
+            "notifications_enabled" => Some(self.notifications_enabled.to_string()),
+            "conflict_webhook_url" => self.conflict_webhook_url.clone(),
+            "conflict_webhook_enabled" => Some(self.conflict_webhook_enabled.to_string()),
             "guardrails_enabled" => Some(self.guardrails.enabled.to_string()),
             _ => None,
         }
@@ -376,6 +400,14 @@ impl Config {
                     false
                 }
             }
+            "embedding_model" => {
+                if !value.trim().is_empty() {
+                    self.embedding_model = value.to_string();
+                    true
+                } else {
+                    false
+                }
+            }
             "retrieval_python_cmd" => {
                 if !value.trim().is_empty() {
                     self.retrieval_python_cmd = value.to_string();
@@ -447,6 +479,20 @@ impl Config {
                     false
                 }
             }
+            "retrieval_deduplicate_enabled" => match value.parse::<bool>() {
+                Ok(v) => {
+                    self.retrieval_deduplicate_enabled = v;
+                    true
+                }
+                Err(_) => false,
+            },
+            "retrieval_fuzzy_matching_enabled" => match value.parse::<bool>() {
+                Ok(v) => {
+                    self.retrieval_fuzzy_matching_enabled = v;
+                    true
+                }
+                Err(_) => false,
+            },
             "retrieval_experimental_pageindex_enabled" => match value.parse::<bool>() {
                 Ok(v) => {
                     self.retrieval_experimental_pageindex_enabled = v;
@@ -743,6 +789,22 @@ impl Config {
                 self.impulse_agent_auto_coordinate = value.parse().unwrap_or(false);
                 true
             }
+            "notifications_enabled" => {
+                self.notifications_enabled = value.parse().unwrap_or(true);
+                true
+            }
+            "conflict_webhook_url" => {
+                if value.is_empty() || value == "none" {
+                    self.conflict_webhook_url = None;
+                } else {
+                    self.conflict_webhook_url = Some(value.to_string());
+                }
+                true
+            }
+            "conflict_webhook_enabled" => {
+                self.conflict_webhook_enabled = value.parse().unwrap_or(false);
+                true
+            }
             "guardrails_enabled" => {
                 self.guardrails.enabled = value.parse().unwrap_or(true);
                 true
@@ -758,7 +820,7 @@ impl Config {
             (
                 "default_platform".to_string(),
                 self.default_platform
-                    .map(|p| format!("{:?}", p).to_lowercase())
+                    .map(|p| p.as_str().to_string())
                     .unwrap_or_default(),
             ),
             ("verbose".to_string(), self.verbose.to_string()),
@@ -787,6 +849,7 @@ impl Config {
                 "retrieval_embedding_provider".to_string(),
                 self.retrieval_embedding_provider.clone(),
             ),
+            ("embedding_model".to_string(), self.embedding_model.clone()),
             (
                 "retrieval_python_cmd".to_string(),
                 self.retrieval_python_cmd.clone(),
@@ -814,6 +877,14 @@ impl Config {
             (
                 "retrieval_candidate_pool".to_string(),
                 self.retrieval_candidate_pool.to_string(),
+            ),
+            (
+                "retrieval_deduplicate_enabled".to_string(),
+                self.retrieval_deduplicate_enabled.to_string(),
+            ),
+            (
+                "retrieval_fuzzy_matching_enabled".to_string(),
+                self.retrieval_fuzzy_matching_enabled.to_string(),
             ),
             (
                 "retrieval_experimental_pageindex_enabled".to_string(),
@@ -977,6 +1048,20 @@ impl Config {
                 "impulse_agent_auto_coordinate".to_string(),
                 self.impulse_agent_auto_coordinate.to_string(),
             ),
+            (
+                "notifications_enabled".to_string(),
+                self.notifications_enabled.to_string(),
+            ),
+            (
+                "conflict_webhook_url".to_string(),
+                self.conflict_webhook_url
+                    .clone()
+                    .unwrap_or_else(|| "(not set)".to_string()),
+            ),
+            (
+                "conflict_webhook_enabled".to_string(),
+                self.conflict_webhook_enabled.to_string(),
+            ),
         ]
     }
 }
@@ -1002,6 +1087,15 @@ pub struct Session {
 pub enum Platform {
     ClaudeCode,
     OpenCode,
+}
+
+impl Platform {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Platform::ClaudeCode => "claude-code",
+            Platform::OpenCode => "opencode",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1299,6 +1393,41 @@ impl State {
             .await
     }
 
+    pub async fn check_file_conflict(
+        &self,
+        session_id: &str,
+        file_path: &str,
+    ) -> Result<Vec<String>> {
+        let state = self
+            .live_state
+            .try_read()
+            .map_err(|_| anyhow::anyhow!("Failed to acquire read lock on live state"))?;
+
+        let mut conflicting = Vec::new();
+        let normalized_path = std::path::Path::new(file_path)
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from(file_path))
+            .to_string_lossy()
+            .to_string();
+
+        for session in state.sessions.values() {
+            if session.id == session_id {
+                continue;
+            }
+            for active_file in &session.active_files {
+                let active_normalized = std::path::Path::new(active_file)
+                    .canonicalize()
+                    .unwrap_or_else(|_| std::path::PathBuf::from(active_file))
+                    .to_string_lossy()
+                    .to_string();
+                if active_normalized == normalized_path {
+                    conflicting.push(session.name.clone());
+                }
+            }
+        }
+        Ok(conflicting)
+    }
+
     pub async fn add_tag(&self, session_id: &str, tag: &str) -> Result<()> {
         self.with_session(session_id, |s| s.add_tag(tag)).await
     }
@@ -1402,9 +1531,190 @@ impl State {
         self.storage.write_json(CONFIG_FILE, &*config)?;
         Ok(())
     }
+
+    pub fn get_conflict_analytics(&self) -> Result<ConflictHistory> {
+        let history: ConflictHistory = self.storage.read_json("CONFLICTS.json").unwrap_or_default();
+        Ok(history)
+    }
+
+    pub fn record_conflict(&self, file_path: &str, sessions: Vec<String>) -> Result<()> {
+        let mut history: ConflictHistory =
+            self.storage.read_json("CONFLICTS.json").unwrap_or_default();
+        history.record_conflict(file_path, sessions);
+        self.storage.write_json("CONFLICTS.json", &history)?;
+        Ok(())
+    }
+
+    pub fn record_conflict_resolution(&self, file_path: &str, resolution: &str) -> Result<()> {
+        let mut history: ConflictHistory =
+            self.storage.read_json("CONFLICTS.json").unwrap_or_default();
+        history.record_resolution(file_path, resolution);
+        self.storage.write_json("CONFLICTS.json", &history)?;
+        Ok(())
+    }
 }
 
 pub type SharedState = Arc<State>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ConflictHistory {
+    #[serde(default)]
+    pub conflict_history: Vec<ConflictEntry>,
+}
+
+impl ConflictHistory {
+    pub fn new() -> Self {
+        Self {
+            conflict_history: Vec::new(),
+        }
+    }
+
+    pub fn record_conflict(&mut self, file_path: &str, detected_sessions: Vec<String>) {
+        if let Some(entry) = self
+            .conflict_history
+            .iter_mut()
+            .find(|e| e.file_path == file_path)
+        {
+            entry.detection_count += 1;
+            entry.last_detected = Utc::now();
+            entry.involved_sessions = detected_sessions;
+        } else {
+            self.conflict_history.push(ConflictEntry {
+                file_path: file_path.to_string(),
+                detection_count: 1,
+                first_detected: Utc::now(),
+                last_detected: Utc::now(),
+                involved_sessions: detected_sessions,
+                resolution: None,
+                resolved_at: None,
+            });
+        }
+    }
+
+    pub fn record_resolution(&mut self, file_path: &str, resolution: &str) {
+        if let Some(entry) = self
+            .conflict_history
+            .iter_mut()
+            .find(|e| e.file_path == file_path)
+        {
+            entry.resolution = Some(resolution.to_string());
+            entry.resolved_at = Some(Utc::now());
+        }
+    }
+
+    pub fn get_conflict_history(&self) -> &[ConflictEntry] {
+        &self.conflict_history
+    }
+
+    pub fn get_analytics(&self) -> ConflictAnalytics {
+        ConflictAnalytics::from_history(&self.conflict_history)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConflictEntry {
+    pub file_path: String,
+    pub detection_count: usize,
+    pub first_detected: DateTime<Utc>,
+    pub last_detected: DateTime<Utc>,
+    pub involved_sessions: Vec<String>,
+    pub resolution: Option<String>,
+    pub resolved_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ConflictAnalytics {
+    pub total_conflicts: usize,
+    pub resolved_count: usize,
+    pub unresolved_count: usize,
+    pub resolution_rate: f64,
+    pub conflicts_by_day: HashMap<String, usize>,
+    pub conflicts_by_week: HashMap<String, usize>,
+    pub conflicts_by_month: HashMap<String, usize>,
+    pub most_common_files: Vec<(String, usize)>,
+    pub resolution_methods: HashMap<String, usize>,
+    pub avg_time_to_resolution_secs: Option<i64>,
+}
+
+impl ConflictAnalytics {
+    pub fn from_history(entries: &[ConflictEntry]) -> Self {
+        let total_conflicts = entries.len();
+        let resolved_count = entries.iter().filter(|e| e.resolution.is_some()).count();
+        let unresolved_count = total_conflicts - resolved_count;
+        let resolution_rate = if total_conflicts > 0 {
+            (resolved_count as f64 / total_conflicts as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        let mut conflicts_by_day: HashMap<String, usize> = HashMap::new();
+        let mut conflicts_by_week: HashMap<String, usize> = HashMap::new();
+        let mut conflicts_by_month: HashMap<String, usize> = HashMap::new();
+        let mut file_counts: HashMap<String, usize> = HashMap::new();
+        let mut resolution_methods: HashMap<String, usize> = HashMap::new();
+        let mut total_resolution_time = 0i64;
+        let mut resolved_with_time = 0usize;
+
+        for entry in entries {
+            let day = entry.first_detected.format("%Y-%m-%d").to_string();
+            let week = entry.first_detected.format("%Y-W%U").to_string();
+            let month = entry.first_detected.format("%Y-%m").to_string();
+
+            *conflicts_by_day.entry(day).or_insert(0) += 1;
+            *conflicts_by_week.entry(week).or_insert(0) += 1;
+            *conflicts_by_month.entry(month).or_insert(0) += 1;
+            *file_counts.entry(entry.file_path.clone()).or_insert(0) += 1;
+
+            if let Some(ref resolution) = entry.resolution {
+                *resolution_methods.entry(resolution.clone()).or_insert(0) += 1;
+
+                if let Some(resolved_at) = entry.resolved_at {
+                    let duration = (resolved_at - entry.first_detected).num_seconds();
+                    total_resolution_time += duration;
+                    resolved_with_time += 1;
+                }
+            }
+        }
+
+        let mut most_common_files: Vec<_> = file_counts.into_iter().collect();
+        most_common_files.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let avg_time_to_resolution_secs = if resolved_with_time > 0 {
+            Some(total_resolution_time / resolved_with_time as i64)
+        } else {
+            None
+        };
+
+        Self {
+            total_conflicts,
+            resolved_count,
+            unresolved_count,
+            resolution_rate,
+            conflicts_by_day,
+            conflicts_by_week,
+            conflicts_by_month,
+            most_common_files,
+            resolution_methods,
+            avg_time_to_resolution_secs,
+        }
+    }
+
+    pub fn format_time_to_resolution(&self) -> String {
+        if let Some(secs) = self.avg_time_to_resolution_secs {
+            if secs < 60 {
+                format!("{}s", secs)
+            } else if secs < 3600 {
+                format!("{}m", secs / 60)
+            } else {
+                let hours = secs / 3600;
+                let mins = (secs % 3600) / 60;
+                format!("{}h {}m", hours, mins)
+            }
+        } else {
+            "N/A".to_string()
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1704,5 +2014,231 @@ mod tests {
 
         let loaded: Config = storage.read_json("config.json").unwrap();
         assert_eq!(loaded.log_level, "info");
+    }
+
+    #[tokio::test]
+    async fn test_check_file_conflict_same_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = crate::state::State::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let session1 = state
+            .create_session("session1".to_string(), None)
+            .await
+            .unwrap();
+        let session2 = state
+            .create_session("session2".to_string(), None)
+            .await
+            .unwrap();
+
+        state.track_file(&session1.id, "src/main.rs").await.unwrap();
+        state.track_file(&session2.id, "src/main.rs").await.unwrap();
+
+        let conflicting = state
+            .check_file_conflict(&session1.id, "src/main.rs")
+            .await
+            .unwrap();
+        assert!(!conflicting.is_empty());
+        assert!(conflicting.contains(&"session2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_check_file_conflict_different_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = crate::state::State::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let session1 = state
+            .create_session("session1".to_string(), None)
+            .await
+            .unwrap();
+        let _session2 = state
+            .create_session("session2".to_string(), None)
+            .await
+            .unwrap();
+
+        state.track_file(&session1.id, "src/main.rs").await.unwrap();
+
+        let conflicting = state
+            .check_file_conflict(&session1.id, "src/lib.rs")
+            .await
+            .unwrap();
+        assert!(conflicting.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_check_file_conflict_no_other_sessions() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = crate::state::State::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let session1 = state
+            .create_session("session1".to_string(), None)
+            .await
+            .unwrap();
+
+        state.track_file(&session1.id, "src/main.rs").await.unwrap();
+
+        let conflicting = state
+            .check_file_conflict(&session1.id, "src/main.rs")
+            .await
+            .unwrap();
+        assert!(conflicting.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_check_file_conflict_self_excluded() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = crate::state::State::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let session = state
+            .create_session("session1".to_string(), None)
+            .await
+            .unwrap();
+
+        state.track_file(&session.id, "src/main.rs").await.unwrap();
+
+        let conflicting = state
+            .check_file_conflict(&session.id, "src/main.rs")
+            .await
+            .unwrap();
+        assert!(conflicting.is_empty());
+    }
+
+    #[test]
+    fn test_conflict_history_new() {
+        let history = ConflictHistory::new();
+        assert!(history.conflict_history.is_empty());
+    }
+
+    #[test]
+    fn test_conflict_history_record_conflict() {
+        let mut history = ConflictHistory::new();
+        history.record_conflict(
+            "src/main.rs",
+            vec!["session1".to_string(), "session2".to_string()],
+        );
+
+        assert_eq!(history.conflict_history.len(), 1);
+        assert_eq!(history.conflict_history[0].file_path, "src/main.rs");
+        assert_eq!(history.conflict_history[0].detection_count, 1);
+        assert_eq!(history.conflict_history[0].involved_sessions.len(), 2);
+    }
+
+    #[test]
+    fn test_conflict_history_record_conflict_increments_count() {
+        let mut history = ConflictHistory::new();
+        history.record_conflict("src/main.rs", vec!["session1".to_string()]);
+        history.record_conflict("src/main.rs", vec!["session2".to_string()]);
+
+        assert_eq!(history.conflict_history.len(), 1);
+        assert_eq!(history.conflict_history[0].detection_count, 2);
+    }
+
+    #[test]
+    fn test_conflict_history_record_resolution() {
+        let mut history = ConflictHistory::new();
+        history.record_conflict("src/main.rs", vec!["session1".to_string()]);
+        history.record_resolution("src/main.rs", "merge");
+
+        assert_eq!(
+            history.conflict_history[0].resolution,
+            Some("merge".to_string())
+        );
+        assert!(history.conflict_history[0].resolved_at.is_some());
+    }
+
+    #[test]
+    fn test_conflict_analytics_from_history_empty() {
+        let analytics = ConflictAnalytics::from_history(&[]);
+        assert_eq!(analytics.total_conflicts, 0);
+        assert_eq!(analytics.resolved_count, 0);
+        assert_eq!(analytics.unresolved_count, 0);
+        assert_eq!(analytics.resolution_rate, 0.0);
+    }
+
+    #[test]
+    fn test_conflict_analytics_from_history_with_data() {
+        use chrono::Duration;
+
+        let mut entry1 = ConflictEntry {
+            file_path: "src/main.rs".to_string(),
+            detection_count: 1,
+            first_detected: chrono::Utc::now(),
+            last_detected: chrono::Utc::now(),
+            involved_sessions: vec!["session1".to_string()],
+            resolution: Some("merge".to_string()),
+            resolved_at: Some(chrono::Utc::now()),
+        };
+        entry1.resolved_at = Some(entry1.first_detected + Duration::seconds(60));
+
+        let entry2 = ConflictEntry {
+            file_path: "src/lib.rs".to_string(),
+            detection_count: 1,
+            first_detected: chrono::Utc::now(),
+            last_detected: chrono::Utc::now(),
+            involved_sessions: vec!["session2".to_string()],
+            resolution: None,
+            resolved_at: None,
+        };
+
+        let analytics = ConflictAnalytics::from_history(&[entry1, entry2]);
+
+        assert_eq!(analytics.total_conflicts, 2);
+        assert_eq!(analytics.resolved_count, 1);
+        assert_eq!(analytics.unresolved_count, 1);
+        assert_eq!(analytics.resolution_rate, 50.0);
+    }
+
+    #[test]
+    fn test_conflict_analytics_most_common_files() {
+        let entry1 = ConflictEntry {
+            file_path: "src/main.rs".to_string(),
+            detection_count: 1,
+            first_detected: chrono::Utc::now(),
+            last_detected: chrono::Utc::now(),
+            involved_sessions: vec![],
+            resolution: None,
+            resolved_at: None,
+        };
+        let entry2 = ConflictEntry {
+            file_path: "src/main.rs".to_string(),
+            detection_count: 1,
+            first_detected: chrono::Utc::now(),
+            last_detected: chrono::Utc::now(),
+            involved_sessions: vec![],
+            resolution: None,
+            resolved_at: None,
+        };
+        let entry3 = ConflictEntry {
+            file_path: "src/lib.rs".to_string(),
+            detection_count: 1,
+            first_detected: chrono::Utc::now(),
+            last_detected: chrono::Utc::now(),
+            involved_sessions: vec![],
+            resolution: None,
+            resolved_at: None,
+        };
+
+        let analytics = ConflictAnalytics::from_history(&[entry1, entry2, entry3]);
+
+        assert_eq!(analytics.most_common_files.len(), 2);
+        assert_eq!(analytics.most_common_files[0].0, "src/main.rs");
+        assert_eq!(analytics.most_common_files[0].1, 2);
+    }
+
+    #[test]
+    fn test_conflict_analytics_format_time_to_resolution() {
+        let analytics_empty = ConflictAnalytics::default();
+        assert_eq!(analytics_empty.format_time_to_resolution(), "N/A");
+
+        let mut analytics_with_time = ConflictAnalytics::default();
+        analytics_with_time.avg_time_to_resolution_secs = Some(30);
+        assert_eq!(analytics_with_time.format_time_to_resolution(), "30s");
+
+        let mut analytics_minutes = ConflictAnalytics::default();
+        analytics_minutes.avg_time_to_resolution_secs = Some(120);
+        assert_eq!(analytics_minutes.format_time_to_resolution(), "2m");
+
+        let mut analytics_hours = ConflictAnalytics::default();
+        analytics_hours.avg_time_to_resolution_secs = Some(3665);
+        assert_eq!(analytics_hours.format_time_to_resolution(), "1h 1m");
     }
 }

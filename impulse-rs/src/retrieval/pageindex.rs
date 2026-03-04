@@ -177,11 +177,20 @@ impl PageIndex {
             .collect()
     }
 
-    /// Save index to file
+    /// Save index to file using atomic temp + rename
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        fs::write(path, json)?;
+        let tmp_path = path.with_extension(format!(
+            "tmp.{}.{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::write(&tmp_path, json)?;
+        fs::rename(tmp_path, path)?;
         Ok(())
     }
 

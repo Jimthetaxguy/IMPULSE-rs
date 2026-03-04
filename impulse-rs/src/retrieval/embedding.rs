@@ -87,7 +87,7 @@ pub fn embed_texts(
 
     let request = EmbedRequest {
         texts,
-        model: "all-MiniLM-L6-v2",
+        model: &config.embedding_model,
     };
     let payload = serde_json::to_vec(&request).map_err(|e| EmbeddingError {
         kind: EmbeddingFailureKind::InvalidOutput,
