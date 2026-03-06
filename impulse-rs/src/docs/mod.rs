@@ -1,5 +1,7 @@
-// Docs module - fetch and cache AI provider documentation
-// Fetches model lists from OpenAI, Anthropic, and other providers
+//! Documentation fetching and display for AI providers.
+//!
+//! Fetches and caches model lists from OpenAI, Anthropic, and other providers.
+//! Supports offline mode via local cache in `.impulse/docs_cache/`.
 
 pub mod cache;
 pub mod fetch;

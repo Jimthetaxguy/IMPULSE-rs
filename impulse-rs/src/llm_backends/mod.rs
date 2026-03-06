@@ -1,3 +1,11 @@
+//! LLM provider abstraction (Anthropic, OpenAI, Minimax).
+//!
+//! Defines the [`LlmProvider`] trait and chat interface types ([`Message`],
+//! [`ChatRequest`], [`ChatResponse`]). Provider implementations live in
+//! [`anthropic`]. Phase 2 API surface — not yet wired to production paths.
+
+#![allow(dead_code)]
+
 pub use crate::error::AgentResult;
 pub use async_trait::async_trait;
 pub use serde::{Deserialize, Serialize};
@@ -20,8 +28,6 @@ pub enum Role {
     Assistant,
 }
 
-// Chat types - reserved for future use
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRequest {
     pub model: String,
@@ -30,7 +36,6 @@ pub struct ChatRequest {
     pub max_tokens: Option<u32>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatResponse {
     pub content: String,
@@ -38,7 +43,6 @@ pub struct ChatResponse {
     pub usage: Usage,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u32,
@@ -46,7 +50,6 @@ pub struct Usage {
 }
 
 #[async_trait]
-#[allow(dead_code)]
 pub trait LlmProvider: Send + Sync {
     fn name(&self) -> &str;
     fn default_model(&self) -> &str;
@@ -54,7 +57,6 @@ pub trait LlmProvider: Send + Sync {
     fn supported_models(&self) -> Vec<&str>;
 }
 
-#[allow(dead_code)]
 pub struct Agent {
     pub id: String,
     pub name: String,
@@ -64,7 +66,6 @@ pub struct Agent {
     pub history: Vec<Message>,
 }
 
-#[allow(dead_code)]
 impl Agent {
     pub fn new(
         id: String,
@@ -120,5 +121,71 @@ impl Agent {
 
     pub fn clear_history(&mut self) {
         self.history.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_role_serde_roundtrip() {
+        for role in [Role::System, Role::User, Role::Assistant] {
+            let json = serde_json::to_string(&role).unwrap();
+            let parsed: Role = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, role);
+        }
+    }
+
+    #[test]
+    fn test_message_construction() {
+        let msg = Message {
+            role: Role::User,
+            content: "hello".into(),
+        };
+        assert_eq!(msg.role, Role::User);
+        assert_eq!(msg.content, "hello");
+    }
+
+    #[test]
+    fn test_chat_request_serialization() {
+        let req = ChatRequest {
+            model: "claude-3".into(),
+            messages: vec![Message {
+                role: Role::User,
+                content: "hi".into(),
+            }],
+            temperature: 0.7,
+            max_tokens: Some(4096),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: ChatRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.model, "claude-3");
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(parsed.max_tokens, Some(4096));
+    }
+
+    #[test]
+    fn test_chat_response_serialization() {
+        let resp = ChatResponse {
+            content: "Hello!".into(),
+            model: "claude-3".into(),
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+            },
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: ChatResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.content, "Hello!");
+        assert_eq!(parsed.usage.input_tokens, 10);
+    }
+
+    #[test]
+    fn test_role_rename_all_lowercase() {
+        let json = serde_json::to_string(&Role::System).unwrap();
+        assert_eq!(json, "\"system\"");
+        let json = serde_json::to_string(&Role::Assistant).unwrap();
+        assert_eq!(json, "\"assistant\"");
     }
 }

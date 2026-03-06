@@ -1,9 +1,41 @@
+//! Unified credential abstraction over 5 backends.
+//!
+//! Provides the [`CredentialProvider`] trait with implementations for
+//! keychain (macOS), Unix socket agent, CLI proxy (Infisical/Doppler/Vault),
+//! environment variables, and in-memory session storage.
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use thiserror::Error;
 
 pub mod cli_proxy;
 pub mod keychain;
 pub mod socket;
+
+/// Structured error type for credential operations.
+#[derive(Error, Debug)]
+pub enum CredentialError {
+    #[error("Key not found: {key} (provider: {provider})")]
+    KeyNotFound { key: String, provider: String },
+
+    #[error("Provider unavailable: {0}")]
+    ProviderUnavailable(String),
+
+    #[error("Operation not supported: {0}")]
+    NotSupported(String),
+
+    #[error("Lock poisoned in {provider}")]
+    PoisonedLock { provider: String },
+
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("Command failed ({provider}): {message}")]
+    CommandFailed { provider: String, message: String },
+
+    #[error("Protocol error ({provider}): {message}")]
+    ProtocolError { provider: String, message: String },
+}
 
 /// Unified trait for all credential providers
 pub trait CredentialProvider: Send + Sync {
@@ -14,16 +46,16 @@ pub trait CredentialProvider: Send + Sync {
     fn provider_type(&self) -> CredentialProviderType;
 
     /// Get a secret by key
-    fn get(&self, key: &str) -> Result<String, String>;
+    fn get(&self, key: &str) -> Result<String, CredentialError>;
 
     /// Set a secret
-    fn set(&self, key: &str, value: &str) -> Result<(), String>;
+    fn set(&self, key: &str, value: &str) -> Result<(), CredentialError>;
 
     /// Delete a secret
-    fn delete(&self, key: &str) -> Result<(), String>;
+    fn delete(&self, key: &str) -> Result<(), CredentialError>;
 
     /// List all secrets (without values)
-    fn list(&self) -> Result<Vec<SecretEntry>, String>;
+    fn list(&self) -> Result<Vec<SecretEntry>, CredentialError>;
 
     /// Get provider status
     fn status(&self) -> CredentialStatus;
@@ -48,6 +80,9 @@ pub fn create_provider(config: &CredentialConfig) -> Box<dyn CredentialProvider>
         CredentialProviderType::Socket => {
             let socket = config.socket_path.clone().unwrap_or_else(|| {
                 let new_path = "/tmp/impulse-credentials.sock";
+                // DEPRECATED(2026-04-01): Remove cockpit-credentials.sock fallback.
+                // The Cockpit→Impulse rename shipped 2026-02-24. After 2026-04-01,
+                // remove this block and use only impulse-credentials.sock.
                 let old_path = "/tmp/cockpit-credentials.sock";
                 if std::path::Path::new(old_path).exists()
                     && !std::path::Path::new(new_path).exists()
@@ -165,20 +200,27 @@ impl CredentialProvider for EnvProvider {
         CredentialProviderType::Env
     }
 
-    fn get(&self, key: &str) -> Result<String, String> {
+    fn get(&self, key: &str) -> Result<String, CredentialError> {
         let env_key = format!("{}_API_KEY", key.to_uppercase());
-        std::env::var(&env_key).map_err(|_| format!("Environment variable {} not set", env_key))
+        std::env::var(&env_key).map_err(|_| CredentialError::KeyNotFound {
+            key: env_key,
+            provider: "env".into(),
+        })
     }
 
-    fn set(&self, _key: &str, _value: &str) -> Result<(), String> {
-        Err("Cannot set environment variables at runtime".to_string())
+    fn set(&self, _key: &str, _value: &str) -> Result<(), CredentialError> {
+        Err(CredentialError::NotSupported(
+            "Cannot set environment variables at runtime".into(),
+        ))
     }
 
-    fn delete(&self, _key: &str) -> Result<(), String> {
-        Err("Cannot delete environment variables".to_string())
+    fn delete(&self, _key: &str) -> Result<(), CredentialError> {
+        Err(CredentialError::NotSupported(
+            "Cannot delete environment variables".into(),
+        ))
     }
 
-    fn list(&self) -> Result<Vec<SecretEntry>, String> {
+    fn list(&self) -> Result<Vec<SecretEntry>, CredentialError> {
         let keys = [
             "ANTHROPIC",
             "OPENAI",
@@ -247,30 +289,47 @@ impl CredentialProvider for MemoryProvider {
         CredentialProviderType::Memory
     }
 
-    fn get(&self, key: &str) -> Result<String, String> {
+    fn get(&self, key: &str) -> Result<String, CredentialError> {
         self.secrets
             .read()
-            .map_err(|e| e.to_string())?
+            .map_err(|_| CredentialError::PoisonedLock {
+                provider: "memory".into(),
+            })?
             .get(key)
             .cloned()
-            .ok_or_else(|| format!("Key not found in memory: {}", key))
+            .ok_or_else(|| CredentialError::KeyNotFound {
+                key: key.into(),
+                provider: "memory".into(),
+            })
     }
 
-    fn set(&self, key: &str, value: &str) -> Result<(), String> {
+    fn set(&self, key: &str, value: &str) -> Result<(), CredentialError> {
         self.secrets
             .write()
-            .map_err(|e| e.to_string())?
+            .map_err(|_| CredentialError::PoisonedLock {
+                provider: "memory".into(),
+            })?
             .insert(key.to_string(), value.to_string());
         Ok(())
     }
 
-    fn delete(&self, key: &str) -> Result<(), String> {
-        self.secrets.write().map_err(|e| e.to_string())?.remove(key);
+    fn delete(&self, key: &str) -> Result<(), CredentialError> {
+        self.secrets
+            .write()
+            .map_err(|_| CredentialError::PoisonedLock {
+                provider: "memory".into(),
+            })?
+            .remove(key);
         Ok(())
     }
 
-    fn list(&self) -> Result<Vec<SecretEntry>, String> {
-        let secrets = self.secrets.read().map_err(|e| e.to_string())?;
+    fn list(&self) -> Result<Vec<SecretEntry>, CredentialError> {
+        let secrets = self
+            .secrets
+            .read()
+            .map_err(|_| CredentialError::PoisonedLock {
+                provider: "memory".into(),
+            })?;
         Ok(secrets
             .keys()
             .map(|k| SecretEntry {
@@ -294,5 +353,141 @@ impl CredentialProvider for MemoryProvider {
 
     fn is_available(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_memory_provider_crud_cycle() {
+        let provider = MemoryProvider::new();
+        assert!(provider.get("key1").is_err());
+
+        provider.set("key1", "value1").unwrap();
+        assert_eq!(provider.get("key1").unwrap(), "value1");
+
+        provider.set("key1", "value2").unwrap();
+        assert_eq!(provider.get("key1").unwrap(), "value2");
+
+        provider.delete("key1").unwrap();
+        assert!(provider.get("key1").is_err());
+    }
+
+    #[test]
+    fn test_memory_provider_list() {
+        let provider = MemoryProvider::new();
+        provider.set("a", "1").unwrap();
+        provider.set("b", "2").unwrap();
+        let entries = provider.list().unwrap();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn test_memory_provider_status() {
+        let provider = MemoryProvider::new();
+        provider.set("x", "y").unwrap();
+        let status = provider.status();
+        assert!(status.available);
+        assert_eq!(status.secrets_count, 1);
+        assert_eq!(status.provider, "memory");
+    }
+
+    #[test]
+    fn test_env_provider_get_missing_key() {
+        let provider = EnvProvider::new();
+        let result = provider.get("nonexistent_test_key_xyz");
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            CredentialError::KeyNotFound { .. }
+        ));
+    }
+
+    #[test]
+    fn test_env_provider_set_not_supported() {
+        let provider = EnvProvider::new();
+        let result = provider.set("key", "value");
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            CredentialError::NotSupported(_)
+        ));
+    }
+
+    #[test]
+    fn test_credential_provider_type_parse_all_aliases() {
+        assert_eq!(
+            CredentialProviderType::parse("keychain"),
+            Some(CredentialProviderType::Keychain)
+        );
+        assert_eq!(
+            CredentialProviderType::parse("socket"),
+            Some(CredentialProviderType::Socket)
+        );
+        assert_eq!(
+            CredentialProviderType::parse("agent"),
+            Some(CredentialProviderType::Socket)
+        );
+        assert_eq!(
+            CredentialProviderType::parse("env"),
+            Some(CredentialProviderType::Env)
+        );
+        assert_eq!(
+            CredentialProviderType::parse("environment"),
+            Some(CredentialProviderType::Env)
+        );
+        assert_eq!(
+            CredentialProviderType::parse("memory"),
+            Some(CredentialProviderType::Memory)
+        );
+        assert_eq!(
+            CredentialProviderType::parse("infisical"),
+            Some(CredentialProviderType::CliProxy)
+        );
+        assert_eq!(CredentialProviderType::parse("unknown"), None);
+    }
+
+    #[test]
+    fn test_credential_provider_type_as_str_roundtrip() {
+        for provider_type in [
+            CredentialProviderType::Keychain,
+            CredentialProviderType::Socket,
+            CredentialProviderType::CliProxy,
+            CredentialProviderType::Env,
+            CredentialProviderType::Memory,
+        ] {
+            let s = provider_type.as_str();
+            assert_eq!(CredentialProviderType::parse(s), Some(provider_type));
+        }
+    }
+
+    #[test]
+    fn test_create_provider_routes_correctly() {
+        let config = CredentialConfig {
+            provider: CredentialProviderType::Memory,
+            cli_tool: None,
+            socket_path: None,
+            provider_url: None,
+        };
+        let provider = create_provider(&config);
+        assert_eq!(provider.name(), "memory");
+
+        let config = CredentialConfig {
+            provider: CredentialProviderType::Env,
+            cli_tool: None,
+            socket_path: None,
+            provider_url: None,
+        };
+        let provider = create_provider(&config);
+        assert_eq!(provider.name(), "env");
+    }
+
+    #[test]
+    fn test_credential_config_default() {
+        let config = CredentialConfig::default();
+        assert_eq!(config.provider, CredentialProviderType::Env);
+        assert!(config.cli_tool.is_none());
     }
 }

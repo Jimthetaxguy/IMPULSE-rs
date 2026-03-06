@@ -6,6 +6,8 @@ use std::process::Command;
 
 /// Check if a tool is installed by running its check command
 pub fn check_tool_installed(tool: &CliTool) -> Result<(bool, Option<String>)> {
+    // SAFETY: check_cmd is sourced from compile-time known_tools() only.
+    // See tools/mod.rs trust boundary documentation.
     let output = Command::new("sh").arg("-c").arg(&tool.check_cmd).output();
 
     match output {
@@ -65,6 +67,7 @@ pub fn init_tools(tool_ids: Option<Vec<String>>, dry_run: bool) -> Result<Vec<(S
             ));
         } else {
             println!("Installing {}...", tool.name);
+            // SAFETY: install_cmd is sourced from compile-time known_tools() only.
             let output = Command::new("sh").arg("-c").arg(&tool.install_cmd).output();
 
             match output {
@@ -114,5 +117,28 @@ mod tests {
         );
         let result = check_tool_installed(&tool);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_known_tools_commands_no_shell_metacharacters() {
+        let dangerous = [';', '|', '&', '$', '`', '>', '<', '#'];
+        for tool in known_tools() {
+            for (cmd_name, cmd) in [
+                ("check_cmd", &tool.check_cmd),
+                ("install_cmd", &tool.install_cmd),
+                ("update_cmd", &tool.update_cmd),
+            ] {
+                for ch in &dangerous {
+                    assert!(
+                        !cmd.contains(*ch),
+                        "Tool '{}' {} contains dangerous char '{}': {}",
+                        tool.id,
+                        cmd_name,
+                        ch,
+                        cmd
+                    );
+                }
+            }
+        }
     }
 }

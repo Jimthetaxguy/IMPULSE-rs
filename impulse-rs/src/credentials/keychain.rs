@@ -1,6 +1,6 @@
 use std::process::Command;
 
-use crate::credentials::{CredentialProviderType, CredentialStatus, SecretEntry};
+use crate::credentials::{CredentialError, CredentialProviderType, CredentialStatus, SecretEntry};
 
 pub struct KeychainProvider {
     service_name: String,
@@ -38,7 +38,7 @@ impl crate::credentials::CredentialProvider for KeychainProvider {
         CredentialProviderType::Keychain
     }
 
-    fn get(&self, key: &str) -> Result<String, String> {
+    fn get(&self, key: &str) -> Result<String, CredentialError> {
         let output = Command::new("security")
             .args([
                 "find-internet-password",
@@ -48,21 +48,19 @@ impl crate::credentials::CredentialProvider for KeychainProvider {
                 key,
                 "-w",
             ])
-            .output()
-            .map_err(|e| format!("Failed to execute security command: {}", e))?;
+            .output()?;
 
         if output.status.success() {
             Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
         } else {
-            Err(format!(
-                "Key not found: {} (error: {})",
-                key,
-                String::from_utf8_lossy(&output.stderr).trim()
-            ))
+            Err(CredentialError::KeyNotFound {
+                key: key.into(),
+                provider: "keychain".into(),
+            })
         }
     }
 
-    fn set(&self, key: &str, value: &str) -> Result<(), String> {
+    fn set(&self, key: &str, value: &str) -> Result<(), CredentialError> {
         let output = Command::new("security")
             .args([
                 "add-internet-password",
@@ -74,20 +72,19 @@ impl crate::credentials::CredentialProvider for KeychainProvider {
                 value,
                 "-U",
             ])
-            .output()
-            .map_err(|e| format!("Failed to execute security command: {}", e))?;
+            .output()?;
 
         if output.status.success() {
             Ok(())
         } else {
-            Err(format!(
-                "Failed to store key: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ))
+            Err(CredentialError::CommandFailed {
+                provider: "keychain".into(),
+                message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            })
         }
     }
 
-    fn delete(&self, key: &str) -> Result<(), String> {
+    fn delete(&self, key: &str) -> Result<(), CredentialError> {
         let output = Command::new("security")
             .args([
                 "delete-internet-password",
@@ -96,26 +93,24 @@ impl crate::credentials::CredentialProvider for KeychainProvider {
                 "-a",
                 key,
             ])
-            .output()
-            .map_err(|e| format!("Failed to execute security command: {}", e))?;
+            .output()?;
 
         if output.status.success()
             || String::from_utf8_lossy(&output.stderr).contains("could not find")
         {
             Ok(())
         } else {
-            Err(format!(
-                "Failed to delete key: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ))
+            Err(CredentialError::CommandFailed {
+                provider: "keychain".into(),
+                message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            })
         }
     }
 
-    fn list(&self) -> Result<Vec<SecretEntry>, String> {
+    fn list(&self) -> Result<Vec<SecretEntry>, CredentialError> {
         let output = Command::new("security")
             .args(["find-internet-password", "-s", &self.service_name])
-            .output()
-            .map_err(|e| format!("Failed to execute security command: {}", e))?;
+            .output()?;
 
         if !output.status.success() {
             return Ok(Vec::new());

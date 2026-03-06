@@ -1,3 +1,9 @@
+//! Atomic file I/O layer and `.impulse/` directory management.
+//!
+//! All writes use temp file + rename for crash safety. Temp file names
+//! include PID + timestamp to avoid collisions. Provides JSON, JSONL,
+//! and plain-text read/write helpers via the [`Storage`] struct.
+
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
 #[allow(unused_imports)]
@@ -118,6 +124,11 @@ impl Storage {
     /// Public for use by stewardship and other modules.
     /// Uses a unique temp file name to prevent collisions from concurrent writes.
     pub fn atomic_write(&self, path: &Path, content: &[u8]) -> Result<()> {
+        Self::atomic_write_path(path, content)
+    }
+
+    /// Atomic write helper for arbitrary paths.
+    pub fn atomic_write_path(path: &Path, content: &[u8]) -> Result<()> {
         let unique_suffix = format!(
             "tmp.{}",
             std::process::id()

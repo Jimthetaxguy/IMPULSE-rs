@@ -1,3 +1,9 @@
+//! Multi-tool orchestration and execution sequencing.
+//!
+//! Coordinates multi-step context injection across target tools (Claude Code,
+//! OpenCode, Codex). Manages session creation, file staging, and ordered
+//! injection delivery for the Impulse sidecar workflow.
+
 use anyhow::Result;
 use chrono::Utc;
 use serde::Serialize;

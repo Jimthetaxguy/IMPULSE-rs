@@ -1,3 +1,9 @@
+//! Async client for daemon IPC.
+//!
+//! Wraps [`tokio::net::UnixStream`] with JSON-line protocol to communicate
+//! with the Impulse daemon. Provides typed methods for session lifecycle,
+//! file tracking, conflict detection, chat, and agent assist.
+
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -14,7 +20,6 @@ impl DaemonClient {
         Self { socket_path }
     }
 
-    #[allow(dead_code)]
     pub fn default_path() -> Self {
         Self::new(PathBuf::from(".impulse/sockets/impulse.sock"))
     }
@@ -31,16 +36,29 @@ impl DaemonClient {
     pub async fn send(&self, request: DaemonRequest) -> Result<DaemonResponse> {
         let mut stream = self.connect().await?;
 
-        let request_json = serde_json::to_string(&request)?;
-        stream.write_all(request_json.as_bytes()).await?;
-        stream.write_all(b"\n").await?;
-        stream.flush().await?;
+        let request_json =
+            serde_json::to_string(&request).context("Failed to serialize daemon request")?;
+        stream
+            .write_all(request_json.as_bytes())
+            .await
+            .context("Failed to write request to daemon socket")?;
+        stream
+            .write_all(b"\n")
+            .await
+            .context("Failed to write newline delimiter to daemon socket")?;
+        stream
+            .flush()
+            .await
+            .context("Failed to flush daemon socket")?;
 
         let (reader, _) = stream.split();
         let mut reader = BufReader::new(reader);
 
         let mut response_line = String::new();
-        reader.read_line(&mut response_line).await?;
+        reader
+            .read_line(&mut response_line)
+            .await
+            .context("Failed to read response from daemon socket")?;
 
         let response: DaemonResponse =
             serde_json::from_str(&response_line).context("Failed to parse daemon response")?;
@@ -240,5 +258,40 @@ impl DaemonClient {
             }
             _ => anyhow::bail!("Agent assist: unexpected response type"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_daemon_client_new_stores_path() {
+        let client = DaemonClient::new(PathBuf::from("/tmp/test.sock"));
+        assert_eq!(client.socket_path, PathBuf::from("/tmp/test.sock"));
+    }
+
+    #[test]
+    fn test_daemon_client_default_path() {
+        let client = DaemonClient::default_path();
+        assert!(client
+            .socket_path
+            .to_str()
+            .unwrap()
+            .contains("impulse.sock"));
+    }
+
+    #[test]
+    fn test_daemon_request_serialization() {
+        let req = DaemonRequest::Ping;
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.is_empty());
+
+        let req = DaemonRequest::CreateSession {
+            name: "test".into(),
+            platform: Some("claude".into()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("test"));
     }
 }

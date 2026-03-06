@@ -1,5 +1,7 @@
-// Office module - handle Excel, Word, and other Office documents
-// Supports parsing and extraction for the context pipeline
+//! Excel/Word document I/O (feature-gated: `office-support`).
+//!
+//! Provides parsing, extraction, and generation for `.xlsx` and `.docx` files.
+//! Used by the context pipeline to ingest Office documents as structured data.
 
 pub mod excel;
 pub mod extraction;

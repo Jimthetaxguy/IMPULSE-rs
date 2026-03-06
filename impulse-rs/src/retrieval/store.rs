@@ -199,6 +199,12 @@ CREATE TABLE IF NOT EXISTS genome_vec (
             return Ok(false);
         }
 
+        // SAFETY: `load_extension` loads arbitrary native code. We validate:
+        // 1. ext_path is absolute (no relative path resolution tricks)
+        // 2. ext_path contains no ".." (prevents path traversal)
+        // 3. ext_path ends with a platform-specific library extension (.so/.dylib/.dll)
+        // 4. ext_path exists on disk
+        // The extension is loaded then immediately disabled to minimize exposure.
         unsafe {
             self.conn.load_extension_enable()?;
             let result = self.conn.load_extension(&ext_path, None).is_ok();

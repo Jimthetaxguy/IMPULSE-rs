@@ -30,6 +30,7 @@ pub fn update_tool(tool: &CliTool, dry_run: bool) -> Result<(bool, String)> {
         version.unwrap_or_default()
     );
 
+    // SAFETY: update_cmd is sourced from compile-time known_tools() only.
     let output = Command::new("sh").arg("-c").arg(&tool.update_cmd).output();
 
     match output {
