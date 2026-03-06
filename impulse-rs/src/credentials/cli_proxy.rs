@@ -1,7 +1,7 @@
 use std::process::Command;
 
 use crate::credentials::{
-    CredentialProvider, CredentialProviderType, CredentialStatus, SecretEntry,
+    CredentialError, CredentialProvider, CredentialProviderType, CredentialStatus, SecretEntry,
 };
 
 pub struct CliProxyProvider {
@@ -17,16 +17,16 @@ impl CliProxyProvider {
         }
     }
 
-    fn run_cli(&self, args: &[&str]) -> Result<String, String> {
-        let output = Command::new(&self.cli_tool)
-            .args(args)
-            .output()
-            .map_err(|e| format!("Failed to run {}: {}", self.cli_tool, e))?;
+    fn run_cli(&self, args: &[&str]) -> Result<String, CredentialError> {
+        let output = Command::new(&self.cli_tool).args(args).output()?;
 
         if output.status.success() {
             Ok(String::from_utf8_lossy(&output.stdout).to_string())
         } else {
-            Err(String::from_utf8_lossy(&output.stderr).to_string())
+            Err(CredentialError::CommandFailed {
+                provider: self.cli_tool.clone(),
+                message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            })
         }
     }
 
@@ -48,7 +48,7 @@ impl CredentialProvider for CliProxyProvider {
         CredentialProviderType::CliProxy
     }
 
-    fn get(&self, key: &str) -> Result<String, String> {
+    fn get(&self, key: &str) -> Result<String, CredentialError> {
         match self.cli_tool.as_str() {
             "infisical" => {
                 let mut args = vec!["secrets", "get", key];
@@ -69,7 +69,10 @@ impl CredentialProvider for CliProxyProvider {
                     json.get("value")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string())
-                        .ok_or_else(|| "Invalid Doppler response".to_string())
+                        .ok_or_else(|| CredentialError::CommandFailed {
+                            provider: "doppler".into(),
+                            message: "Invalid Doppler response: missing 'value' field".into(),
+                        })
                 } else {
                     Ok(output)
                 }
@@ -87,25 +90,28 @@ impl CredentialProvider for CliProxyProvider {
                 let output = self.run_cli(&["get", "item", key])?;
                 Ok(output)
             }
-            _ => Err(format!("Unsupported CLI tool: {}", self.cli_tool)),
+            _ => Err(CredentialError::NotSupported(format!(
+                "Unsupported CLI tool: {}",
+                self.cli_tool
+            ))),
         }
     }
 
-    fn set(&self, _key: &str, _value: &str) -> Result<(), String> {
-        Err(format!(
+    fn set(&self, _key: &str, _value: &str) -> Result<(), CredentialError> {
+        Err(CredentialError::NotSupported(format!(
             "Setting secrets via {} not supported. Use the CLI directly.",
             self.cli_tool
-        ))
+        )))
     }
 
-    fn delete(&self, _key: &str) -> Result<(), String> {
-        Err(format!(
+    fn delete(&self, _key: &str) -> Result<(), CredentialError> {
+        Err(CredentialError::NotSupported(format!(
             "Deleting secrets via {} not supported. Use the CLI directly.",
             self.cli_tool
-        ))
+        )))
     }
 
-    fn list(&self) -> Result<Vec<SecretEntry>, String> {
+    fn list(&self) -> Result<Vec<SecretEntry>, CredentialError> {
         match self.cli_tool.as_str() {
             "infisical" => {
                 let mut args = vec!["secrets", "list"];

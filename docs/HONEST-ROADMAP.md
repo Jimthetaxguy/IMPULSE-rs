@@ -3,12 +3,12 @@ status: active
 phase: all
 audience: builder
 tags: [roadmap, honest, limitations, critique]
-last_updated: 2026-02-24
+last_updated: 2026-03-05
 ---
 
 # Impulse: Honest Roadmap
 
-> **Version:** 1.0 | **Status:** Post-critique | **Updated:** 2026-02-21
+> **Version:** 1.1 | **Status:** Post-critique | **Updated:** 2026-03-05
 > **Source:** Session 5 critique (21 iterations of adversarial analysis)
 > **Complements:** PRODUCT-SPEC-v2.md (the "what to build"), this doc is the "what's real"
 
@@ -19,6 +19,8 @@ last_updated: 2026-02-24
 This is the adversarial complement to `PRODUCT-SPEC-v2.md`. Where the spec describes the ideal, this document describes the real limitations, validated assumptions, unvalidated risks, and corrected phase sequence.
 
 **Read this alongside the spec. Don't ship without it.**
+
+> **Current routing note (2026-03-05):** [`ROADMAP-PLAN.md`](./ROADMAP-PLAN.md) and [`plans/IMPLEMENTATION-HANDOFF.md`](./plans/IMPLEMENTATION-HANDOFF.md) now treat this file as the canonical risk register for hook validation, compaction survival, and `GENOME.md` usefulness. Those items remain open until evidence is recorded here.
 
 > **Note (2026-02-24):** This document was originally written during the TypeScript/Bun era (Session 5, pre-Rust pivot). The project has since been rewritten in Rust (`impulse-rs`). Many corrections below have been addressed by the Rust rewrite — see inline status markers. The document is retained for its analytical rigor and as a record of assumptions that were tested.
 
@@ -103,14 +105,17 @@ This is the adversarial complement to `PRODUCT-SPEC-v2.md`. Where the spec descr
 
 **Correction:** SessionStart detects `extraction_pending` and spawns SessionEnd as a BACKGROUND process (`impulse-session-end &`). SessionStart continues immediately. Extraction completes in the background while the user starts typing.
 
-```typescript
-// SessionStart hook — corrected behavior
-if (liveState.extraction_pending) {
-  spawn('impulse-session-end', [], { detached: true, stdio: 'ignore' });
-  // Do NOT await — continue loading context immediately
-}
-const genome = await readGenome(cwd);
-// ... load context normally ...
+```
+SessionStart hook — corrected behavior (pseudocode):
+
+1. If extraction_pending is set in LiveState, spawn `impulse-session-end`
+   as a detached background process. Do NOT await — continue loading
+   context immediately. The extraction completes asynchronously while
+   the user begins their session.
+
+2. Load GENOME.md from the working directory.
+
+3. Continue with normal context injection.
 ```
 
 ---

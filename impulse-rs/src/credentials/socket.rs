@@ -2,7 +2,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 
 use crate::credentials::{
-    CredentialProvider, CredentialProviderType, CredentialStatus, SecretEntry,
+    CredentialError, CredentialProvider, CredentialProviderType, CredentialStatus, SecretEntry,
 };
 
 pub struct SocketProvider {
@@ -19,37 +19,46 @@ impl SocketProvider {
         command: &str,
         key: &str,
         value: Option<&str>,
-    ) -> Result<String, String> {
+    ) -> Result<String, CredentialError> {
         // Validate key doesn't contain whitespace or newlines (protocol injection prevention)
         if key.contains(|c: char| c.is_whitespace() || c == '\n' || c == '\r') {
-            return Err("Key must not contain whitespace or newline characters".to_string());
+            return Err(CredentialError::ProtocolError {
+                provider: "socket".into(),
+                message: "Key must not contain whitespace or newline characters".into(),
+            });
         }
         // Validate value doesn't contain newlines (command injection prevention)
         if let Some(v) = value {
             if v.contains('\n') || v.contains('\r') {
-                return Err("Value must not contain newline characters".to_string());
+                return Err(CredentialError::ProtocolError {
+                    provider: "socket".into(),
+                    message: "Value must not contain newline characters".into(),
+                });
             }
         }
 
-        let mut stream = UnixStream::connect(&self.socket_path)
-            .map_err(|e| format!("Failed to connect to credential agent: {}", e))?;
+        let mut stream = UnixStream::connect(&self.socket_path).map_err(|_| {
+            CredentialError::ProviderUnavailable(format!(
+                "Failed to connect to credential agent at {}",
+                self.socket_path
+            ))
+        })?;
 
         let request = match value {
             Some(v) => format!("{} {} {}\n", command, key, v),
             None => format!("{} {}\n", command, key),
         };
 
-        stream
-            .write_all(request.as_bytes())
-            .map_err(|e| format!("Failed to send request: {}", e))?;
+        stream.write_all(request.as_bytes())?;
 
         let mut response = String::new();
-        stream
-            .read_to_string(&mut response)
-            .map_err(|e| format!("Failed to read response: {}", e))?;
+        stream.read_to_string(&mut response)?;
 
         if response.starts_with("ERROR:") {
-            Err(response.trim_start_matches("ERROR:").to_string())
+            Err(CredentialError::CommandFailed {
+                provider: "socket".into(),
+                message: response.trim_start_matches("ERROR:").trim().to_string(),
+            })
         } else {
             Ok(response.trim().to_string())
         }
@@ -65,19 +74,19 @@ impl CredentialProvider for SocketProvider {
         CredentialProviderType::Socket
     }
 
-    fn get(&self, key: &str) -> Result<String, String> {
+    fn get(&self, key: &str) -> Result<String, CredentialError> {
         self.send_request("GET", key, None)
     }
 
-    fn set(&self, key: &str, value: &str) -> Result<(), String> {
+    fn set(&self, key: &str, value: &str) -> Result<(), CredentialError> {
         self.send_request("SET", key, Some(value)).map(|_| ())
     }
 
-    fn delete(&self, key: &str) -> Result<(), String> {
+    fn delete(&self, key: &str) -> Result<(), CredentialError> {
         self.send_request("DELETE", key, None).map(|_| ())
     }
 
-    fn list(&self) -> Result<Vec<SecretEntry>, String> {
+    fn list(&self) -> Result<Vec<SecretEntry>, CredentialError> {
         let response = self.send_request("LIST", "", None)?;
         let mut secrets = Vec::new();
 

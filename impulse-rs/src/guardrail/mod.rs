@@ -1,3 +1,9 @@
+//! Pre-execution safety gating with Block/Warn/Log actions.
+//!
+//! [`GuardEngine`] evaluates commands against regex-based [`GuardRule`]s before
+//! execution. Rules are merged from built-in defaults (force-push, rm-rf, DROP TABLE)
+//! and user overrides in `config.json`. Used by PreToolUse hooks.
+
 pub mod config;
 pub mod defaults;
 pub mod engine;

@@ -1,7 +1,7 @@
-// Build Hygiene module — Rust build artifact management and cleanup
-//
-// Provides discovery, measurement, and cleaning of Rust build artifacts
-// across projects. Wraps cargo-sweep, cargo-wipe, cargo-clean-all, and sccache.
+//! Rust build artifact management and cleanup.
+//!
+//! Provides discovery, measurement, and cleaning of Rust build artifacts
+//! across projects. Wraps cargo-sweep, cargo-wipe, cargo-clean-all, and sccache.
 
 pub mod clean_all;
 pub mod discovery;

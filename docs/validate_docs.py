@@ -51,17 +51,17 @@ CONTRACT_REQUIRED_MARKERS = {
     ROOT_DIR / "AGENTS.md": [
         "RUST-CANONICAL-CONTRACT.md",
         "Canonical stack: Rust (impulse-rs)",
-        "Roadmap contract: Now=Rust core, Next=semantic retrieval, Later=advanced coordination UX",
+        "Roadmap contract: Now=Rust core + EGUI workbench, Next=daemon-truth EGUI + hook validation, Later=agent control + artifact polish",
     ],
     ROOT_DIR / "CLAUDE.md": [
         "RUST-CANONICAL-CONTRACT.md",
         "Canonical stack: Rust (impulse-rs)",
-        "Roadmap contract: Now=Rust core, Next=semantic retrieval, Later=advanced coordination UX",
+        "Roadmap contract: Now=Rust core + EGUI workbench, Next=daemon-truth EGUI + hook validation, Later=agent control + artifact polish",
     ],
     DOCS_DIR / "INDEX.md": [
         "RUST-CANONICAL-CONTRACT.md",
         "Canonical stack: Rust (impulse-rs)",
-        "Roadmap contract: Now=Rust core, Next=semantic retrieval, Later=advanced coordination UX",
+        "Roadmap contract: Now=Rust core + EGUI workbench, Next=daemon-truth EGUI + hook validation, Later=agent control + artifact polish",
     ],
     DOCS_DIR / "SUMMARY.md": [
         "RUST-CANONICAL-CONTRACT.md",
@@ -207,10 +207,77 @@ def check_forbidden_active_contradictions(files: List[Path]) -> List[ContractIss
     return issues
 
 
+LINK_PATTERN = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+
+
+def check_links(files: List[Path]) -> List[ContractIssue]:
+    """Find [text](relative/path.md) links and verify targets exist."""
+    issues: List[ContractIssue] = []
+    for path in files:
+        if path.suffix.lower() != ".md":
+            continue
+        content = path.read_text(encoding="utf-8")
+        for match in LINK_PATTERN.finditer(content):
+            target = match.group(2)
+            if target.startswith("http") or target.startswith("#") or target.startswith("mailto:"):
+                continue
+            # Strip anchor fragments
+            target_path = target.split("#")[0]
+            if not target_path:
+                continue
+            resolved = (path.parent / target_path).resolve()
+            if not resolved.exists():
+                line_num = content[: match.start()].count("\n") + 1
+                issues.append(
+                    ContractIssue(
+                        str(path.relative_to(ROOT_DIR)),
+                        line_num,
+                        f"Broken link: [{match.group(1)}]({target}) -> {resolved}",
+                    )
+                )
+    return issues
+
+
+def check_staleness(files: List[Path], threshold_days: int = 90) -> List[ContractIssue]:
+    """Flag docs with last_updated/updated older than threshold."""
+    issues: List[ContractIssue] = []
+    today = datetime.date.today()
+    for path in files:
+        if path.suffix.lower() != ".md":
+            continue
+        content = path.read_text(encoding="utf-8")
+        front_matter = extract_front_matter(content)
+        if not front_matter:
+            continue
+        updated_raw = front_matter.get("last_updated") or front_matter.get("updated")
+        if not updated_raw:
+            continue
+        try:
+            if isinstance(updated_raw, datetime.date):
+                updated = updated_raw
+            else:
+                updated = datetime.datetime.strptime(str(updated_raw), "%Y-%m-%d").date()
+            age = (today - updated).days
+            if age > threshold_days:
+                issues.append(
+                    ContractIssue(
+                        str(path.relative_to(ROOT_DIR)),
+                        1,
+                        f"Stale document: last updated {updated} ({age} days ago, threshold={threshold_days})",
+                    )
+                )
+        except (ValueError, TypeError):
+            pass
+    return issues
+
+
 def run_contract_checks() -> List[ContractIssue]:
     issues: List[ContractIssue] = []
     issues.extend(check_contract_markers())
-    issues.extend(check_forbidden_active_contradictions(get_docs_files()))
+    docs = get_docs_files()
+    issues.extend(check_forbidden_active_contradictions(docs))
+    issues.extend(check_links(docs))
+    issues.extend(check_staleness(docs))
     return issues
 
 

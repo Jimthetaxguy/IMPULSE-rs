@@ -63,6 +63,36 @@ pub enum DaemonRequest {
         params: serde_json::Value,
     },
     ToolSchema,
+    GetOpsSnapshot,
+    SubscribeOps {
+        #[serde(default)]
+        since_seq: Option<u64>,
+    },
+    PublishTerminalOps {
+        report: impulse_ops::TerminalOpsReport,
+    },
+    GetSupervisorPermissions,
+    SupervisorChat {
+        prompt: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context: Option<String>,
+    },
+    RunSupervisorAction {
+        action: impulse_ops::SupervisorAction,
+    },
+    ListArtifacts {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+    },
+    GetArtifact {
+        artifact_id: String,
+    },
+    RunArtifactAction {
+        artifact_id: String,
+        action_id: String,
+        #[serde(default)]
+        params: serde_json::Value,
+    },
     AgentAssist {
         prompt: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -73,9 +103,20 @@ pub enum DaemonRequest {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum DaemonResponse {
-    Ok { result: serde_json::Value },
-    Error { message: String },
-    AgentAssistResult { success: bool, response: String },
+    Ok {
+        result: serde_json::Value,
+    },
+    Error {
+        message: String,
+    },
+    AgentAssistResult {
+        success: bool,
+        response: String,
+    },
+    ConflictCheck {
+        has_conflict: bool,
+        conflicting_sessions: Vec<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -85,7 +126,9 @@ pub enum DaemonResponse {
 /// Daemon status summary.
 #[derive(Debug, Clone, Default)]
 pub struct DaemonStatus {
+    #[allow(dead_code)]
     pub sessions: usize,
+    #[allow(dead_code)]
     pub active: usize,
 }
 
@@ -563,5 +606,108 @@ impl ChatResponse {
                 .and_then(|s| s.as_str())
                 .map(String::from),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_daemon_request_ping_roundtrip() {
+        let req = DaemonRequest::Ping;
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, DaemonRequest::Ping));
+    }
+
+    #[test]
+    fn test_daemon_request_create_session_roundtrip() {
+        let req = DaemonRequest::CreateSession {
+            name: "test".into(),
+            platform: Some("claude".into()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            DaemonRequest::CreateSession { name, platform }
+            if name == "test" && platform == Some("claude".into())
+        ));
+    }
+
+    #[test]
+    fn test_daemon_request_chat_roundtrip() {
+        let req = DaemonRequest::Chat {
+            session_id: "s1".into(),
+            message: "hello".into(),
+            inject_mode: None,
+            inject_explain: true,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            DaemonRequest::Chat {
+                inject_explain: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_daemon_response_ok_roundtrip() {
+        let resp = DaemonResponse::Ok {
+            result: serde_json::json!({"pong": true}),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: DaemonResponse = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, DaemonResponse::Ok { .. }));
+    }
+
+    #[test]
+    fn test_daemon_response_error_roundtrip() {
+        let resp = DaemonResponse::Error {
+            message: "not found".into(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: DaemonResponse = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            DaemonResponse::Error { message } if message == "not found"
+        ));
+    }
+
+    #[test]
+    fn test_daemon_response_conflict_check_roundtrip() {
+        let resp = DaemonResponse::ConflictCheck {
+            has_conflict: true,
+            conflicting_sessions: vec!["s1".into(), "s2".into()],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: DaemonResponse = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            DaemonResponse::ConflictCheck { has_conflict: true, conflicting_sessions }
+            if conflicting_sessions.len() == 2
+        ));
+    }
+
+    #[test]
+    fn test_session_from_value() {
+        let v = serde_json::json!({
+            "id": "abc",
+            "name": "my-session",
+            "platform": "claude",
+            "status": "active",
+            "created_at": "2026-03-01T00:00:00Z",
+            "last_activity": "2026-03-01T01:00:00Z",
+            "active_files": ["main.rs"],
+            "recent_tools": ["bash"]
+        });
+        let session = Session::from_value(&v).unwrap();
+        assert_eq!(session.id, "abc");
+        assert_eq!(session.name, "my-session");
+        assert_eq!(session.active_files, vec!["main.rs"]);
     }
 }

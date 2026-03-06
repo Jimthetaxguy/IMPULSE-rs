@@ -1,3 +1,9 @@
+//! TUI terminal interface for Impulse.
+//!
+//! Provides `TuiApp` — a ratatui-based terminal UI with panel layout,
+//! keybindings, session overview, file tracking, and daemon status display.
+//! Primary interactive surface for CLI users without the egui workbench.
+
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -3519,10 +3525,7 @@ mod tests {
     use crate::agent::coordinator::{
         ConflictResolution, Recommendation, RecommendationType, TrackedConflict,
     };
-    use crate::state::{Platform, SessionStatus};
-    use std::sync::Arc;
     use tempfile::TempDir;
-    use tokio::sync::RwLock;
 
     fn create_test_state() -> TuiState {
         let temp_dir = TempDir::new().unwrap();
@@ -3625,7 +3628,7 @@ mod tests {
         handle_conflict_resolution(&mut state, ConflictResolution::AcceptMine);
 
         // No panic - just returns early
-        assert!(true);
+        assert!(state.conflicts_panel_open);
     }
 
     #[test]

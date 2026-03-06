@@ -1,5 +1,16 @@
-// Tools management module - handles CLI tool initialization and updates
-// Supports: Claude Code, OpenCode, Codex, Gemini
+//! CLI tool discovery, installation, and update management.
+//!
+//! Manages external CLI tools (Claude Code, OpenCode, Codex, Gemini, cargo helpers).
+//! Tool definitions come from the compile-time [`known_tools`] registry only.
+//!
+//! # Trust boundary
+//!
+//! `CliTool` derives `Serialize + Deserialize` for status reporting, but all
+//! `check_cmd`, `install_cmd`, and `update_cmd` values are sourced exclusively
+//! from [`known_tools`]. Shell execution via `sh -c` is safe under this
+//! invariant. If tool definitions are ever loaded from external config or user
+//! input, the execution sites in `init.rs` and `update.rs` MUST be hardened
+//! against command injection.
 
 pub mod benchmark;
 pub mod health;

@@ -1,5 +1,8 @@
-// Plugin infrastructure for Impulse
-// Provides trait-based plugin system for extensible handlers
+//! Plugin discovery and registration.
+//!
+//! Provides a trait-based plugin system for extensible handlers. Plugins are
+//! discovered from `.impulse/plugins/`, registered in [`registry::PluginRegistry`],
+//! and dispatched via action and context hooks.
 
 pub mod action;
 pub mod context;
