@@ -39,24 +39,6 @@ pub enum PanelAction {
     },
 }
 
-impl PanelAction {
-    #[allow(dead_code)]
-    pub fn label(&self) -> &'static str {
-        match self {
-            PanelAction::InjectTo { .. } => "inject",
-            PanelAction::SendTo { .. } => "send",
-            PanelAction::FocusTab { .. } => "focus",
-            PanelAction::SearchTerm { .. } => "search",
-            PanelAction::RunSupervisorProposal { mode, .. } => match mode {
-                ProposalExecutionMode::Run => "run_proposal",
-                ProposalExecutionMode::AllowThisSession => "allow_session_run",
-                ProposalExecutionMode::SaveDefault => "save_default_run",
-                ProposalExecutionMode::Deny => "deny_proposal",
-            },
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -64,53 +46,6 @@ impl PanelAction {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_panel_action_labels() {
-        assert_eq!(
-            PanelAction::InjectTo {
-                tab_id: 0,
-                content: String::new()
-            }
-            .label(),
-            "inject"
-        );
-        assert_eq!(
-            PanelAction::SendTo {
-                tab_id: 0,
-                content: String::new()
-            }
-            .label(),
-            "send"
-        );
-        assert_eq!(PanelAction::FocusTab { tab_id: 0 }.label(), "focus");
-        assert_eq!(
-            PanelAction::SearchTerm {
-                query: String::new()
-            }
-            .label(),
-            "search"
-        );
-        assert_eq!(
-            PanelAction::RunSupervisorProposal {
-                proposal: Box::new(impulse_ops::SupervisorProposal {
-                    id: "proposal-1".to_string(),
-                    title: "Run".to_string(),
-                    description: "Test".to_string(),
-                    action_label: "Run".to_string(),
-                    action: impulse_ops::SupervisorAction::SearchMemory {
-                        query: "memory".to_string(),
-                    },
-                    missing_actions: Vec::new(),
-                    missing_tool_capabilities: Vec::new(),
-                    requires_confirmation: false,
-                }),
-                mode: ProposalExecutionMode::Run,
-            }
-            .label(),
-            "run_proposal"
-        );
-    }
 
     #[test]
     fn test_panel_action_debug() {
@@ -130,6 +65,6 @@ mod tests {
             content: "hello".to_string(),
         };
         let cloned = action.clone();
-        assert_eq!(cloned.label(), "send");
+        assert!(matches!(cloned, PanelAction::SendTo { tab_id: 1, .. }));
     }
 }

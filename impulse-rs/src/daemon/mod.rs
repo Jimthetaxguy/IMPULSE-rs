@@ -23,7 +23,7 @@ fn build_remote_tool_context(
     impulse_dir: &std::path::Path,
     config: &crate::state::Config,
 ) -> crate::tooling::ToolContext {
-    crate::build_tool_context(
+    crate::handlers::build_tool_context(
         impulse_dir,
         config,
         crate::tooling::ExecutionOrigin::Daemon,

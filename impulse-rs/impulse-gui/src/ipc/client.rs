@@ -27,13 +27,6 @@ impl DaemonClient {
         }
     }
 
-    /// Update the socket path, dropping any existing connection.
-    #[allow(dead_code)]
-    pub fn set_socket_path(&mut self, path: std::path::PathBuf) {
-        self.stream = None;
-        self.socket_path = path;
-    }
-
     /// Discover the socket path from the current directory.
     /// Looks for `.impulse/sockets/impulse.sock` relative to cwd,
     /// then falls back to `IMPULSE_SOCKET_PATH` env var.
@@ -141,9 +134,6 @@ impl DaemonClient {
         match resp {
             DaemonResponse::Ok { result } => Ok(result),
             DaemonResponse::Error { message } => Err(message),
-            DaemonResponse::AgentAssistResult { .. } => {
-                Err("unexpected AgentAssistResult".to_string())
-            }
             DaemonResponse::ConflictCheck { .. } => Err("unexpected ConflictCheck".to_string()),
         }
     }
@@ -178,15 +168,6 @@ impl DaemonClient {
             .unwrap_or_default();
 
         Ok(sessions)
-    }
-
-    #[allow(dead_code)]
-    pub fn get_session(&mut self, id: &str) -> Result<Session, String> {
-        let resp = self.send(&DaemonRequest::GetSession {
-            session_id: id.to_string(),
-        })?;
-        let result = self.ok_result(resp)?;
-        Session::from_value(&result).ok_or_else(|| "failed to parse session".to_string())
     }
 
     pub fn list_history(&mut self) -> Result<Vec<HistoryEntry>, String> {
@@ -297,28 +278,6 @@ impl DaemonClient {
         serde_json::from_value(result).map_err(|e| format!("parse supervisor action result: {}", e))
     }
 
-    #[allow(dead_code)]
-    pub fn list_artifacts(
-        &mut self,
-        limit: Option<usize>,
-    ) -> Result<Vec<impulse_ops::ArtifactEnvelope>, String> {
-        let resp = self.send(&DaemonRequest::ListArtifacts { limit })?;
-        let result = self.ok_result(resp)?;
-        serde_json::from_value(result).map_err(|e| format!("parse artifacts: {}", e))
-    }
-
-    #[allow(dead_code)]
-    pub fn get_artifact(
-        &mut self,
-        artifact_id: &str,
-    ) -> Result<impulse_ops::ArtifactEnvelope, String> {
-        let resp = self.send(&DaemonRequest::GetArtifact {
-            artifact_id: artifact_id.to_string(),
-        })?;
-        let result = self.ok_result(resp)?;
-        serde_json::from_value(result).map_err(|e| format!("parse artifact: {}", e))
-    }
-
     pub fn run_artifact_action(
         &mut self,
         artifact_id: &str,
@@ -365,129 +324,5 @@ impl DaemonClient {
         })?;
         self.ok_result(resp)?;
         Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn track_tool(&mut self, session_id: &str, tool_name: &str) -> Result<(), String> {
-        let resp = self.send(&DaemonRequest::TrackTool {
-            session_id: session_id.to_string(),
-            tool_name: tool_name.to_string(),
-        })?;
-        self.ok_result(resp)?;
-        Ok(())
-    }
-
-    // -- Phase 3 endpoints (consumed when Stewardship/Tools/Chat views land) --
-
-    #[allow(dead_code)]
-    pub fn chat(
-        &mut self,
-        session_id: &str,
-        message: &str,
-        inject_mode: Option<&str>,
-    ) -> Result<ChatResponse, String> {
-        let resp = self.send(&DaemonRequest::Chat {
-            session_id: session_id.to_string(),
-            message: message.to_string(),
-            inject_mode: inject_mode.map(String::from),
-            inject_explain: false,
-        })?;
-        let result = self.ok_result(resp)?;
-        Ok(ChatResponse::from_value(&result))
-    }
-
-    #[allow(dead_code)]
-    pub fn steward_status(&mut self) -> Result<StewardshipStatus, String> {
-        let resp = self.send(&DaemonRequest::StewardStatus)?;
-        let result = self.ok_result(resp)?;
-        Ok(StewardshipStatus::from_value(&result))
-    }
-
-    #[allow(dead_code)]
-    pub fn list_proposals(&mut self) -> Result<Vec<Proposal>, String> {
-        let resp = self.send(&DaemonRequest::StewardProposals {
-            action: "list".to_string(),
-            id: None,
-        })?;
-        let result = self.ok_result(resp)?;
-        let proposals = result
-            .get("proposals")
-            .or_else(|| result.as_array().map(|_| &result))
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(Proposal::from_value).collect())
-            .unwrap_or_default();
-        Ok(proposals)
-    }
-
-    #[allow(dead_code)]
-    pub fn approve_proposal(&mut self, id: &str) -> Result<(), String> {
-        let resp = self.send(&DaemonRequest::StewardProposals {
-            action: "approve".to_string(),
-            id: Some(id.to_string()),
-        })?;
-        self.ok_result(resp)?;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn reject_proposal(&mut self, id: &str) -> Result<(), String> {
-        let resp = self.send(&DaemonRequest::StewardProposals {
-            action: "reject".to_string(),
-            id: Some(id.to_string()),
-        })?;
-        self.ok_result(resp)?;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn steward_memory(&mut self) -> Result<CrossProjectMemory, String> {
-        let resp = self.send(&DaemonRequest::StewardMemory)?;
-        let result = self.ok_result(resp)?;
-        Ok(CrossProjectMemory::from_value(&result))
-    }
-
-    #[allow(dead_code)]
-    pub fn list_tools(&mut self, category: Option<&str>) -> Result<Vec<ToolInfo>, String> {
-        let resp = self.send(&DaemonRequest::ListTools {
-            category: category.map(String::from),
-        })?;
-        let result = self.ok_result(resp)?;
-        let tools = result
-            .get("tools")
-            .or_else(|| result.as_array().map(|_| &result))
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(ToolInfo::from_value).collect())
-            .unwrap_or_default();
-        Ok(tools)
-    }
-
-    #[allow(dead_code)]
-    pub fn describe_tool(&mut self, name: &str) -> Result<ToolInfo, String> {
-        let resp = self.send(&DaemonRequest::DescribeTool {
-            name: name.to_string(),
-        })?;
-        let result = self.ok_result(resp)?;
-        ToolInfo::from_value(&result).ok_or_else(|| "failed to parse tool info".to_string())
-    }
-
-    // -- Agent coordination --
-
-    #[allow(dead_code)]
-    pub fn agent_assist(&mut self, prompt: &str, context: Option<&str>) -> Result<String, String> {
-        let resp = self.send(&DaemonRequest::AgentAssist {
-            prompt: prompt.to_string(),
-            context: context.map(String::from),
-        })?;
-        match resp {
-            DaemonResponse::AgentAssistResult { response, .. } => Ok(response),
-            other => {
-                let result = self.ok_result(other)?;
-                Ok(result
-                    .get("response")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("")
-                    .to_string())
-            }
-        }
     }
 }

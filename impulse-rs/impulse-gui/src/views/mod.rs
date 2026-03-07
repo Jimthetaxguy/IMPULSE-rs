@@ -9,6 +9,8 @@ pub mod overview;
 pub mod search;
 pub mod sessions;
 pub mod settings;
+pub mod terminal_context;
+pub mod terminal_insights;
 pub mod terminal_search;
 pub mod terminals;
 

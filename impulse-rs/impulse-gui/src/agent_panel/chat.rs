@@ -43,6 +43,7 @@ impl ChatMessage {
         }
     }
 
+    #[cfg(test)]
     pub fn agent(content: &str) -> Self {
         Self {
             role: ChatRole::Agent,
