@@ -10,26 +10,26 @@ use std::path::{Component, Path, PathBuf};
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ValidationError {
     #[error("control characters in input: {field}")]
-    ControlChars { field: String },
+    ControlChars { field: &'static str },
 
     #[error("path traversal detected: {path}")]
     PathTraversal { path: String },
 
     #[error("percent-encoded input rejected: {field}")]
-    PercentEncoded { field: String },
+    PercentEncoded { field: &'static str },
 
     #[error("invalid resource name (contains '{ch}'): {name}")]
     InvalidResourceName { name: String, ch: char },
 
     #[error("input too long ({len} > {max}): {field}")]
     TooLong {
-        field: String,
+        field: &'static str,
         len: usize,
         max: usize,
     },
 
     #[error("empty input: {field}")]
-    Empty { field: String },
+    Empty { field: &'static str },
 }
 
 impl ValidationError {
@@ -54,37 +54,29 @@ impl ValidationError {
 // ─── Validators ─────────────────────────────────────────────────────────────
 
 /// Reject ASCII control characters (< 0x20 except \n, \r, \t).
-pub fn reject_control_chars(input: &str, field: &str) -> Result<(), ValidationError> {
+pub fn reject_control_chars(input: &str, field: &'static str) -> Result<(), ValidationError> {
     for ch in input.chars() {
         if ch.is_control() && ch != '\n' && ch != '\r' && ch != '\t' {
-            return Err(ValidationError::ControlChars {
-                field: field.to_string(),
-            });
+            return Err(ValidationError::ControlChars { field });
         }
     }
     Ok(())
 }
 
 /// Reject pre-percent-encoded strings when we encode later (avoids double-encode).
-pub fn reject_percent_encoded(input: &str, field: &str) -> Result<(), ValidationError> {
-    // Look for %XX patterns where XX are hex digits.
+pub fn reject_percent_encoded(input: &str, field: &'static str) -> Result<(), ValidationError> {
     let bytes = input.as_bytes();
-    for i in 0..bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let h1 = bytes[i + 1];
-            let h2 = bytes[i + 2];
-            if h1.is_ascii_hexdigit() && h2.is_ascii_hexdigit() {
-                return Err(ValidationError::PercentEncoded {
-                    field: field.to_string(),
-                });
-            }
-        }
+    if bytes
+        .windows(3)
+        .any(|w| w[0] == b'%' && w[1].is_ascii_hexdigit() && w[2].is_ascii_hexdigit())
+    {
+        return Err(ValidationError::PercentEncoded { field });
     }
     Ok(())
 }
 
 /// Reject `?` and `#` in resource names/IDs (prevents embedded query/fragment).
-pub fn validate_resource_name(name: &str, field: &str) -> Result<(), ValidationError> {
+pub fn validate_resource_name(name: &str, field: &'static str) -> Result<(), ValidationError> {
     for ch in ['?', '#', '\0'] {
         if name.contains(ch) {
             return Err(ValidationError::InvalidResourceName {
@@ -125,10 +117,14 @@ pub fn validate_path_sandboxed(path: &str, root: &Path) -> Result<PathBuf, Valid
 }
 
 /// Reject inputs longer than `max` bytes.
-pub fn validate_length(input: &str, field: &str, max: usize) -> Result<(), ValidationError> {
+pub fn validate_length(
+    input: &str,
+    field: &'static str,
+    max: usize,
+) -> Result<(), ValidationError> {
     if input.len() > max {
         return Err(ValidationError::TooLong {
-            field: field.to_string(),
+            field,
             len: input.len(),
             max,
         });
@@ -137,11 +133,9 @@ pub fn validate_length(input: &str, field: &str, max: usize) -> Result<(), Valid
 }
 
 /// Reject empty inputs.
-pub fn reject_empty(input: &str, field: &str) -> Result<(), ValidationError> {
+pub fn reject_empty(input: &str, field: &'static str) -> Result<(), ValidationError> {
     if input.trim().is_empty() {
-        return Err(ValidationError::Empty {
-            field: field.to_string(),
-        });
+        return Err(ValidationError::Empty { field });
     }
     Ok(())
 }
@@ -241,9 +235,7 @@ mod tests {
 
     #[test]
     fn validation_error_kind() {
-        let e = ValidationError::ControlChars {
-            field: "x".into(),
-        };
+        let e = ValidationError::ControlChars { field: "x" };
         assert_eq!(e.kind(), "control_chars");
         assert!(e.retryable());
     }

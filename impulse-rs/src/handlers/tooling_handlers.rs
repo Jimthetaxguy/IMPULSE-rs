@@ -55,8 +55,7 @@ pub fn handle_tooling_describe(
     tool_id: String,
     json: bool,
 ) -> Result<()> {
-    validate::validate_tool_id(&tool_id)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    validate::validate_tool_id(&tool_id)?;
 
     let config = state.config_snapshot()?;
     let registry = build_tool_registry(impulse_dir, &config)?;
@@ -118,8 +117,7 @@ pub async fn handle_tooling_run(
     params: Option<String>,
     json: bool,
 ) -> Result<()> {
-    validate::validate_tool_id(&tool_id)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    validate::validate_tool_id(&tool_id)?;
 
     let config = state.config_snapshot()?;
     let registry = build_tool_registry(impulse_dir, &config)?;

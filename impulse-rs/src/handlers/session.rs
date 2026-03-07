@@ -18,6 +18,7 @@ pub async fn handle_session_start(
 ) -> Result<()> {
     let stdin_payload = read_hook_stdin_payload();
     let name = name.unwrap_or_else(default_session_name);
+    validate::reject_control_chars(&name, "name")?;
     let platform = platform.and_then(|p| parse_platform(&p));
     let session = state.create_session(name.clone(), platform).await?;
     let _ = persist_claude_env_var("IMPULSE_SESSION_ID", &session.id);
@@ -105,10 +106,8 @@ pub async fn handle_session_end(
     should_verify: bool,
     sem_diff_base: Option<String>,
 ) -> Result<()> {
-    validate::validate_session_id(&session_id)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-    validate::reject_control_chars(&summary, "summary")
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    validate::validate_session_id(&session_id)?;
+    validate::reject_control_chars(&summary, "summary")?;
 
     let stdin_payload = read_hook_stdin_payload();
     if should_verify {
@@ -179,8 +178,7 @@ pub async fn handle_track_write(
     file: String,
     session_id: Option<String>,
 ) -> Result<()> {
-    validate::validate_file_arg(&file)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    validate::validate_file_arg(&file)?;
 
     if let Some(sid) = get_session_id(session_id) {
         match state.track_file(&sid, &file).await {
@@ -217,8 +215,7 @@ pub async fn handle_track_tool(
     tool: String,
     session_id: Option<String>,
 ) -> Result<()> {
-    validate::reject_control_chars(&tool, "tool")
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    validate::reject_control_chars(&tool, "tool")?;
 
     if let Some(sid) = get_session_id(session_id) {
         match state.track_tool(&sid, &tool).await {

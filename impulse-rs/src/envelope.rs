@@ -6,7 +6,7 @@
 
 use clap::ValueEnum;
 use serde::Serialize;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, Write};
 use std::time::Instant;
 
 // ─── Output format ──────────────────────────────────────────────────────────
@@ -14,24 +14,13 @@ use std::time::Instant;
 /// Global output format, selectable via `--format`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {
-    /// Compact JSON (one object, one line). Default for non-TTY.
+    /// Compact JSON (one object, one line).
     #[default]
     Json,
-    /// Human-readable text (tables, colours, unicode indicators).
+    /// Human-readable text — pretty-prints data, errors to stderr.
     Text,
     /// Newline-delimited JSON — one envelope per line for streaming.
     Ndjson,
-}
-
-impl OutputFormat {
-    /// Choose a sensible default based on whether stdout is a terminal.
-    pub fn default_for_tty() -> Self {
-        if io::stdout().is_terminal() {
-            OutputFormat::Text
-        } else {
-            OutputFormat::Json
-        }
-    }
 }
 
 // ─── Envelope ───────────────────────────────────────────────────────────────
@@ -44,7 +33,7 @@ impl OutputFormat {
 #[derive(Debug, Serialize)]
 pub struct Envelope<T: Serialize> {
     pub ok: bool,
-    pub command: String,
+    pub command: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<T>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -73,14 +62,14 @@ pub struct Meta {
 
 /// Convenience builder to reduce boilerplate in handlers.
 pub struct EnvelopeBuilder {
-    command: String,
+    command: &'static str,
     start: Instant,
 }
 
 impl EnvelopeBuilder {
-    pub fn new(command: impl Into<String>) -> Self {
+    pub fn new(command: &'static str) -> Self {
         Self {
-            command: command.into(),
+            command,
             start: Instant::now(),
         }
     }
@@ -152,16 +141,7 @@ pub fn write_envelope<T: Serialize>(format: OutputFormat, envelope: &Envelope<T>
     let stdout = io::stdout();
     let mut out = stdout.lock();
     match format {
-        OutputFormat::Json => {
-            if io::stdout().is_terminal() {
-                serde_json::to_writer_pretty(&mut out, envelope)?;
-                writeln!(out)?;
-            } else {
-                serde_json::to_writer(&mut out, envelope)?;
-                writeln!(out)?;
-            }
-        }
-        OutputFormat::Ndjson => {
+        OutputFormat::Json | OutputFormat::Ndjson => {
             serde_json::to_writer(&mut out, envelope)?;
             writeln!(out)?;
         }
@@ -191,7 +171,7 @@ mod tests {
     fn envelope_ok_serializes() {
         let env = EnvelopeBuilder::new("test-cmd").ok(serde_json::json!({"key": "val"}));
         assert!(env.ok);
-        assert_eq!(env.command, "test-cmd");
+        assert_eq!(env.command, "test-cmd" as &str);
         assert!(env.data.is_some());
         assert!(env.error.is_none());
 

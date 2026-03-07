@@ -479,7 +479,26 @@ pub fn handle_schema(command: &str, format: OutputFormat) -> Result<()> {
 
             for p in &cmd_info.params {
                 let mut prop = serde_json::Map::new();
-                prop.insert("type".to_string(), serde_json::json!(p.param_type));
+
+                // Map param_type to valid JSON Schema types
+                if let Some(variants) = p.param_type.strip_prefix("enum(").and_then(|s| s.strip_suffix(')')) {
+                    prop.insert("type".to_string(), serde_json::json!("string"));
+                    let values: Vec<&str> = variants.split(',').collect();
+                    prop.insert("enum".to_string(), serde_json::json!(values));
+                } else {
+                    let schema_type = match p.param_type {
+                        "string" | "path" | "json" => "string",
+                        "bool" => "boolean",
+                        "integer" => "integer",
+                        "float" | "number" => "number",
+                        other => other,
+                    };
+                    prop.insert("type".to_string(), serde_json::json!(schema_type));
+                    if p.param_type == "path" {
+                        prop.insert("format".to_string(), serde_json::json!("path"));
+                    }
+                }
+
                 prop.insert(
                     "description".to_string(),
                     serde_json::json!(p.description),
@@ -517,7 +536,7 @@ pub fn handle_schema(command: &str, format: OutputFormat) -> Result<()> {
                 }),
             );
             write_envelope(format, &env)?;
-            std::process::exit(2);
+            anyhow::bail!("unknown command: {}", command);
         }
     }
 
