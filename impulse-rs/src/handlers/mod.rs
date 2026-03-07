@@ -16,6 +16,7 @@ use crate::{
 pub mod agent;
 pub mod build;
 pub mod config;
+pub mod describe;
 pub mod guard;
 pub mod injection_handlers;
 pub mod memory;

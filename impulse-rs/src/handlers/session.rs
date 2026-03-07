@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::sync::Arc;
 
-use crate::{guardrail, injection, semantic_diff, state, verify};
+use crate::{guardrail, injection, semantic_diff, state, validate, verify};
 
 use super::{
     capture_hook_evidence, default_session_name, get_session_id, hook_session_start_banner,
@@ -105,6 +105,11 @@ pub async fn handle_session_end(
     should_verify: bool,
     sem_diff_base: Option<String>,
 ) -> Result<()> {
+    validate::validate_session_id(&session_id)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    validate::reject_control_chars(&summary, "summary")
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
     let stdin_payload = read_hook_stdin_payload();
     if should_verify {
         let steps = verify::default_steps(&std::env::current_dir()?);
@@ -174,6 +179,9 @@ pub async fn handle_track_write(
     file: String,
     session_id: Option<String>,
 ) -> Result<()> {
+    validate::validate_file_arg(&file)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
     if let Some(sid) = get_session_id(session_id) {
         match state.track_file(&sid, &file).await {
             Ok(_) => println!("Tracked: {}", file),
@@ -209,6 +217,9 @@ pub async fn handle_track_tool(
     tool: String,
     session_id: Option<String>,
 ) -> Result<()> {
+    validate::reject_control_chars(&tool, "tool")
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
     if let Some(sid) = get_session_id(session_id) {
         match state.track_tool(&sid, &tool).await {
             Ok(_) => println!("Tracked: {}", tool),

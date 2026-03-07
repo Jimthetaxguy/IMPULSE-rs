@@ -14,6 +14,7 @@ pub mod context_lifecycle;
 pub mod credentials;
 pub mod daemon;
 pub mod docs;
+pub mod envelope;
 pub mod error;
 pub mod guardrail;
 pub mod handlers;
@@ -36,6 +37,7 @@ pub mod storage;
 pub mod tooling;
 pub mod tools;
 pub mod ui;
+pub mod validate;
 pub mod verify;
 
 #[derive(Parser)]
@@ -56,6 +58,10 @@ struct Cli {
 
     #[arg(long)]
     socket: Option<PathBuf>,
+
+    /// Output format: json (default for pipes), text (default for TTY), ndjson (streaming)
+    #[arg(long, global = true)]
+    format: Option<envelope::OutputFormat>,
 }
 
 #[derive(Subcommand)]
@@ -579,6 +585,15 @@ enum Commands {
         #[arg(long, default_value = "all")]
         period: String,
     },
+
+    /// Emit a machine-readable registry of all commands with schemas and examples (ATCC v1)
+    Describe,
+
+    /// Emit JSON Schema for a specific command path (ATCC v1)
+    Schema {
+        /// Command path (e.g. "session-start", "guard", "tooling-list")
+        command: String,
+    },
 }
 
 #[tokio::main]
@@ -892,6 +907,15 @@ async fn run_daemon_mode(cli: Cli) -> Result<()> {
             handlers::print_verification_report(&report);
             if !report.success() {
                 anyhow::bail!("Verification failed");
+            }
+        }
+        Commands::Describe | Commands::Schema { .. } => {
+            // Introspection commands work without daemon state
+            let fmt = cli.format.unwrap_or(envelope::OutputFormat::Json);
+            match cli.command {
+                Commands::Describe => handlers::describe::handle_describe(fmt)?,
+                Commands::Schema { command } => handlers::describe::handle_schema(&command, fmt)?,
+                _ => unreachable!(),
             }
         }
         Commands::SearchHistory { .. }
@@ -1319,6 +1343,14 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
             period,
         } => {
             handlers::guard::handle_analytics(&state, subcommand, json, period)?;
+        }
+        Commands::Describe => {
+            let fmt = cli.format.unwrap_or(envelope::OutputFormat::Json);
+            handlers::describe::handle_describe(fmt)?;
+        }
+        Commands::Schema { command } => {
+            let fmt = cli.format.unwrap_or(envelope::OutputFormat::Json);
+            handlers::describe::handle_schema(&command, fmt)?;
         }
     }
 

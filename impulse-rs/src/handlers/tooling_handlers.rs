@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::{state, tooling};
+use crate::{state, tooling, validate};
 
 use super::{
     build_tool_context, build_tool_registry, get_session_id, parse_tool_category, print_json,
@@ -55,6 +55,9 @@ pub fn handle_tooling_describe(
     tool_id: String,
     json: bool,
 ) -> Result<()> {
+    validate::validate_tool_id(&tool_id)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
     let config = state.config_snapshot()?;
     let registry = build_tool_registry(impulse_dir, &config)?;
     match registry.get(&tool_id) {
@@ -115,6 +118,9 @@ pub async fn handle_tooling_run(
     params: Option<String>,
     json: bool,
 ) -> Result<()> {
+    validate::validate_tool_id(&tool_id)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
     let config = state.config_snapshot()?;
     let registry = build_tool_registry(impulse_dir, &config)?;
     let params_value: serde_json::Value = if let Some(ref p) = params {
