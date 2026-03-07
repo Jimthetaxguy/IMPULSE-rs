@@ -1,16 +1,36 @@
+//! Daemon IPC server — long-running Unix socket process.
+//!
+//! Accepts JSON-line messages over [`DaemonRequest`] / [`DaemonResponse`] protocol.
+//! Owns in-memory [`crate::state::State`] with dirty-flag sync. Handles session
+//! lifecycle, file tracking, conflict detection, chat, and tool invocation.
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 
 use crate::injection::{run_injection, InjectionMode, InjectionSurface};
 use crate::llm_backends::{AnthropicProvider, ChatRequest, LlmProvider, Message, Role};
 use crate::state::SharedState;
 
 const SOCKET_NAME: &str = "impulse.sock";
+
+fn build_remote_tool_context(
+    impulse_dir: &std::path::Path,
+    config: &crate::state::Config,
+) -> crate::tooling::ToolContext {
+    crate::handlers::build_tool_context(
+        impulse_dir,
+        config,
+        crate::tooling::ExecutionOrigin::Daemon,
+        false,
+        None,
+    )
+}
 
 pub struct DaemonConfig {
     pub socket_path: PathBuf,
@@ -73,6 +93,44 @@ pub enum DaemonRequest {
     },
     /// Export tool schemas in Claude tool-calling format
     ToolSchema,
+    /// Fetch the workbench snapshot used by the egui operator console
+    GetOpsSnapshot,
+    /// Poll for workbench events and a reconciled snapshot
+    SubscribeOps {
+        #[serde(default)]
+        since_seq: Option<u64>,
+    },
+    /// Publish live terminal telemetry from the egui workbench
+    PublishTerminalOps {
+        report: impulse_ops::TerminalOpsReport,
+    },
+    /// Read the effective supervisor permissions for the egui control plane
+    GetSupervisorPermissions,
+    /// Structured supervisor chat for the egui control plane
+    SupervisorChat {
+        prompt: String,
+        context: Option<String>,
+    },
+    /// Run a structured supervisor action with daemon-side policy enforcement
+    RunSupervisorAction {
+        action: impulse_ops::SupervisorAction,
+    },
+    /// List project-scoped artifacts for the egui workbench
+    ListArtifacts {
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// Get a single project artifact by ID
+    GetArtifact {
+        artifact_id: String,
+    },
+    /// Run an artifact action for the egui workbench
+    RunArtifactAction {
+        artifact_id: String,
+        action_id: String,
+        #[serde(default)]
+        params: serde_json::Value,
+    },
     /// Request AI coordination assistance via the Impulse Agent
     AgentAssist {
         prompt: String,
@@ -113,8 +171,12 @@ pub enum DaemonResponse {
 
 pub struct Daemon {
     config: DaemonConfig,
-    shutdown_flag: Arc<RwLock<bool>>,
+    shutdown_flag: Arc<AtomicBool>,
+    shutdown_notify: Arc<Notify>,
     tool_registry: Arc<crate::tooling::ToolRegistry>,
+    tool_context: crate::tooling::ToolContext,
+    terminal_telemetry: Arc<RwLock<crate::ops_workbench::TerminalOpsTelemetryStore>>,
+    supervisor_session_override: Arc<RwLock<Option<impulse_ops::SupervisorPermissionPolicy>>>,
 }
 
 impl Daemon {
@@ -124,14 +186,39 @@ impl Daemon {
             .base_path()
             .join("sockets")
             .join(SOCKET_NAME);
+        let project_root = state
+            .storage()
+            .base_path()
+            .parent()
+            .unwrap_or_else(|| state.storage().base_path());
+        let config_snapshot = state.config_snapshot().unwrap_or_default();
+        let external_tools_dir = config_snapshot.resolved_external_tools_dir_from(project_root);
+        let tool_registry = crate::tooling::ToolRegistry::with_runtime(
+            state.storage().base_path(),
+            &external_tools_dir,
+        )
+        .unwrap_or_else(|_| crate::tooling::ToolRegistry::with_defaults());
+        if let Err(err) = crate::agent_discovery::write_capabilities_manifest(
+            state.storage().base_path(),
+            &tool_registry,
+        ) {
+            tracing::warn!("failed to refresh capabilities manifest: {}", err);
+        }
+        let tool_context = build_remote_tool_context(state.storage().base_path(), &config_snapshot);
 
         Self {
             config: DaemonConfig {
                 socket_path: socket_path.clone(),
                 state,
             },
-            shutdown_flag: Arc::new(RwLock::new(false)),
-            tool_registry: Arc::new(crate::tooling::ToolRegistry::with_defaults()),
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
+            shutdown_notify: Arc::new(Notify::new()),
+            tool_registry: Arc::new(tool_registry),
+            tool_context,
+            terminal_telemetry: Arc::new(RwLock::new(
+                crate::ops_workbench::TerminalOpsTelemetryStore::default(),
+            )),
+            supervisor_session_override: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -150,10 +237,10 @@ impl Daemon {
             .await
             .context("Failed to create socket directory")?;
 
-        if self.config.socket_path.exists() {
-            tokio::fs::remove_file(&self.config.socket_path)
-                .await
-                .context("Failed to remove old socket")?;
+        if let Err(e) = tokio::fs::remove_file(&self.config.socket_path).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(e).context("Failed to remove old socket");
+            }
         }
 
         let listener =
@@ -168,9 +255,25 @@ impl Daemon {
                         Ok((stream, _)) => {
                             let state = self.config.state.clone();
                             let shutdown = self.shutdown_flag.clone();
+                            let notify = self.shutdown_notify.clone();
                             let registry = self.tool_registry.clone();
+                            let tool_context = self.tool_context.clone();
+                            let terminal_telemetry = self.terminal_telemetry.clone();
+                            let supervisor_session_override =
+                                self.supervisor_session_override.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = handle_connection(stream, state, shutdown, registry).await {
+                                if let Err(e) = handle_connection(
+                                    stream,
+                                    state,
+                                    shutdown,
+                                    notify,
+                                    registry,
+                                    tool_context,
+                                    terminal_telemetry,
+                                    supervisor_session_override,
+                                )
+                                .await
+                                {
                                     eprintln!("Connection error: {}", e);
                                 }
                             });
@@ -180,7 +283,7 @@ impl Daemon {
                         }
                     }
                 }
-                _ = self.check_shutdown() => {
+                _ = self.shutdown_notify.notified() => {
                     println!("Shutting down daemon...");
                     break;
                 }
@@ -190,34 +293,25 @@ impl Daemon {
         Ok(())
     }
 
-    async fn check_shutdown(&self) {
-        loop {
-            if let Ok(flag) = self.shutdown_flag.try_read() {
-                if *flag {
-                    return;
-                }
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        }
-    }
-
     #[allow(dead_code)]
     pub async fn shutdown(&self) {
-        if let Ok(mut flag) = self.shutdown_flag.try_write() {
-            *flag = true;
-        }
+        self.shutdown_flag.store(true, Ordering::SeqCst);
+        self.shutdown_notify.notify_waiters();
 
-        if self.config.socket_path.exists() {
-            let _ = tokio::fs::remove_file(&self.config.socket_path).await;
-        }
+        let _ = tokio::fs::remove_file(&self.config.socket_path).await;
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     mut stream: tokio::net::UnixStream,
     state: SharedState,
-    shutdown: Arc<RwLock<bool>>,
+    shutdown: Arc<AtomicBool>,
+    _notify: Arc<Notify>,
     registry: Arc<crate::tooling::ToolRegistry>,
+    tool_context: crate::tooling::ToolContext,
+    terminal_telemetry: Arc<RwLock<crate::ops_workbench::TerminalOpsTelemetryStore>>,
+    supervisor_session_override: Arc<RwLock<Option<impulse_ops::SupervisorPermissionPolicy>>>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.split();
     let mut reader = BufReader::new(reader);
@@ -255,7 +349,15 @@ async fn handle_connection(
             }
         };
 
-        let response = process_request(request, state.clone(), &registry).await;
+        let response = process_request(
+            request,
+            state.clone(),
+            &registry,
+            &tool_context,
+            &terminal_telemetry,
+            &supervisor_session_override,
+        )
+        .await;
 
         writer
             .write_all(serde_json::to_string(&response)?.as_bytes())
@@ -265,20 +367,678 @@ async fn handle_connection(
 
         line.clear();
 
-        if let Ok(flag) = shutdown.try_read() {
-            if *flag {
-                break;
-            }
+        if shutdown.load(Ordering::SeqCst) {
+            break;
         }
     }
 
     Ok(())
 }
 
+async fn load_terminal_reports(
+    state: &SharedState,
+    terminal_telemetry: &Arc<RwLock<crate::ops_workbench::TerminalOpsTelemetryStore>>,
+) -> Vec<impulse_ops::TerminalOpsReport> {
+    let project = crate::ops_workbench::project_summary(state);
+    terminal_telemetry
+        .write()
+        .await
+        .fresh_reports(&project.id, chrono::Utc::now())
+}
+
+async fn build_ops_snapshot(
+    state: &SharedState,
+    terminal_telemetry: &Arc<RwLock<crate::ops_workbench::TerminalOpsTelemetryStore>>,
+) -> Result<impulse_ops::ProjectOpsSnapshot> {
+    let reports = load_terminal_reports(state, terminal_telemetry).await;
+    crate::ops_workbench::build_snapshot(state, &reports).await
+}
+
+#[derive(Debug, Deserialize)]
+struct ParsedSupervisorChatResponse {
+    response: String,
+    #[serde(default)]
+    proposals: Vec<impulse_ops::SupervisorProposal>,
+}
+
+async fn build_supervisor_permission_state(
+    state: &SharedState,
+    supervisor_session_override: &Arc<RwLock<Option<impulse_ops::SupervisorPermissionPolicy>>>,
+) -> Result<impulse_ops::SupervisorPermissionState> {
+    let config = state.config_snapshot()?;
+    let session_override = supervisor_session_override.read().await.clone();
+    Ok(impulse_ops::SupervisorPermissionState::resolve(
+        config.impulse_agent_permissions,
+        session_override,
+    ))
+}
+
+fn required_tool_capabilities_for_action(
+    action: &impulse_ops::SupervisorAction,
+) -> Vec<impulse_ops::ToolCapabilityId> {
+    use impulse_ops::SupervisorAction as Action;
+    use impulse_ops::ToolCapabilityId as Cap;
+
+    match action {
+        Action::InjectContext { .. }
+        | Action::CleanupContext { .. }
+        | Action::HandoffContext { .. } => vec![Cap::FileSystemRead, Cap::FileSystemWrite],
+        Action::OpenArtifactReview { .. } => vec![Cap::FileSystemRead],
+        Action::SearchMemory { .. } => vec![Cap::FileSystemRead],
+        _ => Vec::new(),
+    }
+}
+
+fn supervisor_action_label(action: &impulse_ops::SupervisorAction) -> String {
+    match action {
+        impulse_ops::SupervisorAction::FocusAgent { .. } => "Focus Agent".to_string(),
+        impulse_ops::SupervisorAction::SendInput { .. } => "Send Input".to_string(),
+        impulse_ops::SupervisorAction::InjectContext { .. } => "Stage Injection Review".to_string(),
+        impulse_ops::SupervisorAction::CleanupContext { .. } => "Create Cleanup Review".to_string(),
+        impulse_ops::SupervisorAction::HandoffContext { .. } => "Create Handoff".to_string(),
+        impulse_ops::SupervisorAction::OpenArtifactReview { .. } => "Open Review".to_string(),
+        impulse_ops::SupervisorAction::SearchMemory { .. } => "Search Memory".to_string(),
+        impulse_ops::SupervisorAction::ModifyPermissions { scope, .. } => match scope {
+            impulse_ops::PermissionChangeScope::SessionOverride => "Allow This Session".to_string(),
+            impulse_ops::PermissionChangeScope::PersistentDefault => "Save Default".to_string(),
+        },
+        impulse_ops::SupervisorAction::ClearSessionOverride { .. } => {
+            "Clear Session Override".to_string()
+        }
+        impulse_ops::SupervisorAction::ResetBaselinePermissions { .. } => {
+            "Reset Baseline".to_string()
+        }
+    }
+}
+
+fn hydrate_supervisor_proposal(
+    proposal: &mut impulse_ops::SupervisorProposal,
+    permission_state: &impulse_ops::SupervisorPermissionState,
+) {
+    proposal.requires_confirmation = permission_state
+        .effective
+        .requires_confirmation(proposal.action.permission());
+    proposal.missing_actions = if permission_state
+        .effective
+        .allows_action(proposal.action.permission())
+    {
+        Vec::new()
+    } else {
+        vec![proposal.action.permission()]
+    };
+    proposal.missing_tool_capabilities = required_tool_capabilities_for_action(&proposal.action)
+        .into_iter()
+        .filter(|capability| {
+            !permission_state
+                .effective
+                .allows_tool_capability(*capability)
+        })
+        .collect();
+    if proposal.action_label.trim().is_empty() {
+        proposal.action_label = supervisor_action_label(&proposal.action);
+    }
+}
+
+fn extract_json_object(raw: &str) -> Option<&str> {
+    let start = raw.find('{')?;
+    let end = raw.rfind('}')?;
+    raw.get(start..=end)
+}
+
+fn parse_supervisor_chat_response(
+    raw: &str,
+    permission_state: &impulse_ops::SupervisorPermissionState,
+) -> impulse_ops::SupervisorChatResult {
+    let parsed = serde_json::from_str::<ParsedSupervisorChatResponse>(raw)
+        .ok()
+        .or_else(|| extract_json_object(raw).and_then(|json| serde_json::from_str(json).ok()));
+
+    if let Some(mut parsed) = parsed {
+        for proposal in &mut parsed.proposals {
+            hydrate_supervisor_proposal(proposal, permission_state);
+        }
+        impulse_ops::SupervisorChatResult {
+            response: parsed.response,
+            proposals: parsed.proposals,
+            permission_state: permission_state.clone(),
+        }
+    } else {
+        impulse_ops::SupervisorChatResult {
+            response: raw.trim().to_string(),
+            proposals: Vec::new(),
+            permission_state: permission_state.clone(),
+        }
+    }
+}
+
+fn build_supervisor_prompt(
+    snapshot: &impulse_ops::ProjectOpsSnapshot,
+    permission_state: &impulse_ops::SupervisorPermissionState,
+    prompt: &str,
+    context: Option<&str>,
+) -> String {
+    let compact_snapshot = serde_json::json!({
+        "project": {
+            "id": snapshot.project.id,
+            "name": snapshot.project.name,
+        },
+        "agents": snapshot.agents.iter().map(|agent| serde_json::json!({
+            "id": agent.id,
+            "label": agent.label,
+            "session_id": agent.session_id,
+            "status": agent.status,
+            "backend_kind": agent.backend_kind,
+            "context_tier": agent.context.tier,
+            "current_task": agent.current_task,
+            "warnings": agent.warnings,
+        })).collect::<Vec<_>>(),
+        "interventions": snapshot.interventions.iter().map(|item| serde_json::json!({
+            "id": item.id,
+            "title": item.title,
+            "severity": item.severity,
+            "action_kind": item.action_kind,
+            "target_agent_id": item.target_agent_id,
+        })).collect::<Vec<_>>(),
+        "artifacts": snapshot.artifacts.iter().take(8).map(|artifact| serde_json::json!({
+            "id": artifact.id,
+            "kind": artifact.kind,
+            "title": artifact.title,
+            "status": artifact.status,
+        })).collect::<Vec<_>>(),
+    });
+
+    let extra_context = context.unwrap_or("").trim();
+    format!(
+        "Supervisor permission state:\n{}\n\nWorkspace snapshot:\n{}\n\nOperator context:\n{}\n\nOperator request:\n{}",
+        serde_json::to_string_pretty(permission_state).unwrap_or_else(|_| "{}".to_string()),
+        serde_json::to_string_pretty(&compact_snapshot).unwrap_or_else(|_| "{}".to_string()),
+        if extra_context.is_empty() {
+            "(none provided)"
+        } else {
+            extra_context
+        },
+        prompt
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn save_supervisor_artifact(
+    state: &SharedState,
+    project_id: &str,
+    agent_id: &str,
+    kind: &str,
+    title: String,
+    summary: String,
+    payload: serde_json::Value,
+    related_files: Vec<impulse_ops::ArtifactFileRef>,
+    actions: Vec<impulse_ops::ArtifactAction>,
+) -> Result<String> {
+    let artifact_id = impulse_ops::sanitize_id(&format!(
+        "{}-{}-{}",
+        kind,
+        agent_id,
+        chrono::Utc::now().timestamp_millis()
+    ));
+    let artifact = impulse_ops::ArtifactEnvelope {
+        id: artifact_id.clone(),
+        project_id: project_id.to_string(),
+        agent_id: agent_id.to_string(),
+        session_id: None,
+        kind: kind.to_string(),
+        schema: format!("impulse.{}.v1", kind),
+        title,
+        summary,
+        payload,
+        view_hints: vec![
+            impulse_ops::ArtifactViewHint::SummaryCard,
+            impulse_ops::ArtifactViewHint::Markdown,
+            impulse_ops::ArtifactViewHint::RawJson,
+        ],
+        actions,
+        status: impulse_ops::ArtifactStatus::Staged,
+        created_at: impulse_ops::now_rfc3339(),
+        related_files,
+        metadata: serde_json::json!({
+            "source": "supervisor_action",
+        }),
+    };
+    impulse_ops::save_artifact(state.storage().base_path(), &artifact)?;
+    Ok(artifact_id)
+}
+
+fn resolve_supervisor_target<'a>(
+    snapshot: &'a impulse_ops::ProjectOpsSnapshot,
+    agent_id: Option<&str>,
+    session_id: Option<&str>,
+) -> Option<&'a impulse_ops::AgentRuntime> {
+    session_id
+        .and_then(|target| {
+            snapshot
+                .agents
+                .iter()
+                .find(|agent| agent.session_id.as_deref() == Some(target))
+        })
+        .or_else(|| {
+            agent_id.and_then(|target| snapshot.agents.iter().find(|agent| agent.id == target))
+        })
+}
+
+fn guard_target_for_action(action: &impulse_ops::SupervisorAction) -> &'static str {
+    match action {
+        impulse_ops::SupervisorAction::SendInput { .. } => "bash",
+        impulse_ops::SupervisorAction::InjectContext { .. }
+        | impulse_ops::SupervisorAction::CleanupContext { .. }
+        | impulse_ops::SupervisorAction::HandoffContext { .. }
+        | impulse_ops::SupervisorAction::OpenArtifactReview { .. } => "file-write",
+        _ => "any",
+    }
+}
+
+fn guard_string_for_action(action: &impulse_ops::SupervisorAction) -> String {
+    match action {
+        impulse_ops::SupervisorAction::SendInput { content, .. } => content.clone(),
+        _ => action.summary(),
+    }
+}
+
+async fn run_supervisor_action(
+    state: &SharedState,
+    action: impulse_ops::SupervisorAction,
+    terminal_telemetry: &Arc<RwLock<crate::ops_workbench::TerminalOpsTelemetryStore>>,
+    supervisor_session_override: &Arc<RwLock<Option<impulse_ops::SupervisorPermissionPolicy>>>,
+) -> Result<impulse_ops::SupervisorActionResult> {
+    let snapshot = build_ops_snapshot(state, terminal_telemetry).await?;
+    let permission_state =
+        build_supervisor_permission_state(state, supervisor_session_override).await?;
+    let permission = action.permission();
+
+    if !permission_state.effective.allows_action(permission) {
+        anyhow::bail!(
+            "Permission '{}' is not currently allowed for the supervisor",
+            permission.as_str()
+        );
+    }
+
+    let missing_caps = required_tool_capabilities_for_action(&action)
+        .into_iter()
+        .filter(|capability| {
+            !permission_state
+                .effective
+                .allows_tool_capability(*capability)
+        })
+        .collect::<Vec<_>>();
+    if !missing_caps.is_empty() {
+        anyhow::bail!(
+            "Missing tool capabilities: {}",
+            missing_caps
+                .iter()
+                .map(|capability| capability.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    if permission_state.effective.requires_confirmation(permission) && !action.confirmed() {
+        anyhow::bail!(
+            "Action '{}' requires explicit confirmation",
+            permission.as_str()
+        );
+    }
+
+    let config = state.config_snapshot()?;
+    let guard_results = crate::guardrail::evaluate_action(
+        &guard_string_for_action(&action),
+        guard_target_for_action(&action),
+        &config.guardrails,
+    )
+    .map_err(anyhow::Error::msg)?;
+    if crate::guardrail::GuardEngine::has_blocking(&guard_results) {
+        let reason = guard_results
+            .first()
+            .map(|result| result.reason.clone())
+            .unwrap_or_else(|| "Blocked by guardrail rule".to_string());
+        anyhow::bail!(reason);
+    }
+
+    let project = snapshot.project.clone();
+
+    match action.clone() {
+        impulse_ops::SupervisorAction::FocusAgent { .. }
+        | impulse_ops::SupervisorAction::SendInput { .. }
+        | impulse_ops::SupervisorAction::SearchMemory { .. } => {
+            Ok(impulse_ops::SupervisorActionResult {
+                status: "dispatch_local".to_string(),
+                message: format!("Approved {}", action.summary()),
+                local_action: Some(action),
+                permission_state: Some(permission_state),
+                artifact_id: None,
+                payload: None,
+            })
+        }
+        impulse_ops::SupervisorAction::OpenArtifactReview { artifact_id } => {
+            let review = crate::ops_workbench::run_artifact_action(
+                state.storage().base_path(),
+                &project.id,
+                &artifact_id,
+                "review",
+                &serde_json::Value::Null,
+            )?;
+            Ok(impulse_ops::SupervisorActionResult {
+                status: "executed".to_string(),
+                message: review.message,
+                local_action: None,
+                permission_state: Some(permission_state),
+                artifact_id: Some(artifact_id),
+                payload: review.payload,
+            })
+        }
+        impulse_ops::SupervisorAction::InjectContext {
+            agent_id,
+            session_id,
+            query,
+            ..
+        } => {
+            let target =
+                resolve_supervisor_target(&snapshot, agent_id.as_deref(), session_id.as_deref());
+            let mut query_parts = vec![query.clone()];
+            if let Some(target) = target {
+                query_parts.push(target.label.clone());
+                if let Some(task) = target.current_task.clone() {
+                    query_parts.push(task);
+                }
+                if !target.recent_files.is_empty() {
+                    query_parts.push(target.recent_files.join(" "));
+                }
+            }
+            let injection = run_injection(
+                state.storage().base_path(),
+                &config,
+                InjectionSurface::DaemonChat,
+                Some(InjectionMode::Review),
+                &query_parts,
+            );
+            let artifact_id = injection.artifact_path.as_ref().and_then(|path| {
+                std::path::Path::new(path).file_stem().map(|stem| {
+                    impulse_ops::sanitize_id(&format!("legacy-{}", stem.to_string_lossy()))
+                })
+            });
+            Ok(impulse_ops::SupervisorActionResult {
+                status: if injection.artifact_path.is_some() {
+                    "executed".to_string()
+                } else {
+                    "no_candidates".to_string()
+                },
+                message: if let Some(path) = injection.artifact_path.as_ref() {
+                    format!("Injection review staged at {}", path)
+                } else {
+                    injection
+                        .skipped_reason
+                        .clone()
+                        .unwrap_or_else(|| "No injection candidates found".to_string())
+                },
+                local_action: None,
+                permission_state: Some(permission_state),
+                artifact_id,
+                payload: Some(serde_json::to_value(&injection)?),
+            })
+        }
+        impulse_ops::SupervisorAction::CleanupContext {
+            agent_id,
+            session_id,
+            goal,
+            ..
+        } => {
+            let target =
+                resolve_supervisor_target(&snapshot, agent_id.as_deref(), session_id.as_deref())
+                    .ok_or_else(|| anyhow::anyhow!("Target agent not found"))?;
+            let artifact_id = save_supervisor_artifact(
+                state,
+                &project.id,
+                "impulse-supervisor",
+                "context_cleanup_review",
+                format!("Cleanup Review: {}", target.label),
+                format!("Reviewable cleanup context prepared for {}", target.label),
+                serde_json::json!({
+                    "markdown": format!(
+                        "# Cleanup Review\n\n## Target\n- Agent: {}\n- Session: {}\n- Context Tier: {}\n\n## Goal\n{}\n\n## Recent Files\n{}\n\n## Current Task\n{}\n\n## Warnings\n{}\n",
+                        target.label,
+                        target.session_id.clone().unwrap_or_else(|| "none".to_string()),
+                        target.context.tier,
+                        goal.clone().unwrap_or_else(|| "Prepare a compact reviewable context bundle.".to_string()),
+                        if target.recent_files.is_empty() {
+                            "- (none tracked)".to_string()
+                        } else {
+                            target.recent_files.iter().map(|file| format!("- {}", file)).collect::<Vec<_>>().join("\n")
+                        },
+                        target.current_task.clone().unwrap_or_else(|| "unknown".to_string()),
+                        if target.warnings.is_empty() {
+                            "- (none)".to_string()
+                        } else {
+                            target.warnings.iter().map(|warning| format!("- {}", warning)).collect::<Vec<_>>().join("\n")
+                        },
+                    ),
+                    "target_agent_id": target.id,
+                    "target_session_id": target.session_id,
+                    "goal": goal,
+                }),
+                Vec::new(),
+                vec![
+                    impulse_ops::ArtifactAction {
+                        id: "review".to_string(),
+                        label: "Review".to_string(),
+                        kind: "review".to_string(),
+                        requires_confirmation: false,
+                        params_schema: serde_json::Value::Null,
+                    },
+                    impulse_ops::ArtifactAction {
+                        id: "apply".to_string(),
+                        label: "Apply To Active Agent".to_string(),
+                        kind: "apply".to_string(),
+                        requires_confirmation: true,
+                        params_schema: serde_json::Value::Null,
+                    },
+                    impulse_ops::ArtifactAction {
+                        id: "acknowledge".to_string(),
+                        label: "Acknowledge".to_string(),
+                        kind: "acknowledge".to_string(),
+                        requires_confirmation: false,
+                        params_schema: serde_json::Value::Null,
+                    },
+                ],
+            )?;
+            Ok(impulse_ops::SupervisorActionResult {
+                status: "executed".to_string(),
+                message: format!("Cleanup review created for {}", target.label),
+                local_action: None,
+                permission_state: Some(permission_state),
+                artifact_id: Some(artifact_id),
+                payload: None,
+            })
+        }
+        impulse_ops::SupervisorAction::HandoffContext {
+            session_id,
+            target_tool,
+            task,
+            notes,
+            ..
+        } => {
+            let session = match session_id.as_deref() {
+                Some(value) => state.get_session(value).await?,
+                None => None,
+            };
+            let handoff_path = crate::orchestration::write_handoff(
+                state.storage().base_path(),
+                &target_tool,
+                &task,
+                notes.as_deref(),
+                session.as_ref(),
+            )?;
+            let markdown = std::fs::read_to_string(&handoff_path).unwrap_or_default();
+            let artifact_id = save_supervisor_artifact(
+                state,
+                &project.id,
+                "impulse-supervisor",
+                "handoff_review",
+                format!("Handoff: {}", target_tool),
+                format!("Supervisor handoff prepared for {}", target_tool),
+                serde_json::json!({
+                    "markdown": markdown,
+                    "target_tool": target_tool,
+                    "task": task,
+                    "notes": notes,
+                    "source_path": handoff_path.display().to_string(),
+                }),
+                vec![impulse_ops::ArtifactFileRef {
+                    path: handoff_path.display().to_string(),
+                    label: Some("Generated handoff file".to_string()),
+                }],
+                vec![
+                    impulse_ops::ArtifactAction {
+                        id: "review".to_string(),
+                        label: "Review".to_string(),
+                        kind: "review".to_string(),
+                        requires_confirmation: false,
+                        params_schema: serde_json::Value::Null,
+                    },
+                    impulse_ops::ArtifactAction {
+                        id: "open_file".to_string(),
+                        label: "Open File Ref".to_string(),
+                        kind: "open_file".to_string(),
+                        requires_confirmation: false,
+                        params_schema: serde_json::Value::Null,
+                    },
+                    impulse_ops::ArtifactAction {
+                        id: "acknowledge".to_string(),
+                        label: "Acknowledge".to_string(),
+                        kind: "acknowledge".to_string(),
+                        requires_confirmation: false,
+                        params_schema: serde_json::Value::Null,
+                    },
+                ],
+            )?;
+            Ok(impulse_ops::SupervisorActionResult {
+                status: "executed".to_string(),
+                message: format!("Handoff created for {}", target_tool),
+                local_action: None,
+                permission_state: Some(permission_state),
+                artifact_id: Some(artifact_id),
+                payload: Some(serde_json::json!({
+                    "path": handoff_path.display().to_string(),
+                })),
+            })
+        }
+        impulse_ops::SupervisorAction::ModifyPermissions {
+            scope,
+            grant_actions,
+            grant_tool_capabilities,
+            ..
+        } => {
+            let mut updated_policy = match scope {
+                impulse_ops::PermissionChangeScope::SessionOverride => {
+                    permission_state.effective.clone()
+                }
+                impulse_ops::PermissionChangeScope::PersistentDefault => {
+                    permission_state.baseline.clone()
+                }
+            };
+            for permission in grant_actions {
+                updated_policy.grant_action(permission);
+            }
+            for capability in grant_tool_capabilities {
+                updated_policy.grant_tool_capability(capability);
+            }
+            updated_policy.normalize();
+
+            let next_state = match scope {
+                impulse_ops::PermissionChangeScope::SessionOverride => {
+                    *supervisor_session_override.write().await = Some(updated_policy.clone());
+                    build_supervisor_permission_state(state, supervisor_session_override).await?
+                }
+                impulse_ops::PermissionChangeScope::PersistentDefault => {
+                    state.update_impulse_agent_permissions(updated_policy.clone())?;
+                    *supervisor_session_override.write().await = None;
+                    build_supervisor_permission_state(state, supervisor_session_override).await?
+                }
+            };
+            let artifact_id = save_supervisor_artifact(
+                state,
+                &project.id,
+                "impulse-supervisor",
+                "permission_change",
+                "Supervisor Permission Change".to_string(),
+                format!("Supervisor permissions updated for {:?}", scope),
+                serde_json::json!({
+                    "scope": scope,
+                    "allowed_actions": next_state.effective.allowed_actions,
+                    "allowed_tool_capabilities": next_state.effective.allowed_tool_capabilities,
+                    "require_confirmation_actions": next_state.effective.require_confirmation_actions,
+                }),
+                Vec::new(),
+                vec![
+                    impulse_ops::ArtifactAction {
+                        id: "review".to_string(),
+                        label: "Review".to_string(),
+                        kind: "review".to_string(),
+                        requires_confirmation: false,
+                        params_schema: serde_json::Value::Null,
+                    },
+                    impulse_ops::ArtifactAction {
+                        id: "acknowledge".to_string(),
+                        label: "Acknowledge".to_string(),
+                        kind: "acknowledge".to_string(),
+                        requires_confirmation: false,
+                        params_schema: serde_json::Value::Null,
+                    },
+                ],
+            )?;
+            Ok(impulse_ops::SupervisorActionResult {
+                status: "executed".to_string(),
+                message: "Supervisor permissions updated".to_string(),
+                local_action: None,
+                permission_state: Some(next_state),
+                artifact_id: Some(artifact_id),
+                payload: None,
+            })
+        }
+        impulse_ops::SupervisorAction::ClearSessionOverride { .. } => {
+            *supervisor_session_override.write().await = None;
+            let next_state =
+                build_supervisor_permission_state(state, supervisor_session_override).await?;
+            Ok(impulse_ops::SupervisorActionResult {
+                status: "executed".to_string(),
+                message: "Session override cleared".to_string(),
+                local_action: None,
+                permission_state: Some(next_state),
+                artifact_id: None,
+                payload: None,
+            })
+        }
+        impulse_ops::SupervisorAction::ResetBaselinePermissions { .. } => {
+            state.update_impulse_agent_permissions(
+                impulse_ops::SupervisorPermissionPolicy::default(),
+            )?;
+            *supervisor_session_override.write().await = None;
+            let next_state =
+                build_supervisor_permission_state(state, supervisor_session_override).await?;
+            Ok(impulse_ops::SupervisorActionResult {
+                status: "executed".to_string(),
+                message: "Baseline permissions reset to defaults".to_string(),
+                local_action: None,
+                permission_state: Some(next_state),
+                artifact_id: None,
+                payload: None,
+            })
+        }
+    }
+}
+
 async fn process_request(
     request: DaemonRequest,
     state: SharedState,
     registry: &crate::tooling::ToolRegistry,
+    tool_context: &crate::tooling::ToolContext,
+    terminal_telemetry: &Arc<RwLock<crate::ops_workbench::TerminalOpsTelemetryStore>>,
+    supervisor_session_override: &Arc<RwLock<Option<impulse_ops::SupervisorPermissionPolicy>>>,
 ) -> DaemonResponse {
     match request {
         DaemonRequest::Ping => DaemonResponse::Ok {
@@ -298,11 +1058,7 @@ async fn process_request(
         },
 
         DaemonRequest::CreateSession { name, platform } => {
-            let platform = platform.and_then(|p| match p.as_str() {
-                "claude-code" => Some(crate::state::Platform::ClaudeCode),
-                "opencode" => Some(crate::state::Platform::OpenCode),
-                _ => None,
-            });
+            let platform = platform.and_then(|p| crate::state::Platform::from_str_name(&p));
 
             match state.create_session(name, platform).await {
                 Ok(session) => DaemonResponse::Ok {
@@ -675,12 +1431,17 @@ async fn process_request(
             let out: Vec<_> = descriptors
                 .iter()
                 .map(|d| {
+                    let source = registry
+                        .source(&d.id)
+                        .map(|s| s.as_str())
+                        .unwrap_or("builtin");
                     serde_json::json!({
                         "id": d.id,
                         "name": d.name,
                         "description": d.description,
                         "category": format!("{}", d.category),
                         "params": d.params.len(),
+                        "source": source,
                     })
                 })
                 .collect();
@@ -709,6 +1470,7 @@ async fn process_request(
                         "capabilities": tool.required_capabilities().iter()
                             .map(|c| c.as_str())
                             .collect::<Vec<_>>(),
+                        "source": registry.source(&desc.id).map(|s| s.as_str()).unwrap_or("builtin"),
                     }),
                 }
             }
@@ -718,13 +1480,12 @@ async fn process_request(
         },
 
         DaemonRequest::InvokeTool { name, params } => {
-            // Use restricted context for remote callers (deny-by-default security)
-            let ctx = crate::tooling::ToolContext::default();
-            match registry.execute(&name, params, &ctx).await {
+            match registry.execute(&name, params, tool_context).await {
                 Ok(result) => DaemonResponse::Ok {
                     result: serde_json::json!({
                         "tool": name,
                         "output": result.output,
+                        "metadata": result.metadata,
                     }),
                 },
                 Err(e) => DaemonResponse::Error {
@@ -733,49 +1494,241 @@ async fn process_request(
             }
         }
 
-        DaemonRequest::ToolSchema => {
-            let tools: Vec<_> = registry
-                .list()
-                .iter()
-                .map(|desc| {
-                    let mut properties = serde_json::Map::new();
-                    let mut required = Vec::new();
-                    for param in &desc.params {
-                        let json_type = match param.param_type {
-                            crate::tooling::ParamType::String
-                            | crate::tooling::ParamType::FilePath => "string",
-                            crate::tooling::ParamType::Integer => "integer",
-                            crate::tooling::ParamType::Float => "number",
-                            crate::tooling::ParamType::Bool => "boolean",
-                            crate::tooling::ParamType::Json => "object",
-                        };
-                        let mut prop = serde_json::json!({
-                            "type": json_type,
-                            "description": param.description,
-                        });
-                        if let Some(default) = &param.default {
-                            prop["default"] = default.clone();
-                        }
-                        properties.insert(param.name.clone(), prop);
-                        if param.required {
-                            required.push(serde_json::Value::String(param.name.clone()));
-                        }
-                    }
-                    serde_json::json!({
-                        "name": desc.id,
-                        "description": desc.description,
-                        "input_schema": {
-                            "type": "object",
-                            "properties": properties,
-                            "required": required,
-                        }
-                    })
-                })
-                .collect();
-            DaemonResponse::Ok {
-                result: serde_json::json!({"tools": tools}),
+        DaemonRequest::ToolSchema => DaemonResponse::Ok {
+            result: serde_json::json!({"tools": registry.schema_json()}),
+        },
+
+        DaemonRequest::GetOpsSnapshot => match build_ops_snapshot(&state, terminal_telemetry).await
+        {
+            Ok(snapshot) => match serde_json::to_value(snapshot) {
+                Ok(result) => DaemonResponse::Ok { result },
+                Err(e) => DaemonResponse::Error {
+                    message: format!("Failed to serialize ops snapshot: {}", e),
+                },
+            },
+            Err(e) => DaemonResponse::Error {
+                message: format!("Failed to build ops snapshot: {}", e),
+            },
+        },
+
+        DaemonRequest::SubscribeOps { since_seq } => {
+            let reports = load_terminal_reports(&state, terminal_telemetry).await;
+            match crate::ops_workbench::subscribe_ops(&state, since_seq, &reports).await {
+                Ok(subscription) => match serde_json::to_value(subscription) {
+                    Ok(result) => DaemonResponse::Ok { result },
+                    Err(e) => DaemonResponse::Error {
+                        message: format!("Failed to serialize ops subscription: {}", e),
+                    },
+                },
+                Err(e) => DaemonResponse::Error {
+                    message: format!("Failed to subscribe ops state: {}", e),
+                },
             }
         }
+
+        DaemonRequest::PublishTerminalOps { report } => {
+            let project = crate::ops_workbench::project_summary(&state);
+            terminal_telemetry
+                .write()
+                .await
+                .publish(&project.id, report);
+            DaemonResponse::Ok {
+                result: serde_json::json!({"accepted": true}),
+            }
+        }
+
+        DaemonRequest::GetSupervisorPermissions => {
+            match build_supervisor_permission_state(&state, supervisor_session_override).await {
+                Ok(permission_state) => match serde_json::to_value(permission_state) {
+                    Ok(result) => DaemonResponse::Ok { result },
+                    Err(e) => DaemonResponse::Error {
+                        message: format!("Failed to serialize supervisor permission state: {}", e),
+                    },
+                },
+                Err(e) => DaemonResponse::Error {
+                    message: format!("Failed to resolve supervisor permissions: {}", e),
+                },
+            }
+        }
+
+        DaemonRequest::SupervisorChat { prompt, context } => {
+            let snapshot = match build_ops_snapshot(&state, terminal_telemetry).await {
+                Ok(snapshot) => snapshot,
+                Err(e) => {
+                    return DaemonResponse::Error {
+                        message: format!("Failed to build supervisor snapshot: {}", e),
+                    }
+                }
+            };
+            let permission_state = match build_supervisor_permission_state(
+                &state,
+                supervisor_session_override,
+            )
+            .await
+            {
+                Ok(state) => state,
+                Err(e) => {
+                    return DaemonResponse::Error {
+                        message: format!("Failed to resolve supervisor permissions: {}", e),
+                    }
+                }
+            };
+            let config = match state.config_snapshot() {
+                Ok(c) => c,
+                Err(e) => {
+                    return DaemonResponse::Error {
+                        message: format!("Failed to load config: {}", e),
+                    }
+                }
+            };
+
+            let mut agent = match crate::agent::resolve_from_config(
+                config.impulse_agent_provider.as_deref(),
+                config.impulse_agent_api_key.as_deref(),
+                config.impulse_agent_model.as_deref(),
+                config.impulse_agent_harness.as_deref(),
+            ) {
+                Some(a) => a,
+                None => {
+                    let fallback = impulse_ops::SupervisorChatResult {
+                        response: "Impulse Agent not configured. Configure a provider or harness to enable supervisor chat.".to_string(),
+                        proposals: Vec::new(),
+                        permission_state,
+                    };
+                    return DaemonResponse::Ok {
+                        result: serde_json::to_value(fallback)
+                            .unwrap_or_else(|_| serde_json::json!({})),
+                    };
+                }
+            };
+
+            if !agent.is_ready() {
+                let fallback = impulse_ops::SupervisorChatResult {
+                    response: "Impulse Agent is configured but not ready. Check the API key or harness installation.".to_string(),
+                    proposals: Vec::new(),
+                    permission_state,
+                };
+                return DaemonResponse::Ok {
+                    result: serde_json::to_value(fallback)
+                        .unwrap_or_else(|_| serde_json::json!({})),
+                };
+            }
+
+            let full_prompt =
+                build_supervisor_prompt(&snapshot, &permission_state, &prompt, context.as_deref());
+
+            match agent
+                .query(crate::agent::prompts::SUPERVISOR_SYSTEM, &full_prompt)
+                .await
+            {
+                Ok(response) => {
+                    let parsed = parse_supervisor_chat_response(&response, &permission_state);
+                    match serde_json::to_value(parsed) {
+                        Ok(result) => DaemonResponse::Ok { result },
+                        Err(e) => DaemonResponse::Error {
+                            message: format!("Failed to serialize supervisor chat result: {}", e),
+                        },
+                    }
+                }
+                Err(e) => DaemonResponse::Error {
+                    message: format!("Supervisor chat failed: {}", e),
+                },
+            }
+        }
+
+        DaemonRequest::RunSupervisorAction { action } => {
+            match run_supervisor_action(
+                &state,
+                action,
+                terminal_telemetry,
+                supervisor_session_override,
+            )
+            .await
+            {
+                Ok(result) => match serde_json::to_value(result) {
+                    Ok(result) => DaemonResponse::Ok { result },
+                    Err(e) => DaemonResponse::Error {
+                        message: format!("Failed to serialize supervisor action result: {}", e),
+                    },
+                },
+                Err(e) => DaemonResponse::Error {
+                    message: format!("Supervisor action failed: {}", e),
+                },
+            }
+        }
+
+        DaemonRequest::ListArtifacts { limit } => {
+            match build_ops_snapshot(&state, terminal_telemetry).await {
+                Ok(snapshot) => {
+                    let mut artifacts = snapshot.artifacts;
+                    if let Some(limit) = limit {
+                        artifacts.truncate(limit);
+                    }
+                    match serde_json::to_value(artifacts) {
+                        Ok(result) => DaemonResponse::Ok { result },
+                        Err(e) => DaemonResponse::Error {
+                            message: format!("Failed to serialize artifacts: {}", e),
+                        },
+                    }
+                }
+                Err(e) => DaemonResponse::Error {
+                    message: format!("Failed to list artifacts: {}", e),
+                },
+            }
+        }
+
+        DaemonRequest::GetArtifact { artifact_id } => {
+            match build_ops_snapshot(&state, terminal_telemetry).await {
+                Ok(snapshot) => match crate::ops_workbench::get_artifact(
+                    state.storage().base_path(),
+                    &snapshot.project.id,
+                    &artifact_id,
+                ) {
+                    Ok(Some(artifact)) => match serde_json::to_value(artifact) {
+                        Ok(result) => DaemonResponse::Ok { result },
+                        Err(e) => DaemonResponse::Error {
+                            message: format!("Failed to serialize artifact: {}", e),
+                        },
+                    },
+                    Ok(None) => DaemonResponse::Error {
+                        message: format!("Artifact not found: {}", artifact_id),
+                    },
+                    Err(e) => DaemonResponse::Error {
+                        message: format!("Failed to read artifact: {}", e),
+                    },
+                },
+                Err(e) => DaemonResponse::Error {
+                    message: format!("Failed to resolve project artifact store: {}", e),
+                },
+            }
+        }
+
+        DaemonRequest::RunArtifactAction {
+            artifact_id,
+            action_id,
+            params,
+        } => match build_ops_snapshot(&state, terminal_telemetry).await {
+            Ok(snapshot) => match crate::ops_workbench::run_artifact_action(
+                state.storage().base_path(),
+                &snapshot.project.id,
+                &artifact_id,
+                &action_id,
+                &params,
+            ) {
+                Ok(result) => match serde_json::to_value(result) {
+                    Ok(result) => DaemonResponse::Ok { result },
+                    Err(e) => DaemonResponse::Error {
+                        message: format!("Failed to serialize artifact action result: {}", e),
+                    },
+                },
+                Err(e) => DaemonResponse::Error {
+                    message: format!("Artifact action failed: {}", e),
+                },
+            },
+            Err(e) => DaemonResponse::Error {
+                message: format!("Failed to resolve artifact action context: {}", e),
+            },
+        },
 
         DaemonRequest::StewardMemory => {
             use crate::stewardship;

@@ -56,6 +56,45 @@ Output format: JSON array of objects with fields:
 
 Only report genuine coordination needs. Empty array is fine."#;
 
+/// System prompt for the egui supervisor control plane.
+pub const SUPERVISOR_SYSTEM: &str = r#"You are the Impulse supervisor agent inside the Impulse egui workbench. Your job is to help an operator monitor and control coding agents safely.
+
+You must respond with JSON only. Do not include markdown fences or prose outside the JSON object.
+
+Return an object with this shape:
+{
+  "response": "short operator-facing summary",
+  "proposals": [
+    {
+      "id": "stable-kebab-id",
+      "title": "short title",
+      "description": "one or two sentences",
+      "action_label": "button label",
+      "action": { ... SupervisorAction JSON ... }
+    }
+  ]
+}
+
+Available action kinds:
+- focus_agent
+- send_input
+- inject_context
+- cleanup_context
+- handoff_context
+- open_artifact_review
+- search_memory
+- modify_permissions
+- clear_session_override
+- reset_baseline_permissions
+
+Rules:
+- Prefer 0-3 proposals.
+- Only propose actions justified by the provided workspace snapshot.
+- Do not claim permissions were changed; propose `modify_permissions` instead.
+- For risky actions (`send_input`, `inject_context`, `cleanup_context`, `handoff_context`, `modify_permissions`) set `confirmed` to false.
+- Use stable `agent_id` and `session_id` from the provided snapshot.
+- If no action is appropriate, return an empty `proposals` array."#;
+
 /// System prompt for task summarization.
 /// The agent summarizes what each pane has accomplished for context refresh.
 pub const SUMMARIZE_SYSTEM: &str = r#"You are the Impulse Agent, summarizing AI agent activity for context refresh after compaction or threshold crossing.
@@ -176,6 +215,7 @@ mod tests {
         assert!(!CODE_REVIEW_SYSTEM.is_empty());
         assert!(!ERROR_ANALYSIS_SYSTEM.is_empty());
         assert!(!COORDINATION_SYSTEM.is_empty());
+        assert!(!SUPERVISOR_SYSTEM.is_empty());
         assert!(!SUMMARIZE_SYSTEM.is_empty());
     }
 }

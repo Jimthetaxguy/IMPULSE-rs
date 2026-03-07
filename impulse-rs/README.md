@@ -17,12 +17,20 @@ cargo run -- --help      # Show all commands
 cargo run -- init        # Initialize .impulse/
 cargo run -- run         # Launch TUI
 cargo run -- daemon      # Start background daemon
+cargo run -- validate-hooks --platform claude-code  # Generate real hook validation kit
 
 # ImpulseAgent (LLM coordination)
 cargo run -- agent-configure --provider anthropic --api-key $KEY
 cargo run -- agent-status
 cargo run -- agent-query "Review cross-pane activity"
 ```
+
+## Current Product Contract
+
+- Claude hooks are the canonical memory path; prove them before trusting GUI behavior.
+- The daemon is required for memory/history/ops features.
+- The GUI is a thin workbench for spawning terminals and inspecting memory state.
+- Cross-pane coordination surfaces are experimental until real hook evidence says otherwise.
 
 ## Testing
 

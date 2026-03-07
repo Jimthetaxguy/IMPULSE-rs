@@ -51,49 +51,85 @@ impl PluginRegistry {
         &self,
         format: OfficeFormat,
         provider: Arc<dyn ContextProvider>,
-    ) {
-        let mut providers = self.context_providers.write().unwrap();
+    ) -> PluginResult<()> {
+        let mut providers = self
+            .context_providers
+            .write()
+            .map_err(|_| PluginError::Internal("context_providers lock poisoned".to_string()))?;
         providers.insert(format, provider);
+        Ok(())
     }
 
-    pub fn register_action_handler(&self, name: &str, handler: Arc<dyn ActionHandler>) {
-        let mut handlers = self.action_handlers.write().unwrap();
+    pub fn register_action_handler(
+        &self,
+        name: &str,
+        handler: Arc<dyn ActionHandler>,
+    ) -> PluginResult<()> {
+        let mut handlers = self
+            .action_handlers
+            .write()
+            .map_err(|_| PluginError::Internal("action_handlers lock poisoned".to_string()))?;
         handlers.insert(name.to_string(), handler);
+        Ok(())
     }
 
-    pub fn get_context_provider(&self, format: OfficeFormat) -> Option<Arc<dyn ContextProvider>> {
-        let providers = self.context_providers.read().unwrap();
-        providers.get(&format).cloned()
+    pub fn get_context_provider(
+        &self,
+        format: OfficeFormat,
+    ) -> PluginResult<Option<Arc<dyn ContextProvider>>> {
+        let providers = self
+            .context_providers
+            .read()
+            .map_err(|_| PluginError::Internal("context_providers lock poisoned".to_string()))?;
+        Ok(providers.get(&format).cloned())
     }
 
-    pub fn get_action_handler(&self, name: &str) -> Option<Arc<dyn ActionHandler>> {
-        let handlers = self.action_handlers.read().unwrap();
-        handlers.get(name).cloned()
+    pub fn get_action_handler(&self, name: &str) -> PluginResult<Option<Arc<dyn ActionHandler>>> {
+        let handlers = self
+            .action_handlers
+            .read()
+            .map_err(|_| PluginError::Internal("action_handlers lock poisoned".to_string()))?;
+        Ok(handlers.get(name).cloned())
     }
 
-    pub fn list_context_formats(&self) -> Vec<OfficeFormat> {
-        let providers = self.context_providers.read().unwrap();
-        providers.keys().copied().collect()
+    pub fn list_context_formats(&self) -> PluginResult<Vec<OfficeFormat>> {
+        let providers = self
+            .context_providers
+            .read()
+            .map_err(|_| PluginError::Internal("context_providers lock poisoned".to_string()))?;
+        Ok(providers.keys().copied().collect())
     }
 
-    pub fn list_action_handlers(&self) -> Vec<String> {
-        let handlers = self.action_handlers.read().unwrap();
-        handlers.keys().cloned().collect()
+    pub fn list_action_handlers(&self) -> PluginResult<Vec<String>> {
+        let handlers = self
+            .action_handlers
+            .read()
+            .map_err(|_| PluginError::Internal("action_handlers lock poisoned".to_string()))?;
+        Ok(handlers.keys().cloned().collect())
     }
 
-    pub fn list_context_providers(&self) -> Vec<PluginMetadata> {
-        let providers = self.context_providers.read().unwrap();
-        providers.values().map(|p| p.metadata().clone()).collect()
+    pub fn list_context_providers(&self) -> PluginResult<Vec<PluginMetadata>> {
+        let providers = self
+            .context_providers
+            .read()
+            .map_err(|_| PluginError::Internal("context_providers lock poisoned".to_string()))?;
+        Ok(providers.values().map(|p| p.metadata().clone()).collect())
     }
 
-    pub fn list_action_handlers_metadata(&self) -> Vec<PluginMetadata> {
-        let handlers = self.action_handlers.read().unwrap();
-        handlers.values().map(|h| h.metadata().clone()).collect()
+    pub fn list_action_handlers_metadata(&self) -> PluginResult<Vec<PluginMetadata>> {
+        let handlers = self
+            .action_handlers
+            .read()
+            .map_err(|_| PluginError::Internal("action_handlers lock poisoned".to_string()))?;
+        Ok(handlers.values().map(|h| h.metadata().clone()).collect())
     }
 
-    pub fn supports_format(&self, format: OfficeFormat) -> bool {
-        let providers = self.context_providers.read().unwrap();
-        providers.contains_key(&format)
+    pub fn supports_format(&self, format: OfficeFormat) -> PluginResult<bool> {
+        let providers = self
+            .context_providers
+            .read()
+            .map_err(|_| PluginError::Internal("context_providers lock poisoned".to_string()))?;
+        Ok(providers.contains_key(&format))
     }
 
     pub fn extract(&self, path: &std::path::Path) -> PluginResult<PluginOutput> {
@@ -105,7 +141,7 @@ impl PluginRegistry {
         let format = OfficeFormat::from_extension(ext);
 
         let provider = self
-            .get_context_provider(format)
+            .get_context_provider(format)?
             .ok_or_else(|| PluginError::NotFound(format!("No provider for format: {}", ext)))?;
 
         provider.extract(path)
@@ -120,7 +156,7 @@ impl PluginRegistry {
         let format = OfficeFormat::from_extension(ext);
 
         let provider = self
-            .get_context_provider(format)
+            .get_context_provider(format)?
             .ok_or_else(|| PluginError::NotFound(format!("No provider for format: {}", ext)))?;
 
         provider.extract_smart(path, query)
@@ -186,8 +222,7 @@ pub fn init_global_registry() -> &'static PluginRegistry {
             }
 
             fn extract(&self, path: &std::path::Path) -> PluginResult<PluginOutput> {
-                let result =
-                    office::parse_document(path).map_err(|e| PluginError::ExecutionFailed(e))?;
+                let result = office::parse_document(path).map_err(PluginError::ExecutionFailed)?;
 
                 Ok(PluginOutput::new(result.content)
                     .with_metadata(serde_json::json!({
@@ -209,7 +244,7 @@ pub fn init_global_registry() -> &'static PluginRegistry {
 
             fn extract_smart(&self, path: &std::path::Path, query: &str) -> PluginResult<String> {
                 let target = office::extraction::create_extraction_target(path, query)
-                    .map_err(|e| PluginError::ExecutionFailed(e))?;
+                    .map_err(PluginError::ExecutionFailed)?;
                 Ok(target.content)
             }
 
@@ -242,7 +277,8 @@ pub fn init_global_registry() -> &'static PluginRegistry {
             OfficeFormat::Xls,
             OfficeFormat::Csv,
         ] {
-            registry.register_context_provider(format, Arc::new(OfficeContextProvider::new()));
+            let _ =
+                registry.register_context_provider(format, Arc::new(OfficeContextProvider::new()));
         }
     }
 
@@ -256,13 +292,13 @@ mod tests {
     #[test]
     fn test_registry_creation() {
         let registry = PluginRegistry::new();
-        assert!(registry.list_context_formats().is_empty());
-        assert!(registry.list_action_handlers().is_empty());
+        assert!(registry.list_context_formats().unwrap().is_empty());
+        assert!(registry.list_action_handlers().unwrap().is_empty());
     }
 
     #[test]
     fn test_format_support() {
         let registry = PluginRegistry::new();
-        assert!(!registry.supports_format(OfficeFormat::Docx));
+        assert!(!registry.supports_format(OfficeFormat::Docx).unwrap());
     }
 }

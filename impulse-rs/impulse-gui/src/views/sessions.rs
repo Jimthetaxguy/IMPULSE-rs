@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use eframe::egui;
 
 use super::{View, ViewId};
-use crate::state::{ConnectionStatus, SharedState};
+use crate::state::{ConnectionStatus, PollerCommand, SharedState};
 use crate::theme;
 use crate::theme::colors;
 
@@ -18,6 +18,7 @@ enum Tab {
 }
 
 pub struct SessionsView {
+    cmd_tx: std::sync::mpsc::Sender<PollerCommand>,
     tab: Tab,
     selected_id: Option<String>,
     filter: String,
@@ -33,8 +34,9 @@ pub struct SessionsView {
 }
 
 impl SessionsView {
-    pub fn new() -> Self {
+    pub fn new(cmd_tx: std::sync::mpsc::Sender<PollerCommand>) -> Self {
         Self {
+            cmd_tx,
             tab: Tab::Active,
             selected_id: None,
             filter: String::new(),
@@ -47,44 +49,27 @@ impl SessionsView {
         }
     }
 
-    /// Dispatch session creation on a background thread.
     fn create_session(&mut self, name: String, platform: String) {
         self.show_new_dialog = false;
         self.action_status = Some(("Creating session...".to_string(), true));
-        std::thread::spawn(move || {
-            let mut client = crate::ipc::DaemonClient::discover();
-            match client.create_session(&name, Some(&platform)) {
-                Ok(session) => {
-                    log::info!("Created session: {} ({})", session.name, session.id);
-                }
-                Err(e) => {
-                    log::warn!("Failed to create session: {}", e);
-                }
-            }
-        });
+        let _ = self
+            .cmd_tx
+            .send(PollerCommand::CreateSession { name, platform });
     }
 
-    /// Dispatch session end on a background thread.
     fn end_session(&mut self, session_id: String, summary: String) {
         self.show_end_dialog = false;
         self.action_status = Some(("Ending session...".to_string(), true));
-        std::thread::spawn(move || {
-            let mut client = crate::ipc::DaemonClient::discover();
-            match client.end_session(&session_id, &summary) {
-                Ok(()) => {
-                    log::info!("Ended session: {}", session_id);
-                }
-                Err(e) => {
-                    log::warn!("Failed to end session {}: {}", session_id, e);
-                }
-            }
+        let _ = self.cmd_tx.send(PollerCommand::EndSession {
+            session_id,
+            summary,
         });
     }
 }
 
 impl View for SessionsView {
     fn id(&self) -> ViewId {
-        ViewId::Sessions
+        ViewId::Memory
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, state: &SharedState, _ctx: &egui::Context) {
@@ -620,7 +605,9 @@ fn empty_state(ui: &mut egui::Ui, message: &str) {
         ui.label(egui::RichText::new(message).color(colors::TEXT_DIM));
         ui.add_space(8.0);
         ui.label(
-            egui::RichText::new("Run `impulse daemon` to start the background service.")
+            egui::RichText::new(
+                "Run `impulse daemon` to start the background service. Local terminals still work without it, but memory/history views are reduced.",
+            )
                 .small()
                 .color(colors::TEXT_FAINT),
         );

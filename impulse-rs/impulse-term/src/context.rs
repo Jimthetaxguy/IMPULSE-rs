@@ -357,32 +357,9 @@ impl ContextBridge {
         Ok(())
     }
 
-    /// Preview what would be injected (without writing).
-    pub fn preview_injection(&self, content: &str) -> String {
-        self.wrap_injection(content)
-    }
-
     /// All accumulated insights (newest last).
     pub fn insights(&self) -> &[ExtractedInsight] {
         &self.insights
-    }
-
-    /// Insights since a given timestamp.
-    pub fn insights_since(&self, since: DateTime<Utc>) -> Vec<&ExtractedInsight> {
-        self.insights
-            .iter()
-            .filter(|i| i.timestamp >= since)
-            .collect()
-    }
-
-    /// The agent kind for this bridge.
-    pub fn agent_kind(&self) -> AgentKind {
-        self.agent_kind
-    }
-
-    /// The pane ID.
-    pub fn pane_id(&self) -> usize {
-        self.pane_id
     }
 
     /// The current context tier.

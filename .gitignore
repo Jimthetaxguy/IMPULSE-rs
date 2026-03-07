@@ -4,6 +4,7 @@ LIVE.md
 *.db-wal
 *.db-shm
 .cockpit/
+.impulse/
 
 # Build artifacts
 node_modules/
@@ -41,3 +42,11 @@ cloned-repos/
 
 # Agent coordination lock
 .agent-lock
+
+# Agent memory
+MEMORY.md
+
+# Agent working files
+current-context.md
+cross-platform-conversation-analysis.md
+test-hook.sh

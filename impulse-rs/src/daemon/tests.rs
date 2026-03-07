@@ -110,6 +110,55 @@ mod tests {
                 && inject_mode.as_deref() == Some("review")
                 && inject_explain
         ));
+
+        // Test PublishTerminalOps
+        let publish = DaemonRequest::PublishTerminalOps {
+            report: impulse_ops::TerminalOpsReport {
+                source_id: "gui-test".to_string(),
+                published_at: impulse_ops::now_rfc3339(),
+                agents: Vec::new(),
+                context: impulse_ops::ContextHealthSummary::default(),
+                interventions: Vec::new(),
+            },
+        };
+        let json = serde_json::to_string(&publish).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            DaemonRequest::PublishTerminalOps { report } if report.source_id == "gui-test"
+        ));
+
+        let permissions = DaemonRequest::GetSupervisorPermissions;
+        let json = serde_json::to_string(&permissions).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, DaemonRequest::GetSupervisorPermissions));
+
+        let supervisor_chat = DaemonRequest::SupervisorChat {
+            prompt: "Focus the stuck agent".to_string(),
+            context: Some("One agent is blocked".to_string()),
+        };
+        let json = serde_json::to_string(&supervisor_chat).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            DaemonRequest::SupervisorChat { prompt, context }
+                if prompt == "Focus the stuck agent"
+                    && context.as_deref() == Some("One agent is blocked")
+        ));
+
+        let run_action = DaemonRequest::RunSupervisorAction {
+            action: impulse_ops::SupervisorAction::SearchMemory {
+                query: "compaction".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&run_action).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            DaemonRequest::RunSupervisorAction {
+                action: impulse_ops::SupervisorAction::SearchMemory { query }
+            } if query == "compaction"
+        ));
     }
 
     /// Test DaemonResponse serialization/deserialization
@@ -170,6 +219,26 @@ mod tests {
             DaemonRequest::AgentAssist {
                 prompt: "Review pane activity".to_string(),
                 context: Some("Two panes active".to_string()),
+            },
+            DaemonRequest::PublishTerminalOps {
+                report: impulse_ops::TerminalOpsReport {
+                    source_id: "gui-test".to_string(),
+                    published_at: impulse_ops::now_rfc3339(),
+                    agents: Vec::new(),
+                    context: impulse_ops::ContextHealthSummary::default(),
+                    interventions: Vec::new(),
+                },
+            },
+            DaemonRequest::GetSupervisorPermissions,
+            DaemonRequest::SupervisorChat {
+                prompt: "Show me pending reviews".to_string(),
+                context: None,
+            },
+            DaemonRequest::RunSupervisorAction {
+                action: impulse_ops::SupervisorAction::FocusAgent {
+                    agent_id: "tab-1".to_string(),
+                    session_id: None,
+                },
             },
             DaemonRequest::GuardEvaluate {
                 target: "bash".to_string(),

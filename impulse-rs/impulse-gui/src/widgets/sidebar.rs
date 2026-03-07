@@ -133,6 +133,26 @@ pub fn show(
             ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                 ui.add_space(8.0);
 
+                if let Some(snapshot) = state.ops_snapshot.as_ref() {
+                    let pending_reviews = snapshot.context.pending_review_count;
+                    let interventions = snapshot.interventions.len();
+                    if expanded {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Experimental ops {}  Reviews {}",
+                                interventions, pending_reviews
+                            ))
+                            .small()
+                            .color(if pending_reviews > 0 {
+                                colors::YELLOW
+                            } else {
+                                colors::TEXT_DIM
+                            }),
+                        );
+                    }
+                    ui.add_space(6.0);
+                }
+
                 // Connection status indicator.
                 let (dot_color, label) = match state.connection {
                     ConnectionStatus::Connected => (colors::GREEN, "Online"),

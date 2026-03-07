@@ -4,6 +4,15 @@
 //! `ImpulseApp` drains and dispatches them each frame, keeping the agent panel
 //! decoupled from the terminals view.
 
+/// How a supervisor proposal should be handled when the operator clicks a card action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProposalExecutionMode {
+    Run,
+    AllowThisSession,
+    SaveDefault,
+    Deny,
+}
+
 // ---------------------------------------------------------------------------
 // PanelAction
 // ---------------------------------------------------------------------------
@@ -22,18 +31,12 @@ pub enum PanelAction {
 
     /// Trigger terminal search (opens search overlay when implemented).
     SearchTerm { query: String },
-}
 
-impl PanelAction {
-    #[allow(dead_code)]
-    pub fn label(&self) -> &'static str {
-        match self {
-            PanelAction::InjectTo { .. } => "inject",
-            PanelAction::SendTo { .. } => "send",
-            PanelAction::FocusTab { .. } => "focus",
-            PanelAction::SearchTerm { .. } => "search",
-        }
-    }
+    /// Execute a structured supervisor proposal from the left chat panel.
+    RunSupervisorProposal {
+        proposal: Box<impulse_ops::SupervisorProposal>,
+        mode: ProposalExecutionMode,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -43,34 +46,6 @@ impl PanelAction {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_panel_action_labels() {
-        assert_eq!(
-            PanelAction::InjectTo {
-                tab_id: 0,
-                content: String::new()
-            }
-            .label(),
-            "inject"
-        );
-        assert_eq!(
-            PanelAction::SendTo {
-                tab_id: 0,
-                content: String::new()
-            }
-            .label(),
-            "send"
-        );
-        assert_eq!(PanelAction::FocusTab { tab_id: 0 }.label(), "focus");
-        assert_eq!(
-            PanelAction::SearchTerm {
-                query: String::new()
-            }
-            .label(),
-            "search"
-        );
-    }
 
     #[test]
     fn test_panel_action_debug() {
@@ -90,6 +65,6 @@ mod tests {
             content: "hello".to_string(),
         };
         let cloned = action.clone();
-        assert_eq!(cloned.label(), "send");
+        assert!(matches!(cloned, PanelAction::SendTo { tab_id: 1, .. }));
     }
 }

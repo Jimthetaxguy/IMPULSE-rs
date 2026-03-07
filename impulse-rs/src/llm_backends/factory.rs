@@ -5,7 +5,7 @@
 use async_trait::async_trait;
 
 use super::anthropic::{AnthropicProvider, MinimaxProvider, OpenAiProvider};
-use super::cli::{CliAgent, CliAgentBuilder};
+use super::cli::CliAgent;
 use super::types::{AgentBackend, AgentConfig, AgentType};
 use super::{AgentResult, LlmProvider};
 use crate::error::AgentError;
@@ -61,7 +61,7 @@ impl UnifiedAgent for ApiAgent {
     }
 
     async fn send(&self, message: &str) -> AgentResult<String> {
-        use super::{Agent, ChatRequest, Message, Role};
+        use super::Agent;
 
         let mut agent = Agent::new(
             self.config.id.clone(),
@@ -105,12 +105,7 @@ impl UnifiedAgent for CliUnifiedAgent {
     }
 
     async fn send(&self, message: &str) -> AgentResult<String> {
-        // This would need the agent to be mutable, which doesn't work with &self
-        // In practice, you'd use interior mutability (RefCell, Mutex, etc.)
-        // For now, return an error indicating this needs proper session management
-        Err(AgentError::ApiRequest(
-            "CLI agent requires session management - use AgentManager instead".to_string(),
-        ))
+        self.agent.send_message(message).await.map(|response| response.content)
     }
 }
 
@@ -228,6 +223,7 @@ impl AgentType {
         match self {
             Self::ClaudeCode => "claude-code",
             Self::OpenCode => "opencode",
+            Self::GenericCli => "generic-cli",
             Self::Anthropic => "anthropic",
             Self::OpenAi => "openai",
             Self::Minimax => "minimax",

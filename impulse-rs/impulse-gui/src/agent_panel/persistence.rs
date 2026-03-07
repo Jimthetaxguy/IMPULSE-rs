@@ -240,7 +240,7 @@ mod tests {
         let msg1 = ChatMessage::user("first");
         writeln!(file, "{}", serde_json::to_string(&msg1).unwrap()).unwrap();
         writeln!(file, "THIS IS NOT JSON").unwrap();
-        writeln!(file, "").unwrap(); // empty line
+        writeln!(file).unwrap(); // empty line
         let msg2 = ChatMessage::agent("second");
         writeln!(file, "{}", serde_json::to_string(&msg2).unwrap()).unwrap();
         drop(file);

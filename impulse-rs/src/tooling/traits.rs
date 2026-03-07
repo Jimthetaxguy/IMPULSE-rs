@@ -29,6 +29,50 @@ impl Capability {
     }
 }
 
+/// Where a tool came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSource {
+    Builtin,
+    Document,
+    ExternalProcess,
+    Plugin,
+    McpProxy,
+}
+
+impl ToolSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+            Self::Document => "document",
+            Self::ExternalProcess => "external_process",
+            Self::Plugin => "plugin",
+            Self::McpProxy => "mcp_proxy",
+        }
+    }
+}
+
+/// Origin of the current tool execution request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionOrigin {
+    Cli,
+    Daemon,
+    Mcp,
+    Test,
+}
+
+impl ExecutionOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cli => "cli",
+            Self::Daemon => "daemon",
+            Self::Mcp => "mcp",
+            Self::Test => "test",
+        }
+    }
+}
+
 /// Category for organizing tools in listings
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolCategory {
@@ -50,7 +94,7 @@ impl std::fmt::Display for ToolCategory {
 }
 
 /// Parameter type for tool inputs
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ParamType {
     String,
     Integer,
@@ -92,6 +136,18 @@ pub struct ToolDescriptor {
     pub version: String,
     pub category: ToolCategory,
     pub params: Vec<ToolParam>,
+}
+
+/// Tool metadata exported to agents and external runtimes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestTool {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub category: String,
+    pub params: Vec<ToolParam>,
+    pub capabilities: Vec<String>,
+    pub source: String,
 }
 
 /// Result of executing a tool
@@ -136,10 +192,21 @@ pub struct ToolContext {
     pub allowed_capabilities: HashSet<Capability>,
     /// Maximum execution time in milliseconds
     pub timeout_ms: u64,
+    /// Where the request came from
+    pub execution_origin: ExecutionOrigin,
+    /// Maximum serialized output bytes before truncation
+    pub max_output_bytes: usize,
+    /// Maximum number of artifacts to return
+    pub max_artifacts: usize,
+    /// Read roots allowed for FileSystemRead tools. Empty means unrestricted.
+    pub allowed_read_roots: Vec<PathBuf>,
+    /// Write roots allowed for FileSystemWrite tools. Empty means unrestricted.
+    pub allowed_write_roots: Vec<PathBuf>,
 }
 
 impl Default for ToolContext {
     fn default() -> Self {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         Self {
             impulse_dir: PathBuf::from(".impulse"),
             session_id: None,
@@ -147,11 +214,25 @@ impl Default for ToolContext {
                 .into_iter()
                 .collect(),
             timeout_ms: 30_000,
+            execution_origin: ExecutionOrigin::Daemon,
+            max_output_bytes: 256 * 1024,
+            max_artifacts: 8,
+            allowed_read_roots: vec![cwd.clone(), PathBuf::from(".impulse")],
+            allowed_write_roots: vec![PathBuf::from(".impulse")],
         }
     }
 }
 
 impl ToolContext {
+    /// Create a context for a specific origin.
+    pub fn for_origin(impulse_dir: PathBuf, execution_origin: ExecutionOrigin) -> Self {
+        Self {
+            impulse_dir,
+            execution_origin,
+            ..Default::default()
+        }
+    }
+
     /// Check if a capability is allowed in this context
     pub fn has_capability(&self, cap: Capability) -> bool {
         self.allowed_capabilities.contains(&cap)
@@ -169,8 +250,43 @@ impl ToolContext {
             ]
             .into_iter()
             .collect(),
+            execution_origin: ExecutionOrigin::Cli,
+            allowed_read_roots: Vec::new(),
+            allowed_write_roots: Vec::new(),
             ..Default::default()
         }
+    }
+
+    /// Resolve a potentially relative path against the current working directory.
+    pub fn resolve_path(&self, path: &str) -> PathBuf {
+        let candidate = PathBuf::from(path);
+        if candidate.is_absolute() {
+            candidate
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(candidate)
+        }
+    }
+
+    /// Check whether a path is allowed for the requested access mode.
+    pub fn is_path_allowed(&self, path: &std::path::Path, write: bool) -> bool {
+        let roots = if write {
+            &self.allowed_write_roots
+        } else {
+            &self.allowed_read_roots
+        };
+
+        if roots.is_empty() {
+            return true;
+        }
+
+        let candidate = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+
+        roots.iter().any(|root| {
+            let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+            candidate.starts_with(&root)
+        })
     }
 }
 
@@ -225,6 +341,7 @@ mod tests {
         assert!(ctx.has_capability(Capability::SystemInfo));
         assert!(!ctx.has_capability(Capability::FileSystemWrite));
         assert!(!ctx.has_capability(Capability::PythonExec));
+        assert_eq!(ctx.execution_origin, ExecutionOrigin::Daemon);
     }
 
     #[test]
@@ -235,6 +352,8 @@ mod tests {
         assert!(ctx.has_capability(Capability::Network));
         assert!(ctx.has_capability(Capability::PythonExec));
         assert!(ctx.has_capability(Capability::SystemInfo));
+        assert!(ctx.allowed_read_roots.is_empty());
+        assert!(ctx.allowed_write_roots.is_empty());
     }
 
     #[test]
@@ -243,5 +362,11 @@ mod tests {
         assert_eq!(ToolCategory::Document.to_string(), "document");
         assert_eq!(ToolCategory::Analysis.to_string(), "analysis");
         assert_eq!(ToolCategory::System.to_string(), "system");
+    }
+
+    #[test]
+    fn test_tool_source_str() {
+        assert_eq!(ToolSource::Builtin.as_str(), "builtin");
+        assert_eq!(ToolSource::ExternalProcess.as_str(), "external_process");
     }
 }

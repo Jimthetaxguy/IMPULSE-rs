@@ -5,8 +5,6 @@
 //! cycle testable without live PTY processes.
 
 use std::collections::HashSet;
-use std::fs::OpenOptions;
-use std::io::Write as IoWrite;
 use std::path::Path;
 
 use impulse_term::context::ExtractedInsight;
@@ -20,19 +18,15 @@ pub struct LiveInsightResult {
 
 /// Append insights to a JSONL file, creating parent directories if needed.
 pub fn persist_insights_to_file(path: &Path, insights: &[ExtractedInsight]) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
-        log::warn!("Failed to open {:?} for insight persistence", path);
-        return;
-    };
-
+    let mut content = std::fs::read_to_string(path).unwrap_or_default();
     for insight in insights {
         if let Ok(json) = serde_json::to_string(insight) {
-            let _ = writeln!(file, "{}", json);
+            content.push_str(&json);
+            content.push('\n');
         }
+    }
+    if let Err(err) = impulse_ops::atomic_write_path(path, content.as_bytes()) {
+        log::warn!("Failed to persist insights to {:?}: {}", path, err);
     }
 }
 
@@ -126,17 +120,17 @@ pub fn merge_pane_to_history(
         "insight_count": pane_insights.len(),
     });
 
-    if let Some(parent) = history_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(history_path)
-    {
-        if let Ok(json) = serde_json::to_string(&entry) {
-            let _ = writeln!(file, "{}", json);
+    if let Ok(json) = serde_json::to_string(&entry) {
+        let mut content = std::fs::read_to_string(history_path).unwrap_or_default();
+        content.push_str(&json);
+        content.push('\n');
+        if let Err(err) = impulse_ops::atomic_write_path(history_path, content.as_bytes()) {
+            log::warn!(
+                "Failed to merge pane history into {:?}: {}",
+                history_path,
+                err
+            );
+        } else {
             log::info!(
                 "Merged {} insights from pane {} to HISTORY",
                 pane_insights.len(),
@@ -155,6 +149,8 @@ pub fn build_refresh_context(
     tier: impulse_term::context::ContextTier,
     cross_pane_insights: &[String],
     genome_decisions: &[String],
+    active_sessions: &[String],
+    recent_history: &[String],
 ) -> Option<String> {
     use impulse_term::context::ContextTier;
 
@@ -178,6 +174,22 @@ pub fn build_refresh_context(
         for d in genome_decisions.iter().take(5) {
             refresh.push_str("  - ");
             refresh.push_str(d);
+            refresh.push('\n');
+        }
+    }
+    if !active_sessions.is_empty() {
+        refresh.push_str("\nActive sessions:\n");
+        for s in active_sessions.iter().take(5) {
+            refresh.push_str("  - ");
+            refresh.push_str(s);
+            refresh.push('\n');
+        }
+    }
+    if !recent_history.is_empty() {
+        refresh.push_str("\nRecent session history:\n");
+        for h in recent_history.iter().take(5) {
+            refresh.push_str("  - ");
+            refresh.push_str(h);
             refresh.push('\n');
         }
     }
@@ -550,6 +562,8 @@ mod tests {
             impulse_term::context::ContextTier::Essential,
             &cross,
             &decisions,
+            &[],
+            &[],
         );
         let text = result.expect("Essential should produce context");
         assert!(text.contains("~50%"));
@@ -561,21 +575,72 @@ mod tests {
 
     #[test]
     fn test_build_refresh_context_critical() {
-        let result = build_refresh_context(impulse_term::context::ContextTier::Critical, &[], &[]);
+        let result = build_refresh_context(
+            impulse_term::context::ContextTier::Critical,
+            &[],
+            &[],
+            &[],
+            &[],
+        );
         let text = result.expect("Critical should produce context");
         assert!(text.contains("~70%"));
     }
 
     #[test]
     fn test_build_refresh_context_minimal() {
-        let result = build_refresh_context(impulse_term::context::ContextTier::Minimal, &[], &[]);
+        let result = build_refresh_context(
+            impulse_term::context::ContextTier::Minimal,
+            &[],
+            &[],
+            &[],
+            &[],
+        );
         let text = result.expect("Minimal should produce context");
         assert!(text.contains("80%+"));
     }
 
     #[test]
     fn test_build_refresh_context_none_returns_none() {
-        let result = build_refresh_context(impulse_term::context::ContextTier::None, &[], &[]);
+        let result =
+            build_refresh_context(impulse_term::context::ContextTier::None, &[], &[], &[], &[]);
         assert!(result.is_none(), "Tier None should not produce context");
+    }
+
+    #[test]
+    fn test_build_refresh_context_with_sessions() {
+        let sessions = vec![
+            "gui-claude-code-0: active (3 files)".to_string(),
+            "gui-opencode-1: active (1 file)".to_string(),
+        ];
+        let result = build_refresh_context(
+            impulse_term::context::ContextTier::Essential,
+            &[],
+            &[],
+            &sessions,
+            &[],
+        );
+        let text = result.expect("Should produce context");
+        assert!(text.contains("Active sessions"));
+        assert!(text.contains("gui-claude-code-0"));
+        assert!(text.contains("gui-opencode-1"));
+    }
+
+    #[test]
+    fn test_build_refresh_context_with_history() {
+        let history = vec![
+            "Previous session: 12 insights, 5 files".to_string(),
+            "Earlier session: 3 insights, 1 file".to_string(),
+        ];
+        let result = build_refresh_context(
+            impulse_term::context::ContextTier::Critical,
+            &[],
+            &[],
+            &[],
+            &history,
+        );
+        let text = result.expect("Should produce context");
+        assert!(text.contains("Recent session history"));
+        assert!(text.contains("12 insights"));
+        assert!(text.contains("Earlier session"));
     }
 }

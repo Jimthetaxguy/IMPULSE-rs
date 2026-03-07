@@ -21,13 +21,16 @@ fn tokenize_terms(input: &str) -> Vec<String> {
         if ch.is_ascii_alphanumeric() || ch == '_' {
             current.push(ch.to_ascii_lowercase());
         } else if !current.is_empty() {
-            if current.len() > 1 && seen.insert(current.clone()) {
-                out.push(current.clone());
+            if current.len() > 1 && !seen.contains(&current) {
+                seen.insert(current.clone());
+                out.push(std::mem::take(&mut current));
+            } else {
+                current.clear();
             }
-            current.clear();
         }
     }
-    if !current.is_empty() && current.len() > 1 && seen.insert(current.clone()) {
+    if !current.is_empty() && current.len() > 1 && !seen.contains(&current) {
+        seen.insert(current.clone());
         out.push(current);
     }
 

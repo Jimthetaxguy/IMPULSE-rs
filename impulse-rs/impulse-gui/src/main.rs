@@ -1,7 +1,7 @@
 //! Impulse GUI — Native workbench for AI coding agents.
 //!
-//! Pure Rust GUI using egui/eframe with embedded terminals via egui_term,
-//! plus sidebar navigation to daemon views (Sessions, Genome, Search).
+//! Pure Rust GUI using egui/eframe with embedded terminals,
+//! plus an operator workbench for agent oversight, context, memory, and artifacts.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -38,15 +38,17 @@ fn main() -> eframe::Result {
         println!("  --version       Show version information");
         println!();
         println!("Keyboard shortcuts:");
-        println!("  Ctrl+1-4        Switch views (Terminals/Sessions/Genome/Search)");
-        println!("  Ctrl+5          Toggle Agent panel");
+        println!(
+            "  Ctrl+1-6        Switch views (Overview/Agents/Context/Memory/Artifacts/Settings)"
+        );
         println!("  Ctrl+B          Toggle sidebar");
         println!("  Ctrl+T          New terminal tab");
         println!("  Ctrl+W          Close current terminal tab");
         println!("  Ctrl+Tab        Next terminal tab");
         println!("  Ctrl+Shift+Tab  Previous terminal tab");
-        println!("  Ctrl+K          Focus search");
+        println!("  Ctrl+K          Open Memory");
         println!("  Ctrl+R          Refresh daemon data");
+        println!("  Ctrl+L          Focus Agent panel");
         process::exit(0);
     }
 

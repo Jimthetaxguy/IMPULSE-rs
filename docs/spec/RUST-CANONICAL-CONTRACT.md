@@ -1,8 +1,8 @@
 ---
 title: Rust Canonical Product Contract
 description: Authoritative product contract for Impulse based on impulse-rs
-version: '1.3'
-updated: 2026-02-24
+version: '1.4'
+updated: 2026-03-05
 type: specification
 category: core
 phase: all
@@ -29,7 +29,7 @@ Core outcomes:
 - Persistent project memory (`GENOME`, session history, active state)
 - Cross-session continuity for Claude Code and OpenCode integrations
 - Operationally safe session lifecycle with verification-before-completion gates
-- Human-visible observability through TUI and CLI artifacts
+- Human-visible observability through CLI, TUI, and the EGUI operator workbench
 
 ## 2) Canonical Scope and Roadmap
 
@@ -37,14 +37,14 @@ Core outcomes:
 
 | Stage | Focus | Status |
 | --- | --- | --- |
-| **Now** | Rust memory core + hooks + TUI + verification | Active |
-| **Next** | Semantic retrieval foundation + review-first context injection (feature-flagged, additive) | Active |
-| **Later** | Advanced coordination UX (timeline, orchestration depth, agent dashboarding) | Planned |
+| **Now** | Rust memory core + hooks + retrieval/injection + EGUI operator workbench | Active |
+| **Next** | Daemon-truth EGUI integration + hook/compaction validation | Active |
+| **Later** | Agent control + artifact polish + deeper coordination UX | Planned |
 
 ### Out of Scope for Current Contract
 - Full SWARM semantic injection runtime
-- Large architecture rewrites unrelated to contract correctness
-- Multi-week UX redesigns before core reliability goals
+- Web UI or non-Rust dashboard surfaces
+- Structural blocking before hook validation evidence exists
 
 ## 3) Public Interface Contract
 
@@ -113,6 +113,54 @@ Primary commands that must remain documented and regression-tested:
 | `.impulse/retrieval_index_state.json` | Retrieval index metadata/state | Rebuildable metadata |
 | `.impulse/embeddings/*` | Optional embedding temp artifacts | Runtime cache (gitignored) |
 | `.impulse/retrieval.lock` | Indexing lock guard | Runtime safety artifact |
+| `.impulse/projects/<project_id>/agents/<agent_id>/artifacts/*` | Project-organized operator artifacts | Durable workbench artifacts |
+
+### EGUI Workbench IPC Contract
+
+The daemon is the authoritative source for the EGUI workbench surfaces:
+
+- `Overview`
+- `Agents`
+- `Context`
+- `Artifacts`
+- sidebar operator alerts
+- status bar workbench summary
+
+Canonical snapshot request/response surfaces:
+
+- `GetOpsSnapshot`
+- `SubscribeOps`
+- `ListArtifacts`
+- `GetArtifact`
+- `RunArtifactAction`
+
+Telemetry publication surface:
+
+- `PublishTerminalOps { report: TerminalOpsReport }`
+
+Shared workbench model contract:
+
+- `ProjectOpsSnapshot` is the canonical read model for the daemon-backed workbench.
+- `TerminalOpsReport` is the ephemeral publication model for live terminal telemetry.
+- `AgentRuntime.ephemeral = true` identifies telemetry-only agents that do not currently map to a durable session.
+- `Memory` may continue to use dedicated history/genome/search IPC outside the snapshot model in the current phase.
+
+`TerminalOpsReport` fields:
+
+- `source_id`
+- `published_at`
+- `agents`
+- `context`
+- `interventions`
+
+Daemon overlay rules:
+
+- Build durable snapshot data first.
+- Overlay fresh terminal telemetry by `session_id` first, then agent `id`.
+- Expose unmatched telemetry as ephemeral agents.
+- Mark telemetry stale after 10 seconds without heartbeat.
+- Stop overlaying stale telemetry after 10 seconds.
+- Purge telemetry-only state after 60 seconds.
 
 ### Retrieval Command Extensions (Additive)
 
@@ -156,6 +204,7 @@ Primary commands that must remain documented and regression-tested:
 | Retrieval explainability metadata | Implemented | `search-* --explain` + JSON metadata (`backend_used`, `fallback_code`, `timing_ms`) | Rust integration |
 | Review-first context injection | Implemented (additive) | daemon chat + `orchestrate`/`handoff`/`sync-context` with `--inject-mode` | Rust unit + integration |
 | Injection staging artifacts | Implemented | `.impulse/context/injections/*` | Rust unit + integration |
+| EGUI operator workbench | Implemented (daemon snapshot + telemetry overlay) | `impulse-gui` | Rust unit + workspace checks |
 | Context stewardship | Implemented | `steward` (status/analyze/compact/approve/reject) | Rust unit + integration |
 | Token tracking algorithm | Implemented | Internal metrics for compaction measurement | Rust unit + integration |
 | Tool management | Implemented | `tools` (list/init/update) | Rust unit |
@@ -184,6 +233,7 @@ The following files define product truth and must be updated together for contra
 - `AGENTS.md` (operator-facing guidance)
 - `CLAUDE.md` (project technical context)
 - `docs/INDEX.md` (navigation + source-of-truth routing)
+- `docs/SUMMARY.yaml` (navigation source)
 - `docs/SUMMARY.md` (high-level map)
 
 ### Required Update Checklist for Any Interface Change
@@ -191,7 +241,7 @@ The following files define product truth and must be updated together for contra
 When adding/changing CLI commands, hooks, state files, or roadmap stage definitions:
 1. Update this contract doc.
 2. Update command/state references in `AGENTS.md` and `CLAUDE.md`.
-3. Update `docs/INDEX.md` and `docs/SUMMARY.md` links/status.
+3. Update `docs/INDEX.md`, `docs/SUMMARY.yaml`, and `docs/SUMMARY.md`.
 4. Run `python3 docs/validate_docs.py --contract`.
 5. Include release note fields from `docs/guides/RELEASE-NOTES-TEMPLATE.md`.
 

@@ -16,6 +16,7 @@ pub mod daemon;
 pub mod docs;
 pub mod error;
 pub mod guardrail;
+pub mod handlers;
 pub mod injection;
 pub mod integration_tests;
 pub mod llm_backends;
@@ -24,10 +25,10 @@ pub mod memory;
 pub mod monty;
 pub mod notification;
 pub mod office;
+pub mod ops_workbench;
 pub mod orchestration;
 pub mod plugin;
 pub mod retrieval;
-pub mod session;
 pub mod state;
 pub mod stewardship;
 pub mod storage;
@@ -35,8 +36,6 @@ pub mod tooling;
 pub mod tools;
 pub mod ui;
 pub mod verify;
-
-use state::Platform;
 
 #[derive(Parser)]
 #[command(name = "impulse-rs")]
@@ -59,6 +58,19 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+pub(crate) enum McpCommands {
+    /// Serve the registry-backed MCP interface
+    Serve {
+        /// Transport: stdio (default) or tcp
+        #[arg(long, default_value = "stdio")]
+        transport: String,
+        /// TCP port when using --transport tcp
+        #[arg(long)]
+        port: Option<u16>,
+    },
+}
+
+#[derive(Subcommand)]
 enum Commands {
     Daemon {
         #[arg(long)]
@@ -70,6 +82,10 @@ enum Commands {
         name: Option<String>,
         #[arg(short, long)]
         platform: Option<String>,
+        #[arg(long)]
+        inject_mode: Option<String>,
+        #[arg(long)]
+        inject_explain: bool,
     },
     SessionEnd {
         #[arg(short, long)]
@@ -156,6 +172,11 @@ enum Commands {
     },
     Hooks {
         #[arg(short, long, default_value = "all")]
+        platform: String,
+    },
+    /// Generate a reproducible validation kit for real Claude Code hook testing
+    ValidateHooks {
+        #[arg(short, long, default_value = "claude-code")]
         platform: String,
     },
     Orchestrate {
@@ -429,6 +450,23 @@ enum Commands {
         #[arg(long, default_value = "json")]
         format: String,
     },
+    /// Validate manifest-defined external process tools
+    ToolingValidate {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reload runtime tooling and refresh the capabilities manifest
+    ToolingReload {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Serve registry-backed MCP tools
+    Mcp {
+        #[command(subcommand)]
+        subcommand: McpCommands,
+    },
     /// Configure the Impulse Agent (LLM-powered coordination)
     AgentConfigure {
         /// LLM provider: anthropic, openai, minimax
@@ -512,11 +550,11 @@ async fn main() -> Result<()> {
 }
 
 // ============================================================================
-// Helpers
+// Helpers (kept in main.rs — used before handler module is available)
 // ============================================================================
 
 /// Read an env var with fallback to a deprecated name, emitting a warning on stderr.
-fn env_with_fallback(new_name: &str, old_name: &str) -> Option<String> {
+pub(crate) fn env_with_fallback(new_name: &str, old_name: &str) -> Option<String> {
     if let Ok(v) = std::env::var(new_name) {
         return Some(v);
     }
@@ -552,343 +590,6 @@ fn resolve_impulse_dir(requested: PathBuf) -> PathBuf {
     requested
 }
 
-fn get_session_id(id: Option<String>) -> Option<String> {
-    id.or_else(|| env_with_fallback("IMPULSE_SESSION_ID", "COCKPIT_SESSION_ID"))
-}
-
-fn default_session_name() -> String {
-    std::env::current_dir()
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
-        .unwrap_or_else(|| "session".to_string())
-}
-
-fn parse_platform(s: &str) -> Option<Platform> {
-    match s {
-        "claude-code" => Some(Platform::ClaudeCode),
-        "opencode" => Some(Platform::OpenCode),
-        _ => None,
-    }
-}
-
-/// Load build hygiene config from state, falling back to defaults
-fn load_build_hygiene_config(state: &state::State) -> build_hygiene::BuildHygieneConfig {
-    let config = match state.config_snapshot() {
-        Ok(c) => c,
-        Err(_) => return build_hygiene::BuildHygieneConfig::default(),
-    };
-
-    build_hygiene::BuildHygieneConfig {
-        enabled: config.build_hygiene_enabled,
-        scan_paths: config.build_hygiene_scan_paths.clone(),
-        size_threshold_gb: config.build_hygiene_size_threshold_gb,
-        age_threshold_days: config.build_hygiene_age_threshold_days,
-        sweep_on_session_end: config.build_hygiene_sweep_on_session_end,
-        sweep_on_toolchain_update: config.build_hygiene_sweep_on_toolchain_update,
-        dry_run_default: config.build_hygiene_dry_run_default,
-    }
-}
-
-fn parse_injection_mode(value: Option<&str>) -> Result<Option<injection::types::InjectionMode>> {
-    match value {
-        Some(mode) => injection::types::InjectionMode::parse(mode)
-            .map(Some)
-            .ok_or_else(|| anyhow::anyhow!("Invalid inject mode. Use off|review|apply")),
-        None => Ok(None),
-    }
-}
-
-fn print_injection_explain(result: &injection::types::InjectionRunResult) {
-    println!(
-        "Injection: requested={} effective={} applied={} backend={} fallback_code={} timing={}ms candidates={} status={} artifact={}",
-        result.requested_mode,
-        result.effective_mode,
-        result.applied,
-        result.explain.backend_used,
-        result
-            .explain
-            .fallback_code
-            .map(|c| c.as_str().to_string())
-            .unwrap_or_else(|| "none".to_string()),
-        result.explain.timing_ms,
-        result.explain.candidate_count,
-        result.explain.status,
-        result
-            .artifact_path
-            .clone()
-            .unwrap_or_else(|| "none".to_string())
-    );
-    if let Some(reason) = &result.skipped_reason {
-        println!("  skipped_reason={}", reason);
-    }
-    if let Some(error) = &result.explain.error {
-        println!("  error={}", error);
-    }
-}
-
-fn print_config(config: Vec<(String, String)>) {
-    branding::print_header("Configuration");
-    for (k, v) in config {
-        println!("  {}: {}", k, v);
-    }
-}
-
-fn print_verification_report(report: &verify::VerificationReport) {
-    branding::print_header("Verification Report");
-    for result in &report.results {
-        let status = if result.success { "PASS" } else { "FAIL" };
-        println!("{} - {}", status, result.step.name);
-        if !result.success {
-            let tail = result
-                .output
-                .lines()
-                .rev()
-                .take(20)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>()
-                .join("\n");
-            println!("\nLast output:\n{}\n", tail);
-        }
-    }
-    println!(
-        "Summary: {}",
-        if report.success() {
-            "ALL CHECKS PASSED"
-        } else {
-            "BLOCKED - fix failing checks"
-        }
-    );
-}
-
-// ============================================================================
-// Hook Configuration Builders
-// ============================================================================
-
-/// Build the Claude Code hook configuration JSON value.
-///
-/// Includes both PreToolUse guard hooks (for pre-execution guardrail evaluation)
-/// and PostToolUse tracking hooks (for post-observation recording).
-fn build_claude_hook_config() -> serde_json::Value {
-    serde_json::json!({
-        "hooks": {
-            "PreToolUse": [
-                {
-                    "matcher": "Bash",
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": "impulse-rs guard --action \"$INPUT\" --target bash"
-                        }
-                    ]
-                },
-                {
-                    "matcher": "Write",
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": "impulse-rs guard --action \"$INPUT\" --target file"
-                        }
-                    ]
-                },
-                {
-                    "matcher": "Edit",
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": "impulse-rs guard --action \"$INPUT\" --target file"
-                        }
-                    ]
-                }
-            ],
-            "PostToolUse": [
-                {
-                    "matcher": "Bash",
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": "impulse-rs track-tool --tool Bash --session-id $IMPULSE_SESSION_ID"
-                        }
-                    ]
-                },
-                {
-                    "matcher": "Write",
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": "impulse-rs track-write --file \"$INPUT\" --session-id $IMPULSE_SESSION_ID"
-                        }
-                    ]
-                },
-                {
-                    "matcher": "Edit",
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": "impulse-rs track-write --file \"$INPUT\" --session-id $IMPULSE_SESSION_ID"
-                        }
-                    ]
-                }
-            ],
-            "SessionStart": [
-                {
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": "impulse-rs session-start -n '$CLAUDE_PROJECT_NAME' -p claude-code"
-                        }
-                    ]
-                }
-            ],
-            "SessionEnd": [
-                {
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": "impulse-rs session-end --session-id $IMPULSE_SESSION_ID --summary '$CLAUDE_SESSION_SUMMARY' --verify"
-                        }
-                    ]
-                }
-            ]
-        }
-    })
-}
-
-/// Build the OpenCode hook configuration JSON value.
-///
-/// Includes pre_tool_use guard hook alongside existing tracking hooks.
-fn build_opencode_hook_config() -> serde_json::Value {
-    serde_json::json!({
-        "impulse": {
-            "enabled": true,
-            "session_tracking": true,
-            "hooks": {
-                "pre_tool_use": "impulse-rs guard --action \"$INPUT\" --target any",
-                "session_start": "impulse-rs session-start -n '$OPENCODE_PROJECT_NAME' -p opencode",
-                "session_end": "impulse-rs session-end --session-id $IMPULSE_SESSION_ID --summary '$OPENCODE_SESSION_SUMMARY' --verify",
-                "file_write": "impulse-rs track-write --file \"$OPENCODE_FILE\" --session-id \"$IMPULSE_SESSION_ID\"",
-                "tool_use": "impulse-rs track-tool --tool \"$OPENCODE_TOOL_NAME\" --session-id \"$IMPULSE_SESSION_ID\""
-            }
-        }
-    })
-}
-
-#[cfg(test)]
-mod hook_config_tests {
-    use super::*;
-
-    #[test]
-    fn test_claude_hook_config_includes_guard() {
-        let config = build_claude_hook_config();
-
-        // Verify top-level "hooks" key exists
-        assert!(
-            config.get("hooks").is_some(),
-            "config must have 'hooks' key"
-        );
-
-        let hooks = &config["hooks"];
-
-        // Verify PreToolUse section exists with guard commands
-        let pre_tool_use = hooks
-            .get("PreToolUse")
-            .expect("hooks must have 'PreToolUse' key");
-        assert!(pre_tool_use.is_array(), "PreToolUse must be an array");
-
-        let pre_arr = pre_tool_use.as_array().unwrap();
-        assert!(
-            !pre_arr.is_empty(),
-            "PreToolUse must have at least one entry"
-        );
-
-        // Check that the Bash matcher guard is present
-        let bash_guard = pre_arr
-            .iter()
-            .find(|entry| entry.get("matcher").and_then(|m| m.as_str()) == Some("Bash"))
-            .expect("PreToolUse must have a Bash matcher");
-        let bash_hooks = bash_guard["hooks"].as_array().unwrap();
-        let bash_cmd = bash_hooks[0]["command"].as_str().unwrap();
-        assert!(
-            bash_cmd.contains("impulse-rs guard"),
-            "Bash PreToolUse hook must invoke 'impulse-rs guard', got: {}",
-            bash_cmd
-        );
-
-        // Verify PostToolUse section still exists for tracking
-        let post_tool_use = hooks
-            .get("PostToolUse")
-            .expect("hooks must have 'PostToolUse' key");
-        assert!(post_tool_use.is_array(), "PostToolUse must be an array");
-
-        let post_arr = post_tool_use.as_array().unwrap();
-        let bash_track = post_arr
-            .iter()
-            .find(|entry| entry.get("matcher").and_then(|m| m.as_str()) == Some("Bash"))
-            .expect("PostToolUse must have a Bash matcher");
-        let track_cmd = bash_track["hooks"].as_array().unwrap()[0]["command"]
-            .as_str()
-            .unwrap();
-        assert!(
-            track_cmd.contains("impulse-rs track-tool"),
-            "Bash PostToolUse hook must invoke 'impulse-rs track-tool', got: {}",
-            track_cmd
-        );
-
-        // Verify SessionStart and SessionEnd exist
-        assert!(
-            hooks.get("SessionStart").is_some(),
-            "hooks must have 'SessionStart' key"
-        );
-        assert!(
-            hooks.get("SessionEnd").is_some(),
-            "hooks must have 'SessionEnd' key"
-        );
-    }
-
-    #[test]
-    fn test_opencode_hook_config_includes_guard() {
-        let config = build_opencode_hook_config();
-
-        let impulse = config
-            .get("impulse")
-            .expect("config must have 'impulse' key");
-        assert_eq!(impulse["enabled"], true);
-        assert_eq!(impulse["session_tracking"], true);
-
-        let hooks = impulse.get("hooks").expect("impulse must have 'hooks' key");
-
-        // Verify pre_tool_use guard is present
-        let pre_tool = hooks
-            .get("pre_tool_use")
-            .expect("hooks must have 'pre_tool_use' key");
-        let pre_tool_str = pre_tool.as_str().unwrap();
-        assert!(
-            pre_tool_str.contains("impulse-rs guard"),
-            "pre_tool_use must invoke 'impulse-rs guard', got: {}",
-            pre_tool_str
-        );
-
-        // Verify existing tracking hooks are still present
-        assert!(
-            hooks.get("session_start").is_some(),
-            "hooks must have 'session_start'"
-        );
-        assert!(
-            hooks.get("session_end").is_some(),
-            "hooks must have 'session_end'"
-        );
-        assert!(
-            hooks.get("file_write").is_some(),
-            "hooks must have 'file_write'"
-        );
-        assert!(
-            hooks.get("tool_use").is_some(),
-            "hooks must have 'tool_use'"
-        );
-    }
-}
-
 // ============================================================================
 // Daemon Mode
 // ============================================================================
@@ -917,13 +618,34 @@ async fn run_daemon_mode(cli: Cli) -> Result<()> {
             } else {
                 println!("Daemon running");
                 let status = client.status().await?;
-                println!("{}", serde_json::to_string_pretty(&status).unwrap());
+                handlers::print_json(&status)?;
             }
         }
-        Commands::SessionStart { name, platform } => {
-            let name = name.unwrap_or_else(default_session_name);
+        Commands::SessionStart {
+            name,
+            platform,
+            inject_mode: _,
+            inject_explain: _,
+        } => {
+            let stdin_payload = handlers::read_hook_stdin_payload();
+            let name = name.unwrap_or_else(handlers::default_session_name);
             match client.create_session(name, platform).await {
-                Ok((id, n)) => println!("Created session: {} ({})", n, id),
+                Ok((id, n)) => {
+                    let _ = handlers::persist_claude_env_var("IMPULSE_SESSION_ID", &id);
+                    handlers::capture_hook_evidence(
+                        &cli.impulse_dir,
+                        "session_start",
+                        Some(id.clone()),
+                        Some(n.clone()),
+                        Some("daemon".to_string()),
+                        None,
+                        None,
+                        stdin_payload,
+                        Some("daemon create_session".to_string()),
+                        1,
+                    )?;
+                    println!("Created session: {} ({})", n, id)
+                }
                 Err(e) => eprintln!("Error: {}", e),
             }
         }
@@ -932,21 +654,39 @@ async fn run_daemon_mode(cli: Cli) -> Result<()> {
             summary,
             verify: should_verify,
         } => {
+            let stdin_payload = handlers::read_hook_stdin_payload();
             if should_verify {
                 let steps = verify::default_steps(&std::env::current_dir()?);
                 let report = verify::run_verification(steps)?;
-                print_verification_report(&report);
+                handlers::print_verification_report(&report);
                 if !report.success() {
                     anyhow::bail!("Verification failed. Session end blocked.");
                 }
             }
-            match client.end_session(session_id.clone(), summary).await {
-                Ok(_) => println!("Session {} ended", session_id),
+            match client
+                .end_session(session_id.clone(), summary.clone())
+                .await
+            {
+                Ok(_) => {
+                    handlers::capture_hook_evidence(
+                        &cli.impulse_dir,
+                        "session_end",
+                        Some(session_id.clone()),
+                        None,
+                        Some("daemon".to_string()),
+                        Some(summary),
+                        Some(should_verify),
+                        stdin_payload,
+                        Some(format!("Session {} ended", session_id)),
+                        1,
+                    )?;
+                    println!("Session {} ended", session_id)
+                }
                 Err(e) => eprintln!("Error: {}", e),
             }
         }
         Commands::TrackWrite { file, session_id } => {
-            if let Some(sid) = get_session_id(session_id) {
+            if let Some(sid) = handlers::get_session_id(session_id) {
                 match client.track_file(sid, file).await {
                     Ok(_) => println!("Tracked file"),
                     Err(e) => eprintln!("Error: {}", e),
@@ -956,7 +696,7 @@ async fn run_daemon_mode(cli: Cli) -> Result<()> {
             }
         }
         Commands::TrackTool { tool, session_id } => {
-            if let Some(sid) = get_session_id(session_id) {
+            if let Some(sid) = handlers::get_session_id(session_id) {
                 match client.track_tool(sid, tool).await {
                     Ok(_) => println!("Tracked tool"),
                     Err(e) => eprintln!("Error: {}", e),
@@ -983,11 +723,11 @@ async fn run_daemon_mode(cli: Cli) -> Result<()> {
             Err(e) => eprintln!("Error: {}", e),
         },
         Commands::SessionInfo { id } => match client.get_session(id).await {
-            Ok(s) => println!("{}", serde_json::to_string_pretty(&s).unwrap()),
+            Ok(s) => handlers::print_json(&s)?,
             Err(e) => eprintln!("Error: {}", e),
         },
         Commands::SessionConflicts { file, session_id } => {
-            let sid = match get_session_id(session_id) {
+            let sid = match handlers::get_session_id(session_id) {
                 Some(s) => s,
                 None => {
                     eprintln!("Error: No session_id. Use --session-id or IMPULSE_SESSION_ID");
@@ -998,10 +738,10 @@ async fn run_daemon_mode(cli: Cli) -> Result<()> {
                 Some(f) => match client.check_conflict(sid, f).await {
                     Ok((has_conflict, sessions)) => {
                         if has_conflict {
-                            println!("⚠️  CONFLICT DETECTED");
+                            println!("\u{26a0}\u{fe0f}  CONFLICT DETECTED");
                             println!("File is being edited by: {}", sessions.join(", "));
                         } else {
-                            println!("✓ No conflicts detected");
+                            println!("\u{2713} No conflicts detected");
                         }
                     }
                     Err(e) => eprintln!("Error: {}", e),
@@ -1036,7 +776,7 @@ async fn run_daemon_mode(cli: Cli) -> Result<()> {
                             for (file, sessions) in &file_to_session {
                                 if sessions.len() > 1 {
                                     println!(
-                                        "  ⚠️  {} - being edited by: {}",
+                                        "  \u{26a0}\u{fe0f}  {} - being edited by: {}",
                                         file,
                                         sessions.join(", ")
                                     );
@@ -1051,7 +791,7 @@ async fn run_daemon_mode(cli: Cli) -> Result<()> {
             }
         }
         Commands::Status => match client.status().await {
-            Ok(s) => println!("{}", serde_json::to_string_pretty(&s).unwrap()),
+            Ok(s) => handlers::print_json(&s)?,
             Err(e) => eprintln!("Error: {}", e),
         },
         Commands::Chat {
@@ -1060,7 +800,7 @@ async fn run_daemon_mode(cli: Cli) -> Result<()> {
             inject_mode,
             inject_explain,
         } => {
-            let inject_mode = match parse_injection_mode(inject_mode.as_deref()) {
+            let inject_mode = match handlers::parse_injection_mode(inject_mode.as_deref()) {
                 Ok(mode) => mode.map(|m| m.as_str().to_string()),
                 Err(e) => {
                     eprintln!("Error: {}", e);
@@ -1073,11 +813,11 @@ async fn run_daemon_mode(cli: Cli) -> Result<()> {
             {
                 Ok(result) => {
                     if inject_explain {
-                        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                        handlers::print_json(&result)?;
                     } else if let Some(response) = result.get("response").and_then(|v| v.as_str()) {
                         println!("{}", response);
                     } else {
-                        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                        handlers::print_json(&result)?;
                     }
                 }
                 Err(e) => eprintln!("Error: {}", e),
@@ -1086,7 +826,7 @@ async fn run_daemon_mode(cli: Cli) -> Result<()> {
         Commands::Verify => {
             let steps = verify::default_steps(&std::env::current_dir()?);
             let report = verify::run_verification(steps)?;
-            print_verification_report(&report);
+            handlers::print_verification_report(&report);
             if !report.success() {
                 anyhow::bail!("Verification failed");
             }
@@ -1103,11 +843,12 @@ async fn run_daemon_mode(cli: Cli) -> Result<()> {
 }
 
 // ============================================================================
-// Direct Mode
+// Direct Mode — thin dispatcher delegating to handler modules
 // ============================================================================
 
 async fn run_direct_mode(cli: Cli) -> Result<()> {
     let impulse_dir = cli.impulse_dir.clone();
+    let verbose = cli.verbose;
     let state = Arc::new(state::State::new(impulse_dir.clone())?);
 
     match cli.command {
@@ -1115,331 +856,78 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
             daemon::Daemon::new(state.clone()).start().await?;
         }
         Commands::Run => {
-            ui::run_ui(state.clone())?;
+            println!("Use: impulse-rs --daemon for daemon mode");
         }
-        Commands::SessionStart { name, platform } => {
-            let name = name.unwrap_or_else(default_session_name);
-            let platform = platform.and_then(|p| parse_platform(&p));
-            let session = state.create_session(name, platform).await?;
-            println!("{}", session.id);
+        Commands::SessionStart {
+            name,
+            platform,
+            inject_mode,
+            inject_explain,
+        } => {
+            handlers::session::handle_session_start(
+                &state,
+                name,
+                platform,
+                inject_mode,
+                inject_explain,
+            )
+            .await?;
         }
         Commands::SessionEnd {
             session_id,
             summary,
-            verify: should_verify,
+            verify,
         } => {
-            if should_verify {
-                let steps = verify::default_steps(&std::env::current_dir()?);
-                let report = verify::run_verification(steps)?;
-                print_verification_report(&report);
-                if !report.success() {
-                    anyhow::bail!("Verification failed. Session end blocked.");
-                }
-            }
-            match state.end_session(&session_id, summary).await {
-                Ok(Some(_)) => println!("Session {} ended", session_id),
-                Ok(None) => println!("Session not found: {}", session_id),
-                Err(e) => eprintln!("Error: {}", e),
-            }
+            handlers::session::handle_session_end(&state, session_id, summary, verify).await?;
         }
         Commands::TrackWrite { file, session_id } => {
-            if let Some(sid) = get_session_id(session_id) {
-                match state.track_file(&sid, &file).await {
-                    Ok(_) => println!("Tracked: {}", file),
-                    Err(e) => eprintln!("Error: {}", e),
-                }
-                // Post-observation: evaluate Warn/Log guardrails on the tracked file.
-                // Uses "any" target so all rules (bash, file, tool) are checked.
-                if let Ok(config) = state.config_snapshot() {
-                    if config.guardrails.enabled {
-                        if let Ok(results) =
-                            guardrail::evaluate_action(&file, "any", &config.guardrails)
-                        {
-                            for result in &results {
-                                match result.action {
-                                    guardrail::GuardAction::Warn => {
-                                        eprintln!("{}", result.format_human());
-                                    }
-                                    guardrail::GuardAction::Log => {
-                                        // Tag the session for audit trail
-                                        let _ = state
-                                            .add_tag(&sid, &format!("guard:{}", result.rule_id))
-                                            .await;
-                                    }
-                                    guardrail::GuardAction::Block => {} // handled pre-execution
-                                }
-                            }
-                        }
-                    }
-                }
-            } else {
-                eprintln!("Error: No session_id. Use --session-id or IMPULSE_SESSION_ID");
-            }
+            handlers::session::handle_track_write(&state, file, session_id).await?;
         }
         Commands::TrackTool { tool, session_id } => {
-            if let Some(sid) = get_session_id(session_id) {
-                match state.track_tool(&sid, &tool).await {
-                    Ok(_) => println!("Tracked: {}", tool),
-                    Err(e) => eprintln!("Error: {}", e),
-                }
-                // Post-observation: evaluate Warn/Log guardrails on the tracked tool.
-                // Uses "any" target so all rules (bash, file, tool) are checked.
-                if let Ok(config) = state.config_snapshot() {
-                    if config.guardrails.enabled {
-                        if let Ok(results) =
-                            guardrail::evaluate_action(&tool, "any", &config.guardrails)
-                        {
-                            for result in &results {
-                                match result.action {
-                                    guardrail::GuardAction::Warn => {
-                                        eprintln!("{}", result.format_human());
-                                    }
-                                    guardrail::GuardAction::Log => {
-                                        // Tag the session for audit trail
-                                        let _ = state
-                                            .add_tag(&sid, &format!("guard:{}", result.rule_id))
-                                            .await;
-                                    }
-                                    guardrail::GuardAction::Block => {} // handled pre-execution
-                                }
-                            }
-                        }
-                    }
-                }
-            } else {
-                eprintln!("Error: No session_id. Use --session-id or IMPULSE_SESSION_ID");
-            }
+            handlers::session::handle_track_tool(&state, tool, session_id).await?;
         }
         Commands::ListSessions => {
-            let sessions = state.list_sessions().await?;
-            if sessions.is_empty() {
-                println!("No active sessions");
-            } else {
-                for s in sessions {
-                    println!("{} - {} ({:?})", s.id, s.name, s.status);
-                }
-            }
+            handlers::session::handle_list_sessions(&state).await?;
         }
-        Commands::SessionInfo { id } => match state.get_session(&id).await {
-            Ok(Some(s)) => {
-                println!("Session: {}", s.name);
-                println!("ID: {}", s.id);
-                println!("Status: {:?}", s.status);
-                println!("Platform: {:?}", s.platform);
-                println!("Working Dir: {}", s.working_directory);
-                println!("Created: {}", s.created_at);
-                println!("Files: {:?}", s.active_files);
-                println!("Tools: {:?}", s.recent_tools);
-            }
-            Ok(None) => println!("Session not found: {}", id),
-            Err(e) => eprintln!("Error: {}", e),
-        },
+        Commands::SessionInfo { id } => {
+            handlers::session::handle_session_info(&state, id).await?;
+        }
         Commands::SessionConflicts { file, session_id } => {
-            let sid = match get_session_id(session_id) {
-                Some(s) => s,
-                None => {
-                    eprintln!("Error: No session_id. Use --session-id or IMPULSE_SESSION_ID");
-                    return Ok(());
-                }
-            };
-            match file {
-                Some(f) => {
-                    let conflicting = state.check_file_conflict(&sid, &f).await?;
-                    if !conflicting.is_empty() {
-                        println!("⚠️  CONFLICT DETECTED");
-                        println!("File is being edited by: {}", conflicting.join(", "));
-                    } else {
-                        println!("✓ No conflicts detected");
-                    }
-                }
-                None => {
-                    let sessions = state.list_sessions().await?;
-                    let mut all_files: std::collections::HashSet<String> =
-                        std::collections::HashSet::new();
-                    let mut file_to_session: std::collections::HashMap<String, Vec<String>> =
-                        std::collections::HashMap::new();
-
-                    for s in &sessions {
-                        for f in &s.active_files {
-                            all_files.insert(f.clone());
-                            file_to_session
-                                .entry(f.clone())
-                                .or_default()
-                                .push(s.name.clone());
-                        }
-                    }
-
-                    if all_files.is_empty() {
-                        println!("No active file modifications across sessions");
-                    } else {
-                        println!("Active file modifications across sessions:");
-                        for (file, sessions) in &file_to_session {
-                            if sessions.len() > 1 {
-                                println!(
-                                    "  ⚠️  {} - being edited by: {}",
-                                    file,
-                                    sessions.join(", ")
-                                );
-                            } else {
-                                println!("  {} - edited by: {}", file, sessions.join(", "));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Commands::Chat { .. } => {
-            println!("Chat requires daemon mode. Use: impulse-rs --daemon chat --session-id <id> --message <msg>");
+            handlers::session::handle_session_conflicts(&state, file, session_id).await?;
         }
         Commands::Status => {
-            branding::print_banner();
-            let sessions = state.list_sessions().await?;
-            println!("Active sessions: {}", sessions.len());
-            for s in &sessions {
-                println!("  - {} ({}) [{:?}]", s.name, s.id, s.status);
-            }
+            handlers::config::handle_status(&state).await?;
+        }
+        Commands::Chat { .. } => {
+            handlers::system::handle_chat();
         }
         Commands::Genome => {
-            let genome = state.storage().read_json::<memory::Genome>("GENOME.md")?;
-            println!("{}", genome.to_markdown());
+            handlers::memory::handle_genome(&state)?;
         }
         Commands::History => {
-            let history = state.get_history_sync()?;
-            if history.is_empty() {
-                println!("No session history");
-            } else {
-                for entry in history.iter().rev().take(20) {
-                    println!(
-                        "[{}] {} - {}",
-                        entry.ended_at.format("%Y-%m-%d %H:%M"),
-                        entry.session_name,
-                        entry.summary
-                    );
-                }
-            }
+            handlers::memory::handle_history(&state)?;
         }
         Commands::ListProviders => {
-            use agent::{AnthropicProvider, LlmProvider, MinimaxProvider, OpenAiProvider};
-
-            println!("Available LLM Providers:\n");
-
-            let anthropic = AnthropicProvider::new(String::new());
-            let openai = OpenAiProvider::new(String::new());
-            let minimax = MinimaxProvider::new(String::new());
-
-            println!(
-                "  {} (default: {})\n    Models: {}",
-                anthropic.name(),
-                anthropic.default_model(),
-                anthropic.supported_models().join(", ")
-            );
-            println!(
-                "\n  {} (default: {})\n    Models: {}",
-                openai.name(),
-                openai.default_model(),
-                openai.supported_models().join(", ")
-            );
-            println!(
-                "\n  {} (default: {})\n    Models: {}",
-                minimax.name(),
-                minimax.default_model(),
-                minimax.supported_models().join(", ")
-            );
+            handlers::config::handle_list_providers()?;
         }
         Commands::AddDecision {
             description,
             rationale,
         } => {
-            let mut genome: memory::Genome = state.storage().read_json("GENOME.md")?;
-            genome.add_decision(description, rationale, Vec::new());
-            state.storage().write_json("GENOME.md", &genome)?;
-            println!("Added decision to GENOME");
+            handlers::memory::handle_add_decision(&state, description, rationale)?;
         }
         Commands::Init => {
-            state
-                .storage()
-                .write_json("LIVE_STATE.json", &state::LiveState::new())?;
-            state
-                .storage()
-                .write_json("GENOME.md", &memory::Genome::new())?;
-            state
-                .storage()
-                .write_json("config.json", &state::Config::default())?;
-            let _ = orchestration::ensure_context_dirs(state.storage().base_path())?;
-            branding::print_banner();
-            println!("Initialized at {:?}", state.storage().base_path());
+            handlers::config::handle_init(&state, &impulse_dir)?;
         }
         Commands::Config { key, value, list } => {
-            if list {
-                let config = state.list_config()?;
-                print_config(config);
-            } else if let Some(key) = key {
-                if let Some(value) = value {
-                    match state.set_config(&key, &value) {
-                        Ok(true) => println!("Set {} = {}", key, value),
-                        Ok(false) => {
-                            eprintln!("Error: Invalid value '{}' for key '{}'", value, key)
-                        }
-                        Err(e) => eprintln!("Error: {}", e),
-                    }
-                } else {
-                    match state.get_config(&key)? {
-                        Some(v) => println!("{} = {}", key, v),
-                        None => println!("Unknown config key: {}", key),
-                    }
-                }
-            } else {
-                let config = state.list_config()?;
-                print_config(config);
-                println!("\nUse 'config <key>' to get a value");
-                println!("Use 'config <key> --value <value>' to set a value");
-                println!("Use 'config --list' to list all values");
-            }
+            handlers::config::handle_config(&state, key, value, list)?;
         }
         Commands::Extract {
             content,
             session_id,
             json,
         } => {
-            let sid = session_id.unwrap_or_else(|| "unknown".to_string());
-            let mut contrib = monty::kdb_extraction::KdbContribution::new(sid.clone());
-
-            // Keyword-based extraction
-            let lower = content.to_lowercase();
-            if lower.contains("finding") || lower.contains("found") {
-                contrib.add_finding(
-                    content.clone(),
-                    if lower.contains("critical") || lower.contains("urgent") {
-                        "high".to_string()
-                    } else {
-                        "medium".to_string()
-                    },
-                );
-            }
-            if lower.contains("risk") || lower.contains("concern") {
-                contrib.add_risk(content.clone(), "medium".to_string(), None);
-            }
-
-            if json {
-                println!("{}", serde_json::to_string_pretty(&contrib).unwrap());
-            } else {
-                println!("Extracted from session: {}", sid);
-                if !contrib.findings.is_empty() {
-                    println!("\nFindings ({}):", contrib.findings.len());
-                    for f in &contrib.findings {
-                        println!("  - [{}] {}", f.severity, f.content);
-                    }
-                }
-                if !contrib.risks.is_empty() {
-                    println!("\nRisks ({}):", contrib.risks.len());
-                    for r in &contrib.risks {
-                        println!("  - [{}] {}", r.severity, r.description);
-                    }
-                }
-                if contrib.findings.is_empty() && contrib.risks.is_empty() {
-                    println!("No structured findings extracted.");
-                }
-            }
+            handlers::system::handle_extract(content, session_id, json)?;
         }
         Commands::Swarm {
             agent_a,
@@ -1447,112 +935,16 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
             threshold,
             json,
         } => {
-            let patterns =
-                monty::swarm_coordination::detect_patterns(&agent_a, &agent_b, threshold);
-
-            if json {
-                println!("{}", serde_json::to_string_pretty(&patterns).unwrap());
-            } else {
-                println!("SWARM Pattern Detection:");
-                println!("  Agent A: {}", agent_a);
-                println!("  Agent B: {}", agent_b);
-                println!("  Threshold: {}", threshold);
-                if patterns.is_empty() {
-                    println!("\nNo patterns detected at threshold {}", threshold);
-                } else {
-                    println!("\nDetected {} pattern(s):", patterns.len());
-                    for p in &patterns {
-                        println!("  - {:?} (confidence: {:.2})", p.pattern_type, p.confidence);
-                    }
-                }
-            }
+            handlers::system::handle_swarm(agent_a, agent_b, threshold, json)?;
         }
         Commands::Activity { limit } => {
-            let sessions = state.list_sessions().await?;
-            if sessions.is_empty() {
-                println!("No sessions found");
-            } else {
-                println!("Recent Activity (showing {} most recent):\n=========================================", limit);
-
-                let mut all_files: Vec<_> = sessions
-                    .iter()
-                    .flat_map(|s| {
-                        s.active_files
-                            .iter()
-                            .map(|f| (s.name.clone(), f.clone(), s.last_activity))
-                    })
-                    .collect();
-                let mut all_tools: Vec<_> = sessions
-                    .iter()
-                    .flat_map(|s| {
-                        s.recent_tools
-                            .iter()
-                            .map(|t| (s.name.clone(), t.clone(), s.last_activity))
-                    })
-                    .collect();
-
-                all_files.sort_by(|a, b| b.2.cmp(&a.2));
-                all_tools.sort_by(|a, b| b.2.cmp(&a.2));
-
-                println!("\n📝 Files Modified:");
-                for (name, file, time) in all_files.iter().take(limit) {
-                    println!("  [{}] {} - {}", time.format("%H:%M"), name, file);
-                }
-                println!("\n🔧 Tools Used:");
-                for (name, tool, time) in all_tools.iter().take(limit) {
-                    println!("  [{}] {} - {}", time.format("%H:%M"), name, tool);
-                }
-            }
+            handlers::memory::handle_activity(&state, limit).await?;
         }
         Commands::Hooks { platform } => {
-            let impulse_path = state.storage().base_path().display().to_string();
-
-            if platform == "claude-code" || platform == "all" {
-                println!("Setting up Claude Code hooks...");
-                let hooks_dir = std::path::Path::new(".claude/hooks");
-                if let Err(e) = std::fs::create_dir_all(hooks_dir) {
-                    eprintln!("Error creating .claude/hooks: {}", e);
-                } else {
-                    let hook_config = build_claude_hook_config();
-                    let hook_json =
-                        serde_json::to_string_pretty(&hook_config).unwrap_or_else(|e| {
-                            eprintln!("Error serializing hook config: {}", e);
-                            String::from("{}")
-                        });
-                    let hook_path = std::path::Path::new(".claude/hooks/hooks.json");
-                    if let Err(e) = stewardship::atomic_write_file(hook_path, hook_json.as_bytes())
-                    {
-                        eprintln!("Error writing hooks: {}", e);
-                    } else {
-                        println!("  \u{2713} Created .claude/hooks/hooks.json");
-                    }
-                }
-            }
-
-            if platform == "opencode" || platform == "all" {
-                println!("\nSetting up OpenCode integration...");
-                let opencode_dir = std::path::Path::new(".opencode");
-                if let Err(e) = std::fs::create_dir_all(opencode_dir) {
-                    eprintln!("Error creating .opencode: {}", e);
-                } else {
-                    let opencode_config = build_opencode_hook_config();
-                    let opencode_json = serde_json::to_string_pretty(&opencode_config)
-                        .unwrap_or_else(|e| {
-                            eprintln!("Error serializing OpenCode config: {}", e);
-                            String::from("{}")
-                        });
-                    let opencode_path = std::path::Path::new(".opencode/impulse.json");
-                    if let Err(e) =
-                        stewardship::atomic_write_file(opencode_path, opencode_json.as_bytes())
-                    {
-                        eprintln!("Error writing OpenCode config: {}", e);
-                    } else {
-                        println!("  \u{2713} Created .opencode/impulse.json");
-                    }
-                }
-            }
-
-            println!("\nHooks setup complete!\nImpulse path: {}\nEdit .claude/hooks/hooks.json to customize.", impulse_path);
+            handlers::system::handle_hooks(&state, platform)?;
+        }
+        Commands::ValidateHooks { platform } => {
+            handlers::system::handle_validate_hooks(platform)?;
         }
         Commands::Orchestrate {
             task,
@@ -1560,63 +952,14 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
             inject_explain,
             compute_routing,
         } => {
-            let mode_override = parse_injection_mode(inject_mode.as_deref())?;
-            let mut query_parts = vec![task.clone()];
-            if let Some(active_id) = get_session_id(None) {
-                if let Some(active_session) = state.get_session(&active_id).await? {
-                    query_parts.push(active_session.name);
-                    if !active_session.active_files.is_empty() {
-                        query_parts.push(active_session.active_files.join(" "));
-                    }
-                    if !active_session.recent_tools.is_empty() {
-                        query_parts.push(active_session.recent_tools.join(" "));
-                    }
-                }
-            }
-
-            let config = state.config_snapshot()?;
-            let injection_result = injection::run_injection(
-                state.storage().base_path(),
-                &config,
-                injection::InjectionSurface::Orchestrate,
-                mode_override,
-                &query_parts,
-            );
-
-            let mut reasoning_input = task.clone();
-            if injection_result.applied {
-                if let Some(block) = &injection_result.injected_block {
-                    reasoning_input = format!("{}\n\n{}", reasoning_input, block);
-                }
-            }
-
-            // Use computed routing if requested
-            if compute_routing {
-                let monty_config = monty::MontyConfig::default();
-                let context = format!("Task: {}\nContext: {}", task, reasoning_input);
-
-                match monty::execute_computed_routing(&context, &monty_config) {
-                    Ok(route) => {
-                        println!("Computed routing result:");
-                        println!("  Target: {}", route.target.as_str());
-                        println!("  Confidence: {:.2}", route.confidence);
-                        println!("  Reasoning: {}", route.reasoning);
-                    }
-                    Err(e) => {
-                        eprintln!("Computed routing failed: {}", e);
-                        let tool = orchestration::suggest_tool(&reasoning_input);
-                        println!("Recommended tool: {}", tool.as_str());
-                    }
-                }
-            } else {
-                let tool = orchestration::suggest_tool(&reasoning_input);
-                println!("Recommended tool: {}", tool.as_str());
-            }
-
-            println!("Task: {}", task);
-            if inject_explain {
-                print_injection_explain(&injection_result);
-            }
+            handlers::injection_handlers::handle_orchestrate(
+                &state,
+                task,
+                inject_mode,
+                inject_explain,
+                compute_routing,
+            )
+            .await?;
         }
         Commands::Handoff {
             tool,
@@ -1626,158 +969,35 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
             inject_mode,
             inject_explain,
         } => {
-            let mode_override = parse_injection_mode(inject_mode.as_deref())?;
-            let sid = get_session_id(session_id);
-            let session = if let Some(id) = sid {
-                state.get_session(&id).await?
-            } else {
-                None
-            };
-
-            let mut query_parts = vec![task.clone()];
-            if let Some(n) = &notes {
-                query_parts.push(n.clone());
-            }
-            if let Some(s) = &session {
-                query_parts.push(s.name.clone());
-                if !s.active_files.is_empty() {
-                    query_parts.push(s.active_files.join(" "));
-                }
-                if !s.recent_tools.is_empty() {
-                    query_parts.push(s.recent_tools.join(" "));
-                }
-            }
-            let config = state.config_snapshot()?;
-            let injection_result = injection::run_injection(
-                state.storage().base_path(),
-                &config,
-                injection::InjectionSurface::Handoff,
-                mode_override,
-                &query_parts,
-            );
-
-            let handoff_path = orchestration::write_handoff(
-                state.storage().base_path(),
-                &tool,
-                &task,
-                notes.as_deref(),
-                session.as_ref(),
-            )?;
-            if injection_result.applied {
-                if let Some(block) = &injection_result.injected_block {
-                    if let Err(err) = orchestration::append_injected_context(&handoff_path, block) {
-                        eprintln!("Warning: failed to append injected context: {}", err);
-                    }
-                }
-            }
-            println!("Wrote handoff file: {}", handoff_path.display());
-            if inject_explain {
-                print_injection_explain(&injection_result);
-            }
+            handlers::injection_handlers::handle_handoff(
+                &state,
+                tool,
+                task,
+                session_id,
+                notes,
+                inject_mode,
+                inject_explain,
+            )
+            .await?;
         }
         Commands::SyncContext {
             session_id,
             inject_mode,
             inject_explain,
         } => {
-            let mode_override = parse_injection_mode(inject_mode.as_deref())?;
-            let sid = get_session_id(session_id);
-            let session = if let Some(id) = sid {
-                state.get_session(&id).await?
-            } else {
-                None
-            };
-
-            let mut query_parts = vec!["sync context".to_string()];
-            if let Some(s) = &session {
-                query_parts.push(s.name.clone());
-                if !s.active_files.is_empty() {
-                    query_parts.push(s.active_files.join(" "));
-                }
-                if !s.recent_tools.is_empty() {
-                    query_parts.push(s.recent_tools.join(" "));
-                }
-            }
-            let config = state.config_snapshot()?;
-            let injection_result = injection::run_injection(
-                state.storage().base_path(),
-                &config,
-                injection::InjectionSurface::SyncContext,
-                mode_override,
-                &query_parts,
-            );
-
-            let context_path =
-                orchestration::sync_context(state.storage().base_path(), session.as_ref())?;
-            if injection_result.applied {
-                if let Some(block) = &injection_result.injected_block {
-                    if let Err(err) = orchestration::append_injected_context(&context_path, block) {
-                        eprintln!("Warning: failed to append injected context: {}", err);
-                    }
-                }
-            }
-            println!("Synced context file: {}", context_path.display());
-            if inject_explain {
-                print_injection_explain(&injection_result);
-            }
+            handlers::injection_handlers::handle_sync_context(
+                &state,
+                session_id,
+                inject_mode,
+                inject_explain,
+            )
+            .await?;
         }
-        Commands::ComputeInjection {
-            query,
-            limit: _,
-            json,
-        } => {
-            let monty_config = monty::MontyConfig::default();
-            let context = format!("Query: {}", query);
-
-            match monty::execute_injection_selection(&context, &monty_config) {
-                Ok(decisions) => {
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&decisions).unwrap());
-                    } else {
-                        println!("Computed injection decisions:");
-                        for (i, decision) in decisions.iter().enumerate() {
-                            println!(
-                                "  {}. [{}] {} - {}",
-                                i + 1,
-                                decision.priority,
-                                decision.context_type,
-                                decision.reasoning
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Injection selection failed: {}", e);
-                    anyhow::bail!("Failed to compute injection: {}", e);
-                }
-            }
+        Commands::ComputeInjection { query, limit, json } => {
+            handlers::injection_handlers::handle_compute_injection(query, limit, json)?;
         }
         Commands::Verify => {
-            let steps = verify::default_steps(&std::env::current_dir()?);
-            let report = verify::run_verification(steps)?;
-            print_verification_report(&report);
-            if !report.success() {
-                anyhow::bail!("Verification failed");
-            }
-        }
-        Commands::IndexMemory { scope, rebuild } => {
-            let scope = retrieval::types::IndexScope::parse(&scope).ok_or_else(|| {
-                anyhow::anyhow!("Invalid scope '{}'. Use history|genome|all", scope)
-            })?;
-            let config = state.config_snapshot()?;
-            let index_state =
-                retrieval::index_from_storage(state.storage(), &config, scope, rebuild)?;
-            println!(
-                "Indexed memory: history={} genome={} vector_enabled={} vector_available={} duration={}ms",
-                index_state.history_count,
-                index_state.genome_count,
-                index_state.vector_enabled,
-                index_state.vector_available,
-                index_state.last_index_duration_ms
-            );
-            for note in index_state.notes {
-                println!("Note: {}", note);
-            }
+            handlers::build::handle_verify()?;
         }
         Commands::SearchHistory {
             query,
@@ -1790,83 +1010,9 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
             explain,
             json,
         } => {
-            let mode = if let Some(m) = mode.as_deref() {
-                Some(
-                    retrieval::types::RetrievalMode::parse(m)
-                        .ok_or_else(|| anyhow::anyhow!("Invalid mode. Use keyword|semantic"))?,
-                )
-            } else {
-                None
-            };
-            let backend = if let Some(b) = backend.as_deref() {
-                Some(retrieval::types::SearchBackend::parse(b).ok_or_else(|| {
-                    anyhow::anyhow!("Invalid backend. Use auto|sqlite-vec|rust-cosine|keyword")
-                })?)
-            } else {
-                None
-            };
-            let page_limit = limit.unwrap_or(10);
-            let page_offset = offset.unwrap_or(0)
-                + page
-                    .map(|p| (p.saturating_sub(1)) * page_limit)
-                    .unwrap_or(0);
-            let config = state.config_snapshot()?;
-            let resp = retrieval::search_history(
-                state.storage().base_path(),
-                &config,
-                &query,
-                mode,
-                backend,
-                limit,
-                Some(page_offset),
+            handlers::memory::handle_search_history(
+                &state, query, mode, backend, limit, offset, page, total, explain, json,
             )?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&resp)?);
-            } else {
-                if total {
-                    if let Some(tc) = resp.total_count {
-                        println!("Total matches: {}", tc);
-                    }
-                }
-                if resp.used_fallback {
-                    println!(
-                        "Mode: {} (fallback) [{}] - {}",
-                        resp.mode,
-                        resp.backend_used,
-                        resp.fallback_reason
-                            .unwrap_or_else(|| "unknown reason".to_string())
-                    );
-                } else {
-                    println!("Mode: {} [{}]", resp.mode, resp.backend_used);
-                }
-                if resp.results.is_empty() {
-                    println!("No results");
-                } else {
-                    for (idx, item) in resp.results.iter().enumerate() {
-                        println!(
-                            "{}. [{}] {} ({})\n   {}",
-                            idx + 1,
-                            item.source,
-                            item.title,
-                            item.id,
-                            item.snippet
-                        );
-                    }
-                }
-                if explain {
-                    println!(
-                        "\nExplain: timing={}ms candidates={} fallback_code={}",
-                        resp.timing_ms,
-                        resp.candidate_count,
-                        resp.fallback_code
-                            .map(|c| c.as_str().to_string())
-                            .unwrap_or_else(|| "none".to_string())
-                    );
-                    for note in resp.engine_notes {
-                        println!("  - {}", note);
-                    }
-                }
-            }
         }
         Commands::SearchGenome {
             query,
@@ -1879,490 +1025,61 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
             explain,
             json,
         } => {
-            let mode = if let Some(m) = mode.as_deref() {
-                Some(
-                    retrieval::types::RetrievalMode::parse(m)
-                        .ok_or_else(|| anyhow::anyhow!("Invalid mode. Use keyword|semantic"))?,
-                )
-            } else {
-                None
-            };
-            let backend = if let Some(b) = backend.as_deref() {
-                Some(retrieval::types::SearchBackend::parse(b).ok_or_else(|| {
-                    anyhow::anyhow!("Invalid backend. Use auto|sqlite-vec|rust-cosine|keyword")
-                })?)
-            } else {
-                None
-            };
-            let page_limit = limit.unwrap_or(10);
-            let page_offset = offset.unwrap_or(0)
-                + page
-                    .map(|p| (p.saturating_sub(1)) * page_limit)
-                    .unwrap_or(0);
-            let config = state.config_snapshot()?;
-            let resp = retrieval::search_genome(
-                state.storage().base_path(),
-                &config,
-                &query,
-                mode,
-                backend,
-                limit,
-                Some(page_offset),
+            handlers::memory::handle_search_genome(
+                &state, query, mode, backend, limit, offset, page, total, explain, json,
             )?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&resp)?);
-            } else {
-                if total {
-                    if let Some(tc) = resp.total_count {
-                        println!("Total matches: {}", tc);
-                    }
-                }
-                if resp.used_fallback {
-                    println!(
-                        "Mode: {} (fallback) [{}] - {}",
-                        resp.mode,
-                        resp.backend_used,
-                        resp.fallback_reason
-                            .unwrap_or_else(|| "unknown reason".to_string())
-                    );
-                } else {
-                    println!("Mode: {} [{}]", resp.mode, resp.backend_used);
-                }
-                if resp.results.is_empty() {
-                    println!("No results");
-                } else {
-                    for (idx, item) in resp.results.iter().enumerate() {
-                        println!(
-                            "{}. [{}] {} ({})\n   {}",
-                            idx + 1,
-                            item.source,
-                            item.title,
-                            item.id,
-                            item.snippet
-                        );
-                    }
-                }
-                if explain {
-                    println!(
-                        "\nExplain: timing={}ms candidates={} fallback_code={}",
-                        resp.timing_ms,
-                        resp.candidate_count,
-                        resp.fallback_code
-                            .map(|c| c.as_str().to_string())
-                            .unwrap_or_else(|| "none".to_string())
-                    );
-                    for note in resp.engine_notes {
-                        println!("  - {}", note);
-                    }
-                }
-            }
+        }
+        Commands::IndexMemory { scope, rebuild } => {
+            handlers::retrieval::handle_index_memory(&state, scope, rebuild)?;
         }
         Commands::RetrievalStatus { check, json } => {
-            let config = state.config_snapshot()?;
-            let status = retrieval::status(state.storage().base_path(), &config, check)?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&status)?);
-            } else {
-                println!("Retrieval DB: {}", status.db_path);
-                println!(
-                    "Exists: {} ({} bytes)",
-                    status.db_exists, status.db_size_bytes
-                );
-                println!(
-                    "Indexed at: {} (duration={}ms)",
-                    status.index_state.indexed_at.to_rfc3339(),
-                    status.index_state.last_index_duration_ms
-                );
-                println!(
-                    "Counts: history={} genome={}",
-                    status.index_state.history_count, status.index_state.genome_count
-                );
-                println!(
-                    "Vector: enabled={} extension_available={}",
-                    status.index_state.vector_enabled, status.vector_extension_available
-                );
-                println!("Python cmd available: {}", status.python_available);
-                println!(
-                    "Injection: mode={} scope={} emit_artifacts={} staged={} last_status={} last_artifact={}",
-                    status.injection.config_mode,
-                    status.injection.config_scope,
-                    status.injection.emit_artifacts,
-                    status.injection.staged_artifact_count,
-                    status
-                        .injection
-                        .last_staged_status
-                        .clone()
-                        .unwrap_or_else(|| "none".to_string()),
-                    status
-                        .injection
-                        .last_staged_artifact
-                        .clone()
-                        .unwrap_or_else(|| "none".to_string())
-                );
-                if let Some(ok) = status.integrity_ok {
-                    println!(
-                        "Integrity check: {} ({})",
-                        if ok { "ok" } else { "failed" },
-                        status
-                            .integrity_message
-                            .clone()
-                            .unwrap_or_else(|| "unknown".to_string())
-                    );
-                }
-                if !status.index_state.notes.is_empty() {
-                    for n in status.index_state.notes {
-                        println!("Note: {}", n);
-                    }
-                }
-            }
+            handlers::retrieval::handle_retrieval_status(&state, check, json)?;
         }
-        // Tools management
         Commands::Tools {
             subcommand,
             tool,
             dry_run,
         } => {
-            use tools::{init, list, update};
-
-            let tool_ids = if tool.is_empty() { None } else { Some(tool) };
-
-            match subcommand.as_str() {
-                "list" | "ls" => {
-                    let _ = list::list_tools(cli.verbose)?;
-                }
-                "init" | "install" => {
-                    let results = init::init_tools(tool_ids, dry_run)?;
-                    for (id, status) in &results {
-                        println!("{}: {}", id, status);
-                    }
-                }
-                "update" | "upgrade" => {
-                    let results = update::update_tools(tool_ids, dry_run)?;
-                    for (id, success, msg) in &results {
-                        let status = if *success { "✓" } else { "✗" };
-                        println!("{} {}: {}", status, id, msg);
-                    }
-                }
-                "check" => {
-                    let tools = update::check_updates()?;
-                    if tools.is_empty() {
-                        println!("No tools installed");
-                    } else {
-                        println!("{:<20} {:<15} Status", "Tool", "Version");
-                        println!("{:-<20} {:-<-15} ", "", "");
-                        for (id, version, up_to_date) in tools {
-                            let status = if up_to_date {
-                                "up to date"
-                            } else {
-                                "update available"
-                            };
-                            println!("{:<20} {:<15} {}", id, version, status);
-                        }
-                    }
-                }
-                _ => {
-                    eprintln!(
-                        "Unknown tools subcommand: {}. Use: list, init, update, check",
-                        subcommand
-                    );
-                }
-            }
+            handlers::system::handle_tools(verbose, subcommand, tool, dry_run)?;
         }
-        // Docs management
         Commands::Docs {
             subcommand,
             provider,
-            verbose,
+            verbose: docs_verbose,
             force,
         } => {
-            use docs::{cache, fetch, models as model_mgr};
-
-            let cache = cache::create_cache(state.storage().base_path())?;
-
-            match subcommand.as_str() {
-                "fetch" | "update" => {
-                    println!("Fetching latest model information...");
-
-                    // Get OpenAI API key from environment if available
-                    let openai_key = std::env::var("OPENAI_API_KEY").ok();
-
-                    let models = fetch::fetch_all_models(openai_key.as_deref()).await?;
-                    let providers = docs::known_providers();
-
-                    cache.save_models(&models)?;
-                    cache.save_providers(&providers)?;
-
-                    let metadata = cache::CacheMetadata {
-                        last_updated: std::time::SystemTime::now(),
-                        model_count: models.len(),
-                        provider_count: providers.len(),
-                        source: "api".to_string(),
-                    };
-                    cache.save_metadata(&metadata)?;
-
-                    println!(
-                        "✓ Fetched {} models from {} providers",
-                        models.len(),
-                        providers.len()
-                    );
-                }
-                "list" | "ls" => {
-                    let models = if force {
-                        println!("Fetching latest models...");
-                        let openai_key = std::env::var("OPENAI_API_KEY").ok();
-                        fetch::fetch_all_models(openai_key.as_deref()).await?
-                    } else {
-                        cache.load_models().unwrap_or_else(|_| {
-                            println!("No cached models. Use --force to fetch latest.");
-                            Vec::new()
-                        })
-                    };
-
-                    let filter = model_mgr::ModelFilter {
-                        provider: provider.clone(),
-                        ..Default::default()
-                    };
-
-                    let filtered = filter.apply(&models);
-                    println!(
-                        "{}",
-                        model_mgr::format_models(&filtered, verbose || cli.verbose)
-                    );
-                }
-                "providers" => {
-                    let providers = docs::known_providers();
-                    println!("Available Providers:\n");
-                    for p in &providers {
-                        println!(
-                            "{} ({})\n  API: {}\n  Docs: {}\n",
-                            p.name, p.id, p.api_url, p.docs_url
-                        );
-                    }
-                }
-                "status" => {
-                    let metadata = cache.load_metadata()?;
-                    let age = cache.age_seconds().unwrap_or(0);
-                    println!("Cache Status:");
-                    println!("  Last updated: {} seconds ago", age);
-                    println!("  Models cached: {}", metadata.model_count);
-                    println!("  Providers cached: {}", metadata.provider_count);
-                    println!("  Source: {}", metadata.source);
-
-                    if cache.is_stale(std::time::Duration::from_secs(86400)) {
-                        println!("  Status: STALE (older than 24 hours)");
-                    } else {
-                        println!("  Status: Fresh");
-                    }
-                }
-                _ => {
-                    eprintln!(
-                        "Unknown docs subcommand: {}. Use: fetch, list, providers, status",
-                        subcommand
-                    );
-                }
-            }
+            handlers::system::handle_docs(
+                &state,
+                verbose,
+                subcommand,
+                provider,
+                docs_verbose,
+                force,
+            )
+            .await?;
         }
-        // Model management
         Commands::Model {
             subcommand,
             provider,
             model,
         } => {
-            use docs::cache;
-            use docs::models as model_mgr;
-
-            match subcommand.as_str() {
-                "list" | "ls" => {
-                    // Load cached models or use defaults
-                    let cache = cache::create_cache(state.storage().base_path())?;
-                    let models = cache.load_models().unwrap_or_else(|_| {
-                        // Fall back to fetching default models
-                        Vec::new()
-                    });
-
-                    let filter = model_mgr::ModelFilter {
-                        provider: provider.clone(),
-                        ..Default::default()
-                    };
-
-                    let filtered = filter.apply(&models);
-                    println!("{}", model_mgr::format_models(&filtered, cli.verbose));
-                }
-                "set" => {
-                    let provider =
-                        provider.ok_or_else(|| anyhow::anyhow!("--provider required"))?;
-                    let model = model.ok_or_else(|| anyhow::anyhow!("--model required"))?;
-
-                    // Store in state/config
-                    state.set_config(&format!("model.{}", provider), &model)?;
-                    println!("Set default model for {} to {}", provider, model);
-                }
-                "get" => {
-                    let provider =
-                        provider.ok_or_else(|| anyhow::anyhow!("--provider required"))?;
-                    let model = state.get_config(&format!("model.{}", provider))?;
-                    if let Some(m) = model {
-                        println!("{}: {}", provider, m);
-                    } else {
-                        // Show default
-                        let defaults = model_mgr::ModelConfig::default();
-                        if let Some(def) = defaults.get_default_model(&provider) {
-                            println!("{} (default): {}", provider, def);
-                        } else {
-                            println!("No model configured for {}", provider);
-                        }
-                    }
-                }
-                _ => {
-                    eprintln!(
-                        "Unknown model subcommand: {}. Use: list, set, get",
-                        subcommand
-                    );
-                }
-            }
+            handlers::config::handle_model(
+                &state,
+                &impulse_dir,
+                verbose,
+                subcommand,
+                provider,
+                model,
+            )?;
         }
-        // Office document handling
         Commands::Office {
             subcommand,
             file,
             goal,
             json,
         } => {
-            use office;
-
-            match subcommand.as_str() {
-                "info" | "status" => {
-                    println!("Office Document Support:");
-                    println!("  Formats: xlsx, xls, csv, docx");
-                    println!("  Status: Available (enable office-support feature for full functionality)");
-
-                    let formats = office::supported_formats();
-                    println!("\nSupported Formats:");
-                    println!(
-                        "  {:<10} {:<20} {:<10} {:<10}",
-                        "Extension", "Name", "Read", "Write"
-                    );
-                    println!("  {}", "-".repeat(50));
-                    for (ext, name, read, write) in formats {
-                        println!("  {:<10} {:<20} {:<10} {:<10}", ext, name, read, write);
-                    }
-                }
-                "parse" | "extract" => {
-                    let file = file.ok_or_else(|| anyhow::anyhow!("--file required"))?;
-                    let path = std::path::Path::new(&file);
-
-                    if !path.exists() {
-                        return Err(anyhow::anyhow!("File not found: {}", file));
-                    }
-
-                    let result = office::parse_document(path)
-                        .map_err(|e| anyhow::anyhow!("Failed to parse document: {}", e))?;
-
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&result).unwrap());
-                    } else {
-                        println!("Document: {}", result.metadata.source_path);
-                        println!("Type: {}", result.document_type);
-                        println!("Format: {}", result.metadata.format);
-                        println!("Size: {} bytes", result.metadata.size_bytes);
-                        println!("Chunks: {}", result.chunks.len());
-                        println!("\n--- Content Preview ---");
-                        let preview = result.content.chars().take(1000).collect::<String>();
-                        println!("{}", preview);
-                        if result.content.len() > 1000 {
-                            println!("\n... (truncated, use --json for full content)");
-                        }
-                    }
-                }
-                "sheets" => {
-                    let file = file.ok_or_else(|| anyhow::anyhow!("--file required"))?;
-                    let path = std::path::Path::new(&file);
-
-                    if !path.exists() {
-                        return Err(anyhow::anyhow!("File not found: {}", file));
-                    }
-
-                    match office::excel::get_sheet_info(path) {
-                        Ok(sheets) => {
-                            println!("Sheets in {}:", file);
-                            for sheet in sheets {
-                                println!(
-                                    "  - {} ({} rows x {} cols)",
-                                    sheet.name, sheet.row_count, sheet.column_count
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            return Err(anyhow::anyhow!("Failed to get sheet info: {}", e));
-                        }
-                    }
-                }
-                "chunk" => {
-                    let file = file.ok_or_else(|| anyhow::anyhow!("--file required"))?;
-                    let path = std::path::Path::new(&file);
-
-                    if !path.exists() {
-                        return Err(anyhow::anyhow!("File not found: {}", file));
-                    }
-
-                    let result = office::parse_document(path)
-                        .map_err(|e| anyhow::anyhow!("Failed to parse document: {}", e))?;
-
-                    let chunks = office::extraction::chunk_content(&result.content, 1000, 100);
-
-                    println!("Content split into {} chunks:", chunks.len());
-                    for (i, chunk) in chunks.iter().enumerate() {
-                        println!("\n--- Chunk {} ---", i);
-                        let preview = chunk.content.chars().take(200).collect::<String>();
-                        println!("{}", preview);
-                        if chunk.content.len() > 200 {
-                            println!("...");
-                        }
-                    }
-                }
-                "extract-smart" | "smart" => {
-                    let file = file.ok_or_else(|| anyhow::anyhow!("--file required"))?;
-                    let goal = goal.unwrap_or_else(|| "extract all key information".to_string());
-                    let path = std::path::Path::new(&file);
-
-                    if !path.exists() {
-                        return Err(anyhow::anyhow!("File not found: {}", file));
-                    }
-
-                    let result = office::parse_document(path)
-                        .map_err(|e| anyhow::anyhow!("Failed to parse document: {}", e))?;
-
-                    let chunks = office::extraction::chunk_content(&result.content, 1000, 100);
-
-                    if json {
-                        let target = office::extraction::create_extraction_target(path, &goal)
-                            .map_err(|e| {
-                                anyhow::anyhow!("Failed to create extraction target: {}", e)
-                            })?;
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "goal": goal,
-                                "document_type": result.document_type,
-                                "chunks": chunks.len(),
-                                "content_length": result.content.len(),
-                                "target": target,
-                            }))
-                            .unwrap()
-                        );
-                    } else {
-                        println!("Smart extraction for goal: {}", goal);
-                        println!("Type: {}", result.document_type);
-                        println!("Chunks: {}", chunks.len());
-                        println!("Content length: {} characters", result.content.len());
-                    }
-                }
-                _ => {
-                    eprintln!("Unknown office subcommand: {}. Use: info, parse, sheets, chunk, extract-smart", subcommand);
-                }
-            }
+            handlers::office::handle_office(subcommand, file, goal, json)?;
         }
-        // Credential management
         Commands::Credentials {
             subcommand,
             provider,
@@ -2371,173 +1088,14 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
             socket_path,
             tool,
         } => {
-            use credentials::{create_provider, CredentialConfig, CredentialProviderType};
-
-            // Determine provider type
-            let provider_type = provider
-                .as_ref()
-                .and_then(|p| CredentialProviderType::parse(p))
-                .unwrap_or(CredentialProviderType::Env);
-
-            let config = CredentialConfig {
-                provider: provider_type,
-                cli_tool: tool.clone(),
-                socket_path: socket_path.clone(),
-                provider_url: None,
-            };
-
-            let cred_provider = create_provider(&config);
-
-            match subcommand.as_str() {
-                "list" | "ls" => {
-                    let status = cred_provider.status();
-                    println!(
-                        "Provider: {} (available: {})",
-                        status.provider, status.available
-                    );
-
-                    match cred_provider.list() {
-                        Ok(secrets) => {
-                            if secrets.is_empty() {
-                                println!("No secrets stored.");
-                            } else {
-                                println!("\nStored secrets:");
-                                for secret in secrets {
-                                    println!("  - {}", secret.key);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("Error listing secrets: {}", e);
-                        }
-                    }
-                }
-                "get" => {
-                    let key = key
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("--key required"))?;
-                    match cred_provider.get(key) {
-                        Ok(val) => {
-                            println!("{}", val);
-                        }
-                        Err(e) => {
-                            eprintln!("Error getting secret: {}", e);
-                        }
-                    }
-                }
-                "set" => {
-                    let key = key
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("--key required"))?;
-                    let value = value
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("--value required"))?;
-                    match cred_provider.set(key, value) {
-                        Ok(_) => {
-                            println!("Secret '{}' stored successfully.", key);
-                        }
-                        Err(e) => {
-                            eprintln!("Error setting secret: {}", e);
-                        }
-                    }
-                }
-                "delete" | "rm" => {
-                    let key = key
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("--key required"))?;
-                    match cred_provider.delete(key) {
-                        Ok(_) => {
-                            println!("Secret '{}' deleted.", key);
-                        }
-                        Err(e) => {
-                            eprintln!("Error deleting secret: {}", e);
-                        }
-                    }
-                }
-                "status" => {
-                    let status = cred_provider.status();
-                    println!("Provider: {}", status.provider);
-                    println!("Available: {}", status.available);
-                    println!("Secrets count: {}", status.secrets_count);
-                    if let Some(err) = status.last_error {
-                        println!("Last error: {}", err);
-                    }
-                }
-                _ => {
-                    eprintln!(
-                        "Unknown credentials subcommand: {}. Use: list, get, set, delete, status",
-                        subcommand
-                    );
-                }
-            }
-        }
-        Commands::Calc { expression } => {
-            use crate::tools::python;
-
-            // Check if Python is available
-            if !python::is_python_available() {
-                eprintln!("Error: Python is not available. Please install Python 3.");
-                return Err(anyhow::anyhow!("Python not available"));
-            }
-
-            // Calculate the expression
-            match python::calculate(&expression) {
-                Ok(result) => {
-                    println!("{}", result);
-                }
-                Err(e) => {
-                    eprintln!("Calculation error: {}", e);
-                    return Err(anyhow::anyhow!("Calculation failed"));
-                }
-            }
-        }
-        Commands::Exec { code } => {
-            use crate::tools::python;
-
-            // Check if Python is available
-            if !python::is_python_available() {
-                eprintln!("Error: Python is not available. Please install Python 3.");
-                return Err(anyhow::anyhow!("Python not available"));
-            }
-
-            // Execute the code
-            match python::execute_python(&code) {
-                Ok(result) => {
-                    if let Some(error) = result.error {
-                        eprintln!("Error:\n{}", error);
-                    }
-                    if !result.output.is_empty() {
-                        print!("{}", result.output);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Execution error: {}", e);
-                    return Err(anyhow::anyhow!("Execution failed"));
-                }
-            }
-        }
-        Commands::System {} => {
-            use crate::tools::system::{get_impulse_env_vars, SystemInfo};
-
-            let info = SystemInfo::collect();
-
-            println!("=== System Information ===");
-            println!("OS: {}", info.os);
-            println!("Architecture: {}", info.arch);
-            println!("Home Directory: {:?}", info.home_dir);
-            println!("Current Directory: {}", info.current_dir);
-            println!("Python Available: {}", info.python_available);
-            if let Some(version) = info.python_version {
-                println!("Python Version: {}", version.trim());
-            }
-
-            let impulse_vars = get_impulse_env_vars();
-            if !impulse_vars.is_empty() {
-                println!("\n=== Impulse Environment Variables ===");
-                for var in impulse_vars {
-                    println!("{}: {}", var.key, var.value);
-                }
-            }
+            handlers::config::handle_credentials(
+                subcommand,
+                provider,
+                key,
+                value,
+                socket_path,
+                tool,
+            )?;
         }
         Commands::Steward {
             subcommand,
@@ -2546,793 +1104,90 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
             id,
             json,
         } => {
-            use crate::stewardship;
-
-            let base = &impulse_dir;
-            let config = state.config_snapshot()?;
-            let stew_config = stewardship::StewardshipConfig::from_config(&config);
-
-            match subcommand.as_str() {
-                "status" => {
-                    let proposals = stewardship::approval::list_pending(base)?;
-                    let cross = stewardship::cross_project::load_cross_project(base)?;
-
-                    if json {
-                        let status = serde_json::json!({
-                            "mode": stew_config.mode.as_str(),
-                            "thresholds": {
-                                "monitor": stew_config.monitor_threshold,
-                                "surgical": stew_config.surgical_threshold,
-                                "thoughtful": stew_config.thoughtful_threshold,
-                                "emergency": stew_config.emergency_threshold,
-                            },
-                            "context_window_tokens": stew_config.context_window_tokens,
-                            "pending_proposals": proposals.len(),
-                            "cross_project_patterns": cross.patterns.len(),
-                            "cross_project_learnings": cross.learnings.len(),
-                        });
-                        println!("{}", serde_json::to_string_pretty(&status)?);
-                    } else {
-                        branding::print_header("Stewardship Status");
-                        println!("  Mode: {:?}", stew_config.mode);
-                        println!(
-                            "  Thresholds: {:.0}% / {:.0}% / {:.0}% / {:.0}%",
-                            stew_config.monitor_threshold * 100.0,
-                            stew_config.surgical_threshold * 100.0,
-                            stew_config.thoughtful_threshold * 100.0,
-                            stew_config.emergency_threshold * 100.0,
-                        );
-                        println!(
-                            "  Context window: {} tokens",
-                            stew_config.context_window_tokens
-                        );
-                        println!("  Pending proposals: {}", proposals.len());
-                        for p in &proposals {
-                            println!(
-                                "    - {} [{}] ~{} tokens freed",
-                                p.id,
-                                p.strategy.as_str(),
-                                p.estimated_tokens_freed
-                            );
-                        }
-                        println!("  Cross-project patterns: {}", cross.patterns.len());
-                        println!("  Cross-project learnings: {}", cross.learnings.len());
-                    }
-                }
-                "analyze" => {
-                    let transcript_path = transcript
-                        .ok_or_else(|| anyhow::anyhow!("--transcript required for analyze"))?;
-                    let sid = session_id.as_deref().unwrap_or("unknown");
-                    let cwd = std::env::current_dir().unwrap_or_default();
-                    let phash = stewardship::cross_project::project_hash(&cwd.to_string_lossy());
-                    let analysis = stewardship::analyzer::analyze_session(
-                        &transcript_path,
-                        sid,
-                        &phash,
-                        &config,
-                    )?;
-
-                    if json {
-                        let out = serde_json::json!({
-                            "session_id": analysis.session_id,
-                            "message_count": analysis.message_count,
-                            "estimated_tokens": analysis.estimated_tokens,
-                            "estimated_context_pct": analysis.estimated_context_pct,
-                            "decisions": analysis.decisions.len(),
-                            "files_touched": analysis.files_touched,
-                            "duplicate_regions": analysis.duplicate_regions.len(),
-                            "rot_candidates": analysis.rot_candidates.len(),
-                            "key_insights": analysis.key_insights,
-                        });
-                        println!("{}", serde_json::to_string_pretty(&out)?);
-                    } else {
-                        branding::print_header("Session Analysis");
-                        println!("  Session: {}", analysis.session_id);
-                        println!("  Messages: {}", analysis.message_count);
-                        println!(
-                            "  Tokens: ~{} ({:.1}% of window)",
-                            analysis.estimated_tokens,
-                            analysis.estimated_context_pct * 100.0
-                        );
-                        println!("  Decisions: {}", analysis.decisions.len());
-                        println!("  Files touched: {}", analysis.files_touched.len());
-                        println!("  Duplicate regions: {}", analysis.duplicate_regions.len());
-                        println!("  Rot candidates: {}", analysis.rot_candidates.len());
-                        if !analysis.key_insights.is_empty() {
-                            println!("  Insights:");
-                            for insight in &analysis.key_insights {
-                                println!("    - {}", insight);
-                            }
-                        }
-                    }
-                }
-                "list" => {
-                    let proposals = stewardship::approval::list_pending(base)?;
-                    if json {
-                        let out: Vec<_> = proposals
-                            .iter()
-                            .map(|p| {
-                                serde_json::json!({
-                                    "id": p.id,
-                                    "strategy": p.strategy.as_str(),
-                                    "threshold": p.threshold.as_str(),
-                                    "estimated_tokens_freed": p.estimated_tokens_freed,
-                                    "regions": p.regions.len(),
-                                    "status": p.status.as_str(),
-                                })
-                            })
-                            .collect();
-                        println!("{}", serde_json::to_string_pretty(&out)?);
-                    } else {
-                        println!("Pending Proposals ({}):", proposals.len());
-                        for p in &proposals {
-                            println!(
-                                "  {} [{:?}] {} — ~{} tokens freed",
-                                p.id,
-                                p.threshold,
-                                p.strategy.as_str(),
-                                p.estimated_tokens_freed
-                            );
-                            for region in &p.regions {
-                                println!(
-                                    "    Region: {} ({} messages, ~{} tokens)",
-                                    region.description,
-                                    region.message_indices.len(),
-                                    region.estimated_tokens
-                                );
-                            }
-                        }
-                    }
-                }
-                "approve" => {
-                    let pid = id.ok_or_else(|| anyhow::anyhow!("--id required for approve"))?;
-                    match stewardship::approval::approve_proposal(base, &pid)? {
-                        true => println!("Proposal {} approved and moved to applied.", pid),
-                        false => println!("Proposal {} not found in pending.", pid),
-                    }
-                }
-                "reject" => {
-                    let pid = id.ok_or_else(|| anyhow::anyhow!("--id required for reject"))?;
-                    match stewardship::approval::reject_proposal(base, &pid)? {
-                        true => println!("Proposal {} rejected and removed.", pid),
-                        false => println!("Proposal {} not found in pending.", pid),
-                    }
-                }
-                "memory" => {
-                    let cross = stewardship::cross_project::load_cross_project(base)?;
-                    if json {
-                        let out = serde_json::json!({
-                            "version": cross.version,
-                            "updated": cross.updated.to_rfc3339(),
-                            "patterns": cross.patterns.iter().map(|p| serde_json::json!({
-                                "id": p.id,
-                                "type": p.pattern_type,
-                                "description": p.description,
-                                "occurrences": p.occurrences,
-                                "projects": p.projects,
-                                "insight": p.insight,
-                            })).collect::<Vec<_>>(),
-                            "learnings": cross.learnings,
-                            "stats": {
-                                "total_patterns": cross.stats.total_patterns,
-                                "total_sessions": cross.stats.total_sessions_analyzed,
-                                "total_learnings": cross.stats.total_learnings,
-                            },
-                        });
-                        println!("{}", serde_json::to_string_pretty(&out)?);
-                    } else {
-                        branding::print_header("Cross-Project Memory");
-                        println!("  Version: {}", cross.version);
-                        println!("  Updated: {}", cross.updated.format("%Y-%m-%d %H:%M"));
-                        println!("  Patterns ({}):", cross.patterns.len());
-                        for p in &cross.patterns {
-                            println!(
-                                "    [{}] {} (seen {} times across {} projects)",
-                                p.pattern_type,
-                                p.description,
-                                p.occurrences,
-                                p.projects.len()
-                            );
-                            println!("      Insight: {}", p.insight);
-                        }
-                        println!("  Learnings ({}):", cross.learnings.len());
-                        for l in &cross.learnings {
-                            println!("    - {}", l);
-                        }
-                    }
-                }
-                "compact" => {
-                    let sid = session_id
-                        .ok_or_else(|| anyhow::anyhow!("--session-id required for compact"))?;
-                    let cross = stewardship::cross_project::load_cross_project(base)?;
-
-                    if let Some(transcript_path) = transcript {
-                        let sid_ref = sid.as_str();
-                        let cwd = std::env::current_dir().unwrap_or_default();
-                        let phash =
-                            stewardship::cross_project::project_hash(&cwd.to_string_lossy());
-                        let analysis = stewardship::analyzer::analyze_session(
-                            &transcript_path,
-                            sid_ref,
-                            &phash,
-                            &config,
-                        )?;
-                        let context =
-                            stewardship::cleanup::build_refined_context(&analysis, &cross);
-                        print!("{}", context);
-                    } else {
-                        let mut context = format!("# Session {} — Stewardship Context\n\n", sid);
-                        if !cross.learnings.is_empty() {
-                            context.push_str("## Cross-Project Learnings\n");
-                            for l in &cross.learnings {
-                                context.push_str(&format!("- {}\n", l));
-                            }
-                        }
-                        if !cross.patterns.is_empty() {
-                            context.push_str("\n## Relevant Patterns\n");
-                            for p in &cross.patterns {
-                                context.push_str(&format!("- {} ({})\n", p.description, p.insight));
-                            }
-                        }
-                        print!("{}", context);
-                    }
-                }
-                _ => {
-                    eprintln!("Unknown steward subcommand: '{}'. Available: status, analyze, list, approve, reject, memory, compact", subcommand);
-                }
-            }
+            handlers::stewardship_handlers::handle_steward(
+                &state,
+                &impulse_dir,
+                subcommand,
+                transcript,
+                session_id,
+                id,
+                json,
+            )?;
+        }
+        Commands::Calc { expression } => {
+            handlers::system::handle_calc(expression)?;
+        }
+        Commands::Exec { code } => {
+            handlers::system::handle_exec(code)?;
+        }
+        Commands::System {} => {
+            handlers::system::handle_system()?;
         }
         Commands::Analyze { session_id, scope } => {
-            println!("=== Impulse Analysis ===");
-
-            match scope.as_str() {
-                "session" | "sessions" => {
-                    if let Some(sid) = session_id {
-                        // Analyze specific session
-                        println!("\nAnalyzing session: {}", sid);
-                        // For now, show basic session info
-                        match state.get_session(&sid).await {
-                            Ok(Some(s)) => {
-                                println!("Session: {} ({})", s.name, s.id);
-                                println!("Files: {}", s.active_files.len());
-                                println!("Tools: {}", s.recent_tools.len());
-                            }
-                            Ok(None) => {
-                                println!("Session not found: {}", sid);
-                            }
-                            Err(e) => {
-                                eprintln!("Error fetching session: {}", e);
-                            }
-                        }
-                    } else {
-                        println!("\nUsage: --session-id required for session analysis");
-                    }
-                }
-                "token" | "tokens" => {
-                    println!("\nToken analysis:");
-                    println!("Use `impulse-rs activity` for token tracking details");
-                }
-                "all" | "*" => {
-                    println!("\nAvailable analysis scopes:");
-                    println!("  session  - Analyze specific session (requires --session-id)");
-                    println!("  tokens   - Token usage analysis");
-                    println!("  all      - This help message");
-                }
-                _ => {
-                    eprintln!("Unknown scope: {}. Use: session, tokens, all", scope);
-                }
-            }
+            handlers::stewardship_handlers::handle_analyze(&state, session_id, scope).await?;
         }
         Commands::Health {} => {
-            use crate::tools::health::{check_impulse_health, check_python_health, HealthStatus};
-
-            println!("=== Impulse Health Check ===\n");
-
-            // Check Python
-            let python_check = check_python_health();
-            let status_icon = match python_check.status {
-                HealthStatus::Healthy => "✓",
-                HealthStatus::Warning => "⚠",
-                HealthStatus::Error => "✗",
-            };
-            print!("Python: {} ", status_icon);
-            match python_check.status {
-                HealthStatus::Healthy => println!("OK"),
-                HealthStatus::Warning => println!("Warning: {:?}", python_check.message),
-                HealthStatus::Error => println!("Error: {:?}", python_check.message),
-            }
-
-            // Check impulse directory
-            let report = check_impulse_health(&impulse_dir);
-
-            let overall_icon = match report.overall_status {
-                HealthStatus::Healthy => "✓",
-                HealthStatus::Warning => "⚠",
-                HealthStatus::Error => "✗",
-            };
-
-            println!("\nOverall Status: {} ", overall_icon);
-            match report.overall_status {
-                HealthStatus::Healthy => println!("All systems operational"),
-                HealthStatus::Warning => println!("Some issues detected"),
-                HealthStatus::Error => println!("Critical issues found"),
-            }
-
-            println!("\nDetailed Checks:");
-            for check in &report.checks {
-                let icon = match check.status {
-                    HealthStatus::Healthy => "✓",
-                    HealthStatus::Warning => "⚠",
-                    HealthStatus::Error => "✗",
-                };
-                print!("  {} {}", icon, check.name);
-                if let Some(msg) = &check.message {
-                    println!(" - {}", msg);
-                } else {
-                    println!();
-                }
-            }
+            handlers::stewardship_handlers::handle_health(&impulse_dir)?;
         }
         Commands::Summary {} => {
-            println!("=== Impulse Summary ===\n");
-
-            // Show quick overview
-            println!("Impulse Directory: {}", impulse_dir.display());
-            println!("\nQuick Commands:");
-            println!("  impulse-rs status     - Detailed status");
-            println!("  impulse-rs health    - Health check");
-            println!("  impulse-rs activity  - Recent activity");
-            println!("  impulse-rs history   - Session history");
-            println!("  impulse-rs list      - List sessions");
-            println!("  impulse-rs system    - System info");
-
-            // Show available CLI tools
-            println!("\nCLI Tools Tracked:");
-            for tool in crate::tools::known_tools() {
-                println!("  - {} ({})", tool.name, tool.id);
-            }
-
-            // Show build hygiene commands
-            println!("\nBuild Hygiene:");
-            println!("  impulse-rs sweep         - Clean stale build artifacts");
-            println!("  impulse-rs wipe          - Aggressive target/ cleanup");
-            println!("  impulse-rs clean-all     - Workspace-wide cargo clean");
-            println!("  impulse-rs sccache-setup - Configure compilation cache");
-            println!("  impulse-rs build-health  - Disk usage report");
+            handlers::stewardship_handlers::handle_summary(&impulse_dir)?;
         }
-
-        // ====================================================================
-        // Build Hygiene Commands
-        // ====================================================================
         Commands::Sweep {
             dry_run,
             path,
             days,
-            verbose,
+            verbose: _,
         } => {
-            let config = load_build_hygiene_config(&state);
-            let dry_run = dry_run.unwrap_or(config.dry_run_default);
-            let days = days.unwrap_or(config.age_threshold_days);
-
-            let paths = if let Some(p) = path {
-                vec![p]
-            } else {
-                config.expanded_scan_paths()
-            };
-
-            if paths.is_empty() {
-                println!("No scan paths configured. Use --path or set build_hygiene_scan_paths in config.");
-                return Ok(());
-            }
-
-            println!("=== Cargo Sweep ===\n");
-            println!(
-                "Scanning: {:?}",
-                paths
-                    .iter()
-                    .map(|p| p.display().to_string())
-                    .collect::<Vec<_>>()
-            );
-            println!("Artifacts older than: {} days", days);
-            println!("Mode: {}\n", if dry_run { "DRY RUN" } else { "LIVE" });
-
-            let opts = build_hygiene::sweep::SweepOptions {
-                days,
-                dry_run,
-                paths,
-                recursive: true,
-                verbose,
-            };
-
-            match build_hygiene::sweep::run_sweep(&opts) {
-                Ok(result) => {
-                    println!("{}", result.summary);
-                    if !result.errors.is_empty() {
-                        println!("\nWarnings:");
-                        for err in &result.errors {
-                            println!("  - {}", err);
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Sweep failed: {}", e);
-                    eprintln!("\nHint: Check filesystem permissions and scan path configuration.");
-                }
-            }
+            handlers::build::handle_sweep(&state, dry_run, path, days, verbose)?;
         }
-
         Commands::Wipe { dry_run, path } => {
-            let config = load_build_hygiene_config(&state);
-            let dry_run = dry_run.unwrap_or(config.dry_run_default);
-
-            let paths = if let Some(p) = path {
-                vec![p]
-            } else {
-                config.expanded_scan_paths()
-            };
-
-            if paths.is_empty() {
-                println!("No scan paths configured. Use --path or set build_hygiene_scan_paths in config.");
-                return Ok(());
-            }
-
-            println!("=== Cargo Wipe ===\n");
-            println!(
-                "Mode: {}\n",
-                if dry_run {
-                    "DRY RUN (safe)"
-                } else {
-                    "LIVE — will delete target/ dirs!"
-                }
-            );
-
-            let opts = build_hygiene::wipe::WipeOptions {
-                dry_run,
-                paths,
-                include_node_modules: false,
-            };
-
-            match build_hygiene::wipe::run_wipe(&opts) {
-                Ok(result) => {
-                    println!("{}", result.summary);
-                    if !result.errors.is_empty() {
-                        println!("\nWarnings:");
-                        for err in &result.errors {
-                            println!("  - {}", err);
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Wipe failed: {}", e);
-                    eprintln!("\nHint: Check filesystem permissions and scan path configuration.");
-                }
-            }
+            handlers::build::handle_wipe(&state, dry_run, path)?;
         }
-
         Commands::CleanAll { dry_run } => {
-            let config = load_build_hygiene_config(&state);
-            let dry_run = dry_run.unwrap_or(config.dry_run_default);
-            let paths = config.expanded_scan_paths();
-
-            if paths.is_empty() {
-                println!("No scan paths configured.");
-                return Ok(());
-            }
-
-            println!("=== Cargo Clean All ===\n");
-            println!(
-                "Mode: {}\n",
-                if dry_run {
-                    "DRY RUN"
-                } else {
-                    "LIVE — will cargo clean all projects!"
-                }
-            );
-
-            match build_hygiene::clean_all::clean_all_projects(&paths, dry_run) {
-                Ok(result) => {
-                    println!("{}", result.summary);
-                    if !result.errors.is_empty() {
-                        println!("\nWarnings:");
-                        for err in &result.errors {
-                            println!("  - {}", err);
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Clean-all failed: {}", e);
-                }
-            }
+            handlers::build::handle_clean_all(&state, dry_run)?;
         }
-
         Commands::SccacheSetup { check, json } => {
-            if check || json {
-                let status = build_hygiene::sccache::sccache_status();
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&status).unwrap());
-                } else {
-                    println!("=== sccache Status ===\n");
-                    println!("Installed: {}", if status.installed { "yes" } else { "no" });
-                    if let Some(ref v) = status.version {
-                        println!("Version: {}", v);
-                    }
-                    println!(
-                        "Configured: {}",
-                        if status.configured { "yes" } else { "no" }
-                    );
-                    println!("Config path: {}", status.config_path);
-                    if let Some(ref stats) = status.stats {
-                        println!("\nCache Stats:");
-                        if let Some(hits) = stats.cache_hits {
-                            println!("  Hits: {}", hits);
-                        }
-                        if let Some(misses) = stats.cache_misses {
-                            println!("  Misses: {}", misses);
-                        }
-                        if let Some(ref size) = stats.cache_size {
-                            println!("  Size: {}", size);
-                        }
-                    }
-                }
-            } else {
-                match build_hygiene::sccache::sccache_setup(false) {
-                    Ok(result) => {
-                        println!("=== sccache Setup ===\n");
-                        println!("{}", result.action_taken);
-                        println!("Config: {}", result.config_path);
-                    }
-                    Err(e) => {
-                        eprintln!("sccache setup failed: {}", e);
-                    }
-                }
-            }
+            handlers::build::handle_sccache_setup(check, json)?;
         }
-
         Commands::BuildHealth { json } => {
-            let config = load_build_hygiene_config(&state);
-            let paths = config.expanded_scan_paths();
-
-            let projects = build_hygiene::discovery::discover_rust_projects(&paths);
-            let report =
-                build_hygiene::measurement::generate_report(&projects, config.size_threshold_gb);
-
-            if json {
-                println!("{}", serde_json::to_string_pretty(&report).unwrap());
-            } else {
-                println!("=== Rust Build Health ===\n");
-                println!(
-                    "Total: {} across {} projects\n",
-                    report.total_human, report.project_count
-                );
-
-                if !report.projects.is_empty() {
-                    println!("Projects (largest first):");
-                    for (i, p) in report.projects.iter().enumerate().take(20) {
-                        println!("  {}. {} — {}", i + 1, p.path, p.target_size_human);
-                    }
-                    if report.projects.len() > 20 {
-                        println!("  ... and {} more", report.projects.len() - 20);
-                    }
-                }
-
-                println!("\nRecommendations:");
-                for rec in &report.recommendations {
-                    println!("  - {}", rec);
-                }
-
-                // Also show sccache status
-                let sccache_st = build_hygiene::sccache::sccache_status();
-                println!(
-                    "\nsccache: {}",
-                    if sccache_st.installed && sccache_st.configured {
-                        "configured"
-                    } else if sccache_st.installed {
-                        "installed but not configured — run `impulse-rs sccache-setup`"
-                    } else {
-                        "not installed — run `cargo install sccache`"
-                    }
-                );
-            }
+            handlers::build::handle_build_health(&state, json)?;
         }
-
         Commands::ToolingList { category, json } => {
-            let registry = tooling::ToolRegistry::with_defaults();
-            let tools = if let Some(ref cat) = category {
-                let cat = match cat.as_str() {
-                    "utility" => tooling::ToolCategory::Utility,
-                    "document" => tooling::ToolCategory::Document,
-                    "analysis" => tooling::ToolCategory::Analysis,
-                    "system" => tooling::ToolCategory::System,
-                    _ => {
-                        eprintln!(
-                            "Unknown category: {} (use: utility, document, analysis, system)",
-                            cat
-                        );
-                        return Ok(());
-                    }
-                };
-                registry.list_by_category(cat)
-            } else {
-                registry.list()
-            };
-
-            if json {
-                println!("{}", serde_json::to_string_pretty(&tools).unwrap());
-            } else {
-                println!("=== Dynamic Tools ({}) ===\n", tools.len());
-                for tool in &tools {
-                    println!("  {} — {} [{}]", tool.id, tool.description, tool.category);
-                }
-                if tools.is_empty() {
-                    println!("  (no tools registered)");
-                }
-                println!("\nUse `tooling-describe <id>` for details.");
-            }
+            handlers::tooling_handlers::handle_tooling_list(&state, &impulse_dir, category, json)?;
         }
-
         Commands::ToolingDescribe { tool_id, json } => {
-            let registry = tooling::ToolRegistry::with_defaults();
-            match registry.get(&tool_id) {
-                Some(tool) => {
-                    let desc = tool.descriptor();
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&desc).unwrap());
-                    } else {
-                        println!("=== {} (v{}) ===\n", desc.name, desc.version);
-                        println!("ID:       {}", desc.id);
-                        println!("Category: {}", desc.category);
-                        println!("Description: {}\n", desc.description);
-
-                        if !desc.params.is_empty() {
-                            println!("Parameters:");
-                            for p in &desc.params {
-                                let req = if p.required { "required" } else { "optional" };
-                                println!(
-                                    "  --{} ({:?}, {}) — {}",
-                                    p.name, p.param_type, req, p.description
-                                );
-                            }
-                        } else {
-                            println!("Parameters: none");
-                        }
-
-                        let caps = tool.required_capabilities();
-                        if !caps.is_empty() {
-                            println!("\nRequired capabilities: {:?}", caps);
-                        }
-                    }
-                }
-                None => {
-                    eprintln!("Tool not found: {}", tool_id);
-                    eprintln!("Use `tooling-list` to see available tools.");
-                }
-            }
+            handlers::tooling_handlers::handle_tooling_describe(
+                &state,
+                &impulse_dir,
+                tool_id,
+                json,
+            )?;
         }
-
         Commands::ToolingRun {
             tool_id,
             params,
             json,
         } => {
-            let registry = tooling::ToolRegistry::with_defaults();
-            let params_value: serde_json::Value = if let Some(ref p) = params {
-                serde_json::from_str(p).unwrap_or_else(|e| {
-                    eprintln!("Invalid JSON params: {}", e);
-                    serde_json::json!({})
-                })
-            } else {
-                serde_json::json!({})
-            };
-
-            let ctx = tooling::ToolContext::with_all_capabilities();
-
-            match registry.execute(&tool_id, params_value, &ctx).await {
-                Ok(result) => {
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&result.output).unwrap());
-                    } else {
-                        println!("{}", serde_json::to_string_pretty(&result.output).unwrap());
-                        if !result.metadata.is_empty() {
-                            println!("\n--- Metadata ---");
-                            for (k, v) in &result.metadata {
-                                println!("  {}: {}", k, v);
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Tool execution failed: {}", e);
-                }
-            }
+            handlers::tooling_handlers::handle_tooling_run(
+                &state,
+                &impulse_dir,
+                tool_id,
+                params,
+                json,
+            )
+            .await?;
         }
-
         Commands::ToolingSchema { format } => {
-            let registry = tooling::ToolRegistry::with_defaults();
-            let tools = registry.list();
-
-            match format.as_str() {
-                "json" => {
-                    // Export in a format compatible with LLM tool-calling schemas
-                    let schema: Vec<serde_json::Value> = tools
-                        .iter()
-                        .map(|t| {
-                            let properties: serde_json::Map<String, serde_json::Value> = t
-                                .params
-                                .iter()
-                                .map(|p| {
-                                    let type_str = match p.param_type {
-                                        tooling::ParamType::String => "string",
-                                        tooling::ParamType::Integer => "integer",
-                                        tooling::ParamType::Float => "number",
-                                        tooling::ParamType::Bool => "boolean",
-                                        tooling::ParamType::FilePath => "string",
-                                        tooling::ParamType::Json => "object",
-                                    };
-                                    (
-                                        p.name.clone(),
-                                        serde_json::json!({
-                                            "type": type_str,
-                                            "description": p.description,
-                                        }),
-                                    )
-                                })
-                                .collect();
-
-                            let required: Vec<&str> = t
-                                .params
-                                .iter()
-                                .filter(|p| p.required)
-                                .map(|p| p.name.as_str())
-                                .collect();
-
-                            serde_json::json!({
-                                "name": t.id,
-                                "description": t.description,
-                                "input_schema": {
-                                    "type": "object",
-                                    "properties": properties,
-                                    "required": required,
-                                }
-                            })
-                        })
-                        .collect();
-
-                    println!("{}", serde_json::to_string_pretty(&schema).unwrap());
-                }
-                "markdown" => {
-                    println!("# Impulse Dynamic Tools\n");
-                    println!(
-                        "Available tools for agentic invocation via `impulse-rs tooling-run`.\n"
-                    );
-                    for t in &tools {
-                        println!("## {}\n", t.name);
-                        println!("**ID:** `{}`  ", t.id);
-                        println!("**Category:** {}  ", t.category);
-                        println!("**Version:** {}  \n", t.version);
-                        println!("{}\n", t.description);
-                        if !t.params.is_empty() {
-                            println!("| Parameter | Type | Required | Description |");
-                            println!("|-----------|------|----------|-------------|");
-                            for p in &t.params {
-                                println!(
-                                    "| `{}` | {:?} | {} | {} |",
-                                    p.name,
-                                    p.param_type,
-                                    if p.required { "yes" } else { "no" },
-                                    p.description
-                                );
-                            }
-                            println!();
-                        }
-                        println!("```bash");
-                        println!("impulse-rs tooling-run {} --params '{{...}}' --json", t.id);
-                        println!("```\n");
-                    }
-                }
-                _ => {
-                    eprintln!("Unknown format: {} (use: json, markdown)", format);
-                }
-            }
+            handlers::tooling_handlers::handle_tooling_schema(&state, &impulse_dir, format)?;
+        }
+        Commands::ToolingValidate { json } => {
+            handlers::tooling_handlers::handle_tooling_validate(&state, &impulse_dir, json)?;
+        }
+        Commands::ToolingReload { json } => {
+            handlers::tooling_handlers::handle_tooling_reload(&state, &impulse_dir, json)?;
+        }
+        Commands::Mcp { subcommand } => {
+            handlers::system::handle_mcp(&state, &impulse_dir, subcommand).await?;
         }
         Commands::AgentConfigure {
             provider,
@@ -3342,122 +1197,21 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
             auto_review,
             auto_coordinate,
         } => {
-            if let Some(ref p) = provider {
-                if state.set_config("impulse_agent_provider", p)? {
-                    println!("Set impulse_agent_provider = {}", p);
-                } else {
-                    eprintln!("Invalid provider: {} (use: anthropic, openai, minimax)", p);
-                }
-            }
-            if let Some(ref key) = api_key {
-                let _ = state.set_config("impulse_agent_api_key", key)?;
-                println!("Set impulse_agent_api_key = ***");
-            }
-            if let Some(ref m) = model {
-                let _ = state.set_config("impulse_agent_model", m)?;
-                println!("Set impulse_agent_model = {}", m);
-            }
-            if let Some(ref h) = harness {
-                if state.set_config("impulse_agent_harness", h)? {
-                    println!("Set impulse_agent_harness = {}", h);
-                } else {
-                    eprintln!("Invalid harness: {} (use: claude-code, opencode)", h);
-                }
-            }
-            if auto_review {
-                let _ = state.set_config("impulse_agent_auto_review", "true")?;
-                println!("Enabled auto-review");
-            }
-            if auto_coordinate {
-                let _ = state.set_config("impulse_agent_auto_coordinate", "true")?;
-                println!("Enabled auto-coordinate");
-            }
-
-            // Show resulting agent status
-            let config = state.config_snapshot()?;
-            let agent = agent::resolve_from_config(
-                config.impulse_agent_provider.as_deref(),
-                config.impulse_agent_api_key.as_deref(),
-                config.impulse_agent_model.as_deref(),
-                config.impulse_agent_harness.as_deref(),
-            );
-            match agent {
-                Some(a) => println!("\nImpulse Agent: {}", a.status_summary()),
-                None => println!("\nImpulse Agent: not configured"),
-            }
+            handlers::agent::handle_agent_configure(
+                &state,
+                provider,
+                api_key,
+                model,
+                harness,
+                auto_review,
+                auto_coordinate,
+            )?;
         }
         Commands::AgentStatus { json } => {
-            let config = state.config_snapshot()?;
-
-            let agent = agent::resolve_from_config(
-                config.impulse_agent_provider.as_deref(),
-                config.impulse_agent_api_key.as_deref(),
-                config.impulse_agent_model.as_deref(),
-                config.impulse_agent_harness.as_deref(),
-            );
-
-            if json {
-                let status = serde_json::json!({
-                    "configured": agent.is_some(),
-                    "ready": agent.as_ref().map(|a| a.is_ready()).unwrap_or(false),
-                    "status": agent.as_ref().map(|a| a.status_summary()).unwrap_or_else(|| "not configured".to_string()),
-                    "provider": config.impulse_agent_provider,
-                    "model": config.impulse_agent_model,
-                    "harness": config.impulse_agent_harness,
-                    "auto_review": config.impulse_agent_auto_review,
-                    "auto_coordinate": config.impulse_agent_auto_coordinate,
-                });
-                println!("{}", serde_json::to_string_pretty(&status)?);
-            } else {
-                branding::print_header("Impulse Agent Status");
-                match agent {
-                    Some(a) => {
-                        println!("  Status: {}", a.status_summary());
-                        println!("  Ready:  {}", if a.is_ready() { "yes" } else { "no" });
-                    }
-                    None => {
-                        println!("  Status: not configured");
-                        println!("\n  Configure with:");
-                        println!("    impulse-rs agent-configure --provider anthropic --api-key YOUR_KEY");
-                        println!("    impulse-rs agent-configure --harness claude-code");
-                    }
-                }
-                println!("  Auto-review:     {}", config.impulse_agent_auto_review);
-                println!(
-                    "  Auto-coordinate: {}",
-                    config.impulse_agent_auto_coordinate
-                );
-            }
+            handlers::agent::handle_agent_status(&state, json)?;
         }
         Commands::AgentQuery { prompt, json } => {
-            let config = state.config_snapshot()?;
-
-            let mut agent = agent::resolve_from_config(
-                config.impulse_agent_provider.as_deref(),
-                config.impulse_agent_api_key.as_deref(),
-                config.impulse_agent_model.as_deref(),
-                config.impulse_agent_harness.as_deref(),
-            )
-            .ok_or_else(|| anyhow::anyhow!("Impulse Agent not configured. Run: impulse-rs agent-configure --provider anthropic --api-key YOUR_KEY"))?;
-
-            if !agent.is_ready() {
-                anyhow::bail!("Impulse Agent is configured but not ready (check API key or harness installation)");
-            }
-
-            let response = agent
-                .query(agent::prompts::CODE_REVIEW_SYSTEM, &prompt)
-                .await
-                .map_err(|e| anyhow::anyhow!("Agent query failed: {}", e))?;
-
-            if json {
-                let result = serde_json::json!({
-                    "response": response,
-                    "agent_status": agent.status_summary(),
-                });
-                println!("{}", serde_json::to_string_pretty(&result)?);
-            } else {
-                println!("{}", response);
-            }
+            handlers::agent::handle_agent_query(&state, prompt, json).await?;
         }
         Commands::Guard {
             action,
@@ -3467,199 +1221,14 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
             disable,
             json,
         } => {
-            let config = state.config_snapshot()?;
-
-            if list {
-                let rules = guardrail::list_active_rules(&config.guardrails);
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({ "rules": rules }))
-                            .unwrap_or_else(|_| "{}".to_string())
-                    );
-                } else if rules.is_empty() {
-                    println!("No active guardrail rules.");
-                } else {
-                    println!("Active guardrail rules ({}):\n", rules.len());
-                    for rule in &rules {
-                        println!("{}\n", rule.format_human());
-                    }
-                }
-            } else if let Some(ref rule_id) = enable {
-                // Validate the rule ID exists in built-in or user rules
-                let all_rules = guardrail::defaults::builtin_rules();
-                let mut config = state.config_snapshot()?;
-                let known = all_rules.iter().any(|r| r.id == *rule_id)
-                    || config.guardrails.rules.iter().any(|r| r.id == *rule_id);
-                if !known {
-                    eprintln!(
-                        "Error: rule '{}' not found. Use --list to see available rules.",
-                        rule_id
-                    );
-                    std::process::exit(1);
-                }
-                // Remove any disabled override for this rule
-                config
-                    .guardrails
-                    .rules
-                    .retain(|r| r.id != *rule_id || r.enabled);
-                state.update_guardrail_rules(config.guardrails.rules.clone())?;
-                println!("Enabled rule: {}", rule_id);
-            } else if let Some(ref rule_id) = disable {
-                // Validate the rule ID exists in built-in or user rules
-                let all_rules = guardrail::defaults::builtin_rules();
-                let mut config = state.config_snapshot()?;
-                let known = all_rules.iter().any(|r| r.id == *rule_id)
-                    || config.guardrails.rules.iter().any(|r| r.id == *rule_id);
-                if !known {
-                    eprintln!(
-                        "Error: rule '{}' not found. Use --list to see available rules.",
-                        rule_id
-                    );
-                    std::process::exit(1);
-                }
-                // Remove any existing override for this rule first
-                config.guardrails.rules.retain(|r| r.id != *rule_id);
-                // Add a disabled override
-                config.guardrails.rules.push(guardrail::GuardRule {
-                    id: rule_id.clone(),
-                    pattern: String::new(),
-                    action: guardrail::GuardAction::Log,
-                    target: guardrail::GuardTarget::Any,
-                    reason: "Disabled by user".to_string(),
-                    suggestion: None,
-                    enabled: false,
-                    builtin: false,
-                });
-                state.update_guardrail_rules(config.guardrails.rules.clone())?;
-                println!("Disabled rule: {}", rule_id);
-            } else if let Some(ref action_str) = action {
-                match guardrail::evaluate_action(action_str, &target, &config.guardrails) {
-                    Ok(results) => {
-                        if json {
-                            let has_block = guardrail::GuardEngine::has_blocking(&results);
-                            println!(
-                                "{}",
-                                serde_json::to_string_pretty(&serde_json::json!({
-                                    "blocked": has_block,
-                                    "results": results,
-                                }))
-                                .unwrap_or_else(|_| "{}".to_string())
-                            );
-                            if has_block {
-                                std::process::exit(1);
-                            }
-                        } else if results.is_empty() {
-                            eprintln!("PASS: No guardrail rules matched.");
-                        } else {
-                            let has_block = guardrail::GuardEngine::has_blocking(&results);
-                            for result in &results {
-                                eprintln!("{}", result.format_human());
-                            }
-                            if has_block {
-                                std::process::exit(1);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Guardrail evaluation error: {}", e);
-                        std::process::exit(2);
-                    }
-                }
-            } else {
-                println!("Usage:");
-                println!("  impulse-rs guard --list                         List all active rules");
-                println!("  impulse-rs guard --action \"<cmd>\" --target bash  Evaluate a command");
-                println!("  impulse-rs guard --enable <rule-id>              Enable a rule");
-                println!("  impulse-rs guard --disable <rule-id>             Disable a rule");
-                println!("  impulse-rs guard --list --json                   List rules as JSON");
-                println!("  impulse-rs guard --action \"<cmd>\" --json         Evaluate as JSON");
-            }
+            handlers::guard::handle_guard(&state, action, target, list, enable, disable, json)?;
         }
         Commands::Analytics {
             subcommand,
             json,
             period,
         } => {
-            if subcommand == "conflicts" {
-                let history = state.get_conflict_analytics()?;
-                let analytics = history.get_analytics();
-
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&analytics)
-                            .unwrap_or_else(|_| "{}".to_string())
-                    );
-                } else {
-                    println!("\n=== Conflict Analytics ===\n");
-                    println!("Total Conflicts: {}", analytics.total_conflicts);
-                    println!(
-                        "Resolved: {} ({:.1}%)",
-                        analytics.resolved_count, analytics.resolution_rate
-                    );
-                    println!("Unresolved: {}", analytics.unresolved_count);
-                    println!(
-                        "Avg Time to Resolution: {}",
-                        analytics.format_time_to_resolution()
-                    );
-
-                    if !analytics.most_common_files.is_empty() {
-                        println!("\n--- Most Common Conflict Files ---");
-                        for (file, count) in analytics.most_common_files.iter().take(5) {
-                            println!("  {} ({} times)", file, count);
-                        }
-                    }
-
-                    if !analytics.resolution_methods.is_empty() {
-                        println!("\n--- Resolution Methods ---");
-                        for (method, count) in &analytics.resolution_methods {
-                            println!("  {}: {}", method, count);
-                        }
-                    }
-
-                    match period.as_str() {
-                        "day" => {
-                            if !analytics.conflicts_by_day.is_empty() {
-                                println!("\n--- Conflicts by Day ---");
-                                let mut days: Vec<_> = analytics.conflicts_by_day.iter().collect();
-                                days.sort_by(|a, b| a.0.cmp(b.0));
-                                for (day, count) in days.iter().rev().take(7) {
-                                    println!("  {}: {}", day, count);
-                                }
-                            }
-                        }
-                        "week" => {
-                            if !analytics.conflicts_by_week.is_empty() {
-                                println!("\n--- Conflicts by Week ---");
-                                let mut weeks: Vec<_> =
-                                    analytics.conflicts_by_week.iter().collect();
-                                weeks.sort_by(|a, b| a.0.cmp(b.0));
-                                for (week, count) in weeks.iter().rev().take(8) {
-                                    println!("  {}: {}", week, count);
-                                }
-                            }
-                        }
-                        "month" => {
-                            if !analytics.conflicts_by_month.is_empty() {
-                                println!("\n--- Conflicts by Month ---");
-                                let mut months: Vec<_> =
-                                    analytics.conflicts_by_month.iter().collect();
-                                months.sort_by(|a, b| a.0.cmp(b.0));
-                                for (month, count) in months.iter().rev().take(6) {
-                                    println!("  {}: {}", month, count);
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            } else {
-                println!(
-                    "Unknown analytics type: {}. Available: conflicts",
-                    subcommand
-                );
-            }
+            handlers::guard::handle_analytics(&state, subcommand, json, period)?;
         }
     }
 

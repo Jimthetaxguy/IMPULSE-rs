@@ -61,7 +61,7 @@ This is the adversarial complement to `PRODUCT-SPEC-v2.md`. Where the spec descr
 1. Injected as a system message (what we want)
 2. Injected as a tool_result in conversation history (different behavior)
 
-**Validation:** Write a 10-line bash SessionStart hook that outputs `GENOME: TEST CONTENT`. Verify Claude Code treats this as system-level context in the next session.
+**Validation:** Run `cargo run -- validate-hooks --platform claude-code`, register the generated `SessionStart` sentinel hook, and verify Claude Code treats the emitted marker as usable startup context in the next session.
 
 ---
 

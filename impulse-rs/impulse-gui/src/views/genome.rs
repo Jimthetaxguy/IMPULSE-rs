@@ -31,7 +31,7 @@ impl GenomeView {
 
 impl View for GenomeView {
     fn id(&self) -> ViewId {
-        ViewId::Genome
+        ViewId::Memory
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, state: &SharedState, _ctx: &egui::Context) {

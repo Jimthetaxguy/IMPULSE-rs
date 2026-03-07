@@ -226,6 +226,8 @@ pub struct SettingsView {
     status_msg: Option<(String, bool)>,
     /// Whether values have been modified since last save.
     dirty: bool,
+    /// Supervisor actions queued from the secondary permission surface.
+    pending_supervisor_actions: Vec<impulse_ops::SupervisorAction>,
 }
 
 impl SettingsView {
@@ -249,6 +251,7 @@ impl SettingsView {
             expanded: [true; 5],
             status_msg: None,
             dirty: false,
+            pending_supervisor_actions: Vec::new(),
         }
     }
 
@@ -281,6 +284,10 @@ impl SettingsView {
             self.dirty = true;
         }
     }
+
+    pub fn take_supervisor_actions(&mut self) -> Vec<impulse_ops::SupervisorAction> {
+        std::mem::take(&mut self.pending_supervisor_actions)
+    }
 }
 
 /// Get the default value for a setting definition.
@@ -298,7 +305,7 @@ impl View for SettingsView {
         ViewId::Settings
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _state: &SharedState, _ctx: &egui::Context) {
+    fn ui(&mut self, ui: &mut egui::Ui, state: &SharedState, _ctx: &egui::Context) {
         // --- Header ---
         ui.horizontal(|ui| {
             ui.strong(egui::RichText::new("\u{2699} Settings").color(colors::ACCENT));
@@ -335,6 +342,9 @@ impl View for SettingsView {
         });
 
         ui.separator();
+
+        self.render_supervisor_permissions(ui, state);
+        ui.add_space(8.0);
 
         // --- Scrollable settings categories ---
         egui::ScrollArea::vertical()
@@ -406,6 +416,101 @@ impl View for SettingsView {
 }
 
 impl SettingsView {
+    fn render_supervisor_permissions(&mut self, ui: &mut egui::Ui, state: &SharedState) {
+        egui::Frame::new()
+            .fill(colors::SURFACE)
+            .corner_radius(egui::CornerRadius::same(6))
+            .inner_margin(egui::Margin::symmetric(12, 10))
+            .stroke(egui::Stroke::new(0.5, colors::BORDER))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Supervisor Permissions")
+                            .strong()
+                            .color(colors::ACCENT),
+                    );
+                    if state
+                        .supervisor_permissions
+                        .as_ref()
+                        .map(|permission_state| permission_state.session_override_active())
+                        .unwrap_or(false)
+                    {
+                        ui.label(
+                            egui::RichText::new("session override active")
+                                .small()
+                                .color(colors::YELLOW),
+                        );
+                    }
+                });
+                ui.add_space(4.0);
+
+                let Some(permission_state) = state.supervisor_permissions.as_ref() else {
+                    ui.label(
+                        egui::RichText::new("Waiting for daemon-backed supervisor policy.")
+                            .small()
+                            .color(colors::TEXT_DIM),
+                    );
+                    return;
+                };
+
+                ui.label(
+                    egui::RichText::new("Baseline actions")
+                        .small()
+                        .color(colors::TEXT_MUTED),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    for action in &permission_state.baseline.allowed_actions {
+                        render_chip(ui, action.as_str(), colors::ACCENT);
+                    }
+                });
+
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("Baseline tool capabilities")
+                        .small()
+                        .color(colors::TEXT_MUTED),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    for capability in &permission_state.baseline.allowed_tool_capabilities {
+                        render_chip(ui, capability.as_str(), colors::BLUE);
+                    }
+                });
+
+                if let Some(session_override) = &permission_state.session_override {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("Session override")
+                            .small()
+                            .color(colors::TEXT_MUTED),
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        for action in &session_override.allowed_actions {
+                            render_chip(ui, action.as_str(), colors::YELLOW);
+                        }
+                        for capability in &session_override.allowed_tool_capabilities {
+                            render_chip(ui, capability.as_str(), colors::YELLOW);
+                        }
+                    });
+                }
+
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Clear Session Override").clicked() {
+                        self.pending_supervisor_actions.push(
+                            impulse_ops::SupervisorAction::ClearSessionOverride { confirmed: true },
+                        );
+                    }
+                    if ui.button("Reset Baseline to Defaults").clicked() {
+                        self.pending_supervisor_actions.push(
+                            impulse_ops::SupervisorAction::ResetBaselinePermissions {
+                                confirmed: true,
+                            },
+                        );
+                    }
+                });
+            });
+    }
+
     /// Render a single setting field.
     fn render_setting(&mut self, ui: &mut egui::Ui, setting: &SettingDef) {
         ui.horizontal(|ui| {
@@ -475,6 +580,17 @@ impl SettingsView {
             }
         });
     }
+}
+
+fn render_chip(ui: &mut egui::Ui, label: &str, accent: egui::Color32) {
+    egui::Frame::new()
+        .fill(colors::BG)
+        .corner_radius(egui::CornerRadius::same(255))
+        .inner_margin(egui::Margin::symmetric(8, 4))
+        .stroke(egui::Stroke::new(0.75, accent))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(label).small().color(colors::TEXT_MUTED));
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -562,7 +678,7 @@ mod tests {
         let total: usize = CATEGORIES.iter().map(|c| c.settings.len()).sum();
         // We defined 20 settings across 5 categories (4+4+4+3+4 = 19).
         assert!(
-            total >= 15 && total <= 25,
+            (15..=25).contains(&total),
             "Expected ~20 settings, got {}",
             total
         );

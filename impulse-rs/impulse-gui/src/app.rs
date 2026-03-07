@@ -1,28 +1,22 @@
-//! ImpulseApp — coordinator that owns views, sidebar, status bar, and IPC state.
-//!
-//! The app no longer contains terminal logic directly. It delegates to views:
-//! - `TerminalsView` — terminal multiplexer (migrated from old app.rs)
-//! - `SessionsView` — daemon session list + detail
-//! - `GenomeView` — genome decisions viewer
-//! - `SearchView` — daemon search
-//! - `AgentPanel` — interactive chat with the Impulse coordinator agent
-//!
-//! Layout: Sidebar (left) | Agent Panel (left, optional) | Active View (center) | Status Bar (bottom)
+//! ImpulseApp — egui operator workbench for managing coding agents.
 
 use std::path::PathBuf;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-use crate::agent_panel::actions::PanelAction;
+use crate::agent_panel::actions::{PanelAction, ProposalExecutionMode};
 use crate::agent_panel::AgentPanel;
 use crate::global_config::GlobalConfig;
-use crate::state::{self, ConnectionStatus, PollerCommand, StateHandle};
-use crate::views::genome::GenomeView;
-use crate::views::search::SearchView;
-use crate::views::sessions::SessionsView;
+use crate::state::{
+    self, ConnectionStatus, PollerCommand, PollerEvent, StateHandle, TaskNoticeLevel,
+};
+use crate::views::artifacts::{ArtifactUiAction, ArtifactsView};
+use crate::views::context::ContextView;
+use crate::views::memory::MemoryView;
+use crate::views::overview::OverviewView;
 use crate::views::settings::SettingsView;
 use crate::views::terminals::TerminalsView;
 use crate::views::{View, ViewId};
@@ -31,141 +25,112 @@ use crate::widgets::project_selector::ProjectSelector;
 use crate::widgets::signal_bus::{SignalBus, SignalKind, SignalUrgency};
 use crate::widgets::{sidebar, status_bar};
 
-/// Main application state — thin coordinator.
 pub struct ImpulseApp {
-    // View system.
+    overview: OverviewView,
     terminals: TerminalsView,
-    sessions: SessionsView,
-    genome: GenomeView,
-    search: SearchView,
+    context: ContextView,
+    memory: MemoryView,
+    artifacts: ArtifactsView,
     settings: SettingsView,
     active_view: ViewId,
 
-    // Sidebar.
     sidebar_expanded: bool,
-
-    // Agent panel.
     agent_panel: AgentPanel,
     agent_visible: bool,
     last_context_inject: Instant,
 
-    // Daemon IPC.
     shared_state: StateHandle,
     poller_cmd: Sender<PollerCommand>,
+    poller_events: Receiver<PollerEvent>,
     _poller_thread: Option<JoinHandle<()>>,
+    ops_source_id: String,
+    last_terminal_ops_publish: Instant,
+    last_published_terminal_ops: Option<impulse_ops::TerminalOpsReport>,
+    last_memory_view_active: bool,
 
-    // Context lifecycle.
     last_context_tick: Instant,
-
-    // Project selector.
     project_selector: ProjectSelector,
     global_config: GlobalConfig,
-
-    // Current project.
     current_project: Option<PathBuf>,
-
-    // Search tracking (for live insight search).
     last_search_query: String,
 
-    // Notifications.
     notifications: NotificationManager,
-
-    // Signal bus — collects and routes signals to visual surfaces.
     signal_bus: SignalBus,
 }
 
 impl ImpulseApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // Start background daemon poller.
-        let (shared_state, poller_cmd, poller_thread) = state::start_poller(cc.egui_ctx.clone());
-
-        // Load global config (recent projects).
+        let (shared_state, poller_cmd, poller_events, poller_thread) =
+            state::start_poller(cc.egui_ctx.clone());
         let impulse_home = GlobalConfig::impulse_home();
         let global_config = GlobalConfig::load(&impulse_home).unwrap_or_default();
         let project_selector = ProjectSelector::new(global_config.recent_projects.clone());
 
-        // Ensure application-level identity files exist.
         if let Err(e) = crate::identity::ensure_identity_files(&impulse_home) {
             log::warn!("Failed to create identity files: {}", e);
         }
 
         Self {
-            terminals: TerminalsView::new(),
-            sessions: SessionsView::new(),
-            genome: GenomeView::new(),
-            search: SearchView::new(poller_cmd.clone()),
+            overview: OverviewView::new(),
+            terminals: TerminalsView::new(Some(poller_cmd.clone())),
+            context: ContextView::new(),
+            memory: MemoryView::new(poller_cmd.clone()),
+            artifacts: ArtifactsView::new(),
             settings: SettingsView::new(),
-            active_view: ViewId::Terminals,
-
+            active_view: ViewId::Overview,
             sidebar_expanded: true,
-
             agent_panel: AgentPanel::new(Some(shared_state.clone())),
             agent_visible: true,
             last_context_inject: Instant::now(),
-
             shared_state,
             poller_cmd,
+            poller_events,
             _poller_thread: Some(poller_thread),
-
+            ops_source_id: format!("gui-{}-{}", std::process::id(), impulse_ops::now_rfc3339()),
+            last_terminal_ops_publish: Instant::now() - Duration::from_secs(2),
+            last_published_terminal_ops: None,
+            last_memory_view_active: false,
             last_context_tick: Instant::now(),
-
             project_selector,
             current_project: global_config.last_project.clone(),
             global_config,
-
             last_search_query: String::new(),
-
             notifications: NotificationManager::new(),
             signal_bus: SignalBus::new(),
         }
     }
 
-    /// Handle global keyboard shortcuts (view switching, sidebar toggle, etc.).
     fn handle_global_shortcuts(&mut self, ctx: &egui::Context) {
         ctx.input(|input| {
             let ctrl = input.modifiers.contains(egui::Modifiers::CTRL);
-
             if !ctrl {
                 return;
             }
 
-            // Ctrl+1-4: Switch views.
             if input.key_pressed(egui::Key::Num1) {
-                self.active_view = ViewId::Terminals;
+                self.active_view = ViewId::Overview;
             } else if input.key_pressed(egui::Key::Num2) {
-                self.active_view = ViewId::Sessions;
+                self.active_view = ViewId::Agents;
             } else if input.key_pressed(egui::Key::Num3) {
-                self.active_view = ViewId::Genome;
+                self.active_view = ViewId::Context;
             } else if input.key_pressed(egui::Key::Num4) {
-                self.active_view = ViewId::Search;
-            }
-            // Ctrl+5: Toggle agent panel.  Ctrl+6: Settings.
-            else if input.key_pressed(egui::Key::Num6) {
-                self.active_view = ViewId::Settings;
+                self.active_view = ViewId::Memory;
             } else if input.key_pressed(egui::Key::Num5) {
-                self.agent_visible = !self.agent_visible;
-            }
-            // Ctrl+B: Toggle sidebar.
-            else if input.key_pressed(egui::Key::B) {
+                self.active_view = ViewId::Artifacts;
+            } else if input.key_pressed(egui::Key::Num6) {
+                self.active_view = ViewId::Settings;
+            } else if input.key_pressed(egui::Key::B) {
                 self.sidebar_expanded = !self.sidebar_expanded;
-            }
-            // Ctrl+R: Refresh daemon data.
-            else if input.key_pressed(egui::Key::R) {
+            } else if input.key_pressed(egui::Key::R) {
                 let _ = self.poller_cmd.send(PollerCommand::Refresh);
-            }
-            // Ctrl+K: Focus search.
-            else if input.key_pressed(egui::Key::K) {
-                self.active_view = ViewId::Search;
-            }
-            // Ctrl+T / Ctrl+N: New terminal tab (opens project selector).
-            else if input.key_pressed(egui::Key::T) || input.key_pressed(egui::Key::N) {
+            } else if input.key_pressed(egui::Key::K) {
+                self.active_view = ViewId::Memory;
+            } else if input.key_pressed(egui::Key::T) || input.key_pressed(egui::Key::N) {
                 if let Some(agent) = self.terminals.agents.first() {
-                    self.active_view = ViewId::Terminals;
+                    self.active_view = ViewId::Agents;
                     self.project_selector.open(Some(agent.name.to_string()));
                 }
-            }
-            // Ctrl+L: Focus agent panel (open if hidden).
-            else if input.key_pressed(egui::Key::L) {
+            } else if input.key_pressed(egui::Key::L) {
                 if !self.agent_visible {
                     self.agent_visible = true;
                 }
@@ -218,7 +183,7 @@ impl ImpulseApp {
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
-                    if ui.button("New Tab (Ctrl+T)").clicked() {
+                    if ui.button("New Agent Tab (Ctrl+T)").clicked() {
                         if let Some(agent) = self.terminals.agents.first() {
                             self.project_selector.open(Some(agent.name.to_string()));
                         }
@@ -235,6 +200,19 @@ impl ImpulseApp {
                 });
 
                 ui.menu_button("View", |ui| {
+                    for view in ViewId::all() {
+                        if ui
+                            .selectable_label(
+                                self.active_view == *view,
+                                format!("{} ({})", view.title(), view.shortcut_label()),
+                            )
+                            .clicked()
+                        {
+                            self.active_view = *view;
+                            ui.close_menu();
+                        }
+                    }
+                    ui.separator();
                     if ui
                         .checkbox(&mut self.sidebar_expanded, "Show Sidebar (Ctrl+B)")
                         .clicked()
@@ -242,153 +220,348 @@ impl ImpulseApp {
                         ui.close_menu();
                     }
                     if ui
-                        .checkbox(&mut self.agent_visible, "Agent Panel (Ctrl+5)")
+                        .checkbox(&mut self.agent_visible, "Agent Panel")
                         .clicked()
                     {
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui
-                        .selectable_value(
-                            &mut self.active_view,
-                            ViewId::Terminals,
-                            "Terminals (Ctrl+1)",
-                        )
-                        .clicked()
-                    {
-                        ui.close_menu();
-                    }
-                    if ui
-                        .selectable_value(
-                            &mut self.active_view,
-                            ViewId::Sessions,
-                            "Sessions (Ctrl+2)",
-                        )
-                        .clicked()
-                    {
-                        ui.close_menu();
-                    }
-                    if ui
-                        .selectable_value(&mut self.active_view, ViewId::Genome, "Genome (Ctrl+3)")
-                        .clicked()
-                    {
-                        ui.close_menu();
-                    }
-                    if ui
-                        .selectable_value(&mut self.active_view, ViewId::Search, "Search (Ctrl+K)")
-                        .clicked()
-                    {
-                        ui.close_menu();
-                    }
-                });
-
-                ui.menu_button("Help", |ui| {
-                    if ui.button("About").clicked() {
-                        // Could add an about dialog later
                         ui.close_menu();
                     }
                 });
             });
         });
     }
+
+    fn show_task_notices(&mut self, notices: Vec<crate::state::TaskNotice>) {
+        for notice in notices {
+            let severity = match notice.level {
+                TaskNoticeLevel::Info => Severity::Info,
+                TaskNoticeLevel::Success => Severity::Success,
+                TaskNoticeLevel::Warning => Severity::Warning,
+                TaskNoticeLevel::Error => Severity::Error,
+            };
+            self.notifications.notify(severity, notice.message);
+        }
+    }
+
+    fn handle_artifact_result(&mut self, result: impulse_ops::ArtifactActionResult) {
+        let severity = match result.status.as_str() {
+            "acknowledged" => Severity::Success,
+            "ready_to_apply" => Severity::Success,
+            _ => Severity::Info,
+        };
+        self.notifications.notify(severity, result.message);
+    }
+
+    fn confirmed_supervisor_action(
+        action: impulse_ops::SupervisorAction,
+    ) -> impulse_ops::SupervisorAction {
+        match action {
+            impulse_ops::SupervisorAction::SendInput {
+                agent_id,
+                session_id,
+                content,
+                ..
+            } => impulse_ops::SupervisorAction::SendInput {
+                agent_id,
+                session_id,
+                content,
+                confirmed: true,
+            },
+            impulse_ops::SupervisorAction::InjectContext {
+                agent_id,
+                session_id,
+                query,
+                ..
+            } => impulse_ops::SupervisorAction::InjectContext {
+                agent_id,
+                session_id,
+                query,
+                confirmed: true,
+            },
+            impulse_ops::SupervisorAction::CleanupContext {
+                agent_id,
+                session_id,
+                goal,
+                ..
+            } => impulse_ops::SupervisorAction::CleanupContext {
+                agent_id,
+                session_id,
+                goal,
+                confirmed: true,
+            },
+            impulse_ops::SupervisorAction::HandoffContext {
+                session_id,
+                target_tool,
+                task,
+                notes,
+                ..
+            } => impulse_ops::SupervisorAction::HandoffContext {
+                session_id,
+                target_tool,
+                task,
+                notes,
+                confirmed: true,
+            },
+            impulse_ops::SupervisorAction::ModifyPermissions {
+                scope,
+                grant_actions,
+                grant_tool_capabilities,
+                ..
+            } => impulse_ops::SupervisorAction::ModifyPermissions {
+                scope,
+                grant_actions,
+                grant_tool_capabilities,
+                confirmed: true,
+            },
+            impulse_ops::SupervisorAction::ClearSessionOverride { .. } => {
+                impulse_ops::SupervisorAction::ClearSessionOverride { confirmed: true }
+            }
+            impulse_ops::SupervisorAction::ResetBaselinePermissions { .. } => {
+                impulse_ops::SupervisorAction::ResetBaselinePermissions { confirmed: true }
+            }
+            other => other,
+        }
+    }
+
+    fn permission_grant_for_proposal(
+        proposal: &impulse_ops::SupervisorProposal,
+        scope: impulse_ops::PermissionChangeScope,
+    ) -> Option<impulse_ops::SupervisorAction> {
+        if proposal.missing_actions.is_empty() && proposal.missing_tool_capabilities.is_empty() {
+            return None;
+        }
+
+        Some(impulse_ops::SupervisorAction::ModifyPermissions {
+            scope,
+            grant_actions: proposal.missing_actions.clone(),
+            grant_tool_capabilities: proposal.missing_tool_capabilities.clone(),
+            confirmed: true,
+        })
+    }
+
+    fn dispatch_local_supervisor_action(&mut self, action: impulse_ops::SupervisorAction) -> bool {
+        match action {
+            impulse_ops::SupervisorAction::FocusAgent {
+                agent_id,
+                session_id,
+            } => {
+                if self.terminals.focus_agent(&agent_id, session_id.as_deref()) {
+                    self.active_view = ViewId::Agents;
+                    true
+                } else {
+                    false
+                }
+            }
+            impulse_ops::SupervisorAction::SendInput {
+                agent_id,
+                session_id,
+                content,
+                ..
+            } => self
+                .terminals
+                .send_to_agent(&agent_id, session_id.as_deref(), &content),
+            impulse_ops::SupervisorAction::SearchMemory { query } => {
+                self.active_view = ViewId::Memory;
+                self.memory.focus_search(query);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_supervisor_action_result(&mut self, result: impulse_ops::SupervisorActionResult) {
+        let severity = match result.status.as_str() {
+            "executed" | "dispatch_local" => Severity::Success,
+            "no_candidates" => Severity::Warning,
+            _ => Severity::Info,
+        };
+        self.notifications.notify(severity, &result.message);
+
+        if let Some(artifact_id) = result.artifact_id.as_ref() {
+            self.active_view = ViewId::Artifacts;
+            self.notifications.notify(
+                Severity::Info,
+                format!("Supervisor artifact ready: {}", artifact_id),
+            );
+        }
+
+        if let Some(local_action) = result.local_action {
+            if !self.dispatch_local_supervisor_action(local_action) {
+                self.notifications.notify(
+                    Severity::Warning,
+                    "Supervisor action was approved, but no matching local agent was available.",
+                );
+            }
+        }
+    }
+
+    fn drain_poller_events(&mut self) {
+        while let Ok(event) = self.poller_events.try_recv() {
+            match event {
+                PollerEvent::ArtifactActionResult(result) => self.handle_artifact_result(result),
+                PollerEvent::SupervisorActionResult(result) => {
+                    self.handle_supervisor_action_result(result)
+                }
+                PollerEvent::TabSessionCreated { tab_id, session_id } => {
+                    self.terminals.set_daemon_session_id(tab_id, session_id);
+                }
+                PollerEvent::TabSessionFailed { tab_id, error } => {
+                    log::warn!(
+                        "Failed to create daemon session for tab {}: {}",
+                        tab_id,
+                        error
+                    );
+                }
+            }
+        }
+    }
+
+    fn maybe_publish_terminal_ops(&mut self) {
+        let report = impulse_ops::TerminalOpsReport {
+            source_id: self.ops_source_id.clone(),
+            published_at: impulse_ops::now_rfc3339(),
+            agents: self.terminals.workbench_agents(),
+            context: self.terminals.workbench_context(),
+            interventions: self.terminals.workbench_interventions(),
+        };
+
+        let changed = self
+            .last_published_terminal_ops
+            .as_ref()
+            .map(|previous| {
+                previous.agents != report.agents
+                    || previous.context != report.context
+                    || previous.interventions != report.interventions
+            })
+            .unwrap_or(true);
+        let due = self.last_terminal_ops_publish.elapsed() >= Duration::from_secs(2);
+
+        if changed || due {
+            let _ = self.poller_cmd.send(PollerCommand::PublishTerminalOps {
+                report: report.clone(),
+            });
+            self.last_terminal_ops_publish = Instant::now();
+            self.last_published_terminal_ops = Some(report);
+        }
+    }
 }
 
 impl eframe::App for ImpulseApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Handle window close.
         if ctx.input(|i| i.viewport().close_requested()) {
             self.terminals.shutdown();
             return;
         }
 
-        // Terminal lifecycle checks.
         self.terminals.drain_events();
         self.terminals.refresh_agents();
+        self.drain_poller_events();
 
-        // Context lifecycle tick (every 3 seconds).
         let now = Instant::now();
         if now.duration_since(self.last_context_tick) >= Duration::from_secs(3) {
             self.last_context_tick = now;
             self.terminals.context_tick();
 
-            // Check tier crossings and inject refresh context.
-            let genome_decisions: Vec<String> = self
+            let (genome_decisions, active_sessions, recent_history): (
+                Vec<String>,
+                Vec<String>,
+                Vec<String>,
+            ) = self
                 .shared_state
                 .lock()
                 .ok()
-                .and_then(|s| {
-                    s.genome.as_ref().map(|g| {
-                        g.decisions
-                            .iter()
-                            .rev()
-                            .take(5)
-                            .map(|d| d.description.clone())
-                            .collect()
-                    })
+                .map(|shared| {
+                    let decisions = shared
+                        .ops_snapshot
+                        .as_ref()
+                        .map(|snapshot| {
+                            snapshot
+                                .interventions
+                                .iter()
+                                .take(5)
+                                .map(|item| item.title.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let sessions: Vec<String> = shared
+                        .sessions
+                        .iter()
+                        .filter(|s| s.status == "active")
+                        .take(5)
+                        .map(|s| format!("{}: {} ({})", s.name, s.platform, s.id,))
+                        .collect();
+                    let history: Vec<String> = shared
+                        .history
+                        .iter()
+                        .take(5)
+                        .map(|h| {
+                            let name = if h.session_name.is_empty() {
+                                &h.session_id
+                            } else {
+                                &h.session_name
+                            };
+                            let summary = if h.summary.is_empty() {
+                                "(no summary)"
+                            } else {
+                                &h.summary
+                            };
+                            format!("{}: {}", name, summary)
+                        })
+                        .collect();
+                    (decisions, sessions, history)
                 })
                 .unwrap_or_default();
-            self.terminals.check_threshold_injections(&genome_decisions);
+            self.terminals.check_threshold_injections(
+                &genome_decisions,
+                &active_sessions,
+                &recent_history,
+            );
 
-            // Update activity feed display (every tick, ~3s — cheap Vec swap).
             if self.agent_visible {
                 let insights = self.terminals.collected_insights();
                 self.agent_panel.update_activity(insights);
             }
 
-            // Collect signals from terminal state changes.
-            let signals = self.terminals.collect_signals();
-            for signal in signals {
+            for signal in self.terminals.collect_signals() {
                 self.signal_bus.emit(signal);
             }
         }
 
-        // Drain signals and route to visual surfaces (every frame).
-        {
-            let drained = self.signal_bus.drain();
-            for signal in &drained {
-                match signal.urgency {
-                    SignalUrgency::Urgent => {
-                        self.notifications.notify_with_duration(
-                            Severity::Error,
-                            &signal.message,
-                            10.0,
-                        );
-                    }
-                    SignalUrgency::Important => {
-                        let severity = match &signal.kind {
-                            SignalKind::TaskCompleted => Severity::Success,
-                            SignalKind::ErrorEncountered => Severity::Error,
-                            _ => Severity::Warning,
-                        };
-                        self.notifications.notify(severity, &signal.message);
-                    }
-                    SignalUrgency::Ambient => {} // badges + activity only
+        let drained = self.signal_bus.drain();
+        for signal in &drained {
+            match signal.urgency {
+                SignalUrgency::Urgent => {
+                    self.notifications
+                        .notify_with_duration(Severity::Error, &signal.message, 10.0);
                 }
-            }
-
-            // Sync tab badges for rendering (only when changed).
-            if self.signal_bus.badges_dirty() {
-                self.terminals
-                    .set_tab_badges(self.signal_bus.all_tab_badges().clone());
-                self.signal_bus.mark_badges_clean();
+                SignalUrgency::Important => {
+                    let severity = match &signal.kind {
+                        SignalKind::TaskCompleted => Severity::Success,
+                        SignalKind::ErrorEncountered => Severity::Error,
+                        _ => Severity::Warning,
+                    };
+                    self.notifications.notify(severity, &signal.message);
+                }
+                SignalUrgency::Ambient => {}
             }
         }
 
-        // Handle badge acknowledgment from tab clicks.
+        if self.signal_bus.badges_dirty() {
+            self.terminals
+                .set_tab_badges(self.signal_bus.all_tab_badges().clone());
+            self.signal_bus.mark_badges_clean();
+        }
+
         if let Some(tab_id) = self.terminals.take_badge_ack() {
             self.signal_bus.acknowledge_tab(tab_id);
         }
-
-        // Clean up signal bus state for closed tabs.
         for tab_id in self.terminals.take_closed_tabs() {
             self.signal_bus.remove_tab(tab_id);
         }
 
-        // Process pending init injections.
-        let impulse_home = GlobalConfig::impulse_home();
-        self.terminals.process_pending_injections(&impulse_home);
+        self.terminals
+            .process_pending_injections(&GlobalConfig::impulse_home());
+        self.maybe_publish_terminal_ops();
 
-        // Inject cross-pane context into agent panel (every 60 seconds).
         if self.agent_visible
             && now.duration_since(self.last_context_inject) >= Duration::from_secs(60)
         {
@@ -399,32 +572,32 @@ impl eframe::App for ImpulseApp {
             }
         }
 
-        // Poll agent responses (non-blocking).
         self.agent_panel.tick();
 
-        // Terminal-specific shortcuts (only when terminal view is active).
-        if self.active_view == ViewId::Terminals {
-            self.terminals.handle_shortcuts(ctx);
+        let memory_view_active = self.active_view == ViewId::Memory;
+        if memory_view_active != self.last_memory_view_active {
+            let _ = self.poller_cmd.send(PollerCommand::SetMemoryView {
+                active: memory_view_active,
+            });
+            self.last_memory_view_active = memory_view_active;
         }
 
-        // Global shortcuts.
+        if self.active_view == ViewId::Agents {
+            self.terminals.handle_shortcuts(ctx);
+        }
         self.handle_global_shortcuts(ctx);
 
-        // Check if terminals view requested a spawn (pending_spawn_agent).
         if let Some(agent_name) = self.terminals.take_pending_spawn() {
             self.project_selector.open(Some(agent_name));
         }
 
-        // Project selector dialog.
         if let Some(selected_dir) = self.project_selector.show(ctx) {
-            // Auto-scaffold if needed.
             if crate::project_scaffold::needs_scaffold(&selected_dir) {
                 if let Err(e) = crate::project_scaffold::scaffold_impulse_dir(&selected_dir) {
                     log::error!("Failed to scaffold .impulse/: {}", e);
                 }
             }
 
-            // Update recent/last project.
             self.global_config.add_recent_project(selected_dir.clone());
             self.global_config.last_project = Some(selected_dir.clone());
             self.current_project = Some(selected_dir.clone());
@@ -433,34 +606,36 @@ impl eframe::App for ImpulseApp {
             self.project_selector
                 .update_recents(self.global_config.recent_projects.clone());
 
-            // Find the agent and spawn.
             if let Some(agent_name) = self.project_selector.pending_agent() {
-                if let Some(agent) = self.terminals.agents.iter().find(|a| a.name == agent_name) {
-                    let agent = agent.clone();
-                    self.terminals.spawn_tab(&agent, &selected_dir, ctx);
+                if let Some(agent) = self
+                    .terminals
+                    .agents
+                    .iter()
+                    .find(|candidate| candidate.name == agent_name)
+                {
+                    self.terminals.spawn_tab(&agent.clone(), &selected_dir, ctx);
                 }
             }
         }
 
-        // --- Menu Bar ---
         self.build_menu_bar(ctx);
-
-        // --- Project Bar ---
         self.build_project_bar(ctx);
 
-        // --- Shared State Locking & UI Layout ---
-        // Extract connection status BEFORE the lock scope so that
-        // agent_panel.ui() can resolve the backend without re-locking.
-        // Use .ok() to handle mutex poisoning gracefully instead of panicking.
         let connection = self
             .shared_state
             .lock()
-            .map(|s| s.connection)
+            .map(|shared| shared.connection)
             .unwrap_or(ConnectionStatus::Disconnected);
         self.agent_panel.set_connection_status(connection);
+        let permission_state = self
+            .shared_state
+            .lock()
+            .ok()
+            .and_then(|shared| shared.supervisor_permissions.clone());
+        self.agent_panel
+            .set_supervisor_permissions(permission_state);
 
         let Ok(mut state) = self.shared_state.lock() else {
-            // Mutex poisoned (poller thread panicked) — show error, skip frame.
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.colored_label(
                     egui::Color32::RED,
@@ -470,13 +645,13 @@ impl eframe::App for ImpulseApp {
             return;
         };
 
-        // --- Error Banner ---
+        let drained_notices = std::mem::take(&mut state.task_notices);
+
         let mut clear_error = false;
         if let Some(ref err) = state.error {
             egui::TopBottomPanel::top("error_banner").show(ctx, |ui| {
-                ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("\u{26a0}").color(egui::Color32::RED));
+                    ui.label(egui::RichText::new("\u{26A0}").color(egui::Color32::RED));
                     ui.label(err);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Dismiss").clicked() {
@@ -484,14 +659,12 @@ impl eframe::App for ImpulseApp {
                         }
                     });
                 });
-                ui.add_space(4.0);
             });
         }
         if clear_error {
             state.error = None;
         }
 
-        // --- Sidebar ---
         let sidebar_action = sidebar::show(
             ctx,
             self.active_view,
@@ -506,7 +679,6 @@ impl eframe::App for ImpulseApp {
             self.agent_visible = !self.agent_visible;
         }
 
-        // --- Agent Panel (second left SidePanel, shown when toggled) ---
         if self.agent_visible {
             egui::SidePanel::left("agent_panel")
                 .resizable(true)
@@ -517,28 +689,24 @@ impl eframe::App for ImpulseApp {
                 });
         }
 
-        // --- Live search: populate live results when search query changes ---
-        {
-            let current_query = state.search_query.clone();
-            if current_query != self.last_search_query {
-                self.last_search_query = current_query.clone();
-                if current_query.is_empty() {
-                    state.live_search_results.clear();
-                } else {
-                    let live = self.terminals.search_live_insights(&current_query);
-                    state.live_search_results = live
-                        .into_iter()
-                        .map(|r| crate::state::LiveSearchResult {
-                            title: r.title,
-                            agent: r.agent,
-                            timestamp: r.timestamp,
-                        })
-                        .collect();
-                }
+        let current_query = state.search_query.clone();
+        if current_query != self.last_search_query {
+            self.last_search_query = current_query.clone();
+            if current_query.is_empty() {
+                state.live_search_results.clear();
+            } else {
+                let live = self.terminals.search_live_insights(&current_query);
+                state.live_search_results = live
+                    .into_iter()
+                    .map(|item| crate::state::LiveSearchResult {
+                        title: item.title,
+                        agent: item.agent,
+                        timestamp: item.timestamp,
+                    })
+                    .collect();
             }
         }
 
-        // --- Dispatch agent panel actions ---
         for action in self.agent_panel.take_actions() {
             match action {
                 PanelAction::InjectTo { tab_id, content } => {
@@ -561,67 +729,108 @@ impl eframe::App for ImpulseApp {
                 }
                 PanelAction::FocusTab { tab_id } => {
                     if self.terminals.focus_tab(tab_id) {
-                        self.active_view = ViewId::Terminals;
+                        self.active_view = ViewId::Agents;
                     } else {
                         self.notifications
                             .notify(Severity::Warning, format!("Tab {} not found", tab_id));
                     }
                 }
                 PanelAction::SearchTerm { query } => {
-                    // For now, switch to search view with the query.
-                    // Terminal-level search will be implemented in Task 2.1.
-                    self.active_view = ViewId::Search;
-                    self.notifications
-                        .notify(Severity::Info, format!("Search: {}", query));
+                    self.active_view = ViewId::Memory;
+                    self.memory.focus_search(query);
+                }
+                PanelAction::RunSupervisorProposal { proposal, mode } => {
+                    let proposal = *proposal;
+                    match mode {
+                        ProposalExecutionMode::Deny => {
+                            self.notifications.notify(
+                                Severity::Info,
+                                format!("Denied proposal: {}", proposal.title),
+                            );
+                        }
+                        ProposalExecutionMode::Run => {
+                            let _ = self.poller_cmd.send(PollerCommand::RunSupervisorAction {
+                                action: Self::confirmed_supervisor_action(proposal.action),
+                            });
+                        }
+                        ProposalExecutionMode::AllowThisSession
+                        | ProposalExecutionMode::SaveDefault => {
+                            let scope = match mode {
+                                ProposalExecutionMode::AllowThisSession => {
+                                    impulse_ops::PermissionChangeScope::SessionOverride
+                                }
+                                ProposalExecutionMode::SaveDefault => {
+                                    impulse_ops::PermissionChangeScope::PersistentDefault
+                                }
+                                ProposalExecutionMode::Run | ProposalExecutionMode::Deny => {
+                                    unreachable!()
+                                }
+                            };
+                            if let Some(permission_action) =
+                                Self::permission_grant_for_proposal(&proposal, scope)
+                            {
+                                let _ = self.poller_cmd.send(PollerCommand::RunSupervisorAction {
+                                    action: permission_action,
+                                });
+                            }
+                            let _ = self.poller_cmd.send(PollerCommand::RunSupervisorAction {
+                                action: Self::confirmed_supervisor_action(proposal.action),
+                            });
+                        }
+                    }
                 }
             }
         }
 
-        // --- Status bar ---
-        let active_agents = self.terminals.active_agent_info();
-        status_bar::show(
-            ctx,
-            &state,
-            self.terminals.tab_count(),
-            &active_agents,
-            self.signal_bus.summary(),
-        );
+        status_bar::show(ctx, &state);
 
-        // --- Central panel: active view ---
         egui::CentralPanel::default().show(ctx, |ui| match self.active_view {
-            ViewId::Terminals => {
-                self.terminals.ui(ui, &state, ctx);
-            }
-            ViewId::Sessions => {
-                self.sessions.ui(ui, &state, ctx);
-            }
-            ViewId::Genome => {
-                self.genome.ui(ui, &state, ctx);
-            }
-            ViewId::Search => {
-                self.search.ui(ui, &state, ctx);
-            }
-            ViewId::Settings => {
-                self.settings.ui(ui, &state, ctx);
-            }
+            ViewId::Overview => self.overview.ui(ui, &state, ctx),
+            ViewId::Agents => self.terminals.ui(ui, &state, ctx),
+            ViewId::Context => self.context.ui(ui, &state, ctx),
+            ViewId::Memory => self.memory.ui(ui, &state, ctx),
+            ViewId::Artifacts => self.artifacts.ui(ui, &state, ctx),
+            ViewId::Settings => self.settings.ui(ui, &state, ctx),
         });
 
-        // Release the state lock before rendering overlays.
-        drop(state);
+        for action in self.artifacts.take_actions() {
+            match action {
+                ArtifactUiAction::RunRemote {
+                    artifact_id,
+                    action_id,
+                    params,
+                } => {
+                    let _ = self.poller_cmd.send(PollerCommand::RunArtifactAction {
+                        artifact_id,
+                        action_id,
+                        params,
+                    });
+                }
+            }
+        }
 
-        // --- Toast notifications (overlay, above all content) ---
+        for action in self.settings.take_supervisor_actions() {
+            let _ = self
+                .poller_cmd
+                .send(PollerCommand::RunSupervisorAction { action });
+        }
+
+        drop(state);
+        self.show_task_notices(drained_notices);
         self.notifications.show(ctx);
     }
 
     fn on_exit(&mut self, _context: Option<&eframe::glow::Context>) {
         log::info!("Impulse GUI shutting down");
-
-        // Shut down background poller.
+        let _ = self.poller_cmd.send(PollerCommand::PublishTerminalOps {
+            report: impulse_ops::TerminalOpsReport {
+                source_id: self.ops_source_id.clone(),
+                published_at: impulse_ops::now_rfc3339(),
+                ..Default::default()
+            },
+        });
         let _ = self.poller_cmd.send(PollerCommand::Shutdown);
-
-        // Clean up terminals.
         self.terminals.shutdown();
-
         log::info!("Impulse GUI shutdown complete");
     }
 }

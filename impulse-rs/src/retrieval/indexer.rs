@@ -114,16 +114,6 @@ fn genome_search_text(decision: &Decision) -> String {
     )
 }
 
-fn write_atomic(path: &Path, content: &[u8]) -> Result<()> {
-    let temp_path = path.with_extension("tmp");
-    let mut file = std::fs::File::create(&temp_path)?;
-    file.write_all(content)?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(temp_path, path)?;
-    Ok(())
-}
-
 fn embed_history_jobs(
     store: &RetrievalStore,
     config: &Config,
@@ -145,13 +135,16 @@ fn embed_history_jobs(
                         store.ensure_history_vec0_table(first.len())?;
                     }
                 }
-                for ((id, _), vec) in chunk.iter().zip(vectors.iter()) {
-                    let vector_json = serde_json::to_string(vec)?;
-                    store.upsert_history_vector(id, &vector_json)?;
-                    if vec_available {
-                        store.upsert_history_vector_vec0(id, &vector_json)?;
+                store.with_transaction(|_tx| {
+                    for ((id, _), vec) in chunk.iter().zip(vectors.iter()) {
+                        let vector_json = serde_json::to_string(vec)?;
+                        store.upsert_history_vector(id, &vector_json)?;
+                        if vec_available {
+                            store.upsert_history_vector_vec0(id, &vector_json)?;
+                        }
                     }
-                }
+                    Ok(())
+                })?;
             }
             Err(e) => {
                 notes.push(format!("history vector indexing skipped: {}", e));
@@ -183,13 +176,16 @@ fn embed_genome_jobs(
                         store.ensure_genome_vec0_table(first.len())?;
                     }
                 }
-                for ((id, _), vec) in chunk.iter().zip(vectors.iter()) {
-                    let vector_json = serde_json::to_string(vec)?;
-                    store.upsert_genome_vector(id, &vector_json)?;
-                    if vec_available {
-                        store.upsert_genome_vector_vec0(id, &vector_json)?;
+                store.with_transaction(|_tx| {
+                    for ((id, _), vec) in chunk.iter().zip(vectors.iter()) {
+                        let vector_json = serde_json::to_string(vec)?;
+                        store.upsert_genome_vector(id, &vector_json)?;
+                        if vec_available {
+                            store.upsert_genome_vector_vec0(id, &vector_json)?;
+                        }
                     }
-                }
+                    Ok(())
+                })?;
             }
             Err(e) => {
                 notes.push(format!("genome vector indexing skipped: {}", e));
@@ -237,80 +233,86 @@ pub fn index_memory(
     }
 
     if matches!(scope, IndexScope::History | IndexScope::All) {
-        for h in history {
-            let id = h.session_id.clone();
-            let hash = history_hash(h);
-            let existing_hash = store.get_history_hash(&id)?;
-            let changed = rebuild || existing_hash.as_deref() != Some(hash.as_str());
-            let vector_missing = !store.has_history_vector(&id)?
-                || (vector_available && !store.has_history_vec0(&id)?);
+        store.with_transaction(|_tx| {
+            for h in history {
+                let id = h.session_id.clone();
+                let hash = history_hash(h);
+                let existing_hash = store.get_history_hash(&id)?;
+                let changed = rebuild || existing_hash.as_deref() != Some(hash.as_str());
+                let vector_missing = !store.has_history_vector(&id)?
+                    || (vector_available && !store.has_history_vec0(&id)?);
 
-            if changed {
-                store.delete_history_vector(&id)?;
-                let files_json = serde_json::to_string(&h.files_touched)?;
-                let tools_json = serde_json::to_string(&h.tools_used)?;
-                let search_text = history_search_text(h);
-                store.upsert_history(
-                    &id,
-                    &h.session_name,
-                    Some(&platform_str(h.platform)),
-                    &h.started_at.to_rfc3339(),
-                    &h.ended_at.to_rfc3339(),
-                    &h.summary,
-                    &files_json,
-                    &tools_json,
-                    &search_text,
-                    &hash,
-                )?;
+                if changed {
+                    store.delete_history_vector(&id)?;
+                    let files_json = serde_json::to_string(&h.files_touched)?;
+                    let tools_json = serde_json::to_string(&h.tools_used)?;
+                    let search_text = history_search_text(h);
+                    store.upsert_history(
+                        &id,
+                        &h.session_name,
+                        Some(&platform_str(h.platform)),
+                        &h.started_at.to_rfc3339(),
+                        &h.ended_at.to_rfc3339(),
+                        &h.summary,
+                        &files_json,
+                        &tools_json,
+                        &search_text,
+                        &hash,
+                    )?;
+                }
+
+                if config.retrieval_vector_enabled
+                    && config.retrieval_backend == "fts+vec"
+                    && (changed || vector_missing)
+                {
+                    history_embed_jobs.push((id.clone(), history_search_text(h)));
+                }
+
+                history_seen.insert(id);
+                history_count += 1;
             }
-
-            if config.retrieval_vector_enabled
-                && config.retrieval_backend == "fts+vec"
-                && (changed || vector_missing)
-            {
-                history_embed_jobs.push((id.clone(), history_search_text(h)));
-            }
-
-            history_seen.insert(id);
-            history_count += 1;
-        }
+            Ok(())
+        })?;
         store.delete_history_except(&history_seen)?;
     }
 
     if matches!(scope, IndexScope::Genome | IndexScope::All) {
-        for d in &genome.decisions {
-            let id = genome_id(d);
-            let hash = genome_hash(d);
-            let existing_hash = store.get_genome_hash(&id)?;
-            let changed = rebuild || existing_hash.as_deref() != Some(hash.as_str());
-            let vector_missing = !store.has_genome_vector(&id)?
-                || (vector_available && !store.has_genome_vec0(&id)?);
+        store.with_transaction(|_tx| {
+            for d in &genome.decisions {
+                let id = genome_id(d);
+                let hash = genome_hash(d);
+                let existing_hash = store.get_genome_hash(&id)?;
+                let changed = rebuild || existing_hash.as_deref() != Some(hash.as_str());
+                let vector_missing = !store.has_genome_vector(&id)?
+                    || (vector_available && !store.has_genome_vec0(&id)?);
 
-            if changed {
-                store.delete_genome_vector(&id)?;
-                let tags_json = serde_json::to_string(&d.tags)?;
-                let search_text = genome_search_text(d);
-                store.upsert_genome(
-                    &id,
-                    &d.date.to_rfc3339(),
-                    &d.description,
-                    d.rationale.as_deref(),
-                    &tags_json,
-                    &search_text,
-                    &hash,
-                )?;
+                if changed {
+                    store.delete_genome_vector(&id)?;
+                    let tags_json = serde_json::to_string(&d.tags)?;
+                    let search_text = genome_search_text(d);
+                    store.upsert_genome(
+                        &id,
+                        &d.date.to_rfc3339(),
+                        &d.description,
+                        d.rationale.as_deref(),
+                        &tags_json,
+                        &search_text,
+                        &hash,
+                    )?;
+                }
+
+                if config.retrieval_vector_enabled
+                    && config.retrieval_backend == "fts+vec"
+                    && (changed || vector_missing)
+                {
+                    genome_embed_jobs.push((id.clone(), genome_search_text(d)));
+                }
+
+                genome_seen.insert(id);
+                genome_count += 1;
             }
-
-            if config.retrieval_vector_enabled
-                && config.retrieval_backend == "fts+vec"
-                && (changed || vector_missing)
-            {
-                genome_embed_jobs.push((id.clone(), genome_search_text(d)));
-            }
-
-            genome_seen.insert(id);
-            genome_count += 1;
-        }
+            Ok(())
+        })?;
         store.delete_genome_except(&genome_seen)?;
     }
 
@@ -360,7 +362,7 @@ pub fn index_memory(
     };
 
     let state_path = base_path.join("retrieval_index_state.json");
-    write_atomic(&state_path, &serde_json::to_vec_pretty(&state)?)?;
+    Storage::atomic_write_path(&state_path, &serde_json::to_vec_pretty(&state)?)?;
 
     let _ = std::fs::create_dir_all(base_path.join("embeddings"));
     let marker_path = base_path.join("embeddings/index-meta.json");
@@ -372,7 +374,7 @@ pub fn index_memory(
         "vector_available": state.vector_available,
         "last_index_duration_ms": state.last_index_duration_ms,
     });
-    write_atomic(&marker_path, &serde_json::to_vec_pretty(&marker)?)?;
+    Storage::atomic_write_path(&marker_path, &serde_json::to_vec_pretty(&marker)?)?;
 
     Ok(state)
 }
@@ -412,42 +414,45 @@ pub fn index_memory_from_storage(
     }
 
     if matches!(scope, IndexScope::History | IndexScope::All) {
-        let _ = storage.read_jsonl_stream::<HistoryEntry, _>("HISTORY.jsonl", |h| {
-            let id = h.session_id.clone();
-            let hash = history_hash(&h);
-            let existing_hash = store.get_history_hash(&id)?;
-            let changed = rebuild || existing_hash.as_deref() != Some(hash.as_str());
-            let vector_missing = !store.has_history_vector(&id)?
-                || (vector_available && !store.has_history_vec0(&id)?);
+        store.with_transaction(|_tx| {
+            let _ = storage.read_jsonl_stream::<HistoryEntry, _>("HISTORY.jsonl", |h| {
+                let id = h.session_id.clone();
+                let hash = history_hash(&h);
+                let existing_hash = store.get_history_hash(&id)?;
+                let changed = rebuild || existing_hash.as_deref() != Some(hash.as_str());
+                let vector_missing = !store.has_history_vector(&id)?
+                    || (vector_available && !store.has_history_vec0(&id)?);
 
-            if changed {
-                store.delete_history_vector(&id)?;
-                let files_json = serde_json::to_string(&h.files_touched)?;
-                let tools_json = serde_json::to_string(&h.tools_used)?;
-                let search_text = history_search_text(&h);
-                store.upsert_history(
-                    &id,
-                    &h.session_name,
-                    Some(&platform_str(h.platform)),
-                    &h.started_at.to_rfc3339(),
-                    &h.ended_at.to_rfc3339(),
-                    &h.summary,
-                    &files_json,
-                    &tools_json,
-                    &search_text,
-                    &hash,
-                )?;
-            }
+                if changed {
+                    store.delete_history_vector(&id)?;
+                    let files_json = serde_json::to_string(&h.files_touched)?;
+                    let tools_json = serde_json::to_string(&h.tools_used)?;
+                    let search_text = history_search_text(&h);
+                    store.upsert_history(
+                        &id,
+                        &h.session_name,
+                        Some(&platform_str(h.platform)),
+                        &h.started_at.to_rfc3339(),
+                        &h.ended_at.to_rfc3339(),
+                        &h.summary,
+                        &files_json,
+                        &tools_json,
+                        &search_text,
+                        &hash,
+                    )?;
+                }
 
-            if config.retrieval_vector_enabled
-                && config.retrieval_backend == "fts+vec"
-                && (changed || vector_missing)
-            {
-                history_embed_jobs.push((id.clone(), history_search_text(&h)));
-            }
+                if config.retrieval_vector_enabled
+                    && config.retrieval_backend == "fts+vec"
+                    && (changed || vector_missing)
+                {
+                    history_embed_jobs.push((id.clone(), history_search_text(&h)));
+                }
 
-            history_seen.insert(id);
-            history_count += 1;
+                history_seen.insert(id);
+                history_count += 1;
+                Ok(())
+            })?;
             Ok(())
         })?;
         store.delete_history_except(&history_seen)?;
@@ -455,39 +460,42 @@ pub fn index_memory_from_storage(
 
     if matches!(scope, IndexScope::Genome | IndexScope::All) {
         let genome: Genome = storage.read_json("GENOME.md")?;
-        for d in &genome.decisions {
-            let id = genome_id(d);
-            let hash = genome_hash(d);
-            let existing_hash = store.get_genome_hash(&id)?;
-            let changed = rebuild || existing_hash.as_deref() != Some(hash.as_str());
-            let vector_missing = !store.has_genome_vector(&id)?
-                || (vector_available && !store.has_genome_vec0(&id)?);
+        store.with_transaction(|_tx| {
+            for d in &genome.decisions {
+                let id = genome_id(d);
+                let hash = genome_hash(d);
+                let existing_hash = store.get_genome_hash(&id)?;
+                let changed = rebuild || existing_hash.as_deref() != Some(hash.as_str());
+                let vector_missing = !store.has_genome_vector(&id)?
+                    || (vector_available && !store.has_genome_vec0(&id)?);
 
-            if changed {
-                store.delete_genome_vector(&id)?;
-                let tags_json = serde_json::to_string(&d.tags)?;
-                let search_text = genome_search_text(d);
-                store.upsert_genome(
-                    &id,
-                    &d.date.to_rfc3339(),
-                    &d.description,
-                    d.rationale.as_deref(),
-                    &tags_json,
-                    &search_text,
-                    &hash,
-                )?;
+                if changed {
+                    store.delete_genome_vector(&id)?;
+                    let tags_json = serde_json::to_string(&d.tags)?;
+                    let search_text = genome_search_text(d);
+                    store.upsert_genome(
+                        &id,
+                        &d.date.to_rfc3339(),
+                        &d.description,
+                        d.rationale.as_deref(),
+                        &tags_json,
+                        &search_text,
+                        &hash,
+                    )?;
+                }
+
+                if config.retrieval_vector_enabled
+                    && config.retrieval_backend == "fts+vec"
+                    && (changed || vector_missing)
+                {
+                    genome_embed_jobs.push((id.clone(), genome_search_text(d)));
+                }
+
+                genome_seen.insert(id);
+                genome_count += 1;
             }
-
-            if config.retrieval_vector_enabled
-                && config.retrieval_backend == "fts+vec"
-                && (changed || vector_missing)
-            {
-                genome_embed_jobs.push((id.clone(), genome_search_text(d)));
-            }
-
-            genome_seen.insert(id);
-            genome_count += 1;
-        }
+            Ok(())
+        })?;
         store.delete_genome_except(&genome_seen)?;
     }
 
@@ -537,7 +545,7 @@ pub fn index_memory_from_storage(
     };
 
     let state_path = storage.base_path().join("retrieval_index_state.json");
-    write_atomic(&state_path, &serde_json::to_vec_pretty(&state)?)?;
+    Storage::atomic_write_path(&state_path, &serde_json::to_vec_pretty(&state)?)?;
 
     let _ = std::fs::create_dir_all(storage.base_path().join("embeddings"));
     let marker_path = storage.base_path().join("embeddings/index-meta.json");
@@ -549,7 +557,7 @@ pub fn index_memory_from_storage(
         "vector_available": state.vector_available,
         "last_index_duration_ms": state.last_index_duration_ms,
     });
-    write_atomic(&marker_path, &serde_json::to_vec_pretty(&marker)?)?;
+    Storage::atomic_write_path(&marker_path, &serde_json::to_vec_pretty(&marker)?)?;
 
     Ok(state)
 }

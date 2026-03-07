@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 eframe = "0.31"
+impulse-ops = { path = "../impulse-ops" }
 impulse-term = { path = "../impulse-term" }
 which = "7"
 env_logger = "0.11"

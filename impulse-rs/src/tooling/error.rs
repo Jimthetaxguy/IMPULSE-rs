@@ -14,6 +14,9 @@ pub enum ToolError {
     #[error("Missing required capability: {0:?}")]
     MissingCapability(Capability),
 
+    #[error("Path not allowed for this tool execution: {0}")]
+    PathNotAllowed(String),
+
     #[error("Execution failed: {0}")]
     ExecutionFailed(String),
 

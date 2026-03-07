@@ -15,8 +15,8 @@ pub enum GuiError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
-    #[error("scaffold error: {0}")]
-    Scaffold(String),
+    #[error("ops error: {0}")]
+    Ops(#[from] impulse_ops::OpsError),
 }
 
 #[cfg(test)]
@@ -37,12 +37,6 @@ mod tests {
         let json_err: Result<serde_json::Value, _> = serde_json::from_str("{invalid");
         let err: GuiError = json_err.unwrap_err().into();
         assert!(err.to_string().contains("JSON error"));
-    }
-
-    #[test]
-    fn test_display_scaffold_error() {
-        let err = GuiError::Scaffold("no parent directory".to_string());
-        assert_eq!(err.to_string(), "scaffold error: no parent directory");
     }
 
     #[test]

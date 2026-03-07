@@ -1,15 +1,15 @@
 ---
 title: Documentation Index
 description: Master navigation hub for Impulse documentation
-version: '1.0'
-updated: 2026-02-24
+version: '1.1'
+updated: 2026-03-05
 type: doc
 category: navigation
 phase: all
 status: active
 audience: everyone
 tags: [index, navigation, discovery]
-last_updated: 2026-02-24
+last_updated: 2026-03-05
 authors:
   - name: James Pustorino
     role: Creator
@@ -23,7 +23,8 @@ authors:
 > **Quick start:** Read [`spec/RUST-CANONICAL-CONTRACT.md`](spec/RUST-CANONICAL-CONTRACT.md) first.
 >
 > **Canonical stack: Rust (impulse-rs)**
-> **Roadmap contract: Now=Rust core, Next=semantic retrieval, Later=advanced coordination UX**
+> **Roadmap contract: Now=Rust core + EGUI workbench, Next=daemon-truth EGUI + hook validation, Later=agent control + artifact polish**
+> **Risk register:** [`HONEST-ROADMAP.md`](HONEST-ROADMAP.md) stays canonical for unvalidated assumptions.
 
 > **Prefer `kdb` for searching.** The knowledge database indexes canonical docs with FTS5 full-text search:
 >
@@ -75,6 +76,7 @@ See [decisions/README.md](decisions/README.md) for full decision log.
 | [TEAM-ONBOARDING.md](guides/TEAM-ONBOARDING.md)                 | New contributor guide            |
 | [INTEGRATION-COOKBOOK.md](guides/INTEGRATION-COOKBOOK.md)       | Integration patterns and recipes |
 | [TOOLS-STATUS.md](guides/TOOLS-STATUS.md)                     | Tool installation and validation |
+| [HOOK-VALIDATION-GUIDE.md](guides/HOOK-VALIDATION-GUIDE.md)   | Real Claude hook proof before product claims |
 
 ### Phase Planning
 
@@ -84,10 +86,21 @@ See [decisions/README.md](decisions/README.md) for full decision log.
 | [PHASE1.5-COORDINATION.md](phases/PHASE1.5-COORDINATION.md) | Multi-agent coordination |
 | [PHASE2-PERSISTENCE.md](phases/PHASE2-PERSISTENCE.md)       | Persistence layer design |
 | [PHASE2-MIGRATION-PLAN.md](phases/PHASE2-MIGRATION-PLAN.md) | Migration strategy       |
+| [ROADMAP-PLAN.md](ROADMAP-PLAN.md)                          | Active roadmap reset for Rust + EGUI |
+| [IMPLEMENTATION-HANDOFF.md](plans/IMPLEMENTATION-HANDOFF.md)| Daemon-truth EGUI execution handoff |
+
+### Active EGUI Workbench Track
+
+| Document | Description |
+| -------- | ----------- |
+| [ROADMAP-PLAN.md](ROADMAP-PLAN.md) | Current roadmap and phase ordering for the operator workbench |
+| [IMPLEMENTATION-HANDOFF.md](plans/IMPLEMENTATION-HANDOFF.md) | Current execution sequence for daemon-truth EGUI work |
+| [IMPULSE_TERM_STATUS.md](../impulse-rs/docs/IMPULSE_TERM_STATUS.md) | Terminal telemetry status and remaining daemon integration gap |
+| [HONEST-ROADMAP.md](HONEST-ROADMAP.md) | Canonical validation risk register for hooks and memory claims |
 
 > **NOTE:** `spec/RUST-CANONICAL-CONTRACT.md` is authoritative for implementation. Legacy TypeScript/Bun docs are retained as historical reference unless explicitly marked active and aligned.
 
-> **Quick reference:** See `AGENTS.md` for simplified roadmap (Now/Next/Later/Future)
+> **Quick reference:** See `AGENTS.md` for the enforced roadmap contract and `HONEST-ROADMAP.md` for unresolved risks.
 
 ### Research & Analysis
 
@@ -120,7 +133,7 @@ See [research/README.md](research/README.md) for reading sequences by phase.
 | Document                                              | Topic                   |
 | ----------------------------------------------------- | ----------------------- |
 | [CLI-ARCHITECTURE.md](vision/CLI-ARCHITECTURE.md)     | Future CLI architecture |
-| [DASHBOARD-DESIGN.md](vision/DASHBOARD-DESIGN.md)     | Dashboard UI design     |
+| [DASHBOARD-DESIGN.md](vision/DASHBOARD-DESIGN.md)     | Historical EGUI/dashboard design reference |
 | [DYNAMIC-CLI-VISION.md](vision/DYNAMIC-CLI-VISION.md) | Dynamic CLI concepts    |
 | [BENCHMARKS.md](vision/BENCHMARKS.md)                 | Performance benchmarks  |
 | [DATA-MODELS.md](vision/DATA-MODELS.md)               | Data model designs      |
@@ -153,29 +166,29 @@ See [archive/README.md](archive/README.md) for full supersession history.
 
 ## By Phase
 
-### Now: Rust CLI + Hybrid Mode
+### Now: Rust Core + EGUI Workbench
 
 Start here:
 
 1. [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) — **Start here** - Product contract and interfaces
 2. [AGENTS.md](../AGENTS.md) — Current architecture and operational guidance
-3. [EFFICIENCY-ANALYSIS.md](research/EFFICIENCY-ANALYSIS.md) — Implementation patterns
-4. [BEST-PRACTICES.md](guides/BEST-PRACTICES.md) — Coding conventions
+3. [ROADMAP-PLAN.md](ROADMAP-PLAN.md) — Current roadmap and EGUI progress baseline
+4. [plans/IMPLEMENTATION-HANDOFF.md](plans/IMPLEMENTATION-HANDOFF.md) — Current implementation sequence
+5. [EFFICIENCY-ANALYSIS.md](research/EFFICIENCY-ANALYSIS.md) — Implementation patterns
+6. [BEST-PRACTICES.md](guides/BEST-PRACTICES.md) — Coding conventions
+
+### Next: Daemon-Truth EGUI + Hook Validation
+
+1. [HONEST-ROADMAP.md](HONEST-ROADMAP.md) — Validation risk register
+2. [ROADMAP-PLAN.md](ROADMAP-PLAN.md) — Daemon-truth and workbench stabilization lane
+3. [plans/IMPLEMENTATION-HANDOFF.md](plans/IMPLEMENTATION-HANDOFF.md) — Technical execution details
+4. [impulse-rs/docs/IMPULSE_TERM_STATUS.md](../impulse-rs/docs/IMPULSE_TERM_STATUS.md) — Terminal telemetry status
 5. [TESTING-FRAMEWORK.md](guides/TESTING-FRAMEWORK.md) — Test patterns
-6. [ADR-0002: File-first memory](decisions/0002-file-first-memory.md) — Why no DB
+6. [PHASE1.5-COORDINATION.md](phases/PHASE1.5-COORDINATION.md) — Coordination reference
 
-### Next: Retrieval Foundation + Review-First Injection
+### Later: Agent Control + Artifact Polish
 
-1. [PHASE2-PERSISTENCE.md](phases/PHASE2-PERSISTENCE.md) — Persistence design
-2. [PHASE2-MIGRATION-PLAN.md](phases/PHASE2-MIGRATION-PLAN.md) — Migration strategy
-3. [ADR-0003: Progressive search](decisions/0003-progressive-search.md) — FTS5 first
-4. [DATABASE-GUIDE.md](guides/DATABASE-GUIDE.md) — Database patterns
-5. [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) — Retrieval + injection command/artifact contract
-6. [PAGEINDEX-FEASIBILITY-DECISION.md](research/PAGEINDEX-FEASIBILITY-DECISION.md) — Current NO-GO decision
-
-### Future: Advanced UI
-
-1. [DASHBOARD-DESIGN.md](vision/DASHBOARD-DESIGN.md) — Dashboard concepts
+1. [DASHBOARD-DESIGN.md](vision/DASHBOARD-DESIGN.md) — Historical design reference
 2. [CLI-ARCHITECTURE.md](vision/CLI-ARCHITECTURE.md) — CLI evolution
 
 ---

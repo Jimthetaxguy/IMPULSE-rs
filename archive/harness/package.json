@@ -1,0 +1,34 @@
+{
+  "name": "@cockpit/harness",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "SWARM multi-agent coordination harness",
+  "scripts": {
+    "dev": "bun src/index.ts",
+    "test": "vitest run",
+    "test:watch": "vitest watch",
+    "lint": "eslint src --ext .ts",
+    "type-check": "tsc --noEmit",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "opencode-plugin-sdk": "^0.1.0",
+    "better-sqlite3": "^9.0.0",
+    "sqlite-vec": "^0.1.0",
+    "zod": "^3.20.0",
+    "pino": "^8.14.0",
+    "uuid": "^9.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/node": "^20.0.0",
+    "@types/uuid": "^9.0.0",
+    "typescript": "^5.0.0",
+    "vitest": "^0.34.0",
+    "eslint": "^8.40.0",
+    "@typescript-eslint/eslint-plugin": "^5.0.0",
+    "@typescript-eslint/parser": "^5.0.0"
+  }
+}

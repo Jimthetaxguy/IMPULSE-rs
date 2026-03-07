@@ -3216,6 +3216,7 @@ dependencies = [
  "dirs",
  "eframe",
  "env_logger",
+ "impulse-ops",
  "impulse-term",
  "libc",
  "log",
@@ -3226,6 +3227,17 @@ dependencies = [
  "thiserror 2.0.18",
  "ureq",
  "which",
+]
+
+[[package]]
+name = "impulse-ops"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -3243,6 +3255,7 @@ dependencies = [
  "docx-rs",
  "filetime",
  "glob",
+ "impulse-ops",
  "levenshtein",
  "portable-pty",
  "pyo3",

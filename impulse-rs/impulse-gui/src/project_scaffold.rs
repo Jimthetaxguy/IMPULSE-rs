@@ -42,19 +42,7 @@ pub fn scaffold_impulse_dir(target: &Path) -> Result<(), GuiError> {
 }
 
 fn atomic_write(path: &Path, content: &str) -> Result<(), GuiError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| GuiError::Scaffold("no parent directory".to_string()))?;
-    let tmp_path = parent.join(format!(
-        ".tmp.{}.{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-    std::fs::write(&tmp_path, content)?;
-    std::fs::rename(&tmp_path, path)?;
+    impulse_ops::atomic_write_path(path, content.as_bytes())?;
     Ok(())
 }
 

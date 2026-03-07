@@ -8,14 +8,14 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use impulse_term::context::{ContextHealth, ContextTier, ExtractedInsight, InsightType};
+use impulse_term::context::{ContextHealth, ContextTier, InsightType};
 use impulse_term::TerminalPanel;
 
-use crate::widgets::signal_bus::{GuiSignal, SignalKind, SignalUrgency, TabBadge};
+use crate::widgets::signal_bus::TabBadge;
 
 use super::terminal_search::TerminalSearch;
 use super::{View, ViewId};
-use crate::state::SharedState;
+use crate::state::{PollerCommand, SharedState};
 use crate::theme;
 use crate::theme::colors;
 
@@ -29,34 +29,36 @@ pub struct AgentInfo {
 }
 
 /// A single terminal tab.
-struct Tab {
+pub(super) struct Tab {
     #[allow(dead_code)]
-    id: u64,
-    label: String,
-    agent_name: &'static str,
-    panel: TerminalPanel,
+    pub(super) id: u64,
+    pub(super) label: String,
+    pub(super) agent_name: &'static str,
+    pub(super) panel: TerminalPanel,
     #[allow(dead_code)]
-    target_dir: PathBuf,
+    pub(super) target_dir: PathBuf,
+    /// Daemon session ID, set asynchronously after CreateTabSession round-trip.
+    pub(super) daemon_session_id: Option<String>,
 }
 
 /// A pending context injection — waiting for agent startup.
-struct PendingInjection {
-    tab_id: u64,
-    inject_at: Instant,
-    target_dir: PathBuf,
+pub(super) struct PendingInjection {
+    pub(super) tab_id: u64,
+    pub(super) inject_at: Instant,
+    pub(super) target_dir: PathBuf,
 }
 
 /// State snapshot of a tab for detecting changes between context ticks.
 #[derive(Default)]
-struct TabSnapshot {
-    insight_count: usize,
-    compaction_count: u32,
-    tier: Option<ContextTier>,
-    modified_files: HashSet<String>,
+pub(super) struct TabSnapshot {
+    pub(super) insight_count: usize,
+    pub(super) compaction_count: u32,
+    pub(super) tier: Option<ContextTier>,
+    pub(super) modified_files: HashSet<String>,
 }
 
 pub struct TerminalsView {
-    tabs: BTreeMap<u64, Tab>,
+    pub(super) tabs: BTreeMap<u64, Tab>,
     active_tab: Option<u64>,
     next_id: u64,
     pub agents: Vec<AgentInfo>,
@@ -67,23 +69,29 @@ pub struct TerminalsView {
     /// When set, the project selector should open for this agent name.
     pending_spawn_agent: Option<String>,
     /// Pending context injections waiting for agent startup.
-    pending_injections: Vec<PendingInjection>,
+    pub(super) pending_injections: Vec<PendingInjection>,
     /// Path to LIVE_INSIGHTS.jsonl for the active project.
-    live_insights_path: Option<PathBuf>,
+    pub(super) live_insights_path: Option<PathBuf>,
     /// Last injected tier per tab, for detecting tier crossings.
-    last_injected_tiers: BTreeMap<u64, ContextTier>,
+    pub(super) last_injected_tiers: BTreeMap<u64, ContextTier>,
     /// State snapshots for signal change detection.
-    tab_snapshots: BTreeMap<u64, TabSnapshot>,
+    pub(super) tab_snapshots: BTreeMap<u64, TabSnapshot>,
     /// Tab badges synced from SignalBus.
     tab_badges: BTreeMap<u64, TabBadge>,
     /// Tab whose badges should be acknowledged (set by tab click, consumed by app.rs).
     badge_acknowledged_tab: Option<u64>,
     /// Tabs closed this frame, pending signal_bus.remove_tab() in app.rs.
     closed_tabs: Vec<u64>,
+    /// Active file conflicts per tab: (file_path, conflicting_tab_label)
+    pub active_conflicts: HashMap<u64, Vec<(String, String)>>,
+    /// Channel to send commands to the poller thread for daemon session management.
+    pub(super) poller_cmd: Option<std::sync::mpsc::Sender<PollerCommand>>,
+    /// Files already tracked with the daemon for each session (dedup guard).
+    pub(super) tracked_files: HashMap<String, HashSet<String>>,
 }
 
 impl TerminalsView {
-    pub fn new() -> Self {
+    pub fn new(poller_cmd: Option<std::sync::mpsc::Sender<PollerCommand>>) -> Self {
         let agents = vec![
             AgentInfo {
                 name: "Claude Code",
@@ -132,6 +140,9 @@ impl TerminalsView {
             tab_badges: BTreeMap::new(),
             badge_acknowledged_tab: None,
             closed_tabs: Vec::new(),
+            active_conflicts: HashMap::new(),
+            poller_cmd,
+            tracked_files: HashMap::new(),
         }
     }
 
@@ -232,10 +243,11 @@ impl TerminalsView {
 
                 let tab = Tab {
                     id,
-                    label,
+                    label: label.clone(),
                     agent_name: agent.name,
                     panel,
                     target_dir: target_dir.to_path_buf(),
+                    daemon_session_id: None,
                 };
                 self.tabs.insert(id, tab);
                 self.active_tab = Some(id);
@@ -245,6 +257,17 @@ impl TerminalsView {
                     agent.name,
                     target_dir.display()
                 );
+
+                // Request daemon session creation for this tab.
+                if let Some(ref cmd_tx) = self.poller_cmd {
+                    let session_name =
+                        format!("gui-{}-{}", agent.name.to_lowercase().replace(' ', "-"), id);
+                    let _ = cmd_tx.send(PollerCommand::CreateTabSession {
+                        tab_id: id,
+                        name: session_name,
+                        platform: agent.name.to_string(),
+                    });
+                }
 
                 // Schedule init context injection after startup delay.
                 let delay = match agent.name {
@@ -269,51 +292,24 @@ impl TerminalsView {
         self.pending_spawn_agent.take()
     }
 
-    /// Process pending init injections (called from app.rs update loop).
-    pub fn process_pending_injections(&mut self, impulse_home: &Path) {
-        let now = Instant::now();
-
-        // Drain ready injections (stable alternative to nightly drain_filter).
-        let mut i = 0;
-        while i < self.pending_injections.len() {
-            if now >= self.pending_injections[i].inject_at {
-                let pending = self.pending_injections.remove(i);
-
-                if let Some(tab) = self.tabs.get_mut(&pending.tab_id) {
-                    let identity = crate::identity::load_identity(impulse_home).unwrap_or_default();
-
-                    let project_name = pending
-                        .target_dir
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "unknown".to_string());
-
-                    let context =
-                        build_init_context(&identity, &pending.target_dir, tab.agent_name);
-
-                    match tab.panel.context_bridge().inject_context(&context) {
-                        Ok(()) => log::info!(
-                            "Injected init context into tab {} ({})",
-                            pending.tab_id,
-                            project_name
-                        ),
-                        Err(e) => log::warn!(
-                            "Failed to inject init context into tab {}: {}",
-                            pending.tab_id,
-                            e
-                        ),
-                    }
-                }
-            } else {
-                i += 1;
-            }
-        }
-    }
-
     fn close_tab(&mut self, id: u64) {
         // Merge this tab's insights into HISTORY.jsonl before closing.
         if let Some(tab) = self.tabs.get(&id) {
             self.merge_tab_insights_to_history(id, tab.agent_name, tab.label.clone());
+
+            // End daemon session if one was created.
+            if let Some(ref session_id) = tab.daemon_session_id {
+                let summary = self.build_close_summary(id, tab);
+                if let Some(ref cmd_tx) = self.poller_cmd {
+                    let _ = cmd_tx.send(PollerCommand::EndTabSession {
+                        tab_id: id,
+                        session_id: session_id.clone(),
+                        summary,
+                    });
+                }
+                self.tracked_files.remove(session_id);
+            }
+
             tab.panel.kill();
         }
         self.tabs.remove(&id);
@@ -356,6 +352,7 @@ impl TerminalsView {
     /// Clean up all tabs (called on exit).
     ///
     /// Merges all remaining pane insights into HISTORY.jsonl before killing.
+    /// Ends all daemon sessions with summaries.
     pub fn shutdown(&mut self) {
         let tab_info: Vec<(u64, &'static str, String)> = self
             .tabs
@@ -363,8 +360,22 @@ impl TerminalsView {
             .map(|(&id, tab)| (id, tab.agent_name, tab.label.clone()))
             .collect();
 
-        for (id, agent_name, label) in tab_info {
-            self.merge_tab_insights_to_history(id, agent_name, label);
+        for (id, agent_name, label) in &tab_info {
+            self.merge_tab_insights_to_history(*id, agent_name, label.clone());
+        }
+
+        // End all daemon sessions.
+        if let Some(ref cmd_tx) = self.poller_cmd {
+            for (&id, tab) in &self.tabs {
+                if let Some(ref session_id) = tab.daemon_session_id {
+                    let summary = self.build_close_summary(id, tab);
+                    let _ = cmd_tx.send(PollerCommand::EndTabSession {
+                        tab_id: id,
+                        session_id: session_id.clone(),
+                        summary,
+                    });
+                }
+            }
         }
 
         for tab in self.tabs.values() {
@@ -375,12 +386,8 @@ impl TerminalsView {
         self.last_injected_tiers.clear();
         self.tab_snapshots.clear();
         self.tab_badges.clear();
+        self.tracked_files.clear();
         self.active_tab = None;
-    }
-
-    /// Tab count for status bar display.
-    pub fn tab_count(&self) -> usize {
-        self.tabs.len()
     }
 
     /// Set tab badges from SignalBus (replaces direct field access).
@@ -398,44 +405,40 @@ impl TerminalsView {
         std::mem::take(&mut self.closed_tabs)
     }
 
-    /// Active agent info for the status bar.
-    pub fn active_agent_info(&self) -> Vec<crate::widgets::status_bar::ActiveAgent> {
-        self.tabs
-            .values()
-            .map(|tab| crate::widgets::status_bar::ActiveAgent {
-                name: tab.agent_name,
-                alive: tab.panel.is_alive(),
-            })
-            .collect()
+    /// Set the daemon session ID for a tab (called from app.rs on TabSessionCreated).
+    pub fn set_daemon_session_id(&mut self, tab_id: u64, session_id: String) {
+        if let Some(tab) = self.tabs.get_mut(&tab_id) {
+            log::info!("Tab {} linked to daemon session {}", tab_id, session_id);
+            tab.daemon_session_id = Some(session_id);
+        }
+    }
+
+    /// Build a summary string for ending a daemon session on tab close.
+    fn build_close_summary(&self, id: u64, tab: &Tab) -> String {
+        let insights = tab.panel.insights();
+        let file_count = insights
+            .iter()
+            .filter(|i| i.insight_type == InsightType::FileModified)
+            .map(|i| &i.content)
+            .collect::<HashSet<_>>()
+            .len();
+        let error_count = insights
+            .iter()
+            .filter(|i| i.insight_type == InsightType::ErrorEncountered)
+            .count();
+        format!(
+            "GUI tab {} closed: {} insights, {} files, {} errors",
+            id,
+            insights.len(),
+            file_count,
+            error_count
+        )
     }
 
     /// Count of alive tabs.
     #[allow(dead_code)]
     pub fn alive_count(&self) -> usize {
         self.tabs.values().filter(|t| t.panel.is_alive()).count()
-    }
-
-    /// Collect recent insights from all alive terminal panes.
-    ///
-    /// Returns formatted strings like `[Claude Code] Modified src/main.rs`
-    /// suitable for injecting into the agent panel as cross-pane context.
-    pub fn collected_insights(&mut self) -> Vec<String> {
-        let mut insights = Vec::new();
-        for tab in self.tabs.values_mut() {
-            if tab.panel.is_alive() {
-                let bridge = tab.panel.context_bridge();
-                for insight in bridge.insights().iter().rev().take(5) {
-                    insights.push(format!(
-                        "[{}] {}: {}",
-                        tab.label,
-                        insight.insight_type.as_str(),
-                        insight.content
-                    ));
-                }
-            }
-        }
-        insights.dedup();
-        insights
     }
 
     /// Inject context into a terminal pane via its ContextBridge.
@@ -479,313 +482,207 @@ impl TerminalsView {
         }
     }
 
-    /// Run context extraction tick on all alive panels.
-    ///
-    /// Collects newly extracted insights and persists them to LIVE_INSIGHTS.jsonl.
-    pub fn context_tick(&mut self) {
-        let mut new_insights: Vec<ExtractedInsight> = Vec::new();
-
-        for tab in self.tabs.values_mut() {
-            if tab.panel.is_alive() {
-                let extracted = tab.panel.context_bridge().extract_tick();
-                if !extracted.is_empty() {
-                    new_insights.extend(extracted);
-                }
-            }
+    fn resolve_tab_id_for_agent(&self, agent_id: &str, session_id: Option<&str>) -> Option<u64> {
+        if let Some(tab_id) = agent_id
+            .strip_prefix("tab-")
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|tab_id| self.tabs.contains_key(tab_id))
+        {
+            return Some(tab_id);
         }
 
-        if !new_insights.is_empty() {
-            self.persist_insights(&new_insights);
+        if let Some(session_id) = session_id {
+            return self.tabs.iter().find_map(|(tab_id, tab)| {
+                let runtime_id = format!("tab-{}", tab_id);
+                (runtime_id == session_id || tab.label == session_id).then_some(*tab_id)
+            });
         }
+
+        self.tabs.iter().find_map(|(tab_id, tab)| {
+            (tab.label == agent_id || tab.agent_name == agent_id).then_some(*tab_id)
+        })
     }
 
-    /// Compare tab states against snapshots and emit signals for changes.
-    ///
-    /// Called after `context_tick()` in the 3-second tick block. Detects:
-    /// - New errors/task completions from insight diffs
-    /// - Compaction events from compaction count changes
-    /// - Context tier crossings (60%, 80%)
-    /// - Cross-tab file conflicts from modified_files set intersection
-    pub fn collect_signals(&mut self) -> Vec<GuiSignal> {
-        if self.tabs.is_empty() {
-            return Vec::new();
-        }
-        let mut signals = Vec::new();
-        let now = Instant::now();
-        let tab_ids: Vec<u64> = self.tabs.keys().copied().collect();
+    pub fn focus_agent(&mut self, agent_id: &str, session_id: Option<&str>) -> bool {
+        self.resolve_tab_id_for_agent(agent_id, session_id)
+            .map(|tab_id| self.focus_tab(tab_id))
+            .unwrap_or(false)
+    }
 
-        // Phase 1: Collect per-tab signals by comparing against snapshots.
-        for &id in &tab_ids {
-            let Some(tab) = self.tabs.get(&id) else {
-                continue;
-            };
-            if !tab.panel.is_alive() {
-                continue;
-            }
+    pub fn send_to_agent(&self, agent_id: &str, session_id: Option<&str>, content: &str) -> bool {
+        self.resolve_tab_id_for_agent(agent_id, session_id)
+            .map(|tab_id| self.send_to_tab(tab_id, content))
+            .unwrap_or(false)
+    }
 
-            let health = tab.panel.context_health();
-            let insights = tab.panel.insights();
-            let snapshot = self.tab_snapshots.entry(id).or_default();
+    fn render_ops_roster(&mut self, ui: &mut egui::Ui, state: &SharedState) {
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Agent Fleet")
+                        .strong()
+                        .color(colors::ACCENT),
+                );
 
-            // Check for new insights since last snapshot.
-            if insights.len() > snapshot.insight_count {
-                let new_insights = &insights[snapshot.insight_count..];
-                for insight in new_insights {
-                    match insight.insight_type {
-                        InsightType::ErrorEncountered => {
-                            signals.push(GuiSignal {
-                                kind: SignalKind::ErrorEncountered,
-                                urgency: SignalUrgency::Important,
-                                tab_id: Some(id),
-                                message: format!(
-                                    "[{}] Error: {}",
-                                    tab.label,
-                                    impulse_term::context::truncate_insight(&insight.content, 80)
-                                ),
-                                created_at: now,
-                            });
-                        }
-                        InsightType::TaskCompleted => {
-                            signals.push(GuiSignal {
-                                kind: SignalKind::TaskCompleted,
-                                urgency: SignalUrgency::Important,
-                                tab_id: Some(id),
-                                message: format!(
-                                    "[{}] Task completed: {}",
-                                    tab.label,
-                                    impulse_term::context::truncate_insight(&insight.content, 60)
-                                ),
-                                created_at: now,
-                            });
-                        }
-                        InsightType::FileModified => {
-                            snapshot.modified_files.insert(insight.content.clone());
-                        }
-                        InsightType::DecisionMade => {}
-                    }
+                if let Some(snapshot) = &state.ops_snapshot {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} daemon agents  {} alerts",
+                            snapshot.agents.len(),
+                            snapshot.interventions.len()
+                        ))
+                        .small()
+                        .color(colors::TEXT_MUTED),
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new("Waiting for daemon snapshot")
+                            .small()
+                            .color(colors::TEXT_DIM),
+                    );
                 }
-                snapshot.insight_count = insights.len();
-            }
 
-            // Check compaction count changes.
-            if health.compaction_count > snapshot.compaction_count {
-                signals.push(GuiSignal {
-                    kind: SignalKind::CompactionDetected,
-                    urgency: SignalUrgency::Important,
-                    tab_id: Some(id),
-                    message: format!(
-                        "[{}] Context compacted \u{2014} some memory was lost",
-                        tab.label
-                    ),
-                    created_at: now,
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{} local terminals", self.tabs.len()))
+                            .small()
+                            .color(colors::TEXT_MUTED),
+                    );
                 });
-                snapshot.compaction_count = health.compaction_count;
+            });
+
+            ui.add_space(4.0);
+
+            if let Some(snapshot) = &state.ops_snapshot {
+                if snapshot.agents.is_empty() {
+                    ui.label(
+                        egui::RichText::new("No agents reported by the daemon yet.")
+                            .color(colors::TEXT_DIM),
+                    );
+                } else {
+                    egui::ScrollArea::vertical()
+                        .max_height(180.0)
+                        .show(ui, |ui| {
+                            for agent in &snapshot.agents {
+                                ui.group(|ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(&agent.label)
+                                                .strong()
+                                                .color(theme::agent_color(&agent.backend_kind)),
+                                        );
+                                        if agent.ephemeral {
+                                            ui.label(
+                                                egui::RichText::new("telemetry")
+                                                    .small()
+                                                    .color(colors::YELLOW),
+                                            );
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{}  {}",
+                                                agent.backend_kind, agent.status
+                                            ))
+                                            .small()
+                                            .color(colors::TEXT_MUTED),
+                                        );
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "Context {}",
+                                                        agent.context.tier
+                                                    ))
+                                                    .small()
+                                                    .color(colors::TEXT_MUTED),
+                                                );
+                                            },
+                                        );
+                                    });
+
+                                    if let Some(task) = &agent.current_task {
+                                        ui.label(
+                                            egui::RichText::new(task).small().color(colors::TEXT),
+                                        );
+                                    }
+
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "dir: {}",
+                                                agent.working_directory
+                                            ))
+                                            .small()
+                                            .color(colors::TEXT_DIM),
+                                        );
+                                        ui.separator();
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "reviews: {}",
+                                                agent.context.pending_review_count
+                                            ))
+                                            .small()
+                                            .color(colors::TEXT_DIM),
+                                        );
+                                        ui.separator();
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "compactions: {}",
+                                                agent.context.compaction_count
+                                            ))
+                                            .small()
+                                            .color(colors::TEXT_DIM),
+                                        );
+                                    });
+
+                                    for warning in agent.warnings.iter().take(2) {
+                                        ui.label(
+                                            egui::RichText::new(warning)
+                                                .small()
+                                                .color(colors::YELLOW),
+                                        );
+                                    }
+                                });
+                                ui.add_space(4.0);
+                            }
+                        });
+                }
             }
 
-            // Check tier crossings.
-            let current_tier = health.tier;
-            let previous_tier = snapshot.tier;
-            if previous_tier != Some(current_tier) {
-                match current_tier {
-                    ContextTier::Critical => {
-                        signals.push(GuiSignal {
-                            kind: SignalKind::ContextThreshold { pct: 60 },
-                            urgency: SignalUrgency::Important,
-                            tab_id: Some(id),
-                            message: format!(
-                                "[{}] Context at 60% \u{2014} consider compacting soon",
-                                tab.label
-                            ),
-                            created_at: now,
-                        });
+            if !self.tabs.is_empty() {
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new("Attached terminals")
+                            .small()
+                            .color(colors::TEXT_MUTED),
+                    );
+                    let tab_ids: Vec<u64> = self.tabs.keys().copied().collect();
+                    for id in tab_ids {
+                        if let Some(tab) = self.tabs.get(&id) {
+                            let selected = self.active_tab == Some(id);
+                            let label = format!("{} #{}", tab.label, id);
+                            if ui.selectable_label(selected, label).clicked() {
+                                self.active_tab = Some(id);
+                            }
+                        }
                     }
-                    ContextTier::Minimal => {
-                        signals.push(GuiSignal {
-                            kind: SignalKind::ContextThreshold { pct: 80 },
-                            urgency: SignalUrgency::Urgent,
-                            tab_id: Some(id),
-                            message: format!(
-                                "[{}] Context at 80% \u{2014} compact or start fresh",
-                                tab.label
-                            ),
-                            created_at: now,
-                        });
-                    }
-                    _ => {}
-                }
-                snapshot.tier = Some(current_tier);
-            }
-        }
-
-        // Phase 2: Single-pass conflict detection via file→owners map.
-        let mut file_owners: HashMap<&str, Vec<(u64, &str)>> = HashMap::new();
-        for &id in &tab_ids {
-            if let Some(snap) = self.tab_snapshots.get(&id) {
-                let label = self.tabs.get(&id).map(|t| t.label.as_str()).unwrap_or("");
-                for file in &snap.modified_files {
-                    file_owners
-                        .entry(file.as_str())
-                        .or_default()
-                        .push((id, label));
-                }
-            }
-        }
-        for (file, owners) in &file_owners {
-            if owners.len() < 2 {
-                continue;
-            }
-            let mut push_conflict = |tab_id: u64, other_label: &str| {
-                signals.push(GuiSignal {
-                    kind: SignalKind::FileConflict {
-                        path: file.to_string(),
-                        other_tab: other_label.to_string(),
-                    },
-                    urgency: SignalUrgency::Urgent,
-                    tab_id: Some(tab_id),
-                    message: format!(
-                        "Conflict: {} edited in both tabs (also in {})",
-                        file, other_label
-                    ),
-                    created_at: now,
                 });
-            };
-            for i in 0..owners.len() {
-                for j in (i + 1)..owners.len() {
-                    let (id_a, label_a) = owners[i];
-                    let (id_b, label_b) = owners[j];
-                    // Emit one signal per direction (A sees B, B sees A).
-                    push_conflict(id_a, label_b);
-                    push_conflict(id_b, label_a);
-                }
             }
-        }
-
-        signals
-    }
-
-    /// Append insights to LIVE_INSIGHTS.jsonl.
-    fn persist_insights(&self, insights: &[ExtractedInsight]) {
-        let Some(path) = &self.live_insights_path else {
-            return;
-        };
-        super::memory_persistence::persist_insights_to_file(path, insights);
-    }
-
-    /// Check tier crossings and inject refresh context on threshold changes.
-    ///
-    /// Tracks `last_injected_tier` per tab. When a tier crossing is detected,
-    /// builds refresh context with tier info, cross-pane insights, and recent
-    /// GENOME decisions, then injects via the ContextBridge.
-    pub fn check_threshold_injections(&mut self, genome_decisions: &[String]) {
-        // Phase 1: Collect info immutably — which tabs need injection and what context.
-        let mut injections: Vec<(u64, String)> = Vec::new();
-
-        let tab_ids: Vec<u64> = self.tabs.keys().copied().collect();
-
-        for &id in &tab_ids {
-            let Some(tab) = self.tabs.get(&id) else {
-                continue;
-            };
-            if !tab.panel.is_alive() {
-                continue;
-            }
-            let current_tier = tab.panel.current_tier();
-
-            // Only inject on meaningful tiers (not None, not PostCompaction).
-            let should_inject = matches!(
-                current_tier,
-                ContextTier::Essential | ContextTier::Critical | ContextTier::Minimal
-            );
-            if !should_inject {
-                continue;
-            }
-
-            // Check if this is a new tier crossing.
-            let last_tier = self.last_injected_tiers.get(&id).copied();
-            if last_tier == Some(current_tier) {
-                continue;
-            }
-            self.last_injected_tiers.insert(id, current_tier);
-
-            // Collect cross-pane insights from other alive panes (immutable access).
-            let mut cross_pane = Vec::new();
-            for (&other_id, other_tab) in &self.tabs {
-                if other_id == id || !other_tab.panel.is_alive() {
-                    continue;
-                }
-                for insight in other_tab.panel.insights().iter().rev().take(3) {
-                    cross_pane.push(format!(
-                        "  - [{}] {}: {}",
-                        other_tab.label,
-                        insight.insight_type.as_str(),
-                        insight.content
-                    ));
-                }
-            }
-
-            // Build refresh context via extracted pure function.
-            if let Some(refresh) = super::memory_persistence::build_refresh_context(
-                current_tier,
-                &cross_pane,
-                genome_decisions,
-            ) {
-                injections.push((id, refresh));
-            }
-        }
-
-        // Phase 2: Inject via ContextBridge (requires &mut).
-        for (id, refresh) in injections {
-            if let Some(tab) = self.tabs.get_mut(&id) {
-                match tab.panel.context_bridge().inject_context(&refresh) {
-                    Ok(()) => {
-                        log::info!("Injected refresh context into tab {}", id);
-                    }
-                    Err(e) => {
-                        log::warn!("Threshold injection failed for tab {}: {}", id, e);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Merge a closing tab's insights into HISTORY.jsonl.
-    fn merge_tab_insights_to_history(&self, pane_id: u64, agent_name: &str, label: String) {
-        let Some(insights_path) = &self.live_insights_path else {
-            return;
-        };
-        let history_path = insights_path
-            .parent()
-            .map(|p| p.join("HISTORY.jsonl"))
-            .unwrap_or_default();
-        if !history_path.as_os_str().is_empty() {
-            super::memory_persistence::merge_pane_to_history(
-                insights_path,
-                &history_path,
-                pane_id,
-                agent_name,
-                &label,
-            );
-        }
-    }
-
-    /// Load and search live insights for a query (keyword match).
-    pub fn search_live_insights(
-        &self,
-        query: &str,
-    ) -> Vec<super::memory_persistence::LiveInsightResult> {
-        let Some(path) = &self.live_insights_path else {
-            return Vec::new();
-        };
-        super::memory_persistence::search_insights(path, query)
+        });
     }
 }
 
 impl View for TerminalsView {
     fn id(&self) -> ViewId {
-        ViewId::Terminals
+        ViewId::Agents
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _state: &SharedState, _ctx: &egui::Context) {
+    fn ui(&mut self, ui: &mut egui::Ui, state: &SharedState, _ctx: &egui::Context) {
+        self.render_ops_roster(ui, state);
+        ui.add_space(6.0);
+
         // --- Search overlay (Ctrl+F) ---
         if self.search.active {
             // Collect pane texts (borrow tabs only, not search).
@@ -907,23 +804,22 @@ impl View for TerminalsView {
 
             // Spawn buttons inline in the tab bar.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let agents = self.agents.clone();
-                for agent in agents.iter().rev() {
-                    let btn = egui::Button::new(egui::RichText::new(agent.name).color(
-                        if agent.available {
-                            theme::agent_color(agent.name)
-                        } else {
-                            colors::TEXT_FAINT
-                        },
-                    ))
+                for i in (0..self.agents.len()).rev() {
+                    let name = self.agents[i].name;
+                    let available = self.agents[i].available;
+                    let btn = egui::Button::new(egui::RichText::new(name).color(if available {
+                        theme::agent_color(name)
+                    } else {
+                        colors::TEXT_FAINT
+                    }))
                     .small();
 
-                    let resp = ui.add_enabled(agent.available, btn);
+                    let resp = ui.add_enabled(available, btn);
                     if resp.clicked() {
-                        self.pending_spawn_agent = Some(agent.name.to_string());
+                        self.pending_spawn_agent = Some(name.to_string());
                     }
-                    if !agent.available {
-                        resp.on_hover_text(format!("{} not found on PATH", agent.name));
+                    if !available {
+                        resp.on_hover_text(format!("{} not found on PATH", name));
                     }
                 }
                 ui.weak("Spawn:");
@@ -947,6 +843,16 @@ impl View for TerminalsView {
         // --- Terminal or welcome ---
         if let Some(active_id) = self.active_tab {
             if let Some(tab) = self.tabs.get_mut(&active_id) {
+                // Show conflict banner if any conflicts exist for this tab
+                if let Some(conflicts) = self.active_conflicts.get(&active_id) {
+                    if let Some(resp) = crate::widgets::conflict_banner::show(ui, conflicts) {
+                        if resp.clicked() {
+                            // Acknowledge conflict placeholder
+                        }
+                    }
+                    ui.add_space(4.0);
+                }
+
                 tab.panel.set_focused(true);
                 tab.panel.show(ui);
             }
@@ -974,10 +880,14 @@ impl View for TerminalsView {
                 );
                 ui.add_space(8.0);
 
-                let agents = self.agents.clone();
-                let available: Vec<_> = agents.iter().filter(|a| a.available).collect();
+                let available_names: Vec<&'static str> = self
+                    .agents
+                    .iter()
+                    .filter(|a| a.available)
+                    .map(|a| a.name)
+                    .collect();
 
-                if available.is_empty() {
+                if available_names.is_empty() {
                     ui.label(
                         egui::RichText::new("No agents found on PATH.").color(colors::TEXT_DIM),
                     );
@@ -985,20 +895,19 @@ impl View for TerminalsView {
                     ui.horizontal(|ui| {
                         ui.add_space(
                             (ui.available_width()
-                                - (available.len() as f32 * 100.0)
-                                - ((available.len() as f32 - 1.0) * 8.0))
+                                - (available_names.len() as f32 * 100.0)
+                                - ((available_names.len() as f32 - 1.0) * 8.0))
                                 .max(0.0)
                                 / 2.0,
                         );
-                        for agent in &available {
-                            let color = theme::agent_color(agent.name);
-                            let btn =
-                                egui::Button::new(egui::RichText::new(agent.name).color(color))
-                                    .min_size(egui::vec2(90.0, 32.0))
-                                    .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.4)));
+                        for &name in &available_names {
+                            let color = theme::agent_color(name);
+                            let btn = egui::Button::new(egui::RichText::new(name).color(color))
+                                .min_size(egui::vec2(90.0, 32.0))
+                                .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.4)));
 
                             if ui.add(btn).clicked() {
-                                self.pending_spawn_agent = Some(agent.name.to_string());
+                                self.pending_spawn_agent = Some(name.to_string());
                             }
                             ui.add_space(4.0);
                         }
@@ -1208,7 +1117,7 @@ fn default_shell() -> &'static str {
 ///
 /// Includes identity, project info, standing GENOME decisions, last session
 /// summary, and a tools reference. Sections are omitted when data is absent.
-fn build_init_context(identity: &str, target_dir: &Path, agent_name: &str) -> String {
+pub(super) fn build_init_context(identity: &str, target_dir: &Path, agent_name: &str) -> String {
     let project_impulse_dir = target_dir.join(".impulse");
 
     let decisions = crate::project_context::load_recent_decisions(&project_impulse_dir, 5);

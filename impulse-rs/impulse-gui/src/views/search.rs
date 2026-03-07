@@ -21,16 +21,24 @@ impl SearchView {
         }
     }
 
+    pub fn set_query(&mut self, query: impl Into<String>) {
+        self.query = query.into();
+    }
+
     fn submit(&self) {
         if !self.query.trim().is_empty() {
             let _ = self.cmd_tx.send(PollerCommand::Search(self.query.clone()));
         }
     }
+
+    pub fn submit_current(&self) {
+        self.submit();
+    }
 }
 
 impl View for SearchView {
     fn id(&self) -> ViewId {
-        ViewId::Search
+        ViewId::Memory
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, state: &SharedState, _ctx: &egui::Context) {
