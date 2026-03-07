@@ -29,6 +29,7 @@ pub mod ops_workbench;
 pub mod orchestration;
 pub mod plugin;
 pub mod retrieval;
+pub mod semantic_diff;
 pub mod state;
 pub mod stewardship;
 pub mod storage;
@@ -94,6 +95,9 @@ enum Commands {
         summary: String,
         #[arg(long)]
         verify: bool,
+        /// Capture semantic diff (requires sem CLI). Provide base ref (e.g. commit at session start)
+        #[arg(long)]
+        sem_diff_base: Option<String>,
     },
     TrackWrite {
         #[arg(short, long)]
@@ -524,6 +528,45 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Semantic diff between two Git refs using the `sem` tool
+    SemDiff {
+        /// Base Git ref (commit, branch, tag). Defaults to HEAD~1
+        #[arg(long, default_value = "HEAD~1")]
+        base: String,
+        /// Head Git ref. Defaults to HEAD
+        #[arg(long, default_value = "HEAD")]
+        head: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+        /// Session ID to associate the diff with (stores result)
+        #[arg(long)]
+        session_id: Option<String>,
+    },
+    /// Semantic blame for a file (entity-level git blame)
+    SemBlame {
+        /// File to blame
+        #[arg(long)]
+        file: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Semantic impact analysis for an entity (blast radius)
+    SemImpact {
+        /// Entity name to analyze (e.g. function or struct name)
+        #[arg(long)]
+        entity: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check if the sem CLI tool is available
+    SemStatus {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Show conflict analytics and statistics
     Analytics {
         /// Analytics type: conflicts
@@ -653,6 +696,7 @@ async fn run_daemon_mode(cli: Cli) -> Result<()> {
             session_id,
             summary,
             verify: should_verify,
+            sem_diff_base,
         } => {
             let stdin_payload = handlers::read_hook_stdin_payload();
             if should_verify {
@@ -661,6 +705,25 @@ async fn run_daemon_mode(cli: Cli) -> Result<()> {
                 handlers::print_verification_report(&report);
                 if !report.success() {
                     anyhow::bail!("Verification failed. Session end blocked.");
+                }
+            }
+            // Capture semantic diff if requested and sem is available
+            if let Some(base_ref) = &sem_diff_base {
+                if semantic_diff::sem_available() {
+                    match semantic_diff::capture_semantic_diff(
+                        &cli.impulse_dir,
+                        &std::env::current_dir()?,
+                        &session_id,
+                        base_ref,
+                        "HEAD",
+                    ) {
+                        Ok(report) => {
+                            if !report.changes.is_empty() {
+                                eprintln!("Semantic diff: {}", report.summary);
+                            }
+                        }
+                        Err(e) => eprintln!("Warning: semantic diff failed: {}", e),
+                    }
                 }
             }
             match client
@@ -877,8 +940,16 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
             session_id,
             summary,
             verify,
+            sem_diff_base,
         } => {
-            handlers::session::handle_session_end(&state, session_id, summary, verify).await?;
+            handlers::session::handle_session_end(
+                &state,
+                session_id,
+                summary,
+                verify,
+                sem_diff_base,
+            )
+            .await?;
         }
         Commands::TrackWrite { file, session_id } => {
             handlers::session::handle_track_write(&state, file, session_id).await?;
@@ -1212,6 +1283,25 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
         }
         Commands::AgentQuery { prompt, json } => {
             handlers::agent::handle_agent_query(&state, prompt, json).await?;
+        }
+        Commands::SemDiff {
+            base,
+            head,
+            json,
+            session_id,
+        } => {
+            handlers::semantic_diff_handlers::handle_sem_diff(
+                &state, base, head, json, session_id,
+            )?;
+        }
+        Commands::SemBlame { file, json } => {
+            handlers::semantic_diff_handlers::handle_sem_blame(file, json)?;
+        }
+        Commands::SemImpact { entity, json } => {
+            handlers::semantic_diff_handlers::handle_sem_impact(entity, json)?;
+        }
+        Commands::SemStatus { json } => {
+            handlers::semantic_diff_handlers::handle_sem_status(json)?;
         }
         Commands::Guard {
             action,

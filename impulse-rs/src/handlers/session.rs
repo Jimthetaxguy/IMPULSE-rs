@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::sync::Arc;
 
-use crate::{guardrail, injection, state, verify};
+use crate::{guardrail, injection, semantic_diff, state, verify};
 
 use super::{
     capture_hook_evidence, default_session_name, get_session_id, hook_session_start_banner,
@@ -103,6 +103,7 @@ pub async fn handle_session_end(
     session_id: String,
     summary: String,
     should_verify: bool,
+    sem_diff_base: Option<String>,
 ) -> Result<()> {
     let stdin_payload = read_hook_stdin_payload();
     if should_verify {
@@ -111,6 +112,25 @@ pub async fn handle_session_end(
         print_verification_report(&report);
         if !report.success() {
             anyhow::bail!("Verification failed. Session end blocked.");
+        }
+    }
+    // Capture semantic diff if requested and sem is available
+    if let Some(base_ref) = &sem_diff_base {
+        if semantic_diff::sem_available() {
+            match semantic_diff::capture_semantic_diff(
+                state.storage().base_path(),
+                &std::env::current_dir()?,
+                &session_id,
+                base_ref,
+                "HEAD",
+            ) {
+                Ok(report) => {
+                    if !report.changes.is_empty() {
+                        eprintln!("Semantic diff: {}", report.summary);
+                    }
+                }
+                Err(e) => eprintln!("Warning: semantic diff failed: {}", e),
+            }
         }
     }
     match state.end_session(&session_id, summary.clone()).await {
