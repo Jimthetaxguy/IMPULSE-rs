@@ -642,7 +642,13 @@ mod tests {
 
     #[test]
     fn test_provider_default_model() {
-        // When IMPULSE_MODEL is not set, returns the compiled default.
+        // With env override — all providers return the override value.
+        std::env::set_var("IMPULSE_MODEL", "custom-model");
+        assert_eq!(ImpulseProvider::Anthropic.default_model(), "custom-model");
+        assert_eq!(ImpulseProvider::OpenAi.default_model(), "custom-model");
+        assert_eq!(ImpulseProvider::Minimax.default_model(), "custom-model");
+
+        // Without env override — compiled defaults.
         std::env::remove_var("IMPULSE_MODEL");
         assert_eq!(
             ImpulseProvider::Anthropic.default_model(),
@@ -650,15 +656,6 @@ mod tests {
         );
         assert_eq!(ImpulseProvider::OpenAi.default_model(), "gpt-4o");
         assert_eq!(ImpulseProvider::Minimax.default_model(), "abab6.5s-chat");
-    }
-
-    #[test]
-    fn test_provider_default_model_env_override() {
-        // IMPULSE_MODEL env var takes priority over compiled default.
-        std::env::set_var("IMPULSE_MODEL", "claude-opus-4-6");
-        let model = ImpulseProvider::Anthropic.default_model();
-        std::env::remove_var("IMPULSE_MODEL");
-        assert_eq!(model, "claude-opus-4-6");
     }
 
     #[test]
