@@ -7,6 +7,7 @@
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
+use super::actions::{PanelAction, ProposalExecutionMode};
 use crate::theme::colors;
 
 // ---------------------------------------------------------------------------
@@ -28,6 +29,8 @@ pub struct ChatMessage {
     pub role: ChatRole,
     pub content: String,
     pub timestamp: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub proposals: Vec<impulse_ops::SupervisorProposal>,
 }
 
 impl ChatMessage {
@@ -36,6 +39,7 @@ impl ChatMessage {
             role: ChatRole::User,
             content: content.to_string(),
             timestamp: chrono::Utc::now(),
+            proposals: Vec::new(),
         }
     }
 
@@ -44,6 +48,19 @@ impl ChatMessage {
             role: ChatRole::Agent,
             content: content.to_string(),
             timestamp: chrono::Utc::now(),
+            proposals: Vec::new(),
+        }
+    }
+
+    pub fn agent_with_proposals(
+        content: &str,
+        proposals: Vec<impulse_ops::SupervisorProposal>,
+    ) -> Self {
+        Self {
+            role: ChatRole::Agent,
+            content: content.to_string(),
+            timestamp: chrono::Utc::now(),
+            proposals,
         }
     }
 
@@ -52,6 +69,7 @@ impl ChatMessage {
             role: ChatRole::System,
             content: content.to_string(),
             timestamp: chrono::Utc::now(),
+            proposals: Vec::new(),
         }
     }
 
@@ -86,8 +104,9 @@ pub fn render_messages(
     messages: &[ChatMessage],
     scroll_to_bottom: bool,
     is_thinking: bool,
-) {
+) -> Vec<PanelAction> {
     let scroll_id = ui.id().with("agent_chat_scroll");
+    let mut actions = Vec::new();
 
     let mut area = egui::ScrollArea::vertical()
         .id_salt(scroll_id)
@@ -114,7 +133,7 @@ pub fn render_messages(
 
         for msg in messages {
             ui.add_space(8.0);
-            render_single_message(ui, msg);
+            render_single_message(ui, msg, &mut actions);
         }
 
         if is_thinking {
@@ -124,10 +143,12 @@ pub fn render_messages(
 
         ui.add_space(8.0);
     });
+
+    actions
 }
 
 /// Render a single chat message bubble with role label.
-fn render_single_message(ui: &mut egui::Ui, msg: &ChatMessage) {
+fn render_single_message(ui: &mut egui::Ui, msg: &ChatMessage, actions: &mut Vec<PanelAction>) {
     let available_width = ui.available_width();
     let max_bubble_width = (available_width * 0.85).min(500.0);
 
@@ -163,6 +184,15 @@ fn render_single_message(ui: &mut egui::Ui, msg: &ChatMessage) {
                 .show(ui, |ui| {
                     ui.set_max_width(max_bubble_width);
                     ui.label(egui::RichText::new(&msg.content).color(colors::TEXT));
+                    if !msg.proposals.is_empty() {
+                        ui.add_space(8.0);
+                        for proposal in &msg.proposals {
+                            if let Some(action) = render_proposal_card(ui, proposal) {
+                                actions.push(action);
+                            }
+                            ui.add_space(6.0);
+                        }
+                    }
                 });
             // 2px purple accent on left edge.
             let rect = frame_resp.response.rect;
@@ -187,6 +217,88 @@ fn render_single_message(ui: &mut egui::Ui, msg: &ChatMessage) {
             });
         }
     }
+}
+
+fn render_proposal_card(
+    ui: &mut egui::Ui,
+    proposal: &impulse_ops::SupervisorProposal,
+) -> Option<PanelAction> {
+    let mut clicked = None;
+
+    egui::Frame::new()
+        .fill(colors::BG)
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .stroke(egui::Stroke::new(0.5, colors::BORDER))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new(&proposal.title)
+                        .strong()
+                        .color(colors::ACCENT),
+                );
+                if proposal.requires_confirmation {
+                    render_chip(ui, "confirm");
+                }
+                for missing in &proposal.missing_actions {
+                    render_chip(ui, missing.as_str());
+                }
+                for missing in &proposal.missing_tool_capabilities {
+                    render_chip(ui, missing.as_str());
+                }
+            });
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(&proposal.description)
+                    .small()
+                    .color(colors::TEXT_MUTED),
+            );
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                let primary_label = if proposal.action_label.trim().is_empty() {
+                    "Run"
+                } else {
+                    proposal.action_label.as_str()
+                };
+                if ui.button(primary_label).clicked() {
+                    clicked = Some(PanelAction::RunSupervisorProposal {
+                        proposal: Box::new(proposal.clone()),
+                        mode: ProposalExecutionMode::Run,
+                    });
+                }
+                if ui.button("Allow This Session + Run").clicked() {
+                    clicked = Some(PanelAction::RunSupervisorProposal {
+                        proposal: Box::new(proposal.clone()),
+                        mode: ProposalExecutionMode::AllowThisSession,
+                    });
+                }
+                if ui.button("Save Default + Run").clicked() {
+                    clicked = Some(PanelAction::RunSupervisorProposal {
+                        proposal: Box::new(proposal.clone()),
+                        mode: ProposalExecutionMode::SaveDefault,
+                    });
+                }
+                if ui.button("Deny").clicked() {
+                    clicked = Some(PanelAction::RunSupervisorProposal {
+                        proposal: Box::new(proposal.clone()),
+                        mode: ProposalExecutionMode::Deny,
+                    });
+                }
+            });
+        });
+
+    clicked
+}
+
+fn render_chip(ui: &mut egui::Ui, label: &str) {
+    egui::Frame::new()
+        .fill(colors::SURFACE)
+        .corner_radius(egui::CornerRadius::same(255))
+        .inner_margin(egui::Margin::symmetric(8, 4))
+        .stroke(egui::Stroke::new(0.5, colors::BORDER))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(label).small().color(colors::TEXT_DIM));
+        });
 }
 
 /// Render a typing indicator when the agent is thinking.
@@ -251,6 +363,28 @@ mod tests {
         let parsed: ChatMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.role, ChatRole::User);
         assert_eq!(parsed.content, "hello world");
+        assert!(parsed.proposals.is_empty());
+    }
+
+    #[test]
+    fn test_chat_message_agent_with_proposals() {
+        let msg = ChatMessage::agent_with_proposals(
+            "hello",
+            vec![impulse_ops::SupervisorProposal {
+                id: "proposal-1".to_string(),
+                title: "Search".to_string(),
+                description: "Search memory".to_string(),
+                action_label: "Run".to_string(),
+                action: impulse_ops::SupervisorAction::SearchMemory {
+                    query: "genome".to_string(),
+                },
+                missing_actions: Vec::new(),
+                missing_tool_capabilities: Vec::new(),
+                requires_confirmation: false,
+            }],
+        );
+        assert_eq!(msg.role, ChatRole::Agent);
+        assert_eq!(msg.proposals.len(), 1);
     }
 
     #[test]

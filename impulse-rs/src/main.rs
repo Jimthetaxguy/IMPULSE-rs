@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -24,6 +25,7 @@ pub mod memory;
 pub mod monty;
 pub mod notification;
 pub mod office;
+pub mod ops_workbench;
 pub mod orchestration;
 pub mod plugin;
 pub mod retrieval;
@@ -59,6 +61,19 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum McpCommands {
+    /// Serve the registry-backed MCP interface
+    Serve {
+        /// Transport: stdio (default) or tcp
+        #[arg(long, default_value = "stdio")]
+        transport: String,
+        /// TCP port when using --transport tcp
+        #[arg(long)]
+        port: Option<u16>,
+    },
+}
+
+#[derive(Subcommand)]
 enum Commands {
     Daemon {
         #[arg(long)]
@@ -70,6 +85,10 @@ enum Commands {
         name: Option<String>,
         #[arg(short, long)]
         platform: Option<String>,
+        #[arg(long)]
+        inject_mode: Option<String>,
+        #[arg(long)]
+        inject_explain: bool,
     },
     SessionEnd {
         #[arg(short, long)]
@@ -156,6 +175,11 @@ enum Commands {
     },
     Hooks {
         #[arg(short, long, default_value = "all")]
+        platform: String,
+    },
+    /// Generate a reproducible validation kit for real Claude Code hook testing
+    ValidateHooks {
+        #[arg(short, long, default_value = "claude-code")]
         platform: String,
     },
     Orchestrate {
@@ -429,6 +453,23 @@ enum Commands {
         #[arg(long, default_value = "json")]
         format: String,
     },
+    /// Validate manifest-defined external process tools
+    ToolingValidate {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reload runtime tooling and refresh the capabilities manifest
+    ToolingReload {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Serve registry-backed MCP tools
+    Mcp {
+        #[command(subcommand)]
+        subcommand: McpCommands,
+    },
     /// Configure the Impulse Agent (LLM-powered coordination)
     AgentConfigure {
         /// LLM provider: anthropic, openai, minimax
@@ -500,6 +541,22 @@ enum Commands {
     },
 }
 
+#[derive(Debug, serde::Serialize)]
+struct HookEvidenceRecord {
+    timestamp: String,
+    event: String,
+    impulse_dir: String,
+    session_id: Option<String>,
+    session_name: Option<String>,
+    platform: Option<String>,
+    summary: Option<String>,
+    verify_enabled: Option<bool>,
+    stdin_payload: Option<String>,
+    output_preview: Option<String>,
+    output_lines: usize,
+    env: serde_json::Value,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut cli = Cli::parse();
@@ -563,10 +620,208 @@ fn default_session_name() -> String {
         .unwrap_or_else(|| "session".to_string())
 }
 
+fn is_truthy_env(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn read_hook_stdin_payload() -> Option<String> {
+    let mut stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        return None;
+    }
+
+    let mut payload = String::new();
+    if stdin.read_to_string(&mut payload).is_ok() {
+        let trimmed = payload.trim().to_string();
+        if !trimmed.is_empty() {
+            return Some(trimmed);
+        }
+    }
+    None
+}
+
+fn preview_block(block: &str, max_chars: usize) -> String {
+    let mut chars = block.chars();
+    let preview: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{preview}...")
+    } else {
+        preview
+    }
+}
+
+fn hook_env_snapshot() -> serde_json::Value {
+    serde_json::json!({
+        "CLAUDE_PROJECT_DIR": std::env::var("CLAUDE_PROJECT_DIR").ok(),
+        "CLAUDE_PROJECT_NAME": std::env::var("CLAUDE_PROJECT_NAME").ok(),
+        "CLAUDE_ENV_FILE": std::env::var("CLAUDE_ENV_FILE").ok(),
+        "CLAUDE_SESSION_ID": std::env::var("CLAUDE_SESSION_ID").ok(),
+        "CLAUDE_SESSION_SUMMARY": std::env::var("CLAUDE_SESSION_SUMMARY").ok(),
+        "CLAUDE_SESSION_REASON": std::env::var("CLAUDE_SESSION_REASON").ok(),
+        "CLAUDE_TRANSCRIPT_PATH": std::env::var("CLAUDE_TRANSCRIPT_PATH").ok(),
+        "IMPULSE_SESSION_ID": std::env::var("IMPULSE_SESSION_ID").ok(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn capture_hook_evidence(
+    impulse_dir: &std::path::Path,
+    event: &str,
+    session_id: Option<String>,
+    session_name: Option<String>,
+    platform: Option<String>,
+    summary: Option<String>,
+    verify_enabled: Option<bool>,
+    stdin_payload: Option<String>,
+    output_preview: Option<String>,
+    output_lines: usize,
+) -> Result<()> {
+    if !is_truthy_env("IMPULSE_HOOK_EVIDENCE") {
+        return Ok(());
+    }
+
+    let validation_dir = impulse_dir.join("validation").join("runtime");
+    std::fs::create_dir_all(&validation_dir)?;
+    let log_path = validation_dir.join("hook-events.jsonl");
+
+    let record = HookEvidenceRecord {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        event: event.to_string(),
+        impulse_dir: impulse_dir.display().to_string(),
+        session_id,
+        session_name,
+        platform,
+        summary,
+        verify_enabled,
+        stdin_payload,
+        output_preview,
+        output_lines,
+        env: hook_env_snapshot(),
+    };
+
+    let storage = storage::Storage::new(validation_dir);
+    storage.append_jsonl("hook-events.jsonl", &record)?;
+    debug_assert!(log_path.exists());
+    Ok(())
+}
+
+fn persist_claude_env_var(key: &str, value: &str) -> Result<()> {
+    let Some(env_file) = std::env::var("CLAUDE_ENV_FILE").ok() else {
+        return Ok(());
+    };
+
+    let path = PathBuf::from(env_file);
+    let mut existing = if path.exists() {
+        std::fs::read_to_string(&path)?
+    } else {
+        String::new()
+    };
+
+    let assignment = format!("{key}={value}");
+    let mut lines: Vec<String> = existing
+        .lines()
+        .filter(|line| !line.starts_with(&format!("{key}=")))
+        .map(|line| line.to_string())
+        .collect();
+    lines.push(assignment);
+    existing = format!("{}\n", lines.join("\n"));
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    storage::Storage::atomic_write_path(&path, existing.as_bytes())?;
+    Ok(())
+}
+
+fn hook_session_start_banner() -> Option<String> {
+    if !is_truthy_env("IMPULSE_HOOK_SENTINEL") {
+        return None;
+    }
+
+    Some(format!(
+        "IMPULSE_HOOK_SENTINEL: SessionStart validation marker emitted at {}.\n\
+If you can explain this marker, Impulse hook startup context reached Claude in a usable form.",
+        chrono::Utc::now().to_rfc3339()
+    ))
+}
+
 fn parse_platform(s: &str) -> Option<Platform> {
-    match s {
-        "claude-code" => Some(Platform::ClaudeCode),
-        "opencode" => Some(Platform::OpenCode),
+    Platform::from_str_name(s)
+}
+
+fn tool_resolution_root(impulse_dir: &std::path::Path) -> &std::path::Path {
+    impulse_dir.parent().unwrap_or(impulse_dir)
+}
+
+fn tool_capabilities(
+    allow_all_capabilities: bool,
+) -> std::collections::HashSet<tooling::Capability> {
+    use tooling::Capability;
+
+    if allow_all_capabilities {
+        [
+            Capability::FileSystemRead,
+            Capability::FileSystemWrite,
+            Capability::Network,
+            Capability::PythonExec,
+            Capability::SystemInfo,
+        ]
+        .into_iter()
+        .collect()
+    } else {
+        [Capability::FileSystemRead, Capability::SystemInfo]
+            .into_iter()
+            .collect()
+    }
+}
+
+fn build_tool_registry(
+    impulse_dir: &std::path::Path,
+    config: &state::Config,
+) -> Result<tooling::ToolRegistry> {
+    let resolution_root = tool_resolution_root(impulse_dir);
+    let external_tools_dir = config.resolved_external_tools_dir_from(resolution_root);
+    tooling::ToolRegistry::with_runtime(impulse_dir, &external_tools_dir)
+        .map_err(|err| anyhow::anyhow!("failed to load runtime tool registry: {}", err))
+}
+
+pub(crate) fn build_tool_context(
+    impulse_dir: &std::path::Path,
+    config: &state::Config,
+    origin: tooling::ExecutionOrigin,
+    allow_all_capabilities: bool,
+    session_id: Option<String>,
+) -> tooling::ToolContext {
+    let resolution_root = tool_resolution_root(impulse_dir);
+    tooling::ToolContext {
+        impulse_dir: impulse_dir.to_path_buf(),
+        session_id,
+        allowed_capabilities: tool_capabilities(allow_all_capabilities),
+        timeout_ms: config.tool_execution_default_timeout_ms,
+        execution_origin: origin,
+        max_output_bytes: config.tool_execution_max_output_bytes,
+        max_artifacts: config.tool_execution_max_artifacts,
+        allowed_read_roots: config.resolved_tool_read_roots_from(resolution_root),
+        allowed_write_roots: config.resolved_tool_write_roots_from(resolution_root),
+    }
+}
+
+fn refresh_capabilities_manifest(
+    impulse_dir: &std::path::Path,
+    registry: &tooling::ToolRegistry,
+) -> Result<PathBuf> {
+    agent_discovery::write_capabilities_manifest(impulse_dir, registry)
+        .map_err(|err| anyhow::anyhow!("failed to write capabilities manifest: {}", err))
+}
+
+fn parse_tool_category(category: &str) -> Option<tooling::ToolCategory> {
+    match category {
+        "utility" => Some(tooling::ToolCategory::Utility),
+        "document" => Some(tooling::ToolCategory::Document),
+        "analysis" => Some(tooling::ToolCategory::Analysis),
+        "system" => Some(tooling::ToolCategory::System),
         _ => None,
     }
 }
@@ -631,6 +886,13 @@ fn print_config(config: Vec<(String, String)>) {
     for (k, v) in config {
         println!("  {}: {}", k, v);
     }
+}
+
+fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
+    let json = serde_json::to_string_pretty(value)
+        .map_err(|e| anyhow::anyhow!("JSON serialize: {}", e))?;
+    println!("{}", json);
+    Ok(())
 }
 
 fn print_verification_report(report: &verify::VerificationReport) {
@@ -774,9 +1036,199 @@ fn build_opencode_hook_config() -> serde_json::Value {
     })
 }
 
+fn build_hook_validation_files(platform: &str) -> Vec<(std::path::PathBuf, String)> {
+    match platform {
+        "claude-code" | "claude" => {
+            let readme = r#"# Claude Hook Validation Kit
+
+This kit validates the real memory loop with Claude Code hooks before claiming the feature works end-to-end.
+
+## What this proves
+
+1. `SessionStart` runs the real `impulse-rs session-start` command and reaches Claude in usable startup context
+2. `SessionStart` persists `IMPULSE_SESSION_ID` through `CLAUDE_ENV_FILE` so later hooks can reuse the same session
+3. `SessionEnd` runs the real `impulse-rs session-end` command and records hook evidence
+4. The persisted history/GENOME files are the source for the next session's recall
+
+## How to run
+
+1. Ensure the daemon is running for memory features:
+   - `cargo run -- daemon`
+2. Register the hooks from `settings.local.json` into your Claude project settings.
+3. Start a fresh Claude session in this project.
+4. Ask Claude: `What does IMPULSE_HOOK_SENTINEL mean in this project?`
+5. Do a small piece of real work.
+6. End the session cleanly.
+7. Start a second session and ask:
+   - `What happened in the previous Impulse session?`
+   - `What does Impulse remember from the last run?`
+8. Inspect `.impulse/validation/runtime/hook-events.jsonl`.
+9. Record the result in `evidence.md`.
+
+## Pass criteria
+
+- Claude can explain the sentinel from `SessionStart`, not just echo terminal output.
+- `.impulse/validation/runtime/hook-events.jsonl` contains both `session_start` and `session_end` events.
+- The `session_start` record shows a non-empty output preview and the `session_end` record captures stdin/env metadata.
+- `.impulse/HISTORY.jsonl` gains a new entry after the first session ends.
+- The next session references the prior summary/files from `.impulse/HISTORY.jsonl` or `GENOME.md`.
+
+## Failure criteria
+
+- Claude cannot see the sentinel on startup.
+- `SessionEnd` never records runtime evidence.
+- The next session does not recall the prior persisted summary.
+"#;
+
+            let settings = r#"{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.impulse/validation/claude-code/session-start-sentinel.sh"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.impulse/validation/claude-code/session-end-capture.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+"#;
+
+            let session_start = r#"#!/bin/bash
+set -eu
+
+ROOT="${CLAUDE_PROJECT_DIR:-$(pwd)}"
+VALIDATION_DIR="$ROOT/.impulse/validation/claude-code"
+ARTIFACT_DIR="$VALIDATION_DIR/artifacts"
+mkdir -p "$ARTIFACT_DIR"
+
+PAYLOAD_PATH="$ARTIFACT_DIR/session-start.stdin.json"
+if [ ! -t 0 ]; then
+  cat > "$PAYLOAD_PATH"
+else
+  : > "$PAYLOAD_PATH"
+fi
+
+IMPULSE_HOOK_EVIDENCE=1 \
+IMPULSE_HOOK_SENTINEL=1 \
+impulse-rs -c "$ROOT/.impulse" session-start -n "${CLAUDE_PROJECT_NAME:-hook-validation}" -p claude-code < "$PAYLOAD_PATH"
+"#;
+
+            let session_end = r#"#!/bin/bash
+set -eu
+
+ROOT="${CLAUDE_PROJECT_DIR:-$(pwd)}"
+VALIDATION_DIR="$ROOT/.impulse/validation/claude-code"
+ARTIFACT_DIR="$VALIDATION_DIR/artifacts"
+mkdir -p "$ARTIFACT_DIR"
+
+PAYLOAD_PATH="$ARTIFACT_DIR/session-end.stdin.json"
+if [ ! -t 0 ]; then
+  cat > "$PAYLOAD_PATH"
+else
+  : > "$PAYLOAD_PATH"
+fi
+
+IMPULSE_HOOK_EVIDENCE=1 \
+impulse-rs -c "$ROOT/.impulse" session-end --session-id "${IMPULSE_SESSION_ID:-missing}" --summary "${CLAUDE_SESSION_SUMMARY:-missing}" < "$PAYLOAD_PATH"
+"#;
+
+            let evidence = r#"# Claude Hook Validation Evidence
+
+Date:
+Operator:
+Project:
+
+## Run 1
+- Did Claude explain `IMPULSE_HOOK_SENTINEL` correctly?
+- What exact wording confirmed it saw the injected context?
+- Did `.impulse/HISTORY.jsonl` gain a new entry after the session ended?
+- Did `GENOME.md` change? If yes, what persisted?
+
+## Run 2
+- What prior-session facts did Claude recall?
+- Did the recalled facts match `.impulse/HISTORY.jsonl` / `GENOME.md`?
+- Any mismatch between hook truth and GUI display?
+
+## Verdict
+- Status: PASS / FAIL / PARTIAL
+- Blocking issue:
+- Next fix:
+"#;
+
+            vec![
+                (
+                    std::path::PathBuf::from(".impulse/validation/claude-code/README.md"),
+                    readme.to_string(),
+                ),
+                (
+                    std::path::PathBuf::from(".impulse/validation/claude-code/settings.local.json"),
+                    settings.to_string(),
+                ),
+                (
+                    std::path::PathBuf::from(
+                        ".impulse/validation/claude-code/session-start-sentinel.sh",
+                    ),
+                    session_start.to_string(),
+                ),
+                (
+                    std::path::PathBuf::from(
+                        ".impulse/validation/claude-code/session-end-capture.sh",
+                    ),
+                    session_end.to_string(),
+                ),
+                (
+                    std::path::PathBuf::from(".impulse/validation/claude-code/evidence.md"),
+                    evidence.to_string(),
+                ),
+            ]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn write_hook_validation_kit(platform: &str) -> Result<Vec<std::path::PathBuf>> {
+    let files = build_hook_validation_files(platform);
+    if files.is_empty() {
+        anyhow::bail!("Unsupported platform for validation kit: {}", platform);
+    }
+
+    let mut written = Vec::new();
+    for (path, content) in files {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        stewardship::atomic_write_file(&path, content.as_bytes())?;
+        #[cfg(unix)]
+        if path.extension().and_then(|ext| ext.to_str()) == Some("sh") {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms)?;
+        }
+        written.push(path);
+    }
+
+    Ok(written)
+}
+
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod hook_config_tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn test_claude_hook_config_includes_guard() {
@@ -887,6 +1339,50 @@ mod hook_config_tests {
             "hooks must have 'tool_use'"
         );
     }
+
+    #[test]
+    fn test_validation_kit_uses_runtime_impulse_commands() {
+        let files = build_hook_validation_files("claude-code");
+        let settings = files
+            .iter()
+            .find(|(path, _)| path.ends_with("settings.local.json"))
+            .map(|(_, content)| content.clone())
+            .expect("settings.local.json missing");
+        let session_start = files
+            .iter()
+            .find(|(path, _)| path.ends_with("session-start-sentinel.sh"))
+            .map(|(_, content)| content.clone())
+            .expect("session-start script missing");
+        let session_end = files
+            .iter()
+            .find(|(path, _)| path.ends_with("session-end-capture.sh"))
+            .map(|(_, content)| content.clone())
+            .expect("session-end script missing");
+
+        assert!(settings.contains("session-start-sentinel.sh"));
+        assert!(session_start.contains("impulse-rs -c \"$ROOT/.impulse\" session-start"));
+        assert!(session_start.contains("IMPULSE_HOOK_EVIDENCE=1"));
+        assert!(session_start.contains("IMPULSE_HOOK_SENTINEL=1"));
+        assert!(session_end.contains("impulse-rs -c \"$ROOT/.impulse\" session-end"));
+        assert!(session_end.contains("IMPULSE_HOOK_EVIDENCE=1"));
+    }
+
+    #[test]
+    fn test_persist_claude_env_var_replaces_existing_assignment() {
+        let dir = TempDir::new().unwrap();
+        let env_file = dir.path().join("claude.env");
+        std::fs::write(&env_file, "IMPULSE_SESSION_ID=old\nOTHER_KEY=keep\n").unwrap();
+        std::env::set_var("CLAUDE_ENV_FILE", &env_file);
+
+        persist_claude_env_var("IMPULSE_SESSION_ID", "new-session").unwrap();
+
+        let updated = std::fs::read_to_string(&env_file).unwrap();
+        assert!(updated.contains("IMPULSE_SESSION_ID=new-session"));
+        assert!(updated.contains("OTHER_KEY=keep"));
+        assert!(!updated.contains("IMPULSE_SESSION_ID=old"));
+
+        std::env::remove_var("CLAUDE_ENV_FILE");
+    }
 }
 
 // ============================================================================
@@ -917,13 +1413,34 @@ async fn run_daemon_mode(cli: Cli) -> Result<()> {
             } else {
                 println!("Daemon running");
                 let status = client.status().await?;
-                println!("{}", serde_json::to_string_pretty(&status).unwrap());
+                print_json(&status)?;
             }
         }
-        Commands::SessionStart { name, platform } => {
+        Commands::SessionStart {
+            name,
+            platform,
+            inject_mode: _,
+            inject_explain: _,
+        } => {
+            let stdin_payload = read_hook_stdin_payload();
             let name = name.unwrap_or_else(default_session_name);
             match client.create_session(name, platform).await {
-                Ok((id, n)) => println!("Created session: {} ({})", n, id),
+                Ok((id, n)) => {
+                    let _ = persist_claude_env_var("IMPULSE_SESSION_ID", &id);
+                    capture_hook_evidence(
+                        &cli.impulse_dir,
+                        "session_start",
+                        Some(id.clone()),
+                        Some(n.clone()),
+                        Some("daemon".to_string()),
+                        None,
+                        None,
+                        stdin_payload,
+                        Some("daemon create_session".to_string()),
+                        1,
+                    )?;
+                    println!("Created session: {} ({})", n, id)
+                }
                 Err(e) => eprintln!("Error: {}", e),
             }
         }
@@ -932,6 +1449,7 @@ async fn run_daemon_mode(cli: Cli) -> Result<()> {
             summary,
             verify: should_verify,
         } => {
+            let stdin_payload = read_hook_stdin_payload();
             if should_verify {
                 let steps = verify::default_steps(&std::env::current_dir()?);
                 let report = verify::run_verification(steps)?;
@@ -940,8 +1458,25 @@ async fn run_daemon_mode(cli: Cli) -> Result<()> {
                     anyhow::bail!("Verification failed. Session end blocked.");
                 }
             }
-            match client.end_session(session_id.clone(), summary).await {
-                Ok(_) => println!("Session {} ended", session_id),
+            match client
+                .end_session(session_id.clone(), summary.clone())
+                .await
+            {
+                Ok(_) => {
+                    capture_hook_evidence(
+                        &cli.impulse_dir,
+                        "session_end",
+                        Some(session_id.clone()),
+                        None,
+                        Some("daemon".to_string()),
+                        Some(summary),
+                        Some(should_verify),
+                        stdin_payload,
+                        Some(format!("Session {} ended", session_id)),
+                        1,
+                    )?;
+                    println!("Session {} ended", session_id)
+                }
                 Err(e) => eprintln!("Error: {}", e),
             }
         }
@@ -983,7 +1518,7 @@ async fn run_daemon_mode(cli: Cli) -> Result<()> {
             Err(e) => eprintln!("Error: {}", e),
         },
         Commands::SessionInfo { id } => match client.get_session(id).await {
-            Ok(s) => println!("{}", serde_json::to_string_pretty(&s).unwrap()),
+            Ok(s) => print_json(&s)?,
             Err(e) => eprintln!("Error: {}", e),
         },
         Commands::SessionConflicts { file, session_id } => {
@@ -1051,7 +1586,7 @@ async fn run_daemon_mode(cli: Cli) -> Result<()> {
             }
         }
         Commands::Status => match client.status().await {
-            Ok(s) => println!("{}", serde_json::to_string_pretty(&s).unwrap()),
+            Ok(s) => print_json(&s)?,
             Err(e) => eprintln!("Error: {}", e),
         },
         Commands::Chat {
@@ -1073,11 +1608,11 @@ async fn run_daemon_mode(cli: Cli) -> Result<()> {
             {
                 Ok(result) => {
                     if inject_explain {
-                        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                        print_json(&result)?;
                     } else if let Some(response) = result.get("response").and_then(|v| v.as_str()) {
                         println!("{}", response);
                     } else {
-                        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                        print_json(&result)?;
                     }
                 }
                 Err(e) => eprintln!("Error: {}", e),
@@ -1117,17 +1652,98 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
         Commands::Run => {
             ui::run_ui(state.clone())?;
         }
-        Commands::SessionStart { name, platform } => {
+        Commands::SessionStart {
+            name,
+            platform,
+            inject_mode,
+            inject_explain,
+        } => {
+            let stdin_payload = read_hook_stdin_payload();
             let name = name.unwrap_or_else(default_session_name);
             let platform = platform.and_then(|p| parse_platform(&p));
-            let session = state.create_session(name, platform).await?;
-            println!("{}", session.id);
+            let session = state.create_session(name.clone(), platform).await?;
+            let _ = persist_claude_env_var("IMPULSE_SESSION_ID", &session.id);
+
+            let query_parts = vec![name];
+            let config = state.config_snapshot()?;
+            let mode_override = inject_mode
+                .as_deref()
+                .and_then(injection::InjectionMode::parse)
+                .or(Some(injection::InjectionMode::Apply)); // Default to outputting context to stdout at startup
+
+            let injection_result = injection::run_injection(
+                state.storage().base_path(),
+                &config,
+                injection::InjectionSurface::Orchestrate,
+                mode_override,
+                &query_parts,
+            );
+
+            if inject_explain {
+                let _ = serde_json::to_writer_pretty(std::io::stdout(), &injection_result.explain);
+                println!();
+            }
+
+            let mut output_lines = 0usize;
+            if let Some(sentinel) = hook_session_start_banner() {
+                println!("{}", sentinel);
+                println!();
+                output_lines += sentinel.lines().count() + 1;
+            }
+
+            if let Some(block) = injection_result.injected_block.clone() {
+                let hook_mode = std::env::var("CLAUDE_ENV_FILE").is_ok();
+                if hook_mode {
+                    println!("{}", block);
+                    output_lines += block.lines().count();
+                } else {
+                    println!("{}\n\n{}", session.id, block);
+                    output_lines += block.lines().count() + 2;
+                }
+                capture_hook_evidence(
+                    state.storage().base_path(),
+                    "session_start",
+                    Some(session.id.clone()),
+                    Some(session.name.clone()),
+                    session.platform.map(|p| p.as_str().to_string()),
+                    None,
+                    None,
+                    stdin_payload,
+                    Some(preview_block(&block, 400)),
+                    output_lines,
+                )?;
+            } else {
+                let hook_mode = std::env::var("CLAUDE_ENV_FILE").is_ok();
+                if hook_mode {
+                    println!(
+                        "Impulse started session {}. No prior context was injected on this run.",
+                        session.id
+                    );
+                    output_lines += 1;
+                } else {
+                    println!("{}", session.id);
+                    output_lines += 1;
+                }
+                capture_hook_evidence(
+                    state.storage().base_path(),
+                    "session_start",
+                    Some(session.id.clone()),
+                    Some(session.name.clone()),
+                    session.platform.map(|p| p.as_str().to_string()),
+                    None,
+                    None,
+                    stdin_payload,
+                    Some("no injection block".to_string()),
+                    output_lines,
+                )?;
+            }
         }
         Commands::SessionEnd {
             session_id,
             summary,
             verify: should_verify,
         } => {
+            let stdin_payload = read_hook_stdin_payload();
             if should_verify {
                 let steps = verify::default_steps(&std::env::current_dir()?);
                 let report = verify::run_verification(steps)?;
@@ -1136,9 +1752,37 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
                     anyhow::bail!("Verification failed. Session end blocked.");
                 }
             }
-            match state.end_session(&session_id, summary).await {
-                Ok(Some(_)) => println!("Session {} ended", session_id),
-                Ok(None) => println!("Session not found: {}", session_id),
+            match state.end_session(&session_id, summary.clone()).await {
+                Ok(Some(_)) => {
+                    capture_hook_evidence(
+                        state.storage().base_path(),
+                        "session_end",
+                        Some(session_id.clone()),
+                        None,
+                        None,
+                        Some(summary),
+                        Some(should_verify),
+                        stdin_payload,
+                        Some(format!("Session {} ended", session_id)),
+                        1,
+                    )?;
+                    println!("Session {} ended", session_id)
+                }
+                Ok(None) => {
+                    capture_hook_evidence(
+                        state.storage().base_path(),
+                        "session_end_missing",
+                        Some(session_id.clone()),
+                        None,
+                        None,
+                        Some(summary),
+                        Some(should_verify),
+                        stdin_payload,
+                        Some(format!("Session not found: {}", session_id)),
+                        1,
+                    )?;
+                    println!("Session not found: {}", session_id)
+                }
                 Err(e) => eprintln!("Error: {}", e),
             }
         }
@@ -1366,8 +2010,17 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
                 .storage()
                 .write_json("config.json", &state::Config::default())?;
             let _ = orchestration::ensure_context_dirs(state.storage().base_path())?;
+            let config = state.config_snapshot()?;
+            let external_tools_dir =
+                config.resolved_external_tools_dir_from(tool_resolution_root(&impulse_dir));
+            std::fs::create_dir_all(&external_tools_dir)?;
+            let registry = build_tool_registry(&impulse_dir, &config)?;
+            let manifest_path =
+                refresh_capabilities_manifest(state.storage().base_path(), &registry)?;
             branding::print_banner();
             println!("Initialized at {:?}", state.storage().base_path());
+            println!("External tools dir: {}", external_tools_dir.display());
+            println!("Capabilities manifest: {}", manifest_path.display());
         }
         Commands::Config { key, value, list } => {
             if list {
@@ -1421,7 +2074,7 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
             }
 
             if json {
-                println!("{}", serde_json::to_string_pretty(&contrib).unwrap());
+                print_json(&contrib)?;
             } else {
                 println!("Extracted from session: {}", sid);
                 if !contrib.findings.is_empty() {
@@ -1451,7 +2104,7 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
                 monty::swarm_coordination::detect_patterns(&agent_a, &agent_b, threshold);
 
             if json {
-                println!("{}", serde_json::to_string_pretty(&patterns).unwrap());
+                print_json(&patterns)?;
             } else {
                 println!("SWARM Pattern Detection:");
                 println!("  Agent A: {}", agent_a);
@@ -1553,6 +2206,17 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
             }
 
             println!("\nHooks setup complete!\nImpulse path: {}\nEdit .claude/hooks/hooks.json to customize.", impulse_path);
+        }
+        Commands::ValidateHooks { platform } => {
+            let written = write_hook_validation_kit(&platform)?;
+            println!("Generated hook validation kit for {}:", platform);
+            for path in written {
+                println!("  - {}", path.display());
+            }
+            println!(
+                "\nNext steps:\n  1. Copy .impulse/validation/{}/settings.local.json into your Claude local settings.\n  2. Run a real Claude session and inspect .impulse/validation/runtime/hook-events.jsonl for captured SessionStart/SessionEnd evidence.\n  3. Record the outcome in .impulse/validation/{}/evidence.md and compare it against .impulse/HISTORY.jsonl / .impulse/GENOME.md",
+                platform, platform
+            );
         }
         Commands::Orchestrate {
             task,
@@ -1732,7 +2396,7 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
             match monty::execute_injection_selection(&context, &monty_config) {
                 Ok(decisions) => {
                     if json {
-                        println!("{}", serde_json::to_string_pretty(&decisions).unwrap());
+                        print_json(&decisions)?;
                     } else {
                         println!("Computed injection decisions:");
                         for (i, decision) in decisions.iter().enumerate() {
@@ -2259,7 +2923,7 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
                         .map_err(|e| anyhow::anyhow!("Failed to parse document: {}", e))?;
 
                     if json {
-                        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                        print_json(&result)?;
                     } else {
                         println!("Document: {}", result.metadata.source_path);
                         println!("Type: {}", result.document_type);
@@ -2339,17 +3003,13 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
                             .map_err(|e| {
                                 anyhow::anyhow!("Failed to create extraction target: {}", e)
                             })?;
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "goal": goal,
-                                "document_type": result.document_type,
-                                "chunks": chunks.len(),
-                                "content_length": result.content.len(),
-                                "target": target,
-                            }))
-                            .unwrap()
-                        );
+                        print_json(&serde_json::json!({
+                            "goal": goal,
+                            "document_type": result.document_type,
+                            "chunks": chunks.len(),
+                            "content_length": result.content.len(),
+                            "target": target,
+                        }))?;
                     } else {
                         println!("Smart extraction for goal: {}", goal);
                         println!("Type: {}", result.document_type);
@@ -3049,7 +3709,7 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
             if check || json {
                 let status = build_hygiene::sccache::sccache_status();
                 if json {
-                    println!("{}", serde_json::to_string_pretty(&status).unwrap());
+                    print_json(&status)?;
                 } else {
                     println!("=== sccache Status ===\n");
                     println!("Installed: {}", if status.installed { "yes" } else { "no" });
@@ -3097,7 +3757,7 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
                 build_hygiene::measurement::generate_report(&projects, config.size_threshold_gb);
 
             if json {
-                println!("{}", serde_json::to_string_pretty(&report).unwrap());
+                print_json(&report)?;
             } else {
                 println!("=== Rust Build Health ===\n");
                 println!(
@@ -3136,32 +3796,31 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
         }
 
         Commands::ToolingList { category, json } => {
-            let registry = tooling::ToolRegistry::with_defaults();
-            let tools = if let Some(ref cat) = category {
-                let cat = match cat.as_str() {
-                    "utility" => tooling::ToolCategory::Utility,
-                    "document" => tooling::ToolCategory::Document,
-                    "analysis" => tooling::ToolCategory::Analysis,
-                    "system" => tooling::ToolCategory::System,
-                    _ => {
-                        eprintln!(
-                            "Unknown category: {} (use: utility, document, analysis, system)",
-                            cat
-                        );
-                        return Ok(());
-                    }
+            let config = state.config_snapshot()?;
+            let registry = build_tool_registry(&impulse_dir, &config)?;
+            let mut tools = registry.manifest_tools();
+
+            if let Some(ref cat) = category {
+                let Some(category_kind) = parse_tool_category(cat) else {
+                    eprintln!(
+                        "Unknown category: {} (use: utility, document, analysis, system)",
+                        cat
+                    );
+                    return Ok(());
                 };
-                registry.list_by_category(cat)
-            } else {
-                registry.list()
-            };
+                let category_name = category_kind.to_string();
+                tools.retain(|tool| tool.category == category_name);
+            }
 
             if json {
-                println!("{}", serde_json::to_string_pretty(&tools).unwrap());
+                print_json(&tools)?;
             } else {
                 println!("=== Dynamic Tools ({}) ===\n", tools.len());
                 for tool in &tools {
-                    println!("  {} — {} [{}]", tool.id, tool.description, tool.category);
+                    println!(
+                        "  {} — {} [{} | {}]",
+                        tool.id, tool.description, tool.category, tool.source
+                    );
                 }
                 if tools.is_empty() {
                     println!("  (no tools registered)");
@@ -3171,16 +3830,31 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
         }
 
         Commands::ToolingDescribe { tool_id, json } => {
-            let registry = tooling::ToolRegistry::with_defaults();
+            let config = state.config_snapshot()?;
+            let registry = build_tool_registry(&impulse_dir, &config)?;
             match registry.get(&tool_id) {
                 Some(tool) => {
                     let desc = tool.descriptor();
+                    let capabilities: Vec<_> = tool
+                        .required_capabilities()
+                        .iter()
+                        .map(|cap| cap.as_str())
+                        .collect();
+                    let source = registry
+                        .source(&tool_id)
+                        .map(|value| value.as_str())
+                        .unwrap_or("builtin");
                     if json {
-                        println!("{}", serde_json::to_string_pretty(&desc).unwrap());
+                        print_json(&serde_json::json!({
+                            "descriptor": desc,
+                            "capabilities": capabilities,
+                            "source": source,
+                        }))?;
                     } else {
                         println!("=== {} (v{}) ===\n", desc.name, desc.version);
                         println!("ID:       {}", desc.id);
                         println!("Category: {}", desc.category);
+                        println!("Source:   {}", source);
                         println!("Description: {}\n", desc.description);
 
                         if !desc.params.is_empty() {
@@ -3196,9 +3870,8 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
                             println!("Parameters: none");
                         }
 
-                        let caps = tool.required_capabilities();
-                        if !caps.is_empty() {
-                            println!("\nRequired capabilities: {:?}", caps);
+                        if !capabilities.is_empty() {
+                            println!("\nRequired capabilities: {}", capabilities.join(", "));
                         }
                     }
                 }
@@ -3214,24 +3887,45 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
             params,
             json,
         } => {
-            let registry = tooling::ToolRegistry::with_defaults();
+            let config = state.config_snapshot()?;
+            let registry = build_tool_registry(&impulse_dir, &config)?;
             let params_value: serde_json::Value = if let Some(ref p) = params {
-                serde_json::from_str(p).unwrap_or_else(|e| {
-                    eprintln!("Invalid JSON params: {}", e);
-                    serde_json::json!({})
-                })
+                match serde_json::from_str(p) {
+                    Ok(value) => value,
+                    Err(e) => {
+                        eprintln!("Invalid JSON params: {}", e);
+                        return Ok(());
+                    }
+                }
             } else {
                 serde_json::json!({})
             };
 
-            let ctx = tooling::ToolContext::with_all_capabilities();
+            let ctx = build_tool_context(
+                &impulse_dir,
+                &config,
+                tooling::ExecutionOrigin::Cli,
+                true,
+                get_session_id(None),
+            );
 
             match registry.execute(&tool_id, params_value, &ctx).await {
                 Ok(result) => {
                     if json {
-                        println!("{}", serde_json::to_string_pretty(&result.output).unwrap());
+                        print_json(&serde_json::json!({
+                            "tool": tool_id,
+                            "output": result.output,
+                            "artifacts": result.artifacts,
+                            "metadata": result.metadata,
+                        }))?;
                     } else {
-                        println!("{}", serde_json::to_string_pretty(&result.output).unwrap());
+                        print_json(&result.output)?;
+                        if !result.artifacts.is_empty() {
+                            println!("\n--- Artifacts ---");
+                            for artifact in &result.artifacts {
+                                println!("  {}", artifact.display());
+                            }
+                        }
                         if !result.metadata.is_empty() {
                             println!("\n--- Metadata ---");
                             for (k, v) in &result.metadata {
@@ -3247,93 +3941,110 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
         }
 
         Commands::ToolingSchema { format } => {
-            let registry = tooling::ToolRegistry::with_defaults();
-            let tools = registry.list();
+            let config = state.config_snapshot()?;
+            let registry = build_tool_registry(&impulse_dir, &config)?;
 
             match format.as_str() {
                 "json" => {
-                    // Export in a format compatible with LLM tool-calling schemas
-                    let schema: Vec<serde_json::Value> = tools
-                        .iter()
-                        .map(|t| {
-                            let properties: serde_json::Map<String, serde_json::Value> = t
-                                .params
-                                .iter()
-                                .map(|p| {
-                                    let type_str = match p.param_type {
-                                        tooling::ParamType::String => "string",
-                                        tooling::ParamType::Integer => "integer",
-                                        tooling::ParamType::Float => "number",
-                                        tooling::ParamType::Bool => "boolean",
-                                        tooling::ParamType::FilePath => "string",
-                                        tooling::ParamType::Json => "object",
-                                    };
-                                    (
-                                        p.name.clone(),
-                                        serde_json::json!({
-                                            "type": type_str,
-                                            "description": p.description,
-                                        }),
-                                    )
-                                })
-                                .collect();
-
-                            let required: Vec<&str> = t
-                                .params
-                                .iter()
-                                .filter(|p| p.required)
-                                .map(|p| p.name.as_str())
-                                .collect();
-
-                            serde_json::json!({
-                                "name": t.id,
-                                "description": t.description,
-                                "input_schema": {
-                                    "type": "object",
-                                    "properties": properties,
-                                    "required": required,
-                                }
-                            })
-                        })
-                        .collect();
-
-                    println!("{}", serde_json::to_string_pretty(&schema).unwrap());
+                    print_json(&registry.schema_json())?;
                 }
                 "markdown" => {
                     println!("# Impulse Dynamic Tools\n");
-                    println!(
-                        "Available tools for agentic invocation via `impulse-rs tooling-run`.\n"
-                    );
-                    for t in &tools {
-                        println!("## {}\n", t.name);
-                        println!("**ID:** `{}`  ", t.id);
-                        println!("**Category:** {}  ", t.category);
-                        println!("**Version:** {}  \n", t.version);
-                        println!("{}\n", t.description);
-                        if !t.params.is_empty() {
-                            println!("| Parameter | Type | Required | Description |");
-                            println!("|-----------|------|----------|-------------|");
-                            for p in &t.params {
-                                println!(
-                                    "| `{}` | {:?} | {} | {} |",
-                                    p.name,
-                                    p.param_type,
-                                    if p.required { "yes" } else { "no" },
-                                    p.description
-                                );
-                            }
-                            println!();
-                        }
-                        println!("```bash");
-                        println!("impulse-rs tooling-run {} --params '{{...}}' --json", t.id);
-                        println!("```\n");
-                    }
+                    println!("{}", registry.schema_markdown());
                 }
                 _ => {
                     eprintln!("Unknown format: {} (use: json, markdown)", format);
                 }
             }
         }
+
+        Commands::ToolingValidate { json } => {
+            let config = state.config_snapshot()?;
+            let external_tools_dir =
+                config.resolved_external_tools_dir_from(tool_resolution_root(&impulse_dir));
+            let report = tooling::validate_manifests_in_dir(&external_tools_dir);
+
+            if json {
+                print_json(&report)?;
+            } else {
+                println!("=== External Tool Validation ===\n");
+                println!("Directory: {}", external_tools_dir.display());
+                println!("Valid tools: {}", report.valid_tools);
+                println!("Invalid tools: {}", report.invalid_tools);
+                if report.issues.is_empty() {
+                    println!("\nNo validation issues found.");
+                } else {
+                    println!("\nIssues:");
+                    for issue in &report.issues {
+                        println!("  {} — {}", issue.file, issue.error);
+                    }
+                }
+            }
+
+            if report.invalid_tools > 0 {
+                anyhow::bail!(
+                    "found {} invalid external tool manifest(s)",
+                    report.invalid_tools
+                );
+            }
+        }
+
+        Commands::ToolingReload { json } => {
+            let config = state.config_snapshot()?;
+            let external_tools_dir =
+                config.resolved_external_tools_dir_from(tool_resolution_root(&impulse_dir));
+            let report = tooling::validate_manifests_in_dir(&external_tools_dir);
+            if report.invalid_tools > 0 {
+                if json {
+                    print_json(&report)?;
+                }
+                anyhow::bail!(
+                    "cannot reload tooling: found {} invalid external tool manifest(s)",
+                    report.invalid_tools
+                );
+            }
+
+            let registry = build_tool_registry(&impulse_dir, &config)?;
+            let manifest_path =
+                refresh_capabilities_manifest(state.storage().base_path(), &registry)?;
+
+            if json {
+                print_json(&serde_json::json!({
+                    "manifest_path": manifest_path,
+                    "tool_count": registry.len(),
+                    "external_tools_dir": external_tools_dir,
+                }))?;
+            } else {
+                println!("Reloaded runtime tooling.");
+                println!("External tools dir: {}", external_tools_dir.display());
+                println!("Registered tools: {}", registry.len());
+                println!("Capabilities manifest: {}", manifest_path.display());
+            }
+        }
+
+        Commands::Mcp { subcommand } => match subcommand {
+            McpCommands::Serve { transport, port } => {
+                let config = state.config_snapshot()?;
+                let registry = Arc::new(build_tool_registry(&impulse_dir, &config)?);
+                let tool_context = build_tool_context(
+                    &impulse_dir,
+                    &config,
+                    tooling::ExecutionOrigin::Mcp,
+                    false,
+                    get_session_id(None),
+                );
+                let _ =
+                    refresh_capabilities_manifest(state.storage().base_path(), registry.as_ref())?;
+                let transport = match transport.as_str() {
+                    "stdio" => mcp::server::McpTransport::Stdio,
+                    "tcp" => mcp::server::McpTransport::Tcp(port.unwrap_or(8765)),
+                    _ => anyhow::bail!("Unknown MCP transport: {} (use: stdio or tcp)", transport),
+                };
+                mcp::McpServer::new(registry, tool_context)
+                    .serve(transport)
+                    .await?;
+            }
+        },
         Commands::AgentConfigure {
             provider,
             api_key,

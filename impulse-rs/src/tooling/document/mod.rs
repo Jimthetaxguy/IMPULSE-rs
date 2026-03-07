@@ -15,10 +15,17 @@ pub use excel_read::ExcelReadTool;
 pub use word_read::WordReadTool;
 
 use super::registry::ToolRegistry;
+use super::traits::ToolSource;
 
 /// Register all document tools into a registry
 pub fn register_all(registry: &mut ToolRegistry) {
-    registry.register(Box::new(DocumentParseTool)).unwrap();
-    registry.register(Box::new(ExcelReadTool)).unwrap();
-    registry.register(Box::new(WordReadTool)).unwrap();
+    registry
+        .register_with_source(Box::new(DocumentParseTool), ToolSource::Document)
+        .unwrap();
+    registry
+        .register_with_source(Box::new(ExcelReadTool), ToolSource::Document)
+        .unwrap();
+    registry
+        .register_with_source(Box::new(WordReadTool), ToolSource::Document)
+        .unwrap();
 }

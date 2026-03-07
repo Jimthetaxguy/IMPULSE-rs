@@ -30,7 +30,7 @@ use eframe::egui;
 use crate::state::{ConnectionStatus, StateHandle};
 use crate::theme::colors;
 
-use actions::PanelAction;
+use actions::{PanelAction, ProposalExecutionMode};
 use backend::{AgentBackend, AgentResponse};
 use chat::{ChatMessage, ChatRole};
 
@@ -84,6 +84,8 @@ pub struct AgentPanel {
     history_path: PathBuf,
     /// Actions queued for dispatch by app.rs (drained each frame).
     pending_actions: Vec<PanelAction>,
+    /// Latest effective supervisor permission state.
+    supervisor_permissions: Option<impulse_ops::SupervisorPermissionState>,
     /// Cached connection status — updated each frame by app.rs before ui() is called.
     /// Avoids re-entrant locking of SharedState from within the agent panel.
     connection_status: ConnectionStatus,
@@ -99,13 +101,13 @@ impl AgentPanel {
         let backend = AgentBackend::detect();
         let welcome = match &backend {
             AgentBackend::DaemonChat => {
-                "Impulse Agent ready (daemon). Ask me about your workspace."
+                "Impulse supervisor ready (daemon). Ask me to monitor or control your agents."
             }
             AgentBackend::Harness { .. } => {
-                "Impulse Agent ready (Claude Code). Ask me about your workspace."
+                "Impulse supervisor ready (Claude Code). Ask me to monitor or control your agents."
             }
             AgentBackend::Api { .. } => {
-                "Impulse Agent ready (API mode). Ask me about your workspace."
+                "Impulse supervisor ready (API mode). Ask me to monitor or control your agents."
             }
             AgentBackend::Unavailable => {
                 "No agent backend available. Install Claude Code or set ANTHROPIC_API_KEY."
@@ -145,6 +147,7 @@ impl AgentPanel {
             focus_requested: false,
             history_path,
             pending_actions: Vec::new(),
+            supervisor_permissions: None,
             connection_status: ConnectionStatus::Disconnected,
         }
     }
@@ -401,6 +404,14 @@ impl AgentPanel {
 
         match rx.try_recv() {
             Ok(response) => {
+                if let Some(permission_state) = response.permission_state.clone() {
+                    self.supervisor_permissions = Some(permission_state.clone());
+                    if let Some(handle) = &self.daemon_state {
+                        if let Ok(mut shared) = handle.lock() {
+                            shared.supervisor_permissions = Some(permission_state);
+                        }
+                    }
+                }
                 if response.is_error {
                     self.messages
                         .push(ChatMessage::system(&format!("Error: {}", response.content)));
@@ -408,7 +419,8 @@ impl AgentPanel {
                 } else {
                     // Record in API history for conversation continuity.
                     backend::record_api_response(&mut self.backend, &response.content);
-                    let msg = ChatMessage::agent(&response.content);
+                    let msg =
+                        ChatMessage::agent_with_proposals(&response.content, response.proposals);
                     persistence::append_message(&self.history_path, &msg);
                     self.messages.push(msg);
                     self.state = AgentState::Idle;
@@ -466,7 +478,7 @@ impl AgentPanel {
             ui.painter().rect_filled(rect, 1.0, colors::ACCENT);
 
             ui.add_space(4.0);
-            ui.strong(egui::RichText::new("Agent").color(colors::ACCENT));
+            ui.strong(egui::RichText::new("Supervisor").color(colors::ACCENT));
             ui.separator();
             let effective = backend::resolve_backend(&self.backend, self.connection_status);
             ui.label(
@@ -500,6 +512,11 @@ impl AgentPanel {
         });
 
         ui.separator();
+
+        if let Some(permission_state) = &self.supervisor_permissions {
+            render_permission_strip(ui, permission_state);
+            ui.separator();
+        }
 
         // Activity feed (collapsible, between header and messages).
         if !self.activity_items.is_empty() {
@@ -576,7 +593,7 @@ impl AgentPanel {
                                 .hint_text(if is_thinking {
                                     "Waiting for response..."
                                 } else {
-                                    "Ask the Impulse Agent..."
+                                    "Ask the Impulse supervisor..."
                                 })
                                 .interactive(!is_thinking)
                                 .desired_width(ui.available_width() - 52.0);
@@ -613,8 +630,12 @@ impl AgentPanel {
             });
 
         // Messages fill remaining space.
-        chat::render_messages(ui, &self.messages, self.scroll_to_bottom, is_thinking);
+        let proposal_actions =
+            chat::render_messages(ui, &self.messages, self.scroll_to_bottom, is_thinking);
         self.scroll_to_bottom = false;
+        for action in proposal_actions {
+            self.handle_panel_action(action);
+        }
 
         if submitted && !self.input_buf.trim().is_empty() {
             let text = std::mem::take(&mut self.input_buf);
@@ -627,6 +648,13 @@ impl AgentPanel {
     /// send_message() can resolve the backend without re-locking.
     pub fn set_connection_status(&mut self, status: ConnectionStatus) {
         self.connection_status = status;
+    }
+
+    pub fn set_supervisor_permissions(
+        &mut self,
+        permission_state: Option<impulse_ops::SupervisorPermissionState>,
+    ) {
+        self.supervisor_permissions = permission_state;
     }
 
     /// Request that the input field receives keyboard focus on the next frame.
@@ -657,6 +685,76 @@ impl AgentPanel {
     pub fn is_thinking(&self) -> bool {
         self.state == AgentState::Thinking
     }
+
+    fn handle_panel_action(&mut self, action: PanelAction) {
+        match action {
+            PanelAction::RunSupervisorProposal { proposal, mode } => match mode {
+                ProposalExecutionMode::Deny => {
+                    let msg = ChatMessage::system(&format!("Denied proposal: {}", proposal.title));
+                    persistence::append_message(&self.history_path, &msg);
+                    self.messages.push(msg);
+                    self.scroll_to_bottom = true;
+                }
+                ProposalExecutionMode::Run
+                | ProposalExecutionMode::AllowThisSession
+                | ProposalExecutionMode::SaveDefault => {
+                    let msg = ChatMessage::system(&format!(
+                        "Queued supervisor action: {}",
+                        proposal.title
+                    ));
+                    persistence::append_message(&self.history_path, &msg);
+                    self.messages.push(msg);
+                    self.pending_actions
+                        .push(PanelAction::RunSupervisorProposal { proposal, mode });
+                    self.scroll_to_bottom = true;
+                }
+            },
+            other => self.pending_actions.push(other),
+        }
+    }
+}
+
+fn render_permission_strip(
+    ui: &mut egui::Ui,
+    permission_state: &impulse_ops::SupervisorPermissionState,
+) {
+    ui.vertical(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new("Supervisor Permissions")
+                    .small()
+                    .strong()
+                    .color(colors::ACCENT),
+            );
+            if permission_state.session_override_active() {
+                ui.label(
+                    egui::RichText::new("session override active")
+                        .small()
+                        .color(colors::YELLOW),
+                );
+            }
+        });
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            for action in &permission_state.effective.allowed_actions {
+                render_permission_chip(ui, action.as_str(), colors::ACCENT);
+            }
+            for capability in &permission_state.effective.allowed_tool_capabilities {
+                render_permission_chip(ui, capability.as_str(), colors::BLUE);
+            }
+        });
+    });
+}
+
+fn render_permission_chip(ui: &mut egui::Ui, label: &str, accent: egui::Color32) {
+    egui::Frame::new()
+        .fill(colors::SURFACE)
+        .corner_radius(egui::CornerRadius::same(255))
+        .inner_margin(egui::Margin::symmetric(8, 4))
+        .stroke(egui::Stroke::new(0.75, accent))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(label).small().color(colors::TEXT_MUTED));
+        });
 }
 
 // ---------------------------------------------------------------------------

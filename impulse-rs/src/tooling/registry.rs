@@ -3,16 +3,26 @@
 //! Inspired by DataFusion's SessionContext pattern: register once, query/execute anywhere.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use super::error::ToolError;
-use super::traits::{DynamicTool, ToolCategory, ToolContext, ToolDescriptor, ToolResult};
+use super::executor::ToolExecutor;
+use super::external::load_process_tools_from_dir;
+use super::traits::{
+    DynamicTool, ManifestTool, ToolCategory, ToolContext, ToolDescriptor, ToolResult, ToolSource,
+};
+
+struct RegisteredTool {
+    tool: Box<dyn DynamicTool>,
+    source: ToolSource,
+}
 
 /// Central registry for all dynamic tools.
 ///
 /// Tools are registered by ID and dispatched through `execute()`.
 /// The registry enforces capability checks before execution.
 pub struct ToolRegistry {
-    tools: HashMap<String, Box<dyn DynamicTool>>,
+    tools: HashMap<String, RegisteredTool>,
 }
 
 impl ToolRegistry {
@@ -25,22 +35,36 @@ impl ToolRegistry {
 
     /// Register a tool. Returns error if ID is already taken.
     pub fn register(&mut self, tool: Box<dyn DynamicTool>) -> Result<(), ToolError> {
+        self.register_with_source(tool, ToolSource::Builtin)
+    }
+
+    /// Register a tool with an explicit source classification.
+    pub fn register_with_source(
+        &mut self,
+        tool: Box<dyn DynamicTool>,
+        source: ToolSource,
+    ) -> Result<(), ToolError> {
         let id = tool.id().to_string();
         if self.tools.contains_key(&id) {
             return Err(ToolError::AlreadyRegistered(id));
         }
-        self.tools.insert(id, tool);
+        self.tools.insert(id, RegisteredTool { tool, source });
         Ok(())
     }
 
     /// Get a tool by ID
     pub fn get(&self, id: &str) -> Option<&dyn DynamicTool> {
-        self.tools.get(id).map(|t| t.as_ref())
+        self.tools.get(id).map(|t| t.tool.as_ref())
+    }
+
+    /// Get a tool's source classification.
+    pub fn source(&self, id: &str) -> Option<ToolSource> {
+        self.tools.get(id).map(|entry| entry.source)
     }
 
     /// List all registered tool descriptors
     pub fn list(&self) -> Vec<ToolDescriptor> {
-        let mut descriptors: Vec<_> = self.tools.values().map(|t| t.descriptor()).collect();
+        let mut descriptors: Vec<_> = self.tools.values().map(|t| t.tool.descriptor()).collect();
         descriptors.sort_by(|a, b| a.id.cmp(&b.id));
         descriptors
     }
@@ -50,11 +74,116 @@ impl ToolRegistry {
         let mut descriptors: Vec<_> = self
             .tools
             .values()
-            .map(|t| t.descriptor())
+            .map(|t| t.tool.descriptor())
             .filter(|d| d.category == category)
             .collect();
         descriptors.sort_by(|a, b| a.id.cmp(&b.id));
         descriptors
+    }
+
+    /// Export tools in a manifest shape suitable for agent discovery.
+    pub fn manifest_tools(&self) -> Vec<ManifestTool> {
+        let mut tools: Vec<_> = self
+            .tools
+            .values()
+            .map(|entry| {
+                let desc = entry.tool.descriptor();
+                ManifestTool {
+                    id: desc.id.clone(),
+                    name: desc.name.clone(),
+                    description: desc.description.clone(),
+                    category: desc.category.to_string(),
+                    params: desc.params.clone(),
+                    capabilities: entry
+                        .tool
+                        .required_capabilities()
+                        .iter()
+                        .map(|cap| cap.as_str().to_string())
+                        .collect(),
+                    source: entry.source.as_str().to_string(),
+                }
+            })
+            .collect();
+        tools.sort_by(|a, b| a.id.cmp(&b.id));
+        tools
+    }
+
+    /// Render tools as JSON schemas for agent/tool discovery.
+    pub fn schema_json(&self) -> Vec<serde_json::Value> {
+        let mut schema: Vec<_> = self
+            .tools
+            .values()
+            .map(|entry| {
+                let desc = entry.tool.descriptor();
+                let mut properties = serde_json::Map::new();
+                let mut required = Vec::new();
+                for param in &desc.params {
+                    let type_str = match param.param_type {
+                        super::traits::ParamType::String => "string",
+                        super::traits::ParamType::Integer => "integer",
+                        super::traits::ParamType::Float => "number",
+                        super::traits::ParamType::Bool => "boolean",
+                        super::traits::ParamType::FilePath => "string",
+                        super::traits::ParamType::Json => "object",
+                    };
+                    let mut property = serde_json::json!({
+                        "type": type_str,
+                        "description": param.description,
+                    });
+                    if let Some(default) = &param.default {
+                        property["default"] = default.clone();
+                    }
+                    if matches!(param.param_type, super::traits::ParamType::FilePath) {
+                        property["format"] = serde_json::json!("file-path");
+                    }
+                    properties.insert(param.name.clone(), property);
+                    if param.required {
+                        required.push(param.name.clone());
+                    }
+                }
+                serde_json::json!({
+                    "name": desc.id,
+                    "description": desc.description,
+                    "input_schema": {
+                        "type": "object",
+                        "properties": properties,
+                        "required": required,
+                    },
+                    "capabilities": entry.tool.required_capabilities().iter().map(|cap| cap.as_str()).collect::<Vec<_>>(),
+                    "source": entry.source.as_str(),
+                })
+            })
+            .collect();
+        schema.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        schema
+    }
+
+    pub fn schema_markdown(&self) -> String {
+        let mut out = String::new();
+        for tool in self.manifest_tools() {
+            out.push_str(&format!(
+                "### {} (`{}`)\n\n{}\n\n- Category: `{}`\n- Source: `{}`\n",
+                tool.name, tool.id, tool.description, tool.category, tool.source
+            ));
+            if tool.params.is_empty() {
+                out.push_str("- Parameters: none\n\n");
+                continue;
+            }
+            out.push_str("- Parameters:\n");
+            for param in tool.params {
+                let required = if param.required {
+                    "required"
+                } else {
+                    "optional"
+                };
+                out.push_str(&format!(
+                    "  - `{}` ({:?}, {}) — {}\n",
+                    param.name, param.param_type, required, param.description
+                ));
+            }
+            out.push('\n');
+        }
+        out
     }
 
     /// Number of registered tools
@@ -80,19 +209,7 @@ impl ToolRegistry {
             .tools
             .get(id)
             .ok_or_else(|| ToolError::NotFound(id.to_string()))?;
-
-        // Check capabilities
-        for cap in tool.required_capabilities() {
-            if !ctx.has_capability(cap) {
-                return Err(ToolError::MissingCapability(cap));
-            }
-        }
-
-        // Validate params
-        tool.validate_params(&params)?;
-
-        // Execute
-        tool.execute(params, ctx).await
+        ToolExecutor::execute(tool.tool.as_ref(), params, ctx).await
     }
 
     /// Create a registry with all built-in tools registered.
@@ -107,6 +224,16 @@ impl ToolRegistry {
         super::document::register_all(&mut reg);
 
         reg
+    }
+
+    /// Create a runtime registry with built-ins plus manifest-defined process tools.
+    pub fn with_runtime(impulse_dir: &Path, external_tools_dir: &Path) -> Result<Self, ToolError> {
+        let mut reg = Self::with_defaults();
+        let _ = impulse_dir;
+        for tool in load_process_tools_from_dir(external_tools_dir)? {
+            reg.register_with_source(Box::new(tool), ToolSource::ExternalProcess)?;
+        }
+        Ok(reg)
     }
 }
 
@@ -286,5 +413,25 @@ mod tests {
     fn test_with_defaults() {
         let reg = ToolRegistry::with_defaults();
         assert!(!reg.is_empty());
+    }
+
+    #[test]
+    fn test_manifest_and_schema_include_source_and_capabilities() {
+        let mut reg = ToolRegistry::new();
+        reg.register_with_source(Box::new(WriteTool), ToolSource::ExternalProcess)
+            .unwrap();
+
+        let manifest = reg.manifest_tools();
+        assert_eq!(manifest[0].id, "write_test");
+        assert_eq!(manifest[0].source, "external_process");
+        assert_eq!(manifest[0].capabilities, vec!["filesystem_write"]);
+
+        let schema = reg.schema_json();
+        assert_eq!(schema[0]["name"], "write_test");
+        assert_eq!(schema[0]["source"], "external_process");
+        assert_eq!(
+            schema[0]["capabilities"],
+            serde_json::json!(["filesystem_write"])
+        );
     }
 }

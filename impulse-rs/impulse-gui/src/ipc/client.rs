@@ -27,6 +27,13 @@ impl DaemonClient {
         }
     }
 
+    /// Update the socket path, dropping any existing connection.
+    #[allow(dead_code)]
+    pub fn set_socket_path(&mut self, path: std::path::PathBuf) {
+        self.stream = None;
+        self.socket_path = path;
+    }
+
     /// Discover the socket path from the current directory.
     /// Looks for `.impulse/sockets/impulse.sock` relative to cwd,
     /// then falls back to `IMPULSE_SOCKET_PATH` env var.
@@ -137,6 +144,7 @@ impl DaemonClient {
             DaemonResponse::AgentAssistResult { .. } => {
                 Err("unexpected AgentAssistResult".to_string())
             }
+            DaemonResponse::ConflictCheck { .. } => Err("unexpected ConflictCheck".to_string()),
         }
     }
 
@@ -233,6 +241,99 @@ impl DaemonClient {
         Ok(results)
     }
 
+    pub fn get_ops_snapshot(&mut self) -> Result<impulse_ops::ProjectOpsSnapshot, String> {
+        let resp = self.send(&DaemonRequest::GetOpsSnapshot)?;
+        let result = self.ok_result(resp)?;
+        serde_json::from_value(result).map_err(|e| format!("parse ops snapshot: {}", e))
+    }
+
+    pub fn subscribe_ops(
+        &mut self,
+        since_seq: Option<u64>,
+    ) -> Result<impulse_ops::OpsSubscription, String> {
+        let resp = self.send(&DaemonRequest::SubscribeOps { since_seq })?;
+        let result = self.ok_result(resp)?;
+        serde_json::from_value(result).map_err(|e| format!("parse ops subscription: {}", e))
+    }
+
+    pub fn publish_terminal_ops(
+        &mut self,
+        report: &impulse_ops::TerminalOpsReport,
+    ) -> Result<(), String> {
+        let resp = self.send(&DaemonRequest::PublishTerminalOps {
+            report: report.clone(),
+        })?;
+        self.ok_result(resp)?;
+        Ok(())
+    }
+
+    pub fn get_supervisor_permissions(
+        &mut self,
+    ) -> Result<impulse_ops::SupervisorPermissionState, String> {
+        let resp = self.send(&DaemonRequest::GetSupervisorPermissions)?;
+        let result = self.ok_result(resp)?;
+        serde_json::from_value(result).map_err(|e| format!("parse supervisor permissions: {}", e))
+    }
+
+    pub fn supervisor_chat(
+        &mut self,
+        prompt: &str,
+        context: Option<&str>,
+    ) -> Result<impulse_ops::SupervisorChatResult, String> {
+        let resp = self.send(&DaemonRequest::SupervisorChat {
+            prompt: prompt.to_string(),
+            context: context.map(String::from),
+        })?;
+        let result = self.ok_result(resp)?;
+        serde_json::from_value(result).map_err(|e| format!("parse supervisor chat: {}", e))
+    }
+
+    pub fn run_supervisor_action(
+        &mut self,
+        action: impulse_ops::SupervisorAction,
+    ) -> Result<impulse_ops::SupervisorActionResult, String> {
+        let resp = self.send(&DaemonRequest::RunSupervisorAction { action })?;
+        let result = self.ok_result(resp)?;
+        serde_json::from_value(result).map_err(|e| format!("parse supervisor action result: {}", e))
+    }
+
+    #[allow(dead_code)]
+    pub fn list_artifacts(
+        &mut self,
+        limit: Option<usize>,
+    ) -> Result<Vec<impulse_ops::ArtifactEnvelope>, String> {
+        let resp = self.send(&DaemonRequest::ListArtifacts { limit })?;
+        let result = self.ok_result(resp)?;
+        serde_json::from_value(result).map_err(|e| format!("parse artifacts: {}", e))
+    }
+
+    #[allow(dead_code)]
+    pub fn get_artifact(
+        &mut self,
+        artifact_id: &str,
+    ) -> Result<impulse_ops::ArtifactEnvelope, String> {
+        let resp = self.send(&DaemonRequest::GetArtifact {
+            artifact_id: artifact_id.to_string(),
+        })?;
+        let result = self.ok_result(resp)?;
+        serde_json::from_value(result).map_err(|e| format!("parse artifact: {}", e))
+    }
+
+    pub fn run_artifact_action(
+        &mut self,
+        artifact_id: &str,
+        action_id: &str,
+        params: serde_json::Value,
+    ) -> Result<impulse_ops::ArtifactActionResult, String> {
+        let resp = self.send(&DaemonRequest::RunArtifactAction {
+            artifact_id: artifact_id.to_string(),
+            action_id: action_id.to_string(),
+            params,
+        })?;
+        let result = self.ok_result(resp)?;
+        serde_json::from_value(result).map_err(|e| format!("parse artifact action: {}", e))
+    }
+
     // -- Session management --
 
     pub fn create_session(
@@ -257,7 +358,6 @@ impl DaemonClient {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn track_file(&mut self, session_id: &str, file_path: &str) -> Result<(), String> {
         let resp = self.send(&DaemonRequest::TrackFile {
             session_id: session_id.to_string(),
@@ -372,6 +472,7 @@ impl DaemonClient {
 
     // -- Agent coordination --
 
+    #[allow(dead_code)]
     pub fn agent_assist(&mut self, prompt: &str, context: Option<&str>) -> Result<String, String> {
         let resp = self.send(&DaemonRequest::AgentAssist {
             prompt: prompt.to_string(),

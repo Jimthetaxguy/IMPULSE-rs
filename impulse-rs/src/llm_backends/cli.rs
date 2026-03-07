@@ -1,15 +1,18 @@
 //! CLI Agent Implementation
 //!
-//! Supports running Claude Code and OpenCode as subprocesses
+//! Supports running Claude Code, OpenCode, and generic CLI agents as subprocesses.
 
-use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
+use std::sync::Arc;
+use std::time::Duration;
 
-use super::types::{AgentBackend, AgentConfig, AgentType, CliSession};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::Mutex;
+
+use super::types::{AgentConfig, AgentType, CliProtocol, CliSession};
 use crate::error::{AgentError, AgentResult};
 
 /// A message in CLI agent communication
@@ -51,32 +54,53 @@ pub enum CliAgentError {
 impl From<CliAgentError> for AgentError {
     fn from(e: CliAgentError) -> Self {
         match e {
-            CliAgentError::CommandNotFound(s) => AgentError::ApiRequest(s),
-            CliAgentError::SpawnFailed(s) => AgentError::ApiRequest(s),
+            CliAgentError::CommandNotFound(s) => AgentError::InvalidRequest(s),
+            CliAgentError::SpawnFailed(s) => AgentError::InvalidRequest(s),
+            CliAgentError::NotCliAgent(s) => AgentError::InvalidRequest(s),
             CliAgentError::ProcessExited(s) => AgentError::ApiRequest(s),
             CliAgentError::CommunicationError(s) => AgentError::ApiRequest(s),
-            CliAgentError::SessionNotActive => AgentError::ApiRequest("Session not active".to_string()),
-            CliAgentError::NotCliAgent(s) => AgentError::ApiRequest(s),
+            CliAgentError::SessionNotActive => {
+                AgentError::SessionNotFound { id: "cli".to_string() }
+            }
         }
+    }
+}
+
+struct CliRuntimeState {
+    session: Option<CliSession>,
+    child: Option<Child>,
+    stdin: Option<ChildStdin>,
+    stdout: Option<BufReader<ChildStdout>>,
+    response_buffer: String,
+}
+
+impl CliRuntimeState {
+    fn new() -> Self {
+        Self {
+            session: None,
+            child: None,
+            stdin: None,
+            stdout: None,
+            response_buffer: String::new(),
+        }
+    }
+
+    fn session_id(&self) -> Option<String> {
+        self.session.as_ref().and_then(|session| session.session_id.clone())
     }
 }
 
 /// CLI Agent for running Claude Code, OpenCode, or similar CLI agents
 pub struct CliAgent {
     pub config: AgentConfig,
-    session: Option<CliSession>,
-    child: Option<Child>,
-    /// Buffer for reading responses
-    response_buffer: String,
+    state: Arc<Mutex<CliRuntimeState>>,
 }
 
 impl Clone for CliAgent {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
-            session: self.session.clone(),
-            child: None, // Can't clone child processes
-            response_buffer: self.response_buffer.clone(),
+            state: self.state.clone(),
         }
     }
 }
@@ -85,25 +109,34 @@ impl CliAgent {
     /// Create a new CLI agent
     pub fn new(config: AgentConfig) -> AgentResult<Self> {
         if !config.agent_type.is_cli() {
-            return Err(AgentError::ApiRequest(format!(
-                "Agent type {:?} is not a CLI agent",
-                config.agent_type
-            )));
+            return Err(CliAgentError::NotCliAgent(format!("{:?}", config.agent_type)).into());
+        }
+        if matches!(config.agent_type, AgentType::GenericCli)
+            && config
+                .cli_command
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+        {
+            return Err(CliAgentError::NotCliAgent(
+                "generic-cli requires an explicit cli_command".to_string(),
+            )
+            .into());
         }
 
         Ok(Self {
             config,
-            session: None,
-            child: None,
-            response_buffer: String::new(),
+            state: Arc::new(Mutex::new(CliRuntimeState::new())),
         })
     }
 
     /// Get the CLI command to run
-    fn get_command(&self) -> AgentResult<&str> {
+    fn get_command(&self) -> AgentResult<String> {
         self.config
-            .agent_type
-            .cli_command()
+            .cli_command
+            .clone()
+            .or_else(|| self.config.agent_type.cli_command().map(str::to_string))
             .ok_or_else(|| AgentError::ApiRequest("Unknown CLI agent type".to_string()))
     }
 
@@ -119,15 +152,22 @@ impl CliAgent {
     fn build_env(&self) -> HashMap<String, String> {
         let mut env = std::env::vars().collect::<HashMap<_, _>>();
 
-        // Add/override with custom env vars
         for (key, value) in &self.config.env {
             env.insert(key.clone(), value.clone());
         }
 
-        // Add verbose flag if set
+        env.insert(
+            "IMPULSE_CLI_PROTOCOL".to_string(),
+            match self.config.cli_protocol {
+                CliProtocol::PromptOnce => "prompt-once",
+                CliProtocol::LineDelimited => "line-delimited",
+                CliProtocol::JsonLines => "json-lines",
+            }
+            .to_string(),
+        );
+
         if self.config.verbose {
             if let Some(cmd) = self.config.agent_type.cli_command() {
-                // Some CLIs support --verbose
                 env.insert(format!("{}_VERBOSE", cmd.to_uppercase()), "1".to_string());
             }
         }
@@ -135,38 +175,24 @@ impl CliAgent {
         env
     }
 
-    /// Check if a CLI command is available
-    pub async fn check_availability(&self) -> AgentResult<bool> {
-        let cmd = self.get_command()?;
+    fn ensure_session(state: &mut CliRuntimeState, config: &AgentConfig) {
+        if state.session.is_none() {
+            state.session = Some(CliSession {
+                config: config.clone(),
+                active: true,
+                pid: None,
+                session_id: Some(uuid::Uuid::new_v4().to_string()),
+            });
+            return;
+        }
 
-        // Try to run --version to check if command exists
-        let output = Command::new(cmd)
-            .arg("--version")
-            .output()
-            .await;
-
-        match output {
-            Ok(o) => Ok(o.status.success()),
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    Ok(false)
-                } else {
-                    Err(AgentError::ApiRequest(e.to_string()))
-                }
-            }
+        if let Some(session) = &mut state.session {
+            session.active = true;
         }
     }
 
-    /// Start a CLI session (spawn the subprocess)
-    pub async fn start_session(&mut self, initial_prompt: Option<&str>) -> AgentResult<CliSession> {
+    fn build_command(&self) -> AgentResult<Command> {
         let cmd = self.get_command()?;
-
-        // Check if command exists first
-        if !self.check_availability().await? {
-            return Err(CliAgentError::CommandNotFound(cmd.to_string()).into());
-        }
-
-        // Build the command
         let mut command = Command::new(cmd);
         command
             .current_dir(self.get_working_dir())
@@ -174,130 +200,356 @@ impl CliAgent {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        Ok(command)
+    }
 
-        // Add CLI-specific arguments based on agent type
-        match self.config.agent_type {
-            AgentType::ClaudeCode => {
-                // Claude Code options: --print, --addrompt, --continue, etc.
-                // For interactive sessions, we typically use --continue or no flag
-                if let Some(prompt) = initial_prompt {
-                    command.arg("--add-prompt").arg(prompt);
-                }
-                // Use --print for non-interactive mode, or nothing for interactive
-                // command.arg("--print");
-            }
-            AgentType::OpenCode => {
-                // OpenCode options
-                if let Some(prompt) = initial_prompt {
-                    command.arg("--prompt").arg(prompt);
+    fn render_static_args(&self, prompt: Option<&str>) -> Vec<String> {
+        let mut args = Vec::new();
+        let mut prompt_consumed = false;
+        let system_prompt = self.config.system_prompt.as_deref().unwrap_or("");
+
+        for arg in &self.config.cli_args {
+            let mut rendered = arg.replace("{system_prompt}", system_prompt);
+            if let Some(prompt) = prompt {
+                if rendered.contains("{prompt}") {
+                    rendered = rendered.replace("{prompt}", prompt);
+                    prompt_consumed = true;
                 }
             }
-            _ => {}
+            args.push(rendered);
         }
 
-        // Spawn the process
-        let mut child = command.spawn().map_err(|e| {
-            CliAgentError::SpawnFailed(format!("Failed to spawn {}: {}", cmd, e))
-        })?;
+        match self.config.agent_type {
+            AgentType::ClaudeCode => {
+                if matches!(self.config.cli_protocol, CliProtocol::PromptOnce) {
+                    args.push("--print".to_string());
+                }
+            }
+            AgentType::OpenCode => {}
+            AgentType::GenericCli => {}
+            AgentType::Anthropic | AgentType::OpenAi | AgentType::Minimax | AgentType::Custom => {}
+        }
 
-        // Get stdin/stdout
-        let stdin = child.stdin.take().ok_or_else(|| {
-            CliAgentError::SpawnFailed("Failed to capture stdin".to_string())
-        })?;
+        if let Some(prompt) = prompt {
+            match self.config.agent_type {
+                AgentType::ClaudeCode | AgentType::GenericCli => {
+                    if !prompt_consumed {
+                        args.push(prompt.to_string());
+                    }
+                }
+                AgentType::OpenCode => {
+                    if !prompt_consumed {
+                        args.push("--prompt".to_string());
+                        args.push(prompt.to_string());
+                    }
+                }
+                AgentType::Anthropic
+                | AgentType::OpenAi
+                | AgentType::Minimax
+                | AgentType::Custom => {}
+            }
+        }
 
-        let stdout = child.stdout.take().ok_or_else(|| {
-            CliAgentError::SpawnFailed("Failed to capture stdout".to_string())
-        })?;
+        args
+    }
 
-        let stderr = child.stderr.take();
+    /// Check if a CLI command is available
+    pub async fn check_availability(&self) -> AgentResult<bool> {
+        let cmd = self.get_command()?;
 
-        // Create the session
+        match Command::new(&cmd).arg("--version").output().await {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(AgentError::ApiRequest(e.to_string())),
+        }
+    }
+
+    async fn spawn_persistent_process(&self) -> AgentResult<(Child, ChildStdin, BufReader<ChildStdout>)> {
+        let mut command = self.build_command()?;
+        command.args(self.render_static_args(None));
+
+        let mut child = command
+            .spawn()
+            .map_err(|e| CliAgentError::SpawnFailed(e.to_string()))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| CliAgentError::SpawnFailed("Failed to capture stdin".to_string()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| CliAgentError::SpawnFailed("Failed to capture stdout".to_string()))?;
+
+        Ok((child, stdin, BufReader::new(stdout)))
+    }
+
+    async fn ensure_persistent_session(
+        &self,
+        state: &mut CliRuntimeState,
+    ) -> AgentResult<()> {
+        let needs_spawn = match state.child.as_mut() {
+            Some(child) => matches!(child.try_wait(), Ok(Some(_))),
+            None => true,
+        };
+
+        if !needs_spawn && state.stdin.is_some() && state.stdout.is_some() {
+            return Ok(());
+        }
+
+        let (child, stdin, stdout) = self.spawn_persistent_process().await?;
         let pid = child.id();
-        let session_id = uuid::Uuid::new_v4().to_string();
+        Self::ensure_session(state, &self.config);
+        if let Some(session) = &mut state.session {
+            session.pid = pid;
+        }
+        state.child = Some(child);
+        state.stdin = Some(stdin);
+        state.stdout = Some(stdout);
+        Ok(())
+    }
 
-        self.session = Some(CliSession {
-            config: self.config.clone(),
-            active: true,
-            pid,
-            session_id: Some(session_id.clone()),
-        });
+    async fn read_line_delimited_response(
+        stdout: &mut BufReader<ChildStdout>,
+        response_buffer: &mut String,
+    ) -> AgentResult<Vec<String>> {
+        let mut lines = Vec::new();
 
-        self.child = Some(child);
+        loop {
+            let mut line = String::new();
+            let timeout = if lines.is_empty() {
+                Duration::from_secs(2)
+            } else {
+                Duration::from_millis(250)
+            };
 
-        // Start reading responses in background (simplified for now - we do sync reads)
-        // In a full implementation, we'd spawn a task to read stdout
+            match tokio::time::timeout(timeout, stdout.read_line(&mut line)).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(_)) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        if !lines.is_empty() {
+                            break;
+                        }
+                        continue;
+                    }
+                    response_buffer.push_str(trimmed);
+                    response_buffer.push('\n');
+                    lines.push(trimmed.to_string());
+                }
+                Ok(Err(err)) => {
+                    return Err(
+                        CliAgentError::CommunicationError(format!("failed to read response: {}", err))
+                            .into(),
+                    )
+                }
+                Err(_) if lines.is_empty() => {
+                    return Err(CliAgentError::CommunicationError(
+                        "timed out waiting for CLI response".to_string(),
+                    )
+                    .into())
+                }
+                Err(_) => break,
+            }
+        }
 
-        Ok(CliSession {
-            config: self.config.clone(),
-            active: true,
-            pid,
-            session_id: Some(session_id),
-        })
+        if lines.is_empty() {
+            return Err(CliAgentError::CommunicationError(
+                "CLI returned no response".to_string(),
+            )
+            .into());
+        }
+
+        Ok(lines)
+    }
+
+    fn parse_json_lines(lines: &[String]) -> AgentResult<String> {
+        let mut fragments = Vec::new();
+
+        for line in lines {
+            let value: serde_json::Value = serde_json::from_str(line)
+                .map_err(|err| CliAgentError::CommunicationError(err.to_string()))?;
+
+            if let Some(text) = value.get("content").and_then(|item| item.as_str()) {
+                fragments.push(text.to_string());
+                continue;
+            }
+            if let Some(text) = value.get("text").and_then(|item| item.as_str()) {
+                fragments.push(text.to_string());
+                continue;
+            }
+            if let Some(text) = value
+                .get("message")
+                .and_then(|message| message.get("content"))
+                .and_then(|item| item.as_str())
+            {
+                fragments.push(text.to_string());
+                continue;
+            }
+            if let Some(text) = value
+                .get("result")
+                .and_then(|result| result.get("content"))
+                .and_then(|item| item.as_str())
+            {
+                fragments.push(text.to_string());
+                continue;
+            }
+
+            fragments.push(value.to_string());
+        }
+
+        Ok(fragments.join("\n"))
+    }
+
+    async fn send_via_persistent_session(
+        &self,
+        state: &mut CliRuntimeState,
+        message: &str,
+        json_mode: bool,
+    ) -> AgentResult<String> {
+        self.ensure_persistent_session(state).await?;
+
+        let stdin = state
+            .stdin
+            .as_mut()
+            .ok_or(CliAgentError::SessionNotActive)?;
+        stdin
+            .write_all(message.as_bytes())
+            .await
+            .map_err(|e| CliAgentError::CommunicationError(e.to_string()))?;
+        stdin
+            .write_all(b"\n")
+            .await
+            .map_err(|e| CliAgentError::CommunicationError(e.to_string()))?;
+        stdin
+            .flush()
+            .await
+            .map_err(|e| CliAgentError::CommunicationError(e.to_string()))?;
+
+        let stdout = state
+            .stdout
+            .as_mut()
+            .ok_or(CliAgentError::SessionNotActive)?;
+        let lines =
+            Self::read_line_delimited_response(stdout, &mut state.response_buffer).await?;
+
+        if json_mode {
+            Self::parse_json_lines(&lines)
+        } else {
+            Ok(lines.join("\n"))
+        }
+    }
+
+    async fn run_prompt_once(&self, state: &mut CliRuntimeState, message: &str) -> AgentResult<String> {
+        Self::ensure_session(state, &self.config);
+
+        let mut command = self.build_command()?;
+        command.args(self.render_static_args(Some(message)));
+
+        let output = command
+            .output()
+            .await
+            .map_err(|e| CliAgentError::SpawnFailed(e.to_string()))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let detail = if stderr.is_empty() {
+                format!("exit status {}", output.status)
+            } else {
+                stderr
+            };
+            return Err(CliAgentError::ProcessExited(detail).into());
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// Start a CLI session
+    pub async fn start_session(&self, initial_prompt: Option<&str>) -> AgentResult<CliSession> {
+        let mut state = self.state.lock().await;
+        Self::ensure_session(&mut state, &self.config);
+
+        match self.config.cli_protocol {
+            CliProtocol::PromptOnce => {
+                if let Some(prompt) = initial_prompt {
+                    let _ = self.run_prompt_once(&mut state, prompt).await?;
+                }
+            }
+            CliProtocol::LineDelimited | CliProtocol::JsonLines => {
+                self.ensure_persistent_session(&mut state).await?;
+                if let Some(prompt) = initial_prompt {
+                    let _ = self
+                        .send_via_persistent_session(
+                            &mut state,
+                            prompt,
+                            matches!(self.config.cli_protocol, CliProtocol::JsonLines),
+                        )
+                        .await?;
+                }
+            }
+        }
+
+        state.session.clone().ok_or(CliAgentError::SessionNotActive.into())
     }
 
     /// Send a message to the CLI agent and get a response
-    pub async fn send_message(&mut self, message: &str) -> AgentResult<CliResponse> {
-        let session = self.session.as_ref().ok_or(CliAgentError::SessionNotActive)?;
+    pub async fn send_message(&self, message: &str) -> AgentResult<CliResponse> {
+        let mut state = self.state.lock().await;
+        let content = match self.config.cli_protocol {
+            CliProtocol::PromptOnce => self.run_prompt_once(&mut state, message).await?,
+            CliProtocol::LineDelimited => {
+                self.send_via_persistent_session(&mut state, message, false)
+                    .await?
+            }
+            CliProtocol::JsonLines => {
+                self.send_via_persistent_session(&mut state, message, true)
+                    .await?
+            }
+        };
 
-        if !session.active {
-            return Err(CliAgentError::SessionNotActive.into());
-        }
-
-        // For now, implement a simple approach:
-        // 1. If no child exists, start a new session
-        // 2. Write to stdin
-        // 3. Read from stdout
-
-        // This is a simplified implementation - a full version would need
-        // proper async reading/writing with proper protocol handling
-
-        // For Claude Code / OpenCode, they typically work interactively
-        // So we need to handle the protocol differently
-
-        // Return a placeholder - the full implementation would need
-        // proper CLI protocol handling (like JSON-RPC or similar)
         Ok(CliResponse {
-            content: format!(
-                "[CLI Agent {}] Message sent: {}",
-                self.config.name, message
-            ),
-            session_id: session.session_id.clone(),
+            content,
+            session_id: state.session_id(),
         })
     }
 
     /// End the CLI session
-    pub async fn end_session(&mut self) -> AgentResult<()> {
-        if let Some(mut session) = self.session.take() {
+    pub async fn end_session(&self) -> AgentResult<()> {
+        let mut state = self.state.lock().await;
+        if let Some(session) = &mut state.session {
             session.active = false;
         }
-
-        if let Some(mut child) = self.child.take() {
-            // Try graceful termination first
+        if let Some(mut child) = state.child.take() {
             let _ = child.kill().await;
         }
-
+        state.stdin = None;
+        state.stdout = None;
         Ok(())
     }
 
-    /// Get the current session
-    pub fn session(&self) -> Option<&CliSession> {
-        self.session.as_ref()
+    /// Get the current session snapshot
+    pub fn session(&self) -> Option<CliSession> {
+        self.state
+            .try_lock()
+            .ok()
+            .and_then(|state| state.session.clone())
     }
 
     /// Check if session is active
     pub fn is_active(&self) -> bool {
-        self.session
-            .as_ref()
-            .map(|s| s.active)
+        self.state
+            .try_lock()
+            .ok()
+            .and_then(|state| state.session.as_ref().map(|session| session.active))
             .unwrap_or(false)
     }
 }
 
 impl Drop for CliAgent {
     fn drop(&mut self) {
-        // Ensure we clean up the child process
-        if let Some(mut child) = self.child.take() {
-            let _ = child.start_kill();
+        if let Ok(mut state) = self.state.try_lock() {
+            if let Some(child) = state.child.as_mut() {
+                let _ = child.start_kill();
+            }
         }
     }
 }
@@ -344,6 +596,21 @@ impl CliAgentBuilder {
         self
     }
 
+    pub fn command(mut self, command: impl Into<String>) -> Self {
+        self.config.cli_command = Some(command.into());
+        self
+    }
+
+    pub fn arg(mut self, arg: impl Into<String>) -> Self {
+        self.config.cli_args.push(arg.into());
+        self
+    }
+
+    pub fn protocol(mut self, protocol: CliProtocol) -> Self {
+        self.config.cli_protocol = protocol;
+        self
+    }
+
     pub fn build(self) -> AgentResult<CliAgent> {
         CliAgent::new(self.config)
     }
@@ -359,7 +626,6 @@ mod tests {
         let agent = CliAgent::new(config);
         assert!(agent.is_ok());
 
-        // Try with non-CLI agent should fail
         let config = AgentConfig::anthropic("test", "Test Anthropic", "key");
         let agent = CliAgent::new(config);
         assert!(agent.is_err());
@@ -378,5 +644,28 @@ mod tests {
         assert!(agent.is_ok());
         let agent = agent.unwrap();
         assert!(!agent.is_active());
+    }
+
+    #[test]
+    fn test_generic_cli_builder() {
+        let agent = CliAgentBuilder::new(AgentType::GenericCli)
+            .id("generic")
+            .name("Generic")
+            .command("echo")
+            .arg("{prompt}")
+            .protocol(CliProtocol::PromptOnce)
+            .build();
+
+        assert!(agent.is_ok());
+    }
+
+    #[test]
+    fn test_parse_json_lines_content() {
+        let parsed = CliAgent::parse_json_lines(&[
+            r#"{"content":"hello"}"#.to_string(),
+            r#"{"text":"world"}"#.to_string(),
+        ])
+        .unwrap();
+        assert_eq!(parsed, "hello\nworld");
     }
 }

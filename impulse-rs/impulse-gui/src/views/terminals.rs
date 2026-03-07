@@ -15,7 +15,7 @@ use crate::widgets::signal_bus::{GuiSignal, SignalKind, SignalUrgency, TabBadge}
 
 use super::terminal_search::TerminalSearch;
 use super::{View, ViewId};
-use crate::state::SharedState;
+use crate::state::{PollerCommand, SharedState};
 use crate::theme;
 use crate::theme::colors;
 
@@ -37,6 +37,8 @@ struct Tab {
     panel: TerminalPanel,
     #[allow(dead_code)]
     target_dir: PathBuf,
+    /// Daemon session ID, set asynchronously after CreateTabSession round-trip.
+    daemon_session_id: Option<String>,
 }
 
 /// A pending context injection — waiting for agent startup.
@@ -80,10 +82,16 @@ pub struct TerminalsView {
     badge_acknowledged_tab: Option<u64>,
     /// Tabs closed this frame, pending signal_bus.remove_tab() in app.rs.
     closed_tabs: Vec<u64>,
+    /// Active file conflicts per tab: (file_path, conflicting_tab_label)
+    pub active_conflicts: HashMap<u64, Vec<(String, String)>>,
+    /// Channel to send commands to the poller thread for daemon session management.
+    poller_cmd: Option<std::sync::mpsc::Sender<PollerCommand>>,
+    /// Files already tracked with the daemon for each session (dedup guard).
+    tracked_files: HashMap<String, HashSet<String>>,
 }
 
 impl TerminalsView {
-    pub fn new() -> Self {
+    pub fn new(poller_cmd: Option<std::sync::mpsc::Sender<PollerCommand>>) -> Self {
         let agents = vec![
             AgentInfo {
                 name: "Claude Code",
@@ -132,6 +140,9 @@ impl TerminalsView {
             tab_badges: BTreeMap::new(),
             badge_acknowledged_tab: None,
             closed_tabs: Vec::new(),
+            active_conflicts: HashMap::new(),
+            poller_cmd,
+            tracked_files: HashMap::new(),
         }
     }
 
@@ -232,10 +243,11 @@ impl TerminalsView {
 
                 let tab = Tab {
                     id,
-                    label,
+                    label: label.clone(),
                     agent_name: agent.name,
                     panel,
                     target_dir: target_dir.to_path_buf(),
+                    daemon_session_id: None,
                 };
                 self.tabs.insert(id, tab);
                 self.active_tab = Some(id);
@@ -245,6 +257,17 @@ impl TerminalsView {
                     agent.name,
                     target_dir.display()
                 );
+
+                // Request daemon session creation for this tab.
+                if let Some(ref cmd_tx) = self.poller_cmd {
+                    let session_name =
+                        format!("gui-{}-{}", agent.name.to_lowercase().replace(' ', "-"), id);
+                    let _ = cmd_tx.send(PollerCommand::CreateTabSession {
+                        tab_id: id,
+                        name: session_name,
+                        platform: agent.name.to_string(),
+                    });
+                }
 
                 // Schedule init context injection after startup delay.
                 let delay = match agent.name {
@@ -314,6 +337,20 @@ impl TerminalsView {
         // Merge this tab's insights into HISTORY.jsonl before closing.
         if let Some(tab) = self.tabs.get(&id) {
             self.merge_tab_insights_to_history(id, tab.agent_name, tab.label.clone());
+
+            // End daemon session if one was created.
+            if let Some(ref session_id) = tab.daemon_session_id {
+                let summary = self.build_close_summary(id, tab);
+                if let Some(ref cmd_tx) = self.poller_cmd {
+                    let _ = cmd_tx.send(PollerCommand::EndTabSession {
+                        tab_id: id,
+                        session_id: session_id.clone(),
+                        summary,
+                    });
+                }
+                self.tracked_files.remove(session_id);
+            }
+
             tab.panel.kill();
         }
         self.tabs.remove(&id);
@@ -356,6 +393,7 @@ impl TerminalsView {
     /// Clean up all tabs (called on exit).
     ///
     /// Merges all remaining pane insights into HISTORY.jsonl before killing.
+    /// Ends all daemon sessions with summaries.
     pub fn shutdown(&mut self) {
         let tab_info: Vec<(u64, &'static str, String)> = self
             .tabs
@@ -363,8 +401,22 @@ impl TerminalsView {
             .map(|(&id, tab)| (id, tab.agent_name, tab.label.clone()))
             .collect();
 
-        for (id, agent_name, label) in tab_info {
-            self.merge_tab_insights_to_history(id, agent_name, label);
+        for (id, agent_name, label) in &tab_info {
+            self.merge_tab_insights_to_history(*id, agent_name, label.clone());
+        }
+
+        // End all daemon sessions.
+        if let Some(ref cmd_tx) = self.poller_cmd {
+            for (&id, tab) in &self.tabs {
+                if let Some(ref session_id) = tab.daemon_session_id {
+                    let summary = self.build_close_summary(id, tab);
+                    let _ = cmd_tx.send(PollerCommand::EndTabSession {
+                        tab_id: id,
+                        session_id: session_id.clone(),
+                        summary,
+                    });
+                }
+            }
         }
 
         for tab in self.tabs.values() {
@@ -375,12 +427,8 @@ impl TerminalsView {
         self.last_injected_tiers.clear();
         self.tab_snapshots.clear();
         self.tab_badges.clear();
+        self.tracked_files.clear();
         self.active_tab = None;
-    }
-
-    /// Tab count for status bar display.
-    pub fn tab_count(&self) -> usize {
-        self.tabs.len()
     }
 
     /// Set tab badges from SignalBus (replaces direct field access).
@@ -398,15 +446,164 @@ impl TerminalsView {
         std::mem::take(&mut self.closed_tabs)
     }
 
-    /// Active agent info for the status bar.
-    pub fn active_agent_info(&self) -> Vec<crate::widgets::status_bar::ActiveAgent> {
+    /// Set the daemon session ID for a tab (called from app.rs on TabSessionCreated).
+    pub fn set_daemon_session_id(&mut self, tab_id: u64, session_id: String) {
+        if let Some(tab) = self.tabs.get_mut(&tab_id) {
+            log::info!("Tab {} linked to daemon session {}", tab_id, session_id);
+            tab.daemon_session_id = Some(session_id);
+        }
+    }
+
+    /// Build a summary string for ending a daemon session on tab close.
+    fn build_close_summary(&self, id: u64, tab: &Tab) -> String {
+        let insights = tab.panel.insights();
+        let file_count = insights
+            .iter()
+            .filter(|i| i.insight_type == InsightType::FileModified)
+            .map(|i| &i.content)
+            .collect::<HashSet<_>>()
+            .len();
+        let error_count = insights
+            .iter()
+            .filter(|i| i.insight_type == InsightType::ErrorEncountered)
+            .count();
+        format!(
+            "GUI tab {} closed: {} insights, {} files, {} errors",
+            id,
+            insights.len(),
+            file_count,
+            error_count
+        )
+    }
+
+    pub fn workbench_agents(&self) -> Vec<impulse_ops::AgentRuntime> {
         self.tabs
-            .values()
-            .map(|tab| crate::widgets::status_bar::ActiveAgent {
-                name: tab.agent_name,
-                alive: tab.panel.is_alive(),
+            .iter()
+            .map(|(id, tab)| {
+                let health = tab.panel.context_health();
+                let recent_insights = tab
+                    .panel
+                    .insights()
+                    .iter()
+                    .rev()
+                    .take(5)
+                    .map(|insight| impulse_ops::InsightRecord {
+                        timestamp: Some(insight.timestamp.to_rfc3339()),
+                        agent_label: tab.agent_name.to_string(),
+                        kind: insight.insight_type.as_str().to_string(),
+                        content: insight.content.clone(),
+                    })
+                    .collect::<Vec<_>>();
+
+                let mut warnings = Vec::new();
+                if matches!(health.tier, ContextTier::Critical | ContextTier::Minimal) {
+                    warnings.push(format!(
+                        "Context tier is {} and needs review soon",
+                        health.tier.as_str()
+                    ));
+                }
+                if !tab.panel.is_alive() {
+                    warnings.push("Terminal process is no longer alive".to_string());
+                }
+
+                impulse_ops::AgentRuntime {
+                    id: format!("tab-{}", id),
+                    label: tab.label.clone(),
+                    backend_kind: tab.agent_name.to_string(),
+                    session_id: None,
+                    ephemeral: true,
+                    working_directory: tab.target_dir.display().to_string(),
+                    status: if tab.panel.is_alive() {
+                        "active".to_string()
+                    } else {
+                        "stopped".to_string()
+                    },
+                    current_task: recent_insights
+                        .first()
+                        .map(|insight| insight.content.clone()),
+                    active: tab.panel.is_alive(),
+                    context: impulse_ops::ContextHealthSummary {
+                        tier: health.tier.as_str().to_string(),
+                        usage_fraction: health.usage_fraction,
+                        estimated_tokens: health.estimated_tokens,
+                        window_tokens: health.window_tokens,
+                        compaction_count: health.compaction_count,
+                        injection_count: health.injection_count,
+                        pending_review_count: self.pending_injections.len(),
+                        recent_insights,
+                    },
+                    recent_files: tab
+                        .panel
+                        .insights()
+                        .iter()
+                        .filter(|insight| insight.insight_type == InsightType::FileModified)
+                        .map(|insight| insight.content.clone())
+                        .collect(),
+                    recent_tools: Vec::new(),
+                    warnings,
+                }
             })
             .collect()
+    }
+
+    pub fn workbench_context(&self) -> impulse_ops::ContextHealthSummary {
+        let mut summary = impulse_ops::ContextHealthSummary {
+            tier: "steady".to_string(),
+            pending_review_count: self.pending_injections.len(),
+            ..Default::default()
+        };
+
+        let mut recent_insights = Vec::new();
+        for tab in self.tabs.values() {
+            let health = tab.panel.context_health();
+            if health.usage_fraction > summary.usage_fraction {
+                summary.usage_fraction = health.usage_fraction;
+                summary.tier = health.tier.as_str().to_string();
+                summary.estimated_tokens = health.estimated_tokens;
+                summary.window_tokens = health.window_tokens;
+            }
+            summary.compaction_count += health.compaction_count;
+            summary.injection_count += health.injection_count;
+            recent_insights.extend(tab.panel.insights().iter().rev().take(4).map(|insight| {
+                impulse_ops::InsightRecord {
+                    timestamp: Some(insight.timestamp.to_rfc3339()),
+                    agent_label: tab.agent_name.to_string(),
+                    kind: insight.insight_type.as_str().to_string(),
+                    content: insight.content.clone(),
+                }
+            }));
+        }
+        recent_insights.truncate(20);
+        summary.recent_insights = recent_insights;
+        summary
+    }
+
+    pub fn workbench_interventions(&self) -> Vec<impulse_ops::InterventionRecommendation> {
+        let mut interventions = Vec::new();
+        for agent in self.workbench_agents() {
+            if matches!(agent.context.tier.as_str(), "critical" | "minimal") {
+                interventions.push(impulse_ops::InterventionRecommendation {
+                    id: format!("review-{}", agent.id),
+                    title: format!("Review {}", agent.label),
+                    description: format!(
+                        "{} is at context tier {} ({} tokens of {}).",
+                        agent.label,
+                        agent.context.tier,
+                        agent.context.estimated_tokens,
+                        agent.context.window_tokens
+                    ),
+                    severity: if agent.context.tier == "minimal" {
+                        "urgent".to_string()
+                    } else {
+                        "warning".to_string()
+                    },
+                    action_kind: "focus_agent".to_string(),
+                    action_label: "Focus Agent".to_string(),
+                    target_agent_id: Some(agent.id.clone()),
+                });
+            }
+        }
+        interventions
     }
 
     /// Count of alive tabs.
@@ -479,16 +676,59 @@ impl TerminalsView {
         }
     }
 
+    fn resolve_tab_id_for_agent(&self, agent_id: &str, session_id: Option<&str>) -> Option<u64> {
+        if let Some(tab_id) = agent_id
+            .strip_prefix("tab-")
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|tab_id| self.tabs.contains_key(tab_id))
+        {
+            return Some(tab_id);
+        }
+
+        if let Some(session_id) = session_id {
+            return self.tabs.iter().find_map(|(tab_id, tab)| {
+                let runtime_id = format!("tab-{}", tab_id);
+                (runtime_id == session_id || tab.label == session_id).then_some(*tab_id)
+            });
+        }
+
+        self.tabs.iter().find_map(|(tab_id, tab)| {
+            (tab.label == agent_id || tab.agent_name == agent_id).then_some(*tab_id)
+        })
+    }
+
+    pub fn focus_agent(&mut self, agent_id: &str, session_id: Option<&str>) -> bool {
+        self.resolve_tab_id_for_agent(agent_id, session_id)
+            .map(|tab_id| self.focus_tab(tab_id))
+            .unwrap_or(false)
+    }
+
+    pub fn send_to_agent(&self, agent_id: &str, session_id: Option<&str>, content: &str) -> bool {
+        self.resolve_tab_id_for_agent(agent_id, session_id)
+            .map(|tab_id| self.send_to_tab(tab_id, content))
+            .unwrap_or(false)
+    }
+
     /// Run context extraction tick on all alive panels.
     ///
     /// Collects newly extracted insights and persists them to LIVE_INSIGHTS.jsonl.
+    /// Also forwards FileModified insights to the daemon for session tracking.
     pub fn context_tick(&mut self) {
         let mut new_insights: Vec<ExtractedInsight> = Vec::new();
+        let mut file_tracks: Vec<(String, String)> = Vec::new(); // (session_id, file_path)
 
         for tab in self.tabs.values_mut() {
             if tab.panel.is_alive() {
                 let extracted = tab.panel.context_bridge().extract_tick();
                 if !extracted.is_empty() {
+                    // Track new file modifications with daemon.
+                    if let Some(ref session_id) = tab.daemon_session_id {
+                        for insight in &extracted {
+                            if insight.insight_type == InsightType::FileModified {
+                                file_tracks.push((session_id.clone(), insight.content.clone()));
+                            }
+                        }
+                    }
                     new_insights.extend(extracted);
                 }
             }
@@ -496,6 +736,27 @@ impl TerminalsView {
 
         if !new_insights.is_empty() {
             self.persist_insights(&new_insights);
+        }
+
+        // Forward file tracks to daemon (deduplicating per session).
+        if let Some(ref cmd_tx) = self.poller_cmd {
+            for (session_id, file_path) in file_tracks {
+                let already_tracked = self
+                    .tracked_files
+                    .entry(session_id.clone())
+                    .or_default()
+                    .contains(&file_path);
+                if !already_tracked {
+                    self.tracked_files
+                        .entry(session_id.clone())
+                        .or_default()
+                        .insert(file_path.clone());
+                    let _ = cmd_tx.send(PollerCommand::TrackFile {
+                        session_id,
+                        file_path,
+                    });
+                }
+            }
         }
     }
 
@@ -630,6 +891,8 @@ impl TerminalsView {
                 }
             }
         }
+
+        self.active_conflicts.clear();
         for (file, owners) in &file_owners {
             if owners.len() < 2 {
                 continue;
@@ -655,7 +918,16 @@ impl TerminalsView {
                     let (id_b, label_b) = owners[j];
                     // Emit one signal per direction (A sees B, B sees A).
                     push_conflict(id_a, label_b);
+                    self.active_conflicts
+                        .entry(id_a)
+                        .or_default()
+                        .push((file.to_string(), label_b.to_string()));
+
                     push_conflict(id_b, label_a);
+                    self.active_conflicts
+                        .entry(id_b)
+                        .or_default()
+                        .push((file.to_string(), label_a.to_string()));
                 }
             }
         }
@@ -676,7 +948,12 @@ impl TerminalsView {
     /// Tracks `last_injected_tier` per tab. When a tier crossing is detected,
     /// builds refresh context with tier info, cross-pane insights, and recent
     /// GENOME decisions, then injects via the ContextBridge.
-    pub fn check_threshold_injections(&mut self, genome_decisions: &[String]) {
+    pub fn check_threshold_injections(
+        &mut self,
+        genome_decisions: &[String],
+        active_sessions: &[String],
+        recent_history: &[String],
+    ) {
         // Phase 1: Collect info immutably — which tabs need injection and what context.
         let mut injections: Vec<(u64, String)> = Vec::new();
 
@@ -728,6 +1005,8 @@ impl TerminalsView {
                 current_tier,
                 &cross_pane,
                 genome_decisions,
+                active_sessions,
+                recent_history,
             ) {
                 injections.push((id, refresh));
             }
@@ -778,14 +1057,175 @@ impl TerminalsView {
         };
         super::memory_persistence::search_insights(path, query)
     }
+
+    fn render_ops_roster(&mut self, ui: &mut egui::Ui, state: &SharedState) {
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Agent Fleet")
+                        .strong()
+                        .color(colors::ACCENT),
+                );
+
+                if let Some(snapshot) = &state.ops_snapshot {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} daemon agents  {} alerts",
+                            snapshot.agents.len(),
+                            snapshot.interventions.len()
+                        ))
+                        .small()
+                        .color(colors::TEXT_MUTED),
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new("Waiting for daemon snapshot")
+                            .small()
+                            .color(colors::TEXT_DIM),
+                    );
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{} local terminals", self.tabs.len()))
+                            .small()
+                            .color(colors::TEXT_MUTED),
+                    );
+                });
+            });
+
+            ui.add_space(4.0);
+
+            if let Some(snapshot) = &state.ops_snapshot {
+                if snapshot.agents.is_empty() {
+                    ui.label(
+                        egui::RichText::new("No agents reported by the daemon yet.")
+                            .color(colors::TEXT_DIM),
+                    );
+                } else {
+                    egui::ScrollArea::vertical()
+                        .max_height(180.0)
+                        .show(ui, |ui| {
+                            for agent in &snapshot.agents {
+                                ui.group(|ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(&agent.label)
+                                                .strong()
+                                                .color(theme::agent_color(&agent.backend_kind)),
+                                        );
+                                        if agent.ephemeral {
+                                            ui.label(
+                                                egui::RichText::new("telemetry")
+                                                    .small()
+                                                    .color(colors::YELLOW),
+                                            );
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{}  {}",
+                                                agent.backend_kind, agent.status
+                                            ))
+                                            .small()
+                                            .color(colors::TEXT_MUTED),
+                                        );
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "Context {}",
+                                                        agent.context.tier
+                                                    ))
+                                                    .small()
+                                                    .color(colors::TEXT_MUTED),
+                                                );
+                                            },
+                                        );
+                                    });
+
+                                    if let Some(task) = &agent.current_task {
+                                        ui.label(
+                                            egui::RichText::new(task).small().color(colors::TEXT),
+                                        );
+                                    }
+
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "dir: {}",
+                                                agent.working_directory
+                                            ))
+                                            .small()
+                                            .color(colors::TEXT_DIM),
+                                        );
+                                        ui.separator();
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "reviews: {}",
+                                                agent.context.pending_review_count
+                                            ))
+                                            .small()
+                                            .color(colors::TEXT_DIM),
+                                        );
+                                        ui.separator();
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "compactions: {}",
+                                                agent.context.compaction_count
+                                            ))
+                                            .small()
+                                            .color(colors::TEXT_DIM),
+                                        );
+                                    });
+
+                                    for warning in agent.warnings.iter().take(2) {
+                                        ui.label(
+                                            egui::RichText::new(warning)
+                                                .small()
+                                                .color(colors::YELLOW),
+                                        );
+                                    }
+                                });
+                                ui.add_space(4.0);
+                            }
+                        });
+                }
+            }
+
+            if !self.tabs.is_empty() {
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new("Attached terminals")
+                            .small()
+                            .color(colors::TEXT_MUTED),
+                    );
+                    let tab_ids: Vec<u64> = self.tabs.keys().copied().collect();
+                    for id in tab_ids {
+                        if let Some(tab) = self.tabs.get(&id) {
+                            let selected = self.active_tab == Some(id);
+                            let label = format!("{} #{}", tab.label, id);
+                            if ui.selectable_label(selected, label).clicked() {
+                                self.active_tab = Some(id);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
 }
 
 impl View for TerminalsView {
     fn id(&self) -> ViewId {
-        ViewId::Terminals
+        ViewId::Agents
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _state: &SharedState, _ctx: &egui::Context) {
+    fn ui(&mut self, ui: &mut egui::Ui, state: &SharedState, _ctx: &egui::Context) {
+        self.render_ops_roster(ui, state);
+        ui.add_space(6.0);
+
         // --- Search overlay (Ctrl+F) ---
         if self.search.active {
             // Collect pane texts (borrow tabs only, not search).
@@ -907,23 +1347,22 @@ impl View for TerminalsView {
 
             // Spawn buttons inline in the tab bar.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let agents = self.agents.clone();
-                for agent in agents.iter().rev() {
-                    let btn = egui::Button::new(egui::RichText::new(agent.name).color(
-                        if agent.available {
-                            theme::agent_color(agent.name)
-                        } else {
-                            colors::TEXT_FAINT
-                        },
-                    ))
+                for i in (0..self.agents.len()).rev() {
+                    let name = self.agents[i].name;
+                    let available = self.agents[i].available;
+                    let btn = egui::Button::new(egui::RichText::new(name).color(if available {
+                        theme::agent_color(name)
+                    } else {
+                        colors::TEXT_FAINT
+                    }))
                     .small();
 
-                    let resp = ui.add_enabled(agent.available, btn);
+                    let resp = ui.add_enabled(available, btn);
                     if resp.clicked() {
-                        self.pending_spawn_agent = Some(agent.name.to_string());
+                        self.pending_spawn_agent = Some(name.to_string());
                     }
-                    if !agent.available {
-                        resp.on_hover_text(format!("{} not found on PATH", agent.name));
+                    if !available {
+                        resp.on_hover_text(format!("{} not found on PATH", name));
                     }
                 }
                 ui.weak("Spawn:");
@@ -947,6 +1386,16 @@ impl View for TerminalsView {
         // --- Terminal or welcome ---
         if let Some(active_id) = self.active_tab {
             if let Some(tab) = self.tabs.get_mut(&active_id) {
+                // Show conflict banner if any conflicts exist for this tab
+                if let Some(conflicts) = self.active_conflicts.get(&active_id) {
+                    if let Some(resp) = crate::widgets::conflict_banner::show(ui, conflicts) {
+                        if resp.clicked() {
+                            // Acknowledge conflict placeholder
+                        }
+                    }
+                    ui.add_space(4.0);
+                }
+
                 tab.panel.set_focused(true);
                 tab.panel.show(ui);
             }
@@ -974,10 +1423,14 @@ impl View for TerminalsView {
                 );
                 ui.add_space(8.0);
 
-                let agents = self.agents.clone();
-                let available: Vec<_> = agents.iter().filter(|a| a.available).collect();
+                let available_names: Vec<&'static str> = self
+                    .agents
+                    .iter()
+                    .filter(|a| a.available)
+                    .map(|a| a.name)
+                    .collect();
 
-                if available.is_empty() {
+                if available_names.is_empty() {
                     ui.label(
                         egui::RichText::new("No agents found on PATH.").color(colors::TEXT_DIM),
                     );
@@ -985,20 +1438,19 @@ impl View for TerminalsView {
                     ui.horizontal(|ui| {
                         ui.add_space(
                             (ui.available_width()
-                                - (available.len() as f32 * 100.0)
-                                - ((available.len() as f32 - 1.0) * 8.0))
+                                - (available_names.len() as f32 * 100.0)
+                                - ((available_names.len() as f32 - 1.0) * 8.0))
                                 .max(0.0)
                                 / 2.0,
                         );
-                        for agent in &available {
-                            let color = theme::agent_color(agent.name);
-                            let btn =
-                                egui::Button::new(egui::RichText::new(agent.name).color(color))
-                                    .min_size(egui::vec2(90.0, 32.0))
-                                    .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.4)));
+                        for &name in &available_names {
+                            let color = theme::agent_color(name);
+                            let btn = egui::Button::new(egui::RichText::new(name).color(color))
+                                .min_size(egui::vec2(90.0, 32.0))
+                                .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.4)));
 
                             if ui.add(btn).clicked() {
-                                self.pending_spawn_agent = Some(agent.name.to_string());
+                                self.pending_spawn_agent = Some(name.to_string());
                             }
                             ui.add_space(4.0);
                         }

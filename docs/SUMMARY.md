@@ -1,8 +1,8 @@
 ---
 title: Documentation Summary
 description: Unified navigation structure for Impulse documentation
-version: 2.1
-updated: 2026-02-24
+version: 2.2
+updated: 2026-03-05
 schema_version: '1.0'
 ---
 
@@ -10,29 +10,39 @@ schema_version: '1.0'
 
 ## Quick Reference
 
-| Guide                                         | Description           | Start Here  |
-| --------------------------------------------- | --------------------- | ----------- |
+| Guide | Description | Start Here |
+| ----- | ----------- | ---------- |
 | [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) | Authoritative product contract | ✅ Yes |
-| [AGENTS.md](../../AGENTS.md)                  | AI agent guidelines   | ✅ Yes      |
-| [INDEX.md](INDEX.md)                          | Master navigation     | ✅ Yes      |
-| [HONEST-ROADMAP.md](HONEST-ROADMAP.md)        | Reality check         | ✅ Yes      |
+| [AGENTS.md](../../AGENTS.md) | AI agent guidelines | ✅ Yes |
+| [INDEX.md](INDEX.md) | Master navigation | ✅ Yes |
+| [HONEST-ROADMAP.md](HONEST-ROADMAP.md) | Validation risk register | ✅ Yes |
 
----
+## Active Track
+
+The active roadmap is now Rust core plus the EGUI operator workbench.
+
+- [ROADMAP-PLAN.md](ROADMAP-PLAN.md)
+- [plans/IMPLEMENTATION-HANDOFF.md](plans/IMPLEMENTATION-HANDOFF.md)
+- [../impulse-rs/docs/IMPULSE_TERM_STATUS.md](../impulse-rs/docs/IMPULSE_TERM_STATUS.md)
+- [HONEST-ROADMAP.md](HONEST-ROADMAP.md)
 
 ## By Phase
 
-### Phase 1: Core Infrastructure
+### Now
 
-- [PHASE1-CHECKLIST.md](phases/PHASE1-CHECKLIST.md)
-- [PHASE1.5-COORDINATION.md](phases/PHASE1.5-COORDINATION.md)
-
-### Phase 2: Persistence
-
-- [PHASE2-PERSISTENCE.md](phases/PHASE2-PERSISTENCE.md)
-- [PHASE2-MIGRATION-PLAN.md](phases/PHASE2-MIGRATION-PLAN.md)
+- [ROADMAP-PLAN.md](ROADMAP-PLAN.md)
+- [plans/IMPLEMENTATION-HANDOFF.md](plans/IMPLEMENTATION-HANDOFF.md)
 - [spec/RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md)
 
----
+### Next
+
+- [HONEST-ROADMAP.md](HONEST-ROADMAP.md)
+- [../impulse-rs/docs/IMPULSE_TERM_STATUS.md](../impulse-rs/docs/IMPULSE_TERM_STATUS.md)
+
+### Later
+
+- [vision/DASHBOARD-DESIGN.md](vision/DASHBOARD-DESIGN.md)
+- [vision/CLI-ARCHITECTURE.md](vision/CLI-ARCHITECTURE.md)
 
 ## By Category
 
@@ -41,6 +51,13 @@ schema_version: '1.0'
 - [spec/RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md)
 - [spec/COMPETITIVE-POSITIONING.md](spec/COMPETITIVE-POSITIONING.md)
 - [spec/PERFORMANCE-TARGETS.md](spec/PERFORMANCE-TARGETS.md)
+
+### Roadmap
+
+- [ROADMAP-PLAN.md](ROADMAP-PLAN.md)
+- [plans/IMPLEMENTATION-HANDOFF.md](plans/IMPLEMENTATION-HANDOFF.md)
+- [HONEST-ROADMAP.md](HONEST-ROADMAP.md)
+- [../impulse-rs/docs/IMPULSE_TERM_STATUS.md](../impulse-rs/docs/IMPULSE_TERM_STATUS.md)
 
 ### Architecture & Vision
 
@@ -60,13 +77,6 @@ schema_version: '1.0'
 - [research/PAGEINDEX-FEASIBILITY-DECISION.md](research/PAGEINDEX-FEASIBILITY-DECISION.md)
 - [research/TOKEN-TRACKING-ALGORITHM.md](research/TOKEN-TRACKING-ALGORITHM.md)
 
-### Reference Patterns
-
-- [research/reference-patterns/CLAUDE-HISTORIAN-PATTERNS.md](research/reference-patterns/CLAUDE-HISTORIAN-PATTERNS.md)
-- [research/reference-patterns/SQLITE-VEC-PATTERNS.md](research/reference-patterns/SQLITE-VEC-PATTERNS.md)
-- [research/reference-patterns/OPENCODE-PLUGIN-SDK.md](research/reference-patterns/OPENCODE-PLUGIN-SDK.md)
-- [research/reference-patterns/MEM0-FACT-EXTRACTION.md](research/reference-patterns/MEM0-FACT-EXTRACTION.md)
-
 ### Guides
 
 - [guides/TEAM-ONBOARDING.md](guides/TEAM-ONBOARDING.md)
@@ -75,6 +85,7 @@ schema_version: '1.0'
 - [guides/DATABASE-GUIDE.md](guides/DATABASE-GUIDE.md)
 - [guides/INTEGRATION-COOKBOOK.md](guides/INTEGRATION-COOKBOOK.md)
 - [guides/DEPLOYMENT-FRAMEWORK.md](guides/DEPLOYMENT-FRAMEWORK.md)
+- [guides/TOOLS-STATUS.md](guides/TOOLS-STATUS.md)
 
 ### Decisions (ADRs)
 
@@ -84,12 +95,13 @@ schema_version: '1.0'
 - [decisions/0003-progressive-search.md](decisions/0003-progressive-search.md)
 - [decisions/0004-extraction-strategy.md](decisions/0004-extraction-strategy.md)
 - [decisions/0005-distribution-model.md](decisions/0005-distribution-model.md)
+- [decisions/0006-hook-enhancement-conflict-resolution.md](decisions/0006-hook-enhancement-conflict-resolution.md)
 
 ### Session Logs
 
 - [session-logs/DEVELOPMENT-HISTORY.md](session-logs/DEVELOPMENT-HISTORY.md)
 
-### Archive (Superseded)
+### Archive
 
 - [archive/README.md](archive/README.md)
 - [archive/SPEC-v1.1.md](archive/SPEC-v1.1.md)
@@ -100,21 +112,16 @@ schema_version: '1.0'
 - [archive/research/PRD-v1.md](archive/research/PRD-v1.md)
 - [archive/research/REALISTIC-FRAMEWORK.md](archive/research/REALISTIC-FRAMEWORK.md)
 - [archive/research/cockpit-feature-plan.md](archive/research/cockpit-feature-plan.md)
-- [archive/session-logs/](archive/session-logs/) (11 files — see DEVELOPMENT-HISTORY.md)
-
----
 
 ## Metadata
 
-| Field            | Value              |
-| ---------------- | ------------------ |
-| Total Documents  | 76                 |
-| Categories       | 8                  |
-| Decisions (ADRs) | 5                  |
-| Phases           | 3                  |
-| Status           | Active Development |
-
----
+| Field | Value |
+| ----- | ----- |
+| Total Documents | 76 |
+| Categories | 8 |
+| Decisions (ADRs) | 6 |
+| Phases | 3 |
+| Status | Active Development |
 
 ## Generation
 

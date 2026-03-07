@@ -1,7 +1,11 @@
 // Excel module - parse and extract data from Excel files
 // Uses calamine for reading Excel files
 
-use crate::office::{ExtractionResult, SheetInfo};
+#[cfg(not(feature = "office-support"))]
+use crate::office::ExtractionResult;
+use crate::office::SheetInfo;
+#[cfg(feature = "office-support")]
+use crate::office::{ContentChunk, ExtractionMetadata, ExtractionResult};
 
 #[cfg(feature = "office-support")]
 use calamine::{open_workbook, Reader, Xls, Xlsx};
@@ -66,15 +70,14 @@ fn extract_xlsx_content(
     let sheet_names = workbook.sheet_names().to_vec();
     let mut all_content = String::new();
     let mut chunks = Vec::new();
-    let mut total_rows = 0;
-    let mut total_cols = 0;
+    let mut _max_cols = 0;
 
     for (idx, sheet_name) in sheet_names.iter().enumerate() {
         if let Ok(range) = workbook.worksheet_range(sheet_name) {
             let rows = range.rows().count();
             let cols = range.rows().next().map(|r| r.len()).unwrap_or(0);
-            total_rows += rows;
-            total_cols = total_cols.max(cols);
+            let _ = rows;
+            _max_cols = _max_cols.max(cols);
 
             // Extract sheet content
             let sheet_content = range
@@ -130,8 +133,8 @@ fn extract_xls_content(
 
     for (idx, sheet_name) in sheet_names.iter().enumerate() {
         if let Ok(range) = workbook.worksheet_range(sheet_name) {
-            let rows = range.rows().count();
-            let cols = range.rows().next().map(|r| r.len()).unwrap_or(0);
+            let _rows = range.rows().count();
+            let _cols = range.rows().next().map(|r| r.len()).unwrap_or(0);
 
             let sheet_content = range
                 .rows()
@@ -176,7 +179,6 @@ fn extract_xls_content(
 #[cfg(feature = "office-support")]
 /// Extract content from CSV file
 fn extract_csv_content(path: &Path, content: &str) -> Result<ExtractionResult, String> {
-    let lines: Vec<&str> = content.lines().collect();
     let mut chunks = Vec::new();
 
     if !content.is_empty() {

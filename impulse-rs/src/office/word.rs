@@ -1,7 +1,10 @@
 // Word module - parse and extract data from Word documents
 // Uses docx-rs for reading .docx files
 
+#[cfg(not(feature = "office-support"))]
 use crate::office::ExtractionResult;
+#[cfg(feature = "office-support")]
+use crate::office::{ContentChunk, ExtractionMetadata, ExtractionResult};
 
 #[cfg(feature = "office-support")]
 use docx::*;

@@ -6,6 +6,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use crate::injection::types::{InjectionBundle, StageResult};
+use crate::storage::Storage;
 
 const LOG_WINDOW_FOR_DEDUPE: usize = 50;
 
@@ -26,16 +27,6 @@ pub struct InjectionLogEntry {
     pub bundle_hash: String,
     pub bundle_size: usize,
     pub artifact_path: Option<String>,
-}
-
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let temp_path = path.with_extension("tmp");
-    let mut file = File::create(&temp_path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(temp_path, path)?;
-    Ok(())
 }
 
 fn injections_dir(base_path: &Path) -> PathBuf {
@@ -185,7 +176,7 @@ pub fn stage_bundle(base_path: &Path, bundle: &InjectionBundle) -> Result<StageR
     let filename = artifact_filename(&bundle.source_surface);
     let artifact_path = dir.join(filename);
     let markdown = render_markdown(bundle);
-    write_atomic(&artifact_path, markdown.as_bytes())?;
+    Storage::atomic_write_path(&artifact_path, markdown.as_bytes())?;
 
     let entry = InjectionLogEntry {
         timestamp: Utc::now().to_rfc3339(),

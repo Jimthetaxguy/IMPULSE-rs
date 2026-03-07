@@ -15,6 +15,8 @@ use crate::state::ConnectionStatus;
 pub struct AgentResponse {
     pub content: String,
     pub is_error: bool,
+    pub proposals: Vec<impulse_ops::SupervisorProposal>,
+    pub permission_state: Option<impulse_ops::SupervisorPermissionState>,
 }
 
 /// Which backend to use for agent queries.
@@ -138,6 +140,9 @@ fn query_harness(prompt: &str, context: &str, session_id: Option<&str>) -> Agent
     let mut cmd = std::process::Command::new("claude");
     cmd.arg("--print").arg("-p").arg(&full_prompt);
 
+    // Inject the Impulse persona so Claude responds as Impulse, not as itself.
+    cmd.arg("--system-prompt").arg(agent_persona());
+
     if let Some(sid) = session_id {
         cmd.arg("--resume").arg(sid);
     }
@@ -153,11 +158,15 @@ fn query_harness(prompt: &str, context: &str, session_id: Option<&str>) -> Agent
                 AgentResponse {
                     content: "(empty response)".to_string(),
                     is_error: false,
+                    proposals: Vec::new(),
+                    permission_state: None,
                 }
             } else {
                 AgentResponse {
                     content,
                     is_error: false,
+                    proposals: Vec::new(),
+                    permission_state: None,
                 }
             }
         }
@@ -172,11 +181,15 @@ fn query_harness(prompt: &str, context: &str, session_id: Option<&str>) -> Agent
                     msg
                 },
                 is_error: true,
+                proposals: Vec::new(),
+                permission_state: None,
             }
         }
         Err(e) => AgentResponse {
             content: format!("Failed to run claude: {}", e),
             is_error: true,
+            proposals: Vec::new(),
+            permission_state: None,
         },
     }
 }
@@ -231,18 +244,24 @@ fn query_api(
                         AgentResponse {
                             content: format!("API error ({}): {}", status, text),
                             is_error: true,
+                            proposals: Vec::new(),
+                            permission_state: None,
                         }
                     }
                 }
                 Err(e) => AgentResponse {
                     content: format!("Failed to read API response: {}", e),
                     is_error: true,
+                    proposals: Vec::new(),
+                    permission_state: None,
                 },
             }
         }
         Err(e) => AgentResponse {
             content: format!("API request failed: {}", e),
             is_error: true,
+            proposals: Vec::new(),
+            permission_state: None,
         },
     }
 }
@@ -263,28 +282,38 @@ fn parse_api_response(body: &str) -> AgentResponse {
                     AgentResponse {
                         content: "(empty response)".to_string(),
                         is_error: false,
+                        proposals: Vec::new(),
+                        permission_state: None,
                     }
                 } else {
                     AgentResponse {
                         content: text,
                         is_error: false,
+                        proposals: Vec::new(),
+                        permission_state: None,
                     }
                 }
             } else if let Some(err) = json.get("error").and_then(|e| e.get("message")) {
                 AgentResponse {
                     content: format!("API error: {}", err),
                     is_error: true,
+                    proposals: Vec::new(),
+                    permission_state: None,
                 }
             } else {
                 AgentResponse {
                     content: format!("Unexpected API response: {}", body),
                     is_error: true,
+                    proposals: Vec::new(),
+                    permission_state: None,
                 }
             }
         }
         Err(e) => AgentResponse {
             content: format!("Failed to parse API response: {}", e),
             is_error: true,
+            proposals: Vec::new(),
+            permission_state: None,
         },
     }
 }
@@ -293,7 +322,7 @@ fn parse_api_response(body: &str) -> AgentResponse {
 // Daemon Chat backend
 // ---------------------------------------------------------------------------
 
-/// Run a query via the daemon's AgentAssist endpoint.
+/// Run a query via the daemon's structured supervisor chat endpoint.
 ///
 /// Creates a fresh `DaemonClient` per query — the client holds a `UnixStream`
 /// which isn't `Send`, so we discover + connect on the background thread.
@@ -308,23 +337,29 @@ fn query_daemon_chat(prompt: &str, context: &str) -> AgentResponse {
         Some(context)
     };
 
-    match client.agent_assist(prompt, ctx_opt) {
+    match client.supervisor_chat(prompt, ctx_opt) {
         Ok(response) => {
-            if response.is_empty() {
+            if response.response.is_empty() {
                 AgentResponse {
                     content: "(empty response)".to_string(),
                     is_error: false,
+                    proposals: response.proposals,
+                    permission_state: Some(response.permission_state),
                 }
             } else {
                 AgentResponse {
-                    content: response,
+                    content: response.response,
                     is_error: false,
+                    proposals: response.proposals,
+                    permission_state: Some(response.permission_state),
                 }
             }
         }
         Err(e) => AgentResponse {
             content: format!("Daemon chat failed: {}", e),
             is_error: true,
+            proposals: Vec::new(),
+            permission_state: None,
         },
     }
 }
@@ -373,6 +408,8 @@ pub fn dispatch_query(
                     "No agent backend configured. Install Claude Code or set ANTHROPIC_API_KEY."
                         .to_string(),
                 is_error: true,
+                proposals: Vec::new(),
+                permission_state: None,
             },
         };
         let _ = tx.send(response);

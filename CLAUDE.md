@@ -1,6 +1,9 @@
 # CLAUDE.md — Impulse
 
 > Persistent memory for AI coding agents.
+> Contract: [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
+> Canonical stack: Rust (impulse-rs)
+> Roadmap contract: Now=Rust core + EGUI workbench, Next=daemon-truth EGUI + hook validation, Later=agent control + artifact polish
 
 ---
 
@@ -57,7 +60,7 @@ Before implementing, consider alternative approaches. Choose the simplest soluti
 **Workspace (3 crates):**
 - `impulse-rs/` — main CLI + daemon + TUI (30 modules, ~41K lines)
 - `impulse-rs/impulse-term/` — custom terminal widget (PTY + vt100 + context bridge, ~2K lines, 39 tests)
-- `impulse-rs/impulse-gui/` — egui native workbench (4 views + sidebar + status bar)
+- `impulse-rs/impulse-gui/` — egui native workbench (Overview, Agents, Context, Memory, Artifacts, Settings)
 
 **Dual mode:**
 - **Direct mode** — stateless, per-action (for hooks). Read → process → write → exit.

@@ -11,6 +11,9 @@ authors:
 # AGENTS.md — Impulse
 
 > Guidelines for AI coding agents contributing to this project.
+> Contract: [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
+> Canonical stack: Rust (impulse-rs)
+> Roadmap contract: Now=Rust core + EGUI workbench, Next=daemon-truth EGUI + hook validation, Later=agent control + artifact polish
 
 ---
 
@@ -57,6 +60,7 @@ Choose the simplest solution that works. Prefer editing existing files over crea
 **Dual mode:**
 - **Direct** — stateless per-action (hooks). Read → process → write → exit.
 - **Daemon** — long-running with Unix socket IPC (TUI/chat). In-memory state with dirty-flag sync.
+- **EGUI workbench** — native operator console backed by daemon snapshots and published terminal telemetry.
 
 **Data in `.impulse/`:**
 

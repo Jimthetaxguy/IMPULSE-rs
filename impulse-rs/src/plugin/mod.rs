@@ -100,6 +100,9 @@ pub enum PluginError {
     #[error("Configuration error: {0}")]
     ConfigurationError(String),
 
+    #[error("Internal error: {0}")]
+    Internal(String),
+
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
 }

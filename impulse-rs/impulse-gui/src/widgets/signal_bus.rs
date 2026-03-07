@@ -259,6 +259,7 @@ impl SignalBus {
     }
 
     /// Aggregate summary for the status bar.
+    #[allow(dead_code)]
     pub fn summary(&self) -> &SignalSummary {
         &self.summary
     }

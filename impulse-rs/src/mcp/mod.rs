@@ -1,5 +1,5 @@
 // MCP (Model Context Protocol) server integration for Impulse
-// Exposes plugin functionality to external coding agents
+// Exposes registry-backed dynamic tools to external coding agents
 
 pub mod server;
 

@@ -113,26 +113,26 @@ pub fn save_project_memory(base_path: &Path, memory: &ProjectMemory) -> Result<(
 pub fn extract_patterns(sessions: &[SessionAnalysis]) -> Vec<CrossProjectPattern> {
     use std::collections::HashMap;
 
-    let mut tool_failures: HashMap<String, Vec<String>> = HashMap::new();
-    let mut file_patterns: HashMap<String, Vec<String>> = HashMap::new();
+    let mut tool_failures: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut file_patterns: HashMap<&str, Vec<&str>> = HashMap::new();
 
     for session in sessions {
         // Track tool usage patterns
         for pattern in &session.tool_patterns {
             if pattern.count >= 5 {
                 tool_failures
-                    .entry(pattern.tool_name.clone())
+                    .entry(pattern.tool_name.as_str())
                     .or_default()
-                    .push(session.project_hash.clone());
+                    .push(session.project_hash.as_str());
             }
         }
 
         // Track frequently touched files
         for file in &session.files_touched {
             file_patterns
-                .entry(file.clone())
+                .entry(file.as_str())
                 .or_default()
-                .push(session.project_hash.clone());
+                .push(session.project_hash.as_str());
         }
     }
 
@@ -142,11 +142,11 @@ pub fn extract_patterns(sessions: &[SessionAnalysis]) -> Vec<CrossProjectPattern
     // Convert tool patterns
     for (tool, projects) in &tool_failures {
         if projects.len() >= 2 {
-            let unique_projects: Vec<_> = {
-                let mut p = projects.clone();
+            let unique_projects: Vec<String> = {
+                let mut p: Vec<&str> = projects.clone();
                 p.sort();
                 p.dedup();
-                p
+                p.into_iter().map(|s| s.to_string()).collect()
             };
             patterns.push(CrossProjectPattern {
                 id: format!("tool-{}-{}", tool.to_lowercase(), uuid_short()),

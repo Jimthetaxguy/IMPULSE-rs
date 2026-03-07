@@ -1,8 +1,8 @@
 ---
 title: Documentation Summary
 description: Unified navigation structure for Impulse documentation
-version: '2.1'
-updated: '2026-02-24'
+version: '2.2'
+updated: '2026-03-05'
 schema_version: '1.0'
 type: navigation
 category: docs
@@ -26,28 +26,50 @@ quick_reference:
     start: true
 
   - name: HONEST-ROADMAP.md
-    description: Reality check
+    description: Validation risk register
     path: HONEST-ROADMAP.md
     start: true
 
-phases:
-  phase1:
-    - name: Phase 1 Checklist
-      path: phases/PHASE1-CHECKLIST.md
-    - name: Phase 1.5 Coordination
-      path: phases/PHASE1.5-COORDINATION.md
+active_tracks:
+  - name: Rust + EGUI Workbench
+    description: Current product baseline and roadmap contract
+    docs:
+      - spec/RUST-CANONICAL-CONTRACT.md
+      - ROADMAP-PLAN.md
+      - plans/IMPLEMENTATION-HANDOFF.md
+      - ../impulse-rs/docs/IMPULSE_TERM_STATUS.md
+      - HONEST-ROADMAP.md
 
-  phase2:
-    - name: Phase 2 Persistence
-      path: phases/PHASE2-PERSISTENCE.md
-    - name: Phase 2 Migration Plan
-      path: phases/PHASE2-MIGRATION-PLAN.md
+phases:
+  now:
+    - name: Rust Core + EGUI Workbench
+      path: ROADMAP-PLAN.md
+    - name: EGUI Daemon-Truth Handoff
+      path: plans/IMPLEMENTATION-HANDOFF.md
+
+  next:
+    - name: Honest Roadmap
+      path: HONEST-ROADMAP.md
+    - name: impulse-term Status
+      path: ../impulse-rs/docs/IMPULSE_TERM_STATUS.md
+
+  later:
+    - name: Dashboard Design
+      path: vision/DASHBOARD-DESIGN.md
+    - name: CLI Architecture
+      path: vision/CLI-ARCHITECTURE.md
 
 categories:
   specifications:
     - spec/RUST-CANONICAL-CONTRACT.md
     - spec/COMPETITIVE-POSITIONING.md
     - spec/PERFORMANCE-TARGETS.md
+
+  roadmap:
+    - ROADMAP-PLAN.md
+    - plans/IMPLEMENTATION-HANDOFF.md
+    - HONEST-ROADMAP.md
+    - ../impulse-rs/docs/IMPULSE_TERM_STATUS.md
 
   architecture:
     - vision/CLI-ARCHITECTURE.md
@@ -65,12 +87,6 @@ categories:
     - research/PAGEINDEX-FEASIBILITY-DECISION.md
     - research/TOKEN-TRACKING-ALGORITHM.md
 
-  reference_patterns:
-    - research/reference-patterns/CLAUDE-HISTORIAN-PATTERNS.md
-    - research/reference-patterns/SQLITE-VEC-PATTERNS.md
-    - research/reference-patterns/OPENCODE-PLUGIN-SDK.md
-    - research/reference-patterns/MEM0-FACT-EXTRACTION.md
-
   guides:
     - guides/TEAM-ONBOARDING.md
     - guides/BEST-PRACTICES.md
@@ -78,6 +94,7 @@ categories:
     - guides/DATABASE-GUIDE.md
     - guides/INTEGRATION-COOKBOOK.md
     - guides/DEPLOYMENT-FRAMEWORK.md
+    - guides/TOOLS-STATUS.md
 
   decisions:
     - decisions/README.md
@@ -86,6 +103,7 @@ categories:
     - decisions/0003-progressive-search.md
     - decisions/0004-extraction-strategy.md
     - decisions/0005-distribution-model.md
+    - decisions/0006-hook-enhancement-conflict-resolution.md
 
   session_logs:
     - session-logs/DEVELOPMENT-HISTORY.md
@@ -104,6 +122,6 @@ categories:
 metadata:
   total_documents: 76
   categories: 8
-  decisions: 5
+  decisions: 6
   phases: 3
   status: active_development

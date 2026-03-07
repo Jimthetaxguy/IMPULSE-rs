@@ -228,15 +228,15 @@ pub fn calculate_growth_rate(events: &[TokenEvent]) -> f64 {
         return 0.0;
     }
 
-    let mut sorted = events.to_vec();
+    let mut sorted: Vec<&TokenEvent> = events.iter().collect();
     sorted.sort_by_key(|e| e.timestamp);
 
     let mut total_rate = 0.0;
     let mut count = 0;
 
     for i in 1..sorted.len() {
-        let earlier = &sorted[i - 1];
-        let later = &sorted[i];
+        let earlier = sorted[i - 1];
+        let later = sorted[i];
         let time_diff = (later.timestamp - earlier.timestamp).num_seconds() as f64;
 
         if time_diff > 0.0 {

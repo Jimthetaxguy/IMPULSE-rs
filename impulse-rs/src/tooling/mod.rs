@@ -20,6 +20,8 @@
 //! ```
 
 mod error;
+mod executor;
+mod external;
 mod registry;
 mod traits;
 
@@ -29,8 +31,12 @@ pub mod builtin;
 pub mod document;
 
 pub use error::ToolError;
+pub use external::{
+    validate_manifests_in_dir, CwdPolicy, ExternalToolOutputMode, ExternalToolSource,
+    ExternalToolSpec, ManifestValidationIssue, ManifestValidationReport, ProcessTool,
+};
 pub use registry::ToolRegistry;
 pub use traits::{
-    Capability, DynamicTool, ParamType, ToolCategory, ToolContext, ToolDescriptor, ToolParam,
-    ToolResult,
+    Capability, DynamicTool, ExecutionOrigin, ManifestTool, ParamType, ToolCategory, ToolContext,
+    ToolDescriptor, ToolParam, ToolResult, ToolSource,
 };

@@ -232,6 +232,7 @@ impl TerminalRenderer {
             });
 
             if can_extend {
+                // SAFETY: can_extend is true only when runs.last().is_some_and(...).
                 let last = runs.last_mut().unwrap();
                 last.text.push_str(&ch);
                 last.col_end = col as usize + 1;

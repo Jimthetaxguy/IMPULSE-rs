@@ -1,3 +1,9 @@
+//! In-memory state with dirty-flag sync and Drop persistence.
+//!
+//! Core types: [`Config`] (runtime settings), [`State`] (session/file tracking),
+//! [`LiveState`] (ephemeral session state). All wrapped in `Arc<RwLock<_>>`
+//! for concurrent access. Syncs to `.impulse/` files only when dirty.
+
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -135,6 +141,23 @@ pub struct Config {
     pub conflict_webhook_url: Option<String>,
     /// Enable conflict webhook notifications
     pub conflict_webhook_enabled: bool,
+    /// Default tool execution timeout in milliseconds
+    pub tool_execution_default_timeout_ms: u64,
+    /// Maximum serialized tool output size
+    pub tool_execution_max_output_bytes: usize,
+    /// Maximum tool artifacts returned per invocation
+    pub tool_execution_max_artifacts: usize,
+    /// Allowed roots for read-capable tools
+    pub tool_execution_allowed_read_roots: Vec<String>,
+    /// Allowed roots for write-capable tools
+    pub tool_execution_allowed_write_roots: Vec<String>,
+    /// External tool manifest directory
+    pub external_tools_dir: String,
+    /// Reserved external MCP server definitions
+    pub external_mcp_servers: Vec<String>,
+    /// Baseline supervisor permissions for the Impulse agent control plane
+    #[serde(default)]
+    pub impulse_agent_permissions: impulse_ops::SupervisorPermissionPolicy,
     /// Guardrail configuration
     #[serde(default)]
     pub guardrails: crate::guardrail::GuardConfig,
@@ -204,12 +227,81 @@ impl Default for Config {
             notifications_enabled: true,
             conflict_webhook_url: None,
             conflict_webhook_enabled: false,
+            tool_execution_default_timeout_ms: 30_000,
+            tool_execution_max_output_bytes: 256 * 1024,
+            tool_execution_max_artifacts: 8,
+            tool_execution_allowed_read_roots: vec![".".to_string(), ".impulse".to_string()],
+            tool_execution_allowed_write_roots: vec![".impulse".to_string()],
+            external_tools_dir: ".impulse/tools.d".to_string(),
+            external_mcp_servers: Vec::new(),
+            impulse_agent_permissions: impulse_ops::SupervisorPermissionPolicy::default(),
             guardrails: crate::guardrail::GuardConfig::default(),
         }
     }
 }
 
 impl Config {
+    pub fn resolve_path_setting(&self, value: &str) -> std::path::PathBuf {
+        self.resolve_path_setting_from(
+            &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            value,
+        )
+    }
+
+    pub fn resolve_path_setting_from(
+        &self,
+        base_dir: &std::path::Path,
+        value: &str,
+    ) -> std::path::PathBuf {
+        let path = std::path::PathBuf::from(value);
+        if path.is_absolute() {
+            path
+        } else {
+            base_dir.join(path)
+        }
+    }
+
+    pub fn resolved_external_tools_dir(&self) -> std::path::PathBuf {
+        self.resolve_path_setting(&self.external_tools_dir)
+    }
+
+    pub fn resolved_external_tools_dir_from(
+        &self,
+        base_dir: &std::path::Path,
+    ) -> std::path::PathBuf {
+        self.resolve_path_setting_from(base_dir, &self.external_tools_dir)
+    }
+
+    pub fn resolved_tool_read_roots(&self) -> Vec<std::path::PathBuf> {
+        let base_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        self.resolved_tool_read_roots_from(&base_dir)
+    }
+
+    pub fn resolved_tool_read_roots_from(
+        &self,
+        base_dir: &std::path::Path,
+    ) -> Vec<std::path::PathBuf> {
+        self.tool_execution_allowed_read_roots
+            .iter()
+            .map(|value| self.resolve_path_setting_from(base_dir, value))
+            .collect()
+    }
+
+    pub fn resolved_tool_write_roots(&self) -> Vec<std::path::PathBuf> {
+        let base_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        self.resolved_tool_write_roots_from(&base_dir)
+    }
+
+    pub fn resolved_tool_write_roots_from(
+        &self,
+        base_dir: &std::path::Path,
+    ) -> Vec<std::path::PathBuf> {
+        self.tool_execution_allowed_write_roots
+            .iter()
+            .map(|value| self.resolve_path_setting_from(base_dir, value))
+            .collect()
+    }
+
     /// Get a config value by key
     pub fn get(&self, key: &str) -> Option<String> {
         match key {
@@ -311,6 +403,24 @@ impl Config {
             "notifications_enabled" => Some(self.notifications_enabled.to_string()),
             "conflict_webhook_url" => self.conflict_webhook_url.clone(),
             "conflict_webhook_enabled" => Some(self.conflict_webhook_enabled.to_string()),
+            "tool_execution.default_timeout_ms" => {
+                Some(self.tool_execution_default_timeout_ms.to_string())
+            }
+            "tool_execution.max_output_bytes" => {
+                Some(self.tool_execution_max_output_bytes.to_string())
+            }
+            "tool_execution.max_artifacts" => Some(self.tool_execution_max_artifacts.to_string()),
+            "tool_execution.allowed_read_roots" => {
+                Some(self.tool_execution_allowed_read_roots.join(","))
+            }
+            "tool_execution.allowed_write_roots" => {
+                Some(self.tool_execution_allowed_write_roots.join(","))
+            }
+            "external_tools_dir" => Some(self.external_tools_dir.clone()),
+            "external_mcp_servers" => Some(self.external_mcp_servers.join(",")),
+            "impulse_agent_permissions" => {
+                serde_json::to_string(&self.impulse_agent_permissions).ok()
+            }
             "guardrails_enabled" => Some(self.guardrails.enabled.to_string()),
             _ => None,
         }
@@ -805,6 +915,87 @@ impl Config {
                 self.conflict_webhook_enabled = value.parse().unwrap_or(false);
                 true
             }
+            "tool_execution.default_timeout_ms" => {
+                if let Ok(v) = value.parse::<u64>() {
+                    if (100..=300_000).contains(&v) {
+                        self.tool_execution_default_timeout_ms = v;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+            "tool_execution.max_output_bytes" => {
+                if let Ok(v) = value.parse::<usize>() {
+                    if (256..=5_000_000).contains(&v) {
+                        self.tool_execution_max_output_bytes = v;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+            "tool_execution.max_artifacts" => {
+                if let Ok(v) = value.parse::<usize>() {
+                    if (1..=128).contains(&v) {
+                        self.tool_execution_max_artifacts = v;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+            "tool_execution.allowed_read_roots" => {
+                self.tool_execution_allowed_read_roots = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(ToString::to_string)
+                    .collect();
+                true
+            }
+            "tool_execution.allowed_write_roots" => {
+                self.tool_execution_allowed_write_roots = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(ToString::to_string)
+                    .collect();
+                true
+            }
+            "external_tools_dir" => {
+                if value.trim().is_empty() {
+                    false
+                } else {
+                    self.external_tools_dir = value.to_string();
+                    true
+                }
+            }
+            "external_mcp_servers" => {
+                self.external_mcp_servers = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(ToString::to_string)
+                    .collect();
+                true
+            }
+            "impulse_agent_permissions" => {
+                match serde_json::from_str::<impulse_ops::SupervisorPermissionPolicy>(value) {
+                    Ok(mut policy) => {
+                        policy.normalize();
+                        self.impulse_agent_permissions = policy;
+                        true
+                    }
+                    Err(_) => false,
+                }
+            }
             "guardrails_enabled" => {
                 self.guardrails.enabled = value.parse().unwrap_or(true);
                 true
@@ -1062,6 +1253,42 @@ impl Config {
                 "conflict_webhook_enabled".to_string(),
                 self.conflict_webhook_enabled.to_string(),
             ),
+            (
+                "tool_execution.default_timeout_ms".to_string(),
+                self.tool_execution_default_timeout_ms.to_string(),
+            ),
+            (
+                "tool_execution.max_output_bytes".to_string(),
+                self.tool_execution_max_output_bytes.to_string(),
+            ),
+            (
+                "tool_execution.max_artifacts".to_string(),
+                self.tool_execution_max_artifacts.to_string(),
+            ),
+            (
+                "tool_execution.allowed_read_roots".to_string(),
+                self.tool_execution_allowed_read_roots.join(","),
+            ),
+            (
+                "tool_execution.allowed_write_roots".to_string(),
+                self.tool_execution_allowed_write_roots.join(","),
+            ),
+            (
+                "external_tools_dir".to_string(),
+                self.external_tools_dir.clone(),
+            ),
+            (
+                "external_mcp_servers".to_string(),
+                self.external_mcp_servers.join(","),
+            ),
+            (
+                "impulse_agent_permissions".to_string(),
+                serde_json::to_string(&self.impulse_agent_permissions).unwrap_or_default(),
+            ),
+            (
+                "guardrails_enabled".to_string(),
+                self.guardrails.enabled.to_string(),
+            ),
         ]
     }
 }
@@ -1094,6 +1321,14 @@ impl Platform {
         match self {
             Platform::ClaudeCode => "claude-code",
             Platform::OpenCode => "opencode",
+        }
+    }
+
+    pub fn from_str_name(s: &str) -> Option<Self> {
+        match s {
+            "claude-code" => Some(Self::ClaudeCode),
+            "opencode" => Some(Self::OpenCode),
+            _ => None,
         }
     }
 }
@@ -1256,7 +1491,9 @@ impl Drop for State {
         if let Ok(dirty) = self.dirty.try_read() {
             if *dirty {
                 if let Ok(state) = self.live_state.try_read() {
-                    let _ = self.storage.write_json(LIVE_STATE_FILE, &*state);
+                    if let Err(err) = self.storage.write_json(LIVE_STATE_FILE, &*state) {
+                        tracing::error!("failed to persist live state on drop: {}", err);
+                    }
                 }
             }
         }
@@ -1267,7 +1504,7 @@ impl State {
     pub fn new(base_path: std::path::PathBuf) -> Result<Self> {
         let storage = Storage::new(base_path);
         let live_state = storage.read_json::<LiveState>(LIVE_STATE_FILE)?;
-        let config = storage.read_json::<Config>(CONFIG_FILE).unwrap_or_default();
+        let config = storage.read_json::<Config>(CONFIG_FILE)?;
 
         Ok(Self {
             storage,
@@ -1441,6 +1678,7 @@ impl State {
     where
         F: FnMut(&mut Session),
     {
+        let mut updated = false;
         {
             let mut state = self
                 .live_state
@@ -1448,7 +1686,11 @@ impl State {
                 .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
             if let Some(session) = state.get_session_mut(session_id) {
                 f(session);
+                updated = true;
             }
+        }
+        if !updated {
+            anyhow::bail!("Session not found: {}", session_id);
         }
         self.mark_dirty();
         self.sync_immediate().await?;
@@ -1528,6 +1770,21 @@ impl State {
             .try_write()
             .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
         config.guardrails.rules = rules;
+        self.storage.write_json(CONFIG_FILE, &*config)?;
+        Ok(())
+    }
+
+    pub fn update_impulse_agent_permissions(
+        &self,
+        policy: impulse_ops::SupervisorPermissionPolicy,
+    ) -> Result<()> {
+        let mut config = self
+            .config
+            .try_write()
+            .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
+        let mut normalized = policy;
+        normalized.normalize();
+        config.impulse_agent_permissions = normalized;
         self.storage.write_json(CONFIG_FILE, &*config)?;
         Ok(())
     }
@@ -2102,6 +2359,28 @@ mod tests {
         assert!(conflicting.is_empty());
     }
 
+    #[tokio::test]
+    async fn test_track_file_missing_session_errors() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = crate::state::State::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let err = state
+            .track_file("missing-session", "src/main.rs")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Session not found"));
+    }
+
+    #[test]
+    fn test_state_new_surfaces_config_corruption() {
+        let temp_dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(temp_dir.path()).unwrap();
+        std::fs::write(temp_dir.path().join("config.json"), "{not-json").unwrap();
+
+        let err = crate::state::State::new(temp_dir.path().to_path_buf()).unwrap_err();
+        assert!(err.to_string().contains("Failed to parse JSON"));
+    }
+
     #[test]
     fn test_conflict_history_new() {
         let history = ConflictHistory::new();
@@ -2229,16 +2508,22 @@ mod tests {
         let analytics_empty = ConflictAnalytics::default();
         assert_eq!(analytics_empty.format_time_to_resolution(), "N/A");
 
-        let mut analytics_with_time = ConflictAnalytics::default();
-        analytics_with_time.avg_time_to_resolution_secs = Some(30);
+        let analytics_with_time = ConflictAnalytics {
+            avg_time_to_resolution_secs: Some(30),
+            ..ConflictAnalytics::default()
+        };
         assert_eq!(analytics_with_time.format_time_to_resolution(), "30s");
 
-        let mut analytics_minutes = ConflictAnalytics::default();
-        analytics_minutes.avg_time_to_resolution_secs = Some(120);
+        let analytics_minutes = ConflictAnalytics {
+            avg_time_to_resolution_secs: Some(120),
+            ..ConflictAnalytics::default()
+        };
         assert_eq!(analytics_minutes.format_time_to_resolution(), "2m");
 
-        let mut analytics_hours = ConflictAnalytics::default();
-        analytics_hours.avg_time_to_resolution_secs = Some(3665);
+        let analytics_hours = ConflictAnalytics {
+            avg_time_to_resolution_secs: Some(3665),
+            ..ConflictAnalytics::default()
+        };
         assert_eq!(analytics_hours.format_time_to_resolution(), "1h 1m");
     }
 }

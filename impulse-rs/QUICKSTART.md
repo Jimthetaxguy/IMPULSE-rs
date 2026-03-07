@@ -110,6 +110,18 @@ This creates `.claude/hooks/hooks.json` that tracks:
 - File edits
 - Tool usage
 
+Validate the real Claude hook loop before trusting it:
+
+```bash
+impulse-rs validate-hooks --platform claude-code
+```
+
+This creates `.impulse/validation/claude-code/` with:
+- Startup sentinel hooks for `SessionStart`
+- Transcript capture for `SessionEnd`
+- A local settings snippet
+- An evidence template for pass/fail results
+
 ### Try Semantic Search
 
 ```bash
@@ -156,6 +168,14 @@ pip install opencode
 Set your API key:
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+### "The GUI is offline"
+
+The GUI is a thin workbench client. Memory/history/ops require the daemon:
+
+```bash
+cargo run -- daemon
 ```
 
 ### TUI looks broken

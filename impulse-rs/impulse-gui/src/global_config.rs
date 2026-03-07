@@ -48,18 +48,7 @@ impl GlobalConfig {
         std::fs::create_dir_all(impulse_dir)?;
         let path = impulse_dir.join("config.json");
         let content = serde_json::to_string_pretty(self)?;
-
-        // Atomic write: temp file + rename.
-        let tmp_path = impulse_dir.join(format!(
-            ".config.json.tmp.{}.{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        std::fs::write(&tmp_path, &content)?;
-        std::fs::rename(&tmp_path, &path)?;
+        impulse_ops::atomic_write_path(&path, content.as_bytes())?;
         Ok(())
     }
 
@@ -133,8 +122,10 @@ mod tests {
     #[test]
     fn test_last_project_persists() {
         let dir = TempDir::new().unwrap();
-        let mut config = GlobalConfig::default();
-        config.last_project = Some("/tmp/my-project".into());
+        let config = GlobalConfig {
+            last_project: Some("/tmp/my-project".into()),
+            ..Default::default()
+        };
         config.save(dir.path()).unwrap();
 
         let loaded = GlobalConfig::load(dir.path()).unwrap();

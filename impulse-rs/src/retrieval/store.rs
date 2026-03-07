@@ -29,6 +29,37 @@ impl RetrievalStore {
         &self.db_path
     }
 
+    /// Execute a closure within a transaction, automatically committing on success.
+    /// Returns the result of the closure.
+    ///
+    /// This is useful for batch operations that need to be atomic but don't
+    /// warrant a dedicated method on RetrievalStore.
+    ///
+    /// # Example
+    /// ```ignore
+    /// store.with_transaction(|tx| {
+    ///     tx.execute("DELETE FROM history_vec WHERE session_id = ?1", params![id])?;
+    ///     tx.execute("INSERT INTO history_vec0(...)", ...)?;
+    ///     Ok(())
+    /// })?;
+    /// ```
+    ///
+    /// # Errors
+    /// Returns an error if the transaction fails to begin, if the closure returns
+    /// an error, or if the commit fails.
+    pub fn with_transaction<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&rusqlite::Connection) -> Result<T>,
+    {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("failed to begin transaction")?;
+        let result = f(&tx).context("transaction closure failed")?;
+        tx.commit().context("failed to commit transaction")?;
+        Ok(result)
+    }
+
     pub fn table_exists(&self, table_name: &str) -> Result<bool> {
         let mut stmt = self.conn.prepare(
             "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?1 LIMIT 1",
@@ -268,14 +299,16 @@ CREATE TABLE IF NOT EXISTS genome_vec (
     }
 
     pub fn clear_all(&self) -> Result<()> {
-        self.conn.execute("DELETE FROM history_entries", [])?;
-        self.conn.execute("DELETE FROM genome_decisions", [])?;
-        self.conn.execute("DELETE FROM history_fts", [])?;
-        self.conn.execute("DELETE FROM genome_fts", [])?;
-        self.conn.execute("DELETE FROM history_vec", [])?;
-        self.conn.execute("DELETE FROM genome_vec", [])?;
-        let _ = self.conn.execute("DELETE FROM history_vec0", []);
-        let _ = self.conn.execute("DELETE FROM genome_vec0", []);
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM history_entries", [])?;
+        tx.execute("DELETE FROM genome_decisions", [])?;
+        tx.execute("DELETE FROM history_fts", [])?;
+        tx.execute("DELETE FROM genome_fts", [])?;
+        tx.execute("DELETE FROM history_vec", [])?;
+        tx.execute("DELETE FROM genome_vec", [])?;
+        let _ = tx.execute("DELETE FROM history_vec0", []);
+        let _ = tx.execute("DELETE FROM genome_vec0", []);
+        tx.commit()?;
         Ok(())
     }
 
@@ -433,10 +466,12 @@ ON CONFLICT(decision_id) DO UPDATE SET
     /// WARNING: This does NOT update the FTS tables. Caller MUST call `refresh_fts()`
     /// after this method to keep keyword search consistent.
     pub fn delete_history_except(&self, keep_ids: &HashSet<String>) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
         if keep_ids.is_empty() {
-            self.conn.execute("DELETE FROM history_entries", [])?;
-            self.conn.execute("DELETE FROM history_vec", [])?;
-            let _ = self.conn.execute("DELETE FROM history_vec0", []);
+            tx.execute("DELETE FROM history_entries", [])?;
+            tx.execute("DELETE FROM history_vec", [])?;
+            let _ = tx.execute("DELETE FROM history_vec0", []);
+            tx.commit()?;
             return Ok(());
         }
 
@@ -455,13 +490,10 @@ ON CONFLICT(decision_id) DO UPDATE SET
             "DELETE FROM history_vec0 WHERE session_id NOT IN ({})",
             placeholders
         );
-        self.conn
-            .execute(&sql_entries, rusqlite::params_from_iter(keep_ids.iter()))?;
-        self.conn
-            .execute(&sql_vec, rusqlite::params_from_iter(keep_ids.iter()))?;
-        let _ = self
-            .conn
-            .execute(&sql_vec0, rusqlite::params_from_iter(keep_ids.iter()));
+        tx.execute(&sql_entries, rusqlite::params_from_iter(keep_ids.iter()))?;
+        tx.execute(&sql_vec, rusqlite::params_from_iter(keep_ids.iter()))?;
+        let _ = tx.execute(&sql_vec0, rusqlite::params_from_iter(keep_ids.iter()));
+        tx.commit()?;
         Ok(())
     }
 
@@ -469,10 +501,12 @@ ON CONFLICT(decision_id) DO UPDATE SET
     /// WARNING: This does NOT update the FTS tables. Caller MUST call `refresh_fts()`
     /// after this method to keep keyword search consistent.
     pub fn delete_genome_except(&self, keep_ids: &HashSet<String>) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
         if keep_ids.is_empty() {
-            self.conn.execute("DELETE FROM genome_decisions", [])?;
-            self.conn.execute("DELETE FROM genome_vec", [])?;
-            let _ = self.conn.execute("DELETE FROM genome_vec0", []);
+            tx.execute("DELETE FROM genome_decisions", [])?;
+            tx.execute("DELETE FROM genome_vec", [])?;
+            let _ = tx.execute("DELETE FROM genome_vec0", []);
+            tx.commit()?;
             return Ok(());
         }
 
@@ -491,28 +525,27 @@ ON CONFLICT(decision_id) DO UPDATE SET
             "DELETE FROM genome_vec0 WHERE decision_id NOT IN ({})",
             placeholders
         );
-        self.conn
-            .execute(&sql_entries, rusqlite::params_from_iter(keep_ids.iter()))?;
-        self.conn
-            .execute(&sql_vec, rusqlite::params_from_iter(keep_ids.iter()))?;
-        let _ = self
-            .conn
-            .execute(&sql_vec0, rusqlite::params_from_iter(keep_ids.iter()));
+        tx.execute(&sql_entries, rusqlite::params_from_iter(keep_ids.iter()))?;
+        tx.execute(&sql_vec, rusqlite::params_from_iter(keep_ids.iter()))?;
+        let _ = tx.execute(&sql_vec0, rusqlite::params_from_iter(keep_ids.iter()));
+        tx.commit()?;
         Ok(())
     }
 
     pub fn refresh_fts(&self) -> Result<()> {
-        self.conn.execute("DELETE FROM history_fts", [])?;
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM history_fts", [])?;
+        tx.execute(
             "INSERT INTO history_fts(session_id, search_text) SELECT session_id, search_text FROM history_entries",
             [],
         )?;
 
-        self.conn.execute("DELETE FROM genome_fts", [])?;
-        self.conn.execute(
+        tx.execute("DELETE FROM genome_fts", [])?;
+        tx.execute(
             "INSERT INTO genome_fts(decision_id, search_text) SELECT decision_id, search_text FROM genome_decisions",
             [],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -525,13 +558,11 @@ ON CONFLICT(decision_id) DO UPDATE SET
         Ok(())
     }
 
+    /// Upsert history vector into vec0 table using atomic single statement.
+    /// Uses INSERT OR REPLACE to avoid separate DELETE+INSERT operations.
     pub fn upsert_history_vector_vec0(&self, session_id: &str, vector_json: &str) -> Result<()> {
         self.conn.execute(
-            "DELETE FROM history_vec0 WHERE session_id=?1",
-            params![session_id],
-        )?;
-        self.conn.execute(
-            "INSERT INTO history_vec0(session_id, embedding) VALUES (?1, ?2)",
+            "INSERT OR REPLACE INTO history_vec0(session_id, embedding) VALUES (?1, ?2)",
             params![session_id, vector_json],
         )?;
         Ok(())
@@ -546,18 +577,19 @@ ON CONFLICT(decision_id) DO UPDATE SET
         Ok(())
     }
 
+    /// Upsert genome vector into vec0 table using atomic single statement.
+    /// Uses INSERT OR REPLACE to avoid separate DELETE+INSERT operations.
     pub fn upsert_genome_vector_vec0(&self, decision_id: &str, vector_json: &str) -> Result<()> {
         self.conn.execute(
-            "DELETE FROM genome_vec0 WHERE decision_id=?1",
-            params![decision_id],
-        )?;
-        self.conn.execute(
-            "INSERT INTO genome_vec0(decision_id, embedding) VALUES (?1, ?2)",
+            "INSERT OR REPLACE INTO genome_vec0(decision_id, embedding) VALUES (?1, ?2)",
             params![decision_id, vector_json],
         )?;
         Ok(())
     }
 
+    /// Delete history vector entries from both history_vec and history_vec0 tables.
+    /// Note: Caller should wrap in a transaction for best performance.
+    /// This method is idempotent and safe to call within an existing transaction.
     pub fn delete_history_vector(&self, session_id: &str) -> Result<()> {
         self.conn.execute(
             "DELETE FROM history_vec WHERE session_id=?1",
@@ -570,6 +602,9 @@ ON CONFLICT(decision_id) DO UPDATE SET
         Ok(())
     }
 
+    /// Delete genome vector entries from both genome_vec and genome_vec0 tables.
+    /// Note: Caller should wrap in a transaction for best performance.
+    /// This method is idempotent and safe to call within an existing transaction.
     pub fn delete_genome_vector(&self, decision_id: &str) -> Result<()> {
         self.conn.execute(
             "DELETE FROM genome_vec WHERE decision_id=?1",
@@ -596,7 +631,7 @@ ON CONFLICT(decision_id) DO UPDATE SET
             return Ok(Vec::new());
         }
 
-        let mut stmt = match self.conn.prepare(
+        let mut stmt = match self.conn.prepare_cached(
             r#"
 SELECT h.session_id, h.session_name, h.summary, bm25(history_fts) AS rank
 FROM history_fts
@@ -634,7 +669,7 @@ LIMIT ?2
 
     fn search_history_keyword_like(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
         let like = format!("%{}%", query.to_lowercase());
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             r#"
 SELECT session_id, session_name, summary
 FROM history_entries
@@ -667,7 +702,7 @@ LIMIT ?2
             return Ok(Vec::new());
         }
 
-        let mut stmt = match self.conn.prepare(
+        let mut stmt = match self.conn.prepare_cached(
             r#"
 SELECT g.decision_id, g.description, COALESCE(g.rationale, ''), bm25(genome_fts) AS rank
 FROM genome_fts
@@ -705,7 +740,7 @@ LIMIT ?2
 
     fn search_genome_keyword_like(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
         let like = format!("%{}%", query.to_lowercase());
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             r#"
 SELECT decision_id, description, COALESCE(rationale, '')
 FROM genome_decisions
@@ -735,7 +770,7 @@ LIMIT ?2
     pub fn read_history_vectors(&self) -> Result<Vec<(String, Vec<f32>)>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT session_id, vector_json FROM history_vec")?;
+            .prepare_cached("SELECT session_id, vector_json FROM history_vec")?;
         let rows = stmt.query_map([], |row| {
             let id: String = row.get(0)?;
             let raw: String = row.get(1)?;
@@ -783,7 +818,7 @@ LIMIT ?2
     pub fn read_genome_vectors(&self) -> Result<Vec<(String, Vec<f32>)>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT decision_id, vector_json FROM genome_vec")?;
+            .prepare_cached("SELECT decision_id, vector_json FROM genome_vec")?;
         let rows = stmt.query_map([], |row| {
             let id: String = row.get(0)?;
             let raw: String = row.get(1)?;
@@ -1097,6 +1132,131 @@ mod tests {
     }
 
     #[test]
+    fn test_delete_history_except_cleans_vec_tables() {
+        let (_tmp, store) = open_test_store();
+        for i in 0..3 {
+            let sid = format!("s{}", i);
+            store
+                .upsert_history(&sid, "Sess", None, "d", "d", "sum", "[]", "[]", "text", "")
+                .unwrap();
+            store
+                .upsert_history_vector(&sid, "[1.0, 2.0, 3.0]")
+                .unwrap();
+        }
+
+        // Keep only s1 — s0 and s2 should be removed from both tables atomically
+        let keep: HashSet<String> = ["s1".to_string()].into_iter().collect();
+        store.delete_history_except(&keep).unwrap();
+
+        assert!(store.get_history_by_id("s0").unwrap().is_none());
+        assert!(store.get_history_by_id("s1").unwrap().is_some());
+        assert!(store.get_history_by_id("s2").unwrap().is_none());
+        // Vec entries must also be cleaned
+        assert!(!store.has_history_vector("s0").unwrap());
+        assert!(store.has_history_vector("s1").unwrap());
+        assert!(!store.has_history_vector("s2").unwrap());
+    }
+
+    #[test]
+    fn test_delete_genome_except_cleans_vec_tables() {
+        let (_tmp, store) = open_test_store();
+        for i in 0..3 {
+            let did = format!("d{}", i);
+            store
+                .upsert_genome(&did, "2026-01-01", "desc", None, "[]", "text", "")
+                .unwrap();
+            store.upsert_genome_vector(&did, "[1.0, 2.0, 3.0]").unwrap();
+        }
+
+        let keep: HashSet<String> = ["d1".to_string()].into_iter().collect();
+        store.delete_genome_except(&keep).unwrap();
+
+        assert!(store.get_genome_by_id("d0").unwrap().is_none());
+        assert!(store.get_genome_by_id("d1").unwrap().is_some());
+        assert!(store.get_genome_by_id("d2").unwrap().is_none());
+        assert!(!store.has_genome_vector("d0").unwrap());
+        assert!(store.has_genome_vector("d1").unwrap());
+        assert!(!store.has_genome_vector("d2").unwrap());
+    }
+
+    #[test]
+    fn test_delete_history_except_empty_keeps_clears_all() {
+        let (_tmp, store) = open_test_store();
+        for i in 0..3 {
+            let sid = format!("s{}", i);
+            store
+                .upsert_history(&sid, "Sess", None, "d", "d", "sum", "[]", "[]", "text", "")
+                .unwrap();
+            store.upsert_history_vector(&sid, "[1.0, 2.0]").unwrap();
+        }
+
+        let empty: HashSet<String> = HashSet::new();
+        store.delete_history_except(&empty).unwrap();
+
+        for i in 0..3 {
+            let sid = format!("s{}", i);
+            assert!(store.get_history_by_id(&sid).unwrap().is_none());
+            assert!(!store.has_history_vector(&sid).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_clear_all_multi_table_consistency() {
+        let (_tmp, store) = open_test_store();
+        store
+            .upsert_history("s1", "Sess", None, "d", "d", "sum", "[]", "[]", "text", "")
+            .unwrap();
+        store.upsert_history_vector("s1", "[1.0]").unwrap();
+        store
+            .upsert_genome("d1", "d", "desc", None, "[]", "text", "")
+            .unwrap();
+        store.upsert_genome_vector("d1", "[1.0]").unwrap();
+        store.refresh_fts().unwrap();
+
+        store.clear_all().unwrap();
+
+        assert!(store.get_history_by_id("s1").unwrap().is_none());
+        assert!(store.get_genome_by_id("d1").unwrap().is_none());
+        assert!(!store.has_history_vector("s1").unwrap());
+        assert!(!store.has_genome_vector("d1").unwrap());
+        // FTS should also be empty
+        let h = store.search_history_keyword("text", 10).unwrap();
+        let g = store.search_genome_keyword("text", 10).unwrap();
+        assert!(h.is_empty());
+        assert!(g.is_empty());
+    }
+
+    #[test]
+    fn test_refresh_fts_atomic_both_tables() {
+        let (_tmp, store) = open_test_store();
+        store
+            .upsert_history(
+                "s1",
+                "Sess",
+                None,
+                "d",
+                "d",
+                "sum",
+                "[]",
+                "[]",
+                "history_kw",
+                "",
+            )
+            .unwrap();
+        store
+            .upsert_genome("d1", "d", "desc", None, "[]", "genome_kw", "")
+            .unwrap();
+
+        store.refresh_fts().unwrap();
+
+        // Both FTS tables should be populated in one atomic operation
+        let h = store.search_history_keyword("history_kw", 10).unwrap();
+        let g = store.search_genome_keyword("genome_kw", 10).unwrap();
+        assert_eq!(h.len(), 1);
+        assert_eq!(g.len(), 1);
+    }
+
+    #[test]
     fn test_extension_path_rejects_relative() {
         let (_tmp, store) = open_test_store();
         let result = store.try_load_vec_extension(Some("relative/path/vec.so"));
@@ -1125,5 +1285,92 @@ mod tests {
             .try_load_vec_extension(Some("/nonexistent/path/vec.so"))
             .unwrap();
         assert!(!result, "missing extension file should return Ok(false)");
+    }
+
+    #[test]
+    fn test_with_transaction_success() {
+        let (_tmp, store) = open_test_store();
+
+        let result = store
+            .with_transaction(|tx| {
+                tx.execute(
+                    "INSERT INTO history_entries (session_id, session_name, platform, started_at, ended_at, summary, files_touched_json, tools_used_json, search_text, content_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params!["tx-test-1", "TX Test", "test", "2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z", "test summary", "[]", "[]", "test search", "txhash1"],
+                )?;
+                tx.execute(
+                    "INSERT INTO history_entries (session_id, session_name, platform, started_at, ended_at, summary, files_touched_json, tools_used_json, search_text, content_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params!["tx-test-2", "TX Test 2", "test", "2026-01-02T00:00:00Z", "2026-01-02T01:00:00Z", "test summary 2", "[]", "[]", "test search 2", "txhash2"],
+                )?;
+                Ok::<_, anyhow::Error>(2)
+            })
+            .unwrap();
+
+        assert_eq!(result, 2);
+
+        // Verify data was committed
+        let history = store.get_history_by_id("tx-test-1").unwrap();
+        assert!(history.is_some());
+        let history2 = store.get_history_by_id("tx-test-2").unwrap();
+        assert!(history2.is_some());
+    }
+
+    #[test]
+    fn test_with_transaction_rollback_on_error() {
+        let (_tmp, store) = open_test_store();
+
+        // First insert some data outside the transaction
+        store
+            .upsert_history(
+                "before-tx",
+                "Before TX",
+                Some("test"),
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T01:00:00Z",
+                "before",
+                "[]",
+                "[]",
+                "before search",
+                "beforehash",
+            )
+            .unwrap();
+
+        let result: Result<(), anyhow::Error> = store.with_transaction(|tx| {
+            // Insert in transaction
+            tx.execute(
+                "INSERT INTO history_entries (session_id, session_name, platform, started_at, ended_at, summary, files_touched_json, tools_used_json, search_text, content_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params!["in-tx", "In TX", "test", "2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z", "in tx", "[]", "[]", "in tx", "inhash"],
+            )?;
+            // Deliberate error to trigger rollback
+            Err(anyhow::anyhow!("simulated error"))
+        });
+
+        assert!(result.is_err());
+
+        // Verify the pre-transaction data still exists
+        let before = store.get_history_by_id("before-tx").unwrap();
+        assert!(before.is_some());
+
+        // Verify the in-transaction data was rolled back
+        let in_tx = store.get_history_by_id("in-tx").unwrap();
+        assert!(
+            in_tx.is_none(),
+            "transaction data should have been rolled back"
+        );
+    }
+
+    #[test]
+    fn test_with_transaction_error_context() {
+        let (_tmp, store) = open_test_store();
+
+        // Test that error context is helpful
+        let result: Result<(), anyhow::Error> =
+            store.with_transaction(|_tx| Err(anyhow::anyhow!("inner error")));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("transaction closure failed"),
+            "error should mention transaction closure"
+        );
     }
 }
