@@ -16,11 +16,13 @@ use crate::{
 pub mod agent;
 pub mod build;
 pub mod config;
+pub mod describe;
 pub mod guard;
 pub mod injection_handlers;
 pub mod memory;
 pub mod office;
 pub mod retrieval;
+pub mod semantic_diff_handlers;
 pub mod session;
 pub mod stewardship_handlers;
 pub mod system;

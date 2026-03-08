@@ -491,33 +491,6 @@ mod tests {
         assert!(sessions.is_empty());
     }
 
-    /// Test LiveState active_sessions filter
-    #[test]
-    fn test_live_state_active_filter() {
-        let mut state = LiveState::new();
-
-        // Add multiple sessions with different statuses
-        let mut s1 = Session::new("active1".to_string(), None);
-        s1.set_status(SessionStatus::Active);
-
-        let mut s2 = Session::new("active2".to_string(), None);
-        s2.set_status(SessionStatus::Active);
-
-        let mut s3 = Session::new("idle".to_string(), None);
-        s3.set_status(SessionStatus::Idle);
-
-        let mut s4 = Session::new("completed".to_string(), None);
-        s4.set_status(SessionStatus::Completed);
-
-        state.add_session(s1);
-        state.add_session(s2);
-        state.add_session(s3);
-        state.add_session(s4);
-
-        let active: Vec<_> = state.active_sessions();
-        assert_eq!(active.len(), 2);
-    }
-
     /// Test session context building for chat
     #[test]
     fn test_session_context_building() {

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::sync::Arc;
 
-use crate::{guardrail, injection, state, verify};
+use crate::{guardrail, injection, semantic_diff, state, validate, verify};
 
 use super::{
     capture_hook_evidence, default_session_name, get_session_id, hook_session_start_banner,
@@ -18,6 +18,7 @@ pub async fn handle_session_start(
 ) -> Result<()> {
     let stdin_payload = read_hook_stdin_payload();
     let name = name.unwrap_or_else(default_session_name);
+    validate::reject_control_chars(&name, "name")?;
     let platform = platform.and_then(|p| parse_platform(&p));
     let session = state.create_session(name.clone(), platform).await?;
     let _ = persist_claude_env_var("IMPULSE_SESSION_ID", &session.id);
@@ -103,7 +104,11 @@ pub async fn handle_session_end(
     session_id: String,
     summary: String,
     should_verify: bool,
+    sem_diff_base: Option<String>,
 ) -> Result<()> {
+    validate::validate_session_id(&session_id)?;
+    validate::reject_control_chars(&summary, "summary")?;
+
     let stdin_payload = read_hook_stdin_payload();
     if should_verify {
         let steps = verify::default_steps(&std::env::current_dir()?);
@@ -111,6 +116,25 @@ pub async fn handle_session_end(
         print_verification_report(&report);
         if !report.success() {
             anyhow::bail!("Verification failed. Session end blocked.");
+        }
+    }
+    // Capture semantic diff if requested and sem is available
+    if let Some(base_ref) = &sem_diff_base {
+        if semantic_diff::sem_available() {
+            match semantic_diff::capture_semantic_diff(
+                state.storage().base_path(),
+                &std::env::current_dir()?,
+                &session_id,
+                base_ref,
+                "HEAD",
+            ) {
+                Ok(report) => {
+                    if !report.changes.is_empty() {
+                        eprintln!("Semantic diff: {}", report.summary);
+                    }
+                }
+                Err(e) => eprintln!("Warning: semantic diff failed: {}", e),
+            }
         }
     }
     match state.end_session(&session_id, summary.clone()).await {
@@ -154,30 +178,14 @@ pub async fn handle_track_write(
     file: String,
     session_id: Option<String>,
 ) -> Result<()> {
+    validate::validate_file_arg(&file)?;
+
     if let Some(sid) = get_session_id(session_id) {
         match state.track_file(&sid, &file).await {
             Ok(_) => println!("Tracked: {}", file),
             Err(e) => eprintln!("Error: {}", e),
         }
-        if let Ok(config) = state.config_snapshot() {
-            if config.guardrails.enabled {
-                if let Ok(results) = guardrail::evaluate_action(&file, "any", &config.guardrails) {
-                    for result in &results {
-                        match result.action {
-                            guardrail::GuardAction::Warn => {
-                                eprintln!("{}", result.format_human());
-                            }
-                            guardrail::GuardAction::Log => {
-                                let _ = state
-                                    .add_tag(&sid, &format!("guard:{}", result.rule_id))
-                                    .await;
-                            }
-                            guardrail::GuardAction::Block => {}
-                        }
-                    }
-                }
-            }
-        }
+        evaluate_track_guardrails(state, &sid, &file).await;
     } else {
         eprintln!("Error: No session_id. Use --session-id or IMPULSE_SESSION_ID");
     }
@@ -189,34 +197,40 @@ pub async fn handle_track_tool(
     tool: String,
     session_id: Option<String>,
 ) -> Result<()> {
+    validate::reject_control_chars(&tool, "tool")?;
+
     if let Some(sid) = get_session_id(session_id) {
         match state.track_tool(&sid, &tool).await {
             Ok(_) => println!("Tracked: {}", tool),
             Err(e) => eprintln!("Error: {}", e),
         }
-        if let Ok(config) = state.config_snapshot() {
-            if config.guardrails.enabled {
-                if let Ok(results) = guardrail::evaluate_action(&tool, "any", &config.guardrails) {
-                    for result in &results {
-                        match result.action {
-                            guardrail::GuardAction::Warn => {
-                                eprintln!("{}", result.format_human());
-                            }
-                            guardrail::GuardAction::Log => {
-                                let _ = state
-                                    .add_tag(&sid, &format!("guard:{}", result.rule_id))
-                                    .await;
-                            }
-                            guardrail::GuardAction::Block => {}
-                        }
-                    }
-                }
-            }
-        }
+        evaluate_track_guardrails(state, &sid, &tool).await;
     } else {
         eprintln!("Error: No session_id. Use --session-id or IMPULSE_SESSION_ID");
     }
     Ok(())
+}
+
+async fn evaluate_track_guardrails(state: &Arc<state::State>, session_id: &str, action: &str) {
+    if let Ok(config) = state.config_snapshot() {
+        if config.guardrails.enabled {
+            if let Ok(results) = guardrail::evaluate_action(action, "any", &config.guardrails) {
+                for result in &results {
+                    match result.action {
+                        guardrail::GuardAction::Warn => {
+                            eprintln!("{}", result.format_human());
+                        }
+                        guardrail::GuardAction::Log => {
+                            let _ = state
+                                .add_tag(session_id, &format!("guard:{}", result.rule_id))
+                                .await;
+                        }
+                        guardrail::GuardAction::Block => {}
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub async fn handle_list_sessions(state: &Arc<state::State>) -> Result<()> {
