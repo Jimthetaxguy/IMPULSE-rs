@@ -7,7 +7,7 @@
 use anyhow::Result;
 use serde::Serialize;
 
-use crate::envelope::{EnvelopeBuilder, OutputFormat, write_envelope};
+use crate::envelope::{write_envelope, EnvelopeBuilder, OutputFormat};
 
 // ─── Command registry ───────────────────────────────────────────────────────
 
@@ -50,10 +50,34 @@ fn build_registry() -> Registry {
         version: env!("CARGO_PKG_VERSION"),
         description: "Terminal-native AI coding agent sidecar",
         global_flags: vec![
-            ParamInfo { name: "--impulse-dir", param_type: "path", required: false, description: "Path to .impulse data directory", default: Some(".impulse") },
-            ParamInfo { name: "--verbose", param_type: "bool", required: false, description: "Enable verbose output", default: Some("false") },
-            ParamInfo { name: "--daemon", param_type: "bool", required: false, description: "Run in daemon mode (Unix socket IPC)", default: Some("false") },
-            ParamInfo { name: "--format", param_type: "enum(json,text,ndjson)", required: false, description: "Output format", default: Some("json") },
+            ParamInfo {
+                name: "--impulse-dir",
+                param_type: "path",
+                required: false,
+                description: "Path to .impulse data directory",
+                default: Some(".impulse"),
+            },
+            ParamInfo {
+                name: "--verbose",
+                param_type: "bool",
+                required: false,
+                description: "Enable verbose output",
+                default: Some("false"),
+            },
+            ParamInfo {
+                name: "--daemon",
+                param_type: "bool",
+                required: false,
+                description: "Run in daemon mode (Unix socket IPC)",
+                default: Some("false"),
+            },
+            ParamInfo {
+                name: "--format",
+                param_type: "enum(json,text,ndjson)",
+                required: false,
+                description: "Output format",
+                default: Some("json"),
+            },
         ],
         commands: build_command_list(),
     }
@@ -481,7 +505,11 @@ pub fn handle_schema(command: &str, format: OutputFormat) -> Result<()> {
                 let mut prop = serde_json::Map::new();
 
                 // Map param_type to valid JSON Schema types
-                if let Some(variants) = p.param_type.strip_prefix("enum(").and_then(|s| s.strip_suffix(')')) {
+                if let Some(variants) = p
+                    .param_type
+                    .strip_prefix("enum(")
+                    .and_then(|s| s.strip_suffix(')'))
+                {
                     prop.insert("type".to_string(), serde_json::json!("string"));
                     let values: Vec<&str> = variants.split(',').collect();
                     prop.insert("enum".to_string(), serde_json::json!(values));
@@ -499,10 +527,7 @@ pub fn handle_schema(command: &str, format: OutputFormat) -> Result<()> {
                     }
                 }
 
-                prop.insert(
-                    "description".to_string(),
-                    serde_json::json!(p.description),
-                );
+                prop.insert("description".to_string(), serde_json::json!(p.description));
                 if let Some(d) = p.default {
                     prop.insert("default".to_string(), serde_json::json!(d));
                 }
@@ -572,14 +597,20 @@ mod tests {
     #[test]
     fn schema_command_produces_json_schema() {
         let reg = build_registry();
-        let cmd = reg.commands.iter().find(|c| c.path == "session-start").unwrap();
+        let cmd = reg
+            .commands
+            .iter()
+            .find(|c| c.path == "session-start")
+            .unwrap();
         assert!(!cmd.params.is_empty());
     }
 
     #[test]
     fn all_mutating_commands_documented() {
         let reg = build_registry();
-        let mutating: Vec<&str> = reg.commands.iter()
+        let mutating: Vec<&str> = reg
+            .commands
+            .iter()
             .filter(|c| c.mutating)
             .map(|c| c.path)
             .collect();

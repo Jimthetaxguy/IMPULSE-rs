@@ -137,7 +137,10 @@ impl EnvelopeBuilder {
 // ─── Writer ─────────────────────────────────────────────────────────────────
 
 /// Write an envelope to stdout respecting the chosen format.
-pub fn write_envelope<T: Serialize>(format: OutputFormat, envelope: &Envelope<T>) -> io::Result<()> {
+pub fn write_envelope<T: Serialize>(
+    format: OutputFormat,
+    envelope: &Envelope<T>,
+) -> io::Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
     match format {
