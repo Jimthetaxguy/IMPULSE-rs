@@ -302,995 +302,446 @@ impl Config {
             .collect()
     }
 
-    /// Get a config value by key
-    pub fn get(&self, key: &str) -> Option<String> {
+    // ── Config key infrastructure ──────────────────────────────────────────────
+    //
+    // All 69 config keys in display order. Used by get(), list(), and set().
+    // Adding a new config field requires:
+    //   1. Add the field to the Config struct
+    //   2. Add the key to CONFIG_KEYS
+    //   3. Add a SetRule entry in build_set_rules()
+    //   4. If the key name differs from the field name, add to resolve_field_name()
+
+    /// Ordered list of all config keys (used by `list()`).
+    const CONFIG_KEYS: &'static [&'static str] = &[
+        "log_level", "default_platform", "verbose", "sync_interval_secs",
+        "max_history_entries", "retrieval_mode", "retrieval_backend",
+        "retrieval_default_limit", "retrieval_similarity_threshold",
+        "retrieval_embedding_provider", "embedding_model", "retrieval_python_cmd",
+        "retrieval_vector_enabled", "retrieval_semantic_strategy",
+        "retrieval_query_timeout_secs", "retrieval_index_timeout_secs",
+        "retrieval_batch_size", "retrieval_candidate_pool",
+        "retrieval_deduplicate_enabled", "retrieval_fuzzy_matching_enabled",
+        "retrieval_experimental_pageindex_enabled", "retrieval_pageindex_mode",
+        "context_injection_mode", "context_injection_scope",
+        "context_injection_max_items", "context_injection_max_chars",
+        "context_injection_min_score", "context_injection_use_semantic",
+        "context_injection_emit_artifacts", "stewardship_mode",
+        "stewardship_monitor_threshold", "stewardship_surgical_threshold",
+        "stewardship_thoughtful_threshold", "stewardship_emergency_threshold",
+        "stewardship_poll_interval_secs", "stewardship_context_window_tokens",
+        "stewardship_cross_project_enabled",
+        "model.anthropic", "model.openai", "model.google", "model.mistral",
+        "build_hygiene_enabled", "build_hygiene_scan_paths",
+        "build_hygiene_size_threshold_gb", "build_hygiene_age_threshold_days",
+        "build_hygiene_sweep_on_session_end", "build_hygiene_sweep_on_toolchain_update",
+        "build_hygiene_dry_run_default",
+        "context_lifecycle_enabled", "context_lifecycle_poll_secs",
+        "context_lifecycle_startup_delay_ms", "context_lifecycle_window_tokens",
+        "impulse_agent_provider", "impulse_agent_api_key",
+        "impulse_agent_model", "impulse_agent_harness",
+        "impulse_agent_auto_review", "impulse_agent_auto_coordinate",
+        "notifications_enabled", "conflict_webhook_url", "conflict_webhook_enabled",
+        "tool_execution.default_timeout_ms", "tool_execution.max_output_bytes",
+        "tool_execution.max_artifacts", "tool_execution.allowed_read_roots",
+        "tool_execution.allowed_write_roots",
+        "external_tools_dir", "external_mcp_servers",
+        "impulse_agent_permissions", "guardrails_enabled",
+    ];
+
+    /// Map user-facing key → serde field name (only for keys that differ).
+    fn resolve_field_name(key: &str) -> &str {
         match key {
-            "log_level" => Some(self.log_level.clone()),
-            "default_platform" => self.default_platform.map(|p| p.as_str().to_string()),
-            "verbose" => Some(self.verbose.to_string()),
-            "sync_interval_secs" => Some(self.sync_interval_secs.to_string()),
-            "max_history_entries" => Some(self.max_history_entries.to_string()),
-            "retrieval_mode" => Some(self.retrieval_mode.clone()),
-            "retrieval_backend" => Some(self.retrieval_backend.clone()),
-            "retrieval_default_limit" => Some(self.retrieval_default_limit.to_string()),
-            "retrieval_similarity_threshold" => {
-                Some(self.retrieval_similarity_threshold.to_string())
-            }
-            "retrieval_embedding_provider" => Some(self.retrieval_embedding_provider.clone()),
-            "embedding_model" => Some(self.embedding_model.clone()),
-            "retrieval_python_cmd" => Some(self.retrieval_python_cmd.clone()),
-            "retrieval_vector_enabled" => Some(self.retrieval_vector_enabled.to_string()),
-            "retrieval_semantic_strategy" => Some(self.retrieval_semantic_strategy.clone()),
-            "retrieval_query_timeout_secs" => Some(self.retrieval_query_timeout_secs.to_string()),
-            "retrieval_index_timeout_secs" => Some(self.retrieval_index_timeout_secs.to_string()),
-            "retrieval_batch_size" => Some(self.retrieval_batch_size.to_string()),
-            "retrieval_candidate_pool" => Some(self.retrieval_candidate_pool.to_string()),
-            "retrieval_deduplicate_enabled" => Some(self.retrieval_deduplicate_enabled.to_string()),
-            "retrieval_fuzzy_matching_enabled" => {
-                Some(self.retrieval_fuzzy_matching_enabled.to_string())
-            }
-            "retrieval_experimental_pageindex_enabled" => {
-                Some(self.retrieval_experimental_pageindex_enabled.to_string())
-            }
-            "retrieval_pageindex_mode" => Some(self.retrieval_pageindex_mode.clone()),
-            "context_injection_mode" => Some(self.context_injection_mode.clone()),
-            "context_injection_scope" => Some(self.context_injection_scope.clone()),
-            "context_injection_max_items" => Some(self.context_injection_max_items.to_string()),
-            "context_injection_max_chars" => Some(self.context_injection_max_chars.to_string()),
-            "context_injection_min_score" => Some(self.context_injection_min_score.to_string()),
-            "context_injection_use_semantic" => {
-                Some(self.context_injection_use_semantic.to_string())
-            }
-            "context_injection_emit_artifacts" => {
-                Some(self.context_injection_emit_artifacts.to_string())
-            }
-            "stewardship_mode" => Some(self.stewardship_mode.clone()),
-            "stewardship_monitor_threshold" => Some(self.stewardship_monitor_threshold.to_string()),
-            "stewardship_surgical_threshold" => {
-                Some(self.stewardship_surgical_threshold.to_string())
-            }
-            "stewardship_thoughtful_threshold" => {
-                Some(self.stewardship_thoughtful_threshold.to_string())
-            }
-            "stewardship_emergency_threshold" => {
-                Some(self.stewardship_emergency_threshold.to_string())
-            }
-            "stewardship_poll_interval_secs" => {
-                Some(self.stewardship_poll_interval_secs.to_string())
-            }
-            "stewardship_context_window_tokens" => {
-                Some(self.stewardship_context_window_tokens.to_string())
-            }
-            "stewardship_cross_project_enabled" => {
-                Some(self.stewardship_cross_project_enabled.to_string())
-            }
-            "model.anthropic" => self.model_anthropic.clone(),
-            "model.openai" => self.model_openai.clone(),
-            "model.google" => self.model_google.clone(),
-            "model.mistral" => self.model_mistral.clone(),
-            "build_hygiene_enabled" => Some(self.build_hygiene_enabled.to_string()),
-            "build_hygiene_scan_paths" => Some(self.build_hygiene_scan_paths.join(",")),
-            "build_hygiene_size_threshold_gb" => {
-                Some(self.build_hygiene_size_threshold_gb.to_string())
-            }
-            "build_hygiene_age_threshold_days" => {
-                Some(self.build_hygiene_age_threshold_days.to_string())
-            }
-            "build_hygiene_sweep_on_session_end" => {
-                Some(self.build_hygiene_sweep_on_session_end.to_string())
-            }
-            "build_hygiene_sweep_on_toolchain_update" => {
-                Some(self.build_hygiene_sweep_on_toolchain_update.to_string())
-            }
-            "build_hygiene_dry_run_default" => Some(self.build_hygiene_dry_run_default.to_string()),
-            "context_lifecycle_enabled" => Some(self.context_lifecycle_enabled.to_string()),
-            "context_lifecycle_poll_secs" => Some(self.context_lifecycle_poll_secs.to_string()),
-            "context_lifecycle_startup_delay_ms" => {
-                Some(self.context_lifecycle_startup_delay_ms.to_string())
-            }
-            "context_lifecycle_window_tokens" => {
-                Some(self.context_lifecycle_window_tokens.to_string())
-            }
-            "impulse_agent_provider" => self.impulse_agent_provider.clone(),
-            "impulse_agent_api_key" => self
-                .impulse_agent_api_key
-                .as_ref()
-                .map(|_| "***".to_string()),
-            "impulse_agent_model" => self.impulse_agent_model.clone(),
-            "impulse_agent_harness" => self.impulse_agent_harness.clone(),
-            "impulse_agent_auto_review" => Some(self.impulse_agent_auto_review.to_string()),
-            "impulse_agent_auto_coordinate" => Some(self.impulse_agent_auto_coordinate.to_string()),
-            "notifications_enabled" => Some(self.notifications_enabled.to_string()),
-            "conflict_webhook_url" => self.conflict_webhook_url.clone(),
-            "conflict_webhook_enabled" => Some(self.conflict_webhook_enabled.to_string()),
-            "tool_execution.default_timeout_ms" => {
-                Some(self.tool_execution_default_timeout_ms.to_string())
-            }
-            "tool_execution.max_output_bytes" => {
-                Some(self.tool_execution_max_output_bytes.to_string())
-            }
-            "tool_execution.max_artifacts" => Some(self.tool_execution_max_artifacts.to_string()),
-            "tool_execution.allowed_read_roots" => {
-                Some(self.tool_execution_allowed_read_roots.join(","))
-            }
-            "tool_execution.allowed_write_roots" => {
-                Some(self.tool_execution_allowed_write_roots.join(","))
-            }
-            "external_tools_dir" => Some(self.external_tools_dir.clone()),
-            "external_mcp_servers" => Some(self.external_mcp_servers.join(",")),
-            "impulse_agent_permissions" => {
-                serde_json::to_string(&self.impulse_agent_permissions).ok()
-            }
-            "guardrails_enabled" => Some(self.guardrails.enabled.to_string()),
-            _ => None,
+            "model.anthropic" => "model_anthropic",
+            "model.openai" => "model_openai",
+            "model.google" => "model_google",
+            "model.mistral" => "model_mistral",
+            "tool_execution.default_timeout_ms" => "tool_execution_default_timeout_ms",
+            "tool_execution.max_output_bytes" => "tool_execution_max_output_bytes",
+            "tool_execution.max_artifacts" => "tool_execution_max_artifacts",
+            "tool_execution.allowed_read_roots" => "tool_execution_allowed_read_roots",
+            "tool_execution.allowed_write_roots" => "tool_execution_allowed_write_roots",
+            _ => key,
         }
     }
 
-    /// Set a config value by key
-    pub fn set(&mut self, key: &str, value: &str) -> bool {
+    /// Convert a JSON value from serde reflection to a display string.
+    fn json_value_to_string(v: &serde_json::Value) -> Option<String> {
+        match v {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Bool(b) => Some(b.to_string()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            serde_json::Value::Array(arr) => Some(
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+            other => Some(other.to_string()),
+        }
+    }
+
+    /// Get a config value by key (serde reflection with special-case overrides).
+    pub fn get(&self, key: &str) -> Option<String> {
+        // Fields that can't use serde reflection
         match key {
-            "log_level" => {
-                if ["trace", "debug", "info", "warn", "error"].contains(&value) {
-                    self.log_level = value.to_string();
-                    true
-                } else {
-                    false
-                }
-            }
             "default_platform" => {
-                match value {
-                    "claude-code" => self.default_platform = Some(Platform::ClaudeCode),
-                    "opencode" => self.default_platform = Some(Platform::OpenCode),
-                    "none" => self.default_platform = None,
-                    _ => return false,
-                }
-                true
-            }
-            "verbose" => {
-                self.verbose = value.parse().unwrap_or(false);
-                true
-            }
-            "sync_interval_secs" => {
-                if let Ok(v) = value.parse() {
-                    self.sync_interval_secs = v;
-                    true
-                } else {
-                    false
-                }
-            }
-            "max_history_entries" => {
-                if let Ok(v) = value.parse() {
-                    self.max_history_entries = v;
-                    true
-                } else {
-                    false
-                }
-            }
-            "retrieval_mode" => {
-                if ["keyword", "semantic"].contains(&value) {
-                    self.retrieval_mode = value.to_string();
-                    true
-                } else {
-                    false
-                }
-            }
-            "retrieval_backend" => {
-                if ["fts", "fts+vec"].contains(&value) {
-                    self.retrieval_backend = value.to_string();
-                    true
-                } else {
-                    false
-                }
-            }
-            "retrieval_default_limit" => {
-                if let Ok(v) = value.parse::<usize>() {
-                    self.retrieval_default_limit = v.max(1);
-                    true
-                } else {
-                    false
-                }
-            }
-            "retrieval_similarity_threshold" => {
-                if let Ok(v) = value.parse::<f32>() {
-                    if (0.0..=1.0).contains(&v) {
-                        self.retrieval_similarity_threshold = v;
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            }
-            "retrieval_embedding_provider" => {
-                if !value.trim().is_empty() {
-                    self.retrieval_embedding_provider = value.to_string();
-                    true
-                } else {
-                    false
-                }
-            }
-            "embedding_model" => {
-                if !value.trim().is_empty() {
-                    self.embedding_model = value.to_string();
-                    true
-                } else {
-                    false
-                }
-            }
-            "retrieval_python_cmd" => {
-                if !value.trim().is_empty() {
-                    self.retrieval_python_cmd = value.to_string();
-                    true
-                } else {
-                    false
-                }
-            }
-            "retrieval_vector_enabled" => match value.parse::<bool>() {
-                Ok(v) => {
-                    self.retrieval_vector_enabled = v;
-                    true
-                }
-                Err(_) => false,
-            },
-            "retrieval_semantic_strategy" => {
-                if ["auto", "sqlite-only", "rust-only"].contains(&value) {
-                    self.retrieval_semantic_strategy = value.to_string();
-                    true
-                } else {
-                    false
-                }
-            }
-            "retrieval_query_timeout_secs" => {
-                if let Ok(v) = value.parse::<u64>() {
-                    if (1..=120).contains(&v) {
-                        self.retrieval_query_timeout_secs = v;
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            }
-            "retrieval_index_timeout_secs" => {
-                if let Ok(v) = value.parse::<u64>() {
-                    if (10..=600).contains(&v) {
-                        self.retrieval_index_timeout_secs = v;
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            }
-            "retrieval_batch_size" => {
-                if let Ok(v) = value.parse::<usize>() {
-                    if (1..=512).contains(&v) {
-                        self.retrieval_batch_size = v;
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            }
-            "retrieval_candidate_pool" => {
-                if let Ok(v) = value.parse::<usize>() {
-                    if (10..=5000).contains(&v) {
-                        self.retrieval_candidate_pool = v;
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            }
-            "retrieval_deduplicate_enabled" => match value.parse::<bool>() {
-                Ok(v) => {
-                    self.retrieval_deduplicate_enabled = v;
-                    true
-                }
-                Err(_) => false,
-            },
-            "retrieval_fuzzy_matching_enabled" => match value.parse::<bool>() {
-                Ok(v) => {
-                    self.retrieval_fuzzy_matching_enabled = v;
-                    true
-                }
-                Err(_) => false,
-            },
-            "retrieval_experimental_pageindex_enabled" => match value.parse::<bool>() {
-                Ok(v) => {
-                    self.retrieval_experimental_pageindex_enabled = v;
-                    true
-                }
-                Err(_) => false,
-            },
-            "retrieval_pageindex_mode" => {
-                if ["local-structure", "api-augmented"].contains(&value) {
-                    self.retrieval_pageindex_mode = value.to_string();
-                    true
-                } else {
-                    false
-                }
-            }
-            "context_injection_mode" => {
-                if ["off", "review", "apply"].contains(&value) {
-                    self.context_injection_mode = value.to_string();
-                    true
-                } else {
-                    false
-                }
-            }
-            "context_injection_scope" => {
-                if ["daemon", "direct", "both"].contains(&value) {
-                    self.context_injection_scope = value.to_string();
-                    true
-                } else {
-                    false
-                }
-            }
-            "context_injection_max_items" => {
-                if let Ok(v) = value.parse::<usize>() {
-                    if (1..=50).contains(&v) {
-                        self.context_injection_max_items = v;
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            }
-            "context_injection_max_chars" => {
-                if let Ok(v) = value.parse::<usize>() {
-                    if (200..=20000).contains(&v) {
-                        self.context_injection_max_chars = v;
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            }
-            "context_injection_min_score" => {
-                if let Ok(v) = value.parse::<f32>() {
-                    if (0.0..=1.0).contains(&v) {
-                        self.context_injection_min_score = v;
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            }
-            "context_injection_use_semantic" => match value.parse::<bool>() {
-                Ok(v) => {
-                    self.context_injection_use_semantic = v;
-                    true
-                }
-                Err(_) => false,
-            },
-            "context_injection_emit_artifacts" => match value.parse::<bool>() {
-                Ok(v) => {
-                    self.context_injection_emit_artifacts = v;
-                    true
-                }
-                Err(_) => false,
-            },
-            "stewardship_mode" => {
-                if ["auto", "review", "off"].contains(&value) {
-                    self.stewardship_mode = value.to_string();
-                    true
-                } else {
-                    false
-                }
-            }
-            "stewardship_monitor_threshold" => {
-                if let Ok(v) = value.parse::<f32>() {
-                    if (0.0..=1.0).contains(&v) {
-                        self.stewardship_monitor_threshold = v;
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            }
-            "stewardship_surgical_threshold" => {
-                if let Ok(v) = value.parse::<f32>() {
-                    if (0.0..=1.0).contains(&v) {
-                        self.stewardship_surgical_threshold = v;
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            }
-            "stewardship_thoughtful_threshold" => {
-                if let Ok(v) = value.parse::<f32>() {
-                    if (0.0..=1.0).contains(&v) {
-                        self.stewardship_thoughtful_threshold = v;
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            }
-            "stewardship_emergency_threshold" => {
-                if let Ok(v) = value.parse::<f32>() {
-                    if (0.0..=1.0).contains(&v) {
-                        self.stewardship_emergency_threshold = v;
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            }
-            "stewardship_poll_interval_secs" => {
-                if let Ok(v) = value.parse::<u64>() {
-                    if (1..=300).contains(&v) {
-                        self.stewardship_poll_interval_secs = v;
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            }
-            "stewardship_context_window_tokens" => {
-                if let Ok(v) = value.parse::<usize>() {
-                    if (10_000..=2_000_000).contains(&v) {
-                        self.stewardship_context_window_tokens = v;
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            }
-            "stewardship_cross_project_enabled" => match value.parse::<bool>() {
-                Ok(v) => {
-                    self.stewardship_cross_project_enabled = v;
-                    true
-                }
-                Err(_) => false,
-            },
-            "model.anthropic" => {
-                self.model_anthropic = Some(value.to_string());
-                true
-            }
-            "model.openai" => {
-                self.model_openai = Some(value.to_string());
-                true
-            }
-            "model.google" => {
-                self.model_google = Some(value.to_string());
-                true
-            }
-            "model.mistral" => {
-                self.model_mistral = Some(value.to_string());
-                true
-            }
-            "build_hygiene_enabled" => {
-                self.build_hygiene_enabled = value.parse().unwrap_or(true);
-                true
-            }
-            "build_hygiene_scan_paths" => {
-                self.build_hygiene_scan_paths =
-                    value.split(',').map(|s| s.trim().to_string()).collect();
-                true
-            }
-            "build_hygiene_size_threshold_gb" => {
-                if let Ok(v) = value.parse() {
-                    self.build_hygiene_size_threshold_gb = v;
-                    true
-                } else {
-                    false
-                }
-            }
-            "build_hygiene_age_threshold_days" => {
-                if let Ok(v) = value.parse() {
-                    self.build_hygiene_age_threshold_days = v;
-                    true
-                } else {
-                    false
-                }
-            }
-            "build_hygiene_sweep_on_session_end" => {
-                self.build_hygiene_sweep_on_session_end = value.parse().unwrap_or(false);
-                true
-            }
-            "build_hygiene_sweep_on_toolchain_update" => {
-                self.build_hygiene_sweep_on_toolchain_update = value.parse().unwrap_or(true);
-                true
-            }
-            "build_hygiene_dry_run_default" => {
-                self.build_hygiene_dry_run_default = value.parse().unwrap_or(true);
-                true
-            }
-            "context_lifecycle_enabled" => {
-                self.context_lifecycle_enabled = value.parse().unwrap_or(true);
-                true
-            }
-            "context_lifecycle_poll_secs" => {
-                if let Ok(v) = value.parse::<u64>() {
-                    if (1..=60).contains(&v) {
-                        self.context_lifecycle_poll_secs = v;
-                        return true;
-                    }
-                }
-                false
-            }
-            "context_lifecycle_startup_delay_ms" => {
-                if let Ok(v) = value.parse::<u64>() {
-                    if (100..=30_000).contains(&v) {
-                        self.context_lifecycle_startup_delay_ms = v;
-                        return true;
-                    }
-                }
-                false
-            }
-            "context_lifecycle_window_tokens" => {
-                if let Ok(v) = value.parse::<usize>() {
-                    if (10_000..=2_000_000).contains(&v) {
-                        self.context_lifecycle_window_tokens = v;
-                        return true;
-                    }
-                }
-                false
-            }
-            "impulse_agent_provider" => {
-                if value.is_empty() || value == "none" {
-                    self.impulse_agent_provider = None;
-                } else if crate::agent::ImpulseProvider::parse(value).is_some() {
-                    self.impulse_agent_provider = Some(value.to_string());
-                } else {
-                    return false;
-                }
-                true
+                return self.default_platform.map(|p| p.as_str().to_string());
             }
             "impulse_agent_api_key" => {
-                if value.is_empty() {
-                    self.impulse_agent_api_key = None;
-                } else {
-                    self.impulse_agent_api_key = Some(value.to_string());
-                }
-                true
-            }
-            "impulse_agent_model" => {
-                if value.is_empty() || value == "none" {
-                    self.impulse_agent_model = None;
-                } else {
-                    self.impulse_agent_model = Some(value.to_string());
-                }
-                true
-            }
-            "impulse_agent_harness" => {
-                if value.is_empty() || value == "none" {
-                    self.impulse_agent_harness = None;
-                } else if crate::agent::ImpulseHarness::parse(value).is_some() {
-                    self.impulse_agent_harness = Some(value.to_string());
-                } else {
-                    return false;
-                }
-                true
-            }
-            "impulse_agent_auto_review" => {
-                self.impulse_agent_auto_review = value.parse().unwrap_or(false);
-                true
-            }
-            "impulse_agent_auto_coordinate" => {
-                self.impulse_agent_auto_coordinate = value.parse().unwrap_or(false);
-                true
-            }
-            "notifications_enabled" => {
-                self.notifications_enabled = value.parse().unwrap_or(true);
-                true
-            }
-            "conflict_webhook_url" => {
-                if value.is_empty() || value == "none" {
-                    self.conflict_webhook_url = None;
-                } else {
-                    self.conflict_webhook_url = Some(value.to_string());
-                }
-                true
-            }
-            "conflict_webhook_enabled" => {
-                self.conflict_webhook_enabled = value.parse().unwrap_or(false);
-                true
-            }
-            "tool_execution.default_timeout_ms" => {
-                if let Ok(v) = value.parse::<u64>() {
-                    if (100..=300_000).contains(&v) {
-                        self.tool_execution_default_timeout_ms = v;
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            }
-            "tool_execution.max_output_bytes" => {
-                if let Ok(v) = value.parse::<usize>() {
-                    if (256..=5_000_000).contains(&v) {
-                        self.tool_execution_max_output_bytes = v;
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            }
-            "tool_execution.max_artifacts" => {
-                if let Ok(v) = value.parse::<usize>() {
-                    if (1..=128).contains(&v) {
-                        self.tool_execution_max_artifacts = v;
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            }
-            "tool_execution.allowed_read_roots" => {
-                self.tool_execution_allowed_read_roots = value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|item| !item.is_empty())
-                    .map(ToString::to_string)
-                    .collect();
-                true
-            }
-            "tool_execution.allowed_write_roots" => {
-                self.tool_execution_allowed_write_roots = value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|item| !item.is_empty())
-                    .map(ToString::to_string)
-                    .collect();
-                true
-            }
-            "external_tools_dir" => {
-                if value.trim().is_empty() {
-                    false
-                } else {
-                    self.external_tools_dir = value.to_string();
-                    true
-                }
-            }
-            "external_mcp_servers" => {
-                self.external_mcp_servers = value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|item| !item.is_empty())
-                    .map(ToString::to_string)
-                    .collect();
-                true
+                return self.impulse_agent_api_key.as_ref().map(|_| "***".to_string());
             }
             "impulse_agent_permissions" => {
-                match serde_json::from_str::<impulse_ops::SupervisorPermissionPolicy>(value) {
-                    Ok(mut policy) => {
-                        policy.normalize();
-                        self.impulse_agent_permissions = policy;
-                        true
-                    }
-                    Err(_) => false,
+                return serde_json::to_string(&self.impulse_agent_permissions).ok();
+            }
+            "guardrails_enabled" => return Some(self.guardrails.enabled.to_string()),
+            _ => {}
+        }
+
+        let field = Self::resolve_field_name(key);
+        let value = serde_json::to_value(self).ok()?;
+        let obj = value.as_object()?;
+        let v = obj.get(field)?;
+        Self::json_value_to_string(v)
+    }
+
+    /// Set a config value by key (validation registry + serde round-trip).
+    pub fn set(&mut self, key: &str, value: &str) -> bool {
+        let rules = Self::build_set_rules();
+        let Some(rule) = rules.get(key) else {
+            return false;
+        };
+
+        match rule {
+            SetRule::Bool => match value.parse::<bool>() {
+                Ok(b) => self.set_field_json(Self::resolve_field_name(key), serde_json::Value::Bool(b)),
+                Err(_) => false,
+            },
+            SetRule::String => {
+                if value.trim().is_empty() {
+                    return false;
+                }
+                self.set_field_json(
+                    Self::resolve_field_name(key),
+                    serde_json::Value::String(value.to_string()),
+                )
+            }
+            SetRule::OptionalString => {
+                let json = if value.is_empty() || value == "none" {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(value.to_string())
+                };
+                self.set_field_json(Self::resolve_field_name(key), json)
+            }
+            SetRule::SomeString => self.set_field_json(
+                Self::resolve_field_name(key),
+                serde_json::Value::String(value.to_string()),
+            ),
+            SetRule::CsvList => {
+                let items: Vec<String> = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToString::to_string)
+                    .collect();
+                self.set_field_json(
+                    Self::resolve_field_name(key),
+                    serde_json::to_value(items).unwrap_or_default(),
+                )
+            }
+            SetRule::U64 { min, max } => {
+                let v: u64 = match value.parse() {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
+                if v < *min || v > *max {
+                    return false;
+                }
+                self.set_field_json(
+                    Self::resolve_field_name(key),
+                    serde_json::Value::Number(v.into()),
+                )
+            }
+            SetRule::Usize { min, max } => {
+                let v: usize = match value.parse() {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
+                if v < *min || v > *max {
+                    return false;
+                }
+                self.set_field_json(
+                    Self::resolve_field_name(key),
+                    serde_json::Value::Number(v.into()),
+                )
+            }
+            SetRule::U32 => {
+                let v: u32 = match value.parse() {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
+                self.set_field_json(
+                    Self::resolve_field_name(key),
+                    serde_json::Value::Number(v.into()),
+                )
+            }
+            SetRule::F32 { min, max } => {
+                let v: f32 = match value.parse() {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
+                if v < *min || v > *max {
+                    return false;
+                }
+                match serde_json::Number::from_f64(v as f64) {
+                    Some(n) => self.set_field_json(
+                        Self::resolve_field_name(key),
+                        serde_json::Value::Number(n),
+                    ),
+                    None => false,
                 }
             }
-            "guardrails_enabled" => {
-                self.guardrails.enabled = value.parse().unwrap_or(true);
-                true
+            SetRule::F64 => {
+                let v: f64 = match value.parse() {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
+                match serde_json::Number::from_f64(v) {
+                    Some(n) => self.set_field_json(
+                        Self::resolve_field_name(key),
+                        serde_json::Value::Number(n),
+                    ),
+                    None => false,
+                }
             }
-            _ => false,
+            SetRule::Enum(allowed) => {
+                if !allowed.contains(&value) {
+                    return false;
+                }
+                self.set_field_json(
+                    Self::resolve_field_name(key),
+                    serde_json::Value::String(value.to_string()),
+                )
+            }
+            SetRule::Custom(f) => f(self, value),
         }
     }
 
-    /// List all config keys and values
+    /// List all config keys and values.
     pub fn list(&self) -> Vec<(String, String)> {
-        vec![
-            ("log_level".to_string(), self.log_level.clone()),
-            (
-                "default_platform".to_string(),
-                self.default_platform
-                    .map(|p| p.as_str().to_string())
-                    .unwrap_or_default(),
-            ),
-            ("verbose".to_string(), self.verbose.to_string()),
-            (
-                "sync_interval_secs".to_string(),
-                self.sync_interval_secs.to_string(),
-            ),
-            (
-                "max_history_entries".to_string(),
-                self.max_history_entries.to_string(),
-            ),
-            ("retrieval_mode".to_string(), self.retrieval_mode.clone()),
-            (
-                "retrieval_backend".to_string(),
-                self.retrieval_backend.clone(),
-            ),
-            (
-                "retrieval_default_limit".to_string(),
-                self.retrieval_default_limit.to_string(),
-            ),
-            (
-                "retrieval_similarity_threshold".to_string(),
-                self.retrieval_similarity_threshold.to_string(),
-            ),
-            (
-                "retrieval_embedding_provider".to_string(),
-                self.retrieval_embedding_provider.clone(),
-            ),
-            ("embedding_model".to_string(), self.embedding_model.clone()),
-            (
-                "retrieval_python_cmd".to_string(),
-                self.retrieval_python_cmd.clone(),
-            ),
-            (
-                "retrieval_vector_enabled".to_string(),
-                self.retrieval_vector_enabled.to_string(),
-            ),
-            (
-                "retrieval_semantic_strategy".to_string(),
-                self.retrieval_semantic_strategy.clone(),
-            ),
-            (
-                "retrieval_query_timeout_secs".to_string(),
-                self.retrieval_query_timeout_secs.to_string(),
-            ),
-            (
-                "retrieval_index_timeout_secs".to_string(),
-                self.retrieval_index_timeout_secs.to_string(),
-            ),
-            (
-                "retrieval_batch_size".to_string(),
-                self.retrieval_batch_size.to_string(),
-            ),
-            (
-                "retrieval_candidate_pool".to_string(),
-                self.retrieval_candidate_pool.to_string(),
-            ),
-            (
-                "retrieval_deduplicate_enabled".to_string(),
-                self.retrieval_deduplicate_enabled.to_string(),
-            ),
-            (
-                "retrieval_fuzzy_matching_enabled".to_string(),
-                self.retrieval_fuzzy_matching_enabled.to_string(),
-            ),
-            (
-                "retrieval_experimental_pageindex_enabled".to_string(),
-                self.retrieval_experimental_pageindex_enabled.to_string(),
-            ),
-            (
-                "retrieval_pageindex_mode".to_string(),
-                self.retrieval_pageindex_mode.clone(),
-            ),
-            (
-                "context_injection_mode".to_string(),
-                self.context_injection_mode.clone(),
-            ),
-            (
-                "context_injection_scope".to_string(),
-                self.context_injection_scope.clone(),
-            ),
-            (
-                "context_injection_max_items".to_string(),
-                self.context_injection_max_items.to_string(),
-            ),
-            (
-                "context_injection_max_chars".to_string(),
-                self.context_injection_max_chars.to_string(),
-            ),
-            (
-                "context_injection_min_score".to_string(),
-                self.context_injection_min_score.to_string(),
-            ),
-            (
-                "context_injection_use_semantic".to_string(),
-                self.context_injection_use_semantic.to_string(),
-            ),
-            (
-                "context_injection_emit_artifacts".to_string(),
-                self.context_injection_emit_artifacts.to_string(),
-            ),
-            (
-                "stewardship_mode".to_string(),
-                self.stewardship_mode.clone(),
-            ),
-            (
-                "stewardship_monitor_threshold".to_string(),
-                self.stewardship_monitor_threshold.to_string(),
-            ),
-            (
-                "stewardship_surgical_threshold".to_string(),
-                self.stewardship_surgical_threshold.to_string(),
-            ),
-            (
-                "stewardship_thoughtful_threshold".to_string(),
-                self.stewardship_thoughtful_threshold.to_string(),
-            ),
-            (
-                "stewardship_emergency_threshold".to_string(),
-                self.stewardship_emergency_threshold.to_string(),
-            ),
-            (
-                "stewardship_poll_interval_secs".to_string(),
-                self.stewardship_poll_interval_secs.to_string(),
-            ),
-            (
-                "stewardship_context_window_tokens".to_string(),
-                self.stewardship_context_window_tokens.to_string(),
-            ),
-            (
-                "stewardship_cross_project_enabled".to_string(),
-                self.stewardship_cross_project_enabled.to_string(),
-            ),
-            (
-                "model.anthropic".to_string(),
-                self.model_anthropic.clone().unwrap_or_default(),
-            ),
-            (
-                "model.openai".to_string(),
-                self.model_openai.clone().unwrap_or_default(),
-            ),
-            (
-                "model.google".to_string(),
-                self.model_google.clone().unwrap_or_default(),
-            ),
-            (
-                "model.mistral".to_string(),
-                self.model_mistral.clone().unwrap_or_default(),
-            ),
-            (
-                "build_hygiene_enabled".to_string(),
-                self.build_hygiene_enabled.to_string(),
-            ),
-            (
-                "build_hygiene_scan_paths".to_string(),
-                self.build_hygiene_scan_paths.join(","),
-            ),
-            (
-                "build_hygiene_size_threshold_gb".to_string(),
-                self.build_hygiene_size_threshold_gb.to_string(),
-            ),
-            (
-                "build_hygiene_age_threshold_days".to_string(),
-                self.build_hygiene_age_threshold_days.to_string(),
-            ),
-            (
-                "build_hygiene_sweep_on_session_end".to_string(),
-                self.build_hygiene_sweep_on_session_end.to_string(),
-            ),
-            (
-                "build_hygiene_sweep_on_toolchain_update".to_string(),
-                self.build_hygiene_sweep_on_toolchain_update.to_string(),
-            ),
-            (
-                "build_hygiene_dry_run_default".to_string(),
-                self.build_hygiene_dry_run_default.to_string(),
-            ),
-            (
-                "context_lifecycle_enabled".to_string(),
-                self.context_lifecycle_enabled.to_string(),
-            ),
-            (
-                "context_lifecycle_poll_secs".to_string(),
-                self.context_lifecycle_poll_secs.to_string(),
-            ),
-            (
-                "context_lifecycle_startup_delay_ms".to_string(),
-                self.context_lifecycle_startup_delay_ms.to_string(),
-            ),
-            (
-                "context_lifecycle_window_tokens".to_string(),
-                self.context_lifecycle_window_tokens.to_string(),
-            ),
-            (
-                "impulse_agent_provider".to_string(),
-                self.impulse_agent_provider
-                    .clone()
-                    .unwrap_or_else(|| "(not set)".to_string()),
-            ),
-            (
-                "impulse_agent_api_key".to_string(),
-                if self.impulse_agent_api_key.is_some() {
-                    "***".to_string()
-                } else {
-                    "(not set)".to_string()
-                },
-            ),
-            (
-                "impulse_agent_model".to_string(),
-                self.impulse_agent_model
-                    .clone()
-                    .unwrap_or_else(|| "(default)".to_string()),
-            ),
-            (
-                "impulse_agent_harness".to_string(),
-                self.impulse_agent_harness
-                    .clone()
-                    .unwrap_or_else(|| "(not set)".to_string()),
-            ),
-            (
-                "impulse_agent_auto_review".to_string(),
-                self.impulse_agent_auto_review.to_string(),
-            ),
-            (
-                "impulse_agent_auto_coordinate".to_string(),
-                self.impulse_agent_auto_coordinate.to_string(),
-            ),
-            (
-                "notifications_enabled".to_string(),
-                self.notifications_enabled.to_string(),
-            ),
-            (
-                "conflict_webhook_url".to_string(),
-                self.conflict_webhook_url
-                    .clone()
-                    .unwrap_or_else(|| "(not set)".to_string()),
-            ),
-            (
-                "conflict_webhook_enabled".to_string(),
-                self.conflict_webhook_enabled.to_string(),
-            ),
-            (
-                "tool_execution.default_timeout_ms".to_string(),
-                self.tool_execution_default_timeout_ms.to_string(),
-            ),
-            (
-                "tool_execution.max_output_bytes".to_string(),
-                self.tool_execution_max_output_bytes.to_string(),
-            ),
-            (
-                "tool_execution.max_artifacts".to_string(),
-                self.tool_execution_max_artifacts.to_string(),
-            ),
-            (
-                "tool_execution.allowed_read_roots".to_string(),
-                self.tool_execution_allowed_read_roots.join(","),
-            ),
-            (
-                "tool_execution.allowed_write_roots".to_string(),
-                self.tool_execution_allowed_write_roots.join(","),
-            ),
-            (
-                "external_tools_dir".to_string(),
-                self.external_tools_dir.clone(),
-            ),
-            (
-                "external_mcp_servers".to_string(),
-                self.external_mcp_servers.join(","),
-            ),
-            (
-                "impulse_agent_permissions".to_string(),
-                serde_json::to_string(&self.impulse_agent_permissions).unwrap_or_default(),
-            ),
-            (
-                "guardrails_enabled".to_string(),
-                self.guardrails.enabled.to_string(),
-            ),
-        ]
+        Self::CONFIG_KEYS
+            .iter()
+            .map(|&key| {
+                let display = self.get(key).unwrap_or_else(|| {
+                    match key {
+                        "impulse_agent_provider" | "impulse_agent_harness"
+                        | "impulse_agent_api_key" | "conflict_webhook_url" => {
+                            "(not set)".to_string()
+                        }
+                        "impulse_agent_model" => "(default)".to_string(),
+                        _ => String::new(),
+                    }
+                });
+                (key.to_string(), display)
+            })
+            .collect()
     }
+
+    /// Apply a single field change via serde round-trip.
+    /// Preserves `impulse_agent_api_key` (which has skip_serializing) by
+    /// saving and restoring it across the round-trip.
+    fn set_field_json(&mut self, field: &str, val: serde_json::Value) -> bool {
+        let saved_api_key = self.impulse_agent_api_key.take();
+        let mut obj = match serde_json::to_value(&*self) {
+            Ok(serde_json::Value::Object(m)) => m,
+            _ => {
+                self.impulse_agent_api_key = saved_api_key;
+                return false;
+            }
+        };
+        obj.insert(field.to_string(), val);
+        match serde_json::from_value::<Config>(serde_json::Value::Object(obj)) {
+            Ok(mut new_config) => {
+                new_config.impulse_agent_api_key = saved_api_key;
+                *self = new_config;
+                true
+            }
+            Err(_) => {
+                self.impulse_agent_api_key = saved_api_key;
+                false
+            }
+        }
+    }
+
+    fn build_set_rules() -> HashMap<&'static str, SetRule> {
+        let mut m = HashMap::new();
+
+        // Bool fields (18)
+        for &key in &[
+            "verbose", "retrieval_vector_enabled", "retrieval_deduplicate_enabled",
+            "retrieval_fuzzy_matching_enabled", "retrieval_experimental_pageindex_enabled",
+            "context_injection_use_semantic", "context_injection_emit_artifacts",
+            "stewardship_cross_project_enabled", "build_hygiene_enabled",
+            "build_hygiene_sweep_on_session_end", "build_hygiene_sweep_on_toolchain_update",
+            "build_hygiene_dry_run_default", "context_lifecycle_enabled",
+            "impulse_agent_auto_review", "impulse_agent_auto_coordinate",
+            "notifications_enabled", "conflict_webhook_enabled",
+        ] {
+            m.insert(key, SetRule::Bool);
+        }
+
+        // Enum fields (8)
+        m.insert("log_level", SetRule::Enum(&["trace", "debug", "info", "warn", "error"]));
+        m.insert("retrieval_mode", SetRule::Enum(&["keyword", "semantic"]));
+        m.insert("retrieval_backend", SetRule::Enum(&["fts", "fts+vec"]));
+        m.insert("retrieval_semantic_strategy", SetRule::Enum(&["auto", "sqlite-only", "rust-only"]));
+        m.insert("retrieval_pageindex_mode", SetRule::Enum(&["local-structure", "api-augmented"]));
+        m.insert("context_injection_mode", SetRule::Enum(&["off", "review", "apply"]));
+        m.insert("context_injection_scope", SetRule::Enum(&["daemon", "direct", "both"]));
+        m.insert("stewardship_mode", SetRule::Enum(&["auto", "review", "off"]));
+
+        // U64 fields with ranges (7)
+        m.insert("sync_interval_secs", SetRule::U64 { min: 0, max: u64::MAX });
+        m.insert("retrieval_query_timeout_secs", SetRule::U64 { min: 1, max: 120 });
+        m.insert("retrieval_index_timeout_secs", SetRule::U64 { min: 10, max: 600 });
+        m.insert("stewardship_poll_interval_secs", SetRule::U64 { min: 1, max: 300 });
+        m.insert("context_lifecycle_poll_secs", SetRule::U64 { min: 1, max: 60 });
+        m.insert("context_lifecycle_startup_delay_ms", SetRule::U64 { min: 100, max: 30_000 });
+        m.insert("tool_execution.default_timeout_ms", SetRule::U64 { min: 100, max: 300_000 });
+
+        // Usize fields with ranges (10)
+        m.insert("max_history_entries", SetRule::Usize { min: 0, max: usize::MAX });
+        m.insert("retrieval_default_limit", SetRule::Usize { min: 1, max: usize::MAX });
+        m.insert("retrieval_batch_size", SetRule::Usize { min: 1, max: 512 });
+        m.insert("retrieval_candidate_pool", SetRule::Usize { min: 10, max: 5000 });
+        m.insert("context_injection_max_items", SetRule::Usize { min: 1, max: 50 });
+        m.insert("context_injection_max_chars", SetRule::Usize { min: 200, max: 20000 });
+        m.insert("stewardship_context_window_tokens", SetRule::Usize { min: 10_000, max: 2_000_000 });
+        m.insert("context_lifecycle_window_tokens", SetRule::Usize { min: 10_000, max: 2_000_000 });
+        m.insert("tool_execution.max_output_bytes", SetRule::Usize { min: 256, max: 5_000_000 });
+        m.insert("tool_execution.max_artifacts", SetRule::Usize { min: 1, max: 128 });
+
+        // F32 fields with 0..1 range (6)
+        for &key in &[
+            "retrieval_similarity_threshold", "context_injection_min_score",
+            "stewardship_monitor_threshold", "stewardship_surgical_threshold",
+            "stewardship_thoughtful_threshold", "stewardship_emergency_threshold",
+        ] {
+            m.insert(key, SetRule::F32 { min: 0.0, max: 1.0 });
+        }
+
+        // F64 / U32 fields (2)
+        m.insert("build_hygiene_size_threshold_gb", SetRule::F64);
+        m.insert("build_hygiene_age_threshold_days", SetRule::U32);
+
+        // String fields (non-empty required) (4)
+        for &key in &[
+            "retrieval_embedding_provider", "embedding_model",
+            "retrieval_python_cmd", "external_tools_dir",
+        ] {
+            m.insert(key, SetRule::String);
+        }
+
+        // Optional string fields (empty/"none" clears) (3)
+        m.insert("impulse_agent_model", SetRule::OptionalString);
+        m.insert("conflict_webhook_url", SetRule::OptionalString);
+
+        // Some-string fields (always wraps in Some) (4)
+        for &key in &["model.anthropic", "model.openai", "model.google", "model.mistral"] {
+            m.insert(key, SetRule::SomeString);
+        }
+
+        // CSV list fields (5)
+        for &key in &[
+            "build_hygiene_scan_paths", "tool_execution.allowed_read_roots",
+            "tool_execution.allowed_write_roots", "external_mcp_servers",
+        ] {
+            m.insert(key, SetRule::CsvList);
+        }
+
+        // Custom fields (6)
+        m.insert("default_platform", SetRule::Custom(|c, v| {
+            match v {
+                "claude-code" => c.default_platform = Some(Platform::ClaudeCode),
+                "opencode" => c.default_platform = Some(Platform::OpenCode),
+                "none" => c.default_platform = None,
+                _ => return false,
+            }
+            true
+        }));
+        m.insert("impulse_agent_api_key", SetRule::Custom(|c, v| {
+            c.impulse_agent_api_key = if v.is_empty() { None } else { Some(v.to_string()) };
+            true
+        }));
+        m.insert("impulse_agent_provider", SetRule::Custom(|c, v| {
+            if v.is_empty() || v == "none" {
+                c.impulse_agent_provider = None;
+            } else if crate::agent::ImpulseProvider::parse(v).is_some() {
+                c.impulse_agent_provider = Some(v.to_string());
+            } else {
+                return false;
+            }
+            true
+        }));
+        m.insert("impulse_agent_harness", SetRule::Custom(|c, v| {
+            if v.is_empty() || v == "none" {
+                c.impulse_agent_harness = None;
+            } else if crate::agent::ImpulseHarness::parse(v).is_some() {
+                c.impulse_agent_harness = Some(v.to_string());
+            } else {
+                return false;
+            }
+            true
+        }));
+        m.insert("impulse_agent_permissions", SetRule::Custom(|c, v| {
+            match serde_json::from_str::<impulse_ops::SupervisorPermissionPolicy>(v) {
+                Ok(mut policy) => {
+                    policy.normalize();
+                    c.impulse_agent_permissions = policy;
+                    true
+                }
+                Err(_) => false,
+            }
+        }));
+        m.insert("guardrails_enabled", SetRule::Custom(|c, v| {
+            match v.parse::<bool>() {
+                Ok(b) => { c.guardrails.enabled = b; true }
+                Err(_) => false,
+            }
+        }));
+
+        m
+    }
+}
+
+/// Validation rules for `Config::set()`. Each variant describes how to parse
+/// and validate a string value before applying it to the config.
+enum SetRule {
+    /// Parse as bool; reject non-boolean strings.
+    Bool,
+    /// Non-empty string required.
+    String,
+    /// Empty or "none" → null/None, otherwise set as string.
+    OptionalString,
+    /// Always wrap in Some(string) — no clearing.
+    SomeString,
+    /// Split on commas, trim, filter empty.
+    CsvList,
+    /// Parse u64 with inclusive range.
+    U64 { min: u64, max: u64 },
+    /// Parse usize with inclusive range.
+    Usize { min: usize, max: usize },
+    /// Parse u32 (any valid value).
+    U32,
+    /// Parse f32 with inclusive range.
+    F32 { min: f32, max: f32 },
+    /// Parse f64 (any valid finite value).
+    F64,
+    /// Value must be one of the allowed strings.
+    Enum(&'static [&'static str]),
+    /// Custom validation + setter.
+    Custom(fn(&mut Config, &str) -> bool),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
