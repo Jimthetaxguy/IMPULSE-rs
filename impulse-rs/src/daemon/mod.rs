@@ -1059,6 +1059,39 @@ async fn process_request(
     terminal_telemetry: &Arc<RwLock<crate::ops_workbench::TerminalOpsTelemetryStore>>,
     supervisor_session_override: &Arc<RwLock<Option<impulse_ops::SupervisorPermissionPolicy>>>,
 ) -> DaemonResponse {
+    // ── Boundary validation ─────────────────────────────────────────────────
+    // Validate user-supplied IDs before dispatch to catch malformed input early.
+    if let DaemonRequest::EndSession { ref session_id, .. }
+        | DaemonRequest::GetSession { ref session_id }
+        | DaemonRequest::TrackFile { ref session_id, .. }
+        | DaemonRequest::TrackTool { ref session_id, .. }
+        | DaemonRequest::CheckConflict { ref session_id, .. }
+        | DaemonRequest::Chat { ref session_id, .. } = request
+    {
+        if let Err(e) = crate::validate::validate_session_id(session_id) {
+            return respond_err(e);
+        }
+    }
+    if let DaemonRequest::DescribeTool { ref name }
+        | DaemonRequest::InvokeTool { ref name, .. } = request
+    {
+        if let Err(e) = crate::validate::validate_tool_id(name) {
+            return respond_err(e);
+        }
+    }
+    if let DaemonRequest::CreateSession { ref name, .. } = request {
+        if let Err(e) = crate::validate::reject_control_chars(name, "name") {
+            return respond_err(e);
+        }
+    }
+    if let DaemonRequest::GetArtifact { ref artifact_id }
+        | DaemonRequest::RunArtifactAction { ref artifact_id, .. } = request
+    {
+        if let Err(e) = crate::validate::reject_control_chars(artifact_id, "artifact_id") {
+            return respond_err(e);
+        }
+    }
+
     match request {
         DaemonRequest::Ping => DaemonResponse::Ok {
             result: serde_json::json!({"pong": true}),
