@@ -313,39 +313,76 @@ impl Config {
 
     /// Ordered list of all config keys (used by `list()`).
     const CONFIG_KEYS: &'static [&'static str] = &[
-        "log_level", "default_platform", "verbose", "sync_interval_secs",
-        "max_history_entries", "retrieval_mode", "retrieval_backend",
-        "retrieval_default_limit", "retrieval_similarity_threshold",
-        "retrieval_embedding_provider", "embedding_model", "retrieval_python_cmd",
-        "retrieval_vector_enabled", "retrieval_semantic_strategy",
-        "retrieval_query_timeout_secs", "retrieval_index_timeout_secs",
-        "retrieval_batch_size", "retrieval_candidate_pool",
-        "retrieval_deduplicate_enabled", "retrieval_fuzzy_matching_enabled",
-        "retrieval_experimental_pageindex_enabled", "retrieval_pageindex_mode",
-        "context_injection_mode", "context_injection_scope",
-        "context_injection_max_items", "context_injection_max_chars",
-        "context_injection_min_score", "context_injection_use_semantic",
-        "context_injection_emit_artifacts", "stewardship_mode",
-        "stewardship_monitor_threshold", "stewardship_surgical_threshold",
-        "stewardship_thoughtful_threshold", "stewardship_emergency_threshold",
-        "stewardship_poll_interval_secs", "stewardship_context_window_tokens",
+        "log_level",
+        "default_platform",
+        "verbose",
+        "sync_interval_secs",
+        "max_history_entries",
+        "retrieval_mode",
+        "retrieval_backend",
+        "retrieval_default_limit",
+        "retrieval_similarity_threshold",
+        "retrieval_embedding_provider",
+        "embedding_model",
+        "retrieval_python_cmd",
+        "retrieval_vector_enabled",
+        "retrieval_semantic_strategy",
+        "retrieval_query_timeout_secs",
+        "retrieval_index_timeout_secs",
+        "retrieval_batch_size",
+        "retrieval_candidate_pool",
+        "retrieval_deduplicate_enabled",
+        "retrieval_fuzzy_matching_enabled",
+        "retrieval_experimental_pageindex_enabled",
+        "retrieval_pageindex_mode",
+        "context_injection_mode",
+        "context_injection_scope",
+        "context_injection_max_items",
+        "context_injection_max_chars",
+        "context_injection_min_score",
+        "context_injection_use_semantic",
+        "context_injection_emit_artifacts",
+        "stewardship_mode",
+        "stewardship_monitor_threshold",
+        "stewardship_surgical_threshold",
+        "stewardship_thoughtful_threshold",
+        "stewardship_emergency_threshold",
+        "stewardship_poll_interval_secs",
+        "stewardship_context_window_tokens",
         "stewardship_cross_project_enabled",
-        "model.anthropic", "model.openai", "model.google", "model.mistral",
-        "build_hygiene_enabled", "build_hygiene_scan_paths",
-        "build_hygiene_size_threshold_gb", "build_hygiene_age_threshold_days",
-        "build_hygiene_sweep_on_session_end", "build_hygiene_sweep_on_toolchain_update",
+        "model.anthropic",
+        "model.openai",
+        "model.google",
+        "model.mistral",
+        "build_hygiene_enabled",
+        "build_hygiene_scan_paths",
+        "build_hygiene_size_threshold_gb",
+        "build_hygiene_age_threshold_days",
+        "build_hygiene_sweep_on_session_end",
+        "build_hygiene_sweep_on_toolchain_update",
         "build_hygiene_dry_run_default",
-        "context_lifecycle_enabled", "context_lifecycle_poll_secs",
-        "context_lifecycle_startup_delay_ms", "context_lifecycle_window_tokens",
-        "impulse_agent_provider", "impulse_agent_api_key",
-        "impulse_agent_model", "impulse_agent_harness",
-        "impulse_agent_auto_review", "impulse_agent_auto_coordinate",
-        "notifications_enabled", "conflict_webhook_url", "conflict_webhook_enabled",
-        "tool_execution.default_timeout_ms", "tool_execution.max_output_bytes",
-        "tool_execution.max_artifacts", "tool_execution.allowed_read_roots",
+        "context_lifecycle_enabled",
+        "context_lifecycle_poll_secs",
+        "context_lifecycle_startup_delay_ms",
+        "context_lifecycle_window_tokens",
+        "impulse_agent_provider",
+        "impulse_agent_api_key",
+        "impulse_agent_model",
+        "impulse_agent_harness",
+        "impulse_agent_auto_review",
+        "impulse_agent_auto_coordinate",
+        "notifications_enabled",
+        "conflict_webhook_url",
+        "conflict_webhook_enabled",
+        "tool_execution.default_timeout_ms",
+        "tool_execution.max_output_bytes",
+        "tool_execution.max_artifacts",
+        "tool_execution.allowed_read_roots",
         "tool_execution.allowed_write_roots",
-        "external_tools_dir", "external_mcp_servers",
-        "impulse_agent_permissions", "guardrails_enabled",
+        "external_tools_dir",
+        "external_mcp_servers",
+        "impulse_agent_permissions",
+        "guardrails_enabled",
     ];
 
     /// Map user-facing key → serde field name (only for keys that differ).
@@ -389,7 +426,10 @@ impl Config {
                 return self.default_platform.map(|p| p.as_str().to_string());
             }
             "impulse_agent_api_key" => {
-                return self.impulse_agent_api_key.as_ref().map(|_| "***".to_string());
+                return self
+                    .impulse_agent_api_key
+                    .as_ref()
+                    .map(|_| "***".to_string());
             }
             "impulse_agent_permissions" => {
                 return serde_json::to_string(&self.impulse_agent_permissions).ok();
@@ -414,7 +454,9 @@ impl Config {
 
         match rule {
             SetRule::Bool => match value.parse::<bool>() {
-                Ok(b) => self.set_field_json(Self::resolve_field_name(key), serde_json::Value::Bool(b)),
+                Ok(b) => {
+                    self.set_field_json(Self::resolve_field_name(key), serde_json::Value::Bool(b))
+                }
                 Err(_) => false,
             },
             SetRule::String => {
@@ -533,15 +575,13 @@ impl Config {
         Self::CONFIG_KEYS
             .iter()
             .map(|&key| {
-                let display = self.get(key).unwrap_or_else(|| {
-                    match key {
-                        "impulse_agent_provider" | "impulse_agent_harness"
-                        | "impulse_agent_api_key" | "conflict_webhook_url" => {
-                            "(not set)".to_string()
-                        }
-                        "impulse_agent_model" => "(default)".to_string(),
-                        _ => String::new(),
-                    }
+                let display = self.get(key).unwrap_or_else(|| match key {
+                    "impulse_agent_provider"
+                    | "impulse_agent_harness"
+                    | "impulse_agent_api_key"
+                    | "conflict_webhook_url" => "(not set)".to_string(),
+                    "impulse_agent_model" => "(default)".to_string(),
+                    _ => String::new(),
                 });
                 (key.to_string(), display)
             })
@@ -579,54 +619,159 @@ impl Config {
 
         // Bool fields (18)
         for &key in &[
-            "verbose", "retrieval_vector_enabled", "retrieval_deduplicate_enabled",
-            "retrieval_fuzzy_matching_enabled", "retrieval_experimental_pageindex_enabled",
-            "context_injection_use_semantic", "context_injection_emit_artifacts",
-            "stewardship_cross_project_enabled", "build_hygiene_enabled",
-            "build_hygiene_sweep_on_session_end", "build_hygiene_sweep_on_toolchain_update",
-            "build_hygiene_dry_run_default", "context_lifecycle_enabled",
-            "impulse_agent_auto_review", "impulse_agent_auto_coordinate",
-            "notifications_enabled", "conflict_webhook_enabled",
+            "verbose",
+            "retrieval_vector_enabled",
+            "retrieval_deduplicate_enabled",
+            "retrieval_fuzzy_matching_enabled",
+            "retrieval_experimental_pageindex_enabled",
+            "context_injection_use_semantic",
+            "context_injection_emit_artifacts",
+            "stewardship_cross_project_enabled",
+            "build_hygiene_enabled",
+            "build_hygiene_sweep_on_session_end",
+            "build_hygiene_sweep_on_toolchain_update",
+            "build_hygiene_dry_run_default",
+            "context_lifecycle_enabled",
+            "impulse_agent_auto_review",
+            "impulse_agent_auto_coordinate",
+            "notifications_enabled",
+            "conflict_webhook_enabled",
         ] {
             m.insert(key, SetRule::Bool);
         }
 
         // Enum fields (8)
-        m.insert("log_level", SetRule::Enum(&["trace", "debug", "info", "warn", "error"]));
+        m.insert(
+            "log_level",
+            SetRule::Enum(&["trace", "debug", "info", "warn", "error"]),
+        );
         m.insert("retrieval_mode", SetRule::Enum(&["keyword", "semantic"]));
         m.insert("retrieval_backend", SetRule::Enum(&["fts", "fts+vec"]));
-        m.insert("retrieval_semantic_strategy", SetRule::Enum(&["auto", "sqlite-only", "rust-only"]));
-        m.insert("retrieval_pageindex_mode", SetRule::Enum(&["local-structure", "api-augmented"]));
-        m.insert("context_injection_mode", SetRule::Enum(&["off", "review", "apply"]));
-        m.insert("context_injection_scope", SetRule::Enum(&["daemon", "direct", "both"]));
-        m.insert("stewardship_mode", SetRule::Enum(&["auto", "review", "off"]));
+        m.insert(
+            "retrieval_semantic_strategy",
+            SetRule::Enum(&["auto", "sqlite-only", "rust-only"]),
+        );
+        m.insert(
+            "retrieval_pageindex_mode",
+            SetRule::Enum(&["local-structure", "api-augmented"]),
+        );
+        m.insert(
+            "context_injection_mode",
+            SetRule::Enum(&["off", "review", "apply"]),
+        );
+        m.insert(
+            "context_injection_scope",
+            SetRule::Enum(&["daemon", "direct", "both"]),
+        );
+        m.insert(
+            "stewardship_mode",
+            SetRule::Enum(&["auto", "review", "off"]),
+        );
 
         // U64 fields with ranges (7)
-        m.insert("sync_interval_secs", SetRule::U64 { min: 0, max: u64::MAX });
-        m.insert("retrieval_query_timeout_secs", SetRule::U64 { min: 1, max: 120 });
-        m.insert("retrieval_index_timeout_secs", SetRule::U64 { min: 10, max: 600 });
-        m.insert("stewardship_poll_interval_secs", SetRule::U64 { min: 1, max: 300 });
-        m.insert("context_lifecycle_poll_secs", SetRule::U64 { min: 1, max: 60 });
-        m.insert("context_lifecycle_startup_delay_ms", SetRule::U64 { min: 100, max: 30_000 });
-        m.insert("tool_execution.default_timeout_ms", SetRule::U64 { min: 100, max: 300_000 });
+        m.insert(
+            "sync_interval_secs",
+            SetRule::U64 {
+                min: 0,
+                max: u64::MAX,
+            },
+        );
+        m.insert(
+            "retrieval_query_timeout_secs",
+            SetRule::U64 { min: 1, max: 120 },
+        );
+        m.insert(
+            "retrieval_index_timeout_secs",
+            SetRule::U64 { min: 10, max: 600 },
+        );
+        m.insert(
+            "stewardship_poll_interval_secs",
+            SetRule::U64 { min: 1, max: 300 },
+        );
+        m.insert(
+            "context_lifecycle_poll_secs",
+            SetRule::U64 { min: 1, max: 60 },
+        );
+        m.insert(
+            "context_lifecycle_startup_delay_ms",
+            SetRule::U64 {
+                min: 100,
+                max: 30_000,
+            },
+        );
+        m.insert(
+            "tool_execution.default_timeout_ms",
+            SetRule::U64 {
+                min: 100,
+                max: 300_000,
+            },
+        );
 
         // Usize fields with ranges (10)
-        m.insert("max_history_entries", SetRule::Usize { min: 0, max: usize::MAX });
-        m.insert("retrieval_default_limit", SetRule::Usize { min: 1, max: usize::MAX });
+        m.insert(
+            "max_history_entries",
+            SetRule::Usize {
+                min: 0,
+                max: usize::MAX,
+            },
+        );
+        m.insert(
+            "retrieval_default_limit",
+            SetRule::Usize {
+                min: 1,
+                max: usize::MAX,
+            },
+        );
         m.insert("retrieval_batch_size", SetRule::Usize { min: 1, max: 512 });
-        m.insert("retrieval_candidate_pool", SetRule::Usize { min: 10, max: 5000 });
-        m.insert("context_injection_max_items", SetRule::Usize { min: 1, max: 50 });
-        m.insert("context_injection_max_chars", SetRule::Usize { min: 200, max: 20000 });
-        m.insert("stewardship_context_window_tokens", SetRule::Usize { min: 10_000, max: 2_000_000 });
-        m.insert("context_lifecycle_window_tokens", SetRule::Usize { min: 10_000, max: 2_000_000 });
-        m.insert("tool_execution.max_output_bytes", SetRule::Usize { min: 256, max: 5_000_000 });
-        m.insert("tool_execution.max_artifacts", SetRule::Usize { min: 1, max: 128 });
+        m.insert(
+            "retrieval_candidate_pool",
+            SetRule::Usize { min: 10, max: 5000 },
+        );
+        m.insert(
+            "context_injection_max_items",
+            SetRule::Usize { min: 1, max: 50 },
+        );
+        m.insert(
+            "context_injection_max_chars",
+            SetRule::Usize {
+                min: 200,
+                max: 20000,
+            },
+        );
+        m.insert(
+            "stewardship_context_window_tokens",
+            SetRule::Usize {
+                min: 10_000,
+                max: 2_000_000,
+            },
+        );
+        m.insert(
+            "context_lifecycle_window_tokens",
+            SetRule::Usize {
+                min: 10_000,
+                max: 2_000_000,
+            },
+        );
+        m.insert(
+            "tool_execution.max_output_bytes",
+            SetRule::Usize {
+                min: 256,
+                max: 5_000_000,
+            },
+        );
+        m.insert(
+            "tool_execution.max_artifacts",
+            SetRule::Usize { min: 1, max: 128 },
+        );
 
         // F32 fields with 0..1 range (6)
         for &key in &[
-            "retrieval_similarity_threshold", "context_injection_min_score",
-            "stewardship_monitor_threshold", "stewardship_surgical_threshold",
-            "stewardship_thoughtful_threshold", "stewardship_emergency_threshold",
+            "retrieval_similarity_threshold",
+            "context_injection_min_score",
+            "stewardship_monitor_threshold",
+            "stewardship_surgical_threshold",
+            "stewardship_thoughtful_threshold",
+            "stewardship_emergency_threshold",
         ] {
             m.insert(key, SetRule::F32 { min: 0.0, max: 1.0 });
         }
@@ -637,8 +782,10 @@ impl Config {
 
         // String fields (non-empty required) (4)
         for &key in &[
-            "retrieval_embedding_provider", "embedding_model",
-            "retrieval_python_cmd", "external_tools_dir",
+            "retrieval_embedding_provider",
+            "embedding_model",
+            "retrieval_python_cmd",
+            "external_tools_dir",
         ] {
             m.insert(key, SetRule::String);
         }
@@ -648,68 +795,98 @@ impl Config {
         m.insert("conflict_webhook_url", SetRule::OptionalString);
 
         // Some-string fields (always wraps in Some) (4)
-        for &key in &["model.anthropic", "model.openai", "model.google", "model.mistral"] {
+        for &key in &[
+            "model.anthropic",
+            "model.openai",
+            "model.google",
+            "model.mistral",
+        ] {
             m.insert(key, SetRule::SomeString);
         }
 
         // CSV list fields (5)
         for &key in &[
-            "build_hygiene_scan_paths", "tool_execution.allowed_read_roots",
-            "tool_execution.allowed_write_roots", "external_mcp_servers",
+            "build_hygiene_scan_paths",
+            "tool_execution.allowed_read_roots",
+            "tool_execution.allowed_write_roots",
+            "external_mcp_servers",
         ] {
             m.insert(key, SetRule::CsvList);
         }
 
         // Custom fields (6)
-        m.insert("default_platform", SetRule::Custom(|c, v| {
-            match v {
-                "claude-code" => c.default_platform = Some(Platform::ClaudeCode),
-                "opencode" => c.default_platform = Some(Platform::OpenCode),
-                "none" => c.default_platform = None,
-                _ => return false,
-            }
-            true
-        }));
-        m.insert("impulse_agent_api_key", SetRule::Custom(|c, v| {
-            c.impulse_agent_api_key = if v.is_empty() { None } else { Some(v.to_string()) };
-            true
-        }));
-        m.insert("impulse_agent_provider", SetRule::Custom(|c, v| {
-            if v.is_empty() || v == "none" {
-                c.impulse_agent_provider = None;
-            } else if crate::agent::ImpulseProvider::parse(v).is_some() {
-                c.impulse_agent_provider = Some(v.to_string());
-            } else {
-                return false;
-            }
-            true
-        }));
-        m.insert("impulse_agent_harness", SetRule::Custom(|c, v| {
-            if v.is_empty() || v == "none" {
-                c.impulse_agent_harness = None;
-            } else if crate::agent::ImpulseHarness::parse(v).is_some() {
-                c.impulse_agent_harness = Some(v.to_string());
-            } else {
-                return false;
-            }
-            true
-        }));
-        m.insert("impulse_agent_permissions", SetRule::Custom(|c, v| {
-            match serde_json::from_str::<impulse_ops::SupervisorPermissionPolicy>(v) {
-                Ok(mut policy) => {
-                    policy.normalize();
-                    c.impulse_agent_permissions = policy;
+        m.insert(
+            "default_platform",
+            SetRule::Custom(|c, v| {
+                match v {
+                    "claude-code" => c.default_platform = Some(Platform::ClaudeCode),
+                    "opencode" => c.default_platform = Some(Platform::OpenCode),
+                    "none" => c.default_platform = None,
+                    _ => return false,
+                }
+                true
+            }),
+        );
+        m.insert(
+            "impulse_agent_api_key",
+            SetRule::Custom(|c, v| {
+                c.impulse_agent_api_key = if v.is_empty() {
+                    None
+                } else {
+                    Some(v.to_string())
+                };
+                true
+            }),
+        );
+        m.insert(
+            "impulse_agent_provider",
+            SetRule::Custom(|c, v| {
+                if v.is_empty() || v == "none" {
+                    c.impulse_agent_provider = None;
+                } else if crate::agent::ImpulseProvider::parse(v).is_some() {
+                    c.impulse_agent_provider = Some(v.to_string());
+                } else {
+                    return false;
+                }
+                true
+            }),
+        );
+        m.insert(
+            "impulse_agent_harness",
+            SetRule::Custom(|c, v| {
+                if v.is_empty() || v == "none" {
+                    c.impulse_agent_harness = None;
+                } else if crate::agent::ImpulseHarness::parse(v).is_some() {
+                    c.impulse_agent_harness = Some(v.to_string());
+                } else {
+                    return false;
+                }
+                true
+            }),
+        );
+        m.insert(
+            "impulse_agent_permissions",
+            SetRule::Custom(|c, v| {
+                match serde_json::from_str::<impulse_ops::SupervisorPermissionPolicy>(v) {
+                    Ok(mut policy) => {
+                        policy.normalize();
+                        c.impulse_agent_permissions = policy;
+                        true
+                    }
+                    Err(_) => false,
+                }
+            }),
+        );
+        m.insert(
+            "guardrails_enabled",
+            SetRule::Custom(|c, v| match v.parse::<bool>() {
+                Ok(b) => {
+                    c.guardrails.enabled = b;
                     true
                 }
                 Err(_) => false,
-            }
-        }));
-        m.insert("guardrails_enabled", SetRule::Custom(|c, v| {
-            match v.parse::<bool>() {
-                Ok(b) => { c.guardrails.enabled = b; true }
-                Err(_) => false,
-            }
-        }));
+            }),
+        );
 
         m
     }
@@ -900,7 +1077,6 @@ impl LiveState {
     pub fn list_sessions(&self) -> Vec<&Session> {
         self.sessions.values().collect()
     }
-
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1134,7 +1310,6 @@ impl State {
             .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
         Ok(state.list_sessions().into_iter().cloned().collect())
     }
-
 
     pub fn get_history_sync(&self) -> Result<Vec<HistoryEntry>> {
         let entries = self.storage.read_jsonl::<HistoryEntry>(HISTORY_FILE)?;

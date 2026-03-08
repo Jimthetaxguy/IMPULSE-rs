@@ -1062,18 +1062,18 @@ async fn process_request(
     // ── Boundary validation ─────────────────────────────────────────────────
     // Validate user-supplied IDs before dispatch to catch malformed input early.
     if let DaemonRequest::EndSession { ref session_id, .. }
-        | DaemonRequest::GetSession { ref session_id }
-        | DaemonRequest::TrackFile { ref session_id, .. }
-        | DaemonRequest::TrackTool { ref session_id, .. }
-        | DaemonRequest::CheckConflict { ref session_id, .. }
-        | DaemonRequest::Chat { ref session_id, .. } = request
+    | DaemonRequest::GetSession { ref session_id }
+    | DaemonRequest::TrackFile { ref session_id, .. }
+    | DaemonRequest::TrackTool { ref session_id, .. }
+    | DaemonRequest::CheckConflict { ref session_id, .. }
+    | DaemonRequest::Chat { ref session_id, .. } = request
     {
         if let Err(e) = crate::validate::validate_session_id(session_id) {
             return respond_err(e);
         }
     }
-    if let DaemonRequest::DescribeTool { ref name }
-        | DaemonRequest::InvokeTool { ref name, .. } = request
+    if let DaemonRequest::DescribeTool { ref name } | DaemonRequest::InvokeTool { ref name, .. } =
+        request
     {
         if let Err(e) = crate::validate::validate_tool_id(name) {
             return respond_err(e);
@@ -1085,7 +1085,9 @@ async fn process_request(
         }
     }
     if let DaemonRequest::GetArtifact { ref artifact_id }
-        | DaemonRequest::RunArtifactAction { ref artifact_id, .. } = request
+    | DaemonRequest::RunArtifactAction {
+        ref artifact_id, ..
+    } = request
     {
         if let Err(e) = crate::validate::reject_control_chars(artifact_id, "artifact_id") {
             return respond_err(e);
@@ -1114,9 +1116,7 @@ async fn process_request(
         DaemonRequest::ListTools { .. }
         | DaemonRequest::DescribeTool { .. }
         | DaemonRequest::InvokeTool { .. }
-        | DaemonRequest::ToolSchema => {
-            handle_tool_request(request, registry, tool_context).await
-        }
+        | DaemonRequest::ToolSchema => handle_tool_request(request, registry, tool_context).await,
 
         // Steward group
         DaemonRequest::StewardStatus
@@ -1170,10 +1170,7 @@ async fn handle_status(state: &SharedState) -> DaemonResponse {
     }
 }
 
-async fn handle_session_request(
-    request: DaemonRequest,
-    state: &SharedState,
-) -> DaemonResponse {
+async fn handle_session_request(request: DaemonRequest, state: &SharedState) -> DaemonResponse {
     match request {
         DaemonRequest::CreateSession { name, platform } => {
             let platform = platform.and_then(|p| crate::state::Platform::from_str_name(&p));
@@ -1187,50 +1184,52 @@ async fn handle_session_request(
                 Err(e) => respond_err(e),
             }
         }
-        DaemonRequest::EndSession { session_id, summary } => {
-            match state.end_session(&session_id, summary).await {
-                Ok(Some(entry)) => DaemonResponse::Ok {
-                    result: serde_json::json!({
-                        "session_id": entry.session_id,
-                        "ended_at": entry.ended_at
-                    }),
-                },
-                Ok(None) => respond_err("Session not found"),
-                Err(e) => respond_err(e),
-            }
-        }
-        DaemonRequest::TrackFile { session_id, file_path } => {
-            match state.track_file(&session_id, &file_path).await {
-                Ok(_) => DaemonResponse::Ok {
-                    result: serde_json::json!({"tracked": true}),
-                },
-                Err(e) => respond_err(e),
-            }
-        }
-        DaemonRequest::TrackTool { session_id, tool_name } => {
-            match state.track_tool(&session_id, &tool_name).await {
-                Ok(_) => DaemonResponse::Ok {
-                    result: serde_json::json!({"tracked": true}),
-                },
-                Err(e) => respond_err(e),
-            }
-        }
-        DaemonRequest::CheckConflict { session_id, file_path } => {
-            match state.check_file_conflict(&session_id, &file_path).await {
-                Ok(conflicting) => DaemonResponse::ConflictCheck {
-                    has_conflict: !conflicting.is_empty(),
-                    conflicting_sessions: conflicting,
-                },
-                Err(e) => respond_err(format!("Conflict check failed: {}", e)),
-            }
-        }
-        DaemonRequest::GetSession { session_id } => {
-            match state.get_session(&session_id).await {
-                Ok(Some(session)) => respond_ok(&session),
-                Ok(None) => respond_err("Session not found"),
-                Err(e) => respond_err(e),
-            }
-        }
+        DaemonRequest::EndSession {
+            session_id,
+            summary,
+        } => match state.end_session(&session_id, summary).await {
+            Ok(Some(entry)) => DaemonResponse::Ok {
+                result: serde_json::json!({
+                    "session_id": entry.session_id,
+                    "ended_at": entry.ended_at
+                }),
+            },
+            Ok(None) => respond_err("Session not found"),
+            Err(e) => respond_err(e),
+        },
+        DaemonRequest::TrackFile {
+            session_id,
+            file_path,
+        } => match state.track_file(&session_id, &file_path).await {
+            Ok(_) => DaemonResponse::Ok {
+                result: serde_json::json!({"tracked": true}),
+            },
+            Err(e) => respond_err(e),
+        },
+        DaemonRequest::TrackTool {
+            session_id,
+            tool_name,
+        } => match state.track_tool(&session_id, &tool_name).await {
+            Ok(_) => DaemonResponse::Ok {
+                result: serde_json::json!({"tracked": true}),
+            },
+            Err(e) => respond_err(e),
+        },
+        DaemonRequest::CheckConflict {
+            session_id,
+            file_path,
+        } => match state.check_file_conflict(&session_id, &file_path).await {
+            Ok(conflicting) => DaemonResponse::ConflictCheck {
+                has_conflict: !conflicting.is_empty(),
+                conflicting_sessions: conflicting,
+            },
+            Err(e) => respond_err(format!("Conflict check failed: {}", e)),
+        },
+        DaemonRequest::GetSession { session_id } => match state.get_session(&session_id).await {
+            Ok(Some(session)) => respond_ok(&session),
+            Ok(None) => respond_err("Session not found"),
+            Err(e) => respond_err(e),
+        },
         DaemonRequest::ListSessions => match state.list_sessions().await {
             Ok(sessions) => respond_ok(&sessions),
             Err(e) => respond_err(e),
@@ -1239,10 +1238,7 @@ async fn handle_session_request(
     }
 }
 
-async fn handle_chat_request(
-    request: DaemonRequest,
-    state: &SharedState,
-) -> DaemonResponse {
+async fn handle_chat_request(request: DaemonRequest, state: &SharedState) -> DaemonResponse {
     let DaemonRequest::Chat {
         session_id,
         message,
@@ -1467,10 +1463,7 @@ async fn handle_tool_request(
     }
 }
 
-async fn handle_steward_request(
-    request: DaemonRequest,
-    state: &SharedState,
-) -> DaemonResponse {
+async fn handle_steward_request(request: DaemonRequest, state: &SharedState) -> DaemonResponse {
     use crate::stewardship;
 
     match request {
@@ -1759,10 +1752,7 @@ async fn handle_supervisor_request(
     }
 }
 
-async fn handle_agent_request(
-    request: DaemonRequest,
-    state: &SharedState,
-) -> DaemonResponse {
+async fn handle_agent_request(request: DaemonRequest, state: &SharedState) -> DaemonResponse {
     let DaemonRequest::AgentAssist { prompt, context } = request else {
         return respond_err("Internal routing error: not an agent request");
     };
@@ -1795,7 +1785,9 @@ async fn handle_agent_request(
     if !agent.is_ready() {
         return DaemonResponse::AgentAssistResult {
             success: false,
-            response: "Impulse Agent is configured but not ready (check API key or harness installation)".to_string(),
+            response:
+                "Impulse Agent is configured but not ready (check API key or harness installation)"
+                    .to_string(),
         };
     }
 
@@ -1819,10 +1811,7 @@ async fn handle_agent_request(
     }
 }
 
-async fn handle_guard_request(
-    request: DaemonRequest,
-    state: &SharedState,
-) -> DaemonResponse {
+async fn handle_guard_request(request: DaemonRequest, state: &SharedState) -> DaemonResponse {
     match request {
         DaemonRequest::GuardEvaluate { target, action } => {
             let config = match state.config_snapshot() {
