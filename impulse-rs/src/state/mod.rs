@@ -1450,13 +1450,6 @@ impl LiveState {
         self.sessions.values().collect()
     }
 
-    #[allow(dead_code)]
-    pub fn active_sessions(&self) -> Vec<&Session> {
-        self.sessions
-            .values()
-            .filter(|s| s.status == SessionStatus::Active)
-            .collect()
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1522,28 +1515,6 @@ impl State {
         if let Ok(mut dirty) = self.dirty.try_write() {
             *dirty = true;
         }
-    }
-
-    #[allow(dead_code)]
-    pub async fn sync(&self) -> Result<()> {
-        let should_sync = {
-            if let Ok(dirty) = self.dirty.try_read() {
-                *dirty
-            } else {
-                false
-            }
-        };
-
-        if should_sync {
-            let state = self.live_state.try_read().map(|s| s.clone())?;
-            self.storage.write_json(LIVE_STATE_FILE, &state)?;
-
-            if let Ok(mut dirty) = self.dirty.try_write() {
-                *dirty = false;
-            }
-        }
-
-        Ok(())
     }
 
     pub async fn sync_immediate(&self) -> Result<()> {
@@ -1713,11 +1684,6 @@ impl State {
         Ok(state.list_sessions().into_iter().cloned().collect())
     }
 
-    #[allow(dead_code)]
-    pub async fn get_history(&self) -> Result<Vec<HistoryEntry>> {
-        let entries = self.storage.read_jsonl::<HistoryEntry>(HISTORY_FILE)?;
-        Ok(entries)
-    }
 
     pub fn get_history_sync(&self) -> Result<Vec<HistoryEntry>> {
         let entries = self.storage.read_jsonl::<HistoryEntry>(HISTORY_FILE)?;

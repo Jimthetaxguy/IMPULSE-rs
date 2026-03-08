@@ -1032,6 +1032,25 @@ async fn run_supervisor_action(
     }
 }
 
+// ── Daemon response helpers ─────────────────────────────────────────────────
+
+/// Serialize a value into `DaemonResponse::Ok`, or return an error response.
+fn respond_ok<T: serde::Serialize>(value: &T) -> DaemonResponse {
+    match serde_json::to_value(value) {
+        Ok(result) => DaemonResponse::Ok { result },
+        Err(e) => DaemonResponse::Error {
+            message: format!("serialize: {}", e),
+        },
+    }
+}
+
+/// Shorthand for error response.
+fn respond_err(msg: impl std::fmt::Display) -> DaemonResponse {
+    DaemonResponse::Error {
+        message: msg.to_string(),
+    }
+}
+
 async fn process_request(
     request: DaemonRequest,
     state: SharedState,
@@ -1129,30 +1148,14 @@ async fn process_request(
         },
 
         DaemonRequest::GetSession { session_id } => match state.get_session(&session_id).await {
-            Ok(Some(session)) => match serde_json::to_value(session) {
-                Ok(result) => DaemonResponse::Ok { result },
-                Err(e) => DaemonResponse::Error {
-                    message: format!("Failed to serialize session: {}", e),
-                },
-            },
-            Ok(None) => DaemonResponse::Error {
-                message: "Session not found".to_string(),
-            },
-            Err(e) => DaemonResponse::Error {
-                message: e.to_string(),
-            },
+            Ok(Some(session)) => respond_ok(&session),
+            Ok(None) => respond_err("Session not found"),
+            Err(e) => respond_err(e),
         },
 
         DaemonRequest::ListSessions => match state.list_sessions().await {
-            Ok(sessions) => match serde_json::to_value(sessions) {
-                Ok(result) => DaemonResponse::Ok { result },
-                Err(e) => DaemonResponse::Error {
-                    message: format!("Failed to serialize sessions: {}", e),
-                },
-            },
-            Err(e) => DaemonResponse::Error {
-                message: e.to_string(),
-            },
+            Ok(sessions) => respond_ok(&sessions),
+            Err(e) => respond_err(e),
         },
 
         DaemonRequest::Chat {
@@ -1500,29 +1503,15 @@ async fn process_request(
 
         DaemonRequest::GetOpsSnapshot => match build_ops_snapshot(&state, terminal_telemetry).await
         {
-            Ok(snapshot) => match serde_json::to_value(snapshot) {
-                Ok(result) => DaemonResponse::Ok { result },
-                Err(e) => DaemonResponse::Error {
-                    message: format!("Failed to serialize ops snapshot: {}", e),
-                },
-            },
-            Err(e) => DaemonResponse::Error {
-                message: format!("Failed to build ops snapshot: {}", e),
-            },
+            Ok(snapshot) => respond_ok(&snapshot),
+            Err(e) => respond_err(e),
         },
 
         DaemonRequest::SubscribeOps { since_seq } => {
             let reports = load_terminal_reports(&state, terminal_telemetry).await;
             match crate::ops_workbench::subscribe_ops(&state, since_seq, &reports).await {
-                Ok(subscription) => match serde_json::to_value(subscription) {
-                    Ok(result) => DaemonResponse::Ok { result },
-                    Err(e) => DaemonResponse::Error {
-                        message: format!("Failed to serialize ops subscription: {}", e),
-                    },
-                },
-                Err(e) => DaemonResponse::Error {
-                    message: format!("Failed to subscribe ops state: {}", e),
-                },
+                Ok(subscription) => respond_ok(&subscription),
+                Err(e) => respond_err(e),
             }
         }
 
@@ -1539,15 +1528,8 @@ async fn process_request(
 
         DaemonRequest::GetSupervisorPermissions => {
             match build_supervisor_permission_state(&state, supervisor_session_override).await {
-                Ok(permission_state) => match serde_json::to_value(permission_state) {
-                    Ok(result) => DaemonResponse::Ok { result },
-                    Err(e) => DaemonResponse::Error {
-                        message: format!("Failed to serialize supervisor permission state: {}", e),
-                    },
-                },
-                Err(e) => DaemonResponse::Error {
-                    message: format!("Failed to resolve supervisor permissions: {}", e),
-                },
+                Ok(permission_state) => respond_ok(&permission_state),
+                Err(e) => respond_err(e),
             }
         }
 
@@ -1623,16 +1605,9 @@ async fn process_request(
             {
                 Ok(response) => {
                     let parsed = parse_supervisor_chat_response(&response, &permission_state);
-                    match serde_json::to_value(parsed) {
-                        Ok(result) => DaemonResponse::Ok { result },
-                        Err(e) => DaemonResponse::Error {
-                            message: format!("Failed to serialize supervisor chat result: {}", e),
-                        },
-                    }
+                    respond_ok(&parsed)
                 }
-                Err(e) => DaemonResponse::Error {
-                    message: format!("Supervisor chat failed: {}", e),
-                },
+                Err(e) => respond_err(format!("Supervisor chat failed: {}", e)),
             }
         }
 
@@ -1645,15 +1620,8 @@ async fn process_request(
             )
             .await
             {
-                Ok(result) => match serde_json::to_value(result) {
-                    Ok(result) => DaemonResponse::Ok { result },
-                    Err(e) => DaemonResponse::Error {
-                        message: format!("Failed to serialize supervisor action result: {}", e),
-                    },
-                },
-                Err(e) => DaemonResponse::Error {
-                    message: format!("Supervisor action failed: {}", e),
-                },
+                Ok(result) => respond_ok(&result),
+                Err(e) => respond_err(format!("Supervisor action failed: {}", e)),
             }
         }
 
@@ -1664,16 +1632,9 @@ async fn process_request(
                     if let Some(limit) = limit {
                         artifacts.truncate(limit);
                     }
-                    match serde_json::to_value(artifacts) {
-                        Ok(result) => DaemonResponse::Ok { result },
-                        Err(e) => DaemonResponse::Error {
-                            message: format!("Failed to serialize artifacts: {}", e),
-                        },
-                    }
+                    respond_ok(&artifacts)
                 }
-                Err(e) => DaemonResponse::Error {
-                    message: format!("Failed to list artifacts: {}", e),
-                },
+                Err(e) => respond_err(format!("Failed to list artifacts: {}", e)),
             }
         }
 
@@ -1684,22 +1645,11 @@ async fn process_request(
                     &snapshot.project.id,
                     &artifact_id,
                 ) {
-                    Ok(Some(artifact)) => match serde_json::to_value(artifact) {
-                        Ok(result) => DaemonResponse::Ok { result },
-                        Err(e) => DaemonResponse::Error {
-                            message: format!("Failed to serialize artifact: {}", e),
-                        },
-                    },
-                    Ok(None) => DaemonResponse::Error {
-                        message: format!("Artifact not found: {}", artifact_id),
-                    },
-                    Err(e) => DaemonResponse::Error {
-                        message: format!("Failed to read artifact: {}", e),
-                    },
+                    Ok(Some(artifact)) => respond_ok(&artifact),
+                    Ok(None) => respond_err(format!("Artifact not found: {}", artifact_id)),
+                    Err(e) => respond_err(format!("Failed to read artifact: {}", e)),
                 },
-                Err(e) => DaemonResponse::Error {
-                    message: format!("Failed to resolve project artifact store: {}", e),
-                },
+                Err(e) => respond_err(e),
             }
         }
 
@@ -1715,19 +1665,10 @@ async fn process_request(
                 &action_id,
                 &params,
             ) {
-                Ok(result) => match serde_json::to_value(result) {
-                    Ok(result) => DaemonResponse::Ok { result },
-                    Err(e) => DaemonResponse::Error {
-                        message: format!("Failed to serialize artifact action result: {}", e),
-                    },
-                },
-                Err(e) => DaemonResponse::Error {
-                    message: format!("Artifact action failed: {}", e),
-                },
+                Ok(result) => respond_ok(&result),
+                Err(e) => respond_err(format!("Artifact action failed: {}", e)),
             },
-            Err(e) => DaemonResponse::Error {
-                message: format!("Failed to resolve artifact action context: {}", e),
-            },
+            Err(e) => respond_err(format!("Failed to resolve artifact action context: {}", e)),
         },
 
         DaemonRequest::StewardMemory => {
@@ -1755,9 +1696,7 @@ async fn process_request(
                         },
                     }),
                 },
-                Err(e) => DaemonResponse::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => respond_err(e),
             }
         }
 

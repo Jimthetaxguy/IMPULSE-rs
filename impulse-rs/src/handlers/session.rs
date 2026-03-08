@@ -185,25 +185,7 @@ pub async fn handle_track_write(
             Ok(_) => println!("Tracked: {}", file),
             Err(e) => eprintln!("Error: {}", e),
         }
-        if let Ok(config) = state.config_snapshot() {
-            if config.guardrails.enabled {
-                if let Ok(results) = guardrail::evaluate_action(&file, "any", &config.guardrails) {
-                    for result in &results {
-                        match result.action {
-                            guardrail::GuardAction::Warn => {
-                                eprintln!("{}", result.format_human());
-                            }
-                            guardrail::GuardAction::Log => {
-                                let _ = state
-                                    .add_tag(&sid, &format!("guard:{}", result.rule_id))
-                                    .await;
-                            }
-                            guardrail::GuardAction::Block => {}
-                        }
-                    }
-                }
-            }
-        }
+        evaluate_track_guardrails(state, &sid, &file).await;
     } else {
         eprintln!("Error: No session_id. Use --session-id or IMPULSE_SESSION_ID");
     }
@@ -222,29 +204,33 @@ pub async fn handle_track_tool(
             Ok(_) => println!("Tracked: {}", tool),
             Err(e) => eprintln!("Error: {}", e),
         }
-        if let Ok(config) = state.config_snapshot() {
-            if config.guardrails.enabled {
-                if let Ok(results) = guardrail::evaluate_action(&tool, "any", &config.guardrails) {
-                    for result in &results {
-                        match result.action {
-                            guardrail::GuardAction::Warn => {
-                                eprintln!("{}", result.format_human());
-                            }
-                            guardrail::GuardAction::Log => {
-                                let _ = state
-                                    .add_tag(&sid, &format!("guard:{}", result.rule_id))
-                                    .await;
-                            }
-                            guardrail::GuardAction::Block => {}
-                        }
-                    }
-                }
-            }
-        }
+        evaluate_track_guardrails(state, &sid, &tool).await;
     } else {
         eprintln!("Error: No session_id. Use --session-id or IMPULSE_SESSION_ID");
     }
     Ok(())
+}
+
+async fn evaluate_track_guardrails(state: &Arc<state::State>, session_id: &str, action: &str) {
+    if let Ok(config) = state.config_snapshot() {
+        if config.guardrails.enabled {
+            if let Ok(results) = guardrail::evaluate_action(action, "any", &config.guardrails) {
+                for result in &results {
+                    match result.action {
+                        guardrail::GuardAction::Warn => {
+                            eprintln!("{}", result.format_human());
+                        }
+                        guardrail::GuardAction::Log => {
+                            let _ = state
+                                .add_tag(session_id, &format!("guard:{}", result.rule_id))
+                                .await;
+                        }
+                        guardrail::GuardAction::Block => {}
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub async fn handle_list_sessions(state: &Arc<state::State>) -> Result<()> {
