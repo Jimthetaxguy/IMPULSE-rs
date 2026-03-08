@@ -7,6 +7,8 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
 
+use crate::storage::sanitize_filename;
+
 use super::types::*;
 
 /// Check whether the `sem` CLI is available on PATH.
@@ -147,16 +149,17 @@ pub fn capture_semantic_diff(
         changes,
     );
 
-    // Store the report
+    // Store the report — sanitize session_id to prevent path traversal
+    let safe_id = sanitize_filename(session_id);
     let diff_dir = impulse_dir.join("semantic_diffs");
     std::fs::create_dir_all(&diff_dir)?;
 
-    let report_path = diff_dir.join(format!("{}.json", session_id));
+    let report_path = diff_dir.join(format!("{}.json", safe_id));
     let json = serde_json::to_string_pretty(&report)
         .context("failed to serialize semantic diff report")?;
 
     // Atomic write: temp file + rename
-    let tmp_path = diff_dir.join(format!(".{}.{}.tmp", session_id, std::process::id()));
+    let tmp_path = diff_dir.join(format!(".{}.{}.tmp", safe_id, std::process::id()));
     std::fs::write(&tmp_path, json.as_bytes())?;
     std::fs::rename(&tmp_path, &report_path)?;
 
@@ -169,9 +172,10 @@ pub fn load_semantic_diff(
     impulse_dir: &Path,
     session_id: &str,
 ) -> Result<Option<SemanticDiffReport>> {
+    let safe_id = sanitize_filename(session_id);
     let report_path = impulse_dir
         .join("semantic_diffs")
-        .join(format!("{}.json", session_id));
+        .join(format!("{}.json", safe_id));
 
     if !report_path.exists() {
         return Ok(None);
@@ -481,5 +485,18 @@ mod tests {
         // List
         let ids = list_semantic_diffs(dir.path()).unwrap();
         assert_eq!(ids, vec!["test-session"]);
+    }
+
+    #[test]
+    fn test_load_semantic_diff_path_traversal_sanitized() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // A traversal ID like "../../etc/passwd" should be sanitized to a flat filename
+        let result = load_semantic_diff(dir.path(), "../../etc/passwd").unwrap();
+        assert!(result.is_none());
+
+        // Verify the sanitized path stays inside semantic_diffs/
+        let safe = crate::storage::sanitize_filename("../../etc/passwd");
+        assert!(!safe.contains('/'));
+        assert!(!safe.contains('\\'));
     }
 }
