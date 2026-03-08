@@ -1063,22 +1063,87 @@ async fn process_request(
         DaemonRequest::Ping => DaemonResponse::Ok {
             result: serde_json::json!({"pong": true}),
         },
+        DaemonRequest::Status => handle_status(&state).await,
 
-        DaemonRequest::Status => match state.list_sessions().await {
-            Ok(sessions) => DaemonResponse::Ok {
-                result: serde_json::json!({
-                    "sessions": sessions.len(),
-                    "active": sessions.iter().filter(|s| s.status == crate::state::SessionStatus::Active).count()
-                }),
-            },
-            Err(e) => DaemonResponse::Error {
-                message: e.to_string(),
-            },
+        // Session group
+        DaemonRequest::CreateSession { .. }
+        | DaemonRequest::EndSession { .. }
+        | DaemonRequest::TrackFile { .. }
+        | DaemonRequest::TrackTool { .. }
+        | DaemonRequest::CheckConflict { .. }
+        | DaemonRequest::GetSession { .. }
+        | DaemonRequest::ListSessions => handle_session_request(request, &state).await,
+
+        // Chat
+        DaemonRequest::Chat { .. } => handle_chat_request(request, &state).await,
+
+        // Tool group
+        DaemonRequest::ListTools { .. }
+        | DaemonRequest::DescribeTool { .. }
+        | DaemonRequest::InvokeTool { .. }
+        | DaemonRequest::ToolSchema => {
+            handle_tool_request(request, registry, tool_context).await
+        }
+
+        // Steward group
+        DaemonRequest::StewardStatus
+        | DaemonRequest::StewardProposals { .. }
+        | DaemonRequest::StewardMemory => handle_steward_request(request, &state).await,
+
+        // Ops group
+        DaemonRequest::GetOpsSnapshot
+        | DaemonRequest::SubscribeOps { .. }
+        | DaemonRequest::PublishTerminalOps { .. }
+        | DaemonRequest::ListArtifacts { .. }
+        | DaemonRequest::GetArtifact { .. }
+        | DaemonRequest::RunArtifactAction { .. } => {
+            handle_ops_request(request, &state, terminal_telemetry).await
+        }
+
+        // Supervisor group
+        DaemonRequest::GetSupervisorPermissions
+        | DaemonRequest::SupervisorChat { .. }
+        | DaemonRequest::RunSupervisorAction { .. } => {
+            handle_supervisor_request(
+                request,
+                &state,
+                terminal_telemetry,
+                supervisor_session_override,
+            )
+            .await
+        }
+
+        // Agent assist
+        DaemonRequest::AgentAssist { .. } => handle_agent_request(request, &state).await,
+
+        // Guard group
+        DaemonRequest::GuardEvaluate { .. } | DaemonRequest::GuardList => {
+            handle_guard_request(request, &state).await
+        }
+    }
+}
+
+// ── Sub-handlers ────────────────────────────────────────────────────────────
+
+async fn handle_status(state: &SharedState) -> DaemonResponse {
+    match state.list_sessions().await {
+        Ok(sessions) => DaemonResponse::Ok {
+            result: serde_json::json!({
+                "sessions": sessions.len(),
+                "active": sessions.iter().filter(|s| s.status == crate::state::SessionStatus::Active).count()
+            }),
         },
+        Err(e) => respond_err(e),
+    }
+}
 
+async fn handle_session_request(
+    request: DaemonRequest,
+    state: &SharedState,
+) -> DaemonResponse {
+    match request {
         DaemonRequest::CreateSession { name, platform } => {
             let platform = platform.and_then(|p| crate::state::Platform::from_str_name(&p));
-
             match state.create_session(name, platform).await {
                 Ok(session) => DaemonResponse::Ok {
                     result: serde_json::json!({
@@ -1086,331 +1151,205 @@ async fn process_request(
                         "name": session.name
                     }),
                 },
-                Err(e) => DaemonResponse::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => respond_err(e),
             }
         }
-
-        DaemonRequest::EndSession {
-            session_id,
-            summary,
-        } => match state.end_session(&session_id, summary).await {
-            Ok(Some(entry)) => DaemonResponse::Ok {
-                result: serde_json::json!({
-                    "session_id": entry.session_id,
-                    "ended_at": entry.ended_at
-                }),
-            },
-            Ok(None) => DaemonResponse::Error {
-                message: "Session not found".to_string(),
-            },
-            Err(e) => DaemonResponse::Error {
-                message: e.to_string(),
-            },
-        },
-
-        DaemonRequest::TrackFile {
-            session_id,
-            file_path,
-        } => match state.track_file(&session_id, &file_path).await {
-            Ok(_) => DaemonResponse::Ok {
-                result: serde_json::json!({"tracked": true}),
-            },
-            Err(e) => DaemonResponse::Error {
-                message: e.to_string(),
-            },
-        },
-
-        DaemonRequest::TrackTool {
-            session_id,
-            tool_name,
-        } => match state.track_tool(&session_id, &tool_name).await {
-            Ok(_) => DaemonResponse::Ok {
-                result: serde_json::json!({"tracked": true}),
-            },
-            Err(e) => DaemonResponse::Error {
-                message: e.to_string(),
-            },
-        },
-
-        DaemonRequest::CheckConflict {
-            session_id,
-            file_path,
-        } => match state.check_file_conflict(&session_id, &file_path).await {
-            Ok(conflicting) => DaemonResponse::ConflictCheck {
-                has_conflict: !conflicting.is_empty(),
-                conflicting_sessions: conflicting,
-            },
-            Err(e) => DaemonResponse::Error {
-                message: format!("Conflict check failed: {}", e),
-            },
-        },
-
-        DaemonRequest::GetSession { session_id } => match state.get_session(&session_id).await {
-            Ok(Some(session)) => respond_ok(&session),
-            Ok(None) => respond_err("Session not found"),
-            Err(e) => respond_err(e),
-        },
-
+        DaemonRequest::EndSession { session_id, summary } => {
+            match state.end_session(&session_id, summary).await {
+                Ok(Some(entry)) => DaemonResponse::Ok {
+                    result: serde_json::json!({
+                        "session_id": entry.session_id,
+                        "ended_at": entry.ended_at
+                    }),
+                },
+                Ok(None) => respond_err("Session not found"),
+                Err(e) => respond_err(e),
+            }
+        }
+        DaemonRequest::TrackFile { session_id, file_path } => {
+            match state.track_file(&session_id, &file_path).await {
+                Ok(_) => DaemonResponse::Ok {
+                    result: serde_json::json!({"tracked": true}),
+                },
+                Err(e) => respond_err(e),
+            }
+        }
+        DaemonRequest::TrackTool { session_id, tool_name } => {
+            match state.track_tool(&session_id, &tool_name).await {
+                Ok(_) => DaemonResponse::Ok {
+                    result: serde_json::json!({"tracked": true}),
+                },
+                Err(e) => respond_err(e),
+            }
+        }
+        DaemonRequest::CheckConflict { session_id, file_path } => {
+            match state.check_file_conflict(&session_id, &file_path).await {
+                Ok(conflicting) => DaemonResponse::ConflictCheck {
+                    has_conflict: !conflicting.is_empty(),
+                    conflicting_sessions: conflicting,
+                },
+                Err(e) => respond_err(format!("Conflict check failed: {}", e)),
+            }
+        }
+        DaemonRequest::GetSession { session_id } => {
+            match state.get_session(&session_id).await {
+                Ok(Some(session)) => respond_ok(&session),
+                Ok(None) => respond_err("Session not found"),
+                Err(e) => respond_err(e),
+            }
+        }
         DaemonRequest::ListSessions => match state.list_sessions().await {
             Ok(sessions) => respond_ok(&sessions),
             Err(e) => respond_err(e),
         },
+        _ => respond_err("Internal routing error: not a session request"),
+    }
+}
 
-        DaemonRequest::Chat {
-            session_id,
-            message,
-            inject_mode,
-            inject_explain,
-        } => {
-            let config = match state.config_snapshot() {
-                Ok(c) => c,
-                Err(e) => {
-                    return DaemonResponse::Error {
-                        message: format!("Failed to read config: {}", e),
-                    }
-                }
-            };
-            let api_key = std::env::var("ANTHROPIC_API_KEY")
-                .or_else(|_| std::env::var("CLAUDE_API_KEY"))
-                .unwrap_or_else(|_| "".to_string());
+async fn handle_chat_request(
+    request: DaemonRequest,
+    state: &SharedState,
+) -> DaemonResponse {
+    let DaemonRequest::Chat {
+        session_id,
+        message,
+        inject_mode,
+        inject_explain,
+    } = request
+    else {
+        return respond_err("Internal routing error: not a chat request");
+    };
 
-            #[cfg(debug_assertions)]
-            let test_mode = std::env::var("IMPULSE_TEST_MODE")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-            #[cfg(not(debug_assertions))]
-            let test_mode = false;
+    let config = match state.config_snapshot() {
+        Ok(c) => c,
+        Err(e) => return respond_err(format!("Failed to read config: {}", e)),
+    };
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .or_else(|_| std::env::var("CLAUDE_API_KEY"))
+        .unwrap_or_else(|_| "".to_string());
 
-            if api_key.is_empty() && !test_mode {
-                return DaemonResponse::Error {
-                    message: "ANTHROPIC_API_KEY or CLAUDE_API_KEY not set".to_string(),
-                };
-            }
+    #[cfg(debug_assertions)]
+    let test_mode = std::env::var("IMPULSE_TEST_MODE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    #[cfg(not(debug_assertions))]
+    let test_mode = false;
 
-            // Build session context from state
-            let session_context = state.get_session(&session_id).await.ok().flatten();
+    if api_key.is_empty() && !test_mode {
+        return respond_err("ANTHROPIC_API_KEY or CLAUDE_API_KEY not set");
+    }
 
-            // Create context prompt with session history
-            let mut context_prompt = if let Some(session) = &session_context {
-                let files_list = session.active_files.join(", ");
-                let tools_list = session.recent_tools.join(", ");
+    let session_context = state.get_session(&session_id).await.ok().flatten();
 
-                format!(
-                    "Session Context:\n- Session: {} (ID: {})\n- Files touched: {}\n- Recent tools: {}\n\nUser question: {}",
-                    session.name, session.id,
-                    if files_list.is_empty() { "none".to_string() } else { files_list },
-                    if tools_list.is_empty() { "none".to_string() } else { tools_list },
-                    message
-                )
-            } else {
-                message.clone()
-            };
+    let mut context_prompt = if let Some(session) = &session_context {
+        let files_list = session.active_files.join(", ");
+        let tools_list = session.recent_tools.join(", ");
+        format!(
+            "Session Context:\n- Session: {} (ID: {})\n- Files touched: {}\n- Recent tools: {}\n\nUser question: {}",
+            session.name, session.id,
+            if files_list.is_empty() { "none".to_string() } else { files_list },
+            if tools_list.is_empty() { "none".to_string() } else { tools_list },
+            message
+        )
+    } else {
+        message.clone()
+    };
 
-            let mode_override = inject_mode.as_deref().and_then(InjectionMode::parse);
-            if inject_mode.is_some() && mode_override.is_none() {
-                return DaemonResponse::Error {
-                    message: "Invalid inject_mode. Use off|review|apply".to_string(),
-                };
-            }
-            let mut injection_query_parts = vec![message.clone()];
-            if let Some(session) = &session_context {
-                injection_query_parts.push(session.name.clone());
-                if !session.active_files.is_empty() {
-                    injection_query_parts.push(session.active_files.join(" "));
-                }
-                if !session.recent_tools.is_empty() {
-                    injection_query_parts.push(session.recent_tools.join(" "));
-                }
-            }
-
-            let injection_result = run_injection(
-                state.storage().base_path(),
-                &config,
-                InjectionSurface::DaemonChat,
-                mode_override,
-                &injection_query_parts,
-            );
-
-            if injection_result.applied {
-                if let Some(block) = &injection_result.injected_block {
-                    context_prompt = format!("{}\n\n{}", block, context_prompt);
-                }
-            }
-
-            if test_mode {
-                return DaemonResponse::Ok {
-                    result: serde_json::json!({
-                        "response": format!("TEST_MODE_RESPONSE: {}", message),
-                        "session_id": session_id,
-                        "model": "test-mode",
-                        "context_included": session_context.is_some(),
-                        "injection": if inject_explain {
-                            serde_json::to_value(&injection_result).unwrap_or_else(|_| serde_json::json!({"status": "serialization_error"}))
-                        } else {
-                            serde_json::json!({
-                                "requested_mode": injection_result.requested_mode,
-                                "effective_mode": injection_result.effective_mode,
-                                "applied": injection_result.applied,
-                                "artifact_path": injection_result.artifact_path,
-                                "fallback_code": injection_result.explain.fallback_code,
-                            })
-                        }
-                    }),
-                };
-            }
-
-            let provider = AnthropicProvider::new(api_key);
-            let model = std::env::var("IMPULSE_MODEL")
-                .or_else(|_| std::env::var("COCKPIT_MODEL"))
-                .unwrap_or_else(|_| "claude-sonnet-4-6".to_string());
-            let request = ChatRequest {
-                model,
-                messages: vec![Message {
-                    role: Role::User,
-                    content: context_prompt,
-                }],
-                temperature: 0.7,
-                max_tokens: Some(4096),
-            };
-
-            match provider.chat(request).await {
-                Ok(response) => DaemonResponse::Ok {
-                    result: serde_json::json!({
-                        "response": response.content,
-                        "session_id": session_id,
-                        "model": response.model,
-                        "context_included": session_context.is_some(),
-                        "injection": if inject_explain {
-                            serde_json::to_value(&injection_result).unwrap_or_else(|_| serde_json::json!({"status": "serialization_error"}))
-                        } else {
-                            serde_json::json!({
-                                "requested_mode": injection_result.requested_mode,
-                                "effective_mode": injection_result.effective_mode,
-                                "applied": injection_result.applied,
-                                "artifact_path": injection_result.artifact_path,
-                                "fallback_code": injection_result.explain.fallback_code,
-                            })
-                        }
-                    }),
-                },
-                Err(e) => DaemonResponse::Error {
-                    message: e.to_string(),
-                },
-            }
+    let mode_override = inject_mode.as_deref().and_then(InjectionMode::parse);
+    if inject_mode.is_some() && mode_override.is_none() {
+        return respond_err("Invalid inject_mode. Use off|review|apply");
+    }
+    let mut injection_query_parts = vec![message.clone()];
+    if let Some(session) = &session_context {
+        injection_query_parts.push(session.name.clone());
+        if !session.active_files.is_empty() {
+            injection_query_parts.push(session.active_files.join(" "));
         }
-
-        DaemonRequest::StewardStatus => {
-            use crate::stewardship;
-
-            let base = state.storage().base_path();
-            let config = match state.config_snapshot() {
-                Ok(c) => c,
-                Err(e) => {
-                    return DaemonResponse::Error {
-                        message: format!("Failed to read config: {}", e),
-                    }
-                }
-            };
-            let stew_config = stewardship::StewardshipConfig::from_config(&config);
-
-            let proposals = stewardship::approval::list_pending(base).unwrap_or_default();
-            let cross = stewardship::cross_project::load_cross_project(base).unwrap_or_default();
-
-            DaemonResponse::Ok {
-                result: serde_json::json!({
-                    "mode": stew_config.mode.as_str(),
-                    "thresholds": {
-                        "monitor": stew_config.monitor_threshold,
-                        "surgical": stew_config.surgical_threshold,
-                        "thoughtful": stew_config.thoughtful_threshold,
-                        "emergency": stew_config.emergency_threshold,
-                    },
-                    "context_window_tokens": stew_config.context_window_tokens,
-                    "pending_proposals": proposals.len(),
-                    "cross_project_patterns": cross.patterns.len(),
-                    "cross_project_learnings": cross.learnings.len(),
-                }),
-            }
+        if !session.recent_tools.is_empty() {
+            injection_query_parts.push(session.recent_tools.join(" "));
         }
+    }
 
-        DaemonRequest::StewardProposals { action, id } => {
-            use crate::stewardship;
+    let injection_result = run_injection(
+        state.storage().base_path(),
+        &config,
+        InjectionSurface::DaemonChat,
+        mode_override,
+        &injection_query_parts,
+    );
 
-            let base = state.storage().base_path();
-
-            match action.as_str() {
-                "list" => match stewardship::approval::list_pending(base) {
-                    Ok(proposals) => {
-                        let out: Vec<_> = proposals
-                            .iter()
-                            .map(|p| {
-                                serde_json::json!({
-                                    "id": p.id,
-                                    "strategy": p.strategy.as_str(),
-                                    "threshold": p.threshold.as_str(),
-                                    "estimated_tokens_freed": p.estimated_tokens_freed,
-                                    "regions": p.regions.len(),
-                                })
-                            })
-                            .collect();
-                        DaemonResponse::Ok {
-                            result: serde_json::json!(out),
-                        }
-                    }
-                    Err(e) => DaemonResponse::Error {
-                        message: e.to_string(),
-                    },
-                },
-                "approve" => {
-                    let pid = match id {
-                        Some(pid) => pid,
-                        None => {
-                            return DaemonResponse::Error {
-                                message: "id required for approve".to_string(),
-                            }
-                        }
-                    };
-                    match stewardship::approval::approve_proposal(base, &pid) {
-                        Ok(true) => DaemonResponse::Ok {
-                            result: serde_json::json!({"approved": pid}),
-                        },
-                        Ok(false) => DaemonResponse::Error {
-                            message: format!("Proposal {} not found", pid),
-                        },
-                        Err(e) => DaemonResponse::Error {
-                            message: e.to_string(),
-                        },
-                    }
-                }
-                "reject" => {
-                    let pid = match id {
-                        Some(pid) => pid,
-                        None => {
-                            return DaemonResponse::Error {
-                                message: "id required for reject".to_string(),
-                            }
-                        }
-                    };
-                    match stewardship::approval::reject_proposal(base, &pid) {
-                        Ok(true) => DaemonResponse::Ok {
-                            result: serde_json::json!({"rejected": pid}),
-                        },
-                        Ok(false) => DaemonResponse::Error {
-                            message: format!("Proposal {} not found", pid),
-                        },
-                        Err(e) => DaemonResponse::Error {
-                            message: e.to_string(),
-                        },
-                    }
-                }
-                _ => DaemonResponse::Error {
-                    message: format!("Unknown action: {}. Use list, approve, reject", action),
-                },
-            }
+    if injection_result.applied {
+        if let Some(block) = &injection_result.injected_block {
+            context_prompt = format!("{}\n\n{}", block, context_prompt);
         }
+    }
 
+    if test_mode {
+        return DaemonResponse::Ok {
+            result: serde_json::json!({
+                "response": format!("TEST_MODE_RESPONSE: {}", message),
+                "session_id": session_id,
+                "model": "test-mode",
+                "context_included": session_context.is_some(),
+                "injection": if inject_explain {
+                    serde_json::to_value(&injection_result).unwrap_or_else(|_| serde_json::json!({"status": "serialization_error"}))
+                } else {
+                    serde_json::json!({
+                        "requested_mode": injection_result.requested_mode,
+                        "effective_mode": injection_result.effective_mode,
+                        "applied": injection_result.applied,
+                        "artifact_path": injection_result.artifact_path,
+                        "fallback_code": injection_result.explain.fallback_code,
+                    })
+                }
+            }),
+        };
+    }
+
+    let provider = AnthropicProvider::new(api_key);
+    let model = std::env::var("IMPULSE_MODEL")
+        .or_else(|_| std::env::var("COCKPIT_MODEL"))
+        .unwrap_or_else(|_| "claude-sonnet-4-6".to_string());
+    let request = ChatRequest {
+        model,
+        messages: vec![Message {
+            role: Role::User,
+            content: context_prompt,
+        }],
+        temperature: 0.7,
+        max_tokens: Some(4096),
+    };
+
+    match provider.chat(request).await {
+        Ok(response) => DaemonResponse::Ok {
+            result: serde_json::json!({
+                "response": response.content,
+                "session_id": session_id,
+                "model": response.model,
+                "context_included": session_context.is_some(),
+                "injection": if inject_explain {
+                    serde_json::to_value(&injection_result).unwrap_or_else(|_| serde_json::json!({"status": "serialization_error"}))
+                } else {
+                    serde_json::json!({
+                        "requested_mode": injection_result.requested_mode,
+                        "effective_mode": injection_result.effective_mode,
+                        "applied": injection_result.applied,
+                        "artifact_path": injection_result.artifact_path,
+                        "fallback_code": injection_result.explain.fallback_code,
+                    })
+                }
+            }),
+        },
+        Err(e) => respond_err(e),
+    }
+}
+
+async fn handle_tool_request(
+    request: DaemonRequest,
+    registry: &crate::tooling::ToolRegistry,
+    tool_context: &crate::tooling::ToolContext,
+) -> DaemonResponse {
+    match request {
         DaemonRequest::ListTools { category } => {
             let descriptors = if let Some(cat) = category {
                 let cat = match cat.as_str() {
@@ -1419,12 +1358,10 @@ async fn process_request(
                     "analysis" => crate::tooling::ToolCategory::Analysis,
                     "document" => crate::tooling::ToolCategory::Document,
                     _ => {
-                        return DaemonResponse::Error {
-                            message: format!(
-                                "Unknown category: {}. Use system, utility, analysis, document",
-                                cat
-                            ),
-                        }
+                        return respond_err(format!(
+                            "Unknown category: {}. Use system, utility, analysis, document",
+                            cat
+                        ))
                     }
                 };
                 registry.list_by_category(cat)
@@ -1452,7 +1389,6 @@ async fn process_request(
                 result: serde_json::json!({"tools": out, "count": out.len()}),
             }
         }
-
         DaemonRequest::DescribeTool { name } => match registry.get(&name) {
             Some(tool) => {
                 let desc = tool.descriptor();
@@ -1477,11 +1413,8 @@ async fn process_request(
                     }),
                 }
             }
-            None => DaemonResponse::Error {
-                message: format!("Tool not found: {}", name),
-            },
+            None => respond_err(format!("Tool not found: {}", name)),
         },
-
         DaemonRequest::InvokeTool { name, params } => {
             match registry.execute(&name, params, tool_context).await {
                 Ok(result) => DaemonResponse::Ok {
@@ -1491,32 +1424,155 @@ async fn process_request(
                         "metadata": result.metadata,
                     }),
                 },
-                Err(e) => DaemonResponse::Error {
-                    message: format!("{}", e),
-                },
+                Err(e) => respond_err(e),
             }
         }
-
         DaemonRequest::ToolSchema => DaemonResponse::Ok {
             result: serde_json::json!({"tools": registry.schema_json()}),
         },
+        _ => respond_err("Internal routing error: not a tool request"),
+    }
+}
 
-        DaemonRequest::GetOpsSnapshot => match build_ops_snapshot(&state, terminal_telemetry).await
-        {
-            Ok(snapshot) => respond_ok(&snapshot),
-            Err(e) => respond_err(e),
-        },
+async fn handle_steward_request(
+    request: DaemonRequest,
+    state: &SharedState,
+) -> DaemonResponse {
+    use crate::stewardship;
 
+    match request {
+        DaemonRequest::StewardStatus => {
+            let base = state.storage().base_path();
+            let config = match state.config_snapshot() {
+                Ok(c) => c,
+                Err(e) => return respond_err(format!("Failed to read config: {}", e)),
+            };
+            let stew_config = stewardship::StewardshipConfig::from_config(&config);
+            let proposals = stewardship::approval::list_pending(base).unwrap_or_default();
+            let cross = stewardship::cross_project::load_cross_project(base).unwrap_or_default();
+
+            DaemonResponse::Ok {
+                result: serde_json::json!({
+                    "mode": stew_config.mode.as_str(),
+                    "thresholds": {
+                        "monitor": stew_config.monitor_threshold,
+                        "surgical": stew_config.surgical_threshold,
+                        "thoughtful": stew_config.thoughtful_threshold,
+                        "emergency": stew_config.emergency_threshold,
+                    },
+                    "context_window_tokens": stew_config.context_window_tokens,
+                    "pending_proposals": proposals.len(),
+                    "cross_project_patterns": cross.patterns.len(),
+                    "cross_project_learnings": cross.learnings.len(),
+                }),
+            }
+        }
+        DaemonRequest::StewardProposals { action, id } => {
+            let base = state.storage().base_path();
+            match action.as_str() {
+                "list" => match stewardship::approval::list_pending(base) {
+                    Ok(proposals) => {
+                        let out: Vec<_> = proposals
+                            .iter()
+                            .map(|p| {
+                                serde_json::json!({
+                                    "id": p.id,
+                                    "strategy": p.strategy.as_str(),
+                                    "threshold": p.threshold.as_str(),
+                                    "estimated_tokens_freed": p.estimated_tokens_freed,
+                                    "regions": p.regions.len(),
+                                })
+                            })
+                            .collect();
+                        DaemonResponse::Ok {
+                            result: serde_json::json!(out),
+                        }
+                    }
+                    Err(e) => respond_err(e),
+                },
+                "approve" => {
+                    let pid = match id {
+                        Some(pid) => pid,
+                        None => return respond_err("id required for approve"),
+                    };
+                    match stewardship::approval::approve_proposal(base, &pid) {
+                        Ok(true) => DaemonResponse::Ok {
+                            result: serde_json::json!({"approved": pid}),
+                        },
+                        Ok(false) => respond_err(format!("Proposal {} not found", pid)),
+                        Err(e) => respond_err(e),
+                    }
+                }
+                "reject" => {
+                    let pid = match id {
+                        Some(pid) => pid,
+                        None => return respond_err("id required for reject"),
+                    };
+                    match stewardship::approval::reject_proposal(base, &pid) {
+                        Ok(true) => DaemonResponse::Ok {
+                            result: serde_json::json!({"rejected": pid}),
+                        },
+                        Ok(false) => respond_err(format!("Proposal {} not found", pid)),
+                        Err(e) => respond_err(e),
+                    }
+                }
+                _ => respond_err(format!(
+                    "Unknown action: {}. Use list, approve, reject",
+                    action
+                )),
+            }
+        }
+        DaemonRequest::StewardMemory => {
+            let base = state.storage().base_path();
+            match stewardship::cross_project::load_cross_project(base) {
+                Ok(cross) => DaemonResponse::Ok {
+                    result: serde_json::json!({
+                        "version": cross.version,
+                        "updated": cross.updated.to_rfc3339(),
+                        "patterns": cross.patterns.iter().map(|p| serde_json::json!({
+                            "id": p.id,
+                            "type": p.pattern_type,
+                            "description": p.description,
+                            "occurrences": p.occurrences,
+                            "projects": p.projects,
+                            "insight": p.insight,
+                        })).collect::<Vec<_>>(),
+                        "learnings": cross.learnings,
+                        "stats": {
+                            "total_patterns": cross.stats.total_patterns,
+                            "total_sessions": cross.stats.total_sessions_analyzed,
+                            "total_learnings": cross.stats.total_learnings,
+                        },
+                    }),
+                },
+                Err(e) => respond_err(e),
+            }
+        }
+        _ => respond_err("Internal routing error: not a steward request"),
+    }
+}
+
+async fn handle_ops_request(
+    request: DaemonRequest,
+    state: &SharedState,
+    terminal_telemetry: &Arc<RwLock<crate::ops_workbench::TerminalOpsTelemetryStore>>,
+) -> DaemonResponse {
+    match request {
+        DaemonRequest::GetOpsSnapshot => {
+            match build_ops_snapshot(state, terminal_telemetry).await {
+                Ok(snapshot) => respond_ok(&snapshot),
+                Err(e) => respond_err(e),
+            }
+        }
         DaemonRequest::SubscribeOps { since_seq } => {
-            let reports = load_terminal_reports(&state, terminal_telemetry).await;
-            match crate::ops_workbench::subscribe_ops(&state, since_seq, &reports).await {
+            let reports = load_terminal_reports(state, terminal_telemetry).await;
+            match crate::ops_workbench::subscribe_ops(state, since_seq, &reports).await {
                 Ok(subscription) => respond_ok(&subscription),
                 Err(e) => respond_err(e),
             }
         }
-
         DaemonRequest::PublishTerminalOps { report } => {
-            let project = crate::ops_workbench::project_summary(&state);
+            let project = crate::ops_workbench::project_summary(state);
             terminal_telemetry
                 .write()
                 .await
@@ -1525,43 +1581,86 @@ async fn process_request(
                 result: serde_json::json!({"accepted": true}),
             }
         }
+        DaemonRequest::ListArtifacts { limit } => {
+            match build_ops_snapshot(state, terminal_telemetry).await {
+                Ok(snapshot) => {
+                    let mut artifacts = snapshot.artifacts;
+                    if let Some(limit) = limit {
+                        artifacts.truncate(limit);
+                    }
+                    respond_ok(&artifacts)
+                }
+                Err(e) => respond_err(format!("Failed to list artifacts: {}", e)),
+            }
+        }
+        DaemonRequest::GetArtifact { artifact_id } => {
+            match build_ops_snapshot(state, terminal_telemetry).await {
+                Ok(snapshot) => match crate::ops_workbench::get_artifact(
+                    state.storage().base_path(),
+                    &snapshot.project.id,
+                    &artifact_id,
+                ) {
+                    Ok(Some(artifact)) => respond_ok(&artifact),
+                    Ok(None) => respond_err(format!("Artifact not found: {}", artifact_id)),
+                    Err(e) => respond_err(format!("Failed to read artifact: {}", e)),
+                },
+                Err(e) => respond_err(e),
+            }
+        }
+        DaemonRequest::RunArtifactAction {
+            artifact_id,
+            action_id,
+            params,
+        } => match build_ops_snapshot(state, terminal_telemetry).await {
+            Ok(snapshot) => match crate::ops_workbench::run_artifact_action(
+                state.storage().base_path(),
+                &snapshot.project.id,
+                &artifact_id,
+                &action_id,
+                &params,
+            ) {
+                Ok(result) => respond_ok(&result),
+                Err(e) => respond_err(format!("Artifact action failed: {}", e)),
+            },
+            Err(e) => respond_err(format!("Failed to resolve artifact action context: {}", e)),
+        },
+        _ => respond_err("Internal routing error: not an ops request"),
+    }
+}
 
+async fn handle_supervisor_request(
+    request: DaemonRequest,
+    state: &SharedState,
+    terminal_telemetry: &Arc<RwLock<crate::ops_workbench::TerminalOpsTelemetryStore>>,
+    supervisor_session_override: &Arc<RwLock<Option<impulse_ops::SupervisorPermissionPolicy>>>,
+) -> DaemonResponse {
+    match request {
         DaemonRequest::GetSupervisorPermissions => {
-            match build_supervisor_permission_state(&state, supervisor_session_override).await {
+            match build_supervisor_permission_state(state, supervisor_session_override).await {
                 Ok(permission_state) => respond_ok(&permission_state),
                 Err(e) => respond_err(e),
             }
         }
-
         DaemonRequest::SupervisorChat { prompt, context } => {
-            let snapshot = match build_ops_snapshot(&state, terminal_telemetry).await {
+            let snapshot = match build_ops_snapshot(state, terminal_telemetry).await {
                 Ok(snapshot) => snapshot,
                 Err(e) => {
-                    return DaemonResponse::Error {
-                        message: format!("Failed to build supervisor snapshot: {}", e),
-                    }
+                    return respond_err(format!("Failed to build supervisor snapshot: {}", e))
                 }
             };
-            let permission_state = match build_supervisor_permission_state(
-                &state,
-                supervisor_session_override,
-            )
-            .await
-            {
-                Ok(state) => state,
-                Err(e) => {
-                    return DaemonResponse::Error {
-                        message: format!("Failed to resolve supervisor permissions: {}", e),
+            let permission_state =
+                match build_supervisor_permission_state(state, supervisor_session_override).await {
+                    Ok(state) => state,
+                    Err(e) => {
+                        return respond_err(format!(
+                            "Failed to resolve supervisor permissions: {}",
+                            e
+                        ))
                     }
-                }
-            };
+                };
             let config = match state.config_snapshot() {
                 Ok(c) => c,
-                Err(e) => {
-                    return DaemonResponse::Error {
-                        message: format!("Failed to load config: {}", e),
-                    }
-                }
+                Err(e) => return respond_err(format!("Failed to load config: {}", e)),
             };
 
             let mut agent = match crate::agent::resolve_from_config(
@@ -1610,10 +1709,9 @@ async fn process_request(
                 Err(e) => respond_err(format!("Supervisor chat failed: {}", e)),
             }
         }
-
         DaemonRequest::RunSupervisorAction { action } => {
             match run_supervisor_action(
-                &state,
+                state,
                 action,
                 terminal_telemetry,
                 supervisor_session_override,
@@ -1624,144 +1722,79 @@ async fn process_request(
                 Err(e) => respond_err(format!("Supervisor action failed: {}", e)),
             }
         }
+        _ => respond_err("Internal routing error: not a supervisor request"),
+    }
+}
 
-        DaemonRequest::ListArtifacts { limit } => {
-            match build_ops_snapshot(&state, terminal_telemetry).await {
-                Ok(snapshot) => {
-                    let mut artifacts = snapshot.artifacts;
-                    if let Some(limit) = limit {
-                        artifacts.truncate(limit);
-                    }
-                    respond_ok(&artifacts)
-                }
-                Err(e) => respond_err(format!("Failed to list artifacts: {}", e)),
+async fn handle_agent_request(
+    request: DaemonRequest,
+    state: &SharedState,
+) -> DaemonResponse {
+    let DaemonRequest::AgentAssist { prompt, context } = request else {
+        return respond_err("Internal routing error: not an agent request");
+    };
+
+    let config = match state.config_snapshot() {
+        Ok(c) => c,
+        Err(e) => {
+            return DaemonResponse::AgentAssistResult {
+                success: false,
+                response: format!("Failed to load config: {}", e),
             }
         }
+    };
 
-        DaemonRequest::GetArtifact { artifact_id } => {
-            match build_ops_snapshot(&state, terminal_telemetry).await {
-                Ok(snapshot) => match crate::ops_workbench::get_artifact(
-                    state.storage().base_path(),
-                    &snapshot.project.id,
-                    &artifact_id,
-                ) {
-                    Ok(Some(artifact)) => respond_ok(&artifact),
-                    Ok(None) => respond_err(format!("Artifact not found: {}", artifact_id)),
-                    Err(e) => respond_err(format!("Failed to read artifact: {}", e)),
-                },
-                Err(e) => respond_err(e),
+    let mut agent = match crate::agent::resolve_from_config(
+        config.impulse_agent_provider.as_deref(),
+        config.impulse_agent_api_key.as_deref(),
+        config.impulse_agent_model.as_deref(),
+        config.impulse_agent_harness.as_deref(),
+    ) {
+        Some(a) => a,
+        None => {
+            return DaemonResponse::AgentAssistResult {
+                success: false,
+                response: "Impulse Agent not configured. Run: impulse-rs agent-configure --provider anthropic --api-key YOUR_KEY".to_string(),
             }
         }
+    };
 
-        DaemonRequest::RunArtifactAction {
-            artifact_id,
-            action_id,
-            params,
-        } => match build_ops_snapshot(&state, terminal_telemetry).await {
-            Ok(snapshot) => match crate::ops_workbench::run_artifact_action(
-                state.storage().base_path(),
-                &snapshot.project.id,
-                &artifact_id,
-                &action_id,
-                &params,
-            ) {
-                Ok(result) => respond_ok(&result),
-                Err(e) => respond_err(format!("Artifact action failed: {}", e)),
-            },
-            Err(e) => respond_err(format!("Failed to resolve artifact action context: {}", e)),
+    if !agent.is_ready() {
+        return DaemonResponse::AgentAssistResult {
+            success: false,
+            response: "Impulse Agent is configured but not ready (check API key or harness installation)".to_string(),
+        };
+    }
+
+    let full_prompt = match context {
+        Some(ctx) => format!("Context:\n{}\n\nRequest:\n{}", ctx, prompt),
+        None => prompt,
+    };
+
+    match agent
+        .query(crate::agent::prompts::COORDINATION_SYSTEM, &full_prompt)
+        .await
+    {
+        Ok(response) => DaemonResponse::AgentAssistResult {
+            success: true,
+            response,
         },
+        Err(e) => DaemonResponse::AgentAssistResult {
+            success: false,
+            response: format!("Agent query failed: {}", e),
+        },
+    }
+}
 
-        DaemonRequest::StewardMemory => {
-            use crate::stewardship;
-
-            let base = state.storage().base_path();
-            match stewardship::cross_project::load_cross_project(base) {
-                Ok(cross) => DaemonResponse::Ok {
-                    result: serde_json::json!({
-                        "version": cross.version,
-                        "updated": cross.updated.to_rfc3339(),
-                        "patterns": cross.patterns.iter().map(|p| serde_json::json!({
-                            "id": p.id,
-                            "type": p.pattern_type,
-                            "description": p.description,
-                            "occurrences": p.occurrences,
-                            "projects": p.projects,
-                            "insight": p.insight,
-                        })).collect::<Vec<_>>(),
-                        "learnings": cross.learnings,
-                        "stats": {
-                            "total_patterns": cross.stats.total_patterns,
-                            "total_sessions": cross.stats.total_sessions_analyzed,
-                            "total_learnings": cross.stats.total_learnings,
-                        },
-                    }),
-                },
-                Err(e) => respond_err(e),
-            }
-        }
-
-        DaemonRequest::AgentAssist { prompt, context } => {
-            let config = match state.config_snapshot() {
-                Ok(c) => c,
-                Err(e) => {
-                    return DaemonResponse::AgentAssistResult {
-                        success: false,
-                        response: format!("Failed to load config: {}", e),
-                    }
-                }
-            };
-
-            let mut agent = match crate::agent::resolve_from_config(
-                config.impulse_agent_provider.as_deref(),
-                config.impulse_agent_api_key.as_deref(),
-                config.impulse_agent_model.as_deref(),
-                config.impulse_agent_harness.as_deref(),
-            ) {
-                Some(a) => a,
-                None => {
-                    return DaemonResponse::AgentAssistResult {
-                        success: false,
-                        response: "Impulse Agent not configured. Run: impulse-rs agent-configure --provider anthropic --api-key YOUR_KEY".to_string(),
-                    }
-                }
-            };
-
-            if !agent.is_ready() {
-                return DaemonResponse::AgentAssistResult {
-                    success: false,
-                    response: "Impulse Agent is configured but not ready (check API key or harness installation)".to_string(),
-                };
-            }
-
-            // Build the full prompt, incorporating optional context
-            let full_prompt = match context {
-                Some(ctx) => format!("Context:\n{}\n\nRequest:\n{}", ctx, prompt),
-                None => prompt,
-            };
-
-            match agent
-                .query(crate::agent::prompts::COORDINATION_SYSTEM, &full_prompt)
-                .await
-            {
-                Ok(response) => DaemonResponse::AgentAssistResult {
-                    success: true,
-                    response,
-                },
-                Err(e) => DaemonResponse::AgentAssistResult {
-                    success: false,
-                    response: format!("Agent query failed: {}", e),
-                },
-            }
-        }
-
+async fn handle_guard_request(
+    request: DaemonRequest,
+    state: &SharedState,
+) -> DaemonResponse {
+    match request {
         DaemonRequest::GuardEvaluate { target, action } => {
             let config = match state.config_snapshot() {
                 Ok(c) => c,
-                Err(e) => {
-                    return DaemonResponse::Error {
-                        message: format!("Failed to read config: {}", e),
-                    }
-                }
+                Err(e) => return respond_err(format!("Failed to read config: {}", e)),
             };
             match crate::guardrail::evaluate_action(&action, &target, &config.guardrails) {
                 Ok(results) => {
@@ -1773,26 +1806,20 @@ async fn process_request(
                         }),
                     }
                 }
-                Err(e) => DaemonResponse::Error {
-                    message: format!("Guardrail evaluation failed: {}", e),
-                },
+                Err(e) => respond_err(format!("Guardrail evaluation failed: {}", e)),
             }
         }
-
         DaemonRequest::GuardList => {
             let config = match state.config_snapshot() {
                 Ok(c) => c,
-                Err(e) => {
-                    return DaemonResponse::Error {
-                        message: format!("Failed to read config: {}", e),
-                    }
-                }
+                Err(e) => return respond_err(format!("Failed to read config: {}", e)),
             };
             let rules = crate::guardrail::list_active_rules(&config.guardrails);
             DaemonResponse::Ok {
                 result: serde_json::json!({ "rules": rules }),
             }
         }
+        _ => respond_err("Internal routing error: not a guard request"),
     }
 }
 
