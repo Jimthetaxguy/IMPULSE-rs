@@ -640,4 +640,211 @@ mod tests {
         );
         std::env::remove_var("IMPULSE_EMBED_ALLOW_FAKE");
     }
+
+    #[test]
+    fn test_index_succeeds_with_vector_disabled() {
+        let _guard = env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+
+        let cfg = Config {
+            retrieval_vector_enabled: false,
+            retrieval_backend: "fts".to_string(),
+            ..Config::default()
+        };
+
+        let history = vec![sample_history("vector-disabled test session")];
+        let genome = Genome::default();
+
+        let state =
+            index_memory(temp.path(), &history, &genome, &cfg, IndexScope::All, true).unwrap();
+
+        assert_eq!(state.history_count, 1);
+        assert!(!state.vector_enabled);
+        assert!(!state.vector_available);
+        assert!(
+            state
+                .backend_health
+                .iter()
+                .any(|h| h.contains("vector_backend_disabled=true")),
+            "backend health should note vector is disabled"
+        );
+
+        // FTS should still be populated.
+        let store = RetrievalStore::open(temp.path()).unwrap();
+        store.init_schema().unwrap();
+        let results = store.search_history_keyword("vector-disabled", 10).unwrap();
+        assert_eq!(results.len(), 1, "FTS search should find the entry");
+    }
+
+    #[test]
+    fn test_index_succeeds_when_embed_script_missing() {
+        let _guard = env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+
+        // Point to a nonexistent script so embedding will fail with MissingScript.
+        std::env::set_var("IMPULSE_EMBED_SCRIPT", "/tmp/nonexistent_embed_script.py");
+        let cfg = Config {
+            retrieval_vector_enabled: true,
+            retrieval_backend: "fts+vec".to_string(),
+            ..Config::default()
+        };
+
+        let history = vec![sample_history("embed-fallback session")];
+        let genome = Genome::default();
+
+        let state =
+            index_memory(temp.path(), &history, &genome, &cfg, IndexScope::All, true).unwrap();
+        std::env::remove_var("IMPULSE_EMBED_SCRIPT");
+
+        // Indexing should succeed — document stored, vector skipped.
+        assert_eq!(state.history_count, 1);
+        assert!(state.vector_enabled);
+
+        // Notes should mention the skip.
+        let has_skip_note = state
+            .notes
+            .iter()
+            .any(|n| n.contains("vector indexing skipped") || n.contains("extension unavailable"));
+        assert!(
+            has_skip_note,
+            "notes should record embedding failure: {:?}",
+            state.notes
+        );
+
+        // FTS search should still work.
+        let store = RetrievalStore::open(temp.path()).unwrap();
+        store.init_schema().unwrap();
+        let results = store.search_history_keyword("embed-fallback", 10).unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "FTS should still find entry without vectors"
+        );
+    }
+
+    #[test]
+    fn test_index_genome_without_vectors() {
+        let _guard = env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+
+        let cfg = Config {
+            retrieval_vector_enabled: false,
+            ..Config::default()
+        };
+
+        let genome = Genome {
+            decisions: vec![Decision {
+                date: Utc::now(),
+                description: "Use Rust for all new services".to_string(),
+                rationale: Some("Performance and safety".to_string()),
+                tags: vec!["architecture".to_string()],
+            }],
+            ..Genome::default()
+        };
+
+        let state =
+            index_memory(temp.path(), &[], &genome, &cfg, IndexScope::Genome, true).unwrap();
+
+        assert_eq!(state.genome_count, 1);
+        assert!(!state.vector_enabled);
+
+        // Keyword search should find the genome entry.
+        let store = RetrievalStore::open(temp.path()).unwrap();
+        store.init_schema().unwrap();
+        let results = store.search_genome_keyword("architecture", 10).unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "FTS should find genome entry without vectors"
+        );
+    }
+
+    #[test]
+    fn test_incremental_index_preserves_existing_fts() {
+        let _guard = env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+
+        let cfg = Config {
+            retrieval_vector_enabled: false,
+            ..Config::default()
+        };
+
+        let h1 = HistoryEntry {
+            session_id: "session-first".to_string(),
+            session_name: "first-run".to_string(),
+            platform: Some(Platform::ClaudeCode),
+            started_at: Utc::now() - Duration::minutes(10),
+            ended_at: Utc::now() - Duration::minutes(5),
+            summary: "Initial scaffolding of project".to_string(),
+            files_touched: vec!["main.rs".to_string()],
+            tools_used: vec!["Write".to_string()],
+        };
+
+        // First index — rebuild.
+        index_memory(
+            temp.path(),
+            &[h1.clone()],
+            &Genome::default(),
+            &cfg,
+            IndexScope::History,
+            true,
+        )
+        .unwrap();
+
+        let h2 = HistoryEntry {
+            session_id: "session-second".to_string(),
+            session_name: "second-run".to_string(),
+            platform: Some(Platform::OpenCode),
+            started_at: Utc::now() - Duration::minutes(4),
+            ended_at: Utc::now(),
+            summary: "Added error handling module".to_string(),
+            files_touched: vec!["error.rs".to_string()],
+            tools_used: vec!["Edit".to_string()],
+        };
+
+        // Second index — incremental (rebuild=false).
+        let state = index_memory(
+            temp.path(),
+            &[h1, h2],
+            &Genome::default(),
+            &cfg,
+            IndexScope::History,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(state.history_count, 2);
+
+        // Both entries should be searchable.
+        let store = RetrievalStore::open(temp.path()).unwrap();
+        store.init_schema().unwrap();
+        let r1 = store.search_history_keyword("scaffolding", 10).unwrap();
+        assert_eq!(
+            r1.len(),
+            1,
+            "first entry still searchable after incremental"
+        );
+        let r2 = store.search_history_keyword("error handling", 10).unwrap();
+        assert_eq!(r2.len(), 1, "second entry searchable after incremental");
+    }
+
+    #[test]
+    fn test_empty_inputs_produce_zero_counts() {
+        let _guard = env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+
+        let cfg = Config::default();
+        let state = index_memory(
+            temp.path(),
+            &[],
+            &Genome::default(),
+            &cfg,
+            IndexScope::All,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(state.history_count, 0);
+        assert_eq!(state.genome_count, 0);
+    }
 }

@@ -515,6 +515,11 @@ impl TerminalsView {
             .unwrap_or(false)
     }
 
+    /// Open the terminal search overlay with a pre-filled query.
+    pub fn search_terminals(&mut self, query: String) {
+        self.search.open_with_query(query);
+    }
+
     fn render_ops_roster(&mut self, ui: &mut egui::Ui, state: &SharedState) {
         ui.group(|ui| {
             ui.horizontal(|ui| {

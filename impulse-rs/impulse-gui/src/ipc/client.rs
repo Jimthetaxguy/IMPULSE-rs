@@ -155,6 +155,10 @@ impl DaemonClient {
         Ok(DaemonStatus {
             sessions: result.get("sessions").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
             active: result.get("active").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+            protocol_version: result
+                .get("protocol_version")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32),
         })
     }
 
@@ -291,6 +295,17 @@ impl DaemonClient {
         })?;
         let result = self.ok_result(resp)?;
         serde_json::from_value(result).map_err(|e| format!("parse artifact action: {}", e))
+    }
+
+    pub fn list_guard_rules(&mut self) -> Result<Vec<GuardRule>, String> {
+        let resp = self.send(&DaemonRequest::GuardList)?;
+        let result = self.ok_result(resp)?;
+        let rules = result
+            .get("rules")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(GuardRule::from_value).collect())
+            .unwrap_or_default();
+        Ok(rules)
     }
 
     // -- Session management --

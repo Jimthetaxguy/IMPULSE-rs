@@ -58,10 +58,10 @@ Before implementing, consider alternative approaches. Choose the simplest soluti
 ## Architecture
 
 **Workspace (4 crates):**
-- `impulse-rs/` — main CLI + daemon + TUI (35 modules, ~53K lines, 693 tests)
-- `impulse-rs/impulse-ops/` — operations library (shared utilities)
-- `impulse-rs/impulse-term/` — custom terminal widget (PTY + vt100 + context bridge, ~2.7K lines, 50 tests)
-- `impulse-rs/impulse-gui/` — egui native workbench (Overview, Agents, Context, Memory, Artifacts, Settings, ~13K lines, 177 tests)
+- `impulse-rs/` — main CLI + daemon + TUI (35 modules, ~53K lines, 825 tests)
+- `impulse-rs/impulse-ops/` — operations library (shared types: SupervisorAction, TerminalOpsReport, OpsSnapshot)
+- `impulse-rs/impulse-term/` — custom terminal widget (PTY + vt100 + context bridge, ~2.7K lines, 55 tests)
+- `impulse-rs/impulse-gui/` — egui native workbench (Overview, Terminals, Context, Memory, Artifacts, Settings, ~13K lines, 220 tests)
 
 **Dual mode:**
 - **Direct mode** — stateless, per-action (for hooks). Read → process → write → exit.

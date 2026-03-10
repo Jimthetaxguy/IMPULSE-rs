@@ -152,12 +152,104 @@ impl McpServer {
                     }),
                 }
             }
-            "resources/list" => serde_json::json!({ "resources": [] }),
-            "resources/read" => serde_json::json!({
-                "error": {"code": -32601, "message": "resources/read is not implemented"}
-            }),
+            "resources/list" => self.list_resources(),
+            "resources/read" => {
+                let params = request.get("params").unwrap_or(&request);
+                let uri = params.get("uri").and_then(|v| v.as_str()).unwrap_or("");
+                self.read_resource(uri)
+            }
             _ => serde_json::json!({
                 "error": {"code": -32601, "message": "Method not found"}
+            }),
+        }
+    }
+}
+
+impl McpServer {
+    /// List available Impulse resources for MCP clients.
+    fn list_resources(&self) -> serde_json::Value {
+        let base = &self.ctx.impulse_dir;
+        let mut resources = Vec::new();
+
+        // Core data files that Impulse manages.
+        let resource_defs = [
+            (
+                "impulse://genome",
+                "GENOME.md",
+                "Permanent decisions and preferences",
+                "text/markdown",
+            ),
+            (
+                "impulse://history",
+                "HISTORY.jsonl",
+                "Append-only session log",
+                "application/jsonl",
+            ),
+            (
+                "impulse://live-state",
+                "LIVE_STATE.json",
+                "Active session state (ephemeral)",
+                "application/json",
+            ),
+            (
+                "impulse://config",
+                "config.json",
+                "Runtime configuration",
+                "application/json",
+            ),
+        ];
+
+        for (uri, filename, desc, mime) in &resource_defs {
+            let path = base.join(filename);
+            if path.exists() {
+                resources.push(serde_json::json!({
+                    "uri": uri,
+                    "name": filename,
+                    "description": desc,
+                    "mimeType": mime,
+                }));
+            }
+        }
+
+        serde_json::json!({ "resources": resources })
+    }
+
+    /// Read an Impulse resource by URI.
+    fn read_resource(&self, uri: &str) -> serde_json::Value {
+        let base = &self.ctx.impulse_dir;
+
+        let filename = match uri {
+            "impulse://genome" => "GENOME.md",
+            "impulse://history" => "HISTORY.jsonl",
+            "impulse://live-state" => "LIVE_STATE.json",
+            "impulse://config" => "config.json",
+            _ => {
+                return serde_json::json!({
+                    "error": {"code": -32602, "message": format!("Unknown resource URI: {}", uri)}
+                });
+            }
+        };
+
+        let path = base.join(filename);
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                let mime = if filename.ends_with(".md") {
+                    "text/markdown"
+                } else if filename.ends_with(".jsonl") {
+                    "application/jsonl"
+                } else {
+                    "application/json"
+                };
+                serde_json::json!({
+                    "contents": [{
+                        "uri": uri,
+                        "mimeType": mime,
+                        "text": content,
+                    }]
+                })
+            }
+            Err(e) => serde_json::json!({
+                "error": {"code": -32603, "message": format!("Failed to read {}: {}", filename, e)}
             }),
         }
     }
@@ -205,5 +297,116 @@ mod tests {
             .await;
         assert!(response["content"].is_array());
         assert_ne!(response["isError"], serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_resources_list() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let impulse_dir = dir.path().to_path_buf();
+        // Create a GENOME.md and config.json so they appear in listing.
+        std::fs::write(impulse_dir.join("GENOME.md"), "# Test").unwrap();
+        std::fs::write(impulse_dir.join("config.json"), "{}").unwrap();
+
+        let server = McpServer::new(
+            Arc::new(ToolRegistry::with_defaults()),
+            ToolContext {
+                impulse_dir,
+                execution_origin: ExecutionOrigin::Test,
+                ..ToolContext::with_all_capabilities()
+            },
+        );
+        let response = server
+            .process_request(r#"{"method":"resources/list"}"#)
+            .await;
+        let resources = response["resources"].as_array().unwrap();
+        assert!(resources.len() >= 2);
+
+        let uris: Vec<&str> = resources.iter().filter_map(|r| r["uri"].as_str()).collect();
+        assert!(uris.contains(&"impulse://genome"));
+        assert!(uris.contains(&"impulse://config"));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_resources_read_genome() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let impulse_dir = dir.path().to_path_buf();
+        std::fs::write(
+            impulse_dir.join("GENOME.md"),
+            "# My Decisions\n\n- Use Rust",
+        )
+        .unwrap();
+
+        let server = McpServer::new(
+            Arc::new(ToolRegistry::with_defaults()),
+            ToolContext {
+                impulse_dir,
+                execution_origin: ExecutionOrigin::Test,
+                ..ToolContext::with_all_capabilities()
+            },
+        );
+        let response = server
+            .process_request(r#"{"method":"resources/read","params":{"uri":"impulse://genome"}}"#)
+            .await;
+        let contents = response["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0]["uri"], "impulse://genome");
+        assert_eq!(contents[0]["mimeType"], "text/markdown");
+        assert!(contents[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("My Decisions"));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_resources_read_unknown_uri() {
+        let response = test_server()
+            .process_request(
+                r#"{"method":"resources/read","params":{"uri":"impulse://nonexistent"}}"#,
+            )
+            .await;
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Unknown resource URI"));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_resources_read_missing_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let impulse_dir = dir.path().to_path_buf();
+        // Don't create GENOME.md — should get read error.
+
+        let server = McpServer::new(
+            Arc::new(ToolRegistry::with_defaults()),
+            ToolContext {
+                impulse_dir,
+                execution_origin: ExecutionOrigin::Test,
+                ..ToolContext::with_all_capabilities()
+            },
+        );
+        let response = server
+            .process_request(r#"{"method":"resources/read","params":{"uri":"impulse://genome"}}"#)
+            .await;
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Failed to read"));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_resources_list_empty_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let server = McpServer::new(
+            Arc::new(ToolRegistry::with_defaults()),
+            ToolContext {
+                impulse_dir: dir.path().to_path_buf(),
+                execution_origin: ExecutionOrigin::Test,
+                ..ToolContext::with_all_capabilities()
+            },
+        );
+        let response = server
+            .process_request(r#"{"method":"resources/list"}"#)
+            .await;
+        assert_eq!(response["resources"].as_array().unwrap().len(), 0);
     }
 }

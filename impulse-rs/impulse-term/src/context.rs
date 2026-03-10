@@ -744,6 +744,167 @@ mod tests {
         assert_eq!(result, "");
     }
 
+    // -----------------------------------------------------------------------
+    // Realistic agent output fixture tests (Loop 32)
+    // -----------------------------------------------------------------------
+
+    /// Simulates a real Claude Code session with tool calls, errors, and completions.
+    #[test]
+    fn test_fixture_claude_code_full_session() {
+        let output = r#"I'll help fix the compilation error. Let me read the file first.
+
+Read(src/daemon/mod.rs)
+
+The issue is a missing import. Let me fix it.
+
+Edit(src/daemon/mod.rs)
+
+Now let me verify the fix compiles.
+
+error: could not compile `impulse-rs` due to 2 previous errors
+
+I see there are additional errors. Let me fix those too.
+
+Edit(src/daemon/tests.rs)
+
+Write(src/daemon/helpers.rs)
+
+decision: use tokio::sync::Mutex instead of std::sync::Mutex for async compatibility
+
+Let me run the tests now.
+
+All 47 tests passed
+
+The fix is complete. I chose the async Mutex approach because the daemon handler uses .await."#;
+
+        let insights = extract_insights(AgentKind::ClaudeCode, 1, output);
+
+        // File modifications: Read + 2 Edits + 1 Write + 1 Created
+        let files: Vec<_> = insights
+            .iter()
+            .filter(|i| i.insight_type == InsightType::FileModified)
+            .map(|i| i.content.as_str())
+            .collect();
+        assert_eq!(
+            files,
+            vec![
+                "src/daemon/mod.rs",
+                "src/daemon/tests.rs",
+                "src/daemon/helpers.rs"
+            ]
+        );
+
+        // 1 error (the compile error)
+        let errors: Vec<_> = insights
+            .iter()
+            .filter(|i| i.insight_type == InsightType::ErrorEncountered)
+            .collect();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].content.contains("could not compile"));
+
+        // 2 decisions: "decision:" line + "chose" line
+        let decisions: Vec<_> = insights
+            .iter()
+            .filter(|i| i.insight_type == InsightType::DecisionMade)
+            .collect();
+        assert_eq!(decisions.len(), 2);
+        assert!(decisions[0].content.contains("tokio::sync::Mutex"));
+        assert!(decisions[1].content.contains("chose the async Mutex"));
+
+        // 1 task completion
+        let tasks: Vec<_> = insights
+            .iter()
+            .filter(|i| i.insight_type == InsightType::TaskCompleted)
+            .collect();
+        assert_eq!(tasks.len(), 1);
+        assert!(tasks[0].content.contains("47 tests passed"));
+    }
+
+    /// Simulates OpenCode output with file writes and error patterns.
+    #[test]
+    fn test_fixture_opencode_session() {
+        let output = r#"Analyzing the codebase...
+
+Wrote src/handlers/new_handler.rs
+Modified src/main.rs
+
+Running tests...
+error: Test failed at assertion on line 42
+
+Applying fix...
+Modified src/handlers/new_handler.rs
+
+Tests passed, build succeeded
+deployed to staging"#;
+
+        let insights = extract_insights(AgentKind::OpenCode, 2, output);
+
+        let files: Vec<_> = insights
+            .iter()
+            .filter(|i| i.insight_type == InsightType::FileModified)
+            .map(|i| i.content.as_str())
+            .collect();
+        assert_eq!(
+            files,
+            vec![
+                "src/handlers/new_handler.rs",
+                "src/main.rs",
+                "src/handlers/new_handler.rs",
+            ]
+        );
+
+        let errors: Vec<_> = insights
+            .iter()
+            .filter(|i| i.insight_type == InsightType::ErrorEncountered)
+            .collect();
+        assert_eq!(errors.len(), 1);
+
+        let tasks: Vec<_> = insights
+            .iter()
+            .filter(|i| i.insight_type == InsightType::TaskCompleted)
+            .collect();
+        assert_eq!(tasks.len(), 2); // "build succeeded" + "deployed"
+    }
+
+    /// Compaction detection with realistic Claude output patterns.
+    #[test]
+    fn test_fixture_compaction_detection() {
+        assert!(scan_compaction(
+            "[system] Compressing prior messages in this conversation."
+        ));
+        assert!(scan_compaction(
+            "Note: auto-compact triggered due to context limits."
+        ));
+        assert!(scan_compaction(
+            "The conversation is getting long, some earlier messages may be summarized."
+        ));
+        assert!(!scan_compaction("I'll help you fix the compilation error."));
+    }
+
+    /// Edge case: Claude Code output with Read() (not a modification).
+    #[test]
+    fn test_fixture_read_not_write() {
+        let output = "Read(src/main.rs)\nSome analysis here\n";
+        let insights = extract_insights(AgentKind::ClaudeCode, 1, output);
+        // Read() should NOT be treated as a file modification — only Write/Edit/Created
+        let files: Vec<_> = insights
+            .iter()
+            .filter(|i| i.insight_type == InsightType::FileModified)
+            .collect();
+        assert_eq!(files.len(), 0);
+    }
+
+    /// Edge case: mixed agent output with no actionable patterns.
+    #[test]
+    fn test_fixture_no_insights_from_noise() {
+        let output = r#"Let me think about this...
+The function takes two parameters.
+Here's my analysis of the code structure.
+I recommend we refactor this module."#;
+        let insights = extract_insights(AgentKind::ClaudeCode, 1, output);
+        assert!(insights.is_empty());
+    }
+
     #[test]
     fn test_injection_wrapping_claude() {
         // We can't easily test ContextBridge without a real backend, but we can

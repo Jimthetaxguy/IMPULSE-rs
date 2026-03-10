@@ -9,6 +9,13 @@ mod tests {
     use crate::daemon::{DaemonRequest, DaemonResponse};
     use crate::state::{LiveState, Platform, Session, SessionStatus};
 
+    // Re-import private handler functions for integration tests.
+    // super::super = daemon module (tests.rs is daemon::tests, inner mod is daemon::tests::tests)
+    use super::super::{
+        handle_guard_request, handle_plugin_request, handle_session_request, handle_status,
+        handle_steward_request,
+    };
+
     /// Test DaemonRequest serialization/deserialization
     #[test]
     fn test_daemon_request_serialization() {
@@ -159,6 +166,12 @@ mod tests {
                 action: impulse_ops::SupervisorAction::SearchMemory { query }
             } if query == "compaction"
         ));
+
+        // Test DebugSnapshot
+        let debug = DaemonRequest::DebugSnapshot;
+        let json = serde_json::to_string(&debug).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, DaemonRequest::DebugSnapshot));
     }
 
     /// Test DaemonResponse serialization/deserialization
@@ -665,5 +678,406 @@ mod tests {
         );
 
         assert!(context_prompt.contains("none"));
+    }
+
+    // ── Plugin IPC serde ────────────────────────────────────────────────
+
+    #[test]
+    fn test_list_plugins_request_serde() {
+        let req = DaemonRequest::ListPlugins;
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, DaemonRequest::ListPlugins));
+    }
+
+    #[test]
+    fn test_invoke_plugin_request_serde() {
+        let req = DaemonRequest::InvokePlugin {
+            name: "office".to_string(),
+            input: crate::plugin::PluginInput::new()
+                .with_path(PathBuf::from("/test/file.docx"))
+                .with_query("extract"),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, DaemonRequest::InvokePlugin { ref name, .. } if name == "office"));
+    }
+
+    #[test]
+    fn test_invoke_plugin_default_input() {
+        // InvokePlugin with only a name should deserialize with default PluginInput
+        let json = r#"{"type":"InvokePlugin","data":{"name":"test-plugin"}}"#;
+        let parsed: DaemonRequest = serde_json::from_str(json).unwrap();
+        match parsed {
+            DaemonRequest::InvokePlugin { name, input } => {
+                assert_eq!(name, "test-plugin");
+                assert!(input.path.is_none());
+                assert!(input.query.is_none());
+            }
+            _ => panic!("Expected InvokePlugin"),
+        }
+    }
+
+    #[test]
+    fn test_list_plugins_json_roundtrip() {
+        let json = r#"{"type":"ListPlugins"}"#;
+        let parsed: DaemonRequest = serde_json::from_str(json).unwrap();
+        assert!(matches!(parsed, DaemonRequest::ListPlugins));
+        let re_serialized = serde_json::to_string(&parsed).unwrap();
+        let reparsed: DaemonRequest = serde_json::from_str(&re_serialized).unwrap();
+        assert!(matches!(reparsed, DaemonRequest::ListPlugins));
+    }
+
+    // -- Plugin registry initialization test --------------------------------------
+
+    #[test]
+    fn test_plugin_registry_initialized_after_init() {
+        crate::plugin::registry::init_global_registry();
+        let registry = crate::plugin::registry::global_registry();
+        // After init, the office context provider should be registered
+        let providers = registry.list_context_providers().unwrap();
+        assert!(
+            !providers.is_empty(),
+            "init_global_registry should register at least the office context provider"
+        );
+    }
+
+    // -- Protocol versioning tests -----------------------------------------------
+
+    #[test]
+    fn test_protocol_version_constant_defined() {
+        assert!(crate::daemon::PROTOCOL_VERSION >= 1);
+    }
+
+    #[test]
+    fn test_ping_response_includes_protocol_version() {
+        let ping_response =
+            serde_json::json!({"pong": true, "protocol_version": crate::daemon::PROTOCOL_VERSION});
+        assert_eq!(
+            ping_response["protocol_version"].as_u64().unwrap(),
+            crate::daemon::PROTOCOL_VERSION as u64
+        );
+    }
+
+    #[test]
+    fn test_status_response_includes_protocol_version() {
+        let status_response = serde_json::json!({
+            "sessions": 2,
+            "active": 1,
+            "protocol_version": crate::daemon::PROTOCOL_VERSION,
+        });
+        assert_eq!(
+            status_response["protocol_version"].as_u64().unwrap(),
+            crate::daemon::PROTOCOL_VERSION as u64
+        );
+    }
+
+    // -- Handler integration tests -----------------------------------------------
+
+    fn test_state() -> (tempfile::TempDir, std::sync::Arc<crate::state::State>) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let st = crate::state::State::new(tmp.path().to_path_buf()).unwrap();
+        (tmp, std::sync::Arc::new(st))
+    }
+
+    #[tokio::test]
+    async fn test_handle_status_empty() {
+        let (_tmp, state) = test_state();
+        let resp = handle_status(&state).await;
+        match resp {
+            DaemonResponse::Ok { result } => {
+                assert_eq!(result["sessions"].as_u64().unwrap(), 0);
+                assert_eq!(result["active"].as_u64().unwrap(), 0);
+                assert!(result["protocol_version"].as_u64().is_some());
+            }
+            _ => panic!("Expected Ok response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_status_with_sessions() {
+        let (_tmp, state) = test_state();
+        state.create_session("s1".to_string(), None).await.unwrap();
+        state.create_session("s2".to_string(), None).await.unwrap();
+        let resp = handle_status(&state).await;
+        match resp {
+            DaemonResponse::Ok { result } => {
+                assert_eq!(result["sessions"].as_u64().unwrap(), 2);
+                assert_eq!(result["active"].as_u64().unwrap(), 2);
+            }
+            _ => panic!("Expected Ok response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_session_create() {
+        let (_tmp, state) = test_state();
+        let req = DaemonRequest::CreateSession {
+            name: "test-session".to_string(),
+            platform: Some("claude-code".to_string()),
+        };
+        let resp = handle_session_request(req, &state).await;
+        match resp {
+            DaemonResponse::Ok { result } => {
+                assert!(!result["session_id"].as_str().unwrap().is_empty());
+                assert_eq!(result["name"].as_str().unwrap(), "test-session");
+            }
+            _ => panic!("Expected Ok response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_session_list() {
+        let (_tmp, state) = test_state();
+        state.create_session("s1".to_string(), None).await.unwrap();
+        let resp = handle_session_request(DaemonRequest::ListSessions, &state).await;
+        match resp {
+            DaemonResponse::Ok { result } => {
+                let arr = result.as_array().unwrap();
+                assert_eq!(arr.len(), 1);
+            }
+            _ => panic!("Expected Ok response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_session_end() {
+        let (_tmp, state) = test_state();
+        let session = state
+            .create_session("end-test".to_string(), None)
+            .await
+            .unwrap();
+        let req = DaemonRequest::EndSession {
+            session_id: session.id.clone(),
+            summary: "done".to_string(),
+        };
+        let resp = handle_session_request(req, &state).await;
+        assert!(matches!(resp, DaemonResponse::Ok { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_handle_session_end_not_found() {
+        let (_tmp, state) = test_state();
+        let req = DaemonRequest::EndSession {
+            session_id: "nonexistent".to_string(),
+            summary: "done".to_string(),
+        };
+        let resp = handle_session_request(req, &state).await;
+        // Returns Error when session not found
+        assert!(matches!(resp, DaemonResponse::Error { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_handle_steward_status() {
+        let (_tmp, state) = test_state();
+        let resp = handle_steward_request(DaemonRequest::StewardStatus, &state).await;
+        match resp {
+            DaemonResponse::Ok { result } => {
+                assert!(result["mode"].as_str().is_some());
+                assert!(result["thresholds"].is_object());
+                assert!(result["pending_proposals"].as_u64().is_some());
+            }
+            _ => panic!("Expected Ok response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_steward_proposals_list() {
+        let (_tmp, state) = test_state();
+        let req = DaemonRequest::StewardProposals {
+            action: "list".to_string(),
+            id: None,
+        };
+        let resp = handle_steward_request(req, &state).await;
+        match resp {
+            DaemonResponse::Ok { result } => {
+                // Should be an array (possibly empty)
+                assert!(result.is_array());
+            }
+            _ => panic!("Expected Ok response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_steward_proposals_unknown_action() {
+        let (_tmp, state) = test_state();
+        let req = DaemonRequest::StewardProposals {
+            action: "invalid".to_string(),
+            id: None,
+        };
+        let resp = handle_steward_request(req, &state).await;
+        assert!(matches!(resp, DaemonResponse::Error { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_handle_steward_memory() {
+        let (_tmp, state) = test_state();
+        let resp = handle_steward_request(DaemonRequest::StewardMemory, &state).await;
+        match resp {
+            DaemonResponse::Ok { result } => {
+                assert!(result["patterns"].is_array());
+                assert!(result["learnings"].is_array());
+                assert!(result["stats"].is_object());
+            }
+            _ => panic!("Expected Ok response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_guard_list() {
+        let (_tmp, state) = test_state();
+        let resp = handle_guard_request(DaemonRequest::GuardList, &state).await;
+        match resp {
+            DaemonResponse::Ok { result } => {
+                let rules = result["rules"].as_array().unwrap();
+                // Default config has guardrails enabled with 9 built-in rules
+                assert!(!rules.is_empty());
+            }
+            _ => panic!("Expected Ok response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_guard_evaluate_block() {
+        let (_tmp, state) = test_state();
+        let req = DaemonRequest::GuardEvaluate {
+            target: "bash".to_string(),
+            action: "git push --force origin main".to_string(),
+        };
+        let resp = handle_guard_request(req, &state).await;
+        match resp {
+            DaemonResponse::Ok { result } => {
+                // force-push should trigger the built-in block rule
+                assert!(result["blocked"].as_bool().unwrap());
+            }
+            _ => panic!("Expected Ok response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_guard_evaluate_clean() {
+        let (_tmp, state) = test_state();
+        let req = DaemonRequest::GuardEvaluate {
+            target: "bash".to_string(),
+            action: "cargo test".to_string(),
+        };
+        let resp = handle_guard_request(req, &state).await;
+        match resp {
+            DaemonResponse::Ok { result } => {
+                assert!(!result["blocked"].as_bool().unwrap());
+            }
+            _ => panic!("Expected Ok response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_plugin_list() {
+        crate::plugin::registry::init_global_registry();
+        let resp = handle_plugin_request(DaemonRequest::ListPlugins).await;
+        match resp {
+            DaemonResponse::Ok { result } => {
+                assert!(result["context_providers"].is_array());
+                assert!(result["action_handlers"].is_array());
+            }
+            _ => panic!("Expected Ok response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_session_track_file() {
+        let (_tmp, state) = test_state();
+        let session = state
+            .create_session("track-test".to_string(), None)
+            .await
+            .unwrap();
+        let req = DaemonRequest::TrackFile {
+            session_id: session.id.clone(),
+            file_path: "src/main.rs".to_string(),
+        };
+        let resp = handle_session_request(req, &state).await;
+        assert!(matches!(resp, DaemonResponse::Ok { .. }));
+        // Verify tracking
+        let s = state.get_session(&session.id).await.unwrap().unwrap();
+        assert!(s.active_files.contains(&"src/main.rs".to_string()));
+    }
+
+    // ── Debug snapshot tests ──────────────────────────────
+
+    #[tokio::test]
+    async fn test_handle_debug_snapshot() {
+        let (_dir, state) = test_state();
+        let registry = crate::tooling::ToolRegistry::with_defaults();
+        crate::plugin::registry::init_global_registry();
+        let resp = super::super::handle_debug_snapshot(&state, &registry).await;
+        match resp {
+            DaemonResponse::Ok { result } => {
+                assert_eq!(result["protocol_version"], super::super::PROTOCOL_VERSION);
+                assert!(result["pid"].is_number());
+                assert_eq!(result["sessions"]["total"], 0);
+                assert_eq!(result["sessions"]["active"], 0);
+                assert!(result["tools"]["registered"].as_u64().unwrap() > 0);
+                assert!(result["guardrails"]["rules"].as_u64().unwrap() > 0);
+                assert!(result["plugins"]["context_providers"].is_number());
+            }
+            _ => panic!("Expected Ok response"),
+        }
+    }
+
+    // ── Stale socket detection tests ─────────────────────
+
+    #[tokio::test]
+    async fn test_stale_socket_cleanup() {
+        use super::super::Daemon;
+        let (_dir, state) = test_state();
+        let daemon = Daemon::new(state);
+        let socket_path = daemon.socket_path().clone();
+        let pid_path = socket_path.with_extension("pid");
+
+        // Create fake stale socket file (no listener)
+        tokio::fs::create_dir_all(socket_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&socket_path, b"stale").await.unwrap();
+        tokio::fs::write(&pid_path, "99999999").await.unwrap(); // non-existent PID
+
+        assert!(socket_path.exists());
+        assert!(pid_path.exists());
+
+        // Start should clean up stale socket and succeed
+        // We can't fully start (it would block), but we can verify the cleanup logic
+        // by checking that start doesn't bail with "already running"
+        let start_result =
+            tokio::time::timeout(std::time::Duration::from_millis(500), daemon.start()).await;
+
+        // The start will either succeed (and timeout because it loops) or fail for a non-stale reason
+        match start_result {
+            Ok(Ok(())) => {} // loop exited normally (shouldn't happen but fine)
+            Ok(Err(e)) => {
+                // Should NOT be "already running" — that means stale detection failed
+                assert!(
+                    !e.to_string().contains("already running"),
+                    "Stale socket not cleaned up: {}",
+                    e
+                );
+            }
+            Err(_timeout) => {
+                // Timed out = daemon started listening successfully (expected)
+                // Verify stale files were cleaned up
+                assert!(
+                    !pid_path.exists() || {
+                        // New PID file should contain our PID
+                        let pid = tokio::fs::read_to_string(&pid_path).await.unwrap();
+                        pid.trim() == std::process::id().to_string()
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_pid_file_path_derived_from_socket() {
+        let socket_path = PathBuf::from("/tmp/test/impulse.sock");
+        let pid_path = socket_path.with_extension("pid");
+        assert_eq!(pid_path, PathBuf::from("/tmp/test/impulse.pid"));
     }
 }

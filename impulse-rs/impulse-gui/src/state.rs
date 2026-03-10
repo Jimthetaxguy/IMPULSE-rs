@@ -11,13 +11,168 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-use crate::ipc::{DaemonClient, DaemonStatus, Genome, HistoryEntry, SearchResult, Session};
+use crate::ipc::{
+    DaemonClient, DaemonStatus, Genome, GuardRule, HistoryEntry, SearchResult, Session,
+    EXPECTED_PROTOCOL_VERSION,
+};
 
-const STATUS_POLL: Duration = Duration::from_secs(2);
-const HISTORY_POLL: Duration = Duration::from_secs(10);
-const GENOME_POLL: Duration = Duration::from_secs(30);
-const OPS_RECONCILE: Duration = Duration::from_secs(15);
-const RECONNECT_DELAY: Duration = Duration::from_secs(5);
+const DEFAULT_POLL_INTERVAL: u64 = 2;
+const DEFAULT_HISTORY_POLL: u64 = 10;
+const DEFAULT_GENOME_POLL: u64 = 30;
+const DEFAULT_OPS_RECONCILE: u64 = 15;
+const DEFAULT_RECONNECT_DELAY: u64 = 5;
+const DEFAULT_CONTEXT_TICK_INTERVAL: u64 = 3;
+const DEFAULT_SEARCH_LIMIT: usize = 20;
+const DEFAULT_MAX_HISTORY_ENTRIES: usize = 100;
+const DEFAULT_CACHE_TTL: u64 = 60;
+
+// ---------------------------------------------------------------------------
+// RuntimeSettings — typed values from GlobalConfig.settings HashMap
+// ---------------------------------------------------------------------------
+
+/// Parsed runtime settings derived from the key-value settings map.
+/// Provides typed access with defaults for all 20 GUI settings.
+#[derive(Debug, Clone)]
+pub struct RuntimeSettings {
+    // Performance
+    pub poll_interval_secs: u64,
+    pub cache_ttl_secs: u64,
+    pub max_history_entries: usize,
+    pub max_terminal_scrollback: usize,
+    // Search
+    pub search_limit: usize,
+    pub search_threshold: u32,
+    pub search_include_archived: bool,
+    // Injection
+    pub inject_mode: String,
+    pub inject_explain: bool,
+    pub inject_max_tokens: usize,
+    pub inject_interval_secs: u64,
+    // Agent
+    pub agent_provider: String,
+    pub agent_model: String,
+    pub agent_harness: String,
+    pub agent_max_tokens: usize,
+    // Stewardship
+    pub stewardship_mode: String,
+    pub stewardship_threshold_surgical: u32,
+    pub stewardship_threshold_thoughtful: u32,
+    pub stewardship_threshold_emergency: u32,
+}
+
+impl Default for RuntimeSettings {
+    fn default() -> Self {
+        Self {
+            poll_interval_secs: DEFAULT_POLL_INTERVAL,
+            cache_ttl_secs: DEFAULT_CACHE_TTL,
+            max_history_entries: DEFAULT_MAX_HISTORY_ENTRIES,
+            max_terminal_scrollback: 10000,
+            search_limit: DEFAULT_SEARCH_LIMIT,
+            search_threshold: 50,
+            search_include_archived: false,
+            inject_mode: "review".to_string(),
+            inject_explain: false,
+            inject_max_tokens: 2048,
+            inject_interval_secs: DEFAULT_CONTEXT_TICK_INTERVAL,
+            agent_provider: "anthropic".to_string(),
+            agent_model: "claude-sonnet-4-20250514".to_string(),
+            agent_harness: "claude-code".to_string(),
+            agent_max_tokens: 4096,
+            stewardship_mode: "review".to_string(),
+            stewardship_threshold_surgical: 55,
+            stewardship_threshold_thoughtful: 70,
+            stewardship_threshold_emergency: 85,
+        }
+    }
+}
+
+impl RuntimeSettings {
+    /// Parse settings from a key-value HashMap (as stored in GlobalConfig).
+    pub fn from_map(map: &std::collections::HashMap<String, String>) -> Self {
+        let mut s = Self::default();
+        if let Some(v) = map.get("poll_interval_secs").and_then(|v| v.parse().ok()) {
+            s.poll_interval_secs = v;
+        }
+        if let Some(v) = map.get("cache_ttl_secs").and_then(|v| v.parse().ok()) {
+            s.cache_ttl_secs = v;
+        }
+        if let Some(v) = map.get("max_history_entries").and_then(|v| v.parse().ok()) {
+            s.max_history_entries = v;
+        }
+        if let Some(v) = map
+            .get("max_terminal_scrollback")
+            .and_then(|v| v.parse().ok())
+        {
+            s.max_terminal_scrollback = v;
+        }
+        if let Some(v) = map.get("search_limit").and_then(|v| v.parse().ok()) {
+            s.search_limit = v;
+        }
+        if let Some(v) = map.get("search_threshold").and_then(|v| v.parse().ok()) {
+            s.search_threshold = v;
+        }
+        if let Some(v) = map.get("search_include_archived") {
+            s.search_include_archived = v == "true";
+        }
+        if let Some(v) = map.get("inject_mode") {
+            s.inject_mode = v.clone();
+        }
+        if let Some(v) = map.get("inject_explain") {
+            s.inject_explain = v == "true";
+        }
+        if let Some(v) = map.get("inject_max_tokens").and_then(|v| v.parse().ok()) {
+            s.inject_max_tokens = v;
+        }
+        if let Some(v) = map.get("inject_interval_secs").and_then(|v| v.parse().ok()) {
+            s.inject_interval_secs = v;
+        }
+        if let Some(v) = map.get("agent_provider") {
+            s.agent_provider = v.clone();
+        }
+        if let Some(v) = map.get("agent_model") {
+            s.agent_model = v.clone();
+        }
+        if let Some(v) = map.get("agent_harness") {
+            s.agent_harness = v.clone();
+        }
+        if let Some(v) = map.get("agent_max_tokens").and_then(|v| v.parse().ok()) {
+            s.agent_max_tokens = v;
+        }
+        if let Some(v) = map.get("stewardship_mode") {
+            s.stewardship_mode = v.clone();
+        }
+        if let Some(v) = map
+            .get("stewardship_threshold_surgical")
+            .and_then(|v| v.parse().ok())
+        {
+            s.stewardship_threshold_surgical = v;
+        }
+        if let Some(v) = map
+            .get("stewardship_threshold_thoughtful")
+            .and_then(|v| v.parse().ok())
+        {
+            s.stewardship_threshold_thoughtful = v;
+        }
+        if let Some(v) = map
+            .get("stewardship_threshold_emergency")
+            .and_then(|v| v.parse().ok())
+        {
+            s.stewardship_threshold_emergency = v;
+        }
+        s
+    }
+
+    /// Duration for the status polling interval.
+    #[allow(dead_code)]
+    pub fn status_poll(&self) -> Duration {
+        Duration::from_secs(self.poll_interval_secs.max(1))
+    }
+
+    /// Duration for the context injection tick interval.
+    pub fn context_tick_interval(&self) -> Duration {
+        Duration::from_secs(self.inject_interval_secs.max(1))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionStatus {
@@ -75,6 +230,16 @@ pub struct SharedState {
     pub supervisor_permissions: Option<impulse_ops::SupervisorPermissionState>,
     pub task_notices: Vec<TaskNotice>,
     pub daemon_auto_start: DaemonAutoStartState,
+    /// Runtime settings parsed from GlobalConfig — affects polling, search, injection.
+    pub runtime_settings: RuntimeSettings,
+    /// Active guardrail rules (polled from daemon).
+    pub guard_rules: Vec<GuardRule>,
+    /// Last ping round-trip time (measures IPC latency).
+    pub last_ping_rtt: Option<Duration>,
+    /// Count of disconnects since GUI started.
+    pub disconnect_count: u32,
+    /// Recent signal log snapshot (synced from SignalBus each frame).
+    pub signal_log: Vec<crate::widgets::signal_bus::SignalLogEntry>,
 }
 
 impl Default for SharedState {
@@ -97,6 +262,11 @@ impl Default for SharedState {
             supervisor_permissions: None,
             task_notices: Vec::new(),
             daemon_auto_start: DaemonAutoStartState::NotAttempted,
+            runtime_settings: RuntimeSettings::default(),
+            guard_rules: Vec::new(),
+            last_ping_rtt: None,
+            disconnect_count: 0,
+            signal_log: Vec::new(),
         }
     }
 }
@@ -144,6 +314,8 @@ pub enum PollerCommand {
         session_id: String,
         file_path: String,
     },
+    /// Settings changed — update runtime settings in SharedState.
+    UpdateSettings(RuntimeSettings),
     Shutdown,
 }
 
@@ -157,13 +329,18 @@ pub enum PollerEvent {
 
 pub fn start_poller(
     ctx: egui::Context,
+    initial_settings: RuntimeSettings,
 ) -> (
     StateHandle,
     std::sync::mpsc::Sender<PollerCommand>,
     std::sync::mpsc::Receiver<PollerEvent>,
     JoinHandle<()>,
 ) {
-    let state: StateHandle = Arc::new(Mutex::new(SharedState::default()));
+    let initial_state = SharedState {
+        runtime_settings: initial_settings,
+        ..Default::default()
+    };
+    let state: StateHandle = Arc::new(Mutex::new(initial_state));
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<PollerCommand>();
     let (evt_tx, evt_rx) = std::sync::mpsc::channel::<PollerEvent>();
 
@@ -185,10 +362,23 @@ fn poller_loop(
     ctx: egui::Context,
 ) {
     let mut client = DaemonClient::discover();
-    let mut last_status = Instant::now() - STATUS_POLL;
-    let mut last_history = Instant::now() - HISTORY_POLL;
-    let mut last_genome = Instant::now() - GENOME_POLL;
-    let mut last_ops_reconcile = Instant::now() - OPS_RECONCILE;
+
+    // Read initial settings from SharedState.
+    let initial_settings = state
+        .lock()
+        .ok()
+        .map(|s| s.runtime_settings.clone())
+        .unwrap_or_default();
+    let mut status_poll = Duration::from_secs(initial_settings.poll_interval_secs.max(1));
+    let mut history_poll = Duration::from_secs(DEFAULT_HISTORY_POLL);
+    let mut genome_poll = Duration::from_secs(DEFAULT_GENOME_POLL);
+    let ops_reconcile = Duration::from_secs(DEFAULT_OPS_RECONCILE);
+    let reconnect_delay = Duration::from_secs(DEFAULT_RECONNECT_DELAY);
+
+    let mut last_status = Instant::now() - status_poll;
+    let mut last_history = Instant::now() - history_poll;
+    let mut last_genome = Instant::now() - genome_poll;
+    let mut last_ops_reconcile = Instant::now() - ops_reconcile;
     let mut connected = false;
     let mut memory_view_active = false;
     let mut daemon_process: Option<Child> = None;
@@ -206,10 +396,10 @@ fn poller_loop(
                 return;
             }
             Ok(PollerCommand::Refresh) => {
-                last_status = Instant::now() - STATUS_POLL;
-                last_history = Instant::now() - HISTORY_POLL;
-                last_genome = Instant::now() - GENOME_POLL;
-                last_ops_reconcile = Instant::now() - OPS_RECONCILE;
+                last_status = Instant::now() - status_poll;
+                last_history = Instant::now() - history_poll;
+                last_genome = Instant::now() - genome_poll;
+                last_ops_reconcile = Instant::now() - ops_reconcile;
             }
             Ok(PollerCommand::Search(query)) => {
                 run_search(&mut client, &state, &query);
@@ -320,8 +510,8 @@ fn poller_loop(
             Ok(PollerCommand::SetMemoryView { active }) => {
                 memory_view_active = active;
                 if active {
-                    last_history = Instant::now() - HISTORY_POLL;
-                    last_genome = Instant::now() - GENOME_POLL;
+                    last_history = Instant::now() - history_poll;
+                    last_genome = Instant::now() - genome_poll;
                 }
             }
             Ok(PollerCommand::CreateTabSession {
@@ -372,6 +562,15 @@ fn poller_loop(
                         log::debug!("TrackFile failed for {}: {}", session_id, err);
                     }
                 }
+            }
+            Ok(PollerCommand::UpdateSettings(new_settings)) => {
+                status_poll = Duration::from_secs(new_settings.poll_interval_secs.max(1));
+                history_poll = Duration::from_secs(DEFAULT_HISTORY_POLL);
+                genome_poll = Duration::from_secs(DEFAULT_GENOME_POLL);
+                if let Ok(mut shared) = state.lock() {
+                    shared.runtime_settings = new_settings;
+                }
+                log::info!("Runtime settings updated (poll={}s)", status_poll.as_secs());
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 log::info!("Poller command channel closed");
@@ -440,10 +639,15 @@ fn poller_loop(
         }
 
         let now = Instant::now();
-        if !connected || now.duration_since(last_status) >= STATUS_POLL {
+        if !connected || now.duration_since(last_status) >= status_poll {
             set_connection(&state, ConnectionStatus::Connecting);
+            let ping_start = Instant::now();
             match client.ping() {
                 Ok(true) => {
+                    let rtt = ping_start.elapsed();
+                    if let Ok(mut shared) = state.lock() {
+                        shared.last_ping_rtt = Some(rtt);
+                    }
                     if !connected {
                         connected = true;
                         set_auto_start(&state, DaemonAutoStartState::Running);
@@ -454,11 +658,13 @@ fn poller_loop(
                         );
                         refresh_connected(&mut client, &state, memory_view_active);
                         last_ops_reconcile = now;
+                        // Check protocol version after first connect
+                        check_protocol_version(&state);
                     }
                     set_connection(&state, ConnectionStatus::Connected);
                     refresh_status(&mut client, &state);
                     refresh_ops_delta(&mut client, &state);
-                    if now.duration_since(last_ops_reconcile) >= OPS_RECONCILE {
+                    if now.duration_since(last_ops_reconcile) >= ops_reconcile {
                         refresh_ops_full(&mut client, &state);
                         last_ops_reconcile = now;
                     }
@@ -479,16 +685,18 @@ fn poller_loop(
                     if let Ok(mut shared) = state.lock() {
                         shared.next_ops_seq = None;
                         shared.supervisor_permissions = None;
+                        shared.last_ping_rtt = None;
+                        shared.disconnect_count += 1;
                     }
                     ctx.request_repaint();
-                    thread::sleep(RECONNECT_DELAY);
+                    thread::sleep(reconnect_delay);
                     last_status = now;
                     continue;
                 }
             }
         }
 
-        if connected && memory_view_active && now.duration_since(last_history) >= HISTORY_POLL {
+        if connected && memory_view_active && now.duration_since(last_history) >= history_poll {
             if let Ok(entries) = client.list_history() {
                 if let Ok(mut shared) = state.lock() {
                     shared.history = entries;
@@ -498,7 +706,7 @@ fn poller_loop(
             last_history = now;
         }
 
-        if connected && memory_view_active && now.duration_since(last_genome) >= GENOME_POLL {
+        if connected && memory_view_active && now.duration_since(last_genome) >= genome_poll {
             if let Ok(genome) = client.read_genome() {
                 if let Ok(mut shared) = state.lock() {
                     shared.genome = Some(genome);
@@ -516,6 +724,7 @@ fn refresh_connected(client: &mut DaemonClient, state: &StateHandle, include_mem
     refresh_status(client, state);
     refresh_ops_full(client, state);
     refresh_supervisor_permissions(client, state);
+    refresh_guard_rules(client, state);
     if include_memory {
         if let Ok(entries) = client.list_history() {
             if let Ok(mut shared) = state.lock() {
@@ -593,6 +802,43 @@ fn push_notice(state: &StateHandle, level: TaskNoticeLevel, message: String) {
     }
 }
 
+fn check_protocol_version(state: &StateHandle) {
+    if let Ok(shared) = state.lock() {
+        if let Some(ref status) = shared.daemon_status {
+            match status.protocol_version {
+                Some(v) if v != EXPECTED_PROTOCOL_VERSION => {
+                    drop(shared);
+                    push_notice(
+                        state,
+                        TaskNoticeLevel::Warning,
+                        format!(
+                            "Protocol version mismatch: daemon v{}, GUI expects v{}. Consider updating.",
+                            v, EXPECTED_PROTOCOL_VERSION
+                        ),
+                    );
+                }
+                None => {
+                    drop(shared);
+                    push_notice(
+                        state,
+                        TaskNoticeLevel::Info,
+                        "Daemon does not report protocol version (older build).".to_string(),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn refresh_guard_rules(client: &mut DaemonClient, state: &StateHandle) {
+    if let Ok(rules) = client.list_guard_rules() {
+        if let Ok(mut shared) = state.lock() {
+            shared.guard_rules = rules;
+        }
+    }
+}
+
 fn run_search(client: &mut DaemonClient, state: &StateHandle, query: &str) {
     if let Ok(mut shared) = state.lock() {
         shared.search_in_progress = true;
@@ -612,5 +858,158 @@ fn run_search(client: &mut DaemonClient, state: &StateHandle, query: &str) {
                 shared.error = Some(format!("Search failed: {}", err));
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_runtime_settings_default() {
+        let s = RuntimeSettings::default();
+        assert_eq!(s.poll_interval_secs, DEFAULT_POLL_INTERVAL);
+        assert_eq!(s.max_history_entries, DEFAULT_MAX_HISTORY_ENTRIES);
+        assert_eq!(s.search_limit, DEFAULT_SEARCH_LIMIT);
+        assert_eq!(s.inject_interval_secs, DEFAULT_CONTEXT_TICK_INTERVAL);
+        assert!(!s.inject_explain);
+        assert!(!s.search_include_archived);
+    }
+
+    #[test]
+    fn test_runtime_settings_from_empty_map() {
+        let map = std::collections::HashMap::new();
+        let s = RuntimeSettings::from_map(&map);
+        // All defaults should apply.
+        assert_eq!(s.poll_interval_secs, DEFAULT_POLL_INTERVAL);
+        assert_eq!(s.agent_provider, "anthropic");
+    }
+
+    #[test]
+    fn test_runtime_settings_from_map_overrides() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("poll_interval_secs".to_string(), "5".to_string());
+        map.insert("search_limit".to_string(), "50".to_string());
+        map.insert("inject_explain".to_string(), "true".to_string());
+        map.insert("agent_provider".to_string(), "openai".to_string());
+        map.insert(
+            "stewardship_threshold_emergency".to_string(),
+            "95".to_string(),
+        );
+
+        let s = RuntimeSettings::from_map(&map);
+        assert_eq!(s.poll_interval_secs, 5);
+        assert_eq!(s.search_limit, 50);
+        assert!(s.inject_explain);
+        assert_eq!(s.agent_provider, "openai");
+        assert_eq!(s.stewardship_threshold_emergency, 95);
+        // Unset values keep defaults.
+        assert_eq!(s.max_history_entries, DEFAULT_MAX_HISTORY_ENTRIES);
+    }
+
+    #[test]
+    fn test_runtime_settings_invalid_parse_uses_default() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("poll_interval_secs".to_string(), "not_a_number".to_string());
+        map.insert("search_limit".to_string(), "".to_string());
+
+        let s = RuntimeSettings::from_map(&map);
+        // Invalid parse falls back to default.
+        assert_eq!(s.poll_interval_secs, DEFAULT_POLL_INTERVAL);
+        assert_eq!(s.search_limit, DEFAULT_SEARCH_LIMIT);
+    }
+
+    #[test]
+    fn test_status_poll_duration() {
+        let mut s = RuntimeSettings::default();
+        s.poll_interval_secs = 10;
+        assert_eq!(s.status_poll(), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn test_status_poll_minimum_one_second() {
+        let mut s = RuntimeSettings::default();
+        s.poll_interval_secs = 0;
+        assert_eq!(s.status_poll(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_context_tick_interval_duration() {
+        let mut s = RuntimeSettings::default();
+        s.inject_interval_secs = 15;
+        assert_eq!(s.context_tick_interval(), Duration::from_secs(15));
+    }
+
+    #[test]
+    fn test_context_tick_minimum_one_second() {
+        let mut s = RuntimeSettings::default();
+        s.inject_interval_secs = 0;
+        assert_eq!(s.context_tick_interval(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_shared_state_includes_settings() {
+        let shared = SharedState::default();
+        assert_eq!(
+            shared.runtime_settings.poll_interval_secs,
+            DEFAULT_POLL_INTERVAL
+        );
+    }
+
+    #[test]
+    fn test_runtime_settings_toggle_fields() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("search_include_archived".to_string(), "true".to_string());
+        map.insert("inject_explain".to_string(), "false".to_string());
+
+        let s = RuntimeSettings::from_map(&map);
+        assert!(s.search_include_archived);
+        assert!(!s.inject_explain);
+    }
+
+    #[test]
+    fn test_runtime_settings_all_int_fields() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("cache_ttl_secs".to_string(), "120".to_string());
+        map.insert("max_terminal_scrollback".to_string(), "25000".to_string());
+        map.insert("search_threshold".to_string(), "75".to_string());
+        map.insert("inject_max_tokens".to_string(), "3000".to_string());
+        map.insert("agent_max_tokens".to_string(), "6000".to_string());
+        map.insert(
+            "stewardship_threshold_surgical".to_string(),
+            "40".to_string(),
+        );
+        map.insert(
+            "stewardship_threshold_thoughtful".to_string(),
+            "65".to_string(),
+        );
+
+        let s = RuntimeSettings::from_map(&map);
+        assert_eq!(s.cache_ttl_secs, 120);
+        assert_eq!(s.max_terminal_scrollback, 25000);
+        assert_eq!(s.search_threshold, 75);
+        assert_eq!(s.inject_max_tokens, 3000);
+        assert_eq!(s.agent_max_tokens, 6000);
+        assert_eq!(s.stewardship_threshold_surgical, 40);
+        assert_eq!(s.stewardship_threshold_thoughtful, 65);
+    }
+
+    #[test]
+    fn test_runtime_settings_all_string_fields() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("inject_mode".to_string(), "auto".to_string());
+        map.insert("agent_model".to_string(), "gpt-4o".to_string());
+        map.insert("agent_harness".to_string(), "opencode".to_string());
+        map.insert("stewardship_mode".to_string(), "off".to_string());
+
+        let s = RuntimeSettings::from_map(&map);
+        assert_eq!(s.inject_mode, "auto");
+        assert_eq!(s.agent_model, "gpt-4o");
+        assert_eq!(s.agent_harness, "opencode");
+        assert_eq!(s.stewardship_mode, "off");
     }
 }

@@ -16,6 +16,15 @@ use crate::storage::Storage;
 
 const LIVE_STATE_FILE: &str = "LIVE_STATE.json";
 const HISTORY_FILE: &str = "HISTORY.jsonl";
+const CONFLICTS_FILE: &str = "CONFLICTS.jsonl";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConflictEvent {
+    pub file_path: String,
+    pub session_id: String,
+    pub conflicting_sessions: Vec<String>,
+    pub detected_at: DateTime<Utc>,
+}
 const CONFIG_FILE: &str = "config.json";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryEntry {
@@ -198,7 +207,23 @@ impl State {
                 }
             }
         }
+        // Record conflict in audit trail if detected
+        if !conflicting.is_empty() {
+            let event = ConflictEvent {
+                file_path: file_path.to_string(),
+                session_id: session_id.to_string(),
+                conflicting_sessions: conflicting.clone(),
+                detected_at: Utc::now(),
+            };
+            let _ = self.storage.append_jsonl(CONFLICTS_FILE, &event);
+        }
+
         Ok(conflicting)
+    }
+
+    /// Get the conflict audit trail (all historical conflict events).
+    pub fn get_conflict_history(&self) -> Result<Vec<ConflictEvent>> {
+        self.storage.read_jsonl::<ConflictEvent>(CONFLICTS_FILE)
     }
 
     pub async fn add_tag(&self, session_id: &str, tag: &str) -> Result<()> {
@@ -1055,5 +1080,55 @@ mod tests {
             ..ConflictAnalytics::default()
         };
         assert_eq!(analytics_hours.format_time_to_resolution(), "1h 1m");
+    }
+
+    #[tokio::test]
+    async fn test_conflict_audit_trail_recorded() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = crate::state::State::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let session1 = state.create_session("s1".to_string(), None).await.unwrap();
+        let session2 = state.create_session("s2".to_string(), None).await.unwrap();
+
+        state.track_file(&session1.id, "src/lib.rs").await.unwrap();
+        state.track_file(&session2.id, "src/lib.rs").await.unwrap();
+
+        // Before conflict check, no events
+        let history = state.get_conflict_history().unwrap();
+        assert!(history.is_empty());
+
+        // Trigger conflict detection
+        let conflicting = state
+            .check_file_conflict(&session1.id, "src/lib.rs")
+            .await
+            .unwrap();
+        assert!(!conflicting.is_empty());
+
+        // Audit trail should now have one event
+        let history = state.get_conflict_history().unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].file_path, "src/lib.rs");
+        assert_eq!(history[0].session_id, session1.id);
+        assert!(history[0].conflicting_sessions.contains(&"s2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_conflict_audit_not_recorded_when_no_conflict() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = crate::state::State::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let session1 = state.create_session("s1".to_string(), None).await.unwrap();
+        state.track_file(&session1.id, "src/main.rs").await.unwrap();
+
+        // No conflict (only one session)
+        let conflicting = state
+            .check_file_conflict(&session1.id, "src/main.rs")
+            .await
+            .unwrap();
+        assert!(conflicting.is_empty());
+
+        // No audit event
+        let history = state.get_conflict_history().unwrap();
+        assert!(history.is_empty());
     }
 }

@@ -268,3 +268,155 @@ pub fn handle_credentials(
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn test_state() -> (TempDir, Arc<state::State>) {
+        let tmp = TempDir::new().unwrap();
+        let st = state::State::new(tmp.path().to_path_buf()).unwrap();
+        (tmp, Arc::new(st))
+    }
+
+    // ── handle_config: get/set/list ─────────────────────────────────────
+
+    #[test]
+    fn config_list_succeeds() {
+        let (_tmp, st) = test_state();
+        let result = handle_config(&st, None, None, true);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn config_get_known_key() {
+        let (_tmp, st) = test_state();
+        let result = handle_config(&st, Some("log_level".to_string()), None, false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn config_get_unknown_key() {
+        let (_tmp, st) = test_state();
+        let result = handle_config(&st, Some("nonexistent".to_string()), None, false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn config_set_valid() {
+        let (_tmp, st) = test_state();
+        let result = handle_config(
+            &st,
+            Some("log_level".to_string()),
+            Some("debug".to_string()),
+            false,
+        );
+        assert!(result.is_ok());
+        let val = st.get_config("log_level").unwrap();
+        assert_eq!(val, Some("debug".to_string()));
+    }
+
+    #[test]
+    fn config_set_invalid_value() {
+        let (_tmp, st) = test_state();
+        let result = handle_config(
+            &st,
+            Some("log_level".to_string()),
+            Some("verbose_mode".to_string()),
+            false,
+        );
+        assert!(result.is_ok());
+        let val = st.get_config("log_level").unwrap();
+        assert_eq!(val, Some("info".to_string()));
+    }
+
+    #[test]
+    fn config_no_args_shows_help() {
+        let (_tmp, st) = test_state();
+        let result = handle_config(&st, None, None, false);
+        assert!(result.is_ok());
+    }
+
+    // ── handle_list_providers ───────────────────────────────────────────
+
+    #[test]
+    fn list_providers_succeeds() {
+        let result = handle_list_providers();
+        assert!(result.is_ok());
+    }
+
+    // ── handle_init ─────────────────────────────────────────────────────
+
+    #[test]
+    fn init_creates_files() {
+        let (tmp, st) = test_state();
+        let impulse_dir = tmp.path();
+        let result = handle_init(&st, impulse_dir);
+        assert!(result.is_ok());
+        assert!(impulse_dir.join("LIVE_STATE.json").exists());
+        assert!(impulse_dir.join("GENOME.md").exists());
+        assert!(impulse_dir.join("config.json").exists());
+    }
+
+    // ── handle_status ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn status_shows_no_sessions() {
+        let (_tmp, st) = test_state();
+        let result = handle_status(&st).await;
+        assert!(result.is_ok());
+    }
+
+    // ── handle_model ────────────────────────────────────────────────────
+
+    #[test]
+    fn model_set_and_get() {
+        let (tmp, st) = test_state();
+        let result = handle_model(
+            &st,
+            tmp.path(),
+            false,
+            "set".to_string(),
+            Some("anthropic".to_string()),
+            Some("claude-3-5-sonnet".to_string()),
+        );
+        assert!(result.is_ok());
+
+        let result = handle_model(
+            &st,
+            tmp.path(),
+            false,
+            "get".to_string(),
+            Some("anthropic".to_string()),
+            None,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn model_set_missing_provider_fails() {
+        let (tmp, st) = test_state();
+        let result = handle_model(
+            &st,
+            tmp.path(),
+            false,
+            "set".to_string(),
+            None,
+            Some("gpt-4".to_string()),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn model_unknown_subcommand() {
+        let (tmp, st) = test_state();
+        let result = handle_model(&st, tmp.path(), false, "invalid".to_string(), None, None);
+        assert!(result.is_ok());
+    }
+}

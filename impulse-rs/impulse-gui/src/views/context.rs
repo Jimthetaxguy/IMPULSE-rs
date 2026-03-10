@@ -3,12 +3,24 @@ use eframe::egui;
 use super::{View, ViewId};
 use crate::state::SharedState;
 use crate::theme::colors;
+use crate::views::memory_persistence::build_refresh_context;
 
-pub struct ContextView;
+pub struct ContextView {
+    preview_tier: PreviewTier,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviewTier {
+    Essential,
+    Critical,
+    Minimal,
+}
 
 impl ContextView {
     pub fn new() -> Self {
-        Self
+        Self {
+            preview_tier: PreviewTier::Essential,
+        }
     }
 }
 
@@ -175,6 +187,123 @@ impl View for ContextView {
                 }
             });
         });
+
+        // Injection preview section.
+        ui.add_space(12.0);
+        ui.group(|ui| {
+            ui.label(
+                egui::RichText::new("Context Injection Preview")
+                    .strong()
+                    .color(colors::ACCENT),
+            );
+            ui.label(
+                egui::RichText::new(
+                    "Preview of what terminals receive at each context tier threshold.",
+                )
+                .small()
+                .color(colors::TEXT_DIM),
+            );
+            ui.add_space(6.0);
+
+            ui.horizontal(|ui| {
+                preview_tier_button(ui, &mut self.preview_tier, PreviewTier::Essential, "Essential (~50%)");
+                preview_tier_button(ui, &mut self.preview_tier, PreviewTier::Critical, "Critical (~70%)");
+                preview_tier_button(ui, &mut self.preview_tier, PreviewTier::Minimal, "Minimal (~80%+)");
+            });
+            ui.add_space(6.0);
+
+            let tier = match self.preview_tier {
+                PreviewTier::Essential => impulse_term::context::ContextTier::Essential,
+                PreviewTier::Critical => impulse_term::context::ContextTier::Critical,
+                PreviewTier::Minimal => impulse_term::context::ContextTier::Minimal,
+            };
+
+            // Gather preview data from SharedState.
+            let insights: Vec<String> = snapshot
+                .context
+                .recent_insights
+                .iter()
+                .take(5)
+                .map(|i| format!("[{}] {}: {}", i.agent_label, i.kind, i.content))
+                .collect();
+
+            let genome_decisions: Vec<String> = state
+                .genome
+                .as_ref()
+                .map(|g| {
+                    g.decisions
+                        .iter()
+                        .take(5)
+                        .map(|d| d.description.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let active_sessions: Vec<String> = state
+                .sessions
+                .iter()
+                .filter(|s| s.status == "active")
+                .take(5)
+                .map(|s| format!("{} ({})", s.name, s.platform))
+                .collect();
+
+            let recent_history: Vec<String> = state
+                .history
+                .iter()
+                .take(5)
+                .map(|h| format!("{}: {}", h.session_name, h.summary))
+                .collect();
+
+            match build_refresh_context(
+                tier,
+                &insights,
+                &genome_decisions,
+                &active_sessions,
+                &recent_history,
+            ) {
+                Some(preview) => {
+                    egui::Frame::new()
+                        .fill(colors::BG)
+                        .corner_radius(egui::CornerRadius::same(6))
+                        .inner_margin(egui::Margin::symmetric(10, 8))
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .max_height(250.0)
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        egui::RichText::new(&preview)
+                                            .monospace()
+                                            .small()
+                                            .color(colors::TEXT),
+                                    );
+                                });
+                        });
+                }
+                None => {
+                    ui.label(
+                        egui::RichText::new(
+                            "No injection preview available for this tier (only Essential/Critical/Minimal produce context).",
+                        )
+                        .small()
+                        .color(colors::TEXT_DIM),
+                    );
+                }
+            }
+        });
+    }
+}
+
+fn preview_tier_button(
+    ui: &mut egui::Ui,
+    current: &mut PreviewTier,
+    tier: PreviewTier,
+    label: &str,
+) {
+    if ui
+        .selectable_label(*current == tier, egui::RichText::new(label).small())
+        .clicked()
+    {
+        *current = tier;
     }
 }
 

@@ -129,6 +129,10 @@ enum Commands {
         session_id: Option<String>,
     },
     Status,
+    /// Show detailed daemon internal state snapshot (sessions, tools, plugins, config)
+    Debug,
+    /// Show historical file conflict audit trail
+    ConflictHistory,
     Chat {
         #[arg(short, long)]
         session_id: String,
@@ -594,6 +598,30 @@ enum Commands {
         /// Command path (e.g. "session-start", "guard", "tooling-list")
         command: String,
     },
+
+    /// List registered plugins (context providers + action handlers)
+    PluginList {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Invoke a named action handler plugin
+    PluginInvoke {
+        /// Plugin name
+        name: String,
+        /// Path to operate on
+        #[arg(long)]
+        path: Option<String>,
+        /// Query string
+        #[arg(long)]
+        query: Option<String>,
+        /// Extra options as JSON
+        #[arg(long)]
+        options: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
@@ -872,6 +900,16 @@ async fn run_daemon_mode(cli: Cli) -> Result<()> {
             Ok(s) => handlers::print_json(&s)?,
             Err(e) => eprintln!("Error: {}", e),
         },
+        Commands::Debug => match client.send(daemon::DaemonRequest::DebugSnapshot).await {
+            Ok(daemon::DaemonResponse::Ok { result }) => handlers::print_json(&result)?,
+            Ok(daemon::DaemonResponse::Error { message }) => eprintln!("Error: {}", message),
+            Ok(_) => eprintln!("Unexpected response type"),
+            Err(e) => eprintln!("Error: {}", e),
+        },
+        Commands::ConflictHistory => {
+            // In daemon mode, conflict-history reads from local storage (no IPC needed)
+            println!("Conflict history reads from local .impulse/ — use direct mode.");
+        }
         Commands::Chat {
             session_id,
             message,
@@ -916,6 +954,86 @@ async fn run_daemon_mode(cli: Cli) -> Result<()> {
                 Commands::Describe => handlers::describe::handle_describe(fmt)?,
                 Commands::Schema { command } => handlers::describe::handle_schema(&command, fmt)?,
                 _ => unreachable!(),
+            }
+        }
+        Commands::PluginList { json } => {
+            match client.send(daemon::DaemonRequest::ListPlugins).await {
+                Ok(daemon::DaemonResponse::Ok { result }) => {
+                    if json {
+                        handlers::print_json(&result)?;
+                    } else {
+                        let providers = result
+                            .get("context_providers")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        let actions = result
+                            .get("action_handlers")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        println!("Context Providers ({}):", providers.len());
+                        for p in &providers {
+                            println!(
+                                "  {} v{} — {}",
+                                p.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
+                                p.get("version").and_then(|v| v.as_str()).unwrap_or("?"),
+                                p.get("description").and_then(|v| v.as_str()).unwrap_or(""),
+                            );
+                        }
+                        println!("\nAction Handlers ({}):", actions.len());
+                        for h in &actions {
+                            println!(
+                                "  {} v{} — {}",
+                                h.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
+                                h.get("version").and_then(|v| v.as_str()).unwrap_or("?"),
+                                h.get("description").and_then(|v| v.as_str()).unwrap_or(""),
+                            );
+                        }
+                    }
+                }
+                Ok(daemon::DaemonResponse::Error { message }) => eprintln!("Error: {}", message),
+                Err(e) => eprintln!("Error: {}", e),
+                _ => eprintln!("Unexpected response"),
+            }
+        }
+        Commands::PluginInvoke {
+            name,
+            path,
+            query,
+            options,
+            json,
+        } => {
+            let mut input = plugin::PluginInput::new();
+            if let Some(p) = path {
+                input = input.with_path(std::path::PathBuf::from(p));
+            }
+            if let Some(q) = query {
+                input = input.with_query(q);
+            }
+            if let Some(opts) = options {
+                let parsed: serde_json::Value = serde_json::from_str(&opts)
+                    .unwrap_or_else(|_| serde_json::json!({"raw": opts}));
+                input = input.with_options(parsed);
+            }
+            match client
+                .send(daemon::DaemonRequest::InvokePlugin { name, input })
+                .await
+            {
+                Ok(daemon::DaemonResponse::Ok { result }) => {
+                    if json {
+                        handlers::print_json(&result)?;
+                    } else if let Some(content) = result.get("content").and_then(|v| v.as_str()) {
+                        println!("{}", content);
+                    } else {
+                        handlers::print_json(&result)?;
+                    }
+                }
+                Ok(daemon::DaemonResponse::Error { message }) => {
+                    eprintln!("Plugin error: {}", message)
+                }
+                Err(e) => eprintln!("Plugin error: {}", e),
+                _ => eprintln!("Unexpected response"),
             }
         }
         Commands::SearchHistory { .. }
@@ -993,8 +1111,38 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
         Commands::Status => {
             handlers::config::handle_status(&state).await?;
         }
-        Commands::Chat { .. } => {
-            handlers::system::handle_chat();
+        Commands::Debug => {
+            println!("Debug snapshot requires daemon mode. Use: impulse-rs --daemon debug");
+        }
+        Commands::ConflictHistory => match state.get_conflict_history() {
+            Ok(events) if events.is_empty() => {
+                println!("No conflict events recorded.");
+            }
+            Ok(events) => {
+                handlers::print_json(&events)?;
+            }
+            Err(e) => eprintln!("Error reading conflict history: {}", e),
+        },
+        Commands::Chat {
+            session_id: _,
+            message,
+            inject_mode,
+            inject_explain,
+        } => {
+            let result = handlers::system::handle_chat(
+                &state,
+                &message,
+                inject_mode.as_deref(),
+                inject_explain,
+            )
+            .await?;
+            if inject_explain {
+                handlers::print_json(&result)?;
+            } else if let Some(response) = result.get("response").and_then(|v| v.as_str()) {
+                println!("{}", response);
+            } else {
+                handlers::print_json(&result)?;
+            }
         }
         Commands::Genome => {
             handlers::memory::handle_genome(&state)?;
@@ -1351,6 +1499,88 @@ async fn run_direct_mode(cli: Cli) -> Result<()> {
         Commands::Schema { command } => {
             let fmt = cli.format.unwrap_or(envelope::OutputFormat::Json);
             handlers::describe::handle_schema(&command, fmt)?;
+        }
+        Commands::PluginList { json } => {
+            let registry = plugin::registry::init_global_registry();
+            let providers = registry.list_context_providers().unwrap_or_default();
+            let handlers = registry.list_action_handlers_metadata().unwrap_or_default();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "context_providers": providers,
+                        "action_handlers": handlers,
+                    }))?
+                );
+            } else {
+                println!("Context Providers ({}):", providers.len());
+                for p in &providers {
+                    println!(
+                        "  {} v{} — {} [{}]",
+                        p.name,
+                        p.version,
+                        p.description,
+                        p.supported_formats.join(", ")
+                    );
+                }
+                println!("\nAction Handlers ({}):", handlers.len());
+                for h in &handlers {
+                    println!("  {} v{} — {}", h.name, h.version, h.description);
+                }
+                if providers.is_empty() && handlers.is_empty() {
+                    println!("\nNo plugins registered.");
+                }
+            }
+        }
+        Commands::PluginInvoke {
+            name,
+            path,
+            query,
+            options,
+            json,
+        } => {
+            let registry = plugin::registry::init_global_registry();
+            let mut input = plugin::PluginInput::new();
+            if let Some(p) = path {
+                input = input.with_path(std::path::PathBuf::from(p));
+            }
+            if let Some(q) = query {
+                input = input.with_query(q);
+            }
+            if let Some(opts) = options {
+                let parsed: serde_json::Value = serde_json::from_str(&opts)
+                    .unwrap_or_else(|_| serde_json::json!({"raw": opts}));
+                input = input.with_options(parsed);
+            }
+            match registry.get_action_handler(&name) {
+                Ok(Some(handler)) => {
+                    if let Err(e) = handler.validate(&input) {
+                        eprintln!("Validation error: {}", e);
+                        std::process::exit(1);
+                    }
+                    match handler.execute(&input) {
+                        Ok(output) => {
+                            if json {
+                                println!("{}", serde_json::to_string_pretty(&output)?);
+                            } else {
+                                println!("{}", output.content);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Plugin error: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                Ok(None) => {
+                    eprintln!("Plugin not found: {}", name);
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("Registry error: {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
     }
 

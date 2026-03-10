@@ -13,7 +13,7 @@ pub enum ArtifactUiAction {
     },
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RenderMode {
     Auto,
     Markdown,
@@ -211,6 +211,26 @@ fn render_artifact_payload(
         requested_mode
     };
 
+    // Check if the requested mode can render this artifact, show feedback if not
+    if requested_mode != RenderMode::Auto
+        && requested_mode != RenderMode::RawJson
+        && !can_render(artifact, requested_mode)
+    {
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "Render mode {:?} unavailable for this artifact — showing raw JSON.",
+                    requested_mode
+                ))
+                .small()
+                .color(colors::YELLOW),
+            );
+        });
+        ui.add_space(4.0);
+        render_raw_json(ui, artifact);
+        return;
+    }
+
     match mode {
         RenderMode::Markdown => render_markdown(ui, artifact),
         RenderMode::Timeline => render_timeline(ui, artifact),
@@ -218,6 +238,32 @@ fn render_artifact_payload(
         RenderMode::Diff => render_diff(ui, artifact),
         RenderMode::Log => render_log(ui, artifact),
         RenderMode::RawJson | RenderMode::Auto => render_raw_json(ui, artifact),
+    }
+}
+
+/// Check if an artifact has the expected fields for a given render mode.
+fn can_render(artifact: &impulse_ops::ArtifactEnvelope, mode: RenderMode) -> bool {
+    match mode {
+        RenderMode::Markdown => artifact.payload.get("markdown").is_some(),
+        RenderMode::Timeline => artifact
+            .payload
+            .get("entries")
+            .and_then(|v| v.as_array())
+            .is_some(),
+        RenderMode::Table => artifact
+            .payload
+            .get("entries")
+            .and_then(|v| v.as_array())
+            .is_some(),
+        RenderMode::Diff => {
+            artifact.payload.get("before").is_some() || artifact.payload.get("after").is_some()
+        }
+        RenderMode::Log => artifact
+            .payload
+            .get("lines")
+            .and_then(|v| v.as_array())
+            .is_some(),
+        RenderMode::RawJson | RenderMode::Auto => true,
     }
 }
 
