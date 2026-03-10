@@ -94,7 +94,7 @@ rust_xlsxwriter = { version = "0.7", optional = true }
 docx = { version = "0.4", optional = true, package = "docx-rs" }
 
 [features]
-default = []
+default = ["office-support"]
 # Monty support enables computed routing and dynamic context injection
 # Requires: pip install pydantic-monty
 monty-support = ["dep:pyo3"]

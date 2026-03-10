@@ -19,6 +19,11 @@ use crate::state::SharedState;
 
 const SOCKET_NAME: &str = "impulse.sock";
 
+/// Protocol version — increment when adding new request/response variants
+/// or making breaking changes to existing ones. GUI checks this on connect
+/// and warns if it doesn't match its expected version.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 fn build_remote_tool_context(
     impulse_dir: &std::path::Path,
     config: &crate::state::Config,
@@ -148,6 +153,16 @@ pub enum DaemonRequest {
         session_id: String,
         file_path: String,
     },
+    /// Return a detailed internal state snapshot for debugging
+    DebugSnapshot,
+    /// List registered plugins (context providers + action handlers)
+    ListPlugins,
+    /// Invoke a named action handler plugin
+    InvokePlugin {
+        name: String,
+        #[serde(default)]
+        input: crate::plugin::PluginInput,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -206,6 +221,9 @@ impl Daemon {
         }
         let tool_context = build_remote_tool_context(state.storage().base_path(), &config_snapshot);
 
+        // Initialize the global plugin registry so ListPlugins/InvokePlugin work.
+        crate::plugin::registry::init_global_registry();
+
         Self {
             config: DaemonConfig {
                 socket_path: socket_path.clone(),
@@ -228,6 +246,17 @@ impl Daemon {
     }
 
     pub async fn start(&self) -> Result<()> {
+        // Initialize structured logging for daemon mode.
+        // RUST_LOG=impulse_rs=debug for verbose output; default is info.
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("impulse_rs=info")),
+            )
+            .with_target(false)
+            .compact()
+            .try_init();
+
         let socket_dir = self
             .config
             .socket_path
@@ -237,14 +266,30 @@ impl Daemon {
             .await
             .context("Failed to create socket directory")?;
 
-        if let Err(e) = tokio::fs::remove_file(&self.config.socket_path).await {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                return Err(e).context("Failed to remove old socket");
+        // Stale socket detection: try connecting to distinguish crash residue from running daemon
+        let pid_path = self.config.socket_path.with_extension("pid");
+        if self.config.socket_path.exists() {
+            let is_alive = tokio::net::UnixStream::connect(&self.config.socket_path)
+                .await
+                .is_ok();
+
+            if is_alive {
+                anyhow::bail!(
+                    "Another daemon is already running (socket: {})",
+                    self.config.socket_path.display()
+                );
             }
+
+            // Socket exists but nobody's listening → stale from crash
+            let _ = tokio::fs::remove_file(&self.config.socket_path).await;
+            let _ = tokio::fs::remove_file(&pid_path).await;
         }
 
         let listener =
             UnixListener::bind(&self.config.socket_path).context("Failed to bind socket")?;
+
+        // Write PID file for stale socket detection on next startup
+        let _ = tokio::fs::write(&pid_path, std::process::id().to_string()).await;
 
         println!("Daemon listening on {}", self.config.socket_path.display());
 
@@ -299,6 +344,8 @@ impl Daemon {
         self.shutdown_notify.notify_waiters();
 
         let _ = tokio::fs::remove_file(&self.config.socket_path).await;
+        let pid_path = self.config.socket_path.with_extension("pid");
+        let _ = tokio::fs::remove_file(&pid_path).await;
     }
 }
 
@@ -349,6 +396,8 @@ async fn handle_connection(
             }
         };
 
+        let req_type = request_type_name(&request);
+        let start = std::time::Instant::now();
         let response = process_request(
             request,
             state.clone(),
@@ -358,6 +407,20 @@ async fn handle_connection(
             &supervisor_session_override,
         )
         .await;
+        let elapsed = start.elapsed();
+        if elapsed.as_millis() > 100 {
+            tracing::warn!(
+                request_type = req_type,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "slow request"
+            );
+        } else {
+            tracing::debug!(
+                request_type = req_type,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "request processed"
+            );
+        }
 
         writer
             .write_all(serde_json::to_string(&response)?.as_bytes())
@@ -1051,6 +1114,44 @@ fn respond_err(msg: impl std::fmt::Display) -> DaemonResponse {
     }
 }
 
+fn request_type_name(req: &DaemonRequest) -> &'static str {
+    match req {
+        DaemonRequest::Ping => "Ping",
+        DaemonRequest::Status => "Status",
+        DaemonRequest::CreateSession { .. } => "CreateSession",
+        DaemonRequest::EndSession { .. } => "EndSession",
+        DaemonRequest::TrackFile { .. } => "TrackFile",
+        DaemonRequest::TrackTool { .. } => "TrackTool",
+        DaemonRequest::GetSession { .. } => "GetSession",
+        DaemonRequest::ListSessions => "ListSessions",
+        DaemonRequest::Chat { .. } => "Chat",
+        DaemonRequest::StewardStatus => "StewardStatus",
+        DaemonRequest::StewardProposals { .. } => "StewardProposals",
+        DaemonRequest::StewardMemory => "StewardMemory",
+        DaemonRequest::ListTools { .. } => "ListTools",
+        DaemonRequest::DescribeTool { .. } => "DescribeTool",
+        DaemonRequest::InvokeTool { .. } => "InvokeTool",
+        DaemonRequest::ToolSchema => "ToolSchema",
+        DaemonRequest::GetOpsSnapshot => "GetOpsSnapshot",
+        DaemonRequest::SubscribeOps { .. } => "SubscribeOps",
+        DaemonRequest::PublishTerminalOps { .. } => "PublishTerminalOps",
+        DaemonRequest::GetSupervisorPermissions => "GetSupervisorPermissions",
+        DaemonRequest::SupervisorChat { .. } => "SupervisorChat",
+        DaemonRequest::RunSupervisorAction { .. } => "RunSupervisorAction",
+        DaemonRequest::ListArtifacts { .. } => "ListArtifacts",
+        DaemonRequest::GetArtifact { .. } => "GetArtifact",
+        DaemonRequest::RunArtifactAction { .. } => "RunArtifactAction",
+        DaemonRequest::AgentAssist { .. } => "AgentAssist",
+        DaemonRequest::GuardEvaluate { .. } => "GuardEvaluate",
+        DaemonRequest::GuardList => "GuardList",
+        DaemonRequest::CheckConflict { .. } => "CheckConflict",
+        DaemonRequest::DebugSnapshot => "DebugSnapshot",
+        DaemonRequest::ListPlugins => "ListPlugins",
+        DaemonRequest::InvokePlugin { .. } => "InvokePlugin",
+    }
+}
+
+#[tracing::instrument(skip_all, fields(request_type = request_type_name(&request)))]
 async fn process_request(
     request: DaemonRequest,
     state: SharedState,
@@ -1079,6 +1180,11 @@ async fn process_request(
             return respond_err(e);
         }
     }
+    if let DaemonRequest::InvokePlugin { ref name, .. } = request {
+        if let Err(e) = crate::validate::reject_control_chars(name, "plugin_name") {
+            return respond_err(e);
+        }
+    }
     if let DaemonRequest::CreateSession { ref name, .. } = request {
         if let Err(e) = crate::validate::reject_control_chars(name, "name") {
             return respond_err(e);
@@ -1096,7 +1202,7 @@ async fn process_request(
 
     match request {
         DaemonRequest::Ping => DaemonResponse::Ok {
-            result: serde_json::json!({"pong": true}),
+            result: serde_json::json!({"pong": true, "protocol_version": PROTOCOL_VERSION}),
         },
         DaemonRequest::Status => handle_status(&state).await,
 
@@ -1153,6 +1259,14 @@ async fn process_request(
         DaemonRequest::GuardEvaluate { .. } | DaemonRequest::GuardList => {
             handle_guard_request(request, &state).await
         }
+
+        // Debug
+        DaemonRequest::DebugSnapshot => handle_debug_snapshot(&state, registry).await,
+
+        // Plugin group
+        DaemonRequest::ListPlugins | DaemonRequest::InvokePlugin { .. } => {
+            handle_plugin_request(request).await
+        }
     }
 }
 
@@ -1163,7 +1277,8 @@ async fn handle_status(state: &SharedState) -> DaemonResponse {
         Ok(sessions) => DaemonResponse::Ok {
             result: serde_json::json!({
                 "sessions": sessions.len(),
-                "active": sessions.iter().filter(|s| s.status == crate::state::SessionStatus::Active).count()
+                "active": sessions.iter().filter(|s| s.status == crate::state::SessionStatus::Active).count(),
+                "protocol_version": PROTOCOL_VERSION,
             }),
         },
         Err(e) => respond_err(e),
@@ -1811,6 +1926,60 @@ async fn handle_agent_request(request: DaemonRequest, state: &SharedState) -> Da
     }
 }
 
+async fn handle_debug_snapshot(
+    state: &SharedState,
+    registry: &crate::tooling::ToolRegistry,
+) -> DaemonResponse {
+    use crate::state::SessionStatus;
+
+    let sessions = state.list_sessions().await.unwrap_or_default();
+    let active_count = sessions
+        .iter()
+        .filter(|s| s.status == SessionStatus::Active)
+        .count();
+
+    let tool_count = registry.list().len();
+
+    let config = state.config_snapshot().ok();
+
+    let guardrail_count = config
+        .as_ref()
+        .map(|c| crate::guardrail::config::merge_rules(&c.guardrails).len())
+        .unwrap_or(0);
+
+    let r = crate::plugin::registry::global_registry();
+    let providers = r.list_context_providers().unwrap_or_default().len();
+    let handlers = r.list_action_handlers().unwrap_or_default().len();
+    let plugins = serde_json::json!({
+        "context_providers": providers,
+        "action_handlers": handlers,
+    });
+
+    let base_path = state.storage().base_path().display().to_string();
+
+    DaemonResponse::Ok {
+        result: serde_json::json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "pid": std::process::id(),
+            "base_path": base_path,
+            "sessions": {
+                "total": sessions.len(),
+                "active": active_count,
+            },
+            "tools": {
+                "registered": tool_count,
+            },
+            "guardrails": {
+                "rules": guardrail_count,
+            },
+            "plugins": plugins,
+            "config": config.as_ref().map(|c| serde_json::json!({
+                "default_platform": &c.default_platform,
+            })).unwrap_or(serde_json::json!(null)),
+        }),
+    }
+}
+
 async fn handle_guard_request(request: DaemonRequest, state: &SharedState) -> DaemonResponse {
     match request {
         DaemonRequest::GuardEvaluate { target, action } => {
@@ -1842,6 +2011,49 @@ async fn handle_guard_request(request: DaemonRequest, state: &SharedState) -> Da
             }
         }
         _ => respond_err("Internal routing error: not a guard request"),
+    }
+}
+
+async fn handle_plugin_request(request: DaemonRequest) -> DaemonResponse {
+    let registry = crate::plugin::registry::global_registry();
+
+    match request {
+        DaemonRequest::ListPlugins => {
+            let context_providers = match registry.list_context_providers() {
+                Ok(p) => p,
+                Err(e) => return respond_err(format!("Failed to list context providers: {}", e)),
+            };
+            let action_handlers = match registry.list_action_handlers_metadata() {
+                Ok(h) => h,
+                Err(e) => return respond_err(format!("Failed to list action handlers: {}", e)),
+            };
+            DaemonResponse::Ok {
+                result: serde_json::json!({
+                    "context_providers": context_providers,
+                    "action_handlers": action_handlers,
+                }),
+            }
+        }
+        DaemonRequest::InvokePlugin { name, input } => {
+            let handler = match registry.get_action_handler(&name) {
+                Ok(Some(h)) => h,
+                Ok(None) => {
+                    return respond_err(format!("Plugin not found: {}", name));
+                }
+                Err(e) => return respond_err(format!("Registry error: {}", e)),
+            };
+            match handler.validate(&input) {
+                Ok(()) => {}
+                Err(e) => return respond_err(format!("Validation failed: {}", e)),
+            }
+            match handler.execute(&input) {
+                Ok(output) => DaemonResponse::Ok {
+                    result: serde_json::to_value(output).unwrap_or_default(),
+                },
+                Err(e) => respond_err(format!("Plugin execution failed: {}", e)),
+            }
+        }
+        _ => respond_err("Internal routing error: not a plugin request"),
     }
 }
 

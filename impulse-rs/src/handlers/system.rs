@@ -208,8 +208,122 @@ pub fn handle_validate_hooks(platform: String) -> Result<()> {
     Ok(())
 }
 
-pub fn handle_chat() {
-    println!("Chat requires daemon mode. Use: impulse-rs --daemon chat --session-id <id> --message <msg>");
+pub async fn handle_chat(
+    state: &Arc<state::State>,
+    message: &str,
+    inject_mode: Option<&str>,
+    inject_explain: bool,
+) -> Result<serde_json::Value> {
+    use crate::injection::{engine::run_injection, types::InjectionMode, types::InjectionSurface};
+    use crate::llm_backends::anthropic::AnthropicProvider;
+    use crate::llm_backends::{ChatRequest, LlmProvider, Message, Role};
+
+    // Validate inject_mode first (pure input check, no side effects)
+    let mode_override = inject_mode.and_then(InjectionMode::parse);
+    if inject_mode.is_some() && mode_override.is_none() {
+        anyhow::bail!("Invalid inject_mode. Use off|review|apply");
+    }
+
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .or_else(|_| std::env::var("CLAUDE_API_KEY"))
+        .unwrap_or_default();
+
+    if api_key.is_empty() {
+        anyhow::bail!("ANTHROPIC_API_KEY or CLAUDE_API_KEY not set");
+    }
+
+    let config = state.config_snapshot()?;
+    let mut context_prompt = message.to_string();
+
+    let injection_result = run_injection(
+        state.storage().base_path(),
+        &config,
+        InjectionSurface::DaemonChat,
+        mode_override,
+        &[message.to_string()],
+    );
+
+    if injection_result.applied {
+        if let Some(block) = &injection_result.injected_block {
+            context_prompt = format!("{}\n\n{}", block, context_prompt);
+        }
+    }
+
+    let provider = AnthropicProvider::new(api_key);
+    let model = std::env::var("IMPULSE_MODEL").unwrap_or_else(|_| "claude-sonnet-4-6".to_string());
+    let request = ChatRequest {
+        model,
+        messages: vec![Message {
+            role: Role::User,
+            content: context_prompt,
+        }],
+        temperature: 0.7,
+        max_tokens: Some(4096),
+    };
+
+    let response = provider
+        .chat(request)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    let injection_json = if inject_explain {
+        serde_json::to_value(&injection_result)
+            .unwrap_or_else(|_| serde_json::json!({"status": "serialization_error"}))
+    } else {
+        serde_json::json!({
+            "applied": injection_result.applied,
+        })
+    };
+
+    Ok(serde_json::json!({
+        "response": response.content,
+        "model": response.model,
+        "injection": injection_json,
+    }))
+}
+
+#[cfg(test)]
+mod chat_tests {
+    use super::*;
+
+    fn test_state() -> (tempfile::TempDir, Arc<state::State>) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let st = state::State::new(dir.path().to_path_buf()).unwrap();
+        (dir, Arc::new(st))
+    }
+
+    #[tokio::test]
+    async fn test_chat_rejects_invalid_inject_mode() {
+        let (_dir, st) = test_state();
+        // inject_mode validation happens before API call, so no key needed
+        let result = handle_chat(&st, "hello", Some("invalid_mode"), false).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("inject_mode"),
+            "Expected inject_mode error, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_chat_valid_modes_accepted() {
+        // "off", "review", "apply" are valid inject modes — they won't fail on mode validation
+        // (they'll fail later at the API call stage, but mode parsing succeeds)
+        let (_dir, st) = test_state();
+        for mode in &["off", "review", "apply"] {
+            let result = handle_chat(&st, "hello", Some(mode), false).await;
+            // Should NOT fail with inject_mode error — may fail with API key or network
+            if let Err(e) = &result {
+                assert!(
+                    !e.to_string().contains("inject_mode"),
+                    "Valid mode '{}' rejected: {}",
+                    mode,
+                    e
+                );
+            }
+        }
+    }
 }
 
 pub async fn handle_docs(

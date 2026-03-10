@@ -1,5 +1,7 @@
 //! Bottom status bar — daemon connection, workbench counts, and operator hints.
 
+use std::time::Instant;
+
 use eframe::egui;
 
 use crate::state::{ConnectionStatus, DaemonAutoStartState, SharedState};
@@ -36,6 +38,52 @@ pub fn show(ctx: &egui::Context, state: &SharedState) {
                 let dot_rect = ui.allocate_space(egui::vec2(8.0, 8.0));
                 ui.painter().circle_filled(dot_rect.1.center(), 3.0, dot);
                 ui.label(egui::RichText::new(label).small().color(colors::TEXT_DIM));
+
+                // Health details when connected
+                if state.connection == ConnectionStatus::Connected {
+                    if let Some(ref status) = state.daemon_status {
+                        let version_label = status
+                            .protocol_version
+                            .map(|v| format!("v{}", v))
+                            .unwrap_or_else(|| "v?".to_string());
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "({}  {} sessions)",
+                                version_label, status.sessions
+                            ))
+                            .small()
+                            .color(colors::TEXT_FAINT),
+                        );
+                    }
+                    if let Some(rtt) = state.last_ping_rtt {
+                        let rtt_ms = rtt.as_millis();
+                        let rtt_color = if rtt_ms < 10 {
+                            colors::GREEN
+                        } else if rtt_ms < 100 {
+                            colors::YELLOW
+                        } else {
+                            colors::RED
+                        };
+                        ui.label(
+                            egui::RichText::new(format!("{}ms", rtt_ms))
+                                .small()
+                                .color(rtt_color),
+                        );
+                    }
+                    if let Some(last_poll) = state.last_poll {
+                        let age = Instant::now().duration_since(last_poll);
+                        let age_label = if age.as_secs() < 2 {
+                            "just now".to_string()
+                        } else {
+                            format!("{}s ago", age.as_secs())
+                        };
+                        ui.label(
+                            egui::RichText::new(age_label)
+                                .small()
+                                .color(colors::TEXT_FAINT),
+                        );
+                    }
+                }
 
                 ui.separator();
 
@@ -103,7 +151,7 @@ pub fn show(ctx: &egui::Context, state: &SharedState) {
                     } else {
                         ui.label(
                             egui::RichText::new(
-                                "Ctrl+1-6: views  Ctrl+N: agent  Ctrl+L: panel  Ctrl+B: sidebar",
+                                "Ctrl+1-7: views  Ctrl+N: agent  Ctrl+L: panel  Ctrl+B: sidebar",
                             )
                             .small()
                             .color(colors::TEXT_FAINT),

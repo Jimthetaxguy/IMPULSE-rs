@@ -265,3 +265,121 @@ pub async fn handle_activity(state: &Arc<state::State>, limit: usize) -> Result<
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn test_state() -> (TempDir, Arc<state::State>) {
+        let tmp = TempDir::new().unwrap();
+        let st = state::State::new(tmp.path().to_path_buf()).unwrap();
+        (tmp, Arc::new(st))
+    }
+
+    // ── handle_genome ───────────────────────────────────────────────────
+
+    #[test]
+    fn genome_empty_succeeds() {
+        let (tmp, st) = test_state();
+        // Write an empty genome so the file exists
+        st.storage()
+            .write_json("GENOME.md", &memory::Genome::new())
+            .unwrap();
+        let _ = tmp; // keep alive
+        let result = handle_genome(&st);
+        assert!(result.is_ok());
+    }
+
+    // ── handle_add_decision ─────────────────────────────────────────────
+
+    #[test]
+    fn add_decision_writes_genome() {
+        let (tmp, st) = test_state();
+        st.storage()
+            .write_json("GENOME.md", &memory::Genome::new())
+            .unwrap();
+        let result = handle_add_decision(
+            &st,
+            "Use Rust for all new modules".to_string(),
+            Some("Performance and safety".to_string()),
+        );
+        assert!(result.is_ok());
+
+        // Verify the decision was persisted
+        let genome: memory::Genome = st.storage().read_json("GENOME.md").unwrap();
+        assert_eq!(genome.decisions.len(), 1);
+        assert_eq!(
+            genome.decisions[0].description,
+            "Use Rust for all new modules"
+        );
+        let _ = tmp;
+    }
+
+    #[test]
+    fn add_decision_dedup_guard() {
+        let (tmp, st) = test_state();
+        st.storage()
+            .write_json("GENOME.md", &memory::Genome::new())
+            .unwrap();
+        // Add same decision twice
+        handle_add_decision(&st, "Same decision".to_string(), None).unwrap();
+        handle_add_decision(&st, "Same decision".to_string(), None).unwrap();
+
+        let genome: memory::Genome = st.storage().read_json("GENOME.md").unwrap();
+        // Genome::add_decision has dedup guard — should only be 1
+        assert_eq!(genome.decisions.len(), 1);
+        let _ = tmp;
+    }
+
+    #[test]
+    fn add_decision_different_decisions() {
+        let (tmp, st) = test_state();
+        st.storage()
+            .write_json("GENOME.md", &memory::Genome::new())
+            .unwrap();
+        handle_add_decision(&st, "Decision A".to_string(), None).unwrap();
+        handle_add_decision(&st, "Decision B".to_string(), Some("rationale".to_string())).unwrap();
+
+        let genome: memory::Genome = st.storage().read_json("GENOME.md").unwrap();
+        assert_eq!(genome.decisions.len(), 2);
+        let _ = tmp;
+    }
+
+    // ── handle_history ──────────────────────────────────────────────────
+
+    #[test]
+    fn history_empty_succeeds() {
+        let (_tmp, st) = test_state();
+        let result = handle_history(&st);
+        assert!(result.is_ok());
+    }
+
+    // ── handle_activity ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn activity_no_sessions() {
+        let (_tmp, st) = test_state();
+        let result = handle_activity(&st, 10).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn activity_with_session_and_files() {
+        let (_tmp, st) = test_state();
+        let session = st
+            .create_session("test-session".to_string(), None)
+            .await
+            .unwrap();
+        st.track_file(&session.id, "src/main.rs").await.unwrap();
+        st.track_tool(&session.id, "read_file").await.unwrap();
+
+        let result = handle_activity(&st, 5).await;
+        assert!(result.is_ok());
+    }
+}

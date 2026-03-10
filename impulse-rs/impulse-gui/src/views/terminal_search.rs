@@ -64,6 +64,13 @@ impl TerminalSearch {
         self.focus_requested = true;
     }
 
+    /// Activate the search overlay with a pre-filled query.
+    pub fn open_with_query(&mut self, query: String) {
+        self.query = query;
+        self.active = true;
+        self.focus_requested = true;
+    }
+
     /// Close the search overlay and clear results.
     pub fn close(&mut self) {
         self.active = false;

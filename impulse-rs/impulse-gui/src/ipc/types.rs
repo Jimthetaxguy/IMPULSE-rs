@@ -57,6 +57,7 @@ pub enum DaemonRequest {
         #[serde(default)]
         params: serde_json::Value,
     },
+    GuardList,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -78,6 +79,9 @@ pub enum DaemonResponse {
 // GUI domain types (deserialized from daemon JSON payloads)
 // ---------------------------------------------------------------------------
 
+/// Protocol version expected by this GUI build. Must match daemon's PROTOCOL_VERSION.
+pub const EXPECTED_PROTOCOL_VERSION: u32 = 1;
+
 /// Daemon status summary.
 #[derive(Debug, Clone, Default)]
 pub struct DaemonStatus {
@@ -85,6 +89,7 @@ pub struct DaemonStatus {
     pub sessions: usize,
     #[allow(dead_code)]
     pub active: usize,
+    pub protocol_version: Option<u32>,
 }
 
 /// An active or recently-ended session.
@@ -339,6 +344,54 @@ impl SearchResult {
     }
 }
 
+/// A guardrail rule (deserialized from daemon's GuardList response).
+#[derive(Debug, Clone)]
+pub struct GuardRule {
+    pub id: String,
+    pub pattern: String,
+    pub action: String,
+    pub target: String,
+    pub reason: String,
+    pub suggestion: Option<String>,
+    #[allow(dead_code)]
+    pub enabled: bool,
+    pub builtin: bool,
+}
+
+impl GuardRule {
+    pub fn from_value(v: &serde_json::Value) -> Option<Self> {
+        Some(Self {
+            id: v.get("id")?.as_str()?.to_string(),
+            pattern: v
+                .get("pattern")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string(),
+            action: v
+                .get("action")
+                .and_then(|s| s.as_str())
+                .unwrap_or("log")
+                .to_string(),
+            target: v
+                .get("target")
+                .and_then(|s| s.as_str())
+                .unwrap_or("any")
+                .to_string(),
+            reason: v
+                .get("reason")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string(),
+            suggestion: v
+                .get("suggestion")
+                .and_then(|s| s.as_str())
+                .map(String::from),
+            enabled: v.get("enabled").and_then(|b| b.as_bool()).unwrap_or(true),
+            builtin: v.get("builtin").and_then(|b| b.as_bool()).unwrap_or(false),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,6 +455,198 @@ mod tests {
             DaemonResponse::ConflictCheck { has_conflict: true, conflicting_sessions }
             if conflicting_sessions.len() == 2
         ));
+    }
+
+    // --- Roundtrip tests for all remaining DaemonRequest variants ---
+
+    #[test]
+    fn test_daemon_request_status_roundtrip() {
+        let req = DaemonRequest::Status;
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, DaemonRequest::Status));
+    }
+
+    #[test]
+    fn test_daemon_request_list_sessions_roundtrip() {
+        let req = DaemonRequest::ListSessions;
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, DaemonRequest::ListSessions));
+    }
+
+    #[test]
+    fn test_daemon_request_end_session_roundtrip() {
+        let req = DaemonRequest::EndSession {
+            session_id: "sess-123".into(),
+            summary: "Done working".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            DaemonRequest::EndSession { session_id, summary }
+            if session_id == "sess-123" && summary == "Done working"
+        ));
+    }
+
+    #[test]
+    fn test_daemon_request_track_file_roundtrip() {
+        let req = DaemonRequest::TrackFile {
+            session_id: "sess-1".into(),
+            file_path: "src/main.rs".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            DaemonRequest::TrackFile { session_id, file_path }
+            if session_id == "sess-1" && file_path == "src/main.rs"
+        ));
+    }
+
+    #[test]
+    fn test_daemon_request_invoke_tool_roundtrip() {
+        let req = DaemonRequest::InvokeTool {
+            name: "history_list".into(),
+            params: serde_json::json!({"limit": 10}),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, DaemonRequest::InvokeTool { name, .. } if name == "history_list"));
+    }
+
+    #[test]
+    fn test_daemon_request_tool_schema_roundtrip() {
+        let req = DaemonRequest::ToolSchema;
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, DaemonRequest::ToolSchema));
+    }
+
+    #[test]
+    fn test_daemon_request_get_ops_snapshot_roundtrip() {
+        let req = DaemonRequest::GetOpsSnapshot;
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, DaemonRequest::GetOpsSnapshot));
+    }
+
+    #[test]
+    fn test_daemon_request_subscribe_ops_roundtrip() {
+        let req = DaemonRequest::SubscribeOps {
+            since_seq: Some(42),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            DaemonRequest::SubscribeOps {
+                since_seq: Some(42)
+            }
+        ));
+    }
+
+    #[test]
+    fn test_daemon_request_subscribe_ops_none_roundtrip() {
+        let req = DaemonRequest::SubscribeOps { since_seq: None };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            DaemonRequest::SubscribeOps { since_seq: None }
+        ));
+    }
+
+    #[test]
+    fn test_daemon_request_get_supervisor_permissions_roundtrip() {
+        let req = DaemonRequest::GetSupervisorPermissions;
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, DaemonRequest::GetSupervisorPermissions));
+    }
+
+    #[test]
+    fn test_daemon_request_supervisor_chat_roundtrip() {
+        let req = DaemonRequest::SupervisorChat {
+            prompt: "What is the current status?".into(),
+            context: Some("3 agents running".into()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            DaemonRequest::SupervisorChat { prompt, context }
+            if prompt == "What is the current status?" && context == Some("3 agents running".into())
+        ));
+    }
+
+    #[test]
+    fn test_daemon_request_run_supervisor_action_roundtrip() {
+        let req = DaemonRequest::RunSupervisorAction {
+            action: impulse_ops::SupervisorAction::FocusAgent {
+                agent_id: "agent-1".into(),
+                session_id: None,
+            },
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, DaemonRequest::RunSupervisorAction { .. }));
+    }
+
+    #[test]
+    fn test_daemon_request_run_supervisor_modify_permissions_roundtrip() {
+        let req = DaemonRequest::RunSupervisorAction {
+            action: impulse_ops::SupervisorAction::ModifyPermissions {
+                scope: impulse_ops::PermissionChangeScope::SessionOverride,
+                grant_actions: vec![impulse_ops::SupervisorActionPermission::SendInput],
+                grant_tool_capabilities: vec![],
+                confirmed: true,
+            },
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, DaemonRequest::RunSupervisorAction { .. }));
+    }
+
+    #[test]
+    fn test_daemon_request_run_artifact_action_roundtrip() {
+        let req = DaemonRequest::RunArtifactAction {
+            artifact_id: "art-1".into(),
+            action_id: "acknowledge".into(),
+            params: serde_json::Value::Null,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            DaemonRequest::RunArtifactAction { artifact_id, action_id, .. }
+            if artifact_id == "art-1" && action_id == "acknowledge"
+        ));
+    }
+
+    #[test]
+    fn test_daemon_request_publish_terminal_ops_roundtrip() {
+        let req = DaemonRequest::PublishTerminalOps {
+            report: impulse_ops::TerminalOpsReport {
+                source_id: "gui-1".into(),
+                published_at: "2026-03-09T00:00:00Z".into(),
+                agents: vec![],
+                context: impulse_ops::ContextHealthSummary::default(),
+                interventions: vec![],
+            },
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, DaemonRequest::PublishTerminalOps { .. }));
+    }
+
+    #[test]
+    fn test_daemon_request_guard_list_roundtrip() {
+        let req = DaemonRequest::GuardList;
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, DaemonRequest::GuardList));
     }
 
     #[test]

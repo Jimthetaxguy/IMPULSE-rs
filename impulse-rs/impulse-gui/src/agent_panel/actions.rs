@@ -29,8 +29,11 @@ pub enum PanelAction {
     /// Switch the active terminal tab.
     FocusTab { tab_id: u64 },
 
-    /// Trigger terminal search (opens search overlay when implemented).
+    /// Search terminal output (opens search overlay).
     SearchTerm { query: String },
+
+    /// Search memory/history (switches to Memory view).
+    MemorySearch { query: String },
 
     /// Execute a structured supervisor proposal from the left chat panel.
     RunSupervisorProposal {

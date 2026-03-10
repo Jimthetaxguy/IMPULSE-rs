@@ -206,7 +206,8 @@ impl AgentPanel {
                      /inject <tab_id> <text> — Inject context into a terminal pane\n\
                      /send <tab_id> <text> — Send raw input to a terminal pane\n\
                      /focus <tab_id> — Switch to a terminal tab\n\
-                     /search <query> — Search terminal output\n\n\
+                     /search <query> — Search terminal output\n\
+                     /memory-search <query> — Search session memory\n\n\
                      Shortcuts:\n\
                      Ctrl+L — Focus agent input\n\
                      Ctrl+5 — Toggle agent panel\n\
@@ -382,6 +383,21 @@ impl AgentPanel {
                 } else {
                     self.messages
                         .push(ChatMessage::system("Usage: /search <query>"));
+                }
+                self.scroll_to_bottom = true;
+            }
+            "/memory-search" | "/msearch" => {
+                if let Some(query) = parts.get(1) {
+                    self.pending_actions.push(PanelAction::MemorySearch {
+                        query: query.to_string(),
+                    });
+                    self.messages.push(ChatMessage::system(&format!(
+                        "Searching memory for: {}",
+                        query
+                    )));
+                } else {
+                    self.messages
+                        .push(ChatMessage::system("Usage: /memory-search <query>"));
                 }
                 self.scroll_to_bottom = true;
             }

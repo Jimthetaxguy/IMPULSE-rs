@@ -94,6 +94,9 @@ impulse-rs --daemon session-start -n "chat-session"
 | `.impulse/retrieval_index_state.json` | Retrieval index metadata                   | Rebuildable metadata   |
 | `.impulse/embeddings/*`               | Embedding temp artifacts                   | Runtime cache          |
 | `.impulse/retrieval.lock`             | Retrieval indexing lock guard              | Runtime safety         |
+| `.impulse/CONFLICTS.jsonl`            | File conflict audit trail (append-only)    | Git-committed          |
+| `.impulse/sockets/impulse.sock`       | Daemon Unix socket                         | Runtime                |
+| `.impulse/sockets/impulse.pid`        | Daemon PID file                            | Runtime                |
 
 ### Honest Limitations
 
@@ -117,7 +120,7 @@ impulse-rs --daemon session-start -n "chat-session"
 | **Daemon socket IPC**                | Complete    | `impulse-rs/src/daemon/mod.rs`        |
 | **Claude Code hooks**                | Complete    | `impulse-rs/.claude/hooks/hooks.json` |
 | **OpenCode integration**             | Complete    | `impulse-rs/.opencode/impulse.json`   |
-| **Tests**                            | 475 passing (+1 ignored) | `impulse-rs/src/*/tests.rs` |
+| **Tests**                            | 920 passing (3 ignored) | `impulse-rs/src/*/tests.rs` |
 | **Branding**                         | Complete    | `impulse-rs/src/branding.rs`          |
 | **Phase 2 (chat context)**           | Complete    | Session context in daemon chat        |
 | **Retrieval foundation**             | Complete    | `impulse-rs/src/retrieval/`           |
@@ -137,16 +140,28 @@ impulse-rs --daemon session-start -n "chat-session"
 | **ImpulseAgent (LLM coordination)** | Complete    | `impulse-rs/src/impulse_agent/`       |
 | **Context Lifecycle**                | Complete    | `impulse-rs/src/context_lifecycle/`   |
 | **Intent Detection**                 | Complete    | `impulse-rs/src/intent/`              |
+| **Guardrail engine**                 | Complete    | `impulse-rs/src/guardrail/`           |
+| **Plugin system**                    | Complete    | `impulse-rs/src/plugin/`              |
+| **Semantic diff**                    | Complete    | `impulse-rs/src/semantic_diff/`       |
+| **GUI (egui native workbench)**     | Complete    | `impulse-rs/impulse-gui/`             |
+| **Terminal widget (PTY + vt100)**   | Complete    | `impulse-rs/impulse-term/`            |
+| **IPC protocol versioning**          | Complete    | Daemon + GUI version negotiation      |
+| **Signal bus (GUI)**                 | Complete    | `impulse-gui/src/widgets/signal_bus.rs` |
+| **Supervisor permissions**           | Complete    | `impulse-ops/` + GUI settings view    |
+| **Direct-mode chat**                 | Complete    | `handlers/system.rs` (async LLM call) |
+| **Stale socket cleanup**            | Complete    | `daemon/mod.rs` (startup detection)   |
+| **Conflict audit trail**            | Complete    | `state/persistence.rs` (CONFLICTS.jsonl) |
+| **Structured logging**              | Complete    | `daemon/mod.rs` (tracing-subscriber)  |
 
 ### Codebase Metrics
 
 | Metric | Value |
 |--------|-------|
-| Total Rust source files | 128 |
-| Total lines of code | ~39,900 |
-| Source modules | 27 active (30 declared in `main.rs`) |
-| Tests passing (`cargo test`) | 475 (+1 ignored) |
-| Feature flags | `office-support` (default), use `--no-default-features` for minimal binary |
+| Total Rust source files | 161 (main) + 50+ (impulse-term, impulse-gui) |
+| Total lines of code | ~69K+ (53K main + 2.7K term + 13K gui) |
+| Source modules | 35 declared in `main.rs` |
+| Tests passing (`cargo test`) | 1,100 (825 main + 220 gui + 55 term, 2 ignored) |
+| Feature flags | `office-support` (default), `monty-support`, `datafusion-support` |
 | DynamicTools registered | 23 |
 
 ---
@@ -258,6 +273,34 @@ cargo run -- config                    # Show all
 cargo run -- config <key>              # Get value
 cargo run -- config <key> --value <val>  # Set value
 
+# Guardrails
+cargo run -- guard --action "git push --force" --target bash --json
+cargo run -- guard --list
+cargo run -- guard --enable <rule-id>
+cargo run -- guard --disable <rule-id>
+
+# Semantic diff/blame/impact
+cargo run -- sem-diff --base HEAD~1 --head HEAD [--json]
+cargo run -- sem-blame --file src/main.rs [--json]
+cargo run -- sem-impact --entity handle_chat [--json]
+cargo run -- sem-status [--json]
+
+# Conflict analytics
+cargo run -- conflict-history
+cargo run -- analytics conflicts [--json] [--period day|week|month|all]
+
+# Debug (daemon internal state snapshot)
+cargo run -- debug
+cargo run -- --daemon debug
+
+# Plugins
+cargo run -- plugin-list [--json]
+cargo run -- plugin-invoke <name> [--path <p>] [--query <q>] [--json]
+
+# ATCC command discovery
+cargo run -- describe                  # Full command registry
+cargo run -- schema <command>          # JSON Schema for a command
+
 # Daemon (for TUI/chat)
 cargo run -- daemon                    # Start daemon
 cargo run -- run                       # Start TUI
@@ -284,13 +327,62 @@ cargo test
 
 ---
 
+## GUI Workbench (impulse-gui)
+
+Native egui application providing a visual workbench for Impulse. Connects to the daemon via IPC.
+
+### Views
+
+| View | Shortcut | Description |
+|------|----------|-------------|
+| Overview | Ctrl+1 | Connection stats, session summary, signal history |
+| Terminals | Ctrl+2 | PTY multiplexer with context lifecycle indicators |
+| Context | Ctrl+3 | Context telemetry, injection preview (Essential/Critical/Minimal) |
+| Memory | Ctrl+4 | Session history, genome decisions, search |
+| Artifacts | — | Artifact browser with render modes (Markdown, RawJson, Error) |
+| Settings | — | Config editor, supervisor permissions (interactive toggles), agent detection |
+
+### Keyboard Shortcuts
+
+| Shortcut | Action |
+|----------|--------|
+| Ctrl+N | New terminal tab |
+| Ctrl+W | Close current tab |
+| Ctrl+Tab | Cycle tabs |
+| Ctrl+L | Focus agent panel |
+| Ctrl+B | Toggle sidebar |
+| Ctrl+K | Focus search |
+| Ctrl+S | Explicit session save |
+| Ctrl+E | Toggle agent panel |
+| Ctrl+/ | Shortcuts help overlay |
+
+### Signal Bus
+
+The signal bus collects, debounces, and routes GUI events:
+- **ContextThreshold** — context window pressure alerts
+- **ErrorEncountered** — errors from agent panes
+- **TaskCompleted** — task completion events
+- **CompactionDetected** — context compaction events
+- **FileConflict** — cross-pane file conflicts
+
+Signals appear as tab badges, toast notifications, and in the Signal History section of Overview.
+
+### Daemon Connection Health
+
+The status bar shows real-time connection health:
+- RTT color coding: green (<10ms), yellow (<100ms), red (>=100ms)
+- Protocol version mismatch warnings
+- Disconnect count tracking
+
+---
+
 ## Key Files
 
 | File                                | Purpose                                        |
 | ----------------------------------- | ---------------------------------------------- |
 | `impulse-rs/src/main.rs`            | CLI entry, command routing (2,764 lines)       |
 | `impulse-rs/src/storage/mod.rs`     | Atomic file operations (11 tests)              |
-| `impulse-rs/src/state/mod.rs`       | In-memory state + Drop sync (13 tests)         |
+| `impulse-rs/src/state/`             | In-memory state + Drop sync (mod.rs + config.rs + persistence.rs + session.rs, 13 tests) |
 | `impulse-rs/src/daemon/mod.rs`      | Unix socket server, chat wired (15 tests)      |
 | `impulse-rs/src/client/mod.rs`      | Daemon client                                  |
 | `impulse-rs/src/agent/`             | LLM provider trait + Anthropic/OpenAI/Minimax (8 tests) |
@@ -299,7 +391,7 @@ cargo test
 | `impulse-rs/src/error.rs`           | Global error type definitions                  |
 | `impulse-rs/src/session/mod.rs`     | Session lifecycle management                   |
 | `impulse-rs/src/orchestration/mod.rs` | Multi-step orchestration logic (3 tests)     |
-| `impulse-rs/src/ui/`                | Terminal UI with ratatui (86KB, 6 tests)       |
+| `impulse-rs/src/ui/`                | Terminal UI with ratatui (mod.rs + types.rs + runner.rs + agent_terminal.rs + lifecycle.rs + render_panels.rs + pane_manager + visualization, 6 tests) |
 | `impulse-rs/src/verify/mod.rs`      | Verification gate logic (2 tests)              |
 | `impulse-rs/src/retrieval/`         | SQLite FTS5, embeddings, indexer (7 files, 12 tests) |
 | `impulse-rs/src/injection/`         | Context injection engine (9 tests)             |
@@ -314,7 +406,7 @@ cargo test
 | `impulse-rs/src/office/`            | Office doc parsing — feature-flagged (4 files, 11 tests) |
 | `impulse-rs/src/monty/`             | Computed routing, dynamic injection (6 files, 17 tests) |
 | `impulse-rs/src/impulse_agent/`     | Dual-mode LLM agent: API + CLI harness coordination (3 files, 26 tests) |
-| `impulse-rs/src/context_lifecycle/` | Context window monitor, injector, extractor, detector (7 files, 36 tests) |
+| `impulse-rs/src/context_lifecycle/` | Context window monitor, injector, extractor, detector (7 files, 64 tests) |
 | `impulse-rs/src/intent/`            | Intent detection from agent PTY output (4 files, 11 tests) |
 | `impulse-rs/src/integration_tests.rs` | Integration test suite with DaemonGuard RAII |
 
@@ -578,7 +670,7 @@ Config at `.opencode/impulse.json` with equivalent hooks.
 | **Now**    | Search & Analytics tabs                                                | Rust        | **Complete** |
 | **Now**    | Session tagging                                                        | Rust        | **Complete** |
 | **Now**    | Filter system                                                          | Rust        | **Complete** |
-| **Now**    | Tests (475 passing)                                                    | Rust        | **Complete** |
+| **Now**    | Tests (920 passing)                                                    | Rust        | **Complete** |
 | **Now**    | Tauri macOS app                                                        | Rust        | **Complete** |
 | **Now**    | Terminal in Tauri                                                      | xterm.js    | **Complete** |
 | **Now**    | Context stewardship                                                    | Rust        | **Complete** |
@@ -761,4 +853,4 @@ cargo install --path .
 
 ---
 
-_Last updated: 2026-02-25_
+_Last updated: 2026-03-09_

@@ -15,6 +15,7 @@ use crate::state::{
 };
 use crate::views::artifacts::{ArtifactUiAction, ArtifactsView};
 use crate::views::context::ContextView;
+use crate::views::guardrails::GuardrailsView;
 use crate::views::memory::MemoryView;
 use crate::views::overview::OverviewView;
 use crate::views::settings::SettingsView;
@@ -31,6 +32,7 @@ pub struct ImpulseApp {
     context: ContextView,
     memory: MemoryView,
     artifacts: ArtifactsView,
+    guardrails: GuardrailsView,
     settings: SettingsView,
     active_view: ViewId,
 
@@ -56,14 +58,16 @@ pub struct ImpulseApp {
 
     notifications: NotificationManager,
     signal_bus: SignalBus,
+    show_shortcuts_help: bool,
 }
 
 impl ImpulseApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let (shared_state, poller_cmd, poller_events, poller_thread) =
-            state::start_poller(cc.egui_ctx.clone());
         let impulse_home = GlobalConfig::impulse_home();
         let global_config = GlobalConfig::load(&impulse_home).unwrap_or_default();
+        let initial_settings = state::RuntimeSettings::from_map(&global_config.settings);
+        let (shared_state, poller_cmd, poller_events, poller_thread) =
+            state::start_poller(cc.egui_ctx.clone(), initial_settings);
         let project_selector = ProjectSelector::new(global_config.recent_projects.clone());
 
         if let Err(e) = crate::identity::ensure_identity_files(&impulse_home) {
@@ -76,7 +80,8 @@ impl ImpulseApp {
             context: ContextView::new(),
             memory: MemoryView::new(poller_cmd.clone()),
             artifacts: ArtifactsView::new(),
-            settings: SettingsView::new(),
+            guardrails: GuardrailsView::new(),
+            settings: SettingsView::with_poller(Some(poller_cmd.clone())),
             active_view: ViewId::Overview,
             sidebar_expanded: true,
             agent_panel: AgentPanel::new(Some(shared_state.clone())),
@@ -97,6 +102,7 @@ impl ImpulseApp {
             last_search_query: String::new(),
             notifications: NotificationManager::new(),
             signal_bus: SignalBus::new(),
+            show_shortcuts_help: false,
         }
     }
 
@@ -118,6 +124,8 @@ impl ImpulseApp {
             } else if input.key_pressed(egui::Key::Num5) {
                 self.active_view = ViewId::Artifacts;
             } else if input.key_pressed(egui::Key::Num6) {
+                self.active_view = ViewId::Guardrails;
+            } else if input.key_pressed(egui::Key::Num7) {
                 self.active_view = ViewId::Settings;
             } else if input.key_pressed(egui::Key::B) {
                 self.sidebar_expanded = !self.sidebar_expanded;
@@ -135,8 +143,86 @@ impl ImpulseApp {
                     self.agent_visible = true;
                 }
                 self.agent_panel.request_focus();
+            } else if input.key_pressed(egui::Key::S) {
+                let _ = self.poller_cmd.send(PollerCommand::Refresh);
+            } else if input.key_pressed(egui::Key::E) {
+                self.agent_visible = !self.agent_visible;
+            } else if input.key_pressed(egui::Key::Slash) {
+                self.show_shortcuts_help = !self.show_shortcuts_help;
             }
         });
+    }
+
+    fn show_shortcuts_overlay(&mut self, ctx: &egui::Context) {
+        use crate::theme::colors;
+
+        if !self.show_shortcuts_help {
+            return;
+        }
+
+        let mut open = self.show_shortcuts_help;
+        egui::Window::new("Keyboard Shortcuts")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.set_min_width(320.0);
+
+                let shortcuts = [
+                    (
+                        "Views",
+                        vec![
+                            ("Ctrl+1", "Overview"),
+                            ("Ctrl+2", "Agents / Terminals"),
+                            ("Ctrl+3", "Context"),
+                            ("Ctrl+4", "Memory"),
+                            ("Ctrl+5", "Artifacts"),
+                            ("Ctrl+6", "Guardrails"),
+                            ("Ctrl+7", "Settings"),
+                        ],
+                    ),
+                    (
+                        "Navigation",
+                        vec![
+                            ("Ctrl+B", "Toggle sidebar"),
+                            ("Ctrl+E", "Toggle agent panel"),
+                            ("Ctrl+K", "Focus memory search"),
+                            ("Ctrl+L", "Focus agent input"),
+                            ("Ctrl+R", "Refresh data"),
+                            ("Ctrl+S", "Save / sync data"),
+                            ("Ctrl+/", "Toggle this help"),
+                        ],
+                    ),
+                    (
+                        "Terminals",
+                        vec![
+                            ("Ctrl+T / Ctrl+N", "New agent tab"),
+                            ("Ctrl+W", "Close current tab"),
+                            ("Ctrl+Tab", "Cycle tabs"),
+                            ("Escape", "Dismiss error / close panel"),
+                        ],
+                    ),
+                ];
+
+                for (group, items) in &shortcuts {
+                    ui.label(egui::RichText::new(*group).strong().color(colors::TEXT));
+                    egui::Grid::new(format!("shortcuts_{}", group))
+                        .num_columns(2)
+                        .spacing([16.0, 4.0])
+                        .show(ui, |ui| {
+                            for (key, desc) in items {
+                                ui.label(
+                                    egui::RichText::new(*key).monospace().color(colors::YELLOW),
+                                );
+                                ui.label(egui::RichText::new(*desc).color(colors::TEXT_DIM));
+                                ui.end_row();
+                            }
+                        });
+                    ui.add_space(8.0);
+                }
+            });
+        self.show_shortcuts_help = open;
     }
 
     fn build_project_bar(&mut self, ctx: &egui::Context) {
@@ -457,7 +543,13 @@ impl eframe::App for ImpulseApp {
         self.drain_poller_events();
 
         let now = Instant::now();
-        if now.duration_since(self.last_context_tick) >= Duration::from_secs(3) {
+        let tick_interval = self
+            .shared_state
+            .lock()
+            .ok()
+            .map(|s| s.runtime_settings.context_tick_interval())
+            .unwrap_or_else(|| Duration::from_secs(3));
+        if now.duration_since(self.last_context_tick) >= tick_interval {
             self.last_context_tick = now;
             self.terminals.context_tick();
 
@@ -551,6 +643,11 @@ impl eframe::App for ImpulseApp {
             self.signal_bus.mark_badges_clean();
         }
 
+        // Sync signal log snapshot to SharedState for Overview display.
+        if let Ok(mut state) = self.shared_state.lock() {
+            state.signal_log = self.signal_bus.signal_log_snapshot();
+        }
+
         if let Some(tab_id) = self.terminals.take_badge_ack() {
             self.signal_bus.acknowledge_tab(tab_id);
         }
@@ -586,6 +683,7 @@ impl eframe::App for ImpulseApp {
             self.terminals.handle_shortcuts(ctx);
         }
         self.handle_global_shortcuts(ctx);
+        self.show_shortcuts_overlay(ctx);
 
         if let Some(agent_name) = self.terminals.take_pending_spawn() {
             self.project_selector.open(Some(agent_name));
@@ -736,6 +834,10 @@ impl eframe::App for ImpulseApp {
                     }
                 }
                 PanelAction::SearchTerm { query } => {
+                    self.active_view = ViewId::Agents;
+                    self.terminals.search_terminals(query);
+                }
+                PanelAction::MemorySearch { query } => {
                     self.active_view = ViewId::Memory;
                     self.memory.focus_search(query);
                 }
@@ -790,6 +892,7 @@ impl eframe::App for ImpulseApp {
             ViewId::Context => self.context.ui(ui, &state, ctx),
             ViewId::Memory => self.memory.ui(ui, &state, ctx),
             ViewId::Artifacts => self.artifacts.ui(ui, &state, ctx),
+            ViewId::Guardrails => self.guardrails.ui(ui, &state, ctx),
             ViewId::Settings => self.settings.ui(ui, &state, ctx),
         });
 

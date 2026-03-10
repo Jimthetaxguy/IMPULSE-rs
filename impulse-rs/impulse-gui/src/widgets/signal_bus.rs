@@ -46,6 +46,18 @@ pub struct GuiSignal {
     pub created_at: Instant,
 }
 
+/// Display-ready snapshot of a signal for the Overview view.
+/// Uses age-in-seconds instead of `Instant` so it can be cloned + displayed.
+#[derive(Debug, Clone)]
+pub struct SignalLogEntry {
+    pub kind_label: String,
+    pub message: String,
+    pub urgency: SignalUrgency,
+    #[allow(dead_code)]
+    pub tab_id: Option<u64>,
+    pub age_secs: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Tab badge state
 // ---------------------------------------------------------------------------
@@ -116,6 +128,17 @@ fn debounce_key(kind: &SignalKind, tab_id: Option<u64>) -> String {
 // SignalBus
 // ---------------------------------------------------------------------------
 
+/// Human-readable label for a signal kind.
+fn signal_kind_label(kind: &SignalKind) -> String {
+    match kind {
+        SignalKind::ContextThreshold { pct } => format!("Context {}%", pct),
+        SignalKind::ErrorEncountered => "Error".to_string(),
+        SignalKind::TaskCompleted => "Task Done".to_string(),
+        SignalKind::CompactionDetected => "Compaction".to_string(),
+        SignalKind::FileConflict { path, .. } => format!("Conflict: {}", path),
+    }
+}
+
 /// Maximum debounce window across all signal kinds (seconds).
 const MAX_DEBOUNCE_SECS: u64 = 60;
 
@@ -123,6 +146,9 @@ const MAX_DEBOUNCE_SECS: u64 = 60;
 const PRUNE_INTERVAL_SECS: u64 = 60;
 
 /// Collects, debounces, and routes signals to visual surfaces.
+/// Maximum entries retained in the signal history log.
+const SIGNAL_LOG_MAX: usize = 100;
+
 pub struct SignalBus {
     pending: Vec<GuiSignal>,
     tab_badges: BTreeMap<u64, TabBadge>,
@@ -130,6 +156,8 @@ pub struct SignalBus {
     summary: SignalSummary,
     badges_dirty: bool,
     last_prune: Instant,
+    /// Retained log of recent signals (most recent last, capped at SIGNAL_LOG_MAX).
+    signal_log: Vec<GuiSignal>,
 }
 
 impl SignalBus {
@@ -141,6 +169,7 @@ impl SignalBus {
             summary: SignalSummary::default(),
             badges_dirty: false,
             last_prune: Instant::now(),
+            signal_log: Vec::new(),
         }
     }
 
@@ -201,6 +230,19 @@ impl SignalBus {
             SignalKind::TaskCompleted => self.summary.tasks_completed += 1,
             SignalKind::FileConflict { .. } => self.summary.active_conflicts += 1,
             _ => {}
+        }
+
+        // Retain in signal log for history display.
+        self.signal_log.push(GuiSignal {
+            kind: signal.kind.clone(),
+            urgency: signal.urgency,
+            tab_id: signal.tab_id,
+            message: signal.message.clone(),
+            created_at: signal.created_at,
+        });
+        if self.signal_log.len() > SIGNAL_LOG_MAX {
+            self.signal_log
+                .drain(..self.signal_log.len() - SIGNAL_LOG_MAX);
         }
 
         self.pending.push(signal);
@@ -267,6 +309,21 @@ impl SignalBus {
     /// All tab badges (for syncing to the terminals view).
     pub fn all_tab_badges(&self) -> &BTreeMap<u64, TabBadge> {
         &self.tab_badges
+    }
+
+    /// Snapshot the signal log as display-ready entries (most recent last).
+    pub fn signal_log_snapshot(&self) -> Vec<SignalLogEntry> {
+        let now = Instant::now();
+        self.signal_log
+            .iter()
+            .map(|sig| SignalLogEntry {
+                kind_label: signal_kind_label(&sig.kind),
+                message: sig.message.clone(),
+                urgency: sig.urgency,
+                tab_id: sig.tab_id,
+                age_secs: now.duration_since(sig.created_at).as_secs(),
+            })
+            .collect()
     }
 
     /// Remove debounce entries older than 2× the max debounce window.
@@ -606,6 +663,79 @@ mod tests {
         // Should not panic.
         bus.acknowledge_tab(999);
         assert!(bus.all_tab_badges().is_empty());
+    }
+
+    #[test]
+    fn test_signal_log_retains_accepted_signals() {
+        let mut bus = SignalBus::new();
+        bus.emit(make_signal(
+            SignalKind::ErrorEncountered,
+            SignalUrgency::Important,
+            Some(1),
+        ));
+        bus.emit(make_signal(
+            SignalKind::TaskCompleted,
+            SignalUrgency::Important,
+            Some(2),
+        ));
+
+        let log = bus.signal_log_snapshot();
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].kind_label, "Error");
+        assert_eq!(log[1].kind_label, "Task Done");
+    }
+
+    #[test]
+    fn test_signal_log_does_not_retain_debounced() {
+        let mut bus = SignalBus::new();
+        let now = Instant::now();
+
+        let sig1 = GuiSignal {
+            kind: SignalKind::ErrorEncountered,
+            urgency: SignalUrgency::Important,
+            tab_id: Some(1),
+            message: "first".into(),
+            created_at: now,
+        };
+        let sig2 = GuiSignal {
+            kind: SignalKind::ErrorEncountered,
+            urgency: SignalUrgency::Important,
+            tab_id: Some(1),
+            message: "debounced".into(),
+            created_at: now + Duration::from_secs(1),
+        };
+
+        assert!(bus.emit(sig1));
+        assert!(!bus.emit(sig2)); // debounced — should NOT appear in log
+
+        let log = bus.signal_log_snapshot();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].message, "first");
+    }
+
+    #[test]
+    fn test_signal_log_capped_at_max() {
+        let mut bus = SignalBus::new();
+        // ContextThreshold has 0s debounce, so all are accepted.
+        for i in 0..(SIGNAL_LOG_MAX + 20) {
+            bus.emit(GuiSignal {
+                kind: SignalKind::ContextThreshold {
+                    pct: (i % 100) as u8,
+                },
+                urgency: SignalUrgency::Ambient,
+                tab_id: Some(i as u64),
+                message: format!("signal {}", i),
+                created_at: Instant::now(),
+            });
+        }
+
+        let log = bus.signal_log_snapshot();
+        assert_eq!(log.len(), SIGNAL_LOG_MAX);
+        // Oldest signals should have been trimmed; last entry should be the most recent.
+        assert_eq!(
+            log.last().unwrap().message,
+            format!("signal {}", SIGNAL_LOG_MAX + 19)
+        );
     }
 
     #[test]

@@ -85,7 +85,7 @@ impl TokenTracker {
         self.session_platforms
             .insert(session_id.to_string(), platform);
         self.events.push(event);
-        self.events.last().unwrap()
+        self.events.last().expect("event was just pushed")
     }
 
     /// Record a compaction event
@@ -123,7 +123,7 @@ impl TokenTracker {
         };
 
         self.compactions.push(event);
-        self.compactions.last().unwrap()
+        self.compactions.last().expect("compaction was just pushed")
     }
 
     /// Get the appropriate token budget based on current usage

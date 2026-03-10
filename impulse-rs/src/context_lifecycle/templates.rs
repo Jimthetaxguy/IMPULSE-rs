@@ -185,4 +185,80 @@ mod tests {
         assert!(msg.contains("session_query"));
         assert!(msg.contains("memory_search"));
     }
+
+    #[test]
+    fn test_refresh_message_minimal_tier() {
+        let msg = build_refresh_message(
+            AgentKind::ClaudeCode,
+            ContextTier::Minimal,
+            "claude-1",
+            "## Tools",
+            &[],
+        );
+        assert!(msg.contains("minimal"));
+        assert!(msg.contains("sync-context"));
+        assert!(msg.contains("tooling-list"));
+    }
+
+    #[test]
+    fn test_refresh_message_post_compaction() {
+        let msg = build_refresh_message(
+            AgentKind::ClaudeCode,
+            ContextTier::PostCompaction,
+            "claude-1",
+            "## Tools",
+            &[],
+        );
+        assert!(msg.contains("post_compaction"));
+        assert!(msg.contains("compaction"));
+    }
+
+    #[test]
+    fn test_refresh_message_critical_tier() {
+        let msg = build_refresh_message(
+            AgentKind::ClaudeCode,
+            ContextTier::Critical,
+            "claude-1",
+            "## Tools",
+            &[],
+        );
+        assert!(msg.contains("critical"));
+        assert!(msg.contains("sync-context"));
+    }
+
+    #[test]
+    fn test_cross_pane_section_empty() {
+        let section = format_cross_pane_section(&[]);
+        assert!(section.is_empty());
+    }
+
+    #[test]
+    fn test_cross_pane_section_with_insights() {
+        use crate::context_lifecycle::types::{ExtractedInsight, InsightType};
+        let insights = vec![ExtractedInsight {
+            pane_id: 2,
+            agent_kind: AgentKind::OpenCode,
+            timestamp: chrono::Utc::now(),
+            insight_type: InsightType::FileModified,
+            content: "src/main.rs".to_string(),
+            intent: None,
+        }];
+        let section = format_cross_pane_section(&insights);
+        assert!(section.contains("Cross-Pane Activity"));
+        assert!(section.contains("opencode"));
+        assert!(section.contains("src/main.rs"));
+    }
+
+    #[test]
+    fn test_refresh_message_non_xml_agent() {
+        let msg = build_refresh_message(
+            AgentKind::OpenCode,
+            ContextTier::Essential,
+            "opencode-1",
+            "## Tools",
+            &[],
+        );
+        assert!(msg.contains("# [Impulse Refresh: essential]"));
+        assert!(!msg.contains("<impulse-context"));
+    }
 }

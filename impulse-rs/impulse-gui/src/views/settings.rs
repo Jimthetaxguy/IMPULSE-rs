@@ -228,10 +228,19 @@ pub struct SettingsView {
     dirty: bool,
     /// Supervisor actions queued from the secondary permission surface.
     pending_supervisor_actions: Vec<impulse_ops::SupervisorAction>,
+    /// Command sender to push settings updates to the poller thread.
+    poller_cmd: Option<std::sync::mpsc::Sender<crate::state::PollerCommand>>,
 }
 
 impl SettingsView {
+    #[cfg(test)]
     pub fn new() -> Self {
+        Self::with_poller(None)
+    }
+
+    pub fn with_poller(
+        poller_cmd: Option<std::sync::mpsc::Sender<crate::state::PollerCommand>>,
+    ) -> Self {
         // Load saved settings from GlobalConfig, falling back to defaults.
         let impulse_home = crate::global_config::GlobalConfig::impulse_home();
         let config = crate::global_config::GlobalConfig::load(&impulse_home).unwrap_or_default();
@@ -252,10 +261,11 @@ impl SettingsView {
             status_msg: None,
             dirty: false,
             pending_supervisor_actions: Vec::new(),
+            poller_cmd,
         }
     }
 
-    /// Save current settings to `~/.impulse/config.json`.
+    /// Save current settings to `~/.impulse/config.json` and push to poller.
     fn save_settings(&mut self) {
         let impulse_home = crate::global_config::GlobalConfig::impulse_home();
         let mut config =
@@ -265,6 +275,11 @@ impl SettingsView {
 
         match config.save(&impulse_home) {
             Ok(()) => {
+                // Push updated settings to the poller thread so they take effect immediately.
+                let runtime = crate::state::RuntimeSettings::from_map(&self.values);
+                if let Some(ref tx) = self.poller_cmd {
+                    let _ = tx.send(crate::state::PollerCommand::UpdateSettings(runtime));
+                }
                 self.status_msg = Some(("Settings saved".to_string(), true));
                 self.dirty = false;
             }
@@ -453,44 +468,60 @@ impl SettingsView {
                     return;
                 };
 
+                // Interactive permission toggles — click to grant/deny.
                 ui.label(
-                    egui::RichText::new("Baseline actions")
+                    egui::RichText::new("Action Permissions (click to toggle)")
                         .small()
                         .color(colors::TEXT_MUTED),
                 );
                 ui.horizontal_wrapped(|ui| {
-                    for action in &permission_state.baseline.allowed_actions {
-                        render_chip(ui, action.as_str(), colors::ACCENT);
+                    for &perm in ALL_PERMISSIONS {
+                        let allowed = permission_state.effective.allows_action(perm);
+                        let needs_confirm = permission_state.effective.requires_confirmation(perm);
+                        let (color, tooltip) = if allowed && needs_confirm {
+                            (
+                                colors::YELLOW,
+                                "Allowed (requires confirmation) — click to deny",
+                            )
+                        } else if allowed {
+                            (colors::GREEN, "Allowed — click to deny")
+                        } else {
+                            (colors::TEXT_DIM, "Denied — click to grant for this session")
+                        };
+                        let resp = render_toggle_chip(ui, perm.as_str(), color, allowed);
+                        if resp.clicked() && !allowed {
+                            self.pending_supervisor_actions.push(
+                                impulse_ops::SupervisorAction::ModifyPermissions {
+                                    scope: impulse_ops::PermissionChangeScope::SessionOverride,
+                                    grant_actions: vec![perm],
+                                    grant_tool_capabilities: vec![],
+                                    confirmed: true,
+                                },
+                            );
+                        }
+                        resp.on_hover_text(tooltip);
                     }
                 });
 
                 ui.add_space(4.0);
                 ui.label(
-                    egui::RichText::new("Baseline tool capabilities")
+                    egui::RichText::new("Tool Capabilities")
                         .small()
                         .color(colors::TEXT_MUTED),
                 );
                 ui.horizontal_wrapped(|ui| {
-                    for capability in &permission_state.baseline.allowed_tool_capabilities {
+                    for capability in &permission_state.effective.allowed_tool_capabilities {
                         render_chip(ui, capability.as_str(), colors::BLUE);
                     }
                 });
 
-                if let Some(session_override) = &permission_state.session_override {
+                if permission_state.session_override_active() {
                     ui.add_space(4.0);
                     ui.label(
-                        egui::RichText::new("Session override")
+                        egui::RichText::new("Session override grants are active above.")
                             .small()
-                            .color(colors::TEXT_MUTED),
+                            .color(colors::YELLOW),
                     );
-                    ui.horizontal_wrapped(|ui| {
-                        for action in &session_override.allowed_actions {
-                            render_chip(ui, action.as_str(), colors::YELLOW);
-                        }
-                        for capability in &session_override.allowed_tool_capabilities {
-                            render_chip(ui, capability.as_str(), colors::YELLOW);
-                        }
-                    });
                 }
 
                 ui.add_space(8.0);
@@ -580,6 +611,37 @@ impl SettingsView {
             }
         });
     }
+}
+
+/// All supervisor action permissions for the interactive toggle display.
+const ALL_PERMISSIONS: &[impulse_ops::SupervisorActionPermission] = &[
+    impulse_ops::SupervisorActionPermission::MonitorAgents,
+    impulse_ops::SupervisorActionPermission::FocusAgent,
+    impulse_ops::SupervisorActionPermission::OpenReview,
+    impulse_ops::SupervisorActionPermission::SearchMemory,
+    impulse_ops::SupervisorActionPermission::SendInput,
+    impulse_ops::SupervisorActionPermission::InjectContext,
+    impulse_ops::SupervisorActionPermission::CleanupContext,
+    impulse_ops::SupervisorActionPermission::HandoffContext,
+    impulse_ops::SupervisorActionPermission::ModifyPermissions,
+];
+
+fn render_toggle_chip(
+    ui: &mut egui::Ui,
+    label: &str,
+    accent: egui::Color32,
+    active: bool,
+) -> egui::Response {
+    let fill = if active { colors::SURFACE } else { colors::BG };
+    egui::Frame::new()
+        .fill(fill)
+        .corner_radius(egui::CornerRadius::same(255))
+        .inner_margin(egui::Margin::symmetric(8, 4))
+        .stroke(egui::Stroke::new(if active { 1.0 } else { 0.5 }, accent))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(label).small().color(accent));
+        })
+        .response
 }
 
 fn render_chip(ui: &mut egui::Ui, label: &str, accent: egui::Color32) {

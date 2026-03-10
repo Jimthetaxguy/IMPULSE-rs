@@ -147,7 +147,7 @@ impl CrossPlatformAnalyzer {
         // Determine rankings and comparisons
         let mut rankings: Vec<(Platform, f64)> =
             efficiencies.iter().map(|(p, e)| (*p, *e)).collect();
-        rankings.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        rankings.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let most_efficient = rankings
             .first()
@@ -155,12 +155,12 @@ impl CrossPlatformAnalyzer {
             .unwrap_or(Platform::ClaudeCode);
         let most_stable = intervals
             .iter()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(p, _)| *p)
             .unwrap_or(Platform::ClaudeCode);
         let best_compression = compressions
             .iter()
-            .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(p, _)| *p)
             .unwrap_or(Platform::ClaudeCode);
 

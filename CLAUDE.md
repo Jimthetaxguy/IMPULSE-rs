@@ -57,10 +57,11 @@ Before implementing, consider alternative approaches. Choose the simplest soluti
 
 ## Architecture
 
-**Workspace (3 crates):**
-- `impulse-rs/` — main CLI + daemon + TUI (30 modules, ~41K lines)
-- `impulse-rs/impulse-term/` — custom terminal widget (PTY + vt100 + context bridge, ~2K lines, 39 tests)
-- `impulse-rs/impulse-gui/` — egui native workbench (Overview, Agents, Context, Memory, Artifacts, Settings)
+**Workspace (4 crates):**
+- `impulse-rs/` — main CLI + daemon + TUI (35 modules, ~53K lines, 825 tests)
+- `impulse-rs/impulse-ops/` — operations library (shared types: SupervisorAction, TerminalOpsReport, OpsSnapshot)
+- `impulse-rs/impulse-term/` — custom terminal widget (PTY + vt100 + context bridge, ~2.7K lines, 55 tests)
+- `impulse-rs/impulse-gui/` — egui native workbench (Overview, Terminals, Context, Memory, Artifacts, Settings, ~13K lines, 220 tests)
 
 **Dual mode:**
 - **Direct mode** — stateless, per-action (for hooks). Read → process → write → exit.
@@ -85,7 +86,7 @@ Before implementing, consider alternative approaches. Choose the simplest soluti
 | State | `RwLock` + dirty flag + sync on Drop |
 | Naming | `PascalCase` structs, `snake_case` functions, `SCREAMING_SNAKE` constants |
 | Testing | Unit tests in `mod tests` per file, integration tests with `DaemonGuard` RAII |
-| Feature flags | `office-support`, `monty-support`, `datafusion-support` (all opt-in) |
+| Feature flags | `office-support` (default), `monty-support`, `datafusion-support` (opt-in) |
 
 ---
 

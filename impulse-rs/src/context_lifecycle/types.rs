@@ -300,4 +300,65 @@ mod tests {
         // Oldest entries should have been evicted
         assert!(state.extracted_insights[0].content.contains("file-5"));
     }
+
+    #[test]
+    fn test_can_inject_initially_true() {
+        let state = PaneContextState::new(1, AgentKind::ClaudeCode);
+        assert!(state.can_inject());
+    }
+
+    #[test]
+    fn test_mark_injected_prevents_immediate_reinjection() {
+        let mut state = PaneContextState::new(1, AgentKind::ClaudeCode);
+        state.mark_injected();
+        // Just marked — debounce should prevent injection
+        assert!(!state.can_inject());
+    }
+
+    #[test]
+    fn test_agent_kind_label() {
+        assert_eq!(AgentKind::ClaudeCode.label(), "claude");
+        assert_eq!(AgentKind::Codex.label(), "codex");
+        assert_eq!(AgentKind::OpenCode.label(), "opencode");
+        assert_eq!(AgentKind::GenericShell.label(), "shell");
+    }
+
+    #[test]
+    fn test_agent_kind_uses_xml_context() {
+        assert!(AgentKind::ClaudeCode.uses_xml_context());
+        assert!(!AgentKind::OpenCode.uses_xml_context());
+        assert!(!AgentKind::Codex.uses_xml_context());
+        assert!(!AgentKind::GenericShell.uses_xml_context());
+    }
+
+    #[test]
+    fn test_context_tier_as_str() {
+        assert_eq!(ContextTier::None.as_str(), "none");
+        assert_eq!(ContextTier::Full.as_str(), "full");
+        assert_eq!(ContextTier::Essential.as_str(), "essential");
+        assert_eq!(ContextTier::Critical.as_str(), "critical");
+        assert_eq!(ContextTier::Minimal.as_str(), "minimal");
+        assert_eq!(ContextTier::PostCompaction.as_str(), "post_compaction");
+    }
+
+    #[test]
+    fn test_insight_type_as_str() {
+        assert_eq!(InsightType::FileModified.as_str(), "file_modified");
+        assert_eq!(InsightType::ErrorEncountered.as_str(), "error_encountered");
+        assert_eq!(InsightType::DecisionMade.as_str(), "decision_made");
+        assert_eq!(InsightType::TaskCompleted.as_str(), "task_completed");
+    }
+
+    #[test]
+    fn test_detect_agent_from_pane_name() {
+        // Detection should also work from pane name, not just command
+        assert_eq!(
+            AgentKind::detect("some-cmd", "my-claude-pane"),
+            AgentKind::ClaudeCode
+        );
+        assert_eq!(
+            AgentKind::detect("some-cmd", "codex-session"),
+            AgentKind::Codex
+        );
+    }
 }

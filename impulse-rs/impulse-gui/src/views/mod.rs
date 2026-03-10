@@ -3,6 +3,7 @@
 pub mod artifacts;
 pub mod context;
 pub mod genome;
+pub mod guardrails;
 pub mod memory;
 pub mod memory_persistence;
 pub mod overview;
@@ -25,6 +26,7 @@ pub enum ViewId {
     Context,
     Memory,
     Artifacts,
+    Guardrails,
     Settings,
 }
 
@@ -36,6 +38,7 @@ impl ViewId {
             ViewId::Context,
             ViewId::Memory,
             ViewId::Artifacts,
+            ViewId::Guardrails,
             ViewId::Settings,
         ]
     }
@@ -47,6 +50,7 @@ impl ViewId {
             ViewId::Context => "Context (exp)",
             ViewId::Memory => "Memory",
             ViewId::Artifacts => "Artifacts (exp)",
+            ViewId::Guardrails => "Guardrails",
             ViewId::Settings => "Settings",
         }
     }
@@ -58,6 +62,7 @@ impl ViewId {
             ViewId::Context => "\u{25D4}",
             ViewId::Memory => "\u{1F9E0}",
             ViewId::Artifacts => "\u{25A4}",
+            ViewId::Guardrails => "\u{1F6E1}",
             ViewId::Settings => "\u{2699}",
         }
     }
@@ -69,7 +74,8 @@ impl ViewId {
             ViewId::Context => "Ctrl+3",
             ViewId::Memory => "Ctrl+4",
             ViewId::Artifacts => "Ctrl+5",
-            ViewId::Settings => "Ctrl+6",
+            ViewId::Guardrails => "Ctrl+6",
+            ViewId::Settings => "Ctrl+7",
         }
     }
 }

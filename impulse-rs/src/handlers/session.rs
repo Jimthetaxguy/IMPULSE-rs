@@ -321,3 +321,170 @@ pub async fn handle_session_conflicts(
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn test_state() -> (TempDir, Arc<state::State>) {
+        let tmp = TempDir::new().unwrap();
+        let st = state::State::new(tmp.path().to_path_buf()).unwrap();
+        (tmp, Arc::new(st))
+    }
+
+    // ── handle_list_sessions ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_sessions_empty() {
+        let (_tmp, st) = test_state();
+        let result = handle_list_sessions(&st).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn list_sessions_with_sessions() {
+        let (_tmp, st) = test_state();
+        st.create_session("session-a".to_string(), None)
+            .await
+            .unwrap();
+        st.create_session("session-b".to_string(), None)
+            .await
+            .unwrap();
+        let result = handle_list_sessions(&st).await;
+        assert!(result.is_ok());
+    }
+
+    // ── handle_session_info ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn session_info_existing() {
+        let (_tmp, st) = test_state();
+        let session = st
+            .create_session("test-info".to_string(), None)
+            .await
+            .unwrap();
+        let result = handle_session_info(&st, session.id).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn session_info_not_found() {
+        let (_tmp, st) = test_state();
+        let result = handle_session_info(&st, "nonexistent-id".to_string()).await;
+        assert!(result.is_ok()); // prints "Session not found" but doesn't error
+    }
+
+    // ── handle_track_write ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn track_write_with_session() {
+        let (_tmp, st) = test_state();
+        let session = st
+            .create_session("track-test".to_string(), None)
+            .await
+            .unwrap();
+        let result =
+            handle_track_write(&st, "src/main.rs".to_string(), Some(session.id.clone())).await;
+        assert!(result.is_ok());
+        // Verify tracking
+        let s = st.get_session(&session.id).await.unwrap().unwrap();
+        assert!(s.active_files.contains(&"src/main.rs".to_string()));
+    }
+
+    #[tokio::test]
+    async fn track_write_no_session_id() {
+        let (_tmp, st) = test_state();
+        // No session_id and no env var — should print error but not fail
+        let result = handle_track_write(&st, "src/main.rs".to_string(), None).await;
+        assert!(result.is_ok());
+    }
+
+    // ── handle_track_tool ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn track_tool_with_session() {
+        let (_tmp, st) = test_state();
+        let session = st
+            .create_session("tool-test".to_string(), None)
+            .await
+            .unwrap();
+        let result =
+            handle_track_tool(&st, "read_file".to_string(), Some(session.id.clone())).await;
+        assert!(result.is_ok());
+        let s = st.get_session(&session.id).await.unwrap().unwrap();
+        assert!(s.recent_tools.contains(&"read_file".to_string()));
+    }
+
+    // ── handle_session_end ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn session_end_valid() {
+        let (_tmp, st) = test_state();
+        let session = st
+            .create_session("end-test".to_string(), None)
+            .await
+            .unwrap();
+        let result = handle_session_end(
+            &st,
+            session.id.clone(),
+            "completed successfully".to_string(),
+            false,
+            None,
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn session_end_not_found() {
+        let (_tmp, st) = test_state();
+        let result = handle_session_end(
+            &st,
+            "nonexistent-session".to_string(),
+            "ended".to_string(),
+            false,
+            None,
+        )
+        .await;
+        assert!(result.is_ok()); // prints "Session not found" but Ok
+    }
+
+    // ── handle_session_conflicts ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn conflicts_no_conflict() {
+        let (_tmp, st) = test_state();
+        let s1 = st.create_session("s1".to_string(), None).await.unwrap();
+        st.track_file(&s1.id, "a.rs").await.unwrap();
+        let result =
+            handle_session_conflicts(&st, Some("a.rs".to_string()), Some(s1.id.clone())).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn conflicts_detected() {
+        let (_tmp, st) = test_state();
+        let s1 = st.create_session("s1".to_string(), None).await.unwrap();
+        let s2 = st.create_session("s2".to_string(), None).await.unwrap();
+        st.track_file(&s1.id, "shared.rs").await.unwrap();
+        st.track_file(&s2.id, "shared.rs").await.unwrap();
+        let result =
+            handle_session_conflicts(&st, Some("shared.rs".to_string()), Some(s1.id.clone())).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn conflicts_all_sessions_no_files() {
+        let (_tmp, st) = test_state();
+        let s1 = st.create_session("s1".to_string(), None).await.unwrap();
+        // Pass no file to trigger the "all sessions" branch
+        let result = handle_session_conflicts(&st, None, Some(s1.id.clone())).await;
+        assert!(result.is_ok());
+    }
+}

@@ -3,6 +3,7 @@ use eframe::egui;
 use super::{View, ViewId};
 use crate::state::{ConnectionStatus, SharedState};
 use crate::theme::colors;
+use crate::widgets::signal_bus::SignalUrgency;
 
 pub struct OverviewView;
 
@@ -194,6 +195,53 @@ impl View for OverviewView {
                 }
             });
         });
+
+        // Signal history log — recent GUI signals from the signal bus.
+        if !state.signal_log.is_empty() {
+            ui.add_space(12.0);
+            ui.group(|ui| {
+                ui.label(
+                    egui::RichText::new("Signal History")
+                        .strong()
+                        .color(colors::ACCENT),
+                );
+                ui.add_space(6.0);
+                // Show most recent first, capped at 10 for the overview.
+                for entry in state.signal_log.iter().rev().take(10) {
+                    ui.horizontal_wrapped(|ui| {
+                        let urgency_color = match entry.urgency {
+                            SignalUrgency::Urgent => colors::RED,
+                            SignalUrgency::Important => colors::YELLOW,
+                            SignalUrgency::Ambient => colors::TEXT_DIM,
+                        };
+                        ui.label(
+                            egui::RichText::new(&entry.kind_label)
+                                .small()
+                                .strong()
+                                .color(urgency_color),
+                        );
+                        ui.label(
+                            egui::RichText::new(&entry.message)
+                                .small()
+                                .color(colors::TEXT_MUTED),
+                        );
+                        let age_label = if entry.age_secs < 2 {
+                            "just now".to_string()
+                        } else if entry.age_secs < 60 {
+                            format!("{}s ago", entry.age_secs)
+                        } else {
+                            format!("{}m ago", entry.age_secs / 60)
+                        };
+                        ui.label(
+                            egui::RichText::new(age_label)
+                                .small()
+                                .color(colors::TEXT_FAINT),
+                        );
+                    });
+                    ui.add_space(2.0);
+                }
+            });
+        }
     }
 }
 
