@@ -117,7 +117,7 @@ impulse-rs --daemon session-start -n "chat-session"
 | **Daemon socket IPC**                | Complete    | `impulse-rs/src/daemon/mod.rs`        |
 | **Claude Code hooks**                | Complete    | `impulse-rs/.claude/hooks/hooks.json` |
 | **OpenCode integration**             | Complete    | `impulse-rs/.opencode/impulse.json`   |
-| **Tests**                            | 475 passing (+1 ignored) | `impulse-rs/src/*/tests.rs` |
+| **Tests**                            | 920 passing (3 ignored) | `impulse-rs/src/*/tests.rs` |
 | **Branding**                         | Complete    | `impulse-rs/src/branding.rs`          |
 | **Phase 2 (chat context)**           | Complete    | Session context in daemon chat        |
 | **Retrieval foundation**             | Complete    | `impulse-rs/src/retrieval/`           |
@@ -142,10 +142,10 @@ impulse-rs --daemon session-start -n "chat-session"
 
 | Metric | Value |
 |--------|-------|
-| Total Rust source files | 128 |
-| Total lines of code | ~39,900 |
-| Source modules | 27 active (30 declared in `main.rs`) |
-| Tests passing (`cargo test`) | 475 (+1 ignored) |
+| Total Rust source files | 161 (main) + 50+ (impulse-term, impulse-gui) |
+| Total lines of code | ~69K (53K main + 2.7K term + 13K gui) |
+| Source modules | 35 declared in `main.rs` |
+| Tests passing (`cargo test`) | 920 (3 ignored) |
 | Feature flags | `office-support` (default), use `--no-default-features` for minimal binary |
 | DynamicTools registered | 23 |
 
@@ -290,7 +290,7 @@ cargo test
 | ----------------------------------- | ---------------------------------------------- |
 | `impulse-rs/src/main.rs`            | CLI entry, command routing (2,764 lines)       |
 | `impulse-rs/src/storage/mod.rs`     | Atomic file operations (11 tests)              |
-| `impulse-rs/src/state/mod.rs`       | In-memory state + Drop sync (13 tests)         |
+| `impulse-rs/src/state/`             | In-memory state + Drop sync (mod.rs + config.rs + persistence.rs + session.rs, 13 tests) |
 | `impulse-rs/src/daemon/mod.rs`      | Unix socket server, chat wired (15 tests)      |
 | `impulse-rs/src/client/mod.rs`      | Daemon client                                  |
 | `impulse-rs/src/agent/`             | LLM provider trait + Anthropic/OpenAI/Minimax (8 tests) |
@@ -299,7 +299,7 @@ cargo test
 | `impulse-rs/src/error.rs`           | Global error type definitions                  |
 | `impulse-rs/src/session/mod.rs`     | Session lifecycle management                   |
 | `impulse-rs/src/orchestration/mod.rs` | Multi-step orchestration logic (3 tests)     |
-| `impulse-rs/src/ui/`                | Terminal UI with ratatui (86KB, 6 tests)       |
+| `impulse-rs/src/ui/`                | Terminal UI with ratatui (mod.rs + types.rs + runner.rs + agent_terminal.rs + lifecycle.rs + render_panels.rs + pane_manager + visualization, 6 tests) |
 | `impulse-rs/src/verify/mod.rs`      | Verification gate logic (2 tests)              |
 | `impulse-rs/src/retrieval/`         | SQLite FTS5, embeddings, indexer (7 files, 12 tests) |
 | `impulse-rs/src/injection/`         | Context injection engine (9 tests)             |
@@ -314,7 +314,7 @@ cargo test
 | `impulse-rs/src/office/`            | Office doc parsing — feature-flagged (4 files, 11 tests) |
 | `impulse-rs/src/monty/`             | Computed routing, dynamic injection (6 files, 17 tests) |
 | `impulse-rs/src/impulse_agent/`     | Dual-mode LLM agent: API + CLI harness coordination (3 files, 26 tests) |
-| `impulse-rs/src/context_lifecycle/` | Context window monitor, injector, extractor, detector (7 files, 36 tests) |
+| `impulse-rs/src/context_lifecycle/` | Context window monitor, injector, extractor, detector (7 files, 64 tests) |
 | `impulse-rs/src/intent/`            | Intent detection from agent PTY output (4 files, 11 tests) |
 | `impulse-rs/src/integration_tests.rs` | Integration test suite with DaemonGuard RAII |
 
@@ -578,7 +578,7 @@ Config at `.opencode/impulse.json` with equivalent hooks.
 | **Now**    | Search & Analytics tabs                                                | Rust        | **Complete** |
 | **Now**    | Session tagging                                                        | Rust        | **Complete** |
 | **Now**    | Filter system                                                          | Rust        | **Complete** |
-| **Now**    | Tests (475 passing)                                                    | Rust        | **Complete** |
+| **Now**    | Tests (920 passing)                                                    | Rust        | **Complete** |
 | **Now**    | Tauri macOS app                                                        | Rust        | **Complete** |
 | **Now**    | Terminal in Tauri                                                      | xterm.js    | **Complete** |
 | **Now**    | Context stewardship                                                    | Rust        | **Complete** |
@@ -761,4 +761,4 @@ cargo install --path .
 
 ---
 
-_Last updated: 2026-02-25_
+_Last updated: 2026-03-09_

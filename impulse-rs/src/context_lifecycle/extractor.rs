@@ -324,4 +324,50 @@ mod tests {
         // But pane state should dedup
         assert_eq!(state.extracted_insights.len(), 1);
     }
+
+    #[test]
+    fn test_extract_file_modified_codex() {
+        let insights = OutputExtractor::extract(
+            AgentKind::Codex,
+            3,
+            "wrote src/utils.rs\ncreated src/new_module.rs\nno file here",
+        );
+        let files: Vec<_> = insights
+            .iter()
+            .filter(|i| i.insight_type == InsightType::FileModified)
+            .map(|i| i.content.as_str())
+            .collect();
+        assert_eq!(files, vec!["src/utils.rs", "src/new_module.rs"]);
+    }
+
+    #[test]
+    fn test_truncate_insight_short() {
+        assert_eq!(truncate_insight("short", 120), "short");
+    }
+
+    #[test]
+    fn test_truncate_insight_exact() {
+        let s = "x".repeat(120);
+        assert_eq!(truncate_insight(&s, 120), s);
+    }
+
+    #[test]
+    fn test_truncate_insight_long() {
+        let s = "y".repeat(200);
+        let result = truncate_insight(&s, 120);
+        assert!(result.ends_with("..."));
+        assert!(result.len() <= 123); // 120 + "..."
+    }
+
+    #[test]
+    fn test_extract_empty_input() {
+        let insights = OutputExtractor::extract(AgentKind::ClaudeCode, 1, "");
+        assert!(insights.is_empty());
+    }
+
+    #[test]
+    fn test_extract_whitespace_only() {
+        let insights = OutputExtractor::extract(AgentKind::ClaudeCode, 1, "   \n  \n   ");
+        assert!(insights.is_empty());
+    }
 }

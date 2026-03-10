@@ -221,7 +221,8 @@ impl ToolRegistry {
             .expect("built-in tool registration failed (duplicate IDs)");
 
         #[cfg(feature = "office-support")]
-        super::document::register_all(&mut reg);
+        super::document::register_all(&mut reg)
+            .expect("document tool registration failed (duplicate IDs)");
 
         reg
     }
