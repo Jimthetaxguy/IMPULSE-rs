@@ -13,6 +13,7 @@ pub mod client;
 pub mod context_lifecycle;
 pub mod credentials;
 pub mod daemon;
+pub mod delegation;
 pub mod docs;
 pub mod envelope;
 pub mod error;

@@ -225,7 +225,11 @@ pub(crate) fn context_lifecycle_tick(state: &mut TuiState) {
                         crate::context_lifecycle::ActivityType::Error
                     }
                     crate::context_lifecycle::types::InsightType::TaskCompleted
-                    | crate::context_lifecycle::types::InsightType::DecisionMade => {
+                    | crate::context_lifecycle::types::InsightType::DecisionMade
+                    | crate::context_lifecycle::types::InsightType::ToolInvocation
+                    | crate::context_lifecycle::types::InsightType::DiffDetected
+                    | crate::context_lifecycle::types::InsightType::DelegationDetected
+                    | crate::context_lifecycle::types::InsightType::RemoteConnection => {
                         crate::context_lifecycle::ActivityType::Output
                     }
                 };

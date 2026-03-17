@@ -1224,6 +1224,9 @@ pub(crate) fn render_mier_panel(f: &mut Frame, area: Rect, state: &TuiState) {
                 crate::agent::coordinator::RecommendationType::ErrorAssist => ("?", COLOR_WARNING),
                 crate::agent::coordinator::RecommendationType::CrossPaneSync => ("~", COLOR_ACCENT),
                 crate::agent::coordinator::RecommendationType::TaskComplete => ("v", COLOR_SUCCESS),
+                crate::agent::coordinator::RecommendationType::DelegationReady => {
+                    ("D", COLOR_ACCENT)
+                }
             };
             let desc = if rec.description.len() > 50 {
                 format!("{}...", &rec.description[..50])

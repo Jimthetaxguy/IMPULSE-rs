@@ -17,6 +17,7 @@ pub mod extractor;
 pub mod injector;
 pub mod intent;
 pub mod monitor;
+pub mod parser;
 pub mod templates;
 pub mod types;
 

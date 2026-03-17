@@ -53,6 +53,8 @@ pub enum RecommendationType {
     ErrorAssist,
     CrossPaneSync,
     TaskComplete,
+    /// A delegation completed and the coordinator should receive the handoff.
+    DelegationReady,
 }
 
 impl RecommendationType {
@@ -62,6 +64,7 @@ impl RecommendationType {
             Self::ErrorAssist => "error_assist",
             Self::CrossPaneSync => "cross_pane_sync",
             Self::TaskComplete => "task_complete",
+            Self::DelegationReady => "delegation_ready",
         }
     }
 }
@@ -338,11 +341,26 @@ pub fn aggregate_pane_summaries(insights: &[ExtractedInsight]) -> Vec<(String, V
         .collect()
 }
 
+/// Detect delegation-related insights that need coordinator attention.
+pub fn detect_delegation_events(insights: &[ExtractedInsight]) -> Vec<Recommendation> {
+    insights
+        .iter()
+        .filter(|i| i.insight_type == InsightType::DelegationDetected)
+        .map(|i| Recommendation {
+            recommendation_type: RecommendationType::DelegationReady,
+            panes_involved: vec![format!("pane-{}", i.pane_id)],
+            description: format!("Delegation detected in pane-{}", i.pane_id),
+            action: "Review delegation handoff and coordinate next steps".to_string(),
+        })
+        .collect()
+}
+
 /// Run all local (non-LLM) coordination checks and return recommendations.
 pub fn run_local_coordination(insights: &[ExtractedInsight]) -> Vec<Recommendation> {
     let mut all = Vec::new();
     all.extend(detect_file_conflicts(insights));
     all.extend(detect_cross_pane_errors(insights));
+    all.extend(detect_delegation_events(insights));
     all
 }
 

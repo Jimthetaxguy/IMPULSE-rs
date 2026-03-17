@@ -102,6 +102,14 @@ pub enum InsightType {
     ErrorEncountered,
     DecisionMade,
     TaskCompleted,
+    /// A tool invocation was observed (Phase 1A — structured parser).
+    ToolInvocation,
+    /// Diff output was detected (Phase 1A — structured parser).
+    DiffDetected,
+    /// A delegation marker was found in agent output (Phase 1B).
+    DelegationDetected,
+    /// An SSH/remote connection was detected (Phase 3A).
+    RemoteConnection,
 }
 
 impl InsightType {
@@ -111,6 +119,10 @@ impl InsightType {
             Self::ErrorEncountered => "error_encountered",
             Self::DecisionMade => "decision_made",
             Self::TaskCompleted => "task_completed",
+            Self::ToolInvocation => "tool_invocation",
+            Self::DiffDetected => "diff_detected",
+            Self::DelegationDetected => "delegation_detected",
+            Self::RemoteConnection => "remote_connection",
         }
     }
 }

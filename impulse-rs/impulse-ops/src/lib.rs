@@ -486,21 +486,20 @@ pub struct SupervisorActionResult {
 
 /// Structured status for an agent runtime, replacing plain String.
 /// Tracks the agent's current operational state for UI display and coordination.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum AgentStatus {
     Starting,
+    #[default]
     Idle,
-    Working { task: String },
-    Blocked { reason: String },
+    Working {
+        task: String,
+    },
+    Blocked {
+        reason: String,
+    },
     Interrupted,
     Completed,
-}
-
-impl Default for AgentStatus {
-    fn default() -> Self {
-        Self::Idle
-    }
 }
 
 impl AgentStatus {

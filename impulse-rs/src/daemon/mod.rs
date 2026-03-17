@@ -163,6 +163,26 @@ pub enum DaemonRequest {
         #[serde(default)]
         input: crate::plugin::PluginInput,
     },
+    /// Register a delegation detected in agent output (Phase 1B)
+    RegisterDelegation {
+        spec: crate::delegation::types::DelegationSpec,
+        coordinator_pane_id: usize,
+        #[serde(default)]
+        context_snapshot: String,
+    },
+    /// Mark a delegation as completed (Phase 1B)
+    CompleteDelegation {
+        delegation_id: String,
+        summary: String,
+        #[serde(default)]
+        tool_trace: Vec<impulse_ops::ToolInvocationRecord>,
+        #[serde(default)]
+        diff_summary: Option<impulse_ops::DiffSummary>,
+    },
+    /// List all tracked delegations (Phase 1B)
+    ListDelegations,
+    /// Get the agent pool — all sessions grouped by role (Phase 2B)
+    GetAgentPool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1148,6 +1168,10 @@ fn request_type_name(req: &DaemonRequest) -> &'static str {
         DaemonRequest::DebugSnapshot => "DebugSnapshot",
         DaemonRequest::ListPlugins => "ListPlugins",
         DaemonRequest::InvokePlugin { .. } => "InvokePlugin",
+        DaemonRequest::RegisterDelegation { .. } => "RegisterDelegation",
+        DaemonRequest::CompleteDelegation { .. } => "CompleteDelegation",
+        DaemonRequest::ListDelegations => "ListDelegations",
+        DaemonRequest::GetAgentPool => "GetAgentPool",
     }
 }
 
@@ -1267,6 +1291,33 @@ async fn process_request(
         DaemonRequest::ListPlugins | DaemonRequest::InvokePlugin { .. } => {
             handle_plugin_request(request).await
         }
+
+        // Delegation group (Phase 1B — stub handlers, tracked locally by GUI)
+        DaemonRequest::RegisterDelegation { .. }
+        | DaemonRequest::CompleteDelegation { .. }
+        | DaemonRequest::ListDelegations => DaemonResponse::Ok {
+            result: serde_json::json!({"status": "delegation_tracking_not_yet_wired"}),
+        },
+
+        // Agent pool (Phase 2B — returns sessions grouped by role)
+        DaemonRequest::GetAgentPool => match state.list_sessions().await {
+            Ok(sessions) => DaemonResponse::Ok {
+                result: serde_json::json!({
+                    "agents": sessions.iter().map(|s| {
+                        serde_json::json!({
+                            "id": s.id,
+                            "name": s.name,
+                            "status": format!("{:?}", s.status),
+                            "role": s.role,
+                            "parent_session_id": s.parent_session_id,
+                            "delegation_id": s.delegation_id,
+                            "target": s.target,
+                        })
+                    }).collect::<Vec<_>>(),
+                }),
+            },
+            Err(e) => respond_err(e),
+        },
     }
 }
 
