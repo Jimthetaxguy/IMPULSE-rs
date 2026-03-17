@@ -34,6 +34,8 @@ authors:
 
 This document is intentionally aligned with [`spec/RUST-CANONICAL-CONTRACT.md`](./spec/RUST-CANONICAL-CONTRACT.md). If another active doc conflicts, the contract wins.
 
+> **Enhancement backlog:** [`LONG-RANGE-ENHANCEMENTS.md`](./LONG-RANGE-ENHANCEMENTS.md) organizes the full PR queue by theme (33 PRs across 8 lanes).
+
 ---
 
 ## Current State Summary

@@ -88,6 +88,7 @@ See [decisions/README.md](decisions/README.md) for full decision log.
 | [PHASE2-MIGRATION-PLAN.md](phases/PHASE2-MIGRATION-PLAN.md) | Migration strategy       |
 | [ROADMAP-PLAN.md](ROADMAP-PLAN.md)                          | Active roadmap reset for Rust + EGUI |
 | [IMPLEMENTATION-HANDOFF.md](plans/IMPLEMENTATION-HANDOFF.md)| Daemon-truth EGUI execution handoff |
+| [LONG-RANGE-ENHANCEMENTS.md](LONG-RANGE-ENHANCEMENTS.md) | PR-organized enhancement backlog across 8 lanes |
 
 ### Active EGUI Workbench Track
 
