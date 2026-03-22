@@ -153,6 +153,7 @@ pub async fn build_snapshot(
         },
         retrieval: build_retrieval_summary(state)?,
         artifacts,
+        delegations: Vec::new(),
     };
     overlay_terminal_reports(&mut snapshot, terminal_reports);
 
@@ -346,6 +347,12 @@ fn build_agent_runtime(
         recent_files: session.active_files.clone(),
         recent_tools: session.recent_tools.clone(),
         warnings,
+        agent_status: Default::default(),
+        role: session.role.clone(),
+        group: None,
+        tool_invocations: Vec::new(),
+        diff_summary: None,
+        target: session.target.clone(),
     }
 }
 
@@ -860,6 +867,7 @@ mod tests {
                 recent_files: vec!["src/app.rs".to_string()],
                 recent_tools: vec!["Edit".to_string()],
                 warnings: vec!["Context tier is critical".to_string()],
+                ..Default::default()
             }],
             context: ContextHealthSummary {
                 tier: "critical".to_string(),
@@ -933,6 +941,7 @@ mod tests {
                 recent_files: vec!["src/main.rs".to_string()],
                 recent_tools: vec!["Write".to_string()],
                 warnings: Vec::new(),
+                ..Default::default()
             }],
             context: ContextHealthSummary::default(),
             interventions: Vec::new(),

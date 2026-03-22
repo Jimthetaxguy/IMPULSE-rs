@@ -5,6 +5,7 @@
 //! for concurrent access. Syncs to `.impulse/` files only when dirty.
 
 use chrono::{DateTime, Utc};
+use impulse_ops::{AgentRole, MachineTarget};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -23,7 +24,19 @@ pub struct Session {
     pub recent_tools: Vec<String>,
     pub metadata: HashMap<String, String>,
     #[serde(default)]
-    pub tags: Vec<String>, // New: session tags for organization
+    pub tags: Vec<String>,
+    /// Role in coordinator/worker delegation pattern (Phase 2B).
+    #[serde(default)]
+    pub role: Option<AgentRole>,
+    /// Parent session for worker sessions (Phase 2B).
+    #[serde(default)]
+    pub parent_session_id: Option<String>,
+    /// Associated delegation ID (Phase 2B).
+    #[serde(default)]
+    pub delegation_id: Option<String>,
+    /// Target machine where the agent operates (Phase 3A).
+    #[serde(default)]
+    pub target: Option<MachineTarget>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -85,6 +98,10 @@ impl Session {
             recent_tools: Vec::new(),
             metadata: HashMap::new(),
             tags: Vec::new(),
+            role: None,
+            parent_session_id: None,
+            delegation_id: None,
+            target: None,
         }
     }
 

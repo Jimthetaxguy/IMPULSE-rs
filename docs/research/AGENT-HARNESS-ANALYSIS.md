@@ -3,12 +3,12 @@ status: active
 phase: all
 audience: builder
 tags: [research, agent, harness]
-last_updated: 2026-02-20
+last_updated: 2026-03-17
 ---
 
-# Agent Harness Analysis: OpenCode, Claude Code, OneContext
+# Agent Harness Analysis: OpenCode, Claude Code, OneContext, Desloppify
 
-> **Version:** 1.0 | **Status:** Research Complete | **Updated:** 2026-02-20
+> **Version:** 2.0 | **Status:** Research Complete | **Updated:** 2026-03-17
 > **Purpose:** Deep analysis of agent integration points for Impulse
 > **Builds on:** docs/archive/OPENCODE-INTEGRATION.md, docs/research/TOOL-STACK-ANALYSIS.md
 
@@ -638,35 +638,179 @@ npm i -g onecontext-ai
 
 ---
 
-## 4. Comparison Matrix
+## 4. Desloppify -- Evaluation
 
-| Dimension | OpenCode Plugin SDK | Claude Code Hooks | OneContext |
-|-----------|-------------------|-------------------|-----------|
-| **Session start hook** | NO (use `experimental.chat.system.transform`) | YES (`SessionStart`) | N/A |
-| **Session end hook** | NO (no lifecycle event) | YES (`SessionEnd`) | N/A |
-| **Tool-after hook** | YES (`tool.execute.after`) | YES (`PostToolUse`) | N/A |
-| **Compaction hook** | YES (`experimental.session.compacting`) | YES (`PreCompact`) | N/A |
-| **System prompt injection** | YES (modify `output.system[]`) | YES (stdout from SessionStart) | N/A |
-| **Transcript access** | YES (via SDK client REST API) | YES (`transcript_path` in input) | YES (trajectory recording) |
-| **LLM access from plugin** | YES (via SDK client or external) | NO (must call external API) | N/A |
-| **Block tool execution** | YES (`tool.execute.before` modifies args) | YES (`PreToolUse` can deny) | N/A |
-| **Read/write file access** | YES (in-process, full filesystem) | YES (shell command, full filesystem) | YES |
-| **Plugin registration** | npm package or `file://` path | JSON settings file | npm global install |
-| **Execution model** | In-process async functions | Out-of-process shell commands | Standalone process |
-| **Latency** | Sub-millisecond (in-process) | ~10-50ms (process spawn) | N/A |
-| **Language** | TypeScript (Bun) | Any (shell commands) | Node + Python |
-| **Maturity** | Experimental (hooks may change) | Stable (documented, 16 events) | v0.x (2 weeks old) |
-| **User base** | Growing (open source) | Large (Anthropic-backed) | Small (1.1k stars) |
-| **Multi-agent support** | Plugins run per-instance | Hooks run per-session | Context shared across agents |
-| **Stop/Continue control** | NO | YES (`Stop` hook can block) | NO |
+### 4.1 Architecture and Purpose
+
+**What it is:** A multi-language codebase health scanner and cleanup orchestrator (v0.9.10). Python-first (99.5%), MIT license. Designed to systematically improve code quality across 29 languages by combining mechanical detection (dead code, duplication, complexity) with LLM-driven subjective analysis (naming, abstractions, module boundaries).
+
+**Key design principle:** "The primary user is an AI coding agent, not a human." This drives all architecture decisions.
+
+### 4.2 Layered Architecture
+
+Desloppify uses a strict 5-layer stack with enforced import direction (higher depends on lower, never reverse):
+
+```
+Layer 4: Interface          (app/ - thin CLI entry points)
+Layer 3: Language Plugins   (python/, typescript/, rust/, etc.)
+Layer 2: Framework          (languages/_framework/ - standardized contracts)
+Layer 1: Algorithms         (engine/detectors/ - language-agnostic)
+Layer 0: Foundation         (base/ - paths, config, enums, utilities)
+```
+
+**Key components:**
+
+| Component | Purpose |
+|-----------|---------|
+| **Engine/Detectors** | Language-agnostic analysis algorithms |
+| **Scoring** | Quality rating with anti-gaming safeguards |
+| **Living Plan** | State machine driving 5-phase workflow (Scan → Review → Workflow → Triage → Execute) |
+| **Policy** | Rules and constraints for decision-making |
+| **State** | Persistent storage managing queue lifecycle |
+
+### 4.3 The Living Plan Engine
+
+Desloppify enforces a **5-phase lifecycle** via state machine:
+
+1. **Scan** -- Identify issues, populate queue
+2. **Review** -- Subjective LLM-driven assessment
+3. **Workflow** -- Score communication, import findings
+4. **Triage** -- Expose priority stages
+5. **Execute** -- Apply objective fixes, re-scan
+
+**Safety net pattern:** Even though lifecycle phase is persisted in `plan.refresh_state.lifecycle_phase`, the system re-resolves the correct phase from visible items on load. Persisted state is never trusted alone -- it's validated against source of truth.
+
+### 4.4 Anti-Gaming Mechanism
+
+The scoring system resists manipulation:
+- Subjective findings weighted at **75%**, objective at **25%**
+- Scores only improve through genuine code improvement
+- Cross-checking prevents score anchoring
+- Agents don't see target scores during review ("blind packet" system)
+
+### 4.5 Agent Integration Model
+
+Desloppify is a **CLI-based orchestrator**, not an SDK:
+
+```bash
+desloppify scan --path .           # Identify issues
+desloppify next                    # Get next priority item
+desloppify plan triage --stage ... # Manage workflow
+desloppify resolve                 # Mark work complete
+```
+
+**Delegation pattern** (Hermes integration):
+- Spawns **isolated child agents** (up to 3 concurrent via ThreadPoolExecutor)
+- Each child receives: dedicated prompt file, blind packet (context without score targets), JSON output file
+- Children don't inherit parent context -- explicit information boundaries
+- MAX_DEPTH = 2 (prevents grandchild recursion)
+
+**Execution philosophy -- "THE LOOP":**
+```bash
+desloppify next   # Get ONE priority item
+# Fix it
+desloppify resolve
+# Repeat
+```
+
+Queue is execution-focused (one item at a time), not backlog-focused.
+
+### 4.6 State Management
+
+State lives in `.desloppify/`:
+- `plan.json` -- Active workflow state
+- `review_packet_blind.json` -- Blinded review data (no score targets)
+- `query.json` -- Dimension definitions for scoring
+- `results/` -- Agent outputs
+
+**Key constraint:** No automatic completion. Work completion requires explicit `resolve`, `skip --permanent`, or `reopen` commands. Automated scans can only "add new work, reopen previously completed work, or corroborate existing resolutions."
+
+### 4.7 Patterns Relevant to Impulse
+
+#### Pattern 1: Agent-First Design
+Desloppify's "primary user is an AI agent" principle aligns with Impulse's sidecar model. Prioritize structured output and reliable state over human UX.
+
+#### Pattern 2: State Re-Validation on Load
+Never trust persisted state alone. Re-resolve from visible items on load. Impulse should apply this to `LIVE_STATE.json` -- validate against actual `.impulse/` contents on session resume.
+
+#### Pattern 3: Anti-Anchoring (Blind Packets)
+When replaying context to agents, separate evidence (what was done) from guidance (what should be done). Don't show agents their previous decisions for the same action. Impulse should surface file changes and tool usage without anchoring agents to prior conclusions.
+
+#### Pattern 4: Explicit State Transitions
+Work completion requires explicit `resolve` -- no silent completions. Impulse should require agents to explicitly mark actions complete rather than inferring completion from file modifications.
+
+#### Pattern 5: Phase-Enforced Workflow
+The 5-phase lifecycle ensures work progresses through assessment before improvement. Impulse could enforce: Record → Execute → Verify → Persist as an auditable contract between agent and sidecar.
+
+#### Pattern 6: Strict Layer Boundaries
+The 5-layer import-direction enforcement prevents coupling. Impulse's 4-crate workspace (CLI, ops, terminal, GUI) should enforce similar boundaries with clear contracts between layers.
+
+#### Pattern 7: Execution Queue (One Item at a Time)
+`desloppify next` returns exactly one priority item. This prevents agent context overflow and ensures focused execution. Impulse's context injection should follow the same principle -- inject the most relevant context, not everything.
+
+### 4.8 Overlap Analysis
+
+| Feature | Impulse | Desloppify | Overlap? |
+|---------|---------|------------|----------|
+| Cross-session memory | GENOME.md (permanent decisions) | plan.json (workflow state) | Partial -- different scopes |
+| Quality tracking | Not primary focus | Core feature (scoring + anti-gaming) | No overlap |
+| Agent orchestration | Sidecar (observes agents) | Orchestrator (directs agents) | Complementary |
+| State persistence | `.impulse/` directory | `.desloppify/` directory | Pattern overlap |
+| LLM integration | Session extraction | Subjective review scoring | Different purposes |
+| File change tracking | LIVE_STATE.json | Scan-based detection | Different mechanisms |
+| Multi-agent support | Session tracking | Isolated child delegation | Different models |
+
+### 4.9 Verdict
+
+**Do not adopt desloppify as a foundation.** The reasons:
+
+1. **Different problem domain**: Desloppify orchestrates code quality improvements; Impulse records agent actions. Desloppify is directive; Impulse is observational.
+2. **Python-only**: 99.5% Python, no Rust integration path.
+3. **Orchestrator vs Sidecar**: Desloppify tells agents what to do; Impulse remembers what agents did. These are fundamentally different roles.
+
+**Patterns to borrow:**
+- State re-validation on load (safety net pattern)
+- Anti-anchoring via blind packets (context injection design)
+- Explicit state transitions (no silent completions)
+- Phase-enforced workflow (auditable lifecycle)
+- Agent-first design philosophy
+- Execution queue discipline (one priority item, not backlog dump)
+
+**Future integration path:** Desloppify could consume Impulse's `HISTORY.jsonl` to identify which code areas agents frequently touch (hotspot analysis), or Impulse could record desloppify scan results as session context.
 
 ---
 
-## 5. The SDK Gap -- Detailed Analysis
+## 5. Comparison Matrix
+
+| Dimension | OpenCode Plugin SDK | Claude Code Hooks | OneContext | Desloppify |
+|-----------|-------------------|-------------------|-----------|------------|
+| **Session start hook** | NO (use `experimental.chat.system.transform`) | YES (`SessionStart`) | N/A | N/A (CLI orchestrator) |
+| **Session end hook** | NO (no lifecycle event) | YES (`SessionEnd`) | N/A | N/A |
+| **Tool-after hook** | YES (`tool.execute.after`) | YES (`PostToolUse`) | N/A | N/A |
+| **Compaction hook** | YES (`experimental.session.compacting`) | YES (`PreCompact`) | N/A | N/A |
+| **System prompt injection** | YES (modify `output.system[]`) | YES (stdout from SessionStart) | N/A | YES (prompt files per task) |
+| **Transcript access** | YES (via SDK client REST API) | YES (`transcript_path` in input) | YES (trajectory recording) | NO (agent output via JSON files) |
+| **LLM access from plugin** | YES (via SDK client or external) | NO (must call external API) | N/A | YES (delegated subagent calls) |
+| **Block tool execution** | YES (`tool.execute.before` modifies args) | YES (`PreToolUse` can deny) | N/A | NO |
+| **Read/write file access** | YES (in-process, full filesystem) | YES (shell command, full filesystem) | YES | YES (CLI, full filesystem) |
+| **Plugin registration** | npm package or `file://` path | JSON settings file | npm global install | pip install |
+| **Execution model** | In-process async functions | Out-of-process shell commands | Standalone process | CLI commands (THE LOOP) |
+| **Latency** | Sub-millisecond (in-process) | ~10-50ms (process spawn) | N/A | N/A (batch-oriented) |
+| **Language** | TypeScript (Bun) | Any (shell commands) | Node + Python | Python (99.5%) |
+| **Maturity** | Experimental (hooks may change) | Stable (documented, 16 events) | v0.x (2 weeks old) | v0.9.10 (active development) |
+| **User base** | Growing (open source) | Large (Anthropic-backed) | Small (1.1k stars) | Growing (agent-focused) |
+| **Multi-agent support** | Plugins run per-instance | Hooks run per-session | Context shared across agents | Isolated child delegation (max 3) |
+| **Stop/Continue control** | NO | YES (`Stop` hook can block) | NO | YES (explicit resolve/skip) |
+| **State re-validation** | NO | NO | NO | YES (re-resolve phase from items) |
+| **Anti-gaming** | NO | NO | NO | YES (blind packets, cross-check) |
+
+---
+
+## 6. The SDK Gap -- Detailed Analysis
 
 This section maps every assumption in the impulse-plugin code to reality.
 
-### 5.1 File-by-File Gap Map
+### 6.1 File-by-File Gap Map
 
 #### `impulse-plugin/src/index.ts` -- Plugin Entry
 
@@ -717,7 +861,7 @@ This section maps every assumption in the impulse-plugin code to reality.
 | 22-25 | Receives `CompactionContext` with `projectRoot`, `injectPreCompaction()` | Receives `input: { sessionID }`, `output: { context: string[], prompt?: string }` | HIGH |
 | 45-49 | `ctx.injectPreCompaction(text)` | `output.context.push(text)` | MEDIUM |
 
-### 5.2 Summary of Required Changes for OpenCode Target
+### 6.2 Summary of Required Changes for OpenCode Target
 
 To make impulse-plugin work with OpenCode's actual SDK:
 
@@ -746,6 +890,8 @@ To make impulse-plugin work with OpenCode's actual SDK:
 5. **Claude Code provides `transcript_path` directly to hooks.** This eliminates the need for `getSessionTranscript()` -- the hook script can simply read the JSONL file.
 
 6. **OneContext solves different problems than Impulse.** It's a context replay and sharing tool, not a knowledge extraction and curation tool. They are complementary, not competitive.
+
+7. **Desloppify demonstrates agent-first design principles.** Its "blind packet" anti-anchoring, state re-validation safety net, explicit state transitions (no silent completions), and phase-enforced workflow are patterns worth borrowing. However, it's an orchestrator (tells agents what to do), not a sidecar (remembers what agents did), making it complementary rather than foundational.
 
 ---
 
@@ -842,7 +988,7 @@ OneContext is too immature and its dual-dependency model conflicts with Impulse'
 
 ---
 
-*This document was produced by analyzing the actual source code of OpenCode's Plugin SDK (`packages/plugin/src/index.ts`), OpenCode's plugin loader (`packages/opencode/src/plugin/index.ts`), OpenCode's session management (`packages/opencode/src/session/`), the impulse-plugin implementation (`impulse-plugin/src/`), Claude Code's official hook documentation, and OneContext's README and documentation.*
+*This document was produced by analyzing the actual source code of OpenCode's Plugin SDK (`packages/plugin/src/index.ts`), OpenCode's plugin loader (`packages/opencode/src/plugin/index.ts`), OpenCode's session management (`packages/opencode/src/session/`), the impulse-plugin implementation (`impulse-plugin/src/`), Claude Code's official hook documentation, OneContext's README and documentation, and desloppify's architecture and release notes.*
 
 *Sources consulted:*
 - [Claude Code Hooks Reference](https://code.claude.com/docs/en/hooks)
@@ -850,3 +996,5 @@ OneContext is too immature and its dual-dependency model conflicts with Impulse'
 - [OneContext Documentation](https://github.com/TheAgentContextLab/OneContext/blob/main/Documentation.md)
 - [Claude Code JSONL History](https://kentgigger.com/posts/claude-code-conversation-history)
 - [Claude Code Hook Mastery](https://github.com/disler/claude-code-hooks-mastery)
+- [Desloppify v0.9.10 Release](https://github.com/peteromallet/desloppify/releases/tag/v0.9.10)
+- [Desloppify GitHub Repository](https://github.com/peteromallet/desloppify)

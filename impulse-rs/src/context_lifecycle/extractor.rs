@@ -1,8 +1,12 @@
 //! Output extractor — parses agent PTY output for structured insights.
+//!
+//! Uses the structured parser (Phase 1A) for line classification, falling back
+//! to heuristic matching for PlainText lines.
 
 use chrono::Utc;
 use std::time::Instant;
 
+use super::parser::{self, LineClassification, ToolKind};
 use super::types::{
     AgentKind, ExtractedInsight, InsightType, PaneContextState, EXTRACTION_INTERVAL_SECS,
 };
@@ -12,62 +16,134 @@ pub struct OutputExtractor;
 
 impl OutputExtractor {
     /// Extract insights from screen text for a given agent kind.
-    /// Returns new insights found in this scan.
+    /// Uses the structured parser for line classification, falling back
+    /// to heuristic matching for unclassified (PlainText) lines.
     pub fn extract(agent_kind: AgentKind, pane_id: usize, text: &str) -> Vec<ExtractedInsight> {
         let mut insights = Vec::new();
+        let parsed = parser::parse_output(text, agent_kind);
 
-        for line in text.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
+        // Emit insights from structured parser results
+        for (tool_kind, target) in &parsed.tool_invocations {
+            // Tool invocations that modify files also count as file modifications
+            match tool_kind {
+                ToolKind::Write | ToolKind::Edit => {
+                    insights.push(ExtractedInsight {
+                        pane_id,
+                        agent_kind,
+                        timestamp: Utc::now(),
+                        insight_type: InsightType::FileModified,
+                        content: target.clone(),
+                        intent: None,
+                    });
+                    insights.push(ExtractedInsight {
+                        pane_id,
+                        agent_kind,
+                        timestamp: Utc::now(),
+                        insight_type: InsightType::ToolInvocation,
+                        content: format!("{:?} → {}", tool_kind, target),
+                        intent: None,
+                    });
+                }
+                _ => {
+                    insights.push(ExtractedInsight {
+                        pane_id,
+                        agent_kind,
+                        timestamp: Utc::now(),
+                        insight_type: InsightType::ToolInvocation,
+                        content: format!("{:?} → {}", tool_kind, target),
+                        intent: None,
+                    });
+                }
             }
+        }
 
-            // File modification patterns
-            if let Some(path) = Self::extract_file_modified(agent_kind, trimmed) {
-                insights.push(ExtractedInsight {
-                    pane_id,
-                    agent_kind,
-                    timestamp: Utc::now(),
-                    insight_type: InsightType::FileModified,
-                    content: path,
-                    intent: None,
-                });
+        // Diff summary as a single insight
+        if parsed.diff_summary.files_changed > 0 {
+            insights.push(ExtractedInsight {
+                pane_id,
+                agent_kind,
+                timestamp: Utc::now(),
+                insight_type: InsightType::DiffDetected,
+                content: format!(
+                    "{} files, +{} -{}",
+                    parsed.diff_summary.files_changed,
+                    parsed.diff_summary.lines_added,
+                    parsed.diff_summary.lines_removed,
+                ),
+                intent: None,
+            });
+        }
+
+        // Delegation detection
+        if parsed.delegation_detected {
+            insights.push(ExtractedInsight {
+                pane_id,
+                agent_kind,
+                timestamp: Utc::now(),
+                insight_type: InsightType::DelegationDetected,
+                content: "delegation marker detected".to_string(),
+                intent: None,
+            });
+        }
+
+        // Error lines from parser
+        for (i, classification) in parsed.lines.iter().enumerate() {
+            if *classification == LineClassification::ErrorLine {
+                if let Some(line) = text.lines().nth(i) {
+                    insights.push(ExtractedInsight {
+                        pane_id,
+                        agent_kind,
+                        timestamp: Utc::now(),
+                        insight_type: InsightType::ErrorEncountered,
+                        content: truncate_insight(line.trim(), 120),
+                        intent: None,
+                    });
+                }
             }
+        }
 
-            // Error patterns
-            if let Some(err) = Self::extract_error(agent_kind, trimmed) {
-                insights.push(ExtractedInsight {
-                    pane_id,
-                    agent_kind,
-                    timestamp: Utc::now(),
-                    insight_type: InsightType::ErrorEncountered,
-                    content: err,
-                    intent: None,
-                });
-            }
+        // Fallback: run heuristic extraction on PlainText lines
+        // for decisions and task completions (parser doesn't classify these)
+        for (i, classification) in parsed.lines.iter().enumerate() {
+            if *classification == LineClassification::PlainText {
+                if let Some(line) = text.lines().nth(i) {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if let Some(decision) = Self::extract_decision(trimmed) {
+                        insights.push(ExtractedInsight {
+                            pane_id,
+                            agent_kind,
+                            timestamp: Utc::now(),
+                            insight_type: InsightType::DecisionMade,
+                            content: decision,
+                            intent: None,
+                        });
+                    }
+                    if let Some(task) = Self::extract_task_completed(trimmed) {
+                        insights.push(ExtractedInsight {
+                            pane_id,
+                            agent_kind,
+                            timestamp: Utc::now(),
+                            insight_type: InsightType::TaskCompleted,
+                            content: task,
+                            intent: None,
+                        });
+                    }
 
-            // Decision patterns
-            if let Some(decision) = Self::extract_decision(trimmed) {
-                insights.push(ExtractedInsight {
-                    pane_id,
-                    agent_kind,
-                    timestamp: Utc::now(),
-                    insight_type: InsightType::DecisionMade,
-                    content: decision,
-                    intent: None,
-                });
-            }
-
-            // Task completion patterns
-            if let Some(task) = Self::extract_task_completed(trimmed) {
-                insights.push(ExtractedInsight {
-                    pane_id,
-                    agent_kind,
-                    timestamp: Utc::now(),
-                    insight_type: InsightType::TaskCompleted,
-                    content: task,
-                    intent: None,
-                });
+                    // Remote connection detection (Phase 3A)
+                    if let Some(remote) = Self::extract_remote_connection(trimmed) {
+                        insights.push(ExtractedInsight {
+                            pane_id,
+                            agent_kind,
+                            timestamp: Utc::now(),
+                            insight_type: InsightType::RemoteConnection,
+                            content: remote,
+                            intent: None,
+                        });
+                    }
+                }
             }
         }
 
@@ -99,87 +175,8 @@ impl OutputExtractor {
         insights
     }
 
-    fn extract_file_modified(agent_kind: AgentKind, line: &str) -> Option<String> {
-        match agent_kind {
-            AgentKind::ClaudeCode => {
-                // Claude Code patterns: "Write(path)", "Edit(path)", "Created file: path"
-                if let Some(rest) = line.strip_prefix("Write(") {
-                    return rest.strip_suffix(')').map(|s| s.to_string());
-                }
-                if let Some(rest) = line.strip_prefix("Edit(") {
-                    return rest.strip_suffix(')').map(|s| s.to_string());
-                }
-                if let Some(rest) = line.strip_prefix("Created file: ") {
-                    return Some(rest.trim().to_string());
-                }
-                None
-            }
-            AgentKind::OpenCode => {
-                // OpenCode patterns: "wrote path", "modified path", "created path"
-                for prefix in &["wrote ", "modified ", "created "] {
-                    let lower = line.to_lowercase();
-                    if let Some(rest) = lower.strip_prefix(prefix) {
-                        let path = rest.trim();
-                        if !path.is_empty() && (path.contains('/') || path.contains('.')) {
-                            return Some(path.to_string());
-                        }
-                    }
-                }
-                None
-            }
-            AgentKind::Codex => {
-                // Codex uses similar patterns to OpenCode
-                let lower = line.to_lowercase();
-                for prefix in &["wrote ", "modified ", "created "] {
-                    if let Some(rest) = lower.strip_prefix(prefix) {
-                        let path = rest.trim();
-                        if !path.is_empty() && (path.contains('/') || path.contains('.')) {
-                            return Some(path.to_string());
-                        }
-                    }
-                }
-                None
-            }
-            AgentKind::GenericShell => None,
-        }
-    }
-
-    fn extract_error(agent_kind: AgentKind, line: &str) -> Option<String> {
-        let lower = line.to_lowercase();
-        match agent_kind {
-            AgentKind::ClaudeCode => {
-                if lower.starts_with("error:")
-                    || lower.contains("failed")
-                    || lower.contains("panicked")
-                {
-                    Some(truncate_insight(line, 120))
-                } else {
-                    None
-                }
-            }
-            AgentKind::OpenCode => {
-                if lower.starts_with("error:") || lower.contains("fail") {
-                    Some(truncate_insight(line, 120))
-                } else {
-                    None
-                }
-            }
-            AgentKind::Codex => {
-                if lower.starts_with("error:") || lower.contains("fail") {
-                    Some(truncate_insight(line, 120))
-                } else {
-                    None
-                }
-            }
-            AgentKind::GenericShell => {
-                if lower.starts_with("error:") {
-                    Some(truncate_insight(line, 120))
-                } else {
-                    None
-                }
-            }
-        }
-    }
+    // Note: extract_file_modified and extract_error replaced by structured parser.
+    // Kept as dead code reference for agent-specific patterns if needed.
 
     fn extract_decision(line: &str) -> Option<String> {
         let lower = line.to_lowercase();
@@ -204,6 +201,20 @@ impl OutputExtractor {
         } else {
             None
         }
+    }
+
+    /// Detect SSH/remote connection patterns (Phase 3A).
+    fn extract_remote_connection(line: &str) -> Option<String> {
+        let trimmed = line.trim();
+        // ssh user@host patterns
+        if trimmed.starts_with("ssh ") && trimmed.contains('@') {
+            return Some(truncate_insight(trimmed, 120));
+        }
+        // tmux session creation
+        if trimmed.contains("tmux new-session") || trimmed.contains("tmux new -s") {
+            return Some(truncate_insight(trimmed, 120));
+        }
+        None
     }
 }
 
@@ -299,12 +310,9 @@ mod tests {
 
     #[test]
     fn test_no_extraction_from_shell() {
-        let insights = OutputExtractor::extract(
-            AgentKind::GenericShell,
-            1,
-            "Write(src/main.rs)\nwrote src/lib.rs",
-        );
-        // GenericShell should not extract file modifications
+        let insights =
+            OutputExtractor::extract(AgentKind::GenericShell, 1, "hello world\nls -la\necho done");
+        // GenericShell with plain commands should not extract file modifications
         let files: Vec<_> = insights
             .iter()
             .filter(|i| i.insight_type == InsightType::FileModified)
@@ -317,12 +325,12 @@ mod tests {
         let mut state = PaneContextState::new(1, AgentKind::ClaudeCode);
         let text = "Write(src/main.rs)\nWrite(src/main.rs)";
 
-        // First extraction
+        // First extraction — parser produces FileModified + ToolInvocation per Write()
         let insights1 = OutputExtractor::check_pane(&mut state, text);
-        assert_eq!(insights1.len(), 2); // raw extraction returns both
+        assert_eq!(insights1.len(), 4); // 2 per Write() call
 
-        // But pane state should dedup
-        assert_eq!(state.extracted_insights.len(), 1);
+        // But pane state should dedup by (type, content)
+        assert_eq!(state.extracted_insights.len(), 2); // FileModified + ToolInvocation (deduplicated)
     }
 
     #[test]

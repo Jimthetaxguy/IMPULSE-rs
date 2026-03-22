@@ -484,6 +484,113 @@ pub struct SupervisorActionResult {
     pub payload: Option<serde_json::Value>,
 }
 
+/// Structured status for an agent runtime, replacing plain String.
+/// Tracks the agent's current operational state for UI display and coordination.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum AgentStatus {
+    Starting,
+    #[default]
+    Idle,
+    Working {
+        task: String,
+    },
+    Blocked {
+        reason: String,
+    },
+    Interrupted,
+    Completed,
+}
+
+impl AgentStatus {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Starting => "starting",
+            Self::Idle => "idle",
+            Self::Working { .. } => "working",
+            Self::Blocked { .. } => "blocked",
+            Self::Interrupted => "interrupted",
+            Self::Completed => "completed",
+        }
+    }
+
+    /// Convert to legacy String representation for backward compatibility.
+    pub fn to_legacy_string(&self) -> String {
+        match self {
+            Self::Starting => "starting".to_string(),
+            Self::Idle => "idle".to_string(),
+            Self::Working { task } => format!("working: {}", task),
+            Self::Blocked { reason } => format!("blocked: {}", reason),
+            Self::Interrupted => "interrupted".to_string(),
+            Self::Completed => "completed".to_string(),
+        }
+    }
+}
+
+/// Role of an agent in a coordinator/worker delegation pattern.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRole {
+    Coordinator,
+    Worker { parent_pane_id: usize },
+}
+
+/// A record of a tool invocation observed in agent output.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolInvocationRecord {
+    pub kind: String,
+    pub target: String,
+    pub timestamp: Option<String>,
+}
+
+/// Summary of diff changes observed in agent output.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct DiffSummary {
+    pub files_changed: usize,
+    pub lines_added: usize,
+    pub lines_removed: usize,
+}
+
+/// Summary of a delegation task for cross-crate use.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DelegationSummary {
+    pub id: String,
+    pub task: String,
+    pub state: String,
+    pub coordinator_pane_id: usize,
+    pub worker_pane_id: Option<usize>,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+    #[serde(default)]
+    pub tool_invocations: Vec<ToolInvocationRecord>,
+    #[serde(default)]
+    pub diff_summary: Option<DiffSummary>,
+}
+
+/// Target machine where an agent operates.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MachineTarget {
+    Local {
+        workdir: String,
+    },
+    Remote {
+        user: String,
+        host: String,
+        workdir: String,
+        #[serde(default)]
+        session_name: Option<String>,
+    },
+}
+
+impl Default for MachineTarget {
+    fn default() -> Self {
+        Self::Local {
+            workdir: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct AgentRuntime {
     pub id: String,
@@ -500,6 +607,24 @@ pub struct AgentRuntime {
     pub recent_files: Vec<String>,
     pub recent_tools: Vec<String>,
     pub warnings: Vec<String>,
+    /// Structured agent status (parallel to legacy `status` string).
+    #[serde(default)]
+    pub agent_status: AgentStatus,
+    /// Role in coordinator/worker pattern.
+    #[serde(default)]
+    pub role: Option<AgentRole>,
+    /// Grouping label for agent pool display.
+    #[serde(default)]
+    pub group: Option<String>,
+    /// Tool invocations observed during this agent's current task.
+    #[serde(default)]
+    pub tool_invocations: Vec<ToolInvocationRecord>,
+    /// Diff summary for the current work.
+    #[serde(default)]
+    pub diff_summary: Option<DiffSummary>,
+    /// Target machine where the agent operates.
+    #[serde(default)]
+    pub target: Option<MachineTarget>,
 }
 
 fn dedupe_vec<T: Copy + PartialEq>(values: &mut Vec<T>) {
@@ -624,6 +749,9 @@ pub struct ProjectOpsSnapshot {
     pub memory: MemorySummary,
     pub retrieval: RetrievalSummary,
     pub artifacts: Vec<ArtifactEnvelope>,
+    /// Active and recent delegations for the agent pool view.
+    #[serde(default)]
+    pub delegations: Vec<DelegationSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
