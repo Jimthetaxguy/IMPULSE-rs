@@ -1452,57 +1452,6 @@ mod tests {
     }
 
     // =========================================================================
-    // Backwards Compatibility Tests (cockpit -> impulse migration)
-    // =========================================================================
-
-    #[test]
-    fn test_legacy_cockpit_dir_fallback() {
-        let dir = TempDir::new().unwrap();
-        // Create a .cockpit/ directory (old name) instead of .impulse/
-        let cockpit_dir = dir.path().join(".cockpit");
-        std::fs::create_dir_all(&cockpit_dir).unwrap();
-        // Point the CLI at .impulse (which doesn't exist), expect fallback to .cockpit
-        let impulse_dir = dir.path().join(".impulse");
-        let output = run_impulse_with_impulse_dir(&impulse_dir, &["status"]);
-        assert!(
-            output.status.success(),
-            "status should succeed with legacy .cockpit/ dir fallback. stderr: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("legacy .cockpit/"),
-            "should emit deprecation warning about legacy .cockpit/ dir"
-        );
-    }
-
-    #[test]
-    fn test_legacy_cockpit_session_id_env_var() {
-        let dir = TempDir::new().unwrap();
-        let impulse_dir = dir.path().join(".impulse");
-        // Init the directory
-        let output = run_impulse_with_impulse_dir(&impulse_dir, &["init"]);
-        assert!(output.status.success(), "init should succeed");
-        // Start a session to get a valid ID
-        let output =
-            run_impulse_with_impulse_dir(&impulse_dir, &["session-start", "-n", "compat-test"]);
-        assert!(output.status.success(), "session-start should succeed");
-        let session_id = stdout_str(&output).trim().to_string();
-        // Use old COCKPIT_SESSION_ID env var to track a file
-        // (track-write uses Option<String> for session_id, so env fallback applies)
-        let output = run_impulse_with_env(
-            &impulse_dir,
-            &["track-write", "--file", "test.rs"],
-            &[("COCKPIT_SESSION_ID", &session_id)],
-        );
-        assert!(
-            output.status.success(),
-            "track-write with legacy COCKPIT_SESSION_ID should succeed. stderr: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    // =========================================================================
     // Impulse Agent Integration Tests
     // =========================================================================
 

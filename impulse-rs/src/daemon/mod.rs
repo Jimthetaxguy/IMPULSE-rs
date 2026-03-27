@@ -1502,9 +1502,7 @@ async fn handle_chat_request(request: DaemonRequest, state: &SharedState) -> Dae
     }
 
     let provider = AnthropicProvider::new(api_key);
-    let model = std::env::var("IMPULSE_MODEL")
-        .or_else(|_| std::env::var("COCKPIT_MODEL"))
-        .unwrap_or_else(|_| "claude-sonnet-4-6".to_string());
+    let model = std::env::var("IMPULSE_MODEL").unwrap_or_else(|_| "claude-sonnet-4-6".to_string());
     let request = ChatRequest {
         model,
         messages: vec![Message {

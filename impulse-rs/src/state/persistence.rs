@@ -345,21 +345,18 @@ impl State {
     }
 
     pub fn get_conflict_analytics(&self) -> Result<ConflictHistory> {
-        let history: ConflictHistory = self.storage.read_json("CONFLICTS.json").unwrap_or_default();
-        Ok(history)
+        self.storage.read_json("CONFLICTS.json")
     }
 
     pub fn record_conflict(&self, file_path: &str, sessions: Vec<String>) -> Result<()> {
-        let mut history: ConflictHistory =
-            self.storage.read_json("CONFLICTS.json").unwrap_or_default();
+        let mut history: ConflictHistory = self.storage.read_json("CONFLICTS.json")?;
         history.record_conflict(file_path, sessions);
         self.storage.write_json("CONFLICTS.json", &history)?;
         Ok(())
     }
 
     pub fn record_conflict_resolution(&self, file_path: &str, resolution: &str) -> Result<()> {
-        let mut history: ConflictHistory =
-            self.storage.read_json("CONFLICTS.json").unwrap_or_default();
+        let mut history: ConflictHistory = self.storage.read_json("CONFLICTS.json")?;
         history.record_resolution(file_path, resolution);
         self.storage.write_json("CONFLICTS.json", &history)?;
         Ok(())

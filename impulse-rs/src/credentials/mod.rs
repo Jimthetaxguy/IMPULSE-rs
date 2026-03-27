@@ -78,21 +78,10 @@ pub fn create_provider(config: &CredentialConfig) -> Box<dyn CredentialProvider>
             Box::new(crate::credentials::keychain::KeychainProvider::new())
         }
         CredentialProviderType::Socket => {
-            let socket = config.socket_path.clone().unwrap_or_else(|| {
-                let new_path = "/tmp/impulse-credentials.sock";
-                // DEPRECATED(2026-04-01): Remove cockpit-credentials.sock fallback.
-                // The Cockpit→Impulse rename shipped 2026-02-24. After 2026-04-01,
-                // remove this block and use only impulse-credentials.sock.
-                let old_path = "/tmp/cockpit-credentials.sock";
-                if std::path::Path::new(old_path).exists()
-                    && !std::path::Path::new(new_path).exists()
-                {
-                    eprintln!("Warning: using legacy cockpit-credentials.sock. Rename to impulse-credentials.sock to silence this warning.");
-                    old_path.to_string()
-                } else {
-                    new_path.to_string()
-                }
-            });
+            let socket = config
+                .socket_path
+                .clone()
+                .unwrap_or_else(|| "/tmp/impulse-credentials.sock".to_string());
             Box::new(crate::credentials::socket::SocketProvider::new(socket))
         }
         CredentialProviderType::CliProxy => {

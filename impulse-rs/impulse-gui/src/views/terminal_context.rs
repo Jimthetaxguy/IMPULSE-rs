@@ -125,6 +125,12 @@ impl TerminalsView {
                         .collect(),
                     recent_tools: Vec::new(),
                     warnings,
+                    agent_status: impulse_ops::AgentStatus::default(),
+                    role: None,
+                    group: None,
+                    tool_invocations: Vec::new(),
+                    diff_summary: None,
+                    target: None,
                 }
             })
             .collect()

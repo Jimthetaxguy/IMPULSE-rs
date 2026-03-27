@@ -33,7 +33,7 @@ pub mod tooling_handlers;
 // ============================================================================
 
 pub(crate) fn get_session_id(id: Option<String>) -> Option<String> {
-    id.or_else(|| crate::env_with_fallback("IMPULSE_SESSION_ID", "COCKPIT_SESSION_ID"))
+    id.or_else(|| std::env::var("IMPULSE_SESSION_ID").ok())
 }
 
 pub(crate) fn default_session_name() -> String {

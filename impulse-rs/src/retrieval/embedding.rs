@@ -46,9 +46,7 @@ struct EmbedResponse {
 }
 
 fn resolve_script_path() -> Option<PathBuf> {
-    if let Ok(path) =
-        std::env::var("IMPULSE_EMBED_SCRIPT").or_else(|_| std::env::var("COCKPIT_EMBED_SCRIPT"))
-    {
+    if let Ok(path) = std::env::var("IMPULSE_EMBED_SCRIPT") {
         let p = PathBuf::from(path);
         if p.exists() {
             return Some(p);

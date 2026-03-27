@@ -640,40 +640,8 @@ async fn main() -> Result<()> {
 // Helpers (kept in main.rs — used before handler module is available)
 // ============================================================================
 
-/// Read an env var with fallback to a deprecated name, emitting a warning on stderr.
-pub(crate) fn env_with_fallback(new_name: &str, old_name: &str) -> Option<String> {
-    if let Ok(v) = std::env::var(new_name) {
-        return Some(v);
-    }
-    if let Ok(v) = std::env::var(old_name) {
-        eprintln!(
-            "Warning: {} is deprecated, use {} instead",
-            old_name, new_name
-        );
-        return Some(v);
-    }
-    None
-}
-
-/// Resolve the data directory, falling back to `.cockpit/` if `.impulse/` doesn't exist.
+/// Resolve the data directory.
 fn resolve_impulse_dir(requested: PathBuf) -> PathBuf {
-    if requested.exists() {
-        return requested;
-    }
-    // Fall back to old .cockpit/ directory
-    let old_dir = if requested.ends_with(".impulse") {
-        requested.parent().map(|p| p.join(".cockpit"))
-    } else {
-        None
-    };
-    if let Some(old) = old_dir {
-        if old.exists() {
-            eprintln!(
-                "Warning: using legacy .cockpit/ directory. Rename to .impulse/ to silence this warning."
-            );
-            return old;
-        }
-    }
     requested
 }
 
@@ -682,18 +650,9 @@ fn resolve_impulse_dir(requested: PathBuf) -> PathBuf {
 // ============================================================================
 
 async fn run_daemon_mode(cli: Cli) -> Result<()> {
-    let socket_path = cli.socket.unwrap_or_else(|| {
-        let new_sock = cli.impulse_dir.join("sockets").join("impulse.sock");
-        if new_sock.exists() {
-            return new_sock;
-        }
-        let old_sock = cli.impulse_dir.join("sockets").join("cockpit.sock");
-        if old_sock.exists() {
-            eprintln!("Warning: using legacy cockpit.sock. Rename to impulse.sock to silence this warning.");
-            return old_sock;
-        }
-        new_sock
-    });
+    let socket_path = cli
+        .socket
+        .unwrap_or_else(|| cli.impulse_dir.join("sockets").join("impulse.sock"));
     let client = client::DaemonClient::new(socket_path);
 
     match cli.command {

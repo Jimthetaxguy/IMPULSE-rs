@@ -195,9 +195,7 @@ CREATE TABLE IF NOT EXISTS genome_vec (
     pub fn try_load_vec_extension(&self, ext_path_override: Option<&str>) -> Result<bool> {
         let ext_path = match ext_path_override {
             Some(p) => p.to_string(),
-            None => match std::env::var("IMPULSE_SQLITE_VEC_EXT")
-                .or_else(|_| std::env::var("COCKPIT_SQLITE_VEC_EXT"))
-            {
+            None => match std::env::var("IMPULSE_SQLITE_VEC_EXT") {
                 Ok(v) if !v.trim().is_empty() => v,
                 _ => return Ok(false),
             },
