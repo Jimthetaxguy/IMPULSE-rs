@@ -204,7 +204,8 @@ pub struct ContextBridge {
     previous_screen_text: String,
 
     // Usage history for sparkline visualization (last 100 samples at 3s intervals = ~5 minutes).
-    usage_history: VecDeque<(Instant, f32)>,
+    // Wrapped in Arc so it can be cheaply cloned and returned from behind a lock.
+    usage_history: Arc<VecDeque<(Instant, f32)>>,
 }
 
 impl ContextBridge {
@@ -225,7 +226,7 @@ impl ContextBridge {
             last_injection_at: None,
             last_compaction_scan_at: None,
             previous_screen_text: String::new(),
-            usage_history: VecDeque::with_capacity(100),
+            usage_history: Arc::new(VecDeque::with_capacity(100)),
         }
     }
 
@@ -245,10 +246,10 @@ impl ContextBridge {
         }
     }
 
-    /// Usage history as (fraction) values for sparkline visualization.
-    /// Returns up to 100 recent samples (oldest first).
-    pub fn usage_history(&self) -> &VecDeque<(Instant, f32)> {
-        &self.usage_history
+    /// Usage history as (Instant, fraction) values for sparkline visualization.
+    /// Returns up to 100 recent samples (oldest first) as a shared Arc.
+    pub fn usage_history(&self) -> Arc<VecDeque<(Instant, f32)>> {
+        Arc::clone(&self.usage_history)
     }
 
     /// Run one extraction tick. Call every ~3 seconds.
@@ -278,9 +279,9 @@ impl ContextBridge {
             0.0
         };
         if self.usage_history.len() >= 100 {
-            self.usage_history.pop_front();
+            Arc::make_mut(&mut self.usage_history).pop_front();
         }
-        self.usage_history.push_back((now, fraction));
+        Arc::make_mut(&mut self.usage_history).push_back((now, fraction));
         let screen_text = self.backend.screen_text();
 
         // Compaction detection (debounced).

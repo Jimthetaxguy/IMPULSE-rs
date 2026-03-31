@@ -16,12 +16,15 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use parking_lot::Mutex;
+
 use eframe::egui;
 
 use crate::backend::TerminalBackend;
 use crate::context::{AgentKind, ContextBridge, ContextHealth, ContextTier, ExtractedInsight};
 use crate::input;
 use crate::renderer::TerminalRenderer;
+use crate::status_bar;
 use crate::theme::TerminalTheme;
 
 /// Environment variables to strip before spawning agent processes.
@@ -32,13 +35,52 @@ const SANITIZED_ENV_VARS: &[&str] = &[
     "CLAUDE_CODE_PARENT_SESSION_ID",
 ];
 
+/// RAII guard — snapshots env vars, modifies them for the PTY spawn,
+/// and restores the originals on drop. No unsafe needed.
+struct EnvGuard {
+    saved: Vec<(&'static str, Option<String>)>,
+}
+
+impl EnvGuard {
+    fn new(vars: &[&'static str]) -> Self {
+        let saved: Vec<_> = vars
+            .iter()
+            .map(|var| (*var, std::env::var(var).ok()))
+            .collect();
+        for var in vars {
+            std::env::remove_var(var);
+        }
+        std::env::set_var("TERM", "xterm-256color");
+        std::env::set_var("COLORTERM", "truecolor");
+        std::env::set_var("IMPULSE_TERM_PROGRAM", "impulse-gui");
+        std::env::set_var("IMPULSE_VERSION", env!("CARGO_PKG_VERSION"));
+        Self { saved }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (var, val) in std::mem::take(&mut self.saved) {
+            if let Some(v) = val {
+                std::env::set_var(var, v);
+            } else {
+                std::env::remove_var(var);
+            }
+        }
+    }
+}
+
 /// A complete terminal panel with PTY backend, renderer, input handling,
 /// and context lifecycle integration.
 pub struct TerminalPanel {
     backend: Arc<TerminalBackend>,
     renderer: TerminalRenderer,
     theme: TerminalTheme,
-    context: ContextBridge,
+    /// Shared with StatusBar via Arc<Mutex> so both can access the same
+    /// ContextBridge. The Mutex allows StatusBar::show (which has &mut self) to
+    /// call health() while TerminalPanel methods use MutexGuard::deref().
+    context: Arc<Mutex<ContextBridge>>,
+    status_bar: status_bar::StatusBar,
     // UI state.
     focused: bool,
     show_context_overlay: bool,
@@ -65,48 +107,40 @@ impl TerminalPanel {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let agent_kind = AgentKind::detect(command, agent_name);
 
-        // Sanitize environment variables.
-        let saved: Vec<(&str, Option<String>)> = SANITIZED_ENV_VARS
-            .iter()
-            .map(|var| (*var, std::env::var(var).ok()))
-            .collect();
-
-        // SAFETY: Single-threaded egui main loop — no concurrent env var access.
-        unsafe {
-            for var in SANITIZED_ENV_VARS {
-                std::env::remove_var(var);
-            }
-            std::env::set_var("TERM", "xterm-256color");
-            std::env::set_var("COLORTERM", "truecolor");
-            std::env::set_var("IMPULSE_TERM_PROGRAM", "impulse-gui");
-            std::env::set_var("IMPULSE_VERSION", env!("CARGO_PKG_VERSION"));
-        }
+        // RAII guard: sanitizes env vars on entry, restores them on drop/panic.
+        let _env_guard = EnvGuard::new(SANITIZED_ENV_VARS);
 
         let env_vars = build_env_vars(working_dir, agent_name, pane_id);
 
         let result = TerminalBackend::spawn(command, args, working_dir, &env_vars, 24, 80, None);
 
-        // Restore original environment.
-        // SAFETY: Same reasoning — single-threaded, synchronous operation.
-        unsafe {
-            for (var, val) in saved {
-                if let Some(v) = val {
-                    std::env::set_var(var, v);
-                }
-            }
-        }
-
+        // EnvGuard restores original env vars when dropped — no unsafe needed.
+        // If spawn fails, the guard still drops and restores, so the caller
+        // sees the original environment (important for error messages).
         let backend = Arc::new(result?);
-        let context = ContextBridge::new(pane_id, agent_kind, Arc::clone(&backend));
+        let context = Arc::new(Mutex::new(ContextBridge::new(
+            pane_id,
+            agent_kind,
+            Arc::clone(&backend),
+        )));
+        let theme = TerminalTheme::default();
+        let title = agent_name.to_string();
+        let status_bar = status_bar::StatusBar::new(
+            Arc::clone(&backend),
+            Arc::clone(&context),
+            title.clone(),
+            theme.clone(),
+        );
 
         Ok(Self {
             backend,
             renderer: TerminalRenderer::default(),
-            theme: TerminalTheme::default(),
+            theme,
             context,
+            status_bar,
             focused: false,
             show_context_overlay: false,
-            title: agent_name.to_string(),
+            title,
             agent_name,
             scroll_offset: 0,
             has_new_output_while_scrolled: false,
@@ -238,12 +272,8 @@ impl TerminalPanel {
                     });
                 }
 
-                // Status bar.
-                let copy_clicked = self.render_status_bar(ui);
-                if copy_clicked {
-                    let text = self.backend.screen_text();
-                    ui.ctx().copy_text(text);
-                }
+                // Status bar — Copy button is wired directly inside StatusBar::show().
+                self.status_bar.show(ui);
             });
 
         // Context overlay (Ctrl+Shift+C toggle).
@@ -337,83 +367,9 @@ impl TerminalPanel {
         }
     }
 
-    /// Render the status bar at the bottom of the panel.
-    /// Returns true if the Copy button was clicked.
-    fn render_status_bar(&self, ui: &mut egui::Ui) -> bool {
-        let health = self.context.health();
-        let mut copy_clicked = false;
-
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-
-            // Alive dot.
-            let alive_color = if self.backend.is_alive() {
-                egui::Color32::from_rgb(0x3f, 0xb9, 0x50)
-            } else {
-                egui::Color32::from_rgb(0x6e, 0x76, 0x81)
-            };
-            let dot_rect = ui.allocate_space(egui::vec2(8.0, 8.0));
-            ui.painter()
-                .circle_filled(dot_rect.1.center(), 3.0, alive_color);
-
-            // Title + dimensions.
-            let (cols, rows) = self.backend.size();
-            ui.label(
-                egui::RichText::new(format!("{} {}x{}", self.title, cols, rows))
-                    .small()
-                    .color(egui::Color32::from_rgb(0x8b, 0x94, 0x9e)),
-            );
-
-            ui.separator();
-
-            // Context health indicator.
-            let (tier_icon, tier_color) = context_tier_indicator(&health, &self.theme);
-            let usage_pct = (health.usage_fraction * 100.0) as u8;
-            ui.label(
-                egui::RichText::new(format!(
-                    "{} {}% {}",
-                    tier_icon,
-                    usage_pct,
-                    health.tier.as_str()
-                ))
-                .small()
-                .color(tier_color),
-            );
-
-            ui.separator();
-
-            // Compaction/injection counters.
-            ui.label(
-                egui::RichText::new(format!(
-                    "\u{2193}{} \u{2191}{}",
-                    health.compaction_count, health.injection_count
-                ))
-                .small()
-                .color(egui::Color32::from_rgb(0x6e, 0x76, 0x81)),
-            );
-
-            ui.separator();
-
-            // Copy button — copies visible screen text to clipboard.
-            if ui
-                .small_button(
-                    egui::RichText::new("Copy")
-                        .small()
-                        .color(egui::Color32::from_rgb(0x8b, 0x94, 0x9e)),
-                )
-                .on_hover_text("Copy screen text (Ctrl+Shift+X)")
-                .clicked()
-            {
-                copy_clicked = true;
-            }
-        });
-
-        copy_clicked
-    }
-
     /// Render the context overlay (toggled by Ctrl+Shift+C).
     fn render_context_overlay(&self, ui: &mut egui::Ui) {
-        let health = self.context.health();
+        let health = self.context.lock().health();
 
         egui::Window::new("Context Health")
             .collapsible(false)
@@ -443,7 +399,9 @@ impl TerminalPanel {
                 ui.separator();
                 ui.label(egui::RichText::new("Recent Insights:").strong());
 
-                let insights = self.context.insights();
+                // Hold the lock for the full scope so the &[] reference stays valid.
+                let lock = self.context.lock();
+                let insights = lock.insights();
                 let recent = if insights.len() > 10 {
                     &insights[insights.len() - 10..]
                 } else {
@@ -472,8 +430,9 @@ impl TerminalPanel {
     }
 
     /// Access the context bridge for external lifecycle operations.
-    pub fn context_bridge(&mut self) -> &mut ContextBridge {
-        &mut self.context
+    /// Returns a MutexGuard so callers get &mut ContextBridge via Deref.
+    pub fn context_bridge(&mut self) -> parking_lot::MutexGuard<'_, ContextBridge> {
+        self.context.lock()
     }
 
     /// Whether the child process is still alive.
@@ -507,8 +466,10 @@ impl TerminalPanel {
     }
 
     /// Usage history for sparkline visualization.
-    pub fn usage_history(&self) -> &std::collections::VecDeque<(std::time::Instant, f32)> {
-        self.context.usage_history()
+    pub fn usage_history(
+        &self,
+    ) -> std::sync::Arc<std::collections::VecDeque<(std::time::Instant, f32)>> {
+        self.context.lock().usage_history()
     }
 
     /// Kill the child process.
@@ -518,17 +479,17 @@ impl TerminalPanel {
 
     /// Get context health for status bar display.
     pub fn context_health(&self) -> ContextHealth {
-        self.context.health()
+        self.context.lock().health()
     }
 
     /// Get current context tier (immutable).
     pub fn current_tier(&self) -> ContextTier {
-        self.context.current_tier()
+        self.context.lock().current_tier()
     }
 
     /// Get accumulated insights (immutable).
-    pub fn insights(&self) -> &[ExtractedInsight] {
-        self.context.insights()
+    pub fn insights(&self) -> Vec<ExtractedInsight> {
+        self.context.lock().insights().to_vec()
     }
 
     /// Set focus state.
@@ -538,22 +499,6 @@ impl TerminalPanel {
 }
 
 use chrono::Utc;
-
-/// Map context tier to a status indicator (icon, color).
-fn context_tier_indicator(
-    health: &ContextHealth,
-    theme: &TerminalTheme,
-) -> (&'static str, egui::Color32) {
-    match health.tier {
-        ContextTier::None | ContextTier::Full => {
-            ("\u{25CF}", theme.context_health.comfortable) // ●
-        }
-        ContextTier::Essential => ("\u{25D0}", theme.context_health.essential), // ◐
-        ContextTier::Critical => ("\u{25D1}", theme.context_health.critical),   // ◑
-        ContextTier::Minimal => ("\u{25CB}", theme.context_health.minimal),     // ○
-        ContextTier::PostCompaction => ("\u{25CE}", theme.context_health.essential), // ◎
-    }
-}
 
 /// Format token count for display.
 fn format_tokens(tokens: usize) -> String {
@@ -753,5 +698,61 @@ mod tests {
             !state.has_new_output_while_scrolled,
             "indicator must be cleared when user returns to bottom"
         );
+    }
+
+    #[test]
+    fn test_env_guard_restores_on_drop() {
+        // Set a test env var.
+        std::env::set_var("IMPULSE_TEST_VAR", "original_value");
+
+        {
+            // Guard takes ownership of the test var and replaces it.
+            let guard = EnvGuard::new(&["IMPULSE_TEST_VAR"]);
+            assert_eq!(
+                std::env::var("IMPULSE_TEST_VAR").ok(),
+                None,
+                "guard should remove the existing var"
+            );
+            std::env::set_var("IMPULSE_TEST_VAR", "new_value");
+            assert_eq!(std::env::var("IMPULSE_TEST_VAR").unwrap(), "new_value");
+            // guard drops here, restoring original
+        }
+
+        assert_eq!(
+            std::env::var("IMPULSE_TEST_VAR").unwrap(),
+            "original_value",
+            "env var should be restored after guard drop"
+        );
+
+        // Cleanup.
+        std::env::remove_var("IMPULSE_TEST_VAR");
+    }
+
+    #[test]
+    fn test_env_guard_restores_on_panic() {
+        use std::panic;
+
+        // Set a test env var.
+        std::env::set_var("IMPULSE_TEST_PANIC_VAR", "pre_panic_value");
+
+        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            let _guard = EnvGuard::new(&["IMPULSE_TEST_PANIC_VAR"]);
+            assert_eq!(
+                std::env::var("IMPULSE_TEST_PANIC_VAR").ok(),
+                None,
+                "var should be removed by guard"
+            );
+            panic!("simulate panic");
+        }));
+
+        assert!(result.is_err(), "panic should be propagated");
+        assert_eq!(
+            std::env::var("IMPULSE_TEST_PANIC_VAR").unwrap(),
+            "pre_panic_value",
+            "env var should be restored even after panic"
+        );
+
+        // Cleanup.
+        std::env::remove_var("IMPULSE_TEST_PANIC_VAR");
     }
 }

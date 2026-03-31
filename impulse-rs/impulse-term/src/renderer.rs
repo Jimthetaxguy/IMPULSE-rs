@@ -221,22 +221,29 @@ impl TerminalRenderer {
                 None => (" ".to_string(), theme.fg, theme.bg, false, false, false),
             };
 
-            // Try to extend the current run.
-            let can_extend = runs.last().is_some_and(|last| {
-                last.fg == fg
+            // Try to extend the current run. Using nested-if instead of let-chains
+            // to remain compatible with Rust 2021 edition (let-chains require 2024).
+            // This also eliminates the TOCTOU window that existed with the old
+            // separate can_extend guard + unwrap() pattern.
+            let extended = if let Some(last) = runs.last_mut() {
+                if last.fg == fg
                     && last.bg == bg
                     && last.bold == bold
                     && last.italic == italic
                     && last.underline == underline
                     && last.col_end == col as usize
-            });
-
-            if can_extend {
-                // SAFETY: can_extend is true only when runs.last().is_some_and(...).
-                let last = runs.last_mut().unwrap();
-                last.text.push_str(&ch);
-                last.col_end = col as usize + 1;
+                {
+                    last.text.push_str(&ch);
+                    last.col_end = col as usize + 1;
+                    true
+                } else {
+                    false
+                }
             } else {
+                false
+            };
+
+            if !extended {
                 runs.push(CellRun {
                     text: ch,
                     col_start: col as usize,
@@ -270,5 +277,61 @@ mod tests {
     fn test_renderer_custom_font_size() {
         let renderer = TerminalRenderer::new(16.0);
         assert_eq!(renderer.font_size, 16.0);
+    }
+
+    #[test]
+    fn test_build_runs_single_cell_row() {
+        // Create a parser with a single cell containing 'X' at col 0.
+        let mut parser = vt100::Parser::new(1, 80, 0);
+        parser.process(b"X");
+        let screen = parser.screen();
+        let (_, cols) = screen.size();
+
+        let renderer = TerminalRenderer::new(13.0);
+        let theme = TerminalTheme::default();
+        let runs = renderer.build_runs(&screen, 0, cols, &theme);
+
+        // First run should start with 'X' at col 0. Subsequent empty cells
+        // extend the run since they share the same default styling.
+        assert!(!runs.is_empty());
+        assert!(runs[0].text.starts_with('X'));
+        assert_eq!(runs[0].col_start, 0);
+    }
+
+    #[test]
+    fn test_build_runs_multiple_runs_same_row() {
+        // Create a parser with two color runs: red 'A' then reset+white 'B'.
+        let mut parser = vt100::Parser::new(1, 80, 0);
+        parser.process(b"\x1B[31mA\x1B[0mB"); // Red A, then reset, then white B
+        let screen = parser.screen();
+        let (_, cols) = screen.size();
+
+        let renderer = TerminalRenderer::new(13.0);
+        let theme = TerminalTheme::default();
+        let runs = renderer.build_runs(&screen, 0, cols, &theme);
+
+        // Should produce multiple runs: red A, then spaces, then B.
+        assert!(runs.len() >= 2);
+        // First run should contain 'A'
+        assert!(runs[0].text.contains('A'));
+        // Last run should contain 'B'
+        assert!(runs[runs.len() - 1].text.contains('B'));
+    }
+
+    #[test]
+    fn test_build_runs_no_panic_on_empty_row() {
+        // Create a parser with an empty screen (no content written).
+        let parser = vt100::Parser::new(1, 80, 0);
+        let screen = parser.screen();
+        let (_, cols) = screen.size();
+
+        let renderer = TerminalRenderer::new(13.0);
+        let theme = TerminalTheme::default();
+
+        // This should not panic — the fix replaces unwrap() with if-let.
+        let runs = renderer.build_runs(&screen, 0, cols, &theme);
+
+        // Empty row should produce at least one run (the empty cell default).
+        assert!(!runs.is_empty());
     }
 }

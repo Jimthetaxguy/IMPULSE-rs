@@ -26,6 +26,7 @@ pub mod context;
 pub mod input;
 pub mod panel;
 pub mod renderer;
+pub mod status_bar;
 pub mod theme;
 
 // Re-export public API.
