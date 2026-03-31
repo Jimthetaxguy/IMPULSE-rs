@@ -181,6 +181,12 @@ impl TerminalsView {
         }
     }
 
+    /// Returns the currently active tab ID, if any.
+    #[allow(dead_code)]
+    pub fn active_tab(&self) -> Option<u64> {
+        self.active_tab
+    }
+
     /// Handle terminal-specific keyboard shortcuts.
     pub fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         ctx.input(|input| {
@@ -302,7 +308,8 @@ impl TerminalsView {
         self.pending_spawn_agent.take()
     }
 
-    fn close_tab(&mut self, id: u64) {
+    /// Close a tab by ID.
+    pub fn close_tab(&mut self, id: u64) {
         // Merge this tab's insights into HISTORY.jsonl before closing.
         if let Some(tab) = self.tabs.get(&id) {
             self.merge_tab_insights_to_history(id, tab.agent_name, tab.label.clone());
@@ -338,7 +345,8 @@ impl TerminalsView {
         }
     }
 
-    fn switch_tab(&mut self, forward: bool) {
+    /// Cycle to the next (forward=true) or previous (forward=false) tab.
+    pub fn switch_tab(&mut self, forward: bool) {
         let ids: Vec<u64> = self.tabs.keys().copied().collect();
         if ids.is_empty() {
             return;

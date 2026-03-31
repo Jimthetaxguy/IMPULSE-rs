@@ -1,5 +1,6 @@
-//! Reusable widgets — sidebar navigation, status bar, and notifications.
+//! Reusable widgets — sidebar navigation, status bar, command palette, and notifications.
 
+pub mod command_palette;
 pub mod conflict_banner;
 pub mod notifications;
 pub mod project_selector;

@@ -21,6 +21,7 @@ use crate::views::overview::OverviewView;
 use crate::views::settings::SettingsView;
 use crate::views::terminals::TerminalsView;
 use crate::views::{View, ViewId};
+use crate::widgets::command_palette::CommandPalette;
 use crate::widgets::notifications::{NotificationManager, Severity};
 use crate::widgets::project_selector::ProjectSelector;
 use crate::widgets::signal_bus::{SignalBus, SignalKind, SignalUrgency};
@@ -59,6 +60,7 @@ pub struct ImpulseApp {
     notifications: NotificationManager,
     signal_bus: SignalBus,
     show_shortcuts_help: bool,
+    command_palette: CommandPalette,
 }
 
 impl ImpulseApp {
@@ -103,12 +105,20 @@ impl ImpulseApp {
             notifications: NotificationManager::new(),
             signal_bus: SignalBus::new(),
             show_shortcuts_help: false,
+            command_palette: CommandPalette::new(),
         }
     }
 
     fn handle_global_shortcuts(&mut self, ctx: &egui::Context) {
         ctx.input(|input| {
             let ctrl = input.modifiers.contains(egui::Modifiers::CTRL);
+            let ctrl_shift = input
+                .modifiers
+                .contains(egui::Modifiers::CTRL | egui::Modifiers::SHIFT);
+            if ctrl_shift && input.key_pressed(egui::Key::P) {
+                self.command_palette.open();
+                return;
+            }
             if !ctrl {
                 return;
             }
@@ -223,6 +233,63 @@ impl ImpulseApp {
                 }
             });
         self.show_shortcuts_help = open;
+    }
+
+    fn handle_command_palette(&mut self, ctx: &egui::Context) {
+        use crate::command_palette::Command;
+        use crate::views::ViewId;
+
+        if let Some(cmd) = self.command_palette.show(ctx) {
+            match cmd {
+                Command::NewTab => {
+                    if let Some(agent) = self.terminals.agents.first() {
+                        self.active_view = ViewId::Agents;
+                        self.project_selector.open(Some(agent.name.to_string()));
+                    }
+                }
+                Command::CloseTab => {
+                    if let Some(id) = self.terminals.active_tab() {
+                        self.terminals.close_tab(id);
+                    }
+                }
+                Command::CycleTabs => {
+                    self.terminals.switch_tab(true);
+                }
+                Command::Refresh => {
+                    let _ = self.poller_cmd.send(PollerCommand::Refresh);
+                }
+                Command::ToggleSidebar => {
+                    self.sidebar_expanded = !self.sidebar_expanded;
+                }
+                Command::ToggleShortcuts => {
+                    self.show_shortcuts_help = !self.show_shortcuts_help;
+                }
+                Command::FocusMemory => {
+                    self.active_view = ViewId::Memory;
+                }
+                Command::FocusOverview => {
+                    self.active_view = ViewId::Overview;
+                }
+                Command::FocusAgents => {
+                    self.active_view = ViewId::Agents;
+                }
+                Command::FocusContext => {
+                    self.active_view = ViewId::Context;
+                }
+                Command::FocusArtifacts => {
+                    self.active_view = ViewId::Artifacts;
+                }
+                Command::FocusGuardrails => {
+                    self.active_view = ViewId::Guardrails;
+                }
+                Command::FocusSettings => {
+                    self.active_view = ViewId::Settings;
+                }
+                Command::ToggleAgentPanel => {
+                    self.agent_visible = !self.agent_visible;
+                }
+            }
+        }
     }
 
     fn build_project_bar(&mut self, ctx: &egui::Context) {
@@ -686,6 +753,7 @@ impl eframe::App for ImpulseApp {
         }
         self.handle_global_shortcuts(ctx);
         self.show_shortcuts_overlay(ctx);
+        self.handle_command_palette(ctx);
 
         if let Some(agent_name) = self.terminals.take_pending_spawn() {
             self.project_selector.open(Some(agent_name));
