@@ -162,6 +162,53 @@ Daemon overlay rules:
 - Stop overlaying stale telemetry after 10 seconds.
 - Purge telemetry-only state after 60 seconds.
 
+### Daemon IPC Contract (PROTOCOL_VERSION = 2)
+
+The daemon exposes a JSON-line Unix socket protocol (`impulse.sock`). Full spec: [`docs/IPC-PROTOCOL.md`](../IPC-PROTOCOL.md).
+
+**Session & Tool Management:**
+- `Ping`, `Status`
+- `CreateSession { name, platform }`, `EndSession { session_id, summary }`
+- `TrackFile { session_id, file_path }`, `TrackTool { session_id, tool_name }`
+- `GetSession { session_id }`, `ListSessions`
+
+**Agent System (Phase 3):**
+- `AgentAssist { prompt, context?, insights? }` — coordination assistance with context enrichment. Response: `AgentAssistResult { success, response, recommendations, pane_summaries }`
+- `AgentReviewCode { file_path, diff, insights? }` — code review. Response: `AgentSpecializedResult { success, response }`
+- `AgentAnalyzeError { error_text, context, insights? }` — error analysis. Response: `AgentSpecializedResult { success, response }`
+- `AgentSummarizePane { pane_id, raw_output?, insights? }` — pane summary. Response: `AgentSpecializedResult { success, response }`
+
+**Delegation System (Phase 1B):**
+- `RegisterDelegation { spec, coordinator_pane_id, context_snapshot? }` — track cross-agent delegation
+- `CompleteDelegation { delegation_id, summary, tool_trace?, diff_summary? }` — mark delegation done
+- `ListDelegations` — list all tracked delegations
+
+**Conflict Resolution (Task 20):**
+- `GetConflictHistory` — get conflict resolution history
+- `ClearResolvedConflicts` — clear resolved conflicts
+
+**Agent Pool (Phase 2B):**
+- `GetAgentPool` — all sessions grouped by role
+
+**Steward:**
+- `StewardStatus`, `StewardMemory`, `StewardProposals { action, id? }`
+
+**Guard:**
+- `GuardEvaluate { target, action }`, `GuardList`
+
+**Supervisor (EGUI control plane):**
+- `GetSupervisorPermissions`, `SupervisorChat { prompt, context? }`, `RunSupervisorAction { action }`
+
+**Tools:**
+- `ListTools { category? }`, `DescribeTool { name }`, `InvokeTool { name, params? }`, `ToolSchema`
+
+**EGUI Workbench:**
+- `GetOpsSnapshot`, `SubscribeOps { since_seq? }`, `PublishTerminalOps { report: TerminalOpsReport }`
+- `ListArtifacts { limit? }`, `GetArtifact { artifact_id }`, `RunArtifactAction { artifact_id, action_id, params? }`
+
+**Chat:**
+- `Chat { session_id, message, inject_mode?, inject_explain? }` — daemon-aware chat with context injection
+
 ### Retrieval Command Extensions (Additive)
 
 - `search-history` / `search-genome`:
