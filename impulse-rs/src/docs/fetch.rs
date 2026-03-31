@@ -25,10 +25,12 @@ pub async fn fetch_openai_models(api_key: &str) -> Result<Vec<ModelInfo>> {
         data: Vec<OpenAiModel>,
     }
 
+    /// Populated via serde deserialization from OpenAI API response.
     #[derive(Deserialize)]
-    #[allow(dead_code)]
     struct OpenAiModel {
         id: String,
+        // dead_code: deserialized from OpenAI models API response; retained to match API schema for future filtering
+        #[allow(dead_code)]
         object: String,
         created: u64,
         owned_by: String,

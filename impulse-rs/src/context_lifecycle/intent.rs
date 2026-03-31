@@ -36,6 +36,7 @@ impl AgentType {
         }
     }
 
+    // clippy: from_keywords is a domain method, not From trait
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {

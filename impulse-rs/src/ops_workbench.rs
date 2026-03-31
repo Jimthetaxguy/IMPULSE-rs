@@ -24,12 +24,13 @@ struct GenomeFile {
     last_updated: Option<String>,
 }
 
+/// Fields populated via serde deserialization from GENOME.md JSON.
 #[derive(Debug, Deserialize, Default)]
+// dead_code: fields populated by serde deserialization, not accessed directly in Rust code
+#[allow(dead_code)]
 struct GenomeDecision {
-    #[allow(dead_code)]
     #[serde(default, alias = "date")]
     timestamp: Option<String>,
-    #[allow(dead_code)]
     #[serde(default)]
     description: String,
 }

@@ -24,6 +24,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+#[cfg(test)]
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -31,7 +32,8 @@ use tokio::sync::RwLock;
 /// Maximum notifications to keep in memory
 const MAX_IN_MEMORY_NOTIFICATIONS: usize = 1000;
 
-/// Maximum notifications to persist to disk
+/// Maximum notifications to persist to disk (test-only: NotificationStore is test-gated)
+#[cfg(test)]
 const MAX_PERSISTED_NOTIFICATIONS: usize = 10000;
 
 /// Maximum webhook retry attempts
@@ -401,19 +403,22 @@ impl NotificationBus {
         }
     }
 
-    /// Get recent notifications
+    /// Get recent notifications (test-only: no production callers)
+    #[cfg(test)]
     pub async fn recent(&self, limit: usize) -> Vec<Notification> {
         let notifications = self.notifications.read().await;
         notifications.iter().rev().take(limit).cloned().collect()
     }
 
-    /// Get unread notifications
+    /// Get unread notifications (test-only: no production callers)
+    #[cfg(test)]
     pub async fn unread(&self) -> Vec<Notification> {
         let notifications = self.notifications.read().await;
         notifications.iter().filter(|n| !n.read).cloned().collect()
     }
 
-    /// Get notifications for a specific agent
+    /// Get notifications for a specific agent (test-only: no production callers)
+    #[cfg(test)]
     pub async fn for_agent(&self, agent_id: &str) -> Vec<Notification> {
         let notifications = self.notifications.read().await;
         notifications
@@ -423,7 +428,8 @@ impl NotificationBus {
             .collect()
     }
 
-    /// Mark notifications as read
+    /// Mark notifications as read (test-only: no production callers)
+    #[cfg(test)]
     pub async fn mark_read(&self, ids: &[String]) {
         let mut notifications = self.notifications.write().await;
         for notification in notifications.iter_mut() {
@@ -433,13 +439,8 @@ impl NotificationBus {
         }
     }
 
-    /// Get count of unread notifications
-    pub async fn unread_count(&self) -> usize {
-        let notifications = self.notifications.read().await;
-        notifications.iter().filter(|n| !n.read).count()
-    }
-
-    /// Subscribe to notifications. The callback is invoked for each new notification.
+    /// Subscribe to notifications (test-only: no production callers)
+    #[cfg(test)]
     pub async fn subscribe<F>(&self, callback: F)
     where
         F: Fn(&Notification) + Send + Sync + 'static,
@@ -449,11 +450,13 @@ impl NotificationBus {
     }
 }
 
-/// Store for persisting notifications to disk
+/// Store for persisting notifications to disk (test-only: no production callers)
+#[cfg(test)]
 pub struct NotificationStore {
     base_path: PathBuf,
 }
 
+#[cfg(test)]
 impl NotificationStore {
     /// Create a new notification store
     pub fn new(base_path: PathBuf) -> Self {
@@ -621,86 +624,6 @@ impl WebhookNotifier {
         Ok(())
     }
 }
-pub async fn emit_agent_started(
-    bus: &NotificationBus,
-    agent_id: &str,
-    agent_name: &str,
-    platform: &str,
-    working_directory: Option<&str>,
-) {
-    bus.publish(NotificationEvent::AgentStarted {
-        agent_id: agent_id.to_string(),
-        agent_name: agent_name.to_string(),
-        platform: platform.to_string(),
-        working_directory: working_directory.map(String::from),
-    })
-    .await;
-}
-
-pub async fn emit_agent_ended(
-    bus: &NotificationBus,
-    agent_id: &str,
-    agent_name: &str,
-    summary: Option<&str>,
-) {
-    bus.publish(NotificationEvent::AgentEnded {
-        agent_id: agent_id.to_string(),
-        agent_name: agent_name.to_string(),
-        summary: summary.map(String::from),
-    })
-    .await;
-}
-
-pub async fn emit_tool_used(bus: &NotificationBus, agent_id: &str, tool_name: &str, success: bool) {
-    bus.publish(NotificationEvent::ToolUsed {
-        agent_id: agent_id.to_string(),
-        tool_name: tool_name.to_string(),
-        success,
-    })
-    .await;
-}
-
-pub async fn emit_agent_error(bus: &NotificationBus, agent_id: &str, error: &str) {
-    bus.publish(NotificationEvent::AgentError {
-        agent_id: agent_id.to_string(),
-        error: error.to_string(),
-    })
-    .await;
-}
-
-pub async fn emit_context_injected(
-    bus: &NotificationBus,
-    agent_id: &str,
-    source: &str,
-    size_chars: usize,
-) {
-    bus.publish(NotificationEvent::ContextInjected {
-        agent_id: agent_id.to_string(),
-        source: source.to_string(),
-        size_chars,
-    })
-    .await;
-}
-
-pub async fn emit_agent_handoff(
-    bus: &NotificationBus,
-    from_agent: &str,
-    to_agent: &str,
-    task: &str,
-) {
-    bus.publish(NotificationEvent::AgentHandoff {
-        from_agent: from_agent.to_string(),
-        to_agent: to_agent.to_string(),
-        task: task.to_string(),
-    })
-    .await;
-}
-
-pub async fn emit_multi_agent_detected(bus: &NotificationBus, agents: Vec<String>) {
-    bus.publish(NotificationEvent::MultiAgentDetected { agents })
-        .await;
-}
-
 pub async fn emit_conflict_detected(
     bus: &NotificationBus,
     file_path: &str,
@@ -905,5 +828,85 @@ mod tests {
             .await;
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_notification_severity_round_trip() {
+        for severity in [
+            NotificationSeverity::Debug,
+            NotificationSeverity::Info,
+            NotificationSeverity::Warning,
+            NotificationSeverity::Error,
+        ] {
+            let json = serde_json::to_string(&severity).unwrap();
+            let recovered: NotificationSeverity = serde_json::from_str(&json).unwrap();
+            assert_eq!(severity, recovered);
+        }
+    }
+
+    #[test]
+    fn test_notification_event_agent_started_round_trip() {
+        let event = NotificationEvent::AgentStarted {
+            agent_id: "agent-42".to_string(),
+            agent_name: "Claude".to_string(),
+            platform: "claude-code".to_string(),
+            working_directory: Some("/home/dev/project".to_string()),
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        let recovered: NotificationEvent = serde_json::from_str(&json).unwrap();
+
+        match recovered {
+            NotificationEvent::AgentStarted {
+                agent_id,
+                agent_name,
+                platform,
+                working_directory,
+            } => {
+                assert_eq!(agent_id, "agent-42");
+                assert_eq!(agent_name, "Claude");
+                assert_eq!(platform, "claude-code");
+                assert_eq!(working_directory, Some("/home/dev/project".to_string()));
+            }
+            other => panic!("Expected AgentStarted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_conflict_webhook_payload_round_trip() {
+        let payload = ConflictWebhookPayload {
+            event_type: "conflict_detected".to_string(),
+            timestamp: Utc::now(),
+            file_path: "/src/main.rs".to_string(),
+            panes_involved: vec!["pane-1".to_string(), "pane-2".to_string()],
+            description: "Concurrent modification".to_string(),
+        };
+
+        let json = serde_json::to_string(&payload).unwrap();
+        let recovered: ConflictWebhookPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(recovered.event_type, payload.event_type);
+        assert_eq!(recovered.timestamp, payload.timestamp);
+        assert_eq!(recovered.file_path, payload.file_path);
+        assert_eq!(recovered.panes_involved, payload.panes_involved);
+        assert_eq!(recovered.description, payload.description);
+    }
+
+    #[test]
+    fn test_notification_round_trip() {
+        let event = NotificationEvent::ToolUsed {
+            agent_id: "agent-1".to_string(),
+            tool_name: "file_write".to_string(),
+            success: true,
+        };
+        let notification = Notification::new(event);
+
+        let json = serde_json::to_string(&notification).unwrap();
+        let recovered: Notification = serde_json::from_str(&json).unwrap();
+        assert_eq!(recovered.id, notification.id);
+        assert_eq!(recovered.timestamp, notification.timestamp);
+        assert_eq!(recovered.message, notification.message);
+        assert_eq!(recovered.severity, notification.severity);
+        assert_eq!(recovered.read, notification.read);
+        assert_eq!(recovered.agent_ids, notification.agent_ids);
     }
 }

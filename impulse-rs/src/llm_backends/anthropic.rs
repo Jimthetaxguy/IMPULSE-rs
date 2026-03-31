@@ -82,6 +82,7 @@ impl BaseProvider {
 #[derive(Debug, Deserialize)]
 struct AnthropicResponse {
     content: Vec<AnthropicContent>,
+    // dead_code: deserialized from Anthropic API response; retained for logging and debugging
     #[allow(dead_code)]
     id: String,
     model: String,
@@ -91,6 +92,7 @@ struct AnthropicResponse {
 #[derive(Debug, Deserialize)]
 struct AnthropicContent {
     #[serde(rename = "type")]
+    // dead_code: deserialized from Anthropic API response; required by serde to round-trip the "type" field
     #[allow(dead_code)]
     _type: String,
     text: Option<String>,
@@ -228,6 +230,7 @@ struct OpenAiMessage {
 struct OpenAiUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
+    // dead_code: deserialized from OpenAI API response; kept for future cost-tracking and diagnostic use
     #[allow(dead_code)]
     total_tokens: u32,
 }
@@ -341,6 +344,7 @@ struct MinimaxMessage {
 struct MinimaxUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
+    // dead_code: deserialized from Minimax API response; kept for future cost-tracking and diagnostic use
     #[allow(dead_code)]
     total_tokens: u32,
 }

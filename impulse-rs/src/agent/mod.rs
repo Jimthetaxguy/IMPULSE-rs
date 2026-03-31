@@ -301,6 +301,8 @@ impl ImpulseAgent {
         recs
     }
 
+    // Phase 3 (Task 23) will re-enable these by wiring them to daemon IPC.
+    #[cfg(test)]
     /// Request a code review via the LLM (API mode).
     pub async fn review_code(
         &mut self,
@@ -317,6 +319,8 @@ impl ImpulseAgent {
         agent.chat(&user_msg).await
     }
 
+    // Phase 3 (Task 23) will re-enable this by wiring it to daemon IPC.
+    #[cfg(test)]
     /// Request error analysis via the LLM (API mode).
     pub async fn analyze_error(
         &mut self,
@@ -333,6 +337,8 @@ impl ImpulseAgent {
         agent.chat(&user_msg).await
     }
 
+    // Phase 3 (Task 23) will re-enable this by wiring it to daemon IPC.
+    #[cfg(test)]
     /// Request cross-pane coordination analysis via the LLM (API mode).
     pub async fn coordinate_llm(
         &mut self,
@@ -348,6 +354,8 @@ impl ImpulseAgent {
         agent.chat(&user_msg).await
     }
 
+    // Phase 3 (Task 23) will re-enable this by wiring it to daemon IPC.
+    #[cfg(test)]
     /// Request a task summary via the LLM (API mode).
     pub async fn summarize_pane(
         &mut self,

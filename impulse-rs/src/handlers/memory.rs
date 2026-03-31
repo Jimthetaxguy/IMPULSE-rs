@@ -38,6 +38,7 @@ pub fn handle_add_decision(
     Ok(())
 }
 
+// TODO(refactor): extract params into struct
 #[allow(clippy::too_many_arguments)]
 pub fn handle_search_history(
     state: &Arc<state::State>,
@@ -131,6 +132,7 @@ pub fn handle_search_history(
     Ok(())
 }
 
+// TODO(refactor): extract params into struct
 #[allow(clippy::too_many_arguments)]
 pub fn handle_search_genome(
     state: &Arc<state::State>,

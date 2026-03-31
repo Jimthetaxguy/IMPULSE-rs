@@ -89,6 +89,7 @@ impl TokenTracker {
     }
 
     /// Record a compaction event
+    // TODO(refactor): extract params into struct
     #[allow(clippy::too_many_arguments)]
     pub fn record_compaction(
         &mut self,

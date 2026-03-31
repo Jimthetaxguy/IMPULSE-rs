@@ -4,7 +4,6 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub struct PythonResult {
@@ -28,59 +27,6 @@ pub fn execute_python(code: &str) -> Result<PythonResult> {
         .output()
         .context("Failed to execute Python")?;
 
-    let exit_code = output.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-    Ok(PythonResult {
-        output: stdout,
-        error: if stderr.is_empty() {
-            None
-        } else {
-            Some(stderr)
-        },
-        exit_code,
-    })
-}
-
-/// Execute Python code with a timeout.
-/// If the process exceeds `timeout_secs`, it is killed and an error is returned.
-#[allow(dead_code)]
-pub fn execute_python_with_timeout(code: &str, timeout_secs: u64) -> Result<PythonResult> {
-    let python_cmd = if cfg!(target_os = "windows") {
-        "python"
-    } else {
-        "python3"
-    };
-
-    let mut child = Command::new(python_cmd)
-        .args(["-c", code])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("Failed to spawn Python process")?;
-
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    let poll_interval = Duration::from_millis(100);
-
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait(); // reap zombie
-                    anyhow::bail!("Python execution timed out after {} seconds", timeout_secs);
-                }
-                std::thread::sleep(poll_interval);
-            }
-            Err(e) => anyhow::bail!("Error waiting for Python process: {}", e),
-        }
-    }
-
-    let output = child
-        .wait_with_output()
-        .context("Failed to read Python output")?;
     let exit_code = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -189,16 +135,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_python_available() {
+    fn test_is_python_available_consistent_with_version() {
         let available = is_python_available();
-        // May fail if Python not installed
-        println!("Python available: {}", available);
+        if available {
+            assert!(
+                get_python_version().is_some(),
+                "if python is available, version should be Some"
+            );
+        }
     }
 
     #[test]
-    fn test_get_python_version() {
+    fn test_get_python_version_format_when_present() {
         let version = get_python_version();
-        println!("Python version: {:?}", version);
+        if let Some(v) = version {
+            // Version may be "3.12.0" or "Python 3.12.0" depending on platform
+            assert!(v.contains('.'), "version should contain dot separator: {v}");
+            assert!(
+                v.chars().any(|c| c.is_ascii_digit()),
+                "version should contain digits: {v}"
+            );
+        }
     }
 
     #[test]

@@ -57,6 +57,7 @@ pub struct TerminalPane {
 }
 
 impl TerminalPane {
+    // TODO(refactor): extract params into struct
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         id: usize,

@@ -100,6 +100,7 @@
 //! 4. **Cross-platform analysis**: Different platforms have different thresholds
 //!    and capabilities - understanding these helps optimize context management.
 
+// clippy: tests module inside tests.rs is standard test organization
 #[allow(clippy::module_inception)]
 pub mod research {
     pub const OPENAI_COMPACTION_THRESHOLD: f64 = 0.80;

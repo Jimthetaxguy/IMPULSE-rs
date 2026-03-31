@@ -139,6 +139,7 @@ impl ConflictResolver {
                     .unwrap_or(&recommendation.description)
                     .to_string();
 
+                // clippy: entry API less readable here — separate check + insert is clearer
                 #[allow(clippy::map_entry)]
                 if !self.tracked_conflicts.contains_key(&file_path) {
                     let tracked = TrackedConflict::new(
@@ -234,10 +235,14 @@ impl ConflictResolver {
             .collect()
     }
 
+    // Phase 3 (Task 23) will re-enable this by wiring it to daemon IPC.
+    #[cfg(test)]
     pub fn get_resolution_history(&self) -> &[ConflictRecord] {
         &self.resolution_history
     }
 
+    // Phase 3 (Task 23) will re-enable this by wiring it to daemon IPC.
+    #[cfg(test)]
     pub fn clear_resolved(&mut self) {
         self.tracked_conflicts.retain(|_, c| !c.is_resolved());
     }

@@ -135,7 +135,8 @@ pub struct ExtractedInsight {
     pub timestamp: DateTime<Utc>,
     pub insight_type: InsightType,
     pub content: String,
-    /// Optional classified intent category for this insight.
+    /// Currently always `None` in production — will be wired in Phase 3 (Task 18)
+    /// to populate via `IntentCategory::from_keywords()` during extraction.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub intent: Option<IntentCategory>,
 }
@@ -372,5 +373,74 @@ mod tests {
             AgentKind::detect("some-cmd", "codex-session"),
             AgentKind::Codex
         );
+    }
+
+    #[test]
+    fn test_agent_kind_round_trip() {
+        for kind in [
+            AgentKind::ClaudeCode,
+            AgentKind::Codex,
+            AgentKind::OpenCode,
+            AgentKind::GenericShell,
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            let recovered: AgentKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(kind, recovered);
+        }
+    }
+
+    #[test]
+    fn test_context_tier_round_trip() {
+        for tier in [
+            ContextTier::None,
+            ContextTier::Full,
+            ContextTier::Essential,
+            ContextTier::Critical,
+            ContextTier::Minimal,
+            ContextTier::PostCompaction,
+        ] {
+            let json = serde_json::to_string(&tier).unwrap();
+            let recovered: ContextTier = serde_json::from_str(&json).unwrap();
+            assert_eq!(tier, recovered);
+        }
+    }
+
+    #[test]
+    fn test_insight_type_round_trip() {
+        for insight in [
+            InsightType::FileModified,
+            InsightType::ErrorEncountered,
+            InsightType::DecisionMade,
+            InsightType::TaskCompleted,
+            InsightType::ToolInvocation,
+            InsightType::DiffDetected,
+            InsightType::DelegationDetected,
+            InsightType::RemoteConnection,
+        ] {
+            let json = serde_json::to_string(&insight).unwrap();
+            let recovered: InsightType = serde_json::from_str(&json).unwrap();
+            assert_eq!(insight, recovered);
+        }
+    }
+
+    #[test]
+    fn test_extracted_insight_round_trip() {
+        let insight = ExtractedInsight {
+            pane_id: 3,
+            agent_kind: AgentKind::Codex,
+            timestamp: Utc::now(),
+            insight_type: InsightType::DecisionMade,
+            content: "Chose RwLock over Mutex".to_string(),
+            intent: Some(IntentCategory::Implementing),
+        };
+
+        let json = serde_json::to_string(&insight).unwrap();
+        let recovered: ExtractedInsight = serde_json::from_str(&json).unwrap();
+        assert_eq!(recovered.pane_id, insight.pane_id);
+        assert_eq!(recovered.agent_kind, insight.agent_kind);
+        assert_eq!(recovered.timestamp, insight.timestamp);
+        assert_eq!(recovered.insight_type, insight.insight_type);
+        assert_eq!(recovered.content, insight.content);
+        assert_eq!(recovered.intent, insight.intent);
     }
 }

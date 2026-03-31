@@ -2,6 +2,7 @@
 //! Tests for socket communication, request/response handling
 
 #[cfg(test)]
+// clippy: tests module inside tests.rs is standard test organization
 #[allow(clippy::module_inception)]
 mod tests {
     use std::path::PathBuf;
@@ -9,9 +10,9 @@ mod tests {
     use crate::daemon::{DaemonRequest, DaemonResponse};
     use crate::state::{LiveState, Platform, Session, SessionStatus};
 
-    // Re-import private handler functions for integration tests.
+    // Re-import handler functions from the extracted handlers module.
     // super::super = daemon module (tests.rs is daemon::tests, inner mod is daemon::tests::tests)
-    use super::super::{
+    use super::super::handlers::{
         handle_guard_request, handle_plugin_request, handle_session_request, handle_status,
         handle_steward_request,
     };
@@ -1008,7 +1009,7 @@ mod tests {
         let (_dir, state) = test_state();
         let registry = crate::tooling::ToolRegistry::with_defaults();
         crate::plugin::registry::init_global_registry();
-        let resp = super::super::handle_debug_snapshot(&state, &registry).await;
+        let resp = super::super::handlers::handle_debug_snapshot(&state, &registry).await;
         match resp {
             DaemonResponse::Ok { result } => {
                 assert_eq!(result["protocol_version"], super::super::PROTOCOL_VERSION);

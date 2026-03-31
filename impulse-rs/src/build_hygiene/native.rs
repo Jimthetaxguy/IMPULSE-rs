@@ -332,6 +332,7 @@ fn remove_empty_dirs(root: &Path) -> Vec<String> {
     errors
 }
 
+// clippy: false positive — parameter used in recursive call
 #[allow(clippy::only_used_in_recursion)]
 fn remove_empty_dirs_recursive(dir: &Path, root: &Path, errors: &mut Vec<String>) {
     let entries = match std::fs::read_dir(dir) {

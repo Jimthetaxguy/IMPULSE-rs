@@ -362,4 +362,87 @@ mod tests {
         assert!(formatted.contains("Dangerous delete"));
         assert!(formatted.contains("trash-put"));
     }
+
+    #[test]
+    fn test_guard_config_round_trip() {
+        let config = GuardConfig {
+            enabled: true,
+            rules: vec![
+                GuardRule {
+                    id: "r1".to_string(),
+                    pattern: "rm -rf".to_string(),
+                    action: GuardAction::Block,
+                    target: GuardTarget::Bash,
+                    reason: "Dangerous".to_string(),
+                    suggestion: Some("Use trash".to_string()),
+                    enabled: true,
+                    builtin: true,
+                },
+                GuardRule {
+                    id: "r2".to_string(),
+                    pattern: "deploy.*prod".to_string(),
+                    action: GuardAction::Log,
+                    target: GuardTarget::Any,
+                    reason: "Track deploys".to_string(),
+                    suggestion: None,
+                    enabled: false,
+                    builtin: false,
+                },
+            ],
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let recovered: GuardConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(recovered.enabled, config.enabled);
+        assert_eq!(recovered.rules.len(), 2);
+        assert_eq!(recovered.rules[0].id, "r1");
+        assert_eq!(recovered.rules[0].action, GuardAction::Block);
+        assert_eq!(recovered.rules[1].id, "r2");
+        assert_eq!(recovered.rules[1].action, GuardAction::Log);
+        assert!(!recovered.rules[1].enabled);
+    }
+
+    #[test]
+    fn test_guard_result_round_trip() {
+        let result = GuardResult {
+            rule_id: "no-force-push".to_string(),
+            action: GuardAction::Block,
+            matched_input: "git push --force".to_string(),
+            reason: "Force pushes are dangerous".to_string(),
+            suggestion: Some("Use --force-with-lease".to_string()),
+        };
+
+        let json = serde_json::to_string(&result).unwrap();
+        let recovered: GuardResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(recovered.rule_id, result.rule_id);
+        assert_eq!(recovered.action, result.action);
+        assert_eq!(recovered.matched_input, result.matched_input);
+        assert_eq!(recovered.reason, result.reason);
+        assert_eq!(recovered.suggestion, result.suggestion);
+    }
+
+    #[test]
+    fn test_guard_rule_round_trip_all_fields() {
+        let rule = GuardRule {
+            id: "full-test".to_string(),
+            pattern: r"DROP\s+TABLE".to_string(),
+            action: GuardAction::Warn,
+            target: GuardTarget::ToolCall,
+            reason: "SQL destructive op".to_string(),
+            suggestion: Some("Use soft-delete instead".to_string()),
+            enabled: true,
+            builtin: false,
+        };
+
+        let json = serde_json::to_string(&rule).unwrap();
+        let recovered: GuardRule = serde_json::from_str(&json).unwrap();
+        assert_eq!(recovered.id, rule.id);
+        assert_eq!(recovered.pattern, rule.pattern);
+        assert_eq!(recovered.action, rule.action);
+        assert_eq!(recovered.target, rule.target);
+        assert_eq!(recovered.reason, rule.reason);
+        assert_eq!(recovered.suggestion, rule.suggestion);
+        assert_eq!(recovered.enabled, rule.enabled);
+        assert_eq!(recovered.builtin, rule.builtin);
+    }
 }

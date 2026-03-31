@@ -33,6 +33,7 @@ impl PaneManager {
         self.default_scrollback = lines;
     }
 
+    // TODO(refactor): extract params into struct
     #[allow(clippy::too_many_arguments)]
     pub fn create_pane(
         &mut self,

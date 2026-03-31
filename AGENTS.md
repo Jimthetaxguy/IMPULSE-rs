@@ -101,12 +101,54 @@ cargo fmt --check
 
 ## Contributing
 
-1. All changes must pass `cargo test`, `cargo clippy -- -D warnings`, and `cargo fmt --check`
-2. New modules need unit tests in a `mod tests` block
-3. New CLI commands go in `src/main.rs` with clap derive
-4. New dynamic tools implement the `DynamicTool` trait in `src/tooling/`
-5. File operations must use atomic writes
-6. Error handling must use `Result<T>` — never `unwrap()` on user-facing paths
+### Verification Gate (Non-Negotiable)
+
+All changes must pass before any commit:
+```bash
+cargo build && cargo test && cargo clippy -- -D warnings && cargo fmt --check
+```
+
+### Code Requirements
+
+1. New modules need unit tests in a `mod tests` block — not just one happy-path test
+2. New CLI commands go in `src/main.rs` with clap derive
+3. New dynamic tools implement the `DynamicTool` trait in `src/tooling/`
+4. File operations must use atomic writes (temp + rename)
+5. Error handling must use `Result<T>` — never `unwrap()` on user-facing paths
+
+### Test Quality Requirements
+
+New code must include tests for:
+
+| What | How |
+|------|-----|
+| Happy path | At least one test proving the function works correctly |
+| Error path | At least one test per `Result`-returning function exercising `Err` |
+| Boundary conditions | Empty inputs, zero values, max values where applicable |
+| Serde types | Round-trip test: `deserialize(serialize(val)) == val` |
+| Error enums | `Display` output test: `assert!(format!("{e}").contains("expected"))` |
+
+Tests must assert behavior — `println!` without assertions is not a test.
+
+### Lint Suppression Rules
+
+| Suppression | Rule |
+|-------------|------|
+| `#[allow(dead_code)]` | Must include `// dead_code: <reason>` comment. Grep for callers first — if truly dead, delete it. |
+| `#[allow(clippy::too_many_arguments)]` | Temporary only — add `// TODO: refactor to struct params` |
+| `#![allow(...)]` (file-level) | Not acceptable in new code |
+| Any `#[allow(clippy::*)]` | Must include `// clippy: <reason>` comment |
+
+### Property-Based Testing
+
+Consider `proptest` for functions with combinatorial inputs — path sanitization, config parsing, token arithmetic. Add `proptest` to `[dev-dependencies]` when first used in a module.
+
+### Unsafe Code Rules
+
+Any `unsafe` block requires:
+1. `// SAFETY:` comment documenting all invariants
+2. Precondition validation outside the unsafe block
+3. A dedicated test exercising the unsafe path
 
 ---
 

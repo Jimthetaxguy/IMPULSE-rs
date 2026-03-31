@@ -188,6 +188,8 @@ Daemon overlay rules:
 
 ## 4) Capability Matrix
 
+Test column shows current coverage level: **Full** (≥3.0/KLOC), **Partial** (1.0-3.0/KLOC), **Minimal** (<1.0/KLOC).
+
 | Capability | Status | Interface | Tests |
 | --- | --- | --- | --- |
 | Session lifecycle tracking | Implemented | `session-start`, `session-end` | Rust unit + integration |
@@ -245,7 +247,47 @@ When adding/changing CLI commands, hooks, state files, or roadmap stage definiti
 4. Run `python3 docs/validate_docs.py --contract`.
 5. Include release note fields from `docs/guides/RELEASE-NOTES-TEMPLATE.md`.
 
-## 7) Validation and Drift Prevention
+## 7) Test Quality Contract
+
+### Test Density Targets
+
+| Module Category | Target (tests/KLOC) | Baseline (2026-03-30) |
+|----------------|---------------------|----------------------|
+| Core (state, daemon, agent) | ≥3.0 | ~0.9 |
+| Handlers | ≥2.0 | ~1.2 |
+| UI/TUI | ≥1.0 | ~0.4 |
+| Tooling | ≥2.0 | ~0.3 |
+| Integration | Every stable CLI command | 11 tests |
+
+### Required Test Patterns
+
+New code must include:
+
+| Pattern | Requirement |
+|---------|-------------|
+| Happy path | Every public function has at least one correctness test |
+| Error path | Every `Result<T>`-returning function has at least one `Err` test |
+| Serde round-trip | Every `Serialize + Deserialize` type: `deserialize(serialize(val)) == val` |
+| Error Display | Every `thiserror` enum: `assert!(format!("{e}").contains("expected"))` |
+| Boundary conditions | Empty inputs, zero/max values where applicable |
+
+### Quality Floor
+
+- Tests must contain assertions (`assert!`, `assert_eq!`, `assert_ne!`). `println!`-only tests are not acceptable.
+- Test names must describe the behavior being tested: `test_parse_empty_input_returns_error`, not `test_parse_2`.
+- `unwrap()` in tests must be on operations expected to succeed; use `assert!(result.is_err())` for expected failures.
+
+### Unsafe Code
+
+Any `unsafe` block requires: (1) `// SAFETY:` comment, (2) precondition validation outside the block, (3) a dedicated test exercising the unsafe path.
+
+### Lint Suppression
+
+- `#[allow(dead_code)]` requires `// dead_code: <reason>` comment and grep proof of no callers
+- `#![allow(...)]` (file-level) is not acceptable in new code
+- All `#[allow(clippy::*)]` require `// clippy: <reason>` comment
+
+## 8) Validation and Drift Prevention
 
 Documentation contract validation command:
 

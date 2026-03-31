@@ -310,6 +310,7 @@ CREATE TABLE IF NOT EXISTS genome_vec (
         Ok(())
     }
 
+    // TODO(refactor): extract params into struct
     #[allow(clippy::too_many_arguments)]
     pub fn upsert_history(
         &self,
@@ -357,6 +358,7 @@ ON CONFLICT(session_id) DO UPDATE SET
         Ok(())
     }
 
+    // TODO(refactor): extract params into struct
     #[allow(clippy::too_many_arguments)]
     pub fn upsert_genome(
         &self,
