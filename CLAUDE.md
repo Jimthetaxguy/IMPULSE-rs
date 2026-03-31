@@ -201,19 +201,20 @@ New modules must ship with tests meeting the target density. Existing modules sh
 
 | Module | Risk | Why |
 |--------|------|-----|
-| `src/state/` | HIGH | Persistence layer — corruption means data loss |
-| `src/handlers/` | MEDIUM | User-facing CLI paths with 9 untested files |
-| `src/error.rs` | MEDIUM | `AgentError` has zero Display/From tests |
-| `src/ui/` | MEDIUM | TUI rendering — complex layout logic, limited coverage |
+| `src/state/` | HIGH | Persistence layer — corruption means data loss. Well-tested (47 tests covering conflict detection, audit trail, config corruption, session lifecycle). |
+| `src/handlers/` | MEDIUM | User-facing CLI paths — 13 of 17 files have no tests. Priority: `daemon_dispatch`, `direct_dispatch`, `agent`, `guard`, `injection_handlers`. |
+| `src/error.rs` | LOW | All 8 `AgentError` variants have Display tests. |
+| `src/ui/` | MEDIUM | TUI rendering — complex layout logic, limited coverage. |
 
 ### Codebase Examples
 
-**Good: Error Display test** (missing — should exist for `src/error.rs:AgentError`):
+**Good: Error Display test** (exists in `src/error.rs:AgentError`):
 ```rust
 #[test]
-fn test_agent_error_missing_key_display() {
+fn test_agent_error_missing_api_key_display() {
     let err = AgentError::MissingApiKey { provider: "Anthropic".into() };
     assert!(format!("{err}").contains("Anthropic"));
+    assert!(format!("{err}").contains("No API key"));
 }
 ```
 
