@@ -62,6 +62,38 @@
   "notifications_enabled": true,
   "conflict_webhook_url": null,
   "conflict_webhook_enabled": false,
+  "tool_execution_default_timeout_ms": 30000,
+  "tool_execution_max_output_bytes": 262144,
+  "tool_execution_max_artifacts": 8,
+  "tool_execution_allowed_read_roots": [
+    ".",
+    ".impulse"
+  ],
+  "tool_execution_allowed_write_roots": [
+    ".impulse"
+  ],
+  "external_tools_dir": ".impulse/tools.d",
+  "external_mcp_servers": [],
+  "impulse_agent_permissions": {
+    "allowed_actions": [
+      "monitor_agents",
+      "focus_agent",
+      "open_review",
+      "search_memory",
+      "modify_permissions"
+    ],
+    "allowed_tool_capabilities": [
+      "file_system_read",
+      "system_info"
+    ],
+    "require_confirmation_actions": [
+      "send_input",
+      "inject_context",
+      "cleanup_context",
+      "handoff_context",
+      "modify_permissions"
+    ]
+  },
   "guardrails": {
     "enabled": true,
     "rules": []

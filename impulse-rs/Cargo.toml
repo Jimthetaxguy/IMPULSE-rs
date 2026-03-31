@@ -54,6 +54,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # File operations
 dirs = "6"
 glob = "0.3"
+tempfile = "3"
 
 # Pattern matching
 regex = "1"
@@ -106,7 +107,6 @@ datafusion-support = ["dep:datafusion"]
 office-support = ["dep:calamine", "dep:rust_xlsxwriter", "dep:docx"]
 
 [dev-dependencies]
-tempfile = "3"
 filetime = "0.2"
 
 [profile.release]

@@ -616,6 +616,8 @@ impl eframe::App for ImpulseApp {
             for signal in self.terminals.collect_signals() {
                 self.signal_bus.emit(signal);
             }
+
+            ctx.request_repaint();
         }
 
         let drained = self.signal_bus.drain();

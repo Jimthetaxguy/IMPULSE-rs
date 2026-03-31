@@ -58,6 +58,10 @@ pub enum DaemonRequest {
         params: serde_json::Value,
     },
     GuardList,
+    /// Get conflict resolution history (Task 20)
+    GetConflictHistory,
+    /// Clear resolved conflicts (Task 20)
+    ClearResolvedConflicts,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -80,7 +84,7 @@ pub enum DaemonResponse {
 // ---------------------------------------------------------------------------
 
 /// Protocol version expected by this GUI build. Must match daemon's PROTOCOL_VERSION.
-pub const EXPECTED_PROTOCOL_VERSION: u32 = 1;
+pub const EXPECTED_PROTOCOL_VERSION: u32 = 2;
 
 /// Daemon status summary.
 #[derive(Debug, Clone, Default)]

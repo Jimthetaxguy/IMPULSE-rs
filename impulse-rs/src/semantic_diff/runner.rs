@@ -167,7 +167,7 @@ pub fn capture_semantic_diff(
 }
 
 /// Load a previously stored semantic diff report for a session.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn load_semantic_diff(
     impulse_dir: &Path,
     session_id: &str,
@@ -189,7 +189,7 @@ pub fn load_semantic_diff(
 }
 
 /// List all stored semantic diff session IDs.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn list_semantic_diffs(impulse_dir: &Path) -> Result<Vec<String>> {
     let diff_dir = impulse_dir.join("semantic_diffs");
     if !diff_dir.exists() {

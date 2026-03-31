@@ -18,34 +18,13 @@ pub mod types;
 
 pub use types::*;
 
-/// Atomic write helper: temp file + rename for crash safety
-/// Atomically write content to a file outside `.impulse/`.
+/// Atomic write helper: temp file + rename for crash safety.
 ///
-/// Uses a PID+timestamp-unique temp file to avoid collisions when
-/// multiple processes write concurrently (e.g. parallel hook installs).
+/// Delegates to [`crate::storage::Storage::atomic_write_path`] which is
+/// the single canonical implementation of PID+timestamp atomic writes.
 pub(crate) fn atomic_write_file(path: &std::path::Path, content: &[u8]) -> anyhow::Result<()> {
-    use std::io::Write;
-    let unique_suffix = format!(
-        "tmp.{}.{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos()
-    );
-    let temp_path = path.with_extension(unique_suffix);
-    let mut file = std::fs::File::create(&temp_path)
-        .with_context(|| format!("Failed to create temp file {:?}", temp_path))?;
-    file.write_all(content)
-        .with_context(|| format!("Failed to write temp file {:?}", temp_path))?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(&temp_path, path)
-        .with_context(|| format!("Failed to rename {:?} to {:?}", temp_path, path))?;
-    Ok(())
+    crate::storage::Storage::atomic_write_path(path, content)
 }
-
-use anyhow::Context;
 
 #[cfg(test)]
 mod tests {

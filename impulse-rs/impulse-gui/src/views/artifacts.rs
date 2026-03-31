@@ -294,13 +294,15 @@ fn render_markdown(ui: &mut egui::Ui, artifact: &impulse_ops::ArtifactEnvelope) 
         .get("markdown")
         .and_then(|value| value.as_str())
     {
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(markdown)
-                    .monospace()
-                    .color(colors::TEXT),
-            );
-        });
+        egui::ScrollArea::vertical()
+            .id_salt("artifact_markdown")
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(markdown)
+                        .monospace()
+                        .color(colors::TEXT),
+                );
+            });
     } else {
         render_raw_json(ui, artifact);
     }
@@ -315,39 +317,41 @@ fn render_timeline(ui: &mut egui::Ui, artifact: &impulse_ops::ArtifactEnvelope) 
         render_raw_json(ui, artifact);
         return;
     };
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        for entry in entries {
-            let timestamp = entry
-                .get("timestamp")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            let agent = entry
-                .get("agent_label")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            let kind = entry
-                .get("kind")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            let content = entry
-                .get("content")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            egui::Frame::new()
-                .fill(colors::SURFACE)
-                .corner_radius(egui::CornerRadius::same(6))
-                .inner_margin(egui::Margin::symmetric(10, 8))
-                .show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(format!("{} • {} • {}", timestamp, agent, kind))
-                            .small()
-                            .color(colors::ACCENT),
-                    );
-                    ui.label(egui::RichText::new(content).small().color(colors::TEXT));
-                });
-            ui.add_space(6.0);
-        }
-    });
+    egui::ScrollArea::vertical()
+        .id_salt("artifact_timeline")
+        .show(ui, |ui| {
+            for entry in entries {
+                let timestamp = entry
+                    .get("timestamp")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                let agent = entry
+                    .get("agent_label")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                let kind = entry
+                    .get("kind")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                let content = entry
+                    .get("content")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                egui::Frame::new()
+                    .fill(colors::SURFACE)
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .inner_margin(egui::Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{} • {} • {}", timestamp, agent, kind))
+                                .small()
+                                .color(colors::ACCENT),
+                        );
+                        ui.label(egui::RichText::new(content).small().color(colors::TEXT));
+                    });
+                ui.add_space(6.0);
+            }
+        });
 }
 
 fn render_table(ui: &mut egui::Ui, artifact: &impulse_ops::ArtifactEnvelope) {
@@ -360,46 +364,48 @@ fn render_table(ui: &mut egui::Ui, artifact: &impulse_ops::ArtifactEnvelope) {
         return;
     };
 
-    egui::ScrollArea::both().show(ui, |ui| {
-        egui::Grid::new("artifact_table")
-            .striped(true)
-            .spacing(egui::vec2(12.0, 6.0))
-            .show(ui, |ui| {
-                ui.label(egui::RichText::new("Timestamp").strong());
-                ui.label(egui::RichText::new("Agent").strong());
-                ui.label(egui::RichText::new("Kind").strong());
-                ui.label(egui::RichText::new("Content").strong());
-                ui.end_row();
-
-                for entry in entries {
-                    ui.label(
-                        entry
-                            .get("timestamp")
-                            .and_then(|value| value.as_str())
-                            .unwrap_or(""),
-                    );
-                    ui.label(
-                        entry
-                            .get("agent_label")
-                            .and_then(|value| value.as_str())
-                            .unwrap_or(""),
-                    );
-                    ui.label(
-                        entry
-                            .get("kind")
-                            .and_then(|value| value.as_str())
-                            .unwrap_or(""),
-                    );
-                    ui.label(
-                        entry
-                            .get("content")
-                            .and_then(|value| value.as_str())
-                            .unwrap_or(""),
-                    );
+    egui::ScrollArea::both()
+        .id_salt("artifact_table")
+        .show(ui, |ui| {
+            egui::Grid::new("artifact_table")
+                .striped(true)
+                .spacing(egui::vec2(12.0, 6.0))
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new("Timestamp").strong());
+                    ui.label(egui::RichText::new("Agent").strong());
+                    ui.label(egui::RichText::new("Kind").strong());
+                    ui.label(egui::RichText::new("Content").strong());
                     ui.end_row();
-                }
-            });
-    });
+
+                    for entry in entries {
+                        ui.label(
+                            entry
+                                .get("timestamp")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or(""),
+                        );
+                        ui.label(
+                            entry
+                                .get("agent_label")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or(""),
+                        );
+                        ui.label(
+                            entry
+                                .get("kind")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or(""),
+                        );
+                        ui.label(
+                            entry
+                                .get("content")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or(""),
+                        );
+                        ui.end_row();
+                    }
+                });
+        });
 }
 
 fn render_diff(ui: &mut egui::Ui, artifact: &impulse_ops::ArtifactEnvelope) {
@@ -429,16 +435,18 @@ fn render_log(ui: &mut egui::Ui, artifact: &impulse_ops::ArtifactEnvelope) {
         .get("lines")
         .and_then(|value| value.as_array())
     {
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for line in lines {
-                ui.label(
-                    egui::RichText::new(line.as_str().unwrap_or(""))
-                        .monospace()
-                        .small()
-                        .color(colors::TEXT),
-                );
-            }
-        });
+        egui::ScrollArea::vertical()
+            .id_salt("artifact_log")
+            .show(ui, |ui| {
+                for line in lines {
+                    ui.label(
+                        egui::RichText::new(line.as_str().unwrap_or(""))
+                            .monospace()
+                            .small()
+                            .color(colors::TEXT),
+                    );
+                }
+            });
     } else {
         render_raw_json(ui, artifact);
     }
@@ -446,12 +454,14 @@ fn render_log(ui: &mut egui::Ui, artifact: &impulse_ops::ArtifactEnvelope) {
 
 fn render_raw_json(ui: &mut egui::Ui, artifact: &impulse_ops::ArtifactEnvelope) {
     let raw = serde_json::to_string_pretty(&artifact.payload).unwrap_or_else(|_| "{}".to_string());
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        ui.label(
-            egui::RichText::new(raw)
-                .monospace()
-                .small()
-                .color(colors::TEXT),
-        );
-    });
+    egui::ScrollArea::vertical()
+        .id_salt("artifact_raw_json")
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(raw)
+                    .monospace()
+                    .small()
+                    .color(colors::TEXT),
+            );
+        });
 }

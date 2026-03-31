@@ -109,13 +109,10 @@ pub fn render_messages(
     let scroll_id = ui.id().with("agent_chat_scroll");
     let mut actions = Vec::new();
 
-    let mut area = egui::ScrollArea::vertical()
+    let area = egui::ScrollArea::vertical()
         .id_salt(scroll_id)
-        .auto_shrink([false, false]);
-
-    if scroll_to_bottom {
-        area = area.stick_to_bottom(true);
-    }
+        .auto_shrink([false, false])
+        .stick_to_bottom(true);
 
     area.show(ui, |ui| {
         ui.set_min_width(ui.available_width());

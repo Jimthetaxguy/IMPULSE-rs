@@ -513,6 +513,7 @@ fn poller_loop(
                     last_history = Instant::now() - history_poll;
                     last_genome = Instant::now() - genome_poll;
                 }
+                ctx.request_repaint();
             }
             Ok(PollerCommand::CreateTabSession {
                 tab_id,
@@ -571,6 +572,7 @@ fn poller_loop(
                     shared.runtime_settings = new_settings;
                 }
                 log::info!("Runtime settings updated (poll={}s)", status_poll.as_secs());
+                ctx.request_repaint();
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 log::info!("Poller command channel closed");

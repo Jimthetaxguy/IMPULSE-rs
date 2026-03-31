@@ -15,7 +15,7 @@
 //! - `search_similar(query, limit)` - Search for similar sessions
 
 /// Descriptions of external functions that a future Monty sandbox can call
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn get_external_functions() -> Vec<(&'static str, &'static str)> {
     vec![
         ("route_to", "Route to a specific tool"),

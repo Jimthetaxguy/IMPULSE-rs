@@ -110,16 +110,6 @@ impl Storage {
         Ok(count)
     }
 
-    #[allow(dead_code)]
-    pub fn read_lines(&self, filename: &str) -> Result<Vec<String>> {
-        let path = self.path(filename);
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-        let content = fs::read_to_string(&path).context("Failed to read file")?;
-        Ok(content.lines().map(|s| s.to_string()).collect())
-    }
-
     /// Unified atomic write - shared by write_json and write
     /// Public for use by stewardship and other modules.
     /// Uses a unique temp file name to prevent collisions from concurrent writes.
@@ -128,37 +118,37 @@ impl Storage {
     }
 
     /// Atomic write helper for arbitrary paths.
+    ///
+    /// Uses a PID+timestamp-unique temp file to avoid collisions when
+    /// multiple processes write concurrently (e.g. parallel hook installs).
     pub fn atomic_write_path(path: &Path, content: &[u8]) -> Result<()> {
         let unique_suffix = format!(
-            "tmp.{}",
-            std::process::id()
-                ^ std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .subsec_nanos()
+            "tmp.{}.{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
         );
         let temp_path = path.with_extension(unique_suffix);
-        let mut file = File::create(&temp_path).context("Failed to create temp file")?;
+        let mut file = File::create(&temp_path)
+            .with_context(|| format!("Failed to create temp file {:?}", temp_path))?;
         file.write_all(content)
-            .context("Failed to write temp file")?;
-        file.sync_all().context("Failed to sync temp file")?;
+            .with_context(|| format!("Failed to write temp file {:?}", temp_path))?;
+        file.sync_all()
+            .with_context(|| format!("Failed to sync temp file {:?}", temp_path))?;
         drop(file);
-        fs::rename(&temp_path, path).context("Failed to atomically rename temp file")?;
+        fs::rename(&temp_path, path)
+            .with_context(|| format!("Failed to rename {:?} to {:?}", temp_path, path))?;
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub fn write(&self, filename: &str, content: &str) -> Result<()> {
-        self.ensure_dir()?;
-        self.atomic_write(&self.path(filename), content.as_bytes())
-    }
-
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn exists(&self, filename: &str) -> bool {
         self.path(filename).exists()
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn delete(&self, filename: &str) -> Result<()> {
         let path = self.path(filename);
         if path.exists() {

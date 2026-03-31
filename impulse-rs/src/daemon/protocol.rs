@@ -283,3 +283,443 @@ pub(crate) fn request_type_name(req: &DaemonRequest) -> &'static str {
         DaemonRequest::ClearResolvedConflicts => "ClearResolvedConflicts",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── PROTOCOL_VERSION ───────────────────────────────────────────────
+
+    #[test]
+    fn test_protocol_version_is_two() {
+        assert_eq!(PROTOCOL_VERSION, 2);
+    }
+
+    // ── request_type_name ───────────────────────────────────────────────
+
+    #[test]
+    fn test_request_type_name_unit_variants() {
+        assert_eq!(request_type_name(&DaemonRequest::Ping), "Ping");
+        assert_eq!(request_type_name(&DaemonRequest::Status), "Status");
+        assert_eq!(
+            request_type_name(&DaemonRequest::ListSessions),
+            "ListSessions"
+        );
+        assert_eq!(
+            request_type_name(&DaemonRequest::StewardStatus),
+            "StewardStatus"
+        );
+        assert_eq!(
+            request_type_name(&DaemonRequest::StewardMemory),
+            "StewardMemory"
+        );
+        assert_eq!(request_type_name(&DaemonRequest::ToolSchema), "ToolSchema");
+        assert_eq!(
+            request_type_name(&DaemonRequest::GetOpsSnapshot),
+            "GetOpsSnapshot"
+        );
+        assert_eq!(
+            request_type_name(&DaemonRequest::GetSupervisorPermissions),
+            "GetSupervisorPermissions"
+        );
+        assert_eq!(
+            request_type_name(&DaemonRequest::DebugSnapshot),
+            "DebugSnapshot"
+        );
+        assert_eq!(
+            request_type_name(&DaemonRequest::ListPlugins),
+            "ListPlugins"
+        );
+        assert_eq!(
+            request_type_name(&DaemonRequest::ListDelegations),
+            "ListDelegations"
+        );
+        assert_eq!(
+            request_type_name(&DaemonRequest::GetAgentPool),
+            "GetAgentPool"
+        );
+        assert_eq!(
+            request_type_name(&DaemonRequest::GetConflictHistory),
+            "GetConflictHistory"
+        );
+        assert_eq!(
+            request_type_name(&DaemonRequest::ClearResolvedConflicts),
+            "ClearResolvedConflicts"
+        );
+        assert_eq!(request_type_name(&DaemonRequest::GuardList), "GuardList");
+    }
+
+    #[test]
+    fn test_request_type_name_struct_variants() {
+        assert_eq!(
+            request_type_name(&DaemonRequest::CreateSession {
+                name: "test".into(),
+                platform: None
+            }),
+            "CreateSession"
+        );
+        assert_eq!(
+            request_type_name(&DaemonRequest::Chat {
+                session_id: "s1".into(),
+                message: "hi".into(),
+                inject_mode: None,
+                inject_explain: false
+            }),
+            "Chat"
+        );
+        assert_eq!(
+            request_type_name(&DaemonRequest::ListTools { category: None }),
+            "ListTools"
+        );
+        assert_eq!(
+            request_type_name(&DaemonRequest::DescribeTool { name: "foo".into() }),
+            "DescribeTool"
+        );
+        assert_eq!(
+            request_type_name(&DaemonRequest::InvokeTool {
+                name: "bar".into(),
+                params: serde_json::json!({})
+            }),
+            "InvokeTool"
+        );
+        assert_eq!(
+            request_type_name(&DaemonRequest::CheckConflict {
+                session_id: "s1".into(),
+                file_path: "src/lib.rs".into()
+            }),
+            "CheckConflict"
+        );
+        assert_eq!(
+            request_type_name(&DaemonRequest::AgentReviewCode {
+                file_path: "x.rs".into(),
+                diff: "".into(),
+                insights: vec![]
+            }),
+            "AgentReviewCode"
+        );
+        assert_eq!(
+            request_type_name(&DaemonRequest::AgentAnalyzeError {
+                error_text: "E0425".into(),
+                context: "".into(),
+                insights: vec![]
+            }),
+            "AgentAnalyzeError"
+        );
+        assert_eq!(
+            request_type_name(&DaemonRequest::AgentSummarizePane {
+                pane_id: 1,
+                raw_output: "".into(),
+                insights: vec![]
+            }),
+            "AgentSummarizePane"
+        );
+    }
+
+    // ── respond_ok / respond_err ──────────────────────────────────────
+
+    #[test]
+    fn test_respond_ok_serializes_value() {
+        let resp = respond_ok(&"hello");
+        match resp {
+            DaemonResponse::Ok { result } => assert_eq!(result, serde_json::json!("hello")),
+            other => panic!("expected Ok, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_respond_ok_with_nested_value() {
+        let data = serde_json::json!({"count": 42, "active": true});
+        let resp = respond_ok(&data);
+        match resp {
+            DaemonResponse::Ok { result } => {
+                assert_eq!(result["count"], 42);
+                assert_eq!(result["active"], true);
+            }
+            other => panic!("expected Ok, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_respond_err_contains_message() {
+        let resp = respond_err("something went wrong");
+        match resp {
+            DaemonResponse::Error { message } => {
+                assert_eq!(message, "something went wrong");
+            }
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_respond_err_with_display_format() {
+        use std::fmt;
+        struct CustomError;
+        impl fmt::Display for CustomError {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "custom error: {}", 42)
+            }
+        }
+        let resp = respond_err(CustomError);
+        match resp {
+            DaemonResponse::Error { message } => {
+                assert_eq!(message, "custom error: 42");
+            }
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    // ── DaemonRequest serde roundtrip ─────────────────────────────────
+
+    #[test]
+    fn test_daemon_request_ping_roundtrip() {
+        let req = DaemonRequest::Ping;
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, r#"{"type":"Ping"}"#);
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, DaemonRequest::Ping));
+    }
+
+    #[test]
+    fn test_daemon_request_create_session_roundtrip() {
+        let req = DaemonRequest::CreateSession {
+            name: "my-session".into(),
+            platform: Some("claude".into()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        match parsed {
+            DaemonRequest::CreateSession { name, platform } => {
+                assert_eq!(name, "my-session");
+                assert_eq!(platform.as_deref(), Some("claude"));
+            }
+            other => panic!("expected CreateSession, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_daemon_request_chat_roundtrip() {
+        let req = DaemonRequest::Chat {
+            session_id: "sess-1".into(),
+            message: "what files changed?".into(),
+            inject_mode: Some("auto".into()),
+            inject_explain: true,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        match parsed {
+            DaemonRequest::Chat {
+                session_id,
+                message,
+                inject_mode,
+                inject_explain,
+            } => {
+                assert_eq!(session_id, "sess-1");
+                assert_eq!(message, "what files changed?");
+                assert_eq!(inject_mode.as_deref(), Some("auto"));
+                assert!(inject_explain);
+            }
+            other => panic!("expected Chat, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_daemon_request_list_sessions_roundtrip() {
+        let req = DaemonRequest::ListSessions;
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, r#"{"type":"ListSessions"}"#);
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, DaemonRequest::ListSessions));
+    }
+
+    #[test]
+    fn test_daemon_request_get_conflict_history_roundtrip() {
+        let req = DaemonRequest::GetConflictHistory;
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, r#"{"type":"GetConflictHistory"}"#);
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, DaemonRequest::GetConflictHistory));
+    }
+
+    #[test]
+    fn test_daemon_request_clear_resolved_conflicts_roundtrip() {
+        let req = DaemonRequest::ClearResolvedConflicts;
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, r#"{"type":"ClearResolvedConflicts"}"#);
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, DaemonRequest::ClearResolvedConflicts));
+    }
+
+    #[test]
+    fn test_daemon_request_check_conflict_roundtrip() {
+        let req = DaemonRequest::CheckConflict {
+            session_id: "sess-1".into(),
+            file_path: "src/lib.rs".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        match parsed {
+            DaemonRequest::CheckConflict {
+                session_id,
+                file_path,
+            } => {
+                assert_eq!(session_id, "sess-1");
+                assert_eq!(file_path, "src/lib.rs");
+            }
+            other => panic!("expected CheckConflict, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_daemon_request_list_tools_with_category() {
+        let req = DaemonRequest::ListTools {
+            category: Some("document".into()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains(r#""category":"document""#));
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        match parsed {
+            DaemonRequest::ListTools { category } => {
+                assert_eq!(category.as_deref(), Some("document"));
+            }
+            other => panic!("expected ListTools, got {:?}", other),
+        }
+    }
+
+    // ── DaemonResponse serde roundtrip ─────────────────────────────────
+
+    #[test]
+    fn test_daemon_response_ok_roundtrip() {
+        let resp = DaemonResponse::Ok {
+            result: serde_json::json!({"count": 3}),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: DaemonResponse = serde_json::from_str(&json).unwrap();
+        match parsed {
+            DaemonResponse::Ok { result } => assert_eq!(result["count"], 3),
+            other => panic!("expected Ok, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_daemon_response_error_roundtrip() {
+        let resp = DaemonResponse::Error {
+            message: "connection refused".into(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: DaemonResponse = serde_json::from_str(&json).unwrap();
+        match parsed {
+            DaemonResponse::Error { message } => assert_eq!(message, "connection refused"),
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_daemon_response_agent_assist_result_roundtrip() {
+        let resp = DaemonResponse::AgentAssistResult {
+            success: true,
+            response: "Consider merging these changes".into(),
+            recommendations: vec![],
+            pane_summaries: vec![],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: DaemonResponse = serde_json::from_str(&json).unwrap();
+        match parsed {
+            DaemonResponse::AgentAssistResult {
+                success, response, ..
+            } => {
+                assert!(success);
+                assert_eq!(response, "Consider merging these changes");
+            }
+            other => panic!("expected AgentAssistResult, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_daemon_response_conflict_check_roundtrip() {
+        let resp = DaemonResponse::ConflictCheck {
+            has_conflict: true,
+            conflicting_sessions: vec!["sess-1".into(), "sess-2".into()],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: DaemonResponse = serde_json::from_str(&json).unwrap();
+        match parsed {
+            DaemonResponse::ConflictCheck {
+                has_conflict,
+                conflicting_sessions,
+            } => {
+                assert!(has_conflict);
+                assert_eq!(conflicting_sessions.len(), 2);
+            }
+            other => panic!("expected ConflictCheck, got {:?}", other),
+        }
+    }
+
+    // ── serde tag format verification ─────────────────────────────────
+
+    #[test]
+    fn test_daemon_request_uses_type_tag_format() {
+        let req = DaemonRequest::Ping;
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.starts_with(r#"{"type":""#));
+        assert!(!json.contains(r#""data""#));
+    }
+
+    #[test]
+    fn test_daemon_request_unit_variant_no_data_field() {
+        let req = DaemonRequest::ListSessions;
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, r#"{"type":"ListSessions"}"#);
+    }
+
+    // ── AgentAssist with empty insights ────────────────────────────────
+
+    #[test]
+    fn test_daemon_request_agent_assist_empty_insights_serializes() {
+        // #[serde(default)] does NOT skip empty vectors — empty vec serializes as []
+        let req = DaemonRequest::AgentAssist {
+            prompt: "review my code".into(),
+            context: None,
+            insights: vec![],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains(r#""type":"AgentAssist""#));
+        assert!(json.contains(r#""prompt":"review my code""#));
+        assert!(json.contains(r#""insights":[]"#));
+    }
+
+    #[test]
+    fn test_daemon_request_invoke_tool_default_params() {
+        let req = DaemonRequest::InvokeTool {
+            name: "calculator".into(),
+            params: serde_json::json!({}),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        match parsed {
+            DaemonRequest::InvokeTool { name, params } => {
+                assert_eq!(name, "calculator");
+                assert_eq!(params, serde_json::json!({}));
+            }
+            other => panic!("expected InvokeTool, got {:?}", other),
+        }
+    }
+
+    // ── AgentSpecializedResult roundtrip ────────────────────────────────
+
+    #[test]
+    fn test_daemon_response_agent_specialized_result_roundtrip() {
+        let resp = DaemonResponse::AgentSpecializedResult {
+            success: false,
+            response: "Could not analyze: file not found".into(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: DaemonResponse = serde_json::from_str(&json).unwrap();
+        match parsed {
+            DaemonResponse::AgentSpecializedResult { success, response } => {
+                assert!(!success);
+                assert!(response.contains("file not found"));
+            }
+            other => panic!("expected AgentSpecializedResult, got {:?}", other),
+        }
+    }
+}
