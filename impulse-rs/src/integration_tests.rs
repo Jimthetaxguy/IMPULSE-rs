@@ -59,6 +59,64 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).to_string()
     }
 
+    fn stderr_str(output: &std::process::Output) -> String {
+        String::from_utf8_lossy(&output.stderr).to_string()
+    }
+
+    /// Create a TempDir and initialize it as an impulse directory.
+    /// Returns the TempDir (caller must hold it to keep the dir alive).
+    fn init_test_dir() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        run_impulse_with_impulse_dir(dir.path(), &["init"]);
+        dir
+    }
+
+    /// Create a TempDir with a `.impulse` subdirectory (for steward tests that
+    /// need the nested layout without running `init`).
+    fn init_steward_dir() -> (TempDir, std::path::PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let impulse_dir = dir.path().join(".impulse");
+        std::fs::create_dir_all(&impulse_dir).unwrap();
+        (dir, impulse_dir)
+    }
+
+    /// Initialize a test dir, start a session, and return (TempDir, session_id).
+    fn start_session(session_name: &str) -> (TempDir, String) {
+        let dir = init_test_dir();
+        let start = run_impulse_with_impulse_dir(
+            dir.path(),
+            &["session-start", "-n", session_name, "-p", "claude-code"],
+        );
+        assert!(start.status.success(), "session-start failed");
+        let session_id = stdout_str(&start).trim().to_string();
+        assert!(!session_id.is_empty(), "session id should not be empty");
+        (dir, session_id)
+    }
+
+    /// End a session with a summary.
+    fn end_session(impulse_dir: &std::path::Path, session_id: &str, summary: &str) {
+        let end = run_impulse_with_impulse_dir(
+            impulse_dir,
+            &[
+                "session-end",
+                "--session-id",
+                session_id,
+                "--summary",
+                summary,
+            ],
+        );
+        assert!(
+            end.status.success(),
+            "session-end failed: {}",
+            stderr_str(&end)
+        );
+    }
+
+    /// Parse stdout of an Output as JSON Value.
+    fn parse_json_stdout(output: &std::process::Output) -> Value {
+        serde_json::from_slice(&output.stdout).expect("valid JSON in stdout")
+    }
+
     struct DaemonGuard {
         child: Child,
     }
@@ -120,21 +178,7 @@ mod tests {
             "seed session id should not be empty"
         );
 
-        let end = run_impulse_with_impulse_dir(
-            impulse_dir,
-            &[
-                "session-end",
-                "--session-id",
-                &session_id,
-                "--summary",
-                summary,
-            ],
-        );
-        assert!(
-            end.status.success(),
-            "seed session-end failed: {}",
-            String::from_utf8_lossy(&end.stderr)
-        );
+        end_session(impulse_dir, &session_id, summary);
 
         let index = run_impulse_with_env(
             impulse_dir,
@@ -144,9 +188,91 @@ mod tests {
         assert!(
             index.status.success(),
             "seed index-memory failed: {}",
-            String::from_utf8_lossy(&index.stderr)
+            stderr_str(&index)
         );
     }
+
+    // =========================================================================
+    // Deduplication helpers — coordinator / insight tests
+    // =========================================================================
+
+    /// Build an `ExtractedInsight` in one line instead of seven.
+    fn insight(
+        pane_id: usize,
+        agent_kind: crate::context_lifecycle::types::AgentKind,
+        insight_type: crate::context_lifecycle::types::InsightType,
+        content: &str,
+    ) -> crate::context_lifecycle::types::ExtractedInsight {
+        crate::context_lifecycle::types::ExtractedInsight {
+            pane_id,
+            agent_kind,
+            timestamp: chrono::Utc::now(),
+            insight_type,
+            content: content.to_string(),
+            intent: None,
+        }
+    }
+
+    /// Shorthand: file-modified insight (the most common variant).
+    fn file_mod(
+        pane_id: usize,
+        agent_kind: crate::context_lifecycle::types::AgentKind,
+        file: &str,
+    ) -> crate::context_lifecycle::types::ExtractedInsight {
+        insight(
+            pane_id,
+            agent_kind,
+            crate::context_lifecycle::types::InsightType::FileModified,
+            file,
+        )
+    }
+
+    // =========================================================================
+    // Deduplication helpers — State / config tests
+    // =========================================================================
+
+    /// Create a `TempDir` + `State` pair for agent-config unit tests.
+    fn new_state() -> (TempDir, crate::state::State) {
+        let dir = TempDir::new().unwrap();
+        let state =
+            crate::state::State::new(dir.path().to_path_buf()).expect("State::new should succeed");
+        (dir, state)
+    }
+
+    // =========================================================================
+    // Deduplication helpers — search / retrieval tests
+    // =========================================================================
+
+    /// Create an isolated session, end it, and index history — ready for
+    /// search-history assertions.
+    fn session_with_history_index(name: &str, summary: &str) -> (TempDir, String) {
+        let (dir, session_id) = start_session(name);
+        end_session(dir.path(), &session_id, summary);
+        let index =
+            run_impulse_with_impulse_dir(dir.path(), &["index-memory", "--scope", "history"]);
+        assert!(
+            index.status.success(),
+            "index-memory --scope history failed: {}",
+            stderr_str(&index)
+        );
+        (dir, session_id)
+    }
+
+    /// Set the three config keys needed for vector-search tests.
+    fn configure_vector_search(impulse_dir: &std::path::Path) {
+        let _ = run_impulse_with_impulse_dir(
+            impulse_dir,
+            &["config", "retrieval_backend", "--value", "fts+vec"],
+        );
+        let _ = run_impulse_with_impulse_dir(
+            impulse_dir,
+            &["config", "retrieval_vector_enabled", "--value", "true"],
+        );
+    }
+
+    // =========================================================================
+    // Tests
+    // =========================================================================
 
     /// Test: Initialize impulse directory
     #[test]
@@ -175,10 +301,7 @@ mod tests {
     /// Test: Session lifecycle (create, track, end)
     #[test]
     fn test_session_lifecycle() {
-        let temp_dir = TempDir::new().unwrap();
-
-        // Initialize first
-        run_impulse_with_impulse_dir(temp_dir.path(), &["init"]);
+        let temp_dir = init_test_dir();
 
         // Create session
         let output = run_impulse_with_impulse_dir(
@@ -192,14 +315,14 @@ mod tests {
             ],
         );
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = stdout_str(&output);
 
         // Should output session ID or succeed
         assert!(
             output.status.success() || stdout.contains("session") || stdout.contains("Session"),
             "Session should be created: {} - {}",
             stdout,
-            String::from_utf8_lossy(&output.stderr)
+            stderr_str(&output)
         );
     }
 
@@ -208,7 +331,7 @@ mod tests {
     fn test_config_operations() {
         // List config
         let output = run_impulse(&["config"]);
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = stdout_str(&output);
 
         // Should show config values
         assert!(
@@ -219,7 +342,7 @@ mod tests {
 
         // Get specific config
         let output = run_impulse(&["config", "log_level"]);
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = stdout_str(&output);
 
         // Should show log_level value
         assert!(
@@ -234,7 +357,7 @@ mod tests {
     fn test_status_command() {
         // Check status
         let output = run_impulse(&["status"]);
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = stdout_str(&output);
 
         // Status should work even with no sessions
         assert!(
@@ -254,7 +377,7 @@ mod tests {
         assert!(
             output.status.success(),
             "History should work: {}",
-            String::from_utf8_lossy(&output.stderr)
+            stderr_str(&output)
         );
     }
 
@@ -263,7 +386,7 @@ mod tests {
     fn test_list_providers() {
         // List providers
         let output = run_impulse(&["list-providers"]);
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = stdout_str(&output);
 
         // Should show available providers
         assert!(
@@ -286,7 +409,7 @@ mod tests {
         assert!(
             output.status.success(),
             "Activity should work: {}",
-            String::from_utf8_lossy(&output.stderr)
+            stderr_str(&output)
         );
     }
 
@@ -300,7 +423,7 @@ mod tests {
         assert!(
             output.status.success(),
             "Genome should work: {}",
-            String::from_utf8_lossy(&output.stderr)
+            stderr_str(&output)
         );
     }
 
@@ -327,7 +450,7 @@ mod tests {
             ],
         );
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = stdout_str(&output);
 
         // Should add decision
         assert!(
@@ -354,8 +477,8 @@ mod tests {
         // Should fail gracefully
         assert!(
             !output.status.success()
-                || String::from_utf8_lossy(&output.stderr).contains("not found")
-                || String::from_utf8_lossy(&output.stderr).contains("Not found"),
+                || stderr_str(&output).contains("not found")
+                || stderr_str(&output).contains("Not found"),
             "Session info should fail gracefully"
         );
     }
@@ -370,7 +493,7 @@ mod tests {
         assert!(
             output.status.success(),
             "List sessions should work: {}",
-            String::from_utf8_lossy(&output.stderr)
+            stderr_str(&output)
         );
     }
 
@@ -378,7 +501,7 @@ mod tests {
     #[test]
     fn test_orchestrate_command() {
         let output = run_impulse(&["orchestrate", "--task", "architecture review"]);
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = stdout_str(&output);
         assert!(
             output.status.success() && stdout.contains("Recommended tool"),
             "Orchestrate should return a recommendation: {}",
@@ -389,8 +512,7 @@ mod tests {
     /// Test: Handoff and sync context commands
     #[test]
     fn test_handoff_and_sync_context_commands() {
-        let temp_dir = TempDir::new().unwrap();
-        run_impulse_with_impulse_dir(temp_dir.path(), &["init"]);
+        let temp_dir = init_test_dir();
 
         let handoff = run_impulse_with_impulse_dir(
             temp_dir.path(),
@@ -399,50 +521,21 @@ mod tests {
         assert!(
             handoff.status.success(),
             "handoff should work: {}",
-            String::from_utf8_lossy(&handoff.stderr)
+            stderr_str(&handoff)
         );
 
         let sync = run_impulse_with_impulse_dir(temp_dir.path(), &["sync-context"]);
         assert!(
             sync.status.success(),
             "sync-context should work: {}",
-            String::from_utf8_lossy(&sync.stderr)
+            stderr_str(&sync)
         );
     }
 
     #[test]
     fn test_index_memory_success_on_seeded_data() {
-        let temp_dir = TempDir::new().unwrap();
-        run_impulse_with_impulse_dir(temp_dir.path(), &["init"]);
-
-        let start = run_impulse_with_impulse_dir(
-            temp_dir.path(),
-            &[
-                "session-start",
-                "-n",
-                "retrieval-seeded",
-                "-p",
-                "claude-code",
-            ],
-        );
-        assert!(start.status.success(), "session-start failed");
-        let session_id = stdout_str(&start).trim().to_string();
-
-        let end = run_impulse_with_impulse_dir(
-            temp_dir.path(),
-            &[
-                "session-end",
-                "--session-id",
-                &session_id,
-                "--summary",
-                "retrieval foundation summary",
-            ],
-        );
-        assert!(
-            end.status.success(),
-            "session-end failed: {}",
-            String::from_utf8_lossy(&end.stderr)
-        );
+        let (temp_dir, session_id) = start_session("retrieval-seeded");
+        end_session(temp_dir.path(), &session_id, "retrieval foundation summary");
 
         let decision = run_impulse_with_impulse_dir(
             temp_dir.path(),
@@ -457,7 +550,7 @@ mod tests {
         assert!(
             decision.status.success(),
             "add-decision failed: {}",
-            String::from_utf8_lossy(&decision.stderr)
+            stderr_str(&decision)
         );
 
         let index =
@@ -465,43 +558,14 @@ mod tests {
         assert!(
             index.status.success(),
             "index-memory failed: {}",
-            String::from_utf8_lossy(&index.stderr)
+            stderr_str(&index)
         );
     }
 
     #[test]
     fn test_search_history_keyword_returns_expected_session() {
-        let temp_dir = TempDir::new().unwrap();
-        run_impulse_with_impulse_dir(temp_dir.path(), &["init"]);
-
-        let start = run_impulse_with_impulse_dir(
-            temp_dir.path(),
-            &[
-                "session-start",
-                "-n",
-                "retrieval-history",
-                "-p",
-                "claude-code",
-            ],
-        );
-        let session_id = stdout_str(&start).trim().to_string();
-        assert!(!session_id.is_empty(), "session id should be returned");
-
-        let end = run_impulse_with_impulse_dir(
-            temp_dir.path(),
-            &[
-                "session-end",
-                "--session-id",
-                &session_id,
-                "--summary",
-                "keyword retrieval smoke summary",
-            ],
-        );
-        assert!(end.status.success(), "session-end failed");
-
-        let index =
-            run_impulse_with_impulse_dir(temp_dir.path(), &["index-memory", "--scope", "history"]);
-        assert!(index.status.success(), "index-memory failed");
+        let (temp_dir, session_id) =
+            session_with_history_index("retrieval-history", "keyword retrieval smoke summary");
 
         let search = run_impulse_with_impulse_dir(
             temp_dir.path(),
@@ -517,11 +581,10 @@ mod tests {
         assert!(
             search.status.success(),
             "search-history failed: {}",
-            String::from_utf8_lossy(&search.stderr)
+            stderr_str(&search)
         );
 
-        let body: Value =
-            serde_json::from_slice(&search.stdout).expect("valid search-history json");
+        let body: Value = parse_json_stdout(&search);
         assert_eq!(body["mode"], "keyword");
         assert_eq!(body["used_fallback"], false);
         let results = body["results"].as_array().expect("results array");
@@ -531,8 +594,7 @@ mod tests {
 
     #[test]
     fn test_search_genome_keyword_returns_expected_decision() {
-        let temp_dir = TempDir::new().unwrap();
-        run_impulse_with_impulse_dir(temp_dir.path(), &["init"]);
+        let temp_dir = init_test_dir();
 
         let decision = run_impulse_with_impulse_dir(
             temp_dir.path(),
@@ -564,9 +626,9 @@ mod tests {
         assert!(
             search.status.success(),
             "search-genome failed: {}",
-            String::from_utf8_lossy(&search.stderr)
+            stderr_str(&search)
         );
-        let body: Value = serde_json::from_slice(&search.stdout).expect("valid search-genome json");
+        let body: Value = parse_json_stdout(&search);
         assert_eq!(body["mode"], "keyword");
         let results = body["results"].as_array().expect("results array");
         assert!(!results.is_empty(), "expected at least one genome result");
@@ -575,34 +637,8 @@ mod tests {
 
     #[test]
     fn test_search_semantic_falls_back_when_vector_disabled() {
-        let temp_dir = TempDir::new().unwrap();
-        run_impulse_with_impulse_dir(temp_dir.path(), &["init"]);
-
-        let start = run_impulse_with_impulse_dir(
-            temp_dir.path(),
-            &[
-                "session-start",
-                "-n",
-                "retrieval-semantic",
-                "-p",
-                "claude-code",
-            ],
-        );
-        let session_id = stdout_str(&start).trim().to_string();
-        let end = run_impulse_with_impulse_dir(
-            temp_dir.path(),
-            &[
-                "session-end",
-                "--session-id",
-                &session_id,
-                "--summary",
-                "semantic fallback summary",
-            ],
-        );
-        assert!(end.status.success(), "session-end failed");
-        let index =
-            run_impulse_with_impulse_dir(temp_dir.path(), &["index-memory", "--scope", "history"]);
-        assert!(index.status.success(), "index-memory failed");
+        let (temp_dir, _session_id) =
+            session_with_history_index("retrieval-semantic", "semantic fallback summary");
 
         let search = run_impulse_with_impulse_dir(
             temp_dir.path(),
@@ -619,8 +655,7 @@ mod tests {
             search.status.success(),
             "semantic search should still succeed"
         );
-        let body: Value =
-            serde_json::from_slice(&search.stdout).expect("valid semantic search json");
+        let body: Value = parse_json_stdout(&search);
         assert_eq!(body["mode"], "semantic");
         assert_eq!(body["used_fallback"], true);
         assert_ne!(body["fallback_code"], Value::Null);
@@ -635,14 +670,13 @@ mod tests {
 
     #[test]
     fn test_retrieval_status_reports_health_fields() {
-        let temp_dir = TempDir::new().unwrap();
-        run_impulse_with_impulse_dir(temp_dir.path(), &["init"]);
+        let temp_dir = init_test_dir();
 
         let status = run_impulse_with_impulse_dir(temp_dir.path(), &["retrieval-status"]);
         assert!(
             status.status.success(),
             "retrieval-status failed: {}",
-            String::from_utf8_lossy(&status.stderr)
+            stderr_str(&status)
         );
         let stdout = stdout_str(&status);
         assert!(stdout.contains("Retrieval DB:"), "db path should be shown");
@@ -652,8 +686,7 @@ mod tests {
 
     #[test]
     fn test_retrieval_status_check_json() {
-        let temp_dir = TempDir::new().unwrap();
-        run_impulse_with_impulse_dir(temp_dir.path(), &["init"]);
+        let temp_dir = init_test_dir();
         let status = run_impulse_with_impulse_dir(
             temp_dir.path(),
             &["retrieval-status", "--check", "--json"],
@@ -661,9 +694,9 @@ mod tests {
         assert!(
             status.status.success(),
             "retrieval-status --check --json failed: {}",
-            String::from_utf8_lossy(&status.stderr)
+            stderr_str(&status)
         );
-        let body: Value = serde_json::from_slice(&status.stdout).expect("valid status json");
+        let body: Value = parse_json_stdout(&status);
         assert!(body.get("db_path").is_some());
         assert!(body.get("db_exists").is_some());
         assert!(body.get("python_available").is_some());
@@ -671,31 +704,8 @@ mod tests {
 
     #[test]
     fn test_search_history_explain_output() {
-        let temp_dir = TempDir::new().unwrap();
-        run_impulse_with_impulse_dir(temp_dir.path(), &["init"]);
-        let start = run_impulse_with_impulse_dir(
-            temp_dir.path(),
-            &[
-                "session-start",
-                "-n",
-                "retrieval-explain",
-                "-p",
-                "claude-code",
-            ],
-        );
-        let session_id = stdout_str(&start).trim().to_string();
-        let _ = run_impulse_with_impulse_dir(
-            temp_dir.path(),
-            &[
-                "session-end",
-                "--session-id",
-                &session_id,
-                "--summary",
-                "explain path summary",
-            ],
-        );
-        let _ =
-            run_impulse_with_impulse_dir(temp_dir.path(), &["index-memory", "--scope", "history"]);
+        let (temp_dir, _session_id) =
+            session_with_history_index("retrieval-explain", "explain path summary");
         let out = run_impulse_with_impulse_dir(
             temp_dir.path(),
             &[
@@ -710,7 +720,7 @@ mod tests {
         assert!(
             out.status.success(),
             "search-history --explain failed: {}",
-            String::from_utf8_lossy(&out.stderr)
+            stderr_str(&out)
         );
         let stdout = stdout_str(&out);
         assert!(
@@ -721,33 +731,8 @@ mod tests {
 
     #[test]
     fn test_keyword_search_sets_fallback_metadata_on_db_query_failure() {
-        let temp_dir = TempDir::new().unwrap();
-        run_impulse_with_impulse_dir(temp_dir.path(), &["init"]);
-
-        let start = run_impulse_with_impulse_dir(
-            temp_dir.path(),
-            &[
-                "session-start",
-                "-n",
-                "keyword-fallback",
-                "-p",
-                "claude-code",
-            ],
-        );
-        let session_id = stdout_str(&start).trim().to_string();
-        let end = run_impulse_with_impulse_dir(
-            temp_dir.path(),
-            &[
-                "session-end",
-                "--session-id",
-                &session_id,
-                "--summary",
-                "query failure fallback",
-            ],
-        );
-        assert!(end.status.success());
-        let _ =
-            run_impulse_with_impulse_dir(temp_dir.path(), &["index-memory", "--scope", "history"]);
+        let (temp_dir, _session_id) =
+            session_with_history_index("keyword-fallback", "query failure fallback");
 
         let db_path = temp_dir.path().join("retrieval.db");
         let conn = Connection::open(&db_path).expect("open retrieval db");
@@ -774,8 +759,7 @@ mod tests {
             search.status.success(),
             "keyword search should fallback safely"
         );
-        let body: Value =
-            serde_json::from_slice(&search.stdout).expect("valid search-history json");
+        let body: Value = parse_json_stdout(&search);
         assert_eq!(body["mode"], "keyword");
         assert_eq!(body["used_fallback"], true);
         assert_eq!(body["fallback_code"], "retrieval_db_error");
@@ -783,8 +767,7 @@ mod tests {
 
     #[test]
     fn test_index_memory_lock_file_fails_safely() {
-        let temp_dir = TempDir::new().unwrap();
-        run_impulse_with_impulse_dir(temp_dir.path(), &["init"]);
+        let temp_dir = init_test_dir();
         let lock_path = temp_dir.path().join("retrieval.lock");
         std::fs::write(&lock_path, "stale lock").expect("write lock file");
 
@@ -794,7 +777,7 @@ mod tests {
             !out.status.success(),
             "index-memory should fail on active lock"
         );
-        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stderr = stderr_str(&out);
         assert!(
             stderr.contains("lock active"),
             "expected lock-active guidance, got: {}",
@@ -805,33 +788,10 @@ mod tests {
     #[test]
     #[ignore = "flaky: embedding subprocess env propagation race — falls back to keyword under load"]
     fn test_search_history_rust_backend_reports_backend_used() {
-        let temp_dir = TempDir::new().unwrap();
-        run_impulse_with_impulse_dir(temp_dir.path(), &["init"]);
+        let (temp_dir, session_id) = start_session("backend-rust");
+        end_session(temp_dir.path(), &session_id, "backend rust cosine");
 
-        let start = run_impulse_with_impulse_dir(
-            temp_dir.path(),
-            &["session-start", "-n", "backend-rust", "-p", "claude-code"],
-        );
-        let session_id = stdout_str(&start).trim().to_string();
-        let _ = run_impulse_with_impulse_dir(
-            temp_dir.path(),
-            &[
-                "session-end",
-                "--session-id",
-                &session_id,
-                "--summary",
-                "backend rust cosine",
-            ],
-        );
-
-        let _ = run_impulse_with_impulse_dir(
-            temp_dir.path(),
-            &["config", "retrieval_backend", "--value", "fts+vec"],
-        );
-        let _ = run_impulse_with_impulse_dir(
-            temp_dir.path(),
-            &["config", "retrieval_vector_enabled", "--value", "true"],
-        );
+        configure_vector_search(temp_dir.path());
         let _ = run_impulse_with_impulse_dir(
             temp_dir.path(),
             &["config", "retrieval_similarity_threshold", "--value", "0.0"],
@@ -861,40 +821,16 @@ mod tests {
             search.status.success(),
             "rust backend semantic search should succeed"
         );
-        let body: Value =
-            serde_json::from_slice(&search.stdout).expect("valid semantic search json");
+        let body: Value = parse_json_stdout(&search);
         assert_eq!(body["backend_used"], "rust-cosine");
         assert_eq!(body["used_fallback"], false);
     }
 
     #[test]
     fn test_search_history_sqlite_backend_fallback_without_extension() {
-        let temp_dir = TempDir::new().unwrap();
-        run_impulse_with_impulse_dir(temp_dir.path(), &["init"]);
-
-        let start = run_impulse_with_impulse_dir(
-            temp_dir.path(),
-            &["session-start", "-n", "backend-sqlite", "-p", "claude-code"],
-        );
-        let session_id = stdout_str(&start).trim().to_string();
-        let _ = run_impulse_with_impulse_dir(
-            temp_dir.path(),
-            &[
-                "session-end",
-                "--session-id",
-                &session_id,
-                "--summary",
-                "backend sqlite unavailable",
-            ],
-        );
-        let _ = run_impulse_with_impulse_dir(
-            temp_dir.path(),
-            &["config", "retrieval_backend", "--value", "fts+vec"],
-        );
-        let _ = run_impulse_with_impulse_dir(
-            temp_dir.path(),
-            &["config", "retrieval_vector_enabled", "--value", "true"],
-        );
+        let (temp_dir, session_id) = start_session("backend-sqlite");
+        end_session(temp_dir.path(), &session_id, "backend sqlite unavailable");
+        configure_vector_search(temp_dir.path());
         let _ = run_impulse_with_env(
             temp_dir.path(),
             &["index-memory", "--scope", "history"],
@@ -915,7 +851,7 @@ mod tests {
             ],
         );
         assert!(search.status.success());
-        let body: Value = serde_json::from_slice(&search.stdout).expect("valid json");
+        let body: Value = parse_json_stdout(&search);
         assert_eq!(body["used_fallback"], true);
         assert_eq!(body["fallback_code"], "sqlite_vec_unavailable");
         assert_eq!(body["backend_used"], "keyword");
@@ -928,38 +864,9 @@ mod tests {
             return;
         }
 
-        let temp_dir = TempDir::new().unwrap();
-        run_impulse_with_impulse_dir(temp_dir.path(), &["init"]);
-
-        let start = run_impulse_with_impulse_dir(
-            temp_dir.path(),
-            &[
-                "session-start",
-                "-n",
-                "backend-sqlite-native",
-                "-p",
-                "claude-code",
-            ],
-        );
-        let session_id = stdout_str(&start).trim().to_string();
-        let _ = run_impulse_with_impulse_dir(
-            temp_dir.path(),
-            &[
-                "session-end",
-                "--session-id",
-                &session_id,
-                "--summary",
-                "backend sqlite native",
-            ],
-        );
-        let _ = run_impulse_with_impulse_dir(
-            temp_dir.path(),
-            &["config", "retrieval_backend", "--value", "fts+vec"],
-        );
-        let _ = run_impulse_with_impulse_dir(
-            temp_dir.path(),
-            &["config", "retrieval_vector_enabled", "--value", "true"],
-        );
+        let (temp_dir, session_id) = start_session("backend-sqlite-native");
+        end_session(temp_dir.path(), &session_id, "backend sqlite native");
+        configure_vector_search(temp_dir.path());
         let _ = run_impulse_with_impulse_dir(
             temp_dir.path(),
             &["config", "retrieval_similarity_threshold", "--value", "0.0"],
@@ -987,17 +894,16 @@ mod tests {
         assert!(
             search.status.success(),
             "sqlite-vec semantic search should run: {}",
-            String::from_utf8_lossy(&search.stderr)
+            stderr_str(&search)
         );
-        let body: Value = serde_json::from_slice(&search.stdout).expect("valid json");
+        let body: Value = parse_json_stdout(&search);
         assert_eq!(body["backend_used"], "sqlite-vec");
         assert_eq!(body["used_fallback"], false);
     }
 
     #[test]
     fn test_daemon_chat_review_mode_stages_artifact_without_apply() {
-        let temp_dir = TempDir::new().unwrap();
-        run_impulse_with_impulse_dir(temp_dir.path(), &["init"]);
+        let temp_dir = init_test_dir();
         seed_retrieval_history(
             temp_dir.path(),
             "daemon-review-seed",
@@ -1019,7 +925,7 @@ mod tests {
         assert!(
             create.status.success(),
             "daemon session-start failed: {}",
-            String::from_utf8_lossy(&create.stderr)
+            stderr_str(&create)
         );
         let session_id = parse_daemon_session_id(&stdout_str(&create)).expect("daemon session id");
 
@@ -1041,10 +947,10 @@ mod tests {
         assert!(
             chat.status.success(),
             "daemon chat failed: {}",
-            String::from_utf8_lossy(&chat.stderr)
+            stderr_str(&chat)
         );
 
-        let body: Value = serde_json::from_slice(&chat.stdout).expect("valid daemon chat json");
+        let body: Value = parse_json_stdout(&chat);
         assert_eq!(body["session_id"], session_id);
         assert_eq!(body["injection"]["applied"], false);
         let artifact_path = body["injection"]["artifact_path"]
@@ -1055,8 +961,7 @@ mod tests {
 
     #[test]
     fn test_daemon_chat_apply_mode_includes_injected_block() {
-        let temp_dir = TempDir::new().unwrap();
-        run_impulse_with_impulse_dir(temp_dir.path(), &["init"]);
+        let temp_dir = init_test_dir();
         seed_retrieval_history(
             temp_dir.path(),
             "daemon-apply-seed",
@@ -1093,7 +998,7 @@ mod tests {
             &[("IMPULSE_TEST_MODE", "1")],
         );
         assert!(chat.status.success(), "daemon chat apply should succeed");
-        let body: Value = serde_json::from_slice(&chat.stdout).expect("valid daemon chat json");
+        let body: Value = parse_json_stdout(&chat);
         assert_eq!(body["injection"]["applied"], true);
         assert!(
             body["injection"]["injected_block"]
@@ -1106,8 +1011,7 @@ mod tests {
 
     #[test]
     fn test_direct_injection_review_for_orchestrate_handoff_sync_context() {
-        let temp_dir = TempDir::new().unwrap();
-        run_impulse_with_impulse_dir(temp_dir.path(), &["init"]);
+        let temp_dir = init_test_dir();
         seed_retrieval_history(
             temp_dir.path(),
             "direct-review-seed",
@@ -1167,8 +1071,7 @@ mod tests {
 
     #[test]
     fn test_injection_off_mode_keeps_baseline_and_emits_no_artifact() {
-        let temp_dir = TempDir::new().unwrap();
-        run_impulse_with_impulse_dir(temp_dir.path(), &["init"]);
+        let temp_dir = init_test_dir();
         seed_retrieval_history(temp_dir.path(), "off-mode-seed", "off mode baseline");
 
         let orchestrate = run_impulse_with_impulse_dir(
@@ -1194,8 +1097,7 @@ mod tests {
 
     #[test]
     fn test_injection_explain_contains_fallback_metadata() {
-        let temp_dir = TempDir::new().unwrap();
-        run_impulse_with_impulse_dir(temp_dir.path(), &["init"]);
+        let temp_dir = init_test_dir();
         seed_retrieval_history(
             temp_dir.path(),
             "fallback-meta-seed",
@@ -1227,8 +1129,7 @@ mod tests {
 
     #[test]
     fn test_retrieval_status_json_includes_injection_summary() {
-        let temp_dir = TempDir::new().unwrap();
-        run_impulse_with_impulse_dir(temp_dir.path(), &["init"]);
+        let temp_dir = init_test_dir();
 
         let _ = run_impulse_with_impulse_dir(
             temp_dir.path(),
@@ -1243,7 +1144,7 @@ mod tests {
 
         let status = run_impulse_with_impulse_dir(temp_dir.path(), &["retrieval-status", "--json"]);
         assert!(status.status.success());
-        let body: Value = serde_json::from_slice(&status.stdout).expect("valid status json");
+        let body: Value = parse_json_stdout(&status);
         assert!(
             body["injection"].is_object(),
             "status json should include injection block"
@@ -1258,9 +1159,7 @@ mod tests {
 
     #[test]
     fn test_steward_status_json() {
-        let dir = TempDir::new().unwrap();
-        let impulse_dir = dir.path().join(".impulse");
-        std::fs::create_dir_all(&impulse_dir).unwrap();
+        let (_dir, impulse_dir) = init_steward_dir();
 
         let output = run_impulse_with_impulse_dir(&impulse_dir, &["steward", "status", "--json"]);
         assert!(
@@ -1268,8 +1167,7 @@ mod tests {
             "steward status --json should succeed"
         );
 
-        let body: Value = serde_json::from_slice(&output.stdout)
-            .expect("steward status should return valid json");
+        let body: Value = parse_json_stdout(&output);
         assert!(body["mode"].is_string(), "should have mode field");
         assert!(body["thresholds"].is_object(), "should have thresholds");
         assert!(
@@ -1284,9 +1182,7 @@ mod tests {
 
     #[test]
     fn test_steward_list_empty() {
-        let dir = TempDir::new().unwrap();
-        let impulse_dir = dir.path().join(".impulse");
-        std::fs::create_dir_all(&impulse_dir).unwrap();
+        let (_dir, impulse_dir) = init_steward_dir();
 
         let output = run_impulse_with_impulse_dir(&impulse_dir, &["steward", "list", "--json"]);
         assert!(
@@ -1294,8 +1190,7 @@ mod tests {
             "steward list --json should succeed"
         );
 
-        let body: Value =
-            serde_json::from_slice(&output.stdout).expect("steward list should return valid json");
+        let body: Value = parse_json_stdout(&output);
         assert!(body.is_array(), "list should return array");
         assert_eq!(
             body.as_array().unwrap().len(),
@@ -1306,9 +1201,7 @@ mod tests {
 
     #[test]
     fn test_steward_memory_json() {
-        let dir = TempDir::new().unwrap();
-        let impulse_dir = dir.path().join(".impulse");
-        std::fs::create_dir_all(&impulse_dir).unwrap();
+        let (_dir, impulse_dir) = init_steward_dir();
 
         let output = run_impulse_with_impulse_dir(&impulse_dir, &["steward", "memory", "--json"]);
         assert!(
@@ -1316,8 +1209,7 @@ mod tests {
             "steward memory --json should succeed"
         );
 
-        let body: Value = serde_json::from_slice(&output.stdout)
-            .expect("steward memory should return valid json");
+        let body: Value = parse_json_stdout(&output);
         assert!(body["version"].is_string(), "should have version");
         assert!(body["patterns"].is_array(), "should have patterns array");
         assert!(body["learnings"].is_array(), "should have learnings array");
@@ -1325,9 +1217,7 @@ mod tests {
 
     #[test]
     fn test_steward_analyze_with_fixture() {
-        let dir = TempDir::new().unwrap();
-        let impulse_dir = dir.path().join(".impulse");
-        std::fs::create_dir_all(&impulse_dir).unwrap();
+        let (_dir, impulse_dir) = init_steward_dir();
 
         let fixture_path = impulse_rs_dir()
             .join("tests")
@@ -1353,11 +1243,10 @@ mod tests {
         assert!(
             output.status.success(),
             "steward analyze should succeed. stderr: {}",
-            String::from_utf8_lossy(&output.stderr)
+            stderr_str(&output)
         );
 
-        let body: Value =
-            serde_json::from_slice(&output.stdout).expect("analyze should return valid json");
+        let body: Value = parse_json_stdout(&output);
         assert!(
             body["message_count"].is_number(),
             "should have message_count"
@@ -1376,9 +1265,7 @@ mod tests {
 
     #[test]
     fn test_steward_compact_with_session_id() {
-        let dir = TempDir::new().unwrap();
-        let impulse_dir = dir.path().join(".impulse");
-        std::fs::create_dir_all(&impulse_dir).unwrap();
+        let (_dir, impulse_dir) = init_steward_dir();
 
         let output = run_impulse_with_impulse_dir(
             &impulse_dir,
@@ -1386,7 +1273,7 @@ mod tests {
         );
         assert!(output.status.success(), "steward compact should succeed");
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = stdout_str(&output);
         assert!(
             stdout.contains("test-session-123"),
             "compact output should contain session id"
@@ -1395,9 +1282,7 @@ mod tests {
 
     #[test]
     fn test_steward_approve_nonexistent() {
-        let dir = TempDir::new().unwrap();
-        let impulse_dir = dir.path().join(".impulse");
-        std::fs::create_dir_all(&impulse_dir).unwrap();
+        let (_dir, impulse_dir) = init_steward_dir();
 
         let output = run_impulse_with_impulse_dir(
             &impulse_dir,
@@ -1408,7 +1293,7 @@ mod tests {
             "approve of nonexistent should not crash"
         );
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = stdout_str(&output);
         assert!(
             stdout.contains("not found"),
             "should report proposal not found"
@@ -1417,16 +1302,14 @@ mod tests {
 
     #[test]
     fn test_stewardship_config_fields() {
-        let dir = TempDir::new().unwrap();
-        let impulse_dir = dir.path().join(".impulse");
-        std::fs::create_dir_all(&impulse_dir).unwrap();
+        let (_dir, impulse_dir) = init_steward_dir();
 
         // Init to create config
         let _ = run_impulse_with_impulse_dir(&impulse_dir, &["init"]);
 
         // Check default stewardship mode
         let output = run_impulse_with_impulse_dir(&impulse_dir, &["config", "stewardship_mode"]);
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = stdout_str(&output);
         assert!(
             stdout.contains("review"),
             "default stewardship_mode should be 'review'"
@@ -1444,7 +1327,7 @@ mod tests {
 
         // Verify it was set
         let output = run_impulse_with_impulse_dir(&impulse_dir, &["config", "stewardship_mode"]);
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = stdout_str(&output);
         assert!(
             stdout.contains("auto"),
             "stewardship_mode should be 'auto' after set"
@@ -1458,9 +1341,7 @@ mod tests {
     /// Test (a): Config round-trip for impulse_agent_provider via State.set_config() / get_config()
     #[test]
     fn test_impulse_agent_config_provider_round_trip() {
-        let temp_dir = TempDir::new().unwrap();
-        let state = crate::state::State::new(temp_dir.path().to_path_buf())
-            .expect("State::new should succeed");
+        let (_temp_dir, state) = new_state();
 
         // Default: provider is None
         let val = state
@@ -1517,9 +1398,7 @@ mod tests {
     /// Test (b): Config validation — invalid provider returns false
     #[test]
     fn test_impulse_agent_config_rejects_invalid_provider() {
-        let temp_dir = TempDir::new().unwrap();
-        let state = crate::state::State::new(temp_dir.path().to_path_buf())
-            .expect("State::new should succeed");
+        let (_temp_dir, state) = new_state();
 
         let ok = state
             .set_config("impulse_agent_provider", "invalid_provider")
@@ -1544,9 +1423,7 @@ mod tests {
     /// Test (b continued): Config validation — invalid harness returns false
     #[test]
     fn test_impulse_agent_config_rejects_invalid_harness() {
-        let temp_dir = TempDir::new().unwrap();
-        let state = crate::state::State::new(temp_dir.path().to_path_buf())
-            .expect("State::new should succeed");
+        let (_temp_dir, state) = new_state();
 
         let ok = state
             .set_config("impulse_agent_harness", "cursor")
@@ -1566,9 +1443,7 @@ mod tests {
     /// Test (c): API key masking — set an API key, verify get_config returns "***"
     #[test]
     fn test_impulse_agent_api_key_masking() {
-        let temp_dir = TempDir::new().unwrap();
-        let state = crate::state::State::new(temp_dir.path().to_path_buf())
-            .expect("State::new should succeed");
+        let (_temp_dir, state) = new_state();
 
         // Default: no key
         let val = state
@@ -1731,67 +1606,29 @@ mod tests {
     #[test]
     fn test_impulse_agent_coordinator_end_to_end() {
         use crate::agent::coordinator::{self, RecommendationType};
-        use crate::context_lifecycle::types::{AgentKind, ExtractedInsight, InsightType};
-
-        let now = chrono::Utc::now();
+        use crate::context_lifecycle::types::{AgentKind, InsightType};
 
         // Build a realistic multi-pane scenario:
         // - Pane 1 (ClaudeCode): modified src/lib.rs and src/main.rs
         // - Pane 2 (OpenCode): modified src/lib.rs (conflict!) and got an error
         // - Pane 3 (Codex): modified tests/integration.rs and completed a task
         let insights = vec![
-            // Pane 1 modifications
-            ExtractedInsight {
-                pane_id: 1,
-                agent_kind: AgentKind::ClaudeCode,
-                timestamp: now,
-                insight_type: InsightType::FileModified,
-                content: "src/lib.rs".to_string(),
-                intent: None,
-            },
-            ExtractedInsight {
-                pane_id: 1,
-                agent_kind: AgentKind::ClaudeCode,
-                timestamp: now,
-                insight_type: InsightType::FileModified,
-                content: "src/main.rs".to_string(),
-                intent: None,
-            },
-            // Pane 2 modifies the same file as pane 1 (conflict)
-            ExtractedInsight {
-                pane_id: 2,
-                agent_kind: AgentKind::OpenCode,
-                timestamp: now,
-                insight_type: InsightType::FileModified,
-                content: "src/lib.rs".to_string(),
-                intent: None,
-            },
-            // Pane 2 encounters an error close in time to pane 1's modification
-            ExtractedInsight {
-                pane_id: 2,
-                agent_kind: AgentKind::OpenCode,
-                timestamp: now,
-                insight_type: InsightType::ErrorEncountered,
-                content: "error[E0433]: failed to resolve: use of undeclared crate".to_string(),
-                intent: None,
-            },
-            // Pane 3 works on different files (no conflict)
-            ExtractedInsight {
-                pane_id: 3,
-                agent_kind: AgentKind::Codex,
-                timestamp: now,
-                insight_type: InsightType::FileModified,
-                content: "tests/integration.rs".to_string(),
-                intent: None,
-            },
-            ExtractedInsight {
-                pane_id: 3,
-                agent_kind: AgentKind::Codex,
-                timestamp: now,
-                insight_type: InsightType::TaskCompleted,
-                content: "all tests passing".to_string(),
-                intent: None,
-            },
+            file_mod(1, AgentKind::ClaudeCode, "src/lib.rs"),
+            file_mod(1, AgentKind::ClaudeCode, "src/main.rs"),
+            file_mod(2, AgentKind::OpenCode, "src/lib.rs"),
+            insight(
+                2,
+                AgentKind::OpenCode,
+                InsightType::ErrorEncountered,
+                "error[E0433]: failed to resolve: use of undeclared crate",
+            ),
+            file_mod(3, AgentKind::Codex, "tests/integration.rs"),
+            insight(
+                3,
+                AgentKind::Codex,
+                InsightType::TaskCompleted,
+                "all tests passing",
+            ),
         ];
 
         let recs = coordinator::run_local_coordination(&insights);
@@ -1849,36 +1686,18 @@ mod tests {
     #[test]
     fn test_impulse_agent_coordinator_no_conflicts() {
         use crate::agent::coordinator;
-        use crate::context_lifecycle::types::{AgentKind, ExtractedInsight, InsightType};
-
-        let now = chrono::Utc::now();
+        use crate::context_lifecycle::types::{AgentKind, InsightType};
 
         // Each pane modifies different files — no overlap
         let insights = vec![
-            ExtractedInsight {
-                pane_id: 1,
-                agent_kind: AgentKind::ClaudeCode,
-                timestamp: now,
-                insight_type: InsightType::FileModified,
-                content: "src/auth.rs".to_string(),
-                intent: None,
-            },
-            ExtractedInsight {
-                pane_id: 2,
-                agent_kind: AgentKind::OpenCode,
-                timestamp: now,
-                insight_type: InsightType::FileModified,
-                content: "src/database.rs".to_string(),
-                intent: None,
-            },
-            ExtractedInsight {
-                pane_id: 3,
-                agent_kind: AgentKind::Codex,
-                timestamp: now,
-                insight_type: InsightType::TaskCompleted,
-                content: "refactoring complete".to_string(),
-                intent: None,
-            },
+            file_mod(1, AgentKind::ClaudeCode, "src/auth.rs"),
+            file_mod(2, AgentKind::OpenCode, "src/database.rs"),
+            insight(
+                3,
+                AgentKind::Codex,
+                InsightType::TaskCompleted,
+                "refactoring complete",
+            ),
         ];
 
         let recs = coordinator::run_local_coordination(&insights);
@@ -1892,52 +1711,15 @@ mod tests {
     #[test]
     fn test_impulse_agent_coordinator_multiple_file_conflicts() {
         use crate::agent::coordinator::{self, RecommendationType};
-        use crate::context_lifecycle::types::{AgentKind, ExtractedInsight, InsightType};
-
-        let now = chrono::Utc::now();
+        use crate::context_lifecycle::types::AgentKind;
 
         // Three panes all touching the same two files
         let insights = vec![
-            ExtractedInsight {
-                pane_id: 1,
-                agent_kind: AgentKind::ClaudeCode,
-                timestamp: now,
-                insight_type: InsightType::FileModified,
-                content: "Cargo.toml".to_string(),
-                intent: None,
-            },
-            ExtractedInsight {
-                pane_id: 2,
-                agent_kind: AgentKind::OpenCode,
-                timestamp: now,
-                insight_type: InsightType::FileModified,
-                content: "Cargo.toml".to_string(),
-                intent: None,
-            },
-            ExtractedInsight {
-                pane_id: 3,
-                agent_kind: AgentKind::Codex,
-                timestamp: now,
-                insight_type: InsightType::FileModified,
-                content: "Cargo.toml".to_string(),
-                intent: None,
-            },
-            ExtractedInsight {
-                pane_id: 1,
-                agent_kind: AgentKind::ClaudeCode,
-                timestamp: now,
-                insight_type: InsightType::FileModified,
-                content: "src/config.rs".to_string(),
-                intent: None,
-            },
-            ExtractedInsight {
-                pane_id: 2,
-                agent_kind: AgentKind::OpenCode,
-                timestamp: now,
-                insight_type: InsightType::FileModified,
-                content: "src/config.rs".to_string(),
-                intent: None,
-            },
+            file_mod(1, AgentKind::ClaudeCode, "Cargo.toml"),
+            file_mod(2, AgentKind::OpenCode, "Cargo.toml"),
+            file_mod(3, AgentKind::Codex, "Cargo.toml"),
+            file_mod(1, AgentKind::ClaudeCode, "src/config.rs"),
+            file_mod(2, AgentKind::OpenCode, "src/config.rs"),
         ];
 
         let recs = coordinator::run_local_coordination(&insights);
@@ -1967,7 +1749,7 @@ mod tests {
     #[test]
     fn test_impulse_agent_coordinate_local_accumulates() {
         use crate::agent::{ImpulseAgent, ImpulseAgentConfig, ImpulseProvider};
-        use crate::context_lifecycle::types::{AgentKind, ExtractedInsight, InsightType};
+        use crate::context_lifecycle::types::AgentKind;
 
         let config =
             ImpulseAgentConfig::api(ImpulseProvider::Anthropic).with_api_key("test-key-accumulate");
@@ -1977,26 +1759,10 @@ mod tests {
             "should start with no recs"
         );
 
-        let now = chrono::Utc::now();
-
         // First batch: one conflict
         let batch1 = vec![
-            ExtractedInsight {
-                pane_id: 1,
-                agent_kind: AgentKind::ClaudeCode,
-                timestamp: now,
-                insight_type: InsightType::FileModified,
-                content: "src/a.rs".to_string(),
-                intent: None,
-            },
-            ExtractedInsight {
-                pane_id: 2,
-                agent_kind: AgentKind::OpenCode,
-                timestamp: now,
-                insight_type: InsightType::FileModified,
-                content: "src/a.rs".to_string(),
-                intent: None,
-            },
+            file_mod(1, AgentKind::ClaudeCode, "src/a.rs"),
+            file_mod(2, AgentKind::OpenCode, "src/a.rs"),
         ];
         let recs1 = agent.coordinate_local(&batch1);
         assert_eq!(recs1.len(), 1);
@@ -2004,22 +1770,8 @@ mod tests {
 
         // Second batch: another conflict
         let batch2 = vec![
-            ExtractedInsight {
-                pane_id: 3,
-                agent_kind: AgentKind::Codex,
-                timestamp: now,
-                insight_type: InsightType::FileModified,
-                content: "src/b.rs".to_string(),
-                intent: None,
-            },
-            ExtractedInsight {
-                pane_id: 4,
-                agent_kind: AgentKind::GenericShell,
-                timestamp: now,
-                insight_type: InsightType::FileModified,
-                content: "src/b.rs".to_string(),
-                intent: None,
-            },
+            file_mod(3, AgentKind::Codex, "src/b.rs"),
+            file_mod(4, AgentKind::GenericShell, "src/b.rs"),
         ];
         let recs2 = agent.coordinate_local(&batch2);
         assert_eq!(recs2.len(), 1);
@@ -2153,42 +1905,28 @@ mod tests {
     #[test]
     fn test_impulse_agent_aggregate_pane_summaries() {
         use crate::agent::coordinator::aggregate_pane_summaries;
-        use crate::context_lifecycle::types::{AgentKind, ExtractedInsight, InsightType};
+        use crate::context_lifecycle::types::{AgentKind, InsightType};
 
-        let now = chrono::Utc::now();
         let insights = vec![
-            ExtractedInsight {
-                pane_id: 1,
-                agent_kind: AgentKind::ClaudeCode,
-                timestamp: now,
-                insight_type: InsightType::FileModified,
-                content: "src/main.rs".to_string(),
-                intent: None,
-            },
-            ExtractedInsight {
-                pane_id: 1,
-                agent_kind: AgentKind::ClaudeCode,
-                timestamp: now,
-                insight_type: InsightType::DecisionMade,
-                content: "use async runtime".to_string(),
-                intent: None,
-            },
-            ExtractedInsight {
-                pane_id: 2,
-                agent_kind: AgentKind::OpenCode,
-                timestamp: now,
-                insight_type: InsightType::ErrorEncountered,
-                content: "build failed".to_string(),
-                intent: None,
-            },
-            ExtractedInsight {
-                pane_id: 3,
-                agent_kind: AgentKind::Codex,
-                timestamp: now,
-                insight_type: InsightType::TaskCompleted,
-                content: "refactor done".to_string(),
-                intent: None,
-            },
+            file_mod(1, AgentKind::ClaudeCode, "src/main.rs"),
+            insight(
+                1,
+                AgentKind::ClaudeCode,
+                InsightType::DecisionMade,
+                "use async runtime",
+            ),
+            insight(
+                2,
+                AgentKind::OpenCode,
+                InsightType::ErrorEncountered,
+                "build failed",
+            ),
+            insight(
+                3,
+                AgentKind::Codex,
+                InsightType::TaskCompleted,
+                "refactor done",
+            ),
         ];
 
         let summaries = aggregate_pane_summaries(&insights);
@@ -2212,9 +1950,7 @@ mod tests {
     /// Test: Full config round-trip for all impulse_agent config fields
     #[test]
     fn test_impulse_agent_config_all_fields_round_trip() {
-        let temp_dir = TempDir::new().unwrap();
-        let state = crate::state::State::new(temp_dir.path().to_path_buf())
-            .expect("State::new should succeed");
+        let (_temp_dir, state) = new_state();
 
         // Set all impulse agent config fields
         assert!(state
@@ -2311,8 +2047,7 @@ mod tests {
     /// Test: CLI config set/get for impulse_agent fields via subprocess
     #[test]
     fn test_impulse_agent_config_cli_round_trip() {
-        let temp_dir = TempDir::new().unwrap();
-        run_impulse_with_impulse_dir(temp_dir.path(), &["init"]);
+        let temp_dir = init_test_dir();
 
         // Set provider via CLI
         let output = run_impulse_with_impulse_dir(
@@ -2356,7 +2091,7 @@ mod tests {
             &["config", "impulse_agent_provider", "--value", "invalid_llm"],
         );
         // The CLI may still return success with an error message, or may return non-zero
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr_str(&output);
         let stdout = stdout_str(&output);
         let failed = !output.status.success()
             || stderr.contains("invalid")
