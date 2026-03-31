@@ -32,43 +32,14 @@
 
 ## Medium: Missing Module Docs
 
-### 2. `src/agent/harness.rs` — No Public module-level doc
-
-**Problem:** `harness.rs` has excellent file-level rustdoc and method docs, but there's no `pub mod harness` re-export entry in `agent/mod.rs` doc comment explaining the harness protocol's role.
-
-**Fix:** Add `//! The [`harness`] module — structured JSON protocol for CLI harness mode.` to `agent/mod.rs`
-
----
-
-### 3. `src/context_lifecycle/extractor.rs` — Module doc missing
-
-**Problem:** Ralph Plan 3 activated intent classification at 9 extraction sites. The `extractor.rs` module (511 lines) has no module-level doc explaining what it does.
-
-**Fix:** Add file-level doc comment describing the extraction pipeline
-
----
-
-### 4. `src/context_lifecycle/intent.rs` — Module doc missing
-
-**Problem:** Intent classification is a key Phase 3 feature. Module has no doc.
-
-**Fix:** Add file-level doc comment
-
----
-
-### 5. `src/agent/coordinator.rs` — Missing doc for top-level items
-
-**Problem:** 1,119 lines. Has `CoordinationResult` and `Recommendation` types used in IPC responses. Several public functions lack doc comments.
-
-**Fix:** Add doc comments for `CoordinationResult`, `run_full_coordination()`, `aggregate_pane_summaries()`
-
----
-
-### 6. `src/agent/prompts.rs` — Module doc exists but may be stale
-
-**Problem:** 405 lines. Module doc exists but doesn't mention the new structured `HarnessRequest`/`HarnessResponse` flow.
-
-**Fix:** Update module doc to mention harness protocol integration
+> **Updated 2026-03-31:** After reading the actual files, all P1 module docs were already present:
+> - `extractor.rs` ✓ — "Output extractor — parses agent PTY output for structured insights"
+> - `intent.rs` ✓ — "Intent detection for agent activities"
+> - `coordinator.rs` ✓ — "Cross-pane coordination logic" + all key functions documented
+> - `agent/prompts.rs` ✓ — "System prompts for the Impulse Agent's augmentation modes"
+> - `agent/mod.rs` ✓ — Good module doc covering both API and Harness modes
+>
+> **No action needed on P1 items.**
 
 ---
 
@@ -100,30 +71,30 @@
 
 ## Stale/Dead Docs to Potentially Remove
 
-These docs describe features or designs that are now obsolete or replaced:
+Assessment complete (Loop 4):
 
-| Doc | Reason |
-|-----|--------|
-| `docs/vision/DASHBOARD-DESIGN.md` | EGUI workbench replaced Dashboard concept |
-| `docs/vision/TUI-AUGMENTATION-VISION.md` | TUI workbench already built |
-| `docs/vision/REAL-TIME-INJECTION-VISION.md` | Lane 5 (retrieval) covers this now |
-| `docs/AI build_complete_guide.md` | Unclear purpose, may be obsolete |
+| Doc | Assessment | Action |
+|-----|-----------|--------|
+| `docs/vision/DASHBOARD-DESIGN.md` | Obsolete — Zellij plugin concept replaced by EGUI workbench | **DELETE** |
+| `docs/vision/TUI-AUGMENTATION-VISION.md` | Superseded — Ralph Plan 4 Phase 3/4 (Loops 7-23) implement the actual TUI/UX work | **ARCHIVE** (move to `docs/archive/`) |
+| `docs/vision/REAL-TIME-INJECTION-VISION.md` | Still relevant — Phase 3 per canonical contract, current phase (Now) covers retrieval/injection | **KEEP** |
+| `docs/AI build_complete_guide.md` | Not Impulse-specific — James's personal 22K-line AI-Native Development guide | **REMOVE from project** (belongs in personal docs) |
 
-**Action:** Assess each for deletion or archival.
+**Actions to take:** Delete DASHBOARD-DESIGN.md and AI build_complete_guide.md; archive TUI-AUGMENTATION-VISION.md.
 
 ---
 
 ## Summary: Prioritized Action Items
 
-| Priority | Item | Files | Effort |
-|----------|------|-------|--------|
-| **P0** | Fix IPC-PROTOCOL.md (stale + missing endpoints) | `docs/IPC-PROTOCOL.md` | M |
-| **P1** | Add module docs: extractor.rs, intent.rs | `src/context_lifecycle/` | S |
-| **P1** | Add coordinator.rs doc comments | `src/agent/coordinator.rs` | S |
-| **P2** | Update CLAUDE.md agent IPC section | `CLAUDE.md` | S |
-| **P2** | Update agent/prompts.rs module doc | `src/agent/prompts.rs` | S |
-| **P3** | Audit RUST-CANONICAL-CONTRACT.md Section 3 | `docs/spec/` | M |
-| **P3** | Assess obsolete vision docs for removal | `docs/vision/` | S |
+| Priority | Item | Status | Files | Effort |
+|----------|------|--------|-------|--------|
+| **P0** | Fix IPC-PROTOCOL.md (stale + missing endpoints) | ✅ DONE (Loop 1, `e612548`) | `docs/IPC-PROTOCOL.md` | M |
+| **P1** | Add module docs: extractor.rs, intent.rs | ✅ ALREADY DONE | `src/context_lifecycle/` | S |
+| **P1** | Add coordinator.rs doc comments | ✅ ALREADY DONE | `src/agent/coordinator.rs` | S |
+| **P2** | Update CLAUDE.md agent IPC section | ✅ DONE (Loop 2, `97cb83b`) | `CLAUDE.md` | S |
+| **P2** | Update agent/prompts.rs module doc | ✅ ALREADY DONE | `src/agent/prompts.rs` | S |
+| **P3** | Audit RUST-CANONICAL-CONTRACT.md Section 3 | ⬜ PENDING | `docs/spec/` | M |
+| **P3** | Assess obsolete vision docs for removal | ⬜ PENDING | `docs/vision/` | S |
 
 ---
 
