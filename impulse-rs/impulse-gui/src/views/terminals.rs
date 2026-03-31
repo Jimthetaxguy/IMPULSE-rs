@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -39,6 +40,8 @@ pub(super) struct Tab {
     pub(super) target_dir: PathBuf,
     /// Daemon session ID, set asynchronously after CreateTabSession round-trip.
     pub(super) daemon_session_id: Option<String>,
+    /// Timestamp when this tab was created (used for spawn animation).
+    pub(super) created_at: Instant,
 }
 
 /// A pending context injection — waiting for agent startup.
@@ -248,6 +251,7 @@ impl TerminalsView {
                     panel,
                     target_dir: target_dir.to_path_buf(),
                     daemon_session_id: None,
+                    created_at: Instant::now(),
                 };
                 self.tabs.insert(id, tab);
                 self.active_tab = Some(id);
@@ -748,12 +752,52 @@ impl View for TerminalsView {
                         self.badge_acknowledged_tab = Some(*id);
                     }
 
-                    // Context health indicator for alive panels.
+                    // Context health indicator for alive panels — compact inline budget bar.
                     if let Some((usage_fraction, estimated_tokens)) = health_info {
-                        let (tier_icon, tier_color) = context_tier_display_from(usage_fraction);
-                        let resp =
-                            ui.label(egui::RichText::new(tier_icon).small().color(tier_color));
-                        resp.on_hover_text(format!(
+                        let (bar_rect, _) =
+                            ui.allocate_exact_size(egui::vec2(36.0, 8.0), egui::Sense::hover());
+
+                        // Determine color based on usage fraction (matches render_token_budget).
+                        let fill_color = if usage_fraction < 0.45 {
+                            colors::GREEN
+                        } else if usage_fraction < 0.60 {
+                            colors::YELLOW
+                        } else if usage_fraction < 0.80 {
+                            egui::Color32::from_rgb(0xff, 0x7b, 0x72) // red
+                        } else {
+                            egui::Color32::from_rgb(0xff, 0x45, 0x45) // bright red
+                        };
+
+                        let fill_rect = egui::Rect::from_min_size(
+                            bar_rect.min,
+                            egui::vec2(
+                                bar_rect.width() * usage_fraction.clamp(0.0, 1.0),
+                                bar_rect.height(),
+                            ),
+                        );
+
+                        // Paint the mini progress bar (scoped to avoid holding painter across ui mutations).
+                        {
+                            let painter = ui.painter();
+                            painter.rect_filled(bar_rect, 2.0, colors::BG);
+                            painter.rect_filled(fill_rect, 2.0, fill_color);
+                            painter.rect_stroke(
+                                bar_rect,
+                                2.0,
+                                egui::Stroke::new(0.5, colors::BORDER),
+                                egui::StrokeKind::Outside,
+                            );
+                        }
+
+                        // Percentage label next to the bar.
+                        let pct_text = format!("{:.0}%", usage_fraction * 100.0);
+                        ui.label(
+                            egui::RichText::new(&pct_text)
+                                .small()
+                                .color(fill_color)
+                                .monospace(),
+                        )
+                        .on_hover_text(format!(
                             "Context: {:.0}% ({} tokens)",
                             usage_fraction * 100.0,
                             estimated_tokens
@@ -862,26 +906,98 @@ impl View for TerminalsView {
                 tab.panel.show(ui);
             }
         } else {
-            ui.vertical_centered(|ui| {
-                ui.add_space(ui.available_height() / 6.0);
-                ui.heading(
-                    egui::RichText::new(WELCOME_BANNER)
+            ui.vertical_centered_justified(|ui| {
+                // --- Header zone ---
+                ui.add_space(ui.available_height() / 8.0);
+                ui.label(
+                    egui::RichText::new("IMPULSE")
                         .monospace()
+                        .size(28.0)
                         .color(colors::ACCENT),
                 );
-                ui.add_space(8.0);
+                ui.add_space(4.0);
                 ui.label(
                     egui::RichText::new("Persistent memory for AI coding agents")
-                        .color(colors::TEXT_MUTED),
+                        .small()
+                        .color(colors::TEXT_DIM),
                 );
 
+                // --- Live context zone ---
                 ui.add_space(24.0);
+                let recent = self
+                    .live_insights_path
+                    .as_ref()
+                    .is_some_and(|p| p.exists())
+                    .then(|| {
+                        self.live_insights_path
+                            .as_ref()
+                            .map(|p| load_recent_insights(p))
+                    })
+                    .flatten();
 
-                // Quick action buttons for available agents.
+                egui::Frame::new()
+                    .fill(colors::SURFACE)
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .inner_margin(egui::Margin::symmetric(16, 12))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new("Recent Activity")
+                                .small()
+                                .strong()
+                                .color(colors::TEXT_MUTED),
+                        );
+                        ui.add_space(8.0);
+
+                        if let Some(insights) = recent {
+                            if insights.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "No active sessions — start your first agent below.",
+                                    )
+                                    .small()
+                                    .color(colors::TEXT_DIM),
+                                );
+                            } else {
+                                for (itype, content) in &insights {
+                                    ui.horizontal(|ui| {
+                                        let (badge_color, badge_text) = match itype.as_str() {
+                                            "FileModified" => (colors::GREEN, "file"),
+                                            "ErrorEncountered" => (colors::RED, "error"),
+                                            "DecisionMade" => (colors::ACCENT, "decision"),
+                                            "TaskCompleted" => (colors::GREEN, "done"),
+                                            _ => (colors::TEXT_DIM, "?"),
+                                        };
+                                        ui.label(
+                                            egui::RichText::new(format!("[{}]", badge_text))
+                                                .small()
+                                                .monospace()
+                                                .color(badge_color),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(content)
+                                                .small()
+                                                .color(colors::TEXT),
+                                        );
+                                    });
+                                    ui.add_space(4.0);
+                                }
+                            }
+                        } else {
+                            ui.label(
+                                egui::RichText::new("No .impulse directory found in this project.")
+                                    .small()
+                                    .color(colors::TEXT_DIM),
+                            );
+                        }
+                    });
+
+                // --- Action zone: Quick Launch ---
+                ui.add_space(24.0);
                 ui.label(
-                    egui::RichText::new("Quick Launch")
+                    egui::RichText::new("Start Agent")
+                        .small()
                         .strong()
-                        .color(colors::TEXT),
+                        .color(colors::TEXT_MUTED),
                 );
                 ui.add_space(8.0);
 
@@ -894,27 +1010,28 @@ impl View for TerminalsView {
 
                 if available_names.is_empty() {
                     ui.label(
-                        egui::RichText::new("No agents found on PATH.").color(colors::TEXT_DIM),
+                        egui::RichText::new("No agents found on PATH.")
+                            .small()
+                            .color(colors::TEXT_DIM),
                     );
                 } else {
-                    ui.horizontal(|ui| {
-                        ui.add_space(
-                            (ui.available_width()
-                                - (available_names.len() as f32 * 100.0)
-                                - ((available_names.len() as f32 - 1.0) * 8.0))
-                                .max(0.0)
-                                / 2.0,
-                        );
+                    ui.horizontal_wrapped(|ui| {
                         for &name in &available_names {
                             let color = theme::agent_color(name);
-                            let btn = egui::Button::new(egui::RichText::new(name).color(color))
-                                .min_size(egui::vec2(90.0, 32.0))
-                                .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.4)));
+                            let label = match name {
+                                "Claude Code" => "Start Claude Code",
+                                "Codex" => "Start Codex",
+                                "OpenCode" => "Start OpenCode",
+                                _ => name,
+                            };
+                            let btn = egui::Button::new(egui::RichText::new(label).color(color))
+                                .min_size(egui::vec2(120.0, 28.0))
+                                .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.3)));
 
                             if ui.add(btn).clicked() {
                                 self.pending_spawn_agent = Some(name.to_string());
                             }
-                            ui.add_space(4.0);
+                            ui.add_space(8.0);
                         }
                     });
                 }
@@ -965,7 +1082,7 @@ impl View for TerminalsView {
 fn render_token_budget(
     ui: &mut egui::Ui,
     health: &ContextHealth,
-    history: &VecDeque<(Instant, f32)>,
+    history: Arc<VecDeque<(Instant, f32)>>,
 ) {
     let bar_height = 16.0;
     let available_width = ui.available_width();
@@ -1180,6 +1297,40 @@ pub(super) fn build_init_context(identity: &str, target_dir: &Path, agent_name: 
         "<impulse-context type=\"init\" version=\"3\">\n{}\n</impulse-context>",
         sections.join("\n\n")
     )
+}
+
+/// Load the 3 most recent insights from a LIVE_INSIGHTS.jsonl file.
+/// Returns (insight_type_label, truncated_content) pairs.
+fn load_recent_insights(path: &Path) -> Vec<(String, String)> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|v| {
+            let t = v
+                .get("insight_type")?
+                .as_str()?
+                .strip_prefix("InsightType::")
+                .unwrap_or("?")
+                .to_string();
+            let c = v
+                .get("content")?
+                .as_str()
+                .map(|s| {
+                    if s.len() > 60 {
+                        format!("{}...", &s[..57])
+                    } else {
+                        s.to_string()
+                    }
+                })
+                .unwrap_or_default();
+            Some((t, c))
+        })
+        .rev()
+        .take(3)
+        .collect()
 }
 
 const WELCOME_BANNER: &str = r"
