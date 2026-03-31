@@ -1,8 +1,8 @@
 ---
 title: Rust Canonical Product Contract
 description: Authoritative product contract for Impulse based on impulse-rs
-version: '1.4'
-updated: 2026-03-05
+version: '1.5'
+updated: 2026-03-31
 type: specification
 category: core
 phase: all
@@ -200,6 +200,7 @@ Test column shows current coverage level: **Full** (≥3.0/KLOC), **Partial** (1
 | Hook config generation | Implemented | `hooks --platform ...` | Integration tests |
 | Orchestration handoff/context files | Implemented | `orchestrate`, `handoff`, `sync-context` | Rust tests |
 | Verification gate | Implemented | `verify`, `session-end --verify` | Rust tests |
+| Agent harness (10 features) | Implemented (2026-03-31) | `build_context_prompt`, `query_with_context`, intent classification, `CoordinationResult`, conflict history IPC, JSON harness protocol, session awareness, specialized IPC endpoints | Rust tests |
 | Retrieval indexing + keyword search | Implemented | `index-memory`, `search-history --mode keyword`, `search-genome --mode keyword` | Rust unit + integration |
 | Semantic search (feature-flagged) | Implemented (fallback-safe) | `search-* --mode semantic` with keyword fallback | Rust unit + integration |
 | Retrieval health diagnostics | Implemented | `retrieval-status --check --json` | Rust integration |
@@ -251,12 +252,12 @@ When adding/changing CLI commands, hooks, state files, or roadmap stage definiti
 
 ### Test Density Targets
 
-| Module Category | Target (tests/KLOC) | Baseline (2026-03-30) |
+| Module Category | Target (tests/KLOC) | Current (2026-03-31) |
 |----------------|---------------------|----------------------|
-| Core (state, daemon, agent) | ≥3.0 | ~0.9 |
+| Core (state, daemon, agent) | ≥3.0 | ~1.2 (agent harness +24 tests) |
 | Handlers | ≥2.0 | ~1.2 |
 | UI/TUI | ≥1.0 | ~0.4 |
-| Tooling | ≥2.0 | ~0.3 |
+| Tooling | ≥2.0 | ~17.1 (84 tests, 4,920 LOC) |
 | Integration | Every stable CLI command | 11 tests |
 
 ### Required Test Patterns
