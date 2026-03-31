@@ -75,6 +75,20 @@ Before implementing, consider alternative approaches. Choose the simplest soluti
 - **Daemon mode** — long-running, Unix socket IPC (for TUI/GUI). In-memory state with periodic sync.
 - **GUI mode** — `impulse-gui` binary, connects to daemon via IPC, hosts terminal panes with context lifecycle.
 
+**IPC Protocol (PROTOCOL_VERSION = 2):**
+
+The daemon exposes a JSON-line Unix socket protocol. Key endpoint groups:
+
+| Group | Endpoints | Purpose |
+|-------|-----------|---------|
+| Agent Coordination | `AgentAssist` | AI coordination with context enrichment via extracted insights |
+| Agent Specialized | `AgentReviewCode`, `AgentAnalyzeError`, `AgentSummarizePane` | Per-task agent assistance |
+| Delegation | `RegisterDelegation`, `CompleteDelegation`, `ListDelegations` | Phase 1B cross-agent delegation tracking |
+| Conflict Resolution | `GetConflictHistory`, `ClearResolvedConflicts` | File conflict tracking and resolution |
+| Agent Pool | `GetAgentPool` | All sessions grouped by role (Phase 2B) |
+
+Responses use `AgentAssistResult` (with `recommendations` + `pane_summaries`) or `AgentSpecializedResult` (for review/analyze/summarize). Full protocol spec: [`docs/IPC-PROTOCOL.md`](docs/IPC-PROTOCOL.md).
+
 **Data lives in `.impulse/`:**
 - `HISTORY.jsonl` — append-only session log (committed)
 - `GENOME.md` — permanent decisions and preferences (committed)
