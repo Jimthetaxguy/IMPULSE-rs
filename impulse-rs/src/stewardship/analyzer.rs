@@ -125,7 +125,11 @@ fn extract_assistant_content(
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let input_str = item.get("input").map(|v| v.to_string()).unwrap_or_default();
+                    let input_str = match item.get("input") {
+                        Some(serde_json::Value::String(s)) => s.clone(),
+                        Some(v) => v.to_string(),
+                        None => String::new(),
+                    };
                     let input_chars = input_str.len();
                     let preview_len = input_str.len().min(200);
                     tool_uses.push(ToolUse {
@@ -274,7 +278,7 @@ fn extract_files_touched(messages: &[TranscriptMessage]) -> Vec<String> {
         for tool in &msg.tool_uses {
             if file_tools.contains(&tool.name.as_str()) {
                 // Try to extract file_path from input preview
-                if let Ok(input) = serde_json::from_str::<serde_json::Value>(&tool.input_preview) {
+                if let Some(input) = parse_tool_input(&tool.input_preview) {
                     if let Some(path) = input.get("file_path").and_then(|v| v.as_str()) {
                         if seen.insert(path.to_string()) {
                             files.push(path.to_string());
@@ -285,6 +289,14 @@ fn extract_files_touched(messages: &[TranscriptMessage]) -> Vec<String> {
         }
     }
     files
+}
+
+fn parse_tool_input(input_preview: &str) -> Option<serde_json::Value> {
+    let value = serde_json::from_str::<serde_json::Value>(input_preview).ok()?;
+    match value {
+        serde_json::Value::String(s) => serde_json::from_str::<serde_json::Value>(&s).ok(),
+        other => Some(other),
+    }
 }
 
 /// Find repeated tool call patterns
@@ -542,6 +554,35 @@ mod tests {
         let decisions = extract_decisions(&messages);
         assert!(!decisions.is_empty());
         assert!(decisions[0].description.contains("decided to"));
+    }
+
+    #[test]
+    fn test_parse_assistant_message_with_stringified_tool_input() {
+        let line = r#"{"type":"assistant","content":[{"type":"tool_use","id":"t1","name":"Write","input":"{\"file_path\":\"src/main.rs\",\"content\":\"fn main() {}\"}"}]}"#;
+        let msg = parse_transcript_entry(line).unwrap();
+        assert_eq!(msg.tool_uses.len(), 1);
+        assert!(msg.tool_uses[0].input_preview.contains("src/main.rs"));
+    }
+
+    #[test]
+    fn test_extract_files_touched_from_stringified_tool_input() {
+        let messages = vec![TranscriptMessage {
+            role: "assistant".to_string(),
+            text_content: String::new(),
+            tool_uses: vec![ToolUse {
+                id: "t1".to_string(),
+                name: "Write".to_string(),
+                input_preview: r#"{"file_path":"src/main.rs","content":"fn main() {}"}"#
+                    .to_string(),
+                input_chars: 56,
+            }],
+            tool_results: vec![],
+            char_count: 56,
+            estimated_tokens: 14,
+        }];
+
+        let files = extract_files_touched(&messages);
+        assert_eq!(files, vec!["src/main.rs".to_string()]);
     }
 
     #[test]

@@ -204,7 +204,7 @@ pub fn build_refined_context(
     if !analysis.decisions.is_empty() {
         lines.push("### Key Decisions".to_string());
         for decision in &analysis.decisions {
-            lines.push(format!("- {}", decision.description));
+            lines.push(format!("- {}", render_decision(decision)));
         }
         lines.push(String::new());
     }
@@ -240,6 +240,17 @@ pub fn build_refined_context(
     }
 
     lines.join("\n")
+}
+
+fn render_decision(decision: &ExtractedDecision) -> String {
+    let description = decision.description.trim();
+    let context = decision.context.trim();
+
+    if context.len() > description.len() && context.contains(description) {
+        context.to_string()
+    } else {
+        description.to_string()
+    }
 }
 
 fn uuid_short() -> String {
@@ -343,5 +354,31 @@ mod tests {
         assert!(context.contains("Stewardship Context"));
         assert!(context.contains("Key Decisions"));
         assert!(context.contains("Files Touched"));
+    }
+
+    #[test]
+    fn test_build_refined_context_prefers_richer_decision_context() {
+        let analysis = SessionAnalysis {
+            session_id: "test-session".to_string(),
+            project_hash: "test-hash".to_string(),
+            transcript_path: PathBuf::from("/tmp/test.jsonl"),
+            analyzed_at: Utc::now(),
+            message_count: 1,
+            estimated_tokens: 100,
+            estimated_context_pct: 0.001,
+            decisions: vec![ExtractedDecision {
+                description: "I decided to use a Rust-based architecture with a Unix socket daemon for IPC.".to_string(),
+                context: "I decided to use a Rust-based architecture with a Unix socket daemon for IPC. MUST_SURVIVE: TEST_CONTENT should be preserved through compaction because it appears in a decision sentence.".to_string(),
+                message_index: 0,
+            }],
+            files_touched: vec![],
+            tool_patterns: vec![],
+            duplicate_regions: vec![],
+            rot_candidates: vec![],
+            key_insights: vec![],
+        };
+
+        let context = build_refined_context(&analysis, &CrossProjectMemory::default());
+        assert!(context.contains("MUST_SURVIVE: TEST_CONTENT"));
     }
 }
