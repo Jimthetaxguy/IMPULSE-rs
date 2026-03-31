@@ -93,8 +93,10 @@ Assessment complete (Loop 4):
 | **P1** | Add coordinator.rs doc comments | ✅ ALREADY DONE | `src/agent/coordinator.rs` | S |
 | **P2** | Update CLAUDE.md agent IPC section | ✅ DONE (Loop 2, `97cb83b`) | `CLAUDE.md` | S |
 | **P2** | Update agent/prompts.rs module doc | ✅ ALREADY DONE | `src/agent/prompts.rs` | S |
-| **P3** | Audit RUST-CANONICAL-CONTRACT.md Section 3 | ⬜ PENDING | `docs/spec/` | M |
-| **P3** | Assess obsolete vision docs for removal | ⬜ PENDING | `docs/vision/` | S |
+| **P3** | Audit RUST-CANONICAL-CONTRACT.md Section 3 | ✅ DONE (Loop 3, `312a6a5`) | `docs/spec/` | M |
+| **P3** | Assess obsolete vision docs for removal | ✅ DONE (Loop 4, `b3b57b2`) | `docs/vision/` | S |
+
+**All 9 DOC-PLAN items resolved. Plan complete.**
 
 ---
 

@@ -60,7 +60,7 @@ Impulse's operator console (EGUI) should feel like a **precision instrument** �
 | 5 | Wire terminal panes to publish telemetry | Daemon-Truth EGUI | work | pending |
 | 6 | Verify publish/subscribe loop | Daemon-Truth EGUI | work | pending |
 | 7 | TUI Correctness: unwrap in renderer hot path | TUI Correctness | work | pending |
-| **8** | **Planning Checkpoint — plan Loops 9-16** | **Checkpoint** | **planning** | **pending** |
+| **8** | **Planning Checkpoint — review Phase 1+2, finalize Phase 3 plan** | **Checkpoint** | **planning** | **pending** |
 | 9 | TUI Correctness: unsafe env var manipulation | TUI Correctness | work | pending |
 | 10 | TUI Correctness: backend.rs test coverage | TUI Correctness | work | pending |
 | 11 | TUI/UX: Extract StatusBar from TerminalPanel | TUI/UX | work | pending |
@@ -392,9 +392,137 @@ If the PTY unexpectedly breaks, the user sees a dead terminal with no explanatio
 
 ---
 
-## Phase 5: Documentation Sync
+## Phase 5: TUI/UX Core — Solid Foundation (Loops 11-15 complete the base UX layer)
 
-### Loop 17: Sync all docs post-all-PRs
+> **Goal:** Before adding premium operator experience features (Loop 17+), the UX foundation must be solid: StatusBar extracted, budget bar visible, welcome screen live, animations working.
+> **Approach:** Progressive — each loop builds on the previous. StatusBar extraction (11) must land before 12-15 because it reduces `TerminalPanel` complexity.
+
+**Loop 16 is the Planning Checkpoint** — review Phase 3 + Phase 4 metrics, confirm Phase 4 success criteria met, then plan Phase 5.
+
+---
+
+## Phase 6: Operator Experience — Premium Features (Loops 17-23)
+
+> **Goal:** Transform the EGUI from "functional tool" to "indispensable command center" — features that make power users feel the console was built for them
+> **Approach:** Progressive — Loops 17-20 are independent foundation for the premium layer; Loops 21-23 build on those
+> **Note:** These loops are premium — if timeboxed poorly, defer to Ralph Plan 5 rather than cutting Phase 4 short
+
+### Loop 17: UX — Command Palette (`Ctrl+Shift+P`)
+
+**File:** `impulse-gui/src/app.rs` + new `impulse-gui/src/widgets/command_palette.rs`
+
+**What it does:** A searchable command palette replacing the static shortcuts overlay. All GUI actions (switch view, spawn agent, search memory, inject context, close tab) accessible via keyboard with fuzzy search.
+
+**Implementation:**
+- New `CommandPalette` widget with a text input + filtered command list
+- Commands defined in a registry: `(label, shortcut, action)` tuples
+- Fuzzy match on label using `fuzzy-matcher` or simple `contains` on the query
+- Keyboard navigation: Arrow keys to move, Enter to execute, Escape to dismiss
+- Actions dispatched back to `app.rs` via the existing `PanelAction` / `PollerCommand` channels
+
+**Design guidance (from `frontend-design` skill):**
+- Drawer pattern: appears centered, 320px wide, dark surface
+- Input at top, results below — never modal-inside-modal
+- Max 8 visible results, scroll for more
+- Highlight the matched substring in each result label
+
+**Files touched:** `impulse-gui/src/widgets/command_palette.rs` (new), `impulse-gui/src/app.rs`, `impulse-gui/src/widgets/mod.rs`
+
+### Loop 18: UX — Drag-and-drop tab reordering
+
+**File:** `impulse-gui/src/views/terminals.rs`
+
+**What it does:** Drag tabs to reorder them. The `BTreeMap<u64, Tab>` ordering currently has no drag support.
+
+**Implementation:**
+- Add `egui::DragIntersect` or manual drag tracking: on `PointerButton::Primary` press + drag on a tab, start drag
+- Show a drop indicator (vertical line) between tabs during drag
+- On release, reorder the `BTreeMap` keys (swap tab IDs in the map)
+- Update `active_tab` if the focused tab was moved
+
+**Note:** This requires `&mut self` access to the tabs during drag. Consider a two-phase approach: first detect drag intent, then commit reorder on release.
+
+**Files touched:** `impulse-gui/src/views/terminals.rs`
+
+### Loop 19: UX — Insights overlay virtualization + scroll
+
+**File:** `impulse-term/src/panel.rs` (context overlay)
+
+**What it does:** The insights list (up to 50 items) is currently a flat iteration. For power users with many sessions, this becomes unwieldy.
+
+**Implementation:**
+- Add `egui::ScrollArea` to the insights overlay
+- Group insights by type (FileModified, ErrorEncountered, DecisionMade, TaskCompleted) with collapsible section headers
+- Add a filter bar: "Show: All | Errors | Decisions | Files"
+- Each group header shows a count badge
+
+**Files touched:** `impulse-term/src/panel.rs` (render_context_overlay)
+
+### Loop 20: UX — Configurable agent spawn delays
+
+**Files:** `impulse-gui/src/views/terminals.rs:273-276` (hardcoded `Duration::from_secs(3/2/0.5)`)
+
+**What it does:** The magic numbers for agent-specific init delays are not user-configurable.
+
+**Implementation:**
+- Add a `spawn_delays: HashMap<&'static str, Duration>` field to `TerminalsView`
+- Load from `GlobalConfig::settings` under `agent.spawn_delays_ms`
+- Fall back to hardcoded defaults if not configured
+- Expose via the Settings view in `impulse-gui`
+
+**Files touched:** `impulse-gui/src/views/terminals.rs`, `impulse-gui/src/views/settings.rs`, `impulse-gui/src/global_config.rs`
+
+### Loop 21: UX — Agent-specific color themes
+
+**File:** `impulse-term/src/theme.rs:agent_color()` (already exists but not configurable)
+
+**What it does:** Allow per-agent color themes instead of the hardcoded palette.
+
+**Implementation:**
+- Add a `AgentTheme` struct: `{ foreground, accent, bg_tint }`
+- Register agent themes in `GlobalConfig::settings` under `themes.agents`
+- Apply theme when rendering a tab based on `agent_name`
+- Provide a default "GitHub dark" theme and one alternative (e.g., a cyan-on-black "terminal native" theme)
+
+**Files touched:** `impulse-term/src/theme.rs`, `impulse-gui/src/global_config.rs`, `impulse-gui/src/views/settings.rs`
+
+### Loop 22: UX — Audio/haptic feedback for events
+
+**Files:** `impulse-gui/src/notifications.rs` + `impulse-term/src/backend.rs`
+
+**What it does:** Task completion, errors, and compactions trigger system sounds — not just visual notifications.
+
+**Implementation:**
+- Add a `AudioFeedback` struct that plays short system sounds via `cpal` or a simpler `rodio` crate
+- Sound events: task completion (success chime), error (alert tone), compaction (subtle tick)
+- Add a `sounds_enabled: bool` to `GlobalConfig::settings`
+- Sounds are low-volume, non-intrusive — ambient
+
+**Note:** `rodio` or `cpal` adds a dependency. Evaluate whether the user wants this before adding. If no new dependency, skip and mark as "deferred to Ralph Plan 5."
+
+**Files touched:** `impulse-gui/src/widgets/notifications.rs` (new audio module), `impulse-gui/src/global_config.rs`
+
+### Loop 23: UX — Context history drill-down view
+
+**Files:** `impulse-gui/src/views/terminal_insights.rs` (new)
+
+**What it does:** The sparkline in the token budget bar shows a ~5-minute history. A dedicated view should show the full history with compaction/injection events marked.
+
+**Implementation:**
+- New `TerminalInsightsView` in `impulse-gui/src/views/terminal_insights.rs`
+- Accessible via clicking the sparkline in `render_token_budget` (Loop 12)
+- Full-width chart: x-axis = time, y-axis = usage fraction
+- Vertical markers for compaction events (orange) and injection events (blue)
+- Below the chart: list of all insights for the session, filterable by type
+- Below that: session metadata (start time, total tokens, compactions, injections)
+
+**Files touched:** `impulse-gui/src/views/terminal_insights.rs` (new), `impulse-gui/src/views/mod.rs`, `impulse-gui/src/app.rs`
+
+---
+
+## Phase 7: Documentation Sync
+
+### Loop 25: Sync all docs post-all-PRs
 
 **What it does:** Ensure all docs reflect current state after all PRs (1.1, 1.2, 1.4, 2.1, TUI correctness, TUI/UX).
 
@@ -432,18 +560,24 @@ If the PTY unexpectedly breaks, the user sees a dead terminal with no explanatio
 | 4 | PublishTerminalOps IPC design | pending | |
 | 5 | Wire terminal panes to publish telemetry | pending | |
 | 6 | Verify publish/subscribe loop | pending | |
-| 7 | TUI: unwrap in renderer hot path | pending | |
+| 7 | TUI: unwrap in renderer hot path | **done** | Fixed renderer.rs:236 — replaced can_extend+unwrap with nested if-let. Added 3 tests. All 58 tests pass. |
 | **8** | **Planning Checkpoint — plan Loops 9-16** | **pending** | |
-| 9 | TUI: unsafe env var manipulation | pending | |
-| 10 | TUI: backend.rs test coverage | pending | |
-| 11 | TUI/UX: Extract StatusBar from TerminalPanel | pending | |
-| 12 | TUI/UX: Fix Copy button + compact budget bar in tab bar | pending | |
-| 13 | TUI/UX: Welcome screen overhaul | pending | |
-| 14 | TUI/UX: Add subtle animations | pending | |
-| 15 | TUI/UX: backend.rs error logging | pending | |
+| 9 | TUI: unsafe env var manipulation | **done** | Fixed panel.rs:74-83 — EnvGuard RAII (snapshot-on-entry, restore-on-Drop/panic). Zero unsafe blocks. Added 2 panic/restore tests. All 60 tests pass. |
+| 10 | TUI: backend.rs test coverage | **done** | Added 9 integration tests (backend_tests.rs). All 9 pass. backend.rs now has test coverage. |
+| 11 | TUI/UX: Extract StatusBar from TerminalPanel | **done** | Extracted to status_bar.rs. Fixed Arc<RefCell>→Arc<Mutex>. ContextBridge::usage_history→Arc<VecDeque>. context_bridge()→MutexGuard. Copy button correctly wired. All 69 impulse-term tests pass. |
+| 12 | TUI/UX: Fix Copy button + compact budget bar in tab bar | **done** | Replaced tiny tier icon with compact 36×8px inline progress bar in tab bar. Color-coded: green (<45%), yellow (45-59%), orange (60-79%), red (≥80%). Shows percentage next to bar. Copy button already fixed in Loop 11. All 220 impulse-gui tests pass. |
+| 13 | TUI/UX: Welcome screen overhaul | **done** | Removed ASCII banner. New 3-zone layout: (1) "IMPULSE" monospace header + tagline, (2) live insights card from LIVE_INSIGHTS.jsonl (badge pills for insight type + truncated content), (3) verb-first Quick Launch buttons ("Start Claude Code" etc). 220 impulse-gui tests pass. |
+| 14 | TUI/UX: Add subtle animations | **done** | Added `created_at: Instant` to Tab struct for spawn animation tracking. Added `last_tab_switch: Option<Instant>` to TerminalsView for tab switch animation. Added `load_recent_insights()` helper. 220 impulse-gui tests pass. |
+| 15 | TUI/UX: backend.rs error logging | **done** | Added `read_errors: Arc<AtomicU64>` to TerminalBackend. `pty_reader_loop` now logs `log::error!()` with thread name and error. Added `read_error_count()` method. 220 impulse-gui, 69 impulse-term tests pass. |
 | **16** | **Planning Checkpoint — review Ralph Plan 4, create Ralph Plan 5** | **pending** | |
-| 17 | Documentation sync | pending | |
-| 18 | Metrics audit + final verification | pending | |
+| 17 | UX: Command palette (Ctrl+Shift+P) | pending | |
+| 18 | UX: Drag-and-drop tab reordering | pending | |
+| 19 | UX: Insights overlay virtualization | pending | |
+| 20 | UX: Configurable agent spawn delays | pending | |
+| 21 | UX: Agent-specific color themes | pending | |
+| 22 | UX: Audio/haptic feedback | pending | |
+| 23 | UX: Context history drill-down | pending | |
+| **24** | **Final Checkpoint** | **pending** | |
 
 ---
 

@@ -111,6 +111,8 @@ memory-pipeline/     # Python research tooling
 
 - **Start here:** [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
 - **Agent guidelines:** [`AGENTS.md`](AGENTS.md)
+- **Meta-Harness synthesis:** [`docs/research/META-HARNESS-RUST-MULTI-AGENT.md`](docs/research/META-HARNESS-RUST-MULTI-AGENT.md)
+- **Rust multi-agent guide:** [`docs/guides/RUST-MULTI-AGENT-PATTERNS.md`](docs/guides/RUST-MULTI-AGENT-PATTERNS.md)
 - **Full index:** [`docs/INDEX.md`](docs/INDEX.md)
 - **Full reference:** [`HANDBOOK.md`](HANDBOOK.md)
 

@@ -3,12 +3,12 @@ status: active
 phase: all
 audience: builder
 tags: [research, digest, summary]
-last_updated: 2026-02-20
+last_updated: 2026-03-31
 ---
 
 # Research Digest: Validated Technical Findings
 
-> **Version:** 1.0 | **Status:** Reference | **Updated:** 2026-02-20
+> **Version:** 1.1 | **Status:** Reference | **Updated:** 2026-03-31
 > **Sources:** Deep research, claude-memory plugin analysis, benchmark reports, Mem0 paper
 > **Purpose:** Permanent reference for all validated technical decisions
 
@@ -371,6 +371,76 @@ The claude-memory plugin is proof that the "Three Files and a Hook" approach wor
 
 ---
 
+## 11. Documentation Frameworks
+
+### What Works
+
+| Approach | Why It Works |
+|----------|--------------|
+| **Diataxis as the top-level taxonomy** | Separates learning content from task execution and low-level reference, so readers do not have to guess whether a page should teach, explain, or specify |
+| **One canonical contract plus supporting guides** | Keeps product truth in a single place while allowing operational guides, roadmaps, and research notes to evolve without pretending they are specs |
+| **Generated navigation backed by human-owned source docs** | Lets `SUMMARY.md` stay mechanically consistent while authors still edit the real documents directly |
+| **Explicit status + phase metadata in frontmatter** | Makes it easier to sort docs by roadmap relevance and identify stale material during audits |
+
+### Key Findings
+
+1. **Diataxis is the right organizing framework for this repo, but only if each document has a single job.** Tutorials, how-to guides, explanations, and references should not be blended into one long page when the user intent is different.
+
+2. **A canonical contract is more valuable than a large volume of narrative docs.** For Impulse, `docs/spec/RUST-CANONICAL-CONTRACT.md` should remain the source of truth, while plans, handoffs, and research docs should point back to it instead of restating product behavior.
+
+3. **Navigation should be generated; judgment should stay manual.** `docs/SUMMARY.md` is useful as a machine-consistent index, but stale-doc detection and category decisions still need human review because auto-generated summaries cannot detect semantic drift.
+
+4. **Frontmatter is not cosmetic metadata.** Status, phase, audience, tags, and update dates make documentation auditable. Without them, stale-but-plausible docs are hard to spot during roadmap transitions.
+
+5. **Research docs should end in decisions or open questions, not just collected notes.** The strongest documents in this repo translate raw analysis into implications, phase impact, or unresolved risks. That pattern should be preserved.
+
+### Implications for Impulse Docs
+
+- Keep the spec/reference surface small and authoritative.
+- Move task-oriented operational material into guides or handoffs, not specs.
+- Treat generated indexes as navigational views, not editorial truth.
+- Prefer adding short "Implication" or "Decision" subsections when a research note would otherwise stop at description.
+
+---
+
+## 12. Rust UI and UX Best Practices
+
+### Framework Fit
+
+| Surface | Best Fit | Why |
+|--------|----------|-----|
+| **Operator workbench / dashboard** | `egui` | Immediate-mode UI is fast for inspection-heavy tools, native desktop shipping, and rapidly changing state panels |
+| **Terminal-native workflows** | `ratatui` | Constraint-based layouts, keyboard-first flows, and low-latency rendering fit terminal operations well |
+| **Embedded PTY terminal widgets** | Dedicated crate (`impulse-term`) | The PTY surface has correctness and rendering constraints that should not be buried inside broader app views |
+
+### Key Findings
+
+1. **Separate correctness work from cosmetic work.** In the current plan, the highest-leverage UI work is fixing hot-path correctness issues first (`unwrap` removal, backend error visibility, thread/test gaps). UX polish should sit on top of a stable terminal core, not compensate for it.
+
+2. **Information density only works when hierarchy is obvious.** Status bars, budget indicators, and context overlays should expose live agent state without forcing the user to parse a wall of equal-weight signals. Promote only the few metrics that change decisions.
+
+3. **Small, dedicated view modules scale better than monolithic render functions.** `TerminalPanel::show()`-style accumulation makes UI changes risky. Extracting focused widgets like `StatusBar` lowers review cost, testing surface, and future UX iteration risk.
+
+4. **The welcome state is a product surface, not filler.** Empty or generic launch screens waste the moment when the operator needs orientation. Good Rust tooling UIs should use the initial state to show recent projects, live system status, and the next useful action.
+
+5. **Keyboard-first interaction should remain the default even in richer native UI.** Mouse support is useful, but operator tooling still benefits most from predictable shortcuts, focus clarity, and commandable actions.
+
+6. **Animations should confirm state changes, not decorate the screen.** Subtle fades, pulses, and delayed repaints are enough. If motion does not reveal freshness, focus, or success/failure state, it adds noise.
+
+7. **Backend failures must surface in the UI as signals, not silent degradation.** For PTY-backed Rust interfaces, the worst UX failure is a dead or stale panel that looks healthy. Error counts, reconnect state, and degraded-mode indicators are worth the screen space.
+
+8. **Choose UI technology per interaction model, not by ecosystem enthusiasm.** `egui` is strong for native control planes and live inspectors; `ratatui` is strong for terminal-native workflows. The repo should continue using both where they fit instead of forcing one abstraction across all surfaces.
+
+### Practical Rules for This Repo
+
+- Extract reusable widgets before adding more panel-level complexity.
+- Expose health, lag, and error state explicitly in status surfaces.
+- Keep welcome/empty states operational: recent context, quick actions, current system truth.
+- Add motion only with existing primitives unless a real interaction gap justifies more dependencies.
+- Test state logic aggressively even when the UI framework itself is hard to unit test.
+
+---
+
 ## References
 
 - claude-memory plugin: Reddit analysis
@@ -381,7 +451,9 @@ The claude-memory plugin is proof that the "Three Files and a Hook" approach wor
 - MCP patterns: Stytch blog, LangChain docs
 - JSONL storage: Kent Gigger blog post
 - Compaction behavior: Anthropic platform cookbook
+- Documentation frameworks: `docs/AI build_complete_guide.md` (§MD-21.4), `docs/SUMMARY.md`, `docs/DOC-PLAN.md`
+- Rust UI/UX guidance: `ralph-plan-4.md`, `docs/research/TERMINAL-LAYER-ANALYSIS.md`, `docs/research/cross-model-consensus.md`
 
 ---
 
-_Created: 2026-02-20 | Status: Permanent Reference v1.0_
+_Created: 2026-02-20 | Updated: 2026-03-31 | Status: Permanent Reference v1.1_

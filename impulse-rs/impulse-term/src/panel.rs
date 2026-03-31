@@ -707,7 +707,7 @@ mod tests {
 
         {
             // Guard takes ownership of the test var and replaces it.
-            let guard = EnvGuard::new(&["IMPULSE_TEST_VAR"]);
+            let _guard = EnvGuard::new(&["IMPULSE_TEST_VAR"]);
             assert_eq!(
                 std::env::var("IMPULSE_TEST_VAR").ok(),
                 None,

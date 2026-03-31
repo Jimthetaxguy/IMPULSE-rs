@@ -64,6 +64,8 @@ pub struct TerminalsView {
     pub(super) tabs: BTreeMap<u64, Tab>,
     active_tab: Option<u64>,
     next_id: u64,
+    /// Timestamp of the most recent tab switch (for fade-in animation).
+    last_tab_switch: Option<Instant>,
     pub agents: Vec<AgentInfo>,
     max_tabs: usize,
     last_check: Option<Instant>,
@@ -81,6 +83,8 @@ pub struct TerminalsView {
     pub(super) tab_snapshots: BTreeMap<u64, TabSnapshot>,
     /// Tab badges synced from SignalBus.
     tab_badges: BTreeMap<u64, TabBadge>,
+    /// Timestamp when the most recent compaction pulse started (for badge animation).
+    compaction_pulse_at: Option<Instant>,
     /// Tab whose badges should be acknowledged (set by tab click, consumed by app.rs).
     badge_acknowledged_tab: Option<u64>,
     /// Tabs closed this frame, pending signal_bus.remove_tab() in app.rs.
@@ -131,6 +135,7 @@ impl TerminalsView {
             tabs: BTreeMap::new(),
             active_tab: None,
             next_id: 0,
+            last_tab_switch: None,
             agents,
             max_tabs: 10,
             last_check: Some(Instant::now()),
@@ -141,6 +146,7 @@ impl TerminalsView {
             last_injected_tiers: BTreeMap::new(),
             tab_snapshots: BTreeMap::new(),
             tab_badges: BTreeMap::new(),
+            compaction_pulse_at: None,
             badge_acknowledged_tab: None,
             closed_tabs: Vec::new(),
             active_conflicts: HashMap::new(),
@@ -819,12 +825,66 @@ impl View for TerminalsView {
                             .on_hover_text("Task completed");
                     }
                     if badge.has_compaction {
-                        ui.label(
-                            egui::RichText::new("\u{21BB}")
-                                .small()
-                                .color(colors::YELLOW),
-                        )
-                        .on_hover_text("Context was compacted");
+                        // Pulse animation: scale 1.0 → 1.2 → 1.0 over 300ms.
+                        let pulse_elapsed_ms = self
+                            .compaction_pulse_at
+                            .map(|t| t.elapsed().as_millis() as f32)
+                            .unwrap_or(COMPACTION_PULSE_MS as f32 + 1.0);
+
+                        let (scale, pulsing) = if pulse_elapsed_ms <= COMPACTION_PULSE_MS as f32 {
+                            let t = pulse_elapsed_ms / COMPACTION_PULSE_MS as f32;
+                            let s = if t < 0.5 {
+                                1.0 + 0.2 * (t * 2.0) // 1.0 → 1.2
+                            } else {
+                                1.2 - 0.2 * ((t - 0.5) * 2.0) // 1.2 → 1.0
+                            };
+                            (s, true)
+                        } else {
+                            (1.0, false)
+                        };
+
+                        // Allocate space, draw badge with painter, then attach hover.
+                        let available = ui.available_rect_before_wrap();
+                        let badge_size = 16.0;
+                        let badge_rect = egui::Rect::from_min_size(
+                            available.min,
+                            egui::vec2(badge_size, badge_size),
+                        );
+                        ui.advance_cursor_after_rect(badge_rect);
+
+                        let painter = ui.painter();
+                        let center = badge_rect.center();
+                        let scaled_size = 10.0 * scale;
+                        let radius = 7.0 * scale;
+
+                        painter.circle_stroke(
+                            center,
+                            radius,
+                            egui::Stroke::new(1.0, colors::YELLOW),
+                        );
+                        painter.text(
+                            center,
+                            egui::Align2::CENTER_CENTER,
+                            "\u{21BB}",
+                            egui::FontId::proportional(scaled_size),
+                            colors::YELLOW,
+                        );
+
+                        if pulsing {
+                            // Keep repainting until pulse completes.
+                            ui.ctx().request_repaint_after(Duration::from_millis(16));
+                        } else {
+                            // Start a new pulse next time compaction is seen.
+                            self.compaction_pulse_at = Some(Instant::now());
+                        }
+                        // Attach hover text to the badge area using a transparent hit-test.
+                        let hit_rect = badge_rect.expand2(egui::vec2(4.0, 4.0));
+                        ui.allocate_at_least(hit_rect.size(), egui::Sense::hover())
+                            .1
+                            .on_hover_text("Context was compacted");
+                    } else {
+                        // Compaction badge not active — clear any pending pulse.
+                        self.compaction_pulse_at = None;
                     }
 
                     // Search match count badge.
@@ -903,7 +963,37 @@ impl View for TerminalsView {
                 }
 
                 tab.panel.set_focused(true);
-                tab.panel.show(ui);
+
+                // Apply spawn + tab-switch animations: capture rect, render panel, overlay fade.
+                let spawn_opacity = spawn_anim_params(tab.created_at);
+                let switch_fade = tab_switch_fade_opacity(self.last_tab_switch);
+
+                if spawn_opacity.is_some() || switch_fade.is_some() {
+                    // Capture panel rect BEFORE rendering (available height before wrap).
+                    let panel_rect = ui.available_rect_before_wrap();
+
+                    // Render panel at full opacity.
+                    tab.panel.show(ui);
+
+                    // Paint a dark overlay that fades out — creates the fade-in illusion.
+                    // As combined_opacity goes 0→1, overlay alpha goes 180→0.
+                    let combined_opacity =
+                        spawn_opacity.map(|(o, _)| o).unwrap_or(1.0) * switch_fade.unwrap_or(1.0);
+
+                    if combined_opacity < 1.0 {
+                        let overlay_alpha = ((1.0 - combined_opacity) * 180.0) as u8;
+                        let overlay_color = egui::Color32::from_black_alpha(overlay_alpha);
+                        ui.painter().rect_filled(panel_rect, 0.0, overlay_color);
+                    }
+
+                    // Schedule repaint until animation finishes.
+                    ui.ctx().request_repaint_after(Duration::from_millis(16));
+                } else {
+                    tab.panel.show(ui);
+                }
+
+                // Record this render as the tab switch moment (for fade-in on next switch).
+                self.last_tab_switch = Some(Instant::now());
             }
         } else {
             ui.vertical_centered_justified(|ui| {
@@ -1297,6 +1387,40 @@ pub(super) fn build_init_context(identity: &str, target_dir: &Path, agent_name: 
         "<impulse-context type=\"init\" version=\"3\">\n{}\n</impulse-context>",
         sections.join("\n\n")
     )
+}
+
+/// Animation constants (milliseconds).
+const SPAWN_ANIM_MS: u64 = 200;
+const TAB_SWITCH_ANIM_MS: u64 = 150;
+const COMPACTION_PULSE_MS: u64 = 300;
+
+/// Ease-out cubic: 1 - (1-x)^3, gives smooth deceleration.
+fn ease_out(t: f32) -> f32 {
+    1.0 - (1.0 - t).powi(3)
+}
+
+/// Compute spawn animation params given tab creation time.
+/// Returns (opacity [0-1], slide_up_offset_px) if still animating.
+fn spawn_anim_params(created_at: Instant) -> Option<(f32, f32)> {
+    let elapsed = created_at.elapsed().as_millis() as f32 / SPAWN_ANIM_MS as f32;
+    if elapsed >= 1.0 {
+        return None;
+    }
+    let t = ease_out(elapsed);
+    Some((t, (1.0 - t) * 4.0))
+}
+
+/// Compute tab-switch fade-in opacity if still animating.
+/// Returns opacity [0-1] if still animating, None if done.
+fn tab_switch_fade_opacity(last_switch: Option<Instant>) -> Option<f32> {
+    let Some(switched_at) = last_switch else {
+        return None;
+    };
+    let elapsed = switched_at.elapsed().as_millis() as f32 / TAB_SWITCH_ANIM_MS as f32;
+    if elapsed >= 1.0 {
+        return None;
+    }
+    Some(ease_out(elapsed))
 }
 
 /// Load the 3 most recent insights from a LIVE_INSIGHTS.jsonl file.

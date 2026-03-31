@@ -29,6 +29,8 @@ pub struct TerminalBackend {
     output_bytes: Arc<AtomicU64>,
     output_lines: Arc<AtomicU64>,
     alive: Arc<AtomicBool>,
+    /// Counts consecutive PTY read errors for diagnostics.
+    read_errors: Arc<AtomicU64>,
     _reader_thread: JoinHandle<()>,
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     cols: AtomicU16,
@@ -94,6 +96,7 @@ impl TerminalBackend {
         let alive = Arc::new(AtomicBool::new(true));
         let output_bytes = Arc::new(AtomicU64::new(0));
         let output_lines = Arc::new(AtomicU64::new(0));
+        let read_errors = Arc::new(AtomicU64::new(0));
 
         // Background thread: read PTY output → feed to vt100 parser.
         let reader_thread = {
@@ -101,11 +104,19 @@ impl TerminalBackend {
             let alive = Arc::clone(&alive);
             let output_bytes = Arc::clone(&output_bytes);
             let output_lines = Arc::clone(&output_lines);
+            let read_errors = Arc::clone(&read_errors);
 
             std::thread::Builder::new()
                 .name(format!("pty-reader-{}", command))
                 .spawn(move || {
-                    pty_reader_loop(reader, parser, alive, output_bytes, output_lines);
+                    pty_reader_loop(
+                        reader,
+                        parser,
+                        alive,
+                        output_bytes,
+                        output_lines,
+                        read_errors,
+                    );
                 })?
         };
 
@@ -116,6 +127,7 @@ impl TerminalBackend {
             output_bytes,
             output_lines,
             alive,
+            read_errors,
             _reader_thread: reader_thread,
             child: Arc::new(Mutex::new(child)),
             cols: AtomicU16::new(cols),
@@ -274,6 +286,12 @@ impl TerminalBackend {
     pub fn has_new_output_since(&self, previous_bytes: u64) -> bool {
         self.output_bytes.load(Ordering::Relaxed) > previous_bytes
     }
+
+    /// Total count of PTY read errors encountered since spawn.
+    /// A non-zero value after the terminal is dead indicates the PTY broke unexpectedly.
+    pub fn read_error_count(&self) -> u64 {
+        self.read_errors.load(Ordering::Relaxed)
+    }
 }
 
 /// Background reader thread — reads PTY output and feeds it to the vt100 parser.
@@ -283,6 +301,7 @@ fn pty_reader_loop(
     alive: Arc<AtomicBool>,
     output_bytes: Arc<AtomicU64>,
     output_lines: Arc<AtomicU64>,
+    read_errors: Arc<AtomicU64>,
 ) {
     let mut buf = [0u8; PTY_READ_BUFFER_SIZE];
     loop {
@@ -303,7 +322,13 @@ fn pty_reader_loop(
                 let mut parser = parser.lock();
                 parser.process(&buf[..n]);
             }
-            Err(_) => {
+            Err(e) => {
+                read_errors.fetch_add(1, Ordering::Relaxed);
+                log::error!(
+                    "PTY read error on '{}': {} — marking terminal as dead",
+                    std::thread::current().name().unwrap_or("?"),
+                    e
+                );
                 alive.store(false, Ordering::Relaxed);
                 break;
             }

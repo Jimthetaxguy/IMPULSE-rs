@@ -1,18 +1,30 @@
 {
   "plan_path": "ralph-plan-4.md",
-  "current_iteration": 2,
+  "current_iteration": 15,
   "total_planned": 100,
   "status": "running",
   "started": "2026-03-31T06:56:00Z",
-  "last_completed": "Loop 7 (Ralph Plan 4): Fixed unwrap in renderer.rs:236 hot path",
+  "last_completed": "Loop 15 (Ralph Plan 4): backend.rs error logging — read_errors AtomicU64 counter, log::error!() on PTY read failures, read_error_count() method. 220 impulse-gui, 69 impulse-term tests pass.",
   "completed_steps": [
-    "Loop 7 (Ralph Plan 4): Fixed unwrap in renderer.rs:236 - replaced can_extend guard + unwrap() with nested if-let pattern (Rust 2021 compatible). Added 3 tests for build_runs edge cases.",
-    "Loop 1 (Ralph Plan 4 - implied): Established baseline - 991 tests pass, workspace builds clean"
+    "Loop 7: Fixed unwrap in renderer.rs:236 — nested if-let. 3 tests. 60 tests pass.",
+    "Loop 9: Eliminated unsafe env manipulation — EnvGuard RAII. 2 tests. 60 tests pass.",
+    "Loop 10: Added 9 integration tests for backend.rs. 9/9 pass.",
+    "Loop 11: Extracted StatusBar to status_bar.rs. Arc<RefCell>→Arc<Mutex>. 69 tests pass.",
+    "Loop 12: Compact 36×8px progress bar in tab bar. 220 tests pass.",
+    "Loop 13: Welcome screen overhaul — 3-zone layout, live insights card, verb-first buttons. 220 tests pass.",
+    "Loop 14: Animation infrastructure — Tab::created_at, TerminalsView::last_tab_switch. 220 tests pass.",
+    "Loop 15: backend.rs error logging — read_errors counter, log::error!() on failures. 69 tests pass."
   ],
-  "next_step": "Loop 1 (Ralph Plan 4): SessionStart validation harness - understand hook architecture",
+  "next_step": "Loop 16 (Ralph Plan 4): Planning Checkpoint — review Phase 3/4, plan Loops 17-24",
   "blockers": [],
   "files_modified": [
-    "impulse-rs/impulse-term/src/renderer.rs"
+    "impulse-rs/impulse-term/src/renderer.rs",
+    "impulse-rs/impulse-term/src/panel.rs",
+    "impulse-rs/impulse-term/src/status_bar.rs",
+    "impulse-rs/impulse-term/src/context.rs",
+    "impulse-rs/impulse-term/tests/backend_tests.rs",
+    "impulse-rs/impulse-term/src/backend.rs",
+    "impulse-rs/impulse-gui/src/views/terminals.rs"
   ],
-  "notes": "Overriding DOC-PLAN.md loop. Ralph Plan 4: 3 lanes (Validation, Daemon-Truth EGUI, TUI/UX). Plan has ~24 loops defined. 100 loops requested - will expand or repeat as needed."
+  "notes": "Ralph Plan 4: Loops 7-15 DONE (8 loops). Loop 16 (checkpoint) next. 220 impulse-gui, 69 impulse-term, 0 failures."
 }

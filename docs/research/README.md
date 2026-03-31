@@ -3,7 +3,7 @@ status: active
 phase: all
 audience: builder
 tags: [research, analysis, reference]
-last_updated: 2026-02-20
+last_updated: 2026-03-31
 ---
 
 # Research Index — Impulse
@@ -29,8 +29,8 @@ last_updated: 2026-02-20
 | Document | Size | Topic |
 |----------|------|-------|
 | [RESEARCH-DIGEST.md](RESEARCH-DIGEST.md) | ~13 KB | Consolidated research findings |
+| [META-HARNESS-RUST-MULTI-AGENT.md](META-HARNESS-RUST-MULTI-AGENT.md) | ~10 KB | Meta-Harness + multi-agent + Rust synthesis |
 | [TOOL-STACK-ANALYSIS.md](TOOL-STACK-ANALYSIS.md) | ~15 KB | Tool selection with risk analysis |
-| [REALISTIC-FRAMEWORK.md](REALISTIC-FRAMEWORK.md) | ~25 KB | Architectural pivot rationale (SWARM → 3 files) |
 | [RECONCILIATION-ANALYSIS.md](RECONCILIATION-ANALYSIS.md) | ~15 KB | Spec reconciliation analysis |
 
 ### External Research (moved from project root)
@@ -38,7 +38,6 @@ last_updated: 2026-02-20
 | Document | Original Name | Topic |
 |----------|---------------|-------|
 | [impulse-memory-architecture.md](impulse-memory-architecture.md) | `Impulse Memory Architecture.md` | 5-tier memory system, retrieval patterns |
-| [impulse-feature-plan.md](impulse-feature-plan.md) | `Claude Code Impulse Feature Plan.md` | Zellij layouts, UI components |
 | [cross-model-consensus.md](cross-model-consensus.md) | `Where Models Agree.md` | Cross-model tool consensus (~118 KB) |
 | [cli-language-analysis.md](cli-language-analysis.md) | `what are clis usually coded in...md` | CLI language selection (~65 KB) |
 | [deep-research-compaction.md](deep-research-compaction.md) | `ai_coding_impulse_gpt_deep-research-report.md` | AI coding impulse landscape |
@@ -52,9 +51,9 @@ last_updated: 2026-02-20
 
 | Order | Document | Focus | Time |
 |-------|----------|-------|------|
-| 1 | [impulse-feature-plan.md](impulse-feature-plan.md) | Sections 2-4: layouts, status bar | 45 min |
-| 2 | [cross-model-consensus.md](cross-model-consensus.md) | Sections 2-3: implementation patterns | 30 min |
-| 3 | [REALISTIC-FRAMEWORK.md](REALISTIC-FRAMEWORK.md) | Architectural pivot rationale | 20 min |
+| 1 | [RESEARCH-DIGEST.md](RESEARCH-DIGEST.md) | Three-file memory model, retrieval, compaction | 30 min |
+| 2 | [AGENT-HARNESS-ANALYSIS.md](AGENT-HARNESS-ANALYSIS.md) | Hook and harness platform realities | 45 min |
+| 3 | [RECONCILIATION-ANALYSIS.md](RECONCILIATION-ANALYSIS.md) | Spec and implementation reconciliation | 20 min |
 
 ### Phase 2: Semantic Search
 
@@ -68,8 +67,17 @@ last_updated: 2026-02-20
 
 | Order | Document | Focus | Time |
 |-------|----------|-------|------|
-| 1 | [impulse-feature-plan.md](impulse-feature-plan.md) | Sections 5-7: advanced UI, dashboard | 45 min |
-| 2 | [TERMINAL-LAYER-ANALYSIS.md](TERMINAL-LAYER-ANALYSIS.md) | Terminal integration patterns | 1 hr |
+| 1 | [TERMINAL-LAYER-ANALYSIS.md](TERMINAL-LAYER-ANALYSIS.md) | Terminal integration patterns | 1 hr |
+| 2 | [META-HARNESS-RUST-MULTI-AGENT.md](META-HARNESS-RUST-MULTI-AGENT.md) | Harness layer + topology synthesis | 35 min |
+| 3 | [../guides/RUST-MULTI-AGENT-PATTERNS.md](../guides/RUST-MULTI-AGENT-PATTERNS.md) | Practical Rust implementation rules | 20 min |
+
+### Current Rust + Multi-Agent Synthesis
+
+| Order | Document | Focus | Time |
+|-------|----------|-------|------|
+| 1 | [META-HARNESS-RUST-MULTI-AGENT.md](META-HARNESS-RUST-MULTI-AGENT.md) | Harness layer + topology synthesis | 35 min |
+| 2 | [AGENT-HARNESS-ANALYSIS.md](AGENT-HARNESS-ANALYSIS.md) | Real integration surfaces and hook models | 45 min |
+| 3 | [../guides/RUST-MULTI-AGENT-PATTERNS.md](../guides/RUST-MULTI-AGENT-PATTERNS.md) | Practical Rust implementation rules | 20 min |
 
 ---
 
@@ -84,8 +92,9 @@ last_updated: 2026-02-20
 | Why sqlite-vec | impulse-memory-architecture.md | Section 2 |
 | Bun vs Node | cross-model-consensus.md | Section 2 |
 | TF-IDF scoring | MEMORY-EXTRACTION-ANALYSIS.md | -- |
-| Status bar design | impulse-feature-plan.md | Section 4 |
 | Language selection | cli-language-analysis.md | Comparison table |
+| Meta-Harness + Rust synthesis | META-HARNESS-RUST-MULTI-AGENT.md | Executive Summary + Sections 3-5 |
+| Rust multi-agent patterns | ../guides/RUST-MULTI-AGENT-PATTERNS.md | Sections 2-6 |
 
 ---
 

@@ -2,14 +2,14 @@
 title: Documentation Index
 description: Master navigation hub for Impulse documentation
 version: '1.1'
-updated: 2026-03-05
+updated: 2026-03-31
 type: doc
 category: navigation
 phase: all
 status: active
 audience: everyone
 tags: [index, navigation, discovery]
-last_updated: 2026-03-05
+last_updated: 2026-03-31
 authors:
   - name: James Pustorino
     role: Creator
@@ -77,6 +77,7 @@ See [decisions/README.md](decisions/README.md) for full decision log.
 | [INTEGRATION-COOKBOOK.md](guides/INTEGRATION-COOKBOOK.md)       | Integration patterns and recipes |
 | [TOOLS-STATUS.md](guides/TOOLS-STATUS.md)                     | Tool installation and validation |
 | [HOOK-VALIDATION-GUIDE.md](guides/HOOK-VALIDATION-GUIDE.md)   | Real Claude hook proof before product claims |
+| [RUST-MULTI-AGENT-PATTERNS.md](guides/RUST-MULTI-AGENT-PATTERNS.md) | Rust-first harness and coordination patterns |
 
 ### Phase Planning
 
@@ -113,6 +114,7 @@ See [decisions/README.md](decisions/README.md) for full decision log.
 | [SEARCH-LAYER-ANALYSIS.md](research/SEARCH-LAYER-ANALYSIS.md)             | Search layer architecture                                   |
 | [TERMINAL-LAYER-ANALYSIS.md](research/TERMINAL-LAYER-ANALYSIS.md)         | Terminal layer architecture                                 |
 | [RESEARCH-DIGEST.md](research/RESEARCH-DIGEST.md)                         | Consolidated research findings                              |
+| [META-HARNESS-RUST-MULTI-AGENT.md](research/META-HARNESS-RUST-MULTI-AGENT.md) | Meta-Harness, Rust, and multi-agent coordination synthesis |
 | [TOOL-STACK-ANALYSIS.md](research/TOOL-STACK-ANALYSIS.md)                 | Tool selection analysis                                     |
 | [RECONCILIATION-ANALYSIS.md](research/RECONCILIATION-ANALYSIS.md)         | Spec reconciliation                                         |
 | [EFFICIENCY-ANALYSIS.md](research/EFFICIENCY-ANALYSIS.md)                 | **Implementation efficiency patterns (read before coding)** |
