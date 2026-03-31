@@ -768,7 +768,7 @@ mod tests {
 
     #[test]
     fn test_protocol_version_constant_defined() {
-        assert!(crate::daemon::PROTOCOL_VERSION >= 1);
+        const { assert!(crate::daemon::PROTOCOL_VERSION >= 1) };
     }
 
     #[test]

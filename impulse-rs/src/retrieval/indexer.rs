@@ -783,7 +783,7 @@ mod tests {
         // First index — rebuild.
         index_memory(
             temp.path(),
-            &[h1.clone()],
+            std::slice::from_ref(&h1),
             &Genome::default(),
             &cfg,
             IndexScope::History,

@@ -300,50 +300,6 @@ pub async fn handle_chat_and_display(
     Ok(())
 }
 
-#[cfg(test)]
-mod chat_tests {
-    use super::*;
-
-    fn test_state() -> (tempfile::TempDir, Arc<state::State>) {
-        let dir = tempfile::TempDir::new().unwrap();
-        let st = state::State::new(dir.path().to_path_buf()).unwrap();
-        (dir, Arc::new(st))
-    }
-
-    #[tokio::test]
-    async fn test_chat_rejects_invalid_inject_mode() {
-        let (_dir, st) = test_state();
-        // inject_mode validation happens before API call, so no key needed
-        let result = handle_chat(&st, "hello", Some("invalid_mode"), false).await;
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("inject_mode"),
-            "Expected inject_mode error, got: {}",
-            err_msg
-        );
-    }
-
-    #[tokio::test]
-    async fn test_chat_valid_modes_accepted() {
-        // "off", "review", "apply" are valid inject modes — they won't fail on mode validation
-        // (they'll fail later at the API call stage, but mode parsing succeeds)
-        let (_dir, st) = test_state();
-        for mode in &["off", "review", "apply"] {
-            let result = handle_chat(&st, "hello", Some(mode), false).await;
-            // Should NOT fail with inject_mode error — may fail with API key or network
-            if let Err(e) = &result {
-                assert!(
-                    !e.to_string().contains("inject_mode"),
-                    "Valid mode '{}' rejected: {}",
-                    mode,
-                    e
-                );
-            }
-        }
-    }
-}
-
 pub async fn handle_docs(
     state: &Arc<state::State>,
     cli_verbose: bool,
@@ -520,4 +476,48 @@ pub fn handle_tools(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod chat_tests {
+    use super::*;
+
+    fn test_state() -> (tempfile::TempDir, Arc<state::State>) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let st = state::State::new(dir.path().to_path_buf()).unwrap();
+        (dir, Arc::new(st))
+    }
+
+    #[tokio::test]
+    async fn test_chat_rejects_invalid_inject_mode() {
+        let (_dir, st) = test_state();
+        // inject_mode validation happens before API call, so no key needed
+        let result = handle_chat(&st, "hello", Some("invalid_mode"), false).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("inject_mode"),
+            "Expected inject_mode error, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_chat_valid_modes_accepted() {
+        // "off", "review", "apply" are valid inject modes — they won't fail on mode validation
+        // (they'll fail later at the API call stage, but mode parsing succeeds)
+        let (_dir, st) = test_state();
+        for mode in &["off", "review", "apply"] {
+            let result = handle_chat(&st, "hello", Some(mode), false).await;
+            // Should NOT fail with inject_mode error — may fail with API key or network
+            if let Err(e) = &result {
+                assert!(
+                    !e.to_string().contains("inject_mode"),
+                    "Valid mode '{}' rejected: {}",
+                    mode,
+                    e
+                );
+            }
+        }
+    }
 }

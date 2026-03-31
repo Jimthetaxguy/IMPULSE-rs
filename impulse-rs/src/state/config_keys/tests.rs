@@ -91,8 +91,10 @@ fn config_round_trip_real_file() {
 
 #[test]
 fn serde_roundtrip_api_key_is_skipped() {
-    let mut c = Config::default();
-    c.impulse_agent_api_key = Some("secret-key-123".to_string());
+    let c = Config {
+        impulse_agent_api_key: Some("secret-key-123".to_string()),
+        ..Default::default()
+    };
     let json = serde_json::to_string(&c).unwrap();
     // skip_serializing means the key should NOT appear in JSON output
     assert!(!json.contains("secret-key-123"));
@@ -158,8 +160,10 @@ fn get_optional_none_returns_none() {
 
 #[test]
 fn get_api_key_is_masked() {
-    let mut c = Config::default();
-    c.impulse_agent_api_key = Some("sk-ant-12345".to_string());
+    let c = Config {
+        impulse_agent_api_key: Some("sk-ant-12345".to_string()),
+        ..Default::default()
+    };
     assert_eq!(c.get("impulse_agent_api_key"), Some("***".to_string()));
 }
 
@@ -364,16 +368,20 @@ fn set_optional_string_to_value() {
 
 #[test]
 fn set_optional_string_clear_with_none() {
-    let mut c = Config::default();
-    c.impulse_agent_model = Some("gpt-4".to_string());
+    let mut c = Config {
+        impulse_agent_model: Some("gpt-4".to_string()),
+        ..Default::default()
+    };
     assert!(c.set("impulse_agent_model", "none"));
     assert!(c.impulse_agent_model.is_none());
 }
 
 #[test]
 fn set_optional_string_clear_with_empty() {
-    let mut c = Config::default();
-    c.impulse_agent_model = Some("gpt-4".to_string());
+    let mut c = Config {
+        impulse_agent_model: Some("gpt-4".to_string()),
+        ..Default::default()
+    };
     assert!(c.set("impulse_agent_model", ""));
     assert!(c.impulse_agent_model.is_none());
 }
@@ -467,8 +475,10 @@ fn set_unknown_key_rejected() {
 
 #[test]
 fn set_field_json_preserves_api_key() {
-    let mut c = Config::default();
-    c.impulse_agent_api_key = Some("my-secret".to_string());
+    let mut c = Config {
+        impulse_agent_api_key: Some("my-secret".to_string()),
+        ..Default::default()
+    };
     // Setting an unrelated field should preserve the api key
     assert!(c.set("verbose", "true"));
     assert_eq!(c.impulse_agent_api_key, Some("my-secret".to_string()));
@@ -477,8 +487,10 @@ fn set_field_json_preserves_api_key() {
 
 #[test]
 fn multiple_sets_preserve_api_key() {
-    let mut c = Config::default();
-    c.impulse_agent_api_key = Some("persistent-key".to_string());
+    let mut c = Config {
+        impulse_agent_api_key: Some("persistent-key".to_string()),
+        ..Default::default()
+    };
     assert!(c.set("log_level", "debug"));
     assert!(c.set("verbose", "true"));
     assert!(c.set("max_history_entries", "2000"));
