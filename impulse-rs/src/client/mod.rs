@@ -238,15 +238,29 @@ impl DaemonClient {
     }
 
     pub async fn agent_assist(&self, prompt: &str, context: Option<&str>) -> Result<String> {
+        self.agent_assist_with_insights(prompt, context, Vec::new())
+            .await
+    }
+
+    /// Agent assist with extracted insights for cross-pane context enrichment.
+    pub async fn agent_assist_with_insights(
+        &self,
+        prompt: &str,
+        context: Option<&str>,
+        insights: Vec<crate::context_lifecycle::types::ExtractedInsight>,
+    ) -> Result<String> {
         let response = self
             .send(DaemonRequest::AgentAssist {
                 prompt: prompt.to_string(),
                 context: context.map(|c| c.to_string()),
+                insights,
             })
             .await?;
 
         match response {
-            DaemonResponse::AgentAssistResult { success, response } => {
+            DaemonResponse::AgentAssistResult {
+                success, response, ..
+            } => {
                 if success {
                     Ok(response)
                 } else {
@@ -257,6 +271,138 @@ impl DaemonClient {
                 anyhow::bail!("Agent assist failed: {}", message)
             }
             _ => anyhow::bail!("Agent assist: unexpected response type"),
+        }
+    }
+
+    /// Get the conflict resolution history from the daemon's ConflictResolver.
+    pub async fn get_conflict_history(
+        &self,
+    ) -> Result<Vec<crate::agent::coordinator::ConflictRecord>> {
+        let response = self.send(DaemonRequest::GetConflictHistory).await?;
+
+        match response {
+            DaemonResponse::Ok { result } => {
+                let history: Vec<crate::agent::coordinator::ConflictRecord> =
+                    serde_json::from_value(result)
+                        .context("Failed to parse conflict history response")?;
+                Ok(history)
+            }
+            DaemonResponse::Error { message } => {
+                anyhow::bail!("Get conflict history failed: {}", message)
+            }
+            _ => anyhow::bail!("Get conflict history: unexpected response type"),
+        }
+    }
+
+    /// Request a code review via the Impulse Agent (specialized endpoint).
+    pub async fn agent_review_code(
+        &self,
+        file_path: &str,
+        diff: &str,
+        insights: Vec<crate::context_lifecycle::types::ExtractedInsight>,
+    ) -> Result<String> {
+        let response = self
+            .send(DaemonRequest::AgentReviewCode {
+                file_path: file_path.to_string(),
+                diff: diff.to_string(),
+                insights,
+            })
+            .await?;
+
+        match response {
+            DaemonResponse::AgentSpecializedResult {
+                success, response, ..
+            } => {
+                if success {
+                    Ok(response)
+                } else {
+                    anyhow::bail!("Agent review_code failed: {}", response)
+                }
+            }
+            DaemonResponse::Error { message } => {
+                anyhow::bail!("Agent review_code failed: {}", message)
+            }
+            _ => anyhow::bail!("Agent review_code: unexpected response type"),
+        }
+    }
+
+    /// Request error analysis via the Impulse Agent (specialized endpoint).
+    pub async fn agent_analyze_error(
+        &self,
+        error_text: &str,
+        context: &str,
+        insights: Vec<crate::context_lifecycle::types::ExtractedInsight>,
+    ) -> Result<String> {
+        let response = self
+            .send(DaemonRequest::AgentAnalyzeError {
+                error_text: error_text.to_string(),
+                context: context.to_string(),
+                insights,
+            })
+            .await?;
+
+        match response {
+            DaemonResponse::AgentSpecializedResult {
+                success, response, ..
+            } => {
+                if success {
+                    Ok(response)
+                } else {
+                    anyhow::bail!("Agent analyze_error failed: {}", response)
+                }
+            }
+            DaemonResponse::Error { message } => {
+                anyhow::bail!("Agent analyze_error failed: {}", message)
+            }
+            _ => anyhow::bail!("Agent analyze_error: unexpected response type"),
+        }
+    }
+
+    /// Request a pane summary via the Impulse Agent (specialized endpoint).
+    pub async fn agent_summarize_pane(
+        &self,
+        pane_id: usize,
+        raw_output: &str,
+        insights: Vec<crate::context_lifecycle::types::ExtractedInsight>,
+    ) -> Result<String> {
+        let response = self
+            .send(DaemonRequest::AgentSummarizePane {
+                pane_id,
+                raw_output: raw_output.to_string(),
+                insights,
+            })
+            .await?;
+
+        match response {
+            DaemonResponse::AgentSpecializedResult {
+                success, response, ..
+            } => {
+                if success {
+                    Ok(response)
+                } else {
+                    anyhow::bail!("Agent summarize_pane failed: {}", response)
+                }
+            }
+            DaemonResponse::Error { message } => {
+                anyhow::bail!("Agent summarize_pane failed: {}", message)
+            }
+            _ => anyhow::bail!("Agent summarize_pane: unexpected response type"),
+        }
+    }
+
+    /// Clear resolved conflicts from the daemon's ConflictResolver.
+    pub async fn clear_resolved_conflicts(&self) -> Result<bool> {
+        let response = self.send(DaemonRequest::ClearResolvedConflicts).await?;
+
+        match response {
+            DaemonResponse::Ok { result } => Ok(result
+                .get("cleared")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)),
+            DaemonResponse::Error { message } => {
+                anyhow::bail!("Clear resolved conflicts failed: {}", message)
+            }
+            _ => anyhow::bail!("Clear resolved conflicts: unexpected response type"),
         }
     }
 }
@@ -293,5 +439,124 @@ mod tests {
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("test"));
+    }
+
+    #[test]
+    fn test_get_conflict_history_request_serialization() {
+        let req = DaemonRequest::GetConflictHistory;
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("GetConflictHistory"));
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, DaemonRequest::GetConflictHistory));
+    }
+
+    #[test]
+    fn test_clear_resolved_conflicts_request_serialization() {
+        let req = DaemonRequest::ClearResolvedConflicts;
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("ClearResolvedConflicts"));
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, DaemonRequest::ClearResolvedConflicts));
+    }
+
+    #[test]
+    fn test_agent_review_code_request_serialization() {
+        let req = DaemonRequest::AgentReviewCode {
+            file_path: "src/main.rs".to_string(),
+            diff: "+ added line".to_string(),
+            insights: Vec::new(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("AgentReviewCode"));
+        assert!(json.contains("src/main.rs"));
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, DaemonRequest::AgentReviewCode { .. }));
+    }
+
+    #[test]
+    fn test_agent_analyze_error_request_serialization() {
+        let req = DaemonRequest::AgentAnalyzeError {
+            error_text: "error[E0502]: cannot borrow".to_string(),
+            context: "pane-1".to_string(),
+            insights: Vec::new(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("AgentAnalyzeError"));
+        assert!(json.contains("E0502"));
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, DaemonRequest::AgentAnalyzeError { .. }));
+    }
+
+    #[test]
+    fn test_agent_summarize_pane_request_serialization() {
+        let req = DaemonRequest::AgentSummarizePane {
+            pane_id: 3,
+            raw_output: "some terminal output".to_string(),
+            insights: Vec::new(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("AgentSummarizePane"));
+        assert!(json.contains("\"pane_id\":3"));
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, DaemonRequest::AgentSummarizePane { .. }));
+    }
+
+    #[test]
+    fn test_agent_review_code_insights_default_empty() {
+        // Ensure #[serde(default)] works — omit insights from JSON
+        let json = r#"{"type":"AgentReviewCode","data":{"file_path":"test.rs","diff":""}}"#;
+        let parsed: DaemonRequest = serde_json::from_str(json).unwrap();
+        match parsed {
+            DaemonRequest::AgentReviewCode { insights, .. } => {
+                assert!(insights.is_empty(), "insights should default to empty vec");
+            }
+            _ => panic!("Expected AgentReviewCode"),
+        }
+    }
+
+    #[test]
+    fn test_agent_analyze_error_insights_default_empty() {
+        let json = r#"{"type":"AgentAnalyzeError","data":{"error_text":"err","context":"ctx"}}"#;
+        let parsed: DaemonRequest = serde_json::from_str(json).unwrap();
+        match parsed {
+            DaemonRequest::AgentAnalyzeError { insights, .. } => {
+                assert!(insights.is_empty(), "insights should default to empty vec");
+            }
+            _ => panic!("Expected AgentAnalyzeError"),
+        }
+    }
+
+    #[test]
+    fn test_agent_summarize_pane_insights_default_empty() {
+        let json = r#"{"type":"AgentSummarizePane","data":{"pane_id":1,"raw_output":"output"}}"#;
+        let parsed: DaemonRequest = serde_json::from_str(json).unwrap();
+        match parsed {
+            DaemonRequest::AgentSummarizePane {
+                insights, pane_id, ..
+            } => {
+                assert_eq!(pane_id, 1);
+                assert!(insights.is_empty(), "insights should default to empty vec");
+            }
+            _ => panic!("Expected AgentSummarizePane"),
+        }
+    }
+
+    #[test]
+    fn test_agent_specialized_result_serialization() {
+        let resp = DaemonResponse::AgentSpecializedResult {
+            success: true,
+            response: "review complete".to_string(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("AgentSpecializedResult"));
+        assert!(json.contains("review complete"));
+        let parsed: DaemonResponse = serde_json::from_str(&json).unwrap();
+        match parsed {
+            DaemonResponse::AgentSpecializedResult { success, response } => {
+                assert!(success);
+                assert_eq!(response, "review complete");
+            }
+            _ => panic!("Expected AgentSpecializedResult"),
+        }
     }
 }

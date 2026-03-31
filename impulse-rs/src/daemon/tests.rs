@@ -233,6 +233,7 @@ mod tests {
             DaemonRequest::AgentAssist {
                 prompt: "Review pane activity".to_string(),
                 context: Some("Two panes active".to_string()),
+                insights: Vec::new(),
             },
             DaemonRequest::PublishTerminalOps {
                 report: impulse_ops::TerminalOpsReport {
@@ -542,12 +543,13 @@ mod tests {
         let request = DaemonRequest::AgentAssist {
             prompt: "Review the changes in pane 1".to_string(),
             context: Some("Pane 1 modified src/main.rs and src/lib.rs".to_string()),
+            insights: Vec::new(),
         };
         let json = serde_json::to_string(&request).unwrap();
         let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
         assert!(matches!(
             parsed,
-            DaemonRequest::AgentAssist { prompt, context }
+            DaemonRequest::AgentAssist { prompt, context, .. }
                 if prompt == "Review the changes in pane 1"
                 && context.as_deref() == Some("Pane 1 modified src/main.rs and src/lib.rs")
         ));
@@ -565,14 +567,23 @@ mod tests {
         let request_no_ctx = DaemonRequest::AgentAssist {
             prompt: "Summarize current progress".to_string(),
             context: None,
+            insights: Vec::new(),
         };
         let json2 = serde_json::to_string(&request_no_ctx).unwrap();
         let parsed2: DaemonRequest = serde_json::from_str(&json2).unwrap();
         assert!(matches!(
             parsed2,
-            DaemonRequest::AgentAssist { prompt, context }
+            DaemonRequest::AgentAssist { prompt, context, .. }
                 if prompt == "Summarize current progress"
                 && context.is_none()
+        ));
+
+        // Test backward compatibility: JSON without insights field should deserialize
+        let legacy_json = r#"{"type":"AgentAssist","data":{"prompt":"test","context":null}}"#;
+        let parsed_legacy: DaemonRequest = serde_json::from_str(legacy_json).unwrap();
+        assert!(matches!(
+            parsed_legacy,
+            DaemonRequest::AgentAssist { insights, .. } if insights.is_empty()
         ));
     }
 
@@ -583,12 +594,14 @@ mod tests {
         let success = DaemonResponse::AgentAssistResult {
             success: true,
             response: "No conflicts detected between panes".to_string(),
+            recommendations: Vec::new(),
+            pane_summaries: Vec::new(),
         };
         let json = serde_json::to_string(&success).unwrap();
         let parsed: DaemonResponse = serde_json::from_str(&json).unwrap();
         assert!(matches!(
             parsed,
-            DaemonResponse::AgentAssistResult { success, response }
+            DaemonResponse::AgentAssistResult { success, response, .. }
                 if success && response == "No conflicts detected between panes"
         ));
 
@@ -605,12 +618,14 @@ mod tests {
         let failure = DaemonResponse::AgentAssistResult {
             success: false,
             response: "Impulse Agent not configured".to_string(),
+            recommendations: Vec::new(),
+            pane_summaries: Vec::new(),
         };
         let json2 = serde_json::to_string(&failure).unwrap();
         let parsed2: DaemonResponse = serde_json::from_str(&json2).unwrap();
         assert!(matches!(
             parsed2,
-            DaemonResponse::AgentAssistResult { success, response }
+            DaemonResponse::AgentAssistResult { success, response, .. }
                 if !success && response == "Impulse Agent not configured"
         ));
     }
@@ -622,10 +637,12 @@ mod tests {
             DaemonRequest::AgentAssist {
                 prompt: "Check for file conflicts".to_string(),
                 context: Some("pane-1: src/main.rs, pane-2: src/main.rs".to_string()),
+                insights: Vec::new(),
             },
             DaemonRequest::AgentAssist {
                 prompt: "What should I work on next?".to_string(),
                 context: None,
+                insights: Vec::new(),
             },
         ];
 
@@ -639,10 +656,14 @@ mod tests {
             DaemonResponse::AgentAssistResult {
                 success: true,
                 response: "All clear".to_string(),
+                recommendations: Vec::new(),
+                pane_summaries: Vec::new(),
             },
             DaemonResponse::AgentAssistResult {
                 success: false,
                 response: "Agent not ready".to_string(),
+                recommendations: Vec::new(),
+                pane_summaries: Vec::new(),
             },
         ];
 
@@ -1080,5 +1101,399 @@ mod tests {
         let socket_path = PathBuf::from("/tmp/test/impulse.sock");
         let pid_path = socket_path.with_extension("pid");
         assert_eq!(pid_path, PathBuf::from("/tmp/test/impulse.pid"));
+    }
+
+    // ── Conflict resolver IPC tests (Task 20) ──────────────────────────────
+
+    #[test]
+    fn test_get_conflict_history_request_roundtrip() {
+        let req = DaemonRequest::GetConflictHistory;
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, DaemonRequest::GetConflictHistory));
+    }
+
+    #[test]
+    fn test_clear_resolved_conflicts_request_roundtrip() {
+        let req = DaemonRequest::ClearResolvedConflicts;
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, DaemonRequest::ClearResolvedConflicts));
+    }
+
+    #[test]
+    fn test_conflict_history_empty_response() {
+        // Simulate what the handler returns for an empty ConflictResolver
+        let resolver = crate::agent::coordinator::ConflictResolver::new();
+        let history = resolver.get_resolution_history();
+        assert!(history.is_empty());
+
+        // Verify it serializes to the expected Ok response
+        let response = super::super::protocol::respond_ok(&history);
+        match response {
+            DaemonResponse::Ok { result } => {
+                let arr = result.as_array().unwrap();
+                assert!(arr.is_empty());
+            }
+            _ => panic!("Expected Ok response"),
+        }
+    }
+
+    #[test]
+    fn test_clear_resolved_conflicts_response() {
+        // Simulate what the handler returns after clearing
+        let response = super::super::protocol::respond_ok(&serde_json::json!({"cleared": true}));
+        match response {
+            DaemonResponse::Ok { result } => {
+                assert_eq!(result["cleared"], true);
+            }
+            _ => panic!("Expected Ok response"),
+        }
+    }
+
+    #[test]
+    fn test_backward_compat_old_json_without_conflict_variants() {
+        // Old clients that don't know about GetConflictHistory / ClearResolvedConflicts
+        // should still be able to parse other request types
+        let old_json = r#"{"type":"Ping"}"#;
+        let parsed: DaemonRequest = serde_json::from_str(old_json).unwrap();
+        assert!(matches!(parsed, DaemonRequest::Ping));
+
+        let old_json = r#"{"type":"Status"}"#;
+        let parsed: DaemonRequest = serde_json::from_str(old_json).unwrap();
+        assert!(matches!(parsed, DaemonRequest::Status));
+
+        let old_json = r#"{"type":"GuardList"}"#;
+        let parsed: DaemonRequest = serde_json::from_str(old_json).unwrap();
+        assert!(matches!(parsed, DaemonRequest::GuardList));
+    }
+
+    // ── Agent specialized IPC tests (Task 23) ─────────────────────────────
+
+    #[test]
+    fn test_agent_review_code_request_serde() {
+        let req = DaemonRequest::AgentReviewCode {
+            file_path: "src/main.rs".to_string(),
+            diff: "+ let x = 42;\n- let x = 0;".to_string(),
+            insights: Vec::new(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        match parsed {
+            DaemonRequest::AgentReviewCode {
+                file_path,
+                diff,
+                insights,
+            } => {
+                assert_eq!(file_path, "src/main.rs");
+                assert!(diff.contains("let x = 42"));
+                assert!(insights.is_empty());
+            }
+            _ => panic!("Expected AgentReviewCode"),
+        }
+    }
+
+    #[test]
+    fn test_agent_analyze_error_request_serde() {
+        let req = DaemonRequest::AgentAnalyzeError {
+            error_text: "error[E0502]: cannot borrow `x` as mutable".to_string(),
+            context: "pane-1".to_string(),
+            insights: Vec::new(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        match parsed {
+            DaemonRequest::AgentAnalyzeError {
+                error_text,
+                context,
+                insights,
+            } => {
+                assert!(error_text.contains("E0502"));
+                assert_eq!(context, "pane-1");
+                assert!(insights.is_empty());
+            }
+            _ => panic!("Expected AgentAnalyzeError"),
+        }
+    }
+
+    #[test]
+    fn test_agent_summarize_pane_request_serde() {
+        let req = DaemonRequest::AgentSummarizePane {
+            pane_id: 3,
+            raw_output: "Modified src/lib.rs, ran cargo test, 5 passing".to_string(),
+            insights: Vec::new(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        match parsed {
+            DaemonRequest::AgentSummarizePane {
+                pane_id,
+                raw_output,
+                insights,
+            } => {
+                assert_eq!(pane_id, 3);
+                assert!(raw_output.contains("cargo test"));
+                assert!(insights.is_empty());
+            }
+            _ => panic!("Expected AgentSummarizePane"),
+        }
+    }
+
+    #[test]
+    fn test_agent_specialized_request_roundtrip() {
+        let requests = vec![
+            DaemonRequest::AgentReviewCode {
+                file_path: "src/daemon/protocol.rs".to_string(),
+                diff: "+++ new line".to_string(),
+                insights: Vec::new(),
+            },
+            DaemonRequest::AgentAnalyzeError {
+                error_text: "thread 'main' panicked".to_string(),
+                context: "integration-test".to_string(),
+                insights: Vec::new(),
+            },
+            DaemonRequest::AgentSummarizePane {
+                pane_id: 1,
+                raw_output: "cargo build succeeded".to_string(),
+                insights: Vec::new(),
+            },
+        ];
+
+        for request in requests {
+            let json = serde_json::to_string(&request).unwrap();
+            let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+            assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
+        }
+    }
+
+    #[test]
+    fn test_agent_review_code_backward_compat_no_insights() {
+        // Old clients that don't send insights should still parse
+        let json =
+            r#"{"type":"AgentReviewCode","data":{"file_path":"src/lib.rs","diff":"+ added"}}"#;
+        let parsed: DaemonRequest = serde_json::from_str(json).unwrap();
+        match parsed {
+            DaemonRequest::AgentReviewCode {
+                file_path,
+                diff,
+                insights,
+            } => {
+                assert_eq!(file_path, "src/lib.rs");
+                assert_eq!(diff, "+ added");
+                assert!(insights.is_empty(), "insights should default to empty vec");
+            }
+            _ => panic!("Expected AgentReviewCode"),
+        }
+    }
+
+    #[test]
+    fn test_agent_analyze_error_backward_compat_no_insights() {
+        let json =
+            r#"{"type":"AgentAnalyzeError","data":{"error_text":"panic!","context":"test"}}"#;
+        let parsed: DaemonRequest = serde_json::from_str(json).unwrap();
+        match parsed {
+            DaemonRequest::AgentAnalyzeError {
+                error_text,
+                context,
+                insights,
+            } => {
+                assert_eq!(error_text, "panic!");
+                assert_eq!(context, "test");
+                assert!(insights.is_empty(), "insights should default to empty vec");
+            }
+            _ => panic!("Expected AgentAnalyzeError"),
+        }
+    }
+
+    #[test]
+    fn test_agent_summarize_pane_backward_compat_minimal() {
+        // Minimum required: pane_id — raw_output and insights default
+        let json = r#"{"type":"AgentSummarizePane","data":{"pane_id":5}}"#;
+        let parsed: DaemonRequest = serde_json::from_str(json).unwrap();
+        match parsed {
+            DaemonRequest::AgentSummarizePane {
+                pane_id,
+                raw_output,
+                insights,
+            } => {
+                assert_eq!(pane_id, 5);
+                assert!(raw_output.is_empty(), "raw_output should default to empty");
+                assert!(insights.is_empty(), "insights should default to empty vec");
+            }
+            _ => panic!("Expected AgentSummarizePane"),
+        }
+    }
+
+    #[test]
+    fn test_agent_specialized_json_structure() {
+        // Verify the JSON wire format for each new request type
+        let review = DaemonRequest::AgentReviewCode {
+            file_path: "f.rs".to_string(),
+            diff: "d".to_string(),
+            insights: Vec::new(),
+        };
+        let val: serde_json::Value = serde_json::to_value(&review).unwrap();
+        assert_eq!(val["type"], "AgentReviewCode");
+        assert_eq!(val["data"]["file_path"], "f.rs");
+        assert_eq!(val["data"]["diff"], "d");
+
+        let error = DaemonRequest::AgentAnalyzeError {
+            error_text: "e".to_string(),
+            context: "c".to_string(),
+            insights: Vec::new(),
+        };
+        let val: serde_json::Value = serde_json::to_value(&error).unwrap();
+        assert_eq!(val["type"], "AgentAnalyzeError");
+        assert_eq!(val["data"]["error_text"], "e");
+        assert_eq!(val["data"]["context"], "c");
+
+        let summary = DaemonRequest::AgentSummarizePane {
+            pane_id: 7,
+            raw_output: "out".to_string(),
+            insights: Vec::new(),
+        };
+        let val: serde_json::Value = serde_json::to_value(&summary).unwrap();
+        assert_eq!(val["type"], "AgentSummarizePane");
+        assert_eq!(val["data"]["pane_id"], 7);
+        assert_eq!(val["data"]["raw_output"], "out");
+    }
+
+    #[test]
+    fn test_backward_compat_old_json_without_agent_specialized_variants() {
+        // Old clients that don't know about the new variants should
+        // still be able to parse all existing request types
+        let old_json = r#"{"type":"Ping"}"#;
+        let parsed: DaemonRequest = serde_json::from_str(old_json).unwrap();
+        assert!(matches!(parsed, DaemonRequest::Ping));
+
+        let old_json = r#"{"type":"AgentAssist","data":{"prompt":"help","context":null}}"#;
+        let parsed: DaemonRequest = serde_json::from_str(old_json).unwrap();
+        assert!(matches!(parsed, DaemonRequest::AgentAssist { .. }));
+    }
+
+    // -- GetConflictHistory / ClearResolvedConflicts IPC tests (Task 20) ---------
+
+    #[test]
+    fn test_get_conflict_history_serialization() {
+        let req = DaemonRequest::GetConflictHistory;
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, DaemonRequest::GetConflictHistory));
+    }
+
+    #[test]
+    fn test_clear_resolved_conflicts_serialization() {
+        let req = DaemonRequest::ClearResolvedConflicts;
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, DaemonRequest::ClearResolvedConflicts));
+    }
+
+    #[test]
+    fn test_conflict_resolver_history_via_ipc_types() {
+        // Simulate the IPC flow: create conflicts, resolve them, verify history
+        use crate::agent::coordinator::{ConflictResolution, ConflictResolver};
+        use crate::context_lifecycle::types::{ExtractedInsight, InsightType};
+
+        let mut resolver = ConflictResolver::new();
+
+        // Create conflict insights (two panes editing the same file)
+        let insights = vec![
+            ExtractedInsight {
+                pane_id: 1,
+                agent_kind: crate::context_lifecycle::types::AgentKind::ClaudeCode,
+                timestamp: chrono::Utc::now(),
+                insight_type: InsightType::FileModified,
+                content: "src/main.rs".to_string(),
+                intent: None,
+            },
+            ExtractedInsight {
+                pane_id: 2,
+                agent_kind: crate::context_lifecycle::types::AgentKind::OpenCode,
+                timestamp: chrono::Utc::now(),
+                insight_type: InsightType::FileModified,
+                content: "src/main.rs".to_string(),
+                intent: None,
+            },
+        ];
+
+        // Detect and add conflicts
+        let recs = resolver.detect_and_add_conflicts(&insights);
+        assert_eq!(recs.len(), 1);
+
+        // History should be empty before resolution
+        assert!(resolver.get_resolution_history().is_empty());
+
+        // Resolve the conflict
+        let resolved = resolver.resolve_conflict("src/main.rs", ConflictResolution::Merge);
+        assert!(resolved);
+
+        // History should now have one entry
+        let history = resolver.get_resolution_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].file_path, "src/main.rs");
+        assert!(matches!(history[0].resolution, ConflictResolution::Merge));
+
+        // Verify it serializes cleanly for IPC transport
+        let json = serde_json::to_value(history).unwrap();
+        assert!(json.is_array());
+        assert_eq!(json.as_array().unwrap().len(), 1);
+        assert_eq!(json[0]["file_path"], "src/main.rs");
+        assert_eq!(json[0]["resolution"], "merge");
+    }
+
+    #[test]
+    fn test_conflict_resolver_clear_resolved_via_ipc_types() {
+        use crate::agent::coordinator::{ConflictResolution, ConflictResolver};
+        use crate::context_lifecycle::types::{ExtractedInsight, InsightType};
+
+        let mut resolver = ConflictResolver::new();
+
+        let insights = vec![
+            ExtractedInsight {
+                pane_id: 1,
+                agent_kind: crate::context_lifecycle::types::AgentKind::ClaudeCode,
+                timestamp: chrono::Utc::now(),
+                insight_type: InsightType::FileModified,
+                content: "src/lib.rs".to_string(),
+                intent: None,
+            },
+            ExtractedInsight {
+                pane_id: 2,
+                agent_kind: crate::context_lifecycle::types::AgentKind::OpenCode,
+                timestamp: chrono::Utc::now(),
+                insight_type: InsightType::FileModified,
+                content: "src/lib.rs".to_string(),
+                intent: None,
+            },
+        ];
+
+        resolver.detect_and_add_conflicts(&insights);
+
+        // Resolve and clear
+        resolver.resolve_conflict("src/lib.rs", ConflictResolution::AcceptTheirs);
+        assert_eq!(resolver.get_resolved_conflicts().len(), 1);
+
+        resolver.clear_resolved();
+        assert!(resolver.get_resolved_conflicts().is_empty());
+        // Unresolved should also be empty since the only conflict was resolved
+        assert!(resolver.get_unresolved_conflicts().is_empty());
+
+        // History persists even after clear (clear only removes tracked conflicts)
+        assert_eq!(resolver.get_resolution_history().len(), 1);
+    }
+
+    #[test]
+    fn test_conflict_history_empty_returns_empty_array() {
+        use crate::agent::coordinator::ConflictResolver;
+
+        let resolver = ConflictResolver::new();
+        let history = resolver.get_resolution_history();
+        assert!(history.is_empty());
+
+        // Verify empty serialization is a valid JSON array
+        let json = serde_json::to_value(history).unwrap();
+        assert!(json.is_array());
+        assert_eq!(json.as_array().unwrap().len(), 0);
     }
 }

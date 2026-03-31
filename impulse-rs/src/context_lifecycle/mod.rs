@@ -21,10 +21,10 @@ pub mod parser;
 pub mod templates;
 pub mod types;
 
-pub use intent::{
-    Activity, ActivityType, AgentIntent, AgentType, Complexity, IntentCategory, IntentConflict,
-    IntentContext, IntentStore, RuleBasedClassifier,
-};
+// Phase 3 target (Task 18): RuleBasedClassifier, Complexity, IntentContext, IntentConflict
+// are intentionally not re-exported — they have zero external callers today.
+// AgentIntent is kept because IntentStore methods return it.
+pub use intent::{Activity, ActivityType, AgentIntent, AgentType, IntentCategory, IntentStore};
 pub use types::{
     AgentKind, ContextTier, ExtractedInsight, InsightType, MonitorAction, PaneContextState,
     PendingInjection,

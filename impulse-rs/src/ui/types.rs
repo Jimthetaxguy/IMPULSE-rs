@@ -131,6 +131,7 @@ pub enum MierFeedKind {
     CompactionDetected,
     Recommendation,
     Extraction,
+    PaneSummary,
 }
 
 impl TuiState {

@@ -5,7 +5,8 @@ use std::sync::Arc;
 use crate::{branding, credentials, memory, orchestration, state};
 
 use super::{
-    build_tool_registry, print_config, refresh_capabilities_manifest, tool_resolution_root,
+    build_tool_registry, print_config, refresh_capabilities_manifest, require_arg,
+    tool_resolution_root,
 };
 
 pub fn handle_config(
@@ -131,13 +132,13 @@ pub fn handle_model(
             println!("{}", model_mgr::format_models(&filtered, verbose));
         }
         "set" => {
-            let provider = provider.ok_or_else(|| anyhow::anyhow!("--provider required"))?;
-            let model = model.ok_or_else(|| anyhow::anyhow!("--model required"))?;
+            let provider = require_arg(provider, "provider")?;
+            let model = require_arg(model, "model")?;
             state.set_config(&format!("model.{}", provider), &model)?;
             println!("Set default model for {} to {}", provider, model);
         }
         "get" => {
-            let provider = provider.ok_or_else(|| anyhow::anyhow!("--provider required"))?;
+            let provider = require_arg(provider, "provider")?;
             let model = state.get_config(&format!("model.{}", provider))?;
             if let Some(m) = model {
                 println!("{}: {}", provider, m);

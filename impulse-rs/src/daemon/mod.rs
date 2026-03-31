@@ -52,6 +52,10 @@ pub struct Daemon {
     tool_context: crate::tooling::ToolContext,
     terminal_telemetry: Arc<RwLock<crate::ops_workbench::TerminalOpsTelemetryStore>>,
     supervisor_session_override: Arc<RwLock<Option<impulse_ops::SupervisorPermissionPolicy>>>,
+    conflict_resolver: Arc<RwLock<crate::agent::coordinator::ConflictResolver>>,
+    /// Cached ImpulseAgent instance that persists across requests within the
+    /// daemon session — enables session history continuity for multi-turn queries.
+    cached_agent: Arc<tokio::sync::Mutex<Option<crate::agent::ImpulseAgent>>>,
 }
 
 impl Daemon {
@@ -97,6 +101,10 @@ impl Daemon {
                 crate::ops_workbench::TerminalOpsTelemetryStore::default(),
             )),
             supervisor_session_override: Arc::new(RwLock::new(None)),
+            conflict_resolver: Arc::new(RwLock::new(
+                crate::agent::coordinator::ConflictResolver::new(),
+            )),
+            cached_agent: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -166,6 +174,8 @@ impl Daemon {
                             let terminal_telemetry = self.terminal_telemetry.clone();
                             let supervisor_session_override =
                                 self.supervisor_session_override.clone();
+                            let conflict_resolver = self.conflict_resolver.clone();
+                            let cached_agent = self.cached_agent.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = handle_connection(
                                     stream,
@@ -176,6 +186,8 @@ impl Daemon {
                                     tool_context,
                                     terminal_telemetry,
                                     supervisor_session_override,
+                                    conflict_resolver,
+                                    cached_agent,
                                 )
                                 .await
                                 {
@@ -210,6 +222,8 @@ async fn handle_connection(
     tool_context: crate::tooling::ToolContext,
     terminal_telemetry: Arc<RwLock<crate::ops_workbench::TerminalOpsTelemetryStore>>,
     supervisor_session_override: Arc<RwLock<Option<impulse_ops::SupervisorPermissionPolicy>>>,
+    conflict_resolver: Arc<RwLock<crate::agent::coordinator::ConflictResolver>>,
+    cached_agent: Arc<tokio::sync::Mutex<Option<crate::agent::ImpulseAgent>>>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.split();
     let mut reader = BufReader::new(reader);
@@ -256,6 +270,8 @@ async fn handle_connection(
             &tool_context,
             &terminal_telemetry,
             &supervisor_session_override,
+            &conflict_resolver,
+            &cached_agent,
         )
         .await;
         let elapsed = start.elapsed();

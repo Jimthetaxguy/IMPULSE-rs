@@ -135,8 +135,8 @@ pub struct ExtractedInsight {
     pub timestamp: DateTime<Utc>,
     pub insight_type: InsightType,
     pub content: String,
-    /// Currently always `None` in production — will be wired in Phase 3 (Task 18)
-    /// to populate via `IntentCategory::from_keywords()` during extraction.
+    /// Classified intent for this insight, populated by `IntentCategory::from_keywords()`
+    /// during extraction. Used by the coordinator for intent-based prioritization.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub intent: Option<IntentCategory>,
 }

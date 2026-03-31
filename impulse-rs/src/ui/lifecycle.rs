@@ -243,9 +243,10 @@ pub(crate) fn context_lifecycle_tick(state: &mut TuiState) {
                 state.intent_store.detect(activity);
             }
 
-            // Run local coordination (file conflicts, cross-pane errors)
+            // Run full coordination (file conflicts, cross-pane errors, pane summaries)
             if let Some(ref mut agent) = state.impulse_agent {
-                let new_recs = agent.coordinate_local(&all_insights);
+                let coordination = agent.coordinate_full(&all_insights);
+                let new_recs = coordination.recommendations;
                 let notification_bus = state.notification_bus.clone();
                 let state_clone = state.state.clone();
                 for rec in &new_recs {
@@ -299,6 +300,21 @@ pub(crate) fn context_lifecycle_tick(state: &mut TuiState) {
                 if state.mier_recommendations.len() > 20 {
                     let excess = state.mier_recommendations.len() - 20;
                     state.mier_recommendations.drain(..excess);
+                }
+
+                // Surface pane summaries in the activity feed
+                for (pane_label, summaries) in &coordination.pane_summaries {
+                    let summary_count = summaries.len();
+                    state.mier_activity_feed.push(MierFeedEntry {
+                        timestamp: std::time::Instant::now(),
+                        kind: MierFeedKind::PaneSummary,
+                        message: format!(
+                            "{}: {} insight{}",
+                            pane_label,
+                            summary_count,
+                            if summary_count == 1 { "" } else { "s" }
+                        ),
+                    });
                 }
             }
         }

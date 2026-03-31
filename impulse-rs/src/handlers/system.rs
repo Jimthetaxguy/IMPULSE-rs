@@ -282,6 +282,24 @@ pub async fn handle_chat(
     }))
 }
 
+/// Handle `chat` command in direct mode with display output.
+pub async fn handle_chat_and_display(
+    state: &Arc<state::State>,
+    message: &str,
+    inject_mode: Option<&str>,
+    inject_explain: bool,
+) -> Result<()> {
+    let result = handle_chat(state, message, inject_mode, inject_explain).await?;
+    if inject_explain {
+        super::print_json(&result)?;
+    } else if let Some(response) = result.get("response").and_then(|v| v.as_str()) {
+        println!("{}", response);
+    } else {
+        super::print_json(&result)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod chat_tests {
     use super::*;

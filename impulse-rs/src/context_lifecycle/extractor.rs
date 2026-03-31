@@ -6,6 +6,7 @@
 use chrono::Utc;
 use std::time::Instant;
 
+use super::intent::IntentCategory;
 use super::parser::{self, LineClassification, ToolKind};
 use super::types::{
     AgentKind, ExtractedInsight, InsightType, PaneContextState, EXTRACTION_INTERVAL_SECS,
@@ -15,6 +16,17 @@ use super::types::{
 pub struct OutputExtractor;
 
 impl OutputExtractor {
+    /// Classify content text into an IntentCategory by splitting into words
+    /// and running keyword-based classification.
+    fn classify_content(content: &str) -> Option<IntentCategory> {
+        let words: Vec<&str> = content.split_whitespace().collect();
+        if words.is_empty() {
+            return None;
+        }
+        let category = IntentCategory::from_keywords(&words);
+        Some(category)
+    }
+
     /// Extract insights from screen text for a given agent kind.
     /// Uses the structured parser for line classification, falling back
     /// to heuristic matching for unclassified (PlainText) lines.
@@ -33,25 +45,27 @@ impl OutputExtractor {
                         timestamp: Utc::now(),
                         insight_type: InsightType::FileModified,
                         content: target.clone(),
-                        intent: None,
+                        intent: Self::classify_content(target),
                     });
+                    let tool_content = format!("{:?} → {}", tool_kind, target);
                     insights.push(ExtractedInsight {
                         pane_id,
                         agent_kind,
                         timestamp: Utc::now(),
                         insight_type: InsightType::ToolInvocation,
-                        content: format!("{:?} → {}", tool_kind, target),
-                        intent: None,
+                        content: tool_content.clone(),
+                        intent: Self::classify_content(&tool_content),
                     });
                 }
                 _ => {
+                    let tool_content = format!("{:?} → {}", tool_kind, target);
                     insights.push(ExtractedInsight {
                         pane_id,
                         agent_kind,
                         timestamp: Utc::now(),
                         insight_type: InsightType::ToolInvocation,
-                        content: format!("{:?} → {}", tool_kind, target),
-                        intent: None,
+                        content: tool_content.clone(),
+                        intent: Self::classify_content(&tool_content),
                     });
                 }
             }
@@ -59,30 +73,32 @@ impl OutputExtractor {
 
         // Diff summary as a single insight
         if parsed.diff_summary.files_changed > 0 {
+            let diff_content = format!(
+                "{} files, +{} -{}",
+                parsed.diff_summary.files_changed,
+                parsed.diff_summary.lines_added,
+                parsed.diff_summary.lines_removed,
+            );
             insights.push(ExtractedInsight {
                 pane_id,
                 agent_kind,
                 timestamp: Utc::now(),
                 insight_type: InsightType::DiffDetected,
-                content: format!(
-                    "{} files, +{} -{}",
-                    parsed.diff_summary.files_changed,
-                    parsed.diff_summary.lines_added,
-                    parsed.diff_summary.lines_removed,
-                ),
-                intent: None,
+                content: diff_content.clone(),
+                intent: Self::classify_content(&diff_content),
             });
         }
 
         // Delegation detection
         if parsed.delegation_detected {
+            let deleg_content = "delegation marker detected".to_string();
             insights.push(ExtractedInsight {
                 pane_id,
                 agent_kind,
                 timestamp: Utc::now(),
                 insight_type: InsightType::DelegationDetected,
-                content: "delegation marker detected".to_string(),
-                intent: None,
+                content: deleg_content.clone(),
+                intent: Self::classify_content(&deleg_content),
             });
         }
 
@@ -90,13 +106,14 @@ impl OutputExtractor {
         for (i, classification) in parsed.lines.iter().enumerate() {
             if *classification == LineClassification::ErrorLine {
                 if let Some(line) = text.lines().nth(i) {
+                    let error_content = truncate_insight(line.trim(), 120);
                     insights.push(ExtractedInsight {
                         pane_id,
                         agent_kind,
                         timestamp: Utc::now(),
                         insight_type: InsightType::ErrorEncountered,
-                        content: truncate_insight(line.trim(), 120),
-                        intent: None,
+                        content: error_content.clone(),
+                        intent: Self::classify_content(&error_content),
                     });
                 }
             }
@@ -112,35 +129,38 @@ impl OutputExtractor {
                         continue;
                     }
                     if let Some(decision) = Self::extract_decision(trimmed) {
+                        let intent = Self::classify_content(&decision);
                         insights.push(ExtractedInsight {
                             pane_id,
                             agent_kind,
                             timestamp: Utc::now(),
                             insight_type: InsightType::DecisionMade,
                             content: decision,
-                            intent: None,
+                            intent,
                         });
                     }
                     if let Some(task) = Self::extract_task_completed(trimmed) {
+                        let intent = Self::classify_content(&task);
                         insights.push(ExtractedInsight {
                             pane_id,
                             agent_kind,
                             timestamp: Utc::now(),
                             insight_type: InsightType::TaskCompleted,
                             content: task,
-                            intent: None,
+                            intent,
                         });
                     }
 
                     // Remote connection detection (Phase 3A)
                     if let Some(remote) = Self::extract_remote_connection(trimmed) {
+                        let intent = Self::classify_content(&remote);
                         insights.push(ExtractedInsight {
                             pane_id,
                             agent_kind,
                             timestamp: Utc::now(),
                             insight_type: InsightType::RemoteConnection,
                             content: remote,
-                            intent: None,
+                            intent,
                         });
                     }
                 }
@@ -377,5 +397,115 @@ mod tests {
     fn test_extract_whitespace_only() {
         let insights = OutputExtractor::extract(AgentKind::ClaudeCode, 1, "   \n  \n   ");
         assert!(insights.is_empty());
+    }
+
+    // ─── Intent classification tests ────────────────────────────────────
+
+    #[test]
+    fn test_classify_content_testing() {
+        use super::super::intent::IntentCategory;
+        let result = OutputExtractor::classify_content("running test suite");
+        assert_eq!(result, Some(IntentCategory::Testing));
+    }
+
+    #[test]
+    fn test_classify_content_debugging() {
+        use super::super::intent::IntentCategory;
+        let result = OutputExtractor::classify_content("fix the error in auth");
+        assert_eq!(result, Some(IntentCategory::Debugging));
+    }
+
+    #[test]
+    fn test_classify_content_unknown() {
+        use super::super::intent::IntentCategory;
+        let result = OutputExtractor::classify_content("src/main.rs");
+        // A path name alone has no intent keywords — should return Unknown
+        assert_eq!(result, Some(IntentCategory::Unknown));
+    }
+
+    #[test]
+    fn test_classify_content_empty() {
+        let result = OutputExtractor::classify_content("");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_extracted_insights_have_intent() {
+        // Error lines should get intent classified (error → Debugging)
+        let insights =
+            OutputExtractor::extract(AgentKind::ClaudeCode, 1, "error: cannot find value `x`\n");
+        let errors: Vec<_> = insights
+            .iter()
+            .filter(|i| i.insight_type == InsightType::ErrorEncountered)
+            .collect();
+        assert!(!errors.is_empty());
+        for error in &errors {
+            assert!(
+                error.intent.is_some(),
+                "Error insight should have intent populated"
+            );
+        }
+    }
+
+    #[test]
+    fn test_task_completed_intent_populated() {
+        use super::super::intent::IntentCategory;
+        let insights = OutputExtractor::extract(
+            AgentKind::ClaudeCode,
+            1,
+            "All 47 tests passed\nbuild succeeded\n",
+        );
+        let tasks: Vec<_> = insights
+            .iter()
+            .filter(|i| i.insight_type == InsightType::TaskCompleted)
+            .collect();
+        assert!(!tasks.is_empty());
+        for task in &tasks {
+            assert!(
+                task.intent.is_some(),
+                "TaskCompleted insight should have intent populated"
+            );
+        }
+        // "tests passed" should classify as Testing
+        assert_eq!(tasks[0].intent, Some(IntentCategory::Testing));
+        // "build succeeded" should classify as Deploying (contains "build")
+        assert_eq!(tasks[1].intent, Some(IntentCategory::Deploying));
+    }
+
+    #[test]
+    fn test_decision_intent_populated() {
+        let insights = OutputExtractor::extract(
+            AgentKind::ClaudeCode,
+            1,
+            "decision: use HashMap instead of BTreeMap\n",
+        );
+        let decisions: Vec<_> = insights
+            .iter()
+            .filter(|i| i.insight_type == InsightType::DecisionMade)
+            .collect();
+        assert!(!decisions.is_empty());
+        for decision in &decisions {
+            assert!(
+                decision.intent.is_some(),
+                "DecisionMade insight should have intent populated"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tool_invocation_intent_populated() {
+        let insights =
+            OutputExtractor::extract(AgentKind::ClaudeCode, 1, "Write(src/test_utils.rs)\n");
+        let tools: Vec<_> = insights
+            .iter()
+            .filter(|i| i.insight_type == InsightType::ToolInvocation)
+            .collect();
+        assert!(!tools.is_empty());
+        for tool in &tools {
+            assert!(
+                tool.intent.is_some(),
+                "ToolInvocation insight should have intent populated"
+            );
+        }
     }
 }

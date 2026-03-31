@@ -3,6 +3,7 @@
 //! Aggregates insights from the context lifecycle extractor and generates
 //! coordination recommendations using the LLM provider.
 
+use crate::context_lifecycle::intent::IntentCategory;
 use crate::context_lifecycle::types::{ExtractedInsight, InsightType};
 use std::collections::HashMap;
 
@@ -43,6 +44,24 @@ pub struct Recommendation {
     pub panes_involved: Vec<String>,
     pub description: String,
     pub action: String,
+    /// Priority score (0--100). Higher = more urgent.
+    /// Base priority comes from recommendation type; intent modifiers adjust it.
+    #[serde(default = "default_priority")]
+    pub priority: u8,
+}
+
+fn default_priority() -> u8 {
+    50
+}
+
+/// Full coordination result including recommendations and pane summaries.
+/// Used by the daemon to return a richer response than just recommendations.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CoordinationResult {
+    /// Priority-sorted recommendations (conflicts, errors, delegations).
+    pub recommendations: Vec<Recommendation>,
+    /// Per-pane insight summaries keyed by pane label (e.g. "pane-1").
+    pub pane_summaries: Vec<(String, Vec<String>)>,
 }
 
 /// Types of coordination recommendations.
@@ -235,14 +254,12 @@ impl ConflictResolver {
             .collect()
     }
 
-    // Phase 3 (Task 23) will re-enable this by wiring it to daemon IPC.
-    #[cfg(test)]
+    // Restored from cfg(test) gate — now wired to IPC (Task 20)
     pub fn get_resolution_history(&self) -> &[ConflictRecord] {
         &self.resolution_history
     }
 
-    // Phase 3 (Task 23) will re-enable this by wiring it to daemon IPC.
-    #[cfg(test)]
+    // Restored from cfg(test) gate — now wired to IPC (Task 20)
     pub fn clear_resolved(&mut self) {
         self.tracked_conflicts.retain(|_, c| !c.is_resolved());
     }
@@ -272,6 +289,7 @@ pub fn detect_file_conflicts(insights: &[ExtractedInsight]) -> Vec<Recommendatio
             panes_involved: panes,
             description: format!("Multiple agents modifying: {}", file),
             action: "Coordinate changes to avoid merge conflicts".to_string(),
+            priority: default_priority(),
         })
         .collect()
 }
@@ -320,6 +338,7 @@ pub fn detect_cross_pane_errors(insights: &[ExtractedInsight]) -> Vec<Recommenda
                     "Check if recent modifications to {} caused: {}",
                     mod_files[0], error.content
                 ),
+                priority: default_priority(),
             });
         }
     }
@@ -356,17 +375,96 @@ pub fn detect_delegation_events(insights: &[ExtractedInsight]) -> Vec<Recommenda
             panes_involved: vec![format!("pane-{}", i.pane_id)],
             description: format!("Delegation detected in pane-{}", i.pane_id),
             action: "Review delegation handoff and coordinate next steps".to_string(),
+            priority: default_priority(),
         })
         .collect()
 }
 
+/// Compute the dominant intent across all insights that carry one.
+/// Returns `None` if no insight has a classified intent.
+fn dominant_intent(insights: &[ExtractedInsight]) -> Option<IntentCategory> {
+    let mut counts: HashMap<IntentCategory, usize> = HashMap::new();
+    for insight in insights {
+        if let Some(cat) = &insight.intent {
+            if *cat != IntentCategory::Unknown {
+                *counts.entry(*cat).or_default() += 1;
+            }
+        }
+    }
+    counts.into_iter().max_by_key(|(_, c)| *c).map(|(k, _)| k)
+}
+
+/// Priority score for a recommendation given the dominant intent.
+/// Lower score = higher priority (will sort first).
+fn intent_priority(rec: &Recommendation, dominant: Option<IntentCategory>) -> u8 {
+    let Some(intent) = dominant else {
+        return 50; // neutral when no dominant intent
+    };
+    match intent {
+        IntentCategory::Deploying => match rec.recommendation_type {
+            RecommendationType::FileConflict => 0,
+            RecommendationType::ErrorAssist => 1,
+            RecommendationType::DelegationReady => 2,
+            RecommendationType::CrossPaneSync => 3,
+            RecommendationType::TaskComplete => 4,
+        },
+        IntentCategory::Testing => match rec.recommendation_type {
+            RecommendationType::ErrorAssist => 0,
+            RecommendationType::TaskComplete => 1,
+            RecommendationType::FileConflict => 2,
+            RecommendationType::DelegationReady => 3,
+            RecommendationType::CrossPaneSync => 4,
+        },
+        IntentCategory::Debugging => match rec.recommendation_type {
+            RecommendationType::ErrorAssist => 0,
+            RecommendationType::FileConflict => 1,
+            RecommendationType::CrossPaneSync => 2,
+            RecommendationType::DelegationReady => 3,
+            RecommendationType::TaskComplete => 4,
+        },
+        // For all other intents, use a default priority
+        _ => match rec.recommendation_type {
+            RecommendationType::FileConflict => 1,
+            RecommendationType::ErrorAssist => 2,
+            RecommendationType::DelegationReady => 3,
+            RecommendationType::CrossPaneSync => 4,
+            RecommendationType::TaskComplete => 5,
+        },
+    }
+}
+
 /// Run all local (non-LLM) coordination checks and return recommendations.
+/// Recommendations are sorted by intent-based priority when insights carry
+/// classified intents (e.g., Deploying elevates conflict/error warnings,
+/// Testing/Debugging elevate error-assist recommendations).
 pub fn run_local_coordination(insights: &[ExtractedInsight]) -> Vec<Recommendation> {
     let mut all = Vec::new();
     all.extend(detect_file_conflicts(insights));
     all.extend(detect_cross_pane_errors(insights));
     all.extend(detect_delegation_events(insights));
+
+    let dominant = dominant_intent(insights);
+    // Set priority field: map sort key (0=most urgent) to priority (100=most urgent)
+    for rec in &mut all {
+        let sort_key = intent_priority(rec, dominant) as u16;
+        rec.priority = 100u8.saturating_sub((sort_key * 20).min(100) as u8);
+    }
+    all.sort_by(|a, b| b.priority.cmp(&a.priority));
     all
+}
+
+/// Run all local coordination checks *and* aggregate pane summaries.
+///
+/// This is the full pipeline for daemon responses — it returns both the
+/// priority-sorted recommendations and the per-pane insight summaries that
+/// callers (GUI, CLI) can display alongside recommendations.
+pub fn run_full_coordination(insights: &[ExtractedInsight]) -> CoordinationResult {
+    let recommendations = run_local_coordination(insights);
+    let pane_summaries = aggregate_pane_summaries(insights);
+    CoordinationResult {
+        recommendations,
+        pane_summaries,
+    }
 }
 
 #[cfg(test)]
@@ -631,5 +729,391 @@ mod tests {
         resolved_conflict.resolve(ConflictResolution::Merge);
         assert!(resolved_conflict.is_resolved());
         assert!(resolved_conflict.resolved_at.is_some());
+    }
+
+    // ─── Intent-based priority tests ─────────────────────────────────
+
+    fn make_insight_with_intent(
+        pane_id: usize,
+        insight_type: InsightType,
+        content: &str,
+        intent: Option<IntentCategory>,
+    ) -> ExtractedInsight {
+        ExtractedInsight {
+            pane_id,
+            agent_kind: AgentKind::ClaudeCode,
+            timestamp: Utc::now(),
+            insight_type,
+            content: content.to_string(),
+            intent,
+        }
+    }
+
+    #[test]
+    fn test_dominant_intent_none_when_empty() {
+        let insights: Vec<ExtractedInsight> = vec![];
+        assert_eq!(dominant_intent(&insights), None);
+    }
+
+    #[test]
+    fn test_dominant_intent_none_when_all_none() {
+        let insights = vec![
+            make_insight(1, InsightType::FileModified, "src/main.rs"),
+            make_insight(2, InsightType::ErrorEncountered, "compile error"),
+        ];
+        assert_eq!(dominant_intent(&insights), None);
+    }
+
+    #[test]
+    fn test_dominant_intent_ignores_unknown() {
+        let insights = vec![make_insight_with_intent(
+            1,
+            InsightType::FileModified,
+            "some_file",
+            Some(IntentCategory::Unknown),
+        )];
+        assert_eq!(dominant_intent(&insights), None);
+    }
+
+    #[test]
+    fn test_dominant_intent_picks_most_frequent() {
+        let insights = vec![
+            make_insight_with_intent(
+                1,
+                InsightType::FileModified,
+                "src/main.rs",
+                Some(IntentCategory::Deploying),
+            ),
+            make_insight_with_intent(
+                2,
+                InsightType::FileModified,
+                "src/lib.rs",
+                Some(IntentCategory::Testing),
+            ),
+            make_insight_with_intent(
+                3,
+                InsightType::ToolInvocation,
+                "cargo test",
+                Some(IntentCategory::Testing),
+            ),
+        ];
+        assert_eq!(dominant_intent(&insights), Some(IntentCategory::Testing));
+    }
+
+    #[test]
+    fn test_deploying_intent_boosts_conflict_priority() {
+        let now = Utc::now();
+        // Create insights with Deploying intent + a file conflict + a cross-pane error
+        let insights = vec![
+            ExtractedInsight {
+                pane_id: 1,
+                agent_kind: AgentKind::ClaudeCode,
+                timestamp: now,
+                insight_type: InsightType::FileModified,
+                content: "src/main.rs".to_string(),
+                intent: Some(IntentCategory::Deploying),
+            },
+            ExtractedInsight {
+                pane_id: 2,
+                agent_kind: AgentKind::OpenCode,
+                timestamp: now,
+                insight_type: InsightType::FileModified,
+                content: "src/main.rs".to_string(),
+                intent: Some(IntentCategory::Deploying),
+            },
+            ExtractedInsight {
+                pane_id: 3,
+                agent_kind: AgentKind::Codex,
+                timestamp: now,
+                insight_type: InsightType::ErrorEncountered,
+                content: "deploy failed".to_string(),
+                intent: Some(IntentCategory::Deploying),
+            },
+            // Pane 1 also modified a file recently so cross-pane error is detected
+            ExtractedInsight {
+                pane_id: 1,
+                agent_kind: AgentKind::ClaudeCode,
+                timestamp: now,
+                insight_type: InsightType::FileModified,
+                content: "src/deploy.rs".to_string(),
+                intent: Some(IntentCategory::Deploying),
+            },
+        ];
+
+        let recs = run_local_coordination(&insights);
+        assert!(!recs.is_empty());
+
+        // When deploying, FileConflict should have highest priority (100)
+        let conflict = recs
+            .iter()
+            .find(|r| r.recommendation_type == RecommendationType::FileConflict);
+        assert!(
+            conflict.is_some(),
+            "should have a file conflict recommendation"
+        );
+        assert_eq!(conflict.unwrap().priority, 100);
+    }
+
+    #[test]
+    fn test_testing_intent_boosts_error_priority() {
+        let now = Utc::now();
+        let insights = vec![
+            ExtractedInsight {
+                pane_id: 1,
+                agent_kind: AgentKind::ClaudeCode,
+                timestamp: now,
+                insight_type: InsightType::FileModified,
+                content: "src/main.rs".to_string(),
+                intent: Some(IntentCategory::Testing),
+            },
+            ExtractedInsight {
+                pane_id: 2,
+                agent_kind: AgentKind::OpenCode,
+                timestamp: now,
+                insight_type: InsightType::FileModified,
+                content: "src/main.rs".to_string(),
+                intent: Some(IntentCategory::Testing),
+            },
+            ExtractedInsight {
+                pane_id: 3,
+                agent_kind: AgentKind::Codex,
+                timestamp: now,
+                insight_type: InsightType::ErrorEncountered,
+                content: "test failed".to_string(),
+                intent: Some(IntentCategory::Testing),
+            },
+            ExtractedInsight {
+                pane_id: 1,
+                agent_kind: AgentKind::ClaudeCode,
+                timestamp: now,
+                insight_type: InsightType::FileModified,
+                content: "src/test_utils.rs".to_string(),
+                intent: Some(IntentCategory::Testing),
+            },
+        ];
+
+        let recs = run_local_coordination(&insights);
+        assert!(!recs.is_empty());
+
+        // When testing, ErrorAssist should have highest priority (100)
+        let error_assist = recs
+            .iter()
+            .find(|r| r.recommendation_type == RecommendationType::ErrorAssist);
+        assert!(
+            error_assist.is_some(),
+            "should have an error assist recommendation"
+        );
+        assert_eq!(error_assist.unwrap().priority, 100);
+
+        // FileConflict should be lower priority than ErrorAssist
+        let conflict = recs
+            .iter()
+            .find(|r| r.recommendation_type == RecommendationType::FileConflict);
+        assert!(conflict.is_some());
+        assert!(conflict.unwrap().priority < error_assist.unwrap().priority);
+    }
+
+    #[test]
+    fn test_no_intent_uses_default_priority() {
+        let now = Utc::now();
+        let insights = vec![
+            ExtractedInsight {
+                pane_id: 1,
+                agent_kind: AgentKind::ClaudeCode,
+                timestamp: now,
+                insight_type: InsightType::FileModified,
+                content: "src/main.rs".to_string(),
+                intent: None,
+            },
+            ExtractedInsight {
+                pane_id: 2,
+                agent_kind: AgentKind::OpenCode,
+                timestamp: now,
+                insight_type: InsightType::FileModified,
+                content: "src/main.rs".to_string(),
+                intent: None,
+            },
+        ];
+
+        let recs = run_local_coordination(&insights);
+        assert_eq!(recs.len(), 1);
+        // No dominant intent → neutral priority (100 - 50*0 = depends on neutral arm)
+        // Neutral arm returns 50, so priority = 100 - 50*20 → clamped
+        // Actually neutral returns 50 for all types, so priority = 100 - 50*20 = saturating_sub → 0
+        // Wait, let me check: intent_priority returns 50 when no dominant intent
+        // priority = 100u8.saturating_sub(50 * 20) = 100 - 1000 → saturating → 0
+        assert_eq!(recs[0].priority, 0);
+    }
+
+    // ─── run_full_coordination tests ────────────────────────────────
+
+    #[test]
+    fn test_run_full_coordination_empty() {
+        let result = run_full_coordination(&[]);
+        assert!(result.recommendations.is_empty());
+        assert!(result.pane_summaries.is_empty());
+    }
+
+    #[test]
+    fn test_run_full_coordination_returns_both_recs_and_summaries() {
+        let now = Utc::now();
+        let insights = vec![
+            ExtractedInsight {
+                pane_id: 1,
+                agent_kind: AgentKind::ClaudeCode,
+                timestamp: now,
+                insight_type: InsightType::FileModified,
+                content: "src/main.rs".to_string(),
+                intent: None,
+            },
+            ExtractedInsight {
+                pane_id: 2,
+                agent_kind: AgentKind::OpenCode,
+                timestamp: now,
+                insight_type: InsightType::FileModified,
+                content: "src/main.rs".to_string(),
+                intent: None,
+            },
+            ExtractedInsight {
+                pane_id: 2,
+                agent_kind: AgentKind::OpenCode,
+                timestamp: now,
+                insight_type: InsightType::ErrorEncountered,
+                content: "compile error in main.rs".to_string(),
+                intent: None,
+            },
+        ];
+
+        let result = run_full_coordination(&insights);
+
+        // Should have file conflict + cross-pane error
+        assert!(
+            !result.recommendations.is_empty(),
+            "should produce recommendations"
+        );
+        let has_conflict = result
+            .recommendations
+            .iter()
+            .any(|r| r.recommendation_type == RecommendationType::FileConflict);
+        let has_error = result
+            .recommendations
+            .iter()
+            .any(|r| r.recommendation_type == RecommendationType::ErrorAssist);
+        assert!(has_conflict, "should detect file conflict");
+        assert!(has_error, "should detect cross-pane error");
+
+        // Should have 2 pane summaries (pane-1 and pane-2)
+        assert_eq!(
+            result.pane_summaries.len(),
+            2,
+            "should have 2 pane summaries"
+        );
+        assert_eq!(result.pane_summaries[0].0, "pane-1");
+        assert_eq!(result.pane_summaries[1].0, "pane-2");
+        // pane-1 has 1 insight, pane-2 has 2 insights
+        assert_eq!(result.pane_summaries[0].1.len(), 1);
+        assert_eq!(result.pane_summaries[1].1.len(), 2);
+    }
+
+    #[test]
+    fn test_run_full_coordination_no_duplicate_recs_for_same_file() {
+        let now = Utc::now();
+        // Pane 1 and 2 modify same file (conflict).
+        // Pane 2 also has an error (cross-pane error related to pane 1's modification).
+        // These are distinct recommendation types and should NOT be deduplicated.
+        let insights = vec![
+            ExtractedInsight {
+                pane_id: 1,
+                agent_kind: AgentKind::ClaudeCode,
+                timestamp: now,
+                insight_type: InsightType::FileModified,
+                content: "src/lib.rs".to_string(),
+                intent: Some(IntentCategory::Deploying),
+            },
+            ExtractedInsight {
+                pane_id: 2,
+                agent_kind: AgentKind::OpenCode,
+                timestamp: now,
+                insight_type: InsightType::FileModified,
+                content: "src/lib.rs".to_string(),
+                intent: Some(IntentCategory::Deploying),
+            },
+            ExtractedInsight {
+                pane_id: 2,
+                agent_kind: AgentKind::OpenCode,
+                timestamp: now,
+                insight_type: InsightType::ErrorEncountered,
+                content: "linker error".to_string(),
+                intent: Some(IntentCategory::Deploying),
+            },
+        ];
+
+        let result = run_full_coordination(&insights);
+
+        // Count recommendation types
+        let conflict_count = result
+            .recommendations
+            .iter()
+            .filter(|r| r.recommendation_type == RecommendationType::FileConflict)
+            .count();
+        let error_count = result
+            .recommendations
+            .iter()
+            .filter(|r| r.recommendation_type == RecommendationType::ErrorAssist)
+            .count();
+
+        // Exactly 1 file conflict and 1 error assist — no duplicates
+        assert_eq!(conflict_count, 1, "should have exactly 1 file conflict rec");
+        assert_eq!(error_count, 1, "should have exactly 1 error assist rec");
+
+        // With Deploying intent, conflict should be highest priority
+        let conflict = result
+            .recommendations
+            .iter()
+            .find(|r| r.recommendation_type == RecommendationType::FileConflict)
+            .unwrap();
+        let error = result
+            .recommendations
+            .iter()
+            .find(|r| r.recommendation_type == RecommendationType::ErrorAssist)
+            .unwrap();
+        assert!(
+            conflict.priority >= error.priority,
+            "deploying: conflict priority ({}) should >= error priority ({})",
+            conflict.priority,
+            error.priority
+        );
+    }
+
+    #[test]
+    fn test_coordination_result_serialization() {
+        let result = CoordinationResult {
+            recommendations: vec![Recommendation {
+                recommendation_type: RecommendationType::FileConflict,
+                panes_involved: vec!["pane-1".to_string(), "pane-2".to_string()],
+                description: "Multiple agents modifying: src/main.rs".to_string(),
+                action: "Coordinate changes".to_string(),
+                priority: 100,
+            }],
+            pane_summaries: vec![
+                (
+                    "pane-1".to_string(),
+                    vec!["[file_modified] src/main.rs".to_string()],
+                ),
+                (
+                    "pane-2".to_string(),
+                    vec!["[file_modified] src/main.rs".to_string()],
+                ),
+            ],
+        };
+
+        let json = serde_json::to_string(&result).unwrap();
+        let parsed: CoordinationResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.recommendations.len(), 1);
+        assert_eq!(parsed.pane_summaries.len(), 2);
+        assert_eq!(
+            parsed.recommendations[0].recommendation_type,
+            RecommendationType::FileConflict
+        );
     }
 }

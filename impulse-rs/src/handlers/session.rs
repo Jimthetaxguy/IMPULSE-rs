@@ -322,6 +322,20 @@ pub async fn handle_session_conflicts(
     Ok(())
 }
 
+/// Handle `conflict-history` in direct mode.
+pub fn handle_conflict_history(state: &Arc<state::State>) -> Result<()> {
+    match state.get_conflict_history() {
+        Ok(events) if events.is_empty() => {
+            println!("No conflict events recorded.");
+        }
+        Ok(events) => {
+            super::print_json(&events)?;
+        }
+        Err(e) => eprintln!("Error reading conflict history: {}", e),
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

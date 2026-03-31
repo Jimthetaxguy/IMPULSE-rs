@@ -4,8 +4,6 @@
 //! [`ChatRequest`], [`ChatResponse`]). Provider implementations live in
 //! [`anthropic`]. Phase 2 API surface — not yet wired to production paths.
 
-#![allow(dead_code)]
-
 pub use crate::error::AgentResult;
 pub use async_trait::async_trait;
 pub use serde::{Deserialize, Serialize};

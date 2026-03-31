@@ -2,7 +2,7 @@ use anyhow::Result;
 
 use crate::office;
 
-use super::print_json;
+use super::{print_json, require_arg};
 
 pub fn handle_office(
     subcommand: String,
@@ -28,7 +28,7 @@ pub fn handle_office(
             }
         }
         "parse" | "extract" => {
-            let file = file.ok_or_else(|| anyhow::anyhow!("--file required"))?;
+            let file = require_arg(file, "file")?;
             let path = std::path::Path::new(&file);
 
             if !path.exists() {
@@ -55,7 +55,7 @@ pub fn handle_office(
             }
         }
         "sheets" => {
-            let file = file.ok_or_else(|| anyhow::anyhow!("--file required"))?;
+            let file = require_arg(file, "file")?;
             let path = std::path::Path::new(&file);
 
             if !path.exists() {
@@ -78,7 +78,7 @@ pub fn handle_office(
             }
         }
         "chunk" => {
-            let file = file.ok_or_else(|| anyhow::anyhow!("--file required"))?;
+            let file = require_arg(file, "file")?;
             let path = std::path::Path::new(&file);
 
             if !path.exists() {
@@ -101,7 +101,7 @@ pub fn handle_office(
             }
         }
         "extract-smart" | "smart" => {
-            let file = file.ok_or_else(|| anyhow::anyhow!("--file required"))?;
+            let file = require_arg(file, "file")?;
             let goal = goal.unwrap_or_else(|| "extract all key information".to_string());
             let path = std::path::Path::new(&file);
 

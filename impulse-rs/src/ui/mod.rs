@@ -40,13 +40,21 @@ pub use visualization::*;
 
 pub mod agent_terminal;
 pub mod lifecycle;
-pub mod render_panels;
+pub mod render_content;
+pub mod render_dashboard;
+pub mod render_menu;
+pub mod render_status;
+pub mod render_tabs;
 pub mod runner;
 pub mod types;
 
 pub(crate) use agent_terminal::*;
 pub(crate) use lifecycle::*;
-pub(crate) use render_panels::*;
+pub(crate) use render_content::*;
+pub(crate) use render_dashboard::*;
+pub(crate) use render_menu::*;
+pub(crate) use render_status::*;
+pub(crate) use render_tabs::*;
 pub use runner::*;
 pub use types::*;
 
@@ -82,12 +90,14 @@ mod tests {
             panes_involved: vec!["pane-1".to_string(), "pane-2".to_string()],
             description: "Multiple agents modifying: src/main.rs".to_string(),
             action: "Coordinate changes to avoid merge conflicts".to_string(),
+            priority: 50,
         });
         state.mier_recommendations.push(Recommendation {
             recommendation_type: RecommendationType::FileConflict,
             panes_involved: vec!["pane-1".to_string(), "pane-3".to_string()],
             description: "Multiple agents modifying: src/lib.rs".to_string(),
             action: "Coordinate changes to avoid merge conflicts".to_string(),
+            priority: 50,
         });
 
         // Open conflicts panel
@@ -108,12 +118,14 @@ mod tests {
             panes_involved: vec!["pane-1".to_string(), "pane-2".to_string()],
             description: "Multiple agents modifying: src/main.rs".to_string(),
             action: "Coordinate changes to avoid merge conflicts".to_string(),
+            priority: 50,
         });
         state.mier_recommendations.push(Recommendation {
             recommendation_type: RecommendationType::FileConflict,
             panes_involved: vec!["pane-1".to_string(), "pane-3".to_string()],
             description: "Multiple agents modifying: src/lib.rs".to_string(),
             action: "Coordinate changes to avoid merge conflicts".to_string(),
+            priority: 50,
         });
 
         // Open conflicts panel
@@ -138,6 +150,7 @@ mod tests {
             panes_involved: vec!["pane-1".to_string(), "pane-2".to_string()],
             description: "Multiple agents modifying: src/main.rs".to_string(),
             action: "Coordinate changes to avoid merge conflicts".to_string(),
+            priority: 50,
         });
 
         // Open conflicts panel and resolve
