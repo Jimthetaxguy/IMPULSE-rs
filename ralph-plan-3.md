@@ -544,7 +544,7 @@ Phase 4: Verification & Alignment (sequential)
 | Source LOC (src/) | 75,481 | <71,000 (−4,000+) | **59,116 (−16,365)** EXCEEDED |
 | Files >1,000 lines | 12 | ≤4 | 8 remaining (plan scope: 4 src/ files) |
 | `#[allow(dead_code)]` markers | 17 | 0 (or justified) | 9 remaining (all justified: serde fields + Phase 2 placeholders) |
-| Test count | 1,098 passing | ≥1,150 (net gain despite removals) | 922 (911 unit + 11 daemon) |
+| Test count | 1,098 passing | ≥1,150 (net gain despite removals) | 946 (935 unit + 11 daemon, +24 from protocol tests) |
 | Agent harness wired features | 3 of 10 | 10 of 10 | **10 of 10** ALL WIRED |
 | Unused agent methods | 6+ | 0 | **0** (all restored + IPC-wired) |
 | Largest file (lines) | 2,371 | <800 | 2,106 (integration_tests.rs — was split in Phase 2) |
