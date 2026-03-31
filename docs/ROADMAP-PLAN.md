@@ -17,7 +17,7 @@ authors:
 
 # Dynamic Roadmap Plan — Impulse
 
-> **Updated:** 2026-03-05
+> **Updated:** 2026-03-31
 > **Purpose:** Record the actual active roadmap after the Rust EGUI workbench landed.
 > **Risk register:** [`HONEST-ROADMAP.md`](./HONEST-ROADMAP.md)
 > **Execution handoff:** [`plans/IMPLEMENTATION-HANDOFF.md`](./plans/IMPLEMENTATION-HANDOFF.md)
@@ -44,6 +44,7 @@ This document is intentionally aligned with [`spec/RUST-CANONICAL-CONTRACT.md`](
 |------|--------|---------|
 | Rust memory core | Implemented | Session tracking, genome/history, retrieval, injection, stewardship, daemon, and tool/runtime infrastructure are live. |
 | EGUI operator workbench | In progress | `Overview`, `Agents`, `Context`, `Memory`, `Artifacts`, and `Settings` exist in `impulse-gui`. |
+| Agent harness wiring | **COMPLETE** | All 10 features wired: context→prompts, intent classification, full coordination, conflict history IPC, JSON harness protocol, session awareness, specialized IPC (2026-03-31). |
 | Artifact model | In progress | Provider-neutral artifact envelopes and actions exist, but operator ergonomics still need polish. |
 | Daemon-truth workbench | In progress | Snapshot/artifact IPC exists; terminal telemetry publication and overlay are now the active integration track. |
 | Hook validation | Not yet validated | SessionStart injection, PreCompact survival, and real-world `GENOME.md` usefulness remain open risks. |
@@ -163,7 +164,14 @@ If any of these fail, update the roadmap docs immediately. Failed validation is 
 
 ### Lane 1: Agent Control
 
-Only start after the daemon-truth workbench is stable.
+Only start after the daemon-truth workbench is stable. **Note:** Agent harness is now fully wired (Phase 3 of Ralph Plan 3, 2026-03-31) — all 10 features connected:
+- Context→prompt pipeline (ExtractedInsight → prompts)
+- Intent classification at 9 extraction sites
+- Full coordination pipeline + pane summaries
+- Conflict history IPC (GetConflictHistory, ClearResolvedConflicts)
+- Structured JSON harness protocol with fallback
+- Session history (5-turn bound, cached_agent)
+- Specialized IPC endpoints (AgentReviewCode, AgentAnalyzeError, AgentSummarizePane)
 
 - blocked-work indicators
 - focus affordances

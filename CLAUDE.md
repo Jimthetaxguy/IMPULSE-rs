@@ -65,7 +65,7 @@ Before implementing, consider alternative approaches. Choose the simplest soluti
 ## Architecture
 
 **Workspace (4 crates):**
-- `impulse-rs/` — main CLI + daemon + TUI (35 modules, ~53K lines, 825 tests)
+- `impulse-rs/` — main CLI + daemon + TUI (58,664 LOC in src/, 1,002 tests across 226 .rs files)
 - `impulse-rs/impulse-ops/` — operations library (shared types: SupervisorAction, TerminalOpsReport, OpsSnapshot)
 - `impulse-rs/impulse-term/` — custom terminal widget (PTY + vt100 + context bridge, ~2.7K lines, 55 tests)
 - `impulse-rs/impulse-gui/` — egui native workbench (Overview, Terminals, Context, Memory, Artifacts, Settings, ~13K lines, 220 tests)
@@ -187,11 +187,11 @@ Use descriptive names: `test_<function>_<scenario>_<expected_result>`
 
 ### Test Density Targets
 
-| Module Type | Target | Current |
+| Module Type | Target | Current (as of 2026-03-31) |
 |-------------|--------|---------|
-| Core (state, daemon, agent) | 3.0 tests/KLOC | ~0.9 |
+| Core (state, daemon, agent) | 3.0 tests/KLOC | ~1.2 (agent harness wiring +24 tests) |
 | Handlers | 2.0 tests/KLOC | ~1.2 |
-| Tooling | 2.0 tests/KLOC | ~0.3 |
+| Tooling | 2.0 tests/KLOC | ~17.1 (84 tests, 4,920 LOC) |
 | UI/TUI | 1.0 tests/KLOC | ~0.4 |
 | Integration | Covers every CLI command | 11 tests |
 
@@ -202,10 +202,9 @@ New modules must ship with tests meeting the target density. Existing modules sh
 | Module | Risk | Why |
 |--------|------|-----|
 | `src/state/` | HIGH | Persistence layer — corruption means data loss |
-| `src/daemon/mod.rs` | HIGH | IPC protocol — deserialization bugs crash daemon |
+| `src/handlers/` | MEDIUM | User-facing CLI paths with 9 untested files |
 | `src/error.rs` | MEDIUM | `AgentError` has zero Display/From tests |
-| `src/handlers/` (9 untested files) | MEDIUM | User-facing CLI paths with no regression coverage |
-| `src/tooling/` | MEDIUM | Security model — capability enforcement untested |
+| `src/ui/` | MEDIUM | TUI rendering — complex layout logic, limited coverage |
 
 ### Codebase Examples
 
@@ -296,7 +295,7 @@ cd impulse-gui && cargo build && cargo clippy -- -D warnings
 ### Pre-Commit Checklist
 
 1. `cargo build` — zero warnings
-2. `cargo test` — all tests pass (874+ expected)
+2. `cargo test` — all tests pass (1,002 expected)
 3. `cargo clippy -- -D warnings` — zero warnings
 4. `cargo fmt --check` — zero diffs
 5. No new `#[allow(...)]` without justification comment
