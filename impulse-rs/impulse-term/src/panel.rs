@@ -21,11 +21,22 @@ use parking_lot::Mutex;
 use eframe::egui;
 
 use crate::backend::TerminalBackend;
-use crate::context::{AgentKind, ContextBridge, ContextHealth, ContextTier, ExtractedInsight};
+use crate::context::{
+    AgentKind, ContextBridge, ContextHealth, ContextTier, ExtractedInsight, InsightType,
+};
 use crate::input;
 use crate::renderer::TerminalRenderer;
 use crate::status_bar;
 use crate::theme::TerminalTheme;
+
+/// Filter for the insights overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InsightFilter {
+    All,
+    Errors,
+    Decisions,
+    Files,
+}
 
 /// Environment variables to strip before spawning agent processes.
 const SANITIZED_ENV_VARS: &[&str] = &[
@@ -91,6 +102,8 @@ pub struct TerminalPanel {
     has_new_output_while_scrolled: bool,
     /// Tracks bytes at last repaint to avoid redundant repaints.
     last_repaint_bytes: u64,
+    /// Active filter for the insights overlay.
+    insight_filter: InsightFilter,
 }
 
 impl TerminalPanel {
@@ -145,6 +158,7 @@ impl TerminalPanel {
             scroll_offset: 0,
             has_new_output_while_scrolled: false,
             last_repaint_bytes: 0,
+            insight_filter: InsightFilter::All,
         })
     }
 
@@ -368,14 +382,27 @@ impl TerminalPanel {
     }
 
     /// Render the context overlay (toggled by Ctrl+Shift+C).
-    fn render_context_overlay(&self, ui: &mut egui::Ui) {
+    ///
+    /// Shows context health stats, a filter bar, and grouped insights in a
+    /// scrollable area. Each insight type is shown under a collapsible header
+    /// with a count badge. The filter bar lets users narrow to a single type.
+    fn render_context_overlay(&mut self, ui: &mut egui::Ui) {
         let health = self.context.lock().health();
+
+        // Snapshot insights under the lock, then release before building UI.
+        let all_insights: Vec<ExtractedInsight> = self.context.lock().insights().to_vec();
+
+        // Capture filter as a local so the closure can mutate self.insight_filter
+        // through a separate mutable binding without borrowing all of `self`.
+        let mut current_filter = self.insight_filter;
 
         egui::Window::new("Context Health")
             .collapsible(false)
-            .resizable(false)
+            .resizable(true)
+            .default_size(egui::vec2(340.0, 420.0))
             .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, 8.0))
             .show(ui.ctx(), |ui| {
+                // -- Health summary --
                 ui.label(
                     egui::RichText::new(format!(
                         "Tier: {} ({:.0}%)",
@@ -397,36 +424,124 @@ impl TerminalPanel {
                 ));
 
                 ui.separator();
-                ui.label(egui::RichText::new("Recent Insights:").strong());
 
-                // Hold the lock for the full scope so the &[] reference stays valid.
-                let lock = self.context.lock();
-                let insights = lock.insights();
-                let recent = if insights.len() > 10 {
-                    &insights[insights.len() - 10..]
-                } else {
-                    insights
-                };
-
-                if recent.is_empty() {
-                    ui.label(
-                        egui::RichText::new("No insights yet")
-                            .color(egui::Color32::from_rgb(0x6e, 0x76, 0x81)),
-                    );
-                } else {
-                    for insight in recent.iter().rev() {
-                        let elapsed = Utc::now()
-                            .signed_duration_since(insight.timestamp)
-                            .num_minutes();
-                        ui.label(format!(
-                            "  [{}] {} ({}m ago)",
-                            insight.insight_type.as_str(),
-                            crate::context::truncate_insight(&insight.content, 50),
-                            elapsed
-                        ));
+                // -- Filter bar --
+                ui.horizontal(|ui| {
+                    for (filter, label) in [
+                        (InsightFilter::All, "All"),
+                        (InsightFilter::Errors, "Errors"),
+                        (InsightFilter::Decisions, "Decisions"),
+                        (InsightFilter::Files, "Files"),
+                    ] {
+                        let is_active = current_filter == filter;
+                        let text = if is_active {
+                            egui::RichText::new(label).strong()
+                        } else {
+                            egui::RichText::new(label)
+                        };
+                        if ui.selectable_label(is_active, text).clicked() {
+                            current_filter = filter;
+                        }
                     }
-                }
+                });
+
+                ui.separator();
+
+                // -- Partition insights by type --
+                let file_insights: Vec<&ExtractedInsight> = all_insights
+                    .iter()
+                    .filter(|i| i.insight_type == InsightType::FileModified)
+                    .collect();
+                let error_insights: Vec<&ExtractedInsight> = all_insights
+                    .iter()
+                    .filter(|i| i.insight_type == InsightType::ErrorEncountered)
+                    .collect();
+                let decision_insights: Vec<&ExtractedInsight> = all_insights
+                    .iter()
+                    .filter(|i| i.insight_type == InsightType::DecisionMade)
+                    .collect();
+                let task_insights: Vec<&ExtractedInsight> = all_insights
+                    .iter()
+                    .filter(|i| i.insight_type == InsightType::TaskCompleted)
+                    .collect();
+
+                // -- Scrollable insight groups --
+                egui::ScrollArea::vertical()
+                    .max_height(300.0)
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| {
+                        if all_insights.is_empty() {
+                            ui.label(
+                                egui::RichText::new("No insights yet")
+                                    .color(egui::Color32::from_rgb(0x6e, 0x76, 0x81)),
+                            );
+                            return;
+                        }
+
+                        // Helper: render a collapsible group of insights.
+                        let render_group =
+                            |ui: &mut egui::Ui,
+                             header: &str,
+                             count: usize,
+                             insights: &[&ExtractedInsight]| {
+                                if count == 0 {
+                                    return;
+                                }
+                                egui::CollapsingHeader::new(
+                                    egui::RichText::new(format!("{header} ({count})")).strong(),
+                                )
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    for insight in insights.iter().rev() {
+                                        let elapsed = Utc::now()
+                                            .signed_duration_since(insight.timestamp)
+                                            .num_minutes();
+                                        ui.label(format!(
+                                            "  {} ({}m ago)",
+                                            crate::context::truncate_insight(&insight.content, 60),
+                                            elapsed
+                                        ));
+                                    }
+                                });
+                            };
+
+                        let show_errors =
+                            matches!(current_filter, InsightFilter::All | InsightFilter::Errors);
+                        let show_decisions = matches!(
+                            current_filter,
+                            InsightFilter::All | InsightFilter::Decisions
+                        );
+                        let show_files =
+                            matches!(current_filter, InsightFilter::All | InsightFilter::Files);
+                        let show_tasks = matches!(current_filter, InsightFilter::All);
+
+                        if show_errors {
+                            render_group(ui, "Errors", error_insights.len(), &error_insights);
+                        }
+                        if show_decisions {
+                            render_group(
+                                ui,
+                                "Decisions",
+                                decision_insights.len(),
+                                &decision_insights,
+                            );
+                        }
+                        if show_files {
+                            render_group(ui, "Files Modified", file_insights.len(), &file_insights);
+                        }
+                        if show_tasks {
+                            render_group(
+                                ui,
+                                "Tasks Completed",
+                                task_insights.len(),
+                                &task_insights,
+                            );
+                        }
+                    });
             });
+
+        // Write the (possibly changed) filter back.
+        self.insight_filter = current_filter;
     }
 
     /// Access the context bridge for external lifecycle operations.
