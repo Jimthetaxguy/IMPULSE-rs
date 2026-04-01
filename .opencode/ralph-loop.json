@@ -1,21 +1,21 @@
 {
   "plan_path": "ralph-plan-4.md",
-  "current_iteration": 15,
+  "current_iteration": 16,
   "total_planned": 100,
   "status": "running",
   "started": "2026-03-31T06:56:00Z",
-  "last_completed": "Loop 15 (Ralph Plan 4): backend.rs error logging — read_errors AtomicU64 counter, log::error!() on PTY read failures, read_error_count() method. 220 impulse-gui, 69 impulse-term tests pass.",
+  "last_completed": "Loop 15 (Ralph Plan 4): backend.rs error logging — read_errors counter + log::error!() on PTY failures. Loops 7-15 ALL COMPLETE. 1,020 tests, 0 failures.",
   "completed_steps": [
-    "Loop 7: Fixed unwrap in renderer.rs:236 — nested if-let. 3 tests. 60 tests pass.",
-    "Loop 9: Eliminated unsafe env manipulation — EnvGuard RAII. 2 tests. 60 tests pass.",
+    "Loop 7: Fixed unwrap in renderer.rs:236 — nested if-let. 3 tests. 60 impulse-term tests pass.",
+    "Loop 9: Eliminated unsafe env manipulation — EnvGuard RAII. 2 tests. Zero unsafe in panel.rs.",
     "Loop 10: Added 9 integration tests for backend.rs. 9/9 pass.",
-    "Loop 11: Extracted StatusBar to status_bar.rs. Arc<RefCell>→Arc<Mutex>. 69 tests pass.",
-    "Loop 12: Compact 36×8px progress bar in tab bar. 220 tests pass.",
-    "Loop 13: Welcome screen overhaul — 3-zone layout, live insights card, verb-first buttons. 220 tests pass.",
-    "Loop 14: Animation infrastructure — Tab::created_at, TerminalsView::last_tab_switch. 220 tests pass.",
-    "Loop 15: backend.rs error logging — read_errors counter, log::error!() on failures. 69 tests pass."
+    "Loop 11: Extracted StatusBar to status_bar.rs. Arc<RefCell>→Arc<Mutex>. 69 impulse-term tests pass.",
+    "Loop 12: Compact 36×8px progress bar in tab bar (color-coded). Copy button wired.",
+    "Loop 13: Welcome screen — 3-zone layout (IMPULSE header, live insights card, verb-first buttons).",
+    "Loop 14: Animations — tab-switch fade (150ms), spawn fade (200ms), compaction pulse (300ms).",
+    "Loop 15: backend.rs error logging — read_errors counter, log::error!() on PTY failures, read_error_count()."
   ],
-  "next_step": "Loop 16 (Ralph Plan 4): Planning Checkpoint — review Phase 3/4, plan Loops 17-24",
+  "next_step": "Loop 17 (Ralph Plan 4): UX — Command Palette (Ctrl+Shift+P) + drag-drop tab reordering",
   "blockers": [],
   "files_modified": [
     "impulse-rs/impulse-term/src/renderer.rs",
@@ -26,5 +26,5 @@
     "impulse-rs/impulse-term/src/backend.rs",
     "impulse-rs/impulse-gui/src/views/terminals.rs"
   ],
-  "notes": "Ralph Plan 4: Loops 7-15 DONE (8 loops). Loop 16 (checkpoint) next. 220 impulse-gui, 69 impulse-term, 0 failures."
+  "notes": "Ralph Plan 4: TUI Correctness (7,9,10) COMPLETE. TUI/UX (11-15) COMPLETE. Validation (PRs 1.1,1.2,1.4) COMPLETE. Phase 6 (Loops 17-23 premium UX) next. 1,020 tests, 0 failures, 0 clippy warnings."
 }

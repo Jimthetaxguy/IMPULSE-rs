@@ -322,18 +322,51 @@ New code must include:
 ### Quality Floor
 
 - Tests must contain assertions (`assert!`, `assert_eq!`, `assert_ne!`). `println!`-only tests are not acceptable.
-- Test names must describe the behavior being tested: `test_parse_empty_input_returns_error`, not `test_parse_2`.
+- Test names: `test_<function>_<scenario>_<expected_result>`, not `test_parse_2`.
 - `unwrap()` in tests must be on operations expected to succeed; use `assert!(result.is_err())` for expected failures.
+
+### How to Meet Density Targets
+
+- 1 happy-path test per public function (establishes baseline)
+- 1 Err-path test per `Result`-returning function
+- Boundary condition tests where type allows (empty, zero, max)
+- Serde round-trip test for every `Serialize + Deserialize` type
+- Display test for every `thiserror` enum
+- Property-based tests (`proptest`) for combinatorial input spaces (path validation, config parsing, serialization)
+
+### Test Helper Centralization
+
+| Helper Type | Location |
+|---|---|
+| State factories | `#[cfg(test)]` in owning module |
+| Mock tools | `src/tooling/` test module |
+| Daemon guards | `src/integration_tests.rs` |
+| Assertion helpers | Near first usage; extract if 3+ modules use |
+
+Rule: helpers used by 3+ modules must be extracted to a shared `#[cfg(test)]` module.
 
 ### Unsafe Code
 
-Any `unsafe` block requires: (1) `// SAFETY:` comment, (2) precondition validation outside the block, (3) a dedicated test exercising the unsafe path.
+Any `unsafe` block requires all three: (1) `// SAFETY:` comment documenting every invariant, (2) precondition validation **before** the unsafe block (never inside), (3) a dedicated test exercising the unsafe code path. Never use `unsafe` for convenience or to avoid `Result`.
 
 ### Lint Suppression
 
-- `#[allow(dead_code)]` requires `// dead_code: <reason>` comment and grep proof of no callers
-- `#![allow(...)]` (file-level) is not acceptable in new code
-- All `#[allow(clippy::*)]` require `// clippy: <reason>` comment
+- `#[allow(dead_code)]` requires `// dead_code: <reason>` comment and `grep` proof of no callers. If truly dead, delete it.
+- `#![allow(...)]` (file-level) is not acceptable in new code — must be broken into per-item allows.
+- All `#[allow(clippy::*)]` require `// clippy: <reason>` comment.
+- `#[allow(clippy::too_many_arguments)]` is temporary only — must include `// TODO: refactor to struct params`.
+
+### Verification Gate
+
+All changes must pass before commit:
+```bash
+cargo build && cargo test && cargo clippy -- -D warnings && cargo fmt --check
+```
+Exit on first failure. Do not skip or bypass any step.
+
+### egui Import Convention
+
+`impulse-gui` uses `eframe::egui::*` — never bare `egui::*`. The crate re-exports egui through eframe.
 
 ## 8) Validation and Drift Prevention
 

@@ -3289,6 +3289,7 @@ dependencies = [
  "parking_lot",
  "portable-pty",
  "serde",
+ "serde_json",
  "vt100",
 ]
 

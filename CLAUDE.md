@@ -108,6 +108,7 @@ Responses use `AgentAssistResult` (with `recommendations` + `pane_summaries`) or
 | Naming | `PascalCase` structs, `snake_case` functions, `SCREAMING_SNAKE` constants |
 | Testing | Unit tests in `mod tests` per file, integration tests with `DaemonGuard` RAII |
 | Feature flags | `office-support` (default), `monty-support`, `datafusion-support` (opt-in) |
+| egui imports | `impulse-gui` uses `eframe::egui::*`, NEVER bare `egui::*` — the crate re-exports through eframe |
 
 ---
 
@@ -163,13 +164,43 @@ New `#[allow(dead_code)]` requires proof: grep the codebase for callers first. I
 
 ### Property-Based Testing
 
-Use `proptest` for functions with combinatorial input spaces:
-- Path validation and sanitization functions
-- Configuration parsing (arbitrary field values)
-- Serialization round-trips with random data
-- Token counting arithmetic properties
+Use `proptest` for functions with combinatorial input spaces. Add `proptest` as a `[dev-dependencies]` entry when first used.
 
-Add `proptest` as a `[dev-dependencies]` entry when first used.
+**When to use:** any function where behavior should hold for ANY valid input, not just specific test cases.
+
+```rust
+use proptest::proptest;
+
+// Path sanitization: never produces traversal sequences
+proptest! {
+    #[test]
+    fn test_sanitize_path_never_contains_traversal(path in "[a-zA-Z0-9/_.-]+") {
+        let result = sanitize_path(&path).unwrap();
+        prop_assert!(!result.contains(".."));
+        prop_assert!(!result.contains("//"));
+    }
+}
+
+// Config round-trip with random data
+proptest! {
+    #[test]
+    fn test_config_roundtrip_random(
+        sessions in prop::collection::vec("[a-z]+", 0..10),
+        max_age in 1u64..1000,
+    ) {
+        let config = Config { sessions, max_age };
+        let json = serde_json::to_string(&config)?;
+        let recovered: Config = serde_json::from_str(&json)?;
+        prop_assert_eq!(config, recovered);
+    }
+}
+```
+
+**Strategy reference:**
+- `any::<u64>()` — any u64 value
+- `"[a-zA-Z0-9]+"` — regex string strategy
+- `prop::collection::vec(any::<String>(), 0..100)` — vector of random strings
+- `(any::<u32>(), "[a-z]+")` — tuple combining strategies
 
 ### Test Helpers
 
@@ -207,6 +238,12 @@ Use descriptive names: `test_<function>_<scenario>_<expected_result>`
 | Handlers | 2.0 tests/KLOC | ~1.2 |
 | Tooling | 2.0 tests/KLOC | ~17.1 (84 tests, 4,920 LOC) |
 | UI/TUI | 1.0 tests/KLOC | ~0.4 |
+
+**Why tooling is well-tested (17.1/KLOC):** Dynamic tools execute arbitrary user commands. Failure → data corruption or security breach. High density catches parameter injection, output parsing bugs, and rollback failures.
+
+**Why core is low (1.2/KLOC):** Core modules are critical but large. Trend toward 3.0/KLOC by adding: session lifecycle corner cases (rapid start/end, duplicate IDs), daemon reconnection/recovery (socket errors), agent harness error cases (missing context, malformed JSON).
+
+**Why handlers are low (1.2/KLOC):** 13 of 17 handler files have zero tests. Priority order: (1) `daemon_dispatch.rs`, (2) `direct_dispatch.rs`, (3) `agent.rs`, (4) `guard.rs`, (5) `injection_handlers.rs`.
 | Integration | Covers every CLI command | 11 tests |
 
 New modules must ship with tests meeting the target density. Existing modules should trend toward targets during regular development.
