@@ -202,3 +202,265 @@ pub fn handle_analytics(
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn test_state() -> (TempDir, Arc<state::State>) {
+        let tmp = TempDir::new().unwrap();
+        let st = state::State::new(tmp.path().to_path_buf()).unwrap();
+        (tmp, Arc::new(st))
+    }
+
+    /// Evaluate a guard action and return results instead of printing/exiting.
+    /// Testable extraction of the action evaluation branch of handle_guard.
+    fn evaluate_guard_action(
+        action_str: &str,
+        target: &str,
+        config: &crate::state::Config,
+    ) -> Result<(Vec<guardrail::GuardResult>, bool)> {
+        match guardrail::evaluate_action(action_str, target, &config.guardrails) {
+            Ok(results) => {
+                let has_block = guardrail::GuardEngine::has_blocking(&results);
+                Ok((results, has_block))
+            }
+            Err(e) => Err(anyhow::anyhow!("Guardrail evaluation error: {}", e)),
+        }
+    }
+
+    // ── handle_guard: list mode ────────────────────────────────────────
+
+    #[test]
+    fn test_handle_guard_list_returns_ok() {
+        let (_tmp, st) = test_state();
+        let result = handle_guard(&st, None, "any".to_string(), true, None, None, false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_handle_guard_list_json_returns_ok() {
+        let (_tmp, st) = test_state();
+        let result = handle_guard(&st, None, "any".to_string(), true, None, None, true);
+        assert!(result.is_ok());
+    }
+
+    // ── handle_guard: usage (no flags) ─────────────────────────────────
+
+    #[test]
+    fn test_handle_guard_no_flags_shows_usage() {
+        let (_tmp, st) = test_state();
+        // No action, no list, no enable, no disable => usage branch
+        let result = handle_guard(&st, None, "any".to_string(), false, None, None, false);
+        assert!(result.is_ok());
+    }
+
+    // ── handle_guard: enable a known builtin rule ──────────────────────
+
+    #[test]
+    fn test_handle_guard_enable_known_rule_succeeds() {
+        let (_tmp, st) = test_state();
+        // "block-force-push-main" is a builtin rule
+        let result = handle_guard(
+            &st,
+            None,
+            "any".to_string(),
+            false,
+            Some("block-force-push-main".to_string()),
+            None,
+            false,
+        );
+        assert!(result.is_ok());
+    }
+
+    // ── handle_guard: disable a known builtin rule ─────────────────────
+
+    #[test]
+    fn test_handle_guard_disable_known_rule_succeeds() {
+        let (_tmp, st) = test_state();
+        let result = handle_guard(
+            &st,
+            None,
+            "any".to_string(),
+            false,
+            None,
+            Some("block-force-push-main".to_string()),
+            false,
+        );
+        assert!(result.is_ok());
+
+        // Verify the rule was persisted as disabled
+        let config = st.config_snapshot().unwrap();
+        let disabled = config
+            .guardrails
+            .rules
+            .iter()
+            .find(|r| r.id == "block-force-push-main");
+        assert!(
+            disabled.is_some(),
+            "disabled override should exist in config"
+        );
+        assert!(!disabled.unwrap().enabled, "rule should be marked disabled");
+    }
+
+    // ── evaluate_guard_action (testable core) ──────────────────────────
+
+    #[test]
+    fn test_evaluate_guard_action_safe_command_passes() {
+        let (_tmp, st) = test_state();
+        let config = st.config_snapshot().unwrap();
+        let (results, has_block) = evaluate_guard_action("git status", "bash", &config).unwrap();
+        assert!(results.is_empty(), "safe command should produce no results");
+        assert!(!has_block);
+    }
+
+    #[test]
+    fn test_evaluate_guard_action_dangerous_command_blocks() {
+        let (_tmp, st) = test_state();
+        let config = st.config_snapshot().unwrap();
+        let (results, has_block) =
+            evaluate_guard_action("git push --force origin main", "bash", &config).unwrap();
+        assert!(!results.is_empty(), "dangerous command should match rules");
+        assert!(has_block, "force push should be blocked");
+    }
+
+    #[test]
+    fn test_evaluate_guard_action_no_rules_match_different_target() {
+        let (_tmp, st) = test_state();
+        let config = st.config_snapshot().unwrap();
+        // force push is a bash rule, evaluating against file-write target should not match
+        let (results, has_block) =
+            evaluate_guard_action("git push --force origin main", "file", &config).unwrap();
+        assert!(
+            results.is_empty(),
+            "bash rule should not match file-write target"
+        );
+        assert!(!has_block);
+    }
+
+    // ── handle_analytics ───────────────────────────────────────────────
+
+    #[test]
+    fn test_handle_analytics_conflicts_returns_ok() {
+        let (_tmp, st) = test_state();
+        let result = handle_analytics(&st, "conflicts".to_string(), false, "day".to_string());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_handle_analytics_conflicts_json_returns_ok() {
+        let (_tmp, st) = test_state();
+        let result = handle_analytics(&st, "conflicts".to_string(), true, "day".to_string());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_handle_analytics_conflicts_week_period() {
+        let (_tmp, st) = test_state();
+        let result = handle_analytics(&st, "conflicts".to_string(), false, "week".to_string());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_handle_analytics_conflicts_month_period() {
+        let (_tmp, st) = test_state();
+        let result = handle_analytics(&st, "conflicts".to_string(), false, "month".to_string());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_handle_analytics_unknown_subcommand_returns_ok() {
+        let (_tmp, st) = test_state();
+        // Unknown subcommand prints a message but returns Ok
+        let result = handle_analytics(&st, "unknown".to_string(), false, "day".to_string());
+        assert!(result.is_ok());
+    }
+
+    // ── handle_analytics with recorded conflicts ───────────────────────
+
+    #[test]
+    fn test_handle_analytics_with_recorded_conflicts() {
+        let (_tmp, st) = test_state();
+        st.record_conflict(
+            "src/main.rs",
+            vec!["session-a".to_string(), "session-b".to_string()],
+        )
+        .unwrap();
+        st.record_conflict_resolution("src/main.rs", "manual-merge")
+            .unwrap();
+
+        let result = handle_analytics(&st, "conflicts".to_string(), false, "day".to_string());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_handle_analytics_with_conflicts_json_output() {
+        let (_tmp, st) = test_state();
+        st.record_conflict("src/lib.rs", vec!["s1".to_string()])
+            .unwrap();
+
+        let result = handle_analytics(&st, "conflicts".to_string(), true, "day".to_string());
+        assert!(result.is_ok());
+    }
+
+    // ── handle_guard: list confirms rules are returned ─────────────────
+
+    #[test]
+    fn test_handle_guard_list_rules_nonempty() {
+        let (_tmp, st) = test_state();
+        let config = st.config_snapshot().unwrap();
+        let rules = guardrail::list_active_rules(&config.guardrails);
+        assert!(
+            !rules.is_empty(),
+            "default config should have builtin guardrail rules"
+        );
+        assert!(
+            rules.iter().all(|r| r.enabled),
+            "all listed rules should be enabled"
+        );
+    }
+
+    // ── handle_guard: disable then re-enable round trip ────────────────
+
+    #[test]
+    fn test_handle_guard_disable_then_enable_round_trip() {
+        let (_tmp, st) = test_state();
+        let rule_id = "block-force-push-main";
+
+        // Disable
+        let result = handle_guard(
+            &st,
+            None,
+            "any".to_string(),
+            false,
+            None,
+            Some(rule_id.to_string()),
+            false,
+        );
+        assert!(result.is_ok());
+
+        // Verify disabled
+        let config = st.config_snapshot().unwrap();
+        let disabled = config.guardrails.rules.iter().find(|r| r.id == rule_id);
+        assert!(disabled.is_some());
+        assert!(!disabled.unwrap().enabled);
+
+        // Re-enable
+        let result = handle_guard(
+            &st,
+            None,
+            "any".to_string(),
+            false,
+            Some(rule_id.to_string()),
+            None,
+            false,
+        );
+        assert!(result.is_ok());
+    }
+}

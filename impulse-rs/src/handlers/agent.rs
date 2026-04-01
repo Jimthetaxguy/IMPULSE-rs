@@ -143,3 +143,261 @@ pub async fn handle_agent_query(
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn test_state() -> (TempDir, Arc<state::State>) {
+        let tmp = TempDir::new().unwrap();
+        let st = state::State::new(tmp.path().to_path_buf()).unwrap();
+        (tmp, Arc::new(st))
+    }
+
+    // ── handle_agent_configure ─────────────────────────────────────────
+
+    #[test]
+    fn test_handle_agent_configure_set_provider_reflects_in_config() {
+        let (_tmp, st) = test_state();
+        let result = handle_agent_configure(
+            &st,
+            Some("anthropic".to_string()),
+            None,
+            None,
+            None,
+            false,
+            false,
+        );
+        assert!(result.is_ok());
+        let config = st.config_snapshot().unwrap();
+        assert_eq!(config.impulse_agent_provider.as_deref(), Some("anthropic"));
+    }
+
+    #[test]
+    fn test_handle_agent_configure_set_model_reflects_in_config() {
+        let (_tmp, st) = test_state();
+        let result = handle_agent_configure(
+            &st,
+            None,
+            None,
+            Some("claude-3-5-sonnet".to_string()),
+            None,
+            false,
+            false,
+        );
+        assert!(result.is_ok());
+        let config = st.config_snapshot().unwrap();
+        assert_eq!(
+            config.impulse_agent_model.as_deref(),
+            Some("claude-3-5-sonnet")
+        );
+    }
+
+    #[test]
+    fn test_handle_agent_configure_set_harness_reflects_in_config() {
+        let (_tmp, st) = test_state();
+        let result = handle_agent_configure(
+            &st,
+            None,
+            None,
+            None,
+            Some("claude-code".to_string()),
+            false,
+            false,
+        );
+        assert!(result.is_ok());
+        let config = st.config_snapshot().unwrap();
+        assert_eq!(config.impulse_agent_harness.as_deref(), Some("claude-code"));
+    }
+
+    #[test]
+    fn test_handle_agent_configure_invalid_provider_does_not_set() {
+        let (_tmp, st) = test_state();
+        let result = handle_agent_configure(
+            &st,
+            Some("invalid_provider".to_string()),
+            None,
+            None,
+            None,
+            false,
+            false,
+        );
+        assert!(result.is_ok());
+        let config = st.config_snapshot().unwrap();
+        // Invalid provider should not be stored
+        assert!(config.impulse_agent_provider.is_none());
+    }
+
+    #[test]
+    fn test_handle_agent_configure_empty_provider_clears_value() {
+        let (_tmp, st) = test_state();
+        // First set a valid provider
+        handle_agent_configure(
+            &st,
+            Some("openai".to_string()),
+            None,
+            None,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        let config = st.config_snapshot().unwrap();
+        assert_eq!(config.impulse_agent_provider.as_deref(), Some("openai"));
+
+        // Then clear it with empty string
+        let result =
+            handle_agent_configure(&st, Some("".to_string()), None, None, None, false, false);
+        assert!(result.is_ok());
+        let config = st.config_snapshot().unwrap();
+        assert!(config.impulse_agent_provider.is_none());
+    }
+
+    #[test]
+    fn test_handle_agent_configure_auto_review_flag() {
+        let (_tmp, st) = test_state();
+        let result = handle_agent_configure(&st, None, None, None, None, true, false);
+        assert!(result.is_ok());
+        let config = st.config_snapshot().unwrap();
+        assert!(config.impulse_agent_auto_review);
+    }
+
+    #[test]
+    fn test_handle_agent_configure_auto_coordinate_flag() {
+        let (_tmp, st) = test_state();
+        let result = handle_agent_configure(&st, None, None, None, None, false, true);
+        assert!(result.is_ok());
+        let config = st.config_snapshot().unwrap();
+        assert!(config.impulse_agent_auto_coordinate);
+    }
+
+    #[test]
+    fn test_handle_agent_configure_multiple_fields_at_once() {
+        let (_tmp, st) = test_state();
+        let result = handle_agent_configure(
+            &st,
+            Some("anthropic".to_string()),
+            Some("sk-test-key".to_string()),
+            Some("claude-3-opus".to_string()),
+            None,
+            true,
+            true,
+        );
+        assert!(result.is_ok());
+        let config = st.config_snapshot().unwrap();
+        assert_eq!(config.impulse_agent_provider.as_deref(), Some("anthropic"));
+        assert_eq!(config.impulse_agent_model.as_deref(), Some("claude-3-opus"));
+        assert!(config.impulse_agent_auto_review);
+        assert!(config.impulse_agent_auto_coordinate);
+    }
+
+    #[test]
+    fn test_handle_agent_configure_no_args_succeeds() {
+        let (_tmp, st) = test_state();
+        let result = handle_agent_configure(&st, None, None, None, None, false, false);
+        assert!(result.is_ok());
+    }
+
+    // ── handle_agent_status ────────────────────────────────────────────
+
+    #[test]
+    fn test_handle_agent_status_not_configured() {
+        let (_tmp, st) = test_state();
+        let result = handle_agent_status(&st, false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_handle_agent_status_json_not_configured() {
+        let (_tmp, st) = test_state();
+        let result = handle_agent_status(&st, true);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_handle_agent_status_json_after_configure() {
+        let (_tmp, st) = test_state();
+        // Configure a harness so agent resolves
+        handle_agent_configure(
+            &st,
+            None,
+            None,
+            None,
+            Some("claude-code".to_string()),
+            false,
+            false,
+        )
+        .unwrap();
+        let result = handle_agent_status(&st, true);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_handle_agent_status_text_after_configure() {
+        let (_tmp, st) = test_state();
+        handle_agent_configure(
+            &st,
+            None,
+            None,
+            None,
+            Some("claude-code".to_string()),
+            false,
+            false,
+        )
+        .unwrap();
+        let result = handle_agent_status(&st, false);
+        assert!(result.is_ok());
+    }
+
+    // ── handle_agent_query ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_handle_agent_query_not_configured_returns_error() {
+        let (_tmp, st) = test_state();
+        let result = handle_agent_query(&st, "test prompt".to_string(), false).await;
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("not configured"),
+            "Error should mention 'not configured', got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_agent_query_not_configured_json_returns_error() {
+        let (_tmp, st) = test_state();
+        let result = handle_agent_query(&st, "test prompt".to_string(), true).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_handle_agent_query_configured_but_not_ready_returns_error() {
+        let (_tmp, st) = test_state();
+        // Configure with provider but no API key — agent exists but isn't ready
+        handle_agent_configure(
+            &st,
+            Some("anthropic".to_string()),
+            None,
+            None,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        let result = handle_agent_query(&st, "test prompt".to_string(), false).await;
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("not ready") || err_msg.contains("not configured"),
+            "Error should mention readiness issue, got: {}",
+            err_msg
+        );
+    }
+}

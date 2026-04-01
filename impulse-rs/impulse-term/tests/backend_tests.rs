@@ -150,3 +150,199 @@ fn test_output_lines_incremented() {
         lines
     );
 }
+
+// --- Reader thread EOF / natural exit ---
+
+#[test]
+fn test_reader_thread_eof_sets_alive_false() {
+    // Spawn a short-lived command. When the child exits, the reader thread
+    // hits EOF and sets alive=false without an explicit kill().
+    let backend = impulse_term::TerminalBackend::spawn(
+        "echo",
+        &["done".to_string()],
+        None,
+        &[],
+        24,
+        80,
+        Some(100),
+    )
+    .expect("echo spawn should succeed");
+
+    // Give the reader thread time to process EOF after echo exits.
+    thread::sleep(Duration::from_millis(300));
+    assert!(
+        !backend.is_alive(),
+        "backend should report not-alive after child exits naturally"
+    );
+}
+
+// --- has_new_output_since ---
+
+#[test]
+fn test_has_new_output_since_detects_new_data() {
+    let backend = spawn_cat();
+    thread::sleep(Duration::from_millis(50));
+
+    let baseline = backend.output_bytes();
+    assert!(
+        !backend.has_new_output_since(baseline),
+        "no new output yet at baseline"
+    );
+
+    backend.write_input(b"new data\n").unwrap();
+    thread::sleep(Duration::from_millis(100));
+    assert!(
+        backend.has_new_output_since(baseline),
+        "should detect new output after writing"
+    );
+}
+
+// --- read_error_count ---
+
+#[test]
+fn test_read_error_count_zero_on_healthy_pty() {
+    // A healthy PTY should have zero read errors.
+    let backend = spawn_cat();
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        backend.read_error_count(),
+        0,
+        "read_error_count should be 0 on a healthy PTY"
+    );
+}
+
+// --- with_parser / with_parser_mut ---
+
+#[test]
+fn test_with_parser_reads_screen_size() {
+    let backend = spawn_sleep();
+    let (rows, cols) = backend.with_parser(|p| {
+        let screen = p.screen();
+        (screen.size().0, screen.size().1)
+    });
+    assert_eq!(rows, 24, "parser should report 24 rows");
+    assert_eq!(cols, 80, "parser should report 80 cols");
+}
+
+#[test]
+fn test_with_parser_mut_set_scrollback() {
+    let backend = spawn_cat();
+    thread::sleep(Duration::from_millis(50));
+
+    // Use with_parser_mut to change scrollback, then verify via scrollback_len.
+    backend.with_parser_mut(|p| {
+        p.set_scrollback(42);
+    });
+    // scrollback_len reads from the parser — the scrollback lines available
+    // depend on output, but calling set_scrollback should not panic.
+    // Verify the parser is still usable after mut access.
+    let text = backend.screen_text();
+    // screen_text should succeed (parser not poisoned).
+    assert!(
+        text.len() < 100_000,
+        "screen_text should return reasonable content after with_parser_mut"
+    );
+}
+
+// --- scrollback_len and visible_rows ---
+
+#[test]
+fn test_visible_rows_matches_spawn_rows() {
+    let backend = spawn_sleep();
+    assert_eq!(
+        backend.visible_rows(),
+        24,
+        "visible_rows should match the rows passed to spawn"
+    );
+}
+
+#[test]
+fn test_scrollback_len_starts_at_zero() {
+    // Fresh terminal should have zero scrollback lines.
+    let backend = spawn_sleep();
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        backend.scrollback_len(),
+        0,
+        "scrollback_len should be 0 on a fresh terminal with no overflow"
+    );
+}
+
+// --- spawn with working_dir ---
+
+#[test]
+fn test_spawn_with_working_dir() {
+    let tmp = std::env::temp_dir();
+    let backend = impulse_term::TerminalBackend::spawn(
+        "pwd",
+        &[],
+        Some(tmp.as_path()),
+        &[],
+        24,
+        80,
+        Some(100),
+    )
+    .expect("pwd spawn with working_dir should succeed");
+
+    thread::sleep(Duration::from_millis(200));
+    let text = backend.screen_text();
+
+    // On macOS, temp dirs like /var/folders/... resolve to /private/var/folders/...
+    // pwd may output either form. Canonicalize both sides for comparison.
+    let canonical_tmp = tmp.canonicalize().unwrap_or_else(|_| tmp.clone());
+    let canonical_str = canonical_tmp.to_string_lossy();
+    assert!(
+        text.contains(canonical_str.as_ref()),
+        "pwd output should contain the canonical working dir '{}', got: {:?}",
+        canonical_str,
+        text
+    );
+    assert_eq!(
+        backend.working_dir().map(|p| p.to_path_buf()),
+        Some(tmp.clone()),
+        "working_dir() should return the path passed to spawn"
+    );
+}
+
+// --- spawn with env_vars ---
+
+#[test]
+fn test_spawn_with_env_vars() {
+    let backend = impulse_term::TerminalBackend::spawn(
+        "sh",
+        &["-c".to_string(), "echo $IMPULSE_TEST_VAR".to_string()],
+        None,
+        &[("IMPULSE_TEST_VAR", "hello_from_test".to_string())],
+        24,
+        80,
+        Some(100),
+    )
+    .expect("sh spawn with env_vars should succeed");
+
+    thread::sleep(Duration::from_millis(200));
+    let text = backend.screen_text();
+    assert!(
+        text.contains("hello_from_test"),
+        "child should see injected env var, got: {:?}",
+        text
+    );
+}
+
+// --- spawn failure (invalid command) ---
+
+#[test]
+fn test_spawn_invalid_command_returns_error() {
+    let result = impulse_term::TerminalBackend::spawn(
+        "this_command_definitely_does_not_exist_xyz",
+        &[],
+        None,
+        &[],
+        24,
+        80,
+        Some(100),
+    );
+    assert!(
+        result.is_err(),
+        "spawning a nonexistent command should return an Err"
+    );
+}
