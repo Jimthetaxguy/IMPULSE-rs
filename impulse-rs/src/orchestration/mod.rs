@@ -4,7 +4,7 @@
 //! OpenCode, Codex). Manages session creation, file staging, and ordered
 //! injection delivery for the Impulse sidecar workflow.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::Serialize;
 use std::fs;
@@ -134,7 +134,7 @@ pub fn write_handoff(
         notes_block
     );
 
-    fs::write(&handoff_path, content)?;
+    crate::storage::Storage::atomic_write_path(&handoff_path, content.as_bytes())?;
 
     let log_entry = RoutingLogEntry {
         timestamp: Utc::now().to_rfc3339(),
@@ -199,7 +199,7 @@ pub fn sync_context(impulse_dir: &Path, session: Option<&Session>) -> Result<Pat
         )
     };
 
-    fs::write(&current_task_path, content)?;
+    crate::storage::Storage::atomic_write_path(&current_task_path, content.as_bytes())?;
     Ok(current_task_path)
 }
 
@@ -207,7 +207,8 @@ pub fn append_injected_context(path: &Path, block: &str) -> Result<()> {
     if block.trim().is_empty() {
         return Ok(());
     }
-    let mut content = fs::read_to_string(path).unwrap_or_default();
+    let mut content = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read context file {}", path.display()))?;
     if !content.ends_with('\n') {
         content.push('\n');
     }
@@ -215,7 +216,7 @@ pub fn append_injected_context(path: &Path, block: &str) -> Result<()> {
     content.push_str("## Auto-Injected Context\n\n");
     content.push_str(block);
     content.push('\n');
-    fs::write(path, content)?;
+    crate::storage::Storage::atomic_write_path(path, content.as_bytes())?;
     Ok(())
 }
 
@@ -258,6 +259,34 @@ mod tests {
         append_injected_context(&current, "Injected summary block").unwrap();
         let content = std::fs::read_to_string(&current).unwrap();
         assert!(content.contains("Auto-Injected Context"));
+    }
+
+    #[test]
+    fn test_append_injected_context_preserves_existing_content() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("current-task.md");
+        crate::storage::Storage::atomic_write_path(&path, b"# Current Task\n\nOriginal body\n")
+            .unwrap();
+
+        append_injected_context(&path, "Injected summary block").unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.starts_with("# Current Task"));
+        assert!(content.contains("Original body"));
+        assert!(content.contains("## Auto-Injected Context"));
+        assert!(content.contains("Injected summary block"));
+    }
+
+    #[test]
+    fn test_append_injected_context_returns_error_when_read_fails() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("not-a-file");
+        std::fs::create_dir_all(&path).unwrap();
+
+        let err = append_injected_context(&path, "Injected summary block").unwrap_err();
+
+        assert!(err.to_string().contains("Failed to read context file"));
+        assert!(path.is_dir());
     }
 
     #[test]

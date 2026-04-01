@@ -65,10 +65,10 @@ Before implementing, consider alternative approaches. Choose the simplest soluti
 ## Architecture
 
 **Workspace (4 crates):**
-- `impulse-rs/` — main CLI + daemon + TUI (58,664 LOC in src/, 1,002 tests across 226 .rs files)
-- `impulse-rs/impulse-ops/` — operations library (shared types: SupervisorAction, TerminalOpsReport, OpsSnapshot)
-- `impulse-rs/impulse-term/` — custom terminal widget (PTY + vt100 + context bridge, ~2.7K lines, 55 tests)
-- `impulse-rs/impulse-gui/` — egui native workbench (Overview, Terminals, Context, Memory, Artifacts, Settings, ~13K lines, 220 tests)
+- `impulse-rs/` — main CLI + daemon + TUI (59,356 LOC in src/, 999 unit + 26 integration tests across 178 .rs files)
+- `impulse-rs/impulse-ops/` — operations library (shared types: SupervisorAction, TerminalOpsReport, OpsSnapshot, WorkbenchDaemonRequest/Response, DAEMON_PROTOCOL_VERSION)
+- `impulse-rs/impulse-term/` — custom terminal widget (PTY + vt100 + context bridge, ~3.7K lines, 90 tests)
+- `impulse-rs/impulse-gui/` — egui native workbench (Overview, Terminals, Context, Memory, Artifacts, Settings, ~15K lines, 220 tests)
 
 **Dual mode:**
 - **Direct mode** — stateless, per-action (for hooks). Read → process → write → exit.
@@ -232,10 +232,10 @@ Use descriptive names: `test_<function>_<scenario>_<expected_result>`
 
 ### Test Density Targets
 
-| Module Type | Target | Current (as of 2026-03-31) |
+| Module Type | Target | Current (as of 2026-04-01) |
 |-------------|--------|---------|
-| Core (state, daemon, agent) | 3.0 tests/KLOC | ~1.2 (agent harness wiring +24 tests) |
-| Handlers | 2.0 tests/KLOC | ~1.2 |
+| Core (state, daemon, agent) | 3.0 tests/KLOC | ~1.5 (state ~80 tests, agent harness +24, daemon protocol +2) |
+| Handlers | 2.0 tests/KLOC | ~0.8 (38 tests across 6/19 files; 13 files at zero) |
 | Tooling | 2.0 tests/KLOC | ~17.1 (84 tests, 4,920 LOC) |
 | UI/TUI | 1.0 tests/KLOC | ~0.4 |
 
@@ -243,8 +243,8 @@ Use descriptive names: `test_<function>_<scenario>_<expected_result>`
 
 **Why core is low (1.2/KLOC):** Core modules are critical but large. Trend toward 3.0/KLOC by adding: session lifecycle corner cases (rapid start/end, duplicate IDs), daemon reconnection/recovery (socket errors), agent harness error cases (missing context, malformed JSON).
 
-**Why handlers are low (1.2/KLOC):** 13 of 17 handler files have zero tests. Priority order: (1) `daemon_dispatch.rs`, (2) `direct_dispatch.rs`, (3) `agent.rs`, (4) `guard.rs`, (5) `injection_handlers.rs`.
-| Integration | Covers every CLI command | 11 tests |
+**Why handlers are low (1.2/KLOC):** 13 of 19 handler files have zero tests. 6 files have tests: `session.rs` (12), `config.rs` (11), `memory.rs` (5), `describe.rs` (4), `mod.rs` (4), `system.rs` (2). Priority order for the untested 13: (1) `daemon_dispatch.rs` (450 LOC, routes all IPC), (2) `direct_dispatch.rs` (465 LOC, routes all CLI), (3) `agent.rs` (145 LOC, agent config/query), (4) `guard.rs` (204 LOC, action guardrails), (5) `injection_handlers.rs` (209 LOC, context injection), (6) `common.rs` (379 LOC, shared helpers), (7) `stewardship_handlers.rs` (365 LOC), (8) `tooling_handlers.rs` (270 LOC), (9) `build.rs` (256 LOC), (10) `semantic_diff_handlers.rs` (164 LOC), (11) `office.rs` (142 LOC), (12) `plugin_handlers.rs` (95 LOC), (13) `retrieval.rs` (84 LOC).
+| Integration | Covers CLI commands + daemon IPC | 26 tests |
 
 New modules must ship with tests meeting the target density. Existing modules should trend toward targets during regular development.
 
@@ -252,8 +252,8 @@ New modules must ship with tests meeting the target density. Existing modules sh
 
 | Module | Risk | Why |
 |--------|------|-----|
-| `src/state/` | HIGH | Persistence layer — corruption means data loss. Well-tested (47 tests covering conflict detection, audit trail, config corruption, session lifecycle). |
-| `src/handlers/` | MEDIUM | User-facing CLI paths — 13 of 17 files have no tests. Priority: `daemon_dispatch`, `direct_dispatch`, `agent`, `guard`, `injection_handlers`. |
+| `src/state/` | HIGH | Persistence layer — corruption means data loss. Well-tested (~80 tests covering conflict detection, audit trail, config corruption, session lifecycle, config keys). |
+| `src/handlers/` | HIGH | User-facing CLI paths — 13 of 19 files have zero tests. Priority: `daemon_dispatch`, `direct_dispatch`, `agent`, `guard`, `injection_handlers`, `common`. |
 | `src/error.rs` | LOW | All 8 `AgentError` variants have Display tests. |
 | `src/ui/` | MEDIUM | TUI rendering — complex layout logic, limited coverage. |
 
@@ -318,6 +318,16 @@ if id.contains("..") {
 }
 ```
 
+**Audit checklist for error handling compliance:**
+```bash
+# Find bare ? on I/O operations (should have .context())
+cargo clippy 2>&1 | grep -i "unwrap\|expect"
+# Find bare fs:: calls without .context()
+git grep -n "fs::read\|fs::write\|fs::remove" -- "*.rs" | grep -v "context\|test"
+# Find unwrap() outside tests and main
+git grep -n "\.unwrap()" -- "*.rs" | grep -v "#\[test\]\|mod tests\|fn main\|impl Default"
+```
+
 ---
 
 ## Build & Test
@@ -327,6 +337,16 @@ if id.contains("..") {
 Run before every commit (copy-paste ready):
 ```bash
 cd impulse-rs && cargo build && cargo test && cargo clippy -- -D warnings && cargo fmt --check
+```
+
+**Expected output (update when counts change):**
+- `cargo test`: 5 `test result:` lines totaling 1,025 passed, 3 ignored, 0 failed
+- `cargo clippy`: 0 warnings
+- `cargo fmt --check`: no output (clean)
+
+**Quick health check** (for mid-session verification):
+```bash
+cd impulse-rs && cargo check && cargo test --lib -- --quiet 2>&1 | tail -5
 ```
 
 ### Full Workspace
@@ -341,13 +361,22 @@ cargo fmt --check
 
 # Individual crates
 cd impulse-term && cargo build && cargo test && cargo clippy -- -D warnings
-cd impulse-gui && cargo build && cargo clippy -- -D warnings
+cd impulse-gui && cargo build && cargo test && cargo clippy -- -D warnings
 ```
+
+### Test Count Verification
+
+To verify test counts match expectations:
+```bash
+cd impulse-rs && cargo test 2>&1 | grep "test result:" | awk '{sum += $4} END {print "Total: " sum " passed"}'
+```
+Expected: 1,025 passed. If this changes, update both this section and the Architecture section.
 
 ### Pre-Commit Checklist
 
 1. `cargo build` — zero warnings
-2. `cargo test` — all tests pass (1,002 expected)
+2. `cargo test` — all tests pass (1,025 workspace total expected: 999+26 impulse-rs, 4 ops, 90 term, 220 gui; verify with `cargo test 2>&1 | grep "test result:"`)
+   - **If count changes**: update this line and the Architecture section above
 3. `cargo clippy -- -D warnings` — zero warnings
 4. `cargo fmt --check` — zero diffs
 5. No new `#[allow(...)]` without justification comment

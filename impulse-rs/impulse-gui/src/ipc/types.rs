@@ -3,88 +3,19 @@
 //! The daemon uses `#[serde(tag = "type", content = "data")]` internally-tagged
 //! enums. Messages are newline-delimited JSON over a Unix domain socket.
 
-use serde::{Deserialize, Serialize};
-
 // ---------------------------------------------------------------------------
-// Request / Response envelopes (must match daemon exactly)
+// Request / Response envelopes (shared with daemon via impulse-ops)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data")]
-pub enum DaemonRequest {
-    Ping,
-    Status,
-    ListSessions,
-    CreateSession {
-        name: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        platform: Option<String>,
-    },
-    EndSession {
-        session_id: String,
-        summary: String,
-    },
-    TrackFile {
-        session_id: String,
-        file_path: String,
-    },
-    InvokeTool {
-        name: String,
-        #[serde(default)]
-        params: serde_json::Value,
-    },
-    ToolSchema,
-    GetOpsSnapshot,
-    SubscribeOps {
-        #[serde(default)]
-        since_seq: Option<u64>,
-    },
-    PublishTerminalOps {
-        report: impulse_ops::TerminalOpsReport,
-    },
-    GetSupervisorPermissions,
-    SupervisorChat {
-        prompt: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        context: Option<String>,
-    },
-    RunSupervisorAction {
-        action: impulse_ops::SupervisorAction,
-    },
-    RunArtifactAction {
-        artifact_id: String,
-        action_id: String,
-        #[serde(default)]
-        params: serde_json::Value,
-    },
-    GuardList,
-    /// Get conflict resolution history (Task 20)
-    GetConflictHistory,
-    /// Clear resolved conflicts (Task 20)
-    ClearResolvedConflicts,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data")]
-pub enum DaemonResponse {
-    Ok {
-        result: serde_json::Value,
-    },
-    Error {
-        message: String,
-    },
-    ConflictCheck {
-        has_conflict: bool,
-        conflicting_sessions: Vec<String>,
-    },
-}
+pub use impulse_ops::WorkbenchDaemonRequest as DaemonRequest;
+pub use impulse_ops::WorkbenchDaemonResponse as DaemonResponse;
 
 // ---------------------------------------------------------------------------
 // GUI domain types (deserialized from daemon JSON payloads)
 // ---------------------------------------------------------------------------
 
 /// Protocol version expected by this GUI build. Must match daemon's PROTOCOL_VERSION.
-pub const EXPECTED_PROTOCOL_VERSION: u32 = 2;
+pub const EXPECTED_PROTOCOL_VERSION: u32 = impulse_ops::DAEMON_PROTOCOL_VERSION;
 
 /// Daemon status summary.
 #[derive(Debug, Clone, Default)]

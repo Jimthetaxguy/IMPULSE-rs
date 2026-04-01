@@ -103,7 +103,7 @@ const USER_TEXT: egui::Color32 = egui::Color32::from_rgb(0xe0, 0xd0, 0xff);
 pub fn render_messages(
     ui: &mut egui::Ui,
     messages: &[ChatMessage],
-    scroll_to_bottom: bool,
+    _scroll_to_bottom: bool,
     is_thinking: bool,
 ) -> Vec<PanelAction> {
     let scroll_id = ui.id().with("agent_chat_scroll");

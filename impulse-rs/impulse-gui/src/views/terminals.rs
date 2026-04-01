@@ -1308,19 +1308,6 @@ fn render_token_budget(
         });
 }
 
-/// Map usage_fraction to display icon and color.
-fn context_tier_display_from(usage_fraction: f32) -> (&'static str, egui::Color32) {
-    if usage_fraction < 0.45 {
-        ("\u{25CF}", colors::GREEN) // ● green
-    } else if usage_fraction < 0.60 {
-        ("\u{25D0}", colors::YELLOW) // ◐ yellow
-    } else if usage_fraction < 0.80 {
-        ("\u{25D1}", colors::RED) // ◑ red
-    } else {
-        ("\u{25CB}", colors::RED) // ○ red
-    }
-}
-
 fn default_shell() -> &'static str {
     #[cfg(unix)]
     {
@@ -1421,9 +1408,7 @@ fn spawn_anim_params(created_at: Instant) -> Option<(f32, f32)> {
 /// Compute tab-switch fade-in opacity if still animating.
 /// Returns opacity [0-1] if still animating, None if done.
 fn tab_switch_fade_opacity(last_switch: Option<Instant>) -> Option<f32> {
-    let Some(switched_at) = last_switch else {
-        return None;
-    };
+    let switched_at = last_switch?;
     let elapsed = switched_at.elapsed().as_millis() as f32 / TAB_SWITCH_ANIM_MS as f32;
     if elapsed >= 1.0 {
         return None;
@@ -1464,14 +1449,6 @@ fn load_recent_insights(path: &Path) -> Vec<(String, String)> {
         .take(3)
         .collect()
 }
-
-const WELCOME_BANNER: &str = r"
-  ___ __  __ ____  _   _ _     ____  _____
- |_ _|  \/  |  _ \| | | | |   / ___|| ____|
-  | || |\/| | |_) | | | | |   \___ \|  _|
-  | || |  | |  __/| |_| | |___ ___) | |___
- |___|_|  |_|_|    \___/|_____|____/|_____|
-";
 
 #[cfg(test)]
 mod tests {

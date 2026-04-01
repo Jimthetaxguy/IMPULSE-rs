@@ -289,7 +289,7 @@ mod tests {
 
         let renderer = TerminalRenderer::new(13.0);
         let theme = TerminalTheme::default();
-        let runs = renderer.build_runs(&screen, 0, cols, &theme);
+        let runs = renderer.build_runs(screen, 0, cols, &theme);
 
         // First run should start with 'X' at col 0. Subsequent empty cells
         // extend the run since they share the same default styling.
@@ -308,7 +308,7 @@ mod tests {
 
         let renderer = TerminalRenderer::new(13.0);
         let theme = TerminalTheme::default();
-        let runs = renderer.build_runs(&screen, 0, cols, &theme);
+        let runs = renderer.build_runs(screen, 0, cols, &theme);
 
         // Should produce multiple runs: red A, then spaces, then B.
         assert!(runs.len() >= 2);
@@ -329,7 +329,7 @@ mod tests {
         let theme = TerminalTheme::default();
 
         // This should not panic — the fix replaces unwrap() with if-let.
-        let runs = renderer.build_runs(&screen, 0, cols, &theme);
+        let runs = renderer.build_runs(screen, 0, cols, &theme);
 
         // Empty row should produce at least one run (the empty cell default).
         assert!(!runs.is_empty());

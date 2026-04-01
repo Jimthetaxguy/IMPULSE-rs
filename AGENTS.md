@@ -106,8 +106,10 @@ cargo fmt --check
 
 All changes must pass before any commit:
 ```bash
-cargo build && cargo test && cargo clippy -- -D warnings && cargo fmt --check
+cd impulse-rs && cargo build && cargo test && cargo clippy -- -D warnings && cargo fmt --check
 ```
+
+**Expected (2026-04-01):** 1,025 tests passed, 0 failed, 3 ignored. Update counts in this file, CLAUDE.md, and RUST-CANONICAL-CONTRACT.md when they change.
 
 ### Code Requirements
 
@@ -147,19 +149,25 @@ Use descriptive names: `test_<function>_<scenario>_<expected_result>`
 
 ### Test Density Targets
 
-| Module Category | Target | Why |
-|---|---|---|
-| **Core** (state, daemon, agent) | 3.0 tests/KLOC | Data persistence, IPC safety |
-| **Handlers** (CLI dispatch) | 2.0 tests/KLOC | User-facing entrypoints |
-| **Tooling** (dynamic tools) | 2.0 tests/KLOC | Capability enforcement, security |
-| **UI/TUI** (terminal) | 1.0 tests/KLOC | Layout/rendering correctness |
+| Module Category | Target | Current (2026-04-01) | Why |
+|---|---|---|---|
+| **Core** (state, daemon, agent) | 3.0 tests/KLOC | ~1.5 | Data persistence, IPC safety |
+| **Handlers** (CLI dispatch) | 2.0 tests/KLOC | ~0.8 (13/19 files untested) | User-facing entrypoints |
+| **Tooling** (dynamic tools) | 2.0 tests/KLOC | ~17.1 | Capability enforcement, security |
+| **UI/TUI** (terminal) | 1.0 tests/KLOC | ~0.4 | Layout/rendering correctness |
+| **Integration** | Every stable CLI command | 26 tests | End-to-end verification |
 
 New modules must ship meeting the target. Existing modules should trend toward targets.
 
-High-risk modules (prioritize coverage):
-- `src/state/` — persistence layer, corruption means data loss
-- `src/handlers/daemon_dispatch.rs` — routes all IPC
-- `src/handlers/direct_dispatch.rs` — routes all CLI commands
+**Workspace totals (2026-04-01):** 1,025 tests across 4 crates (impulse-rs: 999+26, ops: 4, term: 90, gui: 220).
+
+High-risk untested modules (prioritize coverage):
+- `src/handlers/daemon_dispatch.rs` (450 LOC) — routes all IPC, zero tests
+- `src/handlers/direct_dispatch.rs` (465 LOC) — routes all CLI commands, zero tests
+- `src/handlers/agent.rs` (145 LOC) — agent configuration and query, zero tests
+- `src/handlers/guard.rs` (204 LOC) — action guardrails with `process::exit`, zero tests
+- `src/handlers/injection_handlers.rs` (209 LOC) — context injection routing, zero tests
+- `src/handlers/common.rs` (379 LOC) — shared helpers used by all handlers, zero tests
 
 ### Test Pattern Examples
 
@@ -270,8 +278,18 @@ fn round_trip_my_type() {
 - `#[serde(default)]` fields: include in test, verify the default is sensible
 - `#[serde(flatten)]` fields: test that flat JSON still deserializes (catches restructure breakage)
 - Multiple formats: test each format separately if type serializes to both JSON and TOML
+- `#[serde(rename_all = "...")]`: test with both Rust field names and serialized names to catch rename drift
 
 **Why:** Catches field renames, missing defaults, and `#[serde(flatten)]` breakage that would silently corrupt persisted data.
+
+**Audit for missing round-trip tests:**
+```bash
+# Find Serialize+Deserialize types
+git grep -l "Serialize.*Deserialize\|Deserialize.*Serialize" -- "*.rs" | sort
+# Find existing round-trip tests
+git grep -l "round_trip\|roundtrip\|serde_json::to_string.*serde_json::from_str" -- "*.rs" | sort
+# Diff the two lists to find gaps
+```
 
 ### Property-Based Testing
 

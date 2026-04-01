@@ -9,7 +9,7 @@ use crate::context_lifecycle::types::ExtractedInsight;
 /// Protocol version — increment when adding new request/response variants
 /// or making breaking changes to existing ones. GUI checks this on connect
 /// and warns if it doesn't match its expected version.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = impulse_ops::DAEMON_PROTOCOL_VERSION;
 
 pub(crate) const SOCKET_NAME: &str = "impulse.sock";
 
@@ -720,6 +720,126 @@ mod tests {
                 assert!(response.contains("file not found"));
             }
             other => panic!("expected AgentSpecializedResult, got {:?}", other),
+        }
+    }
+
+    fn assert_shared_request_compatible(request: impulse_ops::WorkbenchDaemonRequest) {
+        let json = serde_json::to_string(&request).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(request_type_name(&parsed), request_variant_name(&request));
+    }
+
+    fn request_variant_name(request: &impulse_ops::WorkbenchDaemonRequest) -> &'static str {
+        match request {
+            impulse_ops::WorkbenchDaemonRequest::Ping => "Ping",
+            impulse_ops::WorkbenchDaemonRequest::Status => "Status",
+            impulse_ops::WorkbenchDaemonRequest::ListSessions => "ListSessions",
+            impulse_ops::WorkbenchDaemonRequest::CreateSession { .. } => "CreateSession",
+            impulse_ops::WorkbenchDaemonRequest::EndSession { .. } => "EndSession",
+            impulse_ops::WorkbenchDaemonRequest::TrackFile { .. } => "TrackFile",
+            impulse_ops::WorkbenchDaemonRequest::InvokeTool { .. } => "InvokeTool",
+            impulse_ops::WorkbenchDaemonRequest::ToolSchema => "ToolSchema",
+            impulse_ops::WorkbenchDaemonRequest::GetOpsSnapshot => "GetOpsSnapshot",
+            impulse_ops::WorkbenchDaemonRequest::SubscribeOps { .. } => "SubscribeOps",
+            impulse_ops::WorkbenchDaemonRequest::PublishTerminalOps { .. } => "PublishTerminalOps",
+            impulse_ops::WorkbenchDaemonRequest::GetSupervisorPermissions => {
+                "GetSupervisorPermissions"
+            }
+            impulse_ops::WorkbenchDaemonRequest::SupervisorChat { .. } => "SupervisorChat",
+            impulse_ops::WorkbenchDaemonRequest::RunSupervisorAction { .. } => {
+                "RunSupervisorAction"
+            }
+            impulse_ops::WorkbenchDaemonRequest::RunArtifactAction { .. } => "RunArtifactAction",
+            impulse_ops::WorkbenchDaemonRequest::GuardList => "GuardList",
+            impulse_ops::WorkbenchDaemonRequest::GetConflictHistory => "GetConflictHistory",
+            impulse_ops::WorkbenchDaemonRequest::ClearResolvedConflicts => "ClearResolvedConflicts",
+        }
+    }
+
+    #[test]
+    fn test_shared_workbench_requests_deserialize_into_daemon_protocol() {
+        assert_shared_request_compatible(impulse_ops::WorkbenchDaemonRequest::Ping);
+        assert_shared_request_compatible(impulse_ops::WorkbenchDaemonRequest::Status);
+        assert_shared_request_compatible(impulse_ops::WorkbenchDaemonRequest::ListSessions);
+        assert_shared_request_compatible(impulse_ops::WorkbenchDaemonRequest::CreateSession {
+            name: "demo".into(),
+            platform: Some("claude".into()),
+        });
+        assert_shared_request_compatible(impulse_ops::WorkbenchDaemonRequest::EndSession {
+            session_id: "sess-1".into(),
+            summary: "done".into(),
+        });
+        assert_shared_request_compatible(impulse_ops::WorkbenchDaemonRequest::TrackFile {
+            session_id: "sess-1".into(),
+            file_path: "src/main.rs".into(),
+        });
+        assert_shared_request_compatible(impulse_ops::WorkbenchDaemonRequest::InvokeTool {
+            name: "memory_search".into(),
+            params: serde_json::json!({"query": "daemon"}),
+        });
+        assert_shared_request_compatible(impulse_ops::WorkbenchDaemonRequest::ToolSchema);
+        assert_shared_request_compatible(impulse_ops::WorkbenchDaemonRequest::GetOpsSnapshot);
+        assert_shared_request_compatible(impulse_ops::WorkbenchDaemonRequest::SubscribeOps {
+            since_seq: Some(7),
+        });
+        assert_shared_request_compatible(impulse_ops::WorkbenchDaemonRequest::PublishTerminalOps {
+            report: impulse_ops::TerminalOpsReport {
+                source_id: "gui".into(),
+                published_at: "2026-04-01T00:00:00Z".into(),
+                agents: Vec::new(),
+                context: impulse_ops::ContextHealthSummary::default(),
+                interventions: Vec::new(),
+            },
+        });
+        assert_shared_request_compatible(
+            impulse_ops::WorkbenchDaemonRequest::GetSupervisorPermissions,
+        );
+        assert_shared_request_compatible(impulse_ops::WorkbenchDaemonRequest::SupervisorChat {
+            prompt: "status?".into(),
+            context: Some("operator".into()),
+        });
+        assert_shared_request_compatible(
+            impulse_ops::WorkbenchDaemonRequest::RunSupervisorAction {
+                action: impulse_ops::SupervisorAction::FocusAgent {
+                    agent_id: "agent-1".into(),
+                    session_id: None,
+                },
+            },
+        );
+        assert_shared_request_compatible(impulse_ops::WorkbenchDaemonRequest::RunArtifactAction {
+            artifact_id: "artifact-1".into(),
+            action_id: "review".into(),
+            params: serde_json::json!({}),
+        });
+        assert_shared_request_compatible(impulse_ops::WorkbenchDaemonRequest::GuardList);
+        assert_shared_request_compatible(impulse_ops::WorkbenchDaemonRequest::GetConflictHistory);
+        assert_shared_request_compatible(
+            impulse_ops::WorkbenchDaemonRequest::ClearResolvedConflicts,
+        );
+    }
+
+    #[test]
+    fn test_shared_workbench_responses_roundtrip_from_daemon_protocol() {
+        for response in [
+            DaemonResponse::Ok {
+                result: serde_json::json!({"pong": true}),
+            },
+            DaemonResponse::Error {
+                message: "boom".into(),
+            },
+            DaemonResponse::ConflictCheck {
+                has_conflict: true,
+                conflicting_sessions: vec!["a".into(), "b".into()],
+            },
+        ] {
+            let json = serde_json::to_string(&response).unwrap();
+            let parsed: impulse_ops::WorkbenchDaemonResponse = serde_json::from_str(&json).unwrap();
+            let reparsed: DaemonResponse =
+                serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+            assert_eq!(
+                std::mem::discriminant(&response),
+                std::mem::discriminant(&reparsed)
+            );
         }
     }
 }

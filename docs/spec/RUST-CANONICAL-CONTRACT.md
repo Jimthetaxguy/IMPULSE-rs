@@ -2,7 +2,7 @@
 title: Rust Canonical Product Contract
 description: Authoritative product contract for Impulse based on impulse-rs
 version: '1.5'
-updated: 2026-03-31
+updated: 2026-04-01
 type: specification
 category: core
 phase: all
@@ -299,13 +299,15 @@ When adding/changing CLI commands, hooks, state files, or roadmap stage definiti
 
 ### Test Density Targets
 
-| Module Category | Target (tests/KLOC) | Current (2026-03-31) |
-|----------------|---------------------|----------------------|
-| Core (state, daemon, agent) | ≥3.0 | ~1.2 (agent harness +24 tests) |
-| Handlers | ≥2.0 | ~1.2 |
-| UI/TUI | ≥1.0 | ~0.4 |
-| Tooling | ≥2.0 | ~17.1 (84 tests, 4,920 LOC) |
-| Integration | Every stable CLI command | 11 tests |
+| Module Category | Target (tests/KLOC) | Current (2026-04-01) | Gap |
+|----------------|---------------------|----------------------|-----|
+| Core (state, daemon, agent) | ≥3.0 | ~1.5 (state ~80, agent +24, daemon +2) | HIGH — need ~2x more |
+| Handlers | ≥2.0 | ~0.8 (38 tests in 6/19 files; 13 files at zero) | CRITICAL — 68% untested |
+| UI/TUI | ≥1.0 | ~0.4 | MEDIUM — layout/rendering |
+| Tooling | ≥2.0 | ~17.1 (84 tests, 4,920 LOC) | MET — well above target |
+| Integration | Every stable CLI command | 26 tests | PARTIAL — expanding |
+
+**Workspace totals (2026-04-01):** 79,194 LOC, 1,025 tests (999+26 impulse-rs, 4 ops, 90 term, 220 gui), 227 .rs files across 4 crates.
 
 ### Required Test Patterns
 
@@ -360,9 +362,40 @@ Any `unsafe` block requires all three: (1) `// SAFETY:` comment documenting ever
 
 All changes must pass before commit:
 ```bash
-cargo build && cargo test && cargo clippy -- -D warnings && cargo fmt --check
+cd impulse-rs && cargo build && cargo test && cargo clippy -- -D warnings && cargo fmt --check
 ```
 Exit on first failure. Do not skip or bypass any step.
+
+**Expected outputs (update when counts change):**
+- `cargo test`: 1,025 passed, 3 ignored, 0 failed (5 test result lines)
+- `cargo clippy`: 0 warnings
+- `cargo fmt --check`: no output
+
+### Policy Compliance Audit Commands
+
+Run periodically to detect policy drift:
+
+```bash
+# 1. Find bare ? on I/O (should have .context())
+git grep -n "fs::read\|fs::write\|fs::remove" -- "*.rs" | grep -v "context\|test\|// "
+
+# 2. Find unwrap() outside tests/main (violation of Principle 1)
+git grep -n "\.unwrap()" -- "*.rs" | grep -v "#\[test\]\|mod tests\|fn main\|impl Default\|// unwrap:"
+
+# 3. Find #[allow] missing required comments
+git grep -n "#\[allow" -- "*.rs" | grep -v "// dead_code:\|// TODO:\|// clippy:\|// serde:\|cfg_attr"
+
+# 4. Find Serialize+Deserialize types missing round-trip tests
+# Compare: types declaring derive vs files with round-trip tests
+git grep -c "Serialize.*Deserialize\|Deserialize.*Serialize" -- "*.rs"
+git grep -c "round_trip\|roundtrip" -- "*.rs"
+
+# 5. Find handler files without mod tests
+for f in src/handlers/*.rs; do grep -qL "mod tests" "$f" && echo "UNTESTED: $f"; done
+
+# 6. Verify test count hasn't regressed
+cargo test 2>&1 | grep "test result:" | awk '{sum += $4} END {print "Total: " sum " (expected: 1025)"}'
+```
 
 ### egui Import Convention
 

@@ -136,7 +136,7 @@ mod tests {
 
         let lines: Vec<&str> = content.lines().collect();
         assert!(
-            lines.len() >= 1,
+            !lines.is_empty(),
             "Expected at least one JSONL record, got {} lines",
             lines.len()
         );

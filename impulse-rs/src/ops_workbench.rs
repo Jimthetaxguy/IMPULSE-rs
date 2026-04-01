@@ -646,7 +646,8 @@ fn load_genome(base_path: &Path) -> Result<GenomeFile> {
         return Ok(GenomeFile::default());
     }
     let content = fs::read_to_string(&genome_path)?;
-    Ok(serde_json::from_str(&content).unwrap_or_default())
+    serde_json::from_str(&content)
+        .with_context(|| format!("failed to parse {}", genome_path.display()))
 }
 
 fn load_live_insights(base_path: &Path, limit: usize) -> Result<Vec<InsightRecord>> {
@@ -958,6 +959,18 @@ mod tests {
         );
         assert!(!snapshot.agents[0].ephemeral);
         assert_eq!(snapshot.agents[0].context.tier, "essential");
+    }
+
+    #[tokio::test]
+    async fn test_build_snapshot_returns_error_for_malformed_genome() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(temp.path().join("GENOME.md"), "{not-json").unwrap();
+
+        let state = crate::state::State::new(temp.path().to_path_buf()).unwrap();
+        let shared = std::sync::Arc::new(state);
+
+        let err = build_snapshot(&shared, &[]).await.unwrap_err();
+        assert!(err.to_string().contains("failed to parse"));
     }
 
     #[tokio::test]

@@ -100,10 +100,6 @@ impl CommandPalette {
         }
     }
 
-    pub fn is_open(&self) -> bool {
-        self.open
-    }
-
     pub fn open(&mut self) {
         self.open = true;
         self.query.clear();
@@ -156,10 +152,10 @@ impl CommandPalette {
                 ui.add_space(4.0);
 
                 // Search input.
-                let input_response = ui
-                    .text_edit_singleline(&mut self.query)
-                    .hint_text("Type a command...")
-                    .request_focus();
+                let input_response = ui.add(
+                    egui::TextEdit::singleline(&mut self.query).hint_text("Type a command..."),
+                );
+                input_response.request_focus();
 
                 // Reset selection when query changes.
                 if input_response.changed() {
@@ -187,23 +183,24 @@ impl CommandPalette {
                             let label = cmd.label();
                             let shortcut = cmd.shortcut().unwrap_or("");
 
-                            let row_rect = ui.allocate_rect(
+                            let row_response = ui.allocate_rect(
                                 egui::Rect::from_min_size(
                                     ui.cursor().min,
                                     egui::vec2(ui.available_width(), row_height),
                                 ),
                                 egui::Sense::click(),
                             );
+                            let row_rect = row_response.rect;
 
                             if is_selected {
                                 ui.painter().rect_filled(row_rect, 2.0, colors::HOVER);
                             }
 
-                            if row_rect.contains_pointer()() {
-                                if ui.input(|i| i.pointer.any_click()) {
-                                    chosen = Some(cmd);
-                                    self.close();
-                                }
+                            if row_response.contains_pointer()
+                                && ui.input(|i| i.pointer.any_click())
+                            {
+                                chosen = Some(cmd);
+                                self.close();
                             }
 
                             // Label column.
@@ -229,7 +226,7 @@ impl CommandPalette {
                                     egui::pos2(row_rect.max.x - 8.0, row_rect.center().y),
                                     egui::Align2::RIGHT_CENTER,
                                     shortcut,
-                                    egui::FontId::proportional(12.0).monospace(),
+                                    egui::FontId::monospace(12.0),
                                     colors::TEXT_DIM,
                                 );
                             }
@@ -254,11 +251,9 @@ impl CommandPalette {
                     (self.selected_index + 1).min(filtered.len().saturating_sub(1));
             } else if input.key_pressed(egui::Key::ArrowUp) {
                 self.selected_index = self.selected_index.saturating_sub(1);
-            } else if input.key_pressed(egui::Key::Enter) {
-                if !filtered.is_empty() {
-                    chosen = Some(filtered[self.selected_index]);
-                    self.close();
-                }
+            } else if input.key_pressed(egui::Key::Enter) && !filtered.is_empty() {
+                chosen = Some(filtered[self.selected_index]);
+                self.close();
             }
         });
 

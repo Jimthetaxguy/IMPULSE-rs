@@ -236,8 +236,8 @@ impl ImpulseApp {
     }
 
     fn handle_command_palette(&mut self, ctx: &egui::Context) {
-        use crate::command_palette::Command;
         use crate::views::ViewId;
+        use crate::widgets::command_palette::Command;
 
         if let Some(cmd) = self.command_palette.show(ctx) {
             match cmd {

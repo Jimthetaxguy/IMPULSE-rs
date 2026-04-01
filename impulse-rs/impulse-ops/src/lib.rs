@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Shared daemon protocol version for GUI/operator workbench compatibility.
+pub const DAEMON_PROTOCOL_VERSION: u32 = 2;
+
 #[derive(Debug, thiserror::Error)]
 pub enum OpsError {
     #[error("io error: {0}")]
@@ -13,6 +16,72 @@ pub enum OpsError {
     Json(#[from] serde_json::Error),
     #[error("missing artifact parent directory for {0}")]
     MissingParent(PathBuf),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", content = "data")]
+pub enum WorkbenchDaemonRequest {
+    Ping,
+    Status,
+    ListSessions,
+    CreateSession {
+        name: String,
+        platform: Option<String>,
+    },
+    EndSession {
+        session_id: String,
+        summary: String,
+    },
+    TrackFile {
+        session_id: String,
+        file_path: String,
+    },
+    InvokeTool {
+        name: String,
+        #[serde(default)]
+        params: serde_json::Value,
+    },
+    ToolSchema,
+    GetOpsSnapshot,
+    SubscribeOps {
+        #[serde(default)]
+        since_seq: Option<u64>,
+    },
+    PublishTerminalOps {
+        report: TerminalOpsReport,
+    },
+    GetSupervisorPermissions,
+    SupervisorChat {
+        prompt: String,
+        context: Option<String>,
+    },
+    RunSupervisorAction {
+        action: SupervisorAction,
+    },
+    RunArtifactAction {
+        artifact_id: String,
+        action_id: String,
+        #[serde(default)]
+        params: serde_json::Value,
+    },
+    GuardList,
+    GetConflictHistory,
+    ClearResolvedConflicts,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", content = "data")]
+pub enum WorkbenchDaemonResponse {
+    Ok {
+        result: serde_json::Value,
+    },
+    Error {
+        message: String,
+    },
+    ConflictCheck {
+        has_conflict: bool,
+        conflicting_sessions: Vec<String>,
+    },
 }
 
 pub fn sanitize_id(input: &str) -> String {

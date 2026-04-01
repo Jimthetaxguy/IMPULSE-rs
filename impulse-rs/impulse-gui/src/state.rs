@@ -927,29 +927,37 @@ mod tests {
 
     #[test]
     fn test_status_poll_duration() {
-        let mut s = RuntimeSettings::default();
-        s.poll_interval_secs = 10;
+        let s = RuntimeSettings {
+            poll_interval_secs: 10,
+            ..RuntimeSettings::default()
+        };
         assert_eq!(s.status_poll(), Duration::from_secs(10));
     }
 
     #[test]
     fn test_status_poll_minimum_one_second() {
-        let mut s = RuntimeSettings::default();
-        s.poll_interval_secs = 0;
+        let s = RuntimeSettings {
+            poll_interval_secs: 0,
+            ..RuntimeSettings::default()
+        };
         assert_eq!(s.status_poll(), Duration::from_secs(1));
     }
 
     #[test]
     fn test_context_tick_interval_duration() {
-        let mut s = RuntimeSettings::default();
-        s.inject_interval_secs = 15;
+        let s = RuntimeSettings {
+            inject_interval_secs: 15,
+            ..RuntimeSettings::default()
+        };
         assert_eq!(s.context_tick_interval(), Duration::from_secs(15));
     }
 
     #[test]
     fn test_context_tick_minimum_one_second() {
-        let mut s = RuntimeSettings::default();
-        s.inject_interval_secs = 0;
+        let s = RuntimeSettings {
+            inject_interval_secs: 0,
+            ..RuntimeSettings::default()
+        };
         assert_eq!(s.context_tick_interval(), Duration::from_secs(1));
     }
 
