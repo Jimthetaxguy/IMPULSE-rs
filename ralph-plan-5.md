@@ -55,17 +55,17 @@ Transform Impulse from a codebase with strong architecture but uneven test cover
 
 | Loop | Focus | Phase | Type | Status |
 |------|-------|-------|------|--------|
-| 1 | Commit: Stage and commit 12 uncommitted files | Commit + TUI | commit | pending |
-| 2 | TUI Correctness: Fix unwrap in renderer hot path (impulse-term/renderer.rs) | Commit + TUI | work | pending |
-| 3 | TUI Correctness: Safe env var manipulation (impulse-term/panel.rs) | Commit + TUI | work | pending |
-| 4 | TUI Correctness: Backend.rs test coverage (312 LOC, zero tests) | Commit + TUI | work | pending |
-| 5 | Handler Tests: guard.rs (204 LOC — action guardrails with process::exit) | Commit + TUI | work | pending |
-| 6 | Handler Tests: agent.rs (145 LOC — agent config/query) | Commit + TUI | work | pending |
-| 7 | Handler Tests: injection_handlers.rs (209 LOC — context injection) | Commit + TUI | work | pending |
-| **8** | **Planning Checkpoint: Review Phase 1 metrics, plan Phase 2** | **Checkpoint** | **planning** | **pending** |
-| 9 | Handler Tests: daemon_dispatch.rs (450 LOC — routes all IPC) | Handler Tests B1 | work | pending |
-| 10 | Handler Tests: direct_dispatch.rs (465 LOC — routes all CLI) | Handler Tests B1 | work | pending |
-| 11 | Handler Tests: common.rs (379 LOC — shared helpers) | Handler Tests B1 | work | pending |
+| 1 | Commit: Stage and commit 12 uncommitted files | Commit + TUI | commit | **done** (6ef25a4) |
+| 2 | TUI Correctness: Fix unwrap in renderer hot path (impulse-term/renderer.rs) | Commit + TUI | work | **done** (already fixed in RP4) |
+| 3 | TUI Correctness: Safe env var manipulation (impulse-term/panel.rs) | Commit + TUI | work | **done** (already fixed in RP4) |
+| 4 | TUI Correctness: Backend.rs test coverage (312 LOC, zero tests) | Commit + TUI | work | **done** (+10 tests) |
+| 5 | Handler Tests: guard.rs (204 LOC — action guardrails with process::exit) | Commit + TUI | work | **done** (+16 tests) |
+| 6 | Handler Tests: agent.rs (145 LOC — agent config/query) | Commit + TUI | work | **done** (+16 tests) |
+| 7 | Handler Tests: injection_handlers.rs (209 LOC — context injection) | Commit + TUI | work | **done** (+18 tests) |
+| **8** | **Planning Checkpoint: Review Phase 1 metrics, plan Phase 2** | **Checkpoint** | **planning** | **done** (1,076 tests, 9/19 handlers tested) |
+| 9 | Handler Tests: daemon_dispatch.rs (450 LOC — routes all IPC) | Handler Tests B1 | work | in-progress (sub-agent dispatched) |
+| 10 | Handler Tests: direct_dispatch.rs (465 LOC — routes all CLI) | Handler Tests B1 | work | in-progress (sub-agent dispatched) |
+| 11 | Handler Tests: common.rs (379 LOC — shared helpers) | Handler Tests B1 | work | in-progress (sub-agent dispatched) |
 | 12 | Handler Tests: stewardship_handlers.rs (365 LOC) | Handler Tests B1 | work | pending |
 | 13 | Handler Tests: tooling_handlers.rs (270 LOC) | Handler Tests B1 | work | pending |
 | 14 | Handler Tests: build.rs (256 LOC) | Handler Tests B1 | work | pending |
