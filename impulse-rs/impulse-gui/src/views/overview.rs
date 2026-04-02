@@ -60,10 +60,8 @@ impl View for OverviewView {
                     ui.add_space(ui.available_height() / 3.0);
                     ui.vertical_centered(|ui| {
                         ui.label(
-                            egui::RichText::new(
-                                "Waiting for daemon snapshot from the thin workbench runtime...",
-                            )
-                            .color(colors::TEXT_DIM),
+                            egui::RichText::new("Waiting for daemon connection...")
+                                .color(colors::TEXT_DIM),
                         );
                     });
                 }
@@ -74,21 +72,17 @@ impl View for OverviewView {
         let agent_count = snapshot.agents.len();
         let pending_reviews = snapshot.context.pending_review_count;
 
-        ui.heading(
-            egui::RichText::new(format!("{} Thin Workbench", snapshot.project.name))
-                .color(colors::TEXT),
-        );
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("\u{1F680}").size(18.0)); // 🚀
+            ui.heading(
+                egui::RichText::new(format!("{} — Impulse Workbench", snapshot.project.name))
+                    .color(colors::ACCENT),
+            );
+        });
         ui.label(
-            egui::RichText::new(snapshot.project.root_path.clone())
+            egui::RichText::new(&snapshot.project.root_path)
                 .small()
                 .color(colors::TEXT_DIM),
-        );
-        ui.label(
-            egui::RichText::new(
-                "Hooks and the daemon are the source of truth. Coordination telemetry shown here is advisory until validated against real Claude sessions.",
-            )
-            .small()
-            .color(colors::YELLOW),
         );
         ui.add_space(10.0);
 
@@ -97,7 +91,7 @@ impl View for OverviewView {
                 ui,
                 "Agents",
                 format!("{}", agent_count),
-                "Live terminals plus daemon-tracked sessions.",
+                "Active coding agents.",
                 colors::ACCENT,
             );
             summary_card(
@@ -107,7 +101,7 @@ impl View for OverviewView {
                     "{} active / {} history",
                     snapshot.memory.active_sessions, snapshot.memory.history_entries
                 ),
-                "Session continuity plus genome-backed decisions.",
+                "Sessions and persistent decisions.",
                 colors::GREEN,
             );
             summary_card(
@@ -118,7 +112,7 @@ impl View for OverviewView {
                 } else {
                     snapshot.context.tier.clone()
                 },
-                "Experimental telemetry for pressure, compaction risk, and staged review artifacts.",
+                "Context window usage and review queue.",
                 if pending_reviews > 0 {
                     colors::YELLOW
                 } else {
@@ -129,7 +123,7 @@ impl View for OverviewView {
                 ui,
                 "Artifacts",
                 format!("{}", snapshot.artifacts.len()),
-                "Experimental daemon review material, not proof of recall or coordination.",
+                "Generated review artifacts.",
                 colors::TEXT,
             );
         });
@@ -144,7 +138,7 @@ impl View for OverviewView {
                 );
                 ui.add_space(6.0);
                 ui.label(
-                    egui::RichText::new("Experimental only. These items do not prove automated coordination is working.")
+                    egui::RichText::new("Daemon-detected coordination events.")
                         .small()
                         .color(colors::TEXT_DIM),
                 );
