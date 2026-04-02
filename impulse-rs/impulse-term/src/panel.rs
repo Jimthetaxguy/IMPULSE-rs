@@ -278,7 +278,7 @@ impl TerminalPanel {
                         ui.label(
                             egui::RichText::new(badge_text)
                                 .small()
-                                .color(egui::Color32::from_rgb(0xd2, 0x99, 0x22)),
+                                .color(self.theme.context_health.essential), // yellow
                         );
                         if ui.small_button("Jump to bottom").clicked() {
                             self.scroll_offset = 0;
@@ -473,7 +473,7 @@ impl TerminalPanel {
                         if all_insights.is_empty() {
                             ui.label(
                                 egui::RichText::new("No insights yet")
-                                    .color(egui::Color32::from_rgb(0x6e, 0x76, 0x81)),
+                                    .color(self.theme.ansi_colors[8]), // bright black (muted)
                             );
                             return;
                         }

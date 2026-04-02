@@ -1,6 +1,6 @@
 # Impulse Redesign — PTY Fix + Full UI Overhaul
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Fix terminal text corruption caused by PTY write races, then redesign the entire GUI with a space-themed "Launch" design language, tightened layout, and switchable color themes.
 
@@ -40,7 +40,7 @@
 **Files:**
 - Modify: `impulse-term/src/backend.rs`
 
-- [ ] **Step 1: Add WriteQueue struct and tests at the bottom of backend.rs**
+- [x] **Step 1: Add WriteQueue struct and tests at the bottom of backend.rs**
 
 Add this after the `pty_reader_loop` function:
 
@@ -96,7 +96,7 @@ impl WriteQueue {
 }
 ```
 
-- [ ] **Step 2: Add tests for WriteQueue**
+- [x] **Step 2: Add tests for WriteQueue**
 
 Add to the existing `#[cfg(test)] mod tests` (create one if none exists at the bottom of backend.rs):
 
@@ -139,12 +139,12 @@ impl Write for SharedBuf {
 }
 ```
 
-- [ ] **Step 3: Run tests**
+- [x] **Step 3: Run tests**
 
 Run: `cd impulse-rs && cargo test -p impulse-term -- write_queue`
 Expected: 2 tests pass
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add impulse-term/src/backend.rs
@@ -158,7 +158,7 @@ git commit -m "feat(term): add WriteQueue for serialized PTY writes"
 **Files:**
 - Modify: `impulse-term/src/backend.rs`
 
-- [ ] **Step 1: Add WriteQueue field to TerminalBackend**
+- [x] **Step 1: Add WriteQueue field to TerminalBackend**
 
 In the `TerminalBackend` struct, add:
 
@@ -175,7 +175,7 @@ let write_queue = WriteQueue::new(Arc::clone(&writer_arc));
 
 Add `write_queue` to the `Self { ... }` construction. Keep the existing `writer` field for now (the WriteQueue wraps the same Arc).
 
-- [ ] **Step 2: Add public accessors**
+- [x] **Step 2: Add public accessors**
 
 ```rust
 /// Access the write queue for serialized PTY writes.
@@ -184,7 +184,7 @@ pub fn write_queue(&self) -> &WriteQueue {
 }
 ```
 
-- [ ] **Step 3: Deprecate direct write_input**
+- [x] **Step 3: Deprecate direct write_input**
 
 Add a doc comment to the existing `write_input`:
 
@@ -197,12 +197,12 @@ Add a doc comment to the existing `write_input`:
 pub fn write_input(&self, data: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
 ```
 
-- [ ] **Step 4: Run full test suite**
+- [x] **Step 4: Run full test suite**
 
 Run: `cd impulse-rs && cargo test -p impulse-term`
 Expected: All existing tests pass (no behavioral change yet)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add impulse-term/src/backend.rs
@@ -216,7 +216,7 @@ git commit -m "feat(term): wire WriteQueue into TerminalBackend"
 **Files:**
 - Modify: `impulse-term/src/panel.rs`
 
-- [ ] **Step 1: Replace write_input calls in handle_input**
+- [x] **Step 1: Replace write_input calls in handle_input**
 
 In `handle_input()`, replace all `self.backend.write_input(...)` calls with `self.backend.write_queue().write_user_input(...)`:
 
@@ -242,7 +242,7 @@ if let Some(text) = paste_text {
 }
 ```
 
-- [ ] **Step 2: Route context injection through WriteQueue**
+- [x] **Step 2: Route context injection through WriteQueue**
 
 In `context_bridge()` — the `inject_context` method in `context.rs` currently calls `self.backend.write_input()`. Change `ContextBridge` to accept a reference to the `WriteQueue` instead.
 
@@ -269,7 +269,7 @@ pub fn inject_context(&mut self, content: &str) -> Result<(), Box<dyn std::error
 }
 ```
 
-- [ ] **Step 3: Update TerminalPanel::write_input to use WriteQueue**
+- [x] **Step 3: Update TerminalPanel::write_input to use WriteQueue**
 
 In `panel.rs`, the public `write_input` method:
 
@@ -279,12 +279,12 @@ pub fn write_input(&self, data: &[u8]) -> Result<(), Box<dyn std::error::Error>>
 }
 ```
 
-- [ ] **Step 4: Run full workspace tests**
+- [x] **Step 4: Run full workspace tests**
 
 Run: `cd impulse-rs && cargo build && cargo test && cargo clippy -- -D warnings`
 Expected: All 1,344+ tests pass, zero warnings
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add impulse-term/src/panel.rs impulse-term/src/context.rs
@@ -300,7 +300,7 @@ git commit -m "feat(term): route all PTY writes through WriteQueue"
 **Files:**
 - Modify: `impulse-gui/src/theme.rs`
 
-- [ ] **Step 1: Write tests for ColorPalette**
+- [x] **Step 1: Write tests for ColorPalette**
 
 Replace the entire contents of `impulse-gui/src/theme.rs`. Keep the module doc and imports, replace the `colors` module and `apply_dark_theme` with:
 
@@ -563,12 +563,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run tests**
+- [x] **Step 2: Run tests**
 
 Run: `cd impulse-rs && cargo test -p impulse-gui -- theme`
 Expected: 6 tests pass
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add impulse-gui/src/theme.rs
@@ -583,7 +583,7 @@ git commit -m "feat(gui): add ColorPalette theme system with 4 named themes"
 - Modify: `impulse-gui/src/views/mod.rs`
 - Modify: `impulse-gui/src/app.rs`
 
-- [ ] **Step 1: Update ViewId enum**
+- [x] **Step 1: Update ViewId enum**
 
 In `views/mod.rs`, replace the `ViewId` enum and its impls:
 
@@ -646,7 +646,7 @@ Remove the module declarations for pruned views:
 
 Keep: `terminal_context`, `terminal_insights`, `terminal_search` (used by terminals view).
 
-- [ ] **Step 2: Update app.rs — remove pruned view fields and match arms**
+- [x] **Step 2: Update app.rs — remove pruned view fields and match arms**
 
 In `ImpulseApp` struct, remove:
 - `context: ContextView`
@@ -657,18 +657,18 @@ Remove their `use` imports. Remove their construction in `new()`. Remove their m
 
 Update keyboard shortcut handling: Ctrl+3 → Memory, Ctrl+4 → Settings. Remove Ctrl+5/6/7 view shortcuts.
 
-- [ ] **Step 3: Build and fix compile errors**
+- [x] **Step 3: Build and fix compile errors**
 
 Run: `cd impulse-rs && cargo build -p impulse-gui 2>&1 | head -40`
 
 Fix any remaining references to removed variants. The compiler will guide you — each `ViewId::Context`, `ViewId::Artifacts`, `ViewId::Guardrails` reference needs removal.
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `cd impulse-rs && cargo test`
 Expected: Some tests referencing removed views will fail — delete those tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add impulse-gui/src/views/mod.rs impulse-gui/src/app.rs
@@ -682,7 +682,7 @@ git commit -m "refactor(gui): prune views from 7 to 4 (Overview, Terminals, Memo
 **Files:**
 - Modify: `impulse-gui/src/app.rs`
 
-- [ ] **Step 1: Change agent panel from left to right in the layout**
+- [x] **Step 1: Change agent panel from left to right in the layout**
 
 In `app.rs`, find where the agent panel is rendered. It currently uses a left-side panel. Change to:
 
@@ -698,12 +698,12 @@ if self.agent_visible {
 }
 ```
 
-- [ ] **Step 2: Build and verify**
+- [x] **Step 2: Build and verify**
 
 Run: `cd impulse-rs && cargo build -p impulse-gui`
 Expected: Compiles cleanly
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add impulse-gui/src/app.rs
@@ -717,7 +717,7 @@ git commit -m "refactor(gui): move agent panel from left to right side"
 **Files:**
 - Modify: `impulse-gui/src/widgets/sidebar.rs`
 
-- [ ] **Step 1: Update sidebar with rocket branding and new colors**
+- [x] **Step 1: Update sidebar with rocket branding and new colors**
 
 Update the logo section to show a rocket:
 
@@ -755,11 +755,11 @@ let btn = egui::Button::new(egui::RichText::new(&text).color(color))
     .min_size(egui::vec2(if expanded { EXPANDED_WIDTH - 16.0 } else { 32.0 }, 32.0));
 ```
 
-- [ ] **Step 2: Build and verify**
+- [x] **Step 2: Build and verify**
 
 Run: `cd impulse-rs && cargo build -p impulse-gui`
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add impulse-gui/src/widgets/sidebar.rs
@@ -773,7 +773,7 @@ git commit -m "style(gui): sidebar rocket logo, new palette colors, tighter layo
 **Files:**
 - Modify: `impulse-gui/src/agent_panel/mod.rs`
 
-- [ ] **Step 1: Polish the header**
+- [x] **Step 1: Polish the header**
 
 Update the header accent bar color and supervisor label:
 
@@ -786,7 +786,7 @@ ui.horizontal(|ui| {
     ui.strong(egui::RichText::new("Supervisor").size(13.0).color(colors::ACCENT));
 ```
 
-- [ ] **Step 2: Polish the input bar**
+- [x] **Step 2: Polish the input bar**
 
 Update corner radius and colors:
 
@@ -798,12 +798,12 @@ egui::Frame::new()
     .stroke(egui::Stroke::new(1.0, colors::BORDER))
 ```
 
-- [ ] **Step 3: Build and run tests**
+- [x] **Step 3: Build and run tests**
 
 Run: `cd impulse-rs && cargo build && cargo test -p impulse-gui`
 Expected: All tests pass
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add impulse-gui/src/agent_panel/mod.rs
@@ -818,7 +818,7 @@ git commit -m "style(gui): polish agent panel header, input bar, and spacing"
 - Modify: `impulse-gui/src/views/settings.rs`
 - Modify: `impulse-gui/src/app.rs`
 
-- [ ] **Step 1: Add theme selector to Settings view**
+- [x] **Step 1: Add theme selector to Settings view**
 
 Add a `ThemeName` field to `SettingsView`. In the settings UI, add a combo box:
 
@@ -835,7 +835,7 @@ ui.horizontal(|ui| {
 });
 ```
 
-- [ ] **Step 2: Apply theme on change in app.rs**
+- [x] **Step 2: Apply theme on change in app.rs**
 
 In `ImpulseApp::update()`, check if the settings theme changed and call `apply_theme()`:
 
@@ -849,7 +849,7 @@ if current_theme != self.last_applied_theme {
 
 Add `last_applied_theme: ThemeName` field to `ImpulseApp`.
 
-- [ ] **Step 3: Apply default theme on startup**
+- [x] **Step 3: Apply default theme on startup**
 
 In `ImpulseApp::new()`:
 
@@ -857,12 +857,12 @@ In `ImpulseApp::new()`:
 crate::theme::apply_theme(&cc.egui_ctx, &crate::theme::ThemeName::default().palette());
 ```
 
-- [ ] **Step 4: Build and test**
+- [x] **Step 4: Build and test**
 
 Run: `cd impulse-rs && cargo build && cargo test`
 Expected: All tests pass
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add impulse-gui/src/views/settings.rs impulse-gui/src/app.rs
@@ -876,7 +876,7 @@ git commit -m "feat(gui): theme switching in Settings view with 4 named themes"
 **Files:**
 - Modify: `impulse-rs/CLAUDE.md` (update metrics)
 
-- [ ] **Step 1: Full verification gate**
+- [x] **Step 1: Full verification gate**
 
 Run:
 ```bash
@@ -885,11 +885,11 @@ cd impulse-rs && cargo build && cargo test && cargo clippy -- -D warnings && car
 
 Expected: All pass, zero warnings.
 
-- [ ] **Step 2: Update test counts in CLAUDE.md**
+- [x] **Step 2: Update test counts in CLAUDE.md**
 
 Update the test count line to reflect the new total (will be different from 1,025 after adding WriteQueue tests and removing pruned view tests).
 
-- [ ] **Step 3: Visual verification**
+- [x] **Step 3: Visual verification**
 
 ```bash
 cd impulse-rs && cargo run -p impulse-gui
@@ -903,7 +903,7 @@ Check:
 - Terminal input doesn't corrupt when injection fires
 - Theme switching works in Settings
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add -A
