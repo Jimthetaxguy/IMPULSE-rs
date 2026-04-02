@@ -1149,4 +1149,38 @@ mod tests {
         let label = panel.backend.label();
         assert!(!label.is_empty(), "Backend label should be non-empty");
     }
+
+    #[test]
+    fn test_panes_command_queues_list_panes_action() {
+        let mut panel = AgentPanel::new(None);
+        panel.send_message("/panes");
+        assert_eq!(panel.pending_actions.len(), 1);
+        assert!(matches!(panel.pending_actions[0], PanelAction::ListPanes));
+    }
+
+    #[test]
+    fn test_tabs_alias_queues_list_panes_action() {
+        let mut panel = AgentPanel::new(None);
+        panel.send_message("/tabs");
+        assert_eq!(panel.pending_actions.len(), 1);
+        assert!(matches!(panel.pending_actions[0], PanelAction::ListPanes));
+    }
+
+    #[test]
+    fn test_receive_system_message_adds_message() {
+        let mut panel = AgentPanel::new(None);
+        let before = panel.message_count();
+        panel.receive_system_message("test message");
+        assert_eq!(panel.message_count(), before + 1);
+        assert_eq!(panel.messages.last().unwrap().role, ChatRole::System);
+        assert_eq!(panel.messages.last().unwrap().content, "test message");
+    }
+
+    #[test]
+    fn test_help_includes_panes_command() {
+        let mut panel = AgentPanel::new(None);
+        panel.send_message("/help");
+        let last = &panel.messages.last().unwrap().content;
+        assert!(last.contains("/panes"), "Help should list /panes command");
+    }
 }
