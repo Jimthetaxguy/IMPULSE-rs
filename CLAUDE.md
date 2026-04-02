@@ -67,7 +67,7 @@ Before implementing, consider alternative approaches. Choose the simplest soluti
 **Workspace (4 crates):**
 - `impulse-rs/` — main CLI + daemon + TUI (64,068 LOC in src/, 1,318 unit + 26 integration tests across 178 .rs files)
 - `impulse-rs/impulse-ops/` — operations library (shared types: SupervisorAction, TerminalOpsReport, OpsSnapshot, WorkbenchDaemonRequest/Response, DAEMON_PROTOCOL_VERSION, 4 tests)
-- `impulse-rs/impulse-term/` — custom terminal widget (PTY + vt100 + WriteQueue + context bridge, ~3.9K lines, 106 tests)
+- `impulse-rs/impulse-term/` — custom terminal widget (PTY + vt100 + WriteQueue + context bridge, ~3.9K lines, 107 tests)
 - `impulse-rs/impulse-gui/` — egui native workbench (Workbench, Terminals, Memory, Settings + Launch/Nebula/Solar/Aurora themes, ~15.4K lines)
 
 **Dual mode:**
@@ -340,7 +340,7 @@ cd impulse-rs && cargo build && cargo test && cargo clippy -- -D warnings && car
 ```
 
 **Expected output (update when counts change):**
-- `cargo test`: 5 `test result:` lines totaling 1,344 passed, 3 ignored, 0 failed
+- `cargo test`: 5 `test result:` lines totaling 1,344 passed, 3 ignored, 0 failed (plus 240 GUI, 107 term when run per-crate)
 - `cargo clippy`: 0 warnings
 - `cargo fmt --check`: no output (clean)
 
