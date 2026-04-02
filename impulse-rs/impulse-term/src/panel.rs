@@ -107,16 +107,28 @@ pub struct TerminalPanel {
 }
 
 impl TerminalPanel {
-    /// Spawn a new terminal panel.
+    /// Spawn a new terminal panel with an optional custom theme.
     ///
-    /// Strips Claude Code environment variables, sets TERM/COLORTERM/IMPULSE_*,
-    /// then spawns the child process in a PTY.
+    /// If `theme` is `None`, uses `TerminalTheme::default()`.
+    /// Pass `Some(TerminalTheme::from_accent(bg, accent))` to match the GUI palette.
     pub fn spawn(
         command: &str,
         args: &[String],
         working_dir: Option<&Path>,
         agent_name: &'static str,
         pane_id: usize,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::spawn_with_theme(command, args, working_dir, agent_name, pane_id, None)
+    }
+
+    /// Spawn a new terminal panel with an explicit theme.
+    pub fn spawn_with_theme(
+        command: &str,
+        args: &[String],
+        working_dir: Option<&Path>,
+        agent_name: &'static str,
+        pane_id: usize,
+        custom_theme: Option<TerminalTheme>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let agent_kind = AgentKind::detect(command, agent_name);
 
@@ -136,7 +148,7 @@ impl TerminalPanel {
             agent_kind,
             Arc::clone(&backend),
         )));
-        let theme = TerminalTheme::default();
+        let theme = custom_theme.unwrap_or_default();
         let title = agent_name.to_string();
         let status_bar = status_bar::StatusBar::new(
             Arc::clone(&backend),

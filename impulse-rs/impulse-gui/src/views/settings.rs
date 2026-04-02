@@ -259,6 +259,15 @@ impl SettingsView {
             }
         }
 
+        // Load persisted theme from settings, falling back to Launch.
+        let active_theme = config
+            .settings
+            .get("gui_theme")
+            .and_then(|s| {
+                serde_json::from_str::<crate::theme::ThemeName>(&format!("\"{}\"", s)).ok()
+            })
+            .unwrap_or_default();
+
         Self {
             values,
             expanded: [true; 5],
@@ -266,8 +275,8 @@ impl SettingsView {
             dirty: false,
             pending_supervisor_actions: Vec::new(),
             poller_cmd,
-            active_theme: crate::theme::ThemeName::default(),
-            theme_changed: false,
+            active_theme,
+            theme_changed: active_theme != crate::theme::ThemeName::default(),
         }
     }
 
@@ -278,6 +287,11 @@ impl SettingsView {
             crate::global_config::GlobalConfig::load(&impulse_home).unwrap_or_default();
 
         config.settings = self.values.clone();
+        // Persist the active theme alongside other settings.
+        config.settings.insert(
+            "gui_theme".to_string(),
+            self.active_theme.label().to_lowercase(),
+        );
 
         match config.save(&impulse_home) {
             Ok(()) => {
@@ -396,6 +410,8 @@ impl View for SettingsView {
                 });
             if self.active_theme != prev {
                 self.theme_changed = true;
+                // Auto-save theme choice immediately (don't require Save button).
+                self.save_settings();
             }
         });
         ui.add_space(8.0);
