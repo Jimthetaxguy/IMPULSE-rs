@@ -103,8 +103,10 @@ pub fn handle_tooling_describe(
             }
         }
         None => {
-            eprintln!("Tool not found: {}", tool_id);
-            eprintln!("Use `tooling-list` to see available tools.");
+            anyhow::bail!(
+                "Tool not found: {}. Use `tooling-list` to see available tools.",
+                tool_id
+            );
         }
     }
     Ok(())

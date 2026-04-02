@@ -77,7 +77,7 @@ pub fn reject_percent_encoded(input: &str, field: &'static str) -> Result<(), Va
 
 /// Reject `?` and `#` in resource names/IDs (prevents embedded query/fragment).
 pub fn validate_resource_name(name: &str, field: &'static str) -> Result<(), ValidationError> {
-    for ch in ['?', '#', '\0'] {
+    for ch in ['?', '#', '\0', '/', '\\'] {
         if name.contains(ch) {
             return Err(ValidationError::InvalidResourceName {
                 name: name.to_string(),

@@ -2,7 +2,7 @@
 //!
 //! Extracted from `run_direct_mode()` in main.rs.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 
 use crate::plugin;
 
@@ -65,8 +65,7 @@ pub fn handle_plugin_invoke(
     match registry.get_action_handler(&name) {
         Ok(Some(handler)) => {
             if let Err(e) = handler.validate(&input) {
-                eprintln!("Validation error: {}", e);
-                std::process::exit(1);
+                return Err(anyhow!("Validation error: {e}"));
             }
             match handler.execute(&input) {
                 Ok(output) => {
@@ -77,18 +76,15 @@ pub fn handle_plugin_invoke(
                     }
                 }
                 Err(e) => {
-                    eprintln!("Plugin error: {}", e);
-                    std::process::exit(1);
+                    return Err(anyhow!("Plugin error: {e}"));
                 }
             }
         }
         Ok(None) => {
-            eprintln!("Plugin not found: {}", name);
-            std::process::exit(1);
+            return Err(anyhow!("Plugin not found: {name}"));
         }
         Err(e) => {
-            eprintln!("Registry error: {}", e);
-            std::process::exit(1);
+            return Err(anyhow!("Registry error: {e}"));
         }
     }
     Ok(())

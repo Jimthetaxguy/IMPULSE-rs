@@ -4,6 +4,7 @@
 //! only view state plus local task notices and publishes terminal telemetry back
 //! to the daemon.
 
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -584,12 +585,16 @@ fn poller_loop(
         // Auto-start daemon if not connected and not yet attempted.
         if !connected && !daemon_start_attempted {
             daemon_start_attempted = true;
-            match which::which("impulse-rs") {
-                Err(_) => {
-                    log::warn!("impulse-rs binary not found on PATH");
+            // Check for bundled sibling binary first (inside .app bundle),
+            // then fall back to PATH search.
+            let binary_result =
+                find_sibling_binary("impulse-rs").or_else(|| which::which("impulse-rs").ok());
+            match binary_result {
+                None => {
+                    log::warn!("impulse-rs binary not found (checked sibling dir and PATH)");
                     set_auto_start(&state, DaemonAutoStartState::BinaryNotFound);
                 }
-                Ok(binary_path) => {
+                Some(binary_path) => {
                     log::info!("Auto-starting daemon: {}", binary_path.display());
                     set_auto_start(&state, DaemonAutoStartState::Starting);
                     ctx.request_repaint();
@@ -789,6 +794,20 @@ fn refresh_supervisor_permissions(client: &mut DaemonClient, state: &StateHandle
 fn set_connection(state: &StateHandle, status: ConnectionStatus) {
     if let Ok(mut shared) = state.lock() {
         shared.connection = status;
+    }
+}
+
+/// Look for a binary adjacent to the current executable.
+/// Inside a `.app` bundle, both `impulse-gui` and `impulse-rs` live in
+/// `Contents/MacOS/`, so this finds the daemon without requiring PATH.
+fn find_sibling_binary(name: &str) -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let sibling = exe.parent()?.join(name);
+    if sibling.exists() {
+        log::info!("Found bundled sibling binary: {}", sibling.display());
+        Some(sibling)
+    } else {
+        None
     }
 }
 
@@ -1021,5 +1040,28 @@ mod tests {
         assert_eq!(s.agent_model, "gpt-4o");
         assert_eq!(s.agent_harness, "opencode");
         assert_eq!(s.stewardship_mode, "off");
+    }
+
+    #[test]
+    fn test_find_sibling_binary_returns_none_for_nonexistent() {
+        // No binary named "definitely-not-a-real-binary" next to test runner
+        let result = find_sibling_binary("definitely-not-a-real-binary");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_sibling_binary_finds_existing_sibling() {
+        // The test binary itself sits in target/debug/deps/. Create a temp
+        // file next to it to simulate a bundled sibling.
+        let exe = std::env::current_exe().expect("current_exe");
+        let dir = exe.parent().expect("exe parent dir");
+        let sentinel = dir.join("__test_sibling_sentinel__");
+        std::fs::write(&sentinel, b"test").expect("write sentinel");
+
+        let result = find_sibling_binary("__test_sibling_sentinel__");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), sentinel);
+
+        std::fs::remove_file(&sentinel).ok();
     }
 }

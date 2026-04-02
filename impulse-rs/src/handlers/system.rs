@@ -469,7 +469,7 @@ pub fn handle_tools(
             }
         }
         _ => {
-            eprintln!(
+            anyhow::bail!(
                 "Unknown tools subcommand: {}. Use: list, init, update, check",
                 subcommand
             );
