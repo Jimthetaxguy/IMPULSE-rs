@@ -519,6 +519,35 @@ impl AgentPanel {
 
         ui.separator();
 
+        // Prominent banner when no backend is configured.
+        if matches!(self.backend, AgentBackend::Unavailable)
+            && self.connection_status != ConnectionStatus::Connected
+        {
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgba_unmultiplied(
+                    colors::YELLOW.r(),
+                    colors::YELLOW.g(),
+                    colors::YELLOW.b(),
+                    20,
+                ))
+                .inner_margin(egui::Margin::symmetric(8, 6))
+                .corner_radius(egui::CornerRadius::same(6))
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new("No agent backend configured")
+                            .small()
+                            .strong()
+                            .color(colors::YELLOW),
+                    );
+                    ui.label(
+                        egui::RichText::new("Install Claude Code or set ANTHROPIC_API_KEY")
+                            .small()
+                            .color(colors::TEXT_DIM),
+                    );
+                });
+            ui.separator();
+        }
+
         if let Some(permission_state) = &self.supervisor_permissions {
             render_permission_strip(ui, permission_state);
             ui.separator();
@@ -1089,5 +1118,24 @@ mod tests {
         let actions = panel.take_actions();
         assert_eq!(actions.len(), 2);
         assert!(panel.pending_actions.is_empty());
+    }
+
+    #[test]
+    fn test_welcome_message_mentions_backend() {
+        let panel = AgentPanel::new(None);
+        let last = &panel.messages.last().unwrap().content;
+        // Should mention the backend type or "unavailable".
+        assert!(
+            last.contains("supervisor ready") || last.contains("No agent backend"),
+            "Welcome message should mention backend state: {}",
+            last
+        );
+    }
+
+    #[test]
+    fn test_backend_label_accessible() {
+        let panel = AgentPanel::new(None);
+        let label = panel.backend.label();
+        assert!(!label.is_empty(), "Backend label should be non-empty");
     }
 }
