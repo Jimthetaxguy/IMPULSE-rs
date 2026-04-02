@@ -65,10 +65,10 @@ Before implementing, consider alternative approaches. Choose the simplest soluti
 ## Architecture
 
 **Workspace (4 crates):**
-- `impulse-rs/` — main CLI + daemon + TUI (59,356 LOC in src/, 999 unit + 26 integration tests across 178 .rs files)
-- `impulse-rs/impulse-ops/` — operations library (shared types: SupervisorAction, TerminalOpsReport, OpsSnapshot, WorkbenchDaemonRequest/Response, DAEMON_PROTOCOL_VERSION)
-- `impulse-rs/impulse-term/` — custom terminal widget (PTY + vt100 + context bridge, ~3.7K lines, 90 tests)
-- `impulse-rs/impulse-gui/` — egui native workbench (Overview, Terminals, Context, Memory, Artifacts, Settings, ~15K lines, 220 tests)
+- `impulse-rs/` — main CLI + daemon + TUI (64,068 LOC in src/, 1,318 unit + 26 integration tests across 178 .rs files)
+- `impulse-rs/impulse-ops/` — operations library (shared types: SupervisorAction, TerminalOpsReport, OpsSnapshot, WorkbenchDaemonRequest/Response, DAEMON_PROTOCOL_VERSION, 4 tests)
+- `impulse-rs/impulse-term/` — custom terminal widget (PTY + vt100 + WriteQueue + context bridge, ~3.9K lines, 106 tests)
+- `impulse-rs/impulse-gui/` — egui native workbench (Workbench, Terminals, Memory, Settings + Launch/Nebula/Solar/Aurora themes, ~15.4K lines)
 
 **Dual mode:**
 - **Direct mode** — stateless, per-action (for hooks). Read → process → write → exit.
@@ -340,7 +340,7 @@ cd impulse-rs && cargo build && cargo test && cargo clippy -- -D warnings && car
 ```
 
 **Expected output (update when counts change):**
-- `cargo test`: 5 `test result:` lines totaling 1,025 passed, 3 ignored, 0 failed
+- `cargo test`: 5 `test result:` lines totaling 1,344 passed, 3 ignored, 0 failed
 - `cargo clippy`: 0 warnings
 - `cargo fmt --check`: no output (clean)
 
@@ -370,12 +370,12 @@ To verify test counts match expectations:
 ```bash
 cd impulse-rs && cargo test 2>&1 | grep "test result:" | awk '{sum += $4} END {print "Total: " sum " passed"}'
 ```
-Expected: 1,025 passed. If this changes, update both this section and the Architecture section.
+Expected: 1,344 passed. If this changes, update both this section and the Architecture section.
 
 ### Pre-Commit Checklist
 
 1. `cargo build` — zero warnings
-2. `cargo test` — all tests pass (1,025 workspace total expected: 999+26 impulse-rs, 4 ops, 90 term, 220 gui; verify with `cargo test 2>&1 | grep "test result:"`)
+2. `cargo test` — all tests pass (1,344 workspace total expected: 1318+26 impulse-rs, 4 ops, 106 term; verify with `cargo test 2>&1 | grep "test result:"`)
    - **If count changes**: update this line and the Architecture section above
 3. `cargo clippy -- -D warnings` — zero warnings
 4. `cargo fmt --check` — zero diffs
