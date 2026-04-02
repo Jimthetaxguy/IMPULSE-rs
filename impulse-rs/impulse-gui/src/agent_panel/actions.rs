@@ -35,11 +35,14 @@ pub enum PanelAction {
     /// Search memory/history (switches to Memory view).
     MemorySearch { query: String },
 
-    /// Execute a structured supervisor proposal from the left chat panel.
+    /// Execute a structured supervisor proposal from the chat panel.
     RunSupervisorProposal {
         proposal: Box<impulse_ops::SupervisorProposal>,
         mode: ProposalExecutionMode,
     },
+
+    /// List all open terminal panes (responds with system message).
+    ListPanes,
 }
 
 // ---------------------------------------------------------------------------

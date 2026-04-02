@@ -940,6 +940,10 @@ impl eframe::App for ImpulseApp {
                         }
                     }
                 }
+                PanelAction::ListPanes => {
+                    let pane_list = self.terminals.pane_summary();
+                    self.agent_panel.receive_system_message(&pane_list);
+                }
             }
         }
 

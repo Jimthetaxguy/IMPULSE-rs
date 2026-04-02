@@ -501,6 +501,37 @@ impl TerminalsView {
         false
     }
 
+    /// Summary of all open terminal panes for the /panes command.
+    pub fn pane_summary(&self) -> String {
+        if self.tabs.is_empty() {
+            return "No terminal panes open. Use Ctrl+N to spawn one.".to_string();
+        }
+        let mut lines = vec![format!("Open panes ({}):", self.tabs.len())];
+        for (&id, tab) in &self.tabs {
+            let alive = if tab.panel.is_alive() {
+                "alive"
+            } else {
+                "dead"
+            };
+            let active = if self.active_tab == Some(id) {
+                " (active)"
+            } else {
+                ""
+            };
+            let health = tab.panel.context_health();
+            lines.push(format!(
+                "  #{} {} — {} | context: {:.0}% {}{}",
+                id,
+                tab.label,
+                alive,
+                health.usage_fraction * 100.0,
+                health.tier.as_str(),
+                active,
+            ));
+        }
+        lines.join("\n")
+    }
+
     /// Switch the active terminal tab by ID.
     pub fn focus_tab(&mut self, tab_id: u64) -> bool {
         if self.tabs.contains_key(&tab_id) {

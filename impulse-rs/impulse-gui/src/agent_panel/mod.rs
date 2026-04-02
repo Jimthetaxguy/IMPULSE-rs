@@ -201,6 +201,7 @@ impl AgentPanel {
                      /clear — Clear chat messages\n\
                      /help — Show this help\n\
                      /status — Show backend and connection info\n\
+                     /panes — List open terminal panes\n\
                      /activity — Toggle activity feed\n\
                      /history — Show conversation history info\n\
                      /inject <tab_id> <text> — Inject context into a terminal pane\n\
@@ -399,6 +400,10 @@ impl AgentPanel {
                     self.messages
                         .push(ChatMessage::system("Usage: /memory-search <query>"));
                 }
+                self.scroll_to_bottom = true;
+            }
+            "/panes" | "/tabs" => {
+                self.pending_actions.push(PanelAction::ListPanes);
                 self.scroll_to_bottom = true;
             }
             _ => {
@@ -695,6 +700,12 @@ impl AgentPanel {
         permission_state: Option<impulse_ops::SupervisorPermissionState>,
     ) {
         self.supervisor_permissions = permission_state;
+    }
+
+    /// Add a system message from an external source (e.g., /panes response from app.rs).
+    pub fn receive_system_message(&mut self, text: &str) {
+        self.messages.push(ChatMessage::system(text));
+        self.scroll_to_bottom = true;
     }
 
     /// Request that the input field receives keyboard focus on the next frame.
