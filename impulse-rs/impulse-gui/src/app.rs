@@ -72,7 +72,7 @@ impl ImpulseApp {
             log::warn!("Failed to create identity files: {}", e);
         }
 
-        Self {
+        let mut app = Self {
             overview: OverviewView::new(),
             terminals: TerminalsView::new(Some(poller_cmd.clone())),
             memory: MemoryView::new(poller_cmd.clone()),
@@ -100,7 +100,11 @@ impl ImpulseApp {
             signal_bus: SignalBus::new(),
             show_shortcuts_help: false,
             command_palette: CommandPalette::new(),
-        }
+        };
+        // Push initial theme to terminals view so new tabs spawn with the right colors.
+        app.terminals
+            .set_terminal_theme(&app.settings.active_theme().palette());
+        app
     }
 
     fn handle_global_shortcuts(&mut self, ctx: &egui::Context) {
@@ -943,7 +947,10 @@ impl eframe::App for ImpulseApp {
 
         // Apply theme if the user changed it in Settings.
         if self.settings.take_theme_changed() {
-            crate::theme::apply_theme(ctx, &self.settings.active_theme().palette());
+            let palette = self.settings.active_theme().palette();
+            crate::theme::apply_theme(ctx, &palette);
+            // Update terminal theme so new tabs spawn with matching colors.
+            self.terminals.set_terminal_theme(&palette);
         }
 
         egui::CentralPanel::default().show(ctx, |ui| match self.active_view {

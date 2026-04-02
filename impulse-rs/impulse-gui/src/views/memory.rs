@@ -44,11 +44,10 @@ impl View for MemoryView {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, state: &SharedState, ctx: &egui::Context) {
-        ui.label(
-            egui::RichText::new("Memory is authoritative only when backed by the daemon and validated through real hook runs.")
-                .small()
-                .color(colors::TEXT_DIM),
-        );
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("\u{1F9E0}").size(16.0)); // 🧠
+            ui.heading(egui::RichText::new("Memory").color(colors::ACCENT));
+        });
         ui.horizontal(|ui| {
             if selectable_memory_tab(ui, self.tab, MemoryTab::Sessions, "Sessions") {
                 self.tab = MemoryTab::Sessions;

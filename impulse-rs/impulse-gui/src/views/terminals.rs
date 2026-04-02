@@ -95,6 +95,8 @@ pub struct TerminalsView {
     pub(super) poller_cmd: Option<std::sync::mpsc::Sender<PollerCommand>>,
     /// Files already tracked with the daemon for each session (dedup guard).
     pub(super) tracked_files: HashMap<String, HashSet<String>>,
+    /// Terminal theme derived from the active GUI palette.
+    active_terminal_theme: Option<impulse_term::theme::TerminalTheme>,
 }
 
 impl TerminalsView {
@@ -152,7 +154,16 @@ impl TerminalsView {
             active_conflicts: HashMap::new(),
             poller_cmd,
             tracked_files: HashMap::new(),
+            active_terminal_theme: None,
         }
+    }
+
+    /// Update the terminal theme to match the active GUI palette.
+    pub fn set_terminal_theme(&mut self, palette: &crate::theme::ColorPalette) {
+        self.active_terminal_theme = Some(impulse_term::theme::TerminalTheme::from_accent(
+            palette.bg_deep,
+            palette.accent_bright,
+        ));
     }
 
     /// Update the live insights path when the user selects a new project.
@@ -241,12 +252,13 @@ impl TerminalsView {
 
         let args: Vec<String> = agent.args.iter().map(|s| s.to_string()).collect();
 
-        match TerminalPanel::spawn(
+        match TerminalPanel::spawn_with_theme(
             agent.command,
             &args,
             Some(target_dir),
             agent.name,
             id as usize,
+            self.active_terminal_theme.clone(),
         ) {
             Ok(panel) => {
                 // Tab label: "AgentName: project-folder"
