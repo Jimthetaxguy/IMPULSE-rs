@@ -70,40 +70,24 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
-
-      - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: impulse-rs
 
-      - name: Install frontend dependencies
-        working-directory: impulse-rs/impulse-gui
-        run: npm install
-
-      - name: Install Tauri CLI
-        run: cargo install tauri-cli --version "^2"
-
-      - name: Build Tauri app
-        working-directory: impulse-rs/impulse-gui
-        run: cargo tauri build
-
-      - name: Find and rename DMG
-        id: dmg
-        run: |
-          DMG_PATH=$(find impulse-rs/impulse-gui/target/release/bundle -name "*.dmg" | head -1)
-          VERSION=${GITHUB_REF_NAME#v}
-          DEST="Impulse-${VERSION}-macos-aarch64.dmg"
-          cp "$DMG_PATH" "$DEST"
-          echo "path=$DEST" >> "$GITHUB_OUTPUT"
+      - name: Build universal app bundle + DMG
+        working-directory: impulse-rs
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: bash scripts/build-macos-app.sh --universal --dmg --version "${VERSION#v}"
 
       - name: Upload DMG
         uses: actions/upload-artifact@v4
         with:
           name: impulse-dmg
-          path: ${{ steps.dmg.outputs.path }}
+          path: impulse-rs/Impulse-*.dmg
 
   release:
     name: Create Release
