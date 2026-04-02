@@ -150,10 +150,17 @@ fn render_single_message(ui: &mut egui::Ui, msg: &ChatMessage, actions: &mut Vec
     let available_width = ui.available_width();
     let max_bubble_width = (available_width * 0.85).min(500.0);
 
+    let time_label = format_relative_time(msg.timestamp);
+
     match msg.role {
         ChatRole::User => {
-            // Right-aligned role label.
+            // Right-aligned role label with timestamp.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                ui.label(
+                    egui::RichText::new(&time_label)
+                        .small()
+                        .color(colors::TEXT_FAINT),
+                );
                 ui.label(egui::RichText::new("You").small().color(colors::TEXT_DIM));
             });
             ui.add_space(2.0);
@@ -170,12 +177,19 @@ fn render_single_message(ui: &mut egui::Ui, msg: &ChatMessage, actions: &mut Vec
             });
         }
         ChatRole::Agent => {
-            // Left-aligned role label.
-            ui.label(
-                egui::RichText::new("\u{1F680} Impulse")
-                    .small()
-                    .color(colors::TEXT_DIM),
-            );
+            // Left-aligned role label with timestamp.
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("\u{1F680} Impulse")
+                        .small()
+                        .color(colors::TEXT_DIM),
+                );
+                ui.label(
+                    egui::RichText::new(&time_label)
+                        .small()
+                        .color(colors::TEXT_FAINT),
+                );
+            });
             ui.add_space(2.0);
             // Left-aligned bubble with purple accent.
             let frame_resp = egui::Frame::new()
@@ -305,8 +319,20 @@ fn render_chip(ui: &mut egui::Ui, label: &str) {
 
 /// Render a typing indicator when the agent is thinking.
 fn render_thinking_indicator(ui: &mut egui::Ui) {
-    ui.label(egui::RichText::new("Agent").small().color(colors::TEXT_DIM));
+    ui.label(
+        egui::RichText::new("\u{1F680} Impulse")
+            .small()
+            .color(colors::TEXT_DIM),
+    );
     ui.add_space(2.0);
+
+    // Animated dots — cycle through 1-3 dots based on time.
+    let dots = match (ui.input(|i| i.time) * 2.0) as u32 % 3 {
+        0 => "\u{25CF}",
+        1 => "\u{25CF}  \u{25CF}",
+        _ => "\u{25CF}  \u{25CF}  \u{25CF}",
+    };
+
     let frame_resp = egui::Frame::new()
         .fill(colors::SURFACE)
         .corner_radius(egui::CornerRadius::same(8))
@@ -314,9 +340,9 @@ fn render_thinking_indicator(ui: &mut egui::Ui) {
         .stroke(egui::Stroke::new(0.5, colors::BORDER))
         .show(ui, |ui| {
             ui.set_max_width(120.0);
-            ui.label(egui::RichText::new("\u{25CF}  \u{25CF}  \u{25CF}").color(colors::TEXT_MUTED));
+            ui.label(egui::RichText::new(dots).color(colors::ACCENT));
         });
-    // 2px purple accent on left edge.
+    // Accent bar on left edge.
     let rect = frame_resp.response.rect;
     ui.painter().rect_filled(
         egui::Rect::from_min_max(
@@ -326,6 +352,24 @@ fn render_thinking_indicator(ui: &mut egui::Ui) {
         1.0,
         colors::ACCENT,
     );
+    // Request repaint to animate the dots.
+    ui.ctx().request_repaint();
+}
+
+/// Format a timestamp as a relative time string ("just now", "2m ago", "1h ago").
+fn format_relative_time(timestamp: chrono::DateTime<chrono::Utc>) -> String {
+    let elapsed = chrono::Utc::now()
+        .signed_duration_since(timestamp)
+        .num_seconds();
+    if elapsed < 60 {
+        "just now".to_string()
+    } else if elapsed < 3600 {
+        format!("{}m ago", elapsed / 60)
+    } else if elapsed < 86400 {
+        format!("{}h ago", elapsed / 3600)
+    } else {
+        format!("{}d ago", elapsed / 86400)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -394,5 +438,29 @@ mod tests {
         assert_eq!(ChatRole::User, ChatRole::User);
         assert_ne!(ChatRole::User, ChatRole::Agent);
         assert_ne!(ChatRole::Agent, ChatRole::System);
+    }
+
+    #[test]
+    fn test_format_relative_time_just_now() {
+        let now = chrono::Utc::now();
+        assert_eq!(format_relative_time(now), "just now");
+    }
+
+    #[test]
+    fn test_format_relative_time_minutes() {
+        let five_min_ago = chrono::Utc::now() - chrono::Duration::minutes(5);
+        assert_eq!(format_relative_time(five_min_ago), "5m ago");
+    }
+
+    #[test]
+    fn test_format_relative_time_hours() {
+        let two_hours_ago = chrono::Utc::now() - chrono::Duration::hours(2);
+        assert_eq!(format_relative_time(two_hours_ago), "2h ago");
+    }
+
+    #[test]
+    fn test_format_relative_time_days() {
+        let three_days_ago = chrono::Utc::now() - chrono::Duration::days(3);
+        assert_eq!(format_relative_time(three_days_ago), "3d ago");
     }
 }
