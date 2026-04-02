@@ -20,7 +20,10 @@ impl View for OverviewView {
 
     fn ui(&mut self, ui: &mut egui::Ui, state: &SharedState, _ctx: &egui::Context) {
         let Some(snapshot) = state.ops_snapshot.as_ref() else {
-            ui.heading(egui::RichText::new("Impulse Overview").color(colors::TEXT));
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("\u{1F680}").size(20.0)); // 🚀
+                ui.heading(egui::RichText::new("Impulse Workbench").color(colors::ACCENT));
+            });
             ui.separator();
 
             match state.connection {

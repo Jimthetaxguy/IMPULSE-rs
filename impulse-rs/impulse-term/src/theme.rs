@@ -81,6 +81,19 @@ impl Default for TerminalTheme {
 }
 
 impl TerminalTheme {
+    /// Create a terminal theme that matches a GUI accent color.
+    ///
+    /// Uses `bg` as the terminal background (from the GUI palette's `bg_deep`),
+    /// `accent` for cursor and selection, and keeps the standard ANSI color set.
+    pub fn from_accent(bg: egui::Color32, accent: egui::Color32) -> Self {
+        let mut theme = Self::default();
+        theme.bg = bg;
+        theme.cursor = accent;
+        theme.selection_bg =
+            egui::Color32::from_rgba_premultiplied(accent.r(), accent.g(), accent.b(), 0x40);
+        theme
+    }
+
     /// Resolve a vt100 `Color` to an egui `Color32`.
     pub fn resolve_fg(&self, color: vt100::Color) -> egui::Color32 {
         self.resolve_color(color, self.fg)
@@ -326,6 +339,20 @@ pub fn agent_color(name: &str) -> egui::Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_from_accent_uses_custom_bg_and_cursor() {
+        let bg = egui::Color32::from_rgb(0x02, 0x06, 0x17);
+        let accent = egui::Color32::from_rgb(0x3b, 0x82, 0xf6);
+        let theme = TerminalTheme::from_accent(bg, accent);
+        assert_eq!(theme.bg, bg);
+        assert_eq!(theme.cursor, accent);
+        // Selection should use accent with alpha
+        assert_eq!(theme.selection_bg.r(), accent.r());
+        assert_eq!(theme.selection_bg.a(), 0x40);
+        // ANSI colors should be unchanged from default
+        assert_eq!(theme.ansi_colors, TerminalTheme::default().ansi_colors);
+    }
 
     #[test]
     fn test_default_theme_has_16_ansi_colors() {

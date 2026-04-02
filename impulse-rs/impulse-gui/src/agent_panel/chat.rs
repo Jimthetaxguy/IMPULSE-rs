@@ -87,10 +87,10 @@ impl ChatMessage {
 // Colors
 // ---------------------------------------------------------------------------
 
-/// Purple-tinted background for user message bubbles (chat-specific).
-const USER_BG: egui::Color32 = egui::Color32::from_rgb(0x2d, 0x1b, 0x4e);
-/// Lighter text for user messages (chat-specific).
-const USER_TEXT: egui::Color32 = egui::Color32::from_rgb(0xe0, 0xd0, 0xff);
+/// Blue-tinted background for user message bubbles (Launch theme accent).
+const USER_BG: egui::Color32 = egui::Color32::from_rgb(0x0f, 0x24, 0x4e);
+/// Bright text for user messages.
+const USER_TEXT: egui::Color32 = egui::Color32::from_rgb(0xd0, 0xe0, 0xff);
 
 // ---------------------------------------------------------------------------
 // Rendering
@@ -171,7 +171,11 @@ fn render_single_message(ui: &mut egui::Ui, msg: &ChatMessage, actions: &mut Vec
         }
         ChatRole::Agent => {
             // Left-aligned role label.
-            ui.label(egui::RichText::new("Agent").small().color(colors::TEXT_DIM));
+            ui.label(
+                egui::RichText::new("\u{1F680} Impulse")
+                    .small()
+                    .color(colors::TEXT_DIM),
+            );
             ui.add_space(2.0);
             // Left-aligned bubble with purple accent.
             let frame_resp = egui::Frame::new()
