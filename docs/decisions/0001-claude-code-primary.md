@@ -10,7 +10,7 @@ last_updated: 2026-02-20
 
 > **Status:** Accepted
 > **Date:** 2026-02-20
-> **Supersedes:** [0001-opencode-first.md](0001-opencode-first.md)
+> **Supersedes:** historical ADR `0001-opencode-first.md` (not present in the current workspace archive)
 
 ---
 

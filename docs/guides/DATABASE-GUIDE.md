@@ -16,7 +16,7 @@ tags: [guide, database, sqlite, vector-search]
 > **Version:** 1.0 | **Status:** Phase 2+ | **Updated:** 2026-02-21
 > ⚠️ **NOT APPLICABLE TO PHASE 1.** Phase 1 uses plain text files, no database.
 > This guide covers Phase 2+ features: sqlite-vec vector search, FTS5 full-text search.
-> See [PRODUCT-SPEC-v2.md](../spec/PRODUCT-SPEC-v2.md) for Phase 1 architecture.
+> See [RUST-CANONICAL-CONTRACT.md](../spec/RUST-CANONICAL-CONTRACT.md) for the current product contract. The older TypeScript-era Phase 1 spec is not present in this workspace.
 
 ---
 

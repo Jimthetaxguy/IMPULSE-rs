@@ -441,6 +441,6 @@ Once deployed, track live metrics:
 
 | Document | Purpose |
 |----------|---------|
-| [SPEC-v1.1.md](SPEC-v1.1.md) | Success metrics definition |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | Algorithms being tested |
+| `SPEC-v1.1.md` | Historical success metrics document not present in the current workspace |
+| [CLI-ARCHITECTURE.md](CLI-ARCHITECTURE.md) | Current surviving architecture-oriented vision reference |
 | [DATA-MODELS.md](DATA-MODELS.md) | Query patterns for test validation |

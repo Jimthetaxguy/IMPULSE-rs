@@ -10,7 +10,7 @@ last_updated: 2026-02-20
 
 > **Status:** Accepted
 > **Date:** 2026-02-20
-> **Supersedes:** [0002-unified-steward.md](0002-unified-steward.md)
+> **Supersedes:** historical ADR `0002-unified-steward.md` (not present in the current workspace archive)
 
 ---
 

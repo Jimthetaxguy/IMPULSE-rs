@@ -14,7 +14,7 @@ last_updated: 2026-02-21
 >
 > **Version:** 2.1 | **Status:** Active | **Updated:** 2026-02-21
 > **Supersedes:** v1.0 (OpenCode plugin architecture — see `archive/`)
-> **Spec:** [`PRODUCT-SPEC-v2.md`](../spec/PRODUCT-SPEC-v2.md) — Read this first
+> **Spec:** [`RUST-CANONICAL-CONTRACT.md`](../spec/RUST-CANONICAL-CONTRACT.md) — Current contract reference for the live workspace
 > **Limitations:** [`HONEST-ROADMAP.md`](../HONEST-ROADMAP.md) — Read this second
 > **Target:** TypeScript/Bun ONLY. Zero Python. Zero Rust. Zero databases.
 

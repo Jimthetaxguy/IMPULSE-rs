@@ -1,8 +1,22 @@
-# Tool Validation Status — Phase 0
+---
+title: Tool Status
+description: Historical tooling status note retained for context after the Rust-first product reset
+version: '1.1'
+updated: 2026-04-02
+type: guide
+category: tooling
+phase: historical
+status: deprecated
+audience: builder
+tags: [tools, setup, historical]
+---
+
+# Tool Validation Status — Historical Reference
 
 > **Date:** 2026-02-20
-> **Status:** Partially Ready
-> **Next Action:** Install missing tools before Phase 1
+> **Status:** Deprecated
+> **Important:** This document reflects an earlier TypeScript/Bun-era setup contract and should not be used as the current Impulse environment baseline.
+> For the live Rust-first contract, start with [`../spec/RUST-CANONICAL-CONTRACT.md`](../spec/RUST-CANONICAL-CONTRACT.md), [`../spec/USER-STORY-MAP.md`](../spec/USER-STORY-MAP.md), and [`../../AGENTS.md`](../../AGENTS.md).
 
 ---
 

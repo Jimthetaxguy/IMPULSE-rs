@@ -13,7 +13,9 @@ schema_version: '1.0'
 | Guide | Description | Start Here |
 | ----- | ----------- | ---------- |
 | [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) | Authoritative product contract | ✅ Yes |
-| [AGENTS.md](../../AGENTS.md) | AI agent guidelines | ✅ Yes |
+| [USER-STORY-MAP.md](spec/USER-STORY-MAP.md) | Rust-first user stories and acceptance criteria | ✅ Yes |
+| [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md) | Current story-to-test coverage map | ✅ Yes |
+| [AGENTS.md](../AGENTS.md) | AI agent guidelines | ✅ Yes |
 | [INDEX.md](INDEX.md) | Master navigation | ✅ Yes |
 | [HONEST-ROADMAP.md](HONEST-ROADMAP.md) | Validation risk register | ✅ Yes |
 
@@ -41,14 +43,16 @@ The active roadmap is now Rust core plus the EGUI operator workbench.
 
 ### Later
 
-- [vision/DASHBOARD-DESIGN.md](vision/DASHBOARD-DESIGN.md)
 - [vision/CLI-ARCHITECTURE.md](vision/CLI-ARCHITECTURE.md)
+- [archive/TUI-AUGMENTATION-VISION.md](archive/TUI-AUGMENTATION-VISION.md)
 
 ## By Category
 
 ### Specifications
 
 - [spec/RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md)
+- [spec/USER-STORY-MAP.md](spec/USER-STORY-MAP.md)
+- [spec/TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md)
 - [spec/COMPETITIVE-POSITIONING.md](spec/COMPETITIVE-POSITIONING.md)
 - [spec/PERFORMANCE-TARGETS.md](spec/PERFORMANCE-TARGETS.md)
 
@@ -64,7 +68,7 @@ The active roadmap is now Rust core plus the EGUI operator workbench.
 - [vision/CLI-ARCHITECTURE.md](vision/CLI-ARCHITECTURE.md)
 - [vision/DATA-MODELS.md](vision/DATA-MODELS.md)
 - [vision/DYNAMIC-CLI-VISION.md](vision/DYNAMIC-CLI-VISION.md)
-- [vision/DASHBOARD-DESIGN.md](vision/DASHBOARD-DESIGN.md)
+- [archive/TUI-AUGMENTATION-VISION.md](archive/TUI-AUGMENTATION-VISION.md)
 - [vision/BENCHMARKS.md](vision/BENCHMARKS.md)
 
 ### Research
@@ -103,15 +107,9 @@ The active roadmap is now Rust core plus the EGUI operator workbench.
 
 ### Archive
 
-- [archive/README.md](archive/README.md)
-- [archive/SPEC-v1.1.md](archive/SPEC-v1.1.md)
-- [archive/ARCHITECTURE.md](archive/ARCHITECTURE.md)
-- [archive/STEWARD.md](archive/STEWARD.md)
-- [archive/phases/IMPLEMENTATION-ROADMAP.md](archive/phases/IMPLEMENTATION-ROADMAP.md)
-- [archive/spec/PRODUCT-SPEC-v2.md](archive/spec/PRODUCT-SPEC-v2.md)
-- [archive/research/PRD-v1.md](archive/research/PRD-v1.md)
-- [archive/research/REALISTIC-FRAMEWORK.md](archive/research/REALISTIC-FRAMEWORK.md)
-- [archive/research/cockpit-feature-plan.md](archive/research/cockpit-feature-plan.md)
+- [archive/TUI-AUGMENTATION-VISION.md](archive/TUI-AUGMENTATION-VISION.md)
+
+Historical archive references in older docs need a separate recovery or cleanup pass. The current workspace only contains the surviving archived artifact listed above.
 
 ## Metadata
 

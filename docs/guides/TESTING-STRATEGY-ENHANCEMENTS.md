@@ -258,8 +258,8 @@ cargo test test_name -- --ignored
 
 ## Related Documents
 
-- [IMPLEMENTATION-HANDOFF.md](./plans/IMPLEMENTATION-HANDOFF.md)
-- [TESTING-FRAMEWORK.md](./guides/TESTING-FRAMEWORK.md)
+- [IMPLEMENTATION-HANDOFF.md](../plans/IMPLEMENTATION-HANDOFF.md)
+- [TESTING-FRAMEWORK.md](./TESTING-FRAMEWORK.md)
 
 ---
 

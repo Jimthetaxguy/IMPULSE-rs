@@ -1,16 +1,16 @@
 ---
-status: active
+status: deprecated
 phase: 1
 audience: builder
 tags: [guide, testing, vitest]
-last_updated: 2026-02-20
+last_updated: 2026-04-02
 ---
 
 # Testing Framework for Impulse
 
-> **Version:** 1.1 | **Status:** Active | **Updated:** 2026-02-21
-> **Note:** Test structure updated for `impulse/` (Claude Code hooks arch). The `harness/` paths below
-> reference the pre-pivot skeleton — use `impulse/` for Phase 1 implementation.
+> **Version:** 1.1 | **Status:** Deprecated | **Updated:** 2026-04-02
+> **Important:** This guide reflects a pre-Rust, TypeScript/Vitest-era `impulse/` structure and is no longer the current test baseline.
+> Use [`../spec/USER-STORY-MAP.md`](../spec/USER-STORY-MAP.md) and [`../spec/TEST-TRACEABILITY.md`](../spec/TEST-TRACEABILITY.md) for the active Rust-first story and test contract.
 
 ---
 

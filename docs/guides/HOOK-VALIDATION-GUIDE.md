@@ -5,7 +5,7 @@ version: '1.0'
 updated: 2026-03-05
 type: guide
 category: validation
-phase: now
+phase: all
 status: active
 audience: builder
 tags: [hooks, validation, claude-code, memory-loop]

@@ -45,6 +45,8 @@ authors:
 | Document                                                      | Description                                                                | Phase |
 | ------------------------------------------------------------- | -------------------------------------------------------------------------- | ----- |
 | [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) | **Authoritative contract for current product behavior**                    | all   |
+| [USER-STORY-MAP.md](spec/USER-STORY-MAP.md)                   | Rust-first product stories, acceptance criteria, and story status          | all   |
+| [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md)             | Story-to-test map for the current Rust workspace                           | all   |
 | [HONEST-ROADMAP.md](HONEST-ROADMAP.md)                        | **⚠️ READ THIS FIRST** — Limitations, unvalidated assumptions, corrections | all   |
 | [COMPETITIVE-POSITIONING.md](spec/COMPETITIVE-POSITIONING.md) | Market analysis and differentiation                                        | all   |
 | [PERFORMANCE-TARGETS.md](spec/PERFORMANCE-TARGETS.md)         | Performance budgets and benchmarks                                         | 1-2   |
@@ -66,7 +68,8 @@ See [decisions/README.md](decisions/README.md) for full decision log.
 | Document                                                        | Topic                            |
 | --------------------------------------------------------------- | -------------------------------- |
 | [BEST-PRACTICES.md](guides/BEST-PRACTICES.md)                   | Coding conventions and patterns  |
-| [TESTING-FRAMEWORK.md](guides/TESTING-FRAMEWORK.md)             | Test infrastructure and patterns |
+| [TESTING-FRAMEWORK.md](guides/TESTING-FRAMEWORK.md)             | Legacy TypeScript-era testing guide |
+| [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md)               | Current Rust-first test baseline and gap map |
 | [SYNTHETIC-TESTING-GUIDE.md](guides/SYNTHETIC-TESTING-GUIDE.md) | Synthetic test generation        |
 | [ERROR-HANDLING-GUIDE.md](guides/ERROR-HANDLING-GUIDE.md)       | Error handling patterns          |
 | [DATABASE-GUIDE.md](guides/DATABASE-GUIDE.md)                   | Database usage (Phase 2+)        |
@@ -136,7 +139,7 @@ See [research/README.md](research/README.md) for reading sequences by phase.
 | Document                                              | Topic                   |
 | ----------------------------------------------------- | ----------------------- |
 | [CLI-ARCHITECTURE.md](vision/CLI-ARCHITECTURE.md)     | Future CLI architecture |
-| [DASHBOARD-DESIGN.md](vision/DASHBOARD-DESIGN.md)     | Historical EGUI/dashboard design reference |
+| [TUI-AUGMENTATION-VISION.md](archive/TUI-AUGMENTATION-VISION.md) | Historical UI augmentation reference |
 | [DYNAMIC-CLI-VISION.md](vision/DYNAMIC-CLI-VISION.md) | Dynamic CLI concepts    |
 | [BENCHMARKS.md](vision/BENCHMARKS.md)                 | Performance benchmarks  |
 | [DATA-MODELS.md](vision/DATA-MODELS.md)               | Data model designs      |
@@ -151,19 +154,10 @@ See [research/README.md](research/README.md) for reading sequences by phase.
 
 | Document                                                                       | Superseded By                               |
 | ------------------------------------------------------------------------------ | ------------------------------------------- |
-| [ARCHITECTURE.md](archive/ARCHITECTURE.md)                                     | REALISTIC-FRAMEWORK.md + PRODUCT-SPEC-v2.md |
-| [MVP-SPECIFICATION.md](archive/MVP-SPECIFICATION.md)                           | PRODUCT-SPEC-v2.md                          |
-| [SPEC-v1.1.md](archive/SPEC-v1.1.md)                                           | PRODUCT-SPEC-v2.md                          |
-| [STEWARD.md](archive/STEWARD.md)                                               | Hooks-based architecture                    |
-| [OPENCODE-INTEGRATION.md](archive/OPENCODE-INTEGRATION.md)                     | impulse-plugin/ implementation              |
-| [IMPLEMENTATION-ROADMAP.md](archive/phases/IMPLEMENTATION-ROADMAP.md)           | RUST-CANONICAL-CONTRACT.md                  |
-| [PRODUCT-SPEC-v2.md](archive/spec/PRODUCT-SPEC-v2.md)                         | RUST-CANONICAL-CONTRACT.md                  |
-| [PRD-v1.md](archive/research/PRD-v1.md)                                       | RUST-CANONICAL-CONTRACT.md                  |
-| [REALISTIC-FRAMEWORK.md](archive/research/REALISTIC-FRAMEWORK.md)             | RUST-CANONICAL-CONTRACT.md                  |
-| [cockpit-feature-plan.md](archive/research/cockpit-feature-plan.md)             | Current impulse-rs implementation            |
+| [TUI-AUGMENTATION-VISION.md](archive/TUI-AUGMENTATION-VISION.md)              | Current Rust roadmap and workbench docs     |
 | Session logs (11 files)                                                         | [DEVELOPMENT-HISTORY.md](session-logs/DEVELOPMENT-HISTORY.md) |
 
-See [archive/README.md](archive/README.md) for full supersession history.
+The broader historical archive referenced by older docs is not fully present in the current workspace and needs a dedicated recovery or cleanup pass.
 
 ---
 
@@ -174,11 +168,13 @@ See [archive/README.md](archive/README.md) for full supersession history.
 Start here:
 
 1. [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) — **Start here** - Product contract and interfaces
-2. [AGENTS.md](../AGENTS.md) — Current architecture and operational guidance
-3. [ROADMAP-PLAN.md](ROADMAP-PLAN.md) — Current roadmap and EGUI progress baseline
-4. [plans/IMPLEMENTATION-HANDOFF.md](plans/IMPLEMENTATION-HANDOFF.md) — Current implementation sequence
-5. [EFFICIENCY-ANALYSIS.md](research/EFFICIENCY-ANALYSIS.md) — Implementation patterns
-6. [BEST-PRACTICES.md](guides/BEST-PRACTICES.md) — Coding conventions
+2. [USER-STORY-MAP.md](spec/USER-STORY-MAP.md) — Current user stories and acceptance criteria
+3. [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md) — Current automated coverage and known gaps
+4. [AGENTS.md](../AGENTS.md) — Current architecture and operational guidance
+5. [ROADMAP-PLAN.md](ROADMAP-PLAN.md) — Current roadmap and EGUI progress baseline
+6. [plans/IMPLEMENTATION-HANDOFF.md](plans/IMPLEMENTATION-HANDOFF.md) — Current implementation sequence
+7. [EFFICIENCY-ANALYSIS.md](research/EFFICIENCY-ANALYSIS.md) — Implementation patterns
+8. [BEST-PRACTICES.md](guides/BEST-PRACTICES.md) — Coding conventions
 
 ### Next: Daemon-Truth EGUI + Hook Validation
 
@@ -186,12 +182,13 @@ Start here:
 2. [ROADMAP-PLAN.md](ROADMAP-PLAN.md) — Daemon-truth and workbench stabilization lane
 3. [plans/IMPLEMENTATION-HANDOFF.md](plans/IMPLEMENTATION-HANDOFF.md) — Technical execution details
 4. [impulse-rs/docs/IMPULSE_TERM_STATUS.md](../impulse-rs/docs/IMPULSE_TERM_STATUS.md) — Terminal telemetry status
-5. [TESTING-FRAMEWORK.md](guides/TESTING-FRAMEWORK.md) — Test patterns
-6. [PHASE1.5-COORDINATION.md](phases/PHASE1.5-COORDINATION.md) — Coordination reference
+5. [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md) — Current Rust-first test patterns and gaps
+6. [TESTING-FRAMEWORK.md](guides/TESTING-FRAMEWORK.md) — Historical TypeScript-era reference only
+7. [PHASE1.5-COORDINATION.md](phases/PHASE1.5-COORDINATION.md) — Coordination reference
 
 ### Later: Agent Control + Artifact Polish
 
-1. [DASHBOARD-DESIGN.md](vision/DASHBOARD-DESIGN.md) — Historical design reference
+1. [TUI-AUGMENTATION-VISION.md](archive/TUI-AUGMENTATION-VISION.md) — Historical UI reference
 2. [CLI-ARCHITECTURE.md](vision/CLI-ARCHITECTURE.md) — CLI evolution
 
 ---

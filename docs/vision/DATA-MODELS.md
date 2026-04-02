@@ -427,7 +427,7 @@ sqlite3 ~/.impulse/live_state.db "VACUUM;"
 
 | Document | Purpose |
 |----------|---------|
-| [ARCHITECTURE.md](ARCHITECTURE.md) | Three state domains, promotion flow |
-| [STEWARD.md](STEWARD.md) | Config schema (database path, cleanup intervals) |
-| [SPEC-v1.1.md](SPEC-v1.1.md) | Phase 1.5 acceptance criteria for DB |
+| [CLI-ARCHITECTURE.md](CLI-ARCHITECTURE.md) | Current surviving architecture-oriented vision reference |
+| `STEWARD.md` | Historical stewardship reference not present in the current workspace |
+| `SPEC-v1.1.md` | Historical phase acceptance document not present in the current workspace |
 | [BENCHMARKS.md](BENCHMARKS.md) | Query performance tests |

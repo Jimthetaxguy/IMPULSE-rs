@@ -10,7 +10,7 @@ last_updated: 2026-02-20
 
 > **Status:** Accepted
 > **Date:** 2026-02-20
-> **Supersedes:** [0003-split-schema.md](0003-split-schema.md) (content reused in Phase 3)
+> **Supersedes:** historical ADR `0003-split-schema.md` (not present in the current workspace archive); content was reused in Phase 3
 
 ---
 

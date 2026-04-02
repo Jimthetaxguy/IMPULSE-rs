@@ -110,6 +110,8 @@ memory-pipeline/     # Python research tooling
 ## Documentation
 
 - **Start here:** [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
+- **User stories:** [`docs/spec/USER-STORY-MAP.md`](docs/spec/USER-STORY-MAP.md)
+- **Test traceability:** [`docs/spec/TEST-TRACEABILITY.md`](docs/spec/TEST-TRACEABILITY.md)
 - **Agent guidelines:** [`AGENTS.md`](AGENTS.md)
 - **Meta-Harness synthesis:** [`docs/research/META-HARNESS-RUST-MULTI-AGENT.md`](docs/research/META-HARNESS-RUST-MULTI-AGENT.md)
 - **Rust multi-agent guide:** [`docs/guides/RUST-MULTI-AGENT-PATTERNS.md`](docs/guides/RUST-MULTI-AGENT-PATTERNS.md)
@@ -120,7 +122,10 @@ memory-pipeline/     # Python research tooling
 
 ```bash
 cd impulse-rs
-cargo test    # 486 passing
+cargo build
+cargo test
+cargo clippy -- -D warnings
+cargo fmt --check
 ```
 
 ## License
