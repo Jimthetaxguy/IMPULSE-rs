@@ -13,7 +13,7 @@ Impulse runs on macOS, Linux, and (partially) Windows.
 
 ```bash
 # Option 1: Build from source (recommended)
-git clone https://github.com/jamespustorino/impulse-rs.git
+git clone https://github.com/Jimthetaxguy/IMPULSE-rs.git
 cd impulse-rs
 cargo install --path .
 
@@ -78,7 +78,7 @@ impulse-rs session-start -n my-project -p claude-code
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # Clone and build
-git clone https://github.com/jamespustorino/impulse-rs.git
+git clone https://github.com/Jimthetaxguy/IMPULSE-rs.git
 cd impulse-rs
 cargo install --path .
 ```
@@ -143,7 +143,7 @@ wsl --install -d Ubuntu
 
 # Inside Ubuntu VM, follow Linux instructions above
 wsl -e bash -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
-wsl -e bash -c "git clone https://github.com/jamespustorino/impulse-rs.git"
+wsl -e bash -c "git clone https://github.com/Jimthetaxguy/IMPULSE-rs.git"
 ```
 
 ### Option 2: Native (Experimental)
@@ -153,7 +153,7 @@ wsl -e bash -c "git clone https://github.com/jamespustorino/impulse-rs.git"
 rustup default stable-x86_64-pc-windows-msvc
 
 # Build
-git clone https://github.com/jamespustorino/impulse-rs.git
+git clone https://github.com/Jimthetaxguy/IMPULSE-rs.git
 cd impulse-rs
 cargo build --release
 ```
