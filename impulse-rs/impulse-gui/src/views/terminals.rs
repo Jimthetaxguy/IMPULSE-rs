@@ -1177,8 +1177,8 @@ impl View for TerminalsView {
                             ("Ctrl+N", "New terminal tab"),
                             ("Ctrl+W", "Close active tab"),
                             ("Ctrl+Tab", "Next tab"),
-                            ("Ctrl+L", "Focus agent panel"),
-                            ("Ctrl+5", "Toggle agent panel"),
+                            ("Ctrl+L", "Focus supervisor"),
+                            ("Ctrl+E", "Toggle supervisor"),
                             ("Ctrl+B", "Toggle sidebar"),
                             ("Ctrl+K", "Search"),
                         ] {

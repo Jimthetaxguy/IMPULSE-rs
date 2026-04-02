@@ -210,7 +210,7 @@ impl AgentPanel {
                      /memory-search <query> — Search session memory\n\n\
                      Shortcuts:\n\
                      Ctrl+L — Focus agent input\n\
-                     Ctrl+5 — Toggle agent panel\n\
+                     Ctrl+E — Toggle supervisor panel\n\
                      Ctrl+N — New terminal tab\n\
                      Escape — Dismiss error state",
                 ));
