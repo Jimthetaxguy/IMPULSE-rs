@@ -151,7 +151,7 @@ pub fn show(ctx: &egui::Context, state: &SharedState) {
                     } else {
                         ui.label(
                             egui::RichText::new(
-                                "Ctrl+1-7: views  Ctrl+N: agent  Ctrl+L: panel  Ctrl+B: sidebar",
+                                "Ctrl+1-4: views  Ctrl+N: agent  Ctrl+E: panel  Ctrl+B: sidebar",
                             )
                             .small()
                             .color(colors::TEXT_FAINT),

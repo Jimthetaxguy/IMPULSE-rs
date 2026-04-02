@@ -746,24 +746,38 @@ impl View for TerminalsView {
                 let badge = self.tab_badges.get(id).cloned().unwrap_or_default();
 
                 ui.horizontal(|ui| {
-                    // Alive dot.
+                    // Alive dot — smaller, tighter spacing.
                     let dot_color = if is_alive {
                         colors::GREEN
                     } else {
                         colors::TEXT_DIM
                     };
-                    let dot_rect = ui.allocate_space(egui::vec2(8.0, 8.0));
+                    let dot_rect = ui.allocate_space(egui::vec2(6.0, 6.0));
                     ui.painter()
-                        .circle_filled(dot_rect.1.center(), 3.5, dot_color);
+                        .circle_filled(dot_rect.1.center(), 2.5, dot_color);
 
-                    let text = egui::RichText::new(&label).color(if is_active {
+                    let text = egui::RichText::new(&label).size(12.0).color(if is_active {
                         color
                     } else {
                         colors::TEXT_MUTED
                     });
-                    if ui.selectable_label(is_active, text).clicked() {
+                    let tab_resp = ui.selectable_label(is_active, text);
+                    if tab_resp.clicked() {
                         self.active_tab = Some(*id);
                         self.badge_acknowledged_tab = Some(*id);
+                    }
+
+                    // Active tab accent underline.
+                    if is_active {
+                        let rect = tab_resp.rect;
+                        ui.painter().rect_filled(
+                            egui::Rect::from_min_max(
+                                egui::pos2(rect.left(), rect.bottom() - 2.0),
+                                egui::pos2(rect.right(), rect.bottom()),
+                            ),
+                            1.0,
+                            colors::ACCENT,
+                        );
                     }
 
                     // Context health indicator for alive panels — compact inline budget bar.
