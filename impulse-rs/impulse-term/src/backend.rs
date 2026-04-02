@@ -24,6 +24,7 @@ const PTY_READ_BUFFER_SIZE: usize = 4096;
 /// background, continuously feeding PTY output into the parser.
 pub struct TerminalBackend {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    write_queue: WriteQueue,
     parser: Arc<FairMutex<vt100::Parser>>,
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     output_bytes: Arc<AtomicU64>,
@@ -120,8 +121,12 @@ impl TerminalBackend {
                 })?
         };
 
+        let writer_arc = Arc::new(Mutex::new(writer));
+        let write_queue = WriteQueue::new(Arc::clone(&writer_arc));
+
         Ok(Self {
-            writer: Arc::new(Mutex::new(writer)),
+            writer: writer_arc,
+            write_queue,
             parser,
             master,
             output_bytes,
@@ -161,12 +166,20 @@ impl TerminalBackend {
         text
     }
 
-    /// Write raw bytes to the PTY (keyboard input, injected context, etc.).
+    /// Write raw bytes to the PTY.
+    ///
+    /// **Prefer `write_queue().write_user_input()` or `write_queue().write_injection()`**
+    /// for proper serialization. Retained for backwards compat during migration.
     pub fn write_input(&self, data: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
         let mut writer = self.writer.lock();
         writer.write_all(data)?;
         writer.flush()?;
         Ok(())
+    }
+
+    /// Access the write queue for serialized PTY writes.
+    pub fn write_queue(&self) -> &WriteQueue {
+        &self.write_queue
     }
 
     /// Total output bytes received from the PTY since spawn.
@@ -210,11 +223,15 @@ impl TerminalBackend {
 
     /// Resize the PTY and update the parser dimensions.
     ///
-    /// Sends SIGWINCH to the child process via the PTY master handle,
-    /// then updates the vt100 parser to match. Takes `&self` (not `&mut self`)
-    /// so it can be called through `Arc<TerminalBackend>`.
+    /// Locks the parser FIRST to block the reader thread, then resizes the PTY
+    /// master and updates parser dimensions atomically. Without this ordering,
+    /// the reader could process output formatted for the new PTY size while the
+    /// parser still has the old dimensions, causing text wrapping corruption.
     pub fn resize(&self, cols: u16, rows: u16) -> Result<(), Box<dyn std::error::Error>> {
-        // 1. Resize the PTY master (sends SIGWINCH to child process).
+        // Lock parser first — blocks reader thread during the resize window.
+        let mut parser = self.parser.lock();
+
+        // Resize the PTY master (sends SIGWINCH to child process).
         {
             let master = self.master.lock();
             master.resize(PtySize {
@@ -225,11 +242,8 @@ impl TerminalBackend {
             })?;
         }
 
-        // 2. Resize the vt100 parser to match.
-        {
-            let mut parser = self.parser.lock();
-            parser.set_size(rows, cols);
-        }
+        // Update parser dimensions while still holding the lock.
+        parser.set_size(rows, cols);
 
         self.cols.store(cols, Ordering::Relaxed);
         self.rows.store(rows, Ordering::Relaxed);
@@ -294,6 +308,67 @@ impl TerminalBackend {
     }
 }
 
+// ---------------------------------------------------------------------------
+// WriteQueue — serialized PTY writes
+// ---------------------------------------------------------------------------
+
+/// Minimum quiet period (ms) after user input before injection is allowed.
+const INJECTION_QUIET_MS: u64 = 500;
+
+/// Serializes all writes to the PTY, preventing message-level interleaving
+/// between user input, context injection, and lifecycle writes.
+///
+/// All code paths that write to the PTY must go through this queue.
+/// `write_user_input()` always succeeds and records a timestamp.
+/// `write_injection()` is skipped if user input occurred recently.
+pub struct WriteQueue {
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    /// Epoch millis of the last user input write.
+    last_user_input: Arc<AtomicU64>,
+}
+
+impl WriteQueue {
+    /// Create a new WriteQueue wrapping the given PTY writer.
+    pub fn new(writer: Arc<Mutex<Box<dyn Write + Send>>>) -> Self {
+        Self {
+            writer,
+            last_user_input: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Write user keyboard/paste input — always succeeds, updates last-input timestamp.
+    pub fn write_user_input(&self, data: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+        let mut writer = self.writer.lock();
+        writer.write_all(data)?;
+        writer.flush()?;
+        let now = epoch_millis();
+        self.last_user_input.store(now, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Write injected context — skipped if user typed within INJECTION_QUIET_MS.
+    /// Writes the entire buffer in a single lock acquisition to prevent interleaving.
+    /// Returns `true` if the write happened, `false` if skipped.
+    pub fn write_injection(&self, data: &[u8]) -> Result<bool, Box<dyn std::error::Error>> {
+        let now = epoch_millis();
+        let last = self.last_user_input.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < INJECTION_QUIET_MS {
+            return Ok(false);
+        }
+        let mut writer = self.writer.lock();
+        writer.write_all(data)?;
+        writer.flush()?;
+        Ok(true)
+    }
+}
+
+fn epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 /// Background reader thread — reads PTY output and feeds it to the vt100 parser.
 fn pty_reader_loop(
     mut reader: Box<dyn Read + Send>,
@@ -333,5 +408,88 @@ fn pty_reader_loop(
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Shared buffer helper for testing WriteQueue without a real PTY.
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn test_write_queue() -> (WriteQueue, Arc<Mutex<Vec<u8>>>) {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> =
+            Arc::new(Mutex::new(Box::new(SharedBuf(Arc::clone(&buf)))));
+        (WriteQueue::new(writer), buf)
+    }
+
+    #[test]
+    fn test_write_queue_user_input_succeeds() {
+        let (wq, buf) = test_write_queue();
+        wq.write_user_input(b"hello").unwrap();
+        assert_eq!(&*buf.lock(), b"hello");
+    }
+
+    #[test]
+    fn test_write_queue_user_input_multiple_writes() {
+        let (wq, buf) = test_write_queue();
+        wq.write_user_input(b"abc").unwrap();
+        wq.write_user_input(b"def").unwrap();
+        assert_eq!(&*buf.lock(), b"abcdef");
+    }
+
+    #[test]
+    fn test_write_queue_injection_blocked_after_input() {
+        let (wq, buf) = test_write_queue();
+        // Simulate recent user input.
+        wq.write_user_input(b"x").unwrap();
+        // Injection should be blocked (within 500ms).
+        let injected = wq.write_injection(b"context").unwrap();
+        assert!(
+            !injected,
+            "injection should be blocked right after user input"
+        );
+        // Only user input should be in the buffer.
+        assert_eq!(&*buf.lock(), b"x");
+    }
+
+    #[test]
+    fn test_write_queue_injection_succeeds_when_idle() {
+        let (wq, buf) = test_write_queue();
+        // No user input — last_user_input is 0, so the gap is huge.
+        let injected = wq.write_injection(b"context").unwrap();
+        assert!(
+            injected,
+            "injection should succeed when no recent user input"
+        );
+        assert_eq!(&*buf.lock(), b"context");
+    }
+
+    #[test]
+    fn test_write_queue_injection_atomic_write() {
+        let (wq, buf) = test_write_queue();
+        // Write a multi-part injection (simulating bracketed paste).
+        let paste = b"\x1b[200~injected content\x1b[201~";
+        let injected = wq.write_injection(paste).unwrap();
+        assert!(injected);
+        assert_eq!(&*buf.lock(), paste.as_slice());
+    }
+
+    #[test]
+    fn test_epoch_millis_nonzero() {
+        let ms = epoch_millis();
+        assert!(ms > 0, "epoch millis should be nonzero");
     }
 }

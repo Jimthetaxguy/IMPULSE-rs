@@ -13,8 +13,6 @@ use crate::global_config::GlobalConfig;
 use crate::state::{
     self, ConnectionStatus, PollerCommand, PollerEvent, StateHandle, TaskNoticeLevel,
 };
-use crate::views::artifacts::{ArtifactUiAction, ArtifactsView};
-use crate::views::context::ContextView;
 use crate::views::guardrails::GuardrailsView;
 use crate::views::memory::MemoryView;
 use crate::views::overview::OverviewView;
@@ -30,9 +28,7 @@ use crate::widgets::{sidebar, status_bar};
 pub struct ImpulseApp {
     overview: OverviewView,
     terminals: TerminalsView,
-    context: ContextView,
     memory: MemoryView,
-    artifacts: ArtifactsView,
     guardrails: GuardrailsView,
     settings: SettingsView,
     active_view: ViewId,
@@ -79,9 +75,7 @@ impl ImpulseApp {
         Self {
             overview: OverviewView::new(),
             terminals: TerminalsView::new(Some(poller_cmd.clone())),
-            context: ContextView::new(),
             memory: MemoryView::new(poller_cmd.clone()),
-            artifacts: ArtifactsView::new(),
             guardrails: GuardrailsView::new(),
             settings: SettingsView::with_poller(Some(poller_cmd.clone())),
             active_view: ViewId::Overview,
@@ -128,14 +122,8 @@ impl ImpulseApp {
             } else if input.key_pressed(egui::Key::Num2) {
                 self.active_view = ViewId::Agents;
             } else if input.key_pressed(egui::Key::Num3) {
-                self.active_view = ViewId::Context;
-            } else if input.key_pressed(egui::Key::Num4) {
                 self.active_view = ViewId::Memory;
-            } else if input.key_pressed(egui::Key::Num5) {
-                self.active_view = ViewId::Artifacts;
-            } else if input.key_pressed(egui::Key::Num6) {
-                self.active_view = ViewId::Guardrails;
-            } else if input.key_pressed(egui::Key::Num7) {
+            } else if input.key_pressed(egui::Key::Num4) {
                 self.active_view = ViewId::Settings;
             } else if input.key_pressed(egui::Key::B) {
                 self.sidebar_expanded = !self.sidebar_expanded;
@@ -183,13 +171,10 @@ impl ImpulseApp {
                     (
                         "Views",
                         vec![
-                            ("Ctrl+1", "Overview"),
-                            ("Ctrl+2", "Agents / Terminals"),
-                            ("Ctrl+3", "Context"),
-                            ("Ctrl+4", "Memory"),
-                            ("Ctrl+5", "Artifacts"),
-                            ("Ctrl+6", "Guardrails"),
-                            ("Ctrl+7", "Settings"),
+                            ("Ctrl+1", "Workbench"),
+                            ("Ctrl+2", "Terminals"),
+                            ("Ctrl+3", "Memory"),
+                            ("Ctrl+4", "Settings"),
                         ],
                     ),
                     (
@@ -274,13 +259,13 @@ impl ImpulseApp {
                     self.active_view = ViewId::Agents;
                 }
                 Command::FocusContext => {
-                    self.active_view = ViewId::Context;
+                    self.active_view = ViewId::Memory;
                 }
                 Command::FocusArtifacts => {
-                    self.active_view = ViewId::Artifacts;
+                    self.active_view = ViewId::Memory;
                 }
                 Command::FocusGuardrails => {
-                    self.active_view = ViewId::Guardrails;
+                    self.active_view = ViewId::Settings;
                 }
                 Command::FocusSettings => {
                     self.active_view = ViewId::Settings;
@@ -530,7 +515,7 @@ impl ImpulseApp {
         self.notifications.notify(severity, &result.message);
 
         if let Some(artifact_id) = result.artifact_id.as_ref() {
-            self.active_view = ViewId::Artifacts;
+            self.active_view = ViewId::Memory;
             self.notifications.notify(
                 Severity::Info,
                 format!("Supervisor artifact ready: {}", artifact_id),
@@ -848,10 +833,10 @@ impl eframe::App for ImpulseApp {
         }
 
         if self.agent_visible {
-            egui::SidePanel::left("agent_panel")
+            egui::SidePanel::right("agent_panel")
                 .resizable(true)
-                .default_width(340.0)
-                .width_range(280.0..=500.0)
+                .default_width(220.0)
+                .width_range(160.0..=320.0)
                 .show(ctx, |ui| {
                     self.agent_panel.ui(ui, ctx);
                 });
@@ -959,28 +944,9 @@ impl eframe::App for ImpulseApp {
         egui::CentralPanel::default().show(ctx, |ui| match self.active_view {
             ViewId::Overview => self.overview.ui(ui, &state, ctx),
             ViewId::Agents => self.terminals.ui(ui, &state, ctx),
-            ViewId::Context => self.context.ui(ui, &state, ctx),
             ViewId::Memory => self.memory.ui(ui, &state, ctx),
-            ViewId::Artifacts => self.artifacts.ui(ui, &state, ctx),
-            ViewId::Guardrails => self.guardrails.ui(ui, &state, ctx),
             ViewId::Settings => self.settings.ui(ui, &state, ctx),
         });
-
-        for action in self.artifacts.take_actions() {
-            match action {
-                ArtifactUiAction::RunRemote {
-                    artifact_id,
-                    action_id,
-                    params,
-                } => {
-                    let _ = self.poller_cmd.send(PollerCommand::RunArtifactAction {
-                        artifact_id,
-                        action_id,
-                        params,
-                    });
-                }
-            }
-        }
 
         for action in self.settings.take_supervisor_actions() {
             let _ = self

@@ -341,7 +341,7 @@ impl TerminalPanel {
                 .backend
                 .with_parser(|p| p.screen().application_cursor());
             if let Some(bytes) = input::key_to_pty_bytes(key, modifiers, app_cursor) {
-                let _ = self.backend.write_input(&bytes);
+                let _ = self.backend.write_queue().write_user_input(&bytes);
             }
         }
 
@@ -361,7 +361,7 @@ impl TerminalPanel {
         });
 
         for text in &text_events {
-            let _ = self.backend.write_input(text.as_bytes());
+            let _ = self.backend.write_queue().write_user_input(text.as_bytes());
         }
 
         // Handle paste.
@@ -377,7 +377,7 @@ impl TerminalPanel {
 
         if let Some(text) = paste_text {
             let pasted = input::bracketed_paste(&text);
-            let _ = self.backend.write_input(&pasted);
+            let _ = self.backend.write_queue().write_user_input(&pasted);
         }
     }
 
@@ -570,9 +570,9 @@ impl TerminalPanel {
         self.agent_name
     }
 
-    /// Write raw bytes to the PTY.
+    /// Write raw bytes to the PTY via the serialized write queue.
     pub fn write_input(&self, data: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-        self.backend.write_input(data)
+        self.backend.write_queue().write_user_input(data)
     }
 
     /// Get the full visible screen text (for search, context extraction).

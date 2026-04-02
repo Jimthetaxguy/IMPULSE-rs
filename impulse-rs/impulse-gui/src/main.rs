@@ -83,7 +83,7 @@ fn main() -> eframe::Result {
         "Impulse",
         options,
         Box::new(|cc| {
-            theme::apply_dark_theme(&cc.egui_ctx);
+            theme::apply_theme(&cc.egui_ctx, &theme::ThemeName::default().palette());
             Ok(Box::new(ImpulseApp::new(cc)))
         }),
     )

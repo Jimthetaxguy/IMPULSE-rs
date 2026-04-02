@@ -1,7 +1,6 @@
 //! View abstraction — each egui workbench panel implements `View`.
 
-pub mod artifacts;
-pub mod context;
+// Genome and Sessions are embedded in the Memory view (not top-level views).
 pub mod genome;
 pub mod guardrails;
 pub mod memory;
@@ -23,10 +22,7 @@ use crate::state::SharedState;
 pub enum ViewId {
     Overview,
     Agents,
-    Context,
     Memory,
-    Artifacts,
-    Guardrails,
     Settings,
 }
 
@@ -35,10 +31,7 @@ impl ViewId {
         &[
             ViewId::Overview,
             ViewId::Agents,
-            ViewId::Context,
             ViewId::Memory,
-            ViewId::Artifacts,
-            ViewId::Guardrails,
             ViewId::Settings,
         ]
     }
@@ -46,24 +39,18 @@ impl ViewId {
     pub fn title(&self) -> &'static str {
         match self {
             ViewId::Overview => "Workbench",
-            ViewId::Agents => "Agents",
-            ViewId::Context => "Context (exp)",
+            ViewId::Agents => "Terminals",
             ViewId::Memory => "Memory",
-            ViewId::Artifacts => "Artifacts (exp)",
-            ViewId::Guardrails => "Guardrails",
             ViewId::Settings => "Settings",
         }
     }
 
     pub fn icon(&self) -> &'static str {
         match self {
-            ViewId::Overview => "\u{25A6}",
-            ViewId::Agents => "\u{2328}",
-            ViewId::Context => "\u{25D4}",
-            ViewId::Memory => "\u{1F9E0}",
-            ViewId::Artifacts => "\u{25A4}",
-            ViewId::Guardrails => "\u{1F6E1}",
-            ViewId::Settings => "\u{2699}",
+            ViewId::Overview => "\u{1F680}", // 🚀
+            ViewId::Agents => "\u{2328}",    // ⌨
+            ViewId::Memory => "\u{1F9E0}",   // 🧠
+            ViewId::Settings => "\u{2699}",  // ⚙
         }
     }
 
@@ -71,17 +58,14 @@ impl ViewId {
         match self {
             ViewId::Overview => "Ctrl+1",
             ViewId::Agents => "Ctrl+2",
-            ViewId::Context => "Ctrl+3",
-            ViewId::Memory => "Ctrl+4",
-            ViewId::Artifacts => "Ctrl+5",
-            ViewId::Guardrails => "Ctrl+6",
-            ViewId::Settings => "Ctrl+7",
+            ViewId::Memory => "Ctrl+3",
+            ViewId::Settings => "Ctrl+4",
         }
     }
 }
 
 pub trait View {
-    #[allow(dead_code)]
+    #[allow(dead_code)] // dead_code: part of the View trait contract
     fn id(&self) -> ViewId;
     fn ui(&mut self, ui: &mut egui::Ui, state: &SharedState, ctx: &egui::Context);
 }

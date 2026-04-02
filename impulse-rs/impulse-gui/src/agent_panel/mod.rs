@@ -496,11 +496,13 @@ impl AgentPanel {
             ui.add_space(4.0);
             ui.strong(egui::RichText::new("Supervisor").color(colors::ACCENT));
             ui.separator();
-            let effective = backend::resolve_backend(&self.backend, self.connection_status);
             ui.label(
-                egui::RichText::new(effective.label())
-                    .small()
-                    .color(colors::TEXT_MUTED),
+                egui::RichText::new(backend::resolve_backend_label(
+                    &self.backend,
+                    self.connection_status,
+                ))
+                .small()
+                .color(colors::TEXT_MUTED),
             );
             ui.label(
                 egui::RichText::new(format!("({})", msg_count))
@@ -621,10 +623,11 @@ impl AgentPanel {
                                 self.focus_requested = false;
                             }
 
-                            if response.lost_focus()
-                                && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                                && !is_thinking
-                            {
+                            // Enter causes the TextEdit to lose focus — that's
+                            // our submission signal. Don't also check key_pressed(Enter)
+                            // because egui consumes the key event internally before we
+                            // can observe it, causing Enter to silently fail.
+                            if response.lost_focus() && !is_thinking {
                                 submitted = true;
                             }
 
@@ -691,13 +694,13 @@ impl AgentPanel {
     }
 
     /// Number of messages for status display.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // dead_code: used by tests and planned GUI status bar
     pub fn message_count(&self) -> usize {
         self.messages.len()
     }
 
     /// Whether the agent is currently processing a query.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // dead_code: used by tests and planned GUI status bar
     pub fn is_thinking(&self) -> bool {
         self.state == AgentState::Thinking
     }

@@ -31,7 +31,7 @@ impl GuardrailsView {
 
 impl View for GuardrailsView {
     fn id(&self) -> ViewId {
-        ViewId::Guardrails
+        ViewId::Settings
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, state: &SharedState, _ctx: &egui::Context) {

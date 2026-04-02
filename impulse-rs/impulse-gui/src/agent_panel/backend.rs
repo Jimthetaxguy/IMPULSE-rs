@@ -19,6 +19,26 @@ pub struct AgentResponse {
     pub permission_state: Option<impulse_ops::SupervisorPermissionState>,
 }
 
+impl AgentResponse {
+    fn ok(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            is_error: false,
+            proposals: Vec::new(),
+            permission_state: None,
+        }
+    }
+
+    fn error(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            is_error: true,
+            proposals: Vec::new(),
+            permission_state: None,
+        }
+    }
+}
+
 /// Which backend to use for agent queries.
 #[derive(Clone)]
 pub enum AgentBackend {
@@ -52,9 +72,11 @@ impl AgentBackend {
         }
         if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
             if !key.is_empty() {
+                let model = std::env::var("IMPULSE_MODEL")
+                    .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
                 return Self::Api {
                     api_key: key,
-                    model: "claude-sonnet-4-20250514".to_string(),
+                    model,
                     history: Vec::new(),
                 };
             }
@@ -80,6 +102,8 @@ impl AgentBackend {
 ///
 /// Accepts a `ConnectionStatus` value rather than a `StateHandle` to avoid
 /// re-entrant locking — callers extract the status before entering any lock scope.
+///
+/// Returns a clone — for display-only callers (header labels), prefer `resolve_backend_label`.
 pub fn resolve_backend(
     static_backend: &AgentBackend,
     connection: ConnectionStatus,
@@ -88,6 +112,18 @@ pub fn resolve_backend(
         AgentBackend::DaemonChat
     } else {
         static_backend.clone()
+    }
+}
+
+/// Label-only resolution — avoids cloning the full backend (including API history).
+pub fn resolve_backend_label(
+    static_backend: &AgentBackend,
+    connection: ConnectionStatus,
+) -> &'static str {
+    if connection == ConnectionStatus::Connected {
+        "Daemon Chat"
+    } else {
+        static_backend.label()
     }
 }
 
@@ -154,43 +190,23 @@ fn query_harness(prompt: &str, context: &str, session_id: Option<&str>) -> Agent
     match cmd.output() {
         Ok(output) if output.status.success() => {
             let content = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if content.is_empty() {
-                AgentResponse {
-                    content: "(empty response)".to_string(),
-                    is_error: false,
-                    proposals: Vec::new(),
-                    permission_state: None,
-                }
+            AgentResponse::ok(if content.is_empty() {
+                "(empty response)".to_string()
             } else {
-                AgentResponse {
-                    content,
-                    is_error: false,
-                    proposals: Vec::new(),
-                    permission_state: None,
-                }
-            }
+                content
+            })
         }
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
             let msg = if stderr.is_empty() { stdout } else { stderr };
-            AgentResponse {
-                content: if msg.is_empty() {
-                    format!("claude exited with status {}", output.status)
-                } else {
-                    msg
-                },
-                is_error: true,
-                proposals: Vec::new(),
-                permission_state: None,
-            }
+            AgentResponse::error(if msg.is_empty() {
+                format!("claude exited with status {}", output.status)
+            } else {
+                msg
+            })
         }
-        Err(e) => AgentResponse {
-            content: format!("Failed to run claude: {}", e),
-            is_error: true,
-            proposals: Vec::new(),
-            permission_state: None,
-        },
+        Err(e) => AgentResponse::error(format!("Failed to run claude: {e}")),
     }
 }
 
@@ -237,84 +253,39 @@ fn query_api(
         Ok(response) => {
             let status = response.status();
             match response.into_body().read_to_string() {
-                Ok(text) => {
-                    if status == 200 {
-                        parse_api_response(&text)
-                    } else {
-                        AgentResponse {
-                            content: format!("API error ({}): {}", status, text),
-                            is_error: true,
-                            proposals: Vec::new(),
-                            permission_state: None,
-                        }
-                    }
-                }
-                Err(e) => AgentResponse {
-                    content: format!("Failed to read API response: {}", e),
-                    is_error: true,
-                    proposals: Vec::new(),
-                    permission_state: None,
-                },
+                Ok(text) if status == 200 => parse_api_response(&text),
+                Ok(text) => AgentResponse::error(format!("API error ({status}): {text}")),
+                Err(e) => AgentResponse::error(format!("Failed to read API response: {e}")),
             }
         }
-        Err(e) => AgentResponse {
-            content: format!("API request failed: {}", e),
-            is_error: true,
-            proposals: Vec::new(),
-            permission_state: None,
-        },
+        Err(e) => AgentResponse::error(format!("API request failed: {e}")),
     }
 }
 
 /// Parse the Anthropic Messages API response JSON.
 fn parse_api_response(body: &str) -> AgentResponse {
-    match serde_json::from_str::<serde_json::Value>(body) {
-        Ok(json) => {
-            // Extract text from content[0].text
-            if let Some(content) = json.get("content").and_then(|c| c.as_array()) {
-                let text: String = content
-                    .iter()
-                    .filter_map(|block| block.get("text").and_then(|t| t.as_str()))
-                    .collect::<Vec<_>>()
-                    .join("\n");
+    let json: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return AgentResponse::error(format!("Failed to parse API response: {e}")),
+    };
 
-                if text.is_empty() {
-                    AgentResponse {
-                        content: "(empty response)".to_string(),
-                        is_error: false,
-                        proposals: Vec::new(),
-                        permission_state: None,
-                    }
-                } else {
-                    AgentResponse {
-                        content: text,
-                        is_error: false,
-                        proposals: Vec::new(),
-                        permission_state: None,
-                    }
-                }
-            } else if let Some(err) = json.get("error").and_then(|e| e.get("message")) {
-                AgentResponse {
-                    content: format!("API error: {}", err),
-                    is_error: true,
-                    proposals: Vec::new(),
-                    permission_state: None,
-                }
-            } else {
-                AgentResponse {
-                    content: format!("Unexpected API response: {}", body),
-                    is_error: true,
-                    proposals: Vec::new(),
-                    permission_state: None,
-                }
-            }
+    // Extract text from content[0].text
+    if let Some(content) = json.get("content").and_then(|c| c.as_array()) {
+        let text: String = content
+            .iter()
+            .filter_map(|block| block.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if text.is_empty() {
+            AgentResponse::ok("(empty response)")
+        } else {
+            AgentResponse::ok(text)
         }
-        Err(e) => AgentResponse {
-            content: format!("Failed to parse API response: {}", e),
-            is_error: true,
-            proposals: Vec::new(),
-            permission_state: None,
-        },
+    } else if let Some(err) = json.get("error").and_then(|e| e.get("message")) {
+        AgentResponse::error(format!("API error: {err}"))
+    } else {
+        AgentResponse::error(format!("Unexpected API response: {body}"))
     }
 }
 
@@ -339,28 +310,19 @@ fn query_daemon_chat(prompt: &str, context: &str) -> AgentResponse {
 
     match client.supervisor_chat(prompt, ctx_opt) {
         Ok(response) => {
-            if response.response.is_empty() {
-                AgentResponse {
-                    content: "(empty response)".to_string(),
-                    is_error: false,
-                    proposals: response.proposals,
-                    permission_state: Some(response.permission_state),
-                }
+            let content = if response.response.is_empty() {
+                "(empty response)".to_string()
             } else {
-                AgentResponse {
-                    content: response.response,
-                    is_error: false,
-                    proposals: response.proposals,
-                    permission_state: Some(response.permission_state),
-                }
+                response.response
+            };
+            AgentResponse {
+                content,
+                is_error: false,
+                proposals: response.proposals,
+                permission_state: Some(response.permission_state),
             }
         }
-        Err(e) => AgentResponse {
-            content: format!("Daemon chat failed: {}", e),
-            is_error: true,
-            proposals: Vec::new(),
-            permission_state: None,
-        },
+        Err(e) => AgentResponse::error(format!("Daemon chat failed: {e}")),
     }
 }
 
@@ -403,14 +365,9 @@ pub fn dispatch_query(
                 history,
                 ..
             } => query_api(api_key, model, history, &prompt, &context),
-            AgentBackend::Unavailable => AgentResponse {
-                content:
-                    "No agent backend configured. Install Claude Code or set ANTHROPIC_API_KEY."
-                        .to_string(),
-                is_error: true,
-                proposals: Vec::new(),
-                permission_state: None,
-            },
+            AgentBackend::Unavailable => AgentResponse::error(
+                "No agent backend configured. Install Claude Code or set ANTHROPIC_API_KEY.",
+            ),
         };
         let _ = tx.send(response);
     });

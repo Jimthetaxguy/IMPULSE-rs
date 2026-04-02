@@ -1,7 +1,7 @@
 //! Collapsible navigation sidebar.
 //!
-//! 48px when collapsed (icons only), 160px when expanded (icons + labels).
-//! Toggle with `Ctrl+B`.
+//! 44px when collapsed (icons only), 180px when expanded (icons + labels).
+//! Toggle with `Ctrl+B`. Rocket logo at top, connection status at bottom.
 
 use eframe::egui;
 
@@ -9,8 +9,8 @@ use crate::state::{ConnectionStatus, SharedState};
 use crate::theme::colors;
 use crate::views::ViewId;
 
-const COLLAPSED_WIDTH: f32 = 48.0;
-const EXPANDED_WIDTH: f32 = 160.0;
+const COLLAPSED_WIDTH: f32 = 44.0;
+const EXPANDED_WIDTH: f32 = 180.0;
 
 /// Actions returned by the sidebar.
 pub struct SidebarAction {
@@ -42,16 +42,23 @@ pub fn show(
         .resizable(false)
         .exact_width(width)
         .show(ctx, |ui| {
-            ui.add_space(8.0);
+            ui.add_space(10.0);
 
-            // Logo / brand.
+            // Rocket logo + brand name.
             if expanded {
                 ui.horizontal(|ui| {
-                    ui.strong(egui::RichText::new("IMPULSE").color(colors::ACCENT));
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("\u{1F680}").size(18.0)); // 🚀
+                    ui.add_space(2.0);
+                    ui.strong(
+                        egui::RichText::new("IMPULSE")
+                            .color(colors::ACCENT)
+                            .size(14.0),
+                    );
                 });
             } else {
                 ui.vertical_centered(|ui| {
-                    ui.strong(egui::RichText::new("I").color(colors::ACCENT).size(18.0));
+                    ui.label(egui::RichText::new("\u{1F680}").size(20.0)); // 🚀
                 });
             }
 
@@ -59,7 +66,7 @@ pub fn show(
             ui.separator();
             ui.add_space(8.0);
 
-            // Navigation items.
+            // Navigation items — 4 views.
             for &view_id in ViewId::all() {
                 let is_active = view_id == active;
 
@@ -77,10 +84,11 @@ pub fn show(
 
                 let btn = egui::Button::new(egui::RichText::new(&text).color(color))
                     .fill(if is_active {
-                        colors::ACTIVE_BG
+                        colors::SURFACE
                     } else {
                         egui::Color32::TRANSPARENT
                     })
+                    .corner_radius(egui::CornerRadius::same(6))
                     .min_size(egui::vec2(width - 16.0, 32.0));
 
                 let resp = ui.add(btn);
@@ -102,9 +110,9 @@ pub fn show(
 
             // Agent panel toggle button.
             let agent_text = if expanded {
-                "\u{25CF}  Agent".to_string()
+                "\u{25CF}  Supervisor".to_string()
             } else {
-                "AG".to_string()
+                "\u{25CF}".to_string()
             };
 
             let agent_color = if agent_visible {
@@ -119,6 +127,7 @@ pub fn show(
                 } else {
                     egui::Color32::TRANSPARENT
                 })
+                .corner_radius(egui::CornerRadius::same(6))
                 .min_size(egui::vec2(width - 16.0, 32.0));
 
             let agent_resp = ui.add(agent_btn);
@@ -126,32 +135,12 @@ pub fn show(
                 action.toggle_agent = true;
             }
             if !expanded {
-                agent_resp.on_hover_text("Agent Panel (Ctrl+5)");
+                agent_resp.on_hover_text("Supervisor Panel (Ctrl+E)");
             }
 
             // Push remaining content to bottom.
             ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                 ui.add_space(8.0);
-
-                if let Some(snapshot) = state.ops_snapshot.as_ref() {
-                    let pending_reviews = snapshot.context.pending_review_count;
-                    let interventions = snapshot.interventions.len();
-                    if expanded {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "Experimental ops {}  Reviews {}",
-                                interventions, pending_reviews
-                            ))
-                            .small()
-                            .color(if pending_reviews > 0 {
-                                colors::YELLOW
-                            } else {
-                                colors::TEXT_DIM
-                            }),
-                        );
-                    }
-                    ui.add_space(6.0);
-                }
 
                 // Connection status indicator.
                 let (dot_color, label) = match state.connection {
@@ -161,8 +150,9 @@ pub fn show(
                 };
 
                 ui.horizontal(|ui| {
-                    let dot = ui.allocate_space(egui::vec2(10.0, 10.0));
-                    ui.painter().circle_filled(dot.1.center(), 4.0, dot_color);
+                    ui.add_space(4.0);
+                    let dot = ui.allocate_space(egui::vec2(8.0, 8.0));
+                    ui.painter().circle_filled(dot.1.center(), 3.5, dot_color);
                     if expanded {
                         ui.label(egui::RichText::new(label).small().color(colors::TEXT_DIM));
                     }

@@ -340,7 +340,9 @@ impl ContextBridge {
     /// Inject context into the agent's terminal.
     ///
     /// Wraps the content in agent-appropriate delimiters and writes it via
-    /// bracketed paste to avoid triggering agent hotkeys.
+    /// bracketed paste to avoid triggering agent hotkeys. Uses the WriteQueue
+    /// to ensure the entire injection is atomic and skipped if the user is
+    /// actively typing (within 500ms).
     pub fn inject_context(&mut self, content: &str) -> Result<(), Box<dyn std::error::Error>> {
         // Respect debounce.
         if let Some(last) = self.last_injection_at {
@@ -351,10 +353,13 @@ impl ContextBridge {
 
         let wrapped = self.wrap_injection(content);
         let pasted = crate::input::bracketed_paste(&wrapped);
-        self.backend.write_input(&pasted)?;
+        // WriteQueue ensures atomic write and skips if user typed recently.
+        let injected = self.backend.write_queue().write_injection(&pasted)?;
 
-        self.last_injection_at = Some(Instant::now());
-        self.injection_count += 1;
+        if injected {
+            self.last_injection_at = Some(Instant::now());
+            self.injection_count += 1;
+        }
         Ok(())
     }
 
