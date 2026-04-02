@@ -230,6 +230,10 @@ pub struct SettingsView {
     pending_supervisor_actions: Vec<impulse_ops::SupervisorAction>,
     /// Command sender to push settings updates to the poller thread.
     poller_cmd: Option<std::sync::mpsc::Sender<crate::state::PollerCommand>>,
+    /// Active GUI theme.
+    active_theme: crate::theme::ThemeName,
+    /// Whether the theme changed this frame (triggers apply_theme in app.rs).
+    theme_changed: bool,
 }
 
 impl SettingsView {
@@ -262,6 +266,8 @@ impl SettingsView {
             dirty: false,
             pending_supervisor_actions: Vec::new(),
             poller_cmd,
+            active_theme: crate::theme::ThemeName::default(),
+            theme_changed: false,
         }
     }
 
@@ -298,6 +304,18 @@ impl SettingsView {
             }
             self.dirty = true;
         }
+    }
+
+    /// Current active theme.
+    pub fn active_theme(&self) -> crate::theme::ThemeName {
+        self.active_theme
+    }
+
+    /// Whether the theme changed this frame. Resets after reading.
+    pub fn take_theme_changed(&mut self) -> bool {
+        let changed = self.theme_changed;
+        self.theme_changed = false;
+        changed
     }
 
     pub fn take_supervisor_actions(&mut self) -> Vec<impulse_ops::SupervisorAction> {
@@ -356,6 +374,31 @@ impl View for SettingsView {
             });
         });
 
+        ui.separator();
+
+        // --- Theme selector ---
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("\u{1F3A8} Theme")
+                    .strong()
+                    .color(colors::TEXT),
+            );
+            ui.add_space(8.0);
+            let prev = self.active_theme;
+            egui::ComboBox::from_id_salt("theme_selector")
+                .selected_text(self.active_theme.label())
+                .width(120.0)
+                .show_ui(ui, |ui| {
+                    for theme in crate::theme::ThemeName::all() {
+                        ui.selectable_value(&mut self.active_theme, *theme, theme.label());
+                    }
+                });
+            if self.active_theme != prev {
+                self.theme_changed = true;
+            }
+        });
+        ui.add_space(8.0);
         ui.separator();
 
         self.render_supervisor_permissions(ui, state);

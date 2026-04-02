@@ -941,6 +941,11 @@ impl eframe::App for ImpulseApp {
 
         status_bar::show(ctx, &state);
 
+        // Apply theme if the user changed it in Settings.
+        if self.settings.take_theme_changed() {
+            crate::theme::apply_theme(ctx, &self.settings.active_theme().palette());
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| match self.active_view {
             ViewId::Overview => self.overview.ui(ui, &state, ctx),
             ViewId::Agents => self.terminals.ui(ui, &state, ctx),

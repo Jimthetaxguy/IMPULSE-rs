@@ -487,27 +487,17 @@ impl AgentPanel {
         let is_thinking = self.state == AgentState::Thinking;
         let msg_count = self.messages.len();
 
-        // Header with accent bar.
+        // Header with accent bar and rocket icon.
         ui.horizontal(|ui| {
-            // Purple accent bar.
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(3.0, 20.0), egui::Sense::hover());
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(3.0, 16.0), egui::Sense::hover());
             ui.painter().rect_filled(rect, 1.0, colors::ACCENT);
 
-            ui.add_space(4.0);
-            ui.strong(egui::RichText::new("Supervisor").color(colors::ACCENT));
-            ui.separator();
-            ui.label(
-                egui::RichText::new(backend::resolve_backend_label(
-                    &self.backend,
-                    self.connection_status,
-                ))
-                .small()
-                .color(colors::TEXT_MUTED),
-            );
-            ui.label(
-                egui::RichText::new(format!("({})", msg_count))
-                    .small()
-                    .color(colors::TEXT_DIM),
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("\u{1F680}").size(12.0)); // 🚀
+            ui.strong(
+                egui::RichText::new("Supervisor")
+                    .size(13.0)
+                    .color(colors::ACCENT),
             );
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -516,11 +506,10 @@ impl AgentPanel {
                     AgentState::Thinking => colors::YELLOW,
                     AgentState::Error(_) => colors::RED,
                 };
-                // Colored state dot.
                 let (dot_rect, _) =
-                    ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                    ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
                 ui.painter()
-                    .circle_filled(dot_rect.center(), 3.5, state_color);
+                    .circle_filled(dot_rect.center(), 3.0, state_color);
                 ui.label(
                     egui::RichText::new(self.state.label())
                         .small()
@@ -603,18 +592,19 @@ impl AgentPanel {
                 ui.add_space(4.0);
                 egui::Frame::new()
                     .fill(colors::BG)
-                    .inner_margin(egui::Margin::symmetric(6, 4))
-                    .corner_radius(egui::CornerRadius::same(6))
+                    .inner_margin(egui::Margin::symmetric(8, 6))
+                    .corner_radius(egui::CornerRadius::same(8))
+                    .stroke(egui::Stroke::new(1.0, colors::BORDER))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             let text_edit = egui::TextEdit::singleline(&mut self.input_buf)
                                 .hint_text(if is_thinking {
-                                    "Waiting for response..."
+                                    "Thinking..."
                                 } else {
-                                    "Ask the Impulse supervisor..."
+                                    "Ask Impulse..."
                                 })
                                 .interactive(!is_thinking)
-                                .desired_width(ui.available_width() - 52.0);
+                                .desired_width(ui.available_width() - 40.0);
 
                             let response = ui.add(text_edit);
 
@@ -639,7 +629,10 @@ impl AgentPanel {
 
                             let send_btn = ui.add_enabled(
                                 !is_thinking && !self.input_buf.trim().is_empty(),
-                                egui::Button::new(egui::RichText::new("\u{27A4}").color(btn_color)),
+                                egui::Button::new(
+                                    egui::RichText::new("\u{2191}").size(14.0).color(btn_color), // ↑
+                                )
+                                .corner_radius(egui::CornerRadius::same(6)),
                             );
                             if send_btn.clicked() {
                                 submitted = true;
