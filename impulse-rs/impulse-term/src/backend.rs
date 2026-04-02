@@ -492,4 +492,51 @@ mod tests {
         let ms = epoch_millis();
         assert!(ms > 0, "epoch millis should be nonzero");
     }
+
+    #[test]
+    fn test_write_queue_user_input_updates_timestamp() {
+        let (wq, _buf) = test_write_queue();
+        let before = wq.last_user_input.load(Ordering::Relaxed);
+        assert_eq!(before, 0, "initial timestamp should be 0");
+        wq.write_user_input(b"x").unwrap();
+        let after = wq.last_user_input.load(Ordering::Relaxed);
+        assert!(after > 0, "timestamp should be updated after user input");
+    }
+
+    #[test]
+    fn test_write_queue_injection_does_not_update_timestamp() {
+        let (wq, _buf) = test_write_queue();
+        wq.write_injection(b"ctx").unwrap();
+        let ts = wq.last_user_input.load(Ordering::Relaxed);
+        assert_eq!(ts, 0, "injection should not update user input timestamp");
+    }
+
+    #[test]
+    fn test_write_queue_concurrent_user_writes_no_interleave() {
+        let (wq, buf) = test_write_queue();
+        let wq = Arc::new(wq);
+
+        let mut handles = Vec::new();
+        for i in 0..10 {
+            let wq = Arc::clone(&wq);
+            let msg = format!("msg{:02}", i);
+            handles.push(std::thread::spawn(move || {
+                wq.write_user_input(msg.as_bytes()).unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let data = buf.lock().clone();
+        // All 10 messages should be present (each is 5 bytes "msgNN").
+        assert_eq!(data.len(), 50, "all 10 messages should be written");
+        // Each "msg" prefix should appear exactly 10 times (no byte interleaving).
+        let as_str = String::from_utf8(data).unwrap();
+        assert_eq!(
+            as_str.matches("msg").count(),
+            10,
+            "no message should be interleaved"
+        );
+    }
 }
