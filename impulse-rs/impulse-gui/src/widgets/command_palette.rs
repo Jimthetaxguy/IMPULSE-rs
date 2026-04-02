@@ -15,11 +15,12 @@ pub enum Command {
     FocusMemory,
     FocusOverview,
     FocusAgents,
+    FocusSettings,
+    ToggleAgentPanel,
+    // Kept for backwards compat with app.rs match arms.
     FocusContext,
     FocusArtifacts,
     FocusGuardrails,
-    FocusSettings,
-    ToggleAgentPanel,
 }
 
 impl Command {
@@ -32,13 +33,13 @@ impl Command {
             Command::ToggleSidebar => "Toggle Sidebar",
             Command::ToggleShortcuts => "Show Keyboard Shortcuts",
             Command::FocusMemory => "Go to Memory",
-            Command::FocusOverview => "Go to Overview",
-            Command::FocusAgents => "Go to Agents",
-            Command::FocusContext => "Go to Context",
-            Command::FocusArtifacts => "Go to Artifacts",
-            Command::FocusGuardrails => "Go to Guardrails",
+            Command::FocusOverview => "Go to Workbench",
+            Command::FocusAgents => "Go to Terminals",
             Command::FocusSettings => "Go to Settings",
-            Command::ToggleAgentPanel => "Toggle Agent Panel",
+            Command::ToggleAgentPanel => "Toggle Supervisor Panel",
+            Command::FocusContext | Command::FocusArtifacts | Command::FocusGuardrails => {
+                "Go to Memory"
+            }
         }
     }
 
@@ -50,14 +51,12 @@ impl Command {
             Command::Refresh => Some("Ctrl+R"),
             Command::ToggleSidebar => Some("Ctrl+B"),
             Command::ToggleShortcuts => Some("Ctrl+?"),
-            Command::FocusMemory => Some("Ctrl+K"),
+            Command::FocusMemory => Some("Ctrl+3"),
             Command::FocusOverview => Some("Ctrl+1"),
             Command::FocusAgents => Some("Ctrl+2"),
-            Command::FocusContext => Some("Ctrl+3"),
-            Command::FocusArtifacts => Some("Ctrl+5"),
-            Command::FocusGuardrails => Some("Ctrl+6"),
-            Command::FocusSettings => Some("Ctrl+7"),
+            Command::FocusSettings => Some("Ctrl+4"),
             Command::ToggleAgentPanel => Some("Ctrl+E"),
+            Command::FocusContext | Command::FocusArtifacts | Command::FocusGuardrails => None,
         }
     }
 }
@@ -91,9 +90,6 @@ impl CommandPalette {
                 Command::ToggleAgentPanel,
                 Command::FocusOverview,
                 Command::FocusAgents,
-                Command::FocusContext,
-                Command::FocusArtifacts,
-                Command::FocusGuardrails,
                 Command::FocusMemory,
                 Command::FocusSettings,
             ],
@@ -110,6 +106,10 @@ impl CommandPalette {
         self.open = false;
         self.query.clear();
         self.selected_index = 0;
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.open
     }
 
     fn filtered_commands(&self) -> Vec<Command> {
@@ -258,5 +258,66 @@ impl CommandPalette {
         });
 
         chosen
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_command_palette_has_11_commands() {
+        let palette = CommandPalette::new();
+        assert_eq!(palette.commands.len(), 11);
+    }
+
+    #[test]
+    fn test_all_commands_have_labels() {
+        let palette = CommandPalette::new();
+        for cmd in &palette.commands {
+            assert!(!cmd.label().is_empty(), "{:?} has empty label", cmd);
+        }
+    }
+
+    #[test]
+    fn test_no_stale_view_commands_in_palette() {
+        let palette = CommandPalette::new();
+        for cmd in &palette.commands {
+            assert_ne!(
+                *cmd,
+                Command::FocusContext,
+                "FocusContext should not be in the palette"
+            );
+            assert_ne!(
+                *cmd,
+                Command::FocusArtifacts,
+                "FocusArtifacts should not be in the palette"
+            );
+            assert_ne!(
+                *cmd,
+                Command::FocusGuardrails,
+                "FocusGuardrails should not be in the palette"
+            );
+        }
+    }
+
+    #[test]
+    fn test_focus_memory_shortcut_is_ctrl3() {
+        assert_eq!(Command::FocusMemory.shortcut(), Some("Ctrl+3"));
+    }
+
+    #[test]
+    fn test_focus_settings_shortcut_is_ctrl4() {
+        assert_eq!(Command::FocusSettings.shortcut(), Some("Ctrl+4"));
+    }
+
+    #[test]
+    fn test_open_close_toggle() {
+        let mut palette = CommandPalette::new();
+        assert!(!palette.is_open());
+        palette.open();
+        assert!(palette.is_open());
+        palette.close();
+        assert!(!palette.is_open());
     }
 }

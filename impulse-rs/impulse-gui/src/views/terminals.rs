@@ -776,10 +776,8 @@ impl View for TerminalsView {
                             colors::GREEN
                         } else if usage_fraction < 0.60 {
                             colors::YELLOW
-                        } else if usage_fraction < 0.80 {
-                            egui::Color32::from_rgb(0xff, 0x7b, 0x72) // red
                         } else {
-                            egui::Color32::from_rgb(0xff, 0x45, 0x45) // bright red
+                            colors::RED
                         };
 
                         let fill_rect = egui::Rect::from_min_size(
@@ -1209,10 +1207,8 @@ fn render_token_budget(
                     colors::GREEN
                 } else if fill_fraction < 0.60 {
                     colors::YELLOW
-                } else if fill_fraction < 0.80 {
-                    egui::Color32::from_rgb(0xff, 0x7b, 0x72) // red
                 } else {
-                    egui::Color32::from_rgb(0xff, 0x45, 0x45) // bright red
+                    colors::RED
                 };
 
                 let fill_rect = egui::Rect::from_min_size(

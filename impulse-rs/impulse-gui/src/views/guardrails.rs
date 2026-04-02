@@ -347,9 +347,9 @@ mod tests {
     }
 
     #[test]
-    fn view_id_is_guardrails() {
+    fn view_id_is_settings() {
         let view = GuardrailsView::new();
-        assert_eq!(view.id(), ViewId::Guardrails);
+        assert_eq!(view.id(), ViewId::Settings);
     }
 
     #[test]

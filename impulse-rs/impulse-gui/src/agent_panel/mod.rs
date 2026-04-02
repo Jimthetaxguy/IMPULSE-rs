@@ -485,7 +485,6 @@ impl AgentPanel {
         }
 
         let is_thinking = self.state == AgentState::Thinking;
-        let msg_count = self.messages.len();
 
         // Header with accent bar and rocket icon.
         ui.horizontal(|ui| {

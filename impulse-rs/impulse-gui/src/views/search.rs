@@ -143,7 +143,7 @@ use crate::state::LiveSearchResult;
 /// Render a live insight search result with a "Live" badge.
 fn render_live_result(ui: &mut egui::Ui, result: &LiveSearchResult) {
     egui::Frame::new()
-        .fill(egui::Color32::from_rgb(0x16, 0x1b, 0x22))
+        .fill(colors::SURFACE)
         .corner_radius(4.0)
         .inner_margin(8.0)
         .stroke(egui::Stroke::new(0.5, colors::ACCENT.gamma_multiply(0.3)))
@@ -175,13 +175,10 @@ fn render_live_result(ui: &mut egui::Ui, result: &LiveSearchResult) {
 /// Render a daemon search result.
 fn render_daemon_result(ui: &mut egui::Ui, result: &SearchResult) {
     egui::Frame::new()
-        .fill(egui::Color32::from_rgb(0x16, 0x1b, 0x22))
+        .fill(colors::SURFACE)
         .corner_radius(4.0)
         .inner_margin(8.0)
-        .stroke(egui::Stroke::new(
-            0.5,
-            egui::Color32::from_rgb(0x30, 0x36, 0x3d),
-        ))
+        .stroke(egui::Stroke::new(0.5, colors::BORDER))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
