@@ -1565,4 +1565,15 @@ mod tests {
         assert!(result.starts_with("<impulse-context type=\"init\" version=\"3\">"));
         assert!(result.ends_with("</impulse-context>"));
     }
+
+    #[test]
+    fn test_pane_summary_empty() {
+        let view = TerminalsView::new(None);
+        let summary = view.pane_summary();
+        assert!(
+            summary.contains("No terminal panes"),
+            "Empty view should say no panes: {}",
+            summary
+        );
+    }
 }
