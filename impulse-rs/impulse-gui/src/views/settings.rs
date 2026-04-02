@@ -705,6 +705,7 @@ fn render_chip(ui: &mut egui::Ui, label: &str, accent: egui::Color32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::ThemeName;
 
     #[test]
     fn test_settings_view_new_has_all_values() {
@@ -744,6 +745,21 @@ mod tests {
     fn test_settings_not_dirty_on_init() {
         let view = SettingsView::new();
         assert!(!view.dirty);
+    }
+
+    #[test]
+    fn test_settings_default_theme_is_launch() {
+        let view = SettingsView::new();
+        assert_eq!(view.active_theme(), ThemeName::Launch);
+    }
+
+    #[test]
+    fn test_take_theme_changed_resets_flag() {
+        let mut view = SettingsView::new();
+        view.theme_changed = true;
+
+        assert!(view.take_theme_changed());
+        assert!(!view.take_theme_changed());
     }
 
     #[test]

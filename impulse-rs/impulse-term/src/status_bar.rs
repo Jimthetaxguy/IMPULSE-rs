@@ -45,21 +45,23 @@ impl StatusBar {
             ui.spacing_mut().item_spacing.x = 8.0;
 
             // Alive dot.
+            let muted = self.theme.ansi_colors[8]; // bright black
             let alive_color = if self.backend.is_alive() {
-                egui::Color32::from_rgb(0x3f, 0xb9, 0x50) // green
+                self.theme.context_health.comfortable // green
             } else {
-                egui::Color32::from_rgb(0x6e, 0x76, 0x81) // muted
+                muted
             };
-            let dot_rect = ui.allocate_space(egui::vec2(8.0, 8.0));
+            let dot_rect = ui.allocate_space(egui::vec2(6.0, 6.0));
             ui.painter()
-                .circle_filled(dot_rect.1.center(), 3.0, alive_color);
+                .circle_filled(dot_rect.1.center(), 2.5, alive_color);
 
             // Title + dimensions.
             let (cols, rows) = self.backend.size();
+            let text_muted = self.theme.ansi_colors[7]; // white (used as muted text)
             ui.label(
                 egui::RichText::new(format!("{} {}x{}", self.title, cols, rows))
                     .small()
-                    .color(egui::Color32::from_rgb(0x8b, 0x94, 0x9e)),
+                    .color(text_muted),
             );
 
             ui.separator();
@@ -87,20 +89,14 @@ impl StatusBar {
                     health.compaction_count, health.injection_count
                 ))
                 .small()
-                .color(egui::Color32::from_rgb(0x6e, 0x76, 0x81)),
+                .color(muted),
             );
 
             ui.separator();
 
             // Copy button — copies visible screen text to clipboard.
-            // Note: we call copy_text directly inside the closure where ui is mutable.
-            // The old return-value approach was broken because ui.horizontal() returns ().
             if ui
-                .small_button(
-                    egui::RichText::new("Copy")
-                        .small()
-                        .color(egui::Color32::from_rgb(0x8b, 0x94, 0x9e)),
-                )
+                .small_button(egui::RichText::new("Copy").small().color(text_muted))
                 .on_hover_text("Copy screen text (Ctrl+Shift+X)")
                 .clicked()
             {

@@ -126,7 +126,12 @@ impl TerminalRenderer {
             painter.rect_filled(
                 cursor_rect,
                 0.0,
-                egui::Color32::from_rgba_premultiplied(0xc9, 0xd1, 0xd9, 0x80),
+                egui::Color32::from_rgba_premultiplied(
+                    theme.cursor.r(),
+                    theme.cursor.g(),
+                    theme.cursor.b(),
+                    0x80,
+                ),
             );
         }
 
