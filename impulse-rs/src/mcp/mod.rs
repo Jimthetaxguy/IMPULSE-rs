@@ -1,5 +1,9 @@
-// MCP (Model Context Protocol) server integration for Impulse
-// Exposes registry-backed dynamic tools to external coding agents
+//! MCP server integration — exposes Impulse tools via Model Context Protocol.
+//!
+//! Wraps the dynamic [`ToolRegistry`](crate::tooling::ToolRegistry) in a
+//! JSON-line MCP server that external coding agents can connect to over
+//! stdio or TCP. Translates MCP `tools/call` requests into registry lookups,
+//! capability checks, and tool execution.
 
 pub mod server;
 

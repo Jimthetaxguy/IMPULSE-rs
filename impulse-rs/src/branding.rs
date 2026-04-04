@@ -1,3 +1,8 @@
+//! Terminal branding — ASCII art, banners, and engine-state indicators.
+//!
+//! Provides the block-letter banner, compact tagline, and TUI engine-state
+//! art (idle / thinking / success) used across CLI output and the TUI dashboard.
+
 /// ASCII art branding for Impulse CLI.
 ///
 /// Provides the full block-letter banner, compact tagline,

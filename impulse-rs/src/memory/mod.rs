@@ -1,3 +1,10 @@
+//! Genome storage — permanent project decisions, preferences, and constraints.
+//!
+//! Defines the [`Genome`] type that tracks long-lived project knowledge in
+//! `GENOME.md`. Supports adding decisions (with dedup), rendering to Markdown,
+//! and serde round-tripping. Also re-exports [`HistoryEntry`] for the
+//! append-only session log (`HISTORY.jsonl`).
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 

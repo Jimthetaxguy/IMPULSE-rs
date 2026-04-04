@@ -1,8 +1,8 @@
 ---
 title: Rust Canonical Product Contract
 description: Authoritative product contract for Impulse based on impulse-rs
-version: '1.5'
-updated: 2026-04-01
+version: '1.6'
+updated: 2026-04-04
 type: specification
 category: core
 phase: all
@@ -89,6 +89,21 @@ Primary commands that must remain documented and regression-tested:
 - `docs` (subcommands: list, fetch)
 - `model`
 - `credentials` (subcommands: set, get, list, proxy)
+
+**Build hygiene:**
+- `sweep` — clean build artifacts
+- `wipe` — deep clean including caches
+- `clean-all` — comprehensive workspace cleanup
+- `sccache-setup` — configure shared compilation cache
+- `build-health` — report build system health metrics
+
+**Dynamic tooling:**
+- `tooling-list` — list registered dynamic tools
+- `tooling-describe` — describe a specific tool's schema and capabilities
+- `tooling-run` — execute a dynamic tool by name with parameters
+
+**Supervisor:**
+- `panes` — list active terminal panes with context summaries
 
 **Utilities:**
 - `calc`
@@ -299,15 +314,15 @@ When adding/changing CLI commands, hooks, state files, or roadmap stage definiti
 
 ### Test Density Targets
 
-| Module Category | Target (tests/KLOC) | Current (2026-04-01) | Gap |
+| Module Category | Target (tests/KLOC) | Current (2026-04-04) | Gap |
 |----------------|---------------------|----------------------|-----|
 | Core (state, daemon, agent) | ≥3.0 | ~1.5 (state ~80, agent +24, daemon +2) | HIGH — need ~2x more |
-| Handlers | ≥2.0 | ~0.8 (38 tests in 6/19 files; 13 files at zero) | CRITICAL — 68% untested |
+| Handlers | ≥2.0 | ~2.5 (211 tests in 10/19 files; 9 files at zero) | IMPROVING — 47% untested |
 | UI/TUI | ≥1.0 | ~0.4 | MEDIUM — layout/rendering |
 | Tooling | ≥2.0 | ~17.1 (84 tests, 4,920 LOC) | MET — well above target |
 | Integration | Every stable CLI command | 26 tests | PARTIAL — expanding |
 
-**Workspace totals (2026-04-01):** 79,194 LOC, 1,025 tests (999+26 impulse-rs, 4 ops, 90 term, 220 gui), 227 .rs files across 4 crates.
+**Workspace totals (2026-04-04):** ~111K LOC, 1,344 tests (1,318+26 impulse-rs, 4 ops, 110 term, 240+ gui), 237 .rs files across 4 crates.
 
 ### Required Test Patterns
 
@@ -367,7 +382,7 @@ cd impulse-rs && cargo build && cargo test && cargo clippy -- -D warnings && car
 Exit on first failure. Do not skip or bypass any step.
 
 **Expected outputs (update when counts change):**
-- `cargo test`: 1,025 passed, 3 ignored, 0 failed (5 test result lines)
+- `cargo test`: 1,344 passed, 3 ignored, 0 failed (5 test result lines)
 - `cargo clippy`: 0 warnings
 - `cargo fmt --check`: no output
 
@@ -394,7 +409,7 @@ git grep -c "round_trip\|roundtrip" -- "*.rs"
 for f in src/handlers/*.rs; do grep -qL "mod tests" "$f" && echo "UNTESTED: $f"; done
 
 # 6. Verify test count hasn't regressed
-cargo test 2>&1 | grep "test result:" | awk '{sum += $4} END {print "Total: " sum " (expected: 1025)"}'
+cargo test 2>&1 | grep "test result:" | awk '{sum += $4} END {print "Total: " sum " (expected: 1344)"}'
 ```
 
 ### egui Import Convention

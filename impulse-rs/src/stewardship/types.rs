@@ -164,9 +164,12 @@ pub struct ToolUse {
     pub input_chars: usize,
 }
 
-/// A parsed tool result from a transcript message
+/// A parsed tool result from a transcript message.
+///
+/// Named `ParsedToolResult` to distinguish from `tooling::traits::ToolResult`
+/// which represents tool execution output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolResult {
+pub struct ParsedToolResult {
     pub tool_use_id: String,
     pub content_chars: usize,
 }
@@ -177,7 +180,7 @@ pub struct TranscriptMessage {
     pub role: String,
     pub text_content: String,
     pub tool_uses: Vec<ToolUse>,
-    pub tool_results: Vec<ToolResult>,
+    pub tool_results: Vec<ParsedToolResult>,
     pub char_count: usize,
     pub estimated_tokens: usize,
 }

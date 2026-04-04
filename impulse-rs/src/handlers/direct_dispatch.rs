@@ -3,7 +3,7 @@
 //! Extracted from `run_direct_mode()` in main.rs to keep the entry point
 //! focused on argument parsing and top-level mode selection.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::sync::Arc;
 
 use crate::cli::Cli;
@@ -14,11 +14,16 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
     let impulse_dir = cli.impulse_dir.clone();
     let verbose = cli.verbose;
     let format = cli.format;
-    let state = Arc::new(state::State::new(impulse_dir.clone())?);
+    let state = Arc::new(
+        state::State::new(impulse_dir.clone()).context("Failed to initialize impulse state")?,
+    );
 
     match cli.command {
         Commands::Daemon { .. } => {
-            daemon::Daemon::new(state.clone()).start().await?;
+            daemon::Daemon::new(state.clone())
+                .start()
+                .await
+                .context("Failed to start daemon")?;
         }
         Commands::Run => {
             println!("Use: impulse-rs --daemon for daemon mode");
@@ -36,7 +41,8 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
                 inject_mode,
                 inject_explain,
             )
-            .await?;
+            .await
+            .context("Failed to handle session-start command")?;
         }
         Commands::SessionEnd {
             session_id,
@@ -51,31 +57,45 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
                 verify,
                 sem_diff_base,
             )
-            .await?;
+            .await
+            .context("Failed to handle session-end command")?;
         }
         Commands::TrackWrite { file, session_id } => {
-            handlers::session::handle_track_write(&state, file, session_id).await?;
+            handlers::session::handle_track_write(&state, file, session_id)
+                .await
+                .context("Failed to handle track-write command")?;
         }
         Commands::TrackTool { tool, session_id } => {
-            handlers::session::handle_track_tool(&state, tool, session_id).await?;
+            handlers::session::handle_track_tool(&state, tool, session_id)
+                .await
+                .context("Failed to handle track-tool command")?;
         }
         Commands::ListSessions => {
-            handlers::session::handle_list_sessions(&state).await?;
+            handlers::session::handle_list_sessions(&state)
+                .await
+                .context("Failed to handle list-sessions command")?;
         }
         Commands::SessionInfo { id } => {
-            handlers::session::handle_session_info(&state, id).await?;
+            handlers::session::handle_session_info(&state, id)
+                .await
+                .context("Failed to handle session-info command")?;
         }
         Commands::SessionConflicts { file, session_id } => {
-            handlers::session::handle_session_conflicts(&state, file, session_id).await?;
+            handlers::session::handle_session_conflicts(&state, file, session_id)
+                .await
+                .context("Failed to handle session-conflicts command")?;
         }
         Commands::Status => {
-            handlers::config::handle_status(&state).await?;
+            handlers::config::handle_status(&state)
+                .await
+                .context("Failed to handle status command")?;
         }
         Commands::Debug => {
             println!("Debug snapshot requires daemon mode. Use: impulse-rs --daemon debug");
         }
         Commands::ConflictHistory => {
-            handlers::session::handle_conflict_history(&state)?;
+            handlers::session::handle_conflict_history(&state)
+                .context("Failed to handle conflict-history command")?;
         }
         Commands::Chat {
             session_id: _,
@@ -89,35 +109,41 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
                 inject_mode.as_deref(),
                 inject_explain,
             )
-            .await?;
+            .await
+            .context("Failed to handle chat command")?;
         }
         Commands::Genome => {
-            handlers::memory::handle_genome(&state)?;
+            handlers::memory::handle_genome(&state).context("Failed to handle genome command")?;
         }
         Commands::History => {
-            handlers::memory::handle_history(&state)?;
+            handlers::memory::handle_history(&state).context("Failed to handle history command")?;
         }
         Commands::ListProviders => {
-            handlers::config::handle_list_providers()?;
+            handlers::config::handle_list_providers()
+                .context("Failed to handle list-providers command")?;
         }
         Commands::AddDecision {
             description,
             rationale,
         } => {
-            handlers::memory::handle_add_decision(&state, description, rationale)?;
+            handlers::memory::handle_add_decision(&state, description, rationale)
+                .context("Failed to handle add-decision command")?;
         }
         Commands::Init => {
-            handlers::config::handle_init(&state, &impulse_dir)?;
+            handlers::config::handle_init(&state, &impulse_dir)
+                .context("Failed to handle init command")?;
         }
         Commands::Config { key, value, list } => {
-            handlers::config::handle_config(&state, key, value, list)?;
+            handlers::config::handle_config(&state, key, value, list)
+                .context("Failed to handle config command")?;
         }
         Commands::Extract {
             content,
             session_id,
             json,
         } => {
-            handlers::system::handle_extract(content, session_id, json)?;
+            handlers::system::handle_extract(content, session_id, json)
+                .context("Failed to handle extract command")?;
         }
         Commands::Swarm {
             agent_a,
@@ -125,16 +151,21 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
             threshold,
             json,
         } => {
-            handlers::system::handle_swarm(agent_a, agent_b, threshold, json)?;
+            handlers::system::handle_swarm(agent_a, agent_b, threshold, json)
+                .context("Failed to handle swarm command")?;
         }
         Commands::Activity { limit } => {
-            handlers::memory::handle_activity(&state, limit).await?;
+            handlers::memory::handle_activity(&state, limit)
+                .await
+                .context("Failed to handle activity command")?;
         }
         Commands::Hooks { platform } => {
-            handlers::system::handle_hooks(&state, platform)?;
+            handlers::system::handle_hooks(&state, platform)
+                .context("Failed to handle hooks command")?;
         }
         Commands::ValidateHooks { platform } => {
-            handlers::system::handle_validate_hooks(platform)?;
+            handlers::system::handle_validate_hooks(platform)
+                .context("Failed to handle validate-hooks command")?;
         }
         Commands::Orchestrate {
             task,
@@ -149,7 +180,8 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
                 inject_explain,
                 compute_routing,
             )
-            .await?;
+            .await
+            .context("Failed to handle orchestrate command")?;
         }
         Commands::Handoff {
             tool,
@@ -168,7 +200,8 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
                 inject_mode,
                 inject_explain,
             )
-            .await?;
+            .await
+            .context("Failed to handle handoff command")?;
         }
         Commands::SyncContext {
             session_id,
@@ -181,13 +214,15 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
                 inject_mode,
                 inject_explain,
             )
-            .await?;
+            .await
+            .context("Failed to handle sync-context command")?;
         }
         Commands::ComputeInjection { query, limit, json } => {
-            handlers::injection_handlers::handle_compute_injection(query, limit, json)?;
+            handlers::injection_handlers::handle_compute_injection(query, limit, json)
+                .context("Failed to handle compute-injection command")?;
         }
         Commands::Verify => {
-            handlers::build::handle_verify()?;
+            handlers::build::handle_verify().context("Failed to handle verify command")?;
         }
         Commands::SearchHistory {
             query,
@@ -202,7 +237,8 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
         } => {
             handlers::memory::handle_search_history(
                 &state, query, mode, backend, limit, offset, page, total, explain, json,
-            )?;
+            )
+            .context("Failed to handle search-history command")?;
         }
         Commands::SearchGenome {
             query,
@@ -217,20 +253,24 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
         } => {
             handlers::memory::handle_search_genome(
                 &state, query, mode, backend, limit, offset, page, total, explain, json,
-            )?;
+            )
+            .context("Failed to handle search-genome command")?;
         }
         Commands::IndexMemory { scope, rebuild } => {
-            handlers::retrieval::handle_index_memory(&state, scope, rebuild)?;
+            handlers::retrieval::handle_index_memory(&state, scope, rebuild)
+                .context("Failed to handle index-memory command")?;
         }
         Commands::RetrievalStatus { check, json } => {
-            handlers::retrieval::handle_retrieval_status(&state, check, json)?;
+            handlers::retrieval::handle_retrieval_status(&state, check, json)
+                .context("Failed to handle retrieval-status command")?;
         }
         Commands::Tools {
             subcommand,
             tool,
             dry_run,
         } => {
-            handlers::system::handle_tools(verbose, subcommand, tool, dry_run)?;
+            handlers::system::handle_tools(verbose, subcommand, tool, dry_run)
+                .context("Failed to handle tools command")?;
         }
         Commands::Docs {
             subcommand,
@@ -246,7 +286,8 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
                 docs_verbose,
                 force,
             )
-            .await?;
+            .await
+            .context("Failed to handle docs command")?;
         }
         Commands::Model {
             subcommand,
@@ -260,7 +301,8 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
                 subcommand,
                 provider,
                 model,
-            )?;
+            )
+            .context("Failed to handle model command")?;
         }
         Commands::Office {
             subcommand,
@@ -268,7 +310,8 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
             goal,
             json,
         } => {
-            handlers::office::handle_office(subcommand, file, goal, json)?;
+            handlers::office::handle_office(subcommand, file, goal, json)
+                .context("Failed to handle office command")?;
         }
         Commands::Credentials {
             subcommand,
@@ -285,7 +328,8 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
                 value,
                 socket_path,
                 tool,
-            )?;
+            )
+            .context("Failed to handle credentials command")?;
         }
         Commands::Steward {
             subcommand,
@@ -302,25 +346,30 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
                 session_id,
                 id,
                 json,
-            )?;
+            )
+            .context("Failed to handle steward command")?;
         }
         Commands::Calc { expression } => {
-            handlers::system::handle_calc(expression)?;
+            handlers::system::handle_calc(expression).context("Failed to handle calc command")?;
         }
         Commands::Exec { code } => {
-            handlers::system::handle_exec(code)?;
+            handlers::system::handle_exec(code).context("Failed to handle exec command")?;
         }
         Commands::System {} => {
-            handlers::system::handle_system()?;
+            handlers::system::handle_system().context("Failed to handle system command")?;
         }
         Commands::Analyze { session_id, scope } => {
-            handlers::stewardship_handlers::handle_analyze(&state, session_id, scope).await?;
+            handlers::stewardship_handlers::handle_analyze(&state, session_id, scope)
+                .await
+                .context("Failed to handle analyze command")?;
         }
         Commands::Health {} => {
-            handlers::stewardship_handlers::handle_health(&impulse_dir)?;
+            handlers::stewardship_handlers::handle_health(&impulse_dir)
+                .context("Failed to handle health command")?;
         }
         Commands::Summary {} => {
-            handlers::stewardship_handlers::handle_summary(&impulse_dir)?;
+            handlers::stewardship_handlers::handle_summary(&impulse_dir)
+                .context("Failed to handle summary command")?;
         }
         Commands::Sweep {
             dry_run,
@@ -328,22 +377,28 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
             days,
             verbose: _,
         } => {
-            handlers::build::handle_sweep(&state, dry_run, path, days, verbose)?;
+            handlers::build::handle_sweep(&state, dry_run, path, days, verbose)
+                .context("Failed to handle sweep command")?;
         }
         Commands::Wipe { dry_run, path } => {
-            handlers::build::handle_wipe(&state, dry_run, path)?;
+            handlers::build::handle_wipe(&state, dry_run, path)
+                .context("Failed to handle wipe command")?;
         }
         Commands::CleanAll { dry_run } => {
-            handlers::build::handle_clean_all(&state, dry_run)?;
+            handlers::build::handle_clean_all(&state, dry_run)
+                .context("Failed to handle clean-all command")?;
         }
         Commands::SccacheSetup { check, json } => {
-            handlers::build::handle_sccache_setup(check, json)?;
+            handlers::build::handle_sccache_setup(check, json)
+                .context("Failed to handle sccache-setup command")?;
         }
         Commands::BuildHealth { json } => {
-            handlers::build::handle_build_health(&state, json)?;
+            handlers::build::handle_build_health(&state, json)
+                .context("Failed to handle build-health command")?;
         }
         Commands::ToolingList { category, json } => {
-            handlers::tooling_handlers::handle_tooling_list(&state, &impulse_dir, category, json)?;
+            handlers::tooling_handlers::handle_tooling_list(&state, &impulse_dir, category, json)
+                .context("Failed to handle tooling-list command")?;
         }
         Commands::ToolingDescribe { tool_id, json } => {
             handlers::tooling_handlers::handle_tooling_describe(
@@ -351,7 +406,8 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
                 &impulse_dir,
                 tool_id,
                 json,
-            )?;
+            )
+            .context("Failed to handle tooling-describe command")?;
         }
         Commands::ToolingRun {
             tool_id,
@@ -365,19 +421,25 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
                 params,
                 json,
             )
-            .await?;
+            .await
+            .context("Failed to handle tooling-run command")?;
         }
         Commands::ToolingSchema { format: fmt } => {
-            handlers::tooling_handlers::handle_tooling_schema(&state, &impulse_dir, fmt)?;
+            handlers::tooling_handlers::handle_tooling_schema(&state, &impulse_dir, fmt)
+                .context("Failed to handle tooling-schema command")?;
         }
         Commands::ToolingValidate { json } => {
-            handlers::tooling_handlers::handle_tooling_validate(&state, &impulse_dir, json)?;
+            handlers::tooling_handlers::handle_tooling_validate(&state, &impulse_dir, json)
+                .context("Failed to handle tooling-validate command")?;
         }
         Commands::ToolingReload { json } => {
-            handlers::tooling_handlers::handle_tooling_reload(&state, &impulse_dir, json)?;
+            handlers::tooling_handlers::handle_tooling_reload(&state, &impulse_dir, json)
+                .context("Failed to handle tooling-reload command")?;
         }
         Commands::Mcp { subcommand } => {
-            handlers::system::handle_mcp(&state, &impulse_dir, subcommand).await?;
+            handlers::system::handle_mcp(&state, &impulse_dir, subcommand)
+                .await
+                .context("Failed to handle mcp command")?;
         }
         Commands::AgentConfigure {
             provider,
@@ -395,13 +457,17 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
                 harness,
                 auto_review,
                 auto_coordinate,
-            )?;
+            )
+            .context("Failed to handle agent-configure command")?;
         }
         Commands::AgentStatus { json } => {
-            handlers::agent::handle_agent_status(&state, json)?;
+            handlers::agent::handle_agent_status(&state, json)
+                .context("Failed to handle agent-status command")?;
         }
         Commands::AgentQuery { prompt, json } => {
-            handlers::agent::handle_agent_query(&state, prompt, json).await?;
+            handlers::agent::handle_agent_query(&state, prompt, json)
+                .await
+                .context("Failed to handle agent-query command")?;
         }
         Commands::SemDiff {
             base,
@@ -409,18 +475,20 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
             json,
             session_id,
         } => {
-            handlers::semantic_diff_handlers::handle_sem_diff(
-                &state, base, head, json, session_id,
-            )?;
+            handlers::semantic_diff_handlers::handle_sem_diff(&state, base, head, json, session_id)
+                .context("Failed to handle sem-diff command")?;
         }
         Commands::SemBlame { file, json } => {
-            handlers::semantic_diff_handlers::handle_sem_blame(file, json)?;
+            handlers::semantic_diff_handlers::handle_sem_blame(file, json)
+                .context("Failed to handle sem-blame command")?;
         }
         Commands::SemImpact { entity, json } => {
-            handlers::semantic_diff_handlers::handle_sem_impact(entity, json)?;
+            handlers::semantic_diff_handlers::handle_sem_impact(entity, json)
+                .context("Failed to handle sem-impact command")?;
         }
         Commands::SemStatus { json } => {
-            handlers::semantic_diff_handlers::handle_sem_status(json)?;
+            handlers::semantic_diff_handlers::handle_sem_status(json)
+                .context("Failed to handle sem-status command")?;
         }
         Commands::Guard {
             action,
@@ -430,25 +498,30 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
             disable,
             json,
         } => {
-            handlers::guard::handle_guard(&state, action, target, list, enable, disable, json)?;
+            handlers::guard::handle_guard(&state, action, target, list, enable, disable, json)
+                .context("Failed to handle guard command")?;
         }
         Commands::Analytics {
             subcommand,
             json,
             period,
         } => {
-            handlers::guard::handle_analytics(&state, subcommand, json, period)?;
+            handlers::guard::handle_analytics(&state, subcommand, json, period)
+                .context("Failed to handle analytics command")?;
         }
         Commands::Describe => {
             let fmt = format.unwrap_or(envelope::OutputFormat::Json);
-            handlers::describe::handle_describe(fmt)?;
+            handlers::describe::handle_describe(fmt)
+                .context("Failed to handle describe command")?;
         }
         Commands::Schema { command } => {
             let fmt = format.unwrap_or(envelope::OutputFormat::Json);
-            handlers::describe::handle_schema(&command, fmt)?;
+            handlers::describe::handle_schema(&command, fmt)
+                .context("Failed to handle schema command")?;
         }
         Commands::PluginList { json } => {
-            handlers::plugin_handlers::handle_plugin_list(json)?;
+            handlers::plugin_handlers::handle_plugin_list(json)
+                .context("Failed to handle plugin-list command")?;
         }
         Commands::PluginInvoke {
             name,
@@ -457,7 +530,8 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
             options,
             json,
         } => {
-            handlers::plugin_handlers::handle_plugin_invoke(name, path, query, options, json)?;
+            handlers::plugin_handlers::handle_plugin_invoke(name, path, query, options, json)
+                .context("Failed to handle plugin-invoke command")?;
         }
     }
 

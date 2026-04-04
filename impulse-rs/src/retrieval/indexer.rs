@@ -132,19 +132,28 @@ fn embed_history_jobs(
             Ok(vectors) => {
                 if vec_available {
                     if let Some(first) = vectors.first() {
-                        store.ensure_history_vec0_table(first.len())?;
+                        store
+                            .ensure_history_vec0_table(first.len())
+                            .context("Failed to ensure history vec0 table")?;
                     }
                 }
-                store.with_transaction(|_tx| {
-                    for ((id, _), vec) in chunk.iter().zip(vectors.iter()) {
-                        let vector_json = serde_json::to_string(vec)?;
-                        store.upsert_history_vector(id, &vector_json)?;
-                        if vec_available {
-                            store.upsert_history_vector_vec0(id, &vector_json)?;
+                store
+                    .with_transaction(|_tx| {
+                        for ((id, _), vec) in chunk.iter().zip(vectors.iter()) {
+                            let vector_json = serde_json::to_string(vec)
+                                .context("Failed to serialize history embedding vector")?;
+                            store
+                                .upsert_history_vector(id, &vector_json)
+                                .context("Failed to upsert history vector")?;
+                            if vec_available {
+                                store
+                                    .upsert_history_vector_vec0(id, &vector_json)
+                                    .context("Failed to upsert history vec0 vector")?;
+                            }
                         }
-                    }
-                    Ok(())
-                })?;
+                        Ok(())
+                    })
+                    .context("Failed to commit history vector transaction")?;
             }
             Err(e) => {
                 notes.push(format!("history vector indexing skipped: {}", e));
@@ -173,19 +182,28 @@ fn embed_genome_jobs(
             Ok(vectors) => {
                 if vec_available {
                     if let Some(first) = vectors.first() {
-                        store.ensure_genome_vec0_table(first.len())?;
+                        store
+                            .ensure_genome_vec0_table(first.len())
+                            .context("Failed to ensure genome vec0 table")?;
                     }
                 }
-                store.with_transaction(|_tx| {
-                    for ((id, _), vec) in chunk.iter().zip(vectors.iter()) {
-                        let vector_json = serde_json::to_string(vec)?;
-                        store.upsert_genome_vector(id, &vector_json)?;
-                        if vec_available {
-                            store.upsert_genome_vector_vec0(id, &vector_json)?;
+                store
+                    .with_transaction(|_tx| {
+                        for ((id, _), vec) in chunk.iter().zip(vectors.iter()) {
+                            let vector_json = serde_json::to_string(vec)
+                                .context("Failed to serialize genome embedding vector")?;
+                            store
+                                .upsert_genome_vector(id, &vector_json)
+                                .context("Failed to upsert genome vector")?;
+                            if vec_available {
+                                store
+                                    .upsert_genome_vector_vec0(id, &vector_json)
+                                    .context("Failed to upsert genome vec0 vector")?;
+                            }
                         }
-                    }
-                    Ok(())
-                })?;
+                        Ok(())
+                    })
+                    .context("Failed to commit genome vector transaction")?;
             }
             Err(e) => {
                 notes.push(format!("genome vector indexing skipped: {}", e));
@@ -204,13 +222,18 @@ pub fn index_memory(
     scope: IndexScope,
     rebuild: bool,
 ) -> Result<IndexState> {
-    let _lock = IndexLockGuard::acquire(base_path)?;
+    let _lock =
+        IndexLockGuard::acquire(base_path).context("Failed to acquire retrieval index lock")?;
     let started = Instant::now();
 
-    let store = RetrievalStore::open(base_path)?;
-    store.init_schema()?;
+    let store = RetrievalStore::open(base_path).context("Failed to open retrieval store")?;
+    store
+        .init_schema()
+        .context("Failed to initialize retrieval schema")?;
     if rebuild {
-        store.clear_all()?;
+        store
+            .clear_all()
+            .context("Failed to clear retrieval store for rebuild")?;
     }
 
     let mut notes = Vec::new();
@@ -233,90 +256,123 @@ pub fn index_memory(
     }
 
     if matches!(scope, IndexScope::History | IndexScope::All) {
-        store.with_transaction(|_tx| {
-            for h in history {
-                let id = h.session_id.clone();
-                let hash = history_hash(h);
-                let existing_hash = store.get_history_hash(&id)?;
-                let changed = rebuild || existing_hash.as_deref() != Some(hash.as_str());
-                let vector_missing = !store.has_history_vector(&id)?
-                    || (vector_available && !store.has_history_vec0(&id)?);
+        store
+            .with_transaction(|_tx| {
+                for h in history {
+                    let id = h.session_id.clone();
+                    let hash = history_hash(h);
+                    let existing_hash = store
+                        .get_history_hash(&id)
+                        .context("Failed to query history hash from retrieval store")?;
+                    let changed = rebuild || existing_hash.as_deref() != Some(hash.as_str());
+                    let vector_missing = !store
+                        .has_history_vector(&id)
+                        .context("Failed to check history vector existence")?
+                        || (vector_available
+                            && !store
+                                .has_history_vec0(&id)
+                                .context("Failed to check history vec0 existence")?);
 
-                if changed {
-                    store.delete_history_vector(&id)?;
-                    let files_json = serde_json::to_string(&h.files_touched)?;
-                    let tools_json = serde_json::to_string(&h.tools_used)?;
-                    let search_text = history_search_text(h);
-                    store.upsert_history(
-                        &id,
-                        &h.session_name,
-                        Some(&platform_str(h.platform)),
-                        &h.started_at.to_rfc3339(),
-                        &h.ended_at.to_rfc3339(),
-                        &h.summary,
-                        &files_json,
-                        &tools_json,
-                        &search_text,
-                        &hash,
-                    )?;
+                    if changed {
+                        store
+                            .delete_history_vector(&id)
+                            .context("Failed to delete stale history vector")?;
+                        let files_json = serde_json::to_string(&h.files_touched)
+                            .context("Failed to serialize files_touched for history entry")?;
+                        let tools_json = serde_json::to_string(&h.tools_used)
+                            .context("Failed to serialize tools_used for history entry")?;
+                        let search_text = history_search_text(h);
+                        store
+                            .upsert_history(
+                                &id,
+                                &h.session_name,
+                                Some(&platform_str(h.platform)),
+                                &h.started_at.to_rfc3339(),
+                                &h.ended_at.to_rfc3339(),
+                                &h.summary,
+                                &files_json,
+                                &tools_json,
+                                &search_text,
+                                &hash,
+                            )
+                            .context("Failed to upsert history entry into retrieval store")?;
+                    }
+
+                    if config.retrieval_vector_enabled
+                        && config.retrieval_backend == "fts+vec"
+                        && (changed || vector_missing)
+                    {
+                        history_embed_jobs.push((id.clone(), history_search_text(h)));
+                    }
+
+                    history_seen.insert(id);
+                    history_count += 1;
                 }
-
-                if config.retrieval_vector_enabled
-                    && config.retrieval_backend == "fts+vec"
-                    && (changed || vector_missing)
-                {
-                    history_embed_jobs.push((id.clone(), history_search_text(h)));
-                }
-
-                history_seen.insert(id);
-                history_count += 1;
-            }
-            Ok(())
-        })?;
-        store.delete_history_except(&history_seen)?;
+                Ok(())
+            })
+            .context("Failed to commit history indexing transaction")?;
+        store
+            .delete_history_except(&history_seen)
+            .context("Failed to delete stale history entries")?;
     }
 
     if matches!(scope, IndexScope::Genome | IndexScope::All) {
-        store.with_transaction(|_tx| {
-            for d in &genome.decisions {
-                let id = genome_id(d);
-                let hash = genome_hash(d);
-                let existing_hash = store.get_genome_hash(&id)?;
-                let changed = rebuild || existing_hash.as_deref() != Some(hash.as_str());
-                let vector_missing = !store.has_genome_vector(&id)?
-                    || (vector_available && !store.has_genome_vec0(&id)?);
+        store
+            .with_transaction(|_tx| {
+                for d in &genome.decisions {
+                    let id = genome_id(d);
+                    let hash = genome_hash(d);
+                    let existing_hash = store
+                        .get_genome_hash(&id)
+                        .context("Failed to query genome hash from retrieval store")?;
+                    let changed = rebuild || existing_hash.as_deref() != Some(hash.as_str());
+                    let vector_missing = !store
+                        .has_genome_vector(&id)
+                        .context("Failed to check genome vector existence")?
+                        || (vector_available
+                            && !store
+                                .has_genome_vec0(&id)
+                                .context("Failed to check genome vec0 existence")?);
 
-                if changed {
-                    store.delete_genome_vector(&id)?;
-                    let tags_json = serde_json::to_string(&d.tags)?;
-                    let search_text = genome_search_text(d);
-                    store.upsert_genome(
-                        &id,
-                        &d.date.to_rfc3339(),
-                        &d.description,
-                        d.rationale.as_deref(),
-                        &tags_json,
-                        &search_text,
-                        &hash,
-                    )?;
+                    if changed {
+                        store
+                            .delete_genome_vector(&id)
+                            .context("Failed to delete stale genome vector")?;
+                        let tags_json = serde_json::to_string(&d.tags)
+                            .context("Failed to serialize tags for genome decision")?;
+                        let search_text = genome_search_text(d);
+                        store
+                            .upsert_genome(
+                                &id,
+                                &d.date.to_rfc3339(),
+                                &d.description,
+                                d.rationale.as_deref(),
+                                &tags_json,
+                                &search_text,
+                                &hash,
+                            )
+                            .context("Failed to upsert genome decision into retrieval store")?;
+                    }
+
+                    if config.retrieval_vector_enabled
+                        && config.retrieval_backend == "fts+vec"
+                        && (changed || vector_missing)
+                    {
+                        genome_embed_jobs.push((id.clone(), genome_search_text(d)));
+                    }
+
+                    genome_seen.insert(id);
+                    genome_count += 1;
                 }
-
-                if config.retrieval_vector_enabled
-                    && config.retrieval_backend == "fts+vec"
-                    && (changed || vector_missing)
-                {
-                    genome_embed_jobs.push((id.clone(), genome_search_text(d)));
-                }
-
-                genome_seen.insert(id);
-                genome_count += 1;
-            }
-            Ok(())
-        })?;
-        store.delete_genome_except(&genome_seen)?;
+                Ok(())
+            })
+            .context("Failed to commit genome indexing transaction")?;
+        store
+            .delete_genome_except(&genome_seen)
+            .context("Failed to delete stale genome entries")?;
     }
 
-    store.refresh_fts()?;
+    store.refresh_fts().context("Failed to refresh FTS index")?;
 
     if vector_enabled {
         embed_history_jobs(
@@ -325,14 +381,16 @@ pub fn index_memory(
             &history_embed_jobs,
             vector_available,
             &mut notes,
-        )?;
+        )
+        .context("Failed to embed history vectors")?;
         embed_genome_jobs(
             &store,
             config,
             &genome_embed_jobs,
             vector_available,
             &mut notes,
-        )?;
+        )
+        .context("Failed to embed genome vectors")?;
     }
 
     let mut backend_health = Vec::new();
@@ -362,7 +420,10 @@ pub fn index_memory(
     };
 
     let state_path = base_path.join("retrieval_index_state.json");
-    Storage::atomic_write_path(&state_path, &serde_json::to_vec_pretty(&state)?)?;
+    let state_json =
+        serde_json::to_vec_pretty(&state).context("Failed to serialize retrieval index state")?;
+    Storage::atomic_write_path(&state_path, &state_json)
+        .context("Failed to write retrieval index state file")?;
 
     let _ = std::fs::create_dir_all(base_path.join("embeddings"));
     let marker_path = base_path.join("embeddings/index-meta.json");
@@ -374,7 +435,10 @@ pub fn index_memory(
         "vector_available": state.vector_available,
         "last_index_duration_ms": state.last_index_duration_ms,
     });
-    Storage::atomic_write_path(&marker_path, &serde_json::to_vec_pretty(&marker)?)?;
+    let marker_json =
+        serde_json::to_vec_pretty(&marker).context("Failed to serialize index meta marker")?;
+    Storage::atomic_write_path(&marker_path, &marker_json)
+        .context("Failed to write index meta marker file")?;
 
     Ok(state)
 }
@@ -385,13 +449,19 @@ pub fn index_memory_from_storage(
     scope: IndexScope,
     rebuild: bool,
 ) -> Result<IndexState> {
-    let _lock = IndexLockGuard::acquire(storage.base_path())?;
+    let _lock = IndexLockGuard::acquire(storage.base_path())
+        .context("Failed to acquire retrieval index lock")?;
     let started = Instant::now();
 
-    let store = RetrievalStore::open(storage.base_path())?;
-    store.init_schema()?;
+    let store =
+        RetrievalStore::open(storage.base_path()).context("Failed to open retrieval store")?;
+    store
+        .init_schema()
+        .context("Failed to initialize retrieval schema")?;
     if rebuild {
-        store.clear_all()?;
+        store
+            .clear_all()
+            .context("Failed to clear retrieval store for rebuild")?;
     }
 
     let mut notes = Vec::new();
@@ -414,92 +484,129 @@ pub fn index_memory_from_storage(
     }
 
     if matches!(scope, IndexScope::History | IndexScope::All) {
-        store.with_transaction(|_tx| {
-            let _ = storage.read_jsonl_stream::<HistoryEntry, _>("HISTORY.jsonl", |h| {
-                let id = h.session_id.clone();
-                let hash = history_hash(&h);
-                let existing_hash = store.get_history_hash(&id)?;
-                let changed = rebuild || existing_hash.as_deref() != Some(hash.as_str());
-                let vector_missing = !store.has_history_vector(&id)?
-                    || (vector_available && !store.has_history_vec0(&id)?);
+        store
+            .with_transaction(|_tx| {
+                let _ = storage
+                    .read_jsonl_stream::<HistoryEntry, _>("HISTORY.jsonl", |h| {
+                        let id = h.session_id.clone();
+                        let hash = history_hash(&h);
+                        let existing_hash = store
+                            .get_history_hash(&id)
+                            .context("Failed to query history hash from retrieval store")?;
+                        let changed = rebuild || existing_hash.as_deref() != Some(hash.as_str());
+                        let vector_missing = !store
+                            .has_history_vector(&id)
+                            .context("Failed to check history vector existence")?
+                            || (vector_available
+                                && !store
+                                    .has_history_vec0(&id)
+                                    .context("Failed to check history vec0 existence")?);
 
-                if changed {
-                    store.delete_history_vector(&id)?;
-                    let files_json = serde_json::to_string(&h.files_touched)?;
-                    let tools_json = serde_json::to_string(&h.tools_used)?;
-                    let search_text = history_search_text(&h);
-                    store.upsert_history(
-                        &id,
-                        &h.session_name,
-                        Some(&platform_str(h.platform)),
-                        &h.started_at.to_rfc3339(),
-                        &h.ended_at.to_rfc3339(),
-                        &h.summary,
-                        &files_json,
-                        &tools_json,
-                        &search_text,
-                        &hash,
-                    )?;
-                }
+                        if changed {
+                            store
+                                .delete_history_vector(&id)
+                                .context("Failed to delete stale history vector")?;
+                            let files_json = serde_json::to_string(&h.files_touched)
+                                .context("Failed to serialize files_touched for history entry")?;
+                            let tools_json = serde_json::to_string(&h.tools_used)
+                                .context("Failed to serialize tools_used for history entry")?;
+                            let search_text = history_search_text(&h);
+                            store
+                                .upsert_history(
+                                    &id,
+                                    &h.session_name,
+                                    Some(&platform_str(h.platform)),
+                                    &h.started_at.to_rfc3339(),
+                                    &h.ended_at.to_rfc3339(),
+                                    &h.summary,
+                                    &files_json,
+                                    &tools_json,
+                                    &search_text,
+                                    &hash,
+                                )
+                                .context("Failed to upsert history entry into retrieval store")?;
+                        }
 
-                if config.retrieval_vector_enabled
-                    && config.retrieval_backend == "fts+vec"
-                    && (changed || vector_missing)
-                {
-                    history_embed_jobs.push((id.clone(), history_search_text(&h)));
-                }
+                        if config.retrieval_vector_enabled
+                            && config.retrieval_backend == "fts+vec"
+                            && (changed || vector_missing)
+                        {
+                            history_embed_jobs.push((id.clone(), history_search_text(&h)));
+                        }
 
-                history_seen.insert(id);
-                history_count += 1;
+                        history_seen.insert(id);
+                        history_count += 1;
+                        Ok(())
+                    })
+                    .context("Failed to stream history entries for indexing")?;
                 Ok(())
-            })?;
-            Ok(())
-        })?;
-        store.delete_history_except(&history_seen)?;
+            })
+            .context("Failed to commit history indexing transaction")?;
+        store
+            .delete_history_except(&history_seen)
+            .context("Failed to delete stale history entries")?;
     }
 
     if matches!(scope, IndexScope::Genome | IndexScope::All) {
-        let genome: Genome = storage.read_json("GENOME.md")?;
-        store.with_transaction(|_tx| {
-            for d in &genome.decisions {
-                let id = genome_id(d);
-                let hash = genome_hash(d);
-                let existing_hash = store.get_genome_hash(&id)?;
-                let changed = rebuild || existing_hash.as_deref() != Some(hash.as_str());
-                let vector_missing = !store.has_genome_vector(&id)?
-                    || (vector_available && !store.has_genome_vec0(&id)?);
+        let genome: Genome = storage
+            .read_json("GENOME.md")
+            .context("Failed to read GENOME.md for indexing")?;
+        store
+            .with_transaction(|_tx| {
+                for d in &genome.decisions {
+                    let id = genome_id(d);
+                    let hash = genome_hash(d);
+                    let existing_hash = store
+                        .get_genome_hash(&id)
+                        .context("Failed to query genome hash from retrieval store")?;
+                    let changed = rebuild || existing_hash.as_deref() != Some(hash.as_str());
+                    let vector_missing = !store
+                        .has_genome_vector(&id)
+                        .context("Failed to check genome vector existence")?
+                        || (vector_available
+                            && !store
+                                .has_genome_vec0(&id)
+                                .context("Failed to check genome vec0 existence")?);
 
-                if changed {
-                    store.delete_genome_vector(&id)?;
-                    let tags_json = serde_json::to_string(&d.tags)?;
-                    let search_text = genome_search_text(d);
-                    store.upsert_genome(
-                        &id,
-                        &d.date.to_rfc3339(),
-                        &d.description,
-                        d.rationale.as_deref(),
-                        &tags_json,
-                        &search_text,
-                        &hash,
-                    )?;
+                    if changed {
+                        store
+                            .delete_genome_vector(&id)
+                            .context("Failed to delete stale genome vector")?;
+                        let tags_json = serde_json::to_string(&d.tags)
+                            .context("Failed to serialize tags for genome decision")?;
+                        let search_text = genome_search_text(d);
+                        store
+                            .upsert_genome(
+                                &id,
+                                &d.date.to_rfc3339(),
+                                &d.description,
+                                d.rationale.as_deref(),
+                                &tags_json,
+                                &search_text,
+                                &hash,
+                            )
+                            .context("Failed to upsert genome decision into retrieval store")?;
+                    }
+
+                    if config.retrieval_vector_enabled
+                        && config.retrieval_backend == "fts+vec"
+                        && (changed || vector_missing)
+                    {
+                        genome_embed_jobs.push((id.clone(), genome_search_text(d)));
+                    }
+
+                    genome_seen.insert(id);
+                    genome_count += 1;
                 }
-
-                if config.retrieval_vector_enabled
-                    && config.retrieval_backend == "fts+vec"
-                    && (changed || vector_missing)
-                {
-                    genome_embed_jobs.push((id.clone(), genome_search_text(d)));
-                }
-
-                genome_seen.insert(id);
-                genome_count += 1;
-            }
-            Ok(())
-        })?;
-        store.delete_genome_except(&genome_seen)?;
+                Ok(())
+            })
+            .context("Failed to commit genome indexing transaction")?;
+        store
+            .delete_genome_except(&genome_seen)
+            .context("Failed to delete stale genome entries")?;
     }
 
-    store.refresh_fts()?;
+    store.refresh_fts().context("Failed to refresh FTS index")?;
 
     if vector_enabled {
         embed_history_jobs(
@@ -508,14 +615,16 @@ pub fn index_memory_from_storage(
             &history_embed_jobs,
             vector_available,
             &mut notes,
-        )?;
+        )
+        .context("Failed to embed history vectors")?;
         embed_genome_jobs(
             &store,
             config,
             &genome_embed_jobs,
             vector_available,
             &mut notes,
-        )?;
+        )
+        .context("Failed to embed genome vectors")?;
     }
 
     let mut backend_health = Vec::new();
@@ -545,7 +654,10 @@ pub fn index_memory_from_storage(
     };
 
     let state_path = storage.base_path().join("retrieval_index_state.json");
-    Storage::atomic_write_path(&state_path, &serde_json::to_vec_pretty(&state)?)?;
+    let state_json =
+        serde_json::to_vec_pretty(&state).context("Failed to serialize retrieval index state")?;
+    Storage::atomic_write_path(&state_path, &state_json)
+        .context("Failed to write retrieval index state file")?;
 
     let _ = std::fs::create_dir_all(storage.base_path().join("embeddings"));
     let marker_path = storage.base_path().join("embeddings/index-meta.json");
@@ -557,7 +669,10 @@ pub fn index_memory_from_storage(
         "vector_available": state.vector_available,
         "last_index_duration_ms": state.last_index_duration_ms,
     });
-    Storage::atomic_write_path(&marker_path, &serde_json::to_vec_pretty(&marker)?)?;
+    let marker_json =
+        serde_json::to_vec_pretty(&marker).context("Failed to serialize index meta marker")?;
+    Storage::atomic_write_path(&marker_path, &marker_json)
+        .context("Failed to write index meta marker file")?;
 
     Ok(state)
 }

@@ -4,6 +4,12 @@ use std::sync::Arc;
 
 use crate::{branding, state, stewardship};
 
+/// Handle the `steward` command (status/analyze/list/approve/reject/memory/compact).
+///
+/// Dispatches to the appropriate stewardship subcommand for context
+/// management: viewing status, analyzing transcripts, listing/approving/
+/// rejecting compaction proposals, viewing cross-project memory, or
+/// generating a compacted context summary.
 pub fn handle_steward(
     state: &Arc<state::State>,
     impulse_dir: &Path,
@@ -243,6 +249,10 @@ pub fn handle_steward(
     Ok(())
 }
 
+/// Handle the `analyze` command.
+///
+/// Provides scoped analysis: `session` inspects a specific session's files
+/// and tools, `tokens` directs to activity tracking, and `all` shows help.
 pub async fn handle_analyze(
     state: &Arc<state::State>,
     session_id: Option<String>,
@@ -288,6 +298,10 @@ pub async fn handle_analyze(
     Ok(())
 }
 
+/// Handle the `health` command.
+///
+/// Runs a system health check covering Python availability and Impulse
+/// directory integrity, printing pass/warn/fail status for each check.
 pub fn handle_health(impulse_dir: &Path) -> Result<()> {
     use crate::tools::health::{check_impulse_health, check_python_health, HealthStatus};
 
@@ -338,6 +352,10 @@ pub fn handle_health(impulse_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Handle the `summary` command.
+///
+/// Prints a quick-reference overview of the Impulse directory path,
+/// available CLI commands, tracked tools, and build hygiene commands.
 pub fn handle_summary(impulse_dir: &Path) -> Result<()> {
     println!("=== Impulse Summary ===\n");
 

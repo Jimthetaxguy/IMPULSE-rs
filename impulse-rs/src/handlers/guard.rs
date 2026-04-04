@@ -3,6 +3,11 @@ use std::sync::Arc;
 
 use crate::{guardrail, state};
 
+/// Handle the `guard` command.
+///
+/// Evaluates an action against guardrail rules, lists active rules, or
+/// enables/disables a specific rule by ID. Exits with code 1 when a
+/// blocking rule matches, or code 2 on evaluation error.
 pub fn handle_guard(
     state: &Arc<state::State>,
     action: Option<String>,
@@ -118,6 +123,11 @@ pub fn handle_guard(
     Ok(())
 }
 
+/// Handle the `analytics` command.
+///
+/// Currently supports the `conflicts` subcommand, which displays conflict
+/// analytics (totals, resolution rates, common files) grouped by the
+/// specified period (day, week, or month).
 pub fn handle_analytics(
     state: &Arc<state::State>,
     subcommand: String,

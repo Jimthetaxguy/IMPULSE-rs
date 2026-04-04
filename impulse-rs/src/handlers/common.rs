@@ -58,6 +58,15 @@ pub(crate) fn read_hook_stdin_payload() -> Option<String> {
 }
 
 // ============================================================================
+// JSON Parsing Helpers
+// ============================================================================
+
+/// Parse a string as JSON, falling back to `{"raw": input}` on failure.
+pub(crate) fn parse_json_or_raw(input: &str) -> serde_json::Value {
+    serde_json::from_str(input).unwrap_or_else(|_| serde_json::json!({"raw": input}))
+}
+
+// ============================================================================
 // Text / Formatting Helpers
 // ============================================================================
 

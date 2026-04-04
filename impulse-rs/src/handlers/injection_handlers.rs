@@ -5,6 +5,22 @@ use crate::{injection, monty, orchestration, state};
 
 use super::{get_session_id, parse_injection_mode, print_injection_explain, print_json};
 
+/// Apply injection result to target file if it was applied.
+fn apply_injection_result(path: &std::path::Path, result: &injection::InjectionRunResult) {
+    if result.applied {
+        if let Some(block) = &result.injected_block {
+            if let Err(err) = orchestration::append_injected_context(path, block) {
+                eprintln!("Warning: failed to append injected context: {err}");
+            }
+        }
+    }
+}
+
+/// Handle the `orchestrate` command.
+///
+/// Routes a task to the recommended tool, optionally using computed routing
+/// via the Monty engine. Runs context injection and enriches the routing
+/// decision with active session data when available.
 pub async fn handle_orchestrate(
     state: &Arc<state::State>,
     task: String,
@@ -71,6 +87,11 @@ pub async fn handle_orchestrate(
     Ok(())
 }
 
+/// Handle the `handoff` command.
+///
+/// Writes a handoff markdown file for the specified target tool, including
+/// the task description, optional notes, session context, and any injected
+/// context blocks.
 pub async fn handle_handoff(
     state: &Arc<state::State>,
     tool: String,
@@ -117,13 +138,7 @@ pub async fn handle_handoff(
         notes.as_deref(),
         session.as_ref(),
     )?;
-    if injection_result.applied {
-        if let Some(block) = &injection_result.injected_block {
-            if let Err(err) = orchestration::append_injected_context(&handoff_path, block) {
-                eprintln!("Warning: failed to append injected context: {}", err);
-            }
-        }
-    }
+    apply_injection_result(&handoff_path, &injection_result);
     println!("Wrote handoff file: {}", handoff_path.display());
     if inject_explain {
         print_injection_explain(&injection_result);
@@ -131,6 +146,10 @@ pub async fn handle_handoff(
     Ok(())
 }
 
+/// Handle the `sync-context` command.
+///
+/// Writes a `current-task.md` context file combining active session data
+/// with any injected context. Used to synchronize state between agents.
 pub async fn handle_sync_context(
     state: &Arc<state::State>,
     session_id: Option<String>,
@@ -165,13 +184,7 @@ pub async fn handle_sync_context(
     );
 
     let context_path = orchestration::sync_context(state.storage().base_path(), session.as_ref())?;
-    if injection_result.applied {
-        if let Some(block) = &injection_result.injected_block {
-            if let Err(err) = orchestration::append_injected_context(&context_path, block) {
-                eprintln!("Warning: failed to append injected context: {}", err);
-            }
-        }
-    }
+    apply_injection_result(&context_path, &injection_result);
     println!("Synced context file: {}", context_path.display());
     if inject_explain {
         print_injection_explain(&injection_result);
@@ -179,6 +192,10 @@ pub async fn handle_sync_context(
     Ok(())
 }
 
+/// Handle the `compute-injection` command.
+///
+/// Uses the Monty keyword router to determine which context types should
+/// be injected for a given query, printing the prioritized decisions.
 pub fn handle_compute_injection(query: String, _limit: usize, json: bool) -> Result<()> {
     let monty_config = monty::MontyConfig::default();
     let context = format!("Query: {}", query);

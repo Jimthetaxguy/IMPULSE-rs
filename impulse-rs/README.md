@@ -43,7 +43,7 @@ cargo install --path .   # Install globally
 ## Testing
 
 ```bash
-cargo test                        # Workspace (1,343 tests)
+cargo test                        # Workspace (1,344 tests)
 cargo test -p impulse-gui         # GUI crate (246 tests)
 cargo test -p impulse-term        # Terminal crate (110 tests)
 cargo test -p impulse-ops         # Ops crate (4 tests)
@@ -56,7 +56,7 @@ cargo test -p impulse-ops         # Ops crate (4 tests)
 
 | Crate | Purpose |
 |-------|---------|
-| `impulse-rs` | CLI + daemon + TUI (64K LOC, 1,343 tests) |
+| `impulse-rs` | CLI + daemon + TUI (64K LOC, 1,344 tests) |
 | `impulse-ops` | Shared types (SupervisorAction, OpsSnapshot, IPC protocol) |
 | `impulse-term` | Terminal widget (PTY, vt100, WriteQueue, context bridge, 110 tests) |
 | `impulse-gui` | Native workbench (egui, 4 views, 4 themes, 246 tests) |

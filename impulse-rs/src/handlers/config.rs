@@ -9,6 +9,10 @@ use super::{
     tool_resolution_root,
 };
 
+/// Handle the `config` command.
+///
+/// Dispatches to get, set, or list operations depending on the provided
+/// arguments. With no args, lists all config and prints usage hints.
 pub fn handle_config(
     state: &Arc<state::State>,
     key: Option<String>,
@@ -43,6 +47,11 @@ pub fn handle_config(
     Ok(())
 }
 
+/// Handle the `init` command.
+///
+/// Creates the `.impulse/` directory structure including `LIVE_STATE.json`,
+/// `GENOME.md`, `config.json`, context dirs, external tools dir, and the
+/// capabilities manifest.
 pub fn handle_init(state: &Arc<state::State>, impulse_dir: &Path) -> Result<()> {
     state
         .storage()
@@ -67,6 +76,10 @@ pub fn handle_init(state: &Arc<state::State>, impulse_dir: &Path) -> Result<()> 
     Ok(())
 }
 
+/// Handle the `status` command.
+///
+/// Prints the Impulse banner and lists all active sessions with their
+/// names, IDs, and statuses.
 pub async fn handle_status(state: &Arc<state::State>) -> Result<()> {
     branding::print_banner();
     let sessions = state.list_sessions().await?;
@@ -77,6 +90,10 @@ pub async fn handle_status(state: &Arc<state::State>) -> Result<()> {
     Ok(())
 }
 
+/// Handle the `list-providers` command.
+///
+/// Prints all available LLM providers with their default models and
+/// supported model lists.
 pub fn handle_list_providers() -> Result<()> {
     use crate::agent::{AnthropicProvider, LlmProvider, MinimaxProvider, OpenAiProvider};
 
@@ -107,6 +124,10 @@ pub fn handle_list_providers() -> Result<()> {
     Ok(())
 }
 
+/// Handle the `model` command (list/set/get subcommands).
+///
+/// Lists cached models, sets a default model for a provider, or retrieves
+/// the currently configured model for a given provider.
 pub fn handle_model(
     state: &Arc<state::State>,
     _impulse_dir: &Path,
@@ -161,6 +182,10 @@ pub fn handle_model(
     Ok(())
 }
 
+/// Handle the `credentials` command (list/get/set/delete/status subcommands).
+///
+/// Manages secrets through the configured credential provider (env, CLI tool,
+/// or socket). Supports listing, reading, writing, and deleting secrets.
 pub fn handle_credentials(
     subcommand: String,
     provider: Option<String>,

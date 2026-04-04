@@ -484,6 +484,10 @@ fn build_command_list() -> Vec<CommandInfo> {
 
 // ─── Handlers ───────────────────────────────────────────────────────────────
 
+/// Handle the `describe` command.
+///
+/// Emits a machine-readable registry of all CLI commands with parameter
+/// schemas, examples, and metadata in the requested output format.
 pub fn handle_describe(format: OutputFormat) -> Result<()> {
     let registry = build_registry();
     let env = EnvelopeBuilder::new("describe").ok(&registry);
@@ -491,6 +495,10 @@ pub fn handle_describe(format: OutputFormat) -> Result<()> {
     Ok(())
 }
 
+/// Handle the `schema` command.
+///
+/// Emits a JSON Schema for a specific command path, derived from the
+/// command registry. Returns an error envelope if the command is unknown.
 pub fn handle_schema(command: &str, format: OutputFormat) -> Result<()> {
     let registry = build_registry();
     let cmd = registry.commands.iter().find(|c| c.path == command);

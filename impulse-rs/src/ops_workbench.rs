@@ -1,3 +1,10 @@
+//! GUI workbench state adapter — bridges daemon state to `impulse-gui`.
+//!
+//! Builds [`ProjectOpsSnapshot`] from [`SharedState`], aggregating sessions,
+//! history, genome, artifacts, and context health into the schema consumed by
+//! the egui workbench. Also provides [`TerminalOpsTelemetryStore`] for
+//! collecting and expiring per-terminal operation reports.
+
 use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -113,13 +120,21 @@ pub async fn build_snapshot(
     terminal_reports: &[TerminalOpsReport],
 ) -> Result<ProjectOpsSnapshot> {
     let project = project_summary(state);
-    sync_legacy_artifacts(state.storage().base_path(), &project)?;
+    sync_legacy_artifacts(state.storage().base_path(), &project)
+        .context("Failed to sync legacy artifacts for workbench")?;
 
-    let sessions = state.list_sessions().await?;
-    let history = load_history(state.storage().base_path())?;
-    let genome = load_genome(state.storage().base_path())?;
-    let artifacts = list_artifacts(state.storage().base_path(), &project.id)?;
-    let recent_insights = load_live_insights(state.storage().base_path(), 20)?;
+    let sessions = state
+        .list_sessions()
+        .await
+        .context("Failed to list sessions for workbench snapshot")?;
+    let history = load_history(state.storage().base_path())
+        .context("Failed to read history for workbench")?;
+    let genome =
+        load_genome(state.storage().base_path()).context("Failed to load genome for workbench")?;
+    let artifacts = list_artifacts(state.storage().base_path(), &project.id)
+        .context("Failed to list artifacts for workbench")?;
+    let recent_insights = load_live_insights(state.storage().base_path(), 20)
+        .context("Failed to load live insights for workbench")?;
     let pending_review_count = artifacts
         .iter()
         .filter(|artifact| artifact.status == ArtifactStatus::Staged)
@@ -152,7 +167,8 @@ pub async fn build_snapshot(
             genome_decisions: genome.decisions.len(),
             last_genome_update: genome.last_updated,
         },
-        retrieval: build_retrieval_summary(state)?,
+        retrieval: build_retrieval_summary(state)
+            .context("Failed to build retrieval summary for workbench")?,
         artifacts,
         delegations: Vec::new(),
     };
@@ -166,7 +182,9 @@ pub async fn subscribe_ops(
     since_seq: Option<u64>,
     terminal_reports: &[TerminalOpsReport],
 ) -> Result<OpsSubscription> {
-    let snapshot = build_snapshot(state, terminal_reports).await?;
+    let snapshot = build_snapshot(state, terminal_reports)
+        .await
+        .context("Failed to build ops snapshot for subscription")?;
     let next_seq = snapshot_seq(&snapshot);
     let events = if since_seq == Some(next_seq) {
         Vec::new()
@@ -188,21 +206,35 @@ pub fn list_artifacts(base_path: &Path, project_id: &str) -> Result<Vec<Artifact
         return Ok(artifacts);
     }
 
-    for agent_dir in fs::read_dir(&root).with_context(|| format!("read {}", root.display()))? {
-        let agent_dir = agent_dir?;
+    for agent_dir in fs::read_dir(&root)
+        .with_context(|| format!("Failed to read artifact store root {}", root.display()))?
+    {
+        let agent_dir =
+            agent_dir.context("Failed to read agent directory entry in artifact store")?;
         let artifact_dir = agent_dir.path().join("artifacts");
         if !artifact_dir.exists() {
             continue;
         }
-        for entry in fs::read_dir(&artifact_dir)
-            .with_context(|| format!("read {}", artifact_dir.display()))?
-        {
-            let entry = entry?;
+        for entry in fs::read_dir(&artifact_dir).with_context(|| {
+            format!(
+                "Failed to read artifact directory {}",
+                artifact_dir.display()
+            )
+        })? {
+            let entry = entry.context("Failed to read artifact directory entry")?;
             if entry.path().extension().and_then(|ext| ext.to_str()) != Some("json") {
                 continue;
             }
-            let content = fs::read(entry.path())?;
-            let artifact = serde_json::from_slice::<ArtifactEnvelope>(&content)?;
+            let content = fs::read(entry.path()).with_context(|| {
+                format!("Failed to read artifact file {}", entry.path().display())
+            })?;
+            let artifact =
+                serde_json::from_slice::<ArtifactEnvelope>(&content).with_context(|| {
+                    format!(
+                        "Failed to parse artifact JSON from {}",
+                        entry.path().display()
+                    )
+                })?;
             artifacts.push(artifact);
         }
     }
@@ -216,7 +248,8 @@ pub fn get_artifact(
     project_id: &str,
     artifact_id: &str,
 ) -> Result<Option<ArtifactEnvelope>> {
-    let artifacts = list_artifacts(base_path, project_id)?;
+    let artifacts =
+        list_artifacts(base_path, project_id).context("Failed to list artifacts for lookup")?;
     Ok(artifacts
         .into_iter()
         .find(|artifact| artifact.id == artifact_id))
@@ -229,7 +262,9 @@ pub fn run_artifact_action(
     action_id: &str,
     _params: &serde_json::Value,
 ) -> Result<ArtifactActionResult> {
-    let Some(mut artifact) = get_artifact(base_path, project_id, artifact_id)? else {
+    let Some(mut artifact) = get_artifact(base_path, project_id, artifact_id)
+        .context("Failed to retrieve artifact for action")?
+    else {
         anyhow::bail!("Artifact not found: {}", artifact_id);
     };
 
@@ -242,7 +277,8 @@ pub fn run_artifact_action(
         }),
         "acknowledge" => {
             artifact.status = ArtifactStatus::Acknowledged;
-            impulse_ops::save_artifact(base_path, &artifact)?;
+            impulse_ops::save_artifact(base_path, &artifact)
+                .context("Failed to save acknowledged artifact")?;
             Ok(ArtifactActionResult {
                 status: "acknowledged".to_string(),
                 message: "Artifact acknowledged".to_string(),
@@ -252,7 +288,8 @@ pub fn run_artifact_action(
         }
         "apply" => {
             artifact.status = ArtifactStatus::Applied;
-            impulse_ops::save_artifact(base_path, &artifact)?;
+            impulse_ops::save_artifact(base_path, &artifact)
+                .context("Failed to save applied artifact")?;
             Ok(ArtifactActionResult {
                 status: "ready_to_apply".to_string(),
                 message: "Artifact content prepared for the active agent".to_string(),
@@ -627,7 +664,9 @@ fn build_events(snapshot: &ProjectOpsSnapshot, seq: u64) -> Vec<OpsEvent> {
 }
 
 fn build_retrieval_summary(state: &SharedState) -> Result<RetrievalSummary> {
-    let config = state.config_snapshot()?;
+    let config = state
+        .config_snapshot()
+        .context("Failed to read config snapshot for retrieval summary")?;
     Ok(RetrievalSummary {
         mode: config.retrieval_mode,
         backend: config.retrieval_backend,
@@ -645,9 +684,10 @@ fn load_genome(base_path: &Path) -> Result<GenomeFile> {
     if !genome_path.exists() {
         return Ok(GenomeFile::default());
     }
-    let content = fs::read_to_string(&genome_path)?;
+    let content = fs::read_to_string(&genome_path)
+        .with_context(|| format!("Failed to read genome file {}", genome_path.display()))?;
     serde_json::from_str(&content)
-        .with_context(|| format!("failed to parse {}", genome_path.display()))
+        .with_context(|| format!("Failed to parse genome file {}", genome_path.display()))
 }
 
 fn load_live_insights(base_path: &Path, limit: usize) -> Result<Vec<InsightRecord>> {
@@ -657,7 +697,10 @@ fn load_live_insights(base_path: &Path, limit: usize) -> Result<Vec<InsightRecor
     }
 
     let mut insights = Vec::new();
-    for line in fs::read_to_string(&path)?.lines() {
+    for line in fs::read_to_string(&path)
+        .context("Failed to read live insights file")?
+        .lines()
+    {
         if line.trim().is_empty() {
             continue;
         }
@@ -681,8 +724,10 @@ fn load_live_insights(base_path: &Path, limit: usize) -> Result<Vec<InsightRecor
 }
 
 fn sync_legacy_artifacts(base_path: &Path, project: &ProjectSummary) -> Result<()> {
-    sync_legacy_injection_artifacts(base_path, project)?;
-    sync_live_insights_artifact(base_path, project)?;
+    sync_legacy_injection_artifacts(base_path, project)
+        .context("Failed to sync legacy injection artifacts")?;
+    sync_live_insights_artifact(base_path, project)
+        .context("Failed to sync live insights artifact")?;
     Ok(())
 }
 
@@ -692,14 +737,20 @@ fn sync_legacy_injection_artifacts(base_path: &Path, project: &ProjectSummary) -
         return Ok(());
     }
 
-    for entry in fs::read_dir(&injections_dir)? {
-        let entry = entry?;
+    for entry in fs::read_dir(&injections_dir).with_context(|| {
+        format!(
+            "Failed to read injections directory {}",
+            injections_dir.display()
+        )
+    })? {
+        let entry = entry.context("Failed to read injection directory entry")?;
         let path = entry.path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
             continue;
         }
 
-        let content = fs::read_to_string(&path)?;
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read injection file {}", path.display()))?;
         let stem = path
             .file_stem()
             .map(|value| value.to_string_lossy().to_string())
@@ -738,13 +789,15 @@ fn sync_legacy_injection_artifacts(base_path: &Path, project: &ProjectSummary) -
                 "source": "context/injections",
             }),
         };
-        impulse_ops::save_artifact(base_path, &artifact)?;
+        impulse_ops::save_artifact(base_path, &artifact)
+            .with_context(|| format!("Failed to save legacy injection artifact {}", stem))?;
     }
     Ok(())
 }
 
 fn sync_live_insights_artifact(base_path: &Path, project: &ProjectSummary) -> Result<()> {
-    let live_insights = load_live_insights(base_path, 50)?;
+    let live_insights = load_live_insights(base_path, 50)
+        .context("Failed to load live insights for artifact sync")?;
     if live_insights.is_empty() {
         return Ok(());
     }
@@ -784,7 +837,8 @@ fn sync_live_insights_artifact(base_path: &Path, project: &ProjectSummary) -> Re
             "source": "LIVE_INSIGHTS.jsonl",
         }),
     };
-    impulse_ops::save_artifact(base_path, &artifact)?;
+    impulse_ops::save_artifact(base_path, &artifact)
+        .context("Failed to save live insights artifact")?;
     Ok(())
 }
 
@@ -970,7 +1024,11 @@ mod tests {
         let shared = std::sync::Arc::new(state);
 
         let err = build_snapshot(&shared, &[]).await.unwrap_err();
-        assert!(err.to_string().contains("failed to parse"));
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Failed to parse genome") || msg.contains("Failed to load genome"),
+            "expected genome parse/load error, got: {msg}"
+        );
     }
 
     #[tokio::test]

@@ -3,7 +3,7 @@
 //! Extracted from `run_daemon_mode()` in main.rs to keep main.rs focused on
 //! argument parsing and top-level dispatch.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::Path;
 
 use crate::client::DaemonClient;
@@ -24,7 +24,9 @@ pub(crate) async fn dispatch(
 ) -> Result<()> {
     match command {
         Commands::Daemon { stop } => {
-            handle_daemon(client, stop).await?;
+            handle_daemon(client, stop)
+                .await
+                .context("Failed to handle daemon stop/status request")?;
         }
         Commands::SessionStart {
             name,
@@ -32,7 +34,9 @@ pub(crate) async fn dispatch(
             inject_mode: _,
             inject_explain: _,
         } => {
-            handle_session_start(client, impulse_dir, name, platform).await?;
+            handle_session_start(client, impulse_dir, name, platform)
+                .await
+                .context("Failed to handle session-start daemon request")?;
         }
         Commands::SessionEnd {
             session_id,
@@ -48,7 +52,8 @@ pub(crate) async fn dispatch(
                 should_verify,
                 sem_diff_base,
             )
-            .await?;
+            .await
+            .context("Failed to handle session-end daemon request")?;
         }
         Commands::TrackWrite { file, session_id } => {
             if let Some(sid) = get_session_id(session_id) {
@@ -83,18 +88,22 @@ pub(crate) async fn dispatch(
             Err(e) => eprintln!("Error: {}", e),
         },
         Commands::SessionInfo { id } => match client.get_session(id).await {
-            Ok(s) => print_json(&s)?,
+            Ok(s) => print_json(&s).context("Failed to serialize session info")?,
             Err(e) => eprintln!("Error: {}", e),
         },
         Commands::SessionConflicts { file, session_id } => {
-            handle_session_conflicts(client, file, session_id).await?;
+            handle_session_conflicts(client, file, session_id)
+                .await
+                .context("Failed to handle session-conflicts daemon request")?;
         }
         Commands::Status => match client.status().await {
-            Ok(s) => print_json(&s)?,
+            Ok(s) => print_json(&s).context("Failed to serialize daemon status")?,
             Err(e) => eprintln!("Error: {}", e),
         },
         Commands::Debug => match client.send(DaemonRequest::DebugSnapshot).await {
-            Ok(DaemonResponse::Ok { result }) => print_json(&result)?,
+            Ok(DaemonResponse::Ok { result }) => {
+                print_json(&result).context("Failed to serialize debug snapshot")?
+            }
             Ok(DaemonResponse::Error { message }) => eprintln!("Error: {}", message),
             Ok(_) => eprintln!("Unexpected response type"),
             Err(e) => eprintln!("Error: {}", e),
@@ -109,11 +118,15 @@ pub(crate) async fn dispatch(
             inject_mode,
             inject_explain,
         } => {
-            handle_chat(client, session_id, message, inject_mode, inject_explain).await?;
+            handle_chat(client, session_id, message, inject_mode, inject_explain)
+                .await
+                .context("Failed to handle chat daemon request")?;
         }
         Commands::Verify => {
-            let steps = verify::default_steps(&std::env::current_dir()?);
-            let report = verify::run_verification(steps)?;
+            let steps = verify::default_steps(
+                &std::env::current_dir().context("Failed to get current directory for verify")?,
+            );
+            let report = verify::run_verification(steps).context("Failed to run verification")?;
             print_verification_report(&report);
             if !report.success() {
                 anyhow::bail!("Verification failed");
@@ -121,14 +134,18 @@ pub(crate) async fn dispatch(
         }
         Commands::Describe => {
             let fmt = format.unwrap_or(envelope::OutputFormat::Json);
-            super::describe::handle_describe(fmt)?;
+            super::describe::handle_describe(fmt)
+                .context("Failed to handle describe daemon request")?;
         }
         Commands::Schema { command: cmd } => {
             let fmt = format.unwrap_or(envelope::OutputFormat::Json);
-            super::describe::handle_schema(&cmd, fmt)?;
+            super::describe::handle_schema(&cmd, fmt)
+                .context("Failed to handle schema daemon request")?;
         }
         Commands::PluginList { json } => {
-            handle_plugin_list(client, json).await?;
+            handle_plugin_list(client, json)
+                .await
+                .context("Failed to handle plugin-list daemon request")?;
         }
         Commands::PluginInvoke {
             name,
@@ -137,7 +154,9 @@ pub(crate) async fn dispatch(
             options,
             json,
         } => {
-            handle_plugin_invoke(client, name, path, query, options, json).await?;
+            handle_plugin_invoke(client, name, path, query, options, json)
+                .await
+                .context("Failed to handle plugin-invoke daemon request")?;
         }
         Commands::SearchHistory { .. }
         | Commands::SearchGenome { .. }
@@ -161,8 +180,11 @@ async fn handle_daemon(client: &DaemonClient, stop: bool) -> Result<()> {
         println!("Daemon stopped");
     } else {
         println!("Daemon running");
-        let status = client.status().await?;
-        print_json(&status)?;
+        let status = client
+            .status()
+            .await
+            .context("Failed to get daemon status")?;
+        print_json(&status).context("Failed to serialize daemon status")?;
     }
     Ok(())
 }
@@ -189,7 +211,8 @@ async fn handle_session_start(
                 stdin_payload,
                 Some("daemon create_session".to_string()),
                 1,
-            )?;
+            )
+            .context("Failed to capture hook evidence for session-start")?;
             println!("Created session: {} ({})", n, id)
         }
         Err(e) => eprintln!("Error: {}", e),
@@ -207,8 +230,12 @@ async fn handle_session_end(
 ) -> Result<()> {
     let stdin_payload = read_hook_stdin_payload();
     if should_verify {
-        let steps = verify::default_steps(&std::env::current_dir()?);
-        let report = verify::run_verification(steps)?;
+        let steps = verify::default_steps(
+            &std::env::current_dir()
+                .context("Failed to get current directory for session-end verify")?,
+        );
+        let report =
+            verify::run_verification(steps).context("Failed to run session-end verification")?;
         print_verification_report(&report);
         if !report.success() {
             anyhow::bail!("Verification failed. Session end blocked.");
@@ -219,7 +246,8 @@ async fn handle_session_end(
         if semantic_diff::sem_available() {
             match semantic_diff::capture_semantic_diff(
                 impulse_dir,
-                &std::env::current_dir()?,
+                &std::env::current_dir()
+                    .context("Failed to get current directory for semantic diff")?,
                 &session_id,
                 base_ref,
                 "HEAD",
@@ -249,7 +277,8 @@ async fn handle_session_end(
                 stdin_payload,
                 Some(format!("Session {} ended", session_id)),
                 1,
-            )?;
+            )
+            .context("Failed to capture hook evidence for session-end")?;
             println!("Session {} ended", session_id)
         }
         Err(e) => eprintln!("Error: {}", e),
@@ -328,11 +357,11 @@ async fn handle_chat(
     {
         Ok(result) => {
             if inject_explain {
-                print_json(&result)?;
+                print_json(&result).context("Failed to serialize chat result")?;
             } else if let Some(response) = result.get("response").and_then(|v| v.as_str()) {
                 println!("{}", response);
             } else {
-                print_json(&result)?;
+                print_json(&result).context("Failed to serialize chat result")?;
             }
         }
         Err(e) => eprintln!("Error: {}", e),
@@ -344,7 +373,7 @@ async fn handle_plugin_list(client: &DaemonClient, json: bool) -> Result<()> {
     match client.send(DaemonRequest::ListPlugins).await {
         Ok(DaemonResponse::Ok { result }) => {
             if json {
-                print_json(&result)?;
+                print_json(&result).context("Failed to serialize plugin list")?;
             } else {
                 let providers = result
                     .get("context_providers")
@@ -398,11 +427,11 @@ async fn handle_plugin_invoke(
     {
         Ok(DaemonResponse::Ok { result }) => {
             if json {
-                print_json(&result)?;
+                print_json(&result).context("Failed to serialize plugin invoke result")?;
             } else if let Some(content) = result.get("content").and_then(|v| v.as_str()) {
                 println!("{}", content);
             } else {
-                print_json(&result)?;
+                print_json(&result).context("Failed to serialize plugin invoke result")?;
             }
         }
         Ok(DaemonResponse::Error { message }) => {
@@ -432,9 +461,7 @@ fn build_plugin_input(
         input = input.with_query(q);
     }
     if let Some(opts) = options {
-        let parsed: serde_json::Value =
-            serde_json::from_str(&opts).unwrap_or_else(|_| serde_json::json!({"raw": opts}));
-        input = input.with_options(parsed);
+        input = input.with_options(super::parse_json_or_raw(&opts));
     }
     input
 }
@@ -489,9 +516,9 @@ mod tests {
     use super::*;
 
     /// Parse plugin options string: valid JSON passes through, invalid wraps as `{"raw": ...}`.
-    /// Mirrors the parsing logic in `build_plugin_input` for isolated testing.
+    /// Delegates to the shared `parse_json_or_raw` helper.
     fn parse_plugin_options(opts: &str) -> serde_json::Value {
-        serde_json::from_str(opts).unwrap_or_else(|_| serde_json::json!({"raw": opts}))
+        crate::handlers::parse_json_or_raw(opts)
     }
 
     // ── format_session_line ───────────────────────────────────────────

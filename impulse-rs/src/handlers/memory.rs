@@ -3,12 +3,19 @@ use std::sync::Arc;
 
 use crate::{memory, retrieval, state};
 
+/// Handle the `genome` command.
+///
+/// Reads `GENOME.md` from storage and prints it as formatted markdown.
 pub fn handle_genome(state: &Arc<state::State>) -> Result<()> {
     let genome = state.storage().read_json::<memory::Genome>("GENOME.md")?;
     println!("{}", genome.to_markdown());
     Ok(())
 }
 
+/// Handle the `history` command.
+///
+/// Prints the 20 most recent session history entries in reverse
+/// chronological order with timestamps, names, and summaries.
 pub fn handle_history(state: &Arc<state::State>) -> Result<()> {
     let history = state.get_history_sync()?;
     if history.is_empty() {
@@ -26,6 +33,10 @@ pub fn handle_history(state: &Arc<state::State>) -> Result<()> {
     Ok(())
 }
 
+/// Handle the `add-decision` command.
+///
+/// Appends a new decision to `GENOME.md` with an optional rationale.
+/// Duplicate descriptions are silently deduplicated by the Genome layer.
 pub fn handle_add_decision(
     state: &Arc<state::State>,
     description: String,
@@ -38,6 +49,10 @@ pub fn handle_add_decision(
     Ok(())
 }
 
+/// Handle the `search-history` command.
+///
+/// Performs keyword or semantic search across session history entries,
+/// with pagination, backend selection, and optional scoring explanation.
 // TODO(refactor): extract params into struct
 #[allow(clippy::too_many_arguments)]
 pub fn handle_search_history(
@@ -132,6 +147,10 @@ pub fn handle_search_history(
     Ok(())
 }
 
+/// Handle the `search-genome` command.
+///
+/// Performs keyword or semantic search across decisions in `GENOME.md`,
+/// with pagination, backend selection, and optional scoring explanation.
 // TODO(refactor): extract params into struct
 #[allow(clippy::too_many_arguments)]
 pub fn handle_search_genome(
@@ -226,6 +245,10 @@ pub fn handle_search_genome(
     Ok(())
 }
 
+/// Handle the `activity` command.
+///
+/// Aggregates recent file modifications and tool usages across all active
+/// sessions, sorted by recency, and prints up to `limit` entries.
 pub async fn handle_activity(state: &Arc<state::State>, limit: usize) -> Result<()> {
     let sessions = state.list_sessions().await?;
     if sessions.is_empty() {

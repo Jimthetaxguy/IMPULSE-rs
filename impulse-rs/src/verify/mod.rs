@@ -1,3 +1,10 @@
+//! Verification pipeline — auto-detects and runs project health checks.
+//!
+//! Scans the working directory for `package.json` (JS/TS) and `Cargo.toml`
+//! (Rust), then assembles a sequence of verification steps (install, typecheck,
+//! test, lint, build). Executes steps in order, halting on first failure, and
+//! returns a [`VerificationReport`] summarizing pass/fail per step.
+
 use anyhow::{bail, Result};
 use serde::Deserialize;
 use std::fs;

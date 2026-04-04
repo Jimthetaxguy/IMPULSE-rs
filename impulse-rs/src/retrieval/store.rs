@@ -13,14 +13,16 @@ pub struct RetrievalStore {
 
 impl RetrievalStore {
     pub fn open(base_path: &Path) -> Result<Self> {
-        std::fs::create_dir_all(base_path)?;
+        std::fs::create_dir_all(base_path).context("Failed to create retrieval store directory")?;
         let db_path = base_path.join("retrieval.db");
         let conn = Connection::open(&db_path).context("failed to open retrieval.db")?;
 
-        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .context("Failed to enable foreign_keys pragma")?;
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
         let _ = conn.pragma_update(None, "synchronous", "NORMAL");
-        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.busy_timeout(Duration::from_secs(5))
+            .context("Failed to set busy_timeout on retrieval.db")?;
 
         Ok(Self { conn, db_path })
     }
@@ -61,12 +63,16 @@ impl RetrievalStore {
     }
 
     pub fn table_exists(&self, table_name: &str) -> Result<bool> {
-        let mut stmt = self.conn.prepare(
-            "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?1 LIMIT 1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?1 LIMIT 1",
+            )
+            .context("Failed to prepare table_exists query on sqlite_master")?;
         Ok(stmt
             .query_row(params![table_name], |row| row.get::<_, i64>(0))
-            .optional()?
+            .optional()
+            .context("Failed to query sqlite_master for table existence")?
             .is_some())
     }
 
@@ -87,23 +93,32 @@ impl RetrievalStore {
             .prepare(&format!("PRAGMA table_info({})", table))
             .with_context(|| format!("failed to inspect schema for {}", table))?;
 
-        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .with_context(|| format!("Failed to query table_info for {}", table))?;
         let mut found = false;
         for row in rows {
-            if row?.as_str() == column {
+            if row
+                .with_context(|| format!("Failed to read column name from {}", table))?
+                .as_str()
+                == column
+            {
                 found = true;
                 break;
             }
         }
         if !found {
-            self.conn.execute(ddl, [])?;
+            self.conn
+                .execute(ddl, [])
+                .with_context(|| format!("Failed to add column {} to {}", column, table))?;
         }
         Ok(())
     }
 
     pub fn init_schema(&self) -> Result<()> {
-        self.conn.execute_batch(
-            r#"
+        self.conn
+            .execute_batch(
+                r#"
 CREATE TABLE IF NOT EXISTS history_entries (
   session_id TEXT PRIMARY KEY,
   session_name TEXT NOT NULL,
@@ -152,43 +167,58 @@ CREATE TABLE IF NOT EXISTS genome_vec (
   vector_json TEXT NOT NULL
 );
 "#,
-        )?;
+            )
+            .context("Failed to initialize retrieval schema")?;
 
         self.ensure_column(
             "history_entries",
             "content_hash",
             "ALTER TABLE history_entries ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''",
-        )?;
+        )
+        .context("Failed to ensure content_hash column on history_entries")?;
         self.ensure_column(
             "genome_decisions",
             "content_hash",
             "ALTER TABLE genome_decisions ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''",
-        )?;
+        )
+        .context("Failed to ensure content_hash column on genome_decisions")?;
 
-        self.set_meta("schema_version", "2")?;
+        self.set_meta("schema_version", "2")
+            .context("Failed to set schema_version in retrieval_meta")?;
         Ok(())
     }
 
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
-        self.conn.execute(
-            r#"INSERT INTO retrieval_meta(key, value) VALUES (?1, ?2)
+        self.conn
+            .execute(
+                r#"INSERT INTO retrieval_meta(key, value) VALUES (?1, ?2)
                ON CONFLICT(key) DO UPDATE SET value=excluded.value"#,
-            params![key, value],
-        )?;
+                params![key, value],
+            )
+            .with_context(|| format!("Failed to set retrieval_meta key '{}'", key))?;
         Ok(())
     }
 
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT value FROM retrieval_meta WHERE key=?1")?;
-        let value = stmt.query_row(params![key], |row| row.get(0)).optional()?;
+            .prepare("SELECT value FROM retrieval_meta WHERE key=?1")
+            .with_context(|| format!("Failed to prepare retrieval_meta query for key '{}'", key))?;
+        let value = stmt
+            .query_row(params![key], |row| row.get(0))
+            .optional()
+            .with_context(|| format!("Failed to query retrieval_meta for key '{}'", key))?;
         Ok(value)
     }
 
     pub fn quick_check(&self) -> Result<String> {
-        let mut stmt = self.conn.prepare("PRAGMA quick_check(1)")?;
-        let out: String = stmt.query_row([], |row| row.get(0))?;
+        let mut stmt = self
+            .conn
+            .prepare("PRAGMA quick_check(1)")
+            .context("Failed to prepare quick_check pragma")?;
+        let out: String = stmt
+            .query_row([], |row| row.get(0))
+            .context("Failed to execute quick_check pragma")?;
         Ok(out)
     }
 
@@ -235,9 +265,13 @@ CREATE TABLE IF NOT EXISTS genome_vec (
         // 4. ext_path exists on disk
         // The extension is loaded then immediately disabled to minimize exposure.
         unsafe {
-            self.conn.load_extension_enable()?;
+            self.conn
+                .load_extension_enable()
+                .context("Failed to enable SQLite extension loading")?;
             let result = self.conn.load_extension(&ext_path, None).is_ok();
-            self.conn.load_extension_disable()?;
+            self.conn
+                .load_extension_disable()
+                .context("Failed to disable SQLite extension loading")?;
             Ok(result)
         }
     }
@@ -250,11 +284,14 @@ CREATE TABLE IF NOT EXISTS genome_vec (
             "CREATE VIRTUAL TABLE history_vec0 USING vec0(session_id TEXT, embedding float[{}])",
             dim
         );
-        self.conn.execute("DROP TABLE IF EXISTS history_vec0", [])?;
+        self.conn
+            .execute("DROP TABLE IF EXISTS history_vec0", [])
+            .context("Failed to drop existing history_vec0 table")?;
         self.conn
             .execute(&sql, [])
-            .context("failed to create history_vec0 table")?;
-        self.set_meta("history_vec0_dim", &dim.to_string())?;
+            .context("Failed to create history_vec0 table")?;
+        self.set_meta("history_vec0_dim", &dim.to_string())
+            .context("Failed to store history_vec0_dim in retrieval_meta")?;
         Ok(())
     }
 
@@ -266,47 +303,68 @@ CREATE TABLE IF NOT EXISTS genome_vec (
             "CREATE VIRTUAL TABLE genome_vec0 USING vec0(decision_id TEXT, embedding float[{}])",
             dim
         );
-        self.conn.execute("DROP TABLE IF EXISTS genome_vec0", [])?;
+        self.conn
+            .execute("DROP TABLE IF EXISTS genome_vec0", [])
+            .context("Failed to drop existing genome_vec0 table")?;
         self.conn
             .execute(&sql, [])
-            .context("failed to create genome_vec0 table")?;
-        self.set_meta("genome_vec0_dim", &dim.to_string())?;
+            .context("Failed to create genome_vec0 table")?;
+        self.set_meta("genome_vec0_dim", &dim.to_string())
+            .context("Failed to store genome_vec0_dim in retrieval_meta")?;
         Ok(())
     }
 
     pub fn ensure_history_vec0_table(&self, dim: usize) -> Result<()> {
         let current_dim = self
-            .get_meta("history_vec0_dim")?
+            .get_meta("history_vec0_dim")
+            .context("Failed to read history_vec0_dim from retrieval_meta")?
             .and_then(|v| v.parse::<usize>().ok());
-        let exists = self.table_exists("history_vec0")?;
+        let exists = self
+            .table_exists("history_vec0")
+            .context("Failed to check if history_vec0 table exists")?;
         if current_dim != Some(dim) || !exists {
-            self.create_history_vec0_table(dim)?;
+            self.create_history_vec0_table(dim)
+                .context("Failed to create history_vec0 table during ensure")?;
         }
         Ok(())
     }
 
     pub fn ensure_genome_vec0_table(&self, dim: usize) -> Result<()> {
         let current_dim = self
-            .get_meta("genome_vec0_dim")?
+            .get_meta("genome_vec0_dim")
+            .context("Failed to read genome_vec0_dim from retrieval_meta")?
             .and_then(|v| v.parse::<usize>().ok());
-        let exists = self.table_exists("genome_vec0")?;
+        let exists = self
+            .table_exists("genome_vec0")
+            .context("Failed to check if genome_vec0 table exists")?;
         if current_dim != Some(dim) || !exists {
-            self.create_genome_vec0_table(dim)?;
+            self.create_genome_vec0_table(dim)
+                .context("Failed to create genome_vec0 table during ensure")?;
         }
         Ok(())
     }
 
     pub fn clear_all(&self) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM history_entries", [])?;
-        tx.execute("DELETE FROM genome_decisions", [])?;
-        tx.execute("DELETE FROM history_fts", [])?;
-        tx.execute("DELETE FROM genome_fts", [])?;
-        tx.execute("DELETE FROM history_vec", [])?;
-        tx.execute("DELETE FROM genome_vec", [])?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("Failed to begin clear_all transaction")?;
+        tx.execute("DELETE FROM history_entries", [])
+            .context("Failed to delete from history_entries")?;
+        tx.execute("DELETE FROM genome_decisions", [])
+            .context("Failed to delete from genome_decisions")?;
+        tx.execute("DELETE FROM history_fts", [])
+            .context("Failed to delete from history_fts")?;
+        tx.execute("DELETE FROM genome_fts", [])
+            .context("Failed to delete from genome_fts")?;
+        tx.execute("DELETE FROM history_vec", [])
+            .context("Failed to delete from history_vec")?;
+        tx.execute("DELETE FROM genome_vec", [])
+            .context("Failed to delete from genome_vec")?;
         let _ = tx.execute("DELETE FROM history_vec0", []);
         let _ = tx.execute("DELETE FROM genome_vec0", []);
-        tx.commit()?;
+        tx.commit()
+            .context("Failed to commit clear_all transaction")?;
         Ok(())
     }
 
@@ -325,8 +383,9 @@ CREATE TABLE IF NOT EXISTS genome_vec (
         search_text: &str,
         content_hash: &str,
     ) -> Result<()> {
-        self.conn.execute(
-            r#"
+        self.conn
+            .execute(
+                r#"
 INSERT INTO history_entries (
   session_id, session_name, platform, started_at, ended_at, summary,
   files_touched_json, tools_used_json, search_text, content_hash
@@ -342,19 +401,20 @@ ON CONFLICT(session_id) DO UPDATE SET
   search_text=excluded.search_text,
   content_hash=excluded.content_hash
 "#,
-            params![
-                session_id,
-                session_name,
-                platform,
-                started_at,
-                ended_at,
-                summary,
-                files_touched_json,
-                tools_used_json,
-                search_text,
-                content_hash
-            ],
-        )?;
+                params![
+                    session_id,
+                    session_name,
+                    platform,
+                    started_at,
+                    ended_at,
+                    summary,
+                    files_touched_json,
+                    tools_used_json,
+                    search_text,
+                    content_hash
+                ],
+            )
+            .context("Failed to upsert history_entries row")?;
         Ok(())
     }
 
@@ -370,8 +430,9 @@ ON CONFLICT(session_id) DO UPDATE SET
         search_text: &str,
         content_hash: &str,
     ) -> Result<()> {
-        self.conn.execute(
-            r#"
+        self.conn
+            .execute(
+                r#"
 INSERT INTO genome_decisions (
   decision_id, date, description, rationale, tags_json, search_text, content_hash
 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -383,44 +444,49 @@ ON CONFLICT(decision_id) DO UPDATE SET
   search_text=excluded.search_text,
   content_hash=excluded.content_hash
 "#,
-            params![
-                decision_id,
-                date,
-                description,
-                rationale,
-                tags_json,
-                search_text,
-                content_hash
-            ],
-        )?;
+                params![
+                    decision_id,
+                    date,
+                    description,
+                    rationale,
+                    tags_json,
+                    search_text,
+                    content_hash
+                ],
+            )
+            .context("Failed to upsert genome_decisions row")?;
         Ok(())
     }
 
     pub fn get_history_hash(&self, session_id: &str) -> Result<Option<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT content_hash FROM history_entries WHERE session_id=?1")?;
-        Ok(stmt
-            .query_row(params![session_id], |row| row.get(0))
-            .optional()?)
+            .prepare("SELECT content_hash FROM history_entries WHERE session_id=?1")
+            .context("Failed to prepare get_history_hash query")?;
+        stmt.query_row(params![session_id], |row| row.get(0))
+            .optional()
+            .context("Failed to query content_hash from history_entries")
     }
 
     pub fn get_genome_hash(&self, decision_id: &str) -> Result<Option<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT content_hash FROM genome_decisions WHERE decision_id=?1")?;
-        Ok(stmt
-            .query_row(params![decision_id], |row| row.get(0))
-            .optional()?)
+            .prepare("SELECT content_hash FROM genome_decisions WHERE decision_id=?1")
+            .context("Failed to prepare get_genome_hash query")?;
+        stmt.query_row(params![decision_id], |row| row.get(0))
+            .optional()
+            .context("Failed to query content_hash from genome_decisions")
     }
 
     pub fn has_history_vector(&self, session_id: &str) -> Result<bool> {
         let mut stmt = self
             .conn
-            .prepare("SELECT 1 FROM history_vec WHERE session_id=?1 LIMIT 1")?;
+            .prepare("SELECT 1 FROM history_vec WHERE session_id=?1 LIMIT 1")
+            .context("Failed to prepare has_history_vector query")?;
         Ok(stmt
             .query_row(params![session_id], |_| Ok(1_i64))
-            .optional()?
+            .optional()
+            .context("Failed to query history_vec for session existence")?
             .is_some())
     }
 
@@ -434,17 +500,20 @@ ON CONFLICT(decision_id) DO UPDATE SET
         };
         Ok(stmt
             .query_row(params![session_id], |_| Ok(1_i64))
-            .optional()?
+            .optional()
+            .context("Failed to query history_vec0 for session existence")?
             .is_some())
     }
 
     pub fn has_genome_vector(&self, decision_id: &str) -> Result<bool> {
         let mut stmt = self
             .conn
-            .prepare("SELECT 1 FROM genome_vec WHERE decision_id=?1 LIMIT 1")?;
+            .prepare("SELECT 1 FROM genome_vec WHERE decision_id=?1 LIMIT 1")
+            .context("Failed to prepare has_genome_vector query")?;
         Ok(stmt
             .query_row(params![decision_id], |_| Ok(1_i64))
-            .optional()?
+            .optional()
+            .context("Failed to query genome_vec for decision existence")?
             .is_some())
     }
 
@@ -458,7 +527,8 @@ ON CONFLICT(decision_id) DO UPDATE SET
         };
         Ok(stmt
             .query_row(params![decision_id], |_| Ok(1_i64))
-            .optional()?
+            .optional()
+            .context("Failed to query genome_vec0 for decision existence")?
             .is_some())
     }
 
@@ -466,12 +536,18 @@ ON CONFLICT(decision_id) DO UPDATE SET
     /// WARNING: This does NOT update the FTS tables. Caller MUST call `refresh_fts()`
     /// after this method to keep keyword search consistent.
     pub fn delete_history_except(&self, keep_ids: &HashSet<String>) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("Failed to begin delete_history_except transaction")?;
         if keep_ids.is_empty() {
-            tx.execute("DELETE FROM history_entries", [])?;
-            tx.execute("DELETE FROM history_vec", [])?;
+            tx.execute("DELETE FROM history_entries", [])
+                .context("Failed to delete all from history_entries")?;
+            tx.execute("DELETE FROM history_vec", [])
+                .context("Failed to delete all from history_vec")?;
             let _ = tx.execute("DELETE FROM history_vec0", []);
-            tx.commit()?;
+            tx.commit()
+                .context("Failed to commit delete_history_except transaction")?;
             return Ok(());
         }
 
@@ -490,10 +566,13 @@ ON CONFLICT(decision_id) DO UPDATE SET
             "DELETE FROM history_vec0 WHERE session_id NOT IN ({})",
             placeholders
         );
-        tx.execute(&sql_entries, rusqlite::params_from_iter(keep_ids.iter()))?;
-        tx.execute(&sql_vec, rusqlite::params_from_iter(keep_ids.iter()))?;
+        tx.execute(&sql_entries, rusqlite::params_from_iter(keep_ids.iter()))
+            .context("Failed to delete filtered rows from history_entries")?;
+        tx.execute(&sql_vec, rusqlite::params_from_iter(keep_ids.iter()))
+            .context("Failed to delete filtered rows from history_vec")?;
         let _ = tx.execute(&sql_vec0, rusqlite::params_from_iter(keep_ids.iter()));
-        tx.commit()?;
+        tx.commit()
+            .context("Failed to commit delete_history_except transaction")?;
         Ok(())
     }
 
@@ -501,12 +580,18 @@ ON CONFLICT(decision_id) DO UPDATE SET
     /// WARNING: This does NOT update the FTS tables. Caller MUST call `refresh_fts()`
     /// after this method to keep keyword search consistent.
     pub fn delete_genome_except(&self, keep_ids: &HashSet<String>) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("Failed to begin delete_genome_except transaction")?;
         if keep_ids.is_empty() {
-            tx.execute("DELETE FROM genome_decisions", [])?;
-            tx.execute("DELETE FROM genome_vec", [])?;
+            tx.execute("DELETE FROM genome_decisions", [])
+                .context("Failed to delete all from genome_decisions")?;
+            tx.execute("DELETE FROM genome_vec", [])
+                .context("Failed to delete all from genome_vec")?;
             let _ = tx.execute("DELETE FROM genome_vec0", []);
-            tx.commit()?;
+            tx.commit()
+                .context("Failed to commit delete_genome_except transaction")?;
             return Ok(());
         }
 
@@ -525,65 +610,82 @@ ON CONFLICT(decision_id) DO UPDATE SET
             "DELETE FROM genome_vec0 WHERE decision_id NOT IN ({})",
             placeholders
         );
-        tx.execute(&sql_entries, rusqlite::params_from_iter(keep_ids.iter()))?;
-        tx.execute(&sql_vec, rusqlite::params_from_iter(keep_ids.iter()))?;
+        tx.execute(&sql_entries, rusqlite::params_from_iter(keep_ids.iter()))
+            .context("Failed to delete filtered rows from genome_decisions")?;
+        tx.execute(&sql_vec, rusqlite::params_from_iter(keep_ids.iter()))
+            .context("Failed to delete filtered rows from genome_vec")?;
         let _ = tx.execute(&sql_vec0, rusqlite::params_from_iter(keep_ids.iter()));
-        tx.commit()?;
+        tx.commit()
+            .context("Failed to commit delete_genome_except transaction")?;
         Ok(())
     }
 
     pub fn refresh_fts(&self) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM history_fts", [])?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("Failed to begin refresh_fts transaction")?;
+        tx.execute("DELETE FROM history_fts", [])
+            .context("Failed to delete from history_fts")?;
         tx.execute(
             "INSERT INTO history_fts(session_id, search_text) SELECT session_id, search_text FROM history_entries",
             [],
-        )?;
+        ).context("Failed to repopulate history_fts from history_entries")?;
 
-        tx.execute("DELETE FROM genome_fts", [])?;
+        tx.execute("DELETE FROM genome_fts", [])
+            .context("Failed to delete from genome_fts")?;
         tx.execute(
             "INSERT INTO genome_fts(decision_id, search_text) SELECT decision_id, search_text FROM genome_decisions",
             [],
-        )?;
-        tx.commit()?;
+        ).context("Failed to repopulate genome_fts from genome_decisions")?;
+        tx.commit()
+            .context("Failed to commit refresh_fts transaction")?;
         Ok(())
     }
 
     pub fn upsert_history_vector(&self, session_id: &str, vector_json: &str) -> Result<()> {
-        self.conn.execute(
-            r#"INSERT INTO history_vec(session_id, vector_json) VALUES (?1, ?2)
+        self.conn
+            .execute(
+                r#"INSERT INTO history_vec(session_id, vector_json) VALUES (?1, ?2)
                ON CONFLICT(session_id) DO UPDATE SET vector_json=excluded.vector_json"#,
-            params![session_id, vector_json],
-        )?;
+                params![session_id, vector_json],
+            )
+            .context("Failed to upsert vector into history_vec")?;
         Ok(())
     }
 
     /// Upsert history vector into vec0 table using atomic single statement.
     /// Uses INSERT OR REPLACE to avoid separate DELETE+INSERT operations.
     pub fn upsert_history_vector_vec0(&self, session_id: &str, vector_json: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO history_vec0(session_id, embedding) VALUES (?1, ?2)",
-            params![session_id, vector_json],
-        )?;
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO history_vec0(session_id, embedding) VALUES (?1, ?2)",
+                params![session_id, vector_json],
+            )
+            .context("Failed to upsert vector into history_vec0")?;
         Ok(())
     }
 
     pub fn upsert_genome_vector(&self, decision_id: &str, vector_json: &str) -> Result<()> {
-        self.conn.execute(
-            r#"INSERT INTO genome_vec(decision_id, vector_json) VALUES (?1, ?2)
+        self.conn
+            .execute(
+                r#"INSERT INTO genome_vec(decision_id, vector_json) VALUES (?1, ?2)
                ON CONFLICT(decision_id) DO UPDATE SET vector_json=excluded.vector_json"#,
-            params![decision_id, vector_json],
-        )?;
+                params![decision_id, vector_json],
+            )
+            .context("Failed to upsert vector into genome_vec")?;
         Ok(())
     }
 
     /// Upsert genome vector into vec0 table using atomic single statement.
     /// Uses INSERT OR REPLACE to avoid separate DELETE+INSERT operations.
     pub fn upsert_genome_vector_vec0(&self, decision_id: &str, vector_json: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO genome_vec0(decision_id, embedding) VALUES (?1, ?2)",
-            params![decision_id, vector_json],
-        )?;
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO genome_vec0(decision_id, embedding) VALUES (?1, ?2)",
+                params![decision_id, vector_json],
+            )
+            .context("Failed to upsert vector into genome_vec0")?;
         Ok(())
     }
 
@@ -591,10 +693,12 @@ ON CONFLICT(decision_id) DO UPDATE SET
     /// Note: Caller should wrap in a transaction for best performance.
     /// This method is idempotent and safe to call within an existing transaction.
     pub fn delete_history_vector(&self, session_id: &str) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM history_vec WHERE session_id=?1",
-            params![session_id],
-        )?;
+        self.conn
+            .execute(
+                "DELETE FROM history_vec WHERE session_id=?1",
+                params![session_id],
+            )
+            .context("Failed to delete from history_vec")?;
         let _ = self.conn.execute(
             "DELETE FROM history_vec0 WHERE session_id=?1",
             params![session_id],
@@ -606,10 +710,12 @@ ON CONFLICT(decision_id) DO UPDATE SET
     /// Note: Caller should wrap in a transaction for best performance.
     /// This method is idempotent and safe to call within an existing transaction.
     pub fn delete_genome_vector(&self, decision_id: &str) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM genome_vec WHERE decision_id=?1",
-            params![decision_id],
-        )?;
+        self.conn
+            .execute(
+                "DELETE FROM genome_vec WHERE decision_id=?1",
+                params![decision_id],
+            )
+            .context("Failed to delete from genome_vec")?;
         let _ = self.conn.execute(
             "DELETE FROM genome_vec0 WHERE decision_id=?1",
             params![decision_id],
@@ -659,7 +765,7 @@ LIMIT ?2
             Ok(rows) => {
                 let mut out = Vec::new();
                 for row in rows {
-                    out.push(row?);
+                    out.push(row.context("Failed to read FTS result row from history_fts")?);
                 }
                 Ok(out)
             }
@@ -669,29 +775,34 @@ LIMIT ?2
 
     fn search_history_keyword_like(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
         let like = format!("%{}%", query.to_lowercase());
-        let mut stmt = self.conn.prepare_cached(
-            r#"
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                r#"
 SELECT session_id, session_name, summary
 FROM history_entries
 WHERE lower(search_text) LIKE ?1
 ORDER BY ended_at DESC
 LIMIT ?2
 "#,
-        )?;
+            )
+            .context("Failed to prepare LIKE search on history_entries")?;
 
-        let rows = stmt.query_map(params![like, limit as i64], |row| {
-            Ok(SearchResult {
-                source: "history".to_string(),
-                id: row.get(0)?,
-                title: row.get(1)?,
-                snippet: row.get(2)?,
-                score: 0.0,
+        let rows = stmt
+            .query_map(params![like, limit as i64], |row| {
+                Ok(SearchResult {
+                    source: "history".to_string(),
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    snippet: row.get(2)?,
+                    score: 0.0,
+                })
             })
-        })?;
+            .context("Failed to execute LIKE search on history_entries")?;
 
         let mut out = Vec::new();
         for row in rows {
-            out.push(row?);
+            out.push(row.context("Failed to read history_entries LIKE search result row")?);
         }
         Ok(out)
     }
@@ -730,7 +841,7 @@ LIMIT ?2
             Ok(rows) => {
                 let mut out = Vec::new();
                 for row in rows {
-                    out.push(row?);
+                    out.push(row.context("Failed to read FTS result row from genome_fts")?);
                 }
                 Ok(out)
             }
@@ -740,29 +851,34 @@ LIMIT ?2
 
     fn search_genome_keyword_like(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
         let like = format!("%{}%", query.to_lowercase());
-        let mut stmt = self.conn.prepare_cached(
-            r#"
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                r#"
 SELECT decision_id, description, COALESCE(rationale, '')
 FROM genome_decisions
 WHERE lower(search_text) LIKE ?1
 ORDER BY date DESC
 LIMIT ?2
 "#,
-        )?;
+            )
+            .context("Failed to prepare LIKE search on genome_decisions")?;
 
-        let rows = stmt.query_map(params![like, limit as i64], |row| {
-            Ok(SearchResult {
-                source: "genome".to_string(),
-                id: row.get(0)?,
-                title: row.get(1)?,
-                snippet: row.get(2)?,
-                score: 0.0,
+        let rows = stmt
+            .query_map(params![like, limit as i64], |row| {
+                Ok(SearchResult {
+                    source: "genome".to_string(),
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    snippet: row.get(2)?,
+                    score: 0.0,
+                })
             })
-        })?;
+            .context("Failed to execute LIKE search on genome_decisions")?;
 
         let mut out = Vec::new();
         for row in rows {
-            out.push(row?);
+            out.push(row.context("Failed to read genome_decisions LIKE search result row")?);
         }
         Ok(out)
     }
@@ -770,16 +886,19 @@ LIMIT ?2
     pub fn read_history_vectors(&self) -> Result<Vec<(String, Vec<f32>)>> {
         let mut stmt = self
             .conn
-            .prepare_cached("SELECT session_id, vector_json FROM history_vec")?;
-        let rows = stmt.query_map([], |row| {
-            let id: String = row.get(0)?;
-            let raw: String = row.get(1)?;
-            Ok((id, raw))
-        })?;
+            .prepare_cached("SELECT session_id, vector_json FROM history_vec")
+            .context("Failed to prepare read_history_vectors query")?;
+        let rows = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let raw: String = row.get(1)?;
+                Ok((id, raw))
+            })
+            .context("Failed to query history_vec for vectors")?;
 
         let mut out = Vec::new();
         for row in rows {
-            let (id, raw) = row?;
+            let (id, raw) = row.context("Failed to read row from history_vec")?;
             let vec: Vec<f32> = serde_json::from_str(&raw).unwrap_or_default();
             if !vec.is_empty() {
                 out.push((id, vec));
@@ -796,21 +915,26 @@ LIMIT ?2
         if candidate_limit == 0 {
             return Ok(Vec::new());
         }
-        let mut stmt = self.conn.prepare(
-            r#"
+        let mut stmt = self
+            .conn
+            .prepare(
+                r#"
 SELECT session_id, distance
 FROM history_vec0
 WHERE embedding MATCH ?1
 ORDER BY distance
 LIMIT ?2
 "#,
-        )?;
-        let rows = stmt.query_map(params![query_vector_json, candidate_limit as i64], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
-        })?;
+            )
+            .context("Failed to prepare KNN search on history_vec0")?;
+        let rows = stmt
+            .query_map(params![query_vector_json, candidate_limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+            })
+            .context("Failed to execute KNN search on history_vec0")?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row?);
+            out.push(row.context("Failed to read KNN result row from history_vec0")?);
         }
         Ok(out)
     }
@@ -818,16 +942,19 @@ LIMIT ?2
     pub fn read_genome_vectors(&self) -> Result<Vec<(String, Vec<f32>)>> {
         let mut stmt = self
             .conn
-            .prepare_cached("SELECT decision_id, vector_json FROM genome_vec")?;
-        let rows = stmt.query_map([], |row| {
-            let id: String = row.get(0)?;
-            let raw: String = row.get(1)?;
-            Ok((id, raw))
-        })?;
+            .prepare_cached("SELECT decision_id, vector_json FROM genome_vec")
+            .context("Failed to prepare read_genome_vectors query")?;
+        let rows = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let raw: String = row.get(1)?;
+                Ok((id, raw))
+            })
+            .context("Failed to query genome_vec for vectors")?;
 
         let mut out = Vec::new();
         for row in rows {
-            let (id, raw) = row?;
+            let (id, raw) = row.context("Failed to read row from genome_vec")?;
             let vec: Vec<f32> = serde_json::from_str(&raw).unwrap_or_default();
             if !vec.is_empty() {
                 out.push((id, vec));
@@ -844,21 +971,26 @@ LIMIT ?2
         if candidate_limit == 0 {
             return Ok(Vec::new());
         }
-        let mut stmt = self.conn.prepare(
-            r#"
+        let mut stmt = self
+            .conn
+            .prepare(
+                r#"
 SELECT decision_id, distance
 FROM genome_vec0
 WHERE embedding MATCH ?1
 ORDER BY distance
 LIMIT ?2
 "#,
-        )?;
-        let rows = stmt.query_map(params![query_vector_json, candidate_limit as i64], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
-        })?;
+            )
+            .context("Failed to prepare KNN search on genome_vec0")?;
+        let rows = stmt
+            .query_map(params![query_vector_json, candidate_limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+            })
+            .context("Failed to execute KNN search on genome_vec0")?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row?);
+            out.push(row.context("Failed to read KNN result row from genome_vec0")?);
         }
         Ok(out)
     }
@@ -866,10 +998,21 @@ LIMIT ?2
     pub fn get_history_by_id(&self, session_id: &str) -> Result<Option<(String, String)>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT session_name, summary FROM history_entries WHERE session_id=?1")?;
-        let mut rows = stmt.query(params![session_id])?;
-        if let Some(row) = rows.next()? {
-            Ok(Some((row.get(0)?, row.get(1)?)))
+            .prepare("SELECT session_name, summary FROM history_entries WHERE session_id=?1")
+            .context("Failed to prepare get_history_by_id query")?;
+        let mut rows = stmt
+            .query(params![session_id])
+            .context("Failed to query history_entries by session_id")?;
+        if let Some(row) = rows
+            .next()
+            .context("Failed to advance cursor on history_entries query")?
+        {
+            Ok(Some((
+                row.get(0)
+                    .context("Failed to read session_name from history_entries")?,
+                row.get(1)
+                    .context("Failed to read summary from history_entries")?,
+            )))
         } else {
             Ok(None)
         }
@@ -878,10 +1021,20 @@ LIMIT ?2
     pub fn get_genome_by_id(&self, decision_id: &str) -> Result<Option<(String, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT description, COALESCE(rationale, '') FROM genome_decisions WHERE decision_id=?1",
-        )?;
-        let mut rows = stmt.query(params![decision_id])?;
-        if let Some(row) = rows.next()? {
-            Ok(Some((row.get(0)?, row.get(1)?)))
+        ).context("Failed to prepare get_genome_by_id query")?;
+        let mut rows = stmt
+            .query(params![decision_id])
+            .context("Failed to query genome_decisions by decision_id")?;
+        if let Some(row) = rows
+            .next()
+            .context("Failed to advance cursor on genome_decisions query")?
+        {
+            Ok(Some((
+                row.get(0)
+                    .context("Failed to read description from genome_decisions")?,
+                row.get(1)
+                    .context("Failed to read rationale from genome_decisions")?,
+            )))
         } else {
             Ok(None)
         }

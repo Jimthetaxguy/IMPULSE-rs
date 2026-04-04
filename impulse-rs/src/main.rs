@@ -1,3 +1,10 @@
+//! Impulse CLI entry point — mode dispatch and argument parsing.
+//!
+//! Parses CLI arguments via `clap` and routes to one of two execution paths:
+//! **daemon mode** (`--daemon`) forwards commands over a Unix socket to a running
+//! daemon process, while **direct mode** (default) executes commands in-process
+//! and exits. The `--impulse-dir` flag controls where `.impulse/` data lives.
+
 use anyhow::Result;
 use clap::Parser;
 

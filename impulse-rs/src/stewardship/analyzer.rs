@@ -100,7 +100,7 @@ fn extract_text_content(content: &serde_json::Value) -> String {
 /// Extract text, tool uses, and tool results from assistant content
 fn extract_assistant_content(
     content: &serde_json::Value,
-) -> (String, Vec<ToolUse>, Vec<ToolResult>) {
+) -> (String, Vec<ToolUse>, Vec<ParsedToolResult>) {
     let mut text_parts = Vec::new();
     let mut tool_uses = Vec::new();
     let mut tool_results = Vec::new();
@@ -149,7 +149,7 @@ fn extract_assistant_content(
                         .get("content")
                         .map(|v| v.to_string())
                         .unwrap_or_default();
-                    tool_results.push(ToolResult {
+                    tool_results.push(ParsedToolResult {
                         tool_use_id,
                         content_chars: content_str.len(),
                     });

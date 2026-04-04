@@ -6,6 +6,10 @@ use crate::{build_hygiene, state, verify};
 
 use super::{load_build_hygiene_config, print_json, print_verification_report};
 
+/// Handle the `verify` command.
+///
+/// Runs the default verification steps (build, test, clippy, fmt) and prints
+/// a pass/fail report. Bails on failure.
 pub fn handle_verify() -> Result<()> {
     let steps = verify::default_steps(&std::env::current_dir()?);
     let report = verify::run_verification(steps)?;
@@ -16,6 +20,10 @@ pub fn handle_verify() -> Result<()> {
     Ok(())
 }
 
+/// Handle the `clean-all` command.
+///
+/// Runs `cargo clean` across all discovered Rust projects under the
+/// configured scan paths. Respects the dry-run flag.
 pub fn handle_clean_all(state: &Arc<state::State>, dry_run: Option<bool>) -> Result<()> {
     let config = load_build_hygiene_config(state);
     let dry_run = dry_run.unwrap_or(config.dry_run_default);
@@ -53,6 +61,10 @@ pub fn handle_clean_all(state: &Arc<state::State>, dry_run: Option<bool>) -> Res
     Ok(())
 }
 
+/// Handle the `sccache-setup` command.
+///
+/// When `check` or `json` is set, reports sccache installation and cache
+/// stats. Otherwise, performs initial sccache setup and configuration.
 pub fn handle_sccache_setup(check: bool, json: bool) -> Result<()> {
     if check || json {
         let status = build_hygiene::sccache::sccache_status();
@@ -97,6 +109,11 @@ pub fn handle_sccache_setup(check: bool, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Handle the `build-health` command.
+///
+/// Discovers Rust projects under the configured scan paths, measures
+/// `target/` directory sizes, and prints a disk-usage report with
+/// recommendations and sccache status.
 pub fn handle_build_health(state: &Arc<state::State>, json: bool) -> Result<()> {
     let config = load_build_hygiene_config(state);
     let paths = config.expanded_scan_paths();
@@ -143,6 +160,10 @@ pub fn handle_build_health(state: &Arc<state::State>, json: bool) -> Result<()> 
     Ok(())
 }
 
+/// Handle the `sweep` command.
+///
+/// Removes stale Rust build artifacts older than the specified number of
+/// days. Scans the given path or the configured scan paths.
 pub fn handle_sweep(
     state: &Arc<state::State>,
     dry_run: Option<bool>,
@@ -202,6 +223,10 @@ pub fn handle_sweep(
     Ok(())
 }
 
+/// Handle the `wipe` command.
+///
+/// Aggressively deletes entire `target/` directories under the given path
+/// or configured scan paths. Respects the dry-run flag.
 pub fn handle_wipe(
     state: &Arc<state::State>,
     dry_run: Option<bool>,

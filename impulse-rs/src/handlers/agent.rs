@@ -3,6 +3,11 @@ use std::sync::Arc;
 
 use crate::{agent, branding, state};
 
+/// Handle the `agent-configure` command.
+///
+/// Applies any provided agent settings (provider, API key, model, harness,
+/// auto-review, auto-coordinate) to the config store and prints the resolved
+/// agent status.
 pub fn handle_agent_configure(
     state: &Arc<state::State>,
     provider: Option<String>,
@@ -57,6 +62,10 @@ pub fn handle_agent_configure(
     Ok(())
 }
 
+/// Handle the `agent-status` command.
+///
+/// Resolves the current agent configuration and prints its readiness,
+/// provider, model, and harness details in text or JSON format.
 pub fn handle_agent_status(state: &Arc<state::State>, json: bool) -> Result<()> {
     let config = state.config_snapshot()?;
 
@@ -102,6 +111,10 @@ pub fn handle_agent_status(state: &Arc<state::State>, json: bool) -> Result<()> 
     Ok(())
 }
 
+/// Handle the `agent-query` command.
+///
+/// Sends a prompt to the configured Impulse Agent and prints the response.
+/// Returns an error if the agent is not configured or not ready.
 pub async fn handle_agent_query(
     state: &Arc<state::State>,
     prompt: String,

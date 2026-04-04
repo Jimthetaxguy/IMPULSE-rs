@@ -1,3 +1,10 @@
+//! Search and indexing — SQLite FTS, fuzzy matching, and embedding vectors.
+//!
+//! Builds a retrieval index over session history and genome data, stored in
+//! `retrieval.db`. Supports multiple search backends (FTS, fuzzy, embedding)
+//! with configurable scope and mode. The public API surfaces `index`, `search_history`,
+//! `search_genome`, and `status` for health checks.
+
 pub mod embedding;
 pub mod fuzzy;
 pub mod indexer;

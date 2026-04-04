@@ -5,7 +5,7 @@
 //! for concurrent access. Syncs to `.impulse/` files only when dirty.
 
 use super::*;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -67,11 +67,20 @@ impl Drop for State {
     }
 }
 
+/// Convert a lock poison error to an anyhow error.
+fn lock_err<T: std::fmt::Display>(e: T) -> anyhow::Error {
+    anyhow::anyhow!("Lock poisoned: {e}")
+}
+
 impl State {
     pub fn new(base_path: std::path::PathBuf) -> Result<Self> {
         let storage = Storage::new(base_path);
-        let live_state = storage.read_json::<LiveState>(LIVE_STATE_FILE)?;
-        let config = storage.read_json::<Config>(CONFIG_FILE)?;
+        let live_state = storage
+            .read_json::<LiveState>(LIVE_STATE_FILE)
+            .context("Failed to read live state from disk")?;
+        let config = storage
+            .read_json::<Config>(CONFIG_FILE)
+            .context("Failed to read config from disk")?;
 
         Ok(Self {
             storage,
@@ -93,7 +102,9 @@ impl State {
 
     pub async fn sync_immediate(&self) -> Result<()> {
         let state = self.live_state.try_read().map(|s| s.clone())?;
-        self.storage.write_json(LIVE_STATE_FILE, &state)?;
+        self.storage
+            .write_json(LIVE_STATE_FILE, &state)
+            .context("Failed to write live state to disk")?;
 
         if let Ok(mut dirty) = self.dirty.try_write() {
             *dirty = false;
@@ -110,15 +121,14 @@ impl State {
         let session = Session::new(name, platform);
 
         {
-            let mut state = self
-                .live_state
-                .try_write()
-                .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
+            let mut state = self.live_state.try_write().map_err(lock_err)?;
             state.add_session(session.clone());
         }
 
         self.mark_dirty();
-        self.sync_immediate().await?;
+        self.sync_immediate()
+            .await
+            .context("Failed to sync state after creating session")?;
 
         Ok(session)
     }
@@ -129,10 +139,7 @@ impl State {
         summary: String,
     ) -> Result<Option<HistoryEntry>> {
         let history_entry = {
-            let mut state = self
-                .live_state
-                .try_write()
-                .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
+            let mut state = self.live_state.try_write().map_err(lock_err)?;
 
             if let Some(session) = state.get_session_mut(session_id) {
                 session.set_status(SessionStatus::Completed);
@@ -156,11 +163,15 @@ impl State {
         };
 
         if let Some(ref entry) = history_entry {
-            self.storage.append_jsonl(HISTORY_FILE, entry)?;
+            self.storage
+                .append_jsonl(HISTORY_FILE, entry)
+                .context("Failed to append session to history log")?;
         }
 
         self.mark_dirty();
-        self.sync_immediate().await?;
+        self.sync_immediate()
+            .await
+            .context("Failed to sync state after ending session")?;
 
         Ok(history_entry)
     }
@@ -223,7 +234,9 @@ impl State {
 
     /// Get the conflict audit trail (all historical conflict events).
     pub fn get_conflict_history(&self) -> Result<Vec<ConflictEvent>> {
-        self.storage.read_jsonl::<ConflictEvent>(CONFLICTS_FILE)
+        self.storage
+            .read_jsonl::<ConflictEvent>(CONFLICTS_FILE)
+            .context("Failed to read conflict event history from disk")
     }
 
     pub async fn add_tag(&self, session_id: &str, tag: &str) -> Result<()> {
@@ -241,10 +254,7 @@ impl State {
     {
         let mut updated = false;
         {
-            let mut state = self
-                .live_state
-                .try_write()
-                .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
+            let mut state = self.live_state.try_write().map_err(lock_err)?;
             if let Some(session) = state.get_session_mut(session_id) {
                 f(session);
                 updated = true;
@@ -254,78 +264,66 @@ impl State {
             anyhow::bail!("Session not found: {}", session_id);
         }
         self.mark_dirty();
-        self.sync_immediate().await?;
+        self.sync_immediate()
+            .await
+            .context("Failed to sync state after session update")?;
         Ok(())
     }
 
     pub async fn get_session(&self, session_id: &str) -> Result<Option<Session>> {
-        let state = self
-            .live_state
-            .try_read()
-            .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
+        let state = self.live_state.try_read().map_err(lock_err)?;
         Ok(state.get_session(session_id).cloned())
     }
 
     pub async fn list_sessions(&self) -> Result<Vec<Session>> {
-        let state = self
-            .live_state
-            .try_read()
-            .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
+        let state = self.live_state.try_read().map_err(lock_err)?;
         Ok(state.list_sessions().into_iter().cloned().collect())
     }
 
     pub fn get_history_sync(&self) -> Result<Vec<HistoryEntry>> {
-        let entries = self.storage.read_jsonl::<HistoryEntry>(HISTORY_FILE)?;
+        let entries = self
+            .storage
+            .read_jsonl::<HistoryEntry>(HISTORY_FILE)
+            .context("Failed to read history log from disk")?;
         Ok(entries)
     }
 
     /// Get a config value by key
     pub fn get_config(&self, key: &str) -> Result<Option<String>> {
-        let config = self
-            .config
-            .try_read()
-            .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
+        let config = self.config.try_read().map_err(lock_err)?;
         Ok(config.get(key))
     }
 
     /// Set a config value by key
     pub fn set_config(&self, key: &str, value: &str) -> Result<bool> {
-        let mut config = self
-            .config
-            .try_write()
-            .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
+        let mut config = self.config.try_write().map_err(lock_err)?;
         let result = config.set(key, value);
         if result {
-            self.storage.write_json(CONFIG_FILE, &*config)?;
+            self.storage
+                .write_json(CONFIG_FILE, &*config)
+                .context("Failed to persist config to disk")?;
         }
         Ok(result)
     }
 
     /// List all config values
     pub fn list_config(&self) -> Result<Vec<(String, String)>> {
-        let config = self
-            .config
-            .try_read()
-            .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
+        let config = self.config.try_read().map_err(lock_err)?;
         Ok(config.list())
     }
 
     pub fn config_snapshot(&self) -> Result<Config> {
-        let config = self
-            .config
-            .try_read()
-            .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
+        let config = self.config.try_read().map_err(lock_err)?;
         Ok(config.clone())
     }
 
     /// Update guardrail rules in config and persist to disk
     pub fn update_guardrail_rules(&self, rules: Vec<crate::guardrail::GuardRule>) -> Result<()> {
-        let mut config = self
-            .config
-            .try_write()
-            .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
+        let mut config = self.config.try_write().map_err(lock_err)?;
         config.guardrails.rules = rules;
-        self.storage.write_json(CONFIG_FILE, &*config)?;
+        self.storage
+            .write_json(CONFIG_FILE, &*config)
+            .context("Failed to persist guardrail rules to config")?;
         Ok(())
     }
 
@@ -333,32 +331,43 @@ impl State {
         &self,
         policy: impulse_ops::SupervisorPermissionPolicy,
     ) -> Result<()> {
-        let mut config = self
-            .config
-            .try_write()
-            .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
+        let mut config = self.config.try_write().map_err(lock_err)?;
         let mut normalized = policy;
         normalized.normalize();
         config.impulse_agent_permissions = normalized;
-        self.storage.write_json(CONFIG_FILE, &*config)?;
+        self.storage
+            .write_json(CONFIG_FILE, &*config)
+            .context("Failed to persist agent permissions to config")?;
         Ok(())
     }
 
     pub fn get_conflict_analytics(&self) -> Result<ConflictHistory> {
-        self.storage.read_json("CONFLICTS.json")
+        self.storage
+            .read_json("CONFLICTS.json")
+            .context("Failed to read conflict analytics from disk")
     }
 
     pub fn record_conflict(&self, file_path: &str, sessions: Vec<String>) -> Result<()> {
-        let mut history: ConflictHistory = self.storage.read_json("CONFLICTS.json")?;
+        let mut history: ConflictHistory = self
+            .storage
+            .read_json("CONFLICTS.json")
+            .context("Failed to read conflict history from disk")?;
         history.record_conflict(file_path, sessions);
-        self.storage.write_json("CONFLICTS.json", &history)?;
+        self.storage
+            .write_json("CONFLICTS.json", &history)
+            .context("Failed to persist conflict history to disk")?;
         Ok(())
     }
 
     pub fn record_conflict_resolution(&self, file_path: &str, resolution: &str) -> Result<()> {
-        let mut history: ConflictHistory = self.storage.read_json("CONFLICTS.json")?;
+        let mut history: ConflictHistory = self
+            .storage
+            .read_json("CONFLICTS.json")
+            .context("Failed to read conflict history for resolution update")?;
         history.record_resolution(file_path, resolution);
-        self.storage.write_json("CONFLICTS.json", &history)?;
+        self.storage
+            .write_json("CONFLICTS.json", &history)
+            .context("Failed to persist conflict resolution to disk")?;
         Ok(())
     }
 }
@@ -930,7 +939,11 @@ mod tests {
         std::fs::write(temp_dir.path().join("config.json"), "{not-json").unwrap();
 
         let err = crate::state::State::new(temp_dir.path().to_path_buf()).unwrap_err();
-        assert!(err.to_string().contains("Failed to parse JSON"));
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Failed to read config") || msg.contains("Failed to parse JSON"),
+            "expected config read/parse error, got: {msg}"
+        );
     }
 
     #[test]

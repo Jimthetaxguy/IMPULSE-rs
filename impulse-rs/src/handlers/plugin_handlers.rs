@@ -58,9 +58,7 @@ pub fn handle_plugin_invoke(
         input = input.with_query(q);
     }
     if let Some(opts) = options {
-        let parsed: serde_json::Value =
-            serde_json::from_str(&opts).unwrap_or_else(|_| serde_json::json!({"raw": opts}));
-        input = input.with_options(parsed);
+        input = input.with_options(super::parse_json_or_raw(&opts));
     }
     match registry.get_action_handler(&name) {
         Ok(Some(handler)) => {
