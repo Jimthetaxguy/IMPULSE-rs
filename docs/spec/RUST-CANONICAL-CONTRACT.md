@@ -1,8 +1,8 @@
 ---
 title: Rust Canonical Product Contract
 description: Authoritative product contract for Impulse based on impulse-rs
-version: '1.6'
-updated: 2026-04-04
+version: '1.7'
+updated: 2026-04-15
 type: specification
 category: core
 phase: all
@@ -29,24 +29,55 @@ Core outcomes:
 - Persistent project memory (`GENOME`, session history, active state)
 - Cross-session continuity for Claude Code and OpenCode integrations
 - Operationally safe session lifecycle with verification-before-completion gates
-- Human-visible observability through CLI, TUI, and the EGUI operator workbench
+- Human-visible observability through CLI, ratatui TUI, and a Tauri desktop shell (in migration)
 
-## 2) Canonical Scope and Roadmap
+## 2) Desktop Shell Contract (Updated 2026-04-15)
+
+> **This section supersedes all prior references to the EGUI workbench as the active desktop product.**
+
+### Chosen Desktop Stack
+
+| Layer | Technology |
+|---|---|
+| Desktop container | Tauri 2.x |
+| UI framework | Dioxus (rsx! components, inside Tauri webview) |
+| Terminal rendering | xterm.js (mounted via Dioxus eval(), fed by Tauri events) |
+| PTY / session backend | impulse-term (TerminalBackend, WriteQueue) — unchanged |
+| Standalone operator TUI | ratatui — first-class, preserved throughout migration |
+| **Legacy desktop surface** | **egui / impulse-gui — FROZEN. No new features. Sunset after parity.** |
+
+Architectural detail: `docs/spec/DESKTOP-SHELL-ARCHITECTURE.md`
+Stack tradeoffs: `docs/spec/DESKTOP-STACK-TRADEOFFS.md`
+Decision record: `docs/decisions/0007-desktop-shell-stack.md`
+Migration sequence: `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md`
+
+### Desktop Migration Phases
+
+| Phase | Goal | Status |
+|---|---|---|
+| 0 | Documentation contract reset | Active |
+| 1 | Remove eframe from impulse-term, confirm framework-neutral core | Pending |
+| 2 | Static Tauri+Dioxus shell skeleton | Pending |
+| 3 | Live terminal bridge (PTY → xterm.js) | Pending |
+| 4 | Daemon integration, parity, egui freeze | Pending |
+
+## 3) Canonical Scope and Roadmap
 
 ### Roadmap Contract
 
 | Stage | Focus | Status |
 | --- | --- | --- |
-| **Now** | Rust memory core + hooks + retrieval/injection + EGUI operator workbench | Active |
-| **Next** | Daemon-truth EGUI integration + hook/compaction validation | Active |
-| **Later** | Agent control + artifact polish + deeper coordination UX | Planned |
+| **Now** | Rust memory core + hooks + retrieval/injection + Tauri desktop shell (Phase 0) | Active |
+| **Next** | egui boundary cleanup + static shell skeleton + live terminal bridge | Active |
+| **Later** | Daemon parity in desktop shell + agent control + artifact polish | Planned |
 
 ### Out of Scope for Current Contract
 - Full SWARM semantic injection runtime
 - Web UI or non-Rust dashboard surfaces
 - Structural blocking before hook validation evidence exists
+- New egui features (egui is legacy/frozen)
 
-## 3) Public Interface Contract
+## 4) Public Interface Contract
 
 ### CLI Contract (Stable)
 
@@ -130,9 +161,32 @@ Primary commands that must remain documented and regression-tested:
 | `.impulse/retrieval.lock` | Indexing lock guard | Runtime safety artifact |
 | `.impulse/projects/<project_id>/agents/<agent_id>/artifacts/*` | Project-organized operator artifacts | Durable workbench artifacts |
 
-### EGUI Workbench IPC Contract
+### Desktop Shell IPC Contract (Terminal Bridge — Additive)
 
-The daemon is the authoritative source for the EGUI workbench surfaces:
+The desktop shell communicates with the Rust backend via a thin Tauri IPC bridge. These surfaces are **additive** — they do not replace or modify daemon contracts.
+
+**Commands (frontend → backend):**
+
+| Command | Description |
+|---|---|
+| `terminal_open` | Spawn a PTY session, return session_id |
+| `terminal_write` | Write bytes to PTY stdin |
+| `terminal_resize` | Resize PTY and vt100 parser |
+| `terminal_close` | Kill PTY and clean up session |
+| `terminal_focus` | Notify backend of focus change |
+
+**Events (backend → frontend):**
+
+| Event | Description |
+|---|---|
+| `terminal_output` | PTY stdout bytes |
+| `terminal_exit` | PTY child exited |
+| `terminal_status` | Status change |
+| `ops_update` | Daemon ProjectOpsSnapshot update |
+
+### Daemon Workbench IPC Contract (Preserved — Unchanged)
+
+The daemon is the authoritative source for workbench surfaces:
 
 - `Overview`
 - `Agents`
@@ -158,7 +212,6 @@ Shared workbench model contract:
 - `ProjectOpsSnapshot` is the canonical read model for the daemon-backed workbench.
 - `TerminalOpsReport` is the ephemeral publication model for live terminal telemetry.
 - `AgentRuntime.ephemeral = true` identifies telemetry-only agents that do not currently map to a durable session.
-- `Memory` may continue to use dedicated history/genome/search IPC outside the snapshot model in the current phase.
 
 `TerminalOpsReport` fields:
 
@@ -188,22 +241,21 @@ The daemon exposes a JSON-line Unix socket protocol (`impulse.sock`). Full spec:
 - `GetSession { session_id }`, `ListSessions`
 
 **Agent System (Phase 3):**
-- `AgentAssist { prompt, context?, insights? }` — coordination assistance with context enrichment. Response: `AgentAssistResult { success, response, recommendations, pane_summaries }`
-- `AgentReviewCode { file_path, diff, insights? }` — code review. Response: `AgentSpecializedResult { success, response }`
-- `AgentAnalyzeError { error_text, context, insights? }` — error analysis. Response: `AgentSpecializedResult { success, response }`
-- `AgentSummarizePane { pane_id, raw_output?, insights? }` — pane summary. Response: `AgentSpecializedResult { success, response }`
+- `AgentAssist { prompt, context?, insights? }` — coordination assistance with context enrichment.
+- `AgentReviewCode { file_path, diff, insights? }` — code review.
+- `AgentAnalyzeError { error_text, context, insights? }` — error analysis.
+- `AgentSummarizePane { pane_id, raw_output?, insights? }` — pane summary.
 
 **Delegation System (Phase 1B):**
-- `RegisterDelegation { spec, coordinator_pane_id, context_snapshot? }` — track cross-agent delegation
-- `CompleteDelegation { delegation_id, summary, tool_trace?, diff_summary? }` — mark delegation done
-- `ListDelegations` — list all tracked delegations
+- `RegisterDelegation { spec, coordinator_pane_id, context_snapshot? }`
+- `CompleteDelegation { delegation_id, summary, tool_trace?, diff_summary? }`
+- `ListDelegations`
 
 **Conflict Resolution (Task 20):**
-- `GetConflictHistory` — get conflict resolution history
-- `ClearResolvedConflicts` — clear resolved conflicts
+- `GetConflictHistory`, `ClearResolvedConflicts`
 
 **Agent Pool (Phase 2B):**
-- `GetAgentPool` — all sessions grouped by role
+- `GetAgentPool`
 
 **Steward:**
 - `StewardStatus`, `StewardMemory`, `StewardProposals { action, id? }`
@@ -211,74 +263,43 @@ The daemon exposes a JSON-line Unix socket protocol (`impulse.sock`). Full spec:
 **Guard:**
 - `GuardEvaluate { target, action }`, `GuardList`
 
-**Supervisor (EGUI control plane):**
+**Supervisor (desktop control plane):**
 - `GetSupervisorPermissions`, `SupervisorChat { prompt, context? }`, `RunSupervisorAction { action }`
 
 **Tools:**
 - `ListTools { category? }`, `DescribeTool { name }`, `InvokeTool { name, params? }`, `ToolSchema`
 
-**EGUI Workbench:**
+**Workbench:**
 - `GetOpsSnapshot`, `SubscribeOps { since_seq? }`, `PublishTerminalOps { report: TerminalOpsReport }`
 - `ListArtifacts { limit? }`, `GetArtifact { artifact_id }`, `RunArtifactAction { artifact_id, action_id, params? }`
 
 **Chat:**
-- `Chat { session_id, message, inject_mode?, inject_explain? }` — daemon-aware chat with context injection
+- `Chat { session_id, message, inject_mode?, inject_explain? }`
 
-### Retrieval Command Extensions (Additive)
-
-- `search-history` / `search-genome`:
-  - `--backend auto|sqlite-vec|rust-cosine|keyword`
-  - `--explain`
-- `retrieval-status`:
-  - `--check`
-  - `--json`
-- Context injection overrides (additive):
-  - `--daemon chat --inject-mode off|review|apply --inject-explain`
-  - `orchestrate --inject-mode off|review|apply --inject-explain`
-  - `handoff --inject-mode off|review|apply --inject-explain`
-  - `sync-context --inject-mode off|review|apply --inject-explain`
-
-### Context Injection Config Contract (Additive)
-
-- `context_injection_mode`: `off|review|apply` (default `review`)
-- `context_injection_scope`: `daemon|direct|both` (default `both`)
-- `context_injection_max_items`: integer (default `5`)
-- `context_injection_max_chars`: integer (default `2000`)
-- `context_injection_min_score`: float `0.0..1.0` (default `0.60`)
-- `context_injection_use_semantic`: bool (default `true`)
-- `context_injection_emit_artifacts`: bool (default `true`)
-
-## 4) Capability Matrix
-
-Test column shows current coverage level: **Full** (≥3.0/KLOC), **Partial** (1.0-3.0/KLOC), **Minimal** (<1.0/KLOC).
+## 5) Capability Matrix
 
 | Capability | Status | Interface | Tests |
 | --- | --- | --- | --- |
 | Session lifecycle tracking | Implemented | `session-start`, `session-end` | Rust unit + integration |
 | File/tool activity tracking | Implemented | `track-write`, `track-tool` | Rust unit + integration |
-| TUI tabs (dashboard/session/history/etc.) | Implemented | `run` TUI mode | Rust UI tests |
+| ratatui TUI tabs | Implemented | `run` TUI mode | Rust UI tests |
 | Daemon socket operations | Implemented | `daemon`, `--daemon ...` | Daemon tests |
 | Context-aware chat (daemon) | Implemented | `--daemon chat` | Daemon + provider tests |
 | Hook config generation | Implemented | `hooks --platform ...` | Integration tests |
 | Orchestration handoff/context files | Implemented | `orchestrate`, `handoff`, `sync-context` | Rust tests |
 | Verification gate | Implemented | `verify`, `session-end --verify` | Rust tests |
-| Agent harness (10 features) | Implemented (2026-03-31) | `build_context_prompt`, `query_with_context`, intent classification, `CoordinationResult`, conflict history IPC, JSON harness protocol, session awareness, specialized IPC endpoints | Rust tests |
-| Retrieval indexing + keyword search | Implemented | `index-memory`, `search-history --mode keyword`, `search-genome --mode keyword` | Rust unit + integration |
-| Semantic search (feature-flagged) | Implemented (fallback-safe) | `search-* --mode semantic` with keyword fallback | Rust unit + integration |
-| Retrieval health diagnostics | Implemented | `retrieval-status --check --json` | Rust integration |
-| Retrieval explainability metadata | Implemented | `search-* --explain` + JSON metadata (`backend_used`, `fallback_code`, `timing_ms`) | Rust integration |
-| Review-first context injection | Implemented (additive) | daemon chat + `orchestrate`/`handoff`/`sync-context` with `--inject-mode` | Rust unit + integration |
-| Injection staging artifacts | Implemented | `.impulse/context/injections/*` | Rust unit + integration |
-| EGUI operator workbench | Implemented (daemon snapshot + telemetry overlay) | `impulse-gui` | Rust unit + workspace checks |
-| Context stewardship | Implemented | `steward` (status/analyze/compact/approve/reject) | Rust unit + integration |
-| Token tracking algorithm | Implemented | Internal metrics for compaction measurement | Rust unit + integration |
-| Tool management | Implemented | `tools` (list/init/update) | Rust unit |
-| Credential management | Implemented | `credentials` (set/get/list/proxy) | Rust unit |
-| Documentation fetcher | Implemented | `docs` (list/fetch) | Rust unit |
-| System utilities | Implemented | `calc`, `exec`, `system`, `health` | Rust unit |
+| Agent harness | Implemented (2026-03-31) | Multiple IPC endpoints | Rust tests |
+| Retrieval indexing + keyword search | Implemented | `index-memory`, `search-history`, `search-genome` | Rust unit + integration |
+| Semantic search (feature-flagged) | Implemented (fallback-safe) | `search-* --mode semantic` | Rust unit + integration |
+| Review-first context injection | Implemented (additive) | daemon chat + orchestrate/handoff/sync-context | Rust unit + integration |
+| Context stewardship | Implemented | `steward` | Rust unit + integration |
+| Tool management | Implemented | `tools` | Rust unit |
+| Credential management | Implemented | `credentials` | Rust unit |
+| **Tauri desktop shell** | **Phase 0 (docs reset)** | Tauri + Dioxus + xterm.js | Pending Phase 2+ |
+| **egui operator workbench** | **LEGACY — frozen** | `impulse-gui` (compile-only) | Legacy tests only |
 | SWARM semantic coordination runtime | Planned | Future orchestration engine | Not started |
 
-## 5) Claude/OpenCode Parity Contract
+## 6) Claude/OpenCode Parity Contract
 
 | Area | Claude Code | OpenCode | Contract Expectation |
 | --- | --- | --- | --- |
@@ -287,9 +308,8 @@ Test column shows current coverage level: **Full** (≥3.0/KLOC), **Partial** (1
 | Tool tracking | Supported | Supported | Equivalent behavior |
 | Session end verification (`--verify`) | Included in generated hook command | Included in generated hook command | Required |
 | Context handoff artifacts | Shared `.impulse/context/*` | Shared `.impulse/context/*` | Required |
-| Known deltas | Hook event payload shape differs by platform | Hook event payload shape differs by platform | Handle by adapter mapping, not by feature removal |
 
-## 6) Governance and Ownership
+## 7) Governance and Ownership
 
 ### Contract Ownership
 
@@ -300,6 +320,8 @@ The following files define product truth and must be updated together for contra
 - `docs/INDEX.md` (navigation + source-of-truth routing)
 - `docs/SUMMARY.yaml` (navigation source)
 - `docs/SUMMARY.md` (high-level map)
+- `docs/spec/DESKTOP-SHELL-ARCHITECTURE.md` (desktop contract)
+- `docs/decisions/0007-desktop-shell-stack.md` (desktop ADR)
 
 ### Required Update Checklist for Any Interface Change
 
@@ -310,23 +332,21 @@ When adding/changing CLI commands, hooks, state files, or roadmap stage definiti
 4. Run `python3 docs/validate_docs.py --contract`.
 5. Include release note fields from `docs/guides/RELEASE-NOTES-TEMPLATE.md`.
 
-## 7) Test Quality Contract
+## 8) Test Quality Contract
 
 ### Test Density Targets
 
 | Module Category | Target (tests/KLOC) | Current (2026-04-04) | Gap |
 |----------------|---------------------|----------------------|-----|
-| Core (state, daemon, agent) | ≥3.0 | ~1.5 (state ~80, agent +24, daemon +2) | HIGH — need ~2x more |
-| Handlers | ≥2.0 | ~2.5 (211 tests in 10/19 files; 9 files at zero) | IMPROVING — 47% untested |
-| UI/TUI | ≥1.0 | ~0.4 | MEDIUM — layout/rendering |
-| Tooling | ≥2.0 | ~17.1 (84 tests, 4,920 LOC) | MET — well above target |
-| Integration | Every stable CLI command | 26 tests | PARTIAL — expanding |
+| Core (state, daemon, agent) | ≥3.0 | ~1.5 | HIGH |
+| Handlers | ≥2.0 | ~2.5 | IMPROVING |
+| UI/TUI | ≥1.0 | ~0.4 | MEDIUM |
+| Tooling | ≥2.0 | ~17.1 | MET |
+| Integration | Every stable CLI command | 26 tests | PARTIAL |
 
-**Workspace totals (2026-04-04):** ~111K LOC, 1,344 tests (1,318+26 impulse-rs, 4 ops, 110 term, 240+ gui), 237 .rs files across 4 crates.
+**Workspace totals (2026-04-04):** ~111K LOC, 1,344 tests, 237 .rs files across 4 crates.
 
 ### Required Test Patterns
-
-New code must include:
 
 | Pattern | Requirement |
 |---------|-------------|
@@ -336,87 +356,14 @@ New code must include:
 | Error Display | Every `thiserror` enum: `assert!(format!("{e}").contains("expected"))` |
 | Boundary conditions | Empty inputs, zero/max values where applicable |
 
-### Quality Floor
-
-- Tests must contain assertions (`assert!`, `assert_eq!`, `assert_ne!`). `println!`-only tests are not acceptable.
-- Test names: `test_<function>_<scenario>_<expected_result>`, not `test_parse_2`.
-- `unwrap()` in tests must be on operations expected to succeed; use `assert!(result.is_err())` for expected failures.
-
-### How to Meet Density Targets
-
-- 1 happy-path test per public function (establishes baseline)
-- 1 Err-path test per `Result`-returning function
-- Boundary condition tests where type allows (empty, zero, max)
-- Serde round-trip test for every `Serialize + Deserialize` type
-- Display test for every `thiserror` enum
-- Property-based tests (`proptest`) for combinatorial input spaces (path validation, config parsing, serialization)
-
-### Test Helper Centralization
-
-| Helper Type | Location |
-|---|---|
-| State factories | `#[cfg(test)]` in owning module |
-| Mock tools | `src/tooling/` test module |
-| Daemon guards | `src/integration_tests.rs` |
-| Assertion helpers | Near first usage; extract if 3+ modules use |
-
-Rule: helpers used by 3+ modules must be extracted to a shared `#[cfg(test)]` module.
-
-### Unsafe Code
-
-Any `unsafe` block requires all three: (1) `// SAFETY:` comment documenting every invariant, (2) precondition validation **before** the unsafe block (never inside), (3) a dedicated test exercising the unsafe code path. Never use `unsafe` for convenience or to avoid `Result`.
-
-### Lint Suppression
-
-- `#[allow(dead_code)]` requires `// dead_code: <reason>` comment and `grep` proof of no callers. If truly dead, delete it.
-- `#![allow(...)]` (file-level) is not acceptable in new code — must be broken into per-item allows.
-- All `#[allow(clippy::*)]` require `// clippy: <reason>` comment.
-- `#[allow(clippy::too_many_arguments)]` is temporary only — must include `// TODO: refactor to struct params`.
-
 ### Verification Gate
 
 All changes must pass before commit:
 ```bash
 cd impulse-rs && cargo build && cargo test && cargo clippy -- -D warnings && cargo fmt --check
 ```
-Exit on first failure. Do not skip or bypass any step.
 
-**Expected outputs (update when counts change):**
-- `cargo test`: 1,344 passed, 3 ignored, 0 failed (5 test result lines)
-- `cargo clippy`: 0 warnings
-- `cargo fmt --check`: no output
-
-### Policy Compliance Audit Commands
-
-Run periodically to detect policy drift:
-
-```bash
-# 1. Find bare ? on I/O (should have .context())
-git grep -n "fs::read\|fs::write\|fs::remove" -- "*.rs" | grep -v "context\|test\|// "
-
-# 2. Find unwrap() outside tests/main (violation of Principle 1)
-git grep -n "\.unwrap()" -- "*.rs" | grep -v "#\[test\]\|mod tests\|fn main\|impl Default\|// unwrap:"
-
-# 3. Find #[allow] missing required comments
-git grep -n "#\[allow" -- "*.rs" | grep -v "// dead_code:\|// TODO:\|// clippy:\|// serde:\|cfg_attr"
-
-# 4. Find Serialize+Deserialize types missing round-trip tests
-# Compare: types declaring derive vs files with round-trip tests
-git grep -c "Serialize.*Deserialize\|Deserialize.*Serialize" -- "*.rs"
-git grep -c "round_trip\|roundtrip" -- "*.rs"
-
-# 5. Find handler files without mod tests
-for f in src/handlers/*.rs; do grep -qL "mod tests" "$f" && echo "UNTESTED: $f"; done
-
-# 6. Verify test count hasn't regressed
-cargo test 2>&1 | grep "test result:" | awk '{sum += $4} END {print "Total: " sum " (expected: 1344)"}'
-```
-
-### egui Import Convention
-
-`impulse-gui` uses `eframe::egui::*` — never bare `egui::*`. The crate re-exports egui through eframe.
-
-## 8) Validation and Drift Prevention
+## 9) Validation and Drift Prevention
 
 Documentation contract validation command:
 
@@ -426,5 +373,6 @@ python3 docs/validate_docs.py --contract
 
 This command must fail on:
 - Missing canonical references in source-of-truth docs
-- Contradictory active-doc claims (for example, active docs claiming TypeScript/Bun-only core)
+- Contradictory active-doc claims
 - Missing roadmap contract markers in key top-level docs
+- Any doc describing egui as the active or target desktop surface

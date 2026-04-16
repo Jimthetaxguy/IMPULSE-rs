@@ -1,7 +1,7 @@
 ---
 title: Agent Guidelines
 description: Guidelines for AI coding agents working in this repository
-version: '3.0'
+version: '4.0'
 authors:
   - name: James Pustorino
     email: James.s.Pustorino@gmail.com
@@ -13,7 +13,7 @@ authors:
 > Guidelines for AI coding agents contributing to this project.
 > Contract: [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
 > Canonical stack: Rust (impulse-rs)
-> Roadmap contract: Now=Rust core + EGUI workbench, Next=daemon-truth EGUI + hook validation, Later=agent control + artifact polish
+> Roadmap contract: Now=Rust core + Tauri desktop shell (Phase 0 docs reset), Next=egui boundary cleanup + static shell, Later=live terminal bridge + daemon parity
 
 ---
 
@@ -30,6 +30,21 @@ Impulse is a **sidecar memory layer** for AI coding agents. It is NOT a coding a
 ```
 
 **The distinction matters:** Impulse doesn't write code. It remembers what the coding agent did — sessions, file changes, decisions, tool usage — and makes that context available in future sessions.
+
+---
+
+## Desktop Shell Status (as of 2026-04-15)
+
+> **egui / impulse-gui is LEGACY.** It is frozen — no new features. It will be removed after Tauri shell reaches parity.
+
+The chosen desktop stack is **Tauri 2.x + Dioxus + xterm.js terminal bridge**.
+
+- See `docs/spec/DESKTOP-SHELL-ARCHITECTURE.md` for canonical layer boundaries
+- See `docs/spec/DESKTOP-STACK-TRADEOFFS.md` for the full option evaluation
+- See `docs/decisions/0007-desktop-shell-stack.md` for the ADR
+- See `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md` for the build sequence
+
+**Do not add new code to `impulse-gui`.** If you need to touch `impulse-term`, confirm that `eframe` is not re-introduced as a dependency.
 
 ---
 
@@ -60,7 +75,9 @@ Choose the simplest solution that works. Prefer editing existing files over crea
 **Dual mode:**
 - **Direct** — stateless per-action (hooks). Read → process → write → exit.
 - **Daemon** — long-running with Unix socket IPC (TUI/chat). In-memory state with dirty-flag sync.
-- **EGUI workbench** — native operator console backed by daemon snapshots and published terminal telemetry.
+- **Desktop shell** — Tauri + Dioxus webview backed by daemon snapshots and terminal bridge events. *(in migration)*
+- **ratatui TUI** — standalone terminal-native operator surface. Remains first-class throughout migration.
+- **egui workbench** — LEGACY. Frozen. Compile-maintenance only.
 
 **Data in `.impulse/`:**
 
@@ -84,7 +101,7 @@ Choose the simplest solution that works. Prefer editing existing files over crea
 | Naming | `PascalCase` types, `snake_case` functions, `SCREAMING_SNAKE` constants |
 | Tests | Unit tests in `mod tests`, integration tests use `DaemonGuard` RAII |
 | Features | `office-support`, `monty-support`, `datafusion-support` (all opt-in) |
-| egui imports | `impulse-gui` uses `eframe::egui::*`, NEVER bare `egui::*` |
+| egui imports | `impulse-gui` uses `eframe::egui::*`, NEVER bare `egui::*` — **legacy only** |
 
 ---
 
@@ -169,46 +186,6 @@ High-risk untested modules (prioritize coverage):
 - `src/handlers/injection_handlers.rs` (209 LOC) — context injection routing, zero tests
 - `src/handlers/common.rs` (379 LOC) — shared helpers used by all handlers, zero tests
 
-### Test Pattern Examples
-
-```rust
-// Happy path
-#[test]
-fn test_parse_config_valid_json_returns_config() {
-    let json = r#"{"timeout_ms": 5000}"#;
-    let config = parse_config(json).unwrap();
-    assert_eq!(config.timeout_ms, 5000);
-}
-
-// Error path
-#[test]
-fn test_parse_config_invalid_json_returns_error() {
-    assert!(parse_config("not json").is_err());
-}
-
-// Boundary condition
-#[test]
-fn test_parse_config_empty_string_returns_error() {
-    assert!(parse_config("").is_err());
-}
-
-// Serde round-trip
-#[test]
-fn test_session_info_roundtrip() {
-    let original = SessionInfo { id: "abc".into(), active: true };
-    let json = serde_json::to_string(&original).unwrap();
-    let recovered: SessionInfo = serde_json::from_str(&json).unwrap();
-    assert_eq!(original, recovered);
-}
-
-// Error enum Display
-#[test]
-fn test_session_error_display_contains_id() {
-    let err = SessionError::NotFound("abc".into());
-    assert!(format!("{err}").contains("abc"));
-}
-```
-
 ### Error Handling Patterns
 
 **`thiserror` for typed errors:**
@@ -230,11 +207,6 @@ let config: Config = serde_json::from_str(&content)
     .context("Failed to parse config JSON")?;
 ```
 
-**`unwrap()` / `expect()` rules:**
-- `unwrap()` — only in: tests, `Default` impls (failure impossible), `main()` after arg parsing
-- `expect("msg")` — only in: `main()` and test setup, never in library code
-- Every `Result`-returning function needs at least one `is_err()` test
-
 ### Lint Suppression Rules
 
 | Suppression | Rule |
@@ -244,129 +216,12 @@ let config: Config = serde_json::from_str(&content)
 | `#![allow(...)]` (file-level) | Not acceptable in new code |
 | Any `#[allow(clippy::*)]` | Must include `// clippy: <reason>` comment |
 
-**Auditing existing suppressions:**
-```bash
-# Find suppressions missing required comments
-git grep -n "#\[allow" -- "*.rs" | grep -v "// dead_code:\|// TODO:\|// clippy:\|// serde"
-
-# Before adding #[allow(dead_code)], prove no callers exist
-git grep -w "function_name" -- "*.rs"
-# If zero callers → delete the code, don't allow it
-```
-
-**Judging clippy false positives:**
-- Run `cargo clippy --fix --allow-staged` to see auto-fixes
-- If the fix breaks intent, document why in `// clippy: <reason>`
-- If clippy is right, fix the code instead of allowing
-
-### Serde Round-Trip Requirements
-
-Every `#[derive(Serialize, Deserialize)]` type needs a round-trip test:
-
-```rust
-#[test]
-fn round_trip_my_type() {
-    let original = MyType::default();
-    let json = serde_json::to_string(&original).unwrap();
-    let recovered: MyType = serde_json::from_str(&json).unwrap();
-    assert_eq!(original, recovered);
-}
-```
-
-**Special cases:**
-- `#[serde(skip)]` fields: exclude from equality check (not serialized)
-- `#[serde(default)]` fields: include in test, verify the default is sensible
-- `#[serde(flatten)]` fields: test that flat JSON still deserializes (catches restructure breakage)
-- Multiple formats: test each format separately if type serializes to both JSON and TOML
-- `#[serde(rename_all = "...")]`: test with both Rust field names and serialized names to catch rename drift
-
-**Why:** Catches field renames, missing defaults, and `#[serde(flatten)]` breakage that would silently corrupt persisted data.
-
-**Audit for missing round-trip tests:**
-```bash
-# Find Serialize+Deserialize types
-git grep -l "Serialize.*Deserialize\|Deserialize.*Serialize" -- "*.rs" | sort
-# Find existing round-trip tests
-git grep -l "round_trip\|roundtrip\|serde_json::to_string.*serde_json::from_str" -- "*.rs" | sort
-# Diff the two lists to find gaps
-```
-
-### Property-Based Testing
-
-Use `proptest` for functions with combinatorial input spaces. Add `proptest` to `[dev-dependencies]` when first used.
-
-```rust
-use proptest::proptest;
-
-// Path sanitization must never produce traversal
-proptest! {
-    #[test]
-    fn test_sanitize_path_never_contains_traversal(path in "[a-zA-Z0-9/_.-]+") {
-        let result = sanitize_path(&path).unwrap();
-        prop_assert!(!result.contains(".."));
-    }
-}
-
-// Config roundtrip with random data
-proptest! {
-    #[test]
-    fn test_config_roundtrip_random(
-        sessions in prop::collection::vec("[a-z]+", 0..10),
-        max_age in 1u64..1000,
-    ) {
-        let config = Config { sessions, max_age };
-        let json = serde_json::to_string(&config).unwrap();
-        let recovered: Config = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(config, recovered);
-    }
-}
-```
-
-**When to use proptest:** path validation, numeric arithmetic, serialization, config parsing — any function where behavior should hold for ANY valid input.
-
 ### Unsafe Code Rules
 
 Any `unsafe` block requires all three:
 1. `// SAFETY:` comment documenting every invariant the block relies on
 2. Precondition validation **before** the unsafe block (never inside)
 3. A dedicated test exercising the unsafe code path
-
-```rust
-fn read_cstring(ptr: *const u8) -> Result<String> {
-    // Precondition: validate before entering unsafe
-    ensure!(!ptr.is_null(), "pointer must not be NULL");
-
-    // SAFETY: ptr is non-null (validated above) and points to
-    // a valid NUL-terminated C string per this function's contract.
-    let cstr = unsafe { std::ffi::CStr::from_ptr(ptr as *const c_char) };
-    Ok(cstr.to_str()?.to_owned())
-}
-
-#[test]
-fn test_read_cstring_null_returns_error() {
-    assert!(read_cstring(std::ptr::null()).is_err());
-}
-
-#[test]
-fn test_read_cstring_valid_pointer_returns_string() {
-    let data = b"hello\0";
-    assert_eq!(read_cstring(data.as_ptr()).unwrap(), "hello");
-}
-```
-
-**When unsafe is acceptable:** FFI calls, verified pointer arithmetic, layout assumptions.
-**Never for:** convenience, avoiding `Result`, error handling shortcuts.
-
-### Test Helper Centralization
-
-| Helper Type | Location | Purpose |
-|---|---|---|
-| State factories | `#[cfg(test)]` in owning module | `test_state() -> (TempDir, Arc<State>)` |
-| Mock tools | `src/tooling/` test module | `EchoTool`, `WriteTool`, `CapturingTool` |
-| Daemon guards | `src/integration_tests.rs` | `DaemonGuard` RAII cleanup |
-| Assertion helpers | Near first usage | `assert_error_contains()` |
-
-**Rule:** If a helper is used by 3+ modules, extract to a shared `#[cfg(test)]` module. Don't duplicate factory functions across files.
 
 ---
 
@@ -393,8 +248,3 @@ This project uses git worktrees for parallel development. A pre-commit hook warn
 - `git clean -fd`
 - `git reset --hard`
 - Force push to main/master
-
-**Before force pushing, always:**
-```bash
-git branch backup-pre-force  # Create backup
-```

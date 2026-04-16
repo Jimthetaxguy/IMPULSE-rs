@@ -1,14 +1,14 @@
 ---
-title: Implementation Handoff — EGUI Daemon Truth
-description: Execution handoff for the EGUI roadmap reset and daemon-truth workbench pass
-version: '1.1'
-updated: 2026-03-05
+title: Implementation Handoff
+description: Current implementation sequence — Tauri desktop shell migration
+version: '2.0'
+updated: 2026-04-15
 type: doc
 category: handoff
 phase: all
 status: active
 audience: builder
-tags: [handoff, implementation, egui, daemon, telemetry]
+tags: [handoff, implementation, tauri, dioxus, desktop, egui-deprecation]
 authors:
   - name: James Pustorino
     role: Creator
@@ -16,209 +16,110 @@ authors:
 
 # Implementation Handoff Document
 
-> **Updated:** 2026-03-05
+> **Updated:** 2026-04-15
 > **Purpose:** Capture the actual next implementation sequence for Impulse.
 > **Risk register:** [`../HONEST-ROADMAP.md`](../HONEST-ROADMAP.md)
 > **Roadmap anchor:** [`../ROADMAP-PLAN.md`](../ROADMAP-PLAN.md)
+> **Desktop architecture:** [`../spec/DESKTOP-SHELL-ARCHITECTURE.md`](../spec/DESKTOP-SHELL-ARCHITECTURE.md)
+> **Migration build sequence:** [`TAURI-DIOXUS-MIGRATION-HANDOFF.md`](TAURI-DIOXUS-MIGRATION-HANDOFF.md)
 
 ---
 
 ## Executive Summary
 
-The old handoff sequence was stale. The real next sequence is:
+The desktop stack has been formally reset. The previous EGUI-workbench-as-destination direction is superseded. The new desktop contract is:
 
-1. documentation reset
-2. daemon-truth EGUI pass
-3. parallel hook/compaction validation
-4. agent-control and artifact-polish follow-ons
+- **Desktop shell:** Tauri 2.x
+- **Desktop UI layer:** Dioxus (inside the Tauri webview)
+- **Terminal rendering:** xterm.js terminal bridge
+- **PTY/session/daemon ownership:** existing Rust backend (unchanged)
+- **Terminal-native operator surface:** ratatui (preserved, first-class)
+- **Legacy desktop surface:** egui / impulse-gui (frozen, sunset after parity)
 
-This is EGUI-only work for Impulse. No web UI, no TUI expansion, and no broad retrieval redesign in this pass.
+The current phase is **Phase 0 — Documentation Contract Reset**. Implementation begins only after docs, spec, roadmap, and migration handoff all describe the same product.
+
+Full migration build sequence: [`TAURI-DIOXUS-MIGRATION-HANDOFF.md`](TAURI-DIOXUS-MIGRATION-HANDOFF.md)
 
 ---
 
 ## Why The Sequence Changed
 
-The current codebase already has a Rust-native operator workbench:
+egui's immediate-mode rendering, constrained layout model, and the deep coupling between `impulse-term`'s PTY backend and `eframe` make it unsuitable as the long-term desktop shell. The PTY backend (`backend.rs`, `WriteQueue`, `context.rs`) is already framework-neutral in its logic — the `eframe` dependency is mechanical coupling that predates the current product direction.
 
-- `impulse-gui` has `Overview`, `Agents`, `Context`, `Memory`, `Artifacts`, and `Settings`
-- the daemon already exposes workbench snapshot and artifact endpoints
-- the shared Rust ops model exists and is being consumed by the GUI
+Tauri + Dioxus + xterm.js gives us:
+- All application logic stays in Rust
+- xterm.js handles terminal rendering without building a custom cell-grid renderer
+- Dioxus `rsx!` gives declarative component composition without a JS frontend
+- Tauri 2's capability system is the right security model for a tool that spawns arbitrary subprocesses
+- macOS-first delivery, with mobile path available via Tauri 2 when needed
 
-So the product is no longer in a “dashboard someday” phase. The remaining gap is authority and consistency:
-
-- some terminal/context telemetry still originates in the GUI
-- roadmap docs still describe EGUI as future work
-- hook/compaction claims still need evidence from the honest roadmap
+Full tradeoff analysis: [`../spec/DESKTOP-STACK-TRADEOFFS.md`](../spec/DESKTOP-STACK-TRADEOFFS.md)
 
 ---
 
-## Scope
+## Current Phase: Phase 0 — Documentation Reset
 
 ### In Scope
 
-- documentation re-baseline
-- daemon-owned workbench state for EGUI surfaces
-- terminal telemetry publication and merge rules
-- artifact action feedback through daemon snapshots
-- validation documentation for open hook/compaction risks
+- All canonical contract docs updated to reflect Tauri+Dioxus as desktop target
+- egui explicitly marked as legacy/freeze in all docs
+- New spec files: architecture, tradeoffs, ADR, migration handoff, benchmark methodology
+- Doc validation passes
 
-### Out of Scope
+### Out of Scope (for Phase 0)
 
-- TUI work
-- web UI
-- retrieval architecture redesign
-- structural conflict blocking
-- new coordination engines
+- Any code changes
+- Any Cargo.toml changes
+- Any new crates
 
 ---
 
-## Shared Interface Contract
+## Phase 0 Checklist
 
-### Canonical Read Model
-
-`ProjectOpsSnapshot` remains the only workbench read model for:
-
-- `Overview`
-- `Agents`
-- `Context`
-- `Artifacts`
-- sidebar alerts
-- status bar summaries
-
-`Memory` can keep its current dedicated history/genome/search IPC path in this phase.
-
-### New Publication Path
-
-Daemon IPC request:
-
-```rust
-PublishTerminalOps { report: TerminalOpsReport }
-```
-
-Shared model payload:
-
-```rust
-TerminalOpsReport {
-    source_id: String,
-    published_at: String,
-    agents: Vec<AgentRuntime>,
-    context: ContextHealthSummary,
-    interventions: Vec<InterventionRecommendation>,
-}
-```
+- [x] `docs/spec/DESKTOP-SHELL-ARCHITECTURE.md`
+- [x] `docs/spec/DESKTOP-STACK-TRADEOFFS.md`
+- [x] `docs/decisions/0007-desktop-shell-stack.md`
+- [x] `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md`
+- [x] `docs/guides/DESKTOP-BENCHMARK-METHODOLOGY.md`
+- [x] `AGENTS.md` — egui removed as active target
+- [x] `docs/plans/IMPLEMENTATION-HANDOFF.md` — this document
+- [ ] `docs/spec/RUST-CANONICAL-CONTRACT.md` — egui section updated
+- [ ] `docs/ROADMAP-PLAN.md` — phases updated
+- [ ] `docs/INDEX.md` — new docs indexed
+- [ ] `docs/SUMMARY.md` / `docs/SUMMARY.yaml` — updated
+- [ ] `CLAUDE.md` — product description updated
+- [ ] `impulse-rs/docs/IMPULSE_TERM_STATUS.md` — egui deprecation noted
+- [ ] `impulse-rs/README.md` — workspace crate descriptions updated
+- [ ] `impulse-rs/impulse-gui/README.md` — marked as legacy/freeze
+- [ ] `python3 docs/validate_docs.py --contract` — passes
 
 ---
 
-## Implementation Track 1: Documentation Reset
+## Preserved Daemon Contracts
 
-Update these files together:
+The following daemon IPC contracts are unchanged and remain authoritative. The desktop shell adapts to them — they are not changed to serve the desktop:
 
-- `docs/spec/RUST-CANONICAL-CONTRACT.md`
-- `AGENTS.md`
-- `CLAUDE.md`
-- `docs/INDEX.md`
-- `docs/SUMMARY.yaml`
-- `docs/SUMMARY.md`
-- `docs/ROADMAP-PLAN.md`
-- `docs/plans/IMPLEMENTATION-HANDOFF.md`
-- `impulse-rs/docs/IMPULSE_TERM_STATUS.md`
+- `ProjectOpsSnapshot`
+- `TerminalOpsReport`
+- `GetOpsSnapshot`
+- `SubscribeOps`
+- `PublishTerminalOps`
 
-Required outcomes:
-
-- EGUI is described as in progress.
-- “Dashboard / Advanced UX” is no longer framed as deferred speculative work.
-- `HONEST-ROADMAP.md` is explicitly linked as the risk register.
-- The roadmap contract stays consistent across all top-level docs.
+The desktop shell adds the terminal bridge command/event surfaces as **additive** interfaces. See `docs/spec/DESKTOP-SHELL-ARCHITECTURE.md` for the full terminal bridge API.
 
 ---
 
-## Implementation Track 2: Daemon-Truth EGUI Pass
+## Implementation Phases (Summary)
 
-### Daemon Responsibilities
+Full detail in [`TAURI-DIOXUS-MIGRATION-HANDOFF.md`](TAURI-DIOXUS-MIGRATION-HANDOFF.md).
 
-Maintain an in-memory telemetry store keyed by:
-
-- `project_id`
-- `source_id`
-
-Merge behavior:
-
-1. Build the durable snapshot from sessions, history, genome, retrieval, and artifacts.
-2. Overlay fresh terminal telemetry onto matching agents by `session_id` first, then by agent `id`.
-3. Expose unmatched telemetry as ephemeral agents.
-4. Merge telemetry context and intervention data into the snapshot.
-5. Mark telemetry stale after 10 seconds without heartbeat.
-6. Stop overlaying stale telemetry after 10 seconds.
-7. Purge telemetry-only entries after 60 seconds.
-
-### GUI Responsibilities
-
-Terminal surfaces publish `TerminalOpsReport` on:
-
-- tab spawn
-- tab shutdown
-- context tier change
-- compaction event
-- injection event
-- intervention list change
-- a 2-second heartbeat while the window is alive
-
-Workbench read path rules:
-
-- `Overview`, `Agents`, `Context`, `Artifacts`, sidebar, and status bar render from daemon snapshot only.
-- Remove local shadow merges for agent/context/intervention/artifact result state.
-- Artifact actions remain remote; visible post-action state must return through the daemon snapshot.
-
-### Update Loop
-
-- connect: `GetOpsSnapshot`
-- steady state: `SubscribeOps`
-- reconciliation: full snapshot every 15 seconds and on reconnect
-- `Memory` view may continue polling history/genome/search independently in this phase
-
----
-
-## Implementation Track 3: Parallel Validation
-
-The following are still not validated and must be documented honestly:
-
-- SessionStart stdout injection
-- PreCompact survival
-- real-world `GENOME.md` usefulness
-
-Rules for this track:
-
-- record actual pass/fail evidence
-- update [`../HONEST-ROADMAP.md`](../HONEST-ROADMAP.md) with the result
-- if validation fails, correct roadmap docs immediately
-
-Do not hide failed validation behind “future work.” It changes the product claim.
-
----
-
-## Follow-On Order
-
-### Next Lane: Agent Control
-
-- blocked-work indicators
-- focus affordances
-- handoff affordances
-- restart affordances
-- conflict review entry points
-
-### Then: Artifact Polish
-
-- review/apply UX cleanup
-- stronger risky-action confirmation
-- clearer action result handling
-- tighter operator intent around apply/re-run/handoff flows
-
-### Still Deferred
-
-- structural blocking
-- broader retrieval changes
-- new TUI capabilities
-- non-Rust UI surfaces
+| Phase | Goal | Entry Criteria |
+|---|---|---|
+| 0 | Documentation reset | — |
+| 1 | Remove eframe from impulse-term | Phase 0 complete |
+| 2 | Static Tauri+Dioxus shell skeleton | Phase 1 complete |
+| 3 | Live terminal bridge (PTY → xterm.js) | Phase 2 complete |
+| 4 | Daemon integration + parity + egui freeze | Phase 3 complete |
 
 ---
 
@@ -240,21 +141,9 @@ cargo test
 cargo clippy --all-features --all-targets -- -D warnings
 ```
 
-### Manual Acceptance
+### Phase 0 Complete When
 
-- Start the GUI with live terminal tabs and verify status-bar/sidebar counts match daemon snapshot counts.
-- Trigger context tier changes and verify `Context` and `Overview` update without local-only state.
-- Disconnect and reconnect the daemon and verify snapshot recovery.
-- Acknowledge or apply an artifact and verify the visible state change arrives via daemon refresh, not GUI-local mutation.
-
----
-
-## Completion Criteria
-
-This handoff is complete when:
-
-- the docs no longer describe EGUI as future work
-- the daemon is the authoritative workbench source for the targeted EGUI surfaces
-- telemetry heartbeat, stale cutoff, and purge behavior are covered by tests
-- artifact actions visibly round-trip through the daemon snapshot
-- the honest roadmap remains accurate about what is still unverified
+- No doc refers to egui as the active or target desktop surface
+- Tauri+Dioxus is the desktop contract across all top-level docs
+- `validate_docs.py --contract` passes
+- ratatui is explicitly preserved as first-class standalone operator surface
