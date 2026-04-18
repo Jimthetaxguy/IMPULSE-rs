@@ -1,8 +1,8 @@
-//! GUI workbench state adapter — bridges daemon state to `impulse-gui`.
+//! Ops workbench state adapter — bridges daemon state to UI clients.
 //!
 //! Builds [`ProjectOpsSnapshot`] from [`SharedState`], aggregating sessions,
 //! history, genome, artifacts, and context health into the schema consumed by
-//! the egui workbench. Also provides [`TerminalOpsTelemetryStore`] for
+//! UI clients (ratatui TUI, Tauri desktop shell). Also provides [`TerminalOpsTelemetryStore`] for
 //! collecting and expiring per-terminal operation reports.
 
 use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};

@@ -76,8 +76,8 @@ See `cargo run -- --help` for the full command list.
 ## Stack
 
 - **Language:** Rust
-- **TUI:** ratatui + crossterm
-- **GUI:** egui (impulse-gui crate)
+- **TUI:** ratatui + crossterm (canonical operator path)
+- **Desktop (planned):** Tauri + Dioxus (egui `impulse-gui` crate retired 2026-04-17)
 - **Storage:** SQLite (FTS5) + JSONL + Markdown
 - **IPC:** Unix domain sockets
 - **LLM:** Anthropic, OpenAI, Minimax (for daemon chat)

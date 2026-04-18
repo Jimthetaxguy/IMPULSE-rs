@@ -64,16 +64,17 @@ Before implementing, consider alternative approaches. Choose the simplest soluti
 
 ## Architecture
 
-**Workspace (4 crates):**
-- `impulse-rs/` — main CLI + daemon + TUI (64,066 LOC in src/, 1,318 unit + 26 integration tests across 178 .rs files)
+**Workspace (3 crates, post-egui-dump 2026-04-17):**
+- `impulse-rs/` — main CLI + daemon + ratatui TUI (64,066 LOC in src/, 1,318 unit + 26 integration tests across 178 .rs files)
 - `impulse-rs/impulse-ops/` — operations library (shared types: SupervisorAction, TerminalOpsReport, OpsSnapshot, WorkbenchDaemonRequest/Response, DAEMON_PROTOCOL_VERSION, 4 tests)
-- `impulse-rs/impulse-term/` — custom terminal widget (PTY + vt100 + WriteQueue + context bridge, ~3.9K lines, 110 tests)
-- `impulse-rs/impulse-gui/` — egui native workbench (Workbench, Terminals, Memory, Settings + Launch/Nebula/Solar/Aurora themes, ~15.4K lines)
+- `impulse-rs/impulse-term/` — PTY/session/context core (PTY + vt100 + WriteQueue + context bridge, ~3.9K lines, 110 tests)
+
+**Retired:** `impulse-rs/impulse-gui/` (egui workbench) was archived 2026-04-17 to `~/.impulse-cleanup-archive/_archive-2026-04-17-gui-dump/impulse-gui/`. Its replacement is the Tauri desktop shell in `impulse-rs/src-tauri/` (currently scaffold-only, populated by in-flight WIP — see `stash@{0}: pre-cleanup-safety-2026-04-17-main` and tag `recovery/pre-gui-dump-main-stash`).
 
 **Dual mode:**
 - **Direct mode** — stateless, per-action (for hooks). Read → process → write → exit.
-- **Daemon mode** — long-running, Unix socket IPC (for TUI/GUI). In-memory state with periodic sync.
-- **GUI mode** — `impulse-gui` binary, connects to daemon via IPC, hosts terminal panes with context lifecycle.
+- **Daemon mode** — long-running, Unix socket IPC (for TUI and future desktop shell). In-memory state with periodic sync.
+- **Desktop mode** (planned) — `Tauri` + `Dioxus` application, connects to daemon via IPC and a terminal bridge.
 
 **IPC Protocol (PROTOCOL_VERSION = 2):**
 

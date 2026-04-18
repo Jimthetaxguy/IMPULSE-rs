@@ -2,19 +2,21 @@
 
 Rust implementation of Impulse — a sidecar that runs alongside AI coding agents (Claude Code, Codex, OpenCode) and remembers what they did across sessions.
 
-## GUI Workbench
+## Desktop Shell (in progress)
+
+The egui-based `impulse-gui` crate was retired 2026-04-17. Its replacement is a Tauri + Dioxus desktop shell scaffolded in `src-tauri/`; in-progress work is preserved in `stash@{0}` and recovery tag `recovery/pre-gui-dump-main-stash`.
+
+For now, use the ratatui TUI:
 
 ```bash
-cargo run -p impulse-gui
+cargo run -- run                 # ratatui terminal-native workbench
 ```
 
-A native desktop app (egui/eframe) with embedded terminals, agent coordination, and session memory.
+Planned desktop bring-up:
 
-**4 views:** Workbench | Terminals | Memory | Settings
-
-**4 themes:** Launch (blue, default) | Nebula (purple) | Solar (amber) | Aurora (green)
-
-**Agent panel:** Right-side supervisor chat with backend auto-detection (daemon > Claude Code > API > unavailable). Animated thinking indicator, message timestamps, activity feed.
+```bash
+# Future: cargo tauri dev        # Tauri + Dioxus shell (not yet wired)
+```
 
 **Terminal multiplexer:** Spawn Claude Code, Codex, OpenCode, or shell terminals. Context lifecycle (extraction, injection, compaction detection). PTY writes serialized via WriteQueue to prevent text corruption.
 
@@ -43,27 +45,27 @@ cargo install --path .   # Install globally
 ## Testing
 
 ```bash
-cargo test                        # Workspace (1,344 tests)
-cargo test -p impulse-gui         # GUI crate (246 tests)
+cargo test                        # Workspace (~1,360 tests)
 cargo test -p impulse-term        # Terminal crate (110 tests)
 cargo test -p impulse-ops         # Ops crate (4 tests)
-# Total: ~1,700 tests
+# impulse-rs main crate: 1,344 tests
 ```
 
 ## Architecture
 
-**4 crates:**
+**3 crates (post-egui-dump 2026-04-17):**
 
 | Crate | Purpose |
 |-------|---------|
-| `impulse-rs` | CLI + daemon + TUI (64K LOC, 1,344 tests) |
+| `impulse-rs` | CLI + daemon + ratatui TUI (64K LOC, 1,344 tests) |
 | `impulse-ops` | Shared types (SupervisorAction, OpsSnapshot, IPC protocol) |
-| `impulse-term` | Terminal widget (PTY, vt100, WriteQueue, context bridge, 110 tests) |
-| `impulse-gui` | Native workbench (egui, 4 views, 4 themes, 246 tests) |
+| `impulse-term` | Terminal core (PTY, vt100, WriteQueue, context bridge, 110 tests) |
+
+`impulse-gui` (egui native workbench) retired 2026-04-17; archive at `~/.impulse-cleanup-archive/_archive-2026-04-17-gui-dump/`. Replacement: Tauri + Dioxus shell in `src-tauri/` (scaffold).
 
 **Dual mode:**
 - **Direct mode** — stateless CLI, per-action (for hooks)
-- **Daemon mode** — long-running Unix socket IPC (for TUI/GUI)
+- **Daemon mode** — long-running Unix socket IPC (for TUI and future desktop shell)
 
 **Data (`.impulse/`):**
 - `HISTORY.jsonl` — append-only session log
