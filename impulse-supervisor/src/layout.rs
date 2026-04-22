@@ -6,20 +6,15 @@
 use serde::{Deserialize, Serialize};
 
 /// Top-level window layout: sidebar (supervisor) + main (worker grid).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum LayoutMode {
     /// Sidebar pinned, main area hosts 1-N workers in a responsive grid.
+    #[default]
     SidebarWithGrid,
     /// Supervisor temporarily hidden (focus mode on a single worker).
     WorkerFocus,
     /// Supervisor full-width (reviewing cross-pane context).
     SupervisorFocus,
-}
-
-impl Default for LayoutMode {
-    fn default() -> Self {
-        Self::SidebarWithGrid
-    }
 }
 
 /// How worker panes are arranged inside the main area.

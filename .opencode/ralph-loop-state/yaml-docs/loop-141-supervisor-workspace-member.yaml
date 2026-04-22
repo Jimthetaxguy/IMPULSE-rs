@@ -1,0 +1,19 @@
+loop: 141
+title: supervisor workspace integration
+status: completed
+summary:
+  - Added impulse-supervisor as a workspace member and default member.
+  - Shared serde/anyhow/thiserror workspace dependencies are available to the crate scaffold.
+  - Restored root cargo-run behavior with default-run set to impulse-rs so supervisor binary introduction does not break existing integration tests.
+files:
+  - Cargo.toml
+  - impulse-supervisor/src/lib.rs
+  - impulse-supervisor/src/layout.rs
+  - impulse-supervisor/src/panes.rs
+  - impulse-supervisor/src/state.rs
+verification:
+  - cargo test --workspace -p impulse-supervisor
+  - cargo clippy -p impulse-supervisor -- -D warnings
+  - cargo fmt --check -p impulse-supervisor
+notes:
+  - Root Cargo.toml also has an unstaged unix libc dependency hunk from another agent; it was intentionally excluded from this loop commit.

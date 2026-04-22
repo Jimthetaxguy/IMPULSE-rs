@@ -49,11 +49,15 @@ impl PaneRegistry {
     }
 
     pub fn supervisor(&self) -> Option<&PaneIdentity> {
-        self.panes.values().find(|p| p.role == PaneRoleRef::Supervisor)
+        self.panes
+            .values()
+            .find(|p| p.role == PaneRoleRef::Supervisor)
     }
 
     pub fn workers(&self) -> impl Iterator<Item = &PaneIdentity> {
-        self.panes.values().filter(|p| p.role == PaneRoleRef::Worker)
+        self.panes
+            .values()
+            .filter(|p| p.role == PaneRoleRef::Worker)
     }
 
     pub fn worker_count(&self) -> usize {

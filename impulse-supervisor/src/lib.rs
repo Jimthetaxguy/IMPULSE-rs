@@ -52,16 +52,11 @@ pub struct PaneIdentity {
 ///
 /// This crate re-exports it by value so UI code can match on role without depending
 /// on `impulse-term` types leaking into component signatures.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum PaneRoleRef {
+    #[default]
     Worker,
     Supervisor,
-}
-
-impl Default for PaneRoleRef {
-    fn default() -> Self {
-        Self::Worker
-    }
 }
 
 impl PaneRoleRef {

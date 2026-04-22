@@ -69,8 +69,8 @@ pub enum CompactionReason {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::PaneRoleRef;
     use crate::chrono_ish::Timestamp;
+    use crate::PaneRoleRef;
 
     #[test]
     fn test_default_shell_state_is_empty() {
