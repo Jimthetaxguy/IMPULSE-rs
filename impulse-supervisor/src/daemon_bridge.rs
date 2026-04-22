@@ -1,4 +1,6 @@
 use anyhow::{Context, Result};
+use impulse_supervisor::PaneRoleRef;
+use impulse_term::{PaneRole, TerminalPanel, TerminalTheme};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -6,6 +8,8 @@ use tokio::net::UnixStream;
 
 const DEFAULT_SOCKET_PATH: &str = ".impulse/sockets/impulse.sock";
 const DEFAULT_SUPERVISOR_COMMAND: &str = "impulse-rs";
+#[allow(dead_code)] // dead_code: runtime-driven supervisor PTY launch consumes this constant in loops 154-155; tests exercise it now.
+const DEFAULT_SUPERVISOR_AGENT_NAME: &str = "supervisor";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeConfig {
@@ -68,9 +72,51 @@ pub struct DaemonStatusSnapshot {
     pub raw_status: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // dead_code: runtime PTY launch and compaction handoff use this spec in loops 154-160; unit tests exercise it now.
+pub struct SupervisorPtyLaunchSpec {
+    pub command: String,
+    pub args: Vec<String>,
+    pub working_dir: Option<PathBuf>,
+    pub agent_name: &'static str,
+    pub pane_id: usize,
+    pub socket_path: Option<PathBuf>,
+    pub role_ref: PaneRoleRef,
+}
+
+#[allow(dead_code)] // dead_code: runtime PTY launch uses these helpers in loops 154-160; tests exercise them now.
+impl SupervisorPtyLaunchSpec {
+    pub fn pane_role(&self) -> PaneRole {
+        PaneRole::Supervisor
+    }
+
+    pub fn launch_summary(&self) -> String {
+        format!(
+            "role={} pane={} command={} socket={}",
+            self.role_ref.as_str(),
+            self.pane_id,
+            self.command,
+            self.socket_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "none".to_string())
+        )
+    }
+}
+
+#[allow(dead_code)] // dead_code: runtime swaps recording spawners for TerminalPanelSpawner in loops 154-155; tests exercise the trait now.
+pub trait SupervisorPtySpawner {
+    type Output;
+
+    fn spawn_supervisor(&self, spec: &SupervisorPtyLaunchSpec) -> Result<Self::Output>;
+}
+
 pub struct DaemonBridge {
     config: BridgeConfig,
 }
+
+#[allow(dead_code)] // dead_code: spawn_supervisor_pty constructs this in the experimental runtime path, which lands later in the phase.
+struct TerminalPanelSpawner;
 
 impl Default for DaemonBridge {
     fn default() -> Self {
@@ -98,6 +144,36 @@ impl DaemonBridge {
             protocol_version: None,
             raw_status: None,
         }
+    }
+
+    #[allow(dead_code)] // dead_code: runtime PTY orchestration consumes this launch spec in loops 154-160; tests exercise it now.
+    pub fn supervisor_launch_spec(&self, pane_id: usize) -> SupervisorPtyLaunchSpec {
+        SupervisorPtyLaunchSpec {
+            command: self.config.supervisor_command.clone(),
+            args: self.config.supervisor_args.clone(),
+            working_dir: self.config.working_dir.clone(),
+            agent_name: DEFAULT_SUPERVISOR_AGENT_NAME,
+            pane_id,
+            socket_path: Some(self.config.socket_path.clone()),
+            role_ref: PaneRoleRef::Supervisor,
+        }
+    }
+
+    #[allow(dead_code)] // dead_code: runtime event handlers invoke this once the Dioxus shell binds the supervisor pane.
+    pub fn spawn_supervisor_pty(&self, pane_id: usize) -> Result<TerminalPanel> {
+        self.spawn_supervisor_pty_with(pane_id, &TerminalPanelSpawner)
+    }
+
+    #[allow(dead_code)] // dead_code: runtime orchestration injects the real spawner later in the phase; tests exercise it now.
+    pub fn spawn_supervisor_pty_with<S: SupervisorPtySpawner>(
+        &self,
+        pane_id: usize,
+        spawner: &S,
+    ) -> Result<S::Output> {
+        let spec = self.supervisor_launch_spec(pane_id);
+        spawner
+            .spawn_supervisor(&spec)
+            .context(format!("spawn supervisor pty: {}", spec.launch_summary()))
     }
 
     #[allow(dead_code)] // dead_code: runtime-driven daemon polling lands in loops 154-155.
@@ -130,6 +206,23 @@ impl DaemonStatusSnapshot {
             "connection={} protocol={protocol}",
             self.connection_state.label(),
         )
+    }
+}
+
+impl SupervisorPtySpawner for TerminalPanelSpawner {
+    type Output = TerminalPanel;
+
+    fn spawn_supervisor(&self, spec: &SupervisorPtyLaunchSpec) -> Result<Self::Output> {
+        TerminalPanel::spawn_supervisor(
+            &spec.command,
+            &spec.args,
+            spec.working_dir.as_deref(),
+            spec.agent_name,
+            spec.pane_id,
+            Option::<TerminalTheme>::None,
+            spec.socket_path.as_deref(),
+        )
+        .map_err(|error| anyhow::anyhow!("failed to spawn terminal panel: {error}"))
     }
 }
 
@@ -239,8 +332,35 @@ impl RawDaemonClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SpawnReceipt {
+        summary: String,
+        pane_role: PaneRole,
+    }
+
+    #[derive(Default)]
+    struct RecordingSpawner {
+        calls: Mutex<Vec<SupervisorPtyLaunchSpec>>,
+    }
+
+    impl SupervisorPtySpawner for RecordingSpawner {
+        type Output = SpawnReceipt;
+
+        fn spawn_supervisor(&self, spec: &SupervisorPtyLaunchSpec) -> Result<Self::Output> {
+            self.calls
+                .lock()
+                .expect("recording spawner mutex should stay available")
+                .push(spec.clone());
+            Ok(SpawnReceipt {
+                summary: spec.launch_summary(),
+                pane_role: spec.pane_role(),
+            })
+        }
+    }
 
     #[test]
     fn test_default_bridge_config_uses_impulse_socket() {
@@ -296,6 +416,78 @@ mod tests {
     fn test_daemon_bridge_preview_line_includes_snapshot_status() {
         let bridge = DaemonBridge::default();
         assert!(bridge.preview_line().contains("connection=disconnected"));
+    }
+
+    #[test]
+    fn test_supervisor_launch_spec_uses_supervisor_role_ref() {
+        let bridge = DaemonBridge::default();
+        let spec = bridge.supervisor_launch_spec(7);
+        assert_eq!(spec.role_ref, PaneRoleRef::Supervisor);
+    }
+
+    #[test]
+    fn test_supervisor_launch_spec_maps_to_impulse_term_supervisor_role() {
+        let bridge = DaemonBridge::default();
+        let spec = bridge.supervisor_launch_spec(7);
+        assert_eq!(spec.pane_role(), PaneRole::Supervisor);
+    }
+
+    #[test]
+    fn test_supervisor_launch_spec_includes_socket_path() {
+        let bridge = DaemonBridge::default();
+        let spec = bridge.supervisor_launch_spec(7);
+        assert_eq!(
+            spec.socket_path,
+            Some(PathBuf::from(".impulse/sockets/impulse.sock"))
+        );
+    }
+
+    #[test]
+    fn test_supervisor_launch_spec_defaults_agent_name() {
+        let bridge = DaemonBridge::default();
+        let spec = bridge.supervisor_launch_spec(7);
+        assert_eq!(spec.agent_name, "supervisor");
+    }
+
+    #[test]
+    fn test_supervisor_launch_summary_mentions_role_and_socket() {
+        let bridge = DaemonBridge::default();
+        let spec = bridge.supervisor_launch_spec(7);
+        let summary = spec.launch_summary();
+        assert!(summary.contains("role=supervisor"));
+        assert!(summary.contains(".impulse/sockets/impulse.sock"));
+    }
+
+    #[test]
+    fn test_spawn_supervisor_pty_with_passes_launch_spec_to_spawner() {
+        let bridge = DaemonBridge::default();
+        let spawner = RecordingSpawner::default();
+
+        let receipt = bridge
+            .spawn_supervisor_pty_with(42, &spawner)
+            .expect("recording spawner should capture supervisor launch");
+
+        let calls = spawner
+            .calls
+            .lock()
+            .expect("recording spawner mutex should stay available");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].pane_id, 42);
+        assert_eq!(calls[0].pane_role(), PaneRole::Supervisor);
+        assert_eq!(receipt.pane_role, PaneRole::Supervisor);
+    }
+
+    #[test]
+    fn test_spawn_supervisor_pty_with_returns_launch_summary() {
+        let bridge = DaemonBridge::default();
+        let spawner = RecordingSpawner::default();
+
+        let receipt = bridge
+            .spawn_supervisor_pty_with(7, &spawner)
+            .expect("recording spawner should return a receipt");
+
+        assert!(receipt.summary.contains("pane=7"));
+        assert!(receipt.summary.contains("command=impulse-rs"));
     }
 
     #[test]

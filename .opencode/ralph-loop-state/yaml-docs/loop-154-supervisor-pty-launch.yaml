@@ -1,0 +1,15 @@
+loop: 154
+title: supervisor pty launch
+status: completed
+summary:
+  - Added a typed SupervisorPtyLaunchSpec so the Dioxus shell can describe the privileged terminal spawn contract without leaking impulse-term details through the runtime surface.
+  - Wired DaemonBridge::spawn_supervisor_pty() to the real impulse-term TerminalPanel::spawn_supervisor entrypoint through a narrow spawner trait.
+  - Added contract tests for role mapping, socket propagation, and spawner invocation without depending on a live PTY process.
+files:
+  - impulse-supervisor/src/daemon_bridge.rs
+verification:
+  - cargo test --workspace -p impulse-supervisor
+  - cargo clippy -p impulse-supervisor -- -D warnings
+  - cargo fmt --check -p impulse-supervisor
+notes:
+  - The bridge still uses the local protocol-compatible daemon client mirror because the workspace root does not expose src/client as a reusable library target yet.
