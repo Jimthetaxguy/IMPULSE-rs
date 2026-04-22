@@ -1,4 +1,4 @@
-use crate::daemon_bridge::{preview_bridge_line, BridgeConfig, BridgeConnectionState};
+use crate::daemon_bridge::DaemonBridge;
 use dioxus::prelude::*;
 use impulse_supervisor::layout::{LayoutMode, WorkerGrid};
 use impulse_supervisor::state::{ShellState, TerminalState};
@@ -199,10 +199,7 @@ pub fn render_bootstrap_console(bootstrap: &RuntimeBootstrap) -> String {
     let sidebar = supervisor_sidebar_view(bootstrap);
     let status_chip = supervisor_status_chip_view(&sidebar.status_label);
     let registry_summary = pane_registry_summary_view(&bootstrap_shell_state());
-    let bridge_preview = preview_bridge_line(
-        &BridgeConfig::default(),
-        &BridgeConnectionState::Disconnected,
-    );
+    let bridge_preview = DaemonBridge::default().preview_line();
     let panes = worker_pane_stub_views(bootstrap);
     let titles = panes
         .iter()

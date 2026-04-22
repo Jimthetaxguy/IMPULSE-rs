@@ -61,6 +61,72 @@ pub fn preview_bridge_line(config: &BridgeConfig, state: &BridgeConnectionState)
     )
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonStatusSnapshot {
+    pub connection_state: BridgeConnectionState,
+    pub protocol_version: Option<u64>,
+    pub raw_status: Option<serde_json::Value>,
+}
+
+pub struct DaemonBridge {
+    config: BridgeConfig,
+}
+
+impl Default for DaemonBridge {
+    fn default() -> Self {
+        Self::new(BridgeConfig::default())
+    }
+}
+
+impl DaemonBridge {
+    pub fn new(config: BridgeConfig) -> Self {
+        Self { config }
+    }
+
+    pub fn preview_line(&self) -> String {
+        preview_bridge_line(&self.config, &BridgeConnectionState::Disconnected)
+    }
+
+    #[allow(dead_code)] // dead_code: runtime-driven daemon polling lands in loops 154-155.
+    pub async fn probe_connection(&self) -> BridgeConnectionState {
+        let client = RawDaemonClient::new(self.config.socket_path.clone());
+        connection_state_from_ping_result(client.ping().await)
+    }
+
+    #[allow(dead_code)] // dead_code: runtime-driven daemon polling lands in loops 154-155.
+    pub async fn status_snapshot(&self) -> DaemonStatusSnapshot {
+        let client = RawDaemonClient::new(self.config.socket_path.clone());
+        match client.status_value().await {
+            Ok(raw) => status_snapshot_from_value(raw, BridgeConnectionState::Connected),
+            Err(error) => DaemonStatusSnapshot {
+                connection_state: BridgeConnectionState::Error(error.to_string()),
+                protocol_version: None,
+                raw_status: None,
+            },
+        }
+    }
+}
+
+fn connection_state_from_ping_result(result: Result<bool>) -> BridgeConnectionState {
+    match result {
+        Ok(true) => BridgeConnectionState::Connected,
+        Ok(false) => BridgeConnectionState::Pending,
+        Err(error) => BridgeConnectionState::Error(error.to_string()),
+    }
+}
+
+fn status_snapshot_from_value(
+    raw: serde_json::Value,
+    connection_state: BridgeConnectionState,
+) -> DaemonStatusSnapshot {
+    let protocol_version = raw.get("protocol_version").and_then(|value| value.as_u64());
+    DaemonStatusSnapshot {
+        connection_state,
+        protocol_version,
+        raw_status: Some(raw),
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", content = "data")]
 enum MirrorDaemonRequest {
@@ -190,6 +256,39 @@ mod tests {
         let preview =
             preview_bridge_line(&BridgeConfig::default(), &BridgeConnectionState::Pending);
         assert!(preview.contains("daemon=pending"));
+    }
+
+    #[test]
+    fn test_daemon_bridge_preview_line_uses_default_config() {
+        let bridge = DaemonBridge::default();
+        assert!(bridge
+            .preview_line()
+            .contains(".impulse/sockets/impulse.sock"));
+    }
+
+    #[test]
+    fn test_connection_state_from_ping_result_connected() {
+        let state = connection_state_from_ping_result(Ok(true));
+        assert_eq!(state, BridgeConnectionState::Connected);
+    }
+
+    #[test]
+    fn test_connection_state_from_ping_result_error() {
+        let state = connection_state_from_ping_result(Err(anyhow::anyhow!("socket unavailable")));
+        assert!(matches!(state, BridgeConnectionState::Error(_)));
+    }
+
+    #[test]
+    fn test_status_snapshot_from_value_extracts_protocol_version() {
+        let snapshot = status_snapshot_from_value(
+            serde_json::json!({
+                "status": "ready",
+                "protocol_version": 7
+            }),
+            BridgeConnectionState::Connected,
+        );
+        assert_eq!(snapshot.protocol_version, Some(7));
+        assert_eq!(snapshot.raw_status.unwrap()["status"], "ready");
     }
 
     async fn serve_single_response(
