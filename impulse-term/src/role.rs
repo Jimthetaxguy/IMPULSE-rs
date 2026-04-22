@@ -24,19 +24,14 @@ use std::path::Path;
 /// Role is immutable for the lifetime of a panel — a worker pane cannot be
 /// promoted to a supervisor, and vice versa. If a role change is needed,
 /// kill the pane and spawn a replacement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PaneRole {
     /// Normal worker pane (default). Standard PTY, no cross-pane visibility.
+    #[default]
     Worker,
     /// Supervisor pane. Privileged: receives IMPULSE_CMD_SOCKET env var,
     /// impulse-skills/ mount, direct daemon socket handle, cross-pane visibility.
     Supervisor,
-}
-
-impl Default for PaneRole {
-    fn default() -> Self {
-        Self::Worker
-    }
 }
 
 impl PaneRole {
@@ -50,10 +45,7 @@ impl PaneRole {
     pub fn spawn_env_vars(&self, socket_path: Option<&Path>) -> Vec<(String, String)> {
         let mut vars = vec![("IMPULSE_PANE_ROLE".to_string(), self.as_str().to_string())];
         if let (PaneRole::Supervisor, Some(path)) = (self, socket_path) {
-            vars.push((
-                "IMPULSE_CMD_SOCKET".to_string(),
-                path.display().to_string(),
-            ));
+            vars.push(("IMPULSE_CMD_SOCKET".to_string(), path.display().to_string()));
             vars.push(("IMPULSE_SUPERVISOR".to_string(), "1".to_string()));
         }
         vars
@@ -172,7 +164,10 @@ mod tests {
         // Path with spaces / unicode should round-trip via Display.
         let path = PathBuf::from("/var/run/impulse-agent.sock");
         let vars = PaneRole::Supervisor.spawn_env_vars(Some(&path));
-        let sock = vars.iter().find(|(k, _)| k == "IMPULSE_CMD_SOCKET").unwrap();
+        let sock = vars
+            .iter()
+            .find(|(k, _)| k == "IMPULSE_CMD_SOCKET")
+            .unwrap();
         assert_eq!(sock.1, "/var/run/impulse-agent.sock");
     }
 
