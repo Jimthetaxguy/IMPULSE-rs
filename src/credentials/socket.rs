@@ -274,7 +274,10 @@ mod tests {
         // added later, update this test.
         let p = provider();
         let result = p.get("key\0with-null");
-        assert!(matches!(result, Err(CredentialError::ProviderUnavailable(_))));
+        assert!(matches!(
+            result,
+            Err(CredentialError::ProviderUnavailable(_))
+        ));
     }
 
     proptest! {

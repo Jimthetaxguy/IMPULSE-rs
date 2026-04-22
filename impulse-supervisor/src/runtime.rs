@@ -199,7 +199,7 @@ pub fn render_bootstrap_console(bootstrap: &RuntimeBootstrap) -> String {
     let sidebar = supervisor_sidebar_view(bootstrap);
     let status_chip = supervisor_status_chip_view(&sidebar.status_label);
     let registry_summary = pane_registry_summary_view(&bootstrap_shell_state());
-    let bridge_preview = DaemonBridge::default().preview_line();
+    let bridge_preview = DaemonBridge::default().startup_preview_line();
     let panes = worker_pane_stub_views(bootstrap);
     let titles = panes
         .iter()
@@ -570,6 +570,12 @@ mod tests {
     fn test_render_runtime_console_mentions_layout_label() {
         let console = render_runtime_console(&runtime_model());
         assert!(console.contains("layout=SidebarWithGrid"));
+    }
+
+    #[test]
+    fn test_render_runtime_console_mentions_bridge_lifecycle_preview() {
+        let console = render_runtime_console(&runtime_model());
+        assert!(console.contains("bridge=pending -> waiting protocol=?"));
     }
 
     #[test]

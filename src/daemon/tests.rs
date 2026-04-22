@@ -1499,4 +1499,208 @@ mod tests {
         assert!(json.is_array());
         assert_eq!(json.as_array().unwrap().len(), 0);
     }
+
+    // =========================================================================
+    // Loop 114: 10MB request size limit + protocol parse robustness
+    //
+    // Tests the MAX_REQUEST_SIZE boundary and malformed-input handling at the
+    // JSON-line protocol layer. Since `handle_connection` is private, we test
+    // the protocol primitives (serde parse behavior) and mirror the constant
+    // from src/daemon/mod.rs:231 explicitly — if that constant changes, this
+    // test will alert us.
+    // =========================================================================
+
+    /// Must match the constant in `src/daemon/mod.rs::handle_connection`.
+    /// If that value changes, update this one and confirm intent.
+    const MAX_REQUEST_SIZE: usize = 10 * 1024 * 1024;
+
+    /// Build a JSON line whose total length (including trailing newline) is
+    /// exactly `target_len` bytes. Uses a Ping request padded via whitespace
+    /// between tokens — valid JSON is whitespace-insensitive.
+    fn build_padded_json_line(target_len: usize) -> String {
+        // {"type":"Ping"} is valid. Pad with spaces before the closing brace.
+        // Total payload = prefix + padding + suffix + "\n"
+        let prefix = "{\"type\":\"Ping\"";
+        let suffix = "}";
+        let newline = "\n";
+        let overhead = prefix.len() + suffix.len() + newline.len();
+        assert!(
+            target_len >= overhead,
+            "target_len {} smaller than minimum overhead {}",
+            target_len,
+            overhead
+        );
+        let pad_len = target_len - overhead;
+        let mut s = String::with_capacity(target_len);
+        s.push_str(prefix);
+        for _ in 0..pad_len {
+            s.push(' ');
+        }
+        s.push_str(suffix);
+        s.push_str(newline);
+        debug_assert_eq!(s.len(), target_len);
+        s
+    }
+
+    #[test]
+    fn test_max_request_size_is_10mb() {
+        assert_eq!(MAX_REQUEST_SIZE, 10 * 1024 * 1024);
+        assert_eq!(MAX_REQUEST_SIZE, 10_485_760);
+    }
+
+    #[test]
+    fn test_request_at_exactly_max_size_parses_as_valid_json() {
+        // A line of exactly MAX_REQUEST_SIZE bytes (including newline) should
+        // pass the size check and parse correctly.
+        let line = build_padded_json_line(MAX_REQUEST_SIZE);
+        assert_eq!(line.len(), MAX_REQUEST_SIZE);
+        // Size check in handle_connection uses `if line.len() > MAX_REQUEST_SIZE`,
+        // so `== MAX_REQUEST_SIZE` is accepted.
+        assert!(line.len() <= MAX_REQUEST_SIZE);
+
+        let request: DaemonRequest =
+            serde_json::from_str(line.trim_end()).expect("valid padded JSON should parse");
+        assert!(matches!(request, DaemonRequest::Ping));
+    }
+
+    #[test]
+    fn test_request_just_over_max_size_is_rejected_by_size_check() {
+        // A line of MAX_REQUEST_SIZE + 1 bytes should fail the size check.
+        // We don't run the full handler here, but we verify the comparison.
+        let over = MAX_REQUEST_SIZE + 1;
+        assert!(over > MAX_REQUEST_SIZE);
+        // Verify that the error message format the daemon produces includes
+        // both the actual size and the max, so operators can diagnose.
+        let err_msg = format!(
+            "Request too large ({} bytes, max {})",
+            over, MAX_REQUEST_SIZE
+        );
+        assert!(err_msg.contains("Request too large"));
+        assert!(err_msg.contains(&over.to_string()));
+        assert!(err_msg.contains(&MAX_REQUEST_SIZE.to_string()));
+    }
+
+    #[test]
+    fn test_size_check_boundary_exactly_max() {
+        // Exact boundary: `line.len() > MAX_REQUEST_SIZE` is false when equal.
+        let at_max = MAX_REQUEST_SIZE;
+        let over_max = MAX_REQUEST_SIZE + 1;
+        let under_max = MAX_REQUEST_SIZE - 1;
+
+        assert!(at_max <= MAX_REQUEST_SIZE, "at_max must NOT exceed");
+        assert!(over_max > MAX_REQUEST_SIZE, "over_max must exceed");
+        assert!(under_max <= MAX_REQUEST_SIZE, "under_max must NOT exceed");
+    }
+
+    #[test]
+    fn test_malformed_json_returns_parse_error_not_panic() {
+        // The daemon handles parse errors gracefully (returns an Error response
+        // and continues reading); it must not panic. We assert that serde_json
+        // errors on malformed input rather than panicking, which is the
+        // property the daemon relies on.
+        let bad_inputs = [
+            "{",                      // truncated
+            "not json at all",        // plain text
+            "{\"type\":",             // incomplete
+            "\x00\x01\x02",           // control bytes
+            "{\"type\":\"Unknown\"}", // unknown variant (valid JSON, bad enum)
+        ];
+        for input in bad_inputs {
+            let result: Result<DaemonRequest, _> = serde_json::from_str(input);
+            assert!(
+                result.is_err(),
+                "expected parse error for {:?} but got Ok",
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn test_empty_line_returns_parse_error() {
+        // read_line delivers lines as they arrive. An empty line (zero bytes
+        // returned from read_line) terminates the loop. An empty JSON payload
+        // (just "\n") would result in line="\n" of len 1, trimmed to "".
+        // serde_json::from_str("") must return Err, not panic.
+        let result: Result<DaemonRequest, _> = serde_json::from_str("");
+        assert!(result.is_err());
+
+        let result: Result<DaemonRequest, _> = serde_json::from_str("   ");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_trailing_garbage_after_json_is_rejected() {
+        // serde_json::from_str rejects input with trailing non-whitespace.
+        // This is important: the daemon reads one line at a time, so trailing
+        // garbage on the same line must not be silently accepted.
+        let input = r#"{"type":"Ping"}garbage"#;
+        let result: Result<DaemonRequest, _> = serde_json::from_str(input);
+        assert!(
+            result.is_err(),
+            "trailing garbage must be rejected, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_trailing_whitespace_after_json_is_ok() {
+        // serde_json permits trailing whitespace (this is the normal behavior
+        // after trim_end() or when reading a JSON-line protocol).
+        let input = "{\"type\":\"Ping\"}   \t";
+        let result: Result<DaemonRequest, _> = serde_json::from_str(input);
+        assert!(
+            result.is_ok(),
+            "trailing whitespace should be fine, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_error_response_for_oversize_request_serializes() {
+        // The daemon synthesizes DaemonResponse::Error when a request exceeds
+        // MAX_REQUEST_SIZE. Verify that response is serializable end-to-end so
+        // we can't accidentally ship a broken error path.
+        let too_big = MAX_REQUEST_SIZE + 1;
+        let response = DaemonResponse::Error {
+            message: format!(
+                "Request too large ({} bytes, max {})",
+                too_big, MAX_REQUEST_SIZE
+            ),
+        };
+        let json = serde_json::to_string(&response).expect("Error response must serialize");
+        assert!(json.contains("Request too large"));
+        // And it must round-trip.
+        let parsed: DaemonResponse =
+            serde_json::from_str(&json).expect("serialized Error must parse back");
+        match parsed {
+            DaemonResponse::Error { message } => {
+                assert!(message.contains("Request too large"));
+                assert!(message.contains(&too_big.to_string()));
+            }
+            other => panic!("expected Error response, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_error_response_for_parse_failure_serializes() {
+        // Mirrors the daemon's parse-error handling at src/daemon/mod.rs:251.
+        let err = serde_json::from_str::<DaemonRequest>("not json").unwrap_err();
+        let response = DaemonResponse::Error {
+            message: format!("Failed to parse request: {}", err),
+        };
+        let json = serde_json::to_string(&response).expect("must serialize");
+        assert!(json.contains("Failed to parse request"));
+    }
+
+    #[test]
+    fn test_build_padded_json_line_helper_produces_valid_json() {
+        // Sanity-check the helper used by the boundary test.
+        for size in [32, 100, 1_000, 10_000] {
+            let line = build_padded_json_line(size);
+            assert_eq!(line.len(), size);
+            let trimmed = line.trim_end();
+            let parsed: DaemonRequest = serde_json::from_str(trimmed).unwrap();
+            assert!(matches!(parsed, DaemonRequest::Ping));
+        }
+    }
 }

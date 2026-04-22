@@ -29,6 +29,8 @@ pub enum BridgeConnectionState {
 }
 
 impl BridgeConfig {
+    // dead_code: consumed by preview_bridge_line in loops 158+ (status-bar component).
+    #[allow(dead_code)]
     pub fn socket_display(&self) -> String {
         self.socket_path.display().to_string()
     }
@@ -56,6 +58,8 @@ impl BridgeConnectionState {
     }
 }
 
+// dead_code: consumed by DaemonBridge::preview_line in loops 158+ (status-bar component).
+#[allow(dead_code)]
 pub fn preview_bridge_line(config: &BridgeConfig, state: &BridgeConnectionState) -> String {
     format!(
         "daemon={} @ {} via {}",
@@ -70,6 +74,12 @@ pub struct DaemonStatusSnapshot {
     pub connection_state: BridgeConnectionState,
     pub protocol_version: Option<u64>,
     pub raw_status: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeLifecycleSnapshot {
+    pub pending: DaemonStatusSnapshot,
+    pub settled: DaemonStatusSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +139,8 @@ impl DaemonBridge {
         Self { config }
     }
 
+    // dead_code: status-bar component will call this in loops 158+.
+    #[allow(dead_code)]
     pub fn preview_line(&self) -> String {
         let snapshot = self.disconnected_snapshot();
         format!(
@@ -141,6 +153,14 @@ impl DaemonBridge {
     pub fn disconnected_snapshot(&self) -> DaemonStatusSnapshot {
         DaemonStatusSnapshot {
             connection_state: BridgeConnectionState::Disconnected,
+            protocol_version: None,
+            raw_status: None,
+        }
+    }
+
+    pub fn pending_snapshot(&self) -> DaemonStatusSnapshot {
+        DaemonStatusSnapshot {
+            connection_state: BridgeConnectionState::Pending,
             protocol_version: None,
             raw_status: None,
         }
@@ -176,6 +196,18 @@ impl DaemonBridge {
             .context(format!("spawn supervisor pty: {}", spec.launch_summary()))
     }
 
+    pub fn lifecycle_from_settled(&self, settled: DaemonStatusSnapshot) -> BridgeLifecycleSnapshot {
+        BridgeLifecycleSnapshot {
+            pending: self.pending_snapshot(),
+            settled,
+        }
+    }
+
+    pub fn startup_preview_line(&self) -> String {
+        self.lifecycle_from_settled(self.disconnected_snapshot())
+            .transition_line()
+    }
+
     #[allow(dead_code)] // dead_code: runtime-driven daemon polling lands in loops 154-155.
     pub async fn probe_connection(&self) -> BridgeConnectionState {
         let client = RawDaemonClient::new(self.config.socket_path.clone());
@@ -194,9 +226,17 @@ impl DaemonBridge {
             },
         }
     }
+
+    #[allow(dead_code)] // dead_code: runtime polling upgrades from preview-only to async lifecycle reconciliation after phase 7.
+    pub async fn connection_lifecycle(&self) -> BridgeLifecycleSnapshot {
+        let settled = self.status_snapshot().await;
+        self.lifecycle_from_settled(settled)
+    }
 }
 
 impl DaemonStatusSnapshot {
+    // dead_code: consumed by DaemonBridge::preview_line in loops 158+ (status-bar).
+    #[allow(dead_code)]
     pub fn status_line(&self) -> String {
         let protocol = self
             .protocol_version
@@ -205,6 +245,31 @@ impl DaemonStatusSnapshot {
         format!(
             "connection={} protocol={protocol}",
             self.connection_state.label(),
+        )
+    }
+}
+
+impl BridgeLifecycleSnapshot {
+    fn settled_label(&self) -> String {
+        match &self.settled.connection_state {
+            BridgeConnectionState::Disconnected => "waiting".to_string(),
+            BridgeConnectionState::Error(message) => {
+                format!("error ({message})")
+            }
+            state => state.label().to_string(),
+        }
+    }
+
+    pub fn transition_line(&self) -> String {
+        let protocol = self
+            .settled
+            .protocol_version
+            .map(|version| version.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        format!(
+            "bridge={} -> {} protocol={protocol}",
+            self.pending.connection_state.label(),
+            self.settled_label()
         )
     }
 }
@@ -419,6 +484,13 @@ mod tests {
     }
 
     #[test]
+    fn test_pending_snapshot_marks_bridge_pending() {
+        let bridge = DaemonBridge::default();
+        let snapshot = bridge.pending_snapshot();
+        assert_eq!(snapshot.connection_state, BridgeConnectionState::Pending);
+    }
+
+    #[test]
     fn test_supervisor_launch_spec_uses_supervisor_role_ref() {
         let bridge = DaemonBridge::default();
         let spec = bridge.supervisor_launch_spec(7);
@@ -488,6 +560,53 @@ mod tests {
 
         assert!(receipt.summary.contains("pane=7"));
         assert!(receipt.summary.contains("command=impulse-rs"));
+    }
+
+    #[test]
+    fn test_lifecycle_from_settled_starts_pending() {
+        let bridge = DaemonBridge::default();
+        let lifecycle = bridge.lifecycle_from_settled(bridge.disconnected_snapshot());
+        assert_eq!(lifecycle.pending.connection_state, BridgeConnectionState::Pending);
+    }
+
+    #[test]
+    fn test_lifecycle_transition_line_reports_connected_protocol() {
+        let bridge = DaemonBridge::default();
+        let lifecycle = bridge.lifecycle_from_settled(status_snapshot_from_value(
+            serde_json::json!({ "protocol_version": 9 }),
+            BridgeConnectionState::Connected,
+        ));
+        assert_eq!(lifecycle.transition_line(), "bridge=pending -> connected protocol=9");
+    }
+
+    #[test]
+    fn test_lifecycle_transition_line_reports_waiting_when_disconnected() {
+        let bridge = DaemonBridge::default();
+        let lifecycle = bridge.lifecycle_from_settled(bridge.disconnected_snapshot());
+        assert_eq!(lifecycle.transition_line(), "bridge=pending -> waiting protocol=?");
+    }
+
+    #[test]
+    fn test_lifecycle_transition_line_reports_error_message() {
+        let bridge = DaemonBridge::default();
+        let lifecycle = bridge.lifecycle_from_settled(DaemonStatusSnapshot {
+            connection_state: BridgeConnectionState::Error("socket unavailable".into()),
+            protocol_version: None,
+            raw_status: None,
+        });
+        assert_eq!(
+            lifecycle.transition_line(),
+            "bridge=pending -> error (socket unavailable) protocol=?"
+        );
+    }
+
+    #[test]
+    fn test_startup_preview_line_uses_waiting_transition() {
+        let bridge = DaemonBridge::default();
+        assert_eq!(
+            bridge.startup_preview_line(),
+            "bridge=pending -> waiting protocol=?"
+        );
     }
 
     #[test]

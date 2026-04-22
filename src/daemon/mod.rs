@@ -11,6 +11,8 @@
 //! - This file — `Daemon` struct, startup, socket accept loop, shutdown
 
 pub mod handlers;
+#[cfg(unix)]
+pub mod peer_cred;
 pub mod protocol;
 
 // Re-export protocol types so existing `crate::daemon::DaemonRequest` paths keep working.
