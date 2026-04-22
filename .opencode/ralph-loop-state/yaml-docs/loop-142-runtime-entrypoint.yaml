@@ -1,0 +1,16 @@
+loop: 142
+title: runtime entrypoint skeleton
+status: completed
+summary:
+  - Added impulse-supervisor binary entrypoint in src/main.rs.
+  - Added runtime.rs with the experimental-runtime launch gate and default console fallback.
+  - Established runtime bootstrap helpers and baseline supervisor shell tests.
+files:
+  - impulse-supervisor/src/main.rs
+  - impulse-supervisor/src/runtime.rs
+verification:
+  - cargo test --workspace -p impulse-supervisor
+  - cargo clippy -p impulse-supervisor -- -D warnings
+  - cargo fmt --check -p impulse-supervisor
+notes:
+  - The non-feature code path now exercises runtime helpers so clippy stays clean without requiring the Dioxus launch feature.
