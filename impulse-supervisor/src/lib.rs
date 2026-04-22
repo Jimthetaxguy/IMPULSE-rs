@@ -147,10 +147,20 @@ mod tests {
         assert_eq!(id, recovered);
     }
 
+    // Compile-time invariants (catch at build time, not test time).
+    const _: () = assert!(SUPERVISOR_SIDEBAR_WIDTH_PX >= 300);
+    const _: () = assert!(MIN_WORKER_PANE_WIDTH_PX >= 200);
+    const _: () = assert!(SUPERVISOR_SIDEBAR_WIDTH_PX > MIN_WORKER_PANE_WIDTH_PX);
+
     #[test]
-    fn test_layout_constants_are_sane() {
-        assert!(SUPERVISOR_SIDEBAR_WIDTH_PX >= 300);
-        assert!(MIN_WORKER_PANE_WIDTH_PX >= 200);
+    fn test_layout_constants_compile() {
+        // The const-block assertions above do the real work; this test just
+        // anchors them so they're visible in test output.
+        assert_eq!(
+            SUPERVISOR_SIDEBAR_WIDTH_PX % 4,
+            0,
+            "width should be 4-aligned"
+        );
     }
 
     #[test]

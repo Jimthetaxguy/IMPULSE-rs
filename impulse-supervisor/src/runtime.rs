@@ -25,6 +25,14 @@ pub struct WorkerPaneStubView {
     pub detail: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeModel {
+    pub bootstrap: RuntimeBootstrap,
+    pub sidebar: SupervisorSidebarView,
+    pub worker_panes: Vec<WorkerPaneStubView>,
+    pub worker_grid_class: &'static str,
+}
+
 pub fn runtime_disabled_message() -> &'static str {
     "impulse-supervisor requires `--features experimental-runtime` to launch the Dioxus desktop runtime."
 }
@@ -117,6 +125,16 @@ pub fn render_bootstrap_console(bootstrap: &RuntimeBootstrap) -> String {
     )
 }
 
+pub fn runtime_model() -> RuntimeModel {
+    let bootstrap = runtime_bootstrap();
+    RuntimeModel {
+        sidebar: supervisor_sidebar_view(&bootstrap),
+        worker_panes: worker_pane_stub_views(&bootstrap),
+        worker_grid_class: worker_grid_class(bootstrap.worker_grid),
+        bootstrap,
+    }
+}
+
 #[cfg(feature = "experimental-runtime")]
 pub fn launch_desktop() {
     dioxus_desktop::launch(SupervisorRuntimeApp);
@@ -141,23 +159,21 @@ pub fn run() {
 
 #[component]
 pub fn SupervisorRuntimeApp() -> Element {
-    let bootstrap = use_signal(runtime_bootstrap);
-    let bootstrap_state = bootstrap.read().clone();
-    let sidebar = supervisor_sidebar_view(&bootstrap_state);
-    let worker_panes = worker_pane_stub_views(&bootstrap_state);
+    let model = use_signal(runtime_model);
+    let runtime = model.read().clone();
 
     rsx! {
         div {
             id: "impulse-supervisor-runtime",
             class: "layout-sidebar-with-grid",
-            h1 { "{bootstrap_state.title}" }
-            p { class: "runtime-status", "{bootstrap_state.status_label}" }
+            h1 { "{runtime.bootstrap.title}" }
+            p { class: "runtime-status", "{runtime.bootstrap.status_label}" }
             div {
                 class: "runtime-layout",
-                SupervisorSidebar { view: sidebar }
+                SupervisorSidebar { view: runtime.sidebar }
                 WorkerGridPanel {
-                    grid: bootstrap_state.worker_grid,
-                    panes: worker_panes,
+                    grid: runtime.bootstrap.worker_grid,
+                    panes: runtime.worker_panes,
                 }
             }
         }
@@ -319,5 +335,29 @@ mod tests {
         let console = render_bootstrap_console(&runtime_bootstrap());
         assert!(console.contains("Worker 1"));
         assert!(console.contains("Worker 2"));
+    }
+
+    #[test]
+    fn test_runtime_model_uses_bootstrap_title() {
+        let model = runtime_model();
+        assert_eq!(model.bootstrap.title, WINDOW_TITLE);
+    }
+
+    #[test]
+    fn test_runtime_model_carries_sidebar_heading() {
+        let model = runtime_model();
+        assert_eq!(model.sidebar.heading, "Supervisor");
+    }
+
+    #[test]
+    fn test_runtime_model_carries_worker_grid_class() {
+        let model = runtime_model();
+        assert_eq!(model.worker_grid_class, "worker-grid-two-column");
+    }
+
+    #[test]
+    fn test_runtime_model_worker_count_matches_stub_views() {
+        let model = runtime_model();
+        assert_eq!(model.worker_panes.len(), 2);
     }
 }

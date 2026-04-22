@@ -1,0 +1,14 @@
+loop: 143
+title: runtime view model extraction
+status: completed
+summary:
+  - Added RuntimeModel so the Dioxus app consumes a single composed shell snapshot.
+  - Switched the app component from ad hoc bootstrap-derived values to a signal-backed runtime model.
+  - Normalized supervisor lib formatting so package fmt checks stay green.
+files:
+  - impulse-supervisor/src/lib.rs
+  - impulse-supervisor/src/runtime.rs
+verification:
+  - cargo test --workspace -p impulse-supervisor
+  - cargo clippy -p impulse-supervisor -- -D warnings
+  - cargo fmt --check -p impulse-supervisor
