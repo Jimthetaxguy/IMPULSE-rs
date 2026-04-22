@@ -254,6 +254,14 @@ pub fn refresh_runtime_model(model: &mut RuntimeModel, state: &ShellState) {
     *model = runtime_model_from_state(state);
 }
 
+pub fn runtime_shell_model(state: &ShellState) -> RuntimeModel {
+    runtime_model_from_state(state)
+}
+
+pub fn runtime_shell_root_class(state: &ShellState) -> &'static str {
+    shell_root_class(state.terminals.layout)
+}
+
 pub fn render_runtime_console(model: &RuntimeModel) -> String {
     render_bootstrap_console(&model.bootstrap)
 }
@@ -271,22 +279,35 @@ pub fn run() {
 
     #[cfg(not(feature = "experimental-runtime"))]
     {
-        let mut model = runtime_model();
-        refresh_runtime_model(&mut model, &bootstrap_shell_state());
+        let state = bootstrap_shell_state();
+        let bootstrap = runtime_bootstrap();
+        let baseline_model = runtime_model();
+        let mut model = runtime_shell_model(&state);
+        let root_class = runtime_shell_root_class(&state);
+        refresh_runtime_model(&mut model, &state);
         eprintln!(
-            "{} {}",
+            "{} {} | baseline={baseline_console} | shell={root_class} | bootstrap={bootstrap_console}",
             runtime_disabled_message(),
-            render_runtime_console(&model)
+            render_runtime_console(&model),
+            baseline_console = render_runtime_console(&baseline_model),
+            bootstrap_console = render_bootstrap_console(&bootstrap)
         );
     }
 }
 
 #[component]
 pub fn SupervisorRuntimeApp() -> Element {
-    let model = use_signal(runtime_model);
-    let runtime = model.read().clone();
+    rsx! {
+        RuntimeShell {}
+    }
+}
+
+#[component]
+pub fn RuntimeShell() -> Element {
+    let shell_state = use_signal(bootstrap_shell_state);
+    let runtime = runtime_shell_model(&shell_state.read());
     let header = runtime.header.clone();
-    let root_class = shell_root_class(runtime.bootstrap.layout);
+    let root_class = runtime_shell_root_class(&shell_state.read());
 
     rsx! {
         div {
@@ -623,6 +644,30 @@ mod tests {
     fn test_runtime_model_carries_header_title() {
         let model = runtime_model();
         assert_eq!(model.header.title, WINDOW_TITLE);
+    }
+
+    #[test]
+    fn test_runtime_shell_model_matches_runtime_model_from_state() {
+        let state = bootstrap_shell_state();
+        assert_eq!(
+            runtime_shell_model(&state),
+            runtime_model_from_state(&state)
+        );
+    }
+
+    #[test]
+    fn test_runtime_shell_root_class_uses_layout() {
+        let mut state = bootstrap_shell_state();
+        state.terminals.layout = LayoutMode::SupervisorFocus;
+        assert_eq!(runtime_shell_root_class(&state), "layout-supervisor-focus");
+    }
+
+    #[test]
+    fn test_runtime_shell_model_preserves_registry_summary() {
+        let mut state = bootstrap_shell_state();
+        state.session.registered_projects.push("impulse".into());
+        let model = runtime_shell_model(&state);
+        assert_eq!(model.registry_summary.project_count, 1);
     }
 
     #[test]

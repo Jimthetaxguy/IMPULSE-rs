@@ -1,0 +1,23 @@
+loop: 150
+title: runtime shell checkpoint
+status: completed_with_external_test_blocker
+summary:
+  - Added a RuntimeShell component that owns the shell state behind a Dioxus signal.
+  - Reduced SupervisorRuntimeApp to a thin launch wrapper so daemon-driven updates can target one signal boundary later.
+  - Added shell-model tests and prepared the crate for the L150 full-workspace checkpoint.
+  - Full-workspace clippy passed, but the required workspace test command is intermittently blocked by foreign daemon socket startup failures in src/integration_tests.rs outside supervisor ownership.
+files:
+  - impulse-supervisor/src/runtime.rs
+verification:
+  - cargo test --workspace -p impulse-supervisor
+  - cargo clippy -p impulse-supervisor -- -D warnings
+  - cargo fmt --check -p impulse-supervisor
+  - cargo test -p impulse-supervisor -- --test-threads=1
+  - cargo test
+  - cargo clippy -- -D warnings
+blockers:
+  - command: cargo test --workspace -p impulse-supervisor
+    failure:
+      - integration_tests::test_daemon_chat_apply_mode_includes_injected_block
+      - integration_tests::test_daemon_chat_review_mode_stages_artifact_without_apply
+    cause: daemon socket did not become ready in src/integration_tests.rs, outside supervisor ownership
