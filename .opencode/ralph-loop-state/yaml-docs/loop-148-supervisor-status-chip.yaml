@@ -1,0 +1,13 @@
+loop: 148
+title: supervisor status chip component
+status: completed
+summary:
+  - Added a dedicated SupervisorStatusChip component so supervisor readiness has its own view contract.
+  - Derived ready versus pending tone classes from the shell status label without widening the scaffold surface.
+  - Covered chip tone and label preservation with runtime tests.
+files:
+  - impulse-supervisor/src/runtime.rs
+verification:
+  - cargo test --workspace -p impulse-supervisor
+  - cargo clippy -p impulse-supervisor -- -D warnings
+  - cargo fmt --check -p impulse-supervisor

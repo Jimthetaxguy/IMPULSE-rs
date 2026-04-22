@@ -20,6 +20,12 @@ pub struct SupervisorSidebarView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupervisorStatusChipView {
+    pub label: String,
+    pub tone_class: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerPaneStubView {
     pub title: String,
     pub detail: String,
@@ -92,6 +98,19 @@ pub fn supervisor_sidebar_view(bootstrap: &RuntimeBootstrap) -> SupervisorSideba
     }
 }
 
+pub fn supervisor_status_chip_view(status_label: &str) -> SupervisorStatusChipView {
+    let tone_class = if status_label.contains("ready") {
+        "status-chip-ready"
+    } else {
+        "status-chip-pending"
+    };
+
+    SupervisorStatusChipView {
+        label: status_label.to_string(),
+        tone_class,
+    }
+}
+
 pub fn worker_grid_class(grid: WorkerGrid) -> &'static str {
     match grid {
         WorkerGrid::Single => "worker-grid-single",
@@ -148,6 +167,7 @@ pub fn worker_summary_label(panes: &[WorkerPaneStubView]) -> String {
 pub fn render_bootstrap_console(bootstrap: &RuntimeBootstrap) -> String {
     let header = runtime_header_view(bootstrap);
     let sidebar = supervisor_sidebar_view(bootstrap);
+    let status_chip = supervisor_status_chip_view(&sidebar.status_label);
     let panes = worker_pane_stub_views(bootstrap);
     let titles = panes
         .iter()
@@ -156,9 +176,11 @@ pub fn render_bootstrap_console(bootstrap: &RuntimeBootstrap) -> String {
         .join(", ");
 
     format!(
-        "{title} [{status}] | layout={layout} | root={root_class} | {heading}: {detail} | {grid} | {titles}",
+        "{title} [{status}] | chip={chip}::{tone} | layout={layout} | root={root_class} | {heading}: {detail} | {grid} | {titles}",
         title = header.title,
         status = header.status_label,
+        chip = status_chip.label,
+        tone = status_chip.tone_class,
         layout = header.layout_label,
         root_class = shell_root_class(bootstrap.layout),
         heading = sidebar.heading,
@@ -271,12 +293,24 @@ pub fn RuntimeBody(model: RuntimeModel) -> Element {
 
 #[component]
 pub fn SupervisorSidebar(view: SupervisorSidebarView) -> Element {
+    let status_chip = supervisor_status_chip_view(&view.status_label);
     rsx! {
         aside {
             class: "supervisor-sidebar",
             h2 { "{view.heading}" }
+            SupervisorStatusChip { view: status_chip }
             p { class: "sidebar-status", "{view.status_label}" }
             p { class: "sidebar-detail", "{view.detail}" }
+        }
+    }
+}
+
+#[component]
+pub fn SupervisorStatusChip(view: SupervisorStatusChipView) -> Element {
+    rsx! {
+        span {
+            class: "supervisor-status-chip {view.tone_class}",
+            "{view.label}"
         }
     }
 }
@@ -395,6 +429,24 @@ mod tests {
         let bootstrap = runtime_bootstrap();
         let view = supervisor_sidebar_view(&bootstrap);
         assert_eq!(view.status_label, bootstrap.status_label);
+    }
+
+    #[test]
+    fn test_supervisor_status_chip_pending_tone() {
+        let chip = supervisor_status_chip_view("supervisor pending · 0 worker panes");
+        assert_eq!(chip.tone_class, "status-chip-pending");
+    }
+
+    #[test]
+    fn test_supervisor_status_chip_ready_tone() {
+        let chip = supervisor_status_chip_view("supervisor ready · 2 worker panes");
+        assert_eq!(chip.tone_class, "status-chip-ready");
+    }
+
+    #[test]
+    fn test_supervisor_status_chip_preserves_label() {
+        let chip = supervisor_status_chip_view("supervisor ready · 2 worker panes");
+        assert_eq!(chip.label, "supervisor ready · 2 worker panes");
     }
 
     #[test]
