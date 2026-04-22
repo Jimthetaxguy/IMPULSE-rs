@@ -289,13 +289,22 @@ pub fn WorkerGridPanel(grid: WorkerGrid, panes: Vec<WorkerPaneStubView>) -> Elem
             h2 { "Workers" }
             p { "Default grid: {grid:?}" }
             for pane in panes {
-                div {
+                WorkerPaneCard {
                     key: "{pane.title}",
-                    class: "worker-pane-stub",
-                    h3 { "{pane.title}" }
-                    p { "{pane.detail}" }
+                    pane,
                 }
             }
+        }
+    }
+}
+
+#[component]
+pub fn WorkerPaneCard(pane: WorkerPaneStubView) -> Element {
+    rsx! {
+        article {
+            class: "worker-pane-stub",
+            h3 { "{pane.title}" }
+            p { "{pane.detail}" }
         }
     }
 }
@@ -505,6 +514,18 @@ mod tests {
     fn test_runtime_model_carries_worker_summary() {
         let model = runtime_model();
         assert_eq!(model.worker_summary, "Visible worker panes: 2");
+    }
+
+    #[test]
+    fn test_worker_pane_stub_titles_are_unique() {
+        let panes = worker_pane_stub_views(&runtime_bootstrap());
+        assert_ne!(panes[0].title, panes[1].title);
+    }
+
+    #[test]
+    fn test_worker_pane_stub_detail_mentions_placeholder() {
+        let panes = worker_pane_stub_views(&runtime_bootstrap());
+        assert!(panes[0].detail.contains("Bootstrap placeholder"));
     }
 
     #[test]

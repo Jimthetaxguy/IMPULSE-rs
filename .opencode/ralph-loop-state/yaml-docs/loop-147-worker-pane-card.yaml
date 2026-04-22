@@ -1,0 +1,13 @@
+loop: 147
+title: worker pane card component
+status: completed
+summary:
+  - Extracted worker pane stub markup into a dedicated WorkerPaneCard component.
+  - Kept WorkerGridPanel focused on layout concerns rather than card rendering details.
+  - Added worker-pane identity tests to lock the stub contract ahead of daemon/compaction overlays.
+files:
+  - impulse-supervisor/src/runtime.rs
+verification:
+  - cargo test --workspace -p impulse-supervisor
+  - cargo clippy -p impulse-supervisor -- -D warnings
+  - cargo fmt --check -p impulse-supervisor
