@@ -57,14 +57,17 @@ pub fn bootstrap_shell_state() -> ShellState {
     }
 }
 
-pub fn runtime_bootstrap() -> RuntimeBootstrap {
-    let state = bootstrap_shell_state();
+pub fn runtime_bootstrap_from_state(state: &ShellState) -> RuntimeBootstrap {
     RuntimeBootstrap {
         title: WINDOW_TITLE,
         layout: state.terminals.layout,
         worker_grid: state.terminals.worker_grid.unwrap_or(WorkerGrid::Single),
-        status_label: shell_status_label(&state),
+        status_label: shell_status_label(state),
     }
+}
+
+pub fn runtime_bootstrap() -> RuntimeBootstrap {
+    runtime_bootstrap_from_state(&bootstrap_shell_state())
 }
 
 pub fn shell_status_label(state: &ShellState) -> String {
@@ -178,6 +181,23 @@ pub fn runtime_model() -> RuntimeModel {
     }
 }
 
+pub fn runtime_model_from_state(state: &ShellState) -> RuntimeModel {
+    let bootstrap = runtime_bootstrap_from_state(state);
+    let worker_panes = worker_pane_stub_views(&bootstrap);
+    RuntimeModel {
+        header: runtime_header_view(&bootstrap),
+        sidebar: supervisor_sidebar_view(&bootstrap),
+        worker_summary: worker_summary_label(&worker_panes),
+        worker_panes,
+        worker_grid_class: worker_grid_class(bootstrap.worker_grid),
+        bootstrap,
+    }
+}
+
+pub fn refresh_runtime_model(model: &mut RuntimeModel, state: &ShellState) {
+    *model = runtime_model_from_state(state);
+}
+
 pub fn render_runtime_console(model: &RuntimeModel) -> String {
     render_bootstrap_console(&model.bootstrap)
 }
@@ -195,7 +215,8 @@ pub fn run() {
 
     #[cfg(not(feature = "experimental-runtime"))]
     {
-        let model = runtime_model();
+        let mut model = runtime_model();
+        refresh_runtime_model(&mut model, &bootstrap_shell_state());
         eprintln!(
             "{} {}",
             runtime_disabled_message(),
@@ -321,6 +342,13 @@ mod tests {
     fn test_runtime_bootstrap_uses_window_title() {
         let bootstrap = runtime_bootstrap();
         assert_eq!(bootstrap.title, WINDOW_TITLE);
+    }
+
+    #[test]
+    fn test_runtime_bootstrap_from_state_uses_explicit_grid() {
+        let state = bootstrap_shell_state();
+        let bootstrap = runtime_bootstrap_from_state(&state);
+        assert_eq!(bootstrap.worker_grid, WorkerGrid::TwoColumn);
     }
 
     #[test]
@@ -477,5 +505,55 @@ mod tests {
     fn test_runtime_model_carries_worker_summary() {
         let model = runtime_model();
         assert_eq!(model.worker_summary, "Visible worker panes: 2");
+    }
+
+    #[test]
+    fn test_runtime_model_from_state_reflects_supervisor_ready() {
+        let state: ShellState = serde_json::from_value(serde_json::json!({
+            "session": {
+                "active_project": "impulse",
+                "registered_projects": ["impulse"],
+                "focused_pane": null
+            },
+            "terminals": {
+                "registry": {
+                    "panes": {
+                        "00000000-0000-0000-0000-000000000001": {
+                            "id": "00000000-0000-0000-0000-000000000001",
+                            "role": "Supervisor",
+                            "project": "impulse",
+                            "cwd": "/tmp",
+                            "spawned_at": 0
+                        },
+                        "00000000-0000-0000-0000-000000000002": {
+                            "id": "00000000-0000-0000-0000-000000000002",
+                            "role": "Worker",
+                            "project": "impulse",
+                            "cwd": "/tmp",
+                            "spawned_at": 0
+                        }
+                    }
+                },
+                "layout": "SidebarWithGrid",
+                "worker_grid": "TwoColumn"
+            },
+            "ops": {
+                "active_compactions": [],
+                "notification_count": 0
+            }
+        }))
+        .unwrap();
+
+        let model = runtime_model_from_state(&state);
+        assert!(model.bootstrap.status_label.contains("supervisor ready"));
+        assert_eq!(model.worker_summary, "Visible worker panes: 2");
+    }
+
+    #[test]
+    fn test_refresh_runtime_model_replaces_existing_state() {
+        let mut model = runtime_model();
+        let state = bootstrap_shell_state();
+        refresh_runtime_model(&mut model, &state);
+        assert_eq!(model.worker_grid_class, "worker-grid-two-column");
     }
 }
