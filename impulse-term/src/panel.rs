@@ -259,13 +259,8 @@ impl TerminalPanel {
         // Supervisors skip sanitization (first-principles rule #6).
         let _env_guard = EnvGuard::for_role(role, SANITIZED_ENV_VARS);
 
-        let env_vars = build_env_vars_for_role(
-            working_dir,
-            agent_name,
-            pane_id,
-            role,
-            cmd_socket_path,
-        );
+        let env_vars =
+            build_env_vars_for_role(working_dir, agent_name, pane_id, role, cmd_socket_path);
         // Convert owned (String, String) into the (&str, String) shape
         // TerminalBackend::spawn expects.
         let env_ref: Vec<(&str, String)> = env_vars
@@ -1037,6 +1032,171 @@ mod tests {
         // Cleanup.
         std::env::remove_var("IMPULSE_TEST_VAR");
     }
+
+    // -----------------------------------------------------------------
+    // PaneRole integration tests (Loop 115-116)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_build_env_vars_for_role_worker_has_role_key() {
+        let vars = build_env_vars_for_role(None, "claude", 0, PaneRole::Worker, None);
+        let role = vars
+            .iter()
+            .find(|(k, _)| k == "IMPULSE_PANE_ROLE")
+            .expect("worker must emit IMPULSE_PANE_ROLE");
+        assert_eq!(role.1, "worker");
+    }
+
+    #[test]
+    fn test_build_env_vars_for_role_worker_has_no_supervisor_env() {
+        // Worker must NEVER leak IMPULSE_SUPERVISOR or IMPULSE_CMD_SOCKET,
+        // even if a socket path is passed (it's ignored for workers).
+        let sock = PathBuf::from("/tmp/impulse.sock");
+        let vars = build_env_vars_for_role(None, "claude", 0, PaneRole::Worker, Some(&sock));
+        assert!(
+            !vars.iter().any(|(k, _)| k == "IMPULSE_SUPERVISOR"),
+            "worker must not set IMPULSE_SUPERVISOR"
+        );
+        assert!(
+            !vars.iter().any(|(k, _)| k == "IMPULSE_CMD_SOCKET"),
+            "worker must not set IMPULSE_CMD_SOCKET"
+        );
+    }
+
+    #[test]
+    fn test_build_env_vars_for_role_supervisor_has_all_supervisor_env() {
+        let sock = PathBuf::from("/tmp/impulse-daemon.sock");
+        let vars = build_env_vars_for_role(
+            Some(Path::new("/tmp/proj")),
+            "supervisor",
+            0,
+            PaneRole::Supervisor,
+            Some(&sock),
+        );
+
+        let get = |k: &str| vars.iter().find(|(vk, _)| vk == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("IMPULSE_PANE_ROLE"), Some("supervisor"));
+        assert_eq!(get("IMPULSE_SUPERVISOR"), Some("1"));
+        assert_eq!(get("IMPULSE_CMD_SOCKET"), Some("/tmp/impulse-daemon.sock"));
+        // Base keys are still present.
+        assert!(get("IMPULSE_PANE_ID").is_some());
+        assert!(get("IMPULSE_HOME").is_some());
+    }
+
+    #[test]
+    fn test_build_env_vars_for_role_supervisor_without_socket() {
+        // Supervisor without a socket path still gets IMPULSE_PANE_ROLE=supervisor
+        // but NOT IMPULSE_SUPERVISOR / IMPULSE_CMD_SOCKET (graceful degradation).
+        let vars = build_env_vars_for_role(None, "supervisor", 0, PaneRole::Supervisor, None);
+        let role = vars.iter().find(|(k, _)| k == "IMPULSE_PANE_ROLE").unwrap();
+        assert_eq!(role.1, "supervisor");
+        assert!(
+            !vars.iter().any(|(k, _)| k == "IMPULSE_SUPERVISOR"),
+            "supervisor without socket must not claim privileged flag"
+        );
+        assert!(
+            !vars.iter().any(|(k, _)| k == "IMPULSE_CMD_SOCKET"),
+            "supervisor without socket must not set IMPULSE_CMD_SOCKET"
+        );
+    }
+
+    #[test]
+    fn test_env_guard_for_role_worker_sanitizes() {
+        // Worker panes sanitize parent-agent env vars.
+        // Use a dedicated var so parallel tests don't race on CLAUDECODE.
+        const TEST_VARS: &[&str] = &["IMPULSE_TEST_WORKER_SANITIZE_VAR"];
+        std::env::set_var(TEST_VARS[0], "should-be-hidden");
+        {
+            let guard = EnvGuard::for_role(PaneRole::Worker, TEST_VARS);
+            assert!(guard.is_sanitized(), "worker guard must sanitize");
+            assert!(
+                std::env::var(TEST_VARS[0]).is_err(),
+                "test var should be removed for worker spawn"
+            );
+            // guard drops here, restoring original
+        }
+        assert_eq!(
+            std::env::var(TEST_VARS[0]).unwrap_or_default(),
+            "should-be-hidden",
+            "original test var must be restored after worker spawn"
+        );
+        std::env::remove_var(TEST_VARS[0]);
+    }
+
+    #[test]
+    fn test_env_guard_for_role_supervisor_does_not_sanitize() {
+        // Supervisor panes INTEND to inherit ambient Impulse env, so the guard
+        // does NOT remove parent-agent vars. Use a dedicated var so parallel
+        // tests don't race on shared env state.
+        const TEST_VARS: &[&str] = &["IMPULSE_TEST_SUPERVISOR_NOSANITIZE_VAR"];
+        std::env::set_var(TEST_VARS[0], "supervisor-sees-this");
+        {
+            let guard = EnvGuard::for_role(PaneRole::Supervisor, TEST_VARS);
+            assert!(!guard.is_sanitized(), "supervisor guard must NOT sanitize");
+            assert_eq!(
+                std::env::var(TEST_VARS[0]).unwrap_or_default(),
+                "supervisor-sees-this",
+                "supervisor must see ambient test var"
+            );
+        }
+        // Cleanup.
+        std::env::remove_var(TEST_VARS[0]);
+    }
+
+    #[test]
+    fn test_env_guard_for_role_supervisor_still_sets_terminal_defaults() {
+        // Even without sanitization, the guard should still set TERM etc.
+        // NOTE: this test depends on ambient TERM state; it is still valuable
+        // because it proves `new_privileged` writes the default TERM/COLORTERM
+        // even when called repeatedly. We check via the guard's own setters.
+        {
+            let _guard = EnvGuard::new_privileged();
+            assert_eq!(
+                std::env::var("IMPULSE_TERM_PROGRAM").unwrap(),
+                "impulse-gui",
+                "supervisor guard must still set terminal defaults"
+            );
+            assert_eq!(std::env::var("TERM").unwrap(), "xterm-256color");
+        }
+    }
+
+    #[test]
+    fn test_build_env_vars_for_role_supervisor_never_drops_base_keys() {
+        // Base keys from build_env_vars must still appear for Supervisor.
+        let vars = build_env_vars_for_role(
+            Some(Path::new("/tmp")),
+            "sup",
+            5,
+            PaneRole::Supervisor,
+            Some(Path::new("/tmp/s.sock")),
+        );
+        let keys: Vec<&str> = vars.iter().map(|(k, _)| k.as_str()).collect();
+        for expected in &[
+            "TERM",
+            "COLORTERM",
+            "IMPULSE_PANE_ID",
+            "IMPULSE_PANE_NAME",
+            "IMPULSE_HOME",
+            "IMPULSE_SESSION_ID",
+        ] {
+            assert!(
+                keys.contains(expected),
+                "supervisor env must include base key {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_env_vars_for_role_worker_always_has_role() {
+        // A worker without socket still has IMPULSE_PANE_ROLE=worker.
+        let vars = build_env_vars_for_role(None, "c", 1, PaneRole::Worker, None);
+        let role = vars.iter().find(|(k, _)| k == "IMPULSE_PANE_ROLE").unwrap();
+        assert_eq!(role.1, "worker");
+    }
+
+    // -----------------------------------------------------------------
+    // Existing env guard tests
+    // -----------------------------------------------------------------
 
     #[test]
     fn test_env_guard_restores_on_panic() {
