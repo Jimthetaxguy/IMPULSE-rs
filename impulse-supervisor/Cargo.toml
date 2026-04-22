@@ -1,0 +1,32 @@
+[package]
+name = "impulse-supervisor"
+version = "0.1.0"
+edition = "2021"
+description = "Dioxus desktop supervisor shell — privileged terminal orchestrator for Impulse"
+publish = false
+
+# STATUS: SCAFFOLD — Phase 8 prototype. Not yet wired to the runtime. See
+# .opencode/ralph-loop-state/cleanup/DECISIONS.md for the architectural contract.
+
+[dependencies]
+dioxus = { version = "0.6", features = ["desktop"] }
+dioxus-desktop = "0.6"
+tokio = { version = "1", features = ["full"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Impulse internal crates
+impulse-ops = { path = "../impulse-ops" }
+impulse-term = { path = "../impulse-term" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = []
+# Until the runtime is wired, the crate compiles but does not run as a binary.
+experimental-runtime = []

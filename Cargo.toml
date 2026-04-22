@@ -108,6 +108,7 @@ office-support = ["dep:calamine", "dep:rust_xlsxwriter", "dep:docx"]
 
 [dev-dependencies]
 filetime = "0.2"
+proptest = "1"
 
 [profile.release]
 opt-level = 3

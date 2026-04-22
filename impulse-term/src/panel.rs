@@ -26,6 +26,7 @@ use crate::context::{
 };
 use crate::input;
 use crate::renderer::TerminalRenderer;
+use crate::role::PaneRole;
 use crate::status_bar;
 use crate::theme::TerminalTheme;
 
@@ -48,11 +49,22 @@ const SANITIZED_ENV_VARS: &[&str] = &[
 
 /// RAII guard — snapshots env vars, modifies them for the PTY spawn,
 /// and restores the originals on drop. No unsafe needed.
+///
+/// Workers sanitize parent-agent env vars (CLAUDECODE, etc.) before spawn.
+/// Supervisors intentionally skip sanitization — they are privileged and
+/// INTEND to see the ambient Impulse env (first-principles rule #6).
 struct EnvGuard {
     saved: Vec<(&'static str, Option<String>)>,
+    /// True if this guard sanitized env vars; false for supervisor panes.
+    /// dead_code: read only in tests via `is_sanitized()`, but always set so
+    /// the Drop impl sees consistent state.
+    #[allow(dead_code)]
+    sanitized: bool,
 }
 
 impl EnvGuard {
+    /// Sanitizing guard — removes parent-agent vars, then sets terminal defaults.
+    /// Use for Worker panes.
     fn new(vars: &[&'static str]) -> Self {
         let saved: Vec<_> = vars
             .iter()
@@ -65,7 +77,39 @@ impl EnvGuard {
         std::env::set_var("COLORTERM", "truecolor");
         std::env::set_var("IMPULSE_TERM_PROGRAM", "impulse-gui");
         std::env::set_var("IMPULSE_VERSION", env!("CARGO_PKG_VERSION"));
-        Self { saved }
+        Self {
+            saved,
+            sanitized: true,
+        }
+    }
+
+    /// Non-sanitizing guard — leaves parent-agent vars intact, but still sets
+    /// terminal defaults and records nothing to restore. Use for Supervisor
+    /// panes which INTEND to inherit the ambient Impulse env.
+    fn new_privileged() -> Self {
+        std::env::set_var("TERM", "xterm-256color");
+        std::env::set_var("COLORTERM", "truecolor");
+        std::env::set_var("IMPULSE_TERM_PROGRAM", "impulse-gui");
+        std::env::set_var("IMPULSE_VERSION", env!("CARGO_PKG_VERSION"));
+        Self {
+            saved: Vec::new(),
+            sanitized: false,
+        }
+    }
+
+    /// Choose the right guard for the role.
+    fn for_role(role: PaneRole, vars: &[&'static str]) -> Self {
+        if role.should_sanitize_env() {
+            Self::new(vars)
+        } else {
+            Self::new_privileged()
+        }
+    }
+
+    /// Whether this guard performed parent-agent env sanitization.
+    #[cfg(test)]
+    fn is_sanitized(&self) -> bool {
+        self.sanitized
     }
 }
 
@@ -104,13 +148,15 @@ pub struct TerminalPanel {
     last_repaint_bytes: u64,
     /// Active filter for the insights overlay.
     insight_filter: InsightFilter,
+    /// Role assigned at spawn time — immutable for the panel's lifetime.
+    role: PaneRole,
 }
 
 impl TerminalPanel {
-    /// Spawn a new terminal panel with an optional custom theme.
+    /// Spawn a new terminal panel as a Worker (default role).
     ///
-    /// If `theme` is `None`, uses `TerminalTheme::default()`.
-    /// Pass `Some(TerminalTheme::from_accent(bg, accent))` to match the GUI palette.
+    /// Backwards-compatible — existing callers keep the 5-arg signature.
+    /// For supervisor panes, use [`Self::spawn_supervisor`].
     pub fn spawn(
         command: &str,
         args: &[String],
@@ -121,7 +167,7 @@ impl TerminalPanel {
         Self::spawn_with_theme(command, args, working_dir, agent_name, pane_id, None)
     }
 
-    /// Spawn a new terminal panel with an explicit theme.
+    /// Spawn a new terminal panel with an explicit theme (Worker role).
     pub fn spawn_with_theme(
         command: &str,
         args: &[String],
@@ -130,14 +176,104 @@ impl TerminalPanel {
         pane_id: usize,
         custom_theme: Option<TerminalTheme>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::spawn_with_role(
+            command,
+            args,
+            working_dir,
+            agent_name,
+            pane_id,
+            custom_theme,
+            PaneRole::Worker,
+            None,
+        )
+    }
+
+    /// Spawn a Worker pane — explicit, no supervisor env vars.
+    ///
+    /// Equivalent to [`Self::spawn`] but documents intent at the call site.
+    pub fn spawn_worker(
+        command: &str,
+        args: &[String],
+        working_dir: Option<&Path>,
+        agent_name: &'static str,
+        pane_id: usize,
+        custom_theme: Option<TerminalTheme>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::spawn_with_role(
+            command,
+            args,
+            working_dir,
+            agent_name,
+            pane_id,
+            custom_theme,
+            PaneRole::Worker,
+            None,
+        )
+    }
+
+    /// Spawn a Supervisor pane — privileged, receives `IMPULSE_SUPERVISOR=1`
+    /// and (if provided) `IMPULSE_CMD_SOCKET=<cmd_socket_path>`.
+    ///
+    /// `EnvGuard` sanitization is SKIPPED so the supervisor can orchestrate
+    /// the ambient Impulse env.
+    pub fn spawn_supervisor(
+        command: &str,
+        args: &[String],
+        working_dir: Option<&Path>,
+        agent_name: &'static str,
+        pane_id: usize,
+        custom_theme: Option<TerminalTheme>,
+        cmd_socket_path: Option<&Path>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::spawn_with_role(
+            command,
+            args,
+            working_dir,
+            agent_name,
+            pane_id,
+            custom_theme,
+            PaneRole::Supervisor,
+            cmd_socket_path,
+        )
+    }
+
+    /// Spawn a new terminal panel with an explicit role and optional cmd socket path.
+    ///
+    /// This is the canonical spawn entrypoint. The role determines:
+    /// - which env vars are injected (`PaneRole::spawn_env_vars`)
+    /// - whether parent-agent env sanitization runs (`PaneRole::should_sanitize_env`)
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_role(
+        command: &str,
+        args: &[String],
+        working_dir: Option<&Path>,
+        agent_name: &'static str,
+        pane_id: usize,
+        custom_theme: Option<TerminalTheme>,
+        role: PaneRole,
+        cmd_socket_path: Option<&Path>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let agent_kind = AgentKind::detect(command, agent_name);
 
-        // RAII guard: sanitizes env vars on entry, restores them on drop/panic.
-        let _env_guard = EnvGuard::new(SANITIZED_ENV_VARS);
+        // RAII guard: role-aware. Workers sanitize CLAUDECODE-style vars.
+        // Supervisors skip sanitization (first-principles rule #6).
+        let _env_guard = EnvGuard::for_role(role, SANITIZED_ENV_VARS);
 
-        let env_vars = build_env_vars(working_dir, agent_name, pane_id);
+        let env_vars = build_env_vars_for_role(
+            working_dir,
+            agent_name,
+            pane_id,
+            role,
+            cmd_socket_path,
+        );
+        // Convert owned (String, String) into the (&str, String) shape
+        // TerminalBackend::spawn expects.
+        let env_ref: Vec<(&str, String)> = env_vars
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.clone()))
+            .collect();
 
-        let result = TerminalBackend::spawn(command, args, working_dir, &env_vars, 24, 80, None);
+        let result = TerminalBackend::spawn(command, args, working_dir, &env_ref, 24, 80, None);
 
         // EnvGuard restores original env vars when dropped — no unsafe needed.
         // If spawn fails, the guard still drops and restores, so the caller
@@ -171,7 +307,13 @@ impl TerminalPanel {
             has_new_output_while_scrolled: false,
             last_repaint_bytes: 0,
             insight_filter: InsightFilter::All,
+            role,
         })
+    }
+
+    /// The role assigned at spawn time — immutable for the panel's lifetime.
+    pub fn role(&self) -> PaneRole {
+        self.role
     }
 
     /// Render the terminal panel into the given UI region.
@@ -686,6 +828,30 @@ fn build_env_vars<'a>(
             ),
         ),
     ]
+}
+
+/// Build environment variables with role-specific additions.
+///
+/// Superset of [`build_env_vars`] — returns the same base keys, plus
+/// `IMPULSE_PANE_ROLE` for all roles and `IMPULSE_CMD_SOCKET` +
+/// `IMPULSE_SUPERVISOR` for `Supervisor` when a socket path is given.
+///
+/// Returns owned `(String, String)` pairs because the role-specific keys
+/// are already `String` and copying the base keys keeps the return type
+/// uniform.
+fn build_env_vars_for_role(
+    working_dir: Option<&Path>,
+    agent_name: &str,
+    pane_id: usize,
+    role: PaneRole,
+    cmd_socket_path: Option<&Path>,
+) -> Vec<(String, String)> {
+    let mut vars: Vec<(String, String)> = build_env_vars(working_dir, agent_name, pane_id)
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+    vars.extend(role.spawn_env_vars(cmd_socket_path));
+    vars
 }
 
 #[cfg(test)]
