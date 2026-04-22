@@ -1,0 +1,15 @@
+loop: 153
+title: daemon bridge facade
+status: completed
+summary:
+  - Added a typed DaemonBridge facade and DaemonStatusSnapshot lifecycle model.
+  - Introduced stable bridge status-line formatting so runtime code can consume a single bridge-facing string.
+  - Extended daemon bridge tests to cover lifecycle mapping and protocol-version extraction.
+files:
+  - impulse-supervisor/src/daemon_bridge.rs
+verification:
+  - cargo test -p impulse-supervisor -- --test-threads=1
+  - cargo clippy -p impulse-supervisor -- -D warnings
+  - cargo fmt --check -p impulse-supervisor
+notes:
+  - Workspace-wide loop verification remains blocked by foreign daemon integration failures recorded at loop 150.

@@ -84,7 +84,20 @@ impl DaemonBridge {
     }
 
     pub fn preview_line(&self) -> String {
-        preview_bridge_line(&self.config, &BridgeConnectionState::Disconnected)
+        let snapshot = self.disconnected_snapshot();
+        format!(
+            "{} | {}",
+            preview_bridge_line(&self.config, &snapshot.connection_state),
+            snapshot.status_line()
+        )
+    }
+
+    pub fn disconnected_snapshot(&self) -> DaemonStatusSnapshot {
+        DaemonStatusSnapshot {
+            connection_state: BridgeConnectionState::Disconnected,
+            protocol_version: None,
+            raw_status: None,
+        }
     }
 
     #[allow(dead_code)] // dead_code: runtime-driven daemon polling lands in loops 154-155.
@@ -104,6 +117,19 @@ impl DaemonBridge {
                 raw_status: None,
             },
         }
+    }
+}
+
+impl DaemonStatusSnapshot {
+    pub fn status_line(&self) -> String {
+        let protocol = self
+            .protocol_version
+            .map(|version| version.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        format!(
+            "connection={} protocol={protocol}",
+            self.connection_state.label(),
+        )
     }
 }
 
@@ -267,6 +293,12 @@ mod tests {
     }
 
     #[test]
+    fn test_daemon_bridge_preview_line_includes_snapshot_status() {
+        let bridge = DaemonBridge::default();
+        assert!(bridge.preview_line().contains("connection=disconnected"));
+    }
+
+    #[test]
     fn test_connection_state_from_ping_result_connected() {
         let state = connection_state_from_ping_result(Ok(true));
         assert_eq!(state, BridgeConnectionState::Connected);
@@ -289,6 +321,26 @@ mod tests {
         );
         assert_eq!(snapshot.protocol_version, Some(7));
         assert_eq!(snapshot.raw_status.unwrap()["status"], "ready");
+    }
+
+    #[test]
+    fn test_status_snapshot_line_includes_protocol_version() {
+        let snapshot = DaemonStatusSnapshot {
+            connection_state: BridgeConnectionState::Connected,
+            protocol_version: Some(7),
+            raw_status: None,
+        };
+        assert_eq!(snapshot.status_line(), "connection=connected protocol=7");
+    }
+
+    #[test]
+    fn test_status_snapshot_line_uses_unknown_protocol_placeholder() {
+        let snapshot = DaemonStatusSnapshot {
+            connection_state: BridgeConnectionState::Pending,
+            protocol_version: None,
+            raw_status: None,
+        };
+        assert_eq!(snapshot.status_line(), "connection=pending protocol=?");
     }
 
     async fn serve_single_response(
