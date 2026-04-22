@@ -1,0 +1,15 @@
+loop: 145
+title: phase 6 supervisor checkpoint
+status: completed
+summary:
+  - Added explicit shell root classes and worker summary labeling to the runtime model.
+  - Runtime body now exposes a stable worker summary string for future daemon/compaction overlays.
+  - Completed the L145 checkpoint with full-workspace cargo test and clippy validation.
+files:
+  - impulse-supervisor/src/runtime.rs
+verification:
+  - cargo test --workspace -p impulse-supervisor
+  - cargo clippy -p impulse-supervisor -- -D warnings
+  - cargo fmt --check -p impulse-supervisor
+  - cargo test
+  - cargo clippy -- -D warnings

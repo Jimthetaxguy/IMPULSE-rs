@@ -39,6 +39,7 @@ pub struct RuntimeModel {
     pub sidebar: SupervisorSidebarView,
     pub worker_panes: Vec<WorkerPaneStubView>,
     pub worker_grid_class: &'static str,
+    pub worker_summary: String,
 }
 
 pub fn runtime_disabled_message() -> &'static str {
@@ -129,6 +130,18 @@ pub fn runtime_header_view(bootstrap: &RuntimeBootstrap) -> RuntimeHeaderView {
     }
 }
 
+pub fn shell_root_class(layout: LayoutMode) -> &'static str {
+    match layout {
+        LayoutMode::SidebarWithGrid => "layout-sidebar-with-grid",
+        LayoutMode::WorkerFocus => "layout-worker-focus",
+        LayoutMode::SupervisorFocus => "layout-supervisor-focus",
+    }
+}
+
+pub fn worker_summary_label(panes: &[WorkerPaneStubView]) -> String {
+    format!("Visible worker panes: {}", panes.len())
+}
+
 pub fn render_bootstrap_console(bootstrap: &RuntimeBootstrap) -> String {
     let header = runtime_header_view(bootstrap);
     let sidebar = supervisor_sidebar_view(bootstrap);
@@ -140,10 +153,11 @@ pub fn render_bootstrap_console(bootstrap: &RuntimeBootstrap) -> String {
         .join(", ");
 
     format!(
-        "{title} [{status}] | layout={layout} | {heading}: {detail} | {grid} | {titles}",
+        "{title} [{status}] | layout={layout} | root={root_class} | {heading}: {detail} | {grid} | {titles}",
         title = header.title,
         status = header.status_label,
         layout = header.layout_label,
+        root_class = shell_root_class(bootstrap.layout),
         heading = sidebar.heading,
         detail = sidebar.detail,
         grid = worker_grid_class(bootstrap.worker_grid),
@@ -153,10 +167,12 @@ pub fn render_bootstrap_console(bootstrap: &RuntimeBootstrap) -> String {
 
 pub fn runtime_model() -> RuntimeModel {
     let bootstrap = runtime_bootstrap();
+    let worker_panes = worker_pane_stub_views(&bootstrap);
     RuntimeModel {
         header: runtime_header_view(&bootstrap),
         sidebar: supervisor_sidebar_view(&bootstrap),
-        worker_panes: worker_pane_stub_views(&bootstrap),
+        worker_summary: worker_summary_label(&worker_panes),
+        worker_panes,
         worker_grid_class: worker_grid_class(bootstrap.worker_grid),
         bootstrap,
     }
@@ -193,11 +209,12 @@ pub fn SupervisorRuntimeApp() -> Element {
     let model = use_signal(runtime_model);
     let runtime = model.read().clone();
     let header = runtime.header.clone();
+    let root_class = shell_root_class(runtime.bootstrap.layout);
 
     rsx! {
         div {
             id: "impulse-supervisor-runtime",
-            class: "layout-sidebar-with-grid",
+            class: "{root_class}",
             RuntimeHeader { view: header }
             RuntimeBody { model: runtime }
         }
@@ -226,6 +243,7 @@ pub fn RuntimeBody(model: RuntimeModel) -> Element {
                 grid: model.bootstrap.worker_grid,
                 panes: model.worker_panes,
             }
+            p { class: "worker-summary", "{model.worker_summary}" }
         }
     }
 }
@@ -412,6 +430,14 @@ mod tests {
     }
 
     #[test]
+    fn test_shell_root_class_sidebar_with_grid() {
+        assert_eq!(
+            shell_root_class(LayoutMode::SidebarWithGrid),
+            "layout-sidebar-with-grid"
+        );
+    }
+
+    #[test]
     fn test_runtime_header_view_uses_layout_label() {
         let header = runtime_header_view(&runtime_bootstrap());
         assert_eq!(header.layout_label, "SidebarWithGrid");
@@ -436,8 +462,20 @@ mod tests {
     }
 
     #[test]
+    fn test_worker_summary_label_uses_pane_count() {
+        let panes = worker_pane_stub_views(&runtime_bootstrap());
+        assert_eq!(worker_summary_label(&panes), "Visible worker panes: 2");
+    }
+
+    #[test]
     fn test_runtime_model_worker_count_matches_stub_views() {
         let model = runtime_model();
         assert_eq!(model.worker_panes.len(), 2);
+    }
+
+    #[test]
+    fn test_runtime_model_carries_worker_summary() {
+        let model = runtime_model();
+        assert_eq!(model.worker_summary, "Visible worker panes: 2");
     }
 }
