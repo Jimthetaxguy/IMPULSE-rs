@@ -1,0 +1,807 @@
+//! Signal bus — collects, debounces, and routes GUI signals to visual surfaces.
+//!
+//! Fed from the context tick loop (every 3s) and drained each frame to route
+//! signals to toasts, tab badges, activity feed, and status bar counters.
+
+use std::collections::{BTreeMap, HashMap};
+use std::time::{Duration, Instant};
+
+// ---------------------------------------------------------------------------
+// Signal types
+// ---------------------------------------------------------------------------
+
+/// How urgently a signal should be surfaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalUrgency {
+    /// Badges + activity feed only — no toast.
+    // dead_code: ambient routing is reserved for low-noise signal surfacing once more views consume the bus.
+    #[allow(dead_code)]
+    Ambient,
+    /// Toast notification (standard duration).
+    Important,
+    /// Toast notification (extended duration, red).
+    Urgent,
+}
+
+/// What kind of signal was detected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignalKind {
+    /// Context window crossed a threshold (60% or 80%).
+    ContextThreshold { pct: u8 },
+    /// Agent encountered an error.
+    ErrorEncountered,
+    /// Agent completed a task.
+    TaskCompleted,
+    /// Context compaction was detected.
+    CompactionDetected,
+    /// Two panes are editing the same file.
+    FileConflict { path: String, other_tab: String },
+}
+
+/// A signal emitted from context observation.
+pub struct GuiSignal {
+    pub kind: SignalKind,
+    pub urgency: SignalUrgency,
+    pub tab_id: Option<u64>,
+    pub message: String,
+    pub created_at: Instant,
+}
+
+/// Display-ready snapshot of a signal for the Overview view.
+/// Uses age-in-seconds instead of `Instant` so it can be cloned + displayed.
+#[derive(Debug, Clone)]
+pub struct SignalLogEntry {
+    pub kind_label: String,
+    pub message: String,
+    pub urgency: SignalUrgency,
+    // dead_code: retained so log rows can later deep-link back to a tab without reshaping the snapshot type.
+    #[allow(dead_code)]
+    pub tab_id: Option<u64>,
+    pub age_secs: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Tab badge state
+// ---------------------------------------------------------------------------
+
+/// Visual badge state for a single tab.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TabBadge {
+    pub has_error: bool,
+    pub has_conflict: bool,
+    pub has_compaction: bool,
+    pub has_task_complete: bool,
+}
+
+impl TabBadge {
+    // dead_code: reserved for future badge-pruning once empty-tab cleanup is wired into view state.
+    #[allow(dead_code)]
+    fn is_empty(&self) -> bool {
+        !self.has_error && !self.has_conflict && !self.has_compaction && !self.has_task_complete
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Summary for status bar
+// ---------------------------------------------------------------------------
+
+/// Aggregate signal counts for the status bar.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SignalSummary {
+    pub unread_errors: usize,
+    pub active_conflicts: usize,
+    pub tasks_completed: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Debounce windows (in seconds)
+// ---------------------------------------------------------------------------
+
+fn debounce_window(kind: &SignalKind) -> Duration {
+    match kind {
+        // Already debounced upstream in ContextBridge (60s intervals).
+        SignalKind::ContextThreshold { .. } => Duration::from_secs(0),
+        // Avoid spam from cascading errors.
+        SignalKind::ErrorEncountered => Duration::from_secs(10),
+        // Group rapid completions.
+        SignalKind::TaskCompleted => Duration::from_secs(5),
+        // One compaction event per minute max.
+        SignalKind::CompactionDetected => Duration::from_secs(60),
+        // Don't re-alert same conflict.
+        SignalKind::FileConflict { .. } => Duration::from_secs(30),
+    }
+}
+
+/// Build a debounce key combining signal kind + tab ID.
+fn debounce_key(kind: &SignalKind, tab_id: Option<u64>) -> String {
+    let tab_str = tab_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "global".to_string());
+
+    match kind {
+        SignalKind::ContextThreshold { pct } => format!("ctx_thresh:{}:{}", pct, tab_str),
+        SignalKind::ErrorEncountered => format!("error:{}", tab_str),
+        SignalKind::TaskCompleted => format!("task:{}", tab_str),
+        SignalKind::CompactionDetected => format!("compact:{}", tab_str),
+        SignalKind::FileConflict { path, .. } => format!("conflict:{}:{}", path, tab_str),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SignalBus
+// ---------------------------------------------------------------------------
+
+/// Human-readable label for a signal kind.
+fn signal_kind_label(kind: &SignalKind) -> String {
+    match kind {
+        SignalKind::ContextThreshold { pct } => format!("Context {}%", pct),
+        SignalKind::ErrorEncountered => "Error".to_string(),
+        SignalKind::TaskCompleted => "Task Done".to_string(),
+        SignalKind::CompactionDetected => "Compaction".to_string(),
+        SignalKind::FileConflict { path, .. } => format!("Conflict: {}", path),
+    }
+}
+
+/// Maximum debounce window across all signal kinds (seconds).
+const MAX_DEBOUNCE_SECS: u64 = 60;
+
+/// How often to prune stale debounce entries (seconds).
+const PRUNE_INTERVAL_SECS: u64 = 60;
+
+/// Collects, debounces, and routes signals to visual surfaces.
+/// Maximum entries retained in the signal history log.
+const SIGNAL_LOG_MAX: usize = 100;
+
+pub struct SignalBus {
+    pending: Vec<GuiSignal>,
+    tab_badges: BTreeMap<u64, TabBadge>,
+    debounce: HashMap<String, Instant>,
+    summary: SignalSummary,
+    badges_dirty: bool,
+    last_prune: Instant,
+    /// Retained log of recent signals (most recent last, capped at SIGNAL_LOG_MAX).
+    signal_log: Vec<GuiSignal>,
+}
+
+impl SignalBus {
+    pub fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+            tab_badges: BTreeMap::new(),
+            debounce: HashMap::new(),
+            summary: SignalSummary::default(),
+            badges_dirty: false,
+            last_prune: Instant::now(),
+            signal_log: Vec::new(),
+        }
+    }
+
+    /// Emit a signal into the bus. Returns `true` if accepted (not debounced).
+    pub fn emit(&mut self, signal: GuiSignal) -> bool {
+        // Periodically prune stale debounce entries.
+        self.prune_stale_debounce(signal.created_at);
+
+        let key = debounce_key(&signal.kind, signal.tab_id);
+        let window = debounce_window(&signal.kind);
+
+        // Check debounce.
+        if !window.is_zero() {
+            if let Some(last) = self.debounce.get(&key) {
+                if signal.created_at.duration_since(*last) < window {
+                    return false;
+                }
+            }
+        }
+
+        // Record debounce timestamp.
+        self.debounce.insert(key, signal.created_at);
+
+        // Update tab badge.
+        if let Some(tab_id) = signal.tab_id {
+            let badge = self.tab_badges.entry(tab_id).or_default();
+            let changed = match &signal.kind {
+                SignalKind::ErrorEncountered => {
+                    let was = badge.has_error;
+                    badge.has_error = true;
+                    !was
+                }
+                SignalKind::TaskCompleted => {
+                    let was = badge.has_task_complete;
+                    badge.has_task_complete = true;
+                    !was
+                }
+                SignalKind::CompactionDetected => {
+                    let was = badge.has_compaction;
+                    badge.has_compaction = true;
+                    !was
+                }
+                SignalKind::FileConflict { .. } => {
+                    let was = badge.has_conflict;
+                    badge.has_conflict = true;
+                    !was
+                }
+                SignalKind::ContextThreshold { .. } => false, // no badge, handled by tier icon
+            };
+            if changed {
+                self.badges_dirty = true;
+            }
+        }
+
+        // Update summary counters.
+        match &signal.kind {
+            SignalKind::ErrorEncountered => self.summary.unread_errors += 1,
+            SignalKind::TaskCompleted => self.summary.tasks_completed += 1,
+            SignalKind::FileConflict { .. } => self.summary.active_conflicts += 1,
+            _ => {}
+        }
+
+        // Retain in signal log for history display.
+        self.signal_log.push(GuiSignal {
+            kind: signal.kind.clone(),
+            urgency: signal.urgency,
+            tab_id: signal.tab_id,
+            message: signal.message.clone(),
+            created_at: signal.created_at,
+        });
+        if self.signal_log.len() > SIGNAL_LOG_MAX {
+            self.signal_log
+                .drain(..self.signal_log.len() - SIGNAL_LOG_MAX);
+        }
+
+        self.pending.push(signal);
+        true
+    }
+
+    /// Drain all pending signals for routing to visual surfaces.
+    pub fn drain(&mut self) -> Vec<GuiSignal> {
+        std::mem::take(&mut self.pending)
+    }
+
+    /// Get the badge state for a specific tab.
+    #[allow(dead_code)]
+    pub fn tab_badge(&self, id: u64) -> Option<&TabBadge> {
+        self.tab_badges.get(&id)
+    }
+
+    /// Clear badges when user clicks/acknowledges a tab.
+    pub fn acknowledge_tab(&mut self, id: u64) {
+        if let Some(badge) = self.tab_badges.get_mut(&id) {
+            // Decrement summary counters for cleared badges.
+            if badge.has_error {
+                self.summary.unread_errors = self.summary.unread_errors.saturating_sub(1);
+            }
+            if badge.has_conflict {
+                self.summary.active_conflicts = self.summary.active_conflicts.saturating_sub(1);
+            }
+            // Reset badge.
+            *badge = TabBadge::default();
+            self.badges_dirty = true;
+        }
+    }
+
+    /// Remove a tab's badge state on tab close.
+    pub fn remove_tab(&mut self, id: u64) {
+        if let Some(badge) = self.tab_badges.remove(&id) {
+            // Decrement summary counters.
+            if badge.has_error {
+                self.summary.unread_errors = self.summary.unread_errors.saturating_sub(1);
+            }
+            if badge.has_conflict {
+                self.summary.active_conflicts = self.summary.active_conflicts.saturating_sub(1);
+            }
+            self.badges_dirty = true;
+        }
+    }
+
+    /// Whether badge state has changed since the last `mark_badges_clean()` call.
+    pub fn badges_dirty(&self) -> bool {
+        self.badges_dirty
+    }
+
+    /// Mark badge state as synced (caller has cloned the badges).
+    pub fn mark_badges_clean(&mut self) {
+        self.badges_dirty = false;
+    }
+
+    /// Aggregate summary for the status bar.
+    #[allow(dead_code)]
+    pub fn summary(&self) -> &SignalSummary {
+        &self.summary
+    }
+
+    /// All tab badges (for syncing to the terminals view).
+    pub fn all_tab_badges(&self) -> &BTreeMap<u64, TabBadge> {
+        &self.tab_badges
+    }
+
+    /// Snapshot the signal log as display-ready entries (most recent last).
+    pub fn signal_log_snapshot(&self) -> Vec<SignalLogEntry> {
+        let now = Instant::now();
+        self.signal_log
+            .iter()
+            .map(|sig| SignalLogEntry {
+                kind_label: signal_kind_label(&sig.kind),
+                message: sig.message.clone(),
+                urgency: sig.urgency,
+                tab_id: sig.tab_id,
+                age_secs: now.duration_since(sig.created_at).as_secs(),
+            })
+            .collect()
+    }
+
+    /// Remove debounce entries older than 2× the max debounce window.
+    /// Called from `emit()` at most once per `PRUNE_INTERVAL_SECS`.
+    fn prune_stale_debounce(&mut self, now: Instant) {
+        if now.duration_since(self.last_prune) < Duration::from_secs(PRUNE_INTERVAL_SECS) {
+            return;
+        }
+        self.last_prune = now;
+        let cutoff = Duration::from_secs(MAX_DEBOUNCE_SECS * 2);
+        self.debounce
+            .retain(|_, ts| now.duration_since(*ts) < cutoff);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_signal(kind: SignalKind, urgency: SignalUrgency, tab_id: Option<u64>) -> GuiSignal {
+        GuiSignal {
+            kind,
+            urgency,
+            tab_id,
+            message: "test signal".into(),
+            created_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn test_new_bus_is_empty() {
+        let mut bus = SignalBus::new();
+        assert!(bus.drain().is_empty());
+        assert_eq!(bus.summary().unread_errors, 0);
+        assert_eq!(bus.summary().active_conflicts, 0);
+        assert_eq!(bus.summary().tasks_completed, 0);
+    }
+
+    #[test]
+    fn test_emit_and_drain() {
+        let mut bus = SignalBus::new();
+        let accepted = bus.emit(make_signal(
+            SignalKind::ErrorEncountered,
+            SignalUrgency::Important,
+            Some(1),
+        ));
+        assert!(accepted);
+
+        let drained = bus.drain();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].message, "test signal");
+
+        // Drain again is empty.
+        assert!(bus.drain().is_empty());
+    }
+
+    #[test]
+    fn test_debounce_suppresses_duplicate() {
+        let mut bus = SignalBus::new();
+        let now = Instant::now();
+
+        let sig1 = GuiSignal {
+            kind: SignalKind::ErrorEncountered,
+            urgency: SignalUrgency::Important,
+            tab_id: Some(1),
+            message: "error 1".into(),
+            created_at: now,
+        };
+        let sig2 = GuiSignal {
+            kind: SignalKind::ErrorEncountered,
+            urgency: SignalUrgency::Important,
+            tab_id: Some(1),
+            message: "error 2".into(),
+            created_at: now + Duration::from_secs(1), // within 10s window
+        };
+
+        assert!(bus.emit(sig1));
+        assert!(!bus.emit(sig2)); // suppressed
+
+        assert_eq!(bus.drain().len(), 1);
+    }
+
+    #[test]
+    fn test_debounce_allows_after_window() {
+        let mut bus = SignalBus::new();
+        let now = Instant::now();
+
+        let sig1 = GuiSignal {
+            kind: SignalKind::TaskCompleted,
+            urgency: SignalUrgency::Important,
+            tab_id: Some(1),
+            message: "task 1".into(),
+            created_at: now,
+        };
+        let sig2 = GuiSignal {
+            kind: SignalKind::TaskCompleted,
+            urgency: SignalUrgency::Important,
+            tab_id: Some(1),
+            message: "task 2".into(),
+            created_at: now + Duration::from_secs(6), // past 5s window
+        };
+
+        assert!(bus.emit(sig1));
+        assert!(bus.emit(sig2));
+
+        assert_eq!(bus.drain().len(), 2);
+    }
+
+    #[test]
+    fn test_context_threshold_no_debounce() {
+        let mut bus = SignalBus::new();
+        let now = Instant::now();
+
+        let sig1 = GuiSignal {
+            kind: SignalKind::ContextThreshold { pct: 60 },
+            urgency: SignalUrgency::Important,
+            tab_id: Some(1),
+            message: "60%".into(),
+            created_at: now,
+        };
+        let sig2 = GuiSignal {
+            kind: SignalKind::ContextThreshold { pct: 60 },
+            urgency: SignalUrgency::Important,
+            tab_id: Some(1),
+            message: "60% again".into(),
+            created_at: now, // same instant — 0s debounce means always accepted
+        };
+
+        assert!(bus.emit(sig1));
+        assert!(bus.emit(sig2));
+        assert_eq!(bus.drain().len(), 2);
+    }
+
+    #[test]
+    fn test_badge_accumulation() {
+        let mut bus = SignalBus::new();
+
+        bus.emit(make_signal(
+            SignalKind::ErrorEncountered,
+            SignalUrgency::Important,
+            Some(1),
+        ));
+        bus.emit(make_signal(
+            SignalKind::TaskCompleted,
+            SignalUrgency::Important,
+            Some(1),
+        ));
+
+        let badge = bus.tab_badge(1).unwrap();
+        assert!(badge.has_error);
+        assert!(badge.has_task_complete);
+        assert!(!badge.has_conflict);
+        assert!(!badge.has_compaction);
+    }
+
+    #[test]
+    fn test_badge_acknowledgment_clears() {
+        let mut bus = SignalBus::new();
+
+        bus.emit(make_signal(
+            SignalKind::ErrorEncountered,
+            SignalUrgency::Important,
+            Some(1),
+        ));
+        assert!(bus.tab_badge(1).unwrap().has_error);
+        assert_eq!(bus.summary().unread_errors, 1);
+
+        bus.acknowledge_tab(1);
+        let badge = bus.tab_badge(1).unwrap();
+        assert!(!badge.has_error);
+        assert!(badge.is_empty());
+        assert_eq!(bus.summary().unread_errors, 0);
+    }
+
+    #[test]
+    fn test_remove_tab_cleanup() {
+        let mut bus = SignalBus::new();
+
+        bus.emit(make_signal(
+            SignalKind::FileConflict {
+                path: "src/main.rs".into(),
+                other_tab: "Tab 2".into(),
+            },
+            SignalUrgency::Urgent,
+            Some(1),
+        ));
+        assert_eq!(bus.summary().active_conflicts, 1);
+        assert!(bus.tab_badge(1).is_some());
+
+        bus.remove_tab(1);
+        assert!(bus.tab_badge(1).is_none());
+        assert_eq!(bus.summary().active_conflicts, 0);
+    }
+
+    #[test]
+    fn test_summary_computation() {
+        let mut bus = SignalBus::new();
+
+        bus.emit(make_signal(
+            SignalKind::ErrorEncountered,
+            SignalUrgency::Important,
+            Some(1),
+        ));
+        bus.emit(make_signal(
+            SignalKind::ErrorEncountered,
+            SignalUrgency::Important,
+            Some(2),
+        ));
+        bus.emit(make_signal(
+            SignalKind::TaskCompleted,
+            SignalUrgency::Important,
+            Some(3),
+        ));
+
+        let summary = bus.summary();
+        assert_eq!(summary.unread_errors, 2);
+        assert_eq!(summary.tasks_completed, 1);
+        assert_eq!(summary.active_conflicts, 0);
+    }
+
+    #[test]
+    fn test_different_tabs_not_debounced() {
+        let mut bus = SignalBus::new();
+        let now = Instant::now();
+
+        let sig1 = GuiSignal {
+            kind: SignalKind::ErrorEncountered,
+            urgency: SignalUrgency::Important,
+            tab_id: Some(1),
+            message: "tab 1 error".into(),
+            created_at: now,
+        };
+        let sig2 = GuiSignal {
+            kind: SignalKind::ErrorEncountered,
+            urgency: SignalUrgency::Important,
+            tab_id: Some(2),
+            message: "tab 2 error".into(),
+            created_at: now,
+        };
+
+        assert!(bus.emit(sig1));
+        assert!(bus.emit(sig2)); // different tab — not debounced
+        assert_eq!(bus.drain().len(), 2);
+    }
+
+    #[test]
+    fn test_compaction_badge() {
+        let mut bus = SignalBus::new();
+        bus.emit(make_signal(
+            SignalKind::CompactionDetected,
+            SignalUrgency::Important,
+            Some(5),
+        ));
+
+        let badge = bus.tab_badge(5).unwrap();
+        assert!(badge.has_compaction);
+        assert!(!badge.has_error);
+    }
+
+    #[test]
+    fn test_context_threshold_no_badge() {
+        let mut bus = SignalBus::new();
+        bus.emit(make_signal(
+            SignalKind::ContextThreshold { pct: 60 },
+            SignalUrgency::Important,
+            Some(1),
+        ));
+
+        // Context threshold doesn't set any badge (handled by tier icon).
+        let badge = bus.tab_badge(1);
+        assert!(badge.is_none() || badge.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_no_tab_id_signal() {
+        let mut bus = SignalBus::new();
+        let accepted = bus.emit(make_signal(
+            SignalKind::ErrorEncountered,
+            SignalUrgency::Important,
+            None,
+        ));
+        assert!(accepted);
+        assert_eq!(bus.drain().len(), 1);
+        // No badge created for None tab.
+        assert!(bus.all_tab_badges().is_empty());
+    }
+
+    #[test]
+    fn test_file_conflict_debounce_by_path_and_tab() {
+        let mut bus = SignalBus::new();
+        let now = Instant::now();
+
+        let sig1 = GuiSignal {
+            kind: SignalKind::FileConflict {
+                path: "src/main.rs".into(),
+                other_tab: "Tab 2".into(),
+            },
+            urgency: SignalUrgency::Urgent,
+            tab_id: Some(1),
+            message: "conflict".into(),
+            created_at: now,
+        };
+        let sig2 = GuiSignal {
+            kind: SignalKind::FileConflict {
+                path: "src/main.rs".into(),
+                other_tab: "Tab 1".into(),
+            },
+            urgency: SignalUrgency::Urgent,
+            tab_id: Some(2),
+            message: "reverse direction".into(),
+            created_at: now + Duration::from_secs(1),
+        };
+        // Same tab re-emitting same path IS debounced.
+        let sig3 = GuiSignal {
+            kind: SignalKind::FileConflict {
+                path: "src/main.rs".into(),
+                other_tab: "Tab 2".into(),
+            },
+            urgency: SignalUrgency::Urgent,
+            tab_id: Some(1),
+            message: "duplicate".into(),
+            created_at: now + Duration::from_secs(2),
+        };
+
+        assert!(bus.emit(sig1));
+        assert!(bus.emit(sig2)); // different tab — not debounced
+        assert!(!bus.emit(sig3)); // same tab + same path — debounced
+    }
+
+    #[test]
+    fn test_acknowledge_nonexistent_tab() {
+        let mut bus = SignalBus::new();
+        // Should not panic.
+        bus.acknowledge_tab(999);
+        assert!(bus.all_tab_badges().is_empty());
+    }
+
+    #[test]
+    fn test_signal_log_retains_accepted_signals() {
+        let mut bus = SignalBus::new();
+        bus.emit(make_signal(
+            SignalKind::ErrorEncountered,
+            SignalUrgency::Important,
+            Some(1),
+        ));
+        bus.emit(make_signal(
+            SignalKind::TaskCompleted,
+            SignalUrgency::Important,
+            Some(2),
+        ));
+
+        let log = bus.signal_log_snapshot();
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].kind_label, "Error");
+        assert_eq!(log[1].kind_label, "Task Done");
+    }
+
+    #[test]
+    fn test_signal_log_does_not_retain_debounced() {
+        let mut bus = SignalBus::new();
+        let now = Instant::now();
+
+        let sig1 = GuiSignal {
+            kind: SignalKind::ErrorEncountered,
+            urgency: SignalUrgency::Important,
+            tab_id: Some(1),
+            message: "first".into(),
+            created_at: now,
+        };
+        let sig2 = GuiSignal {
+            kind: SignalKind::ErrorEncountered,
+            urgency: SignalUrgency::Important,
+            tab_id: Some(1),
+            message: "debounced".into(),
+            created_at: now + Duration::from_secs(1),
+        };
+
+        assert!(bus.emit(sig1));
+        assert!(!bus.emit(sig2)); // debounced — should NOT appear in log
+
+        let log = bus.signal_log_snapshot();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].message, "first");
+    }
+
+    #[test]
+    fn test_signal_log_capped_at_max() {
+        let mut bus = SignalBus::new();
+        // ContextThreshold has 0s debounce, so all are accepted.
+        for i in 0..(SIGNAL_LOG_MAX + 20) {
+            bus.emit(GuiSignal {
+                kind: SignalKind::ContextThreshold {
+                    pct: (i % 100) as u8,
+                },
+                urgency: SignalUrgency::Ambient,
+                tab_id: Some(i as u64),
+                message: format!("signal {}", i),
+                created_at: Instant::now(),
+            });
+        }
+
+        let log = bus.signal_log_snapshot();
+        assert_eq!(log.len(), SIGNAL_LOG_MAX);
+        // Oldest signals should have been trimmed; last entry should be the most recent.
+        assert_eq!(
+            log.last().unwrap().message,
+            format!("signal {}", SIGNAL_LOG_MAX + 19)
+        );
+    }
+
+    #[test]
+    fn test_badge_is_empty() {
+        let badge = TabBadge::default();
+        assert!(badge.is_empty());
+
+        let badge = TabBadge {
+            has_error: true,
+            ..Default::default()
+        };
+        assert!(!badge.is_empty());
+    }
+
+    #[test]
+    fn test_debounce_prune_removes_stale_entries() {
+        let mut bus = SignalBus::new();
+        let old = Instant::now() - Duration::from_secs(300); // 5 minutes ago
+
+        // Manually insert a stale debounce entry.
+        bus.debounce.insert("stale:1".into(), old);
+        bus.debounce.insert("fresh:2".into(), Instant::now());
+        assert_eq!(bus.debounce.len(), 2);
+
+        // Force prune by setting last_prune far in the past.
+        bus.last_prune = old;
+        bus.prune_stale_debounce(Instant::now());
+
+        // Stale entry (300s old, cutoff is 120s) should be removed.
+        assert_eq!(bus.debounce.len(), 1);
+        assert!(bus.debounce.contains_key("fresh:2"));
+    }
+
+    #[test]
+    fn test_badges_dirty_flag() {
+        let mut bus = SignalBus::new();
+        assert!(!bus.badges_dirty());
+
+        bus.emit(make_signal(
+            SignalKind::ErrorEncountered,
+            SignalUrgency::Important,
+            Some(1),
+        ));
+        assert!(bus.badges_dirty());
+
+        bus.mark_badges_clean();
+        assert!(!bus.badges_dirty());
+
+        // Acknowledging also sets dirty.
+        bus.acknowledge_tab(1);
+        assert!(bus.badges_dirty());
+
+        bus.mark_badges_clean();
+        assert!(!bus.badges_dirty());
+
+        // Removing also sets dirty.
+        bus.emit(make_signal(
+            SignalKind::ErrorEncountered,
+            SignalUrgency::Important,
+            Some(2),
+        ));
+        bus.mark_badges_clean();
+        bus.remove_tab(2);
+        assert!(bus.badges_dirty());
+    }
+}

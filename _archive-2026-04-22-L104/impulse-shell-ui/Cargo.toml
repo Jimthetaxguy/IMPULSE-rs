@@ -1,0 +1,15 @@
+[package]
+name = "impulse-shell-ui"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Dioxus component prototype for the Impulse desktop migration"
+authors = ["James Pustorino"]
+license = "MIT"
+
+[lib]
+name = "impulse_shell_ui"
+path = "src/lib.rs"
+
+[dependencies]
+dioxus = { version = "0.7.5", default-features = false, features = ["minimal"] }

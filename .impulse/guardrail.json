@@ -1,0 +1,46 @@
+{
+  "enabled": true,
+  "conflict_blocking_enabled": false,
+  "rules": [
+    {
+      "id": "block-force-push",
+      "pattern": "git\\s+push\\s+(--force|-f)\\s*(main|master)?",
+      "action": "block",
+      "target": "bash",
+      "reason": "Force pushes to main/master can overwrite team changes",
+      "suggestion": "Use --force-with-lease instead or create a backup branch first"
+    },
+    {
+      "id": "block-rm-rf-root",
+      "pattern": "rm\\s+-rf\\s+/",
+      "action": "block",
+      "target": "bash",
+      "reason": "Recursive deletion from root can destroy the entire system",
+      "suggestion": "Use more specific paths or rm -rf with confirmation"
+    },
+    {
+      "id": "block-destructive-db",
+      "pattern": "(DROP|TRUNCATE|DELETE\\s+FROM)\\s+(?!.*WHERE)",
+      "action": "block",
+      "target": "bash",
+      "reason": "Destructive database commands without WHERE clause can cause data loss",
+      "suggestion": "Add WHERE clause or use SELECT first to verify"
+    },
+    {
+      "id": "warn-sudo",
+      "pattern": "sudo\\s+",
+      "action": "warn",
+      "target": "bash",
+      "reason": "Sudo commands run with elevated privileges and can cause system damage",
+      "suggestion": "Ensure you understand the command and have proper authorization"
+    },
+    {
+      "id": "block-git-clean",
+      "pattern": "git\\s+clean\\s+(-fd|-fdx|-f\\s*-d)",
+      "action": "block",
+      "target": "bash",
+      "reason": "git clean permanently removes untracked files",
+      "suggestion": "Use -n flag first to preview what would be deleted"
+    }
+  ]
+}

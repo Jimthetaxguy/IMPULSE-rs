@@ -1,0 +1,16 @@
+{
+  "version": "1",
+  "schema_version": 2,
+  "indexed_at": "2026-02-24T02:41:22.728554Z",
+  "history_count": 2,
+  "genome_count": 6,
+  "vector_enabled": false,
+  "vector_available": false,
+  "last_index_duration_ms": 3,
+  "last_integrity_check": null,
+  "last_error_code": null,
+  "backend_health": [
+    "vector_backend_disabled=true"
+  ],
+  "notes": []
+}

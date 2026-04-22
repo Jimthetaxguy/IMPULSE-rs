@@ -1,0 +1,2 @@
+{"session_id":"cockpit-rs-20260223-064015-ba2eec46","session_name":"test-session","platform":"claudecode","started_at":"2026-02-23T06:40:15.873607Z","ended_at":"2026-02-23T06:40:55.004504Z","summary":"Test completed","files_touched":[],"tools_used":[]}
+{"session_id":"cockpit-rs-20260223-151018-997cb2a1","session_name":"test-session","platform":"claudecode","started_at":"2026-02-23T15:10:18.617084Z","ended_at":"2026-02-23T15:10:38.443949Z","summary":"Test completed successfully","files_touched":["src/main.rs"],"tools_used":["Write"]}

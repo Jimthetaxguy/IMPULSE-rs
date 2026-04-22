@@ -1,0 +1,28 @@
+# Build artifacts
+target/
+target.old/
+target2/
+
+# macOS app bundles & installers
+Impulse.app/
+*.dmg
+
+# Runtime state (regenerated on run)
+.impulse/retrieval.db
+.impulse/SESSIONS.json
+.impulse/LIVE_STATE.json
+.impulse/sockets/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Misc
+.superpowers/

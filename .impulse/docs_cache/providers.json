@@ -1,0 +1,37 @@
+[
+  {
+    "id": "openai",
+    "name": "OpenAI",
+    "api_url": "https://api.openai.com",
+    "docs_url": "https://platform.openai.com/docs",
+    "models_url": "https://api.openai.com/v1/models"
+  },
+  {
+    "id": "anthropic",
+    "name": "Anthropic",
+    "api_url": "https://api.anthropic.com",
+    "docs_url": "https://docs.anthropic.com/en/docs",
+    "models_url": "https://docs.anthropic.com/en/docs/models"
+  },
+  {
+    "id": "google",
+    "name": "Google",
+    "api_url": "https://generativelanguage.googleapis.com",
+    "docs_url": "https://ai.google.dev/docs",
+    "models_url": "https://ai.google.dev/models"
+  },
+  {
+    "id": "mistral",
+    "name": "Mistral AI",
+    "api_url": "https://api.mistral.ai",
+    "docs_url": "https://docs.mistral.ai",
+    "models_url": "https://docs.mistral.ai/models"
+  },
+  {
+    "id": "cohere",
+    "name": "Cohere",
+    "api_url": "https://api.cohere.ai",
+    "docs_url": "https://docs.cohere.com/docs",
+    "models_url": "https://docs.cohere.com/docs/models"
+  }
+]

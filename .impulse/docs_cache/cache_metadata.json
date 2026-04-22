@@ -1,0 +1,9 @@
+{
+  "last_updated": {
+    "secs_since_epoch": 1771900164,
+    "nanos_since_epoch": 958270000
+  },
+  "model_count": 16,
+  "provider_count": 5,
+  "source": "api"
+}

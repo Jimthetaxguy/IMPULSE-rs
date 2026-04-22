@@ -1,0 +1,101 @@
+{
+  "log_level": "info",
+  "default_platform": null,
+  "verbose": false,
+  "sync_interval_secs": 30,
+  "max_history_entries": 1000,
+  "retrieval_mode": "keyword",
+  "retrieval_backend": "fts",
+  "retrieval_default_limit": 10,
+  "retrieval_similarity_threshold": 0.75,
+  "retrieval_embedding_provider": "python-st",
+  "embedding_model": "all-MiniLM-L6-v2",
+  "retrieval_python_cmd": "python3",
+  "retrieval_vector_enabled": false,
+  "retrieval_semantic_strategy": "auto",
+  "retrieval_query_timeout_secs": 10,
+  "retrieval_index_timeout_secs": 60,
+  "retrieval_batch_size": 64,
+  "retrieval_candidate_pool": 200,
+  "retrieval_deduplicate_enabled": true,
+  "retrieval_fuzzy_matching_enabled": false,
+  "retrieval_experimental_pageindex_enabled": false,
+  "retrieval_pageindex_mode": "local-structure",
+  "context_injection_mode": "review",
+  "context_injection_scope": "both",
+  "context_injection_max_items": 5,
+  "context_injection_max_chars": 2000,
+  "context_injection_min_score": 0.6,
+  "context_injection_use_semantic": true,
+  "context_injection_emit_artifacts": true,
+  "stewardship_mode": "review",
+  "stewardship_monitor_threshold": 0.3,
+  "stewardship_surgical_threshold": 0.45,
+  "stewardship_thoughtful_threshold": 0.6,
+  "stewardship_emergency_threshold": 0.8,
+  "stewardship_poll_interval_secs": 10,
+  "stewardship_context_window_tokens": 200000,
+  "stewardship_cross_project_enabled": true,
+  "model_anthropic": null,
+  "model_openai": null,
+  "model_google": null,
+  "model_mistral": null,
+  "build_hygiene_enabled": true,
+  "build_hygiene_scan_paths": [
+    "~/projects",
+    "~/Desktop"
+  ],
+  "build_hygiene_size_threshold_gb": 10.0,
+  "build_hygiene_age_threshold_days": 30,
+  "build_hygiene_sweep_on_session_end": false,
+  "build_hygiene_sweep_on_toolchain_update": true,
+  "build_hygiene_dry_run_default": true,
+  "context_lifecycle_enabled": true,
+  "context_lifecycle_poll_secs": 5,
+  "context_lifecycle_startup_delay_ms": 3000,
+  "context_lifecycle_window_tokens": 200000,
+  "impulse_agent_provider": null,
+  "impulse_agent_model": null,
+  "impulse_agent_harness": null,
+  "impulse_agent_auto_review": false,
+  "impulse_agent_auto_coordinate": false,
+  "notifications_enabled": true,
+  "conflict_webhook_url": null,
+  "conflict_webhook_enabled": false,
+  "tool_execution_default_timeout_ms": 30000,
+  "tool_execution_max_output_bytes": 262144,
+  "tool_execution_max_artifacts": 8,
+  "tool_execution_allowed_read_roots": [
+    ".",
+    ".impulse"
+  ],
+  "tool_execution_allowed_write_roots": [
+    ".impulse"
+  ],
+  "external_tools_dir": ".impulse/tools.d",
+  "external_mcp_servers": [],
+  "impulse_agent_permissions": {
+    "allowed_actions": [
+      "monitor_agents",
+      "focus_agent",
+      "open_review",
+      "search_memory",
+      "modify_permissions"
+    ],
+    "allowed_tool_capabilities": [
+      "file_system_read",
+      "system_info"
+    ],
+    "require_confirmation_actions": [
+      "send_input",
+      "inject_context",
+      "cleanup_context",
+      "handoff_context",
+      "modify_permissions"
+    ]
+  },
+  "guardrails": {
+    "enabled": true,
+    "rules": []
+  }
+}

@@ -1,0 +1,1049 @@
+//! Context bridge — wraps context_lifecycle patterns for the terminal widget.
+//!
+//! Ports extraction, monitoring, compaction detection, and injection logic
+//! from `impulse-rs/src/context_lifecycle/` into a self-contained module that
+//! avoids depending on the full impulse-rs crate.
+
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::time::Instant;
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+use crate::backend::TerminalBackend;
+
+// ---------------------------------------------------------------------------
+// Constants (ported from context_lifecycle/types.rs)
+// ---------------------------------------------------------------------------
+
+/// Maximum insights to keep per bridge (bounded buffer).
+const MAX_INSIGHTS: usize = 50;
+
+/// Minimum seconds between extractions.
+const EXTRACTION_INTERVAL_SECS: u64 = 30;
+
+/// Minimum seconds between injections.
+const INJECTION_DEBOUNCE_SECS: u64 = 60;
+
+/// Minimum seconds between compaction scans.
+const COMPACTION_DEBOUNCE_SECS: u64 = 60;
+
+/// Token estimation: visible text is ~60% of total context.
+/// The remaining ~40% is system prompt, tool call JSON, and user turns.
+/// Applied to ANSI-stripped visible chars, not raw PTY bytes.
+const VISIBLE_TO_CONTEXT_MULTIPLIER: f64 = 1.6;
+
+/// Characters per token.
+const CHARS_PER_TOKEN: f64 = 4.0;
+
+/// Default context window size in tokens.
+const DEFAULT_WINDOW_TOKENS: usize = 200_000;
+
+// ---------------------------------------------------------------------------
+// Types (ported from context_lifecycle/types.rs)
+// ---------------------------------------------------------------------------
+
+/// The kind of AI agent running in a terminal pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentKind {
+    ClaudeCode,
+    Codex,
+    OpenCode,
+    GenericShell,
+}
+
+impl AgentKind {
+    /// Detect agent kind from the command name.
+    pub fn detect(command: &str, name: &str) -> Self {
+        let cmd_lower = command.to_lowercase();
+        let name_lower = name.to_lowercase();
+
+        if cmd_lower.contains("claude") || name_lower.contains("claude") {
+            Self::ClaudeCode
+        } else if cmd_lower.contains("codex") || name_lower.contains("codex") {
+            Self::Codex
+        } else if cmd_lower.contains("opencode") || name_lower.contains("opencode") {
+            Self::OpenCode
+        } else {
+            Self::GenericShell
+        }
+    }
+
+    /// Human-readable label.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "Claude Code",
+            Self::Codex => "Codex",
+            Self::OpenCode => "OpenCode",
+            Self::GenericShell => "Shell",
+        }
+    }
+
+    /// How long to wait after spawn before injecting bootstrap context.
+    pub fn startup_delay_ms(&self) -> u64 {
+        match self {
+            Self::ClaudeCode => 3000,
+            Self::Codex | Self::OpenCode => 2000,
+            Self::GenericShell => 500,
+        }
+    }
+
+    /// Whether this agent uses XML-delimited context.
+    pub fn uses_xml_context(&self) -> bool {
+        matches!(self, Self::ClaudeCode)
+    }
+}
+
+/// Context window usage tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextTier {
+    None,
+    Full,
+    Essential,
+    Critical,
+    Minimal,
+    PostCompaction,
+}
+
+impl ContextTier {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Full => "full",
+            Self::Essential => "essential",
+            Self::Critical => "critical",
+            Self::Minimal => "minimal",
+            Self::PostCompaction => "post_compaction",
+        }
+    }
+}
+
+/// Type of insight extracted from agent output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InsightType {
+    FileModified,
+    ErrorEncountered,
+    DecisionMade,
+    TaskCompleted,
+    RemoteConnection,
+}
+
+impl InsightType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::FileModified => "FileModified",
+            Self::ErrorEncountered => "ErrorEncountered",
+            Self::DecisionMade => "DecisionMade",
+            Self::TaskCompleted => "TaskCompleted",
+            Self::RemoteConnection => "RemoteConnection",
+        }
+    }
+}
+
+/// A structured insight extracted from agent PTY output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractedInsight {
+    pub pane_id: usize,
+    pub agent_kind: AgentKind,
+    pub timestamp: DateTime<Utc>,
+    pub insight_type: InsightType,
+    pub content: String,
+}
+
+/// Context health summary for display.
+#[derive(Debug, Clone)]
+pub struct ContextHealth {
+    pub tier: ContextTier,
+    pub estimated_tokens: usize,
+    pub window_tokens: usize,
+    pub usage_fraction: f32,
+    pub compaction_count: u32,
+    pub injection_count: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Compaction patterns (ported from context_lifecycle/detector.rs)
+// ---------------------------------------------------------------------------
+
+const COMPACTION_PATTERNS: &[&str] = &[
+    "compressing prior messages",
+    "auto-compact",
+    "context compressed",
+    "compacted conversation",
+    "summarizing conversation",
+    "conversation is getting long",
+    "context window is getting full",
+];
+
+// ---------------------------------------------------------------------------
+// ContextBridge
+// ---------------------------------------------------------------------------
+
+/// Bridges the terminal backend with context lifecycle operations.
+///
+/// Call `extract_tick()` periodically (every ~3 seconds) to scan for new
+/// insights, check compaction, and update token estimates. Call `inject_context()`
+/// to push context into the agent's terminal.
+pub struct ContextBridge {
+    pane_id: usize,
+    agent_kind: AgentKind,
+    backend: Arc<TerminalBackend>,
+
+    // Token estimation.
+    estimated_tokens: usize,
+    window_tokens: usize,
+    current_tier: ContextTier,
+    last_output_bytes: u64,
+
+    // Counters.
+    compaction_count: u32,
+    injection_count: u32,
+
+    // Insights.
+    insights: Vec<ExtractedInsight>,
+
+    // Timing.
+    last_extraction_at: Option<Instant>,
+    last_injection_at: Option<Instant>,
+    last_compaction_scan_at: Option<Instant>,
+
+    // Diff-based extraction.
+    previous_screen_text: String,
+
+    // Usage history for sparkline visualization (last 100 samples at 3s intervals = ~5 minutes).
+    // Wrapped in Arc so it can be cheaply cloned and returned from behind a lock.
+    usage_history: Arc<VecDeque<(Instant, f32)>>,
+}
+
+impl ContextBridge {
+    /// Create a new context bridge for a terminal backend.
+    pub fn new(pane_id: usize, agent_kind: AgentKind, backend: Arc<TerminalBackend>) -> Self {
+        Self {
+            pane_id,
+            agent_kind,
+            backend,
+            estimated_tokens: 0,
+            window_tokens: DEFAULT_WINDOW_TOKENS,
+            current_tier: ContextTier::None,
+            last_output_bytes: 0,
+            compaction_count: 0,
+            injection_count: 0,
+            insights: Vec::new(),
+            last_extraction_at: None,
+            last_injection_at: None,
+            last_compaction_scan_at: None,
+            previous_screen_text: String::new(),
+            usage_history: Arc::new(VecDeque::with_capacity(100)),
+        }
+    }
+
+    /// Get the current context health.
+    pub fn health(&self) -> ContextHealth {
+        ContextHealth {
+            tier: self.current_tier,
+            estimated_tokens: self.estimated_tokens,
+            window_tokens: self.window_tokens,
+            usage_fraction: if self.window_tokens > 0 {
+                self.estimated_tokens as f32 / self.window_tokens as f32
+            } else {
+                0.0
+            },
+            compaction_count: self.compaction_count,
+            injection_count: self.injection_count,
+        }
+    }
+
+    /// Usage history as (Instant, fraction) values for sparkline visualization.
+    /// Returns up to 100 recent samples (oldest first) as a shared Arc.
+    pub fn usage_history(&self) -> Arc<VecDeque<(Instant, f32)>> {
+        Arc::clone(&self.usage_history)
+    }
+
+    /// Run one extraction tick. Call every ~3 seconds.
+    ///
+    /// 1. Updates token estimate from output bytes.
+    /// 2. Scans for compaction events (debounced).
+    /// 3. Extracts insights from new screen content (debounced).
+    ///
+    /// Returns newly extracted insights.
+    pub fn extract_tick(&mut self) -> Vec<ExtractedInsight> {
+        let current_bytes = self.backend.output_bytes();
+
+        // Update token estimate using visible chars (ANSI-stripped).
+        if current_bytes != self.last_output_bytes {
+            self.last_output_bytes = current_bytes;
+            let visible_chars = self.backend.visible_char_count();
+            self.estimated_tokens = estimate_tokens(visible_chars);
+            self.current_tier = usage_tier(self.estimated_tokens, self.window_tokens);
+        }
+
+        let now = Instant::now();
+
+        // Record usage history for sparkline (bounded to 100 samples).
+        let fraction = if self.window_tokens > 0 {
+            self.estimated_tokens as f32 / self.window_tokens as f32
+        } else {
+            0.0
+        };
+        if self.usage_history.len() >= 100 {
+            Arc::make_mut(&mut self.usage_history).pop_front();
+        }
+        Arc::make_mut(&mut self.usage_history).push_back((now, fraction));
+        let screen_text = self.backend.screen_text();
+
+        // Compaction detection (debounced).
+        let should_scan_compaction = self
+            .last_compaction_scan_at
+            .is_none_or(|t| now.duration_since(t).as_secs() >= COMPACTION_DEBOUNCE_SECS);
+
+        if should_scan_compaction {
+            self.last_compaction_scan_at = Some(now);
+            if scan_compaction(&screen_text) {
+                self.compaction_count += 1;
+                self.estimated_tokens = self.window_tokens / 10;
+                self.current_tier = ContextTier::PostCompaction;
+            }
+        }
+
+        // Extraction (debounced).
+        let should_extract = self
+            .last_extraction_at
+            .is_none_or(|t| now.duration_since(t).as_secs() >= EXTRACTION_INTERVAL_SECS);
+
+        if !should_extract {
+            return Vec::new();
+        }
+        self.last_extraction_at = Some(now);
+
+        // Find new content by diffing.
+        let new_content = diff_new_content(&self.previous_screen_text, &screen_text);
+        self.previous_screen_text = screen_text;
+
+        if new_content.is_empty() {
+            return Vec::new();
+        }
+
+        // Extract insights from new content.
+        let new_insights = extract_insights(self.agent_kind, self.pane_id, &new_content);
+
+        // Deduplicate and add to buffer.
+        let mut added = Vec::new();
+        for insight in new_insights {
+            let already_exists = self.insights.iter().any(|existing| {
+                existing.content == insight.content && existing.insight_type == insight.insight_type
+            });
+            if !already_exists {
+                if self.insights.len() >= MAX_INSIGHTS {
+                    self.insights.remove(0);
+                }
+                self.insights.push(insight.clone());
+                added.push(insight);
+            }
+        }
+
+        added
+    }
+
+    /// Inject context into the agent's terminal.
+    ///
+    /// Wraps the content in agent-appropriate delimiters and writes it via
+    /// bracketed paste to avoid triggering agent hotkeys. Uses the WriteQueue
+    /// to ensure the entire injection is atomic and skipped if the user is
+    /// actively typing (within 500ms).
+    pub fn inject_context(&mut self, content: &str) -> Result<(), Box<dyn std::error::Error>> {
+        // Respect debounce.
+        if let Some(last) = self.last_injection_at {
+            if last.elapsed().as_secs() < INJECTION_DEBOUNCE_SECS {
+                return Ok(());
+            }
+        }
+
+        let wrapped = self.wrap_injection(content);
+        let pasted = crate::input::bracketed_paste(&wrapped);
+        // WriteQueue ensures atomic write and skips if user typed recently.
+        let injected = self.backend.write_queue().write_injection(&pasted)?;
+
+        if injected {
+            self.last_injection_at = Some(Instant::now());
+            self.injection_count += 1;
+        }
+        Ok(())
+    }
+
+    /// All accumulated insights (newest last).
+    pub fn insights(&self) -> &[ExtractedInsight] {
+        &self.insights
+    }
+
+    /// Recent remote or mux ownership hints, newest first.
+    pub fn recent_remote_connections(&self, limit: usize) -> Vec<String> {
+        self.insights
+            .iter()
+            .rev()
+            .filter(|insight| insight.insight_type == InsightType::RemoteConnection)
+            .take(limit)
+            .map(|insight| insight.content.clone())
+            .collect()
+    }
+
+    /// The current context tier.
+    pub fn current_tier(&self) -> ContextTier {
+        self.current_tier
+    }
+
+    /// Wrap content in agent-appropriate delimiters.
+    fn wrap_injection(&self, content: &str) -> String {
+        let tier = self.current_tier.as_str();
+        if self.agent_kind.uses_xml_context() {
+            format!(
+                "<impulse-context type=\"refresh\" tier=\"{}\">\n{}\n</impulse-context>\n",
+                tier, content
+            )
+        } else {
+            format!("# [Impulse Context — {}]\n{}\n", tier, content)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Standalone helpers
+// ---------------------------------------------------------------------------
+
+/// Estimate tokens from visible character count (ANSI-stripped).
+///
+/// Uses visible chars (not raw PTY bytes) to avoid inflating the estimate
+/// with ANSI escape sequences. The multiplier accounts for context that
+/// isn't visible in PTY output (system prompt, tool call JSON, user turns).
+fn estimate_tokens(visible_chars: usize) -> usize {
+    (visible_chars as f64 * VISIBLE_TO_CONTEXT_MULTIPLIER / CHARS_PER_TOKEN) as usize
+}
+
+/// Map token usage to a tier.
+fn usage_tier(estimated_tokens: usize, window_tokens: usize) -> ContextTier {
+    if window_tokens == 0 {
+        return ContextTier::None;
+    }
+    let pct = (estimated_tokens as f64 / window_tokens as f64 * 100.0) as u8;
+    match pct {
+        0..=44 => ContextTier::None,
+        45..=59 => ContextTier::Essential,
+        60..=79 => ContextTier::Critical,
+        _ => ContextTier::Minimal,
+    }
+}
+
+/// Scan text for compaction patterns (case-insensitive).
+fn scan_compaction(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    COMPACTION_PATTERNS.iter().any(|pat| lower.contains(pat))
+}
+
+/// Simple diff: return lines in `current` that aren't in `previous`.
+fn diff_new_content(previous: &str, current: &str) -> String {
+    if previous.is_empty() {
+        return current.to_string();
+    }
+    // Find the first divergence point and return everything after.
+    let prev_lines: Vec<&str> = previous.lines().collect();
+    let curr_lines: Vec<&str> = current.lines().collect();
+
+    let common = prev_lines
+        .iter()
+        .zip(curr_lines.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    curr_lines[common..].join("\n")
+}
+
+/// Extract insights from text (ported from context_lifecycle/extractor.rs).
+fn extract_insights(agent_kind: AgentKind, pane_id: usize, text: &str) -> Vec<ExtractedInsight> {
+    let mut insights = Vec::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // File modification patterns.
+        if let Some(path) = extract_file_modified(agent_kind, trimmed) {
+            insights.push(ExtractedInsight {
+                pane_id,
+                agent_kind,
+                timestamp: Utc::now(),
+                insight_type: InsightType::FileModified,
+                content: path,
+            });
+        }
+
+        // Error patterns.
+        if let Some(err) = extract_error(agent_kind, trimmed) {
+            insights.push(ExtractedInsight {
+                pane_id,
+                agent_kind,
+                timestamp: Utc::now(),
+                insight_type: InsightType::ErrorEncountered,
+                content: err,
+            });
+        }
+
+        // Decision patterns.
+        if let Some(decision) = extract_decision(trimmed) {
+            insights.push(ExtractedInsight {
+                pane_id,
+                agent_kind,
+                timestamp: Utc::now(),
+                insight_type: InsightType::DecisionMade,
+                content: decision,
+            });
+        }
+
+        // Task completion patterns.
+        if let Some(task) = extract_task_completed(trimmed) {
+            insights.push(ExtractedInsight {
+                pane_id,
+                agent_kind,
+                timestamp: Utc::now(),
+                insight_type: InsightType::TaskCompleted,
+                content: task,
+            });
+        }
+
+        if let Some(remote) = extract_remote_connection(trimmed) {
+            insights.push(ExtractedInsight {
+                pane_id,
+                agent_kind,
+                timestamp: Utc::now(),
+                insight_type: InsightType::RemoteConnection,
+                content: remote,
+            });
+        }
+    }
+
+    insights
+}
+
+fn extract_file_modified(agent_kind: AgentKind, line: &str) -> Option<String> {
+    match agent_kind {
+        AgentKind::ClaudeCode => {
+            if let Some(rest) = line.strip_prefix("Write(") {
+                return rest.strip_suffix(')').map(|s| s.to_string());
+            }
+            if let Some(rest) = line.strip_prefix("Edit(") {
+                return rest.strip_suffix(')').map(|s| s.to_string());
+            }
+            if let Some(rest) = line.strip_prefix("Created file: ") {
+                return Some(rest.trim().to_string());
+            }
+            None
+        }
+        AgentKind::OpenCode | AgentKind::Codex => {
+            let trimmed = line.trim();
+            let lower = trimmed.to_ascii_lowercase();
+            for prefix in &["wrote ", "modified ", "created "] {
+                if lower.starts_with(prefix) {
+                    let path = trimmed[prefix.len()..].trim();
+                    if !path.is_empty() && (path.contains('/') || path.contains('.')) {
+                        return Some(path.to_string());
+                    }
+                }
+            }
+            None
+        }
+        AgentKind::GenericShell => None,
+    }
+}
+
+fn extract_error(agent_kind: AgentKind, line: &str) -> Option<String> {
+    let lower = line.to_lowercase();
+    match agent_kind {
+        AgentKind::ClaudeCode => {
+            if lower.starts_with("error:") || lower.contains("failed") || lower.contains("panicked")
+            {
+                Some(truncate_insight(line, 120))
+            } else {
+                None
+            }
+        }
+        AgentKind::OpenCode | AgentKind::Codex => {
+            if lower.starts_with("error:") || lower.contains("fail") {
+                Some(truncate_insight(line, 120))
+            } else {
+                None
+            }
+        }
+        AgentKind::GenericShell => {
+            if lower.starts_with("error:") {
+                Some(truncate_insight(line, 120))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn extract_decision(line: &str) -> Option<String> {
+    let lower = line.to_lowercase();
+    if lower.contains("decision:") || lower.contains("chose ") || lower.contains("using approach") {
+        Some(truncate_insight(line, 120))
+    } else {
+        None
+    }
+}
+
+fn extract_task_completed(line: &str) -> Option<String> {
+    let lower = line.to_lowercase();
+    if lower.contains("test passed")
+        || lower.contains("tests passed")
+        || lower.contains("build succeeded")
+        || lower.contains("deployed")
+    {
+        Some(truncate_insight(line, 120))
+    } else {
+        None
+    }
+}
+
+fn extract_remote_connection(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if trimmed.starts_with("ssh ") && trimmed.contains('@') {
+        return Some(truncate_insight(trimmed, 120));
+    }
+    if lower.contains("tmux new-session")
+        || lower.contains("tmux new -s")
+        || lower.contains("tmux attach -t")
+    {
+        return Some(truncate_insight(trimmed, 120));
+    }
+    if lower.starts_with("smux ") || lower.contains(" smux ") {
+        return Some(truncate_insight(trimmed, 120));
+    }
+    None
+}
+
+/// Truncate a string to max_len, adding "..." if truncated. UTF-8 safe.
+pub fn truncate_insight(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        let mut end = max_len;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &s[..end])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_agent_kind_detect() {
+        assert_eq!(
+            AgentKind::detect("claude", "claude-1"),
+            AgentKind::ClaudeCode
+        );
+        assert_eq!(AgentKind::detect("codex", "codex-1"), AgentKind::Codex);
+        assert_eq!(AgentKind::detect("opencode", "oc-1"), AgentKind::OpenCode);
+        assert_eq!(
+            AgentKind::detect("/bin/bash", "bash"),
+            AgentKind::GenericShell
+        );
+    }
+
+    #[test]
+    fn test_agent_kind_startup_delay_ms_matches_runtime_expectations() {
+        assert_eq!(AgentKind::ClaudeCode.startup_delay_ms(), 3000);
+        assert_eq!(AgentKind::Codex.startup_delay_ms(), 2000);
+        assert_eq!(AgentKind::OpenCode.startup_delay_ms(), 2000);
+        assert_eq!(AgentKind::GenericShell.startup_delay_ms(), 500);
+    }
+
+    #[test]
+    fn test_context_tier_ordering() {
+        assert!(ContextTier::None < ContextTier::Full);
+        assert!(ContextTier::Full < ContextTier::Essential);
+        assert!(ContextTier::Essential < ContextTier::Critical);
+        assert!(ContextTier::Critical < ContextTier::Minimal);
+    }
+
+    #[test]
+    fn test_estimate_tokens() {
+        // Formula: visible_chars * 1.6 / 4.0 = visible_chars * 0.4
+        assert_eq!(estimate_tokens(0), 0);
+        assert_eq!(estimate_tokens(1000), 400);
+        assert_eq!(estimate_tokens(800_000), 320_000);
+    }
+
+    #[test]
+    fn test_estimate_tokens_lower_than_old_formula() {
+        // The old formula was output_bytes * 2.5 / 4.0 = 0.625x.
+        // The new formula is visible_chars * 1.6 / 4.0 = 0.4x.
+        // For the same input, the new estimate should be lower.
+        let old_result = (1000_f64 * 2.5 / 4.0) as usize; // 625
+        let new_result = estimate_tokens(1000); // 400
+        assert!(
+            new_result < old_result,
+            "new estimate ({}) should be lower than old ({})",
+            new_result,
+            old_result
+        );
+    }
+
+    #[test]
+    fn test_estimate_tokens_realistic_session() {
+        // A Claude Code session with ~68K actual tokens might show
+        // ~170K visible chars on screen. The estimate should be closer
+        // to 68K than the old formula's ~106K.
+        let visible_chars = 170_000;
+        let estimated = estimate_tokens(visible_chars);
+        // 170_000 * 0.4 = 68_000
+        assert_eq!(estimated, 68_000);
+    }
+
+    #[test]
+    fn test_usage_tier() {
+        assert_eq!(usage_tier(0, 200_000), ContextTier::None);
+        assert_eq!(usage_tier(89_000, 200_000), ContextTier::None);
+        assert_eq!(usage_tier(90_000, 200_000), ContextTier::Essential);
+        assert_eq!(usage_tier(120_000, 200_000), ContextTier::Critical);
+        assert_eq!(usage_tier(160_000, 200_000), ContextTier::Minimal);
+    }
+
+    #[test]
+    fn test_scan_compaction() {
+        assert!(scan_compaction("System: compressing prior messages"));
+        assert!(scan_compaction("auto-compact triggered"));
+        assert!(!scan_compaction("Hello world"));
+        assert!(!scan_compaction(""));
+    }
+
+    #[test]
+    fn test_extract_file_modified_claude() {
+        let insights = extract_insights(
+            AgentKind::ClaudeCode,
+            1,
+            "Write(src/main.rs)\nEdit(src/lib.rs)\nCreated file: src/new.rs\nSome other line",
+        );
+        let files: Vec<_> = insights
+            .iter()
+            .filter(|i| i.insight_type == InsightType::FileModified)
+            .map(|i| i.content.as_str())
+            .collect();
+        assert_eq!(files, vec!["src/main.rs", "src/lib.rs", "src/new.rs"]);
+    }
+
+    #[test]
+    fn test_extract_errors() {
+        let insights = extract_insights(
+            AgentKind::ClaudeCode,
+            1,
+            "error: cannot find value `x`\nAll good here\nTest failed at line 42",
+        );
+        let errors: Vec<_> = insights
+            .iter()
+            .filter(|i| i.insight_type == InsightType::ErrorEncountered)
+            .collect();
+        assert_eq!(errors.len(), 2);
+    }
+
+    #[test]
+    fn test_extract_decisions() {
+        let insights = extract_insights(
+            AgentKind::ClaudeCode,
+            1,
+            "decision: use HashMap instead of BTreeMap\nSome other line",
+        );
+        let decisions: Vec<_> = insights
+            .iter()
+            .filter(|i| i.insight_type == InsightType::DecisionMade)
+            .collect();
+        assert_eq!(decisions.len(), 1);
+    }
+
+    #[test]
+    fn test_extract_task_completed() {
+        let insights = extract_insights(
+            AgentKind::ClaudeCode,
+            1,
+            "All 47 tests passed\nbuild succeeded\n",
+        );
+        let tasks: Vec<_> = insights
+            .iter()
+            .filter(|i| i.insight_type == InsightType::TaskCompleted)
+            .collect();
+        assert_eq!(tasks.len(), 2);
+    }
+
+    #[test]
+    fn test_extract_remote_connections_and_mux_hints() {
+        let insights = extract_insights(
+            AgentKind::ClaudeCode,
+            1,
+            "ssh james@example.com\ntmux attach -t demo-shell\nsmux attach demo --command codex",
+        );
+        let remote: Vec<_> = insights
+            .iter()
+            .filter(|i| i.insight_type == InsightType::RemoteConnection)
+            .map(|i| i.content.as_str())
+            .collect();
+        assert_eq!(
+            remote,
+            vec![
+                "ssh james@example.com",
+                "tmux attach -t demo-shell",
+                "smux attach demo --command codex",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_extract_file_modified_preserves_case_for_opencode_and_codex() {
+        let insights = extract_insights(
+            AgentKind::OpenCode,
+            2,
+            "Wrote src/Main.rs\nModified Cargo.toml\nCreated README.md",
+        );
+        let files: Vec<_> = insights
+            .iter()
+            .filter(|i| i.insight_type == InsightType::FileModified)
+            .map(|i| i.content.as_str())
+            .collect();
+        assert_eq!(files, vec!["src/Main.rs", "Cargo.toml", "README.md"]);
+    }
+
+    #[test]
+    fn test_truncate_insight() {
+        assert_eq!(truncate_insight("short", 120), "short");
+        let long = "a".repeat(200);
+        let truncated = truncate_insight(&long, 120);
+        assert!(truncated.ends_with("..."));
+        assert!(truncated.len() <= 123); // 120 + "..."
+    }
+
+    #[test]
+    fn test_diff_new_content_empty_previous() {
+        let result = diff_new_content("", "hello\nworld");
+        assert_eq!(result, "hello\nworld");
+    }
+
+    #[test]
+    fn test_diff_new_content_with_overlap() {
+        let result = diff_new_content("line1\nline2", "line1\nline2\nline3");
+        assert_eq!(result, "line3");
+    }
+
+    #[test]
+    fn test_diff_new_content_no_change() {
+        let result = diff_new_content("same\nlines", "same\nlines");
+        assert_eq!(result, "");
+    }
+
+    // -----------------------------------------------------------------------
+    // Realistic agent output fixture tests (Loop 32)
+    // -----------------------------------------------------------------------
+
+    /// Simulates a real Claude Code session with tool calls, errors, and completions.
+    #[test]
+    fn test_fixture_claude_code_full_session() {
+        let output = r#"I'll help fix the compilation error. Let me read the file first.
+
+Read(src/daemon/mod.rs)
+
+The issue is a missing import. Let me fix it.
+
+Edit(src/daemon/mod.rs)
+
+Now let me verify the fix compiles.
+
+error: could not compile `impulse-rs` due to 2 previous errors
+
+I see there are additional errors. Let me fix those too.
+
+Edit(src/daemon/tests.rs)
+
+Write(src/daemon/helpers.rs)
+
+decision: use tokio::sync::Mutex instead of std::sync::Mutex for async compatibility
+
+Let me run the tests now.
+
+All 47 tests passed
+
+The fix is complete. I chose the async Mutex approach because the daemon handler uses .await."#;
+
+        let insights = extract_insights(AgentKind::ClaudeCode, 1, output);
+
+        // File modifications: Read + 2 Edits + 1 Write + 1 Created
+        let files: Vec<_> = insights
+            .iter()
+            .filter(|i| i.insight_type == InsightType::FileModified)
+            .map(|i| i.content.as_str())
+            .collect();
+        assert_eq!(
+            files,
+            vec![
+                "src/daemon/mod.rs",
+                "src/daemon/tests.rs",
+                "src/daemon/helpers.rs"
+            ]
+        );
+
+        // 1 error (the compile error)
+        let errors: Vec<_> = insights
+            .iter()
+            .filter(|i| i.insight_type == InsightType::ErrorEncountered)
+            .collect();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].content.contains("could not compile"));
+
+        // 2 decisions: "decision:" line + "chose" line
+        let decisions: Vec<_> = insights
+            .iter()
+            .filter(|i| i.insight_type == InsightType::DecisionMade)
+            .collect();
+        assert_eq!(decisions.len(), 2);
+        assert!(decisions[0].content.contains("tokio::sync::Mutex"));
+        assert!(decisions[1].content.contains("chose the async Mutex"));
+
+        // 1 task completion
+        let tasks: Vec<_> = insights
+            .iter()
+            .filter(|i| i.insight_type == InsightType::TaskCompleted)
+            .collect();
+        assert_eq!(tasks.len(), 1);
+        assert!(tasks[0].content.contains("47 tests passed"));
+    }
+
+    /// Simulates OpenCode output with file writes and error patterns.
+    #[test]
+    fn test_fixture_opencode_session() {
+        let output = r#"Analyzing the codebase...
+
+Wrote src/handlers/new_handler.rs
+Modified src/main.rs
+
+Running tests...
+error: Test failed at assertion on line 42
+
+Applying fix...
+Modified src/handlers/new_handler.rs
+
+Tests passed, build succeeded
+deployed to staging"#;
+
+        let insights = extract_insights(AgentKind::OpenCode, 2, output);
+
+        let files: Vec<_> = insights
+            .iter()
+            .filter(|i| i.insight_type == InsightType::FileModified)
+            .map(|i| i.content.as_str())
+            .collect();
+        assert_eq!(
+            files,
+            vec![
+                "src/handlers/new_handler.rs",
+                "src/main.rs",
+                "src/handlers/new_handler.rs",
+            ]
+        );
+
+        let errors: Vec<_> = insights
+            .iter()
+            .filter(|i| i.insight_type == InsightType::ErrorEncountered)
+            .collect();
+        assert_eq!(errors.len(), 1);
+
+        let tasks: Vec<_> = insights
+            .iter()
+            .filter(|i| i.insight_type == InsightType::TaskCompleted)
+            .collect();
+        assert_eq!(tasks.len(), 2); // "build succeeded" + "deployed"
+    }
+
+    /// Compaction detection with realistic Claude output patterns.
+    #[test]
+    fn test_fixture_compaction_detection() {
+        assert!(scan_compaction(
+            "[system] Compressing prior messages in this conversation."
+        ));
+        assert!(scan_compaction(
+            "Note: auto-compact triggered due to context limits."
+        ));
+        assert!(scan_compaction(
+            "The conversation is getting long, some earlier messages may be summarized."
+        ));
+        assert!(!scan_compaction("I'll help you fix the compilation error."));
+    }
+
+    /// Edge case: Claude Code output with Read() (not a modification).
+    #[test]
+    fn test_fixture_read_not_write() {
+        let output = "Read(src/main.rs)\nSome analysis here\n";
+        let insights = extract_insights(AgentKind::ClaudeCode, 1, output);
+        // Read() should NOT be treated as a file modification — only Write/Edit/Created
+        let files: Vec<_> = insights
+            .iter()
+            .filter(|i| i.insight_type == InsightType::FileModified)
+            .collect();
+        assert_eq!(files.len(), 0);
+    }
+
+    /// Edge case: mixed agent output with no actionable patterns.
+    #[test]
+    fn test_fixture_no_insights_from_noise() {
+        let output = r#"Let me think about this...
+The function takes two parameters.
+Here's my analysis of the code structure.
+I recommend we refactor this module."#;
+        let insights = extract_insights(AgentKind::ClaudeCode, 1, output);
+        assert!(insights.is_empty());
+    }
+
+    #[test]
+    fn test_injection_wrapping_claude() {
+        // We can't easily test ContextBridge without a real backend, but we can
+        // test the wrapping logic directly.
+        let agent = AgentKind::ClaudeCode;
+        let content = "test content";
+        let tier = "essential";
+
+        let wrapped = if agent.uses_xml_context() {
+            format!(
+                "<impulse-context type=\"refresh\" tier=\"{}\">\n{}\n</impulse-context>\n",
+                tier, content
+            )
+        } else {
+            format!("# [Impulse Context — {}]\n{}\n", tier, content)
+        };
+
+        assert!(wrapped.contains("<impulse-context"));
+        assert!(wrapped.contains("test content"));
+    }
+
+    #[test]
+    fn test_injection_wrapping_opencode() {
+        let agent = AgentKind::OpenCode;
+        let content = "test content";
+        let tier = "critical";
+
+        let wrapped = if agent.uses_xml_context() {
+            format!(
+                "<impulse-context type=\"refresh\" tier=\"{}\">\n{}\n</impulse-context>\n",
+                tier, content
+            )
+        } else {
+            format!("# [Impulse Context — {}]\n{}\n", tier, content)
+        };
+
+        assert!(wrapped.starts_with("# [Impulse Context"));
+        assert!(wrapped.contains("test content"));
+    }
+}

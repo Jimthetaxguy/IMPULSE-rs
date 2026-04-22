@@ -1,0 +1,488 @@
+{
+  "version": "2.0",
+  "impulse_version": "0.1.0",
+  "generated_at": "2026-03-27T19:00:34.743656+00:00",
+  "tools": [
+    {
+      "id": "benchmark",
+      "name": "Benchmark",
+      "description": "Run a micro-benchmark on a Python expression",
+      "category": "analysis",
+      "params": [
+        {
+          "name": "code",
+          "description": "Python code to benchmark",
+          "param_type": "String",
+          "required": true,
+          "default": null
+        },
+        {
+          "name": "iterations",
+          "description": "Number of iterations (default: 100)",
+          "param_type": "Integer",
+          "required": false,
+          "default": 100
+        }
+      ],
+      "capabilities": [
+        "python_exec"
+      ],
+      "source": "builtin"
+    },
+    {
+      "id": "build_health",
+      "name": "Build Health",
+      "description": "Analyze Rust build artifact disk usage across projects",
+      "category": "system",
+      "params": [
+        {
+          "name": "scan_paths",
+          "description": "Comma-separated directories to scan (supports ~). Defaults to ~/projects,~/Desktop",
+          "param_type": "String",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "threshold_gb",
+          "description": "Size threshold in GB for warnings (default: 10.0)",
+          "param_type": "Float",
+          "required": false,
+          "default": 10.0
+        }
+      ],
+      "capabilities": [
+        "filesystem_read"
+      ],
+      "source": "builtin"
+    },
+    {
+      "id": "calculator",
+      "name": "Calculator",
+      "description": "Evaluate mathematical expressions using Python",
+      "category": "utility",
+      "params": [
+        {
+          "name": "expression",
+          "description": "Mathematical expression to evaluate (e.g., '2 + 2', '(10 * 5) / 3')",
+          "param_type": "String",
+          "required": true,
+          "default": null
+        }
+      ],
+      "capabilities": [
+        "python_exec"
+      ],
+      "source": "builtin"
+    },
+    {
+      "id": "clean_all",
+      "name": "Clean All",
+      "description": "Run cargo clean across all discovered Rust projects (dry-run default)",
+      "category": "system",
+      "params": [
+        {
+          "name": "dry_run",
+          "description": "Only show what would be cleaned (default: true)",
+          "param_type": "Bool",
+          "required": false,
+          "default": true
+        }
+      ],
+      "capabilities": [
+        "filesystem_read",
+        "filesystem_write"
+      ],
+      "source": "builtin"
+    },
+    {
+      "id": "config_get",
+      "name": "Config Get",
+      "description": "Read Impulse configuration values",
+      "category": "system",
+      "params": [
+        {
+          "name": "key",
+          "description": "Specific config key to read (omit for all config)",
+          "param_type": "String",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "impulse_dir",
+          "description": "Path to .impulse directory (default: .impulse)",
+          "param_type": "FilePath",
+          "required": false,
+          "default": null
+        }
+      ],
+      "capabilities": [
+        "filesystem_read"
+      ],
+      "source": "builtin"
+    },
+    {
+      "id": "document_extract",
+      "name": "Document Extract",
+      "description": "Extract structured data (dates, amounts, contacts) from Office documents",
+      "category": "document",
+      "params": [
+        {
+          "name": "path",
+          "description": "Path to the document file",
+          "param_type": "FilePath",
+          "required": true,
+          "default": null
+        },
+        {
+          "name": "goal",
+          "description": "What to extract: 'dates', 'amounts', 'contacts', 'names', or custom text",
+          "param_type": "String",
+          "required": true,
+          "default": null
+        },
+        {
+          "name": "use_python",
+          "description": "Use Python regex extraction (default: true)",
+          "param_type": "Bool",
+          "required": false,
+          "default": true
+        }
+      ],
+      "capabilities": [
+        "filesystem_read"
+      ],
+      "source": "builtin"
+    },
+    {
+      "id": "file_read",
+      "name": "File Read",
+      "description": "Read a file with size limits and optional line range",
+      "category": "utility",
+      "params": [
+        {
+          "name": "path",
+          "description": "Path to the file to read",
+          "param_type": "FilePath",
+          "required": true,
+          "default": null
+        },
+        {
+          "name": "start_line",
+          "description": "First line to read (1-based, default: 1)",
+          "param_type": "Integer",
+          "required": false,
+          "default": 1
+        },
+        {
+          "name": "max_lines",
+          "description": "Maximum lines to return (default: 200)",
+          "param_type": "Integer",
+          "required": false,
+          "default": 200
+        }
+      ],
+      "capabilities": [
+        "filesystem_read"
+      ],
+      "source": "builtin"
+    },
+    {
+      "id": "genome_read",
+      "name": "Genome Read",
+      "description": "Read permanent project decisions and preferences from GENOME.md",
+      "category": "analysis",
+      "params": [
+        {
+          "name": "section",
+          "description": "Optional section filter (e.g., 'decisions', 'preferences', 'patterns')",
+          "param_type": "String",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "impulse_dir",
+          "description": "Path to .impulse directory (default: .impulse)",
+          "param_type": "FilePath",
+          "required": false,
+          "default": null
+        }
+      ],
+      "capabilities": [
+        "filesystem_read"
+      ],
+      "source": "builtin"
+    },
+    {
+      "id": "health_check",
+      "name": "Health Check",
+      "description": "Run health checks on the .impulse/ directory",
+      "category": "system",
+      "params": [
+        {
+          "name": "impulse_dir",
+          "description": "Path to .impulse/ directory (defaults to .impulse in cwd)",
+          "param_type": "FilePath",
+          "required": false,
+          "default": ".impulse"
+        }
+      ],
+      "capabilities": [
+        "filesystem_read"
+      ],
+      "source": "builtin"
+    },
+    {
+      "id": "memory_search",
+      "name": "Memory Search",
+      "description": "Search GENOME decisions and session history via retrieval index",
+      "category": "analysis",
+      "params": [
+        {
+          "name": "query",
+          "description": "Search query text",
+          "param_type": "String",
+          "required": true,
+          "default": null
+        },
+        {
+          "name": "scope",
+          "description": "What to search: 'history', 'genome', or 'all' (default: all)",
+          "param_type": "String",
+          "required": false,
+          "default": "all"
+        },
+        {
+          "name": "mode",
+          "description": "Search mode: 'keyword' or 'semantic' (default: keyword)",
+          "param_type": "String",
+          "required": false,
+          "default": "keyword"
+        },
+        {
+          "name": "limit",
+          "description": "Maximum results (default: 5)",
+          "param_type": "Integer",
+          "required": false,
+          "default": 5
+        },
+        {
+          "name": "impulse_dir",
+          "description": "Path to .impulse directory (default: .impulse)",
+          "param_type": "FilePath",
+          "required": false,
+          "default": null
+        }
+      ],
+      "capabilities": [
+        "filesystem_read"
+      ],
+      "source": "builtin"
+    },
+    {
+      "id": "python_exec",
+      "name": "Python Execute",
+      "description": "Execute Python code and return stdout/stderr",
+      "category": "utility",
+      "params": [
+        {
+          "name": "code",
+          "description": "Python code to execute",
+          "param_type": "String",
+          "required": true,
+          "default": null
+        },
+        {
+          "name": "timeout",
+          "description": "Timeout in seconds (default: 30)",
+          "param_type": "Integer",
+          "required": false,
+          "default": 30
+        }
+      ],
+      "capabilities": [
+        "python_exec"
+      ],
+      "source": "builtin"
+    },
+    {
+      "id": "sccache_setup",
+      "name": "Sccache Setup",
+      "description": "Configure sccache as the Rust compilation cache in ~/.cargo/config.toml",
+      "category": "system",
+      "params": [
+        {
+          "name": "check_only",
+          "description": "Only check if configured, don't modify (default: false)",
+          "param_type": "Bool",
+          "required": false,
+          "default": false
+        }
+      ],
+      "capabilities": [
+        "filesystem_write"
+      ],
+      "source": "builtin"
+    },
+    {
+      "id": "sccache_status",
+      "name": "Sccache Status",
+      "description": "Check sccache installation, configuration, and cache statistics",
+      "category": "system",
+      "params": [],
+      "capabilities": [
+        "system_info"
+      ],
+      "source": "builtin"
+    },
+    {
+      "id": "session_query",
+      "name": "Session Query",
+      "description": "Search session history for cross-session awareness",
+      "category": "analysis",
+      "params": [
+        {
+          "name": "query",
+          "description": "Text to search for in session names and summaries",
+          "param_type": "String",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "limit",
+          "description": "Maximum sessions to return (default: 10)",
+          "param_type": "Integer",
+          "required": false,
+          "default": 10
+        },
+        {
+          "name": "impulse_dir",
+          "description": "Path to .impulse directory (default: .impulse)",
+          "param_type": "FilePath",
+          "required": false,
+          "default": null
+        }
+      ],
+      "capabilities": [
+        "filesystem_read"
+      ],
+      "source": "builtin"
+    },
+    {
+      "id": "steward_status",
+      "name": "Steward Status",
+      "description": "Check context stewardship config, pending proposals, and cross-project patterns",
+      "category": "system",
+      "params": [
+        {
+          "name": "impulse_dir",
+          "description": "Path to .impulse directory (default: .impulse)",
+          "param_type": "FilePath",
+          "required": false,
+          "default": null
+        }
+      ],
+      "capabilities": [
+        "filesystem_read"
+      ],
+      "source": "builtin"
+    },
+    {
+      "id": "sweep",
+      "name": "Sweep",
+      "description": "Clean stale Rust build artifacts not accessed in N days (dry-run default)",
+      "category": "system",
+      "params": [
+        {
+          "name": "days",
+          "description": "Remove artifacts older than this many days (default: 30)",
+          "param_type": "Integer",
+          "required": false,
+          "default": 30
+        },
+        {
+          "name": "dry_run",
+          "description": "Only show what would be cleaned (default: true)",
+          "param_type": "Bool",
+          "required": false,
+          "default": true
+        },
+        {
+          "name": "path",
+          "description": "Directory to sweep. Default: configured scan_paths",
+          "param_type": "FilePath",
+          "required": false,
+          "default": null
+        }
+      ],
+      "capabilities": [
+        "filesystem_read",
+        "filesystem_write"
+      ],
+      "source": "builtin"
+    },
+    {
+      "id": "system_info",
+      "name": "System Info",
+      "description": "Collect system information (OS, arch, Python availability, env vars)",
+      "category": "system",
+      "params": [
+        {
+          "name": "include_env",
+          "description": "Include IMPULSE_ environment variables in output",
+          "param_type": "Bool",
+          "required": false,
+          "default": false
+        }
+      ],
+      "capabilities": [
+        "system_info"
+      ],
+      "source": "builtin"
+    },
+    {
+      "id": "tool_availability",
+      "name": "Tool Availability",
+      "description": "Check which cargo build tools are installed (cargo-sweep, cargo-wipe, sccache)",
+      "category": "system",
+      "params": [],
+      "capabilities": [
+        "system_info"
+      ],
+      "source": "builtin"
+    },
+    {
+      "id": "wipe",
+      "name": "Wipe",
+      "description": "Remove all Rust target/ directories (dry-run default)",
+      "category": "system",
+      "params": [
+        {
+          "name": "dry_run",
+          "description": "Only show what would be wiped (default: true)",
+          "param_type": "Bool",
+          "required": false,
+          "default": true
+        },
+        {
+          "name": "path",
+          "description": "Directory to scan",
+          "param_type": "FilePath",
+          "required": false,
+          "default": null
+        }
+      ],
+      "capabilities": [
+        "filesystem_read",
+        "filesystem_write"
+      ],
+      "source": "builtin"
+    }
+  ],
+  "features": [
+    "retrieval",
+    "context_injection",
+    "stewardship",
+    "build_hygiene",
+    "office"
+  ]
+}

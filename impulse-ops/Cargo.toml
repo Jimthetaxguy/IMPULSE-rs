@@ -1,0 +1,16 @@
+[package]
+name = "impulse-ops"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Shared operator workbench types for Impulse"
+license = "MIT"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"

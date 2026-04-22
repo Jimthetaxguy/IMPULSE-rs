@@ -1,0 +1,3 @@
+[build]
+# Keep subcrate cargo invocations on the shared workspace target tree.
+target-dir = "target"
