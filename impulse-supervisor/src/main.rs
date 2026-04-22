@@ -1,3 +1,4 @@
+mod daemon_bridge;
 mod runtime;
 
 fn main() {

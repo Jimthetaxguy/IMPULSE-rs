@@ -1,3 +1,4 @@
+use crate::daemon_bridge::{preview_bridge_line, BridgeConfig, BridgeConnectionState};
 use dioxus::prelude::*;
 use impulse_supervisor::layout::{LayoutMode, WorkerGrid};
 use impulse_supervisor::state::{ShellState, TerminalState};
@@ -198,6 +199,10 @@ pub fn render_bootstrap_console(bootstrap: &RuntimeBootstrap) -> String {
     let sidebar = supervisor_sidebar_view(bootstrap);
     let status_chip = supervisor_status_chip_view(&sidebar.status_label);
     let registry_summary = pane_registry_summary_view(&bootstrap_shell_state());
+    let bridge_preview = preview_bridge_line(
+        &BridgeConfig::default(),
+        &BridgeConnectionState::Disconnected,
+    );
     let panes = worker_pane_stub_views(bootstrap);
     let titles = panes
         .iter()
@@ -206,13 +211,14 @@ pub fn render_bootstrap_console(bootstrap: &RuntimeBootstrap) -> String {
         .join(", ");
 
     format!(
-        "{title} [{status}] | chip={chip}::{tone} | layout={layout} | root={root_class} | {heading}: {detail} | registry={registry} | {grid} | {titles}",
+        "{title} [{status}] | chip={chip}::{tone} | layout={layout} | root={root_class} | bridge={bridge} | {heading}: {detail} | registry={registry} | {grid} | {titles}",
         title = header.title,
         status = header.status_label,
         chip = status_chip.label,
         tone = status_chip.tone_class,
         layout = header.layout_label,
         root_class = shell_root_class(bootstrap.layout),
+        bridge = bridge_preview,
         heading = sidebar.heading,
         detail = sidebar.detail,
         registry = pane_registry_summary_line(&registry_summary),
