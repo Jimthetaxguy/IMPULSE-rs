@@ -39,10 +39,18 @@ pub struct RuntimeHeaderView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneRegistrySummaryView {
+    pub supervisor_present: bool,
+    pub worker_count: usize,
+    pub project_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeModel {
     pub bootstrap: RuntimeBootstrap,
     pub header: RuntimeHeaderView,
     pub sidebar: SupervisorSidebarView,
+    pub registry_summary: PaneRegistrySummaryView,
     pub worker_panes: Vec<WorkerPaneStubView>,
     pub worker_grid_class: &'static str,
     pub worker_summary: String,
@@ -152,6 +160,27 @@ pub fn runtime_header_view(bootstrap: &RuntimeBootstrap) -> RuntimeHeaderView {
     }
 }
 
+pub fn pane_registry_summary_view(state: &ShellState) -> PaneRegistrySummaryView {
+    PaneRegistrySummaryView {
+        supervisor_present: state.terminals.registry.supervisor().is_some(),
+        worker_count: state.terminals.registry.worker_count(),
+        project_count: state.session.registered_projects.len(),
+    }
+}
+
+pub fn pane_registry_summary_line(view: &PaneRegistrySummaryView) -> String {
+    let supervisor = if view.supervisor_present {
+        "present"
+    } else {
+        "pending"
+    };
+
+    format!(
+        "Supervisor: {supervisor} · Workers: {} · Projects: {}",
+        view.worker_count, view.project_count
+    )
+}
+
 pub fn shell_root_class(layout: LayoutMode) -> &'static str {
     match layout {
         LayoutMode::SidebarWithGrid => "layout-sidebar-with-grid",
@@ -168,6 +197,7 @@ pub fn render_bootstrap_console(bootstrap: &RuntimeBootstrap) -> String {
     let header = runtime_header_view(bootstrap);
     let sidebar = supervisor_sidebar_view(bootstrap);
     let status_chip = supervisor_status_chip_view(&sidebar.status_label);
+    let registry_summary = pane_registry_summary_view(&bootstrap_shell_state());
     let panes = worker_pane_stub_views(bootstrap);
     let titles = panes
         .iter()
@@ -176,7 +206,7 @@ pub fn render_bootstrap_console(bootstrap: &RuntimeBootstrap) -> String {
         .join(", ");
 
     format!(
-        "{title} [{status}] | chip={chip}::{tone} | layout={layout} | root={root_class} | {heading}: {detail} | {grid} | {titles}",
+        "{title} [{status}] | chip={chip}::{tone} | layout={layout} | root={root_class} | {heading}: {detail} | registry={registry} | {grid} | {titles}",
         title = header.title,
         status = header.status_label,
         chip = status_chip.label,
@@ -185,17 +215,20 @@ pub fn render_bootstrap_console(bootstrap: &RuntimeBootstrap) -> String {
         root_class = shell_root_class(bootstrap.layout),
         heading = sidebar.heading,
         detail = sidebar.detail,
+        registry = pane_registry_summary_line(&registry_summary),
         grid = worker_grid_class(bootstrap.worker_grid),
         titles = titles,
     )
 }
 
 pub fn runtime_model() -> RuntimeModel {
+    let state = bootstrap_shell_state();
     let bootstrap = runtime_bootstrap();
     let worker_panes = worker_pane_stub_views(&bootstrap);
     RuntimeModel {
         header: runtime_header_view(&bootstrap),
         sidebar: supervisor_sidebar_view(&bootstrap),
+        registry_summary: pane_registry_summary_view(&state),
         worker_summary: worker_summary_label(&worker_panes),
         worker_panes,
         worker_grid_class: worker_grid_class(bootstrap.worker_grid),
@@ -209,6 +242,7 @@ pub fn runtime_model_from_state(state: &ShellState) -> RuntimeModel {
     RuntimeModel {
         header: runtime_header_view(&bootstrap),
         sidebar: supervisor_sidebar_view(&bootstrap),
+        registry_summary: pane_registry_summary_view(state),
         worker_summary: worker_summary_label(&worker_panes),
         worker_panes,
         worker_grid_class: worker_grid_class(bootstrap.worker_grid),
@@ -282,6 +316,9 @@ pub fn RuntimeBody(model: RuntimeModel) -> Element {
         div {
             class: "runtime-layout",
             SupervisorSidebar { view: model.sidebar }
+            PaneRegistrySummary {
+                view: model.registry_summary,
+            }
             WorkerGridPanel {
                 grid: model.bootstrap.worker_grid,
                 panes: model.worker_panes,
@@ -311,6 +348,17 @@ pub fn SupervisorStatusChip(view: SupervisorStatusChipView) -> Element {
         span {
             class: "supervisor-status-chip {view.tone_class}",
             "{view.label}"
+        }
+    }
+}
+
+#[component]
+pub fn PaneRegistrySummary(view: PaneRegistrySummaryView) -> Element {
+    rsx! {
+        section {
+            class: "pane-registry-summary",
+            h2 { "Registry" }
+            p { "{pane_registry_summary_line(&view)}" }
         }
     }
 }
@@ -533,6 +581,33 @@ mod tests {
     }
 
     #[test]
+    fn test_pane_registry_summary_view_defaults_pending() {
+        let summary = pane_registry_summary_view(&bootstrap_shell_state());
+        assert!(!summary.supervisor_present);
+        assert_eq!(summary.worker_count, 0);
+    }
+
+    #[test]
+    fn test_pane_registry_summary_line_formats_counts() {
+        let summary = PaneRegistrySummaryView {
+            supervisor_present: true,
+            worker_count: 2,
+            project_count: 1,
+        };
+        assert_eq!(
+            pane_registry_summary_line(&summary),
+            "Supervisor: present · Workers: 2 · Projects: 1"
+        );
+    }
+
+    #[test]
+    fn test_runtime_model_carries_registry_summary() {
+        let model = runtime_model();
+        assert_eq!(model.registry_summary.project_count, 0);
+        assert_eq!(model.registry_summary.worker_count, 0);
+    }
+
+    #[test]
     fn test_runtime_model_carries_sidebar_heading() {
         let model = runtime_model();
         assert_eq!(model.sidebar.heading, "Supervisor");
@@ -619,6 +694,8 @@ mod tests {
 
         let model = runtime_model_from_state(&state);
         assert!(model.bootstrap.status_label.contains("supervisor ready"));
+        assert!(model.registry_summary.supervisor_present);
+        assert_eq!(model.registry_summary.project_count, 1);
         assert_eq!(model.worker_summary, "Visible worker panes: 2");
     }
 
