@@ -2,7 +2,7 @@
 
 **Date:** 2026-04-22
 **Author:** Claude (on behalf of James Pustorino)
-**Status:** EXECUTING
+**Status:** COMPLETE — ~44 GB reclaimed. Source safe in git. Next: push to GitHub.
 
 ---
 
@@ -239,7 +239,9 @@ git status            # should be clean
 ### Immediate (this session)
 
 - [x] Initialize git and commit source
-- [x] Delete ~45 GB of build artifacts
+- [x] Delete ~44 GB of build artifacts (`target.old`, `target2`, `impulse-gui/target`, `target/debug/*`, `.dmg`, `.app`)
+- [x] Remove stale `Cargo 2.lock` and `.DS_Store` files
+- [x] Add `target-claude/` to `.gitignore` (worktree build dir)
 - [ ] Push to GitHub as private repo for offsite backup
 
 ### Short-term

@@ -2,6 +2,7 @@
 target/
 target.old/
 target2/
+target-claude/
 
 # macOS app bundles & installers
 Impulse.app/
