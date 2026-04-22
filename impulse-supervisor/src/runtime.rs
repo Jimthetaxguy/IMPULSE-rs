@@ -26,8 +26,16 @@ pub struct WorkerPaneStubView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeHeaderView {
+    pub title: &'static str,
+    pub status_label: String,
+    pub layout_label: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeModel {
     pub bootstrap: RuntimeBootstrap,
+    pub header: RuntimeHeaderView,
     pub sidebar: SupervisorSidebarView,
     pub worker_panes: Vec<WorkerPaneStubView>,
     pub worker_grid_class: &'static str,
@@ -105,7 +113,24 @@ pub fn worker_pane_stub_views(bootstrap: &RuntimeBootstrap) -> Vec<WorkerPaneStu
         .collect()
 }
 
+pub fn layout_label(layout: LayoutMode) -> &'static str {
+    match layout {
+        LayoutMode::SidebarWithGrid => "SidebarWithGrid",
+        LayoutMode::WorkerFocus => "WorkerFocus",
+        LayoutMode::SupervisorFocus => "SupervisorFocus",
+    }
+}
+
+pub fn runtime_header_view(bootstrap: &RuntimeBootstrap) -> RuntimeHeaderView {
+    RuntimeHeaderView {
+        title: bootstrap.title,
+        status_label: bootstrap.status_label.clone(),
+        layout_label: layout_label(bootstrap.layout),
+    }
+}
+
 pub fn render_bootstrap_console(bootstrap: &RuntimeBootstrap) -> String {
+    let header = runtime_header_view(bootstrap);
     let sidebar = supervisor_sidebar_view(bootstrap);
     let panes = worker_pane_stub_views(bootstrap);
     let titles = panes
@@ -115,9 +140,10 @@ pub fn render_bootstrap_console(bootstrap: &RuntimeBootstrap) -> String {
         .join(", ");
 
     format!(
-        "{title} [{status}] | {heading}: {detail} | {grid} | {titles}",
-        title = bootstrap.title,
-        status = sidebar.status_label,
+        "{title} [{status}] | layout={layout} | {heading}: {detail} | {grid} | {titles}",
+        title = header.title,
+        status = header.status_label,
+        layout = header.layout_label,
         heading = sidebar.heading,
         detail = sidebar.detail,
         grid = worker_grid_class(bootstrap.worker_grid),
@@ -128,11 +154,16 @@ pub fn render_bootstrap_console(bootstrap: &RuntimeBootstrap) -> String {
 pub fn runtime_model() -> RuntimeModel {
     let bootstrap = runtime_bootstrap();
     RuntimeModel {
+        header: runtime_header_view(&bootstrap),
         sidebar: supervisor_sidebar_view(&bootstrap),
         worker_panes: worker_pane_stub_views(&bootstrap),
         worker_grid_class: worker_grid_class(bootstrap.worker_grid),
         bootstrap,
     }
+}
+
+pub fn render_runtime_console(model: &RuntimeModel) -> String {
+    render_bootstrap_console(&model.bootstrap)
 }
 
 #[cfg(feature = "experimental-runtime")]
@@ -148,11 +179,11 @@ pub fn run() {
 
     #[cfg(not(feature = "experimental-runtime"))]
     {
-        let bootstrap = runtime_bootstrap();
+        let model = runtime_model();
         eprintln!(
             "{} {}",
             runtime_disabled_message(),
-            render_bootstrap_console(&bootstrap)
+            render_runtime_console(&model)
         );
     }
 }
@@ -161,20 +192,39 @@ pub fn run() {
 pub fn SupervisorRuntimeApp() -> Element {
     let model = use_signal(runtime_model);
     let runtime = model.read().clone();
+    let header = runtime.header.clone();
 
     rsx! {
         div {
             id: "impulse-supervisor-runtime",
             class: "layout-sidebar-with-grid",
-            h1 { "{runtime.bootstrap.title}" }
-            p { class: "runtime-status", "{runtime.bootstrap.status_label}" }
-            div {
-                class: "runtime-layout",
-                SupervisorSidebar { view: runtime.sidebar }
-                WorkerGridPanel {
-                    grid: runtime.bootstrap.worker_grid,
-                    panes: runtime.worker_panes,
-                }
+            RuntimeHeader { view: header }
+            RuntimeBody { model: runtime }
+        }
+    }
+}
+
+#[component]
+pub fn RuntimeHeader(view: RuntimeHeaderView) -> Element {
+    rsx! {
+        header {
+            class: "runtime-header",
+            h1 { "{view.title}" }
+            p { class: "runtime-status", "{view.status_label}" }
+            p { class: "runtime-layout-label", "Layout: {view.layout_label}" }
+        }
+    }
+}
+
+#[component]
+pub fn RuntimeBody(model: RuntimeModel) -> Element {
+    rsx! {
+        div {
+            class: "runtime-layout",
+            SupervisorSidebar { view: model.sidebar }
+            WorkerGridPanel {
+                grid: model.bootstrap.worker_grid,
+                panes: model.worker_panes,
             }
         }
     }
@@ -183,7 +233,7 @@ pub fn SupervisorRuntimeApp() -> Element {
 #[component]
 pub fn SupervisorSidebar(view: SupervisorSidebarView) -> Element {
     rsx! {
-        div {
+        aside {
             class: "supervisor-sidebar",
             h2 { "{view.heading}" }
             p { class: "sidebar-status", "{view.status_label}" }
@@ -338,9 +388,33 @@ mod tests {
     }
 
     #[test]
+    fn test_render_runtime_console_mentions_layout_label() {
+        let console = render_runtime_console(&runtime_model());
+        assert!(console.contains("layout=SidebarWithGrid"));
+    }
+
+    #[test]
     fn test_runtime_model_uses_bootstrap_title() {
         let model = runtime_model();
         assert_eq!(model.bootstrap.title, WINDOW_TITLE);
+    }
+
+    #[test]
+    fn test_layout_label_sidebar_with_grid() {
+        assert_eq!(layout_label(LayoutMode::SidebarWithGrid), "SidebarWithGrid");
+    }
+
+    #[test]
+    fn test_runtime_header_view_uses_status_label() {
+        let bootstrap = runtime_bootstrap();
+        let header = runtime_header_view(&bootstrap);
+        assert_eq!(header.status_label, bootstrap.status_label);
+    }
+
+    #[test]
+    fn test_runtime_header_view_uses_layout_label() {
+        let header = runtime_header_view(&runtime_bootstrap());
+        assert_eq!(header.layout_label, "SidebarWithGrid");
     }
 
     #[test]
@@ -353,6 +427,12 @@ mod tests {
     fn test_runtime_model_carries_worker_grid_class() {
         let model = runtime_model();
         assert_eq!(model.worker_grid_class, "worker-grid-two-column");
+    }
+
+    #[test]
+    fn test_runtime_model_carries_header_title() {
+        let model = runtime_model();
+        assert_eq!(model.header.title, WINDOW_TITLE);
     }
 
     #[test]
