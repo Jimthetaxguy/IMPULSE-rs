@@ -42,13 +42,13 @@
 //! is one 16ms frame, well within human perception. If profiling shows
 //! the 16ms tick is the bottleneck, swap for `tokio::sync::Notify` later.
 
-#![cfg(feature = "desktop")]
-
 use std::time::Duration;
 
 use dioxus::prelude::*;
+use impulse_term_core::input::key_to_pty_bytes;
 use impulse_term_core::CellRun;
 
+use crate::key_shim::{dx_key_to_term, dx_mods_to_term};
 use crate::live::RowSnapshot;
 use crate::source::{PtySource, PtySpec};
 use crate::theme::CssTheme;
@@ -156,9 +156,13 @@ pub fn PtyTerminalView(props: PtyTerminalViewProps) -> Element {
     rsx! {
         div {
             class: "impulse-pty-view",
+            tabindex: "0",
             "data-rows": "{rows}",
             "data-cols": "{cols}",
             style: "{container_style}",
+            onkeydown: move |evt| {
+                handle_key_event(&evt, source);
+            },
             for (idx, row_sig) in signals_snapshot.into_iter().enumerate() {
                 LivePtyRow {
                     key: "{idx}",
@@ -169,6 +173,38 @@ pub fn PtyTerminalView(props: PtyTerminalViewProps) -> Element {
             }
         }
     }
+}
+
+/// Translate a Dioxus `KeyboardEvent` into PTY bytes and write them to the
+/// `PtySource`. Returns silently on:
+/// - keys that have no terminal mapping (modifier keys, function-only keys)
+/// - source write errors (logged via `tracing` so they surface in dev tools)
+/// - missing source (spawn failed at component mount)
+///
+/// Application-cursor mode is currently hard-coded false — when the
+/// supervisor learns to track DECCKM state per pane (Phase 3+), pass it in
+/// via a `Signal<bool>`.
+fn handle_key_event(evt: &Event<KeyboardData>, source: Signal<Option<PtySource>>) {
+    let key = evt.key();
+    let modifiers = evt.modifiers();
+
+    let Some(term_key) = dx_key_to_term(&key) else {
+        return;
+    };
+    let term_mods = dx_mods_to_term(&modifiers);
+
+    let Some(bytes) = key_to_pty_bytes(&term_key, &term_mods, false) else {
+        return;
+    };
+
+    let src = source.read();
+    let Some(s) = src.as_ref() else { return };
+    if let Err(e) = s.write_input(&bytes) {
+        tracing::warn!("write_input failed: {e}");
+    }
+    // Prevent the browser/webview from also handling the event (e.g. Tab
+    // moving focus, Backspace navigating back).
+    evt.prevent_default();
 }
 
 /// One row of the live terminal. Reads from a `Signal<RowSnapshot>` so it
@@ -244,14 +280,14 @@ mod tests {
     /// Rendering tests for PtyTerminalView require a Dioxus runtime with
     /// a Tokio executor (use_future spawns); covered by the integration
     /// smoke test in impulse-supervisor at L167.
-    #[test]
-    fn test_tick_interval_is_within_human_perception() {
-        // ~60fps is 16ms. Anything above ~33ms (30fps) becomes perceptibly
-        // laggy for typing feedback. Anything below 5ms wastes CPU when
-        // idle since we'd poll a parser that hasn't changed.
+    // ~60fps is 16ms. Anything above ~33ms (30fps) becomes perceptibly
+    // laggy for typing feedback. Anything below 5ms wastes CPU when
+    // idle since we'd poll a parser that hasn't changed. Asserted at
+    // compile time via const block.
+    const _: () = {
         assert!(TICK_INTERVAL_MS >= 5);
         assert!(TICK_INTERVAL_MS <= 33);
-    }
+    };
 
     #[test]
     fn test_props_construct_with_defaults() {

@@ -24,8 +24,6 @@
 //! `Signal` damage tracking so updates only diff the rows that actually
 //! changed. L164 wires the `TerminalBackend` PTY source.
 
-#![cfg(feature = "desktop")]
-
 use dioxus::prelude::*;
 use impulse_term_core::{CellRun, GridSnapshot};
 
