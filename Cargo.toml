@@ -4,6 +4,7 @@ members = [
     "impulse-ops",
     "impulse-term",
     "impulse-term-core",
+    "impulse-term-dioxus",
     "impulse-gui",
     "impulse-supervisor",
 ]

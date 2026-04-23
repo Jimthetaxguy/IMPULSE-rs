@@ -1,0 +1,39 @@
+[package]
+name = "impulse-term-dioxus"
+version = "0.1.0"
+edition = "2021"
+description = "Dioxus 0.6 renderer for impulse-term-core. Renders GridSnapshot to rsx! span runs with per-row Signal damage tracking; translates Dioxus key events to TermKey for PTY input."
+authors = ["James Pustorino"]
+license = "MIT"
+
+# Dioxus 0.6 desktop uses the system webview (wry → WKWebView/WebView2/WebKitGTK).
+# No bundled Chromium, no Node runtime, ~25MB binary. Authoring is 100% Rust.
+# Design rules (carried into this crate to prevent the egui memory bug):
+# - Run-based rendering: one <span> per CellRun, not per cell
+# - Per-row Signal<RowSnapshot> damage tracking; idle rows = zero diffs
+# - Bounded retained state; old scrollback compacts to immutable frozen blocks
+# - Event-driven re-renders only (no 60fps poll)
+# See impulse-rs/docs/plans/2026-04-23-impulse-term-decouple-and-dioxus.md.
+
+[dependencies]
+# Toolkit-neutral terminal core: PTY backend, parser, GridSnapshot, TermKey.
+impulse-term-core = { path = "../impulse-term-core" }
+
+# Dioxus 0.6 — desktop default uses the system webview (wry → WKWebView /
+# WebView2 / WebKitGTK). The `macro` feature gives us `rsx!`, `#[component]`,
+# `#[derive(Props)]`. The `desktop` feature is opt-in via this crate's own
+# `desktop` feature so tooling that only needs the API surface (e.g. doc
+# generation, type-only dependents) doesn't pay the wry compile cost.
+# Dioxus default features cover the authoring surface (macro, html, signals,
+# hooks) without pulling in any specific platform runtime. `desktop` is opt-in
+# via this crate's own `desktop` feature so tooling that only needs the API
+# surface (doc generation, type-only consumers) doesn't pay the wry compile cost.
+dioxus = "0.6"
+
+[features]
+default = []
+desktop = ["dioxus/desktop"]
+
+[dev-dependencies]
+# Tests touch GridSnapshot::from_screen(parser.screen()) directly.
+vt100 = "0.15"
