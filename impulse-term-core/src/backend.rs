@@ -32,6 +32,12 @@ pub struct TerminalBackend {
     alive: Arc<AtomicBool>,
     /// Counts consecutive PTY read errors for diagnostics.
     read_errors: Arc<AtomicU64>,
+    /// Append-only buffer of raw PTY bytes since the last `drain_recent_bytes`
+    /// call. Used by callers that need the raw byte stream (e.g. OSC 133
+    /// block-boundary detection) without taking ownership of the parser.
+    /// Bounded only by the time between drains; default callers (PtySource)
+    /// drain every tick (~16ms).
+    recent_bytes: Arc<Mutex<Vec<u8>>>,
     _reader_thread: JoinHandle<()>,
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     cols: AtomicU16,
@@ -98,14 +104,17 @@ impl TerminalBackend {
         let output_bytes = Arc::new(AtomicU64::new(0));
         let output_lines = Arc::new(AtomicU64::new(0));
         let read_errors = Arc::new(AtomicU64::new(0));
+        let recent_bytes = Arc::new(Mutex::new(Vec::with_capacity(PTY_READ_BUFFER_SIZE)));
 
-        // Background thread: read PTY output → feed to vt100 parser.
+        // Background thread: read PTY output → feed to vt100 parser AND
+        // append to recent_bytes for callers that need the raw stream.
         let reader_thread = {
             let parser = Arc::clone(&parser);
             let alive = Arc::clone(&alive);
             let output_bytes = Arc::clone(&output_bytes);
             let output_lines = Arc::clone(&output_lines);
             let read_errors = Arc::clone(&read_errors);
+            let recent_bytes = Arc::clone(&recent_bytes);
 
             std::thread::Builder::new()
                 .name(format!("pty-reader-{}", command))
@@ -117,6 +126,7 @@ impl TerminalBackend {
                         output_bytes,
                         output_lines,
                         read_errors,
+                        recent_bytes,
                     );
                 })?
         };
@@ -133,6 +143,7 @@ impl TerminalBackend {
             output_lines,
             alive,
             read_errors,
+            recent_bytes,
             _reader_thread: reader_thread,
             child: Arc::new(Mutex::new(child)),
             cols: AtomicU16::new(cols),
@@ -140,6 +151,16 @@ impl TerminalBackend {
             command: command.to_string(),
             working_dir: working_dir.map(|p| p.to_path_buf()),
         })
+    }
+
+    /// Drain and return any PTY bytes received since the last call to this
+    /// method. Used by callers that need the raw byte stream (e.g.
+    /// `Osc133Parser` for block-boundary detection) without parser
+    /// ownership. Returns an empty `Vec` if no bytes accumulated.
+    ///
+    /// Safe to call concurrently with the reader thread.
+    pub fn drain_recent_bytes(&self) -> Vec<u8> {
+        std::mem::take(&mut *self.recent_bytes.lock())
     }
 
     /// Get the full visible screen text (no scrollback).
@@ -369,7 +390,9 @@ fn epoch_millis() -> u64 {
         .as_millis() as u64
 }
 
-/// Background reader thread — reads PTY output and feeds it to the vt100 parser.
+/// Background reader thread — reads PTY output, feeds it to the vt100 parser,
+/// AND appends the raw bytes to `recent_bytes` for callers that need the raw
+/// stream (e.g. OSC 133 detection).
 fn pty_reader_loop(
     mut reader: Box<dyn Read + Send>,
     parser: Arc<FairMutex<vt100::Parser>>,
@@ -377,7 +400,15 @@ fn pty_reader_loop(
     output_bytes: Arc<AtomicU64>,
     output_lines: Arc<AtomicU64>,
     read_errors: Arc<AtomicU64>,
+    recent_bytes: Arc<Mutex<Vec<u8>>>,
 ) {
+    /// Cap the recent_bytes buffer so a caller that never drains doesn't
+    /// blow up memory. 1 MiB holds ~6 seconds of full-blast PTY output
+    /// (PTY_READ_BUFFER_SIZE * 256). When exceeded, the oldest bytes are
+    /// dropped — block-boundary detection on stale data is meaningless
+    /// anyway.
+    const RECENT_BYTES_CAP: usize = 1024 * 1024;
+
     let mut buf = [0u8; PTY_READ_BUFFER_SIZE];
     loop {
         match reader.read(&mut buf) {
@@ -394,8 +425,19 @@ fn pty_reader_loop(
                     output_lines.fetch_add(newlines as u64, Ordering::Relaxed);
                 }
 
-                let mut parser = parser.lock();
-                parser.process(&buf[..n]);
+                {
+                    let mut parser = parser.lock();
+                    parser.process(&buf[..n]);
+                }
+
+                {
+                    let mut rb = recent_bytes.lock();
+                    rb.extend_from_slice(&buf[..n]);
+                    if rb.len() > RECENT_BYTES_CAP {
+                        let drop_n = rb.len() - RECENT_BYTES_CAP;
+                        rb.drain(..drop_n);
+                    }
+                }
             }
             Err(e) => {
                 read_errors.fetch_add(1, Ordering::Relaxed);
