@@ -87,6 +87,19 @@ const DEFAULT_CSS: &str = r#"
     border-bottom: 1px solid #2d2d2d;
 }
 
+.impulse-block-number {
+    display: inline-block;
+    min-width: 2.5ch;
+    text-align: right;
+    color: #555;
+    font-size: 0.75em;
+    font-variant-numeric: tabular-nums;
+    user-select: none;
+}
+.impulse-block:hover > .impulse-block-header > .impulse-block-number {
+    color: #888;
+}
+
 .impulse-block-status {
     display: inline-block;
     min-width: 1ch;

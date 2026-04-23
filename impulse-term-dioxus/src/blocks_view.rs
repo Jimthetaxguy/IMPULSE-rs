@@ -91,6 +91,7 @@ pub fn BlockView(props: BlockViewProps) -> Element {
     let ask_full = full_text;
 
     let is_running = matches!(block.state, BlockState::Streaming);
+    let tooltip = block_tooltip(&block, &command_text);
 
     rsx! {
         li {
@@ -98,8 +99,14 @@ pub fn BlockView(props: BlockViewProps) -> Element {
             "data-block-id": "{id}",
             "data-state": "{state_data_attr}",
             "data-running": if is_running { "true" } else { "false" },
+            title: "{tooltip}",
             header {
                 class: "impulse-block-header",
+                span {
+                    class: "impulse-block-number",
+                    "aria-label": "Block {id}",
+                    "#{id}"
+                }
                 span { class: "impulse-block-status", "{icon}" }
                 code { class: "impulse-block-command", "{command_text}" }
                 if !exit_label.is_empty() {
@@ -249,6 +256,28 @@ fn exit_label(state: BlockState) -> String {
         BlockState::Finished(Some(n)) => format!("exit {n}"),
         BlockState::Finished(None) => "exit ?".into(),
         _ => String::new(),
+    }
+}
+
+/// Build the title attribute (browser hover tooltip + screen-reader text)
+/// for the block's `<li>`. Format: `Block #N — <state> — <command>`.
+///
+/// Tooltips are deliberately brief (most browsers truncate long titles).
+/// The full output is visible inline already — the tooltip's job is to
+/// give a one-glance summary while hovering, not duplicate the body.
+fn block_tooltip(block: &Block, command_text: &str) -> String {
+    let state_phrase = match block.state {
+        BlockState::PromptShown => "prompt".to_string(),
+        BlockState::AwaitingCommand => "awaiting input".to_string(),
+        BlockState::Streaming => "running".to_string(),
+        BlockState::Finished(Some(0)) => "exit 0".to_string(),
+        BlockState::Finished(Some(n)) => format!("exit {n}"),
+        BlockState::Finished(None) => "finished".to_string(),
+    };
+    if command_text.is_empty() {
+        format!("Block #{} — {}", block.id, state_phrase)
+    } else {
+        format!("Block #{} — {} — {}", block.id, state_phrase, command_text)
     }
 }
 
@@ -556,6 +585,67 @@ mod tests {
         assert!(
             nav_open_tag.contains("data-block-id=\"42\""),
             "toolbar should carry block id 42: {nav_open_tag}"
+        );
+    }
+
+    #[test]
+    fn test_block_tooltip_running() {
+        let mut store = BlockStore::new();
+        store.open_prompt();
+        store.set_command("sleep 5");
+        store.open_output();
+        let b = store.current().unwrap().clone();
+        let t = block_tooltip(&b, "sleep 5");
+        assert!(t.contains("Block #0"), "{t}");
+        assert!(t.contains("running"), "{t}");
+        assert!(t.contains("sleep 5"), "{t}");
+    }
+
+    #[test]
+    fn test_block_tooltip_finished_zero() {
+        let b = make_finished(2, "ls", "out\n", 0);
+        let t = block_tooltip(&b, "ls");
+        assert_eq!(t, "Block #2 — exit 0 — ls");
+    }
+
+    #[test]
+    fn test_block_tooltip_finished_nonzero() {
+        let b = make_finished(3, "false", "", 1);
+        let t = block_tooltip(&b, "false");
+        assert_eq!(t, "Block #3 — exit 1 — false");
+    }
+
+    #[test]
+    fn test_block_tooltip_no_command() {
+        let mut store = BlockStore::new();
+        store.open_prompt();
+        let b = store.current().unwrap().clone();
+        let t = block_tooltip(&b, "");
+        assert_eq!(t, "Block #0 — prompt");
+    }
+
+    #[test]
+    fn test_render_includes_block_number() {
+        let block = make_finished(7, "ls", "out\n", 0);
+        let html = render_block_to_string(block);
+        assert!(
+            html.contains("impulse-block-number"),
+            "expected number span: {html}"
+        );
+        assert!(html.contains("#7"), "expected #7 label: {html}");
+        assert!(
+            html.contains("aria-label=\"Block 7\""),
+            "expected aria-label: {html}"
+        );
+    }
+
+    #[test]
+    fn test_render_includes_title_attribute() {
+        let block = make_finished(0, "echo hi", "hi\n", 0);
+        let html = render_block_to_string(block);
+        assert!(
+            html.contains("title=\"Block #0 — exit 0 — echo hi\""),
+            "expected title attribute: {html}"
         );
     }
 
