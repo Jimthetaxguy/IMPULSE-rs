@@ -35,14 +35,42 @@
 use dioxus::prelude::*;
 use impulse_term_core::{Block, BlockState};
 
+/// Actions the toolbar can request. The component itself is side-effect
+/// free — it emits these events and the consumer (e.g. `impulse-supervisor`)
+/// wires them to clipboard / PTY / AI integrations.
+///
+/// Keeping these as data + callback (rather than baking clipboard/PTY
+/// access into the component) keeps `blocks_view.rs` testable without a
+/// webview, and keeps consumer apps free to choose their own clipboard
+/// strategy (web `navigator.clipboard` vs `arboard` native, etc.).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockAction {
+    /// User clicked "copy command" — wants `block.command` on the clipboard.
+    CopyCommand { block_id: u64, text: String },
+    /// User clicked "copy output" — wants `block.output` on the clipboard.
+    CopyOutput { block_id: u64, text: String },
+    /// User clicked "rerun" — wants `block.command + "\n"` written to the PTY.
+    Rerun { block_id: u64, command: String },
+    /// User clicked "ask AI" — wants the block handed to the agent for
+    /// insight extraction. Carries `Block::full_text()` so the consumer
+    /// doesn't need to look up the block.
+    AskAi { block_id: u64, full_text: String },
+}
+
 /// Props for one block.
 #[derive(Props, Clone, PartialEq)]
 pub struct BlockViewProps {
     pub block: Block,
+    /// Optional toolbar action handler. If `None`, the toolbar is hidden.
+    /// If `Some`, four buttons appear in the header (copy command, copy
+    /// output, rerun, ask AI) emitting `BlockAction` values.
+    #[props(default)]
+    pub on_action: Option<EventHandler<BlockAction>>,
 }
 
 /// Render a single `Block` as a `<li>` card with status icon, command,
-/// optional exit code, and output.
+/// optional exit code, output, and (if `on_action` is provided) a toolbar
+/// of action buttons.
 #[component]
 pub fn BlockView(props: BlockViewProps) -> Element {
     let block = props.block;
@@ -53,6 +81,14 @@ pub fn BlockView(props: BlockViewProps) -> Element {
     let id = block.id;
     let command_text = block.command.clone().unwrap_or_default();
     let output_text = block.output.clone();
+    let full_text = block.full_text();
+    let has_toolbar = props.on_action.is_some();
+    let on_action = props.on_action;
+
+    let copy_command = command_text.clone();
+    let copy_output = output_text.clone();
+    let rerun_command = command_text.clone();
+    let ask_full = full_text;
 
     rsx! {
         li {
@@ -65,6 +101,75 @@ pub fn BlockView(props: BlockViewProps) -> Element {
                 code { class: "impulse-block-command", "{command_text}" }
                 if !exit_label.is_empty() {
                     span { class: "impulse-block-exit", "{exit_label}" }
+                }
+                if has_toolbar {
+                    nav {
+                        class: "impulse-block-toolbar",
+                        "data-block-id": "{id}",
+                        button {
+                            class: "impulse-block-action impulse-block-action-copy-command",
+                            "data-action": "copy-command",
+                            r#type: "button",
+                            title: "Copy command",
+                            disabled: copy_command.is_empty(),
+                            onclick: move |_| {
+                                if let Some(h) = on_action {
+                                    h.call(BlockAction::CopyCommand {
+                                        block_id: id,
+                                        text: copy_command.clone(),
+                                    });
+                                }
+                            },
+                            "⧉ cmd"
+                        }
+                        button {
+                            class: "impulse-block-action impulse-block-action-copy-output",
+                            "data-action": "copy-output",
+                            r#type: "button",
+                            title: "Copy output",
+                            disabled: copy_output.is_empty(),
+                            onclick: move |_| {
+                                if let Some(h) = on_action {
+                                    h.call(BlockAction::CopyOutput {
+                                        block_id: id,
+                                        text: copy_output.clone(),
+                                    });
+                                }
+                            },
+                            "⧉ out"
+                        }
+                        button {
+                            class: "impulse-block-action impulse-block-action-rerun",
+                            "data-action": "rerun",
+                            r#type: "button",
+                            title: "Rerun command",
+                            disabled: rerun_command.is_empty(),
+                            onclick: move |_| {
+                                if let Some(h) = on_action {
+                                    h.call(BlockAction::Rerun {
+                                        block_id: id,
+                                        command: rerun_command.clone(),
+                                    });
+                                }
+                            },
+                            "↻ rerun"
+                        }
+                        button {
+                            class: "impulse-block-action impulse-block-action-ask-ai",
+                            "data-action": "ask-ai",
+                            r#type: "button",
+                            title: "Send block to AI",
+                            onclick: move |_| {
+                                if let Some(h) = on_action {
+                                    h.call(BlockAction::AskAi {
+                                        block_id: id,
+                                        full_text: ask_full.clone(),
+                                    });
+                                }
+                            },
+                            "✨ ai"
+                        }
+                    }
                 }
             }
             if !output_text.is_empty() {
@@ -81,6 +186,9 @@ pub fn BlockView(props: BlockViewProps) -> Element {
 #[derive(Props, Clone, PartialEq)]
 pub struct BlockListViewProps {
     pub blocks: Vec<Block>,
+    /// Forwarded to every child `BlockView`. If `None`, no toolbars render.
+    #[props(default)]
+    pub on_action: Option<EventHandler<BlockAction>>,
 }
 
 /// Render a list of blocks as an ordered list.
@@ -91,6 +199,7 @@ pub struct BlockListViewProps {
 #[component]
 pub fn BlockListView(props: BlockListViewProps) -> Element {
     let blocks = props.blocks;
+    let on_action = props.on_action;
     rsx! {
         ol {
             class: "impulse-block-list",
@@ -98,6 +207,7 @@ pub fn BlockListView(props: BlockListViewProps) -> Element {
                 BlockView {
                     key: "{block.id}",
                     block: block.clone(),
+                    on_action,
                 }
             }
         }
@@ -145,13 +255,49 @@ mod tests {
     use impulse_term_core::BlockStore;
 
     fn render_block_to_string(block: Block) -> String {
-        let mut vdom = VirtualDom::new_with_props(BlockView, BlockViewProps { block });
+        let mut vdom = VirtualDom::new_with_props(
+            BlockView,
+            BlockViewProps {
+                block,
+                on_action: None,
+            },
+        );
+        vdom.rebuild_in_place();
+        dioxus_ssr::render(&vdom)
+    }
+
+    fn render_block_with_toolbar_to_string(block: Block) -> String {
+        // EventHandler::new must be constructed inside a Dioxus runtime
+        // context, so we wrap BlockView in a tiny component that creates
+        // the handler from inside its own scope.
+        #[derive(Props, Clone, PartialEq)]
+        struct Wrapper {
+            block: Block,
+        }
+        #[component]
+        fn ToolbarWrapper(props: Wrapper) -> Element {
+            let on_action = EventHandler::new(|_action: BlockAction| {});
+            rsx! {
+                BlockView {
+                    block: props.block.clone(),
+                    on_action,
+                }
+            }
+        }
+
+        let mut vdom = VirtualDom::new_with_props(ToolbarWrapper, Wrapper { block });
         vdom.rebuild_in_place();
         dioxus_ssr::render(&vdom)
     }
 
     fn render_list_to_string(blocks: Vec<Block>) -> String {
-        let mut vdom = VirtualDom::new_with_props(BlockListView, BlockListViewProps { blocks });
+        let mut vdom = VirtualDom::new_with_props(
+            BlockListView,
+            BlockListViewProps {
+                blocks,
+                on_action: None,
+            },
+        );
         vdom.rebuild_in_place();
         dioxus_ssr::render(&vdom)
     }
@@ -314,8 +460,142 @@ mod tests {
         let block = make_finished(7, "pwd", "/home\n", 0);
         let props = BlockViewProps {
             block: block.clone(),
+            on_action: None,
         };
         assert_eq!(props.block.id, 7);
         assert_eq!(props.block.command.as_deref(), Some("pwd"));
+    }
+
+    #[test]
+    fn test_no_toolbar_when_on_action_is_none() {
+        let block = make_finished(0, "ls", "out\n", 0);
+        let html = render_block_to_string(block);
+        assert!(
+            !html.contains("impulse-block-toolbar"),
+            "no toolbar expected when on_action=None: {html}"
+        );
+        assert!(
+            !html.contains("data-action="),
+            "no action buttons expected: {html}"
+        );
+    }
+
+    #[test]
+    fn test_toolbar_renders_four_action_buttons() {
+        let block = make_finished(3, "ls", "out\n", 0);
+        let html = render_block_with_toolbar_to_string(block);
+        assert!(
+            html.contains("impulse-block-toolbar"),
+            "expected toolbar: {html}"
+        );
+        for action in &["copy-command", "copy-output", "rerun", "ask-ai"] {
+            assert!(
+                html.contains(&format!("data-action=\"{action}\"")),
+                "missing action {action}: {html}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_toolbar_disables_copy_output_when_output_empty() {
+        let mut store = BlockStore::new();
+        store.open_prompt();
+        store.set_command("noop");
+        store.close_with_exit(Some(0));
+        let block = store.current().unwrap().clone();
+        let html = render_block_with_toolbar_to_string(block);
+        // copy-output button should have disabled attribute
+        let copy_out_pos = html
+            .find("impulse-block-action-copy-output")
+            .expect("copy-output button present");
+        let following = &html[copy_out_pos..];
+        let close = following.find("</button>").unwrap_or(following.len());
+        let button_html = &following[..close];
+        assert!(
+            button_html.contains("disabled"),
+            "copy-output should be disabled when output empty: {button_html}"
+        );
+    }
+
+    #[test]
+    fn test_toolbar_disables_rerun_when_command_empty() {
+        // Block with empty command (e.g. a prompt that was abandoned).
+        let mut store = BlockStore::new();
+        store.open_prompt();
+        let block = store.current().unwrap().clone();
+        let html = render_block_with_toolbar_to_string(block);
+        let rerun_pos = html
+            .find("impulse-block-action-rerun")
+            .expect("rerun button present");
+        let following = &html[rerun_pos..];
+        let close = following.find("</button>").unwrap_or(following.len());
+        let button_html = &following[..close];
+        assert!(
+            button_html.contains("disabled"),
+            "rerun should be disabled when command empty: {button_html}"
+        );
+    }
+
+    #[test]
+    fn test_toolbar_block_id_attr_present() {
+        let block = make_finished(42, "echo hi", "hi\n", 0);
+        let html = render_block_with_toolbar_to_string(block);
+        assert!(
+            html.contains("class=\"impulse-block-toolbar\"")
+                || html.contains("class=\"impulse-block-toolbar\" data-block-id"),
+            "toolbar should have toolbar class: {html}"
+        );
+        // The toolbar should carry data-block-id="42"
+        let toolbar_pos = html.find("impulse-block-toolbar").expect("toolbar present");
+        let following = &html[toolbar_pos..];
+        let nav_close = following.find('>').unwrap_or(following.len());
+        let nav_open_tag = &following[..nav_close];
+        assert!(
+            nav_open_tag.contains("data-block-id=\"42\""),
+            "toolbar should carry block id 42: {nav_open_tag}"
+        );
+    }
+
+    #[test]
+    fn test_block_action_variants_carry_correct_payload() {
+        let copy_cmd = BlockAction::CopyCommand {
+            block_id: 1,
+            text: "ls".into(),
+        };
+        let copy_out = BlockAction::CopyOutput {
+            block_id: 1,
+            text: "result\n".into(),
+        };
+        let rerun = BlockAction::Rerun {
+            block_id: 1,
+            command: "ls".into(),
+        };
+        let ask_ai = BlockAction::AskAi {
+            block_id: 1,
+            full_text: "$ ls\nresult\n".into(),
+        };
+
+        // Pattern-match each to confirm exhaustiveness + payload.
+        if let BlockAction::CopyCommand { block_id, text } = copy_cmd {
+            assert_eq!(block_id, 1);
+            assert_eq!(text, "ls");
+        } else {
+            panic!("expected CopyCommand");
+        }
+        if let BlockAction::CopyOutput { text, .. } = copy_out {
+            assert_eq!(text, "result\n");
+        } else {
+            panic!("expected CopyOutput");
+        }
+        if let BlockAction::Rerun { command, .. } = rerun {
+            assert_eq!(command, "ls");
+        } else {
+            panic!("expected Rerun");
+        }
+        if let BlockAction::AskAi { full_text, .. } = ask_ai {
+            assert_eq!(full_text, "$ ls\nresult\n");
+        } else {
+            panic!("expected AskAi");
+        }
     }
 }

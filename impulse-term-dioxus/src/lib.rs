@@ -45,7 +45,7 @@ pub use live::{LiveGrid, RowSnapshot, UpdateReport};
 pub use source::{PtySource, PtySourceError, PtySpec};
 
 #[cfg(feature = "desktop")]
-pub use blocks_view::{BlockListView, BlockListViewProps, BlockView, BlockViewProps};
+pub use blocks_view::{BlockAction, BlockListView, BlockListViewProps, BlockView, BlockViewProps};
 #[cfg(feature = "desktop")]
 pub use key_shim::{dx_key_to_term, dx_mods_to_term};
 #[cfg(feature = "desktop")]
