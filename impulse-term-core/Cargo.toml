@@ -1,0 +1,23 @@
+[package]
+name = "impulse-term-core"
+version = "0.1.0"
+edition = "2021"
+description = "Toolkit-neutral terminal core: PTY backend, vt100 parser, grid snapshots, and context bridge. No GUI dependency."
+authors = ["James Pustorino"]
+license = "MIT"
+
+# This crate is the pure-Rust terminal core. It MUST NOT depend on any GUI
+# toolkit (no eframe/egui, no dioxus, no iced, no gpui). Renderers consume
+# `GridSnapshot` and `CellRun` and map `TermColor` to whatever color type the
+# host toolkit uses. See docs/plans/2026-04-23-impulse-term-decouple-and-dioxus.md.
+
+[dependencies]
+portable-pty = "0.9"
+vt100 = "0.15"
+parking_lot = "0.12"
+log = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

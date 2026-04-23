@@ -4539,6 +4539,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "impulse-term-core"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "log",
+ "parking_lot",
+ "portable-pty",
+ "serde",
+ "serde_json",
+ "vt100",
+]
+
+[[package]]
 name = "indexmap"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

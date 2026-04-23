@@ -3,6 +3,7 @@ members = [
     ".",
     "impulse-ops",
     "impulse-term",
+    "impulse-term-core",
     "impulse-gui",
     "impulse-supervisor",
 ]
