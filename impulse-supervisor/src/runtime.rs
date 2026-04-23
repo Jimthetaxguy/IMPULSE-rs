@@ -487,12 +487,17 @@ pub fn LiveWorkerPane(pane: WorkerPaneStubView) -> Element {
     rsx! {
         div {
             class: "live-worker-pane",
-            style: "border: 1px solid #444; border-radius: 4px; margin-top: 8px; height: 380px;",
+            style: "border: 1px solid #444; border-radius: 4px; margin-top: 8px; min-height: 380px;",
+            // L181: render the live grid AND the OSC 133 block history
+            // beneath it. Both surfaces read from the same PtySource so
+            // they stay consistent. Empty until the shell emits OSC 133
+            // markers (zsh w/ p10k, fish, bash w/ vte integration).
             PtyTerminalView {
                 spec,
                 font_size_px: 12,
                 line_height: 1.25,
                 theme: None,
+                show_blocks: true,
             }
         }
     }

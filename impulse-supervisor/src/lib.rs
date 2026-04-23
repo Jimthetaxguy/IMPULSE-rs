@@ -15,7 +15,8 @@
 //!
 //! 1. **Ownership at Birth** — every pane receives a typed `PaneRole` + `Uuid` at spawn
 //! 2. **View ≠ State** — visible scrollback may lag the durable `.impulse/` log
-//! 3. **One Language** — 100% Rust; no webview, no TypeScript
+//! 3. **One Language** — 100% Rust authoring; system webview (WKWebView/WebView2/WebKitGTK)
+//!    as renderer; no bundled Chromium; no TypeScript
 //! 4. **Daemon as Library** — daemon lives for the window lifetime, not forever
 //! 5. **Context Replacement** — compaction replaces the worker's context file and
 //!    restarts; no in-memory mutation of a running agent

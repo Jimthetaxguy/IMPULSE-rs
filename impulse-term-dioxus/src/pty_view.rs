@@ -48,11 +48,13 @@ use dioxus::prelude::*;
 use impulse_term_core::input::key_to_pty_bytes;
 use impulse_term_core::CellRun;
 
+use crate::blocks_view::BlockListView;
 use crate::key_shim::{dx_key_to_term, dx_mods_to_term};
 use crate::live::RowSnapshot;
 use crate::source::{PtySource, PtySpec};
 use crate::theme::CssTheme;
 use crate::view::ThemeProp;
+use impulse_term_core::Block;
 
 /// Polling cadence in milliseconds. Defaults to 16ms (~60 Hz). Lower this
 /// (5–10ms) for ultra-responsive typing latency at the cost of idle CPU;
@@ -72,6 +74,12 @@ pub struct PtyTerminalViewProps {
     /// Line height multiplier. Default: 1.2.
     #[props(default = 1.2)]
     pub line_height: f32,
+    /// When true, render a `BlockListView` of OSC 133-derived command
+    /// blocks beneath the live grid. The supervisor uses this to expose
+    /// the Warp-style block history alongside the live terminal output.
+    /// Default: `false` (preserves the original L165 behavior).
+    #[props(default = false)]
+    pub show_blocks: bool,
 }
 
 /// Live, PTY-driven terminal component.
@@ -83,6 +91,7 @@ pub fn PtyTerminalView(props: PtyTerminalViewProps) -> Element {
     let rows = props.spec.rows;
     let cols = props.spec.cols;
     let spec = props.spec.clone();
+    let show_blocks = props.show_blocks;
 
     // The PtySource lives for the lifetime of this component. use_signal
     // ensures it's created exactly once and gives us a Copy handle for
@@ -103,6 +112,12 @@ pub fn PtyTerminalView(props: PtyTerminalViewProps) -> Element {
             .map(|_| Signal::new(RowSnapshot::default()))
             .collect::<Vec<_>>()
     });
+
+    // OSC 133 block history. Empty until the shell emits OSC 133 markers
+    // (most modern shells: zsh w/ p10k, fish, bash w/ vte integration).
+    // Refreshed inside the same tick loop that updates row signals so the
+    // block list stays consistent with the live grid.
+    let mut blocks_signal = use_signal(Vec::<Block>::new);
 
     // Background poll. use_future runs once per component lifecycle.
     use_future(move || async move {
@@ -131,6 +146,15 @@ pub fn PtyTerminalView(props: PtyTerminalViewProps) -> Element {
                     let mut sig = *sig;
                     sig.set(snapshot.clone());
                 }
+            }
+            // Refresh the block snapshot once per dirty tick. Cheap when
+            // the store has 0..N blocks; we clone so the rendering side
+            // gets a stable Vec<Block>. If show_blocks=false, the signal
+            // is never read by any consumer, so updating it is essentially
+            // free (Dioxus only re-renders subscribed components).
+            let snapshot = s.block_store().blocks.clone();
+            if blocks_signal.peek().as_slice() != snapshot.as_slice() {
+                blocks_signal.set(snapshot);
             }
         }
     });
@@ -170,6 +194,12 @@ pub fn PtyTerminalView(props: PtyTerminalViewProps) -> Element {
                     row_signal: row_sig,
                     theme: theme.clone(),
                 }
+            }
+        }
+        if show_blocks {
+            BlockListView {
+                blocks: blocks_signal.read().clone(),
+                on_action: None,
             }
         }
     }
@@ -296,8 +326,24 @@ mod tests {
             theme: None,
             font_size_px: 13,
             line_height: 1.2,
+            show_blocks: false,
         };
         assert_eq!(props.spec.command, "/bin/sh");
         assert_eq!(props.font_size_px, 13);
+        assert!(!props.show_blocks);
+    }
+
+    #[test]
+    fn test_props_show_blocks_can_be_enabled() {
+        // L181: supervisor opts in via show_blocks=true to render the
+        // OSC 133 block history beneath the live grid in the same card.
+        let props = PtyTerminalViewProps {
+            spec: PtySpec::shell("/bin/sh"),
+            theme: None,
+            font_size_px: 12,
+            line_height: 1.25,
+            show_blocks: true,
+        };
+        assert!(props.show_blocks);
     }
 }
