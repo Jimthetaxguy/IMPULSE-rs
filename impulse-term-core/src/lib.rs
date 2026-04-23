@@ -32,12 +32,14 @@
 #![deny(clippy::all)]
 
 pub mod backend;
+pub mod blocks;
 pub mod context;
 pub mod escape;
 pub mod grid;
 pub mod input;
 pub mod role;
 
+pub use blocks::{Block, BlockState, BlockStore};
 pub use grid::{CellAttrs, CellRun, GridSnapshot, TermColor};
 pub use input::{TermKey, TermModifiers};
 
