@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use impulse_ops::{SupervisorTargetRef, TerminalOwnership, TerminalTransportKind};
-use impulse_term::context::{AgentKind, ContextHealth, ContextTier, InsightType};
 use impulse_term::TerminalPanel;
+use impulse_term_core::context::{AgentKind, ContextHealth, ContextTier, InsightType};
 
 use crate::terminal_transport::{build_launch_plan, LaunchFallbackWarning};
 use crate::widgets::signal_bus::TabBadge;

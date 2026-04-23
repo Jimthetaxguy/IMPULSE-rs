@@ -4461,6 +4461,7 @@ dependencies = [
  "env_logger",
  "impulse-ops",
  "impulse-term",
+ "impulse-term-core",
  "libc",
  "log",
  "rfd 0.15.4",

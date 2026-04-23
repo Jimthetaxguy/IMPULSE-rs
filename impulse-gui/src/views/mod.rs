@@ -2,7 +2,6 @@
 
 // Genome and Sessions are embedded in the Memory view (not top-level views).
 pub mod genome;
-pub mod guardrails;
 pub mod memory;
 pub mod memory_persistence;
 pub mod overview;

@@ -332,13 +332,8 @@ fn default_agent_theme(name: &str) -> AgentTheme {
 /// This is the original hardcoded lookup, preserved as a fallback for callers
 /// that do not (yet) have access to an [`AgentThemeConfig`].
 pub fn agent_color(name: &str) -> egui::Color32 {
-    match name {
-        "Claude Code" => egui::Color32::from_rgb(0x8b, 0x5c, 0xf6), // purple
-        "OpenCode" => egui::Color32::from_rgb(0x3f, 0xb9, 0x50),    // green
-        "Codex" => egui::Color32::from_rgb(0xd2, 0x99, 0x22),       // yellow
-        "Shell" => egui::Color32::from_rgb(0x58, 0xa6, 0xff),       // blue
-        _ => egui::Color32::from_rgb(0xc9, 0xd1, 0xd9),             // default text
-    }
+    let (r, g, b) = impulse_term_core::theme::agent_color_rgb(name);
+    egui::Color32::from_rgb(r, g, b)
 }
 
 #[cfg(test)]

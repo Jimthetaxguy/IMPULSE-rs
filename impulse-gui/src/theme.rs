@@ -214,7 +214,8 @@ pub fn apply_theme(ctx: &egui::Context, palette: &ColorPalette) {
 
 /// Return a color associated with an agent name for tab/button rendering.
 pub fn agent_color(name: &str) -> egui::Color32 {
-    impulse_term::theme::agent_color(name)
+    let (r, g, b) = impulse_term_core::theme::agent_color_rgb(name);
+    egui::Color32::from_rgb(r, g, b)
 }
 
 // ---------------------------------------------------------------------------

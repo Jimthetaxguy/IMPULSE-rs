@@ -13,7 +13,6 @@ use crate::global_config::GlobalConfig;
 use crate::state::{
     self, ConnectionStatus, PollerCommand, PollerEvent, StateHandle, TaskNoticeLevel,
 };
-use crate::views::guardrails::GuardrailsView;
 use crate::views::memory::MemoryView;
 use crate::views::overview::OverviewView;
 use crate::views::settings::SettingsView;
@@ -29,9 +28,6 @@ pub struct ImpulseApp {
     overview: OverviewView,
     terminals: TerminalsView,
     memory: MemoryView,
-    #[allow(dead_code)]
-    // dead_code: guardrails view state is retained while the workbench routes guardrail data through other surfaces.
-    guardrails: GuardrailsView,
     settings: SettingsView,
     active_view: ViewId,
 
@@ -78,7 +74,6 @@ impl ImpulseApp {
             overview: OverviewView::new(),
             terminals: TerminalsView::new(Some(poller_cmd.clone())),
             memory: MemoryView::new(poller_cmd.clone()),
-            guardrails: GuardrailsView::new(),
             settings: SettingsView::with_poller(Some(poller_cmd.clone())),
             active_view: ViewId::Overview,
             sidebar_expanded: true,

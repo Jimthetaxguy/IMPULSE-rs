@@ -213,9 +213,9 @@ impl View for ContextView {
             ui.add_space(6.0);
 
             let tier = match self.preview_tier {
-                PreviewTier::Essential => impulse_term::context::ContextTier::Essential,
-                PreviewTier::Critical => impulse_term::context::ContextTier::Critical,
-                PreviewTier::Minimal => impulse_term::context::ContextTier::Minimal,
+                PreviewTier::Essential => impulse_term_core::context::ContextTier::Essential,
+                PreviewTier::Critical => impulse_term_core::context::ContextTier::Critical,
+                PreviewTier::Minimal => impulse_term_core::context::ContextTier::Minimal,
             };
 
             // Gather preview data from SharedState.

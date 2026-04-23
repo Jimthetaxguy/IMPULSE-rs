@@ -3,7 +3,7 @@
 //! Extracted from terminals.rs — persist, merge, search, and collect
 //! insights from terminal panes.
 
-use impulse_term::context::ExtractedInsight;
+use impulse_term_core::context::ExtractedInsight;
 
 use super::terminals::TerminalsView;
 

@@ -280,7 +280,13 @@ impl SearchResult {
 }
 
 /// A guardrail rule (deserialized from daemon's GuardList response).
+//
+// dead_code: fields are populated by `GuardRule::from_value` and stored in
+// `SharedState::guard_rules` for the daemon poller, but not yet read by any
+// view since the egui GuardrailsView was archived (Plan 2 / L180b). Kept as
+// a typed struct so the Dioxus port can render guardrails when ready.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct GuardRule {
     pub id: String,
     pub pattern: String,
@@ -288,7 +294,6 @@ pub struct GuardRule {
     pub target: String,
     pub reason: String,
     pub suggestion: Option<String>,
-    #[allow(dead_code)]
     pub enabled: bool,
     pub builtin: bool,
 }

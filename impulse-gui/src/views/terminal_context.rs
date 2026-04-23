@@ -8,7 +8,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use impulse_ops::TerminalTransportKind;
-use impulse_term::context::{ContextTier, InsightType};
+use impulse_term_core::context::{ContextTier, InsightType};
 
 use crate::state::PollerCommand;
 use crate::terminal_transport::{infer_machine_target, infer_ownership};
@@ -230,7 +230,7 @@ impl TerminalsView {
     /// Collects newly extracted insights and persists them to LIVE_INSIGHTS.jsonl.
     /// Also forwards FileModified insights to the daemon for session tracking.
     pub fn context_tick(&mut self) {
-        let mut new_insights: Vec<impulse_term::context::ExtractedInsight> = Vec::new();
+        let mut new_insights: Vec<impulse_term_core::context::ExtractedInsight> = Vec::new();
         let mut file_tracks: Vec<(String, String)> = Vec::new(); // (session_id, file_path)
 
         for tab in self.tabs.values_mut() {
@@ -317,7 +317,10 @@ impl TerminalsView {
                                 message: format!(
                                     "[{}] Error: {}",
                                     tab.label,
-                                    impulse_term::context::truncate_insight(&insight.content, 80)
+                                    impulse_term_core::context::truncate_insight(
+                                        &insight.content,
+                                        80
+                                    )
                                 ),
                                 created_at: now,
                             });
@@ -330,7 +333,10 @@ impl TerminalsView {
                                 message: format!(
                                     "[{}] Task completed: {}",
                                     tab.label,
-                                    impulse_term::context::truncate_insight(&insight.content, 60)
+                                    impulse_term_core::context::truncate_insight(
+                                        &insight.content,
+                                        60
+                                    )
                                 ),
                                 created_at: now,
                             });

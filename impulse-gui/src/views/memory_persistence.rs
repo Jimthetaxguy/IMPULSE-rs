@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use impulse_term::context::ExtractedInsight;
+use impulse_term_core::context::ExtractedInsight;
 
 /// A search result from live insights.
 pub struct LiveInsightResult {
@@ -95,7 +95,7 @@ pub fn merge_pane_to_history(
 
     let files: Vec<String> = pane_insights
         .iter()
-        .filter(|i| i.insight_type == impulse_term::context::InsightType::FileModified)
+        .filter(|i| i.insight_type == impulse_term_core::context::InsightType::FileModified)
         .map(|i| i.content.clone())
         .collect::<HashSet<_>>()
         .into_iter()
@@ -146,13 +146,13 @@ pub fn merge_pane_to_history(
 ///
 /// Returns `None` for `ContextTier::None` and other non-injectable tiers.
 pub fn build_refresh_context(
-    tier: impulse_term::context::ContextTier,
+    tier: impulse_term_core::context::ContextTier,
     cross_pane_insights: &[String],
     genome_decisions: &[String],
     active_sessions: &[String],
     recent_history: &[String],
 ) -> Option<String> {
-    use impulse_term::context::ContextTier;
+    use impulse_term_core::context::ContextTier;
 
     let tier_desc = match tier {
         ContextTier::Essential => "Context at ~50%. Prioritizing essential information.",
@@ -200,7 +200,7 @@ pub fn build_refresh_context(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use impulse_term::context::{AgentKind, InsightType};
+    use impulse_term_core::context::{AgentKind, InsightType};
     use tempfile::TempDir;
 
     /// Helper to create a test insight with specific fields.
@@ -559,7 +559,7 @@ mod tests {
         let cross = vec!["  - [pane-1] FileModified: lib.rs".to_string()];
         let decisions = vec!["Use tokio for async".to_string()];
         let result = build_refresh_context(
-            impulse_term::context::ContextTier::Essential,
+            impulse_term_core::context::ContextTier::Essential,
             &cross,
             &decisions,
             &[],
@@ -576,7 +576,7 @@ mod tests {
     #[test]
     fn test_build_refresh_context_critical() {
         let result = build_refresh_context(
-            impulse_term::context::ContextTier::Critical,
+            impulse_term_core::context::ContextTier::Critical,
             &[],
             &[],
             &[],
@@ -589,7 +589,7 @@ mod tests {
     #[test]
     fn test_build_refresh_context_minimal() {
         let result = build_refresh_context(
-            impulse_term::context::ContextTier::Minimal,
+            impulse_term_core::context::ContextTier::Minimal,
             &[],
             &[],
             &[],
@@ -601,8 +601,13 @@ mod tests {
 
     #[test]
     fn test_build_refresh_context_none_returns_none() {
-        let result =
-            build_refresh_context(impulse_term::context::ContextTier::None, &[], &[], &[], &[]);
+        let result = build_refresh_context(
+            impulse_term_core::context::ContextTier::None,
+            &[],
+            &[],
+            &[],
+            &[],
+        );
         assert!(result.is_none(), "Tier None should not produce context");
     }
 
@@ -613,7 +618,7 @@ mod tests {
             "gui-opencode-1: active (1 file)".to_string(),
         ];
         let result = build_refresh_context(
-            impulse_term::context::ContextTier::Essential,
+            impulse_term_core::context::ContextTier::Essential,
             &[],
             &[],
             &sessions,
@@ -632,7 +637,7 @@ mod tests {
             "Earlier session: 3 insights, 1 file".to_string(),
         ];
         let result = build_refresh_context(
-            impulse_term::context::ContextTier::Critical,
+            impulse_term_core::context::ContextTier::Critical,
             &[],
             &[],
             &[],
