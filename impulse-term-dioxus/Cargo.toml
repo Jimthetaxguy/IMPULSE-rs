@@ -37,3 +37,6 @@ desktop = ["dioxus/desktop"]
 [dev-dependencies]
 # Tests touch GridSnapshot::from_screen(parser.screen()) directly.
 vt100 = "0.15"
+# SSR renders rsx! to an HTML string for snapshot-style assertions.
+# Lets us verify the renderer produces the expected DOM without a webview.
+dioxus-ssr = "0.6"

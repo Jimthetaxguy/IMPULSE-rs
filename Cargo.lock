@@ -606,6 +606,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "askama_escape"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "619743e34b5ba4e9703bba34deac3427c72507c7159f5fd030aea8cac0cfe341"
+
+[[package]]
 name = "async-broadcast"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2722,6 +2728,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dioxus-ssr"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38e1fac097e71ccec4e9e15d44b68393be2981276e42170703180bceb0b6f122"
+dependencies = [
+ "askama_escape",
+ "dioxus-core",
+ "dioxus-core-types",
+ "rustc-hash 1.1.0",
+]
+
+[[package]]
 name = "dioxus-web"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4556,6 +4574,7 @@ name = "impulse-term-dioxus"
 version = "0.1.0"
 dependencies = [
  "dioxus",
+ "dioxus-ssr",
  "impulse-term-core",
  "vt100",
 ]

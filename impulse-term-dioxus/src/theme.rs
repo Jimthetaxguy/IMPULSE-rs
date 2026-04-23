@@ -12,6 +12,7 @@ use impulse_term_core::TermColor;
 ///
 /// The default fg/bg are configurable so the supervisor shell can theme
 /// terminals by role (e.g. supervisor pane vs worker pane).
+#[derive(Clone, PartialEq, Eq)]
 pub struct CssTheme {
     pub fg_default: &'static str,
     pub bg_default: &'static str,
