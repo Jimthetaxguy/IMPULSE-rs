@@ -37,11 +37,13 @@ pub mod context;
 pub mod escape;
 pub mod grid;
 pub mod input;
+pub mod osc133;
 pub mod role;
 
 pub use blocks::{Block, BlockState, BlockStore};
 pub use grid::{CellAttrs, CellRun, GridSnapshot, TermColor};
 pub use input::{TermKey, TermModifiers};
+pub use osc133::{Osc133Event, Osc133Parser};
 
 pub use backend::TerminalBackend;
 pub use context::{
