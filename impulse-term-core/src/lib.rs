@@ -35,9 +35,11 @@ pub mod backend;
 pub mod context;
 pub mod escape;
 pub mod grid;
+pub mod input;
 pub mod role;
 
 pub use grid::{CellAttrs, CellRun, GridSnapshot, TermColor};
+pub use input::{TermKey, TermModifiers};
 
 pub use backend::TerminalBackend;
 pub use context::{
