@@ -22,11 +22,17 @@ thiserror = { workspace = true }
 # Impulse internal crates
 impulse-ops = { path = "../impulse-ops" }
 impulse-term = { path = "../impulse-term" }
+# Live PTY-driven Dioxus terminal component. Always-built for the
+# toolkit-neutral surface (LiveGrid, PtySource); the runtime component
+# (PtyTerminalView) is gated behind the `desktop` feature passthrough below.
+impulse-term-dioxus = { path = "../impulse-term-dioxus" }
 
 [dev-dependencies]
 tempfile = "3"
 
 [features]
 default = []
-# Until the runtime is wired, the crate compiles but does not run as a binary.
-experimental-runtime = []
+# Enables the Dioxus desktop runtime entry (launch_desktop) and the
+# PtyTerminalView component wired into worker panes. Pulls in wry and the
+# system webview backend.
+experimental-runtime = ["impulse-term-dioxus/desktop"]

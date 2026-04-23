@@ -1,3 +1,12 @@
+// dead_code: when experimental-runtime is on, the bin's `run()` takes
+// the launch_desktop branch and the non-runtime helpers (runtime_bootstrap,
+// render_bootstrap_console, render_runtime_console, refresh_runtime_model,
+// runtime_disabled_message, runtime_model + ShellState transition methods)
+// become unused in the bin compile unit. They remain in the API for the
+// lib's tests and for downstream consumers; the dead-code is true only
+// for this specific bin/feature combination.
+#![cfg_attr(feature = "experimental-runtime", allow(dead_code))]
+
 use crate::daemon_bridge::DaemonBridge;
 use dioxus::prelude::*;
 use impulse_supervisor::layout::{LayoutMode, WorkerGrid};
@@ -271,7 +280,10 @@ pub fn render_runtime_console(model: &RuntimeModel) -> String {
 
 #[cfg(feature = "experimental-runtime")]
 pub fn launch_desktop() {
-    dioxus_desktop::launch(SupervisorRuntimeApp);
+    // Dioxus 0.6 unified launch API — picks the desktop backend (wry +
+    // system webview) based on the `dioxus/desktop` feature being enabled
+    // through `impulse-term-dioxus/desktop` -> `experimental-runtime`.
+    dioxus::launch(SupervisorRuntimeApp);
 }
 
 pub fn run() {
@@ -406,11 +418,82 @@ pub fn WorkerGridPanel(grid: WorkerGrid, panes: Vec<WorkerPaneStubView>) -> Elem
 
 #[component]
 pub fn WorkerPaneCard(pane: WorkerPaneStubView) -> Element {
+    let live_inner = render_live_pane_inner(pane.clone());
     rsx! {
         article {
             class: "worker-pane-stub",
             h3 { "{pane.title}" }
             p { "{pane.detail}" }
+            {live_inner}
+        }
+    }
+}
+
+// dead_code: invoked from WorkerPaneCard (a Dioxus #[component]); clippy
+// can't see through the macro-generated component plumbing.
+#[allow(dead_code)]
+#[cfg(feature = "experimental-runtime")]
+fn render_live_pane_inner(pane: WorkerPaneStubView) -> Element {
+    rsx! { LiveWorkerPane { pane } }
+}
+
+// dead_code: same reason as above; this branch is the no-op fallback when
+// the runtime isn't compiled in.
+#[allow(dead_code)]
+#[cfg(not(feature = "experimental-runtime"))]
+fn render_live_pane_inner(_pane: WorkerPaneStubView) -> Element {
+    // No live PTY embed when the experimental runtime is disabled — the
+    // stub card alone is enough for the non-runtime build path.
+    rsx! { Fragment {} }
+}
+
+/// Live PTY-driven worker pane — the L167 integration smoke surface.
+///
+/// Spawns a `/bin/sh -c 'echo "Impulse worker pane: <title>"; exec /bin/sh'`
+/// PTY for each worker pane card, rendering it through `PtyTerminalView`.
+/// The `exec /bin/sh` keeps the pane interactive after the welcome `echo`
+/// so a user can type into the pane and see real shell output.
+///
+/// This is deliberately minimal — Phase 3 (L168+) wires the actual pane
+/// command, env vars, working directory from the pane registry. The goal
+/// of L167 is to prove the chain end-to-end:
+///
+///   PtySpec → PtySource → TerminalBackend → vt100 parser →
+///   GridSnapshot → LiveGrid (per-row signals) → PtyTerminalView
+///
+/// inside a real `dioxus_desktop::launch` window.
+#[cfg(feature = "experimental-runtime")]
+#[component]
+pub fn LiveWorkerPane(pane: WorkerPaneStubView) -> Element {
+    use impulse_term_dioxus::{PtySpec, PtyTerminalView};
+
+    // Spawn a login-style sh that prints a marker line then drops to an
+    // interactive prompt. The `exec` replaces sh-with-args with sh, so the
+    // pane stays alive after the echo runs.
+    let title = pane.title.clone();
+    let spec = PtySpec {
+        command: "/bin/sh".into(),
+        args: vec![
+            "-c".into(),
+            format!("echo 'Impulse worker pane: {title}'; exec /bin/sh"),
+        ],
+        working_dir: None,
+        env_vars: Vec::new(),
+        rows: 18,
+        cols: 80,
+        scrollback_lines: Some(2_000),
+    };
+
+    rsx! {
+        div {
+            class: "live-worker-pane",
+            style: "border: 1px solid #444; border-radius: 4px; margin-top: 8px; height: 380px;",
+            PtyTerminalView {
+                spec,
+                font_size_px: 12,
+                line_height: 1.25,
+                theme: None,
+            }
         }
     }
 }
