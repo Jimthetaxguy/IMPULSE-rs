@@ -29,12 +29,14 @@
 #![deny(clippy::all)]
 
 pub mod live;
+pub mod source;
 pub mod theme;
 
 #[cfg(feature = "desktop")]
 pub mod view;
 
 pub use live::{LiveGrid, RowSnapshot, UpdateReport};
+pub use source::{PtySource, PtySourceError, PtySpec};
 
 pub use impulse_term_core::{
     CellAttrs, CellRun, ContextBridge, GridSnapshot, PaneRole, TermColor, TermKey, TermModifiers,

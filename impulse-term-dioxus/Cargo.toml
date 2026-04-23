@@ -19,6 +19,9 @@ license = "MIT"
 # Toolkit-neutral terminal core: PTY backend, parser, GridSnapshot, TermKey.
 impulse-term-core = { path = "../impulse-term-core" }
 
+# Error type derives for PtySource (Spawn/Write/Resize variants).
+thiserror = { workspace = true }
+
 # Dioxus 0.6 — desktop default uses the system webview (wry → WKWebView /
 # WebView2 / WebKitGTK). The `macro` feature gives us `rsx!`, `#[component]`,
 # `#[derive(Props)]`. The `desktop` feature is opt-in via this crate's own
