@@ -86,12 +86,11 @@ pub fn key_to_pty_bytes(
 }
 
 /// Wrap pasted text in bracketed paste escape sequences.
-pub fn bracketed_paste(text: &str) -> Vec<u8> {
-    let mut bytes = b"\x1b[200~".to_vec();
-    bytes.extend_from_slice(text.as_bytes());
-    bytes.extend_from_slice(b"\x1b[201~");
-    bytes
-}
+///
+/// Re-export of the toolkit-neutral helper from `impulse-term-core` so
+/// existing consumers of `impulse_term::input::bracketed_paste` continue to
+/// work after the L157 decouple.
+pub use impulse_term_core::escape::bracketed_paste;
 
 /// Map Ctrl+key to the corresponding control character byte.
 fn ctrl_key_byte(key: &egui::Key) -> Option<u8> {

@@ -1,42 +1,44 @@
-//! impulse-term — custom terminal widget with context lifecycle integration.
+//! impulse-term — egui adapter for `impulse-term-core`.
 //!
-//! Replaces `egui_term` with a terminal backend that gives zero-copy, in-process
-//! access to both context extraction (reading agent output) and context injection
-//! (writing context blocks into agent terminals).
+//! Wraps the toolkit-neutral terminal core (`impulse-term-core`) with an
+//! egui-specific renderer, theme, status bar, key shim, and composite panel
+//! widget. **For new code, prefer importing the renderer-specific crate
+//! directly** (`impulse-term-egui`, `impulse-term-dioxus`) and the core
+//! types from `impulse-term-core`.
 //!
-//! # Architecture
+//! # Re-exports for back-compat
+//!
+//! Existing consumers (`impulse-gui`, `impulse-rs`) can keep using
+//! `impulse_term::TerminalBackend` etc. — these are re-exported from
+//! `impulse-term-core`. This shim layer disappears in L161 once consumers
+//! repoint to `impulse-term-egui` directly.
+//!
+//! # Architecture (post-L157)
 //!
 //! ```text
-//! Agent Process (claude, opencode, shell)
+//! impulse-term-core     ← PTY, parser, context bridge (no GUI dep)
+//!     ▲
+//!     │ consumed by
 //!     │
-//!     │ PTY (pseudoterminal pair)
-//!     ▼
-//! TerminalBackend
-//!     ├── reader thread → vt100::Parser (background, continuous)
-//!     ├── writer handle → Box<dyn Write> (for keyboard + injection)
-//!     └── alive: AtomicBool (process status)
-//!     │
-//!     ├─── TerminalRenderer reads vt100::Screen → egui paint calls
-//!     ├─── ContextBridge reads screen_text() for extraction
-//!     └─── ContextBridge writes inject_context() via PTY writer
+//! impulse-term (this)   ← egui renderer, theme, panel, status bar, keys
 //! ```
 
-pub mod backend;
-pub mod context;
 pub mod input;
 pub mod panel;
 pub mod renderer;
-pub mod role;
 pub mod status_bar;
 pub mod theme;
 
-// Re-export public API.
-pub use backend::TerminalBackend;
-pub use context::{
-    AgentKind, ContextBridge, ContextHealth, ContextTier, ExtractedInsight, InsightType,
+// Re-export core types AND modules for back-compat. The module re-exports
+// allow internal panel.rs / status_bar.rs to keep using `crate::backend::*`
+// etc. without a sweeping import rewrite.
+pub use impulse_term_core::{backend, context, role};
+pub use impulse_term_core::{
+    AgentKind, ContextBridge, ContextHealth, ContextTier, ExtractedInsight, InsightType, PaneRole,
+    TerminalBackend,
 };
+
 pub use input::key_to_pty_bytes;
 pub use panel::TerminalPanel;
 pub use renderer::TerminalRenderer;
-pub use role::PaneRole;
 pub use theme::{AgentTheme, AgentThemeConfig, TerminalTheme};

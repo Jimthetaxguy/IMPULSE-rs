@@ -566,7 +566,10 @@ mod tests {
     fn test_lifecycle_from_settled_starts_pending() {
         let bridge = DaemonBridge::default();
         let lifecycle = bridge.lifecycle_from_settled(bridge.disconnected_snapshot());
-        assert_eq!(lifecycle.pending.connection_state, BridgeConnectionState::Pending);
+        assert_eq!(
+            lifecycle.pending.connection_state,
+            BridgeConnectionState::Pending
+        );
     }
 
     #[test]
@@ -576,14 +579,20 @@ mod tests {
             serde_json::json!({ "protocol_version": 9 }),
             BridgeConnectionState::Connected,
         ));
-        assert_eq!(lifecycle.transition_line(), "bridge=pending -> connected protocol=9");
+        assert_eq!(
+            lifecycle.transition_line(),
+            "bridge=pending -> connected protocol=9"
+        );
     }
 
     #[test]
     fn test_lifecycle_transition_line_reports_waiting_when_disconnected() {
         let bridge = DaemonBridge::default();
         let lifecycle = bridge.lifecycle_from_settled(bridge.disconnected_snapshot());
-        assert_eq!(lifecycle.transition_line(), "bridge=pending -> waiting protocol=?");
+        assert_eq!(
+            lifecycle.transition_line(),
+            "bridge=pending -> waiting protocol=?"
+        );
     }
 
     #[test]

@@ -4530,9 +4530,9 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "eframe",
+ "impulse-term-core",
  "log",
  "parking_lot",
- "portable-pty",
  "serde",
  "serde_json",
  "vt100",

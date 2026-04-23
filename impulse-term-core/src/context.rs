@@ -363,7 +363,7 @@ impl ContextBridge {
         }
 
         let wrapped = self.wrap_injection(content);
-        let pasted = crate::input::bracketed_paste(&wrapped);
+        let pasted = crate::escape::bracketed_paste(&wrapped);
         // WriteQueue ensures atomic write and skips if user typed recently.
         let injected = self.backend.write_queue().write_injection(&pasted)?;
 
