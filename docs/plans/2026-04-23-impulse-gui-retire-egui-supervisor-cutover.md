@@ -1,5 +1,10 @@
 # Plan 2 — Retire egui & cut over to the Dioxus supervisor
 
+> **SUPERSEDED 2026-04-23** — Converted to gitspec format.
+> Authoritative source: `docs/specs/SPEC-EGUI-RETIRE.md` and
+> `docs/stories/STORY-180*…STORY-195*`. This file is preserved for
+> traceability only — do not edit.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make `impulse-supervisor` (Dioxus, retained-mode) the only desktop UI for Impulse. Permanently delete `impulse-gui` (egui workbench) and `impulse-term` (egui adapter). The supervisor must reach feature parity for the workflows the user actually uses *before* the egui crates are archived; the parts of `impulse-gui` that are aspirational/unused are deleted, not ported.

@@ -1,5 +1,9 @@
 # impulse-gui ⇢ Decouple from impulse-term (egui adapter) — Implementation Plan
 
+> **SUPERSEDED 2026-04-23** — All 8 tasks complete (commits a18ae46, 100389c).
+> Rolled into gitspec spec `docs/specs/SPEC-EGUI-RETIRE.md` as the
+> "Plan 1 prerequisites" subsection. This file preserved for traceability.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Sever every dependency from `impulse-gui` to `impulse-term` *except* the two that genuinely need egui (`TerminalPanel` widget, `TerminalTheme` egui-color struct). After this plan, `impulse-gui`'s only remaining tie to the egui adapter is the live terminal rendering surface — which Plan 2 (a separate, future plan) will replace with a Dioxus equivalent.
