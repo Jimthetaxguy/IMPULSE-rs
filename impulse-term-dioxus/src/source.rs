@@ -47,7 +47,7 @@ pub enum PtySourceError {
 }
 
 /// Configuration for spawning a PTY-backed terminal source.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PtySpec {
     pub command: String,
     pub args: Vec<String>,

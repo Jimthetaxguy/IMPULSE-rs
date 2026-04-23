@@ -33,9 +33,14 @@ thiserror = { workspace = true }
 # surface (doc generation, type-only consumers) doesn't pay the wry compile cost.
 dioxus = "0.6"
 
+# Tokio for use_future-driven polling in pty_view (desktop only).
+# Match Dioxus 0.6's tokio version family. `time` for sleep.
+tokio = { version = "1", features = ["time", "rt"], optional = true }
+tracing = { version = "0.1", optional = true }
+
 [features]
 default = []
-desktop = ["dioxus/desktop"]
+desktop = ["dioxus/desktop", "dep:tokio", "dep:tracing"]
 
 [dev-dependencies]
 # Tests touch GridSnapshot::from_screen(parser.screen()) directly.

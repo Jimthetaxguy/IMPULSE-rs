@@ -33,10 +33,17 @@ pub mod source;
 pub mod theme;
 
 #[cfg(feature = "desktop")]
+pub mod pty_view;
+#[cfg(feature = "desktop")]
 pub mod view;
 
 pub use live::{LiveGrid, RowSnapshot, UpdateReport};
 pub use source::{PtySource, PtySourceError, PtySpec};
+
+#[cfg(feature = "desktop")]
+pub use pty_view::{PtyTerminalView, PtyTerminalViewProps};
+#[cfg(feature = "desktop")]
+pub use view::{TerminalView, TerminalViewProps, ThemeProp};
 
 pub use impulse_term_core::{
     CellAttrs, CellRun, ContextBridge, GridSnapshot, PaneRole, TermColor, TermKey, TermModifiers,

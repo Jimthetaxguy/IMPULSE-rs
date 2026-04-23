@@ -4577,6 +4577,8 @@ dependencies = [
  "dioxus-ssr",
  "impulse-term-core",
  "thiserror 2.0.18",
+ "tokio",
+ "tracing",
  "vt100",
 ]
 
