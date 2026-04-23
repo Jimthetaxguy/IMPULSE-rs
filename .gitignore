@@ -27,3 +27,7 @@ Impulse.app/
 
 # Misc
 .superpowers/
+
+# Claude Code session-local state (ralph loop, worktrees, transcripts)
+.claude/ralph-loop.local.md
+.claude/worktrees/
