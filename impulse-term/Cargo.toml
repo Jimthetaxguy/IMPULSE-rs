@@ -1,8 +1,8 @@
 [package]
 name = "impulse-term"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Custom terminal widget for Impulse GUI with context lifecycle integration"
+description = "Egui adapter for impulse-term-core: renderer, theme, panel widget, status bar, and egui::Key shim. Pair with impulse-term-core for the toolkit-neutral PTY/parser/context backend."
 authors = ["James Pustorino"]
 license = "MIT"
 
