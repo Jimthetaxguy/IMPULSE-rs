@@ -22,6 +22,7 @@ thiserror = { workspace = true }
 # Impulse internal crates
 impulse-ops = { path = "../impulse-ops" }
 impulse-term = { path = "../impulse-term" }
+impulse-term-core = { path = "../impulse-term-core" }
 # Live PTY-driven Dioxus terminal component. Always-built for the
 # toolkit-neutral surface (LiveGrid, PtySource); the runtime component
 # (PtyTerminalView) is gated behind the `desktop` feature passthrough below.

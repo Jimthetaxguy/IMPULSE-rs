@@ -845,7 +845,9 @@ fn build_env_vars_for_role(
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
         .collect();
-    vars.extend(role.spawn_env_vars(cmd_socket_path));
+    // pane_id=None: the egui panel uses a usize pane_id baked into
+    // build_env_vars; the uuid-based IMPULSE_WORKER_PANE_ID is supervisor-only.
+    vars.extend(role.spawn_env_vars(cmd_socket_path, None));
     vars
 }
 
@@ -1049,8 +1051,11 @@ mod tests {
 
     #[test]
     fn test_build_env_vars_for_role_worker_has_no_supervisor_env() {
-        // Worker must NEVER leak IMPULSE_SUPERVISOR or IMPULSE_CMD_SOCKET,
-        // even if a socket path is passed (it's ignored for workers).
+        // L182 design change: workers NOW receive IMPULSE_CMD_SOCKET so they
+        // can emit `@impulse <verb>` commands that the daemon hook intercepts.
+        // The privilege boundary is IMPULSE_SUPERVISOR=1, NOT socket access:
+        // the daemon enforces what each pane is allowed to do based on the
+        // PaneRole + IMPULSE_WORKER_PANE_ID it sees in the request payload.
         let sock = PathBuf::from("/tmp/impulse.sock");
         let vars = build_env_vars_for_role(None, "claude", 0, PaneRole::Worker, Some(&sock));
         assert!(
@@ -1058,8 +1063,8 @@ mod tests {
             "worker must not set IMPULSE_SUPERVISOR"
         );
         assert!(
-            !vars.iter().any(|(k, _)| k == "IMPULSE_CMD_SOCKET"),
-            "worker must not set IMPULSE_CMD_SOCKET"
+            vars.iter().any(|(k, _)| k == "IMPULSE_CMD_SOCKET"),
+            "worker must receive IMPULSE_CMD_SOCKET to send @impulse commands"
         );
     }
 

@@ -18,6 +18,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use uuid::Uuid;
 
 /// Role assigned to a pane at spawn time.
 ///
@@ -37,16 +38,32 @@ pub enum PaneRole {
 impl PaneRole {
     /// Env vars injected at PTY spawn time for this role.
     ///
-    /// `socket_path` is only consulted for `Supervisor`; workers ignore it.
-    /// If the role is `Supervisor` but no socket path is given, only the
-    /// base `IMPULSE_PANE_ROLE` var is emitted — callers can always add
-    /// the socket later, but the supervisor process starts without daemon
-    /// access. This is a graceful-degradation choice, not an error.
-    pub fn spawn_env_vars(&self, socket_path: Option<&Path>) -> Vec<(String, String)> {
+    /// All panes that get a `socket_path` receive `IMPULSE_CMD_SOCKET=<path>`
+    /// — workers need it to send `@impulse` commands; supervisor needs it to
+    /// receive them. Workers also get `IMPULSE_WORKER_PANE_ID=<uuid>` when a
+    /// `pane_id` is provided, so the daemon can identify which worker emitted
+    /// a given command. Only `Supervisor` gets the additional
+    /// `IMPULSE_SUPERVISOR=1` privilege flag.
+    pub fn spawn_env_vars(
+        &self,
+        socket_path: Option<&Path>,
+        pane_id: Option<Uuid>,
+    ) -> Vec<(String, String)> {
         let mut vars = vec![("IMPULSE_PANE_ROLE".to_string(), self.as_str().to_string())];
-        if let (PaneRole::Supervisor, Some(path)) = (self, socket_path) {
+        if let Some(path) = socket_path {
             vars.push(("IMPULSE_CMD_SOCKET".to_string(), path.display().to_string()));
-            vars.push(("IMPULSE_SUPERVISOR".to_string(), "1".to_string()));
+        }
+        match self {
+            PaneRole::Supervisor => {
+                if socket_path.is_some() {
+                    vars.push(("IMPULSE_SUPERVISOR".to_string(), "1".to_string()));
+                }
+            }
+            PaneRole::Worker => {
+                if let Some(id) = pane_id {
+                    vars.push(("IMPULSE_WORKER_PANE_ID".to_string(), id.to_string()));
+                }
+            }
         }
         vars
     }
@@ -86,17 +103,19 @@ mod tests {
     }
 
     #[test]
-    fn test_worker_env_is_minimal() {
-        // Worker only gets IMPULSE_PANE_ROLE, regardless of socket path.
-        let vars = PaneRole::Worker.spawn_env_vars(Some(Path::new("/tmp/sock")));
-        assert_eq!(vars.len(), 1);
-        assert_eq!(vars[0].0, "IMPULSE_PANE_ROLE");
-        assert_eq!(vars[0].1, "worker");
+    fn test_worker_env_with_socket_includes_cmd_socket() {
+        // Workers DO receive IMPULSE_CMD_SOCKET so they can send `@impulse`
+        // commands to the daemon. They do NOT receive IMPULSE_SUPERVISOR.
+        let vars = PaneRole::Worker.spawn_env_vars(Some(Path::new("/tmp/sock")), None);
+        let get = |k: &str| vars.iter().find(|(vk, _)| vk == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("IMPULSE_PANE_ROLE"), Some("worker"));
+        assert_eq!(get("IMPULSE_CMD_SOCKET"), Some("/tmp/sock"));
+        assert_eq!(get("IMPULSE_SUPERVISOR"), None);
     }
 
     #[test]
     fn test_worker_env_without_socket() {
-        let vars = PaneRole::Worker.spawn_env_vars(None);
+        let vars = PaneRole::Worker.spawn_env_vars(None, None);
         assert_eq!(vars.len(), 1);
         assert_eq!(vars[0].0, "IMPULSE_PANE_ROLE");
         assert_eq!(vars[0].1, "worker");
@@ -106,7 +125,7 @@ mod tests {
     fn test_supervisor_env_includes_socket() {
         // Supervisor with a socket path gets 3 vars: role + socket + supervisor flag.
         let path = PathBuf::from("/tmp/impulse.sock");
-        let vars = PaneRole::Supervisor.spawn_env_vars(Some(&path));
+        let vars = PaneRole::Supervisor.spawn_env_vars(Some(&path), None);
         assert_eq!(vars.len(), 3);
 
         let get = |k: &str| vars.iter().find(|(vk, _)| vk == k).map(|(_, v)| v.as_str());
@@ -119,7 +138,7 @@ mod tests {
     fn test_supervisor_without_socket_path() {
         // Graceful — supervisor without socket only gets IMPULSE_PANE_ROLE.
         // This is valid: the supervisor can spawn before the socket is ready.
-        let vars = PaneRole::Supervisor.spawn_env_vars(None);
+        let vars = PaneRole::Supervisor.spawn_env_vars(None, None);
         assert_eq!(vars.len(), 1);
         assert_eq!(vars[0].0, "IMPULSE_PANE_ROLE");
         assert_eq!(vars[0].1, "supervisor");
@@ -163,7 +182,7 @@ mod tests {
     fn test_supervisor_env_preserves_socket_path_display() {
         // Path with spaces / unicode should round-trip via Display.
         let path = PathBuf::from("/var/run/impulse-agent.sock");
-        let vars = PaneRole::Supervisor.spawn_env_vars(Some(&path));
+        let vars = PaneRole::Supervisor.spawn_env_vars(Some(&path), None);
         let sock = vars
             .iter()
             .find(|(k, _)| k == "IMPULSE_CMD_SOCKET")
@@ -177,6 +196,33 @@ mod tests {
         let r = PaneRole::Supervisor;
         let r2 = r;
         assert_eq!(r, r2);
+    }
+
+    #[test]
+    fn test_worker_with_pane_id_emits_worker_pane_id_var() {
+        let id = Uuid::new_v4();
+        let vars = PaneRole::Worker.spawn_env_vars(Some(Path::new("/tmp/sock")), Some(id));
+        let get = |k: &str| vars.iter().find(|(vk, _)| vk == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("IMPULSE_PANE_ROLE"), Some("worker"));
+        assert_eq!(get("IMPULSE_CMD_SOCKET"), Some("/tmp/sock"));
+        assert_eq!(get("IMPULSE_WORKER_PANE_ID"), Some(id.to_string().as_str()));
+        // Worker MUST NOT receive the privilege flag.
+        assert_eq!(get("IMPULSE_SUPERVISOR"), None);
+    }
+
+    #[test]
+    fn test_supervisor_does_not_receive_worker_pane_id() {
+        let id = Uuid::new_v4();
+        let vars = PaneRole::Supervisor.spawn_env_vars(Some(Path::new("/tmp/sock")), Some(id));
+        let get = |k: &str| vars.iter().find(|(vk, _)| vk == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("IMPULSE_SUPERVISOR"), Some("1"));
+        assert_eq!(get("IMPULSE_WORKER_PANE_ID"), None);
+    }
+
+    #[test]
+    fn test_worker_without_pane_id_omits_worker_pane_id_var() {
+        let vars = PaneRole::Worker.spawn_env_vars(Some(Path::new("/tmp/sock")), None);
+        assert!(vars.iter().all(|(k, _)| k != "IMPULSE_WORKER_PANE_ID"));
     }
 
     #[test]

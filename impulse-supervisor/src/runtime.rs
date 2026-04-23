@@ -465,7 +465,18 @@ fn render_live_pane_inner(_pane: WorkerPaneStubView) -> Element {
 #[cfg(feature = "experimental-runtime")]
 #[component]
 pub fn LiveWorkerPane(pane: WorkerPaneStubView) -> Element {
+    use impulse_term_core::role::PaneRole;
     use impulse_term_dioxus::{PtySpec, PtyTerminalView};
+    use std::path::PathBuf;
+
+    // L182: every worker pane gets a stable uuid + the daemon command socket
+    // so it can emit `@impulse <verb>` requests that the future hook
+    // intercepts on PTY input. Resolved once per component lifetime via
+    // use_signal so re-renders don't reroll the uuid.
+    let pane_id = use_signal(uuid::Uuid::new_v4);
+    let pane_id_value = *pane_id.read();
+    let socket_path: Option<PathBuf> = std::env::var("IMPULSE_CMD_SOCKET").ok().map(PathBuf::from);
+    let env_vars = PaneRole::Worker.spawn_env_vars(socket_path.as_deref(), Some(pane_id_value));
 
     // Spawn a login-style sh that prints a marker line then drops to an
     // interactive prompt. The `exec` replaces sh-with-args with sh, so the
@@ -478,7 +489,7 @@ pub fn LiveWorkerPane(pane: WorkerPaneStubView) -> Element {
             format!("echo 'Impulse worker pane: {title}'; exec /bin/sh"),
         ],
         working_dir: None,
-        env_vars: Vec::new(),
+        env_vars,
         rows: 18,
         cols: 80,
         scrollback_lines: Some(2_000),
