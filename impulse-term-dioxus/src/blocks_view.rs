@@ -90,11 +90,14 @@ pub fn BlockView(props: BlockViewProps) -> Element {
     let rerun_command = command_text.clone();
     let ask_full = full_text;
 
+    let is_running = matches!(block.state, BlockState::Streaming);
+
     rsx! {
         li {
             class: "impulse-block {state_class}",
             "data-block-id": "{id}",
             "data-state": "{state_data_attr}",
+            "data-running": if is_running { "true" } else { "false" },
             header {
                 class: "impulse-block-header",
                 span { class: "impulse-block-status", "{icon}" }

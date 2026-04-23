@@ -38,8 +38,11 @@ pub mod blocks_view;
 pub mod key_shim;
 #[cfg(feature = "desktop")]
 pub mod pty_view;
+pub mod styles;
 #[cfg(feature = "desktop")]
 pub mod view;
+
+pub use styles::default_block_styles;
 
 pub use live::{LiveGrid, RowSnapshot, UpdateReport};
 pub use source::{PtySource, PtySourceError, PtySpec};
