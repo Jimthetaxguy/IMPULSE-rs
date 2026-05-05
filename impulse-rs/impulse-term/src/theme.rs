@@ -86,12 +86,17 @@ impl TerminalTheme {
     /// Uses `bg` as the terminal background (from the GUI palette's `bg_deep`),
     /// `accent` for cursor and selection, and keeps the standard ANSI color set.
     pub fn from_accent(bg: egui::Color32, accent: egui::Color32) -> Self {
-        let mut theme = Self::default();
-        theme.bg = bg;
-        theme.cursor = accent;
-        theme.selection_bg =
-            egui::Color32::from_rgba_premultiplied(accent.r(), accent.g(), accent.b(), 0x40);
-        theme
+        Self {
+            bg,
+            cursor: accent,
+            selection_bg: egui::Color32::from_rgba_premultiplied(
+                accent.r(),
+                accent.g(),
+                accent.b(),
+                0x40,
+            ),
+            ..Self::default()
+        }
     }
 
     /// Resolve a vt100 `Color` to an egui `Color32`.
