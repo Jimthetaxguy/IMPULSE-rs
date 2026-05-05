@@ -65,7 +65,7 @@ Before implementing, consider alternative approaches. Choose the simplest soluti
 ## Architecture
 
 **Workspace (3 crates, post-egui-dump 2026-04-17):**
-- `impulse-rs/` — main CLI + daemon + ratatui TUI (64,066 LOC in src/, 1,318 unit + 26 integration tests across 178 .rs files)
+- `impulse-rs/` — main CLI + daemon + ratatui TUI (64,714 LOC in src/, 1,318 unit + 26 integration tests across 178 .rs files)
 - `impulse-rs/impulse-ops/` — operations library (shared types: SupervisorAction, TerminalOpsReport, OpsSnapshot, WorkbenchDaemonRequest/Response, DAEMON_PROTOCOL_VERSION, 4 tests)
 - `impulse-rs/impulse-term/` — PTY/session/context core (PTY + vt100 + WriteQueue + context bridge, ~3.9K lines, 110 tests)
 
@@ -109,7 +109,6 @@ Responses use `AgentAssistResult` (with `recommendations` + `pane_summaries`) or
 | Naming | `PascalCase` structs, `snake_case` functions, `SCREAMING_SNAKE` constants |
 | Testing | Unit tests in `mod tests` per file, integration tests with `DaemonGuard` RAII |
 | Feature flags | `office-support` (default), `monty-support`, `datafusion-support` (opt-in) |
-| egui imports | `impulse-gui` uses `eframe::egui::*`, NEVER bare `egui::*` — the crate re-exports through eframe |
 
 ---
 
@@ -341,7 +340,7 @@ cd impulse-rs && cargo build && cargo test && cargo clippy -- -D warnings && car
 ```
 
 **Expected output (update when counts change):**
-- `cargo test`: 5 `test result:` lines totaling 1,344 passed, 4 ignored, 0 failed (plus 240 GUI, 110 term when run per-crate; 1,698 total)
+- `cargo test --workspace`: 1,318 unit + 26 integration (impulse-rs) + 4 (impulse-ops) + 110 (impulse-term) = 1,458 passed, 3 ignored, 0 failed
 - `cargo clippy`: 0 warnings
 - `cargo fmt --check`: no output (clean)
 
@@ -362,7 +361,7 @@ cargo fmt --check
 
 # Individual crates
 cd impulse-term && cargo build && cargo test && cargo clippy -- -D warnings
-cd impulse-gui && cargo build && cargo test && cargo clippy -- -D warnings
+cd impulse-ops && cargo build && cargo test && cargo clippy -- -D warnings
 ```
 
 ### Test Count Verification
@@ -371,12 +370,12 @@ To verify test counts match expectations:
 ```bash
 cd impulse-rs && cargo test 2>&1 | grep "test result:" | awk '{sum += $4} END {print "Total: " sum " passed"}'
 ```
-Expected: 1,344 passed. If this changes, update both this section and the Architecture section.
+Expected: 1,458 passed across the 3 crates. If this changes, update both this section and the Architecture section.
 
 ### Pre-Commit Checklist
 
 1. `cargo build` — zero warnings
-2. `cargo test` — all tests pass (1,344 workspace total expected: 1318+26 impulse-rs, 4 ops, 110 term, 240 gui; verify with `cargo test 2>&1 | grep "test result:"`)
+2. `cargo test` — all tests pass (1,458 workspace total expected: 1318+26 impulse-rs, 4 ops, 110 term; verify with `cargo test 2>&1 | grep "test result:"`)
    - **If count changes**: update this line and the Architecture section above
 3. `cargo clippy -- -D warnings` — zero warnings
 4. `cargo fmt --check` — zero diffs
