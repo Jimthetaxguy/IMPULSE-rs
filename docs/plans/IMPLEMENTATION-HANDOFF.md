@@ -2,7 +2,7 @@
 title: Implementation Handoff
 description: Current implementation sequence — Tauri desktop shell migration
 version: '2.0'
-updated: 2026-04-15
+updated: 2026-05-22
 type: doc
 category: handoff
 phase: all
@@ -16,7 +16,7 @@ authors:
 
 # Implementation Handoff Document
 
-> **Updated:** 2026-04-15
+> **Updated:** 2026-05-22
 > **Purpose:** Capture the actual next implementation sequence for Impulse.
 > **Risk register:** [`../HONEST-ROADMAP.md`](../HONEST-ROADMAP.md)
 > **Roadmap anchor:** [`../ROADMAP-PLAN.md`](../ROADMAP-PLAN.md)
@@ -36,7 +36,7 @@ The desktop stack has been formally reset. The previous EGUI-workbench-as-destin
 - **Terminal-native operator surface:** ratatui (preserved, first-class)
 - **Legacy desktop surface:** egui / impulse-gui (frozen, sunset after parity)
 
-The current phase is **Phase 0 — Documentation Contract Reset**. Implementation begins only after docs, spec, roadmap, and migration handoff all describe the same product.
+Phase 0 established the desktop contract, but Plan 6 found residual active-doc drift. The current implementation stance is: Tauri+Dioxus is active, `impulse-gui` is already frozen, and remaining work should harden the terminal bridge and daemon-backed desktop parity without reviving egui as a product path.
 
 Full migration build sequence: [`TAURI-DIOXUS-MIGRATION-HANDOFF.md`](TAURI-DIOXUS-MIGRATION-HANDOFF.md)
 
@@ -57,16 +57,16 @@ Full tradeoff analysis: [`../spec/DESKTOP-STACK-TRADEOFFS.md`](../spec/DESKTOP-S
 
 ---
 
-## Current Phase: Phase 0 — Documentation Reset
+## Current Plan 6 Focus — Platform Truth Stabilization
 
 ### In Scope
 
 - All canonical contract docs updated to reflect Tauri+Dioxus as desktop target
 - egui explicitly marked as legacy/freeze in all docs
-- New spec files: architecture, tradeoffs, ADR, migration handoff, benchmark methodology
+- Active docs route users to Claude Code/Codex primary platform truth, with OpenCode marked as legacy compatibility
 - Doc validation passes
 
-### Out of Scope (for Phase 0)
+### Out of Scope
 
 - Any code changes
 - Any Cargo.toml changes
@@ -74,7 +74,7 @@ Full tradeoff analysis: [`../spec/DESKTOP-STACK-TRADEOFFS.md`](../spec/DESKTOP-S
 
 ---
 
-## Phase 0 Checklist
+## Platform Truth Checklist
 
 - [x] `docs/spec/DESKTOP-SHELL-ARCHITECTURE.md`
 - [x] `docs/spec/DESKTOP-STACK-TRADEOFFS.md`
@@ -83,14 +83,14 @@ Full tradeoff analysis: [`../spec/DESKTOP-STACK-TRADEOFFS.md`](../spec/DESKTOP-S
 - [x] `docs/guides/DESKTOP-BENCHMARK-METHODOLOGY.md`
 - [x] `AGENTS.md` — egui removed as active target
 - [x] `docs/plans/IMPLEMENTATION-HANDOFF.md` — this document
-- [ ] `docs/spec/RUST-CANONICAL-CONTRACT.md` — egui section updated
+- [x] `docs/spec/RUST-CANONICAL-CONTRACT.md` — egui section updated
 - [ ] `docs/ROADMAP-PLAN.md` — phases updated
 - [ ] `docs/INDEX.md` — new docs indexed
 - [ ] `docs/SUMMARY.md` / `docs/SUMMARY.yaml` — updated
-- [ ] `CLAUDE.md` — product description updated
+- [x] `CLAUDE.md` — product description updated
 - [ ] `impulse-rs/docs/IMPULSE_TERM_STATUS.md` — egui deprecation noted
 - [ ] `impulse-rs/README.md` — workspace crate descriptions updated
-- [ ] `impulse-rs/impulse-gui/README.md` — marked as legacy/freeze
+- [x] `impulse-rs/impulse-gui/README.md` — marked as legacy/freeze
 - [ ] `python3 docs/validate_docs.py --contract` — passes
 
 ---
@@ -116,10 +116,10 @@ Full detail in [`TAURI-DIOXUS-MIGRATION-HANDOFF.md`](TAURI-DIOXUS-MIGRATION-HAND
 | Phase | Goal | Entry Criteria |
 |---|---|---|
 | 0 | Documentation reset | — |
-| 1 | Remove eframe from impulse-term | Phase 0 complete |
+| 1 | Remove eframe from impulse-term | Active-doc drift resolved |
 | 2 | Static Tauri+Dioxus shell skeleton | Phase 1 complete |
 | 3 | Live terminal bridge (PTY → xterm.js) | Phase 2 complete |
-| 4 | Daemon integration + parity + egui freeze | Phase 3 complete |
+| 4 | Daemon integration + parity | Phase 3 complete |
 
 ---
 
@@ -141,7 +141,7 @@ cargo test
 cargo clippy --all-features --all-targets -- -D warnings
 ```
 
-### Phase 0 Complete When
+### Platform Truth Cleanup Complete When
 
 - No doc refers to egui as the active or target desktop surface
 - Tauri+Dioxus is the desktop contract across all top-level docs

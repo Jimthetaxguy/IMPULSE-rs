@@ -1,7 +1,7 @@
 ---
 title: Agent Guidelines
 description: Guidelines for AI coding agents working in this repository
-version: '4.0'
+version: '4.1'
 authors:
   - name: James Pustorino
     email: James.s.Pustorino@gmail.com
@@ -12,8 +12,9 @@ authors:
 
 > Guidelines for AI coding agents contributing to this project.
 > Contract: [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
+> Collaboration playbook: [`docs/guides/COLLABORATIVE-AGENTIC-CODING.md`](docs/guides/COLLABORATIVE-AGENTIC-CODING.md)
 > Canonical stack: Rust (impulse-rs)
-> Roadmap contract: Now=Rust core + Tauri desktop shell (Phase 0 docs reset), Next=egui boundary cleanup + static shell, Later=live terminal bridge + daemon parity
+> Roadmap contract: Now=Rust core + Tauri desktop shell; Next=terminal bridge + daemon parity; Legacy=egui compile-maintenance only
 
 ---
 
@@ -22,7 +23,7 @@ authors:
 Impulse is a **sidecar memory layer** for AI coding agents. It is NOT a coding agent itself.
 
 ```
- Coding Agent (Claude Code, Codex, OpenCode)
+ Coding Agent (Claude Code, Codex; legacy OpenCode compatibility)
        │
        │ hooks auto-track files + tools
        ▼
@@ -45,6 +46,22 @@ The chosen desktop stack is **Tauri 2.x + Dioxus + xterm.js terminal bridge**.
 - See `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md` for the build sequence
 
 **Do not add new code to `impulse-gui`.** If you need to touch `impulse-term`, confirm that `eframe` is not re-introduced as a dependency.
+
+---
+
+## Collaborative Agentic Coding
+
+Before mutating code or docs, read [`docs/guides/COLLABORATIVE-AGENTIC-CODING.md`](docs/guides/COLLABORATIVE-AGENTIC-CODING.md) and follow its lane rules.
+
+Minimum required operating state:
+
+- inspect `git status --short`, current branch, and `git worktree list`
+- identify owner, role, branch, worktree, owned paths, blocked/shared paths, and verification commands
+- create or update a lane work card under `docs/plans/worktrees/<date>-<lane-slug>.md` for parallel or multi-session work
+- treat `Cargo.toml`, `Cargo.lock`, `AGENTS.md`, `CLAUDE.md`, docs indexes, validator files, and protocol/spec docs as shared files that require explicit ownership
+- hand off before overlapping another lane's files
+
+Parallel orchestrators are allowed only when lane ownership is explicit and documented.
 
 ---
 

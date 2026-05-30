@@ -2,7 +2,7 @@
 title: Documentation Summary
 description: Unified navigation structure for Impulse documentation
 version: '2.2'
-updated: '2026-03-05'
+updated: '2026-05-21'
 schema_version: '1.0'
 type: navigation
 category: docs
@@ -30,6 +30,16 @@ quick_reference:
     path: ../AGENTS.md
     start: true
 
+  - name: COLLABORATIVE-AGENTIC-CODING.md
+    description: Agent lane, worktree, and handoff rules
+    path: guides/COLLABORATIVE-AGENTIC-CODING.md
+    start: true
+
+  - name: CONTRIBUTING.md
+    description: Human and agent contribution rules
+    path: ../CONTRIBUTING.md
+    start: true
+
   - name: INDEX.md
     description: Master navigation
     path: INDEX.md
@@ -41,23 +51,24 @@ quick_reference:
     start: true
 
 active_tracks:
-  - name: Rust + EGUI Workbench
+  - name: Rust + Tauri Desktop Shell
     description: Current product baseline and roadmap contract
     docs:
       - spec/RUST-CANONICAL-CONTRACT.md
       - spec/USER-STORY-MAP.md
       - spec/TEST-TRACEABILITY.md
       - ROADMAP-PLAN.md
-      - plans/IMPLEMENTATION-HANDOFF.md
+      - plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md
+      - guides/COLLABORATIVE-AGENTIC-CODING.md
       - ../impulse-rs/docs/IMPULSE_TERM_STATUS.md
       - HONEST-ROADMAP.md
 
 phases:
   now:
-    - name: Rust Core + EGUI Workbench
+    - name: Rust Core + Tauri Desktop Shell
       path: ROADMAP-PLAN.md
-    - name: EGUI Daemon-Truth Handoff
-      path: plans/IMPLEMENTATION-HANDOFF.md
+    - name: Tauri Dioxus Migration Handoff
+      path: plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md
 
   next:
     - name: Honest Roadmap
@@ -103,6 +114,7 @@ categories:
 
   guides:
     - guides/TEAM-ONBOARDING.md
+    - guides/COLLABORATIVE-AGENTIC-CODING.md
     - guides/BEST-PRACTICES.md
     - guides/ERROR-HANDLING-GUIDE.md
     - guides/DATABASE-GUIDE.md

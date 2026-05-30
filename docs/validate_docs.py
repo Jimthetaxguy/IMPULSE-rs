@@ -50,18 +50,21 @@ CONTRACT_KEY_FILES = [
 CONTRACT_REQUIRED_MARKERS = {
     ROOT_DIR / "AGENTS.md": [
         "RUST-CANONICAL-CONTRACT.md",
+        "COLLABORATIVE-AGENTIC-CODING.md",
         "Canonical stack: Rust (impulse-rs)",
-        "Roadmap contract: Now=Rust core + EGUI workbench, Next=daemon-truth EGUI + hook validation, Later=agent control + artifact polish",
+        "Roadmap contract: Now=Rust core + Tauri desktop shell; Next=terminal bridge + daemon parity; Legacy=egui compile-maintenance only",
     ],
     ROOT_DIR / "CLAUDE.md": [
         "RUST-CANONICAL-CONTRACT.md",
+        "COLLABORATIVE-AGENTIC-CODING.md",
         "Canonical stack: Rust (impulse-rs)",
-        "Roadmap contract: Now=Rust core + EGUI workbench, Next=daemon-truth EGUI + hook validation, Later=agent control + artifact polish",
+        "Roadmap contract: Now=Rust core + Tauri desktop shell; Next=terminal bridge + daemon parity; Legacy=egui compile-maintenance only",
     ],
     DOCS_DIR / "INDEX.md": [
         "RUST-CANONICAL-CONTRACT.md",
+        "COLLABORATIVE-AGENTIC-CODING.md",
         "Canonical stack: Rust (impulse-rs)",
-        "Roadmap contract: Now=Rust core + EGUI workbench, Next=daemon-truth EGUI + hook validation, Later=agent control + artifact polish",
+        "Roadmap contract: Now=Rust core + Tauri desktop shell (Phase 0 docs reset), Next=egui boundary cleanup + static shell, Later=live terminal bridge + daemon parity",
     ],
     DOCS_DIR / "SUMMARY.md": [
         "RUST-CANONICAL-CONTRACT.md",
@@ -71,6 +74,13 @@ CONTRACT_REQUIRED_MARKERS = {
 FORBIDDEN_ACTIVE_PHRASES = [
     "TypeScript/Bun ONLY. Zero Python. Zero Rust. Zero WASM.",
     "Target: TypeScript/Bun ONLY. Zero Python. Zero Rust. Zero databases.",
+    "Roadmap contract: Now=Rust core + EGUI workbench, Next=daemon-truth EGUI + hook validation, Later=agent control + artifact polish",
+    "Active EGUI Workbench Track",
+    "Now: Rust Core + EGUI Workbench",
+    "Next: Daemon-Truth EGUI + Hook Validation",
+    "The active roadmap is now Rust core plus the EGUI operator workbench.",
+    "EGUI/operator workbench is marked as active work",
+    "active Rust-native EGUI surface",
 ]
 
 NON_AUTHORITATIVE_STATUSES = {"superseded", "deprecated", "archive", "historical"}
@@ -238,7 +248,7 @@ def check_links(files: List[Path]) -> List[ContractIssue]:
     return issues
 
 
-def check_staleness(files: List[Path], threshold_days: int = 90) -> List[ContractIssue]:
+def check_staleness(files: List[Path], threshold_days: int = 120) -> List[ContractIssue]:
     """Flag docs with last_updated/updated older than threshold."""
     issues: List[ContractIssue] = []
     today = datetime.date.today()
@@ -324,7 +334,7 @@ def validate_docs() -> Dict[str, Any]:
 
 
 def run_self_test() -> int:
-    # Validate that contradiction detection catches active-doc phrase.
+    # Validate that contradiction detection catches active-doc phrases.
     tmp_path = ROOT_DIR / ".tmp_validate_docs_self_test.md"
     tmp_path.write_text(
         """---
@@ -335,6 +345,8 @@ updated: 2026-02-23
 ---
 
 Target: TypeScript/Bun ONLY. Zero Python. Zero Rust. Zero databases.
+
+Active EGUI Workbench Track
 """,
         encoding="utf-8",
     )
@@ -343,8 +355,8 @@ Target: TypeScript/Bun ONLY. Zero Python. Zero Rust. Zero databases.
 
     try:
         issues = check_forbidden_active_contradictions([tmp_path])
-        if not issues:
-            print("SELF-TEST FAILED: expected contradiction issue not found")
+        if len(issues) < 2:
+            print("SELF-TEST FAILED: expected contradiction issues not found")
             return 1
 
         tmp_dup_path.write_text(

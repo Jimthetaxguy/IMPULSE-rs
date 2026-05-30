@@ -3,7 +3,7 @@ title: Desktop Stack Tradeoffs
 status: active
 version: 1.0.0
 created: 2026-04-15
-updated: 2026-04-15
+updated: 2026-05-21
 ---
 
 # Desktop Stack Tradeoffs
@@ -16,7 +16,7 @@ The chosen stack is **Tauri + Dioxus + terminal bridge (xterm.js)**. See `docs/d
 
 ## Evaluation Matrix
 
-| Criterion | egui (current) | Tauri + Dioxus + xterm.js | Pure Dioxus desktop | Tauri + TS frontend | SwiftUI | Wrap ratatui in Tauri |
+| Criterion | egui (legacy baseline) | Tauri + Dioxus + xterm.js | Pure Dioxus desktop | Tauri + TS frontend | SwiftUI | Wrap ratatui in Tauri |
 |---|---|---|---|---|---|---|
 | UI language | Rust (immediate-mode) | Rust (declarative rsx!) | Rust (declarative rsx!) | TypeScript/JS | Swift | N/A |
 | Backend language | Rust | Rust | Rust | Rust | Swift | Rust |
@@ -35,7 +35,7 @@ The chosen stack is **Tauri + Dioxus + terminal bridge (xterm.js)**. See `docs/d
 
 ## Option Analysis
 
-### Current: egui / impulse-gui
+### Legacy Baseline: egui / impulse-gui
 
 **Why it was used:** Fast to prototype, pure Rust, no webview overhead, the custom `TerminalBackend` could be integrated directly.
 

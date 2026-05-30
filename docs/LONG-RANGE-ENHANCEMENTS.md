@@ -113,10 +113,10 @@ Apply the extraction prompt to real session transcripts. Measure what it capture
 
 ---
 
-## Lane 2: Daemon-Truth Completion
+## Lane 2: Desktop Daemon-Truth Completion
 
 **Stage:** Next
-**Goal:** Make the daemon the authoritative source of workbench state. Completes the execution sequence from [`IMPLEMENTATION-HANDOFF.md`](./plans/IMPLEMENTATION-HANDOFF.md).
+**Goal:** Make the daemon the authoritative source of desktop shell state. Completes the execution sequence from [`TAURI-DIOXUS-MIGRATION-HANDOFF.md`](./plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md).
 
 ### PR 2.1 — Terminal telemetry publication via PublishTerminalOps
 
@@ -124,8 +124,8 @@ Apply the extraction prompt to real session transcripts. Measure what it capture
 |-------|-------|
 | **Size** | L |
 | **Depends** | — |
-| **Key files** | `impulse-gui/src/views/terminals.rs`, `impulse-ops/src/lib.rs`, `impulse-rs/src/daemon/mod.rs` |
-| **Success** | GUI terminal surfaces emit `TerminalOpsReport` on tab spawn, shutdown, tier change, compaction, injection, intervention change, and 2-second heartbeat. |
+| **Key files** | `impulse-desktop/src/`, `impulse-ops/src/lib.rs`, `impulse-rs/src/daemon/mod.rs` |
+| **Success** | Desktop terminal surfaces emit `TerminalOpsReport` on tab spawn, shutdown, tier change, compaction, injection, intervention change, and 2-second heartbeat. |
 
 Implement the `PublishTerminalOps { report: TerminalOpsReport }` daemon IPC request. Terminal panes publish telemetry to the daemon rather than maintaining local-only state.
 
@@ -140,16 +140,16 @@ Implement the `PublishTerminalOps { report: TerminalOpsReport }` daemon IPC requ
 
 Implement the overlay rules from ROADMAP-PLAN.md: build durable snapshot first, overlay fresh telemetry, mark stale, purge old.
 
-### PR 2.3 — Remove GUI shadow merges for workbench surfaces
+### PR 2.3 — Remove desktop shadow merges for workbench surfaces
 
 | Field | Value |
 |-------|-------|
 | **Size** | M |
 | **Depends** | PR 2.2 |
-| **Key files** | `impulse-gui/src/views/overview.rs`, `agents.rs`, `context.rs`, `artifacts.rs` |
+| **Key files** | `impulse-desktop/src/` side-panel components |
 | **Success** | Overview, Agents, Context, Artifacts render exclusively from daemon snapshot. No local-only state for these surfaces. |
 
-Remove local shadow merge logic from GUI views. All workbench surfaces read from `ProjectOpsSnapshot` via daemon IPC.
+Remove local shadow merge logic from desktop views. All workbench surfaces read from `ProjectOpsSnapshot` via daemon IPC.
 
 ### PR 2.4 — Artifact action round-trip through daemon snapshot
 
@@ -157,8 +157,8 @@ Remove local shadow merge logic from GUI views. All workbench surfaces read from
 |-------|-------|
 | **Size** | M |
 | **Depends** | PR 2.3 |
-| **Key files** | `impulse-gui/src/views/artifacts.rs`, daemon artifact handlers |
-| **Success** | Apply/acknowledge artifact → visible state change arrives only via daemon snapshot refresh, not GUI-local mutation. Manual acceptance verified. |
+| **Key files** | `impulse-desktop/src/`, daemon artifact handlers |
+| **Success** | Apply/acknowledge artifact → visible state change arrives only via daemon snapshot refresh, not frontend-local mutation. Manual acceptance verified. |
 
 ---
 
@@ -261,8 +261,8 @@ Remove local shadow merge logic from GUI views. All workbench surfaces read from
 |-------|-------|
 | **Size** | M |
 | **Depends** | PR 2.1 |
-| **Key files** | `impulse-term/src/context.rs`, `impulse-gui/src/views/terminals.rs` |
-| **Success** | Detect Idle/Working/Blocked/Starting from terminal screen text patterns. Status badges visible in GUI tab bar with correct colors. |
+| **Key files** | `impulse-term/src/context.rs`, `impulse-desktop/src/` terminal/status components |
+| **Success** | Detect Idle/Working/Blocked/Starting from terminal screen text patterns. Status badges visible in desktop tab bar with correct colors. |
 | **Source** | `[OpenSquirrel]` AgentStatus enum with exhaustive match |
 
 ### PR 4.5 — Anti-anchoring context injection (blind packet pattern)
@@ -353,7 +353,7 @@ Remove local shadow merge logic from GUI views. All workbench surfaces read from
 | **Size** | M |
 | **Depends** | — |
 | **Key files** | `src/safety/patterns.rs` (new), coordinator integration |
-| **Success** | 28 regex patterns for dangerous commands (rm -rf, DROP, privilege escalation). Warnings surfaced in daemon and GUI. False positive rate < 2%. |
+| **Success** | 28 regex patterns for dangerous commands (rm -rf, DROP, privilege escalation). Warnings surfaced in daemon and desktop shell. False positive rate < 2%. |
 | **Source** | `[Hermes]` approval.py — 28 dangerous command patterns |
 
 ---
@@ -363,13 +363,13 @@ Remove local shadow merge logic from GUI views. All workbench surfaces read from
 **Stage:** Later
 **Goal:** Agent control UX, artifact ergonomics, debug tooling. Follows ROADMAP-PLAN.md "Follow-On Order After Daemon Truth."
 
-### PR 7.1 — Blocked-work indicators in EGUI workbench
+### PR 7.1 — Blocked-work indicators in the Tauri desktop shell
 
 | Field | Value |
 |-------|-------|
 | **Size** | M |
 | **Depends** | PR 4.4 |
-| **Key files** | `impulse-gui/src/views/overview.rs`, `agents.rs` |
+| **Key files** | `impulse-desktop/src/` overview and agent surfaces |
 | **Success** | Visual indicators when agents are blocked on permissions, errors, or conflicts. Operator can see at a glance which agents need attention. |
 
 ### PR 7.2 — Focus/handoff/restart affordances in agent view
@@ -378,7 +378,7 @@ Remove local shadow merge logic from GUI views. All workbench surfaces read from
 |-------|-------|
 | **Size** | M |
 | **Depends** | PR 7.1 |
-| **Key files** | `impulse-gui/src/views/agents.rs`, daemon commands |
+| **Key files** | `impulse-desktop/src/` agent surfaces, daemon commands |
 | **Success** | One-click focus on specific agent, handoff context to new agent, restart stalled agent. Actions round-trip through daemon. |
 
 ### PR 7.3 — Review/apply artifact UX cleanup
@@ -387,7 +387,7 @@ Remove local shadow merge logic from GUI views. All workbench surfaces read from
 |-------|-------|
 | **Size** | M |
 | **Depends** | PR 2.4 |
-| **Key files** | `impulse-gui/src/views/artifacts.rs` |
+| **Key files** | `impulse-desktop/src/` artifact surfaces |
 | **Success** | Clearer confirmation flows for risky artifact actions. Better post-action result presentation. Stronger intentionality around apply/re-run/handoff flows. |
 
 ### PR 7.4 — Grid/Pipeline/Focus terminal view modes
@@ -396,7 +396,7 @@ Remove local shadow merge logic from GUI views. All workbench surfaces read from
 |-------|-------|
 | **Size** | L |
 | **Depends** | PR 4.4 |
-| **Key files** | `impulse-gui/src/views/terminals.rs` |
+| **Key files** | `impulse-desktop/src/` terminal surfaces |
 | **Success** | Grid (2xN tiled with status badges), Pipeline (coordinator→worker flow with arrows), Focus (single terminal expanded). Mode selector in toolbar. |
 | **Source** | `[OpenSquirrel]` ViewMode enum: 1→full, 2→split, 4→2x2 |
 

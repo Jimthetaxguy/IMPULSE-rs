@@ -409,7 +409,7 @@ The claude-memory plugin is proof that the "Three Files and a Hook" approach wor
 
 | Surface | Best Fit | Why |
 |--------|----------|-----|
-| **Operator workbench / dashboard** | `egui` | Immediate-mode UI is fast for inspection-heavy tools, native desktop shipping, and rapidly changing state panels |
+| **Operator desktop shell / dashboard** | Tauri + Dioxus + xterm.js | Webview UI gives better product-shell layout while xterm.js owns terminal rendering and Rust owns PTY/session state |
 | **Terminal-native workflows** | `ratatui` | Constraint-based layouts, keyboard-first flows, and low-latency rendering fit terminal operations well |
 | **Embedded PTY terminal widgets** | Dedicated crate (`impulse-term`) | The PTY surface has correctness and rendering constraints that should not be buried inside broader app views |
 
@@ -429,7 +429,7 @@ The claude-memory plugin is proof that the "Three Files and a Hook" approach wor
 
 7. **Backend failures must surface in the UI as signals, not silent degradation.** For PTY-backed Rust interfaces, the worst UX failure is a dead or stale panel that looks healthy. Error counts, reconnect state, and degraded-mode indicators are worth the screen space.
 
-8. **Choose UI technology per interaction model, not by ecosystem enthusiasm.** `egui` is strong for native control planes and live inspectors; `ratatui` is strong for terminal-native workflows. The repo should continue using both where they fit instead of forcing one abstraction across all surfaces.
+8. **Choose UI technology per interaction model, not by ecosystem enthusiasm.** Tauri+Dioxus is now the active desktop product shell, xterm.js owns desktop terminal rendering, and `ratatui` remains first-class for terminal-native workflows. `egui` remains historical/legacy context only.
 
 ### Practical Rules for This Repo
 

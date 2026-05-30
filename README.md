@@ -6,7 +6,7 @@ Impulse is a terminal-native sidecar for AI coding agents that preserves session
 
 ## Why
 
-AI coding agents (Claude Code, OpenCode, Codex) forget everything between sessions. You re-explain your architecture, re-discover your preferences, and re-learn your codebase patterns every time. Impulse fixes that.
+AI coding agents (Claude Code and Codex) forget everything between sessions. You re-explain your architecture, re-discover your preferences, and re-learn your codebase patterns every time. Impulse fixes that. Legacy OpenCode compatibility exists for older projects, but OpenCode is no longer a peer active platform.
 
 ## What It Does
 
@@ -17,7 +17,7 @@ AI coding agents (Claude Code, OpenCode, Codex) forget everything between sessio
 - **Retrieval search** — FTS5 keyword search + semantic search across session history and genome
 - **Context stewardship** — Monitors context window usage and proposes cleanup strategies
 - **Daemon + TUI** — Long-running daemon with 9-tab interactive terminal UI
-- **Platform hooks** — Auto-generated hooks for Claude Code and OpenCode
+- **Platform hooks** — Auto-generated hooks for Claude Code and Codex, with legacy OpenCode compatibility preserved where already implemented
 
 ## Quick Start
 
@@ -45,7 +45,7 @@ cargo run -- run
 
 ```
 Direct Mode (per-action, stateless)     Daemon Mode (long-running)
-  Claude Code/OpenCode hooks              TUI, interactive chat
+  Claude Code/Codex hooks                 TUI, interactive chat
   read -> process -> write -> exit        Unix socket IPC
                     |
                     v
@@ -77,7 +77,7 @@ See `cargo run -- --help` for the full command list.
 
 - **Language:** Rust
 - **TUI:** ratatui + crossterm (canonical operator path)
-- **Desktop (planned):** Tauri + Dioxus (egui `impulse-gui` crate retired 2026-04-17)
+- **Desktop (in progress):** Tauri + Dioxus via `impulse-desktop`; egui `impulse-gui` is legacy/frozen for compile-maintenance only
 - **Storage:** SQLite (FTS5) + JSONL + Markdown
 - **IPC:** Unix domain sockets
 - **LLM:** Anthropic, OpenAI, Minimax (for daemon chat)

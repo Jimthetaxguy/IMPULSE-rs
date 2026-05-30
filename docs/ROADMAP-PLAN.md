@@ -1,15 +1,15 @@
 ---
 title: Dynamic Roadmap Plan
-description: Actionable next steps based on the current Rust and EGUI product state
+description: Actionable next steps based on the current Rust and Tauri desktop shell product state
 version: '1.2'
-updated: 2026-03-05
+updated: 2026-05-21
 type: doc
 category: roadmap
 phase: all
 status: active
 audience: builder
-tags: [roadmap, action, planning, egui, daemon]
-last_updated: 2026-03-05
+tags: [roadmap, action, planning, tauri, dioxus, daemon]
+last_updated: 2026-05-21
 authors:
   - name: James Pustorino
     role: Creator
@@ -17,8 +17,8 @@ authors:
 
 # Dynamic Roadmap Plan — Impulse
 
-> **Updated:** 2026-03-31
-> **Purpose:** Record the actual active roadmap after the Rust EGUI workbench landed.
+> **Updated:** 2026-05-21
+> **Purpose:** Record the active roadmap after the desktop contract reset to Tauri+Dioxus.
 > **Risk register:** [`HONEST-ROADMAP.md`](./HONEST-ROADMAP.md)
 > **Execution handoff:** [`plans/IMPLEMENTATION-HANDOFF.md`](./plans/IMPLEMENTATION-HANDOFF.md)
 
@@ -28,9 +28,9 @@ authors:
 
 | Stage | Focus | Status |
 |------|-------|--------|
-| **Now** | Rust memory core + hooks + retrieval/injection + EGUI operator workbench | Active |
-| **Next** | Daemon-truth EGUI integration + hook/compaction validation | Active |
-| **Later** | Agent control + artifact polish + deeper coordination UX | Planned |
+| **Now** | Rust memory core + hooks + retrieval/injection + Tauri desktop shell Phase 0 | Active |
+| **Next** | egui boundary cleanup + static shell skeleton + live terminal bridge | Active |
+| **Later** | Daemon parity in desktop shell + agent control + artifact polish | Planned |
 
 This document is intentionally aligned with [`spec/RUST-CANONICAL-CONTRACT.md`](./spec/RUST-CANONICAL-CONTRACT.md). If another active doc conflicts, the contract wins.
 
@@ -43,14 +43,14 @@ This document is intentionally aligned with [`spec/RUST-CANONICAL-CONTRACT.md`](
 | Area | Status | Reality |
 |------|--------|---------|
 | Rust memory core | Implemented | Session tracking, genome/history, retrieval, injection, stewardship, daemon, and tool/runtime infrastructure are live. |
-| EGUI operator workbench | In progress | `Overview`, `Agents`, `Context`, `Memory`, `Artifacts`, and `Settings` exist in `impulse-gui`. |
+| Tauri desktop shell | In migration | `impulse-desktop` contains a Dioxus shell and typed bridge scaffold; live PTY and daemon parity remain pending. |
 | Agent harness wiring | **COMPLETE** | All 10 features wired: context→prompts, intent classification, full coordination, conflict history IPC, JSON harness protocol, session awareness, specialized IPC (2026-03-31). |
 | Artifact model | In progress | Provider-neutral artifact envelopes and actions exist, but operator ergonomics still need polish. |
-| Daemon-truth workbench | In progress | Snapshot/artifact IPC exists; terminal telemetry publication and overlay are now the active integration track. |
+| Daemon-truth desktop panels | Planned | Snapshot/artifact IPC exists; desktop shell must render daemon snapshots rather than frontend-local truth. |
 | Hook validation | Not yet validated | SessionStart injection, PreCompact survival, and real-world `GENOME.md` usefulness remain open risks. |
 | Structural blocking | Deferred | Remains gated behind validation evidence from the honest roadmap. |
 
-The old `Dashboard/Advanced UX` framing is obsolete. The product already has an active Rust-native EGUI surface. The remaining work is to make that surface operationally authoritative and easier to supervise.
+The old `Dashboard/Advanced UX` and active-EGUI framing is obsolete. The remaining desktop work is to make the Tauri+Dioxus shell operationally authoritative while preserving the ratatui path.
 
 ---
 
@@ -72,15 +72,17 @@ Update the active docs together so they describe the same product:
 
 Required outcome:
 
-- EGUI/operator workbench is marked as active work, not future dashboard work.
+- Tauri+Dioxus is marked as the active desktop shell.
+- egui / `impulse-gui` is marked legacy/frozen, not active feature work.
 - `HONEST-ROADMAP.md` remains the canonical risk register.
 - The roadmap sequence becomes:
   1. documentation reset
-  2. daemon-truth EGUI pass
-  3. parallel hook/compaction validation
-  4. agent-control and artifact-polish follow-ons
+  2. egui boundary cleanup
+  3. static desktop shell hardening
+  4. live terminal bridge
+  5. daemon parity and artifact polish
 
-### 2. Daemon-Truth EGUI Pass
+### 2. Desktop Boundary And Daemon-Truth Pass
 
 Make the daemon the authoritative source of workbench state for:
 
@@ -108,7 +110,7 @@ Implementation rules:
 - Terminal telemetry is ephemeral daemon memory, not a new persisted file.
 - Durable snapshot data is built first from sessions, history, genome, retrieval, and artifacts.
 - Fresh terminal telemetry overlays onto that durable snapshot.
-- GUI workbench surfaces must stop relying on local shadow merges for agent/context/artifact state.
+- Desktop shell surfaces must render daemon snapshots rather than maintaining local shadow truth for agent/context/artifact state.
 
 ### 3. Parallel Validation Track
 
@@ -126,7 +128,7 @@ If any of these fail, update the roadmap docs immediately. Failed validation is 
 
 ### Shared Types
 
-`ProjectOpsSnapshot` stays canonical for EGUI reads and includes:
+`ProjectOpsSnapshot` stays canonical for desktop shell reads and includes:
 
 - project metadata
 - active agent runtime view
@@ -151,7 +153,7 @@ If any of these fail, update the roadmap docs immediately. Failed validation is 
 - Stop overlaying stale telemetry after 10 seconds.
 - Purge telemetry-only entries after 60 seconds.
 
-### GUI Update Loop
+### Desktop Update Loop
 
 - Bootstrap with `GetOpsSnapshot`.
 - Use `SubscribeOps` as the primary refresh path.

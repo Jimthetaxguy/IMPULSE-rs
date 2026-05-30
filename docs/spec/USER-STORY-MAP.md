@@ -220,21 +220,21 @@ Primary interfaces:
 - `daemon`
 - JSON-line IPC protocol v2
 
-#### ST-09 Observe work through the EGUI operator workbench
+#### ST-09 Observe work through the Tauri desktop shell
 
-As an operator, I want Overview, Agents, Context, Memory, and Artifacts views so I can supervise agent work without reading raw state files.
+As an operator, I want Overview, Agents, Context, Memory, and Artifacts views in the Tauri+Dioxus desktop shell so I can supervise agent work without reading raw state files.
 
 Status: In progress
 
 Acceptance criteria:
 
-- `impulse-gui` renders the current workbench surfaces
+- `impulse-desktop` renders the current workbench surfaces
 - daemon snapshots provide the durable read model for the active workbench surfaces
 - live terminal telemetry can be overlaid without replacing durable daemon truth
 
 Primary interfaces:
 
-- `impulse-gui`
+- `impulse-desktop`
 - `GetOpsSnapshot`
 - `SubscribeOps`
 - `PublishTerminalOps`

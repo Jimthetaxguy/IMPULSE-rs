@@ -3,20 +3,20 @@ title: Tauri + Dioxus Migration Handoff
 status: active
 version: 1.0.0
 created: 2026-04-15
-updated: 2026-04-15
+updated: 2026-05-22
 ---
 
 # Tauri + Dioxus Migration Handoff
 
-This document is the decision-complete build sequence for the desktop shell migration. Documentation cleanup (Phase 0) must be complete before any implementation phase begins.
+This document is the decision-complete build sequence for the desktop shell migration. Phase 0 established the contract; Plan 6 is correcting residual active-doc drift and should not be read as permission to revive egui as an active desktop path.
 
 See `docs/spec/DESKTOP-SHELL-ARCHITECTURE.md` for layer boundaries and `docs/decisions/0007-desktop-shell-stack.md` for the ADR.
 
 ---
 
-## Phase 0 - Documentation Contract Reset (CURRENT PHASE)
+## Phase 0 - Documentation Contract Reset (BASELINE; PLAN 6 DRIFT CLEANUP)
 
-**Exit criteria:** All docs describe Tauri+Dioxus as the desktop contract. egui is explicitly legacy. `validate_docs.py --contract` passes.
+**Exit criteria:** All active docs describe Tauri+Dioxus as the desktop contract. egui is explicitly legacy/frozen. `validate_docs.py --contract` passes.
 
 **Checklist:**
 - [x] `docs/spec/DESKTOP-SHELL-ARCHITECTURE.md`
@@ -24,23 +24,23 @@ See `docs/spec/DESKTOP-SHELL-ARCHITECTURE.md` for layer boundaries and `docs/dec
 - [x] `docs/decisions/0007-desktop-shell-stack.md`
 - [x] `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md` (this document)
 - [x] `docs/guides/DESKTOP-BENCHMARK-METHODOLOGY.md`
-- [ ] Update `docs/spec/RUST-CANONICAL-CONTRACT.md` - mark egui as legacy, Tauri+Dioxus as desktop contract
+- [x] Update `docs/spec/RUST-CANONICAL-CONTRACT.md` - mark egui as legacy, Tauri+Dioxus as desktop contract
 - [ ] Update `docs/ROADMAP-PLAN.md` - replace EGUI workbench phases with desktop shell phases
-- [ ] Update `docs/plans/IMPLEMENTATION-HANDOFF.md` - add desktop migration reference
+- [x] Update `docs/plans/IMPLEMENTATION-HANDOFF.md` - add desktop migration reference
 - [ ] Update `docs/INDEX.md` - add new spec files, mark impulse-gui as legacy
 - [ ] Update `docs/SUMMARY.md` / `docs/SUMMARY.yaml`
-- [ ] Update `AGENTS.md` - remove egui as active target, add desktop shell context
-- [ ] Update `CLAUDE.md` - update product description and active stack
+- [x] Update `AGENTS.md` - remove egui as active target, add desktop shell context
+- [x] Update `CLAUDE.md` - update product description and active stack
 - [ ] Update `impulse-rs/docs/IMPULSE_TERM_STATUS.md` - egui deprecation status
 - [ ] Update `impulse-rs/README.md` - workspace crate descriptions
-- [ ] Update `impulse-rs/impulse-gui/README.md` - mark as legacy/freeze
+- [x] Update `impulse-rs/impulse-gui/README.md` - mark as legacy/freeze
 - [ ] `python3 docs/validate_docs.py --contract`
 
 ---
 
 ## Phase 1 - Backend / UI Boundary Cleanup
 
-**Entry criteria:** Phase 0 complete.
+**Entry criteria:** Active-doc drift from Plan 6 Loop 2 resolved and docs validation passing.
 
 **Goal:** Confirm `impulse-term` core is fully framework-neutral before any Tauri wiring begins.
 
@@ -137,7 +137,7 @@ See `docs/spec/DESKTOP-SHELL-ARCHITECTURE.md` for layer boundaries and `docs/dec
 3. Wire Dioxus side panels to render from `ops_update` snapshots
 4. Implement session switching in left rail
 5. Implement daemon reconnect - shell state must restore cleanly without restart
-6. Once parity confirmed: freeze `impulse-gui`, remove from active roadmap
+6. Once parity confirmed: remove `impulse-gui` from the active roadmap and plan crate removal; it is already frozen for new features
 
 **Parity checklist:**
 - [ ] Terminal tabs/panes open and close
@@ -173,7 +173,7 @@ cargo test --manifest-path impulse-rs/Cargo.toml --workspace
 cargo clippy --manifest-path impulse-rs/Cargo.toml --workspace --all-targets -- -D warnings
 ```
 
-Doc validation after Phase 0:
+Doc validation after platform-truth cleanup:
 
 ```bash
 python3 docs/validate_docs.py --contract

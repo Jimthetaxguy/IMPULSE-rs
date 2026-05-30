@@ -2,7 +2,7 @@
 title: Rust Canonical Product Contract
 description: Authoritative product contract for Impulse based on impulse-rs
 version: '1.7'
-updated: 2026-04-15
+updated: 2026-05-22
 type: specification
 category: core
 phase: all
@@ -27,7 +27,7 @@ Impulse is a terminal-native sidecar for AI coding agents that preserves session
 
 Core outcomes:
 - Persistent project memory (`GENOME`, session history, active state)
-- Cross-session continuity for Claude Code and OpenCode integrations
+- Cross-session continuity for Claude Code and Codex integrations, with legacy OpenCode compatibility preserved where already implemented
 - Operationally safe session lifecycle with verification-before-completion gates
 - Human-visible observability through CLI, ratatui TUI, and a Tauri desktop shell (in migration)
 
@@ -55,11 +55,11 @@ Migration sequence: `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md`
 
 | Phase | Goal | Status |
 |---|---|---|
-| 0 | Documentation contract reset | Active |
+| 0 | Documentation contract reset | Completed; Plan 6 is correcting residual active-doc drift |
 | 1 | Remove eframe from impulse-term, confirm framework-neutral core | Pending |
-| 2 | Static Tauri+Dioxus shell skeleton | Pending |
+| 2 | Static Tauri+Dioxus shell skeleton | Partial: `impulse-desktop` Dioxus shell + typed bridge scaffold |
 | 3 | Live terminal bridge (PTY → xterm.js) | Pending |
-| 4 | Daemon integration, parity, egui freeze | Pending |
+| 4 | Daemon integration and parity | Pending; `impulse-gui` is already frozen for new features |
 
 ## 3) Canonical Scope and Roadmap
 
@@ -67,8 +67,8 @@ Migration sequence: `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md`
 
 | Stage | Focus | Status |
 | --- | --- | --- |
-| **Now** | Rust memory core + hooks + retrieval/injection + Tauri desktop shell (Phase 0) | Active |
-| **Next** | egui boundary cleanup + static shell skeleton + live terminal bridge | Active |
+| **Now** | Rust memory core + hooks + retrieval/injection + Tauri desktop shell | Active |
+| **Next** | terminal bridge hardening + daemon-backed desktop parity | Active |
 | **Later** | Daemon parity in desktop shell + agent control + artifact polish | Planned |
 
 ### Out of Scope for Current Contract
@@ -174,6 +174,7 @@ The desktop shell communicates with the Rust backend via a thin Tauri IPC bridge
 | `terminal_resize` | Resize PTY and vt100 parser |
 | `terminal_close` | Kill PTY and clean up session |
 | `terminal_focus` | Notify backend of focus change |
+| `native_island_request` | Request a narrow macOS-native island and receive a serializable result DTO |
 
 **Events (backend → frontend):**
 
@@ -183,6 +184,7 @@ The desktop shell communicates with the Rust backend via a thin Tauri IPC bridge
 | `terminal_exit` | PTY child exited |
 | `terminal_status` | Status change |
 | `ops_update` | Daemon ProjectOpsSnapshot update |
+| native island result | Returned through `native_island_request`; native code does not own session, memory, terminal, or artifact state |
 
 ### Daemon Workbench IPC Contract (Preserved — Unchanged)
 
@@ -295,19 +297,21 @@ The daemon exposes a JSON-line Unix socket protocol (`impulse.sock`). Full spec:
 | Context stewardship | Implemented | `steward` | Rust unit + integration |
 | Tool management | Implemented | `tools` | Rust unit |
 | Credential management | Implemented | `credentials` | Rust unit |
-| **Tauri desktop shell** | **Phase 0 (docs reset)** | Tauri + Dioxus + xterm.js | Pending Phase 2+ |
+| **Tauri desktop shell** | **In migration; scaffold partial** | Tauri + Dioxus + xterm.js | Pending live bridge + daemon parity |
 | **egui operator workbench** | **LEGACY — frozen** | `impulse-gui` (compile-only) | Legacy tests only |
 | SWARM semantic coordination runtime | Planned | Future orchestration engine | Not started |
 
-## 6) Claude/OpenCode Parity Contract
+## 6) Primary Platform And Legacy Compatibility Contract
 
-| Area | Claude Code | OpenCode | Contract Expectation |
-| --- | --- | --- | --- |
-| Session lifecycle hooks | Generated config | Generated config | Equivalent coverage |
-| File write tracking | Supported | Supported | Equivalent behavior |
-| Tool tracking | Supported | Supported | Equivalent behavior |
-| Session end verification (`--verify`) | Included in generated hook command | Included in generated hook command | Required |
-| Context handoff artifacts | Shared `.impulse/context/*` | Shared `.impulse/context/*` | Required |
+Claude Code and Codex are the current primary coding-agent platforms for active Impulse work. OpenCode support is legacy compatibility: preserve existing behavior unless a removal plan explicitly owns migration risk, but do not treat OpenCode as a peer platform for new roadmap work.
+
+| Area | Claude Code | Codex | OpenCode legacy compatibility | Contract Expectation |
+| --- | --- | --- | --- | --- |
+| Session lifecycle hooks | Primary | Primary where implemented | Preserve existing generated config | Primary coverage for active platforms; no new OpenCode parity requirement |
+| File write tracking | Supported | Supported where implemented | Preserve existing behavior | Equivalent active-platform behavior |
+| Tool tracking | Supported | Supported where implemented | Preserve existing behavior | Equivalent active-platform behavior |
+| Session end verification (`--verify`) | Required | Required where hook integration exists | Preserve existing generated command | Verification remains required for active platforms |
+| Context handoff artifacts | Shared `.impulse/context/*` | Shared `.impulse/context/*` | Shared `.impulse/context/*` | Handoff artifacts stay platform-neutral |
 
 ## 7) Governance and Ownership
 

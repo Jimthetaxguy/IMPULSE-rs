@@ -2,7 +2,7 @@
 title: Documentation Index
 description: Master navigation hub for Impulse documentation
 version: '1.1'
-updated: 2026-03-31
+updated: 2026-05-21
 type: doc
 category: navigation
 phase: all
@@ -23,7 +23,8 @@ authors:
 > **Quick start:** Read [`spec/RUST-CANONICAL-CONTRACT.md`](spec/RUST-CANONICAL-CONTRACT.md) first.
 >
 > **Canonical stack: Rust (impulse-rs)**
-> **Roadmap contract: Now=Rust core + EGUI workbench, Next=daemon-truth EGUI + hook validation, Later=agent control + artifact polish**
+> **Roadmap contract: Now=Rust core + Tauri desktop shell (Phase 0 docs reset), Next=egui boundary cleanup + static shell, Later=live terminal bridge + daemon parity**
+> **Collaboration playbook:** [`guides/COLLABORATIVE-AGENTIC-CODING.md`](guides/COLLABORATIVE-AGENTIC-CODING.md)
 > **Risk register:** [`HONEST-ROADMAP.md`](HONEST-ROADMAP.md) stays canonical for unvalidated assumptions.
 
 > **Prefer `kdb` for searching.** The knowledge database indexes canonical docs with FTS5 full-text search:
@@ -68,6 +69,8 @@ See [decisions/README.md](decisions/README.md) for full decision log.
 | Document                                                        | Topic                            |
 | --------------------------------------------------------------- | -------------------------------- |
 | [BEST-PRACTICES.md](guides/BEST-PRACTICES.md)                   | Coding conventions and patterns  |
+| [COLLABORATIVE-AGENTIC-CODING.md](guides/COLLABORATIVE-AGENTIC-CODING.md) | Agent lanes, worktrees, handoffs, and verification |
+| [CONTRIBUTING.md](../CONTRIBUTING.md)                           | Contribution rules for humans and agents |
 | [TESTING-FRAMEWORK.md](guides/TESTING-FRAMEWORK.md)             | Legacy TypeScript-era testing guide |
 | [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md)               | Current Rust-first test baseline and gap map |
 | [SYNTHETIC-TESTING-GUIDE.md](guides/SYNTHETIC-TESTING-GUIDE.md) | Synthetic test generation        |
@@ -90,17 +93,19 @@ See [decisions/README.md](decisions/README.md) for full decision log.
 | [PHASE1.5-COORDINATION.md](phases/PHASE1.5-COORDINATION.md) | Multi-agent coordination |
 | [PHASE2-PERSISTENCE.md](phases/PHASE2-PERSISTENCE.md)       | Persistence layer design |
 | [PHASE2-MIGRATION-PLAN.md](phases/PHASE2-MIGRATION-PLAN.md) | Migration strategy       |
-| [ROADMAP-PLAN.md](ROADMAP-PLAN.md)                          | Active roadmap reset for Rust + EGUI |
-| [IMPLEMENTATION-HANDOFF.md](plans/IMPLEMENTATION-HANDOFF.md)| Daemon-truth EGUI execution handoff |
+| [ROADMAP-PLAN.md](ROADMAP-PLAN.md)                          | Active roadmap reset for Rust + Tauri/Dioxus |
+| [TAURI-DIOXUS-MIGRATION-HANDOFF.md](plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md) | Tauri+Dioxus desktop migration sequence |
+| [IMPLEMENTATION-HANDOFF.md](plans/IMPLEMENTATION-HANDOFF.md)| Desktop migration execution handoff |
 | [LONG-RANGE-ENHANCEMENTS.md](LONG-RANGE-ENHANCEMENTS.md) | PR-organized enhancement backlog across 8 lanes |
 
-### Active EGUI Workbench Track
+### Active Tauri+Dioxus Desktop Track
 
 | Document | Description |
 | -------- | ----------- |
-| [ROADMAP-PLAN.md](ROADMAP-PLAN.md) | Current roadmap and phase ordering for the operator workbench |
-| [IMPLEMENTATION-HANDOFF.md](plans/IMPLEMENTATION-HANDOFF.md) | Current execution sequence for daemon-truth EGUI work |
-| [IMPULSE_TERM_STATUS.md](../impulse-rs/docs/IMPULSE_TERM_STATUS.md) | Terminal telemetry status and remaining daemon integration gap |
+| [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) | Authoritative product and desktop shell contract |
+| [DESKTOP-SHELL-ARCHITECTURE.md](spec/DESKTOP-SHELL-ARCHITECTURE.md) | Tauri+Dioxus+xterm.js layer boundaries |
+| [TAURI-DIOXUS-MIGRATION-HANDOFF.md](plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md) | Current desktop shell build sequence |
+| [IMPULSE_TERM_STATUS.md](../impulse-rs/docs/IMPULSE_TERM_STATUS.md) | Terminal backend status and desktop bridge implications |
 | [HONEST-ROADMAP.md](HONEST-ROADMAP.md) | Canonical validation risk register for hooks and memory claims |
 
 > **NOTE:** `spec/RUST-CANONICAL-CONTRACT.md` is authoritative for implementation. Legacy TypeScript/Bun docs are retained as historical reference unless explicitly marked active and aligned.
@@ -163,7 +168,7 @@ The broader historical archive referenced by older docs is not fully present in 
 
 ## By Phase
 
-### Now: Rust Core + EGUI Workbench
+### Now: Rust Core + Tauri Desktop Shell
 
 Start here:
 
@@ -171,16 +176,17 @@ Start here:
 2. [USER-STORY-MAP.md](spec/USER-STORY-MAP.md) — Current user stories and acceptance criteria
 3. [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md) — Current automated coverage and known gaps
 4. [AGENTS.md](../AGENTS.md) — Current architecture and operational guidance
-5. [ROADMAP-PLAN.md](ROADMAP-PLAN.md) — Current roadmap and EGUI progress baseline
-6. [plans/IMPLEMENTATION-HANDOFF.md](plans/IMPLEMENTATION-HANDOFF.md) — Current implementation sequence
-7. [EFFICIENCY-ANALYSIS.md](research/EFFICIENCY-ANALYSIS.md) — Implementation patterns
-8. [BEST-PRACTICES.md](guides/BEST-PRACTICES.md) — Coding conventions
+5. [COLLABORATIVE-AGENTIC-CODING.md](guides/COLLABORATIVE-AGENTIC-CODING.md) — Agent lane, worktree, and handoff rules
+6. [ROADMAP-PLAN.md](ROADMAP-PLAN.md) — Current roadmap and desktop progress baseline
+7. [plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md](plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md) — Current desktop migration sequence
+8. [EFFICIENCY-ANALYSIS.md](research/EFFICIENCY-ANALYSIS.md) — Implementation patterns
+9. [BEST-PRACTICES.md](guides/BEST-PRACTICES.md) — Coding conventions
 
-### Next: Daemon-Truth EGUI + Hook Validation
+### Next: Boundary Cleanup + Static Shell + Live Terminal Bridge
 
 1. [HONEST-ROADMAP.md](HONEST-ROADMAP.md) — Validation risk register
-2. [ROADMAP-PLAN.md](ROADMAP-PLAN.md) — Daemon-truth and workbench stabilization lane
-3. [plans/IMPLEMENTATION-HANDOFF.md](plans/IMPLEMENTATION-HANDOFF.md) — Technical execution details
+2. [ROADMAP-PLAN.md](ROADMAP-PLAN.md) — Desktop shell stabilization lane
+3. [plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md](plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md) — Technical execution details
 4. [impulse-rs/docs/IMPULSE_TERM_STATUS.md](../impulse-rs/docs/IMPULSE_TERM_STATUS.md) — Terminal telemetry status
 5. [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md) — Current Rust-first test patterns and gaps
 6. [TESTING-FRAMEWORK.md](guides/TESTING-FRAMEWORK.md) — Historical TypeScript-era reference only

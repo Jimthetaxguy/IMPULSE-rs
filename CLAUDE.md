@@ -2,14 +2,15 @@
 
 > Persistent memory for AI coding agents.
 > Contract: [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
+> Collaboration playbook: [`docs/guides/COLLABORATIVE-AGENTIC-CODING.md`](docs/guides/COLLABORATIVE-AGENTIC-CODING.md)
 > Canonical stack: Rust (impulse-rs)
-> Roadmap contract: Now=Rust core + EGUI workbench, Next=daemon-truth EGUI + hook validation, Later=agent control + artifact polish
+> Roadmap contract: Now=Rust core + Tauri desktop shell; Next=terminal bridge + daemon parity; Legacy=egui compile-maintenance only
 
 ---
 
 ## What Impulse Is
 
-Impulse is a **sidecar**, not a coding agent. It runs alongside AI coding agents (Claude Code, Codex, OpenCode) and remembers what they did across sessions.
+Impulse is a **sidecar**, not a coding agent. It runs alongside primary AI coding agents (Claude Code and Codex) and remembers what they did across sessions. Legacy OpenCode compatibility remains for older Impulse surfaces, but OpenCode is not a peer active platform.
 
 ```
  Coding Agent (does the work)
@@ -20,6 +21,22 @@ Impulse is a **sidecar**, not a coding agent. It runs alongside AI coding agents
 ```
 
 The coding agent writes code. Impulse records which files changed, which tools were used, what decisions were made — and makes that context available next session.
+
+---
+
+## Collaborative Agentic Coding
+
+Read [`docs/guides/COLLABORATIVE-AGENTIC-CODING.md`](docs/guides/COLLABORATIVE-AGENTIC-CODING.md) before mutating the repository.
+
+Required operating facts for any non-trivial lane:
+
+- owner, role, branch, and worktree path
+- owned files/directories and blocked/shared paths
+- plan/spec link and acceptance criteria
+- verification commands
+- lane work card under `docs/plans/worktrees/<date>-<lane-slug>.md`
+
+Multiple orchestrators may run in parallel only when their lanes have disjoint ownership or an explicit handoff/integration lane. Do not infer ownership from silence.
 
 ---
 
@@ -64,17 +81,18 @@ Before implementing, consider alternative approaches. Choose the simplest soluti
 
 ## Architecture
 
-**Workspace (3 crates, post-egui-dump 2026-04-17):**
-- `impulse-rs/` — main CLI + daemon + ratatui TUI (64,714 LOC in src/, 1,318 unit + 26 integration tests across 178 .rs files)
+**Workspace (Rust-first, desktop shell in migration):**
+- `impulse-rs/` — main CLI + daemon + ratatui TUI
 - `impulse-rs/impulse-ops/` — operations library (shared types: SupervisorAction, TerminalOpsReport, OpsSnapshot, WorkbenchDaemonRequest/Response, DAEMON_PROTOCOL_VERSION, 4 tests)
-- `impulse-rs/impulse-term/` — PTY/session/context core (PTY + vt100 + WriteQueue + context bridge, ~3.9K lines, 110 tests)
+- `impulse-rs/impulse-term/` — PTY/session/context core (PTY + vt100 + WriteQueue + context bridge)
+- `impulse-rs/impulse-desktop/` — Tauri+Dioxus desktop shell scaffold and typed bridge contracts
 
-**Retired:** `impulse-rs/impulse-gui/` (egui workbench) was archived 2026-04-17 to `~/.impulse-cleanup-archive/_archive-2026-04-17-gui-dump/impulse-gui/`. Its replacement is the Tauri desktop shell in `impulse-rs/src-tauri/` (currently scaffold-only, populated by in-flight WIP — see `stash@{0}: pre-cleanup-safety-2026-04-17-main` and tag `recovery/pre-gui-dump-main-stash`).
+**Legacy:** `impulse-gui` / egui is frozen. It receives compile-maintenance only until the Tauri+Dioxus shell reaches parity.
 
 **Dual mode:**
 - **Direct mode** — stateless, per-action (for hooks). Read → process → write → exit.
 - **Daemon mode** — long-running, Unix socket IPC (for TUI and future desktop shell). In-memory state with periodic sync.
-- **Desktop mode** (planned) — `Tauri` + `Dioxus` application, connects to daemon via IPC and a terminal bridge.
+- **Desktop mode** (in migration) — `Tauri` + `Dioxus` application, connects to daemon via IPC and a terminal bridge.
 
 **IPC Protocol (PROTOCOL_VERSION = 2):**
 

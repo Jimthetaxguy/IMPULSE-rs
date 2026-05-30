@@ -5,6 +5,7 @@
 > **Previous:** Ralph Plan 3 (30 loops, codebase reduction + agent harness — COMPLETE)
 > **Goal:** Close every quality gap found in the 2026-04-01 deep code review, complete remaining Ralph Plan 4 work, and push all test density targets to green
 > **Baseline (2026-04-01):** 79,194 LOC, 1,025 tests, 13/19 handler files untested, 0.8 handler tests/KLOC
+> **Archive note (2026-05-22):** Superseded by `ralph-plan-6.md` for current Impulse platform stabilization. This plan remains preserved as historical context; its Root documents are intentionally unchanged.
 
 ---
 

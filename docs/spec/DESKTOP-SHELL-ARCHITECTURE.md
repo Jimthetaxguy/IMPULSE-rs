@@ -76,6 +76,13 @@ DAEMON (impulse-rs binary)
 - Notify backend of resize via `terminal_resize` commands when the pane dimensions change
 - All terminal rendering is handled by xterm.js - no custom Rust terminal widget is built for the desktop path
 
+### Native Islands (macOS)
+
+- Provide macOS-specific affordances such as menu bar, global shortcuts, file panels, notifications, accessibility hooks, and optional floating panels
+- Are invoked through serializable request/result DTOs, not shared UI state
+- May use Swift/AppKit behind an Objective-C-compatible ABI (`@objc`/`NSObject`) or Rust `objc2`
+- Must not retain authoritative session, memory, terminal, or artifact state; Dioxus remains the interface owner and daemon snapshots remain authoritative
+
 ### impulse-term Core
 
 - Owns PTY spawn, stdin/stdout, resize (SIGWINCH), env injection, and session lifecycle
@@ -161,6 +168,7 @@ This is the full public interface between the Dioxus frontend and the Rust backe
 | `terminal_resize` | `{session_id, cols, rows}` | Resize PTY and parser |
 | `terminal_close` | `{session_id}` | Kill PTY and clean up session |
 | `terminal_focus` | `{session_id}` | Notify backend of focus change |
+| `native_island_request` | `{request_id, kind, payload}` | Invoke a narrow native macOS island and return a serialized result |
 
 ### Events (backend -> frontend)
 

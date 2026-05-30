@@ -2,7 +2,7 @@
 title: Documentation Summary
 description: Unified navigation structure for Impulse documentation
 version: 2.2
-updated: 2026-03-05
+updated: 2026-05-21
 schema_version: '1.0'
 ---
 
@@ -16,15 +16,18 @@ schema_version: '1.0'
 | [USER-STORY-MAP.md](spec/USER-STORY-MAP.md) | Rust-first user stories and acceptance criteria | ✅ Yes |
 | [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md) | Current story-to-test coverage map | ✅ Yes |
 | [AGENTS.md](../AGENTS.md) | AI agent guidelines | ✅ Yes |
+| [COLLABORATIVE-AGENTIC-CODING.md](guides/COLLABORATIVE-AGENTIC-CODING.md) | Agent lane, worktree, and handoff rules | ✅ Yes |
+| [CONTRIBUTING.md](../CONTRIBUTING.md) | Human and agent contribution rules | ✅ Yes |
 | [INDEX.md](INDEX.md) | Master navigation | ✅ Yes |
 | [HONEST-ROADMAP.md](HONEST-ROADMAP.md) | Validation risk register | ✅ Yes |
 
 ## Active Track
 
-The active roadmap is now Rust core plus the EGUI operator workbench.
+The active roadmap is now Rust core plus the Tauri+Dioxus desktop shell migration.
 
 - [ROADMAP-PLAN.md](ROADMAP-PLAN.md)
-- [plans/IMPLEMENTATION-HANDOFF.md](plans/IMPLEMENTATION-HANDOFF.md)
+- [plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md](plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md)
+- [guides/COLLABORATIVE-AGENTIC-CODING.md](guides/COLLABORATIVE-AGENTIC-CODING.md)
 - [../impulse-rs/docs/IMPULSE_TERM_STATUS.md](../impulse-rs/docs/IMPULSE_TERM_STATUS.md)
 - [HONEST-ROADMAP.md](HONEST-ROADMAP.md)
 
@@ -33,7 +36,7 @@ The active roadmap is now Rust core plus the EGUI operator workbench.
 ### Now
 
 - [ROADMAP-PLAN.md](ROADMAP-PLAN.md)
-- [plans/IMPLEMENTATION-HANDOFF.md](plans/IMPLEMENTATION-HANDOFF.md)
+- [plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md](plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md)
 - [spec/RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md)
 
 ### Next
@@ -84,6 +87,7 @@ The active roadmap is now Rust core plus the EGUI operator workbench.
 ### Guides
 
 - [guides/TEAM-ONBOARDING.md](guides/TEAM-ONBOARDING.md)
+- [guides/COLLABORATIVE-AGENTIC-CODING.md](guides/COLLABORATIVE-AGENTIC-CODING.md)
 - [guides/BEST-PRACTICES.md](guides/BEST-PRACTICES.md)
 - [guides/ERROR-HANDLING-GUIDE.md](guides/ERROR-HANDLING-GUIDE.md)
 - [guides/DATABASE-GUIDE.md](guides/DATABASE-GUIDE.md)

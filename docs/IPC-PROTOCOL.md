@@ -117,13 +117,13 @@ Version mismatch triggers a warning in the GUI status bar.
 | `StewardProposals` | `{action, id?}` | v1 | Propose or review a stewardship action |
 | `StewardMemory` | — | v1 | Analyze and report on memory health |
 
-### Operations Snapshot (GUI)
+### Operations Snapshot (Desktop Shell)
 
 | Request | Data | Since | Description |
 |---------|------|-------|-------------|
-| `GetOpsSnapshot` | — | v1 | Full state snapshot for GUI rendering |
+| `GetOpsSnapshot` | — | v1 | Full state snapshot for desktop shell rendering |
 | `SubscribeOps` | `{since_seq?}` | v1 | Get ops updates since sequence number |
-| `PublishTerminalOps` | `{report}` | v1 | Push live terminal telemetry from the EGUI workbench |
+| `PublishTerminalOps` | `{report}` | v1 | Push live terminal telemetry from the desktop shell |
 
 #### PublishTerminalOps — TerminalOpsReport fields
 
@@ -288,7 +288,7 @@ Returns `AgentAssistResult` with sessions organized by agent role.
 
 | Request | Data | Since | Description |
 |---------|------|-------|-------------|
-| `ListArtifacts` | `{limit?}` | v1 | List project-scoped artifacts for the EGUI workbench |
+| `ListArtifacts` | `{limit?}` | v1 | List project-scoped artifacts for the desktop shell |
 | `GetArtifact` | `{artifact_id}` | v1 | Get a single artifact by ID |
 | `RunArtifactAction` | `{artifact_id, action_id, params}` | v1 | Execute an artifact action |
 

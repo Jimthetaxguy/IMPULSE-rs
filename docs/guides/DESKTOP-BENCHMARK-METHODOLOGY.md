@@ -18,7 +18,7 @@ Four baselines must be measured on the **same machine** under the same condition
 
 | Baseline | Binary | Description |
 |---|---|---|
-| B1 | `impulse-gui` (current egui) | Current desktop surface, release build |
+| B1 | `impulse-gui` (legacy egui) | Legacy desktop baseline, release build |
 | B2 | `impulse-rs` (ratatui CLI) | Standalone terminal-native operator |
 | B3 | Tauri + Dioxus - static shell | No live PTY, no daemon connection |
 | B4a | Tauri + Dioxus - 2 PTY panes | Two live xterm.js terminal panes |
@@ -128,7 +128,7 @@ top -pid $pid -l 3 | tail -1 | awk '{print $3}'  # CPU%
 | PTY resize latency | Must not regress vs B1 by more than 10% | Resize must feel instant |
 | Daemon snapshot refresh latency | Must not regress vs B1 by more than 10% | Side panels must stay live |
 | Idle RSS | May exceed B2; should stay <= B1 or within 25% above | Webview overhead expected; must not be runaway |
-| Idle CPU | Should be <= B1 at idle (no immediate-mode repaints) | Dioxus virtual DOM cheaper at idle than egui |
+| Idle CPU | Should be <= B1 at idle (no immediate-mode repaints) | Dioxus virtual DOM should be cheaper at idle than the legacy egui baseline |
 | Cold start | Should be <= 2x B2; informational vs B1 | Webview startup is slower than TUI; acceptable |
 | Warm start | Should be within 50% of B1 | After OS caching, startup should be fast |
 
