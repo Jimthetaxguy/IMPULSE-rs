@@ -63,7 +63,7 @@ impl TokenTracker {
         max_context: u32,
         message_count: u32,
         tool_call_count: u32,
-    ) -> &TokenEvent {
+    ) {
         let usage_ratio = if max_context > 0 {
             context_tokens as f64 / max_context as f64
         } else {
@@ -85,7 +85,6 @@ impl TokenTracker {
         self.session_platforms
             .insert(session_id.to_string(), platform);
         self.events.push(event);
-        self.events.last().expect("event was just pushed")
     }
 
     /// Record a compaction event
@@ -101,7 +100,7 @@ impl TokenTracker {
         tokens_after: u32,
         compaction_type: CompactionType,
         is_automatic: bool,
-    ) -> &CompactionEvent {
+    ) {
         let duration_ms = (completed_at - started_at).num_milliseconds() as u64;
         let compression_ratio = if tokens_before > 0 {
             tokens_after as f64 / tokens_before as f64
@@ -124,7 +123,6 @@ impl TokenTracker {
         };
 
         self.compactions.push(event);
-        self.compactions.last().expect("compaction was just pushed")
     }
 
     /// Get the appropriate token budget based on current usage

@@ -43,6 +43,7 @@ pub struct Session {
 #[serde(rename_all = "lowercase")]
 pub enum Platform {
     ClaudeCode,
+    Codex,
     OpenCode,
 }
 
@@ -50,6 +51,7 @@ impl Platform {
     pub fn as_str(&self) -> &'static str {
         match self {
             Platform::ClaudeCode => "claude-code",
+            Platform::Codex => "codex",
             Platform::OpenCode => "opencode",
         }
     }
@@ -57,6 +59,7 @@ impl Platform {
     pub fn from_str_name(s: &str) -> Option<Self> {
         match s {
             "claude-code" => Some(Self::ClaudeCode),
+            "codex" => Some(Self::Codex),
             "opencode" => Some(Self::OpenCode),
             _ => None,
         }
@@ -136,6 +139,28 @@ impl Session {
     pub fn set_status(&mut self, status: SessionStatus) {
         self.status = status;
         self.last_activity = Utc::now();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_platform_codex_roundtrip_serializes_lowercase() {
+        let json = serde_json::to_string(&Platform::Codex).unwrap();
+        assert_eq!(json, "\"codex\"");
+        let parsed: Platform = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, Platform::Codex);
+    }
+
+    #[test]
+    fn test_session_with_codex_platform_roundtrips() {
+        let session = Session::new("codex-agent".to_string(), Some(Platform::Codex));
+        let json = serde_json::to_string(&session).unwrap();
+        assert!(json.contains("\"platform\":\"codex\""));
+        let parsed: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.platform, Some(Platform::Codex));
     }
 }
 

@@ -63,6 +63,7 @@ fn sha256_hex(parts: &[&str]) -> String {
 fn platform_str(platform: Option<Platform>) -> String {
     match platform {
         Some(Platform::ClaudeCode) => "claude-code".to_string(),
+        Some(Platform::Codex) => "codex".to_string(),
         Some(Platform::OpenCode) => "opencode".to_string(),
         None => "unknown".to_string(),
     }

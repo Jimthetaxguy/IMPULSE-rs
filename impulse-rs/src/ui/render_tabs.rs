@@ -192,6 +192,7 @@ pub(crate) fn render_status_bar(
         if let Some(s) = sessions.iter().find(|s| &s.id == sid) {
             let platform_str = match &s.platform {
                 Some(Platform::ClaudeCode) => "Claude Code",
+                Some(Platform::Codex) => "Codex",
                 Some(Platform::OpenCode) => "OpenCode",
                 None => "Unknown",
             };
@@ -216,6 +217,7 @@ pub(crate) fn render_status_bar(
             .as_ref()
             .map(|p| match p {
                 Platform::ClaudeCode => "Claude Code",
+                Platform::Codex => "Codex",
                 Platform::OpenCode => "OpenCode",
             })
             .unwrap_or("Unknown");

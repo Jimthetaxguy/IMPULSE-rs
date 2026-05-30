@@ -419,10 +419,9 @@ mod tests {
         // branch logic: if env var is set, we get Some; if not, we get None.
         // Just verify the function doesn't panic with None arg.
         let result = get_session_id(None);
-        // Result is either Some (env set) or None (env unset) — both valid
-        match &result {
-            Some(id) => assert!(!id.is_empty(), "env-sourced session ID should not be empty"),
-            None => {} // expected when IMPULSE_SESSION_ID is unset
+        // Result is either Some (env set) or None (env unset) — both valid.
+        if let Some(id) = &result {
+            assert!(!id.is_empty(), "env-sourced session ID should not be empty");
         }
     }
 
@@ -582,6 +581,12 @@ mod tests {
     fn test_parse_platform_opencode() {
         let result = parse_platform("opencode");
         assert_eq!(result, Some(state::Platform::OpenCode));
+    }
+
+    #[test]
+    fn test_parse_platform_codex() {
+        let result = parse_platform("codex");
+        assert_eq!(result, Some(state::Platform::Codex));
     }
 
     #[test]
@@ -1253,8 +1258,10 @@ mod tests {
     #[test]
     fn test_build_tool_context_uses_config_timeout() {
         let tmp = TempDir::new().unwrap();
-        let mut config = state::Config::default();
-        config.tool_execution_default_timeout_ms = 9999;
+        let config = state::Config {
+            tool_execution_default_timeout_ms: 9999,
+            ..Default::default()
+        };
         let ctx = build_tool_context(
             tmp.path(),
             &config,

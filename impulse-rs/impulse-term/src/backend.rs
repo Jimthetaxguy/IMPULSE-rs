@@ -14,6 +14,15 @@ use std::thread::JoinHandle;
 use parking_lot::{FairMutex, Mutex};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
+pub type OutputCallback = Arc<dyn Fn(&[u8]) + Send + Sync + 'static>;
+pub type ExitCallback = Arc<dyn Fn() + Send + Sync + 'static>;
+
+#[derive(Default, Clone)]
+pub struct TerminalCallbacks {
+    pub output: Option<OutputCallback>,
+    pub exit: Option<ExitCallback>,
+}
+
 /// Default scrollback buffer size.
 const DEFAULT_SCROLLBACK_LINES: usize = 10_000;
 
@@ -59,6 +68,32 @@ impl TerminalBackend {
         rows: u16,
         cols: u16,
         scrollback: Option<usize>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::spawn_with_callbacks(
+            command,
+            args,
+            working_dir,
+            env_vars,
+            rows,
+            cols,
+            scrollback,
+            None,
+            None,
+        )
+    }
+
+    /// Spawn a child process in a new PTY and report raw output/exit events.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_callbacks(
+        command: &str,
+        args: &[String],
+        working_dir: Option<&Path>,
+        env_vars: &[(&str, String)],
+        rows: u16,
+        cols: u16,
+        scrollback: Option<usize>,
+        output_callback: Option<OutputCallback>,
+        exit_callback: Option<ExitCallback>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let scrollback = scrollback.unwrap_or(DEFAULT_SCROLLBACK_LINES);
 
@@ -106,6 +141,10 @@ impl TerminalBackend {
             let output_bytes = Arc::clone(&output_bytes);
             let output_lines = Arc::clone(&output_lines);
             let read_errors = Arc::clone(&read_errors);
+            let callbacks = TerminalCallbacks {
+                output: output_callback,
+                exit: exit_callback,
+            };
 
             std::thread::Builder::new()
                 .name(format!("pty-reader-{}", command))
@@ -117,6 +156,7 @@ impl TerminalBackend {
                         output_bytes,
                         output_lines,
                         read_errors,
+                        callbacks,
                     );
                 })?
         };
@@ -377,6 +417,7 @@ fn pty_reader_loop(
     output_bytes: Arc<AtomicU64>,
     output_lines: Arc<AtomicU64>,
     read_errors: Arc<AtomicU64>,
+    callbacks: TerminalCallbacks,
 ) {
     let mut buf = [0u8; PTY_READ_BUFFER_SIZE];
     loop {
@@ -384,10 +425,16 @@ fn pty_reader_loop(
             Ok(0) => {
                 // EOF — child closed its end.
                 alive.store(false, Ordering::Relaxed);
+                if let Some(callback) = &callbacks.exit {
+                    callback();
+                }
                 break;
             }
             Ok(n) => {
                 output_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                if let Some(callback) = &callbacks.output {
+                    callback(&buf[..n]);
+                }
 
                 let newlines = buf[..n].iter().filter(|&&b| b == b'\n').count();
                 if newlines > 0 {
@@ -405,6 +452,9 @@ fn pty_reader_loop(
                     e
                 );
                 alive.store(false, Ordering::Relaxed);
+                if let Some(callback) = &callbacks.exit {
+                    callback();
+                }
                 break;
             }
         }

@@ -1,6 +1,7 @@
 [workspace]
 members = [
     ".",
+    "impulse-desktop",
     "impulse-ops",
     "impulse-term",
 ]

@@ -23,10 +23,16 @@
 
 pub mod backend;
 pub mod context;
+#[cfg(feature = "egui")]
 pub mod input;
+#[cfg(feature = "egui")]
 pub mod panel;
+pub mod paste;
+#[cfg(feature = "egui")]
 pub mod renderer;
+#[cfg(feature = "egui")]
 pub mod status_bar;
+#[cfg(feature = "egui")]
 pub mod theme;
 
 // Re-export public API.
@@ -34,7 +40,12 @@ pub use backend::TerminalBackend;
 pub use context::{
     AgentKind, ContextBridge, ContextHealth, ContextTier, ExtractedInsight, InsightType,
 };
+#[cfg(feature = "egui")]
 pub use input::key_to_pty_bytes;
+#[cfg(feature = "egui")]
 pub use panel::TerminalPanel;
+pub use paste::bracketed_paste;
+#[cfg(feature = "egui")]
 pub use renderer::TerminalRenderer;
+#[cfg(feature = "egui")]
 pub use theme::{AgentTheme, AgentThemeConfig, TerminalTheme};

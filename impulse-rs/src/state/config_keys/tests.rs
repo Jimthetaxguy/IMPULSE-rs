@@ -422,6 +422,8 @@ fn set_platform_valid() {
     let mut c = Config::default();
     assert!(c.set("default_platform", "claude-code"));
     assert_eq!(c.default_platform, Some(Platform::ClaudeCode));
+    assert!(c.set("default_platform", "codex"));
+    assert_eq!(c.default_platform, Some(Platform::Codex));
     assert!(c.set("default_platform", "opencode"));
     assert_eq!(c.default_platform, Some(Platform::OpenCode));
     assert!(c.set("default_platform", "none"));

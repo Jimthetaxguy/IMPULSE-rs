@@ -212,24 +212,28 @@ impl ToolRegistry {
         ToolExecutor::execute(tool.tool.as_ref(), params, ctx).await
     }
 
-    /// Create a registry with all built-in tools registered.
-    ///
-    /// Panics only if there's a bug in tool ID uniqueness (programming error).
-    pub fn with_defaults() -> Self {
+    /// Try to create a registry with all built-in tools registered.
+    pub fn try_with_defaults() -> Result<Self, ToolError> {
         let mut reg = Self::new();
-        super::builtin::register_all(&mut reg)
-            .expect("built-in tool registration failed (duplicate IDs)");
+        super::builtin::register_all(&mut reg)?;
 
         #[cfg(feature = "office-support")]
-        super::document::register_all(&mut reg)
-            .expect("document tool registration failed (duplicate IDs)");
+        super::document::register_all(&mut reg)?;
 
-        reg
+        Ok(reg)
+    }
+
+    /// Create a registry with all built-in tools registered.
+    pub fn with_defaults() -> Self {
+        Self::try_with_defaults().unwrap_or_else(|err| {
+            tracing::error!("failed to register built-in tools: {}", err);
+            Self::new()
+        })
     }
 
     /// Create a runtime registry with built-ins plus manifest-defined process tools.
     pub fn with_runtime(impulse_dir: &Path, external_tools_dir: &Path) -> Result<Self, ToolError> {
-        let mut reg = Self::with_defaults();
+        let mut reg = Self::try_with_defaults()?;
         let _ = impulse_dir;
         for tool in load_process_tools_from_dir(external_tools_dir)? {
             reg.register_with_source(Box::new(tool), ToolSource::ExternalProcess)?;
@@ -414,6 +418,13 @@ mod tests {
     fn test_with_defaults() {
         let reg = ToolRegistry::with_defaults();
         assert!(!reg.is_empty());
+    }
+
+    #[test]
+    fn test_try_with_defaults_returns_populated_registry() {
+        let reg = ToolRegistry::try_with_defaults().unwrap();
+        assert!(!reg.is_empty());
+        assert!(reg.get("system_info").is_some());
     }
 
     #[test]

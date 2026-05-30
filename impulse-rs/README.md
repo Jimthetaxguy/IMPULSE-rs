@@ -4,7 +4,7 @@ Rust implementation of Impulse — a sidecar that runs alongside AI coding agent
 
 ## Desktop Shell (in progress)
 
-The egui-based `impulse-gui` crate was retired 2026-04-17. Its replacement is a Tauri + Dioxus desktop shell scaffolded in `src-tauri/`; in-progress work is preserved in `stash@{0}` and recovery tag `recovery/pre-gui-dump-main-stash`.
+The egui-based `impulse-gui` crate was retired 2026-04-17. Its replacement is a Tauri + Dioxus desktop shell scaffolded in `impulse-desktop`; pre-scaffold GUI work is preserved in `stash@{0}` and recovery tag `recovery/pre-gui-dump-main-stash`.
 
 For now, use the ratatui TUI:
 
@@ -53,15 +53,16 @@ cargo test -p impulse-ops         # Ops crate (4 tests)
 
 ## Architecture
 
-**3 crates (post-egui-dump 2026-04-17):**
+**4 crates (post-Dioxus shell scaffold):**
 
 | Crate | Purpose |
 |-------|---------|
 | `impulse-rs` | CLI + daemon + ratatui TUI (64K LOC, 1,344 tests) |
+| `impulse-desktop` | Dioxus-owned desktop shell, Tauri command DTOs, native island bridge contracts |
 | `impulse-ops` | Shared types (SupervisorAction, OpsSnapshot, IPC protocol) |
 | `impulse-term` | Terminal core (PTY, vt100, WriteQueue, context bridge, 110 tests) |
 
-`impulse-gui` (egui native workbench) retired 2026-04-17; archive at `~/.impulse-cleanup-archive/_archive-2026-04-17-gui-dump/`. Replacement: Tauri + Dioxus shell in `src-tauri/` (scaffold).
+`impulse-gui` (egui native workbench) retired 2026-04-17; archive at `~/.impulse-cleanup-archive/_archive-2026-04-17-gui-dump/`. Replacement: Tauri + Dioxus shell in `impulse-desktop` (static shell + typed bridge scaffold).
 
 **Dual mode:**
 - **Direct mode** — stateless CLI, per-action (for hooks)

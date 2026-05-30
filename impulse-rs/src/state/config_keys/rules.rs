@@ -217,6 +217,7 @@ impl Config {
             SetRule::Custom(|c, v| {
                 match v {
                     "claude-code" => c.default_platform = Some(Platform::ClaudeCode),
+                    "codex" => c.default_platform = Some(Platform::Codex),
                     "opencode" => c.default_platform = Some(Platform::OpenCode),
                     "none" => c.default_platform = None,
                     _ => return false,

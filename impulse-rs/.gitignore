@@ -3,3 +3,23 @@ target.old/
 target2/
 .superpowers/
 Impulse.app/
+
+# OS metadata
+.DS_Store
+
+# Local agent/runtime state
+.claude/worktrees/
+.impulse/.DS_Store
+.impulse/LIVE_STATE.json
+.impulse/SESSIONS.json
+.impulse/agent_history.jsonl
+.impulse/retrieval.db
+.impulse/retrieval.db-*
+.impulse/sockets/
+impulse-gui/.impulse/agent_history.jsonl
+
+# Scratch/generated local work areas
+target-claude/
+impulse-supervisor/
+impulse-term-core/
+impulse-term-dioxus/

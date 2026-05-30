@@ -3,6 +3,7 @@
 //! Maps egui `Key` + `Modifiers` to VT100/xterm escape bytes that are written
 //! to the PTY master, where the child process reads them as terminal input.
 
+pub use crate::paste::bracketed_paste;
 use eframe::egui;
 
 /// Convert an egui key event to PTY-compatible bytes.
@@ -83,14 +84,6 @@ pub fn key_to_pty_bytes(
     // Processing them here would cause doubled keystrokes since egui fires
     // both Event::Key and Event::Text for every printable keypress.
     None
-}
-
-/// Wrap pasted text in bracketed paste escape sequences.
-pub fn bracketed_paste(text: &str) -> Vec<u8> {
-    let mut bytes = b"\x1b[200~".to_vec();
-    bytes.extend_from_slice(text.as_bytes());
-    bytes.extend_from_slice(b"\x1b[201~");
-    bytes
 }
 
 /// Map Ctrl+key to the corresponding control character byte.

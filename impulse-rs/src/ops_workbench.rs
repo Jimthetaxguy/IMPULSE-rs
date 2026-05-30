@@ -1016,6 +1016,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_build_snapshot_uses_codex_backend_kind() {
+        let temp = TempDir::new().unwrap();
+        let state = crate::state::State::new(temp.path().to_path_buf()).unwrap();
+        let shared = std::sync::Arc::new(state);
+        let session = shared
+            .create_session(
+                "codex-session".to_string(),
+                Some(crate::state::Platform::Codex),
+            )
+            .await
+            .unwrap();
+
+        let snapshot = build_snapshot(&shared, &[]).await.unwrap();
+        let agent = snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.session_id.as_deref() == Some(&session.id))
+            .expect("codex session appears in ops snapshot");
+
+        assert_eq!(agent.backend_kind, "codex");
+    }
+
+    #[tokio::test]
     async fn test_build_snapshot_returns_error_for_malformed_genome() {
         let temp = TempDir::new().unwrap();
         std::fs::write(temp.path().join("GENOME.md"), "{not-json").unwrap();

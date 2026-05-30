@@ -1,5 +1,7 @@
 # impulse-gui
 
+> **LEGACY / FROZEN:** `impulse-gui` is the old egui/eframe desktop workbench. Do not add new features here. Active desktop work belongs in the Tauri+Dioxus `impulse-desktop` shell; this crate receives compile-maintenance and historical comparison only until removal after parity.
+
 Native desktop workbench for Impulse -- an egui/eframe application that hosts embedded terminals, agent coordination, and session memory in a single window.
 
 ## Architecture
@@ -30,7 +32,7 @@ ImpulseApp (app.rs)
 | View | Module | Description |
 |------|--------|-------------|
 | **Workbench** | `overview.rs` | Dashboard with daemon connection status, active sessions, and ops snapshot summary |
-| **Terminals** | `terminals.rs` | PTY multiplexer -- spawn Claude Code, Codex, OpenCode, or shell tabs with full vt100 rendering |
+| **Terminals** | `terminals.rs` | PTY multiplexer -- spawn Claude Code, Codex, legacy OpenCode, or shell tabs with full vt100 rendering |
 | *Terminal Context* | `terminal_context.rs` | Context lifecycle: extraction ticks, threshold injection, signal collection |
 | *Terminal Insights* | `terminal_insights.rs` | Insight persistence: append to `LIVE_INSIGHTS.jsonl`, merge, search across panes |
 | *Terminal Search* | `terminal_search.rs` | Ctrl+F overlay searching all pane transcripts with match counts and F3 navigation |

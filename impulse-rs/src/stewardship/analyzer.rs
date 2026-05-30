@@ -328,11 +328,9 @@ fn find_tool_patterns(messages: &[TranscriptMessage]) -> Vec<ToolPattern> {
 fn sha2_hash(data: &[u8]) -> u64 {
     use sha2::{Digest, Sha256};
     let result = Sha256::digest(data);
-    u64::from_le_bytes(
-        result[..8]
-            .try_into()
-            .expect("SHA256 always produces 32 bytes; first 8 are always available"),
-    )
+    let mut prefix = [0_u8; 8];
+    prefix.copy_from_slice(&result[..8]);
+    u64::from_le_bytes(prefix)
 }
 
 /// Find duplicate regions (consecutive repeated tool calls)

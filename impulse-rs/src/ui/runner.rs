@@ -268,8 +268,7 @@ pub(crate) fn run_app(
                             .modifiers
                             .contains(crossterm::event::KeyModifiers::CONTROL) =>
                     {
-                        spawn_agent_in_terminal(&mut state, "codex", Platform::OpenCode);
-                        // Codex uses opencode
+                        spawn_agent_in_terminal(&mut state, "codex", Platform::Codex);
                     }
                     // Close terminal tab with Ctrl+w
                     KeyCode::Char('w')

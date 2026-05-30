@@ -40,6 +40,7 @@ pub(crate) fn spawn_agent_in_terminal(state: &mut TuiState, agent_cmd: &str, pla
             Some(&session_id),
             Some(match platform {
                 Platform::ClaudeCode => "Claude Code",
+                Platform::Codex => "Codex",
                 Platform::OpenCode => "OpenCode",
             }),
         ) {

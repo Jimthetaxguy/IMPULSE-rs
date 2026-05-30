@@ -237,6 +237,7 @@ pub fn calculate_analytics(history: &[crate::state::HistoryEntry]) -> AnalyticsS
         // Platform breakdown
         let platform_str = match entry.platform {
             Some(Platform::ClaudeCode) => "ClaudeCode",
+            Some(Platform::Codex) => "Codex",
             Some(Platform::OpenCode) => "OpenCode",
             None => "Unknown",
         };

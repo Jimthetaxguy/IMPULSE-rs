@@ -24,7 +24,9 @@ TerminalBackend
 TerminalPanel (assembled widget: backend + renderer + input + theme + context + status bar)
 ```
 
-Data flows in one direction: the agent process writes to the PTY slave, the reader thread feeds bytes into the vt100 parser, the renderer converts the parsed screen into egui draw calls, and the context bridge extracts insights from the visible text. Injection flows the opposite way through the WriteQueue.
+Data flows in one direction: the agent process writes to the PTY slave, the reader thread feeds bytes into the vt100 parser, the optional egui renderer converts the parsed screen into draw calls, and the context bridge extracts insights from the visible text. Injection flows the opposite way through the WriteQueue.
+
+The core boundary is framework-neutral. `TerminalBackend`, `WriteQueue`, `ContextBridge`, context data types, and bracketed paste helpers compile without egui via `cargo test -p impulse-term --no-default-features`. The default feature set still enables the legacy egui panel, renderer, input, status-bar, and theme modules for compatibility.
 
 ---
 
@@ -34,11 +36,12 @@ Data flows in one direction: the agent process writes to the PTY slave, the read
 |--------|------:|------:|---------|
 | `backend.rs` | ~540 | 10 | PTY spawn via `portable-pty`, vt100 parser, background reader thread, `WriteQueue` for serialized writes with user-input priority and injection debounce |
 | `context.rs` | ~950 | 28 | `ContextBridge` wrapping extraction, compaction detection, token estimation, and injection. Defines `AgentKind`, `ContextTier`, `InsightType`, `ExtractedInsight` |
-| `panel.rs` | ~880 | 14 | `TerminalPanel` -- assembled egui widget combining all modules. Handles keyboard/paste input, dynamic PTY resize, scroll-guard, context overlay (Ctrl+Shift+C), `EnvGuard` RAII |
-| `renderer.rs` | ~340 | 4 | Run-based rendering: groups consecutive cells with identical attributes into runs, reducing draw calls from ~4,800/frame to ~100-300/frame |
-| `input.rs` | ~370 | 13 | Translates egui `Key` + `Modifiers` into VT100/xterm escape sequences. Ctrl+letter, Alt+key, arrow keys (normal/application cursor), function keys, bracketed paste |
-| `theme.rs` | ~690 | 28 | Full 16-color ANSI palette resolution (named, 216-cube, grayscale, RGB). `AgentThemeConfig` with user overrides and two built-in presets (github-dark, terminal-native) |
-| `status_bar.rs` | ~130 | 0 | Status bar widget: alive indicator, title + dimensions, context tier icon + usage %, compaction/injection counters, copy button |
+| `paste.rs` | ~20 | 1 | Framework-neutral bracketed paste helper used by context injection and egui paste handling |
+| `panel.rs` | ~880 | 14 | egui-only `TerminalPanel` assembled widget combining all modules. Handles keyboard/paste input, dynamic PTY resize, scroll-guard, context overlay (Ctrl+Shift+C), `EnvGuard` RAII |
+| `renderer.rs` | ~340 | 4 | egui-only run-based rendering: groups consecutive cells with identical attributes into runs, reducing draw calls from ~4,800/frame to ~100-300/frame |
+| `input.rs` | ~370 | 13 | egui-only key translation from `Key` + `Modifiers` into VT100/xterm escape sequences. Ctrl+letter, Alt+key, arrow keys, function keys, bracketed paste re-export |
+| `theme.rs` | ~690 | 28 | egui-only full 16-color ANSI palette resolution (named, 216-cube, grayscale, RGB). `AgentThemeConfig` with user overrides and two built-in presets |
+| `status_bar.rs` | ~130 | 0 | egui-only status bar widget: alive indicator, title + dimensions, context tier icon + usage %, compaction/injection counters, copy button |
 | `lib.rs` | ~40 | 0 | Module declarations and public re-exports |
 
 ---
@@ -85,6 +88,9 @@ cargo build -p impulse-term
 # Test
 cargo test -p impulse-term
 
+# Test the framework-neutral boundary without egui
+cargo test -p impulse-term --no-default-features
+
 # Clippy
 cargo clippy -p impulse-term -- -D warnings
 ```
@@ -110,7 +116,7 @@ cargo clippy -p impulse-term -- -D warnings
 |-------|---------|---------|
 | `portable-pty` | 0.9 | Cross-platform PTY spawn and management |
 | `vt100` | 0.15 | Terminal state machine (parser + screen model) |
-| `eframe` | 0.31 | egui framework (used for `egui::*` types in renderer, input, theme) |
+| `eframe` | 0.31 | Optional egui framework behind the default `egui` feature; used by renderer, input, panel, status bar, and theme |
 | `parking_lot` | 0.12 | `FairMutex` (prevents reader-thread starvation) and `Mutex` |
 | `chrono` | 0.4 | Timestamps on extracted insights |
 | `serde` | 1.0 | Serialization for `AgentTheme`, `AgentKind`, `ContextTier`, `InsightType` |

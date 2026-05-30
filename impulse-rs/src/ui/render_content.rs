@@ -52,6 +52,7 @@ pub(crate) fn render_sessions(
 
             let platform = match &s.platform {
                 Some(Platform::ClaudeCode) => "Claude",
+                Some(Platform::Codex) => "Codex",
                 Some(Platform::OpenCode) => "OpenCode",
                 None => "Unknown",
             };
@@ -260,6 +261,7 @@ pub(crate) fn render_history(f: &mut Frame, area: Rect, history: &[crate::state:
         let time = entry.ended_at.format("%m/%d %H:%M").to_string();
         let platform = match &entry.platform {
             Some(Platform::ClaudeCode) => "Claude",
+            Some(Platform::Codex) => "Codex",
             Some(Platform::OpenCode) => "OpenCode",
             None => "-",
         };

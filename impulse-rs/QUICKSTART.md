@@ -26,36 +26,17 @@ impulse-rs init
 
 Creates `.impulse/` with `config.json`, `GENOME.md`, and `HISTORY.jsonl`.
 
-## Step 3: Launch the GUI Workbench
+## Step 3: Launch the TUI Workbench
 
 ```bash
-cargo run -p impulse-gui
+cargo run -- run
 ```
 
-The workbench opens with 4 views:
-- **Workbench** (Ctrl+1) — Dashboard with agent fleet and session overview
-- **Terminals** (Ctrl+2) — Spawn and manage AI agent terminals
-- **Memory** (Ctrl+3) — Session history, genome decisions, search
-- **Settings** (Ctrl+4) — Configuration and theme selection
-
-### Spawn an Agent Terminal
-
-1. Go to Terminals view (Ctrl+2)
-2. Click an available agent (Claude Code, Codex, Shell)
-3. Select a project directory
-4. The terminal spawns with context lifecycle tracking
-
-### Switch Themes
-
-Go to Settings (Ctrl+4) and pick a theme:
-- **Launch** (default) — Deep space blue
-- **Nebula** — Purple violet
-- **Solar** — Warm amber
-- **Aurora** — Emerald green
+The terminal-native workbench is the current operator path. The Tauri+Dioxus desktop shell lives in `impulse-desktop` and is in migration; use the migration handoff for desktop build sequencing. The old egui `impulse-gui` workbench is legacy/frozen and should be used only for compile-maintenance or historical comparison.
 
 ### Use the Supervisor
 
-The right-side panel (Ctrl+E) is the Impulse supervisor — an AI coordinator that monitors your agent terminals. Type questions or use slash commands:
+The TUI supervisor coordinates agent sessions and context. Type questions or use slash commands:
 
 ```
 /help      — Show available commands
@@ -66,7 +47,7 @@ The right-side panel (Ctrl+E) is the Impulse supervisor — an AI coordinator th
 
 ## Step 4: Set Up Agent Hooks
 
-Auto-track sessions with Claude Code:
+Auto-track sessions with Claude Code. Codex is the other active platform; legacy OpenCode compatibility is preserved where already implemented, but new setup should prefer Claude Code or Codex.
 
 ```bash
 impulse-rs validate-hooks --platform claude-code
@@ -96,4 +77,4 @@ impulse-rs search-history --query "auth"
 
 **"No agent backend configured"** — Set `ANTHROPIC_API_KEY` or install Claude Code
 
-**GUI shows "Waiting for daemon"** — The daemon is optional. Terminal multiplexing works without it. Memory/history features require `impulse-rs daemon`.
+**Desktop shell status is unclear** — Use the ratatui TUI for current work. The Tauri+Dioxus shell is still in migration, and `impulse-gui` is legacy/frozen.
