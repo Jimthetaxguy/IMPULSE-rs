@@ -8,6 +8,11 @@ interface, Tauri owns the native shell/IPC boundary, Rust owns
 PTY/session/daemon state, xterm.js owns terminal rendering, and macOS-native
 islands stay behind typed request/result DTOs.
 
+The product model is a terminal-agent harness: each coding agent is a PTY-backed
+actor with an explicit workspace target, a runtime snapshot, and a visible set of
+Rust MCP tools that can help the agent act inside that workspace. Dioxus renders
+and requests those capabilities; Rust validates and executes them.
+
 ## Ownership
 
 | Layer | Owner |
@@ -17,9 +22,32 @@ islands stay behind typed request/result DTOs.
 | PTY lifecycle, daemon snapshots, persistence | Rust backend |
 | Terminal glyph rendering | xterm.js |
 | Menu bar, panels, notifications, accessibility hooks | Native island bridge |
+| Built-in MCP tools and connector status | Rust runtime snapshots surfaced to Dioxus |
 
 Native islands must publish serializable DTOs back to Dioxus. They must not keep
 independent copies of sessions, memory, terminal state, or artifacts.
+
+## Runtime Contracts
+
+- `WorkspaceTarget` names the folder an agent is allowed to operate in. The
+  runtime derives it from `cwd` when the UI does not provide richer metadata.
+- `AgentSpawnRequest` carries platform, command, workspace, terminal dimensions,
+  and optional MCP tool descriptors.
+- `AgentRuntimeSnapshot` is the source of truth for what Dioxus displays:
+  focused state, process status, workspace, context health, output metrics, and
+  built-in Rust MCP tools.
+- Built-in MCP tools default to safe descriptors for `impulse.agent_spawn`,
+  `impulse.agent_write`, `impulse.search_memory`, and
+  `impulse.review_injection`; mutating terminal actions require confirmation.
+
+The active path is:
+
+```text
+Dioxus controls -> Tauri command -> DesktopRuntime -> impulse-term TerminalBackend
+        ^                                                    |
+        |                                                    v
+        +----- terminal_output / agent_runtime_update events +
+```
 
 ## Features
 

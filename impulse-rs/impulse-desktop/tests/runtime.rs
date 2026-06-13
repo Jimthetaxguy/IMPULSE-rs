@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use impulse_desktop::{
     AgentPlatformKind, AgentSpawnRequest, AgentWriteRequest, DesktopEvent, DesktopEventSink,
     DesktopRuntime, LocalSupervisorAction, SupervisorLocalActionRequest, TerminalCloseRequest,
-    TerminalFocusRequest, TerminalResizeRequest,
+    TerminalFocusRequest, TerminalResizeRequest, WorkspaceTarget,
 };
 
 #[derive(Default)]
@@ -37,6 +37,8 @@ fn shell_spawn(agent_id: &str, script: &str) -> AgentSpawnRequest {
         args: vec!["-lc".to_string(), script.to_string()],
         cwd: None,
         env: HashMap::new(),
+        workspace: None,
+        mcp_tools: Vec::new(),
         rows: 24,
         cols: 80,
         role: None,
@@ -75,6 +77,51 @@ fn test_desktop_runtime_spawns_shell_and_emits_terminal_output() {
     }
 
     panic!("expected terminal_output event containing shell output");
+}
+
+#[test]
+fn test_desktop_runtime_snapshot_carries_workspace_and_builtin_mcp_tools() {
+    let runtime = DesktopRuntime::default();
+    let mut request = shell_spawn("workspace-agent", "sleep 2");
+    request.cwd = Some("/tmp".to_string());
+    request.workspace = Some(WorkspaceTarget {
+        root: "/tmp".to_string(),
+        label: Some("scratch".to_string()),
+        purpose: Some("safe terminal harness smoke workspace".to_string()),
+    });
+
+    let snapshot = runtime
+        .spawn_agent(request)
+        .expect("spawn workspace-scoped agent");
+
+    assert_eq!(
+        snapshot
+            .workspace
+            .as_ref()
+            .map(|workspace| workspace.root.as_str()),
+        Some("/tmp")
+    );
+    assert_eq!(
+        snapshot
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.label.as_deref()),
+        Some("scratch")
+    );
+    assert!(snapshot
+        .mcp_tools
+        .iter()
+        .any(|tool| tool.name == "impulse.agent_spawn" && tool.requires_confirmation));
+    assert!(snapshot
+        .mcp_tools
+        .iter()
+        .any(|tool| tool.name == "impulse.search_memory" && !tool.requires_confirmation));
+
+    runtime
+        .close_agent(TerminalCloseRequest {
+            session_id: "workspace-agent".to_string(),
+        })
+        .expect("close workspace agent");
 }
 
 #[test]

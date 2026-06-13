@@ -21,6 +21,11 @@ fn test_dioxus_shell_renders_five_panel_layout_without_egui() {
     assert!(html.contains("right-inspector"));
     assert!(html.contains("event-strip"));
     assert!(html.contains("agent-pool"));
+    assert!(html.contains("workspace-picker"));
+    assert!(html.contains("data-source=\"workspace_target\""));
+    assert!(html.contains("data-source=\"builtin_mcp_tools\""));
+    assert!(html.contains("Rust MCP Tools"));
+    assert!(html.contains("agent_spawn and agent_write require confirmation"));
     assert!(html.contains("xterm.js terminal mount"));
     assert!(html.contains("terminal-pane-codex"));
     assert!(html.contains("agent_runtime_update stream pending"));
@@ -68,6 +73,8 @@ fn test_terminal_bridge_routes_open_write_resize_focus_close() {
             args: Vec::new(),
             cwd: Some("/tmp".to_string()),
             env: HashMap::new(),
+            workspace: None,
+            mcp_tools: Vec::new(),
             rows: 30,
             cols: 100,
         })

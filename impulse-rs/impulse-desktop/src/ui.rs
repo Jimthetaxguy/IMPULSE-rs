@@ -126,6 +126,12 @@ pub fn DesktopShell() -> Element {
                         button { class: "rail-item", "OpenCode" }
                         button { class: "rail-item", "Shell" }
                     }
+                    section { class: "workspace-picker", "data-source": "workspace_target",
+                        h2 { "Workspaces" }
+                        button { class: "rail-item active", "Current repo" }
+                        button { class: "rail-item", "/code" }
+                        button { class: "rail-item", "Desktop clone" }
+                    }
                 }
                 section { class: "terminal-stage", "data-terminal-renderer": "xterm.js",
                     div { class: "terminal-tabs", "data-owner": "dioxus",
@@ -161,6 +167,11 @@ pub fn DesktopShell() -> Element {
                     section { class: "inspector-section",
                         h2 { "Native Islands" }
                         p { "macOS affordances report through serializable DTOs" }
+                    }
+                    section { class: "inspector-section", "data-source": "builtin_mcp_tools",
+                        h2 { "Rust MCP Tools" }
+                        p { "agent_spawn and agent_write require confirmation" }
+                        p { "search_memory is read-only" }
                     }
                     section { class: "inspector-section",
                         h2 { "Supervisor" }
