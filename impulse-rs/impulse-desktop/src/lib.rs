@@ -5,15 +5,21 @@
 //! session, memory, terminal, or artifact state.
 
 pub mod bridge;
+pub mod mcp;
 pub mod native;
 pub mod runtime;
 pub mod tauri_commands;
 pub mod ui;
+pub mod workspace;
 
 pub use bridge::{
     DesktopBridgeError, DesktopCommandRouter, InMemoryTerminalBridge, TerminalBridge,
     TerminalCloseRequest, TerminalFocusRequest, TerminalOpenRequest, TerminalResizeRequest,
     TerminalSessionResponse, TerminalWriteRequest,
+};
+pub use mcp::{
+    AgentSpawnTool, AgentWriteTool, ListAgentsTool, ListWorkspacesTool, McpContext, McpError,
+    McpInvocation, McpTool, McpToolRegistry, PassthroughMcpTool, SearchMemoryTool,
 };
 pub use native::{
     DefaultNativeIslandHost, NativeIslandHost, NativeIslandKind, NativeIslandRequest,
@@ -25,3 +31,4 @@ pub use runtime::{
     DesktopRuntimeBuilder, LocalSupervisorAction, SupervisorLocalActionRequest, WorkspaceTarget,
 };
 pub use ui::DesktopShell;
+pub use workspace::{WorkspaceEntry, WorkspaceRegistry, WorkspaceRegistryError};

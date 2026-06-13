@@ -154,6 +154,34 @@ pub struct AgentSpawnRequest {
     pub target: Option<MachineTarget>,
 }
 
+impl AgentSpawnRequest {
+    pub fn terminal_harness(
+        agent_id: impl Into<String>,
+        platform: AgentPlatformKind,
+        workspace_root: impl Into<String>,
+        rows: u16,
+        cols: u16,
+    ) -> Self {
+        let agent_id = agent_id.into();
+        let workspace = WorkspaceTarget::from_root(workspace_root.into());
+        Self {
+            agent_id: Some(agent_id.clone()),
+            session_id: Some(format!("{agent_id}-session")),
+            platform,
+            command: None,
+            args: Vec::new(),
+            cwd: Some(workspace.root.clone()),
+            env: HashMap::new(),
+            workspace: Some(workspace),
+            mcp_tools: default_builtin_mcp_tools(),
+            rows,
+            cols,
+            role: None,
+            target: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentWriteRequest {
     pub agent_id: String,

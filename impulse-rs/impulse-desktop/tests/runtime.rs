@@ -125,6 +125,36 @@ fn test_desktop_runtime_snapshot_carries_workspace_and_builtin_mcp_tools() {
 }
 
 #[test]
+fn test_terminal_harness_spawn_request_binds_workspace_and_default_tools() {
+    let request = AgentSpawnRequest::terminal_harness(
+        "codex-harness",
+        AgentPlatformKind::Codex,
+        "/Users/jamespustorino/code",
+        32,
+        100,
+    );
+
+    assert_eq!(request.agent_id.as_deref(), Some("codex-harness"));
+    assert_eq!(request.session_id.as_deref(), Some("codex-harness-session"));
+    assert_eq!(request.platform, AgentPlatformKind::Codex);
+    assert_eq!(request.command, None);
+    assert_eq!(request.cwd.as_deref(), Some("/Users/jamespustorino/code"));
+    assert_eq!(
+        request
+            .workspace
+            .as_ref()
+            .map(|workspace| workspace.root.as_str()),
+        Some("/Users/jamespustorino/code")
+    );
+    assert!(request
+        .mcp_tools
+        .iter()
+        .any(|tool| tool.name == "impulse.review_injection"));
+    assert_eq!(request.rows, 32);
+    assert_eq!(request.cols, 100);
+}
+
+#[test]
 fn test_desktop_runtime_resize_focus_snapshot_and_close() {
     let runtime = DesktopRuntime::default();
     runtime

@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::runtime::{BuiltInMcpTool, WorkspaceTarget};
 use crate::native::{NativeIslandHost, NativeIslandRequest, NativeIslandResult};
+use crate::runtime::{BuiltInMcpTool, WorkspaceTarget};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum DesktopBridgeError {
