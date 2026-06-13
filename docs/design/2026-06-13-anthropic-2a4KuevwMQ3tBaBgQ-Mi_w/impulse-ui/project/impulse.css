@@ -1,0 +1,215 @@
+/* Impulse — TUI/GUI Design Explorations
+   Shared design system. Retro cockpit HUD + monospace.
+*/
+
+:root {
+  /* Background tones */
+  --bg-0: #060a0e;        /* deepest void */
+  --bg-1: #0a1117;        /* panel back */
+  --bg-2: #0f1820;        /* raised panel */
+  --bg-3: #142028;        /* hover */
+  --bg-grid: rgba(120, 220, 255, 0.04);
+
+  /* Foreground */
+  --fg-0: #d6f3ff;        /* primary text */
+  --fg-1: #8fb8c8;        /* secondary */
+  --fg-2: #5d8090;        /* tertiary / labels */
+  --fg-3: #3a5562;        /* muted / dim */
+
+  /* Accents — share lightness/chroma, vary hue */
+  --cyan:    oklch(0.82 0.14 215);   /* primary HUD */
+  --cyan-d:  oklch(0.62 0.12 215);
+  --blue:    oklch(0.74 0.15 255);
+  --amber:   oklch(0.84 0.13 78);
+  --magenta: oklch(0.72 0.17 330);
+  --green:   oklch(0.82 0.16 145);
+  --red:     oklch(0.72 0.18 25);
+
+  --border: rgba(120, 220, 255, 0.22);
+  --border-strong: rgba(120, 220, 255, 0.45);
+
+  --font-mono: "JetBrains Mono", "IBM Plex Mono", ui-monospace, Menlo, Consolas, monospace;
+  --font-pixel: "Press Start 2P", "JetBrains Mono", monospace;
+  --font-ui: "Inter", system-ui, -apple-system, "Helvetica Neue", sans-serif;
+}
+
+/* === Scanline overlay (used inside artboards that opt in) === */
+.scanlines {
+  position: relative;
+  isolation: isolate;
+}
+.scanlines::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(
+    to bottom,
+    rgba(255, 255, 255, 0.02) 0,
+    rgba(255, 255, 255, 0.02) 1px,
+    transparent 1px,
+    transparent 3px
+  );
+  pointer-events: none;
+  z-index: 10;
+}
+
+/* === Generic terminal frame === */
+.tui-frame {
+  font-family: var(--font-mono);
+  background: var(--bg-0);
+  color: var(--fg-0);
+  border: 1px solid var(--border);
+  font-size: 13px;
+  line-height: 1.5;
+  letter-spacing: 0.01em;
+}
+
+.tui-frame .row { display: flex; gap: 0; }
+.tui-frame .panel {
+  border: 1px solid var(--border);
+  padding: 8px 12px;
+}
+.tui-frame .panel-title {
+  display: inline-block;
+  position: absolute;
+  top: -8px;
+  left: 12px;
+  background: var(--bg-0);
+  padding: 0 6px;
+  color: var(--cyan);
+  font-size: 10px;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+}
+.tui-frame .panel-rel {
+  position: relative;
+}
+
+.cyan { color: var(--cyan); }
+.amber { color: var(--amber); }
+.blue { color: var(--blue); }
+.magenta { color: var(--magenta); }
+.green { color: var(--green); }
+.red { color: var(--red); }
+.dim { color: var(--fg-2); }
+.muted { color: var(--fg-3); }
+
+.dot {
+  display: inline-block;
+  width: 8px; height: 8px;
+  background: var(--cyan);
+  vertical-align: middle;
+}
+.dot-amber { background: var(--amber); }
+.dot-magenta { background: var(--magenta); }
+.dot-green { background: var(--green); }
+.dot-red { background: var(--red); }
+.dot-dim { background: var(--fg-3); }
+
+.blink { animation: blink 1.05s steps(2, end) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+
+.pulse { animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: 0.45; } }
+
+/* === Bracket corners (cockpit HUD style) === */
+.hud-frame {
+  position: relative;
+  border: 1px dashed var(--border);
+}
+.hud-frame::before, .hud-frame::after,
+.hud-frame > .bl::before, .hud-frame > .br::before {
+  content: "";
+  position: absolute;
+  width: 14px; height: 14px;
+  border: 2px solid var(--cyan);
+}
+.hud-frame::before { top: -2px; left: -2px; border-right: 0; border-bottom: 0; }
+.hud-frame::after  { top: -2px; right: -2px; border-left: 0; border-bottom: 0; }
+.hud-frame > .bl { position: absolute; bottom: -2px; left: -2px; width: 14px; height: 14px; }
+.hud-frame > .br { position: absolute; bottom: -2px; right: -2px; width: 14px; height: 14px; }
+.hud-frame > .bl::before { inset: 0; border-right: 0; border-top: 0; }
+.hud-frame > .br::before { inset: 0; border-left: 0; border-top: 0; }
+
+/* === Bar charts via background === */
+.bar {
+  display: inline-block;
+  height: 8px;
+  background: var(--cyan);
+  vertical-align: middle;
+}
+.bar-track {
+  display: inline-block;
+  height: 8px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  width: 100%;
+  position: relative;
+}
+.bar-track > i {
+  display: block;
+  height: 100%;
+  background: var(--cyan);
+}
+
+/* === ASCII characters used as building blocks === */
+pre.ascii {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.15;
+  color: var(--cyan);
+  white-space: pre;
+}
+
+/* === GUI windowed surfaces === */
+.gui-window {
+  background: var(--bg-1);
+  color: var(--fg-0);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  border: 1px solid #1c2a35;
+  box-shadow: 0 30px 80px rgba(0,0,0,0.55), 0 1px 0 rgba(255,255,255,0.03) inset;
+}
+.gui-titlebar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 36px;
+  padding: 0 12px;
+  background: linear-gradient(to bottom, #122029, #0d1820);
+  border-bottom: 1px solid #1c2a35;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--fg-1);
+}
+.tlight { width: 12px; height: 12px; border-radius: 50%; }
+
+/* === Tile glyphs === */
+.tile-grid {
+  display: grid;
+  gap: 2px;
+}
+
+/* Re-usable measurement bar */
+.meter {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.meter .track {
+  flex: 1;
+  height: 6px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  position: relative;
+  overflow: hidden;
+}
+.meter .track > i {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: var(--cyan);
+  display: block;
+}

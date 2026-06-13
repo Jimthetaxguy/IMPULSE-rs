@@ -1,0 +1,39 @@
+{
+  "generatedBy": "scripts/vendor_xterm_assets.mjs",
+  "source": "npm",
+  "packages": {
+    "@xterm/xterm": "6.0.0",
+    "@xterm/addon-fit": "0.11.0"
+  },
+  "globals": {
+    "terminal": "window.Terminal",
+    "fitAddon": "window.FitAddon.FitAddon"
+  },
+  "assets": [
+    {
+      "package": "@xterm/xterm",
+      "path": "assets/vendor/xterm/xterm.css",
+      "provides": "xterm.css"
+    },
+    {
+      "package": "@xterm/xterm",
+      "path": "assets/vendor/xterm/xterm.js",
+      "provides": "window.Terminal"
+    },
+    {
+      "package": "@xterm/addon-fit",
+      "path": "assets/vendor/xterm/addon-fit.js",
+      "provides": "window.FitAddon.FitAddon"
+    },
+    {
+      "package": "@xterm/xterm",
+      "path": "assets/vendor/xterm/LICENSE.xterm.txt",
+      "provides": "license"
+    },
+    {
+      "package": "@xterm/addon-fit",
+      "path": "assets/vendor/xterm/LICENSE.addon-fit.txt",
+      "provides": "license"
+    }
+  ]
+}

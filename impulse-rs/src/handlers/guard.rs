@@ -191,14 +191,12 @@ pub fn handle_analytics(
                         }
                     }
                 }
-                "month" => {
-                    if !analytics.conflicts_by_month.is_empty() {
-                        println!("\n--- Conflicts by Month ---");
-                        let mut months: Vec<_> = analytics.conflicts_by_month.iter().collect();
-                        months.sort_by(|a, b| a.0.cmp(b.0));
-                        for (month, count) in months.iter().rev().take(6) {
-                            println!("  {}: {}", month, count);
-                        }
+                "month" if !analytics.conflicts_by_month.is_empty() => {
+                    println!("\n--- Conflicts by Month ---");
+                    let mut months: Vec<_> = analytics.conflicts_by_month.iter().collect();
+                    months.sort_by(|a, b| a.0.cmp(b.0));
+                    for (month, count) in months.iter().rev().take(6) {
+                        println!("  {}: {}", month, count);
                     }
                 }
                 _ => {}

@@ -495,7 +495,7 @@ impl ConflictAnalytics {
         }
 
         let mut most_common_files: Vec<_> = file_counts.into_iter().collect();
-        most_common_files.sort_by(|a, b| b.1.cmp(&a.1));
+        most_common_files.sort_by_key(|b| std::cmp::Reverse(b.1));
 
         let avg_time_to_resolution_secs = if resolved_with_time > 0 {
             Some(total_resolution_time / resolved_with_time as i64)

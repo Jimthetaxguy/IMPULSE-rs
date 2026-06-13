@@ -276,8 +276,8 @@ pub async fn handle_activity(state: &Arc<state::State>, limit: usize) -> Result<
             })
             .collect();
 
-        all_files.sort_by(|a, b| b.2.cmp(&a.2));
-        all_tools.sort_by(|a, b| b.2.cmp(&a.2));
+        all_files.sort_by_key(|b| std::cmp::Reverse(b.2));
+        all_tools.sort_by_key(|b| std::cmp::Reverse(b.2));
 
         println!("\n\u{1f4dd} Files Modified:");
         for (name, file, time) in all_files.iter().take(limit) {

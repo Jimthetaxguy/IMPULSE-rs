@@ -41,7 +41,7 @@ mod tests {
         let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
         assert!(matches!(
             parsed,
-            DaemonRequest::CreateSession { name, platform } if name == "test-session"
+            DaemonRequest::CreateSession { name, platform: _ } if name == "test-session"
         ));
 
         // Test EndSession
@@ -53,7 +53,7 @@ mod tests {
         let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
         assert!(matches!(
             parsed,
-            DaemonRequest::EndSession { session_id, summary } if session_id == "test-123"
+            DaemonRequest::EndSession { session_id, summary: _ } if session_id == "test-123"
         ));
 
         // Test TrackFile
@@ -65,7 +65,7 @@ mod tests {
         let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
         assert!(matches!(
             parsed,
-            DaemonRequest::TrackFile { session_id, file_path } if file_path == "/path/to/file.rs"
+            DaemonRequest::TrackFile { session_id: _, file_path } if file_path == "/path/to/file.rs"
         ));
 
         // Test TrackTool
@@ -77,7 +77,7 @@ mod tests {
         let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
         assert!(matches!(
             parsed,
-            DaemonRequest::TrackTool { session_id, tool_name } if tool_name == "Write"
+            DaemonRequest::TrackTool { session_id: _, tool_name } if tool_name == "Write"
         ));
 
         // Test GetSession

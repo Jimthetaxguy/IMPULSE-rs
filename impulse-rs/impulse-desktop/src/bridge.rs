@@ -6,6 +6,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::native::{NativeIslandHost, NativeIslandRequest, NativeIslandResult};
+use crate::runtime::{BuiltInMcpTool, WorkspaceTarget};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum DesktopBridgeError {
@@ -32,6 +33,10 @@ pub struct TerminalOpenRequest {
     pub cwd: Option<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub workspace: Option<WorkspaceTarget>,
+    #[serde(default)]
+    pub mcp_tools: Vec<BuiltInMcpTool>,
     pub rows: u16,
     pub cols: u16,
 }

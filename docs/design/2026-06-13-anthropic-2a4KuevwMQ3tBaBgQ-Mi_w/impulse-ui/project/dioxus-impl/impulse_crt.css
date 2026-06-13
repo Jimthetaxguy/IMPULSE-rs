@@ -1,0 +1,271 @@
+/* impulse_crt.css — Retro Broadcast skin for the Dioxus desktop shell.
+   Themes the EXACT class names emitted by impulse-desktop/src/ui.rs
+   (.impulse-shell, .top-bar, .workspace-grid, .left-rail, .terminal-stage,
+   .right-inspector, .event-strip) so it drops in without restructuring RSX.
+
+   Ship as a Dioxus asset: asset!("/assets/impulse_crt.css")
+   or inline via document::Style. See INTEGRATION.md.
+
+   Design contract: chrome stays calm & legible (low bloom);
+   only the brand wordmark and a single pending signal go "loud".
+*/
+
+:root {
+  --p-black:   #000000;
+  --p-amber:   #ffb01a;
+  --p-amber-h: #ffe39a;
+  --p-orange:  #ff6a00;
+  --p-red:     #ff3b1f;
+  --p-blue:    #5b63ff;
+  --p-blue-h:  #aeb4ff;
+  --p-cyan:    #2fd0ff;
+  --p-teal:    #2fd6a8;
+  --p-lime:    #b6f03c;
+  --p-magenta: #ff3d81;
+  --p-yellow:  #ffd23f;
+
+  --c-fg:    #d6f3ff;
+  --c-dim:   #8fb8c8;
+  --c-label: #5d8090;
+  --c-faint: #3a5562;
+  --c-panel: #0a0f14;
+  --c-line:  rgba(120, 200, 255, 0.16);
+  --c-line-warm: rgba(255, 140, 40, 0.22);
+
+  --font-mono: "JetBrains Mono", "SFMono-Regular", Menlo, Monaco, monospace;
+  --font-broadcast: "Baloo 2", system-ui, sans-serif;
+}
+
+/* ===== Screen ===== */
+.impulse-shell {
+  position: relative;
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  height: 100vh;
+  margin: 0;
+  background:
+    radial-gradient(130% 100% at 50% 38%, rgba(20,16,30,0.5) 0%, #000 72%),
+    #000;
+  color: var(--c-fg);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  isolation: isolate;
+  overflow: hidden;
+}
+/* aperture grille — fine vertical stripes + faint horizontal scanlines */
+.impulse-shell::before {
+  content: "";
+  position: absolute; inset: 0;
+  pointer-events: none; z-index: 60;
+  background:
+    repeating-linear-gradient(90deg,
+      rgba(0,0,0,0) 0px, rgba(0,0,0,0) 1px,
+      rgba(0,0,0,0.45) 1.6px, rgba(0,0,0,0.45) 2px),
+    repeating-linear-gradient(0deg,
+      rgba(0,0,0,0) 0px, rgba(0,0,0,0) 2px,
+      rgba(0,0,0,0.14) 3px, rgba(0,0,0,0.14) 3.5px);
+}
+/* vignette + barrel */
+.impulse-shell::after {
+  content: "";
+  position: absolute; inset: 0;
+  pointer-events: none; z-index: 61;
+  box-shadow: inset 0 0 140px 36px rgba(0,0,0,0.9);
+}
+
+/* ===== Top bar ===== */
+.top-bar {
+  position: relative; z-index: 5;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 22px;
+  border-bottom: 1px solid var(--c-line);
+}
+.top-bar .brand { display: flex; align-items: baseline; gap: 14px; }
+.top-bar .brand h1 {
+  margin: 0;
+  font-family: var(--font-broadcast);
+  font-weight: 800;
+  font-size: 26px;
+  letter-spacing: 0.02em;
+  text-transform: lowercase;
+  color: var(--p-amber-h);
+  text-shadow:
+    0 0 1px #fff,
+    0 0 4px var(--p-amber),
+    0 0 12px var(--p-orange),
+    0 0 30px var(--p-red);
+}
+.daemon-state {
+  font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase;
+  color: var(--c-label);
+}
+.daemon-state[data-state="online"] { color: var(--p-lime); }
+.command-surface { display: flex; gap: 8px; }
+.icon-button {
+  background: transparent;
+  border: 1px solid var(--c-line);
+  color: var(--c-dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  padding: 6px 12px;
+  cursor: pointer;
+  transition: border-color .15s, color .15s;
+}
+.icon-button:hover { border-color: var(--p-cyan); color: var(--p-cyan); }
+
+/* ===== Workspace grid ===== */
+.workspace-grid {
+  position: relative; z-index: 5;
+  display: grid;
+  grid-template-columns: 232px 1fr 300px;
+  min-height: 0;
+}
+
+/* Left rail */
+.left-rail {
+  border-right: 1px solid var(--c-line);
+  padding: 16px 14px;
+  display: flex; flex-direction: column; gap: 4px;
+  overflow: auto;
+}
+.left-rail h2 {
+  margin: 14px 0 8px;
+  font-size: 10px; letter-spacing: 0.22em; text-transform: uppercase;
+  color: var(--c-label); font-weight: 500;
+}
+.left-rail h2:first-child { margin-top: 0; }
+.rail-item {
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-left: 2px solid transparent;
+  color: var(--c-dim);
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  padding: 7px 12px;
+  cursor: pointer;
+  transition: background .15s, color .15s;
+}
+.rail-item:hover { background: rgba(120,200,255,0.05); color: var(--c-fg); }
+.rail-item.active {
+  background: rgba(123,224,255,0.08);
+  border-left-color: var(--p-cyan);
+  color: var(--p-cyan);
+}
+.agent-pool { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; }
+
+/* status dots for agents (add a <span class="dot status-*"> in RSX) */
+.impulse-shell .dot {
+  display: inline-block; width: 7px; height: 7px; margin-right: 8px;
+  vertical-align: middle; background: var(--c-faint);
+}
+.impulse-shell .status-working   { background: var(--p-cyan);  box-shadow: 0 0 6px var(--p-cyan); }
+.impulse-shell .status-starting  { background: var(--p-yellow); box-shadow: 0 0 6px var(--p-yellow); }
+.impulse-shell .status-blocked   { background: var(--p-red);   box-shadow: 0 0 6px var(--p-red); }
+.impulse-shell .status-idle      { background: var(--c-faint); }
+.impulse-shell .status-completed { background: var(--p-lime); }
+
+/* ===== Terminal stage ===== */
+.terminal-stage {
+  display: flex; flex-direction: column; min-height: 0;
+  background: #03060a;
+}
+.terminal-tabs {
+  display: flex; gap: 0;
+  border-bottom: 1px solid var(--c-line);
+}
+.terminal-tab {
+  background: transparent; border: 0;
+  border-right: 1px solid var(--c-line);
+  border-bottom: 2px solid transparent;
+  color: var(--c-dim);
+  font-family: var(--font-mono); font-size: 12px;
+  padding: 8px 16px; cursor: pointer;
+}
+.terminal-tab.active { color: var(--p-amber-h); border-bottom-color: var(--p-amber); }
+.xterm-mount { flex: 1; min-height: 0; padding: 8px 10px; }
+.xterm-mount.pending { opacity: .5; }
+.xterm-mount[data-xterm-state="degraded"]::after {
+  content: "terminal interop degraded — xterm.js / Tauri not detected";
+  color: var(--p-red); font-size: 11px;
+}
+
+/* ===== Right inspector ===== */
+.right-inspector {
+  border-left: 1px solid var(--c-line);
+  padding: 16px 18px;
+  display: flex; flex-direction: column; gap: 18px;
+  overflow: auto;
+}
+.inspector-section h2 {
+  margin: 0 0 6px;
+  font-size: 10px; letter-spacing: 0.22em; text-transform: uppercase;
+  color: var(--c-label); font-weight: 500;
+}
+.inspector-section p { margin: 0; font-size: 12.5px; color: var(--c-dim); line-height: 1.5; }
+
+/* numeric stat trio inside inspector or home */
+.impulse-shell .stat-row { display: grid; grid-template-columns: repeat(3, 1fr);
+  border-top: 1px solid var(--c-line); border-bottom: 1px solid var(--c-line); }
+.impulse-shell .stat { padding: 14px 16px; border-right: 1px solid var(--c-line); }
+.impulse-shell .stat:last-child { border-right: 0; }
+.impulse-shell .stat .k { font-size: 10px; letter-spacing: 0.22em; color: var(--c-label); text-transform: uppercase; }
+.impulse-shell .stat .v {
+  font-family: var(--font-broadcast); font-weight: 800; font-size: 30px; line-height: 1; margin-top: 6px;
+  color: #d8faff; text-shadow: 0 0 4px var(--p-cyan), 0 0 14px rgba(47,208,255,0.55);
+}
+.impulse-shell .stat .s { font-size: 11px; color: var(--c-dim); margin-top: 6px; }
+
+/* pending review — the one "loud" signal */
+.impulse-shell .pending-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  border: 1px solid var(--c-line-warm);
+  box-shadow: inset 0 0 18px rgba(255,106,0,0.18);
+  padding: 12px 18px; margin-top: 4px;
+}
+.impulse-shell .pending-bar .label { font-size: 13px; color: #ffce8a; }
+.impulse-shell .pending-bar .label .mark { color: var(--p-amber-h); font-weight: 800; margin-right: 10px;
+  text-shadow: 0 0 6px var(--p-orange); }
+.impulse-shell .pending-bar .keys { font-size: 12px; color: var(--c-dim); }
+.impulse-shell .pending-bar .keys b { color: var(--p-amber-h); font-weight: 700; }
+
+/* ===== Event strip ===== */
+.event-strip {
+  position: relative; z-index: 5;
+  display: flex; gap: 22px;
+  padding: 6px 22px;
+  border-top: 1px solid var(--c-line);
+  font-size: 11px; color: var(--c-label);
+}
+.event-strip span::before { content: "› "; color: var(--p-cyan); }
+
+/* ===== Brand lockup (boot / home hero) ===== */
+.impulse-shell .crt-hero { display: flex; align-items: center; justify-content: center; gap: 40px; padding: 28px 0 8px; }
+.impulse-shell .brand-wordmark {
+  font-family: var(--font-broadcast); font-weight: 800; font-size: 80px; line-height: .85;
+  letter-spacing: .02em; text-transform: lowercase; color: var(--p-amber-h);
+  text-shadow: 0 0 1px #fff, 0 0 4px var(--p-amber), 0 0 10px var(--p-orange),
+               0 0 24px var(--p-orange), 0 0 52px var(--p-red);
+}
+.impulse-shell .brand-tagline {
+  font-family: var(--font-broadcast); font-weight: 700; font-size: 14px;
+  letter-spacing: .4em; text-transform: uppercase; margin-top: 8px;
+  color: #d8faff; text-shadow: 0 0 5px var(--p-cyan), 0 0 14px var(--p-cyan);
+}
+.glow-blue  { filter: drop-shadow(0 0 6px var(--p-blue)) drop-shadow(0 0 20px #3138e0); }
+.glow-soft  { filter: drop-shadow(0 0 4px rgba(255,140,40,0.7)); }
+
+/* boot checklist */
+.boot-list { width: 420px; margin: 14px auto 0; line-height: 2; font-size: 14px; }
+.boot-list .ln { display: flex; justify-content: space-between; }
+.boot-list .ok  { color: var(--p-lime); font-weight: 800; margin-right: 14px; text-shadow: 0 0 6px #7bc400; }
+.boot-list .arm { color: var(--p-amber-h); font-weight: 800; margin-right: 14px; text-shadow: 0 0 6px var(--p-orange); }
+.boot-list .name { color: var(--c-dim); }
+.boot-list .state { color: #d8faff; font-size: 12px; text-shadow: 0 0 5px var(--p-cyan); }
+
+/* motion, accessibility-gated */
+@media (prefers-reduced-motion: no-preference) {
+  .impulse-shell { animation: crt-flicker 5.2s steps(60) infinite; }
+}
+@keyframes crt-flicker { 0%,100%{opacity:1} 3%{opacity:.975} 47%{opacity:.99} }

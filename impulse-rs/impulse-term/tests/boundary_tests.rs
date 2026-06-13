@@ -5,17 +5,22 @@
 
 use impulse_term::{bracketed_paste, AgentKind, ContextHealth, ContextTier, TerminalBackend};
 
+/// The exact signature `TerminalBackend::spawn` must keep exporting when built
+/// without the egui feature. Aliasing both documents the API contract and
+/// satisfies `clippy::type_complexity` (clippy's own "factor into a type def").
+type SpawnFn = fn(
+    &str,
+    &[String],
+    Option<&std::path::Path>,
+    &[(&str, String)],
+    u16,
+    u16,
+    Option<usize>,
+) -> Result<TerminalBackend, Box<dyn std::error::Error>>;
+
 #[test]
 fn test_core_exports_available_without_egui_feature() {
-    let _spawn: fn(
-        &str,
-        &[String],
-        Option<&std::path::Path>,
-        &[(&str, String)],
-        u16,
-        u16,
-        Option<usize>,
-    ) -> Result<TerminalBackend, Box<dyn std::error::Error>> = TerminalBackend::spawn;
+    let _spawn: SpawnFn = TerminalBackend::spawn;
 
     assert_eq!(AgentKind::detect("codex", "agent"), AgentKind::Codex);
     assert_eq!(ContextTier::Critical.as_str(), "critical");
