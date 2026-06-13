@@ -41,7 +41,6 @@ pub use theme::{
 };
 pub use ui::{DesktopShell, DesktopShellWithSnapshot, DesktopShellWithSnapshotProps};
 pub use views::{
-    ArtifactsView, ArtifactsViewProps, DesktopView, MemoryView, MemoryViewProps, ReviewView,
-    ReviewViewProps, ShellIntent, SupervisorView, SupervisorViewProps,
+    ArtifactsView, ArtifactsViewProps, DesktopView, MemoryView, MemoryViewProps, ShellIntent,
 };
 pub use workspace::{WorkspaceEntry, WorkspaceRegistry, WorkspaceRegistryError};

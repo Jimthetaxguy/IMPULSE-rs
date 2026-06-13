@@ -19,14 +19,11 @@
 
 use dioxus::prelude::*;
 use impulse_ops::{
-    AgentRuntime, ArtifactEnvelope, ArtifactStatus, ArtifactViewHint, ContextHealthSummary,
-    DelegationSummary, InsightRecord, InterventionRecommendation, MemorySummary, RetrievalSummary,
+    ArtifactEnvelope, ArtifactStatus, ArtifactViewHint, ContextHealthSummary, InsightRecord,
+    MemorySummary, RetrievalSummary,
 };
 
-use crate::theme::{
-    artifact_status_class, artifact_status_label, format_count, severity_class, status_dot_class,
-    status_label, usage_meter_pct,
-};
+use crate::theme::{artifact_status_class, artifact_status_label, format_count, usage_meter_pct};
 
 /// The five center-stage destinations reachable from the left-rail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,34 +68,22 @@ impl DesktopView {
     }
 }
 
-/// A user intent emitted by an action button.
-///
-/// The shell records the latest intent in a status line. Wiring these to the
-/// real `supervisor_local_action` Tauri command is a deliberate follow-up —
-/// the command surface stays untouched in this redesign pass.
+/// A user intent emitted by an artifact action button. The shell records the
+/// latest intent in its status line; wiring it to a real Tauri command is a
+/// deliberate follow-up (the command surface stays untouched here).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellIntent {
-    ApplyInjection,
-    SkipInjection,
-    OpenInjectionDiff,
     ArtifactAction { artifact_id: String, action: String },
-    ResolveIntervention { id: String },
 }
 
 impl ShellIntent {
     /// One-line description shown in the shell's status line.
     pub fn describe(&self) -> String {
         match self {
-            ShellIntent::ApplyInjection => "apply injection bundle".to_string(),
-            ShellIntent::SkipInjection => "skip injection bundle".to_string(),
-            ShellIntent::OpenInjectionDiff => "open injection diff".to_string(),
             ShellIntent::ArtifactAction {
                 artifact_id,
                 action,
             } => format!("{action} on artifact {artifact_id}"),
-            ShellIntent::ResolveIntervention { id } => {
-                format!("resolve intervention {id}")
-            }
         }
     }
 }
@@ -278,112 +263,6 @@ pub fn MemoryView(
     }
 }
 
-// ──────────────────────────── Review view ────────────────────────────
-
-/// The product's signature flow: review-before-apply. The injection bundle is
-/// the hero — what *would* be added to context, shown as additive diff lines,
-/// with an explicit apply / diff / skip action row. This is the only data
-/// view allowed a warm accent (the apply affordance).
-#[component]
-pub fn ReviewView(
-    pending: usize,
-    insights: Vec<InsightRecord>,
-    staged: Vec<ArtifactEnvelope>,
-    on_intent: EventHandler<ShellIntent>,
-) -> Element {
-    let bundle_items = insights.len() + staged.len();
-    let nothing = pending == 0 && bundle_items == 0;
-
-    if nothing {
-        return rsx! {
-            div { class: "stage-view view-review active", "data-view": "review",
-                div { class: "review-empty",
-                    div { class: "review-empty-mark", "✓" }
-                    div { class: "review-empty-title", "Memory is quiet" }
-                    div { class: "review-empty-sub", "Nothing staged for review. Impulse is watching silently." }
-                }
-            }
-        };
-    }
-
-    rsx! {
-        div { class: "stage-view view-review active", "data-view": "review",
-            header { class: "view-hero review-hero",
-                div { class: "view-eyebrow", "Review before apply" }
-                div { class: "view-hero-row",
-                    div { class: "view-hero-value", "{pending}" }
-                    div { class: "view-hero-meta",
-                        div { class: "view-hero-tier", "bundle(s) awaiting review" }
-                        div { class: "view-hero-sub",
-                            "{insights.len()} insights · {staged.len()} staged artifacts"
-                        }
-                    }
-                }
-            }
-            section { class: "view-section diff-preview", "data-source": "injection_bundle",
-                h3 { "Would inject" }
-                if bundle_items == 0 {
-                    p { class: "section-empty", "Nothing in this bundle." }
-                } else {
-                    div { class: "diff-lines",
-                        for (i, insight) in insights.iter().enumerate() {
-                            {
-                                let kind = if insight.kind.is_empty() {
-                                    "note"
-                                } else {
-                                    insight.kind.as_str()
-                                };
-                                rsx! {
-                                    div { key: "ins-{i}", class: "diff-line add",
-                                        span { class: "diff-sign", "+" }
-                                        span { class: "diff-kind", "{kind}" }
-                                        span { class: "diff-agent", "{insight.agent_label}" }
-                                        span { class: "diff-text", "{insight.content}" }
-                                    }
-                                }
-                            }
-                        }
-                        for (i, artifact) in staged.iter().enumerate() {
-                            {
-                                let title = if artifact.title.is_empty() {
-                                    artifact.kind.clone()
-                                } else {
-                                    artifact.title.clone()
-                                };
-                                rsx! {
-                                    div { key: "art-{i}", class: "diff-line add staged",
-                                        span { class: "diff-sign", "+" }
-                                        span { class: "diff-kind", "{artifact_status_label(&artifact.status)}" }
-                                        span { class: "diff-agent", "{artifact.agent_id}" }
-                                        span { class: "diff-text", "{title}" }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            div { class: "review-bundle-actions",
-                button {
-                    class: "action-apply",
-                    onclick: move |_| on_intent.call(ShellIntent::ApplyInjection),
-                    "apply"
-                }
-                button {
-                    class: "action-ghost",
-                    onclick: move |_| on_intent.call(ShellIntent::OpenInjectionDiff),
-                    "diff"
-                }
-                button {
-                    class: "action-ghost",
-                    onclick: move |_| on_intent.call(ShellIntent::SkipInjection),
-                    "skip"
-                }
-            }
-        }
-    }
-}
-
 // ──────────────────────────── Artifacts view ────────────────────────────
 
 #[component]
@@ -512,151 +391,6 @@ pub fn ArtifactsView(
     }
 }
 
-// ──────────────────────────── Supervisor view ────────────────────────────
-
-#[component]
-fn InterventionCard(
-    rec: InterventionRecommendation,
-    on_intent: EventHandler<ShellIntent>,
-) -> Element {
-    let id = rec.id.clone();
-    let target = rec.target_agent_id.clone().unwrap_or_default();
-    let action_label = if rec.action_label.is_empty() {
-        "resolve".to_string()
-    } else {
-        rec.action_label.clone()
-    };
-    rsx! {
-        article { class: "intervention-card {severity_class(&rec.severity)}",
-            "data-intervention-id": "{rec.id}",
-            header { class: "intervention-head",
-                span { class: "sev-badge", "{rec.severity}" }
-                h4 { "{rec.title}" }
-            }
-            if !rec.description.is_empty() {
-                p { class: "intervention-desc", "{rec.description}" }
-            }
-            div { class: "intervention-foot",
-                if !target.is_empty() {
-                    span { class: "intervention-target", "→ {target}" }
-                }
-                button {
-                    class: "action-ghost",
-                    onclick: move |_| on_intent.call(ShellIntent::ResolveIntervention { id: id.clone() }),
-                    "{action_label}"
-                }
-            }
-        }
-    }
-}
-
-#[component]
-fn DelegationRow(delegation: DelegationSummary) -> Element {
-    let diff_text = match delegation.diff_summary.as_ref() {
-        Some(d) => format!(
-            "+{} −{} · {} files",
-            d.lines_added, d.lines_removed, d.files_changed
-        ),
-        None => "no diff".to_string(),
-    };
-    let worker = delegation
-        .worker_pane_id
-        .map(|w| w.to_string())
-        .unwrap_or_else(|| "—".to_string());
-    rsx! {
-        div { class: "delegation-row", "data-delegation-id": "{delegation.id}",
-            span { class: "delegation-task", "{delegation.task}" }
-            span { class: "delegation-state", "{delegation.state}" }
-            span { class: "delegation-route", "{delegation.coordinator_pane_id} → {worker}" }
-            span { class: "delegation-diff", "{diff_text}" }
-        }
-    }
-}
-
-/// Operator board: interventions (severity-coded), delegations, and an agent
-/// status table. This is the densest view — Operator density mode.
-#[component]
-pub fn SupervisorView(
-    interventions: Vec<InterventionRecommendation>,
-    delegations: Vec<DelegationSummary>,
-    agents: Vec<AgentRuntime>,
-    on_intent: EventHandler<ShellIntent>,
-) -> Element {
-    let headline = if interventions.is_empty() {
-        "clear".to_string()
-    } else {
-        interventions.len().to_string()
-    };
-    rsx! {
-        div { class: "stage-view view-supervisor active", "data-view": "supervisor",
-            header { class: "view-hero",
-                div { class: "view-eyebrow", "Operator board" }
-                div { class: "view-hero-row",
-                    div { class: "view-hero-value", "{headline}" }
-                    div { class: "view-hero-meta",
-                        div { class: "view-hero-tier", "interventions" }
-                        div { class: "view-hero-sub",
-                            "{agents.len()} agents · {delegations.len()} delegations"
-                        }
-                    }
-                }
-            }
-            section { class: "view-section interventions", "data-source": "interventions",
-                h3 { "Interventions" }
-                if interventions.is_empty() {
-                    p { class: "section-empty", "No interventions recommended." }
-                } else {
-                    div { class: "intervention-grid",
-                        for rec in interventions.iter() {
-                            InterventionCard { key: "{rec.id}", rec: rec.clone(), on_intent }
-                        }
-                    }
-                }
-            }
-            section { class: "view-section delegations", "data-source": "delegations",
-                h3 { "Delegations" }
-                if delegations.is_empty() {
-                    p { class: "section-empty", "No active delegations." }
-                } else {
-                    div { class: "delegation-list",
-                        for delegation in delegations.iter() {
-                            DelegationRow { key: "{delegation.id}", delegation: delegation.clone() }
-                        }
-                    }
-                }
-            }
-            section { class: "view-section agent-board", "data-source": "agents",
-                h3 { "Agents" }
-                if agents.is_empty() {
-                    p { class: "section-empty", "No agents running." }
-                } else {
-                    div { class: "agent-board-list",
-                        for agent in agents.iter() {
-                            {
-                                let task = agent.current_task.clone().unwrap_or_default();
-                                let diff = match agent.diff_summary.as_ref() {
-                                    Some(d) => format!("+{} −{}", d.lines_added, d.lines_removed),
-                                    None => String::new(),
-                                };
-                                rsx! {
-                                    div { key: "{agent.id}", class: "agent-board-row",
-                                        "data-agent-id": "{agent.id}",
-                                        span { class: "dot {status_dot_class(&agent.agent_status)}" }
-                                        span { class: "agent-board-label", "{agent.label}" }
-                                        span { class: "agent-board-status", "{status_label(&agent.agent_status)}" }
-                                        span { class: "agent-board-task", "{task}" }
-                                        span { class: "agent-board-diff", "{diff}" }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -686,31 +420,12 @@ mod tests {
     #[test]
     fn test_shell_intent_describe_is_human_readable() {
         assert_eq!(
-            ShellIntent::ApplyInjection.describe(),
-            "apply injection bundle"
-        );
-        assert_eq!(
             ShellIntent::ArtifactAction {
                 artifact_id: "art-1".to_string(),
                 action: "apply".to_string(),
             }
             .describe(),
             "apply on artifact art-1"
-        );
-        assert_eq!(
-            ShellIntent::ResolveIntervention {
-                id: "iv-9".to_string()
-            }
-            .describe(),
-            "resolve intervention iv-9"
-        );
-        assert_eq!(
-            ShellIntent::SkipInjection.describe(),
-            "skip injection bundle"
-        );
-        assert_eq!(
-            ShellIntent::OpenInjectionDiff.describe(),
-            "open injection diff"
         );
     }
 
