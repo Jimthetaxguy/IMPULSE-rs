@@ -20,8 +20,8 @@ pub use native::{
     NativeIslandResult,
 };
 pub use runtime::{
-    AgentPlatformKind, AgentRuntimeSnapshot, AgentSpawnRequest, AgentWriteRequest, DesktopEvent,
-    DesktopEventSink, DesktopRuntime, DesktopRuntimeBuilder, LocalSupervisorAction,
-    SupervisorLocalActionRequest,
+    default_builtin_mcp_tools, AgentPlatformKind, AgentRuntimeSnapshot, AgentSpawnRequest,
+    AgentWriteRequest, BuiltInMcpTool, DesktopEvent, DesktopEventSink, DesktopRuntime,
+    DesktopRuntimeBuilder, LocalSupervisorAction, SupervisorLocalActionRequest, WorkspaceTarget,
 };
 pub use ui::DesktopShell;

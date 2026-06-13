@@ -12,6 +12,84 @@ use crate::bridge::{
     TerminalOpenRequest, TerminalResizeRequest, TerminalSessionResponse, TerminalWriteRequest,
 };
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceTarget {
+    pub root: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub purpose: Option<String>,
+}
+
+impl WorkspaceTarget {
+    pub fn from_root(root: impl Into<String>) -> Self {
+        let root = root.into();
+        Self {
+            label: Path::new(&root)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .map(|value| value.to_string()),
+            root,
+            purpose: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BuiltInMcpTool {
+    pub name: String,
+    pub description: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub requires_confirmation: bool,
+}
+
+impl BuiltInMcpTool {
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        capabilities: Vec<String>,
+        requires_confirmation: bool,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            capabilities,
+            requires_confirmation,
+        }
+    }
+}
+
+pub fn default_builtin_mcp_tools() -> Vec<BuiltInMcpTool> {
+    vec![
+        BuiltInMcpTool::new(
+            "impulse.agent_spawn",
+            "Start a terminal coding agent in an explicit workspace through the Rust PTY runtime.",
+            vec!["terminal".to_string(), "workspace".to_string()],
+            true,
+        ),
+        BuiltInMcpTool::new(
+            "impulse.agent_write",
+            "Send confirmed input bytes to a running terminal coding agent.",
+            vec!["terminal".to_string()],
+            true,
+        ),
+        BuiltInMcpTool::new(
+            "impulse.search_memory",
+            "Search Impulse memory and session history for context before agent action.",
+            vec!["memory".to_string(), "read_only".to_string()],
+            false,
+        ),
+        BuiltInMcpTool::new(
+            "impulse.review_injection",
+            "Stage retrieved context for review before injecting it into an agent terminal.",
+            vec!["context".to_string(), "review".to_string()],
+            true,
+        ),
+    ]
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum AgentPlatformKind {
@@ -64,6 +142,10 @@ pub struct AgentSpawnRequest {
     pub cwd: Option<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub workspace: Option<WorkspaceTarget>,
+    #[serde(default)]
+    pub mcp_tools: Vec<BuiltInMcpTool>,
     pub rows: u16,
     pub cols: u16,
     #[serde(default)]
@@ -104,6 +186,7 @@ pub struct AgentRuntimeSnapshot {
     pub command: String,
     pub args: Vec<String>,
     pub cwd: Option<String>,
+    pub workspace: Option<WorkspaceTarget>,
     pub session_id: Option<String>,
     pub rows: u16,
     pub cols: u16,
@@ -113,6 +196,7 @@ pub struct AgentRuntimeSnapshot {
     pub current_task: Option<String>,
     pub role: Option<AgentRole>,
     pub target: Option<MachineTarget>,
+    pub mcp_tools: Vec<BuiltInMcpTool>,
     pub output_bytes: u64,
     pub output_lines: u64,
     pub context: ContextHealthSummary,
@@ -157,9 +241,11 @@ struct RuntimeRecord {
     command: String,
     args: Vec<String>,
     cwd: Option<PathBuf>,
+    workspace: Option<WorkspaceTarget>,
     session_id: Option<String>,
     role: Option<AgentRole>,
     target: Option<MachineTarget>,
+    mcp_tools: Vec<BuiltInMcpTool>,
     focused: bool,
     status: AgentStatus,
     backend: TerminalBackend,
@@ -181,6 +267,7 @@ impl RuntimeRecord {
             command: self.command.clone(),
             args: self.args.clone(),
             cwd: self.cwd.as_ref().map(|path| path.display().to_string()),
+            workspace: self.workspace.clone(),
             session_id: self.session_id.clone(),
             rows,
             cols,
@@ -190,6 +277,7 @@ impl RuntimeRecord {
             current_task: None,
             role: self.role.clone(),
             target: self.target.clone(),
+            mcp_tools: self.mcp_tools.clone(),
             output_bytes: self.backend.output_bytes(),
             output_lines: self.backend.output_lines(),
             context: ContextHealthSummary::default(),
@@ -244,6 +332,15 @@ impl DesktopRuntime {
                 sanitize_runtime_id(&format!("{}-{}", request.platform.as_str(), Uuid::new_v4()))
             });
         let cwd = request.cwd.as_ref().map(PathBuf::from);
+        let workspace = request
+            .workspace
+            .clone()
+            .or_else(|| request.cwd.clone().map(WorkspaceTarget::from_root));
+        let mcp_tools = if request.mcp_tools.is_empty() {
+            default_builtin_mcp_tools()
+        } else {
+            request.mcp_tools.clone()
+        };
         let env_pairs = runtime_env(&agent_id, &request, &command);
         let sink = Arc::clone(&self.sink);
         let output_agent_id = agent_id.clone();
@@ -282,9 +379,11 @@ impl DesktopRuntime {
             command,
             args: request.args,
             cwd,
+            workspace,
             session_id: request.session_id,
             role: request.role,
             target: request.target,
+            mcp_tools,
             focused: false,
             status: AgentStatus::Starting,
             backend,
@@ -444,6 +543,8 @@ impl TerminalBridge for DesktopRuntime {
             args: request.args,
             cwd: request.cwd,
             env: request.env,
+            workspace: request.workspace,
+            mcp_tools: request.mcp_tools,
             rows: request.rows,
             cols: request.cols,
             role: None,
