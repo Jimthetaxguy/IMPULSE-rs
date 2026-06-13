@@ -9,6 +9,7 @@ pub mod mcp;
 pub mod native;
 pub mod runtime;
 pub mod tauri_commands;
+pub mod theme;
 pub mod ui;
 pub mod workspace;
 
@@ -30,5 +31,6 @@ pub use runtime::{
     AgentWriteRequest, BuiltInMcpTool, DesktopEvent, DesktopEventSink, DesktopRuntime,
     DesktopRuntimeBuilder, LocalSupervisorAction, SupervisorLocalActionRequest, WorkspaceTarget,
 };
-pub use ui::DesktopShell;
+pub use theme::{format_count, status_dot_class, status_label};
+pub use ui::{DesktopShell, DesktopShellWithSnapshot, DesktopShellWithSnapshotProps};
 pub use workspace::{WorkspaceEntry, WorkspaceRegistry, WorkspaceRegistryError};

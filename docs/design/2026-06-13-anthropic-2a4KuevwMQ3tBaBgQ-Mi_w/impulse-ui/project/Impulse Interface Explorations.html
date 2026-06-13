@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Impulse — TUI / GUI Explorations</title>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&family=Baloo+2:wght@500;600;700;800&family=Press+Start+2P&display=swap" rel="stylesheet"/>
+<link rel="stylesheet" href="impulse.css"/>
+<link rel="stylesheet" href="crt.css"/>
+<link rel="stylesheet" href="dioxus-impl/impulse_crt.css"/>
+<style>
+  body { margin: 0; background: #0a1117; }
+</style>
+</head>
+<body>
+
+<div id="root"></div>
+
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+<script type="text/babel" src="design-canvas.jsx"></script>
+<script type="text/babel" src="rocket-sprite.jsx"></script>
+<script type="text/babel" src="v1-tui-cockpit.jsx"></script>
+<script type="text/babel" src="v1b-tui-cockpit-calm.jsx"></script>
+<script type="text/babel" src="v2-tui-tmux.jsx"></script>
+<script type="text/babel" src="v3-tui-minimal.jsx"></script>
+<script type="text/babel" src="v4-gui-workbench.jsx"></script>
+<script type="text/babel" src="v4b-gui-workbench-calm.jsx"></script>
+<script type="text/babel" src="v5-gui-memory.jsx"></script>
+<script type="text/babel" src="v6-gui-board.jsx"></script>
+<script type="text/babel" src="v7-principles.jsx"></script>
+<script type="text/babel" src="v8-retro-brand.jsx"></script>
+<script type="text/babel" src="v9-retro-boot.jsx"></script>
+<script type="text/babel" src="v10-dioxus-shell.jsx"></script>
+
+<script type="text/babel">
+const { DesignCanvas, DCSection, DCArtboard } = window;
+
+const Intro = () => (
+  <div style={{
+    fontFamily: "Inter, system-ui, sans-serif",
+    color: "#d6f3ff", padding: "32px 40px", maxWidth: 980,
+    background: "#0f1820", border: "1px solid #1c2a35"
+  }}>
+    <div style={{fontFamily:"JetBrains Mono", fontSize:11, color:"#5d8090", letterSpacing:"0.25em"}}>
+      DESIGN EXPLORATION · IMPULSE TUI/GUI
+    </div>
+    <h1 style={{fontFamily:"JetBrains Mono", fontWeight:700, fontSize:32, margin:"10px 0 14px", color:"#7be0ff"}}>
+      Six directions for the Impulse interface
+    </h1>
+    <p style={{fontSize:14, lineHeight:1.65, color:"#8fb8c8", margin:0}}>
+      Inspired by your reference cockpit-HUD frame and grounded in the actual
+      <span style={{color:"#d6f3ff"}}> impulse-rs </span>
+      codebase (ratatui TUI + egui workbench, daemon, retrieval, injection, steward, guardrail,
+      multi-agent orchestration). Three TUI directions, three GUI directions — each pulls a
+      different lever (density, narrative, data-viz, operator-board, etc.) so we can mix and
+      match before committing.
+    </p>
+    <div style={{display:"grid", gridTemplateColumns:"repeat(3, 1fr)", gap:12, marginTop:22, fontSize:12}}>
+      {[
+        ["TUI · Cockpit Supervisor",   "Brand splash. Hi-density HUD with pixel-grid wordmark, memory stream, agent network, event log.", "#7be0ff"],
+        ["TUI · Tmux Workbench",       "Operator path. ratatui-style multipane: sidebar + 2×2 agent panes + status line. What `cargo run -- run` should look like.", "#7be0ff"],
+        ["TUI · Minimal Flow",         "Quiet. Narrow column · prose-first · charm/glow-style. For the 'silent' part of the promise.", "#7be0ff"],
+        ["GUI · Workbench Overview",   "egui-native. Stat cards, signal history, subsystem panel, daemon RTT in status bar.", "#ffce6b"],
+        ["GUI · Memory Map",           "Genome as graph. Force layout + injection diff inspector + 30-day growth timeline.", "#ffce6b"],
+        ["GUI · Orchestration Board",  "Kanban for agents. Queue → in-flight → review → done · handoff prep · steward proposal.", "#ffce6b"],
+      ].map((c, i) => (
+        <div key={i} style={{background:"#0a1117", border:"1px solid #1c2a35", padding:"12px 14px"}}>
+          <div style={{color:c[2], fontFamily:"JetBrains Mono", fontSize:12, marginBottom:6}}>{c[0]}</div>
+          <div style={{color:"#8fb8c8", lineHeight:1.55}}>{c[1]}</div>
+        </div>
+      ))}
+    </div>
+    <div style={{marginTop:22, fontSize:12, color:"#5d8090", lineHeight:1.7}}>
+      <span style={{color:"#ffce6b"}}>Next steps:</span> tell me which direction(s) to advance —
+      we can also fork any artboard for sub-variations (color, density, motion), then turn the
+      winner into a clickable prototype with real keyboard shortcuts and signal-bus toasts.
+    </div>
+  </div>
+);
+
+const App = () => (
+  <DesignCanvas
+    title="Impulse — TUI / GUI Explorations"
+    subtitle="Six directions across terminal and desktop surfaces · grounded in impulse-rs"
+  >
+    <DCSection id="brief" title="Brief">
+      <DCArtboard id="intro" label="Read me first" width={1060} height={520}>
+        <Intro/>
+      </DCArtboard>
+      <DCArtboard id="principles" label="Design Principles · v0.1 (refined from explorations)" width={1180} height={1500}>
+        <window.Principles/>
+      </DCArtboard>
+    </DCSection>
+
+    <DCSection id="retro" title="Retro Broadcast direction (70s–80s CRT)">
+      <DCArtboard id="retro-brand" label="V8 · IMPULSE broadcast lockup (aperture-iris + rocket + phosphor)" width={1000} height={720}>
+        <window.RetroBrand/>
+      </DCArtboard>
+      <DCArtboard id="retro-boot" label="V9 · CRT boot / home screen (vibe applied to product UI)" width={1100} height={720}>
+        <window.RetroBoot/>
+      </DCArtboard>
+      <DCArtboard id="dioxus-shell" label="V10 · Dioxus desktop shell — retro-themed (real ui.rs DOM + shipped impulse_crt.css)" width={1320} height={820}>
+        <window.DioxusShellRetro/>
+      </DCArtboard>
+    </DCSection>
+
+    <DCSection id="tui" title="TUI directions">
+      <DCArtboard id="tui-cockpit-calm" label="V1b · Cockpit · Calm (NEW · ASCII rocket + progressive disclosure)" width={1140} height={760}>
+        <window.TuiCockpitCalm/>
+      </DCArtboard>
+      <DCArtboard id="tui-cockpit" label="V1 · Cockpit Supervisor (dense original)" width={1140} height={1000}>
+        <window.TuiCockpit/>
+      </DCArtboard>
+      <DCArtboard id="tui-tmux" label="V2 · Tmux Workbench" width={1300} height={760}>
+        <window.TuiTmux/>
+      </DCArtboard>
+      <DCArtboard id="tui-minimal" label="V3 · Minimal Flow" width={780} height={700}>
+        <window.TuiMinimal/>
+      </DCArtboard>
+    </DCSection>
+
+    <DCSection id="gui" title="GUI directions">
+      <DCArtboard id="gui-workbench-calm" label="V4b · Workbench · Calm (NEW · ASCII rocket hero, one primary action)" width={1300} height={840}>
+        <window.GuiWorkbenchCalm/>
+      </DCArtboard>
+      <DCArtboard id="gui-workbench" label="V4 · Workbench Overview (dense original)" width={1300} height={840}>
+        <window.GuiWorkbench/>
+      </DCArtboard>
+      <DCArtboard id="gui-memory" label="V5 · Memory Map" width={1300} height={840}>
+        <window.GuiMemoryMap/>
+      </DCArtboard>
+      <DCArtboard id="gui-board" label="V6 · Orchestration Board" width={1340} height={840}>
+        <window.GuiAgentBoard/>
+      </DCArtboard>
+    </DCSection>
+  </DesignCanvas>
+);
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>

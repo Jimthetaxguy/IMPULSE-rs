@@ -1,9 +1,13 @@
 use dioxus::prelude::*;
+use impulse_ops::ProjectOpsSnapshot;
 
 use crate::mcp::McpInvocation;
 use crate::runtime::{AgentRuntimeSnapshot, BuiltInMcpTool};
 use crate::tauri_commands::McpInvokeRequest;
+use crate::theme::{format_count, status_dot_class, status_label};
 use crate::workspace::WorkspaceEntry;
+
+const CRT_CSS: &str = include_str!("../assets/impulse_crt.css");
 
 const TERMINAL_INTEROP_SCRIPT: &str = r#"
 (() => {
@@ -161,7 +165,10 @@ fn AgentPool(
                                 class: "{class_name}",
                                 "data-agent-id": "{id}",
                                 onclick: move |_| on_focus.call(id_for_click.clone()),
-                                "{snapshot.label}" }
+                                span { class: "dot {status_dot_class(&snapshot.status)}" }
+                                "{snapshot.label}"
+                                span { class: "agent-status-label", "{status_label(&snapshot.status)}" }
+                            }
                         }
                     }
                 }
@@ -375,19 +382,157 @@ fn WorkspaceList(workspaces: Vec<WorkspaceEntry>, selected_root: Option<String>)
 }
 
 #[component]
-pub fn DesktopShell() -> Element {
+fn Stat(k: String, v: String, s: String) -> Element {
+    rsx! {
+        div { class: "stat",
+            div { class: "k", "{k}" }
+            div { class: "v", "{v}" }
+            div { class: "s", "{s}" }
+        }
+    }
+}
+
+#[component]
+fn PendingReview(count: usize) -> Element {
+    rsx! {
+        div { class: "pending-bar",
+            span { class: "label",
+                span { class: "mark", ">" }
+                "{count} injection(s) awaiting review"
+            }
+            span { class: "keys",
+                b { "[a]" } " apply  " b { "[d]" } " diff  " b { "[s]" } " skip"
+            }
+        }
+    }
+}
+
+#[component]
+fn BrandHero() -> Element {
+    let blade_colors = [
+        "#ff8a1e", "#ff6a00", "#ffb01a", "#2fd6a8", "#2e7bff", "#5b63ff", "#2fd0ff", "#ff8a1e",
+    ];
+    let blades: Vec<(f64, f64, f64, &str)> = blade_colors
+        .iter()
+        .enumerate()
+        .map(|(i, color)| {
+            let angle = (i as f64 / 8.0) * std::f64::consts::TAU;
+            let (cx, cy, radius) = (130.0, 130.0, 78.0);
+            (
+                cx + angle.cos() * radius,
+                cy + angle.sin() * radius,
+                angle.to_degrees() + 90.0,
+                *color,
+            )
+        })
+        .collect();
+
+    rsx! {
+        div { class: "crt-hero",
+            div { style: "position:relative;width:200px;height:200px;",
+                svg {
+                    width: "200",
+                    height: "200",
+                    view_box: "0 0 260 260",
+                    style: "position:absolute;inset:0;",
+                    for (i, (x, y, rot, color)) in blades.iter().enumerate() {
+                        g {
+                            key: "{i}",
+                            class: "glow-soft",
+                            transform: "translate({x},{y}) rotate({rot})",
+                            rect {
+                                x: "-9",
+                                y: "-30",
+                                width: "18",
+                                height: "52",
+                                fill: "{color}",
+                            }
+                        }
+                    }
+                    circle {
+                        cx: "130",
+                        cy: "130",
+                        r: "46",
+                        fill: "none",
+                        stroke: "#ffb01a",
+                        stroke_width: "3",
+                        style: "filter:drop-shadow(0 0 6px #ff6a00);",
+                    }
+                }
+                div { style: "position:absolute;inset:0;display:grid;place-items:center;",
+                    svg {
+                        width: "64",
+                        height: "99",
+                        view_box: "0 0 60 93",
+                        class: "glow-blue",
+                        path { d: "M30 2 C40 14 44 30 44 48 L44 64 L16 64 L16 48 C16 30 20 14 30 2 Z", fill: "#5b63ff" }
+                        circle { cx: "30", cy: "34", r: "8", fill: "#000" }
+                        circle { cx: "30", cy: "34", r: "5", fill: "#2fd0ff" }
+                        path { d: "M16 50 L4 70 L16 64 Z", fill: "#ff6a00" }
+                        path { d: "M44 50 L56 70 L44 64 Z", fill: "#ff6a00" }
+                        rect { x: "16", y: "64", width: "28", height: "6", fill: "#5b63ff" }
+                        path { d: "M20 70 L30 92 L40 70 Z", fill: "#ffb01a" }
+                        path { d: "M24 70 L30 84 L36 70 Z", fill: "#ff3b1f" }
+                    }
+                }
+            }
+            div { style: "text-align:left;",
+                div { class: "brand-wordmark", "impulse" }
+                div { class: "brand-tagline", "your ai remembers" }
+            }
+        }
+    }
+}
+
+#[component]
+pub fn DesktopShellWithSnapshot(snapshot: ProjectOpsSnapshot) -> Element {
     use_effect(move || {
         spawn(async move {
             let _ = document::eval(TERMINAL_INTEROP_SCRIPT).await;
         });
     });
 
+    let context = &snapshot.context;
+    let tokens = format_count(context.estimated_tokens);
+    let window = format_count(context.window_tokens);
+    let usage_pct = (context.usage_fraction * 100.0).round() as i32;
+    let agents_online = snapshot.agents.iter().filter(|agent| agent.active).count();
+    let working_agents = snapshot
+        .agents
+        .iter()
+        .filter(|agent| matches!(agent.agent_status, impulse_ops::AgentStatus::Working { .. }))
+        .count();
+    let pending_review_count = context.pending_review_count;
+    let daemon_online = !snapshot.agents.is_empty();
+    let daemon_label = if daemon_online {
+        "online · watching"
+    } else {
+        "daemon offline"
+    };
+    let daemon_state = if daemon_online { "online" } else { "offline" };
+    let tier = if context.tier.is_empty() {
+        "idle"
+    } else {
+        context.tier.as_str()
+    };
+    let generated_at = if snapshot.generated_at.is_empty() {
+        "ops_update stream pending"
+    } else {
+        snapshot.generated_at.as_str()
+    };
+
     rsx! {
+        document::Style { {CRT_CSS} }
+        document::Link { rel: "preconnect", href: "https://fonts.googleapis.com" }
+        document::Link {
+            rel: "stylesheet",
+            href: "https://fonts.googleapis.com/css2?family=Baloo+2:wght@500;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap",
+        }
         main { class: "impulse-shell",
             header { class: "top-bar",
                 div { class: "brand",
-                    h1 { "Impulse" }
-                    span { class: "daemon-state", "Daemon offline" }
+                    h1 { "impulse" }
+                    span { class: "daemon-state", "data-state": "{daemon_state}", "{daemon_label}" }
                 }
                 nav { class: "command-surface",
                     button { class: "icon-button", title: "Command palette", "Cmd-K" }
@@ -414,6 +559,27 @@ pub fn DesktopShell() -> Element {
                     }
                 }
                 section { class: "terminal-stage", "data-terminal-renderer": "xterm.js",
+                    BrandHero {}
+                    div { class: "stat-row",
+                        Stat {
+                            k: "Memory".to_string(),
+                            v: tokens.clone(),
+                            s: "tokens · {usage_pct}% of {window}",
+                        }
+                        Stat {
+                            k: "Agents".to_string(),
+                            v: agents_online.to_string(),
+                            s: "online · {working_agents} working",
+                        }
+                        Stat {
+                            k: "Retrieval".to_string(),
+                            v: snapshot.retrieval.backend.clone(),
+                            s: "{snapshot.memory.genome_decisions} genome decisions",
+                        }
+                    }
+                    if pending_review_count > 0 {
+                        PendingReview { count: pending_review_count }
+                    }
                     div { class: "terminal-tabs", "data-owner": "dioxus",
                         button { class: "terminal-tab active", "codex" }
                         button { class: "terminal-tab", "claude" }
@@ -441,8 +607,18 @@ pub fn DesktopShell() -> Element {
                 }
                 aside { class: "right-inspector", "data-owner": "dioxus",
                     section { class: "inspector-section",
-                        h2 { "Context" }
-                        p { "Review-first injection queue" }
+                        h2 { "Context · {tier}" }
+                        p { "{tokens} / {window} tokens · {context.injection_count} injections · {context.compaction_count} compactions" }
+                    }
+                    section { class: "inspector-section",
+                        h2 { "Pending review" }
+                        p {
+                            if pending_review_count > 0 {
+                                "{pending_review_count} bundle(s) awaiting review-first apply"
+                            } else {
+                                "Nothing pending. Memory is quiet."
+                            }
+                        }
                     }
                     section { class: "inspector-section",
                         h2 { "Native Islands" }
@@ -472,11 +648,23 @@ pub fn DesktopShell() -> Element {
                 }
             }
             footer { class: "event-strip", "data-owner": "dioxus",
-                span { "ops_update stream pending" }
+                span { "ops_update {generated_at}" }
+                span { "{agents_online} agents" }
+                span { "{snapshot.artifacts.len()} artifacts" }
+                span { "{snapshot.interventions.len()} interventions" }
                 span { "terminal_output stream pending" }
                 span { "agent_runtime_update stream pending" }
                 span { "supervisor_local_action stream pending" }
             }
+        }
+    }
+}
+
+#[component]
+pub fn DesktopShell() -> Element {
+    rsx! {
+        DesktopShellWithSnapshot {
+            snapshot: ProjectOpsSnapshot::default(),
         }
     }
 }

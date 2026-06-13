@@ -1,0 +1,158 @@
+/* Impulse — CRT / Phosphor / Broadcast effect engine
+   Scanimate-era look: pure black, hot saturated fills, heavy bloom,
+   fine aperture-grille striping, subtle vignette + curvature.
+   Grounded in the NEW YORK / Avant Garde / oasis / Aperture references.
+*/
+
+:root {
+  /* Phosphor palette — hot, saturated, on pure black */
+  --p-black:   #000000;
+  --p-amber:   #ffb01a;   /* core wordmark */
+  --p-amber-h: #ffe39a;   /* hot bright center */
+  --p-orange:  #ff6a00;   /* edge bleed */
+  --p-red:     #ff3b1f;   /* deep edge */
+  --p-blue:    #5b63ff;   /* periwinkle (NY skyline) */
+  --p-blue-h:  #aeb4ff;
+  --p-cyan:    #2fd0ff;
+  --p-teal:    #2fd6a8;   /* aperture green-teal */
+  --p-lime:    #b6f03c;   /* oasis palm */
+  --p-magenta: #ff3d81;
+  --p-yellow:  #ffd23f;
+}
+
+/* === The screen: pure black with vignette + faint global glow === */
+.crt {
+  position: relative;
+  background:
+    radial-gradient(120% 90% at 50% 42%, rgba(20,16,30,0.55) 0%, #000 70%),
+    #000;
+  isolation: isolate;
+  overflow: hidden;
+}
+/* very slight barrel feel via inset shadow */
+.crt::after {
+  content: "";
+  position: absolute; inset: 0;
+  pointer-events: none; z-index: 50;
+  box-shadow:
+    inset 0 0 120px 30px rgba(0,0,0,0.9),
+    inset 0 0 30px rgba(0,0,0,0.6);
+  border-radius: inherit;
+}
+
+/* === Aperture-grille: fine VERTICAL phosphor stripes (the dominant artifact) === */
+.grille {
+  position: relative;
+}
+.grille::before {
+  content: "";
+  position: absolute; inset: 0;
+  pointer-events: none; z-index: 40;
+  background:
+    repeating-linear-gradient(
+      90deg,
+      rgba(0,0,0,0)   0px,
+      rgba(0,0,0,0)   1px,
+      rgba(0,0,0,0.55) 1.6px,
+      rgba(0,0,0,0.55) 2px
+    );
+  mix-blend-mode: multiply;
+}
+/* fainter horizontal scanlines layered on top */
+.grille::after {
+  content: "";
+  position: absolute; inset: 0;
+  pointer-events: none; z-index: 41;
+  background:
+    repeating-linear-gradient(
+      0deg,
+      rgba(0,0,0,0)    0px,
+      rgba(0,0,0,0)    2px,
+      rgba(0,0,0,0.18) 3px,
+      rgba(0,0,0,0.18) 3.5px
+    );
+}
+
+/* moving scan sweep (optional, gated on motion pref) */
+.scan-sweep > .sweep {
+  position: absolute; left: 0; right: 0; height: 22%;
+  top: -22%; z-index: 42; pointer-events: none;
+  background: linear-gradient(180deg, transparent, rgba(255,255,255,0.06), transparent);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .scan-sweep > .sweep { animation: sweep 6.5s linear infinite; }
+}
+@keyframes sweep { to { top: 120%; } }
+
+/* === Phosphor bloom for TEXT — bright core, saturated halo === */
+.phos {
+  position: relative;
+  font-weight: 800;
+  letter-spacing: 0.01em;
+}
+.phos-amber {
+  color: var(--p-amber-h);
+  text-shadow:
+    0 0 1px #fff,
+    0 0 4px var(--p-amber),
+    0 0 10px var(--p-orange),
+    0 0 24px var(--p-orange),
+    0 0 52px var(--p-red);
+}
+.phos-blue {
+  color: var(--p-blue-h);
+  text-shadow:
+    0 0 1px #fff,
+    0 0 5px var(--p-blue),
+    0 0 14px var(--p-blue),
+    0 0 34px #3a42ff,
+    0 0 64px #2a30dd;
+}
+.phos-cyan {
+  color: #d8faff;
+  text-shadow:
+    0 0 1px #fff,
+    0 0 5px var(--p-cyan),
+    0 0 14px var(--p-cyan),
+    0 0 34px #109fd6;
+}
+.phos-yellow {
+  color: #fff3c2;
+  text-shadow:
+    0 0 1px #fff,
+    0 0 5px var(--p-yellow),
+    0 0 14px var(--p-amber),
+    0 0 34px var(--p-orange);
+}
+.phos-lime {
+  color: #effbc9;
+  text-shadow:
+    0 0 1px #fff,
+    0 0 6px var(--p-lime),
+    0 0 18px #7bc400;
+}
+
+/* Bloom for SHAPES / svg / boxes */
+.glow-amber  { filter: drop-shadow(0 0 6px var(--p-orange)) drop-shadow(0 0 18px var(--p-red)); }
+.glow-blue   { filter: drop-shadow(0 0 6px var(--p-blue)) drop-shadow(0 0 20px #3138e0); }
+.glow-cyan   { filter: drop-shadow(0 0 6px var(--p-cyan)) drop-shadow(0 0 18px #109fd6); }
+.glow-soft   { filter: drop-shadow(0 0 8px rgba(255,180,40,0.5)); }
+
+/* Slight chromatic split for that videotape-capture feel */
+.aberrate {
+  text-shadow:
+    -1px 0 0 rgba(255,0,90,0.55),
+     1px 0 0 rgba(0,160,255,0.55),
+     0 0 8px currentColor;
+}
+
+/* Pixel/scan flicker on the whole screen, very subtle */
+@media (prefers-reduced-motion: no-preference) {
+  .flicker { animation: flick 5.2s steps(60) infinite; }
+}
+@keyframes flick {
+  0%,100% { opacity: 1; }
+  3% { opacity: 0.97; }
+  6% { opacity: 1; }
+  47% { opacity: 0.985; }
+}

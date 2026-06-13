@@ -2,9 +2,14 @@ use std::collections::HashMap;
 
 use dioxus::prelude::*;
 use impulse_desktop::{
-    AgentWriteRequest, DesktopCommandRouter, DesktopShell, InMemoryTerminalBridge,
+    format_count, status_dot_class, status_label, AgentWriteRequest, DesktopCommandRouter,
+    DesktopShell, DesktopShellWithSnapshot, DesktopShellWithSnapshotProps, InMemoryTerminalBridge,
     NativeIslandKind, NativeIslandRequest, TerminalCloseRequest, TerminalFocusRequest,
     TerminalOpenRequest, TerminalResizeRequest, TerminalWriteRequest,
+};
+use impulse_ops::{
+    AgentRuntime, AgentStatus, ContextHealthSummary, MemorySummary, ProjectOpsSnapshot,
+    RetrievalSummary,
 };
 use serde_json::json;
 
@@ -20,6 +25,10 @@ fn test_dioxus_shell_renders_five_panel_layout_without_egui() {
     assert!(html.contains("terminal-stage"));
     assert!(html.contains("right-inspector"));
     assert!(html.contains("event-strip"));
+    assert!(html.contains("crt-hero"));
+    assert!(html.contains("brand-wordmark"));
+    assert!(html.contains("stat-row"));
+    assert!(html.contains("your ai remembers"));
     assert!(html.contains("agent-pool"));
     assert!(html.contains("workspace-picker"));
     assert!(html.contains("data-source=\"workspace_target\""));
@@ -31,6 +40,78 @@ fn test_dioxus_shell_renders_five_panel_layout_without_egui() {
     assert!(html.contains("agent_runtime_update stream pending"));
     assert!(html.contains("data-pty-owner=\"rust-backend\""));
     assert!(!html.contains("egui"));
+}
+
+#[test]
+fn test_retro_shell_binds_project_ops_snapshot() {
+    let mut snapshot = ProjectOpsSnapshot {
+        generated_at: "2026-06-13T12:00:00Z".to_string(),
+        context: ContextHealthSummary {
+            tier: "operator".to_string(),
+            usage_fraction: 0.236,
+            estimated_tokens: 47_238,
+            window_tokens: 200_000,
+            compaction_count: 2,
+            injection_count: 7,
+            pending_review_count: 1,
+            ..Default::default()
+        },
+        memory: MemorySummary {
+            genome_decisions: 12,
+            ..Default::default()
+        },
+        retrieval: RetrievalSummary {
+            backend: "sqlite-vector".to_string(),
+            mode: "hybrid".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    snapshot.agents.push(AgentRuntime {
+        id: "codex".to_string(),
+        label: "Codex".to_string(),
+        active: true,
+        agent_status: AgentStatus::Working {
+            task: "integrate design".to_string(),
+        },
+        ..Default::default()
+    });
+
+    let mut vdom = VirtualDom::new_with_props(
+        DesktopShellWithSnapshot,
+        DesktopShellWithSnapshotProps { snapshot },
+    );
+    vdom.rebuild_in_place();
+
+    let html = dioxus_ssr::render(&vdom);
+
+    assert!(html.contains("online · watching"));
+    assert!(html.contains("Context · operator"));
+    assert!(html.contains("47.2k"));
+    assert!(html.contains("200.0k"));
+    assert!(html.contains("tokens · 24% of 200.0k"));
+    assert!(html.contains("1 injection(s) awaiting review"));
+    assert!(html.contains("sqlite-vector"));
+    assert!(html.contains("12 genome decisions"));
+    assert!(html.contains("ops_update 2026-06-13T12:00:00Z"));
+}
+
+#[test]
+fn test_retro_theme_helpers_map_backend_statuses() {
+    assert_eq!(format_count(999), "999");
+    assert_eq!(format_count(47_238), "47.2k");
+    assert_eq!(status_dot_class(&AgentStatus::Idle), "status-idle");
+    assert_eq!(
+        status_dot_class(&AgentStatus::Working {
+            task: "build".to_string(),
+        }),
+        "status-working"
+    );
+    assert_eq!(
+        status_dot_class(&AgentStatus::Interrupted),
+        "status-blocked"
+    );
+    assert_eq!(status_label(&AgentStatus::Completed), "done");
 }
 
 #[test]
