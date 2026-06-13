@@ -55,3 +55,27 @@ Dioxus controls -> Tauri command -> DesktopRuntime -> impulse-term TerminalBacke
   `objc2`.
 - `tauri-runtime` enables Tauri command annotations without making Tauri a hard
   dependency of the default workspace check.
+
+## Visual Smoke
+
+Before running the visual smoke, `npm run vendor:xterm` copies the pinned
+`@xterm/xterm` and `@xterm/addon-fit` browser assets into
+`assets/vendor/xterm/`. The Dioxus shell declares those local files with
+`data-impulse-terminal-asset` tags; the eventual Tauri host should load those
+same relative paths instead of a CDN.
+
+The visual smoke renders static Dioxus SSR fixtures for each `DesktopView`, then
+opens them in headless Chromium to assert non-blank layout, no shell overlap, no
+viewport overflow, route-specific visible content, local xterm globals, and no
+remote font or terminal asset URLs.
+
+```bash
+cd /Users/jamespustorino/code/IMPULSE-rs/impulse-rs/impulse-desktop
+npm install
+npm run vendor:xterm
+npm run visual:install
+CARGO_TARGET_DIR=/tmp/impulse-visual-target npm run visual:smoke
+```
+
+Screenshots are generated under `../../output/playwright/impulse-desktop-visual/`
+and ignored by the repository root `.gitignore`.

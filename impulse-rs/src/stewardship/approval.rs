@@ -58,7 +58,7 @@ pub fn list_pending(base_path: &Path) -> Result<Vec<CleanupProposal>> {
         }
     }
 
-    proposals.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    proposals.sort_by_key(|a| a.created_at);
     Ok(proposals)
 }
 

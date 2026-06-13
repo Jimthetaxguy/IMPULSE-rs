@@ -128,7 +128,7 @@ fn file_fallback_history(base_path: &Path, query: &str, limit: usize) -> Vec<Sea
         })
         .collect::<Vec<_>>();
 
-    rows.sort_by(|a, b| b.ended_at.cmp(&a.ended_at));
+    rows.sort_by_key(|b| std::cmp::Reverse(b.ended_at));
     rows.into_iter()
         .take(limit)
         .map(|entry| SearchResult {
@@ -159,7 +159,7 @@ fn file_fallback_genome(base_path: &Path, query: &str, limit: usize) -> Vec<Sear
                 || decision.tags.iter().any(|t| t.to_lowercase().contains(&q))
         })
         .collect::<Vec<_>>();
-    rows.sort_by(|a, b| b.date.cmp(&a.date));
+    rows.sort_by_key(|b| std::cmp::Reverse(b.date));
 
     rows.into_iter()
         .take(limit)

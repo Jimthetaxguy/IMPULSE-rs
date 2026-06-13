@@ -19,6 +19,8 @@ pub struct WorkspaceTarget {
     pub label: Option<String>,
     #[serde(default)]
     pub purpose: Option<String>,
+    #[serde(default)]
+    pub project_notes: Option<String>,
 }
 
 impl WorkspaceTarget {
@@ -31,6 +33,7 @@ impl WorkspaceTarget {
                 .map(|value| value.to_string()),
             root,
             purpose: None,
+            project_notes: None,
         }
     }
 }
@@ -86,6 +89,26 @@ pub fn default_builtin_mcp_tools() -> Vec<BuiltInMcpTool> {
             "Stage retrieved context for review before injecting it into an agent terminal.",
             vec!["context".to_string(), "review".to_string()],
             true,
+        ),
+        BuiltInMcpTool::new(
+            "impulse.review_decision",
+            "Apply or skip a staged review payload with an audit receipt.",
+            vec![
+                "context".to_string(),
+                "review".to_string(),
+                "terminal".to_string(),
+            ],
+            true,
+        ),
+        BuiltInMcpTool::new(
+            "impulse.project_context",
+            "Read operator-authored context for a registered project workspace.",
+            vec![
+                "workspace".to_string(),
+                "context".to_string(),
+                "read_only".to_string(),
+            ],
+            false,
         ),
     ]
 }
@@ -369,7 +392,7 @@ impl DesktopRuntime {
         } else {
             request.mcp_tools.clone()
         };
-        let env_pairs = runtime_env(&agent_id, &request, &command);
+        let env_pairs = runtime_env(&agent_id, &request, &command, workspace.as_ref());
         let sink = Arc::clone(&self.sink);
         let output_agent_id = agent_id.clone();
         let output_callback = Arc::new(move |data: &[u8]| {
@@ -661,6 +684,7 @@ fn runtime_env(
     agent_id: &str,
     request: &AgentSpawnRequest,
     command: &str,
+    workspace: Option<&WorkspaceTarget>,
 ) -> Vec<(&'static str, String)> {
     let mut env = vec![
         ("IMPULSE_AGENT_ID", agent_id.to_string()),
@@ -672,6 +696,28 @@ fn runtime_env(
     ];
     if let Some(session_id) = &request.session_id {
         env.push(("IMPULSE_SESSION_ID", session_id.clone()));
+    }
+    if let Some(workspace) = workspace {
+        env.push(("IMPULSE_WORKSPACE_ROOT", workspace.root.clone()));
+        env.push(("IMPULSE_PROJECT", workspace.root.clone()));
+        if let Some(label) = &workspace.label {
+            env.push(("IMPULSE_WORKSPACE_LABEL", label.clone()));
+            env.push(("IMPULSE_PROJECT_LABEL", label.clone()));
+        }
+        if let Some(purpose) = &workspace.purpose {
+            env.push(("IMPULSE_WORKSPACE_PURPOSE", purpose.clone()));
+            env.push(("IMPULSE_PROJECT_PURPOSE", purpose.clone()));
+        }
+        if let Some(project_notes) = &workspace.project_notes {
+            env.push((
+                "IMPULSE_PROJECT_CONTEXT_SOURCE",
+                "workspace_registry".to_string(),
+            ));
+            env.push((
+                "IMPULSE_PROJECT_NOTES_HASH",
+                project_notes_hash(project_notes),
+            ));
+        }
     }
     for (key, value) in &request.env {
         if let Some(key) = static_env_key(key) {
@@ -685,10 +731,18 @@ fn static_env_key(key: &str) -> Option<&'static str> {
     match key {
         "IMPULSE_CAPABILITIES_PATH" => Some("IMPULSE_CAPABILITIES_PATH"),
         "IMPULSE_HOME" => Some("IMPULSE_HOME"),
-        "IMPULSE_PROJECT" => Some("IMPULSE_PROJECT"),
         "TERM" => Some("TERM"),
         _ => None,
     }
+}
+
+pub(crate) fn project_notes_hash(notes: &str) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in notes.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("fnv1a64:{hash:016x}")
 }
 
 #[cfg(feature = "tauri-runtime")]

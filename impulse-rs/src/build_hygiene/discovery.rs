@@ -32,7 +32,7 @@ pub fn discover_rust_projects(search_paths: &[PathBuf]) -> Vec<RustProject> {
     }
 
     // Sort by target size (largest first) for prioritized reporting
-    projects.sort_by(|a, b| b.target_size_bytes.cmp(&a.target_size_bytes));
+    projects.sort_by_key(|b| std::cmp::Reverse(b.target_size_bytes));
     projects
 }
 

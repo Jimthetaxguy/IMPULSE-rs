@@ -449,7 +449,7 @@ pub fn run_local_coordination(insights: &[ExtractedInsight]) -> Vec<Recommendati
         let sort_key = intent_priority(rec, dominant) as u16;
         rec.priority = 100u8.saturating_sub((sort_key * 20).min(100) as u8);
     }
-    all.sort_by(|a, b| b.priority.cmp(&a.priority));
+    all.sort_by_key(|b| std::cmp::Reverse(b.priority));
     all
 }
 

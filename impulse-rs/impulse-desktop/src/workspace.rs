@@ -85,7 +85,7 @@ impl WorkspaceRegistry {
     /// Build a registry seeded with a small set of sensible defaults rooted
     /// under the user's home `~/code`. Missing folders are silently skipped.
     pub fn with_default_workspaces() -> Self {
-        let mut registry = Self::empty();
+        let registry = Self::empty();
         if let Some(home) = home_dir() {
             for (label, relative) in [
                 ("code", "code"),
@@ -110,14 +110,14 @@ impl WorkspaceRegistry {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let mut registry = Self::empty();
+        let registry = Self::empty();
         for root in roots {
             registry.register_workspace(WorkspaceTarget::from_root(root.as_ref()))?;
         }
         Ok(registry)
     }
 
-    pub fn register(&mut self, target: WorkspaceTarget) -> Result<()> {
+    pub fn register(&self, target: WorkspaceTarget) -> Result<()> {
         validate_root(&target.root)?;
         let mut inner = self.inner.lock().expect("workspace registry poisoned");
         let key = canonical_key(&target.root);
@@ -133,7 +133,7 @@ impl WorkspaceRegistry {
 
     /// Convenience wrapper matching the `register` style — used by tests
     /// and runtime paths that already have a `WorkspaceTarget`.
-    pub fn register_workspace(&mut self, target: WorkspaceTarget) -> Result<()> {
+    pub fn register_workspace(&self, target: WorkspaceTarget) -> Result<()> {
         self.register(target)
     }
 
@@ -242,7 +242,7 @@ mod tests {
 
     #[test]
     fn test_register_and_list() {
-        let mut registry = WorkspaceRegistry::empty();
+        let registry = WorkspaceRegistry::empty();
         for root in fixture_roots() {
             registry
                 .register(WorkspaceTarget::from_root(root))
@@ -256,14 +256,14 @@ mod tests {
 
     #[test]
     fn test_register_rejects_empty() {
-        let mut registry = WorkspaceRegistry::empty();
+        let registry = WorkspaceRegistry::empty();
         let result = registry.register(WorkspaceTarget::from_root(""));
         assert!(matches!(result, Err(WorkspaceRegistryError::Empty { .. })));
     }
 
     #[test]
     fn test_register_rejects_relative() {
-        let mut registry = WorkspaceRegistry::empty();
+        let registry = WorkspaceRegistry::empty();
         let result = registry.register(WorkspaceTarget::from_root("code/IMPULSE-rs"));
         assert!(matches!(
             result,
@@ -273,7 +273,7 @@ mod tests {
 
     #[test]
     fn test_register_rejects_duplicate() {
-        let mut registry = WorkspaceRegistry::empty();
+        let registry = WorkspaceRegistry::empty();
         registry
             .register(WorkspaceTarget::from_root("/tmp"))
             .expect("first register");
@@ -286,7 +286,7 @@ mod tests {
 
     #[test]
     fn test_touch_marks_recent_use() {
-        let mut registry = WorkspaceRegistry::empty();
+        let registry = WorkspaceRegistry::empty();
         registry
             .register(WorkspaceTarget::from_root("/tmp"))
             .expect("register");
@@ -334,5 +334,24 @@ mod tests {
         target.label = Some("scratch".to_string());
         let entry = WorkspaceEntry::new(target);
         assert_eq!(entry.label(), "scratch");
+    }
+
+    #[test]
+    fn test_register_preserves_project_notes_metadata() {
+        let registry = WorkspaceRegistry::empty();
+        registry
+            .register(WorkspaceTarget {
+                root: "/tmp".to_string(),
+                label: Some("scratch".to_string()),
+                purpose: Some("safe harness workspace".to_string()),
+                project_notes: Some("operator-authored context".to_string()),
+            })
+            .expect("register workspace with notes");
+
+        let entry = registry.lookup("/tmp").expect("lookup workspace");
+        assert_eq!(
+            entry.target.project_notes.as_deref(),
+            Some("operator-authored context")
+        );
     }
 }

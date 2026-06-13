@@ -1,20 +1,226 @@
-use dioxus::prelude::*;
-use impulse_ops::ProjectOpsSnapshot;
+use std::collections::HashMap;
 
-use crate::mcp::McpInvocation;
-use crate::runtime::{AgentRuntimeSnapshot, BuiltInMcpTool};
-use crate::tauri_commands::McpInvokeRequest;
-use crate::theme::{format_count, status_dot_class, status_label};
+use dioxus::prelude::*;
+use impulse_ops::{AgentRuntime, ProjectOpsSnapshot};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::mcp::{McpInvocation, ReviewDecision, ReviewQueueItem, ReviewQueueStatus};
+use crate::runtime::{
+    default_builtin_mcp_tools, AgentPlatformKind, AgentRuntimeSnapshot, AgentSpawnRequest,
+    BuiltInMcpTool, WorkspaceTarget,
+};
+use crate::tauri_commands::{McpInvokeRequest, RegisterWorkspaceRequest};
+use crate::theme::{format_count, status_dot_class, status_label, usage_meter_pct};
+use crate::views::{ArtifactsView, DesktopView, MemoryView, ShellIntent};
 use crate::workspace::WorkspaceEntry;
 
 const CRT_CSS: &str = include_str!("../assets/impulse_crt.css");
+pub const XTERM_CSS_PATH: &str = "assets/vendor/xterm/xterm.css";
+pub const XTERM_JS_PATH: &str = "assets/vendor/xterm/xterm.js";
+pub const XTERM_FIT_JS_PATH: &str = "assets/vendor/xterm/addon-fit.js";
+
+pub fn terminal_asset_paths() -> &'static [&'static str] {
+    &[XTERM_CSS_PATH, XTERM_JS_PATH, XTERM_FIT_JS_PATH]
+}
+
+const DESKTOP_EVENT_BRIDGE_SCRIPT: &str = r#"
+(async () => {
+  const existing = window.__impulseOpsBridge;
+  if (existing?.unlisten?.length) {
+    for (const unlisten of existing.unlisten) {
+      try { await unlisten(); } catch (_) {}
+    }
+  }
+
+  const tauri = window.__TAURI__;
+  const invoke = tauri?.core?.invoke;
+  const listen = tauri?.event?.listen;
+
+  window.__impulseOpsBridge = {
+    mounted: true,
+    degraded: !listen,
+    unlisten: [],
+  };
+  document.documentElement.setAttribute(
+    "data-impulse-ops-bridge",
+    listen ? "mounted" : "degraded"
+  );
+
+  const forward = (kind, payload) => {
+    try {
+      dioxus.send({ kind, payload });
+    } catch (error) {
+      console.warn("impulse ops bridge send failed", error);
+    }
+  };
+
+  const refreshReviewQueue = async () => {
+    if (!invoke) {
+      forward("bridge_status", { status: "review_queue_failed", reason: "tauri invoke API unavailable" });
+      return [];
+    }
+    try {
+      const items = await invoke("review_queue");
+      forward("review_queue", { items });
+      return items;
+    } catch (error) {
+      forward("bridge_status", { status: "review_queue_failed", reason: String(error) });
+      return [];
+    }
+  };
+  const refreshAgents = async () => {
+    if (!invoke) {
+      forward("bridge_status", { status: "agent_snapshot_failed", reason: "tauri invoke API unavailable" });
+      return [];
+    }
+    try {
+      const agents = await invoke("agent_snapshot");
+      forward("agent_snapshot", { agents });
+      return agents;
+    } catch (error) {
+      forward("bridge_status", { status: "agent_snapshot_failed", reason: String(error) });
+      return [];
+    }
+  };
+  const refreshWorkspaces = async () => {
+    if (!invoke) {
+      forward("bridge_status", { status: "workspaces_failed", reason: "tauri invoke API unavailable" });
+      return [];
+    }
+    try {
+      const workspaces = await invoke("list_workspaces");
+      forward("workspaces", { workspaces });
+      return workspaces;
+    } catch (error) {
+      forward("bridge_status", { status: "workspaces_failed", reason: String(error) });
+      return [];
+    }
+  };
+  const refreshMcpDescriptors = async () => {
+    if (!invoke) {
+      forward("bridge_status", { status: "mcp_descriptors_failed", reason: "tauri invoke API unavailable" });
+      return [];
+    }
+    try {
+      const tools = await invoke("mcp_descriptors");
+      forward("mcp_descriptors", { tools });
+      return tools;
+    } catch (error) {
+      forward("bridge_status", { status: "mcp_descriptors_failed", reason: String(error) });
+      return [];
+    }
+  };
+
+  window.__impulseOpsBridge.refreshAgents = refreshAgents;
+  window.__impulseOpsBridge.refreshWorkspaces = refreshWorkspaces;
+  window.__impulseOpsBridge.refreshMcpDescriptors = refreshMcpDescriptors;
+  window.__impulseOpsBridge.refreshReviewQueue = refreshReviewQueue;
+  window.__impulseOpsBridge.registerWorkspace = async (request) => {
+    if (!invoke) {
+      forward("bridge_status", { status: "register_workspace_failed", reason: "tauri invoke API unavailable" });
+      return null;
+    }
+    try {
+      const entry = await invoke("register_workspace", { request });
+      forward("workspace_registered", { entry });
+      await refreshWorkspaces();
+      return entry;
+    } catch (error) {
+      forward("bridge_status", {
+        status: "register_workspace_failed",
+        reason: String(error),
+        request,
+      });
+      throw error;
+    }
+  };
+  window.__impulseOpsBridge.invokeMcp = async (request) => {
+    if (!invoke) {
+      forward("bridge_status", { status: "mcp_invoke_failed", reason: "tauri invoke API unavailable" });
+      return null;
+    }
+    try {
+      const invocation = await invoke("mcp_invoke", { request });
+      forward("mcp_invocation", { invocation });
+      await refreshAgents();
+      await refreshWorkspaces();
+      return invocation;
+    } catch (error) {
+      forward("bridge_status", {
+        status: "mcp_invoke_failed",
+        reason: String(error),
+        request,
+      });
+      throw error;
+    }
+  };
+  window.__impulseOpsBridge.focusAgent = async (agentId) => {
+    if (!invoke) {
+      forward("bridge_status", { status: "agent_focus_failed", reason: "tauri invoke API unavailable" });
+      return null;
+    }
+    try {
+      const snapshot = await invoke("agent_focus", { request: { session_id: agentId } });
+      forward("agent_runtime_update", snapshot);
+      await refreshAgents();
+      return snapshot;
+    } catch (error) {
+      forward("bridge_status", {
+        status: "agent_focus_failed",
+        reason: String(error),
+        agent_id: agentId,
+      });
+      throw error;
+    }
+  };
+  window.__impulseOpsBridge.reviewDecision = async (request) => {
+    if (!invoke) {
+      forward("bridge_status", { status: "review_decision_failed", reason: "tauri invoke API unavailable" });
+      return null;
+    }
+    const commandRequest = { ...request, confirmed: true };
+    try {
+      const invocation = await invoke("review_decision", { request: commandRequest });
+      forward("mcp_invocation", { invocation });
+      await refreshReviewQueue();
+      return invocation;
+    } catch (error) {
+      forward("bridge_status", {
+        status: "review_decision_failed",
+        reason: String(error),
+        request: commandRequest,
+      });
+      throw error;
+    }
+  };
+
+  if (!listen) {
+    forward("bridge_status", { status: "degraded", reason: "tauri event API unavailable" });
+    await new Promise(() => {});
+  }
+
+  const opsUnlisten = await listen("ops_update", (event) => {
+    forward("ops_update", event?.payload ?? event);
+  });
+  const runtimeUnlisten = await listen("agent_runtime_update", (event) => {
+    forward("agent_runtime_update", event?.payload ?? event);
+  });
+  window.__impulseOpsBridge.unlisten = [opsUnlisten, runtimeUnlisten];
+
+    if (invoke) {
+      await refreshAgents();
+      await refreshWorkspaces();
+      await refreshMcpDescriptors();
+      await refreshReviewQueue();
+    }
+
+  await new Promise(() => {});
+})();
+"#;
 
 const TERMINAL_INTEROP_SCRIPT: &str = r#"
 (() => {
-  if (window.__impulseTerminalInterop?.mounted) {
-    return "already-mounted";
-  }
-
   const tauri = window.__TAURI__;
   const invoke = tauri?.core?.invoke;
   const listen = tauri?.event?.listen;
@@ -22,11 +228,15 @@ const TERMINAL_INTEROP_SCRIPT: &str = r#"
   const FitAddonCtor = window.FitAddon?.FitAddon || window.FitAddon;
   const mounts = Array.from(document.querySelectorAll("[data-xterm-mount='true']"));
 
-  window.__impulseTerminalInterop = {
+  const interop = window.__impulseTerminalInterop || {
     mounted: true,
     terminals: {},
-    degraded: !invoke || !listen || !Terminal,
+    unlisten: [],
+    listenersMounted: false,
   };
+  interop.mounted = true;
+  interop.degraded = !invoke || !listen || !Terminal;
+  window.__impulseTerminalInterop = interop;
 
   if (!invoke || !listen || !Terminal) {
     mounts.forEach((mount) => mount.setAttribute("data-xterm-state", "degraded"));
@@ -47,10 +257,10 @@ const TERMINAL_INTEROP_SCRIPT: &str = r#"
   };
   const encodeInput = (data) => Array.from(encoder.encode(data));
 
-  for (const mount of mounts) {
+  const mountAgentTerminal = (mount) => {
     const agentId = mount.dataset.agentId;
-    if (!agentId || window.__impulseTerminalInterop.terminals[agentId]) {
-      continue;
+    if (!agentId || interop.terminals[agentId]) {
+      return;
     }
 
     const terminal = new Terminal({
@@ -74,23 +284,30 @@ const TERMINAL_INTEROP_SCRIPT: &str = r#"
       });
     }
 
-    window.__impulseTerminalInterop.terminals[agentId] = terminal;
+    interop.terminals[agentId] = terminal;
     mount.setAttribute("data-xterm-state", "mounted");
+  };
+
+  mounts.forEach(mountAgentTerminal);
+
+  if (interop.listenersMounted) {
+    return "mounted";
   }
+  interop.listenersMounted = true;
 
-  listen("terminal_output", (event) => {
+  Promise.resolve(listen("terminal_output", (event) => {
     const payload = resolvePayload(event);
     const agentId = resolveAgentId(payload);
-    const terminal = window.__impulseTerminalInterop.terminals[agentId];
+    const terminal = interop.terminals[agentId];
     if (terminal) terminal.write(resolveBytes(payload));
-  });
+  })).then((unlisten) => interop.unlisten.push(unlisten));
 
-  listen("terminal_exit", (event) => {
+  Promise.resolve(listen("terminal_exit", (event) => {
     const payload = resolvePayload(event);
     const agentId = resolveAgentId(payload);
-    const terminal = window.__impulseTerminalInterop.terminals[agentId];
+    const terminal = interop.terminals[agentId];
     if (terminal) terminal.write("\r\n[process exited]\r\n");
-  });
+  })).then((unlisten) => interop.unlisten.push(unlisten));
 
   return "mounted";
 })();
@@ -100,7 +317,92 @@ pub fn terminal_interop_script() -> &'static str {
     TERMINAL_INTEROP_SCRIPT
 }
 
+pub fn desktop_event_bridge_script() -> &'static str {
+    DESKTOP_EVENT_BRIDGE_SCRIPT
+}
+
+pub fn workspace_registration_bridge_script(request: &RegisterWorkspaceRequest) -> String {
+    let payload = serde_json::to_string(request).unwrap_or_else(|_| "{}".to_string());
+    format!(
+        r#"(async () => {{
+  const bridge = window.__impulseOpsBridge;
+  if (!bridge?.registerWorkspace) {{
+    console.warn("impulse workspace registration bridge unavailable");
+    return "degraded";
+  }}
+  return await bridge.registerWorkspace({payload});
+}})();"#
+    )
+}
+
+pub fn mcp_invoke_bridge_script(request: &McpInvokeRequest) -> String {
+    let payload = serde_json::to_string(request).unwrap_or_else(|_| "{}".to_string());
+    format!(
+        r#"(async () => {{
+  const bridge = window.__impulseOpsBridge;
+  if (!bridge?.invokeMcp) {{
+    console.warn("impulse MCP bridge unavailable");
+    return "degraded";
+  }}
+  return await bridge.invokeMcp({payload});
+}})();"#
+    )
+}
+
+pub fn agent_launch_bridge_script(request: &AgentSpawnRequest) -> String {
+    let request = McpInvokeRequest {
+        tool: "impulse.agent_spawn".to_string(),
+        arguments: serde_json::to_value(request).unwrap_or(Value::Null),
+        confirmed: true,
+        caller_agent_id: Some("impulse-ui".to_string()),
+    };
+    mcp_invoke_bridge_script(&request)
+}
+
+pub fn agent_focus_bridge_script(agent_id: &str) -> String {
+    let payload = serde_json::to_string(agent_id).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"(async () => {{
+  const bridge = window.__impulseOpsBridge;
+  if (!bridge?.focusAgent) {{
+    console.warn("impulse agent focus bridge unavailable");
+    return "degraded";
+  }}
+  return await bridge.focusAgent({payload});
+}})();"#
+    )
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DesktopBridgeMessage {
+    pub kind: String,
+    #[serde(default)]
+    pub payload: Value,
+}
+
 // ──────────────────────────── New components ────────────────────────────
+
+#[component]
+fn ViewRail(active: DesktopView, on_select: EventHandler<DesktopView>) -> Element {
+    rsx! {
+        nav { class: "view-rail", "aria-label": "Desktop views",
+            for view in DesktopView::ALL {
+                {
+                    let class_name = if view == active { "rail-item active" } else { "rail-item" };
+                    rsx! {
+                        button {
+                            key: "{view.slug()}",
+                            class: "{class_name}",
+                            "data-view": "{view.slug()}",
+                            onclick: move |_| on_select.call(view),
+                            "{view.label()}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// Replace the hard-coded workspace buttons in the left-rail. Renders one
 /// rail-item per `WorkspaceEntry`; the selected entry gets the `active`
@@ -306,6 +608,185 @@ fn McpReadOnlyRow(tool_name: String, on_invoke: EventHandler<McpInvokeRequest>) 
     }
 }
 
+#[component]
+fn WorkspaceLaunchPanel(
+    workspaces: Vec<WorkspaceEntry>,
+    selected_root: String,
+    on_register: EventHandler<RegisterWorkspaceRequest>,
+    on_launch: EventHandler<AgentSpawnRequest>,
+) -> Element {
+    let mut register_root = use_signal(String::new);
+    let mut label = use_signal(String::new);
+    let mut purpose = use_signal(String::new);
+    let mut project_notes = use_signal(String::new);
+    let mut selected_workspace_root = use_signal(String::new);
+    let mut platform = use_signal(|| "codex".to_string());
+    let mut agent_id = use_signal(String::new);
+    let mut command = use_signal(String::new);
+
+    let first_workspace_root = workspaces
+        .first()
+        .map(|entry| entry.target.root.clone())
+        .unwrap_or_default();
+    let selected_from_panel = selected_workspace_root();
+    let launch_root = if !selected_from_panel.trim().is_empty() {
+        selected_from_panel
+    } else if !selected_root.trim().is_empty() {
+        selected_root
+    } else {
+        first_workspace_root
+    };
+    let can_register = !register_root().trim().is_empty();
+    let can_launch = !launch_root.trim().is_empty();
+    let launch_workspace = workspaces
+        .iter()
+        .find(|entry| entry.target.root == launch_root)
+        .map(|entry| entry.target.clone());
+
+    rsx! {
+        section { class: "inspector-section workspace-launch", "data-source": "workspace_launcher",
+            header { class: "section-header",
+                div {
+                    h2 { "Workspace Launcher" }
+                    p { "Register a folder, then launch Codex, Claude, OpenCode, or Shell inside it." }
+                }
+                span { class: "workspace-launch-badge", "MCP audited" }
+            }
+            div { class: "workspace-launch-grid",
+                label { class: "workspace-field wide",
+                    span { "Folder path" }
+                    input {
+                        r#type: "text",
+                        placeholder: "Absolute project folder",
+                        value: "{register_root}",
+                        oninput: move |evt| register_root.set(evt.value()),
+                    }
+                }
+                label { class: "workspace-field",
+                    span { "Label" }
+                    input {
+                        r#type: "text",
+                        placeholder: "IMPULSE-rs",
+                        value: "{label}",
+                        oninput: move |evt| label.set(evt.value()),
+                    }
+                }
+                label { class: "workspace-field",
+                    span { "Purpose" }
+                    input {
+                        r#type: "text",
+                        placeholder: "terminal harness",
+                        value: "{purpose}",
+                        oninput: move |evt| purpose.set(evt.value()),
+                    }
+                }
+                label { class: "workspace-field wide",
+                    span { "Project notes" }
+                    input {
+                        r#type: "text",
+                        placeholder: "Context the agent should remember before acting",
+                        value: "{project_notes}",
+                        oninput: move |evt| project_notes.set(evt.value()),
+                    }
+                }
+                button {
+                    class: "invoke-button workspace-primary",
+                    disabled: !can_register,
+                    onclick: move |_| {
+                        let root = register_root().trim().to_string();
+                        if root.is_empty() {
+                            return;
+                        }
+                        on_register.call(RegisterWorkspaceRequest {
+                            root,
+                            label: optional_text(label()),
+                            purpose: optional_text(purpose()),
+                            project_notes: optional_text(project_notes()),
+                        });
+                    },
+                    "Register folder"
+                }
+            }
+            div { class: "workspace-launch-grid launch",
+                label { class: "workspace-field wide",
+                    span { "Launch from" }
+                    select {
+                        value: "{launch_root}",
+                        onchange: move |evt| selected_workspace_root.set(evt.value()),
+                        if workspaces.is_empty() {
+                            option { value: "", "Register a workspace first" }
+                        } else {
+                            for entry in workspaces.iter() {
+                                option { value: "{entry.target.root}", "{entry.label()}" }
+                            }
+                        }
+                    }
+                }
+                label { class: "workspace-field",
+                    span { "Agent" }
+                    select {
+                        value: "{platform}",
+                        onchange: move |evt| platform.set(evt.value()),
+                        option { value: "codex", "Codex" }
+                        option { value: "claude-code", "Claude Code" }
+                        option { value: "opencode", "OpenCode" }
+                        option { value: "shell", "Shell" }
+                    }
+                }
+                label { class: "workspace-field",
+                    span { "Agent id" }
+                    input {
+                        r#type: "text",
+                        placeholder: "optional",
+                        value: "{agent_id}",
+                        oninput: move |evt| agent_id.set(evt.value()),
+                    }
+                }
+                label { class: "workspace-field wide",
+                    span { "Command override" }
+                    input {
+                        r#type: "text",
+                        placeholder: "blank uses platform default",
+                        value: "{command}",
+                        oninput: move |evt| command.set(evt.value()),
+                    }
+                }
+                button {
+                    class: "invoke-button workspace-primary",
+                    disabled: !can_launch,
+                    onclick: move |_| {
+                        let root = launch_root.trim().to_string();
+                        if root.is_empty() {
+                            return;
+                        }
+                        let agent_id_value = optional_text(agent_id());
+                        let session_id = agent_id_value
+                            .as_ref()
+                            .map(|value| format!("{value}-session"));
+                        let workspace = launch_workspace.clone().unwrap_or_else(|| WorkspaceTarget::from_root(root.clone()));
+                        on_launch.call(AgentSpawnRequest {
+                            agent_id: agent_id_value,
+                            session_id,
+                            platform: parse_platform_kind(&platform()),
+                            command: optional_text(command()),
+                            args: Vec::new(),
+                            cwd: Some(root),
+                            env: HashMap::new(),
+                            workspace: Some(workspace),
+                            mcp_tools: default_builtin_mcp_tools(),
+                            rows: 32,
+                            cols: 100,
+                            role: None,
+                            target: None,
+                        });
+                    },
+                    "Launch agent"
+                }
+            }
+        }
+    }
+}
+
 /// New inspector subsection. Scrollable, capped to the first 100 invocations
 /// the parent passes in. Optional agent filter narrows the visible rows.
 #[component]
@@ -346,6 +827,213 @@ fn AuditTrail(invocations: Vec<McpInvocation>, agent_filter: Option<String>) -> 
     }
 }
 
+fn optional_text(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn parse_platform_kind(value: &str) -> AgentPlatformKind {
+    match value {
+        "claude-code" => AgentPlatformKind::ClaudeCode,
+        "opencode" => AgentPlatformKind::OpenCode,
+        "shell" => AgentPlatformKind::Shell,
+        _ => AgentPlatformKind::Codex,
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReviewDecisionUiRequest {
+    pub id: String,
+    pub decision: ReviewDecision,
+    pub target_agent_id: Option<String>,
+}
+
+pub fn review_decision_bridge_script(request: &ReviewDecisionUiRequest) -> String {
+    let payload = serde_json::to_string(request).unwrap_or_else(|_| "{}".to_string());
+    format!(
+        r#"(async () => {{
+  const bridge = window.__impulseOpsBridge;
+  if (!bridge?.reviewDecision) {{
+    console.warn("impulse review decision bridge unavailable");
+    return "degraded";
+  }}
+  return await bridge.reviewDecision({payload});
+}})();"#
+    )
+}
+
+/// First-class review queue surface. It shows staged payloads and exposes
+/// apply/skip events to the parent shell, which will route them through the
+/// Tauri/MCP decision path in the live app.
+#[component]
+fn ReviewConsole(
+    items: Vec<ReviewQueueItem>,
+    on_decision: EventHandler<ReviewDecisionUiRequest>,
+) -> Element {
+    let pending = items
+        .iter()
+        .filter(|item| item.status == ReviewQueueStatus::Pending)
+        .count();
+    rsx! {
+        section { class: "review-console", "data-source": "review_queue",
+            header { class: "review-console-header",
+                div {
+                    h2 { "Review Queue" }
+                    p { "{pending} pending · {items.len()} staged" }
+                }
+                span { class: "review-console-badge", "review-first" }
+            }
+            if items.is_empty() {
+                p { class: "section-empty", "No staged context awaiting review" }
+            } else {
+                div { class: "review-items",
+                    for item in items.iter().take(6) {
+                        {
+                            let status = review_status_label(&item.status);
+                            let target = item.target_agent_id.clone().unwrap_or_else(|| "select target".to_string());
+                            let is_pending = item.status == ReviewQueueStatus::Pending;
+                            let can_apply = is_pending && item.target_agent_id.is_some();
+                            let can_skip = is_pending;
+                            let apply_id = item.id.clone();
+                            let apply_target = item.target_agent_id.clone();
+                            let skip_id = item.id.clone();
+                            let skip_target = item.target_agent_id.clone();
+                            let short_id: String = item.id.chars().take(8).collect();
+                            rsx! {
+                                article { class: "review-item status-{status}", "data-review-id": "{item.id}",
+                                    header { class: "review-item-header",
+                                        div {
+                                            h3 { "staged {short_id}" }
+                                            span { class: "review-target", "{target}" }
+                                        }
+                                        span { class: "review-status", "{status}" }
+                                    }
+                                    pre { class: "review-preview", "{item.preview}" }
+                                    div { class: "review-actions",
+                                        button {
+                                            class: "invoke-button",
+                                            disabled: !can_apply,
+                                            onclick: move |_| {
+                                                on_decision.call(ReviewDecisionUiRequest {
+                                                    id: apply_id.clone(),
+                                                    decision: ReviewDecision::Apply,
+                                                    target_agent_id: apply_target.clone(),
+                                                });
+                                            },
+                                            "Apply"
+                                        }
+                                        button {
+                                            class: "invoke-button secondary",
+                                            disabled: !can_skip,
+                                            onclick: move |_| {
+                                                on_decision.call(ReviewDecisionUiRequest {
+                                                    id: skip_id.clone(),
+                                                    decision: ReviewDecision::Skip,
+                                                    target_agent_id: skip_target.clone(),
+                                                });
+                                            },
+                                            "Skip"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn review_status_label(status: &ReviewQueueStatus) -> &'static str {
+    match status {
+        ReviewQueueStatus::Pending => "pending",
+        ReviewQueueStatus::Applied => "applied",
+        ReviewQueueStatus::Skipped => "skipped",
+    }
+}
+
+#[component]
+fn OperatorBoard(
+    runtime_agents: Vec<AgentRuntimeSnapshot>,
+    review_queue: Vec<ReviewQueueItem>,
+    last_invocations: Vec<McpInvocation>,
+) -> Element {
+    let queued = runtime_agents
+        .iter()
+        .filter(|agent| matches!(agent.status, impulse_ops::AgentStatus::Starting))
+        .count();
+    let in_flight = runtime_agents
+        .iter()
+        .filter(|agent| matches!(agent.status, impulse_ops::AgentStatus::Working { .. }))
+        .count();
+    let review = review_queue
+        .iter()
+        .filter(|item| item.status == ReviewQueueStatus::Pending)
+        .count();
+    let done = runtime_agents
+        .iter()
+        .filter(|agent| matches!(agent.status, impulse_ops::AgentStatus::Completed))
+        .count()
+        + review_queue
+            .iter()
+            .filter(|item| item.status != ReviewQueueStatus::Pending)
+            .count();
+
+    rsx! {
+        section { class: "operator-board", "data-source": "operator_board",
+            div { class: "operator-lanes",
+                OperatorLane { label: "Queued".to_string(), count: queued, hint: "starting agents".to_string() }
+                OperatorLane { label: "In flight".to_string(), count: in_flight, hint: "active terminal work".to_string() }
+                OperatorLane { label: "Review".to_string(), count: review, hint: "pending context gates".to_string() }
+                OperatorLane { label: "Done".to_string(), count: done, hint: "completed or decided".to_string() }
+            }
+            if !runtime_agents.is_empty() {
+                div { class: "operator-agent-strip",
+                    for agent in runtime_agents.iter().take(4) {
+                        {
+                            let audit_count = last_invocations
+                                .iter()
+                                .filter(|invocation| invocation.caller_agent_id.as_deref() == Some(agent.agent_id.as_str()))
+                                .count();
+                            let workspace = agent.workspace.as_ref()
+                                .and_then(|workspace| workspace.label.as_deref())
+                                .or(agent.cwd.as_deref())
+                                .unwrap_or("no workspace");
+                            rsx! {
+                                article { class: "operator-agent-card", "data-agent-id": "{agent.agent_id}",
+                                    header {
+                                        span { class: "dot {status_dot_class(&agent.status)}" }
+                                        h3 { "{agent.label}" }
+                                        span { class: "operator-agent-status", "{status_label(&agent.status)}" }
+                                    }
+                                    p { "{workspace}" }
+                                    span { class: "operator-agent-audit", "{audit_count} audit rows" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn OperatorLane(label: String, count: usize, hint: String) -> Element {
+    rsx! {
+        div { class: "operator-lane",
+            span { class: "operator-lane-label", "{label}" }
+            strong { "{count}" }
+            span { class: "operator-lane-hint", "{hint}" }
+        }
+    }
+}
+
 /// Read-only list of `WorkspaceEntry` rows for the right-inspector. Shows
 /// root, label, and last-used timestamp. Empty state renders a hint.
 #[component]
@@ -370,6 +1058,9 @@ fn WorkspaceList(workspaces: Vec<WorkspaceEntry>, selected_root: Option<String>)
                                     span { class: "workspace-label", "{entry.label()}" }
                                     span { class: "workspace-root", title: "{entry.target.root}",
                                         "{entry.target.root}" }
+                                    if let Some(notes) = entry.target.project_notes.as_deref() {
+                                        span { class: "workspace-notes", title: "{notes}", "notes" }
+                                    }
                                     span { class: "workspace-last-used", "{last_used}" }
                                 }
                             }
@@ -378,6 +1069,190 @@ fn WorkspaceList(workspaces: Vec<WorkspaceEntry>, selected_root: Option<String>)
                 }
             }
         }
+    }
+}
+
+pub fn apply_desktop_bridge_message(
+    snapshot: &mut ProjectOpsSnapshot,
+    runtime_agents: &mut Vec<AgentRuntimeSnapshot>,
+    workspaces: &mut Vec<WorkspaceEntry>,
+    mcp_tools: &mut Vec<BuiltInMcpTool>,
+    review_queue: &mut Vec<ReviewQueueItem>,
+    last_invocations: &mut Vec<McpInvocation>,
+    message: DesktopBridgeMessage,
+) -> Result<(), String> {
+    match message.kind.as_str() {
+        "ops_update" => {
+            let payload = extract_ops_update_payload(&message.payload);
+            *snapshot = serde_json::from_value(payload.clone())
+                .map_err(|error| format!("invalid ops_update payload: {error}"))?;
+            Ok(())
+        }
+        "agent_runtime_update" => {
+            let payload = extract_agent_snapshot_payload(&message.payload);
+            let runtime_snapshot = serde_json::from_value::<AgentRuntimeSnapshot>(payload.clone())
+                .map_err(|error| format!("invalid agent_runtime_update payload: {error}"))?;
+            upsert_agent_runtime(snapshot, runtime_agents, runtime_snapshot);
+            Ok(())
+        }
+        "agent_snapshot" => {
+            let agents = message
+                .payload
+                .get("agents")
+                .cloned()
+                .unwrap_or_else(|| message.payload.clone());
+            let runtime_snapshots = serde_json::from_value::<Vec<AgentRuntimeSnapshot>>(agents)
+                .map_err(|error| format!("invalid agent_snapshot payload: {error}"))?;
+            *runtime_agents = runtime_snapshots;
+            snapshot.agents = runtime_agents
+                .iter()
+                .cloned()
+                .map(agent_runtime_from_desktop_snapshot)
+                .collect();
+            Ok(())
+        }
+        "workspaces" => {
+            let items = message
+                .payload
+                .get("workspaces")
+                .cloned()
+                .unwrap_or_else(|| message.payload.clone());
+            *workspaces = serde_json::from_value::<Vec<WorkspaceEntry>>(items)
+                .map_err(|error| format!("invalid workspaces payload: {error}"))?;
+            Ok(())
+        }
+        "workspace_registered" => {
+            let entry = message
+                .payload
+                .get("entry")
+                .cloned()
+                .unwrap_or_else(|| message.payload.clone());
+            let entry = serde_json::from_value::<WorkspaceEntry>(entry)
+                .map_err(|error| format!("invalid workspace_registered payload: {error}"))?;
+            if let Some(existing) = workspaces
+                .iter_mut()
+                .find(|workspace| workspace.target.root == entry.target.root)
+            {
+                *existing = entry;
+            } else {
+                workspaces.push(entry);
+            }
+            Ok(())
+        }
+        "mcp_descriptors" | "mcp_tools" => {
+            let tools = message
+                .payload
+                .get("tools")
+                .cloned()
+                .unwrap_or_else(|| message.payload.clone());
+            *mcp_tools = serde_json::from_value::<Vec<BuiltInMcpTool>>(tools)
+                .map_err(|error| format!("invalid mcp_descriptors payload: {error}"))?;
+            Ok(())
+        }
+        "review_queue" => {
+            let items = message
+                .payload
+                .get("items")
+                .cloned()
+                .unwrap_or_else(|| message.payload.clone());
+            *review_queue = serde_json::from_value::<Vec<ReviewQueueItem>>(items)
+                .map_err(|error| format!("invalid review_queue payload: {error}"))?;
+            Ok(())
+        }
+        "mcp_invocation" => {
+            let invocation = message
+                .payload
+                .get("invocation")
+                .cloned()
+                .unwrap_or_else(|| message.payload.clone());
+            let invocation = serde_json::from_value::<McpInvocation>(invocation)
+                .map_err(|error| format!("invalid mcp_invocation payload: {error}"))?;
+            last_invocations.push(invocation);
+            if last_invocations.len() > 100 {
+                let overflow = last_invocations.len() - 100;
+                last_invocations.drain(0..overflow);
+            }
+            Ok(())
+        }
+        "bridge_status" => Ok(()),
+        other => Err(format!("unknown desktop bridge message `{other}`")),
+    }
+}
+
+fn upsert_agent_runtime(
+    snapshot: &mut ProjectOpsSnapshot,
+    runtime_agents: &mut Vec<AgentRuntimeSnapshot>,
+    runtime: AgentRuntimeSnapshot,
+) {
+    if let Some(existing) = runtime_agents
+        .iter_mut()
+        .find(|agent| agent.agent_id == runtime.agent_id)
+    {
+        *existing = runtime.clone();
+    } else {
+        runtime_agents.push(runtime.clone());
+    }
+    snapshot.agents = runtime_agents
+        .iter()
+        .cloned()
+        .map(agent_runtime_from_desktop_snapshot)
+        .collect();
+}
+
+fn extract_ops_update_payload(payload: &Value) -> &Value {
+    payload
+        .get("data")
+        .and_then(|data| data.get("payload"))
+        .or_else(|| payload.get("payload"))
+        .unwrap_or(payload)
+}
+
+fn extract_agent_snapshot_payload(payload: &Value) -> &Value {
+    payload
+        .get("data")
+        .and_then(|data| data.get("snapshot"))
+        .or_else(|| payload.get("snapshot"))
+        .unwrap_or(payload)
+}
+
+fn agent_runtime_from_desktop_snapshot(snapshot: AgentRuntimeSnapshot) -> AgentRuntime {
+    let working_directory = snapshot
+        .cwd
+        .clone()
+        .or_else(|| {
+            snapshot
+                .workspace
+                .as_ref()
+                .map(|workspace| workspace.root.clone())
+        })
+        .unwrap_or_default();
+    AgentRuntime {
+        id: snapshot.agent_id,
+        label: snapshot.label,
+        backend_kind: snapshot.platform.as_str().to_string(),
+        session_id: snapshot.session_id,
+        ephemeral: false,
+        working_directory,
+        status: snapshot.status.to_legacy_string(),
+        current_task: snapshot.current_task,
+        active: snapshot.alive,
+        context: snapshot.context,
+        recent_files: Vec::new(),
+        recent_tools: snapshot
+            .mcp_tools
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect(),
+        warnings: Vec::new(),
+        agent_status: snapshot.status,
+        role: snapshot.role,
+        group: snapshot
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.label.clone()),
+        tool_invocations: Vec::new(),
+        diff_summary: None,
+        target: snapshot.target,
     }
 }
 
@@ -485,24 +1360,30 @@ fn BrandHero() -> Element {
 }
 
 #[component]
-pub fn DesktopShellWithSnapshot(snapshot: ProjectOpsSnapshot) -> Element {
-    use_effect(move || {
-        spawn(async move {
-            let _ = document::eval(TERMINAL_INTEROP_SCRIPT).await;
-        });
-    });
-
+pub fn DesktopShellWithSnapshot(
+    snapshot: ProjectOpsSnapshot,
+    #[props(default)] runtime_agents: Vec<AgentRuntimeSnapshot>,
+    #[props(default)] workspaces: Vec<WorkspaceEntry>,
+    #[props(default)] mcp_tools: Vec<BuiltInMcpTool>,
+    #[props(default)] last_invocations: Vec<McpInvocation>,
+    #[props(default)] review_queue: Vec<ReviewQueueItem>,
+    #[props(default = DesktopView::Terminal)] initial_view: DesktopView,
+) -> Element {
     let context = &snapshot.context;
     let tokens = format_count(context.estimated_tokens);
     let window = format_count(context.window_tokens);
-    let usage_pct = (context.usage_fraction * 100.0).round() as i32;
+    let usage_pct = usage_meter_pct(context.usage_fraction);
     let agents_online = snapshot.agents.iter().filter(|agent| agent.active).count();
     let working_agents = snapshot
         .agents
         .iter()
         .filter(|agent| matches!(agent.agent_status, impulse_ops::AgentStatus::Working { .. }))
         .count();
-    let pending_review_count = context.pending_review_count;
+    let pending_queue_count = review_queue
+        .iter()
+        .filter(|item| item.status == ReviewQueueStatus::Pending)
+        .count();
+    let pending_review_count = context.pending_review_count.max(pending_queue_count);
     let daemon_online = !snapshot.agents.is_empty();
     let daemon_label = if daemon_online {
         "online · watching"
@@ -520,14 +1401,41 @@ pub fn DesktopShellWithSnapshot(snapshot: ProjectOpsSnapshot) -> Element {
     } else {
         snapshot.generated_at.as_str()
     };
+    let first_workspace_root = workspaces
+        .first()
+        .map(|entry| entry.target.root.clone())
+        .unwrap_or_default();
+    let mut focused_workspace_root = use_signal(String::new);
+    let selected_root = if focused_workspace_root().trim().is_empty() {
+        first_workspace_root
+    } else {
+        focused_workspace_root()
+    };
+    let has_runtime_agents = !runtime_agents.is_empty();
+    let mut active_view = use_signal(|| initial_view);
+    let mut latest_shell_intent = use_signal(|| None::<String>);
+    let active_view_value = active_view();
+    let terminal_view_class = if active_view_value == DesktopView::Terminal {
+        "stage-view view-terminal active"
+    } else {
+        "stage-view view-terminal"
+    };
 
     rsx! {
-        document::Style { {CRT_CSS} }
-        document::Link { rel: "preconnect", href: "https://fonts.googleapis.com" }
-        document::Link {
+        link {
             rel: "stylesheet",
-            href: "https://fonts.googleapis.com/css2?family=Baloo+2:wght@500;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap",
+            href: XTERM_CSS_PATH,
+            "data-impulse-terminal-asset": "xterm-css",
         }
+        script {
+            src: XTERM_JS_PATH,
+            "data-impulse-terminal-asset": "xterm-js",
+        }
+        script {
+            src: XTERM_FIT_JS_PATH,
+            "data-impulse-terminal-asset": "xterm-fit-addon",
+        }
+        style { {CRT_CSS} }
         main { class: "impulse-shell",
             header { class: "top-bar",
                 div { class: "brand",
@@ -542,67 +1450,152 @@ pub fn DesktopShellWithSnapshot(snapshot: ProjectOpsSnapshot) -> Element {
             }
             div { class: "workspace-grid",
                 aside { class: "left-rail", "data-owner": "dioxus",
-                    h2 { "Sessions" }
-                    button { class: "rail-item active", "Terminal" }
-                    button { class: "rail-item", "Memory" }
-                    button { class: "rail-item", "Artifacts" }
-                    button { class: "rail-item", "Supervisor" }
+                    h2 { "Views" }
+                    ViewRail {
+                        active: active_view_value,
+                        on_select: move |view: DesktopView| active_view.set(view),
+                    }
                     AgentPool {
-                        agents: Vec::<AgentRuntimeSnapshot>::new(),
+                        agents: runtime_agents.clone(),
                         focused_agent_id: None,
-                        on_focus: move |_id| {},
+                        on_focus: move |id: String| {
+                            let script = agent_focus_bridge_script(&id);
+                            spawn(async move {
+                                let _ = document::eval(&script).await;
+                            });
+                        },
                     }
                     WorkspaceSwitcher {
-                        workspaces: Vec::<WorkspaceEntry>::new(),
-                        selected_root: String::new(),
-                        on_select: move |_root| {},
+                        workspaces: workspaces.clone(),
+                        selected_root: selected_root.clone(),
+                        on_select: move |root: String| focused_workspace_root.set(root),
                     }
                 }
                 section { class: "terminal-stage", "data-terminal-renderer": "xterm.js",
-                    BrandHero {}
-                    div { class: "stat-row",
-                        Stat {
-                            k: "Memory".to_string(),
-                            v: tokens.clone(),
-                            s: "tokens · {usage_pct}% of {window}",
+                    div { class: "{terminal_view_class}", "data-view": "terminal",
+                        BrandHero {}
+                        div { class: "stat-row",
+                            Stat {
+                                k: "Memory".to_string(),
+                                v: tokens.clone(),
+                                s: "tokens · {usage_pct}% of {window}",
+                            }
+                            Stat {
+                                k: "Agents".to_string(),
+                                v: agents_online.to_string(),
+                                s: "online · {working_agents} working",
+                            }
+                            Stat {
+                                k: "Retrieval".to_string(),
+                                v: snapshot.retrieval.backend.clone(),
+                                s: "{snapshot.memory.genome_decisions} genome decisions",
+                            }
                         }
-                        Stat {
-                            k: "Agents".to_string(),
-                            v: agents_online.to_string(),
-                            s: "online · {working_agents} working",
+                        if pending_review_count > 0 {
+                            PendingReview { count: pending_review_count }
                         }
-                        Stat {
-                            k: "Retrieval".to_string(),
-                            v: snapshot.retrieval.backend.clone(),
-                            s: "{snapshot.memory.genome_decisions} genome decisions",
+                        div { class: "terminal-tabs", "data-owner": "dioxus",
+                            if has_runtime_agents {
+                                for agent in runtime_agents.iter() {
+                                {
+                                    let class_name = if agent.focused { "terminal-tab active" } else { "terminal-tab" };
+                                    let agent_id = agent.agent_id.clone();
+                                    rsx! {
+                                        button {
+                                            class: "{class_name}",
+                                                "data-agent-id": "{agent_id}",
+                                                onclick: move |_| {
+                                                    let script = agent_focus_bridge_script(&agent_id);
+                                                    spawn(async move {
+                                                        let _ = document::eval(&script).await;
+                                                    });
+                                                },
+                                                "{agent.label}" }
+                                        }
+                                    }
+                                }
+                            } else {
+                                button { class: "terminal-tab active", "codex" }
+                                button { class: "terminal-tab", "claude" }
+                                button { class: "terminal-tab", "shell" }
+                            }
+                        }
+                        if has_runtime_agents {
+                            for agent in runtime_agents.iter() {
+                                {
+                                    let pane_id = format!("terminal-pane-{}", impulse_ops::sanitize_id(&agent.agent_id));
+                                    let class_name = if agent.focused { "xterm-mount" } else { "xterm-mount pending" };
+                                    rsx! {
+                                        div {
+                                            id: "{pane_id}",
+                                            class: "{class_name}",
+                                            "data-xterm-mount": "true",
+                                            "data-agent-id": "{agent.agent_id}",
+                                            "data-platform": "{agent.platform.as_str()}",
+                                            "data-pty-owner": "rust-backend",
+                                            "data-xterm-on-data": "agent_write",
+                                            "data-xterm-on-resize": "agent_resize",
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            div {
+                                id: "terminal-pane-primary",
+                                class: "xterm-mount",
+                                "data-xterm-mount": "true",
+                                "data-agent-id": "shell",
+                                "data-pty-owner": "rust-backend",
+                                "data-command-bus": "agent_write",
+                                "xterm.js terminal mount"
+                            }
+                            div {
+                                id: "terminal-pane-codex",
+                                class: "xterm-mount pending",
+                                "data-xterm-mount": "true",
+                                "data-agent-id": "codex",
+                                "data-platform": "codex",
+                                "data-pty-owner": "rust-backend",
+                                "data-xterm-on-data": "agent_write",
+                                "data-xterm-on-resize": "agent_resize",
+                            }
                         }
                     }
-                    if pending_review_count > 0 {
-                        PendingReview { count: pending_review_count }
-                    }
-                    div { class: "terminal-tabs", "data-owner": "dioxus",
-                        button { class: "terminal-tab active", "codex" }
-                        button { class: "terminal-tab", "claude" }
-                        button { class: "terminal-tab", "shell" }
-                    }
-                    div {
-                        id: "terminal-pane-primary",
-                        class: "xterm-mount",
-                        "data-xterm-mount": "true",
-                        "data-agent-id": "shell",
-                        "data-pty-owner": "rust-backend",
-                        "data-command-bus": "agent_write",
-                        "xterm.js terminal mount"
-                    }
-                    div {
-                        id: "terminal-pane-codex",
-                        class: "xterm-mount pending",
-                        "data-xterm-mount": "true",
-                        "data-agent-id": "codex",
-                        "data-platform": "codex",
-                        "data-pty-owner": "rust-backend",
-                        "data-xterm-on-data": "agent_write",
-                        "data-xterm-on-resize": "agent_resize",
+                    match active_view_value {
+                        DesktopView::Terminal => rsx! {},
+                        DesktopView::Memory => rsx! {
+                            MemoryView {
+                                context: snapshot.context.clone(),
+                                memory: snapshot.memory.clone(),
+                                retrieval: snapshot.retrieval.clone(),
+                            }
+                        },
+                        DesktopView::Review => rsx! {
+                            ReviewConsole {
+                                items: review_queue.clone(),
+                                on_decision: move |request| {
+                                    let script = review_decision_bridge_script(&request);
+                                    spawn(async move {
+                                        let _ = document::eval(&script).await;
+                                    });
+                                },
+                            }
+                        },
+                        DesktopView::Artifacts => rsx! {
+                            ArtifactsView {
+                                artifacts: snapshot.artifacts.clone(),
+                                on_intent: move |intent: ShellIntent| {
+                                    latest_shell_intent.set(Some(intent.describe()));
+                                },
+                            }
+                        },
+                        DesktopView::Supervisor => rsx! {
+                            OperatorBoard {
+                                runtime_agents: runtime_agents.clone(),
+                                review_queue: review_queue.clone(),
+                                last_invocations: last_invocations.clone(),
+                            }
+                        },
                     }
                 }
                 aside { class: "right-inspector", "data-owner": "dioxus",
@@ -624,21 +1617,42 @@ pub fn DesktopShellWithSnapshot(snapshot: ProjectOpsSnapshot) -> Element {
                         h2 { "Native Islands" }
                         p { "macOS affordances report through serializable DTOs" }
                     }
+                    WorkspaceLaunchPanel {
+                        workspaces: workspaces.clone(),
+                        selected_root: selected_root.clone(),
+                        on_register: move |request: RegisterWorkspaceRequest| {
+                            let script = workspace_registration_bridge_script(&request);
+                            spawn(async move {
+                                let _ = document::eval(&script).await;
+                            });
+                        },
+                        on_launch: move |request: AgentSpawnRequest| {
+                            let script = agent_launch_bridge_script(&request);
+                            spawn(async move {
+                                let _ = document::eval(&script).await;
+                            });
+                        },
+                    }
                     McpToolPalette {
-                        tools: Vec::<BuiltInMcpTool>::new(),
-                        last_invocations: Vec::<McpInvocation>::new(),
-                        on_invoke: move |_request| {},
+                        tools: mcp_tools.clone(),
+                        last_invocations: last_invocations.clone(),
+                        on_invoke: move |request: McpInvokeRequest| {
+                            let script = mcp_invoke_bridge_script(&request);
+                            spawn(async move {
+                                let _ = document::eval(&script).await;
+                            });
+                        },
                     }
                     WorkspaceList {
-                        workspaces: Vec::<WorkspaceEntry>::new(),
-                        selected_root: None,
+                        workspaces: workspaces.clone(),
+                        selected_root: if selected_root.is_empty() { None } else { Some(selected_root.clone()) },
                     }
                     section { class: "inspector-section",
                         h2 { "Supervisor" }
                         p { "Actions require backend confirmation" }
                     }
                     AuditTrail {
-                        invocations: Vec::<McpInvocation>::new(),
+                        invocations: last_invocations,
                         agent_filter: None,
                     }
                     section { class: "inspector-section",
@@ -655,6 +1669,9 @@ pub fn DesktopShellWithSnapshot(snapshot: ProjectOpsSnapshot) -> Element {
                 span { "terminal_output stream pending" }
                 span { "agent_runtime_update stream pending" }
                 span { "supervisor_local_action stream pending" }
+                if let Some(intent) = latest_shell_intent() {
+                    span { class: "shell-notice", "{intent}" }
+                }
             }
         }
     }
@@ -662,9 +1679,60 @@ pub fn DesktopShellWithSnapshot(snapshot: ProjectOpsSnapshot) -> Element {
 
 #[component]
 pub fn DesktopShell() -> Element {
+    let mut snapshot = use_signal(ProjectOpsSnapshot::default);
+    let mut runtime_agents = use_signal(Vec::<AgentRuntimeSnapshot>::new);
+    let mut workspaces = use_signal(Vec::<WorkspaceEntry>::new);
+    let mut mcp_tools = use_signal(Vec::<BuiltInMcpTool>::new);
+    let mut review_queue = use_signal(Vec::<ReviewQueueItem>::new);
+    let mut last_invocations = use_signal(Vec::<McpInvocation>::new);
+
+    use_effect(move || {
+        let _agent_mount_count = runtime_agents().len();
+        spawn(async move {
+            let _ = document::eval(TERMINAL_INTEROP_SCRIPT).await;
+        });
+    });
+
+    use_effect(move || {
+        spawn(async move {
+            let mut eval = document::eval(DESKTOP_EVENT_BRIDGE_SCRIPT);
+            while let Ok(message) = eval.recv::<DesktopBridgeMessage>().await {
+                let mut next_snapshot = snapshot();
+                let mut next_agents = runtime_agents();
+                let mut next_workspaces = workspaces();
+                let mut next_mcp_tools = mcp_tools();
+                let mut next_queue = review_queue();
+                let mut next_invocations = last_invocations();
+                if apply_desktop_bridge_message(
+                    &mut next_snapshot,
+                    &mut next_agents,
+                    &mut next_workspaces,
+                    &mut next_mcp_tools,
+                    &mut next_queue,
+                    &mut next_invocations,
+                    message,
+                )
+                .is_ok()
+                {
+                    snapshot.set(next_snapshot);
+                    runtime_agents.set(next_agents);
+                    workspaces.set(next_workspaces);
+                    mcp_tools.set(next_mcp_tools);
+                    review_queue.set(next_queue);
+                    last_invocations.set(next_invocations);
+                }
+            }
+        });
+    });
+
     rsx! {
         DesktopShellWithSnapshot {
-            snapshot: ProjectOpsSnapshot::default(),
+            snapshot: snapshot(),
+            runtime_agents: runtime_agents(),
+            workspaces: workspaces(),
+            mcp_tools: mcp_tools(),
+            review_queue: review_queue(),
+            last_invocations: last_invocations(),
         }
     }
 }

@@ -439,7 +439,7 @@ fn extract_key_insights(messages: &[TranscriptMessage]) -> Vec<String> {
         }
     }
     let mut sorted_tools: Vec<_> = tool_counts.into_iter().collect();
-    sorted_tools.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted_tools.sort_by_key(|b| std::cmp::Reverse(b.1));
     if !sorted_tools.is_empty() {
         let top_tools: Vec<String> = sorted_tools
             .iter()

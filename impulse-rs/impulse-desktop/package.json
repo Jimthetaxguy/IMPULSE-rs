@@ -1,0 +1,16 @@
+{
+  "name": "impulse-desktop-visual-smoke",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "vendor:xterm": "node scripts/vendor_xterm_assets.mjs",
+    "visual:fixtures": "cargo run -p impulse-desktop --example render_visual_fixtures -- ../../output/playwright/impulse-desktop-visual",
+    "visual:install": "playwright install chromium",
+    "visual:smoke": "npm run vendor:xterm && npm run visual:fixtures && node scripts/visual_smoke.mjs ../../output/playwright/impulse-desktop-visual ../../output/playwright/impulse-desktop-visual"
+  },
+  "devDependencies": {
+    "@xterm/addon-fit": "0.11.0",
+    "@xterm/xterm": "6.0.0",
+    "playwright": "1.60.0"
+  }
+}

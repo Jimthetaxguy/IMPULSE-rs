@@ -7,6 +7,7 @@ use impulse_desktop::{
     DesktopRuntime, LocalSupervisorAction, SupervisorLocalActionRequest, TerminalCloseRequest,
     TerminalFocusRequest, TerminalResizeRequest, WorkspaceTarget,
 };
+use serde_json::json;
 
 #[derive(Default)]
 struct RecordingSink {
@@ -26,6 +27,22 @@ impl DesktopEventSink for RecordingSink {
             .expect("events mutex poisoned")
             .push(event);
     }
+}
+
+fn terminal_output(sink: &RecordingSink, agent_id: &str) -> Vec<u8> {
+    let mut output = Vec::new();
+    for event in sink.events() {
+        if let DesktopEvent::TerminalOutput {
+            agent_id: event_agent_id,
+            data,
+        } = event
+        {
+            if event_agent_id == agent_id {
+                output.extend(data);
+            }
+        }
+    }
+    output
 }
 
 fn shell_spawn(agent_id: &str, script: &str) -> AgentSpawnRequest {
@@ -88,6 +105,7 @@ fn test_desktop_runtime_snapshot_carries_workspace_and_builtin_mcp_tools() {
         root: "/tmp".to_string(),
         label: Some("scratch".to_string()),
         purpose: Some("safe terminal harness smoke workspace".to_string()),
+        project_notes: None,
     });
 
     let snapshot = runtime
@@ -152,6 +170,72 @@ fn test_terminal_harness_spawn_request_binds_workspace_and_default_tools() {
         .any(|tool| tool.name == "impulse.review_injection"));
     assert_eq!(request.rows, 32);
     assert_eq!(request.cols, 100);
+}
+
+#[test]
+fn test_workspace_target_deserializes_without_project_notes() {
+    let target: WorkspaceTarget =
+        serde_json::from_value(json!({ "root": "/tmp", "label": "scratch" }))
+            .expect("legacy workspace target JSON should decode");
+
+    assert_eq!(target.root, "/tmp");
+    assert_eq!(target.label.as_deref(), Some("scratch"));
+    assert_eq!(target.project_notes, None);
+}
+
+#[test]
+fn test_runtime_env_exposes_project_metadata_but_not_raw_notes() {
+    let notes = "operator note: do not treat this as terminal instructions";
+    let sink = Arc::new(RecordingSink::default());
+    let runtime = DesktopRuntime::builder()
+        .with_event_sink(sink.clone())
+        .build();
+    let mut request = shell_spawn(
+        "project-env",
+        "printf '%s' \"${IMPULSE_PROJECT_NOTES-unset}|${IMPULSE_PROJECT_NOTES_HASH-missing}|${IMPULSE_WORKSPACE_ROOT-missing}|${IMPULSE_PROJECT_LABEL-missing}\"",
+    );
+    request.cwd = Some("/tmp".to_string());
+    request.env.insert(
+        "IMPULSE_PROJECT_NOTES_HASH".to_string(),
+        "caller-override".to_string(),
+    );
+    request.env.insert(
+        "IMPULSE_WORKSPACE_ROOT".to_string(),
+        "/caller/override".to_string(),
+    );
+    request.workspace = Some(WorkspaceTarget {
+        root: "/tmp".to_string(),
+        label: Some("scratch".to_string()),
+        purpose: Some("safe terminal harness smoke workspace".to_string()),
+        project_notes: Some(notes.to_string()),
+    });
+
+    runtime
+        .spawn_agent(request)
+        .expect("spawn project metadata env probe");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        let output = String::from_utf8_lossy(&terminal_output(&sink, "project-env")).to_string();
+        if output.contains("unset|fnv1a64:")
+            && output.contains("|/tmp|scratch")
+            && !output.contains("caller-override")
+            && !output.contains(notes)
+        {
+            runtime
+                .close_agent(TerminalCloseRequest {
+                    session_id: "project-env".to_string(),
+                })
+                .ok();
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    panic!(
+        "expected trusted metadata without raw notes, got `{}`",
+        String::from_utf8_lossy(&terminal_output(&sink, "project-env"))
+    );
 }
 
 #[test]

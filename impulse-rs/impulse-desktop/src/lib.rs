@@ -11,6 +11,7 @@ pub mod runtime;
 pub mod tauri_commands;
 pub mod theme;
 pub mod ui;
+pub mod views;
 pub mod workspace;
 
 pub use bridge::{
@@ -20,7 +21,9 @@ pub use bridge::{
 };
 pub use mcp::{
     AgentSpawnTool, AgentWriteTool, ListAgentsTool, ListWorkspacesTool, McpContext, McpError,
-    McpInvocation, McpTool, McpToolRegistry, PassthroughMcpTool, SearchMemoryTool,
+    McpInvocation, McpTool, McpToolRegistry, PassthroughMcpTool, ProjectContextTool,
+    ReviewDecision, ReviewDecisionTool, ReviewInjectionTool, ReviewQueueItem, ReviewQueueStatus,
+    SearchMemoryTool,
 };
 pub use native::{
     DefaultNativeIslandHost, NativeIslandHost, NativeIslandKind, NativeIslandRequest,
@@ -31,6 +34,14 @@ pub use runtime::{
     AgentWriteRequest, BuiltInMcpTool, DesktopEvent, DesktopEventSink, DesktopRuntime,
     DesktopRuntimeBuilder, LocalSupervisorAction, SupervisorLocalActionRequest, WorkspaceTarget,
 };
-pub use theme::{format_count, status_dot_class, status_label};
+pub use tauri_commands::{RegisterWorkspaceRequest, ReviewDecisionRequest};
+pub use theme::{
+    artifact_status_class, artifact_status_label, format_count, severity_class, status_dot_class,
+    status_label, usage_meter_pct,
+};
 pub use ui::{DesktopShell, DesktopShellWithSnapshot, DesktopShellWithSnapshotProps};
+pub use views::{
+    ArtifactsView, ArtifactsViewProps, DesktopView, MemoryView, MemoryViewProps, ReviewView,
+    ReviewViewProps, ShellIntent, SupervisorView, SupervisorViewProps,
+};
 pub use workspace::{WorkspaceEntry, WorkspaceRegistry, WorkspaceRegistryError};
