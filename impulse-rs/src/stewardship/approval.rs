@@ -29,10 +29,13 @@ fn sanitize_id(id: &str) -> Result<&str> {
 
 /// Queue a proposal for user approval
 pub fn queue_proposal(base_path: &Path, proposal: &CleanupProposal) -> Result<()> {
+    // Validate the id before using it as a filename, consistent with approve/
+    // reject — an unvalidated id with `..`/`/` would escape the pending dir.
+    let safe_id = sanitize_id(&proposal.id)?;
     let dir = base_path.join(STEWARDSHIP_DIR).join(PENDING_DIR);
     std::fs::create_dir_all(&dir)?;
 
-    let path = dir.join(format!("{}.yaml", proposal.id));
+    let path = dir.join(format!("{}.yaml", safe_id));
     let yaml = serde_yaml::to_string(proposal)?;
     super::atomic_write_file(&path, yaml.as_bytes())?;
     Ok(())
@@ -253,6 +256,11 @@ mod tests {
         assert!(reject_proposal(dir.path(), "../malicious").is_err());
         assert!(approve_proposal(dir.path(), "id with spaces").is_err());
         assert!(approve_proposal(dir.path(), "").is_err());
+
+        // queue_proposal must validate the proposal id too — a malicious id
+        // would otherwise write the YAML outside the pending dir.
+        assert!(queue_proposal(dir.path(), &make_proposal("../../etc/evil")).is_err());
+        assert!(queue_proposal(dir.path(), &make_proposal("queued-ok_1")).is_ok());
 
         // Valid IDs should work (return false because proposal doesn't exist)
         assert!(!approve_proposal(dir.path(), "valid-id_123").unwrap());
