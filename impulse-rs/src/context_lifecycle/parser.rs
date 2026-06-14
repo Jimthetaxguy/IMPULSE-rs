@@ -340,17 +340,37 @@ fn detect_tool_invocation(line: &str) -> Option<(ToolKind, String)> {
         }
     }
 
-    // OpenCode/Codex patterns: "wrote path", "modified path", "created path"
-    let lower = line.to_lowercase();
+    // Natural-language file-operation announcements emitted by Codex, Gemini,
+    // Cursor and OpenCode (Claude uses the parenthesized form above). Matched
+    // case-insensitively at line start; the path is sliced from the ORIGINAL
+    // line so its case is preserved on case-sensitive filesystems. The
+    // `is_likely_file_path` guard keeps prose like "reading the docs" from
+    // being misread as a tool call.
     for (prefix, kind) in &[
         ("wrote ", ToolKind::Write),
-        ("modified ", ToolKind::Edit),
+        ("writing ", ToolKind::Write),
         ("created ", ToolKind::Write),
+        ("creating ", ToolKind::Write),
+        ("modified ", ToolKind::Edit),
+        ("modifying ", ToolKind::Edit),
+        ("editing ", ToolKind::Edit),
+        ("edited ", ToolKind::Edit),
+        ("updated ", ToolKind::Edit),
+        ("updating ", ToolKind::Edit),
+        // Codex/Gemini apply-patch flows announce edits as patches.
+        ("patched ", ToolKind::Edit),
+        ("patching ", ToolKind::Edit),
+        ("applied patch to ", ToolKind::Edit),
+        ("reading ", ToolKind::Read),
     ] {
-        if let Some(rest) = lower.strip_prefix(prefix) {
-            let path = rest.trim();
-            if is_likely_file_path(path) {
-                return Some((kind.clone(), path.to_string()));
+        // `get(..)` returns None unless `prefix.len()` is a char boundary, so
+        // the subsequent slice can never panic on multibyte input.
+        if let Some(head) = line.get(..prefix.len()) {
+            if head.eq_ignore_ascii_case(prefix) {
+                let path = line[prefix.len()..].trim();
+                if is_likely_file_path(path) {
+                    return Some((kind.clone(), path.to_string()));
+                }
             }
         }
     }
@@ -453,6 +473,63 @@ mod tests {
                 target: "src/handler.rs".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn test_classify_tool_invocation_natural_language_verbs() {
+        // Present-tense and additional verbs used by Codex/Gemini/Cursor.
+        let cases = [
+            ("Editing src/main.rs", ToolKind::Edit, "src/main.rs"),
+            ("Creating src/new.rs", ToolKind::Write, "src/new.rs"),
+            ("Updating src/lib.rs", ToolKind::Edit, "src/lib.rs"),
+            ("Reading Cargo.toml", ToolKind::Read, "Cargo.toml"),
+            ("patched src/auth/mod.rs", ToolKind::Edit, "src/auth/mod.rs"),
+            (
+                "Applied patch to src/parser.rs",
+                ToolKind::Edit,
+                "src/parser.rs",
+            ),
+        ];
+        for (line, kind, target) in cases {
+            assert_eq!(
+                classify_line(line, AgentKind::Codex),
+                LineClassification::ToolInvocation {
+                    kind: kind.clone(),
+                    target: target.to_string(),
+                },
+                "line: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tool_invocation_preserves_path_case() {
+        // The path must retain its original case (previously lowercased).
+        assert_eq!(
+            classify_line("Writing src/MyModule.rs", AgentKind::Gemini),
+            LineClassification::ToolInvocation {
+                kind: ToolKind::Write,
+                target: "src/MyModule.rs".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_tool_invocation_rejects_prose() {
+        // Verb prefixes followed by non-paths must not be read as tool calls.
+        for line in [
+            "reading the documentation now",
+            "editing in progress",
+            "created a new plan for the refactor",
+        ] {
+            assert!(
+                !matches!(
+                    classify_line(line, AgentKind::Codex),
+                    LineClassification::ToolInvocation { .. }
+                ),
+                "prose misread as tool call: {line}"
+            );
+        }
     }
 
     #[test]
