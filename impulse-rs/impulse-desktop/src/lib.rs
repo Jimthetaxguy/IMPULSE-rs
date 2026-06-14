@@ -1,14 +1,18 @@
-//! Hybrid Dioxus desktop shell boundary for Impulse.
+//! Dioxus desktop shell boundary for Impulse.
 //!
-//! Dioxus owns the product interface. Tauri owns native process and IPC edges.
+//! Dioxus owns the product interface and host direction. Legacy Tauri-shaped
+//! adapters are temporary compatibility edges while Dioxus Desktop launch
+//! plumbing lands.
 //! Native macOS islands are narrow capability bridges and never own Impulse
 //! session, memory, terminal, or artifact state.
 
 pub mod bridge;
+#[cfg(feature = "desktop-app")]
+pub mod desktop_host;
+pub mod host_commands;
 pub mod mcp;
 pub mod native;
 pub mod runtime;
-pub mod tauri_commands;
 pub mod theme;
 pub mod ui;
 pub mod views;
@@ -19,6 +23,7 @@ pub use bridge::{
     TerminalCloseRequest, TerminalFocusRequest, TerminalOpenRequest, TerminalResizeRequest,
     TerminalSessionResponse, TerminalWriteRequest,
 };
+pub use host_commands::{RegisterWorkspaceRequest, ReviewDecisionRequest};
 pub use mcp::{
     AgentSpawnTool, AgentWriteTool, ListAgentsTool, ListWorkspacesTool, McpContext, McpError,
     McpInvocation, McpTool, McpToolRegistry, PassthroughMcpTool, ProjectContextTool,
@@ -34,7 +39,6 @@ pub use runtime::{
     AgentWriteRequest, BuiltInMcpTool, DesktopEvent, DesktopEventSink, DesktopRuntime,
     DesktopRuntimeBuilder, LocalSupervisorAction, SupervisorLocalActionRequest, WorkspaceTarget,
 };
-pub use tauri_commands::{RegisterWorkspaceRequest, ReviewDecisionRequest};
 pub use theme::{
     artifact_status_class, artifact_status_label, format_count, severity_class, status_dot_class,
     status_label, usage_meter_pct,

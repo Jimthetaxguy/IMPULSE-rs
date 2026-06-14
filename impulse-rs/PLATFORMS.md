@@ -37,10 +37,10 @@ npm install -g @openai/codex                 # Codex (optional)
 
 ```bash
 # For Claude Code chat in daemon
-export ANTHROPIC_API_KEY=sk-ant-your-key-here
+export ANTHROPIC_API_KEY=anthropic-key-not-real
 
 # Add to shell profile for persistence
-echo 'export ANTHROPIC_API_KEY=sk-ant-...' >> ~/.zshrc
+echo 'export ANTHROPIC_API_KEY=anthropic-key-redacted' >> ~/.zshrc
 ```
 
 ### Running
@@ -99,8 +99,8 @@ npm install -g @openai/codex                 # Codex (optional)
 
 ```bash
 # Add to ~/.bashrc or ~/.zshrc
-export ANTHROPIC_API_KEY=sk-ant-your-key-here
-export OPENAI_API_KEY=sk-your-key-here
+export ANTHROPIC_API_KEY=anthropic-key-not-real
+export OPENAI_API_KEY=openai-key-not-real
 ```
 
 ### Running

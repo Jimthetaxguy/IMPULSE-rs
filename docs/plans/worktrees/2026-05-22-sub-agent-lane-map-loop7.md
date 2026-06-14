@@ -5,23 +5,26 @@ updated: 2026-05-22
 type: doc
 category: planning
 phase: all
-status: active
+status: superseded
 audience: builders
 tags: [worktree, lane, ralph-plan, sub-agent, sequencing, handoff]
 ---
 
 # Sub-Agent Lane Map Loop 7
 
+> Historical lane map from the May 2026 Tauri+Dioxus migration phase. Use the
+> 2026-06-14 Dioxus Desktop work cards and ADR-0008 for current host direction.
+
 ## Lane Facts
 
 - Owner: Codex Loop 7 worker
 - Role: Lane integrator and sequencing mapper
 - Branch: `main`
-- Worktree: `/Users/jamespustorino/Desktop/VibeCode_Prime/CLI_CU_L8R`
-- Owned paths: this artifact, `ralph-plan-6.md`, `docs/plans/worktrees/2026-05-22-ralph-plan-6-platform-stabilization.md`
-- Read-only inputs: `docs/plans/worktrees/2026-05-22-daemon-truth-boundary-loop6.md`, Loop 1-6 Working Logs in `ralph-plan-6.md`
+- Worktree: `<legacy-worktree>`
+- Owned paths: this artifact, `docs/archive/ralph-plans/ralph-plan-6.md`, `docs/plans/worktrees/2026-05-22-ralph-plan-6-platform-stabilization.md`
+- Read-only inputs: `docs/plans/worktrees/2026-05-22-daemon-truth-boundary-loop6.md`, Loop 1-6 Working Logs in `docs/archive/ralph-plans/ralph-plan-6.md`
 - Blocked/shared paths: `impulse-rs/**` source and Cargo files, `docs/validate_docs.py`, `AGENTS.md`, `CLAUDE.md`, `README.md`, `docs/spec/**`, docs indexes, protocol docs, and unrelated dirty files
-- Verification: `bash /Users/jamespustorino/.agents/skills/ralph-plan/scripts/validate-plan.sh --strict-v2 ralph-plan-6.md`; `git diff --check`
+- Verification: `bash <agent-skills>/ralph-plan/scripts/validate-plan.sh --strict-v2 docs/archive/ralph-plans/ralph-plan-6.md`; `git diff --check`
 - Latest status: Loop 7 lane map completed as a docs-only artifact; no Rust, Cargo, validator, spec, index, root guidance, or unrelated dirty files were edited
 
 ## Execution Map For Loops 9-15
@@ -33,10 +36,10 @@ Loop 8 should adopt or adjust this map, then update the Root Iteration Contents.
 | 9 | Shared protocol parity for artifact list/get/action DTOs | Rust protocol implementer | `impulse-rs/impulse-ops/src/lib.rs`; `impulse-rs/src/daemon/protocol.rs`; focused protocol tests in the same crates | `impulse-rs/Cargo.toml`; `Cargo.lock`; `impulse-rs/impulse-desktop/**`; docs indexes/spec docs unless separately claimed | Loop 6 artifact gap; Loop 8 adopts lane; no desktop artifact panel work starts first | `cd impulse-rs && cargo test -p impulse-ops`; `cd impulse-rs && cargo test -p impulse-rs daemon::protocol::tests::test_shared_workbench_requests_deserialize_into_daemon_protocol`; `cd impulse-rs && cargo test -p impulse-rs ops_workbench`; plan validation; `git diff --check` |
 | 10 | Desktop daemon client adapter for workbench requests | Desktop runtime implementer | New or existing daemon-client adapter under `impulse-rs/impulse-desktop/src/**`; focused desktop tests under `impulse-rs/impulse-desktop/tests/**` | `impulse-rs/impulse-ops/src/lib.rs`; `impulse-rs/src/daemon/protocol.rs`; Cargo files unless Loop 14 grants ownership | Loop 9 green; no UI panel rendering work depends on bespoke JSON before this adapter exists | `cd impulse-rs && cargo test -p impulse-desktop`; focused daemon-client tests; plan validation; `git diff --check` |
 | 11 | Runtime telemetry adapter and publish cadence | Desktop runtime implementer with daemon reviewer | `impulse-rs/impulse-desktop/src/runtime.rs`; telemetry adapter module/tests under `impulse-rs/impulse-desktop/src/**` and `tests/**` | `impulse-rs/impulse-ops/src/lib.rs`; `impulse-rs/src/daemon/protocol.rs`; UI panel state files unless Loop 12 starts after handoff | Loop 9 DTOs stable; Loop 10 daemon client path exists | `cd impulse-rs && cargo test -p impulse-desktop --test runtime`; focused tests for spawn/resize/focus/exit publish triggers; plan validation; `git diff --check` |
-| 12 | UI ops-update rendering and artifact/supervisor panels | Desktop UI implementer | `impulse-rs/impulse-desktop/src/ui.rs`; desktop UI contract tests under `impulse-rs/impulse-desktop/tests/**`; render-only panel modules if introduced | Runtime telemetry internals from Loop 11 unless handed off; protocol DTOs from Loop 9; docs specs/indexes | Loop 10 request adapter; Loop 11 telemetry adapter; daemon truth remains source for panel state | `cd impulse-rs && cargo test -p impulse-desktop --test desktop_contract --test tauri_surface`; UI contract tests prove panels render daemon payloads without client-side snapshot mutation; plan validation; `git diff --check` |
+| 12 | UI ops-update rendering and artifact/supervisor panels | Desktop UI implementer | `impulse-rs/impulse-desktop/src/ui.rs`; desktop UI contract tests under `impulse-rs/impulse-desktop/tests/**`; render-only panel modules if introduced | Runtime telemetry internals from Loop 11 unless handed off; protocol DTOs from Loop 9; docs specs/indexes | Loop 10 request adapter; Loop 11 telemetry adapter; daemon truth remains source for panel state | Historical gate: `cd impulse-rs && cargo test -p impulse-desktop --test desktop_contract --test tauri_surface`. Current equivalent after the 2026-06-14 host rename is `cd impulse-rs && cargo test -p impulse-desktop --test desktop_contract --test host_surface`; UI contract tests prove panels render daemon payloads without client-side snapshot mutation; plan validation; `git diff --check` |
 | 13 | Docs validator and index reconciliation after implementation semantics settle | Docs contract implementer | `docs/validate_docs.py`; `docs/INDEX.md`; `docs/SUMMARY.md`; `docs/SUMMARY.yaml`; `docs/metadata.yaml`; targeted docs under `docs/plans/**` | `AGENTS.md`; `CLAUDE.md`; `README.md`; `docs/spec/**`; Rust source/Cargo files unless explicitly claimed | Loops 9-12 define actual protocol/desktop truth; validator marker drift from Loop 2 is still known debt | `python3 docs/validate_docs.py --contract`; `python3 docs/validate_docs.py --all`; plan validation; `git diff --check` |
 | 14 | Cargo integration and workspace verification | Integration implementer/verifier | `impulse-rs/Cargo.toml`; `impulse-rs/Cargo.lock`; crate manifests only if required by accepted Loop 9-12 changes; no feature work beyond dependency wiring | All feature source paths except mechanical manifest-driven compile fixes; docs specs/indexes unless Loop 13 hands off | Loops 9-12 declare final dependency needs; no parallel lane edits Cargo files | `cd impulse-rs && cargo check --workspace`; `cd impulse-rs && cargo test --workspace`; `cd impulse-rs && cargo clippy --workspace -- -D warnings`; `cd impulse-rs && cargo fmt --check`; plan validation; `git diff --check` |
-| 15 | OpenCode compatibility cleanup decision and Loop 16 prep | Reviewer/planner with docs support | New work card under `docs/plans/worktrees/**`; `ralph-plan-6.md` Working Log; optional compatibility audit artifact under `docs/plans/worktrees/**` | OpenCode code/tests/docs, `AGENTS.md`, `CLAUDE.md`, `README.md`, `docs/spec/**`, `docs/validate_docs.py`, Cargo files unless Loop 16 explicitly claims them | Loops 9-14 complete or have exact blockers; Loop 13 docs status known | Plan validation; `git diff --check`; optional read-only `rg -n "OpenCode|opencode" AGENTS.md CLAUDE.md README.md docs impulse-rs --glob '!target/**'` with findings only |
+| 15 | OpenCode compatibility cleanup decision and Loop 16 prep | Reviewer/planner with docs support | New work card under `docs/plans/worktrees/**`; `docs/archive/ralph-plans/ralph-plan-6.md` Working Log; optional compatibility audit artifact under `docs/plans/worktrees/**` | OpenCode code/tests/docs, `AGENTS.md`, `CLAUDE.md`, `README.md`, `docs/spec/**`, `docs/validate_docs.py`, Cargo files unless Loop 16 explicitly claims them | Loops 9-14 complete or have exact blockers; Loop 13 docs status known | Plan validation; `git diff --check`; optional read-only `rg -n "OpenCode|opencode" AGENTS.md CLAUDE.md README.md docs impulse-rs --glob '!target/**'` with findings only |
 
 ## Shared-File Sequencing Rules
 
@@ -50,7 +53,7 @@ These files must not be edited opportunistically by future workers:
 | `impulse-rs/src/daemon/protocol.rs` | Loop 9 only | Protocol compatibility tests move with shared DTO changes. Desktop lanes must not update daemon protocol tests to make UI code pass. |
 | `impulse-rs/impulse-desktop/**` | Loops 10-12, sequential | Loop 10 owns daemon client request plumbing, Loop 11 owns runtime telemetry publishing, Loop 12 owns UI rendering. Each loop hands off before the next edits overlapping desktop files. |
 | Docs indexes and spec docs | Loop 13 only, except plan files | `docs/INDEX.md`, `docs/SUMMARY.md`, `docs/SUMMARY.yaml`, `docs/metadata.yaml`, and `docs/spec/**` wait until implementation truth is stable. |
-| Plan files | Current loop owner only | Each loop may update its work card and `ralph-plan-6.md` status/log. Root loop assignments for 9-15 are reserved for Loop 8. |
+| Plan files | Current loop owner only | Each loop may update its work card and `docs/archive/ralph-plans/ralph-plan-6.md` status/log. Root loop assignments for 9-15 are reserved for Loop 8. |
 
 ## Blocked-Path Rules
 
@@ -81,7 +84,7 @@ Loop 13 may start read-only scanning earlier, but it must not write docs indexes
 Every future lane keeps the plan checks:
 
 ```bash
-bash /Users/jamespustorino/.agents/skills/ralph-plan/scripts/validate-plan.sh --strict-v2 ralph-plan-6.md
+bash <agent-skills>/ralph-plan/scripts/validate-plan.sh --strict-v2 docs/archive/ralph-plans/ralph-plan-6.md
 git diff --check
 ```
 

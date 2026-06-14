@@ -6,6 +6,22 @@ use std::sync::Arc;
 use super::{ChatRequest, ChatResponse, LlmProvider, Message, Role, Usage};
 use crate::error::{AgentError, AgentResult};
 
+/// Total request timeout for an LLM call. Long enough for slow completions,
+/// bounded so a hung connection can never block the daemon indefinitely.
+const HTTP_REQUEST_TIMEOUT_SECS: u64 = 120;
+/// Connection-establishment timeout (fail fast when the endpoint is unreachable).
+const HTTP_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// Build the shared HTTP client with bounded timeouts. Falls back to a default
+/// client if the builder fails (it never does for static timeout config).
+fn build_http_client() -> Client {
+    Client::builder()
+        .timeout(std::time::Duration::from_secs(HTTP_REQUEST_TIMEOUT_SECS))
+        .connect_timeout(std::time::Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
+        .build()
+        .unwrap_or_else(|_| Client::new())
+}
+
 /// Common provider structure - shared by all LLM providers
 pub struct BaseProvider {
     api_key: String,
@@ -18,7 +34,9 @@ impl Clone for BaseProvider {
     fn clone(&self) -> Self {
         Self {
             api_key: self.api_key.clone(),
-            http_client: Arc::new(Client::new()),
+            // Share the connection pool (and its timeout config) rather than
+            // spinning up a fresh client per clone.
+            http_client: Arc::clone(&self.http_client),
             provider_name: self.provider_name,
             default_model: self.default_model.clone(),
         }
@@ -29,7 +47,7 @@ impl BaseProvider {
     pub fn new(provider_name: &'static str, api_key: String, default_model: &'static str) -> Self {
         Self {
             api_key,
-            http_client: Arc::new(Client::new()),
+            http_client: Arc::new(build_http_client()),
             provider_name,
             default_model: default_model.to_string(),
         }
@@ -433,6 +451,18 @@ mod tests {
     fn test_base_provider_new() {
         let provider = BaseProvider::new("test", "api_key123".to_string(), "gpt-4");
         assert_eq!(provider.api_key(), "api_key123");
+    }
+
+    #[test]
+    fn test_base_provider_clone_shares_http_client() {
+        // Cloning must reuse the same (timeout-configured) connection pool
+        // rather than building a fresh client each time.
+        let provider = BaseProvider::new("test", "api_key".to_string(), "gpt-4");
+        let cloned = provider.clone();
+        assert!(
+            Arc::ptr_eq(&provider.http_client, &cloned.http_client),
+            "clone should share the http client Arc"
+        );
     }
 
     #[test]

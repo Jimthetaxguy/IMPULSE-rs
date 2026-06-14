@@ -51,3 +51,7 @@ MEMORY.md
 current-context.md
 cross-platform-conversation-analysis.md
 test-hook.sh
+
+# Local agent working notes / scratch — not for the public repo
+_working-files/
+.remember/

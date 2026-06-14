@@ -51,24 +51,24 @@ quick_reference:
     start: true
 
 active_tracks:
-  - name: Rust + Tauri Desktop Shell
+  - name: Rust + Dioxus Desktop Host
     description: Current product baseline and roadmap contract
     docs:
       - spec/RUST-CANONICAL-CONTRACT.md
       - spec/USER-STORY-MAP.md
       - spec/TEST-TRACEABILITY.md
       - ROADMAP-PLAN.md
-      - plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md
+      - plans/IMPLEMENTATION-HANDOFF.md
       - guides/COLLABORATIVE-AGENTIC-CODING.md
       - ../impulse-rs/docs/IMPULSE_TERM_STATUS.md
       - HONEST-ROADMAP.md
 
 phases:
   now:
-    - name: Rust Core + Tauri Desktop Shell
+    - name: Rust Core + Dioxus Desktop Host
       path: ROADMAP-PLAN.md
-    - name: Tauri Dioxus Migration Handoff
-      path: plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md
+    - name: Dioxus Desktop Implementation Handoff
+      path: plans/IMPLEMENTATION-HANDOFF.md
 
   next:
     - name: Honest Roadmap
@@ -136,9 +136,10 @@ categories:
 
   archive:
     - archive/TUI-AUGMENTATION-VISION.md
+    - archive/ralph-plans/README.md
 
 metadata:
-  total_documents: 78
+  total_documents: 85
   categories: 8
   decisions: 6
   phases: 3

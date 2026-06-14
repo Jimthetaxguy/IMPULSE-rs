@@ -2,7 +2,7 @@ use std::path::Path;
 
 use portable_pty::PtySize;
 
-use super::terminal_pane::{TerminalPane, DEFAULT_SCROLLBACK_LINES};
+use super::terminal_pane::{TerminalPane, TerminalSpawnRequest, DEFAULT_SCROLLBACK_LINES};
 
 pub struct PaneManager {
     pub panes: Vec<TerminalPane>,
@@ -10,6 +10,19 @@ pub struct PaneManager {
     next_id: usize,
     /// Default scrollback lines for new panes
     default_scrollback: usize,
+}
+
+pub struct PaneCreateRequest<'a> {
+    pub name: String,
+    pub command: &'a str,
+    pub args: &'a [&'a str],
+    pub working_dir: Option<&'a Path>,
+    pub size: PtySize,
+    pub project_index: usize,
+    pub impulse_home: Option<&'a Path>,
+    pub scrollback_lines: Option<usize>,
+    pub session_id: Option<&'a str>,
+    pub platform: Option<&'a str>,
 }
 
 impl Default for PaneManager {
@@ -33,35 +46,34 @@ impl PaneManager {
         self.default_scrollback = lines;
     }
 
-    // TODO(refactor): extract params into struct
-    #[allow(clippy::too_many_arguments)]
-    pub fn create_pane(
-        &mut self,
-        name: String,
-        command: &str,
-        args: &[&str],
-        working_dir: Option<&Path>,
-        size: PtySize,
-        project_index: usize,
-        impulse_home: Option<&Path>,
-        scrollback_lines: Option<usize>,
-        session_id: Option<&str>,
-        platform: Option<&str>,
-    ) -> anyhow::Result<usize> {
-        let id = self.next_id;
-        self.next_id += 1;
-
-        let pane = TerminalPane::spawn(
-            id,
-            name.clone(),
+    pub fn create_pane(&mut self, request: PaneCreateRequest<'_>) -> anyhow::Result<usize> {
+        let PaneCreateRequest {
+            name,
             command,
             args,
             working_dir,
             size,
             project_index,
             impulse_home,
-            scrollback_lines.or(Some(self.default_scrollback)),
-        )?;
+            scrollback_lines,
+            session_id,
+            platform,
+        } = request;
+
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let pane = TerminalPane::spawn(TerminalSpawnRequest {
+            id,
+            name: name.clone(),
+            command,
+            args,
+            working_dir,
+            size,
+            project_index,
+            impulse_home,
+            scrollback_lines: scrollback_lines.or(Some(self.default_scrollback)),
+        })?;
 
         // Send startup message to inform the agent about Impulse
         if let (Some(sid), Some(plat)) = (session_id, platform) {

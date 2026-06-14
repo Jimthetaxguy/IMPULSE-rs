@@ -36,6 +36,7 @@ pub mod office;
 pub mod ops_workbench;
 pub mod orchestration;
 pub mod plugin;
+pub mod process_util;
 pub mod retrieval;
 pub mod semantic_diff;
 pub mod state;

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use impulse_desktop::tauri_commands;
+use impulse_desktop::host_commands;
 use impulse_desktop::{
     DesktopEvent, DesktopEventSink, DesktopRuntime, LocalSupervisorAction, McpToolRegistry,
     NativeIslandKind, NativeIslandRequest, RegisterWorkspaceRequest, ReviewDecision,
@@ -43,12 +43,12 @@ impl DesktopEventSink for RecordingSink {
 }
 
 #[tokio::test]
-async fn test_tauri_terminal_open_command_surface_returns_serializable_session() {
+async fn test_host_terminal_open_command_surface_returns_serializable_session() {
     let runtime = DesktopRuntime::default();
-    let response = tauri_commands::terminal_open(
+    let response = host_commands::terminal_open(
         &runtime,
         TerminalOpenRequest {
-            session_id: Some("tauri-session".to_string()),
+            session_id: Some("host-session".to_string()),
             command: "sh".to_string(),
             args: vec!["-lc".to_string(), "printf ready; sleep 1".to_string()],
             cwd: None,
@@ -62,23 +62,23 @@ async fn test_tauri_terminal_open_command_surface_returns_serializable_session()
     .await
     .expect("terminal_open command should route");
 
-    assert_eq!(response.session_id, "tauri-session");
+    assert_eq!(response.session_id, "host-session");
     assert!(response.alive);
 
-    tauri_commands::terminal_write(
+    host_commands::terminal_write(
         &runtime,
         TerminalWriteRequest {
-            session_id: "tauri-session".to_string(),
+            session_id: "host-session".to_string(),
             data: b"pwd".to_vec(),
         },
     )
     .await
     .expect("terminal_write should see shared command state");
 
-    tauri_commands::terminal_close(
+    host_commands::terminal_close(
         &runtime,
         TerminalCloseRequest {
-            session_id: "tauri-session".to_string(),
+            session_id: "host-session".to_string(),
         },
     )
     .await
@@ -86,9 +86,9 @@ async fn test_tauri_terminal_open_command_surface_returns_serializable_session()
 }
 
 #[tokio::test]
-async fn test_tauri_supervisor_local_action_routes_to_runtime() {
+async fn test_host_supervisor_local_action_routes_to_runtime() {
     let runtime = DesktopRuntime::default();
-    tauri_commands::terminal_open(
+    host_commands::terminal_open(
         &runtime,
         TerminalOpenRequest {
             session_id: Some("supervisor-session".to_string()),
@@ -105,7 +105,7 @@ async fn test_tauri_supervisor_local_action_routes_to_runtime() {
     .await
     .expect("open terminal session");
 
-    tauri_commands::supervisor_local_action(
+    host_commands::supervisor_local_action(
         &runtime,
         SupervisorLocalActionRequest {
             action: LocalSupervisorAction::FocusAgent {
@@ -116,13 +116,13 @@ async fn test_tauri_supervisor_local_action_routes_to_runtime() {
     .await
     .expect("focus agent through supervisor action");
 
-    let snapshot = tauri_commands::agent_snapshot(&runtime)
+    let snapshot = host_commands::agent_snapshot(&runtime)
         .await
         .expect("snapshot agents");
     assert_eq!(snapshot.len(), 1);
     assert!(snapshot[0].focused);
 
-    tauri_commands::terminal_close(
+    host_commands::terminal_close(
         &runtime,
         TerminalCloseRequest {
             session_id: "supervisor-session".to_string(),
@@ -133,30 +133,30 @@ async fn test_tauri_supervisor_local_action_routes_to_runtime() {
 }
 
 #[tokio::test]
-async fn test_tauri_native_island_command_surface_returns_dto() {
-    let result = tauri_commands::native_island_request(NativeIslandRequest {
-        request_id: "tauri-native".to_string(),
+async fn test_host_native_island_command_surface_returns_dto() {
+    let result = host_commands::native_island_request(NativeIslandRequest {
+        request_id: "host-native".to_string(),
         kind: NativeIslandKind::AppKitProbe,
         payload: json!({ "caller": "dioxus" }),
     })
     .await
     .expect("native island command should route");
 
-    assert_eq!(result.request_id, "tauri-native");
+    assert_eq!(result.request_id, "host-native");
     assert_eq!(result.payload["state_owner"], "dioxus");
 }
 
 #[tokio::test]
-async fn test_tauri_workspace_registration_preserves_project_notes() {
+async fn test_host_workspace_registration_preserves_project_notes() {
     let memory_root = tempfile::tempdir().expect("tempdir");
-    let state = tauri_commands::DesktopShellState::new(
+    let state = host_commands::DesktopShellState::new(
         Arc::new(DesktopRuntime::default()),
         Arc::new(WorkspaceRegistry::empty()),
         Arc::new(McpToolRegistry::with_builtins()),
         memory_root.path().to_path_buf(),
     );
 
-    let entry = tauri_commands::register_workspace(
+    let entry = host_commands::register_workspace(
         &state,
         RegisterWorkspaceRequest {
             root: "/tmp".to_string(),
@@ -175,7 +175,7 @@ async fn test_tauri_workspace_registration_preserves_project_notes() {
         Some("operator-authored context")
     );
 
-    let listed = tauri_commands::list_workspaces(&state)
+    let listed = host_commands::list_workspaces(&state)
         .await
         .expect("list workspaces");
     assert_eq!(listed.len(), 1);
@@ -186,19 +186,19 @@ async fn test_tauri_workspace_registration_preserves_project_notes() {
 }
 
 #[tokio::test]
-async fn test_tauri_mcp_agent_spawn_rejects_unregistered_workspace() {
+async fn test_host_mcp_agent_spawn_rejects_unregistered_workspace() {
     let memory_root = tempfile::tempdir().expect("tempdir");
     let runtime = Arc::new(DesktopRuntime::default());
-    let state = tauri_commands::DesktopShellState::new(
+    let state = host_commands::DesktopShellState::new(
         Arc::clone(&runtime),
         Arc::new(WorkspaceRegistry::empty()),
         Arc::new(McpToolRegistry::with_builtins()),
         memory_root.path().to_path_buf(),
     );
 
-    let error = tauri_commands::mcp_invoke(
+    let error = host_commands::mcp_invoke(
         &state,
-        tauri_commands::McpInvokeRequest {
+        host_commands::McpInvokeRequest {
             tool: "impulse.agent_spawn".to_string(),
             arguments: json!({
                 "agent_id": "unregistered-agent",
@@ -220,7 +220,7 @@ async fn test_tauri_mcp_agent_spawn_rejects_unregistered_workspace() {
 
     assert!(error.contains("not registered"));
     assert!(
-        tauri_commands::agent_snapshot(runtime.as_ref())
+        host_commands::agent_snapshot(runtime.as_ref())
             .await
             .expect("snapshot agents")
             .is_empty(),
@@ -229,17 +229,17 @@ async fn test_tauri_mcp_agent_spawn_rejects_unregistered_workspace() {
 }
 
 #[tokio::test]
-async fn test_tauri_mcp_agent_spawn_audits_and_touches_registered_workspace() {
+async fn test_host_mcp_agent_spawn_audits_and_touches_registered_workspace() {
     let memory_root = tempfile::tempdir().expect("tempdir");
     let runtime = Arc::new(DesktopRuntime::default());
-    let state = tauri_commands::DesktopShellState::new(
+    let state = host_commands::DesktopShellState::new(
         Arc::clone(&runtime),
         Arc::new(WorkspaceRegistry::empty()),
         Arc::new(McpToolRegistry::with_builtins()),
         memory_root.path().to_path_buf(),
     );
 
-    tauri_commands::register_workspace(
+    host_commands::register_workspace(
         &state,
         RegisterWorkspaceRequest {
             root: "/tmp".to_string(),
@@ -251,9 +251,9 @@ async fn test_tauri_mcp_agent_spawn_audits_and_touches_registered_workspace() {
     .await
     .expect("register launch workspace");
 
-    let invocation = tauri_commands::mcp_invoke(
+    let invocation = host_commands::mcp_invoke(
         &state,
-        tauri_commands::McpInvokeRequest {
+        host_commands::McpInvokeRequest {
             tool: "impulse.agent_spawn".to_string(),
             arguments: json!({
                 "agent_id": "mcp-launch-agent",
@@ -284,7 +284,7 @@ async fn test_tauri_mcp_agent_spawn_audits_and_touches_registered_workspace() {
     assert_eq!(invocation.result["agent_id"], "mcp-launch-agent");
     assert_eq!(invocation.result["workspace"]["root"], "/tmp");
 
-    let agents = tauri_commands::agent_snapshot(runtime.as_ref())
+    let agents = host_commands::agent_snapshot(runtime.as_ref())
         .await
         .expect("snapshot spawned agent");
     assert_eq!(agents.len(), 1);
@@ -297,7 +297,7 @@ async fn test_tauri_mcp_agent_spawn_audits_and_touches_registered_workspace() {
         Some("/tmp")
     );
 
-    let listed = tauri_commands::list_workspaces(&state)
+    let listed = host_commands::list_workspaces(&state)
         .await
         .expect("list touched workspaces");
     assert_eq!(listed.len(), 1);
@@ -308,7 +308,7 @@ async fn test_tauri_mcp_agent_spawn_audits_and_touches_registered_workspace() {
         .iter()
         .any(|item| item.tool == "impulse.agent_spawn" && item.ok));
 
-    tauri_commands::terminal_close(
+    host_commands::terminal_close(
         runtime.as_ref(),
         TerminalCloseRequest {
             session_id: "mcp-launch-agent".to_string(),
@@ -319,7 +319,7 @@ async fn test_tauri_mcp_agent_spawn_audits_and_touches_registered_workspace() {
 }
 
 #[tokio::test]
-async fn test_tauri_review_queue_apply_writes_only_after_review_decision_and_audits() {
+async fn test_host_review_queue_apply_writes_only_after_review_decision_and_audits() {
     let memory_root = tempfile::tempdir().expect("memory tempdir");
     let sink = Arc::new(RecordingSink::default());
     let runtime = Arc::new(
@@ -327,14 +327,14 @@ async fn test_tauri_review_queue_apply_writes_only_after_review_decision_and_aud
             .with_event_sink(sink.clone())
             .build(),
     );
-    let state = tauri_commands::DesktopShellState::new(
+    let state = host_commands::DesktopShellState::new(
         Arc::clone(&runtime),
         Arc::new(WorkspaceRegistry::empty()),
         Arc::new(McpToolRegistry::with_builtins()),
         memory_root.path().to_path_buf(),
     );
 
-    tauri_commands::terminal_open(
+    host_commands::terminal_open(
         runtime.as_ref(),
         TerminalOpenRequest {
             session_id: Some("review-agent".to_string()),
@@ -351,9 +351,9 @@ async fn test_tauri_review_queue_apply_writes_only_after_review_decision_and_aud
     .await
     .expect("open review target terminal");
 
-    let staged = tauri_commands::mcp_invoke(
+    let staged = host_commands::mcp_invoke(
         &state,
-        tauri_commands::McpInvokeRequest {
+        host_commands::McpInvokeRequest {
             tool: "impulse.review_injection".to_string(),
             arguments: json!({
                 "content": "approved context\n",
@@ -367,7 +367,7 @@ async fn test_tauri_review_queue_apply_writes_only_after_review_decision_and_aud
     .expect("stage review payload");
     let id = staged.result["id"].as_str().expect("review id").to_string();
 
-    let queued = tauri_commands::review_queue(&state)
+    let queued = host_commands::review_queue(&state)
         .await
         .expect("list review queue");
     assert_eq!(queued.len(), 1);
@@ -377,7 +377,7 @@ async fn test_tauri_review_queue_apply_writes_only_after_review_decision_and_aud
         "staging must not write to terminal"
     );
 
-    let decision = tauri_commands::review_decision(
+    let decision = host_commands::review_decision(
         &state,
         ReviewDecisionRequest {
             id: id.clone(),
@@ -399,7 +399,7 @@ async fn test_tauri_review_queue_apply_writes_only_after_review_decision_and_aud
     }
     assert!(sink.output_for("review-agent").contains("approved context"));
 
-    let queued = tauri_commands::review_queue(&state)
+    let queued = host_commands::review_queue(&state)
         .await
         .expect("list review queue after apply");
     assert_eq!(queued[0].status, ReviewQueueStatus::Applied);
@@ -412,7 +412,7 @@ async fn test_tauri_review_queue_apply_writes_only_after_review_decision_and_aud
         .iter()
         .any(|item| item.tool == "impulse.review_decision"));
 
-    tauri_commands::terminal_close(
+    host_commands::terminal_close(
         runtime.as_ref(),
         TerminalCloseRequest {
             session_id: "review-agent".to_string(),
@@ -423,7 +423,7 @@ async fn test_tauri_review_queue_apply_writes_only_after_review_decision_and_aud
 }
 
 #[tokio::test]
-async fn test_tauri_review_queue_skip_updates_queue_without_terminal_write_and_audits() {
+async fn test_host_review_queue_skip_updates_queue_without_terminal_write_and_audits() {
     let memory_root = tempfile::tempdir().expect("memory tempdir");
     let sink = Arc::new(RecordingSink::default());
     let runtime = Arc::new(
@@ -431,16 +431,16 @@ async fn test_tauri_review_queue_skip_updates_queue_without_terminal_write_and_a
             .with_event_sink(sink.clone())
             .build(),
     );
-    let state = tauri_commands::DesktopShellState::new(
+    let state = host_commands::DesktopShellState::new(
         Arc::clone(&runtime),
         Arc::new(WorkspaceRegistry::empty()),
         Arc::new(McpToolRegistry::with_builtins()),
         memory_root.path().to_path_buf(),
     );
 
-    let staged = tauri_commands::mcp_invoke(
+    let staged = host_commands::mcp_invoke(
         &state,
-        tauri_commands::McpInvokeRequest {
+        host_commands::McpInvokeRequest {
             tool: "impulse.review_injection".to_string(),
             arguments: json!({
                 "content": "skipped context\n",
@@ -454,7 +454,7 @@ async fn test_tauri_review_queue_skip_updates_queue_without_terminal_write_and_a
     .expect("stage review payload");
     let id = staged.result["id"].as_str().expect("review id").to_string();
 
-    let decision = tauri_commands::review_decision(
+    let decision = host_commands::review_decision(
         &state,
         ReviewDecisionRequest {
             id,
@@ -472,7 +472,7 @@ async fn test_tauri_review_queue_skip_updates_queue_without_terminal_write_and_a
         "skipping a review item must not write to the terminal"
     );
 
-    let queued = tauri_commands::review_queue(&state)
+    let queued = host_commands::review_queue(&state)
         .await
         .expect("list review queue after skip");
     assert_eq!(queued.len(), 1);

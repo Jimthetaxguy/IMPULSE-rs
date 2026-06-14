@@ -219,3 +219,98 @@ pub struct RetrievalHealth {
     pub rust_cosine: bool,
     pub keyword_fts: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_retrieval_mode_parse_as_str_round_trip() {
+        for mode in [RetrievalMode::Keyword, RetrievalMode::Semantic] {
+            assert_eq!(RetrievalMode::parse(mode.as_str()), Some(mode));
+        }
+        assert_eq!(RetrievalMode::parse("nope"), None);
+    }
+
+    #[test]
+    fn test_search_backend_parse_as_str_round_trip() {
+        // Includes the hyphenated forms where a parse/as_str mismatch would
+        // silently break backend selection.
+        for backend in [
+            SearchBackend::Auto,
+            SearchBackend::SqliteVec,
+            SearchBackend::RustCosine,
+            SearchBackend::Keyword,
+        ] {
+            assert_eq!(SearchBackend::parse(backend.as_str()), Some(backend));
+        }
+        assert_eq!(SearchBackend::parse("sqlite_vec"), None); // underscore is not the wire form
+        assert_eq!(SearchBackend::parse("unknown"), None);
+    }
+
+    #[test]
+    fn test_index_scope_parse() {
+        assert_eq!(IndexScope::parse("history"), Some(IndexScope::History));
+        assert_eq!(IndexScope::parse("genome"), Some(IndexScope::Genome));
+        assert_eq!(IndexScope::parse("all"), Some(IndexScope::All));
+        assert_eq!(IndexScope::parse("everything"), None);
+    }
+
+    #[test]
+    fn test_fallback_code_as_str_matches_serde() {
+        // FallbackCode carries TWO wire representations — as_str() and the serde
+        // snake_case rename. They must agree, or a value serialized via one path
+        // can't be read via the other.
+        let all = [
+            FallbackCode::VectorBackendDisabled,
+            FallbackCode::SqliteVecUnavailable,
+            FallbackCode::EmbeddingTimeout,
+            FallbackCode::EmbeddingSpawnFailed,
+            FallbackCode::EmbeddingProcessFailed,
+            FallbackCode::EmbeddingNoVector,
+            FallbackCode::EmbeddingDimensionMismatch,
+            FallbackCode::RetrievalDbError,
+            FallbackCode::RetrievalDbCorrupt,
+            FallbackCode::IndexLockActive,
+        ];
+        for code in all {
+            let serde_form = serde_json::to_value(code).unwrap();
+            assert_eq!(
+                serde_form.as_str(),
+                Some(code.as_str()),
+                "as_str() and serde disagree for {code:?}"
+            );
+            // And the serde form round-trips back to the same variant.
+            let back: FallbackCode = serde_json::from_value(serde_form).unwrap();
+            assert_eq!(back, code);
+        }
+    }
+
+    #[test]
+    fn test_search_response_serde_round_trip() {
+        let original = SearchResponse {
+            mode: "semantic".to_string(),
+            used_fallback: true,
+            fallback_reason: Some("backend down".to_string()),
+            fallback_code: Some(FallbackCode::SqliteVecUnavailable),
+            backend_used: "keyword".to_string(),
+            timing_ms: 12,
+            candidate_count: 3,
+            total_count: Some(3),
+            engine_notes: vec!["note".to_string()],
+            results: vec![SearchResult {
+                source: "history".to_string(),
+                id: "s1".to_string(),
+                title: "t".to_string(),
+                snippet: "snip".to_string(),
+                score: 0.91,
+            }],
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let back: SearchResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.mode, original.mode);
+        assert_eq!(back.fallback_code, original.fallback_code);
+        assert_eq!(back.results.len(), 1);
+        assert_eq!(back.results[0].score, 0.91);
+    }
+}

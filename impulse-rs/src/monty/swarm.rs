@@ -52,33 +52,43 @@ pub struct CoordinationSuggestion {
     pub priority: String,
 }
 
-/// Detect coordination patterns between two agents using keyword analysis
+/// Confidence assigned to an Echo pattern (identical agents).
+const ECHO_CONFIDENCE: f64 = 0.9;
+/// Confidence assigned to a Complement pattern (distinct agents).
+const COMPLEMENT_CONFIDENCE: f64 = 0.8;
+
+/// Detect coordination patterns between two agents using keyword analysis.
+///
+/// `threshold` is a confidence floor: a pattern is reported only when its
+/// confidence is at least `threshold`. (Previously Echo ignored the threshold
+/// entirely, so a high threshold filtered Complement but let lower-confidence
+/// Echo patterns leak through.)
 pub fn detect_patterns(agent_a: &str, agent_b: &str, threshold: f64) -> Vec<Pattern> {
     let mut patterns = Vec::new();
 
-    // Check if agents share the same platform (potential echo)
     let a_lower = agent_a.to_lowercase();
     let b_lower = agent_b.to_lowercase();
 
-    if a_lower == b_lower {
+    // Identical agents → echo (one repeating the other).
+    if a_lower == b_lower && ECHO_CONFIDENCE >= threshold {
         patterns.push(Pattern {
             id: format!("echo-{}-{}", agent_a, agent_b),
             agents: vec![agent_a.to_string(), agent_b.to_string()],
             file_scope: None,
-            confidence: 0.9,
+            confidence: ECHO_CONFIDENCE,
             pattern_type: PatternType::Echo,
             detected_at: chrono::Utc::now().to_rfc3339(),
             decay_minutes: Some(30),
         });
     }
 
-    // Different agents → complement pattern (above threshold)
-    if a_lower != b_lower && threshold <= 0.8 {
+    // Distinct agents → complement (working on different parts).
+    if a_lower != b_lower && COMPLEMENT_CONFIDENCE >= threshold {
         patterns.push(Pattern {
             id: format!("complement-{}-{}", agent_a, agent_b),
             agents: vec![agent_a.to_string(), agent_b.to_string()],
             file_scope: None,
-            confidence: 0.8,
+            confidence: COMPLEMENT_CONFIDENCE,
             pattern_type: PatternType::Complement,
             detected_at: chrono::Utc::now().to_rfc3339(),
             decay_minutes: Some(60),
@@ -115,5 +125,22 @@ mod tests {
         assert!(!patterns
             .iter()
             .any(|p| matches!(p.pattern_type, PatternType::Complement)));
+    }
+
+    #[test]
+    fn test_detect_patterns_echo_respects_threshold() {
+        // Echo confidence is 0.9, so a threshold above it must suppress Echo
+        // (previously Echo ignored the threshold and always fired).
+        let patterns = detect_patterns("claude-code", "claude-code", 0.95);
+        assert!(
+            patterns.is_empty(),
+            "echo (confidence 0.9) must not be reported when threshold is 0.95"
+        );
+
+        // At a threshold equal to its confidence, Echo is reported.
+        let patterns = detect_patterns("claude-code", "claude-code", 0.9);
+        assert!(patterns
+            .iter()
+            .any(|p| matches!(p.pattern_type, PatternType::Echo)));
     }
 }

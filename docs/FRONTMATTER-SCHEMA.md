@@ -82,10 +82,10 @@ status: active
 tags: [rust, tui, ratatui]
 audience: developers
 authors:
-  - name: James Pustorino
-    role: Creator
-    email: James.s.Pustorino@gmail.com
-    github: jamespustorino
+  - name: Impulse Maintainers
+    role: Maintainer
+    email: impulse-rs@users.noreply.github.com
+    github: Jimthetaxguy/IMPULSE-rs
 ---
 ```
 

@@ -33,7 +33,7 @@ tags: [worktree, lane, handoff, docs]
 
 - Added the collaborative coding guide and contribution guide.
 - Updated agent entrypoints, docs navigation, roadmap, summary, story map, traceability, IPC, benchmark, long-range, and research digest references away from active EGUI roadmap language.
-- Updated `docs/validate_docs.py` to require the collaborative coding guide and current Tauri desktop roadmap markers.
+- Updated `docs/validate_docs.py` to require the collaborative coding guide and desktop roadmap markers. Historical note: the validator has since moved from the earlier Tauri roadmap markers to the current Dioxus Desktop host contract.
 
 ## Tests
 

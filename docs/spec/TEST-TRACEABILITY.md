@@ -10,8 +10,8 @@ status: active
 audience: builders
 tags: [testing, traceability, validation, rust]
 authors:
-  - name: James Pustorino
-    role: Creator
+  - name: Impulse Maintainers
+    role: Maintainer
 ---
 
 # Test Traceability Matrix
@@ -40,7 +40,7 @@ authors:
 | ST-06 Stage context before injecting it | `impulse-rs/src/injection/engine.rs`, `src/injection/staging.rs`, `src/handlers/injection_handlers.rs`, `src/orchestration/mod.rs`, integration enhancement paths | Strong | the biggest remaining gap is full-flow end-to-end validation of retrieval-seeded injection effects across output plus on-disk artifacts |
 | ST-07 Produce handoff artifacts for the next agent or session | orchestration tests, injection-handler tests, context artifact contracts, file-path assertions in current Rust modules | Strong | stronger end-to-end artifact assertions would still reduce regression risk |
 | ST-08 Use a daemon as the long-lived source of truth | `impulse-rs/src/daemon/tests.rs`, `src/daemon/protocol.rs`, integration daemon guard flows, daemon-adjacent handler coverage | Strong | the open risk is workbench IPC lifecycle coverage, not the absence of daemon tests |
-| ST-09 Observe work through the Tauri desktop shell | `impulse-rs/impulse-desktop/tests/desktop_contract.rs`, `tests/tauri_surface.rs`, `impulse-term/tests/backend_tests.rs` | Moderate | the key remaining gap is daemon-truth end-to-end verification across desktop snapshot, terminal bridge, and telemetry overlay behavior |
+| ST-09 Observe work through the Dioxus desktop host | `impulse-rs/impulse-desktop/tests/desktop_contract.rs`, `tests/host_surface.rs`, `impulse-term/tests/backend_tests.rs` | Moderate | the key remaining gap is Dioxus Desktop launch and daemon-truth end-to-end verification across desktop snapshot, terminal bridge, and telemetry overlay behavior |
 | ST-10 Review risky context and stewardship actions explicitly | stewardship modules, guardrail and approval surfaces, integration enhancement coverage | Thin | stewardship command dispatch and operator decision paths need clearer regression tests |
 | ST-11 Enforce verification-before-completion | `impulse-rs/src/validate.rs`, recent invalid-direct-request fixes, session-end verify flows | Strong | manual operator acceptance still matters for claim wording, but automated coverage is present |
 | ST-12 Prove the real hook memory loop before expanding claims | `impulse-rs/tests/hook_validation_session_start.rs`, `hook_validation_precompact.rs`, `hook_validation_extraction_benchmark.rs`, `docs/guides/HOOK-VALIDATION-GUIDE.md` | Manual | the code can generate evidence, but product truth still depends on real external hook runs |

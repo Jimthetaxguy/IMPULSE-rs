@@ -3,9 +3,53 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use super::error::ToolError;
+
+/// Lexically collapse `.` and `..` components without touching the filesystem.
+/// Used as a security fallback when a path can't be canonicalized (e.g. a file
+/// being created that does not exist yet) so traversal sequences can't survive
+/// into the `starts_with` sandbox check.
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Resolve a path to an absolute, traversal-free form for the sandbox check.
+///
+/// Prefers `canonicalize` (resolves symlinks and `..` for existing paths). When
+/// the target itself does not exist (typical for a write of a new file), it
+/// canonicalizes the nearest existing ancestor and re-attaches the remainder,
+/// collapsing `..` lexically — so `<root>/../../etc/x` can never be mistaken for
+/// a path under `<root>`.
+fn secure_resolve(path: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+    // The target doesn't exist (e.g. a new file). Canonicalize the nearest
+    // existing ancestor — resolving symlinks (e.g. macOS /var -> /private/var)
+    // and `..` in the existing prefix — then re-attach the remaining tail with
+    // any `..` collapsed lexically so it can't escape the resolved ancestor.
+    for ancestor in path.ancestors().skip(1) {
+        if let Ok(base) = std::fs::canonicalize(ancestor) {
+            return match path.strip_prefix(ancestor) {
+                Ok(rest) => normalize_lexical(&base.join(rest)),
+                Err(_) => base,
+            };
+        }
+    }
+    normalize_lexical(path)
+}
 
 /// Capability a tool may require — deny-by-default security model
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -281,10 +325,14 @@ impl ToolContext {
             return true;
         }
 
-        let candidate = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        // Resolve to a traversal-free path. The previous implementation fell
+        // back to the RAW path when canonicalize failed (the common case for a
+        // not-yet-created write target), which let `<root>/../../etc/x` slip
+        // through the component-based `starts_with` check.
+        let candidate = secure_resolve(path);
 
         roots.iter().any(|root| {
-            let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+            let root = secure_resolve(root);
             candidate.starts_with(&root)
         })
     }
@@ -325,6 +373,55 @@ mod tests {
         let result = ToolResult::text("hello");
         assert_eq!(result.output, serde_json::Value::String("hello".into()));
         assert!(result.artifacts.is_empty());
+    }
+
+    #[test]
+    fn test_normalize_lexical_collapses_traversal() {
+        assert_eq!(
+            normalize_lexical(Path::new("/a/b/../../etc/passwd")),
+            PathBuf::from("/etc/passwd")
+        );
+        assert_eq!(
+            normalize_lexical(Path::new("/a/b/./c")),
+            PathBuf::from("/a/b/c")
+        );
+        // A pop at the root stays at the root (cannot underflow).
+        assert_eq!(
+            normalize_lexical(Path::new("/../../x")),
+            PathBuf::from("/x")
+        );
+    }
+
+    #[test]
+    fn test_is_path_allowed_blocks_traversal_to_nonexistent_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Canonicalize the root up front so the traversal is demonstrated
+        // independently of platform symlink quirks (e.g. macOS /var ->
+        // /private/var): the raw escape path then genuinely shares the root's
+        // prefix, which is exactly what the old component-based check allowed.
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let ctx = ToolContext {
+            allowed_write_roots: vec![root.clone()],
+            ..ToolContext::default()
+        };
+
+        // A new (non-existent) file UNDER the root is allowed.
+        let inside = root.join("subdir/new_file.txt");
+        assert!(
+            ctx.is_path_allowed(&inside, true),
+            "writing a new file under the sandbox root must be allowed"
+        );
+
+        // A traversal escaping the root to a non-existent target must be denied.
+        // The raw path `<root>/../../../tmp/x` shares the root's leading
+        // components, so the previous `starts_with` check (on the un-collapsed
+        // path, since canonicalize fails for a non-existent target) wrongly
+        // allowed it.
+        let escape = root.join("../../../tmp/impulse_escape_test_file");
+        assert!(
+            !ctx.is_path_allowed(&escape, true),
+            "traversal to a non-existent target outside the root must be denied"
+        );
     }
 
     #[test]

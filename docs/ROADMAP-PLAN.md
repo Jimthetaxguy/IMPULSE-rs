@@ -1,24 +1,24 @@
 ---
 title: Dynamic Roadmap Plan
-description: Actionable next steps based on the current Rust and Tauri desktop shell product state
+description: Actionable next steps based on the current Rust and Dioxus desktop host product state
 version: '1.2'
-updated: 2026-05-21
+updated: 2026-06-14
 type: doc
 category: roadmap
 phase: all
 status: active
 audience: builder
-tags: [roadmap, action, planning, tauri, dioxus, daemon]
-last_updated: 2026-05-21
+tags: [roadmap, action, planning, dioxus, desktop, daemon]
+last_updated: 2026-06-14
 authors:
-  - name: James Pustorino
-    role: Creator
+  - name: Impulse Maintainers
+    role: Maintainer
 ---
 
 # Dynamic Roadmap Plan — Impulse
 
-> **Updated:** 2026-05-21
-> **Purpose:** Record the active roadmap after the desktop contract reset to Tauri+Dioxus.
+> **Updated:** 2026-06-14
+> **Purpose:** Record the active roadmap after the desktop contract reset to Dioxus Desktop.
 > **Risk register:** [`HONEST-ROADMAP.md`](./HONEST-ROADMAP.md)
 > **Execution handoff:** [`plans/IMPLEMENTATION-HANDOFF.md`](./plans/IMPLEMENTATION-HANDOFF.md)
 
@@ -28,8 +28,8 @@ authors:
 
 | Stage | Focus | Status |
 |------|-------|--------|
-| **Now** | Rust memory core + hooks + retrieval/injection + Tauri desktop shell Phase 0 | Active |
-| **Next** | egui boundary cleanup + static shell skeleton + live terminal bridge | Active |
+| **Now** | Rust memory core + hooks + retrieval/injection + Dioxus desktop host | Active |
+| **Next** | Dioxus Desktop launch scaffold + live terminal bridge parity | Active |
 | **Later** | Daemon parity in desktop shell + agent control + artifact polish | Planned |
 
 This document is intentionally aligned with [`spec/RUST-CANONICAL-CONTRACT.md`](./spec/RUST-CANONICAL-CONTRACT.md). If another active doc conflicts, the contract wins.
@@ -43,14 +43,14 @@ This document is intentionally aligned with [`spec/RUST-CANONICAL-CONTRACT.md`](
 | Area | Status | Reality |
 |------|--------|---------|
 | Rust memory core | Implemented | Session tracking, genome/history, retrieval, injection, stewardship, daemon, and tool/runtime infrastructure are live. |
-| Tauri desktop shell | In migration | `impulse-desktop` contains a Dioxus shell and typed bridge scaffold; live PTY and daemon parity remain pending. |
+| Dioxus desktop host | In migration | `impulse-desktop` contains a Dioxus shell, typed host bridge scaffold, Dioxus-native host smoke, and explicit legacy compatibility adapter; Dioxus Desktop launch and daemon parity remain pending. |
 | Agent harness wiring | **COMPLETE** | All 10 features wired: context→prompts, intent classification, full coordination, conflict history IPC, JSON harness protocol, session awareness, specialized IPC (2026-03-31). |
 | Artifact model | In progress | Provider-neutral artifact envelopes and actions exist, but operator ergonomics still need polish. |
 | Daemon-truth desktop panels | Planned | Snapshot/artifact IPC exists; desktop shell must render daemon snapshots rather than frontend-local truth. |
 | Hook validation | Not yet validated | SessionStart injection, PreCompact survival, and real-world `GENOME.md` usefulness remain open risks. |
 | Structural blocking | Deferred | Remains gated behind validation evidence from the honest roadmap. |
 
-The old `Dashboard/Advanced UX` and active-EGUI framing is obsolete. The remaining desktop work is to make the Tauri+Dioxus shell operationally authoritative while preserving the ratatui path.
+The old `Dashboard/Advanced UX`, active-EGUI framing, and Tauri-as-target framing are obsolete. The remaining desktop work is to make the Dioxus Desktop host operationally authoritative while preserving the ratatui path.
 
 ---
 
@@ -72,13 +72,13 @@ Update the active docs together so they describe the same product:
 
 Required outcome:
 
-- Tauri+Dioxus is marked as the active desktop shell.
+- Dioxus Desktop is marked as the active desktop host.
 - egui / `impulse-gui` is marked legacy/frozen, not active feature work.
 - `HONEST-ROADMAP.md` remains the canonical risk register.
 - The roadmap sequence becomes:
   1. documentation reset
-  2. egui boundary cleanup
-  3. static desktop shell hardening
+  2. Dioxus Desktop launch scaffold
+  3. host command/event parity
   4. live terminal bridge
   5. daemon parity and artifact polish
 
@@ -166,7 +166,7 @@ If any of these fail, update the roadmap docs immediately. Failed validation is 
 
 ### Lane 1: Agent Control
 
-Only start after the daemon-truth workbench is stable. **Note:** Agent harness is now fully wired (Phase 3 of Ralph Plan 3, 2026-03-31) — all 10 features connected:
+Only start after the daemon-truth workbench is stable. **Historical note:** the agent harness wiring landed in the 2026-03-31 Ralph Plan 3 cycle; the current roadmap should validate the live daemon and Dioxus host paths rather than treat the old plan as the active source of truth.
 - Context→prompt pipeline (ExtractedInsight → prompts)
 - Intent classification at 9 extraction sites
 - Full coordination pipeline + pane summaries

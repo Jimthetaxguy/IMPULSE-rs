@@ -38,10 +38,14 @@ fn log_path(base_path: &Path) -> PathBuf {
 }
 
 fn artifact_filename(surface: &str) -> String {
+    // Defense-in-depth: `surface` is currently an InjectionSurface enum string,
+    // but a path-building helper must not trust its input — sanitize so it can
+    // never inject a path separator into the staged artifact filename.
+    let safe_surface = crate::storage::sanitize_filename(surface);
     format!(
         "inject-{}-{}.md",
         Utc::now().format("%Y%m%d-%H%M%S"),
-        surface
+        safe_surface
     )
 }
 
@@ -213,6 +217,17 @@ mod tests {
 
     use super::*;
     use crate::injection::types::{InjectionBundle, InjectionSnippet};
+
+    #[test]
+    fn test_artifact_filename_sanitizes_surface() {
+        // A surface containing path separators must not produce a filename that
+        // can escape the staging directory.
+        let name = artifact_filename("../../etc/evil");
+        assert!(!name.contains('/') && !name.contains('\\'), "name: {name}");
+        assert!(name.starts_with("inject-") && name.ends_with(".md"));
+        // A normal enum surface is preserved verbatim.
+        assert!(artifact_filename("review").ends_with("-review.md"));
+    }
 
     fn sample_bundle() -> InjectionBundle {
         InjectionBundle {

@@ -132,7 +132,7 @@ fn seeded_snapshot() -> ProjectOpsSnapshot {
                 label: "Codex Live".to_string(),
                 backend_kind: "pty".to_string(),
                 session_id: Some("codex-live-session".to_string()),
-                working_directory: "/Users/jamespustorino/code/IMPULSE-rs".to_string(),
+                working_directory: "<repo>".to_string(),
                 status: "working".to_string(),
                 current_task: Some(
                     "visual smoke fixture with a deliberately long task label".to_string(),
@@ -158,7 +158,7 @@ fn seeded_snapshot() -> ProjectOpsSnapshot {
                     lines_removed: 8,
                 }),
                 target: Some(MachineTarget::Local {
-                    workdir: "/Users/jamespustorino/code/IMPULSE-rs".to_string(),
+                    workdir: "<repo>".to_string(),
                 }),
                 ephemeral: false,
             },
@@ -166,9 +166,7 @@ fn seeded_snapshot() -> ProjectOpsSnapshot {
                 id: "claude-review".to_string(),
                 label: "Claude Review".to_string(),
                 backend_kind: "pty".to_string(),
-                working_directory:
-                    "/Users/jamespustorino/code/IMPULSE-rs/.worktrees/claude-desktop-views"
-                        .to_string(),
+                working_directory: "<repo>/.worktrees/claude-desktop-views".to_string(),
                 status: "blocked".to_string(),
                 current_task: Some("waiting for merge owner".to_string()),
                 active: true,
@@ -294,7 +292,7 @@ fn runtime_agent(
     focused: bool,
 ) -> AgentRuntimeSnapshot {
     let workspace = WorkspaceTarget {
-        root: "/Users/jamespustorino/code/IMPULSE-rs".to_string(),
+        root: "<repo>".to_string(),
         label: Some("IMPULSE-rs".to_string()),
         purpose: Some("Dioxus terminal harness".to_string()),
         project_notes: Some("Visual smoke uses static SSR fixtures.".to_string()),
@@ -326,7 +324,7 @@ fn runtime_agent(
             Some(AgentRole::Worker { parent_pane_id: 1 })
         },
         target: Some(MachineTarget::Local {
-            workdir: "/Users/jamespustorino/code/IMPULSE-rs".to_string(),
+            workdir: "<repo>".to_string(),
         }),
         mcp_tools: default_builtin_mcp_tools(),
         output_bytes: 18_240,
@@ -343,13 +341,9 @@ fn runtime_agent(
 
 fn seeded_workspaces() -> Vec<WorkspaceEntry> {
     [
+        ("<repo>", "IMPULSE-rs", "active Dioxus terminal harness"),
         (
-            "/Users/jamespustorino/code/IMPULSE-rs",
-            "IMPULSE-rs",
-            "active Dioxus terminal harness",
-        ),
-        (
-            "/Users/jamespustorino/code/ROSA_RenewBuild/ROSA_Swift-Implementation",
+            "/workspace/rosa-example",
             "ROSA Swift",
             "adjacent local-first assistant implementation",
         ),
@@ -398,7 +392,7 @@ fn seeded_invocations() -> Vec<McpInvocation> {
         call_id: "call-agent-spawn".to_string(),
         tool: "impulse.agent_spawn".to_string(),
         caller_agent_id: Some("codex-live".to_string()),
-        arguments: json!({ "workspace": "/Users/jamespustorino/code/IMPULSE-rs" }),
+        arguments: json!({ "workspace": "<repo>" }),
         confirmed: true,
         result: json!({ "agent_id": "codex-live", "ok": true }),
         ok: true,

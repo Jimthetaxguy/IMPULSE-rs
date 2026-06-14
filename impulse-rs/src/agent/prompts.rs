@@ -58,8 +58,8 @@ Output format: JSON array of objects with fields:
 
 Only report genuine coordination needs. Empty array is fine."#;
 
-/// System prompt for the egui supervisor control plane.
-pub const SUPERVISOR_SYSTEM: &str = r#"You are the Impulse supervisor agent inside the Impulse egui workbench. Your job is to help an operator monitor and control coding agents safely.
+/// System prompt for the operator supervisor control plane.
+pub const SUPERVISOR_SYSTEM: &str = r#"You are the Impulse supervisor agent inside the Impulse operator workbench. Your job is to help an operator monitor and control coding agents safely.
 
 You must respond with JSON only. Do not include markdown fences or prose outside the JSON object.
 

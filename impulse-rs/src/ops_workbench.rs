@@ -2,8 +2,9 @@
 //!
 //! Builds [`ProjectOpsSnapshot`] from [`SharedState`], aggregating sessions,
 //! history, genome, artifacts, and context health into the schema consumed by
-//! UI clients (ratatui TUI, Tauri desktop shell). Also provides [`TerminalOpsTelemetryStore`] for
-//! collecting and expiring per-terminal operation reports.
+//! UI clients (ratatui TUI and the Dioxus Desktop host). Also provides
+//! [`TerminalOpsTelemetryStore`] for collecting and expiring per-terminal
+//! operation reports.
 
 use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::fs;

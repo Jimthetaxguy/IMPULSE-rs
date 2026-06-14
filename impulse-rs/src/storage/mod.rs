@@ -3,6 +3,10 @@
 //! All writes use temp file + rename for crash safety. Temp file names
 //! include PID + timestamp to avoid collisions. Provides JSON, JSONL,
 //! and plain-text read/write helpers via the [`Storage`] struct.
+//!
+//! JSONL reads tolerate a malformed record (skipping it with a warning) so a
+//! crash-torn trailing line in an append-only log can't make the whole log
+//! unreadable.
 
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
@@ -74,13 +78,23 @@ impl Storage {
         let file = File::open(&path).context("Failed to open JSONL file")?;
         let reader = BufReader::new(file);
         let mut results = Vec::new();
-        for line in reader.lines() {
+        for (idx, line) in reader.lines().enumerate() {
             let line = line.context("Failed to read line")?;
             if line.trim().is_empty() {
                 continue;
             }
-            let record: T = serde_json::from_str(&line).context("Failed to parse JSONL record")?;
-            results.push(record);
+            // Skip (don't fail on) a malformed record. These are append-only
+            // logs written non-atomically, so a crash can leave a torn trailing
+            // line — one bad line must not make the whole log unreadable.
+            match serde_json::from_str::<T>(&line) {
+                Ok(record) => results.push(record),
+                Err(err) => tracing::warn!(
+                    "skipping malformed JSONL record in {:?} (line {}): {}",
+                    path,
+                    idx + 1,
+                    err
+                ),
+            }
         }
         Ok(results)
     }
@@ -98,12 +112,25 @@ impl Storage {
         let file = File::open(&path).context("Failed to open JSONL file")?;
         let reader = BufReader::new(file);
         let mut count = 0usize;
-        for line in reader.lines() {
+        for (idx, line) in reader.lines().enumerate() {
             let line = line.context("Failed to read line")?;
             if line.trim().is_empty() {
                 continue;
             }
-            let record: T = serde_json::from_str(&line).context("Failed to parse JSONL record")?;
+            // Skip malformed records (e.g. a crash-torn trailing line) rather
+            // than aborting the whole stream — see read_jsonl.
+            let record: T = match serde_json::from_str(&line) {
+                Ok(record) => record,
+                Err(err) => {
+                    tracing::warn!(
+                        "skipping malformed JSONL record in {:?} (line {}): {}",
+                        path,
+                        idx + 1,
+                        err
+                    );
+                    continue;
+                }
+            };
             on_record(record)?;
             count += 1;
         }
@@ -269,6 +296,48 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].name, "first");
         assert_eq!(records[1].name, "second");
+    }
+
+    #[test]
+    fn test_read_jsonl_skips_malformed_lines() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = Storage::new(temp_dir.path().to_path_buf());
+
+        #[derive(Serialize, Deserialize)]
+        struct Record {
+            id: i32,
+        }
+
+        storage
+            .append_jsonl("log.jsonl", &Record { id: 1 })
+            .unwrap();
+        // Simulate a crash-torn trailing line: a partial/invalid JSON record.
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(storage.path("log.jsonl"))
+            .unwrap();
+        writeln!(f, "{{\"id\": 2, \"na").unwrap();
+        drop(f);
+        storage
+            .append_jsonl("log.jsonl", &Record { id: 3 })
+            .unwrap();
+
+        // The valid records survive; the torn line is skipped, not fatal.
+        let records: Vec<Record> = storage.read_jsonl("log.jsonl").unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].id, 1);
+        assert_eq!(records[1].id, 3);
+
+        // The streaming reader is equally resilient.
+        let mut seen = Vec::new();
+        let count = storage
+            .read_jsonl_stream::<Record, _>("log.jsonl", |r| {
+                seen.push(r.id);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(seen, vec![1, 3]);
     }
 
     #[test]

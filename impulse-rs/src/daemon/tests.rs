@@ -13,8 +13,8 @@ mod tests {
     // Re-import handler functions from the extracted handlers module.
     // super::super = daemon module (tests.rs is daemon::tests, inner mod is daemon::tests::tests)
     use super::super::handlers::{
-        handle_guard_request, handle_plugin_request, handle_session_request, handle_status,
-        handle_steward_request,
+        handle_delegation_request, handle_guard_request, handle_plugin_request,
+        handle_session_request, handle_status, handle_steward_request,
     };
 
     /// Test DaemonRequest serialization/deserialization
@@ -846,6 +846,91 @@ mod tests {
             }
             _ => panic!("Expected Ok response"),
         }
+    }
+
+    fn delegation_tracker_handle(
+    ) -> std::sync::Arc<tokio::sync::RwLock<crate::delegation::DelegationTracker>> {
+        std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::delegation::DelegationTracker::new(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_handle_delegation_register_list_complete() {
+        let tracker = delegation_tracker_handle();
+        let spec = crate::delegation::types::DelegationSpec {
+            task: "refactor auth".to_string(),
+            target_files: vec!["src/auth.rs".to_string()],
+            constraints: None,
+            max_depth: 2,
+            restricted_tools: vec![],
+        };
+
+        // Register → returns a delegation id.
+        let resp = handle_delegation_request(
+            DaemonRequest::RegisterDelegation {
+                spec,
+                coordinator_pane_id: 0,
+                context_snapshot: "ctx".to_string(),
+            },
+            &tracker,
+        )
+        .await;
+        let id = match resp {
+            DaemonResponse::Ok { result } => result["delegation_id"].as_str().unwrap().to_string(),
+            other => panic!("expected Ok, got {other:?}"),
+        };
+        assert!(!id.is_empty());
+
+        // List → contains the registered delegation in the pending state.
+        let resp = handle_delegation_request(DaemonRequest::ListDelegations, &tracker).await;
+        match resp {
+            DaemonResponse::Ok { result } => {
+                let arr = result.as_array().expect("summaries array");
+                assert_eq!(arr.len(), 1);
+                assert_eq!(arr[0]["id"].as_str().unwrap(), id);
+                assert_eq!(arr[0]["state"].as_str().unwrap(), "pending");
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+
+        // Complete → marks completed and returns a handoff prompt.
+        let resp = handle_delegation_request(
+            DaemonRequest::CompleteDelegation {
+                delegation_id: id.clone(),
+                summary: "done refactoring".to_string(),
+                tool_trace: vec![],
+                diff_summary: None,
+            },
+            &tracker,
+        )
+        .await;
+        match resp {
+            DaemonResponse::Ok { result } => {
+                assert!(result["completed"].as_bool().unwrap());
+                assert!(result["handoff_prompt"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Delegation Complete"));
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_delegation_complete_unknown_id_errors() {
+        let tracker = delegation_tracker_handle();
+        let resp = handle_delegation_request(
+            DaemonRequest::CompleteDelegation {
+                delegation_id: "del-does-not-exist".to_string(),
+                summary: "x".to_string(),
+                tool_trace: vec![],
+                diff_summary: None,
+            },
+            &tracker,
+        )
+        .await;
+        assert!(matches!(resp, DaemonResponse::Error { .. }));
     }
 
     #[tokio::test]

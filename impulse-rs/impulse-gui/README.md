@@ -1,6 +1,6 @@
 # impulse-gui
 
-> **LEGACY / FROZEN:** `impulse-gui` is the old egui/eframe desktop workbench. Do not add new features here. Active desktop work belongs in the Tauri+Dioxus `impulse-desktop` shell; this crate receives compile-maintenance and historical comparison only until removal after parity.
+> **LEGACY / FROZEN:** `impulse-gui` is the old egui/eframe desktop workbench. Do not add new features here. Active desktop work belongs in the Dioxus Desktop `impulse-desktop` host; this crate receives compile-maintenance and historical comparison only until removal after parity.
 
 Native desktop workbench for Impulse -- an egui/eframe application that hosts embedded terminals, agent coordination, and session memory in a single window.
 

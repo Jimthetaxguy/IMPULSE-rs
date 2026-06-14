@@ -4,24 +4,38 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
 description = "Hybrid Dioxus desktop shell contracts for Impulse"
-authors = ["James Pustorino"]
+authors = ["Impulse Maintainers"]
 license = "MIT"
 
 [lib]
 name = "impulse_desktop"
 path = "src/lib.rs"
 
+[[bin]]
+name = "impulse-desktop"
+path = "src/bin/impulse_desktop.rs"
+required-features = ["desktop-app"]
+
+[[example]]
+name = "emit_dioxus_host_bootstrap"
+path = "examples/emit_dioxus_host_bootstrap.rs"
+required-features = ["desktop-app"]
+
 [features]
 default = []
+desktop-app = ["dep:dioxus-desktop", "dioxus/desktop"]
 native-macos = [
     "dep:objc2",
     "dep:objc2-app-kit",
     "dep:objc2-foundation",
 ]
-tauri-runtime = ["dep:tauri"]
+# Temporary compatibility adapter while the desktop host migrates to Dioxus Desktop.
+legacy-tauri-runtime = ["dep:tauri"]
+tauri-runtime = ["legacy-tauri-runtime"]
 
 [dependencies]
 dioxus = { version = "0.6.3", default-features = false, features = ["minimal", "document"] }
+dioxus-desktop = { version = "0.6.3", optional = true }
 impulse-ops = { path = "../impulse-ops" }
 impulse-term = { path = "../impulse-term", default-features = false }
 serde = { version = "1", features = ["derive"] }

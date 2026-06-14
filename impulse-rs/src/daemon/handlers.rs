@@ -206,19 +206,29 @@ fn build_supervisor_prompt(
     )
 }
 
-// TODO(refactor): extract params into struct
-#[allow(clippy::too_many_arguments)]
-fn save_supervisor_artifact(
-    state: &SharedState,
-    project_id: &str,
-    agent_id: &str,
-    kind: &str,
+struct SupervisorArtifactInput {
+    project_id: String,
+    agent_id: String,
+    kind: String,
     title: String,
     summary: String,
     payload: serde_json::Value,
     related_files: Vec<impulse_ops::ArtifactFileRef>,
     actions: Vec<impulse_ops::ArtifactAction>,
-) -> Result<String> {
+}
+
+fn save_supervisor_artifact(state: &SharedState, input: SupervisorArtifactInput) -> Result<String> {
+    let SupervisorArtifactInput {
+        project_id,
+        agent_id,
+        kind,
+        title,
+        summary,
+        payload,
+        related_files,
+        actions,
+    } = input;
+
     let artifact_id = impulse_ops::sanitize_id(&format!(
         "{}-{}-{}",
         kind,
@@ -227,10 +237,10 @@ fn save_supervisor_artifact(
     ));
     let artifact = impulse_ops::ArtifactEnvelope {
         id: artifact_id.clone(),
-        project_id: project_id.to_string(),
-        agent_id: agent_id.to_string(),
+        project_id,
+        agent_id,
         session_id: None,
-        kind: kind.to_string(),
+        kind: kind.clone(),
         schema: format!("impulse.{}.v1", kind),
         title,
         summary,
@@ -439,58 +449,60 @@ async fn run_supervisor_action(
                     .ok_or_else(|| anyhow::anyhow!("Target agent not found"))?;
             let artifact_id = save_supervisor_artifact(
                 state,
-                &project.id,
-                "impulse-supervisor",
-                "context_cleanup_review",
-                format!("Cleanup Review: {}", target.label),
-                format!("Reviewable cleanup context prepared for {}", target.label),
-                serde_json::json!({
-                    "markdown": format!(
-                        "# Cleanup Review\n\n## Target\n- Agent: {}\n- Session: {}\n- Context Tier: {}\n\n## Goal\n{}\n\n## Recent Files\n{}\n\n## Current Task\n{}\n\n## Warnings\n{}\n",
-                        target.label,
-                        target.session_id.clone().unwrap_or_else(|| "none".to_string()),
-                        target.context.tier,
-                        goal.clone().unwrap_or_else(|| "Prepare a compact reviewable context bundle.".to_string()),
-                        if target.recent_files.is_empty() {
-                            "- (none tracked)".to_string()
-                        } else {
-                            target.recent_files.iter().map(|file| format!("- {}", file)).collect::<Vec<_>>().join("\n")
+                SupervisorArtifactInput {
+                    project_id: project.id.clone(),
+                    agent_id: "impulse-supervisor".to_string(),
+                    kind: "context_cleanup_review".to_string(),
+                    title: format!("Cleanup Review: {}", target.label),
+                    summary: format!("Reviewable cleanup context prepared for {}", target.label),
+                    payload: serde_json::json!({
+                        "markdown": format!(
+                            "# Cleanup Review\n\n## Target\n- Agent: {}\n- Session: {}\n- Context Tier: {}\n\n## Goal\n{}\n\n## Recent Files\n{}\n\n## Current Task\n{}\n\n## Warnings\n{}\n",
+                            target.label,
+                            target.session_id.clone().unwrap_or_else(|| "none".to_string()),
+                            target.context.tier,
+                            goal.clone().unwrap_or_else(|| "Prepare a compact reviewable context bundle.".to_string()),
+                            if target.recent_files.is_empty() {
+                                "- (none tracked)".to_string()
+                            } else {
+                                target.recent_files.iter().map(|file| format!("- {}", file)).collect::<Vec<_>>().join("\n")
+                            },
+                            target.current_task.clone().unwrap_or_else(|| "unknown".to_string()),
+                            if target.warnings.is_empty() {
+                                "- (none)".to_string()
+                            } else {
+                                target.warnings.iter().map(|warning| format!("- {}", warning)).collect::<Vec<_>>().join("\n")
+                            },
+                        ),
+                        "target_agent_id": target.id,
+                        "target_session_id": target.session_id,
+                        "goal": goal,
+                    }),
+                    related_files: Vec::new(),
+                    actions: vec![
+                        impulse_ops::ArtifactAction {
+                            id: "review".to_string(),
+                            label: "Review".to_string(),
+                            kind: "review".to_string(),
+                            requires_confirmation: false,
+                            params_schema: serde_json::Value::Null,
                         },
-                        target.current_task.clone().unwrap_or_else(|| "unknown".to_string()),
-                        if target.warnings.is_empty() {
-                            "- (none)".to_string()
-                        } else {
-                            target.warnings.iter().map(|warning| format!("- {}", warning)).collect::<Vec<_>>().join("\n")
+                        impulse_ops::ArtifactAction {
+                            id: "apply".to_string(),
+                            label: "Apply To Active Agent".to_string(),
+                            kind: "apply".to_string(),
+                            requires_confirmation: true,
+                            params_schema: serde_json::Value::Null,
                         },
-                    ),
-                    "target_agent_id": target.id,
-                    "target_session_id": target.session_id,
-                    "goal": goal,
-                }),
-                Vec::new(),
-                vec![
-                    impulse_ops::ArtifactAction {
-                        id: "review".to_string(),
-                        label: "Review".to_string(),
-                        kind: "review".to_string(),
-                        requires_confirmation: false,
-                        params_schema: serde_json::Value::Null,
-                    },
-                    impulse_ops::ArtifactAction {
-                        id: "apply".to_string(),
-                        label: "Apply To Active Agent".to_string(),
-                        kind: "apply".to_string(),
-                        requires_confirmation: true,
-                        params_schema: serde_json::Value::Null,
-                    },
-                    impulse_ops::ArtifactAction {
-                        id: "acknowledge".to_string(),
-                        label: "Acknowledge".to_string(),
-                        kind: "acknowledge".to_string(),
-                        requires_confirmation: false,
-                        params_schema: serde_json::Value::Null,
-                    },
-                ],
+                        impulse_ops::ArtifactAction {
+                            id: "acknowledge".to_string(),
+                            label: "Acknowledge".to_string(),
+                            kind: "acknowledge".to_string(),
+                            requires_confirmation: false,
+                            params_schema: serde_json::Value::Null,
+                        },
+                    ],
+                },
             )?;
             Ok(impulse_ops::SupervisorActionResult {
                 status: "executed".to_string(),
@@ -522,45 +534,47 @@ async fn run_supervisor_action(
             let markdown = std::fs::read_to_string(&handoff_path).unwrap_or_default();
             let artifact_id = save_supervisor_artifact(
                 state,
-                &project.id,
-                "impulse-supervisor",
-                "handoff_review",
-                format!("Handoff: {}", target_tool),
-                format!("Supervisor handoff prepared for {}", target_tool),
-                serde_json::json!({
-                    "markdown": markdown,
-                    "target_tool": target_tool,
-                    "task": task,
-                    "notes": notes,
-                    "source_path": handoff_path.display().to_string(),
-                }),
-                vec![impulse_ops::ArtifactFileRef {
-                    path: handoff_path.display().to_string(),
-                    label: Some("Generated handoff file".to_string()),
-                }],
-                vec![
-                    impulse_ops::ArtifactAction {
-                        id: "review".to_string(),
-                        label: "Review".to_string(),
-                        kind: "review".to_string(),
-                        requires_confirmation: false,
-                        params_schema: serde_json::Value::Null,
-                    },
-                    impulse_ops::ArtifactAction {
-                        id: "open_file".to_string(),
-                        label: "Open File Ref".to_string(),
-                        kind: "open_file".to_string(),
-                        requires_confirmation: false,
-                        params_schema: serde_json::Value::Null,
-                    },
-                    impulse_ops::ArtifactAction {
-                        id: "acknowledge".to_string(),
-                        label: "Acknowledge".to_string(),
-                        kind: "acknowledge".to_string(),
-                        requires_confirmation: false,
-                        params_schema: serde_json::Value::Null,
-                    },
-                ],
+                SupervisorArtifactInput {
+                    project_id: project.id.clone(),
+                    agent_id: "impulse-supervisor".to_string(),
+                    kind: "handoff_review".to_string(),
+                    title: format!("Handoff: {}", target_tool),
+                    summary: format!("Supervisor handoff prepared for {}", target_tool),
+                    payload: serde_json::json!({
+                        "markdown": markdown,
+                        "target_tool": target_tool,
+                        "task": task,
+                        "notes": notes,
+                        "source_path": handoff_path.display().to_string(),
+                    }),
+                    related_files: vec![impulse_ops::ArtifactFileRef {
+                        path: handoff_path.display().to_string(),
+                        label: Some("Generated handoff file".to_string()),
+                    }],
+                    actions: vec![
+                        impulse_ops::ArtifactAction {
+                            id: "review".to_string(),
+                            label: "Review".to_string(),
+                            kind: "review".to_string(),
+                            requires_confirmation: false,
+                            params_schema: serde_json::Value::Null,
+                        },
+                        impulse_ops::ArtifactAction {
+                            id: "open_file".to_string(),
+                            label: "Open File Ref".to_string(),
+                            kind: "open_file".to_string(),
+                            requires_confirmation: false,
+                            params_schema: serde_json::Value::Null,
+                        },
+                        impulse_ops::ArtifactAction {
+                            id: "acknowledge".to_string(),
+                            label: "Acknowledge".to_string(),
+                            kind: "acknowledge".to_string(),
+                            requires_confirmation: false,
+                            params_schema: serde_json::Value::Null,
+                        },
+                    ],
+                },
             )?;
             Ok(impulse_ops::SupervisorActionResult {
                 status: "executed".to_string(),
@@ -608,34 +622,36 @@ async fn run_supervisor_action(
             };
             let artifact_id = save_supervisor_artifact(
                 state,
-                &project.id,
-                "impulse-supervisor",
-                "permission_change",
-                "Supervisor Permission Change".to_string(),
-                format!("Supervisor permissions updated for {:?}", scope),
-                serde_json::json!({
-                    "scope": scope,
-                    "allowed_actions": next_state.effective.allowed_actions,
-                    "allowed_tool_capabilities": next_state.effective.allowed_tool_capabilities,
-                    "require_confirmation_actions": next_state.effective.require_confirmation_actions,
-                }),
-                Vec::new(),
-                vec![
-                    impulse_ops::ArtifactAction {
-                        id: "review".to_string(),
-                        label: "Review".to_string(),
-                        kind: "review".to_string(),
-                        requires_confirmation: false,
-                        params_schema: serde_json::Value::Null,
-                    },
-                    impulse_ops::ArtifactAction {
-                        id: "acknowledge".to_string(),
-                        label: "Acknowledge".to_string(),
-                        kind: "acknowledge".to_string(),
-                        requires_confirmation: false,
-                        params_schema: serde_json::Value::Null,
-                    },
-                ],
+                SupervisorArtifactInput {
+                    project_id: project.id.clone(),
+                    agent_id: "impulse-supervisor".to_string(),
+                    kind: "permission_change".to_string(),
+                    title: "Supervisor Permission Change".to_string(),
+                    summary: format!("Supervisor permissions updated for {:?}", scope),
+                    payload: serde_json::json!({
+                        "scope": scope,
+                        "allowed_actions": next_state.effective.allowed_actions,
+                        "allowed_tool_capabilities": next_state.effective.allowed_tool_capabilities,
+                        "require_confirmation_actions": next_state.effective.require_confirmation_actions,
+                    }),
+                    related_files: Vec::new(),
+                    actions: vec![
+                        impulse_ops::ArtifactAction {
+                            id: "review".to_string(),
+                            label: "Review".to_string(),
+                            kind: "review".to_string(),
+                            requires_confirmation: false,
+                            params_schema: serde_json::Value::Null,
+                        },
+                        impulse_ops::ArtifactAction {
+                            id: "acknowledge".to_string(),
+                            label: "Acknowledge".to_string(),
+                            kind: "acknowledge".to_string(),
+                            requires_confirmation: false,
+                            params_schema: serde_json::Value::Null,
+                        },
+                    ],
+                },
             )?;
             Ok(impulse_ops::SupervisorActionResult {
                 status: "executed".to_string(),
@@ -680,18 +696,34 @@ async fn run_supervisor_action(
 
 // ── Main dispatcher ──────────���─────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
+pub(crate) struct ProcessRequestContext<'a> {
+    pub state: SharedState,
+    pub registry: &'a crate::tooling::ToolRegistry,
+    pub tool_context: &'a crate::tooling::ToolContext,
+    pub terminal_telemetry: &'a Arc<RwLock<crate::ops_workbench::TerminalOpsTelemetryStore>>,
+    pub supervisor_session_override:
+        &'a Arc<RwLock<Option<impulse_ops::SupervisorPermissionPolicy>>>,
+    pub conflict_resolver: &'a Arc<RwLock<crate::agent::coordinator::ConflictResolver>>,
+    pub delegation_tracker: &'a Arc<RwLock<crate::delegation::DelegationTracker>>,
+    pub cached_agent: &'a Arc<tokio::sync::Mutex<Option<crate::agent::ImpulseAgent>>>,
+}
+
 #[tracing::instrument(skip_all, fields(request_type = request_type_name(&request)))]
 pub(crate) async fn process_request(
     request: DaemonRequest,
-    state: SharedState,
-    registry: &crate::tooling::ToolRegistry,
-    tool_context: &crate::tooling::ToolContext,
-    terminal_telemetry: &Arc<RwLock<crate::ops_workbench::TerminalOpsTelemetryStore>>,
-    supervisor_session_override: &Arc<RwLock<Option<impulse_ops::SupervisorPermissionPolicy>>>,
-    conflict_resolver: &Arc<RwLock<crate::agent::coordinator::ConflictResolver>>,
-    cached_agent: &Arc<tokio::sync::Mutex<Option<crate::agent::ImpulseAgent>>>,
+    context: ProcessRequestContext<'_>,
 ) -> DaemonResponse {
+    let ProcessRequestContext {
+        state,
+        registry,
+        tool_context,
+        terminal_telemetry,
+        supervisor_session_override,
+        conflict_resolver,
+        delegation_tracker,
+        cached_agent,
+    } = context;
+
     // ── Boundary validation ─��───────────────────────────────────────────────
     // Validate user-supplied IDs before dispatch to catch malformed input early.
     if let DaemonRequest::EndSession { ref session_id, .. }
@@ -810,12 +842,12 @@ pub(crate) async fn process_request(
             handle_plugin_request(request).await
         }
 
-        // Delegation group (Phase 1B — stub handlers, tracked locally by GUI)
+        // Delegation group (Phase 1B — backed by the shared DelegationTracker)
         DaemonRequest::RegisterDelegation { .. }
         | DaemonRequest::CompleteDelegation { .. }
-        | DaemonRequest::ListDelegations => DaemonResponse::Ok {
-            result: serde_json::json!({"status": "delegation_tracking_not_yet_wired"}),
-        },
+        | DaemonRequest::ListDelegations => {
+            handle_delegation_request(request, delegation_tracker).await
+        }
 
         // Conflict resolver group (Task 20)
         DaemonRequest::GetConflictHistory => {
@@ -1736,6 +1768,54 @@ pub(crate) async fn handle_guard_request(
             }
         }
         _ => respond_err("Internal routing error: not a guard request"),
+    }
+}
+
+/// Handle delegation lifecycle requests against the shared DelegationTracker
+/// (Phase 1B). Backs RegisterDelegation / CompleteDelegation / ListDelegations.
+pub(crate) async fn handle_delegation_request(
+    request: DaemonRequest,
+    delegation_tracker: &Arc<RwLock<crate::delegation::DelegationTracker>>,
+) -> DaemonResponse {
+    match request {
+        DaemonRequest::RegisterDelegation {
+            spec,
+            coordinator_pane_id,
+            context_snapshot,
+        } => {
+            // Daemon-registered delegations are top-level (depth 0); nested
+            // depth tracking is an in-process concern.
+            let mut tracker = delegation_tracker.write().await;
+            match tracker.register(spec, coordinator_pane_id, context_snapshot, 0) {
+                Some(id) => respond_ok(&serde_json::json!({ "delegation_id": id })),
+                None => respond_err(format!(
+                    "delegation rejected: max depth ({}) would be exceeded",
+                    crate::delegation::types::MAX_DELEGATION_DEPTH
+                )),
+            }
+        }
+        DaemonRequest::CompleteDelegation {
+            delegation_id,
+            summary,
+            tool_trace,
+            diff_summary,
+        } => {
+            let mut tracker = delegation_tracker.write().await;
+            if tracker.complete(&delegation_id, summary, tool_trace, diff_summary) {
+                let handoff_prompt = tracker.build_handoff_prompt(&delegation_id);
+                respond_ok(&serde_json::json!({
+                    "completed": true,
+                    "handoff_prompt": handoff_prompt,
+                }))
+            } else {
+                respond_err(format!("delegation not found: {delegation_id}"))
+            }
+        }
+        DaemonRequest::ListDelegations => {
+            let tracker = delegation_tracker.read().await;
+            respond_ok(&tracker.to_summaries())
+        }
+        _ => respond_err("Internal routing error: not a delegation request"),
     }
 }
 

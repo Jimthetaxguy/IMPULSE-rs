@@ -2,7 +2,7 @@
 
 > **Date:** 2026-03-02
 > **Status:** Draft
-> **Companion:** [`~/.ai-memory/docs/spec-os-sandbox-framework.md`](~/.ai-memory/docs/spec-os-sandbox-framework.md)
+> **Companion:** Private local design note, not included in this public repository.
 > **Source:** NullClaw analysis §2.4, existing Impulse guardrail system
 
 ---
@@ -349,7 +349,7 @@ no real sandbox is detected.
 
 ## 10. Cross-References
 
-- **Companion (cross-cutting):** [`spec-os-sandbox-framework.md`](~/.ai-memory/docs/spec-os-sandbox-framework.md)
+- **Companion (cross-cutting):** Private local design note, not included in this public repository.
 - **Spec 4 — Agent Patterns:** [`spec-nullclaw-agent-patterns.md`](./spec-nullclaw-agent-patterns.md) — vtable comparison informs trait design
 - **Impulse source:**
   - `src/guardrail/types.rs:10` — `GuardAction` enum (Block/Warn/Log)

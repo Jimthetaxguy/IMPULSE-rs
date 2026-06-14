@@ -13,6 +13,12 @@ use crate::tooling::{ManifestTool, ToolRegistry};
 pub const MANIFEST_VERSION: &str = "2.0";
 pub const DEFAULT_MANIFEST_FILE: &str = "impulse-capabilities.json";
 
+/// Coding-agent platforms Impulse can detect, monitor, and drive. Kept in sync
+/// with the agent-kind/platform/harness enums (claude-code, codex, opencode,
+/// gemini, cursor). Surfaced so an agent or operator reading the manifest can
+/// see which peers Impulse interoperates with.
+pub const SUPPORTED_AGENTS: &[&str] = &["claude-code", "codex", "opencode", "gemini", "cursor"];
+
 /// The capabilities manifest — describes Impulse capabilities for agents.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapabilitiesManifest {
@@ -21,6 +27,10 @@ pub struct CapabilitiesManifest {
     pub generated_at: String,
     pub tools: Vec<ManifestTool>,
     pub features: Vec<String>,
+    /// Coding-agent platforms Impulse can monitor and drive. `#[serde(default)]`
+    /// keeps manifests written before this field was added loadable.
+    #[serde(default)]
+    pub supported_agents: Vec<String>,
 }
 
 impl Default for CapabilitiesManifest {
@@ -48,6 +58,7 @@ impl CapabilitiesManifest {
             generated_at: Utc::now().to_rfc3339(),
             tools,
             features,
+            supported_agents: SUPPORTED_AGENTS.iter().map(|s| s.to_string()).collect(),
         }
     }
 
@@ -105,6 +116,14 @@ fn summary_from_manifest(manifest: &CapabilitiesManifest) -> String {
         }
     }
 
+    if !manifest.supported_agents.is_empty() {
+        out.push_str("\n### Monitored Agents\n");
+        out.push_str(&format!(
+            "Impulse can detect, monitor, and drive: {}\n",
+            manifest.supported_agents.join(", ")
+        ));
+    }
+
     out.push_str("\n### Usage\n");
     out.push_str("Run `impulse-rs tooling-list` to see all available tools.\n");
     out.push_str("Run `impulse-rs tooling-describe <tool-id>` for details.\n");
@@ -139,5 +158,42 @@ mod tests {
         let summary = generate_capabilities_summary();
         assert!(summary.contains("Impulse Capabilities"));
         assert!(summary.contains("Available Tools"));
+    }
+
+    #[test]
+    fn test_manifest_lists_supported_agents() {
+        let manifest = CapabilitiesManifest::default();
+        // The agents added across the multi-agent work (claude/codex/opencode/
+        // gemini/cursor) are advertised so peers can discover interop.
+        for agent in ["claude-code", "codex", "opencode", "gemini", "cursor"] {
+            assert!(
+                manifest.supported_agents.iter().any(|a| a == agent),
+                "manifest should advertise support for {agent}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_summary_includes_monitored_agents() {
+        let summary = summary_from_manifest(&CapabilitiesManifest::default());
+        assert!(summary.contains("Monitored Agents"));
+        assert!(summary.contains("gemini"));
+        assert!(summary.contains("cursor"));
+    }
+
+    #[test]
+    fn test_manifest_loads_without_supported_agents_field() {
+        // Backward compatibility: a manifest written before supported_agents
+        // existed (the field absent) must still deserialize.
+        let legacy = r#"{
+            "version": "2.0",
+            "impulse_version": "0.1.0",
+            "generated_at": "2026-01-01T00:00:00Z",
+            "tools": [],
+            "features": ["retrieval"]
+        }"#;
+        let manifest: CapabilitiesManifest = serde_json::from_str(legacy).unwrap();
+        assert!(manifest.supported_agents.is_empty());
+        assert_eq!(manifest.version, "2.0");
     }
 }

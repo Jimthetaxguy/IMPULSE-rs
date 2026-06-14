@@ -6,10 +6,16 @@
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use crate::daemon::{DaemonRequest, DaemonResponse};
+
+/// How long to wait for a daemon response before giving up. Generous enough for
+/// slow LLM-backed handlers (the daemon's own LLM calls cap at ~120s) but
+/// bounded so a hung/deadlocked daemon can't hang the CLI indefinitely.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(180);
 
 pub struct DaemonClient {
     socket_path: PathBuf,
@@ -34,6 +40,16 @@ impl DaemonClient {
     }
 
     pub async fn send(&self, request: DaemonRequest) -> Result<DaemonResponse> {
+        self.send_with_timeout(request, RESPONSE_TIMEOUT).await
+    }
+
+    /// Send a request and await the response, failing if the daemon does not
+    /// reply within `timeout` (so a hung daemon can't hang the caller forever).
+    async fn send_with_timeout(
+        &self,
+        request: DaemonRequest,
+        timeout: Duration,
+    ) -> Result<DaemonResponse> {
         let mut stream = self.connect().await?;
 
         let request_json =
@@ -55,9 +71,14 @@ impl DaemonClient {
         let mut reader = BufReader::new(reader);
 
         let mut response_line = String::new();
-        reader
-            .read_line(&mut response_line)
+        tokio::time::timeout(timeout, reader.read_line(&mut response_line))
             .await
+            .with_context(|| {
+                format!(
+                    "Daemon did not respond within {}s (it may be hung)",
+                    timeout.as_secs()
+                )
+            })?
             .context("Failed to read response from daemon socket")?;
 
         let response: DaemonResponse =
@@ -415,6 +436,40 @@ mod tests {
     fn test_daemon_client_new_stores_path() {
         let client = DaemonClient::new(PathBuf::from("/tmp/test.sock"));
         assert_eq!(client.socket_path, PathBuf::from("/tmp/test.sock"));
+    }
+
+    #[tokio::test]
+    async fn test_send_times_out_when_daemon_never_responds() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("hang.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+
+        // Accept the connection but never send a response.
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _hold = stream;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+
+        let client = DaemonClient::new(sock);
+        let start = std::time::Instant::now();
+        let result = client
+            .send_with_timeout(DaemonRequest::Ping, Duration::from_millis(200))
+            .await;
+
+        assert!(
+            result.is_err(),
+            "an unresponsive daemon must yield an error"
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("did not respond"),
+            "error should explain the timeout"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the call must fail promptly, not hang"
+        );
     }
 
     #[test]

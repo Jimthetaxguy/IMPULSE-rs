@@ -32,7 +32,7 @@ Creates `.impulse/` with `config.json`, `GENOME.md`, and `HISTORY.jsonl`.
 cargo run -- run
 ```
 
-The terminal-native workbench is the current operator path. The Tauri+Dioxus desktop shell lives in `impulse-desktop` and is in migration; use the migration handoff for desktop build sequencing. The old egui `impulse-gui` workbench is legacy/frozen and should be used only for compile-maintenance or historical comparison.
+The terminal-native workbench is the current operator path. The Dioxus Desktop host lives in `impulse-desktop`; Tauri-shaped code is legacy compatibility only while host parity moves over. The old egui `impulse-gui` workbench is legacy/frozen and should be used only for compile-maintenance or historical comparison.
 
 ### Use the Supervisor
 
@@ -77,4 +77,4 @@ impulse-rs search-history --query "auth"
 
 **"No agent backend configured"** — Set `ANTHROPIC_API_KEY` or install Claude Code
 
-**Desktop shell status is unclear** — Use the ratatui TUI for current work. The Tauri+Dioxus shell is still in migration, and `impulse-gui` is legacy/frozen.
+**Desktop shell status** — Use the ratatui TUI for current work. The Dioxus Desktop host is the active native-shell target, Tauri-shaped code is legacy compatibility only, and `impulse-gui` is legacy/frozen.

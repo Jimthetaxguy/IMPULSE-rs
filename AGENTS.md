@@ -3,9 +3,9 @@ title: Agent Guidelines
 description: Guidelines for AI coding agents working in this repository
 version: '4.1'
 authors:
-  - name: James Pustorino
-    email: James.s.Pustorino@gmail.com
-    github: jamespustorino
+  - name: Impulse Maintainers
+    email: impulse-rs@users.noreply.github.com
+    github: Jimthetaxguy/IMPULSE-rs
 ---
 
 # AGENTS.md — Impulse
@@ -14,7 +14,7 @@ authors:
 > Contract: [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
 > Collaboration playbook: [`docs/guides/COLLABORATIVE-AGENTIC-CODING.md`](docs/guides/COLLABORATIVE-AGENTIC-CODING.md)
 > Canonical stack: Rust (impulse-rs)
-> Roadmap contract: Now=Rust core + Tauri desktop shell; Next=terminal bridge + daemon parity; Legacy=egui compile-maintenance only
+> Roadmap contract: Now=Rust core + Dioxus desktop host; Next=Dioxus Desktop launch scaffold + terminal bridge parity; Legacy=egui compile-maintenance only; Tauri=legacy compatibility adapter only
 
 ---
 
@@ -34,16 +34,17 @@ Impulse is a **sidecar memory layer** for AI coding agents. It is NOT a coding a
 
 ---
 
-## Desktop Shell Status (as of 2026-04-15)
+## Desktop Shell Status (as of 2026-06-14)
 
-> **egui / impulse-gui is LEGACY.** It is frozen — no new features. It will be removed after Tauri shell reaches parity.
+> **egui / impulse-gui is LEGACY.** It is frozen — no new features. It will be removed after the Dioxus desktop host reaches parity.
 
-The chosen desktop stack is **Tauri 2.x + Dioxus + xterm.js terminal bridge**.
+The chosen desktop stack is **Dioxus Desktop + xterm.js terminal bridge**. Tauri-shaped code is retained only as a temporary compatibility adapter while Dioxus Desktop launch plumbing lands.
 
 - See `docs/spec/DESKTOP-SHELL-ARCHITECTURE.md` for canonical layer boundaries
 - See `docs/spec/DESKTOP-STACK-TRADEOFFS.md` for the full option evaluation
-- See `docs/decisions/0007-desktop-shell-stack.md` for the ADR
-- See `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md` for the build sequence
+- See `docs/decisions/0008-dioxus-desktop-host.md` for the active ADR
+- See `docs/decisions/0007-desktop-shell-stack.md` for the superseded Tauri-era ADR
+- See `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md` for historical migration context; do not use it as the next product goal
 
 **Do not add new code to `impulse-gui`.** If you need to touch `impulse-term`, confirm that `eframe` is not re-introduced as a dependency.
 
@@ -89,10 +90,10 @@ Choose the simplest solution that works. Prefer editing existing files over crea
 
 ## Architecture
 
-**Dual mode:**
+**Execution surfaces:**
 - **Direct** — stateless per-action (hooks). Read → process → write → exit.
 - **Daemon** — long-running with Unix socket IPC (TUI/chat). In-memory state with dirty-flag sync.
-- **Desktop shell** — Tauri + Dioxus webview backed by daemon snapshots and terminal bridge events. *(in migration)*
+- **Desktop shell** — Dioxus Desktop host target backed by daemon snapshots, Rust host commands, and xterm.js terminal bridge events. Legacy Tauri-shaped adapters remain compatibility-only while the Dioxus host boundary reaches parity.
 - **ratatui TUI** — standalone terminal-native operator surface. Remains first-class throughout migration.
 - **egui workbench** — LEGACY. Frozen. Compile-maintenance only.
 

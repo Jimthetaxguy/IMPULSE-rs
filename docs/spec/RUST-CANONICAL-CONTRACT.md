@@ -10,10 +10,10 @@ status: active
 audience: builders
 tags: [contract, rust, canonical, roadmap]
 authors:
-  - name: James Pustorino
-    role: Creator
-    email: James.s.Pustorino@gmail.com
-    github: jamespustorino
+  - name: Impulse Maintainers
+    role: Maintainer
+    email: impulse-rs@users.noreply.github.com
+    github: Jimthetaxguy/IMPULSE-rs
 ---
 
 # Rust Canonical Product Contract
@@ -29,9 +29,9 @@ Core outcomes:
 - Persistent project memory (`GENOME`, session history, active state)
 - Cross-session continuity for Claude Code and Codex integrations, with legacy OpenCode compatibility preserved where already implemented
 - Operationally safe session lifecycle with verification-before-completion gates
-- Human-visible observability through CLI, ratatui TUI, and a Tauri desktop shell (in migration)
+- Human-visible observability through CLI, ratatui TUI, and a Dioxus Desktop shell (in migration)
 
-## 2) Desktop Shell Contract (Updated 2026-04-15)
+## 2) Desktop Shell Contract (Updated 2026-06-14)
 
 > **This section supersedes all prior references to the EGUI workbench as the active desktop product.**
 
@@ -39,17 +39,18 @@ Core outcomes:
 
 | Layer | Technology |
 |---|---|
-| Desktop container | Tauri 2.x |
-| UI framework | Dioxus (rsx! components, inside Tauri webview) |
-| Terminal rendering | xterm.js (mounted via Dioxus eval(), fed by Tauri events) |
+| Desktop host | Dioxus Desktop |
+| UI framework | Dioxus (rsx! components, signals, host adapter) |
+| Terminal rendering | xterm.js (mounted via Dioxus eval(), fed by host events) |
 | PTY / session backend | impulse-term (TerminalBackend, WriteQueue) — unchanged |
 | Standalone operator TUI | ratatui — first-class, preserved throughout migration |
 | **Legacy desktop surface** | **egui / impulse-gui — FROZEN. No new features. Sunset after parity.** |
+| **Legacy host adapter** | **Tauri-shaped command/event bridge — compatibility only, not the next product scaffold.** |
 
 Architectural detail: `docs/spec/DESKTOP-SHELL-ARCHITECTURE.md`
 Stack tradeoffs: `docs/spec/DESKTOP-STACK-TRADEOFFS.md`
-Decision record: `docs/decisions/0007-desktop-shell-stack.md`
-Migration sequence: `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md`
+Decision record: `docs/decisions/0008-dioxus-desktop-host.md`
+Historical migration sequence: `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md`
 
 ### Desktop Migration Phases
 
@@ -57,8 +58,8 @@ Migration sequence: `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md`
 |---|---|---|
 | 0 | Documentation contract reset | Completed; Plan 6 is correcting residual active-doc drift |
 | 1 | Remove eframe from impulse-term, confirm framework-neutral core | Pending |
-| 2 | Static Tauri+Dioxus shell skeleton | Partial: `impulse-desktop` Dioxus shell + typed bridge scaffold |
-| 3 | Live terminal bridge (PTY → xterm.js) | Pending |
+| 2 | Static Dioxus shell skeleton | Partial: `impulse-desktop` Dioxus shell + typed bridge scaffold |
+| 3 | Dioxus Desktop launch scaffold + live terminal bridge (PTY → xterm.js) | Pending |
 | 4 | Daemon integration and parity | Pending; `impulse-gui` is already frozen for new features |
 
 ## 3) Canonical Scope and Roadmap
@@ -67,8 +68,8 @@ Migration sequence: `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md`
 
 | Stage | Focus | Status |
 | --- | --- | --- |
-| **Now** | Rust memory core + hooks + retrieval/injection + Tauri desktop shell | Active |
-| **Next** | terminal bridge hardening + daemon-backed desktop parity | Active |
+| **Now** | Rust memory core + hooks + retrieval/injection + Dioxus desktop host | Active |
+| **Next** | Dioxus Desktop launch scaffold + terminal bridge hardening | Active |
 | **Later** | Daemon parity in desktop shell + agent control + artifact polish | Planned |
 
 ### Out of Scope for Current Contract
@@ -161,9 +162,9 @@ Primary commands that must remain documented and regression-tested:
 | `.impulse/retrieval.lock` | Indexing lock guard | Runtime safety artifact |
 | `.impulse/projects/<project_id>/agents/<agent_id>/artifacts/*` | Project-organized operator artifacts | Durable workbench artifacts |
 
-### Desktop Shell IPC Contract (Terminal Bridge — Additive)
+### Desktop Shell Host Contract (Terminal Bridge — Additive)
 
-The desktop shell communicates with the Rust backend via a thin Tauri IPC bridge. These surfaces are **additive** — they do not replace or modify daemon contracts.
+The desktop shell communicates with the Rust backend through a Dioxus host adapter command/event boundary. The remaining Tauri-shaped bridge is compatibility-only while Dioxus Desktop launch plumbing reaches parity. These surfaces are **additive** — they do not replace or modify daemon contracts.
 
 **Commands (frontend → backend):**
 
@@ -297,7 +298,8 @@ The daemon exposes a JSON-line Unix socket protocol (`impulse.sock`). Full spec:
 | Context stewardship | Implemented | `steward` | Rust unit + integration |
 | Tool management | Implemented | `tools` | Rust unit |
 | Credential management | Implemented | `credentials` | Rust unit |
-| **Tauri desktop shell** | **In migration; scaffold partial** | Tauri + Dioxus + xterm.js | Pending live bridge + daemon parity |
+| **Dioxus desktop shell** | **In migration; scaffold partial** | Dioxus Desktop + xterm.js | Pending launch scaffold + live bridge parity |
+| **Tauri-shaped host adapter** | **LEGACY — compatibility only** | Optional gated bridge | Remove after Dioxus host command/event parity |
 | **egui operator workbench** | **LEGACY — frozen** | `impulse-gui` (compile-only) | Legacy tests only |
 | SWARM semantic coordination runtime | Planned | Future orchestration engine | Not started |
 
@@ -325,7 +327,7 @@ The following files define product truth and must be updated together for contra
 - `docs/SUMMARY.yaml` (navigation source)
 - `docs/SUMMARY.md` (high-level map)
 - `docs/spec/DESKTOP-SHELL-ARCHITECTURE.md` (desktop contract)
-- `docs/decisions/0007-desktop-shell-stack.md` (desktop ADR)
+- `docs/decisions/0008-dioxus-desktop-host.md` (desktop ADR)
 
 ### Required Update Checklist for Any Interface Change
 

@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use super::types::{MonitorAction, PaneContextState, COMPACTION_DEBOUNCE_SECS};
+use super::types::{ContextTier, MonitorAction, PaneContextState, COMPACTION_DEBOUNCE_SECS};
 
 /// Known phrases emitted by AI agents when compacting context.
 const COMPACTION_PATTERNS: &[&str] = &[
@@ -45,6 +45,15 @@ impl CompactionDetector {
             state.compaction_count += 1;
             // Reset estimated tokens to 10% of window (agent has freed context)
             state.estimated_tokens = window_tokens / 10;
+            // Re-baseline byte accounting to "now" so the monitor measures
+            // post-compaction growth from ~empty instead of the cumulative total.
+            state.output_bytes_baseline = state.output_bytes_at_last_check;
+            // Re-arm the threshold ladder. Without this, a pane that already
+            // climbed to a high tier (e.g. Minimal) keeps `last_threshold` at
+            // that tier forever, so the monitor's `new_tier > last_threshold`
+            // guard can never fire again — the post-compaction refresh cycle
+            // would be permanently dead for that pane.
+            state.last_threshold = ContextTier::None;
             Some(MonitorAction::CompactionDetected {
                 pane_id: state.pane_id,
             })
@@ -107,6 +116,37 @@ mod tests {
         ));
         assert_eq!(state.estimated_tokens, 20_000); // 10% of 200k
         assert_eq!(state.compaction_count, 1);
+    }
+
+    #[test]
+    fn test_check_pane_resets_last_threshold_on_compaction() {
+        // Regression: a pane that already climbed to a high tier must have its
+        // threshold ladder re-armed on compaction, otherwise the monitor's
+        // `new_tier > last_threshold` guard can never fire again.
+        let mut state = PaneContextState::new(1, AgentKind::ClaudeCode);
+        state.last_threshold = ContextTier::Minimal;
+        state.estimated_tokens = 180_000;
+        state.output_bytes_at_last_check = 288_000;
+
+        let action = CompactionDetector::check_pane(
+            &mut state,
+            "System: compressing prior messages",
+            200_000,
+        );
+
+        assert!(matches!(
+            action,
+            Some(MonitorAction::CompactionDetected { pane_id: 1 })
+        ));
+        assert_eq!(
+            state.last_threshold,
+            ContextTier::None,
+            "last_threshold must reset to None so future tier crossings re-fire"
+        );
+        assert_eq!(
+            state.output_bytes_baseline, 288_000,
+            "byte baseline must move to current so usage is measured post-compaction"
+        );
     }
 
     #[test]

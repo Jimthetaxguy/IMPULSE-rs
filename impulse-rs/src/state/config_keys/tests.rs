@@ -161,7 +161,7 @@ fn get_optional_none_returns_none() {
 #[test]
 fn get_api_key_is_masked() {
     let c = Config {
-        impulse_agent_api_key: Some("sk-ant-12345".to_string()),
+        impulse_agent_api_key: Some("test-anthropic-key-not-real".to_string()),
         ..Default::default()
     };
     assert_eq!(c.get("impulse_agent_api_key"), Some("***".to_string()));
@@ -442,8 +442,11 @@ fn set_platform_invalid_rejected() {
 #[test]
 fn set_api_key_stores_and_clears() {
     let mut c = Config::default();
-    assert!(c.set("impulse_agent_api_key", "sk-test-key"));
-    assert_eq!(c.impulse_agent_api_key, Some("sk-test-key".to_string()));
+    assert!(c.set("impulse_agent_api_key", "test-api-key-not-real"));
+    assert_eq!(
+        c.impulse_agent_api_key,
+        Some("test-api-key-not-real".to_string())
+    );
     assert!(c.set("impulse_agent_api_key", ""));
     assert!(c.impulse_agent_api_key.is_none());
 }

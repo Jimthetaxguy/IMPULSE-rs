@@ -65,7 +65,8 @@ data_files:
 | Language | Rust | stable |
 | CLI Parser | clap | 4.x |
 | TUI | ratatui | 0.28 |
-| Desktop shell | Tauri + Dioxus | in migration |
+| Desktop shell | Dioxus Desktop + xterm.js | in migration |
+| Legacy host adapter | Tauri-shaped bridge | compatibility only |
 | Legacy desktop | egui / impulse-gui | frozen |
 | Async | tokio | 1.x |
 | HTTP Client | reqwest | 0.11 |
@@ -155,7 +156,7 @@ impulse-rs/
 
 | Name | Role |
 |------|------|
-| James Pustorino | Creator (james.s.pustorino@gmail.com, github.com/jamespustorino) |
+| Impulse Maintainers | Project maintainers |
 
 ## Version History
 

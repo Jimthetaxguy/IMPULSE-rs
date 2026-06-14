@@ -3,7 +3,7 @@ title: Desktop Shell Architecture
 status: active
 version: 1.0.0
 created: 2026-04-15
-updated: 2026-04-15
+updated: 2026-06-14
 ---
 
 # Desktop Shell Architecture
@@ -14,28 +14,29 @@ This document is the canonical reference for the Impulse desktop shell. It descr
 
 The chosen desktop stack is:
 
-- **Shell container:** Tauri 2.x
-- **UI layer:** Dioxus (inside the Tauri webview)
+- **Shell host:** Dioxus Desktop
+- **UI layer:** Dioxus (`rsx!` components and signals)
 - **Terminal rendering:** xterm.js (mounted into Dioxus `rsx!` component divs via `eval()`)
 - **PTY / session / daemon ownership:** existing Rust backend (`impulse-term`, `impulse-ops`, daemon)
 - **Terminal-native operator surface:** `ratatui` (standalone, preserved)
 - **Legacy desktop surface:** `egui` / `impulse-gui` (freeze and sunset)
+- **Legacy host adapter:** Tauri-shaped command/event bridge (compatibility only)
 
-See `docs/decisions/0007-desktop-shell-stack.md` for the full ADR.
+See `docs/decisions/0008-dioxus-desktop-host.md` for the current ADR.
 
 ---
 
 ## Layer Boundaries
 
 ```
-DESKTOP SHELL (Tauri + Dioxus webview)
+DESKTOP SHELL (Dioxus Desktop)
   Left Rail | Center Terminal Panes (xterm.js) | Right Inspector
   Top Bar (daemon status)
   Bottom Strip (event log)
 
-          | Tauri IPC commands + events |
+          | Dioxus host adapter commands + events |
 
-RUST BACKEND (src-tauri)
+RUST BACKEND (impulse-desktop / impulse-term)
   Terminal Bridge: terminal_open/write/resize/close/focus
   Terminal Events: terminal_output/exit/status/ops_update
   impulse-term core: TerminalBackend, WriteQueue, PTY, vt100
@@ -52,21 +53,27 @@ DAEMON (impulse-rs binary)
 
 ## Runtime Responsibilities
 
-### Tauri Shell (src-tauri)
+### Dioxus Desktop Host
 
-- Owns the native window, menu bar, and OS-level lifecycle
-- Hosts the Dioxus webview
-- Exposes command handlers for the terminal bridge API
-- Subscribes to daemon events and forwards them to the frontend as Tauri events
+- Owns the native window and desktop lifecycle
+- Hosts the Dioxus application and installs `window.__IMPULSE_DESKTOP_HOST`
+- Exposes host command handlers for the terminal bridge API
+- Subscribes to daemon/runtime events and forwards them to the frontend as host events
 - Never becomes the PTY owner
 - Never holds UI state - it relays state from daemon/backend to the frontend
 
-### Dioxus Frontend (inside webview)
+### Legacy Tauri-Shaped Adapter
+
+- Exists only to keep older command/event tests and compatibility paths green while Dioxus Desktop launch plumbing lands
+- Must not be used as the next product scaffold
+- Must be removable after Dioxus host command/event parity is covered by tests
+
+### Dioxus Frontend
 
 - Renders all non-terminal UI chrome using `rsx!` components
 - Mounts xterm.js instances into `<div>` elements for each terminal pane
-- Subscribes to Tauri events (`terminal_output`, `ops_update`, etc.) and routes them to the correct xterm.js instance or UI component
-- Sends user actions (keyboard input, resize, tab switch, session commands) as Tauri commands to the backend
+- Subscribes to host events (`terminal_output`, `ops_update`, etc.) and routes them to the correct xterm.js instance or UI component
+- Sends user actions (keyboard input, resize, tab switch, session commands) as host commands to the backend
 - **Does not hold authoritative state.** All panel data (sessions, context, artifacts, supervisor) is read from daemon snapshots, not from frontend-local shadow copies
 
 ### Terminal Panes (xterm.js)
@@ -114,7 +121,7 @@ DAEMON (impulse-rs binary)
 Child process stdout
   -> PTY master reader thread (pty_reader_loop)
   -> vt100::Parser (backend.rs)
-  -> Tauri backend emits terminal_output event {session_id, data: Vec<u8>}
+  -> Dioxus host adapter emits terminal_output event {session_id, data: Vec<u8>}
   -> Dioxus event listener routes to correct xterm.js instance
   -> xterm.js.write(data)
   -> WebKit canvas/WebGL renders glyphs
@@ -126,7 +133,7 @@ Child process stdout
 User keypress in xterm.js
   -> xterm.js onData handler
   -> Dioxus eval() bridge sends terminal_write command
-  -> Tauri backend command handler
+  -> host command handler
   -> WriteQueue.write_user_input(bytes)
   -> PTY stdin -> Child process stdin
 ```
@@ -137,7 +144,7 @@ User keypress in xterm.js
 Pane container resized (CSS layout change)
   -> xterm.js ResizeObserver / fit addon
   -> Dioxus eval() sends terminal_resize command {session_id, cols, rows}
-  -> Tauri backend command handler
+  -> host command handler
   -> TerminalBackend.resize(cols, rows)
   -> parser lock -> PTY master resize -> SIGWINCH -> parser set_size
 ```
@@ -146,8 +153,8 @@ Pane container resized (CSS layout change)
 
 ```
 Daemon publishes ProjectOpsSnapshot / TerminalOpsReport
-  -> Tauri backend receives via daemon IPC subscription
-  -> Backend emits ops_update Tauri event {snapshot}
+  -> Dioxus host receives via daemon IPC subscription
+  -> Backend emits ops_update host event {snapshot}
   -> Dioxus component subscribes to ops_update
   -> Component re-renders from new snapshot
   -> Side panels (context, artifacts, supervisor) update

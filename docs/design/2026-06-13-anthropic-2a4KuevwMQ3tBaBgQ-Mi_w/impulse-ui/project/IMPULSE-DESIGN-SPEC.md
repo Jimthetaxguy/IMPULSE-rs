@@ -159,13 +159,13 @@ The same screen can shift modes — e.g. the home dashboard goes Calm → Diagno
 | T11 | **Pending review row** | NEW | Single peeking row · amber accent · `[a/d/s]` hints. |
 | T12 | **Pixel cursor block** | EXISTS | Blinking 8×14 cyan block. |
 
-### GUI · egui (`impulse-rs/impulse-gui/`)
+### Desktop · Dioxus (`impulse-rs/impulse-desktop/`)
 
 | # | Component | Status | Notes |
 |---|---|---|---|
 | G1 | **Title bar w/ traffic lights** | EXISTS | Add daemon RTT + protocol version chip. |
-| G2 | **Left view rail (icon)** | EXISTS | 58 px wide; 6 icons; active = cyan border-left + bg highlight. |
-| G3 | **Hero block (rocket + headline)** | NEW | 220-px sprite + Inter h1. Home view only. |
+| G2 | **Left view rail (icon)** | EXISTS | Dioxus view spine; active = cyan border-left + bg highlight. |
+| G3 | **Hero block (rocket + headline)** | NEW | Brand moment for home/supervisor views only. |
 | G4 | **Pending action banner** | NEW | Amber border-left · single primary button (`REVIEW & APPLY`). |
 | G5 | **Stat trio strip** | NEW | Three columns w/ vertical dividers · 38 px numbers. |
 | G6 | **Stat card** | EXISTS | Title-eyebrow + big number + meter. |

@@ -4,7 +4,7 @@
 > Contract: [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
 > Collaboration playbook: [`docs/guides/COLLABORATIVE-AGENTIC-CODING.md`](docs/guides/COLLABORATIVE-AGENTIC-CODING.md)
 > Canonical stack: Rust (impulse-rs)
-> Roadmap contract: Now=Rust core + Tauri desktop shell; Next=terminal bridge + daemon parity; Legacy=egui compile-maintenance only
+> Roadmap contract: Now=Rust core + Dioxus desktop host; Next=Dioxus Desktop launch scaffold + terminal bridge parity; Legacy=egui compile-maintenance only; Tauri=legacy compatibility adapter only
 
 ---
 
@@ -85,14 +85,14 @@ Before implementing, consider alternative approaches. Choose the simplest soluti
 - `impulse-rs/` — main CLI + daemon + ratatui TUI
 - `impulse-rs/impulse-ops/` — operations library (shared types: SupervisorAction, TerminalOpsReport, OpsSnapshot, WorkbenchDaemonRequest/Response, DAEMON_PROTOCOL_VERSION, 4 tests)
 - `impulse-rs/impulse-term/` — PTY/session/context core (PTY + vt100 + WriteQueue + context bridge)
-- `impulse-rs/impulse-desktop/` — Tauri+Dioxus desktop shell scaffold and typed bridge contracts
+- `impulse-rs/impulse-desktop/` — Dioxus desktop shell scaffold and typed host bridge contracts
 
-**Legacy:** `impulse-gui` / egui is frozen. It receives compile-maintenance only until the Tauri+Dioxus shell reaches parity.
+**Legacy:** `impulse-gui` / egui is frozen. It receives compile-maintenance only until the Dioxus desktop host reaches parity. Tauri-shaped code is also compatibility-only, not a new product scaffold target.
 
-**Dual mode:**
+**Execution surfaces:**
 - **Direct mode** — stateless, per-action (for hooks). Read → process → write → exit.
 - **Daemon mode** — long-running, Unix socket IPC (for TUI and future desktop shell). In-memory state with periodic sync.
-- **Desktop mode** (in migration) — `Tauri` + `Dioxus` application, connects to daemon via IPC and a terminal bridge.
+- **Desktop mode** (in migration) — Dioxus Desktop host with xterm.js terminal bridge, backed by Rust daemon/runtime state. Tauri-shaped command/event code is compatibility-only.
 
 **IPC Protocol (PROTOCOL_VERSION = 2):**
 
@@ -250,10 +250,10 @@ Use descriptive names: `test_<function>_<scenario>_<expected_result>`
 
 ### Test Density Targets
 
-| Module Type | Target | Current (as of 2026-04-01) |
+| Module Type | Target | Current (as of 2026-06-14) |
 |-------------|--------|---------|
 | Core (state, daemon, agent) | 3.0 tests/KLOC | ~1.5 (state ~80 tests, agent harness +24, daemon protocol +2) |
-| Handlers | 2.0 tests/KLOC | ~0.8 (38 tests across 6/19 files; 13 files at zero) |
+| Handlers | 2.0 tests/KLOC | ~32 tests/KLOC (362 tests across 12/19 files, 11,183 LOC) — target exceeded |
 | Tooling | 2.0 tests/KLOC | ~17.1 (84 tests, 4,920 LOC) |
 | UI/TUI | 1.0 tests/KLOC | ~0.4 |
 
@@ -261,8 +261,8 @@ Use descriptive names: `test_<function>_<scenario>_<expected_result>`
 
 **Why core is low (1.2/KLOC):** Core modules are critical but large. Trend toward 3.0/KLOC by adding: session lifecycle corner cases (rapid start/end, duplicate IDs), daemon reconnection/recovery (socket errors), agent harness error cases (missing context, malformed JSON).
 
-**Why handlers are low (1.2/KLOC):** 13 of 19 handler files have zero tests. 6 files have tests: `session.rs` (12), `config.rs` (11), `memory.rs` (5), `describe.rs` (4), `mod.rs` (4), `system.rs` (2). Priority order for the untested 13: (1) `daemon_dispatch.rs` (450 LOC, routes all IPC), (2) `direct_dispatch.rs` (465 LOC, routes all CLI), (3) `agent.rs` (145 LOC, agent config/query), (4) `guard.rs` (204 LOC, action guardrails), (5) `injection_handlers.rs` (209 LOC, context injection), (6) `common.rs` (379 LOC, shared helpers), (7) `stewardship_handlers.rs` (365 LOC), (8) `tooling_handlers.rs` (270 LOC), (9) `build.rs` (256 LOC), (10) `semantic_diff_handlers.rs` (164 LOC), (11) `office.rs` (142 LOC), (12) `plugin_handlers.rs` (95 LOC), (13) `retrieval.rs` (84 LOC).
-| Integration | Covers CLI commands + daemon IPC | 26 tests |
+**Why handlers now exceed target (~32/KLOC):** The dispatch routers and shared helpers are heavily covered — `direct_dispatch.rs` (117 tests), `common.rs` (84), `daemon_dispatch.rs` (69), `injection_handlers.rs` (18), `guard.rs` (17), `agent.rs` (16), `session.rs` (12), `config.rs` (12), `memory.rs` (7), `describe.rs` (4), `mod.rs` (4), `system.rs` (2). The remaining **7 zero-test files are all thin CLI print-wrappers** that delegate to already-tested modules (`build_hygiene`, `semantic_diff`, `tooling`, etc.): `build.rs`, `office.rs`, `plugin_handlers.rs`, `retrieval.rs`, `semantic_diff_handlers.rs`, `stewardship_handlers.rs`, `tooling_handlers.rs`. Adding "does not panic" tests to these would be the println-only anti-pattern called out above — prefer testing the underlying modules, or extract any non-trivial decision logic out of the handler before testing it.
+| Integration | Covers CLI commands + daemon IPC | 26 tests (4 files under `tests/`) |
 
 New modules must ship with tests meeting the target density. Existing modules should trend toward targets during regular development.
 
@@ -271,7 +271,7 @@ New modules must ship with tests meeting the target density. Existing modules sh
 | Module | Risk | Why |
 |--------|------|-----|
 | `src/state/` | HIGH | Persistence layer — corruption means data loss. Well-tested (~80 tests covering conflict detection, audit trail, config corruption, session lifecycle, config keys). |
-| `src/handlers/` | HIGH | User-facing CLI paths — 13 of 19 files have zero tests. Priority: `daemon_dispatch`, `direct_dispatch`, `agent`, `guard`, `injection_handlers`, `common`. |
+| `src/handlers/` | MEDIUM | User-facing CLI paths — 12 of 19 files tested (362 tests, ~32/KLOC). Remaining 7 zero-test files are thin print-wrappers; test their underlying modules instead. |
 | `src/error.rs` | LOW | All 8 `AgentError` variants have Display tests. |
 | `src/ui/` | MEDIUM | TUI rendering — complex layout logic, limited coverage. |
 
@@ -358,13 +358,14 @@ cd impulse-rs && cargo build && cargo test && cargo clippy -- -D warnings && car
 ```
 
 **Expected output (update when counts change):**
-- `cargo test --workspace`: 1,318 unit + 26 integration (impulse-rs) + 4 (impulse-ops) + 110 (impulse-term) = 1,458 passed, 3 ignored, 0 failed
+- `cargo test --workspace`: 1,326 unit + 26 integration (impulse-rs) + 4 (impulse-ops) + 114 (impulse-term) + 116 (impulse-desktop) = 1,586 passed, 4 ignored, 0 failed
 - `cargo clippy`: 0 warnings
 - `cargo fmt --check`: no output (clean)
 
 **Quick health check** (for mid-session verification):
 ```bash
-cd impulse-rs && cargo check && cargo test --lib -- --quiet 2>&1 | tail -5
+# Note: impulse-rs is a binary crate (no lib target), so use --bins not --lib.
+cd impulse-rs && cargo check && cargo test --bins -- --quiet 2>&1 | tail -5
 ```
 
 ### Full Workspace
@@ -388,12 +389,12 @@ To verify test counts match expectations:
 ```bash
 cd impulse-rs && cargo test 2>&1 | grep "test result:" | awk '{sum += $4} END {print "Total: " sum " passed"}'
 ```
-Expected: 1,458 passed across the 3 crates. If this changes, update both this section and the Architecture section.
+Expected: 1,586 passed across the 4 crates (impulse-rs, impulse-ops, impulse-term, impulse-desktop). If this changes, update both this section and the Architecture section.
 
 ### Pre-Commit Checklist
 
 1. `cargo build` — zero warnings
-2. `cargo test` — all tests pass (1,458 workspace total expected: 1318+26 impulse-rs, 4 ops, 110 term; verify with `cargo test 2>&1 | grep "test result:"`)
+2. `cargo test` — all tests pass (1,586 workspace total expected: 1326+26 impulse-rs, 4 ops, 114 term, 116 desktop; verify with `cargo test --workspace 2>&1 | grep "test result:"`)
    - **If count changes**: update this line and the Architecture section above
 3. `cargo clippy -- -D warnings` — zero warnings
 4. `cargo fmt --check` — zero diffs

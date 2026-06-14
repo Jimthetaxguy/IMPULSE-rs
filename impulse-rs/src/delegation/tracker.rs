@@ -171,6 +171,21 @@ impl DelegationTracker {
             .collect()
     }
 
+    /// Active delegations (Pending or InProgress) created more than
+    /// `max_age_secs` ago — handoffs that look stalled because no worker has
+    /// completed or failed them. Lets the coordinator surface stuck work (e.g.
+    /// a worker that crashed or never picked up the task). Returned oldest-first.
+    pub fn stale_active(&self, max_age_secs: i64) -> Vec<&TrackedDelegation> {
+        let now = Utc::now();
+        let mut stale: Vec<&TrackedDelegation> = self
+            .delegations
+            .values()
+            .filter(|d| d.is_active() && (now - d.created_at).num_seconds() >= max_age_secs)
+            .collect();
+        stale.sort_by_key(|d| d.created_at);
+        stale
+    }
+
     /// Export delegation summaries for impulse-ops consumption.
     pub fn to_summaries(&self) -> Vec<DelegationSummary> {
         self.delegations
@@ -321,6 +336,27 @@ mod tests {
 
         let summaries = tracker.to_summaries();
         assert_eq!(summaries.len(), 2);
+    }
+
+    #[test]
+    fn test_stale_active_detection() {
+        let mut tracker = DelegationTracker::new();
+        let pending_id = tracker.register(sample_spec(), 0, "".into(), 0).unwrap();
+        let inprogress_id = tracker.register(sample_spec(), 0, "".into(), 0).unwrap();
+        tracker.assign_worker(&inprogress_id, 2);
+        let done_id = tracker.register(sample_spec(), 0, "".into(), 0).unwrap();
+        tracker.complete(&done_id, "done".into(), vec![], None);
+
+        // max_age 0: every active (pending + in-progress) delegation is stale;
+        // the completed one is excluded by is_active().
+        let stale = tracker.stale_active(0);
+        assert_eq!(stale.len(), 2);
+        let ids: Vec<&str> = stale.iter().map(|d| d.id.as_str()).collect();
+        assert!(ids.contains(&pending_id.as_str()));
+        assert!(ids.contains(&inprogress_id.as_str()));
+
+        // A long threshold: freshly created delegations are not yet stale.
+        assert!(tracker.stale_active(3600).is_empty());
     }
 
     #[test]

@@ -5,7 +5,7 @@ not a second UI architecture.
 
 ## Boundary
 
-- Dioxus sends a `NativeIslandRequest` through a Tauri command.
+- Dioxus sends a `NativeIslandRequest` through the desktop host command surface.
 - Rust routes the request to a `NativeIslandHost`.
 - The native bridge returns a `NativeIslandResult`.
 - Dioxus updates UI from that result and daemon snapshots.
@@ -30,6 +30,7 @@ final class ImpulseNativeIsland: NSObject {
 }
 ```
 
-Rust calls the bridge through `objc2` or a Tauri plugin. Objective-C
-compatibility is the ABI boundary; Swift/AppKit can implement the native
-behavior behind it.
+Rust calls the bridge through `objc2` or another narrow host adapter.
+Objective-C compatibility is the ABI boundary; Swift/AppKit can implement the
+native behavior behind it. Legacy Tauri plugins are compatibility-only and must
+not become the primary host architecture.

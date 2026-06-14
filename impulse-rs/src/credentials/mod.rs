@@ -190,9 +190,17 @@ impl CredentialProvider for EnvProvider {
     }
 
     fn get(&self, key: &str) -> Result<String, CredentialError> {
-        let env_key = format!("{}_API_KEY", key.to_uppercase());
-        std::env::var(&env_key).map_err(|_| CredentialError::KeyNotFound {
-            key: env_key,
+        // Prefer the `<KEY>_API_KEY` convention used across Impulse, then fall
+        // back to the key as a raw environment variable so non-API-key secrets
+        // (tokens, connection strings) can also be resolved through this
+        // provider rather than only LLM API keys.
+        let upper = key.to_uppercase();
+        let api_key_var = format!("{upper}_API_KEY");
+        if let Ok(value) = std::env::var(&api_key_var) {
+            return Ok(value);
+        }
+        std::env::var(&upper).map_err(|_| CredentialError::KeyNotFound {
+            key: format!("{api_key_var} or {upper}"),
             provider: "env".into(),
         })
     }
@@ -403,6 +411,30 @@ mod tests {
             result.unwrap_err(),
             CredentialError::NotSupported(_)
         ));
+    }
+
+    #[test]
+    fn test_env_provider_prefers_api_key_convention() {
+        let provider = EnvProvider::new();
+        // Unique var names keep this safe under parallel test execution.
+        std::env::set_var("IMPULSE_TEST_CRED_PROV_API_KEY", "from-api-key-var");
+        assert_eq!(
+            provider.get("impulse_test_cred_prov").unwrap(),
+            "from-api-key-var"
+        );
+        std::env::remove_var("IMPULSE_TEST_CRED_PROV_API_KEY");
+    }
+
+    #[test]
+    fn test_env_provider_falls_back_to_raw_env_var() {
+        let provider = EnvProvider::new();
+        // A non-API-key secret (e.g. a token) resolved via the raw env var.
+        std::env::set_var("IMPULSE_TEST_CRED_RAW_TOKEN", "raw-token-value");
+        assert_eq!(
+            provider.get("impulse_test_cred_raw_token").unwrap(),
+            "raw-token-value"
+        );
+        std::env::remove_var("IMPULSE_TEST_CRED_RAW_TOKEN");
     }
 
     #[test]

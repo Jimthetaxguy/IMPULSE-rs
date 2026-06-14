@@ -1,9 +1,11 @@
 # impulse-term: Implementation Status & Daemon-Truth Gap
 
 > **Updated:** 2026-03-05
-> **Scope:** EGUI-only status for the Impulse operator workbench
+> **Scope:** Historical/legacy EGUI-only status for the earlier Impulse operator workbench
 > **Roadmap:** [`../../docs/ROADMAP-PLAN.md`](../../docs/ROADMAP-PLAN.md)
 > **Risk register:** [`../../docs/HONEST-ROADMAP.md`](../../docs/HONEST-ROADMAP.md)
+
+> **Status:** Historical. The active desktop direction is Dioxus Desktop; EGUI/`impulse-gui` is retained for compile-maintenance only.
 
 ---
 
@@ -57,7 +59,7 @@ Some live terminal insight and context telemetry still originate in the GUI/runt
 - sidebar alerts
 - status bar
 
-This is the current daemon-truth EGUI pass.
+This was the daemon-truth EGUI pass before the Dioxus Desktop host direction.
 
 ---
 

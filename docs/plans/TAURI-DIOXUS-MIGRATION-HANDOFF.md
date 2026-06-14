@@ -1,22 +1,22 @@
 ---
 title: Tauri + Dioxus Migration Handoff
-status: active
+status: superseded
 version: 1.0.0
 created: 2026-04-15
-updated: 2026-05-22
+updated: 2026-06-14
 ---
 
 # Tauri + Dioxus Migration Handoff
 
-This document is the decision-complete build sequence for the desktop shell migration. Phase 0 established the contract; Plan 6 is correcting residual active-doc drift and should not be read as permission to revive egui as an active desktop path.
+This document is historical migration context for the earlier Tauri+Dioxus direction. It is retained for provenance only; it is not the active desktop implementation plan.
 
-See `docs/spec/DESKTOP-SHELL-ARCHITECTURE.md` for layer boundaries and `docs/decisions/0007-desktop-shell-stack.md` for the ADR.
+See `docs/spec/DESKTOP-SHELL-ARCHITECTURE.md` for current layer boundaries and `docs/decisions/0008-dioxus-desktop-host.md` for the active ADR.
 
 ---
 
 ## Phase 0 - Documentation Contract Reset (BASELINE; PLAN 6 DRIFT CLEANUP)
 
-**Exit criteria:** All active docs describe Tauri+Dioxus as the desktop contract. egui is explicitly legacy/frozen. `validate_docs.py --contract` passes.
+**Historical exit criteria:** At the time, active docs described Tauri+Dioxus as the desktop contract. This has been superseded by the Dioxus Desktop host direction.
 
 **Checklist:**
 - [x] `docs/spec/DESKTOP-SHELL-ARCHITECTURE.md`
@@ -68,7 +68,7 @@ See `docs/spec/DESKTOP-SHELL-ARCHITECTURE.md` for layer boundaries and `docs/dec
 
 **Entry criteria:** Phase 1 complete.
 
-**Goal:** Stand up a real Tauri + Dioxus app with static chrome. No live PTY. No daemon.
+**Historical goal:** Stand up a real Tauri + Dioxus app with static chrome. No live PTY. No daemon.
 
 **Steps:**
 1. Create `impulse-rs/impulse-desktop/` as a new workspace member

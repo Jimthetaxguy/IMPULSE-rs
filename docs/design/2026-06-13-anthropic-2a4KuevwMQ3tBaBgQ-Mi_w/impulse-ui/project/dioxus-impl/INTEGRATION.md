@@ -1,7 +1,7 @@
-# Retro Broadcast → Dioxus integration
+# Retro Broadcast → Dioxus Integration
 
 Drop the Retro Broadcast skin into the live **`impulse-desktop`** crate
-(Dioxus 0.6.3 + Tauri). It themes the existing `ui.rs` DOM and binds to the
+(Dioxus 0.6.3 shell; originally written against the legacy host-shaped bridge). It themes the existing `ui.rs` DOM and binds to the
 real `impulse-ops` DTOs — no backend contract changes required.
 
 ## Files
@@ -45,7 +45,8 @@ Option B keeps your current `features = ["minimal", "document"]` untouched.
 
 `RetroShell` takes `ReadOnlySignal<ProjectOpsSnapshot>`. The backend already
 emits `DesktopEvent::OpsUpdate { payload }` and `AgentRuntimeUpdate` through the
-`DesktopEventSink` (Tauri `emit`). Bridge those events into a `Signal`:
+host event sink. In the current Dioxus Desktop direction, bridge those events
+through the Dioxus-owned host adapter into a `Signal`:
 
 ```rust
 use dioxus::prelude::*;
@@ -55,10 +56,10 @@ use impulse_ops::ProjectOpsSnapshot;
 fn App() -> Element {
     let mut snapshot = use_signal(ProjectOpsSnapshot::default);
 
-    // Subscribe to the Tauri `ops_update` event and update the signal.
+    // Subscribe to the Dioxus host `ops_update` event and update the signal.
     use_effect(move || {
         spawn(async move {
-            let mut rx = listen_ops_update().await; // your Tauri listen wrapper
+            let mut rx = listen_ops_update().await; // your Dioxus host listener
             while let Some(evt) = rx.next().await {
                 if let Ok(snap) = serde_json::from_value::<ProjectOpsSnapshot>(evt.payload) {
                     snapshot.set(snap);
@@ -73,8 +74,8 @@ fn App() -> Element {
 
 `DesktopEvent` names are already defined (`runtime.rs`):
 `ops_update`, `agent_runtime_update`, `terminal_output`, `terminal_exit`,
-`supervisor_local_action`. The `TauriEventSink` emits them under
-`feature = "tauri-runtime"`.
+`supervisor_local_action`. The compatibility Tauri-shaped sink is legacy-only;
+new product wiring should target the Dioxus host adapter.
 
 For agent-level updates without a full snapshot, merge
 `AgentRuntimeUpdate { snapshot }` into `snapshot.write().agents` by `agent_id`.
@@ -109,10 +110,10 @@ reserved for the **brand wordmark** and a **single pending signal**. Do not add
 bloom to terminal text or dense tables (it destroys legibility — see
 `IMPULSE-DESIGN-SPEC.md` §11). xterm.js text must stay un-bloomed.
 
-## 6. Fonts in Tauri
+## 6. Fonts in the Desktop Host
 
 The CSS pulls Baloo 2 + JetBrains Mono from Google Fonts for dev. For a
-packaged Tauri app, vendor the woff2 files under `assets/fonts/` and replace the
+packaged desktop app, vendor the woff2 files under `assets/fonts/` and replace the
 `document::Link` to Google Fonts with local `@font-face` declarations so the app
 works offline.
 

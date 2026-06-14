@@ -72,6 +72,8 @@ pub(crate) fn render_mier_panel(f: &mut Frame, area: Rect, state: &TuiState) {
                 AgentKind::ClaudeCode => "claude",
                 AgentKind::Codex => "codex",
                 AgentKind::OpenCode => "opencode",
+                AgentKind::Gemini => "gemini",
+                AgentKind::Cursor => "cursor",
                 AgentKind::GenericShell => "shell",
             };
             // Simple gauge bar

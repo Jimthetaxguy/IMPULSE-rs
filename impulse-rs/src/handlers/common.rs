@@ -113,22 +113,36 @@ pub(crate) struct HookEvidenceRecord {
     pub env: serde_json::Value,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn capture_hook_evidence(
-    impulse_dir: &Path,
-    event: &str,
-    session_id: Option<String>,
-    session_name: Option<String>,
-    platform: Option<String>,
-    summary: Option<String>,
-    verify_enabled: Option<bool>,
-    stdin_payload: Option<String>,
-    output_preview: Option<String>,
-    output_lines: usize,
-) -> Result<()> {
+pub(crate) struct HookEvidenceInput<'a> {
+    pub impulse_dir: &'a Path,
+    pub event: &'a str,
+    pub session_id: Option<String>,
+    pub session_name: Option<String>,
+    pub platform: Option<String>,
+    pub summary: Option<String>,
+    pub verify_enabled: Option<bool>,
+    pub stdin_payload: Option<String>,
+    pub output_preview: Option<String>,
+    pub output_lines: usize,
+}
+
+pub(crate) fn capture_hook_evidence(input: HookEvidenceInput<'_>) -> Result<()> {
     if !is_truthy_env("IMPULSE_HOOK_EVIDENCE") {
         return Ok(());
     }
+
+    let HookEvidenceInput {
+        impulse_dir,
+        event,
+        session_id,
+        session_name,
+        platform,
+        summary,
+        verify_enabled,
+        stdin_payload,
+        output_preview,
+        output_lines,
+    } = input;
 
     let validation_dir = impulse_dir.join("validation").join("runtime");
     std::fs::create_dir_all(&validation_dir)?;
@@ -816,18 +830,18 @@ mod tests {
         // If IMPULSE_HOOK_EVIDENCE happens to be set, the file may be created,
         // so we just verify no error occurs.
         let tmp = TempDir::new().unwrap();
-        let result = capture_hook_evidence(
-            tmp.path(),
-            "test-event",
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            0,
-        );
+        let result = capture_hook_evidence(HookEvidenceInput {
+            impulse_dir: tmp.path(),
+            event: "test-event",
+            session_id: None,
+            session_name: None,
+            platform: None,
+            summary: None,
+            verify_enabled: None,
+            stdin_payload: None,
+            output_preview: None,
+            output_lines: 0,
+        });
         assert!(result.is_ok());
     }
 
@@ -838,18 +852,18 @@ mod tests {
         // the function, accepting that another test may unset it concurrently.
         std::env::set_var("IMPULSE_HOOK_EVIDENCE", "1");
         let tmp = TempDir::new().unwrap();
-        let result = capture_hook_evidence(
-            tmp.path(),
-            "session-start",
-            Some("sess-123".to_string()),
-            Some("my-session".to_string()),
-            Some("claude-code".to_string()),
-            Some("test summary".to_string()),
-            Some(true),
-            None,
-            Some("output preview".to_string()),
-            42,
-        );
+        let result = capture_hook_evidence(HookEvidenceInput {
+            impulse_dir: tmp.path(),
+            event: "session-start",
+            session_id: Some("sess-123".to_string()),
+            session_name: Some("my-session".to_string()),
+            platform: Some("claude-code".to_string()),
+            summary: Some("test summary".to_string()),
+            verify_enabled: Some(true),
+            stdin_payload: None,
+            output_preview: Some("output preview".to_string()),
+            output_lines: 42,
+        });
         assert!(result.is_ok());
 
         let log_path = tmp.path().join("validation/runtime/hook-events.jsonl");

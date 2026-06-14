@@ -3,33 +3,33 @@ title: Desktop Stack Tradeoffs
 status: active
 version: 1.0.0
 created: 2026-04-15
-updated: 2026-05-21
+updated: 2026-06-14
 ---
 
 # Desktop Stack Tradeoffs
 
 This document records the full evaluation of desktop UI stack options for Impulse. It exists so the decision is not buried in chat history and so future contributors understand what was considered, what was rejected, and why.
 
-The chosen stack is **Tauri + Dioxus + terminal bridge (xterm.js)**. See `docs/decisions/0007-desktop-shell-stack.md` for the ADR.
+The chosen stack is **Dioxus Desktop + terminal bridge (xterm.js)**. See `docs/decisions/0008-dioxus-desktop-host.md` for the current ADR. `docs/decisions/0007-desktop-shell-stack.md` records the superseded Tauri+Dioxus decision.
 
 ---
 
 ## Evaluation Matrix
 
-| Criterion | egui (legacy baseline) | Tauri + Dioxus + xterm.js | Pure Dioxus desktop | Tauri + TS frontend | SwiftUI | Wrap ratatui in Tauri |
+| Criterion | egui (legacy baseline) | Dioxus Desktop + xterm.js | Legacy Tauri + Dioxus + xterm.js | Tauri + TS frontend | SwiftUI | Wrap ratatui in Tauri |
 |---|---|---|---|---|---|---|
 | UI language | Rust (immediate-mode) | Rust (declarative rsx!) | Rust (declarative rsx!) | TypeScript/JS | Swift | N/A |
 | Backend language | Rust | Rust | Rust | Rust | Swift | Rust |
 | Terminal rendering | Custom egui widget | xterm.js (mature) | xterm.js or custom | xterm.js (mature) | Custom/SwiftTerm | PTY-in-PTY |
 | Rendering model | Immediate-mode GPU | WebKit webview | WebKit webview | WebKit webview | Metal native | WebKit + PTY |
-| Cross-platform | macOS/Win/Linux | macOS/Win/Linux + mobile | macOS/Win/Linux | macOS/Win/Linux + mobile | Apple only | macOS/Win/Linux |
+| Cross-platform | macOS/Win/Linux | macOS/Win/Linux | macOS/Win/Linux + mobile | macOS/Win/Linux + mobile | Apple only | macOS/Win/Linux |
 | Memory at idle | High (repaints every frame) | Moderate (virtual DOM) | Moderate | Moderate | Low (native) | Low + overhead |
 | Layout flexibility | Limited | Full CSS + Dioxus | Full CSS + Dioxus | Full CSS | SwiftUI layout | Constrained |
 | Ecosystem maturity | Stable | Dioxus 0.6 (stable) | Dioxus 0.6 (stable) | Large (web ecosystem) | Mature (Apple only) | Not viable |
 | Custom terminal widget required | Yes (already built) | No (xterm.js) | Likely yes | No (xterm.js) | Yes (SwiftTerm) | No |
 | Web tech required | No | ~10 lines JS glue | ~10 lines JS glue | Full JS/CSS/TS | No | No |
-| Mobile path | No | Yes (Tauri 2) | No | Yes (Tauri 2) | iOS/iPadOS only | No |
-| Chosen | Deprecated | **CHOSEN** | Valid fallback | Valid alternative | Rejected | Rejected |
+| Mobile path | No | Not primary | Yes (Tauri 2) | Yes (Tauri 2) | iOS/iPadOS only | No |
+| Chosen | Deprecated | **CHOSEN** | Legacy compatibility | Valid alternative | Rejected | Rejected |
 
 ---
 
@@ -45,37 +45,38 @@ The chosen stack is **Tauri + Dioxus + terminal bridge (xterm.js)**. See `docs/d
 - The egui terminal widget in `impulse-term` requires `eframe` as a dependency even though `backend.rs` has no rendering code
 - egui is not suitable as a long-term polished desktop product shell
 
-**Disposition:** Freeze. No new features. Remove after Tauri shell reaches parity on terminal/session/context/artifact/supervisor flows.
+**Disposition:** Freeze. No new features. Remove after the Dioxus desktop host reaches parity on terminal/session/context/artifact/supervisor flows.
 
 ---
 
-### Chosen: Tauri + Dioxus + xterm.js terminal bridge
+### Chosen: Dioxus Desktop + xterm.js terminal bridge
 
 **Why it is chosen:**
-- Keeps the entire application logic (backend, IPC, session management, daemon integration) in Rust
+- Keeps the entire application logic (backend, host bridge, session management, daemon integration) in Rust
 - xterm.js is a battle-tested, feature-complete terminal renderer - Unicode, sixel, ligatures, WebGL acceleration, selection, copy/paste, scroll, accessibility. Writing a competing terminal renderer is not a good use of time.
 - Dioxus's `rsx!` syntax provides React-style declarative component composition without writing JavaScript for application logic
 - The JS surface area is minimal: ~10 lines of `eval()` glue per terminal pane to mount xterm.js and wire the event listener
-- The existing `TerminalBackend` and `WriteQueue` map directly to the Tauri command/event bridge with no structural changes
-- Tauri 2's capability system provides a security-first, minimal-privilege model
-- Mobile path (iOS/Android) is available via Tauri 2 if ever needed
+- The existing `TerminalBackend` and `WriteQueue` map directly to the host command/event bridge with no structural changes
+- Dioxus Desktop keeps the product shell and state model in one Rust UI framework
 
 **Known tradeoffs:**
 - WebKit rendering on macOS means UI chrome goes through the browser engine, not Metal directly
 - Dioxus 0.6 is stable but smaller ecosystem than React/Svelte
 - The `eval()` JS bridge for xterm.js initialization is a small but real seam. It must be contained to the terminal pane component.
+- Tauri's updater/plugin/capability ecosystem is no longer the primary path; add individual native islands only when a Dioxus-hosted capability needs them.
 
 ---
 
-### Alternative: Pure Dioxus desktop (without Tauri)
+### Legacy Compatibility: Tauri + Dioxus
 
-**Why considered:** Simpler project setup - no `src-tauri` directory, no Tauri capability configuration.
+**Why it remains temporarily:** Existing tests and command annotations already prove useful host command/event behavior. Keeping a legacy adapter during migration prevents a behavior gap while the Dioxus Desktop launcher is built.
 
-**Why not chosen as primary:**
-- Loses Tauri's IPC model, plugin system (clipboard, notifications, file dialogs, tray), and future mobile path
-- Tauri's capability-based security model is meaningful for a tool that runs arbitrary code
+**Why it is no longer the product target:**
+- It centers future work around Tauri IPC rather than the Dioxus Desktop host adapter
+- The user goal is full Dioxus, not a new `src-tauri` scaffold
+- It creates extra naming and ownership ambiguity for an app where Dioxus should own visible state
 
-**Disposition:** Valid fallback if Tauri integration proves too complex. Dioxus `rsx!` components would be identical.
+**Disposition:** Legacy compatibility only. Remove after Dioxus Desktop command/event parity is covered.
 
 ---
 

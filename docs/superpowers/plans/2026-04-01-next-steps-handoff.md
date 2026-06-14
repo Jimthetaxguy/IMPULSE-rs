@@ -3,7 +3,7 @@
 > **Date:** 2026-04-01
 > **From:** Deep code review + Ralph Plan 5 creation session
 > **To:** Next session(s) executing the 100-loop plan
-> **Plan file:** `ralph-plan-5.md` (root of CLI_CU_L8R)
+> **Plan file:** `docs/archive/ralph-plans/ralph-plan-5.md` (root of CLI_CU_L8R)
 
 ---
 
@@ -28,7 +28,7 @@ Updated all three contract docs with verified metrics:
 - **RUST-CANONICAL-CONTRACT.md**: Gap column, workspace totals, policy compliance audit commands
 
 ### 4. Ralph Plan 5 Created
-100-loop plan in `ralph-plan-5.md` covering 12 phases with:
+100-loop plan in `docs/archive/ralph-plans/ralph-plan-5.md` covering 12 phases with:
 - Full iteration table (100 rows)
 - Dependency graph with parallelization opportunities
 - Sub-agent strategy (which agent types for which loops)
@@ -42,12 +42,12 @@ Updated all three contract docs with verified metrics:
 ### Quick Start (copy-paste)
 
 ```
-Execute Ralph Plan 5. Read ralph-plan-5.md. Start with Loop 1 (commit 12 uncommitted files), then execute Loops 2-7 using sub-agents for parallel work. Use /ralph-loop for iteration tracking.
+Execute Ralph Plan 5. Read docs/archive/ralph-plans/ralph-plan-5.md. Start with Loop 1 (commit 12 uncommitted files), then execute Loops 2-7 using sub-agents for parallel work. Use /ralph-loop for iteration tracking.
 ```
 
 ### Detailed Instructions
 
-1. **Read the plan**: `ralph-plan-5.md` — focus on Root docs + Phase 1 detailed plans
+1. **Read the plan**: `docs/archive/ralph-plans/ralph-plan-5.md` — focus on Root docs + Phase 1 detailed plans
 2. **Start Ralph Loop**: Use `/ralph-loop` with `max_iterations: 100`
 3. **Loop 1 (commit)**: Stage + commit + push the 12 uncommitted files
 4. **Loops 2-4 (parallel TUI fixes)**:
@@ -75,9 +75,9 @@ Expected: 1,025+ tests passed (will grow as loops add tests), 0 warnings, 0 diff
 
 | File | Purpose |
 |------|---------|
-| `ralph-plan-5.md` | The 100-loop plan (iteration table, dependencies, sub-agent strategy) |
-| `ralph-plan-4.md` | Previous plan (loops 7-24 pending — subsumed into RP5 Phase 1 + Phase 4) |
-| `ralph-plan-3.md` | Completed plan (30 loops — codebase reduction + agent harness) |
+| `docs/archive/ralph-plans/ralph-plan-5.md` | The 100-loop plan (iteration table, dependencies, sub-agent strategy) |
+| `docs/archive/ralph-plans/ralph-plan-4.md` | Previous plan (loops 7-24 pending — subsumed into RP5 Phase 1 + Phase 4) |
+| `docs/archive/ralph-plans/ralph-plan-3.md` | Completed plan (30 loops — codebase reduction + agent harness) |
 | `CLAUDE.md` | Project instructions with updated metrics |
 | `AGENTS.md` | Agent guidelines with updated test targets |
 | `docs/spec/RUST-CANONICAL-CONTRACT.md` | Product contract with policy compliance audit commands |

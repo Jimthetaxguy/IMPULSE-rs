@@ -56,20 +56,32 @@ pub struct TerminalPane {
     _output_thread: Option<JoinHandle<()>>,
 }
 
+pub struct TerminalSpawnRequest<'a> {
+    pub id: usize,
+    pub name: String,
+    pub command: &'a str,
+    pub args: &'a [&'a str],
+    pub working_dir: Option<&'a Path>,
+    pub size: PtySize,
+    pub project_index: usize,
+    pub impulse_home: Option<&'a Path>,
+    pub scrollback_lines: Option<usize>,
+}
+
 impl TerminalPane {
-    // TODO(refactor): extract params into struct
-    #[allow(clippy::too_many_arguments)]
-    pub fn spawn(
-        id: usize,
-        name: String,
-        command: &str,
-        args: &[&str],
-        working_dir: Option<&Path>,
-        size: PtySize,
-        project_index: usize,
-        impulse_home: Option<&Path>,
-        scrollback_lines: Option<usize>,
-    ) -> anyhow::Result<Self> {
+    pub fn spawn(request: TerminalSpawnRequest<'_>) -> anyhow::Result<Self> {
+        let TerminalSpawnRequest {
+            id,
+            name,
+            command,
+            args,
+            working_dir,
+            size,
+            project_index,
+            impulse_home,
+            scrollback_lines,
+        } = request;
+
         // Clamp scrollback to valid range
         let scrollback = scrollback_lines
             .unwrap_or(DEFAULT_SCROLLBACK_LINES)

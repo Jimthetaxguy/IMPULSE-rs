@@ -19,6 +19,9 @@ last_updated: 2026-02-20
 | [0003](0003-progressive-search.md) | Progressive search (FTS5 then vectors) | **Accepted** | 2026-02-20 | historical `0003-split-schema` |
 | [0004](0004-extraction-strategy.md) | LLM extraction strategy | **Accepted** | 2026-02-20 | -- |
 | [0005](0005-distribution-model.md) | npm distribution model | **Accepted** | 2026-02-20 | -- |
+| [0006](0006-hook-enhancement-conflict-resolution.md) | Hook enhancement conflict resolution | **Accepted** | 2026-03-31 | -- |
+| [0007](0007-desktop-shell-stack.md) | Desktop shell stack | **Superseded** | 2026-04-15 | -- |
+| [0008](0008-dioxus-desktop-host.md) | Dioxus Desktop host | **Accepted** | 2026-06-14 | 0007 |
 
 ## ADR Format
 

@@ -18,7 +18,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
@@ -89,8 +89,8 @@ impl WorkspaceRegistry {
         if let Some(home) = home_dir() {
             for (label, relative) in [
                 ("code", "code"),
-                ("Desktop/VibeCode_Prime", "Desktop/VibeCode_Prime"),
-                ("OneDrive/career", "OneDrive/career"),
+                ("desktop-projects", "Desktop"),
+                ("documents", "Documents"),
             ] {
                 let root = home.join(relative);
                 if root.exists() {
@@ -119,7 +119,7 @@ impl WorkspaceRegistry {
 
     pub fn register(&self, target: WorkspaceTarget) -> Result<()> {
         validate_root(&target.root)?;
-        let mut inner = self.inner.lock().expect("workspace registry poisoned");
+        let mut inner = self.lock_inner();
         let key = canonical_key(&target.root);
         if let Some(existing) = inner.get(&key) {
             return Err(WorkspaceRegistryError::Duplicate {
@@ -138,23 +138,16 @@ impl WorkspaceRegistry {
     }
 
     pub fn list(&self) -> Vec<WorkspaceEntry> {
-        let inner = self.inner.lock().expect("workspace registry poisoned");
+        let inner = self.lock_inner();
         inner.values().cloned().collect()
     }
 
     pub fn contains(&self, root: &str) -> bool {
-        self.inner
-            .lock()
-            .expect("workspace registry poisoned")
-            .contains_key(&canonical_key(root))
+        self.lock_inner().contains_key(&canonical_key(root))
     }
 
     pub fn lookup(&self, root: &str) -> Option<WorkspaceEntry> {
-        self.inner
-            .lock()
-            .expect("workspace registry poisoned")
-            .get(&canonical_key(root))
-            .cloned()
+        self.lock_inner().get(&canonical_key(root)).cloned()
     }
 
     /// Mark the workspace as recently used. If the workspace is not known
@@ -162,7 +155,7 @@ impl WorkspaceRegistry {
     /// error so callers can decide whether to auto-register.
     pub fn touch(&self, root: &str) -> Result<()> {
         validate_root(root)?;
-        let mut inner = self.inner.lock().expect("workspace registry poisoned");
+        let mut inner = self.lock_inner();
         let key = canonical_key(root);
         let now = current_unix_ms();
         if let Some(entry) = inner.get_mut(&key) {
@@ -176,7 +169,7 @@ impl WorkspaceRegistry {
     }
 
     pub fn unregister(&mut self, root: &str) -> Result<WorkspaceEntry> {
-        let mut inner = self.inner.lock().expect("workspace registry poisoned");
+        let mut inner = self.lock_inner();
         inner
             .remove(&canonical_key(root))
             .ok_or_else(|| WorkspaceRegistryError::NotRegistered {
@@ -185,14 +178,17 @@ impl WorkspaceRegistry {
     }
 
     pub fn len(&self) -> usize {
-        self.inner
-            .lock()
-            .expect("workspace registry poisoned")
-            .len()
+        self.lock_inner().len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    fn lock_inner(&self) -> MutexGuard<'_, BTreeMap<String, WorkspaceEntry>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -324,7 +320,7 @@ mod tests {
 
     #[test]
     fn test_label_defaults_to_basename() {
-        let entry = WorkspaceEntry::from_root("/Users/james/code/IMPULSE-rs");
+        let entry = WorkspaceEntry::from_root("/Users/example/code/IMPULSE-rs");
         assert_eq!(entry.label(), "IMPULSE-rs");
     }
 

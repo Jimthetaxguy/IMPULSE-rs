@@ -296,7 +296,7 @@ mod tests {
         let result = handle_agent_configure(
             &st,
             Some("anthropic".to_string()),
-            Some("sk-test-key".to_string()),
+            Some("test-api-key-not-real".to_string()),
             Some("claude-3-opus".to_string()),
             None,
             true,

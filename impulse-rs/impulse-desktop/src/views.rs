@@ -69,7 +69,7 @@ impl DesktopView {
 }
 
 /// A user intent emitted by an artifact action button. The shell records the
-/// latest intent in its status line; wiring it to a real Tauri command is a
+/// latest intent in its status line; wiring it to a real host command is a
 /// deliberate follow-up (the command surface stays untouched here).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellIntent {

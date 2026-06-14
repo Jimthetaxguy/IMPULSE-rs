@@ -5,6 +5,7 @@ members = [
     "impulse-ops",
     "impulse-term",
 ]
+exclude = ["impulse-gui"]
 
 [package]
 name = "impulse-rs"
@@ -12,7 +13,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
 description = "Terminal-native AI coding agent sidecar with multi-agent monitoring"
-authors = ["James Pustorino"]
+authors = ["Impulse Maintainers"]
 license = "MIT"
 
 [[bin]]

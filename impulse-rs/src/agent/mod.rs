@@ -2,7 +2,7 @@
 //!
 //! The Impulse Agent can operate in two modes:
 //! 1. **API mode**: Direct LLM API calls (Anthropic, OpenAI, Minimax) using an API key
-//! 2. **Harness mode**: Delegates to a CLI harness (Claude Code, OpenCode) via subprocess
+//! 2. **Harness mode**: Delegates to a CLI harness (Claude Code, OpenCode, Codex, Gemini) via subprocess
 //!
 //! The agent reads context from all panes via the context lifecycle extractor,
 //! detects coordination needs, and generates actionable recommendations.
@@ -89,6 +89,8 @@ impl ImpulseProvider {
 pub enum ImpulseHarness {
     ClaudeCode,
     OpenCode,
+    Codex,
+    Gemini,
 }
 
 impl ImpulseHarness {
@@ -96,6 +98,8 @@ impl ImpulseHarness {
         match s.to_lowercase().as_str() {
             "claude-code" | "claude" => Some(Self::ClaudeCode),
             "opencode" | "open-code" => Some(Self::OpenCode),
+            "codex" => Some(Self::Codex),
+            "gemini" | "antigravity" => Some(Self::Gemini),
             _ => None,
         }
     }
@@ -104,6 +108,8 @@ impl ImpulseHarness {
         match self {
             Self::ClaudeCode => "claude-code",
             Self::OpenCode => "opencode",
+            Self::Codex => "codex",
+            Self::Gemini => "gemini",
         }
     }
 
@@ -111,6 +117,26 @@ impl ImpulseHarness {
         match self {
             Self::ClaudeCode => "claude",
             Self::OpenCode => "opencode",
+            Self::Codex => "codex",
+            Self::Gemini => "gemini",
+        }
+    }
+
+    /// Leading CLI args that put the harness into non-interactive
+    /// (single-prompt, print-to-stdout) mode. The combined prompt is appended
+    /// as the final positional argument by the caller.
+    ///
+    /// Each agent CLI has its own entry point for this:
+    /// - Claude Code: `claude --print "<prompt>"`
+    /// - OpenCode:    `opencode run "<prompt>"`
+    /// - Codex:       `codex exec "<prompt>"`
+    /// - Gemini:      `gemini -p "<prompt>"`
+    pub fn invocation_args(self) -> &'static [&'static str] {
+        match self {
+            Self::ClaudeCode => &["--print"],
+            Self::OpenCode => &["run"],
+            Self::Codex => &["exec"],
+            Self::Gemini => &["-p"],
         }
     }
 }
@@ -124,7 +150,7 @@ pub enum AgentMode {
         provider: ImpulseProvider,
         model: Option<String>,
     },
-    /// Delegate to a CLI harness (Claude Code, OpenCode).
+    /// Delegate to a CLI harness (Claude Code, OpenCode, Codex, Gemini).
     Harness { harness: ImpulseHarness },
     /// Agent is disabled.
     #[default]
@@ -518,8 +544,10 @@ impl ImpulseAgent {
             AgentError::ApiRequest(format!("Failed to write harness request file: {e}"))
         })?;
 
-        // For the --print fallback, combine system + user prompt as a single string.
-        // This ensures backward compatibility with harnesses that ignore the env var.
+        // Combine system + user prompt into a single positional argument so
+        // harnesses that ignore IMPULSE_HARNESS_REQUEST still receive the full
+        // context. The leading args (e.g. `--print`, `run`, `exec`) are
+        // per-harness; the prompt is always the trailing positional.
         let print_arg = if system_prompt.is_empty() {
             user_prompt.to_string()
         } else {
@@ -527,7 +555,7 @@ impl ImpulseAgent {
         };
 
         let mut cmd = tokio::process::Command::new(harness_kind.command());
-        cmd.arg("--print").arg(&print_arg);
+        cmd.args(harness_kind.invocation_args()).arg(&print_arg);
 
         // Set env var pointing to the structured request file
         cmd.env(
@@ -757,7 +785,31 @@ mod tests {
             ImpulseHarness::parse("opencode"),
             Some(ImpulseHarness::OpenCode)
         );
+        assert_eq!(ImpulseHarness::parse("codex"), Some(ImpulseHarness::Codex));
+        assert_eq!(
+            ImpulseHarness::parse("gemini"),
+            Some(ImpulseHarness::Gemini)
+        );
+        assert_eq!(
+            ImpulseHarness::parse("antigravity"),
+            Some(ImpulseHarness::Gemini)
+        );
         assert_eq!(ImpulseHarness::parse("invalid"), None);
+    }
+
+    #[test]
+    fn test_impulse_harness_invocation_args() {
+        // Each harness has its own non-interactive entry point; the prompt is
+        // appended as the trailing positional by the caller.
+        assert_eq!(ImpulseHarness::ClaudeCode.invocation_args(), &["--print"]);
+        assert_eq!(ImpulseHarness::OpenCode.invocation_args(), &["run"]);
+        assert_eq!(ImpulseHarness::Codex.invocation_args(), &["exec"]);
+        assert_eq!(ImpulseHarness::Gemini.invocation_args(), &["-p"]);
+        // command() returns the binary name for `which` lookups.
+        assert_eq!(ImpulseHarness::Codex.command(), "codex");
+        assert_eq!(ImpulseHarness::Codex.as_str(), "codex");
+        assert_eq!(ImpulseHarness::Gemini.command(), "gemini");
+        assert_eq!(ImpulseHarness::Gemini.as_str(), "gemini");
     }
 
     #[test]

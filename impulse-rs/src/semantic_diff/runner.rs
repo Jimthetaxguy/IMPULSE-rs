@@ -6,10 +6,16 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
+use crate::process_util::run_with_timeout;
 use crate::storage::sanitize_filename;
 
 use super::types::*;
+
+/// Hard timeout for any `sem` subprocess. A stuck `sem` (e.g. on a pathological
+/// repo) must never hang the caller indefinitely.
+const SEM_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Check whether the `sem` CLI is available on PATH.
 pub fn sem_available() -> bool {
@@ -39,14 +45,13 @@ pub fn run_semantic_diff(
         format!("{}..{}", base_ref, head_ref)
     };
 
-    let output = Command::new("sem")
-        .arg("diff")
+    let mut cmd = Command::new("sem");
+    cmd.arg("diff")
         .arg(&range)
         .arg("--format")
         .arg("json")
-        .current_dir(repo_path)
-        .output()
-        .context("failed to run `sem diff`")?;
+        .current_dir(repo_path);
+    let output = run_with_timeout(cmd, SEM_TIMEOUT).context("failed to run `sem diff`")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -73,14 +78,13 @@ pub fn run_semantic_blame(repo_path: &Path, file_path: &str) -> Result<Vec<Seman
         );
     }
 
-    let output = Command::new("sem")
-        .arg("blame")
+    let mut cmd = Command::new("sem");
+    cmd.arg("blame")
         .arg(file_path)
         .arg("--format")
         .arg("json")
-        .current_dir(repo_path)
-        .output()
-        .context("failed to run `sem blame`")?;
+        .current_dir(repo_path);
+    let output = run_with_timeout(cmd, SEM_TIMEOUT).context("failed to run `sem blame`")?;
 
     if !output.status.success() {
         anyhow::bail!(
@@ -107,14 +111,13 @@ pub fn run_semantic_impact(repo_path: &Path, entity_name: &str) -> Result<Impact
         );
     }
 
-    let output = Command::new("sem")
-        .arg("impact")
+    let mut cmd = Command::new("sem");
+    cmd.arg("impact")
         .arg(entity_name)
         .arg("--format")
         .arg("json")
-        .current_dir(repo_path)
-        .output()
-        .context("failed to run `sem impact`")?;
+        .current_dir(repo_path);
+    let output = run_with_timeout(cmd, SEM_TIMEOUT).context("failed to run `sem impact`")?;
 
     if !output.status.success() {
         anyhow::bail!(

@@ -215,6 +215,8 @@ pub(crate) fn context_lifecycle_tick(state: &mut TuiState) {
                     AgentKind::ClaudeCode => crate::context_lifecycle::AgentType::Claude,
                     AgentKind::Codex => crate::context_lifecycle::AgentType::Codex,
                     AgentKind::OpenCode => crate::context_lifecycle::AgentType::OpenCode,
+                    AgentKind::Gemini => crate::context_lifecycle::AgentType::Gemini,
+                    AgentKind::Cursor => crate::context_lifecycle::AgentType::Cursor,
                     AgentKind::GenericShell => crate::context_lifecycle::AgentType::Shell,
                 };
                 let activity_type = match insight.insight_type {

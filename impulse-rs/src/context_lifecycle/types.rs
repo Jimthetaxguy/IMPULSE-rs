@@ -16,21 +16,36 @@ pub enum AgentKind {
     ClaudeCode,
     Codex,
     OpenCode,
+    /// Google Gemini CLI / Antigravity coding agent.
+    Gemini,
+    /// Cursor CLI / `cursor-agent` coding agent.
+    Cursor,
     GenericShell,
 }
 
 impl AgentKind {
     /// Detect agent kind from the command name and optional pane name.
+    ///
+    /// Matching is substring-based and ordered most-specific first. New CLI/TUI
+    /// coding agents are added by extending this chain plus the per-variant
+    /// methods below (`startup_delay_ms`, `label`, `uses_xml_context`).
     pub fn detect(command: &str, name: &str) -> Self {
         let cmd_lower = command.to_lowercase();
         let name_lower = name.to_lowercase();
+        let matches = |needle: &str| cmd_lower.contains(needle) || name_lower.contains(needle);
 
-        if cmd_lower.contains("claude") || name_lower.contains("claude") {
+        if matches("claude") {
             Self::ClaudeCode
-        } else if cmd_lower.contains("codex") || name_lower.contains("codex") {
+        } else if matches("codex") {
             Self::Codex
-        } else if cmd_lower.contains("opencode") || name_lower.contains("opencode") {
+        } else if matches("opencode") {
+            // Check before the bare "cursor"/"gemini" arms so the longer,
+            // more specific name always wins regardless of ordering.
             Self::OpenCode
+        } else if matches("gemini") || matches("antigravity") {
+            Self::Gemini
+        } else if matches("cursor") {
+            Self::Cursor
         } else {
             Self::GenericShell
         }
@@ -41,8 +56,7 @@ impl AgentKind {
     pub fn startup_delay_ms(&self) -> u64 {
         match self {
             Self::ClaudeCode => 3000,
-            Self::Codex => 2000,
-            Self::OpenCode => 2000,
+            Self::Codex | Self::OpenCode | Self::Gemini | Self::Cursor => 2000,
             Self::GenericShell => 500,
         }
     }
@@ -53,6 +67,8 @@ impl AgentKind {
             Self::ClaudeCode => "claude",
             Self::Codex => "codex",
             Self::OpenCode => "opencode",
+            Self::Gemini => "gemini",
+            Self::Cursor => "cursor",
             Self::GenericShell => "shell",
         }
     }
@@ -147,6 +163,11 @@ pub struct PaneContextState {
     pub agent_kind: AgentKind,
     pub initial_injection_done: bool,
     pub output_bytes_at_last_check: u64,
+    /// Cumulative output-byte count at the most recent compaction. The monitor
+    /// estimates context-window usage from bytes emitted *since* this baseline,
+    /// so a compaction (which frees the agent's context) makes the estimate
+    /// drop instead of climbing forever off the cumulative total.
+    pub output_bytes_baseline: u64,
     pub estimated_tokens: usize,
     pub last_threshold: ContextTier,
     pub last_injection_at: Option<Instant>,
@@ -180,6 +201,7 @@ impl PaneContextState {
             agent_kind,
             initial_injection_done: false,
             output_bytes_at_last_check: 0,
+            output_bytes_baseline: 0,
             estimated_tokens: 0,
             last_threshold: ContextTier::None,
             last_injection_at: None,
@@ -259,6 +281,33 @@ mod tests {
     }
 
     #[test]
+    fn test_agent_kind_detect_gemini() {
+        assert_eq!(AgentKind::detect("gemini", "gemini-1"), AgentKind::Gemini);
+        assert_eq!(AgentKind::detect("GEMINI", "test"), AgentKind::Gemini);
+        // Antigravity is Google's agent surface — alias to Gemini.
+        assert_eq!(AgentKind::detect("antigravity", "ag-1"), AgentKind::Gemini);
+    }
+
+    #[test]
+    fn test_agent_kind_detect_cursor() {
+        assert_eq!(AgentKind::detect("cursor", "cursor-1"), AgentKind::Cursor);
+        assert_eq!(
+            AgentKind::detect("cursor-agent", "session"),
+            AgentKind::Cursor
+        );
+        assert_eq!(AgentKind::detect("CURSOR", "test"), AgentKind::Cursor);
+    }
+
+    #[test]
+    fn test_agent_kind_detect_specificity() {
+        // "opencode" must not be misclassified by a broader substring match.
+        assert_eq!(
+            AgentKind::detect("opencode", "opencode"),
+            AgentKind::OpenCode
+        );
+    }
+
+    #[test]
     fn test_agent_kind_detect_shell() {
         assert_eq!(
             AgentKind::detect("/bin/bash", "bash"),
@@ -273,7 +322,12 @@ mod tests {
         assert_eq!(AgentKind::ClaudeCode.startup_delay_ms(), 3000);
         assert_eq!(AgentKind::Codex.startup_delay_ms(), 2000);
         assert_eq!(AgentKind::OpenCode.startup_delay_ms(), 2000);
+        assert_eq!(AgentKind::Gemini.startup_delay_ms(), 2000);
+        assert_eq!(AgentKind::Cursor.startup_delay_ms(), 2000);
         assert_eq!(AgentKind::GenericShell.startup_delay_ms(), 500);
+        // Labels round-trip to lowercase agent names.
+        assert_eq!(AgentKind::Gemini.label(), "gemini");
+        assert_eq!(AgentKind::Cursor.label(), "cursor");
     }
 
     #[test]

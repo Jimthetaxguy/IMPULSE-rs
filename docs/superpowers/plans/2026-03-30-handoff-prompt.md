@@ -9,7 +9,7 @@
 You are executing **Ralph Plan 3** for the Impulse project (`impulse-rs`). Impulse is a Rust sidecar that runs alongside AI coding agents (Claude Code, Codex, OpenCode) and remembers what they did across sessions.
 
 **Two plan documents exist — read both before starting:**
-1. `ralph-plan-3.md` — Ralph Loop structure (iteration table, dependency graph, metrics targets, risk register)
+1. `docs/archive/ralph-plans/ralph-plan-3.md` — Ralph Loop structure (iteration table, dependency graph, metrics targets, risk register)
 2. `docs/superpowers/plans/2026-03-30-codebase-reduction-agent-harness.md` — Full implementation plan (30 tasks, 130+ bite-sized steps, exact file paths, code blocks, parallelization map)
 
 Use `/superpowers:executing-plans` or `/superpowers:subagent-driven-development` to execute task-by-task.
@@ -101,7 +101,7 @@ The agent harness has fully-implemented subsystems that are never connected:
 | 27 | Add 20+ tests for `tooling/` module (2,650 LOC, only 8 tests = 3.0/KLOC). Test: capability enforcement, param validation, tool registration, schema export. Critical security model. | `tooling/` test modules | LOW |
 | 28 | Full workspace verification: `cargo build --all-features && cargo test && cargo clippy --all-features --all-targets -- -D warnings && cargo fmt --check`. Fix any regressions. | All files | LOW |
 | 29 | Update docs: `CLAUDE.md` (module counts, LOC, architecture), `ROADMAP-PLAN.md` (mark completed items), `MEMORY.md` (record outcomes). | Docs | LOW |
-| 30 | Final metrics comparison vs baseline. Record in `ralph-plan-3.md` Working Log. | `ralph-plan-3.md` | LOW |
+| 30 | Final metrics comparison vs baseline. Record in `docs/archive/ralph-plans/ralph-plan-3.md` Working Log. | `docs/archive/ralph-plans/ralph-plan-3.md` | LOW |
 
 **Parallelization:** Tasks 26 and 27 share ZERO files — run in parallel.
 
@@ -163,9 +163,9 @@ impulse-rs/                    ← Main crate (CLI + daemon + TUI, ~53K lines)
 
 ## How to Start
 
-1. Read `ralph-plan-3.md` for the iteration table and dependency graph
+1. Read `docs/archive/ralph-plans/ralph-plan-3.md` for the iteration table and dependency graph
 2. Read `docs/superpowers/plans/2026-03-30-codebase-reduction-agent-harness.md` for the full step-by-step plan with code blocks
 3. Start with Phase 1. For maximum speed, dispatch Tasks 1, 3, 4, 6 as parallel subagents (they share zero files)
 4. After each task: `cargo build && cargo test && cargo clippy -- -D warnings`
 5. At planning checkpoints (Loops 8, 16, 25): gather metrics, compare vs. baseline, adjust if needed
-6. Update `ralph-plan-3.md` Iteration Contents status column as you complete each loop
+6. Update `docs/archive/ralph-plans/ralph-plan-3.md` Iteration Contents status column as you complete each loop

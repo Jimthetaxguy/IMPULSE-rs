@@ -6,7 +6,7 @@ use crate::{guardrail, injection, semantic_diff, state, validate, verify};
 use super::{
     capture_hook_evidence, default_session_name, get_session_id, hook_session_start_banner,
     parse_platform, persist_claude_env_var, preview_block, print_verification_report,
-    read_hook_stdin_payload,
+    read_hook_stdin_payload, HookEvidenceInput,
 };
 
 pub async fn handle_session_start(
@@ -59,18 +59,18 @@ pub async fn handle_session_start(
             println!("{}\n\n{}", session.id, block);
             output_lines += block.lines().count() + 2;
         }
-        capture_hook_evidence(
-            state.storage().base_path(),
-            "session_start",
-            Some(session.id.clone()),
-            Some(session.name.clone()),
-            session.platform.map(|p| p.as_str().to_string()),
-            None,
-            None,
+        capture_hook_evidence(HookEvidenceInput {
+            impulse_dir: state.storage().base_path(),
+            event: "session_start",
+            session_id: Some(session.id.clone()),
+            session_name: Some(session.name.clone()),
+            platform: session.platform.map(|p| p.as_str().to_string()),
+            summary: None,
+            verify_enabled: None,
             stdin_payload,
-            Some(preview_block(&block, 400)),
+            output_preview: Some(preview_block(&block, 400)),
             output_lines,
-        )?;
+        })?;
     } else {
         let hook_mode = std::env::var("CLAUDE_ENV_FILE").is_ok();
         if hook_mode {
@@ -83,18 +83,18 @@ pub async fn handle_session_start(
             println!("{}", session.id);
             output_lines += 1;
         }
-        capture_hook_evidence(
-            state.storage().base_path(),
-            "session_start",
-            Some(session.id.clone()),
-            Some(session.name.clone()),
-            session.platform.map(|p| p.as_str().to_string()),
-            None,
-            None,
+        capture_hook_evidence(HookEvidenceInput {
+            impulse_dir: state.storage().base_path(),
+            event: "session_start",
+            session_id: Some(session.id.clone()),
+            session_name: Some(session.name.clone()),
+            platform: session.platform.map(|p| p.as_str().to_string()),
+            summary: None,
+            verify_enabled: None,
             stdin_payload,
-            Some("no injection block".to_string()),
+            output_preview: Some("no injection block".to_string()),
             output_lines,
-        )?;
+        })?;
     }
     Ok(())
 }
@@ -139,33 +139,33 @@ pub async fn handle_session_end(
     }
     match state.end_session(&session_id, summary.clone()).await {
         Ok(Some(_)) => {
-            capture_hook_evidence(
-                state.storage().base_path(),
-                "session_end",
-                Some(session_id.clone()),
-                None,
-                None,
-                Some(summary),
-                Some(should_verify),
+            capture_hook_evidence(HookEvidenceInput {
+                impulse_dir: state.storage().base_path(),
+                event: "session_end",
+                session_id: Some(session_id.clone()),
+                session_name: None,
+                platform: None,
+                summary: Some(summary),
+                verify_enabled: Some(should_verify),
                 stdin_payload,
-                Some(format!("Session {} ended", session_id)),
-                1,
-            )?;
+                output_preview: Some(format!("Session {} ended", session_id)),
+                output_lines: 1,
+            })?;
             println!("Session {} ended", session_id)
         }
         Ok(None) => {
-            capture_hook_evidence(
-                state.storage().base_path(),
-                "session_end_missing",
-                Some(session_id.clone()),
-                None,
-                None,
-                Some(summary),
-                Some(should_verify),
+            capture_hook_evidence(HookEvidenceInput {
+                impulse_dir: state.storage().base_path(),
+                event: "session_end_missing",
+                session_id: Some(session_id.clone()),
+                session_name: None,
+                platform: None,
+                summary: Some(summary),
+                verify_enabled: Some(should_verify),
                 stdin_payload,
-                Some(format!("Session not found: {}", session_id)),
-                1,
-            )?;
+                output_preview: Some(format!("Session not found: {}", session_id)),
+                output_lines: 1,
+            })?;
             println!("Session not found: {}", session_id)
         }
         Err(e) => eprintln!("Error: {}", e),

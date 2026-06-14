@@ -8,7 +8,7 @@
 
 You are continuing **Ralph Plan 3** for the Impulse project (`impulse-rs`). Phases 1-3 are **COMPLETE**. Phase 4 (Loops 24-30) remains.
 
-**Plan document:** `ralph-plan-3.md` — read it first for the full iteration table and metrics.
+**Plan document:** `docs/archive/ralph-plans/ralph-plan-3.md` — read it first for the full iteration table and metrics.
 **Implementation plan:** `docs/superpowers/plans/2026-03-30-codebase-reduction-agent-harness.md`
 
 ---
@@ -99,7 +99,7 @@ Target areas:
 - Agent feature matrix: 10/10 ✓
 - Files >800 lines: list remaining
 - `#[allow(dead_code)]`: count remaining
-- Record all metrics in `ralph-plan-3.md` Working Log
+- Record all metrics in `docs/archive/ralph-plans/ralph-plan-3.md` Working Log
 
 ---
 
@@ -107,7 +107,7 @@ Target areas:
 1. `cargo build && cargo test && cargo clippy -- -D warnings` after every task
 2. Don't break existing tests — the 2 flaky daemon socket tests are known pre-existing
 3. Commit at loop 24 (Phase 3) and after loop 30 (Phase 4)
-4. Update `ralph-plan-3.md` status column as each loop completes
+4. Update `docs/archive/ralph-plans/ralph-plan-3.md` status column as each loop completes
 
 ---
 
@@ -131,7 +131,7 @@ Files to update: `CLAUDE.md`, `docs/spec/RUST-CANONICAL-CONTRACT.md`, project ME
 ---
 
 ## How to Start
-1. Read `ralph-plan-3.md` for current status
+1. Read `docs/archive/ralph-plans/ralph-plan-3.md` for current status
 2. Start with Loop 24 (commit Phase 3 work)
 3. Use `superpowers:verification-before-completion` before committing
 4. Loops 26 and 27 can run as parallel subagents (zero file overlap)

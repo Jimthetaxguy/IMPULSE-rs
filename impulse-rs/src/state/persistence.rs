@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -41,7 +42,11 @@ pub struct HistoryEntry {
 pub struct State {
     storage: Storage,
     live_state: RwLock<LiveState>,
-    dirty: RwLock<bool>,
+    /// Set on every mutation, cleared after a sync. A lock-free `AtomicBool`
+    /// so `mark_dirty` (sync, called from async mutators) and the `Drop` flush
+    /// can never silently fail to set/read it under lock contention — a dropped
+    /// set would lose the mutation that triggered it.
+    dirty: AtomicBool,
     config: RwLock<Config>,
 }
 
@@ -55,12 +60,10 @@ impl std::fmt::Debug for State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        if let Ok(dirty) = self.dirty.try_read() {
-            if *dirty {
-                if let Ok(state) = self.live_state.try_read() {
-                    if let Err(err) = self.storage.write_json(LIVE_STATE_FILE, &*state) {
-                        tracing::error!("failed to persist live state on drop: {}", err);
-                    }
+        if self.dirty.load(Ordering::Acquire) {
+            if let Ok(state) = self.live_state.try_read() {
+                if let Err(err) = self.storage.write_json(LIVE_STATE_FILE, &*state) {
+                    tracing::error!("failed to persist live state on drop: {}", err);
                 }
             }
         }
@@ -85,7 +88,7 @@ impl State {
         Ok(Self {
             storage,
             live_state: RwLock::new(live_state),
-            dirty: RwLock::new(false),
+            dirty: AtomicBool::new(false),
             config: RwLock::new(config),
         })
     }
@@ -95,9 +98,9 @@ impl State {
     }
 
     fn mark_dirty(&self) {
-        if let Ok(mut dirty) = self.dirty.try_write() {
-            *dirty = true;
-        }
+        // Release so a subsequent Acquire load (Drop / sync) sees this set
+        // along with the mutation that preceded it.
+        self.dirty.store(true, Ordering::Release);
     }
 
     pub async fn sync_immediate(&self) -> Result<()> {
@@ -106,9 +109,7 @@ impl State {
             .write_json(LIVE_STATE_FILE, &state)
             .context("Failed to write live state to disk")?;
 
-        if let Ok(mut dirty) = self.dirty.try_write() {
-            *dirty = false;
-        }
+        self.dirty.store(false, Ordering::Release);
 
         Ok(())
     }
