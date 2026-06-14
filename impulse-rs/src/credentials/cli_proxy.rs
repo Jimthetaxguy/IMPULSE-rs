@@ -1,8 +1,15 @@
 use std::process::Command;
+use std::time::Duration;
 
 use crate::credentials::{
     CredentialError, CredentialProvider, CredentialProviderType, CredentialStatus, SecretEntry,
 };
+use crate::process_util::run_with_timeout;
+
+/// Hard timeout for a secrets-manager CLI call. These fetches are network-backed
+/// (Infisical/Doppler/Vault/1Password), so a hung backend must not block the
+/// caller — or the daemon — indefinitely.
+const CLI_PROXY_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub struct CliProxyProvider {
     cli_tool: String,
@@ -18,7 +25,9 @@ impl CliProxyProvider {
     }
 
     fn run_cli(&self, args: &[&str]) -> Result<String, CredentialError> {
-        let output = Command::new(&self.cli_tool).args(args).output()?;
+        let mut command = Command::new(&self.cli_tool);
+        command.args(args);
+        let output = run_with_timeout(command, CLI_PROXY_TIMEOUT)?;
 
         if output.status.success() {
             Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -31,9 +40,9 @@ impl CliProxyProvider {
     }
 
     pub fn is_tool_available(&self) -> bool {
-        Command::new(&self.cli_tool)
-            .arg("--version")
-            .output()
+        let mut command = Command::new(&self.cli_tool);
+        command.arg("--version");
+        run_with_timeout(command, CLI_PROXY_TIMEOUT)
             .map(|o| o.status.success())
             .unwrap_or(false)
     }
