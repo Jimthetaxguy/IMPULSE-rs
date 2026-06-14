@@ -13,8 +13,9 @@ use dioxus::prelude::*;
 use impulse_desktop::ui::{
     agent_focus_bridge_script, agent_launch_bridge_script, apply_desktop_bridge_message,
     desktop_event_bridge_script, mcp_invoke_bridge_script, review_decision_bridge_script,
-    terminal_asset_paths, workspace_registration_bridge_script, DesktopBridgeMessage,
-    ReviewDecisionUiRequest, XTERM_CSS_PATH, XTERM_FIT_JS_PATH, XTERM_JS_PATH,
+    terminal_asset_paths, workspace_registration_bridge_script, BridgeStatusUpdate,
+    DesktopBridgeMessage, ReviewDecisionUiRequest, XTERM_CSS_PATH, XTERM_FIT_JS_PATH,
+    XTERM_JS_PATH,
 };
 use impulse_desktop::{
     default_builtin_mcp_tools, format_count, status_dot_class, status_label, AgentPlatformKind,
@@ -538,6 +539,7 @@ fn test_retro_shell_binds_project_ops_snapshot() {
             mcp_tools: Vec::new(),
             last_invocations: Vec::new(),
             review_queue: Vec::new(),
+            bridge_status: None,
             initial_view: DesktopView::Terminal,
         },
     );
@@ -1425,6 +1427,7 @@ fn test_shell_render_accepts_live_agents_workspaces_and_tools() {
                 path: "/tmp/review-1.json".to_string(),
                 preview: "cargo test\\n".to_string(),
             }],
+            bridge_status: None,
             initial_view: DesktopView::Terminal,
         },
     );
@@ -1469,6 +1472,7 @@ fn test_shell_review_route_gates_review_console() {
                 path: "/tmp/review-1.json".to_string(),
                 preview: "cargo test\\n".to_string(),
             }],
+            bridge_status: None,
             initial_view: DesktopView::Review,
         },
     );
@@ -1505,6 +1509,7 @@ fn test_shell_supervisor_route_gates_operator_board() {
                 ok: true,
             }],
             review_queue: Vec::new(),
+            bridge_status: None,
             initial_view: DesktopView::Supervisor,
         },
     );
@@ -1779,4 +1784,109 @@ fn test_appkit_probe_smoke_uses_objc_bridge() {
     assert!(result.handled);
     assert_eq!(result.payload["bridge"], "objc2");
     assert_eq!(result.payload["framework"], "AppKit");
+}
+
+#[test]
+fn test_bridge_status_update_parses_degraded_and_failed_messages() {
+    let degraded = BridgeStatusUpdate::parse(&DesktopBridgeMessage {
+        kind: "bridge_status".to_string(),
+        payload: json!({ "status": "degraded", "reason": "host event API unavailable" }),
+    })
+    .expect("degraded status parses");
+    assert!(degraded.is_degraded());
+    assert_eq!(degraded.headline(), "Host bridge degraded");
+    assert_eq!(
+        degraded.reason.as_deref(),
+        Some("host event API unavailable")
+    );
+
+    let failed = BridgeStatusUpdate::parse(&DesktopBridgeMessage {
+        kind: "bridge_status".to_string(),
+        payload: json!({ "status": "review_queue_failed", "reason": "boom" }),
+    })
+    .expect("failed status parses");
+    assert!(failed.is_degraded());
+    assert_eq!(failed.headline(), "Host call failed: review queue");
+}
+
+#[test]
+fn test_bridge_status_update_ignores_other_messages_and_empty_status() {
+    assert!(BridgeStatusUpdate::parse(&DesktopBridgeMessage {
+        kind: "ops_update".to_string(),
+        payload: json!({ "status": "degraded" }),
+    })
+    .is_none());
+    assert!(BridgeStatusUpdate::parse(&DesktopBridgeMessage {
+        kind: "bridge_status".to_string(),
+        payload: json!({ "reason": "missing status" }),
+    })
+    .is_none());
+    assert!(BridgeStatusUpdate::parse(&DesktopBridgeMessage {
+        kind: "bridge_status".to_string(),
+        payload: json!({ "status": "" }),
+    })
+    .is_none());
+}
+
+#[test]
+fn test_bridge_status_update_recovery_markers_are_not_degraded() {
+    for status in ["mounted", "ok", "ready"] {
+        let update = BridgeStatusUpdate {
+            status: status.to_string(),
+            reason: None,
+        };
+        assert!(!update.is_degraded(), "{status} should clear the banner");
+    }
+}
+
+#[test]
+fn test_shell_renders_bridge_status_banner_when_degraded() {
+    let mut vdom = VirtualDom::new_with_props(
+        DesktopShellWithSnapshot,
+        DesktopShellWithSnapshotProps {
+            snapshot: ProjectOpsSnapshot::default(),
+            runtime_agents: Vec::new(),
+            workspaces: Vec::new(),
+            mcp_tools: Vec::new(),
+            last_invocations: Vec::new(),
+            review_queue: Vec::new(),
+            bridge_status: Some(BridgeStatusUpdate {
+                status: "degraded".to_string(),
+                reason: Some("host event API unavailable".to_string()),
+            }),
+            initial_view: DesktopView::Terminal,
+        },
+    );
+    vdom.rebuild_in_place();
+    let html = dioxus_ssr::render(&vdom);
+
+    // The class name also appears in the inlined CRT stylesheet, so assert on
+    // the rendered element's marker attribute, which the CSS never emits.
+    assert!(html.contains("data-bridge-status=\"degraded\""));
+    assert!(html.contains("class=\"bridge-status-banner\""));
+    assert!(html.contains("Host bridge degraded"));
+    assert!(html.contains("host event API unavailable"));
+}
+
+#[test]
+fn test_shell_hides_bridge_status_banner_when_healthy() {
+    let mut vdom = VirtualDom::new_with_props(
+        DesktopShellWithSnapshot,
+        DesktopShellWithSnapshotProps {
+            snapshot: ProjectOpsSnapshot::default(),
+            runtime_agents: Vec::new(),
+            workspaces: Vec::new(),
+            mcp_tools: Vec::new(),
+            last_invocations: Vec::new(),
+            review_queue: Vec::new(),
+            bridge_status: None,
+            initial_view: DesktopView::Terminal,
+        },
+    );
+    vdom.rebuild_in_place();
+    let html = dioxus_ssr::render(&vdom);
+
+    // The class is present in the inlined stylesheet; the element's marker
+    // attribute is what proves the banner did (not) render.
+    assert!(!html.contains("data-bridge-status="));
 }

@@ -425,6 +425,78 @@ pub struct DesktopBridgeMessage {
     pub payload: Value,
 }
 
+/// Parsed `bridge_status` signal. The ops/terminal bridges forward these when
+/// the host transport is unavailable (`degraded`) or an individual `invoke`
+/// rejects (`*_failed`), so the shell can show the operator that something is
+/// wrong instead of silently dropping the message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BridgeStatusUpdate {
+    pub status: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+impl BridgeStatusUpdate {
+    /// Extract a status update from a `bridge_status` bridge message, or `None`
+    /// for any other message kind (or a malformed payload missing `status`).
+    pub fn parse(message: &DesktopBridgeMessage) -> Option<Self> {
+        if message.kind != "bridge_status" {
+            return None;
+        }
+        let status = message.payload.get("status").and_then(Value::as_str)?;
+        if status.is_empty() {
+            return None;
+        }
+        let reason = message
+            .payload
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        Some(Self {
+            status: status.to_string(),
+            reason,
+        })
+    }
+
+    /// Every status the host emits is a problem signal; only explicit recovery
+    /// markers clear the banner.
+    pub fn is_degraded(&self) -> bool {
+        !matches!(self.status.as_str(), "mounted" | "ok" | "ready")
+    }
+
+    /// Human-facing one-liner for the banner.
+    pub fn headline(&self) -> String {
+        match self.status.as_str() {
+            "degraded" => "Host bridge degraded".to_string(),
+            other => {
+                let action = other.trim_end_matches("_failed").replace('_', " ");
+                format!("Host call failed: {action}")
+            }
+        }
+    }
+}
+
+/// Degraded-state banner. Rendered in the shell chrome whenever a
+/// [`BridgeStatusUpdate::is_degraded`] status is active so the operator sees
+/// that the Rust host transport is unavailable or a call failed.
+#[component]
+fn BridgeStatusBanner(status: BridgeStatusUpdate) -> Element {
+    let reason = status
+        .reason
+        .clone()
+        .unwrap_or_else(|| "no detail reported".to_string());
+    rsx! {
+        div {
+            class: "bridge-status-banner",
+            role: "alert",
+            "data-bridge-status": "{status.status}",
+            span { class: "bridge-status-mark", "!" }
+            span { class: "bridge-status-headline", "{status.headline()}" }
+            span { class: "bridge-status-reason", "{reason}" }
+        }
+    }
+}
+
 // ──────────────────────────── New components ────────────────────────────
 
 #[component]
@@ -1416,6 +1488,7 @@ pub fn DesktopShellWithSnapshot(
     #[props(default)] mcp_tools: Vec<BuiltInMcpTool>,
     #[props(default)] last_invocations: Vec<McpInvocation>,
     #[props(default)] review_queue: Vec<ReviewQueueItem>,
+    #[props(default)] bridge_status: Option<BridgeStatusUpdate>,
     #[props(default = DesktopView::Terminal)] initial_view: DesktopView,
 ) -> Element {
     let context = &snapshot.context;
@@ -1495,6 +1568,11 @@ pub fn DesktopShellWithSnapshot(
                     button { class: "icon-button", title: "Command palette", "Cmd-K" }
                     button { class: "icon-button", title: "Review context", "Review" }
                     button { class: "icon-button", title: "Settings", "Settings" }
+                }
+            }
+            if let Some(status) = bridge_status.as_ref() {
+                if status.is_degraded() {
+                    BridgeStatusBanner { status: status.clone() }
                 }
             }
             div { class: "workspace-grid",
@@ -1717,6 +1795,7 @@ pub fn DesktopShell() -> Element {
     let mut mcp_tools = use_signal(Vec::<BuiltInMcpTool>::new);
     let mut review_queue = use_signal(Vec::<ReviewQueueItem>::new);
     let mut last_invocations = use_signal(Vec::<McpInvocation>::new);
+    let mut bridge_status = use_signal(|| None::<BridgeStatusUpdate>);
 
     use_effect(move || {
         let _agent_mount_count = runtime_agents().len();
@@ -1729,6 +1808,12 @@ pub fn DesktopShell() -> Element {
         spawn(async move {
             let mut eval = document::eval(DESKTOP_EVENT_BRIDGE_SCRIPT);
             while let Ok(message) = eval.recv::<DesktopBridgeMessage>().await {
+                // `bridge_status` messages carry no state to reduce — they tell
+                // the operator the transport degraded or a call failed.
+                if let Some(update) = BridgeStatusUpdate::parse(&message) {
+                    bridge_status.set(Some(update));
+                    continue;
+                }
                 let mut next_snapshot = snapshot();
                 let mut next_agents = runtime_agents();
                 let mut next_workspaces = workspaces();
@@ -1752,6 +1837,10 @@ pub fn DesktopShell() -> Element {
                     mcp_tools.set(next_mcp_tools);
                     review_queue.set(next_queue);
                     last_invocations.set(next_invocations);
+                    // A successful refresh means the transport recovered.
+                    if bridge_status.read().is_some() {
+                        bridge_status.set(None);
+                    }
                 }
             }
         });
@@ -1765,6 +1854,7 @@ pub fn DesktopShell() -> Element {
             mcp_tools: mcp_tools(),
             review_queue: review_queue(),
             last_invocations: last_invocations(),
+            bridge_status: bridge_status(),
         }
     }
 }
