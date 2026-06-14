@@ -97,6 +97,7 @@ try {
     await page.goto(pathToFileURL(fixturePath).href, { waitUntil: "load" });
     await assertAssetsLoaded(page);
     if (hostMode === "dioxus") {
+      // Install the manifest-only bootstrap and confirm its stubs reject.
       await page.evaluate((bootstrap) => {
         window.eval(bootstrap);
         const bootstrapHost = window.__IMPULSE_DESKTOP_HOST;
@@ -123,16 +124,25 @@ try {
         return Promise.all([
           capturePending("invoke", () => bootstrapHost.invoke("agent_snapshot")),
           capturePending("listen", () => bootstrapHost.listen("ops_update", () => {})),
-        ]).then(() => {
-          window.__IMPULSE_DESKTOP_HOST = {
-            ...bootstrapHost,
-            invoke: window.__IMPULSE_TEST_HOST_API.invoke,
-            listen: window.__IMPULSE_TEST_HOST_API.listen,
-          };
-        });
+        ]);
       }, dioxusHostBootstrap);
       await assertDioxusBootstrapManifest(page);
       await assertPendingBootstrapFailsClosed(page);
+      // Before the live eval bridge lands, the interop must fail closed: the
+      // rejecting stubs must not be advertised as a mounted terminal bridge.
+      await assertPendingBootstrapDegradesInterop(page, interopScript);
+
+      // Model the live eval bridge: it replaces the stub transports with
+      // working ones AND moves the host status off the pending sentinel.
+      await page.evaluate(() => {
+        const bootstrapHost = window.__IMPULSE_DESKTOP_HOST;
+        window.__IMPULSE_DESKTOP_HOST = {
+          ...bootstrapHost,
+          status: "dioxus-eval-bridge-ready",
+          invoke: window.__IMPULSE_TEST_HOST_API.invoke,
+          listen: window.__IMPULSE_TEST_HOST_API.listen,
+        };
+      });
     }
 
     const mounted = await page.evaluate((script) => {
@@ -317,6 +327,25 @@ async function assertPendingBootstrapFailsClosed(page) {
     probe?.listen?.includes("Dioxus Desktop host adapter pending: listen:ops_update"),
     `pending Dioxus host listen unexpectedly succeeded: ${probe?.listen}`,
   );
+}
+
+async function assertPendingBootstrapDegradesInterop(page, interopScript) {
+  const result = await page.evaluate(
+    (script) => window.eval(script),
+    interopScript,
+  );
+  assert(
+    result === "degraded",
+    `manifest-only bootstrap should degrade terminal interop, got ${result}`,
+  );
+  const hostKind = await page.evaluate(() =>
+    document.documentElement.getAttribute("data-impulse-host-kind"),
+  );
+  assert(
+    hostKind === "dioxus",
+    `expected dioxus host-kind during pending bootstrap, got ${hostKind}`,
+  );
+  await expectMountState(page, "degraded");
 }
 
 async function expectMountState(page, expected) {

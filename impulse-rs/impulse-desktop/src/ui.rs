@@ -27,12 +27,27 @@ pub fn terminal_asset_paths() -> &'static [&'static str] {
 macro_rules! impulse_host_adapter_resolution_script {
     () => {
         r#"
+  // Keep in sync with host_commands::PENDING_HOST_BOOTSTRAP_STATUS — the
+  // manifest-only Dioxus bootstrap installs invoke/listen stubs that always
+  // reject until the live eval bridge replaces them. Treating those stubs as a
+  // live API makes the bridges advertise themselves mounted and then
+  // unhandled-reject on the first call, so we must detect and skip them.
+  const PENDING_IMPULSE_HOST_STATUS = "manifest-only-pending-dioxus-eval-bridge";
+  const impulseHostFnReady = (host, fn) =>
+    !!host &&
+    typeof host[fn] === "function" &&
+    host.status !== PENDING_IMPULSE_HOST_STATUS &&
+    !host[fn].__impulseHostPending;
   const resolveImpulseHostAdapter = () => {
     const dioxusHost = window.__IMPULSE_DESKTOP_HOST;
     const legacyTauri = window.__TAURI__;
     return {
-      invoke: dioxusHost?.invoke || legacyTauri?.core?.invoke,
-      listen: dioxusHost?.listen || legacyTauri?.event?.listen,
+      invoke: impulseHostFnReady(dioxusHost, "invoke")
+        ? dioxusHost.invoke
+        : legacyTauri?.core?.invoke,
+      listen: impulseHostFnReady(dioxusHost, "listen")
+        ? dioxusHost.listen
+        : legacyTauri?.event?.listen,
       hostKind: dioxusHost ? "dioxus" : legacyTauri ? "legacy-tauri" : "missing",
     };
   };

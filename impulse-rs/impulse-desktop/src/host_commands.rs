@@ -14,6 +14,15 @@ use crate::NativeIslandHost;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Status string the manifest-only Dioxus host bootstrap publishes before the
+/// live eval bridge swaps in working `invoke`/`listen` implementations. The
+/// host-adapter resolver in `ui.rs` treats a host carrying this status — or
+/// whose `invoke`/`listen` are still the rejecting `__impulseHostPending`
+/// stubs — as NOT ready, so the ops + terminal bridges fail closed (degrade or
+/// fall back to legacy Tauri) instead of advertising a live bridge over stubs
+/// that reject on the first call.
+pub const PENDING_HOST_BOOTSTRAP_STATUS: &str = "manifest-only-pending-dioxus-eval-bridge";
+
 pub const AGENT_CLOSE_COMMAND: &str = "agent_close";
 pub const AGENT_FOCUS_COMMAND: &str = "agent_focus";
 pub const AGENT_RESIZE_COMMAND: &str = "agent_resize";

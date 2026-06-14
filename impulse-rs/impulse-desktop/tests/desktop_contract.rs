@@ -318,12 +318,178 @@ fn test_terminal_interop_prefers_dioxus_native_host_adapter() {
     assert!(script.contains("resolveImpulseHostAdapter"));
     assert!(script.contains("window.__IMPULSE_DESKTOP_HOST"));
     assert!(script.contains("const legacyTauri = window.__TAURI__"));
-    assert!(script.contains("invoke: dioxusHost?.invoke || legacyTauri?.core?.invoke"));
-    assert!(script.contains("listen: dioxusHost?.listen || legacyTauri?.event?.listen"));
     assert!(script.contains("const { invoke, listen, hostKind } = resolveImpulseHostAdapter();"));
     assert!(script.contains(r#"hostKind: dioxusHost ? "dioxus""#));
     assert!(script.contains(r#"legacyTauri ? "legacy-tauri""#));
     assert!(script.contains("data-impulse-host-kind"));
+
+    // The resolver must treat the manifest-only bootstrap stubs as unavailable
+    // rather than advertising them as a live host. It keys off both the pending
+    // status sentinel and the `__impulseHostPending` flag the bootstrap stamps
+    // onto its rejecting stubs.
+    assert!(script.contains("impulseHostFnReady"));
+    assert!(script.contains("__impulseHostPending"));
+    assert!(script.contains("legacyTauri?.core?.invoke"));
+    assert!(script.contains("legacyTauri?.event?.listen"));
+    assert!(script.contains(impulse_desktop::host_commands::PENDING_HOST_BOOTSTRAP_STATUS));
+}
+
+/// The manifest-only Dioxus bootstrap installs `invoke`/`listen` that always
+/// reject. Without a real eval bridge or a legacy Tauri host, the ops bridge
+/// must degrade — never advertise itself as mounted over the rejecting stubs.
+#[test]
+fn test_pending_dioxus_host_ops_bridge_fails_closed() {
+    if skip_without_node() {
+        return;
+    }
+
+    let smoke = run_pending_host_bridge_smoke(/* with_legacy = */ false);
+    assert_eq!(
+        smoke["attrs"]["data-impulse-host-kind"],
+        serde_json::Value::String("dioxus".to_string()),
+        "host-kind should still report the present dioxus host object"
+    );
+    assert_eq!(
+        smoke["attrs"]["data-impulse-ops-bridge"],
+        serde_json::Value::String("degraded".to_string()),
+        "pending stub host must not advertise a mounted bridge"
+    );
+    assert_eq!(
+        smoke["attrs"]["data-impulse-ops-bridge-reason"],
+        serde_json::Value::String("host event API unavailable".to_string())
+    );
+    assert_eq!(smoke["bridge"]["degraded"], serde_json::Value::Bool(true));
+    assert_eq!(
+        smoke["invoked"].as_array().map(|calls| calls.len()),
+        Some(0),
+        "pending stub host must not be invoked"
+    );
+}
+
+/// When a legacy Tauri host is present alongside the pending Dioxus stubs, the
+/// resolver must fall back to the working legacy transport and mount the bridge
+/// rather than degrade on the rejecting stubs.
+#[test]
+fn test_pending_dioxus_host_falls_back_to_legacy_tauri() {
+    if skip_without_node() {
+        return;
+    }
+
+    let smoke = run_pending_host_bridge_smoke(/* with_legacy = */ true);
+    assert_eq!(
+        smoke["attrs"]["data-impulse-ops-bridge"],
+        serde_json::Value::String("mounted".to_string()),
+        "legacy fallback should mount the bridge"
+    );
+    assert_eq!(smoke["bridge"]["degraded"], serde_json::Value::Bool(false));
+    let invoked = smoke["invoked"].as_array().expect("invoked array");
+    assert!(
+        invoked
+            .iter()
+            .any(|call| call["command"] == "agent_snapshot"),
+        "legacy transport should receive bridge refresh invokes, got {invoked:?}"
+    );
+}
+
+fn skip_without_node() -> bool {
+    match Command::new("node").arg("--version").output() {
+        Ok(output) if output.status.success() => false,
+        _ => {
+            eprintln!("node is unavailable; skipping pending-host bridge smoke");
+            true
+        }
+    }
+}
+
+/// Drive the ops bridge script against a mocked webview whose
+/// `window.__IMPULSE_DESKTOP_HOST` mirrors the real manifest-only bootstrap:
+/// `invoke`/`listen` are present but flagged `__impulseHostPending` and reject.
+/// Optionally also install a working legacy Tauri host to exercise fallback.
+fn run_pending_host_bridge_smoke(with_legacy: bool) -> serde_json::Value {
+    let legacy_setup = if with_legacy {
+        r#"
+window.__TAURI__ = {
+  core: {
+    invoke: async (command) => {
+      invoked.push({ command });
+      if (command === "agent_snapshot") return [];
+      if (command === "list_workspaces") return [];
+      if (command === "mcp_descriptors") return [];
+      if (command === "review_queue") return [];
+      return null;
+    }
+  },
+  event: {
+    listen: async (name, handler) => { listeners[name] = handler; return async () => {}; }
+  }
+};
+"#
+    } else {
+        ""
+    };
+
+    let smoke_script = format!(
+        r#"
+const bridgeScript = {bridge_script};
+const pendingStatus = {pending_status};
+const sent = [];
+const invoked = [];
+const listeners = {{}};
+const attrs = {{}};
+
+global.window = {{}};
+global.document = {{
+  documentElement: {{
+    setAttribute: (key, value) => {{ attrs[key] = value; }}
+  }}
+}};
+global.dioxus = {{ send: (message) => sent.push(message) }};
+
+const pending = (operation) =>
+  Promise.reject(new Error(`Dioxus Desktop host adapter pending: ${{operation}}`));
+const pendingInvoke = (command) => {{ invoked.push({{ command, pending: true }}); return pending(`invoke:${{command}}`); }};
+const pendingListen = (event) => pending(`listen:${{event}}`);
+pendingInvoke.__impulseHostPending = true;
+pendingListen.__impulseHostPending = true;
+window.__IMPULSE_DESKTOP_HOST = {{
+  invoke: pendingInvoke,
+  listen: pendingListen,
+  hostKind: "dioxus",
+  status: pendingStatus,
+}};
+{legacy_setup}
+
+const bridgePromise = eval(bridgeScript);
+if (bridgePromise && typeof bridgePromise.catch === "function") {{
+  bridgePromise.catch(() => {{}});
+}}
+setTimeout(() => {{
+  console.log(JSON.stringify({{ attrs, sent, invoked, bridge: window.__impulseOpsBridge }}));
+  process.exit(0);
+}}, 40);
+"#,
+        bridge_script =
+            serde_json::to_string(desktop_event_bridge_script()).expect("serialize bridge script"),
+        pending_status =
+            serde_json::to_string(impulse_desktop::host_commands::PENDING_HOST_BOOTSTRAP_STATUS)
+                .expect("serialize pending status"),
+        legacy_setup = legacy_setup,
+    );
+
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let smoke_path = tempdir.path().join("pending-host-bridge-smoke.js");
+    std::fs::write(&smoke_path, smoke_script).expect("write pending-host smoke script");
+    let output = Command::new("node")
+        .arg(&smoke_path)
+        .output()
+        .expect("run node pending-host bridge smoke");
+    assert!(
+        output.status.success(),
+        "pending-host bridge smoke failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("parse pending-host bridge smoke output")
 }
 
 #[test]

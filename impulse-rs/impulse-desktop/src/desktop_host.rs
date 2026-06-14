@@ -2,7 +2,7 @@ use crate::host_commands::HOST_INVOKE_COMMANDS;
 use crate::runtime::DesktopEvent;
 
 pub const HOST_KIND: &str = "dioxus";
-pub const HOST_BOOTSTRAP_STATUS: &str = "manifest-only-pending-dioxus-eval-bridge";
+pub const HOST_BOOTSTRAP_STATUS: &str = crate::host_commands::PENDING_HOST_BOOTSTRAP_STATUS;
 pub const HOST_EVENT_NAMES: &[&str] = DesktopEvent::HOST_EVENT_NAMES;
 
 pub fn host_bootstrap_script() -> String {
@@ -29,6 +29,12 @@ pub fn host_bootstrap_script() -> String {
     supportedInvokes: __IMPULSE_HOST_INVOKES__,
     supportedEvents: __IMPULSE_HOST_EVENTS__,
   };
+  // Mark the placeholder transport so the host-adapter resolver can tell these
+  // always-rejecting stubs apart from a live eval bridge that later replaces
+  // them. Without this flag the resolver would advertise the bridge as mounted
+  // and then unhandled-reject on the first invoke/listen.
+  window.__IMPULSE_DESKTOP_HOST.invoke.__impulseHostPending = true;
+  window.__IMPULSE_DESKTOP_HOST.listen.__impulseHostPending = true;
   document.documentElement?.setAttribute("data-impulse-host-kind", "__IMPULSE_HOST_KIND__");
   document.documentElement?.setAttribute(
     "data-impulse-host-status",
@@ -88,6 +94,25 @@ mod tests {
         assert!(script.contains("supportedInvokes"));
         assert!(script.contains("supportedEvents"));
         assert!(is_manifest_only_bootstrap());
+    }
+
+    #[test]
+    fn host_bootstrap_flags_pending_stub_transport() {
+        let script = host_bootstrap_script();
+
+        // The resolver in ui.rs keys off `__impulseHostPending` to fail closed
+        // when only the manifest-only stubs are installed; the bootstrap must
+        // tag both transports or that gate silently stops working.
+        assert!(
+            script.contains("window.__IMPULSE_DESKTOP_HOST.invoke.__impulseHostPending = true;")
+        );
+        assert!(
+            script.contains("window.__IMPULSE_DESKTOP_HOST.listen.__impulseHostPending = true;")
+        );
+        assert_eq!(
+            HOST_BOOTSTRAP_STATUS,
+            crate::host_commands::PENDING_HOST_BOOTSTRAP_STATUS
+        );
     }
 
     #[test]
