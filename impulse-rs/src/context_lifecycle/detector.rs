@@ -45,6 +45,9 @@ impl CompactionDetector {
             state.compaction_count += 1;
             // Reset estimated tokens to 10% of window (agent has freed context)
             state.estimated_tokens = window_tokens / 10;
+            // Re-baseline byte accounting to "now" so the monitor measures
+            // post-compaction growth from ~empty instead of the cumulative total.
+            state.output_bytes_baseline = state.output_bytes_at_last_check;
             // Re-arm the threshold ladder. Without this, a pane that already
             // climbed to a high tier (e.g. Minimal) keeps `last_threshold` at
             // that tier forever, so the monitor's `new_tier > last_threshold`
@@ -123,6 +126,7 @@ mod tests {
         let mut state = PaneContextState::new(1, AgentKind::ClaudeCode);
         state.last_threshold = ContextTier::Minimal;
         state.estimated_tokens = 180_000;
+        state.output_bytes_at_last_check = 288_000;
 
         let action = CompactionDetector::check_pane(
             &mut state,
@@ -138,6 +142,10 @@ mod tests {
             state.last_threshold,
             ContextTier::None,
             "last_threshold must reset to None so future tier crossings re-fire"
+        );
+        assert_eq!(
+            state.output_bytes_baseline, 288_000,
+            "byte baseline must move to current so usage is measured post-compaction"
         );
     }
 

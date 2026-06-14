@@ -46,7 +46,11 @@ impl ContextWindowMonitor {
             return None;
         }
         state.output_bytes_at_last_check = current_output_bytes;
-        state.estimated_tokens = Self::estimate_tokens(current_output_bytes);
+        // Estimate usage from output produced since the last compaction baseline
+        // (0 until the first compaction), so a freed context window is reflected
+        // as a drop rather than climbing forever off the cumulative byte total.
+        let bytes_since_baseline = current_output_bytes.saturating_sub(state.output_bytes_baseline);
+        state.estimated_tokens = Self::estimate_tokens(bytes_since_baseline);
 
         let pct = if self.window_tokens > 0 {
             (state.estimated_tokens as f64 / self.window_tokens as f64 * 100.0) as u8
@@ -133,6 +137,46 @@ mod tests {
         // Same bytes again — no double-fire
         let action = monitor.check_pane(pane_id, 144_000);
         assert!(action.is_none());
+    }
+
+    #[test]
+    fn test_usage_drops_after_compaction_rebaseline() {
+        let mut monitor = ContextWindowMonitor::new(200_000);
+        let pane_id = 1;
+        monitor.pane_states.insert(
+            pane_id,
+            PaneContextState::new(pane_id, AgentKind::ClaudeCode),
+        );
+
+        // Climb to 45% (Essential).
+        assert!(monitor.check_pane(pane_id, 144_000).is_some());
+
+        // Simulate what CompactionDetector does on a compaction event:
+        // re-baseline byte accounting to "now" and re-arm the threshold ladder.
+        {
+            let state = monitor.pane_states.get_mut(&pane_id).unwrap();
+            state.output_bytes_baseline = state.output_bytes_at_last_check;
+            state.last_threshold = ContextTier::None;
+        }
+
+        // Cumulative bytes keep growing, but usage is now measured from the
+        // baseline, so 56k new bytes => ~17% => below threshold => no action.
+        let action = monitor.check_pane(pane_id, 200_000);
+        assert!(
+            action.is_none(),
+            "post-compaction usage should drop below threshold, got {action:?}"
+        );
+
+        // After 144k more bytes since the baseline, we cross 45% again and the
+        // re-armed ladder fires a fresh Essential refresh.
+        let action = monitor.check_pane(pane_id, 144_000 + 144_000);
+        assert!(matches!(
+            action,
+            Some(MonitorAction::RefreshContext {
+                tier: ContextTier::Essential,
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -163,6 +163,11 @@ pub struct PaneContextState {
     pub agent_kind: AgentKind,
     pub initial_injection_done: bool,
     pub output_bytes_at_last_check: u64,
+    /// Cumulative output-byte count at the most recent compaction. The monitor
+    /// estimates context-window usage from bytes emitted *since* this baseline,
+    /// so a compaction (which frees the agent's context) makes the estimate
+    /// drop instead of climbing forever off the cumulative total.
+    pub output_bytes_baseline: u64,
     pub estimated_tokens: usize,
     pub last_threshold: ContextTier,
     pub last_injection_at: Option<Instant>,
@@ -196,6 +201,7 @@ impl PaneContextState {
             agent_kind,
             initial_injection_done: false,
             output_bytes_at_last_check: 0,
+            output_bytes_baseline: 0,
             estimated_tokens: 0,
             last_threshold: ContextTier::None,
             last_injection_at: None,
