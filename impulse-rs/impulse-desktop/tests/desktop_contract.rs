@@ -185,7 +185,12 @@ fn test_dioxus_shell_renders_five_panel_layout_without_egui() {
     assert!(html.contains("Launch an agent from the workspace panel"));
     assert!(!html.contains("data-xterm-mount=\"true\""));
     assert!(!html.contains("terminal-pane-codex"));
-    assert!(html.contains("agent_runtime_update stream pending"));
+    // Footer stream health is derived, not hardcoded: with no agents and a
+    // healthy transport the runtime/terminal streams read `idle`.
+    assert!(!html.contains("stream pending"));
+    assert!(html.contains("data-stream=\"agent_runtime_update\""));
+    assert!(html.contains("agent_runtime_update · idle"));
+    assert!(html.contains("supervisor_local_action · ready"));
     assert!(!html.contains("data-pty-owner=\"rust-backend\""));
     assert!(!html.contains("<section class=\"review-console\""));
     assert!(!html.contains("<section class=\"operator-board\""));
@@ -1889,4 +1894,56 @@ fn test_shell_hides_bridge_status_banner_when_healthy() {
     // The class is present in the inlined stylesheet; the element's marker
     // attribute is what proves the banner did (not) render.
     assert!(!html.contains("data-bridge-status="));
+}
+
+#[test]
+fn test_footer_stream_health_reflects_live_agent() {
+    let mut vdom = VirtualDom::new_with_props(
+        DesktopShellWithSnapshot,
+        DesktopShellWithSnapshotProps {
+            snapshot: ProjectOpsSnapshot::default(),
+            runtime_agents: vec![runtime_snapshot("codex-live")],
+            workspaces: Vec::new(),
+            mcp_tools: Vec::new(),
+            last_invocations: Vec::new(),
+            review_queue: Vec::new(),
+            bridge_status: None,
+            initial_view: DesktopView::Terminal,
+        },
+    );
+    vdom.rebuild_in_place();
+    let html = dioxus_ssr::render(&vdom);
+
+    // runtime_snapshot has output_bytes > 0 and a present agent → both streams live.
+    assert!(html.contains("terminal_output · live"));
+    assert!(html.contains("agent_runtime_update · live"));
+    assert!(html.contains("supervisor_local_action · ready"));
+    assert!(!html.contains("stream pending"));
+}
+
+#[test]
+fn test_footer_stream_health_reads_down_when_transport_degraded() {
+    let mut vdom = VirtualDom::new_with_props(
+        DesktopShellWithSnapshot,
+        DesktopShellWithSnapshotProps {
+            snapshot: ProjectOpsSnapshot::default(),
+            runtime_agents: vec![runtime_snapshot("codex-live")],
+            workspaces: Vec::new(),
+            mcp_tools: Vec::new(),
+            last_invocations: Vec::new(),
+            review_queue: Vec::new(),
+            bridge_status: Some(BridgeStatusUpdate {
+                status: "degraded".to_string(),
+                reason: Some("host event API unavailable".to_string()),
+            }),
+            initial_view: DesktopView::Terminal,
+        },
+    );
+    vdom.rebuild_in_place();
+    let html = dioxus_ssr::render(&vdom);
+
+    // A degraded transport means no events can arrive — every stream reads down.
+    assert!(html.contains("terminal_output · down"));
+    assert!(html.contains("agent_runtime_update · down"));
+    assert!(html.contains("supervisor_local_action · down"));
 }

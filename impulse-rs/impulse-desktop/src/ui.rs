@@ -966,6 +966,20 @@ fn parse_platform_kind(value: &str) -> AgentPlatformKind {
     }
 }
 
+/// Footer event-stream health label. `down` when the host transport is
+/// degraded (no events can arrive), `live` when data has actually been
+/// observed on the stream, otherwise `idle`. Replaces the previous hardcoded
+/// "stream pending" so the strip reflects real state.
+fn event_stream_state(active: bool, degraded: bool) -> &'static str {
+    if degraded {
+        "down"
+    } else if active {
+        "live"
+    } else {
+        "idle"
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReviewDecisionUiRequest {
     pub id: String,
@@ -1519,10 +1533,26 @@ pub fn DesktopShellWithSnapshot(
         context.tier.as_str()
     };
     let generated_at = if snapshot.generated_at.is_empty() {
-        "ops_update stream pending"
+        "awaiting first ops_update"
     } else {
         snapshot.generated_at.as_str()
     };
+    // Real footer stream health derived from observed state (replaces the old
+    // permanent "stream pending"). A degraded host transport means no events
+    // can arrive at all, so every stream reads `down`.
+    let bridge_degraded = bridge_status
+        .as_ref()
+        .map(BridgeStatusUpdate::is_degraded)
+        .unwrap_or(false);
+    let terminal_stream = event_stream_state(
+        runtime_agents.iter().any(|agent| agent.output_bytes > 0),
+        bridge_degraded,
+    );
+    let runtime_stream = event_stream_state(!runtime_agents.is_empty(), bridge_degraded);
+    // No UI consumer subscribes to supervisor_local_action yet, so reflect the
+    // transport: `down` when degraded, otherwise `ready` (defined, awaiting a
+    // consumer) — never the misleading permanent "pending".
+    let supervisor_stream = if bridge_degraded { "down" } else { "ready" };
     let first_workspace_root = workspaces
         .first()
         .map(|entry| entry.target.root.clone())
@@ -1772,13 +1802,13 @@ pub fn DesktopShellWithSnapshot(
                 }
             }
             footer { class: "event-strip", "data-owner": "dioxus",
-                span { "ops_update {generated_at}" }
+                span { "data-stream": "ops_update", "ops_update {generated_at}" }
                 span { "{agents_online} agents" }
                 span { "{snapshot.artifacts.len()} artifacts" }
                 span { "{snapshot.interventions.len()} interventions" }
-                span { "terminal_output stream pending" }
-                span { "agent_runtime_update stream pending" }
-                span { "supervisor_local_action stream pending" }
+                span { "data-stream": "terminal_output", "terminal_output · {terminal_stream}" }
+                span { "data-stream": "agent_runtime_update", "agent_runtime_update · {runtime_stream}" }
+                span { "data-stream": "supervisor_local_action", "supervisor_local_action · {supervisor_stream}" }
                 if let Some(intent) = latest_shell_intent() {
                     span { class: "shell-notice", "{intent}" }
                 }
