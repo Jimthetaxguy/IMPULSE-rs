@@ -71,7 +71,11 @@ pub fn write_handoff(
     session: Option<&Session>,
 ) -> Result<PathBuf> {
     let root = ensure_context_dirs(impulse_dir)?;
-    let handoff_path = root.join(format!("handoff-{}.md", target_tool));
+    // `target_tool` can be a raw CLI/daemon argument. Sanitize it before using
+    // it as a filename component — an unsanitized `/` or `..` would let the
+    // handoff file escape .impulse/context (path traversal write).
+    let safe_tool = crate::storage::sanitize_filename(target_tool);
+    let handoff_path = root.join(format!("handoff-{}.md", safe_tool));
 
     let (session_id, session_name, files, tools) = if let Some(s) = session {
         (
@@ -259,6 +263,27 @@ mod tests {
         append_injected_context(&current, "Injected summary block").unwrap();
         let content = std::fs::read_to_string(&current).unwrap();
         assert!(content.contains("Auto-Injected Context"));
+    }
+
+    #[test]
+    fn test_write_handoff_sanitizes_traversal_in_target_tool() {
+        let temp = TempDir::new().unwrap();
+        // A malicious target tool with path separators must not escape the
+        // .impulse/context directory.
+        let path = write_handoff(temp.path(), "../../../tmp/evil", "task", None, None).unwrap();
+
+        let context = temp.path().join("context");
+        assert_eq!(
+            path.parent().unwrap(),
+            context,
+            "handoff file escaped the context dir: {path:?}"
+        );
+        let name = path.file_name().unwrap().to_string_lossy();
+        assert!(
+            !name.contains('/') && !name.contains('\\'),
+            "filename still contains a path separator: {name}"
+        );
+        assert!(path.exists());
     }
 
     #[test]
