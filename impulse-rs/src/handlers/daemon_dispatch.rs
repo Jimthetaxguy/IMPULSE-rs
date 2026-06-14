@@ -12,7 +12,7 @@ use crate::{envelope, plugin, semantic_diff, verify, Commands};
 
 use super::{
     capture_hook_evidence, default_session_name, get_session_id, parse_injection_mode, print_json,
-    print_verification_report, read_hook_stdin_payload,
+    print_verification_report, read_hook_stdin_payload, HookEvidenceInput,
 };
 
 /// Run a CLI command in daemon mode (forwarding over IPC).
@@ -200,18 +200,18 @@ async fn handle_session_start(
     match client.create_session(name, platform).await {
         Ok((id, n)) => {
             let _ = super::persist_claude_env_var("IMPULSE_SESSION_ID", &id);
-            capture_hook_evidence(
+            capture_hook_evidence(HookEvidenceInput {
                 impulse_dir,
-                "session_start",
-                Some(id.clone()),
-                Some(n.clone()),
-                Some("daemon".to_string()),
-                None,
-                None,
+                event: "session_start",
+                session_id: Some(id.clone()),
+                session_name: Some(n.clone()),
+                platform: Some("daemon".to_string()),
+                summary: None,
+                verify_enabled: None,
                 stdin_payload,
-                Some("daemon create_session".to_string()),
-                1,
-            )
+                output_preview: Some("daemon create_session".to_string()),
+                output_lines: 1,
+            })
             .context("Failed to capture hook evidence for session-start")?;
             println!("Created session: {} ({})", n, id)
         }
@@ -266,18 +266,18 @@ async fn handle_session_end(
         .await
     {
         Ok(_) => {
-            capture_hook_evidence(
+            capture_hook_evidence(HookEvidenceInput {
                 impulse_dir,
-                "session_end",
-                Some(session_id.clone()),
-                None,
-                Some("daemon".to_string()),
-                Some(summary),
-                Some(should_verify),
+                event: "session_end",
+                session_id: Some(session_id.clone()),
+                session_name: None,
+                platform: Some("daemon".to_string()),
+                summary: Some(summary),
+                verify_enabled: Some(should_verify),
                 stdin_payload,
-                Some(format!("Session {} ended", session_id)),
-                1,
-            )
+                output_preview: Some(format!("Session {} ended", session_id)),
+                output_lines: 1,
+            })
             .context("Failed to capture hook evidence for session-end")?;
             println!("Session {} ended", session_id)
         }

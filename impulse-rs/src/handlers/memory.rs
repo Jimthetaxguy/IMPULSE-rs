@@ -3,6 +3,18 @@ use std::sync::Arc;
 
 use crate::{memory, retrieval, state};
 
+pub struct SearchMemoryOptions {
+    pub query: String,
+    pub mode: Option<String>,
+    pub backend: Option<String>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    pub page: Option<usize>,
+    pub total: bool,
+    pub explain: bool,
+    pub json: bool,
+}
+
 /// Handle the `genome` command.
 ///
 /// Reads `GENOME.md` from storage and prints it as formatted markdown.
@@ -53,20 +65,22 @@ pub fn handle_add_decision(
 ///
 /// Performs keyword or semantic search across session history entries,
 /// with pagination, backend selection, and optional scoring explanation.
-// TODO(refactor): extract params into struct
-#[allow(clippy::too_many_arguments)]
 pub fn handle_search_history(
     state: &Arc<state::State>,
-    query: String,
-    mode: Option<String>,
-    backend: Option<String>,
-    limit: Option<usize>,
-    offset: Option<usize>,
-    page: Option<usize>,
-    total: bool,
-    explain: bool,
-    json: bool,
+    options: SearchMemoryOptions,
 ) -> Result<()> {
+    let SearchMemoryOptions {
+        query,
+        mode,
+        backend,
+        limit,
+        offset,
+        page,
+        total,
+        explain,
+        json,
+    } = options;
+
     let mode = if let Some(m) = mode.as_deref() {
         Some(
             retrieval::types::RetrievalMode::parse(m)
@@ -151,20 +165,19 @@ pub fn handle_search_history(
 ///
 /// Performs keyword or semantic search across decisions in `GENOME.md`,
 /// with pagination, backend selection, and optional scoring explanation.
-// TODO(refactor): extract params into struct
-#[allow(clippy::too_many_arguments)]
-pub fn handle_search_genome(
-    state: &Arc<state::State>,
-    query: String,
-    mode: Option<String>,
-    backend: Option<String>,
-    limit: Option<usize>,
-    offset: Option<usize>,
-    page: Option<usize>,
-    total: bool,
-    explain: bool,
-    json: bool,
-) -> Result<()> {
+pub fn handle_search_genome(state: &Arc<state::State>, options: SearchMemoryOptions) -> Result<()> {
+    let SearchMemoryOptions {
+        query,
+        mode,
+        backend,
+        limit,
+        offset,
+        page,
+        total,
+        explain,
+        json,
+    } = options;
+
     let mode = if let Some(m) = mode.as_deref() {
         Some(
             retrieval::types::RetrievalMode::parse(m)

@@ -2,7 +2,7 @@
 
 > **Date:** 2026-03-02
 > **Status:** Draft
-> **Companion:** [`~/.ai-memory/docs/spec-cli-provider-abstraction.md`](~/.ai-memory/docs/spec-cli-provider-abstraction.md)
+> **Companion:** Private local design note, not included in this public repository.
 > **Source:** NullClaw analysis §2.6, existing Impulse `CliAgent` stub
 
 ---
@@ -377,7 +377,7 @@ injects the appropriate protocol automatically.
 
 ## 12. Cross-References
 
-- **Companion (cross-cutting):** [`spec-cli-provider-abstraction.md`](~/.ai-memory/docs/spec-cli-provider-abstraction.md)
+- **Companion (cross-cutting):** Private local design note, not included in this public repository.
 - **Spec 1 — Retrieval Pipeline:** [`spec-retrieval-pipeline-upgrade.md`](./spec-retrieval-pipeline-upgrade.md) — LLM rerank stage needs working LlmProvider
 - **Spec 4 — Agent Patterns:** [`spec-nullclaw-agent-patterns.md`](./spec-nullclaw-agent-patterns.md) — §5 NullClaw as Impulse panel, vtable comparison
 - **Impulse source:**

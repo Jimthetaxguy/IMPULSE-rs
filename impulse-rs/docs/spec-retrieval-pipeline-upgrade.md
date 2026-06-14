@@ -2,7 +2,7 @@
 
 > **Date:** 2026-03-02
 > **Status:** Draft
-> **Companion:** [`~/.ai-memory/docs/spec-semantic-retrieval-pipeline.md`](~/.ai-memory/docs/spec-semantic-retrieval-pipeline.md)
+> **Companion:** Private local design note, not included in this public repository.
 > **Source:** NullClaw analysis §2.2, existing Impulse retrieval system
 
 ---
@@ -383,7 +383,7 @@ When `retrieval_pipeline.enabled` is `false`, the system uses the existing
 
 ## 9. Cross-References
 
-- **Companion (cross-cutting):** [`spec-semantic-retrieval-pipeline.md`](~/.ai-memory/docs/spec-semantic-retrieval-pipeline.md)
+- **Companion (cross-cutting):** Private local design note, not included in this public repository.
 - **Spec 3 — CLI Provider:** [`spec-cli-provider-extension.md`](./spec-cli-provider-extension.md) — LLM rerank stage needs `LlmProvider`
 - **Spec 4 — Agent Patterns:** [`spec-nullclaw-agent-patterns.md`](./spec-nullclaw-agent-patterns.md) — §3 BackendDescriptor for capability queries
 - **Phase 3 Research:** [`PHASE3_SQLITE_VEC_RESEARCH.md`](./PHASE3_SQLITE_VEC_RESEARCH.md) — existing sqlite-vec roadmap

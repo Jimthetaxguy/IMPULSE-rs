@@ -2,7 +2,7 @@
 //!
 //! Dynamic algorithm for tracking token usage and measuring autocompaction events
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -87,39 +87,27 @@ impl TokenTracker {
         self.events.push(event);
     }
 
-    /// Record a compaction event
-    // TODO(refactor): extract params into struct
-    #[allow(clippy::too_many_arguments)]
-    pub fn record_compaction(
-        &mut self,
-        platform: Platform,
-        session_id: &str,
-        started_at: DateTime<Utc>,
-        completed_at: DateTime<Utc>,
-        tokens_before: u32,
-        tokens_after: u32,
-        compaction_type: CompactionType,
-        is_automatic: bool,
-    ) {
-        let duration_ms = (completed_at - started_at).num_milliseconds() as u64;
-        let compression_ratio = if tokens_before > 0 {
-            tokens_after as f64 / tokens_before as f64
+    /// Record a compaction event.
+    pub fn record_compaction(&mut self, record: CompactionRecord) {
+        let duration_ms = (record.completed_at - record.started_at).num_milliseconds() as u64;
+        let compression_ratio = if record.tokens_before > 0 {
+            record.tokens_after as f64 / record.tokens_before as f64
         } else {
             1.0
         };
 
         let event = CompactionEvent {
             id: Uuid::new_v4().to_string(),
-            platform,
-            session_id: session_id.to_string(),
-            started_at,
-            completed_at,
+            platform: record.platform,
+            session_id: record.session_id,
+            started_at: record.started_at,
+            completed_at: record.completed_at,
             duration_ms,
-            tokens_before,
-            tokens_after,
+            tokens_before: record.tokens_before,
+            tokens_after: record.tokens_after,
             compression_ratio,
-            compaction_type,
-            is_automatic,
+            compaction_type: record.compaction_type,
+            is_automatic: record.is_automatic,
         };
 
         self.compactions.push(event);
@@ -503,16 +491,16 @@ mod tests {
         let start = Utc::now();
         let end = start + Duration::seconds(5);
 
-        tracker.record_compaction(
-            Platform::ClaudeCode,
-            session_id,
-            start,
-            end,
-            150_000, // Before
-            80_000,  // After
-            CompactionType::Summarize,
-            true, // Automatic
-        );
+        tracker.record_compaction(CompactionRecord {
+            platform: Platform::ClaudeCode,
+            session_id: session_id.to_string(),
+            started_at: start,
+            completed_at: end,
+            tokens_before: 150_000,
+            tokens_after: 80_000,
+            compaction_type: CompactionType::Summarize,
+            is_automatic: true,
+        });
 
         // Get statistics
         let stats = tracker.get_statistics();

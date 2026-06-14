@@ -28,22 +28,22 @@ pub(crate) fn spawn_agent_in_terminal(state: &mut TuiState, agent_cmd: &str, pla
         };
 
         // Create the pane
-        match pm.create_pane(
-            agent_cmd.to_string(),
-            agent_cmd,
-            &[],
-            cwd,
+        match pm.create_pane(crate::ui::pane_manager::PaneCreateRequest {
+            name: agent_cmd.to_string(),
+            command: agent_cmd,
+            args: &[],
+            working_dir: cwd,
             size,
-            state.active_project_index,
-            None,
-            None,
-            Some(&session_id),
-            Some(match platform {
+            project_index: state.active_project_index,
+            impulse_home: None,
+            scrollback_lines: None,
+            session_id: Some(&session_id),
+            platform: Some(match platform {
                 Platform::ClaudeCode => "Claude Code",
                 Platform::Codex => "Codex",
                 Platform::OpenCode => "OpenCode",
             }),
-        ) {
+        }) {
             Ok(pane_id) => {
                 // Also create UI terminal tab for display
                 let tab_name = format!("{}-{}", agent_cmd, pane_id);

@@ -2,7 +2,7 @@
 //!
 //! Provides `TuiApp` — a ratatui-based terminal UI with panel layout,
 //! keybindings, session overview, file tracking, and daemon status display.
-//! Primary interactive surface for CLI users without the egui workbench.
+//! Primary interactive surface for CLI users outside the desktop host.
 
 use std::path::PathBuf;
 use std::time::Duration;

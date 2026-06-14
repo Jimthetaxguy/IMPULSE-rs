@@ -140,6 +140,27 @@ pub struct CompactionEvent {
     pub is_automatic: bool,
 }
 
+/// Input for recording a compaction event before derived metrics are computed.
+#[derive(Debug, Clone)]
+pub struct CompactionRecord {
+    /// Platform where compaction occurred
+    pub platform: Platform,
+    /// Session identifier
+    pub session_id: String,
+    /// Timestamp when compaction started
+    pub started_at: DateTime<Utc>,
+    /// Timestamp when compaction completed
+    pub completed_at: DateTime<Utc>,
+    /// Token count before compaction
+    pub tokens_before: u32,
+    /// Token count after compaction
+    pub tokens_after: u32,
+    /// Type of compaction performed
+    pub compaction_type: CompactionType,
+    /// Whether this was triggered automatically or manually
+    pub is_automatic: bool,
+}
+
 /// Type of compaction performed
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

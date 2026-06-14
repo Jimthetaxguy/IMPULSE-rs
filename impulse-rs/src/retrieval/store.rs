@@ -11,6 +11,29 @@ pub struct RetrievalStore {
     db_path: PathBuf,
 }
 
+pub struct HistoryUpsert<'a> {
+    pub session_id: &'a str,
+    pub session_name: &'a str,
+    pub platform: Option<&'a str>,
+    pub started_at: &'a str,
+    pub ended_at: &'a str,
+    pub summary: &'a str,
+    pub files_touched_json: &'a str,
+    pub tools_used_json: &'a str,
+    pub search_text: &'a str,
+    pub content_hash: &'a str,
+}
+
+pub struct GenomeUpsert<'a> {
+    pub decision_id: &'a str,
+    pub date: &'a str,
+    pub description: &'a str,
+    pub rationale: Option<&'a str>,
+    pub tags_json: &'a str,
+    pub search_text: &'a str,
+    pub content_hash: &'a str,
+}
+
 impl RetrievalStore {
     pub fn open(base_path: &Path) -> Result<Self> {
         std::fs::create_dir_all(base_path).context("Failed to create retrieval store directory")?;
@@ -368,21 +391,7 @@ CREATE TABLE IF NOT EXISTS genome_vec (
         Ok(())
     }
 
-    // TODO(refactor): extract params into struct
-    #[allow(clippy::too_many_arguments)]
-    pub fn upsert_history(
-        &self,
-        session_id: &str,
-        session_name: &str,
-        platform: Option<&str>,
-        started_at: &str,
-        ended_at: &str,
-        summary: &str,
-        files_touched_json: &str,
-        tools_used_json: &str,
-        search_text: &str,
-        content_hash: &str,
-    ) -> Result<()> {
+    pub fn upsert_history(&self, row: HistoryUpsert<'_>) -> Result<()> {
         self.conn
             .execute(
                 r#"
@@ -402,34 +411,23 @@ ON CONFLICT(session_id) DO UPDATE SET
   content_hash=excluded.content_hash
 "#,
                 params![
-                    session_id,
-                    session_name,
-                    platform,
-                    started_at,
-                    ended_at,
-                    summary,
-                    files_touched_json,
-                    tools_used_json,
-                    search_text,
-                    content_hash
+                    row.session_id,
+                    row.session_name,
+                    row.platform,
+                    row.started_at,
+                    row.ended_at,
+                    row.summary,
+                    row.files_touched_json,
+                    row.tools_used_json,
+                    row.search_text,
+                    row.content_hash
                 ],
             )
             .context("Failed to upsert history_entries row")?;
         Ok(())
     }
 
-    // TODO(refactor): extract params into struct
-    #[allow(clippy::too_many_arguments)]
-    pub fn upsert_genome(
-        &self,
-        decision_id: &str,
-        date: &str,
-        description: &str,
-        rationale: Option<&str>,
-        tags_json: &str,
-        search_text: &str,
-        content_hash: &str,
-    ) -> Result<()> {
+    pub fn upsert_genome(&self, row: GenomeUpsert<'_>) -> Result<()> {
         self.conn
             .execute(
                 r#"
@@ -445,13 +443,13 @@ ON CONFLICT(decision_id) DO UPDATE SET
   content_hash=excluded.content_hash
 "#,
                 params![
-                    decision_id,
-                    date,
-                    description,
-                    rationale,
-                    tags_json,
-                    search_text,
-                    content_hash
+                    row.decision_id,
+                    row.date,
+                    row.description,
+                    row.rationale,
+                    row.tags_json,
+                    row.search_text,
+                    row.content_hash
                 ],
             )
             .context("Failed to upsert genome_decisions row")?;
@@ -1052,6 +1050,33 @@ mod tests {
         (tmp, store)
     }
 
+    fn test_history_row<'a>(session_id: &'a str, session_name: &'a str) -> HistoryUpsert<'a> {
+        HistoryUpsert {
+            session_id,
+            session_name,
+            platform: None,
+            started_at: "2026-01-01",
+            ended_at: "2026-01-01",
+            summary: "summary",
+            files_touched_json: "[]",
+            tools_used_json: "[]",
+            search_text: "text",
+            content_hash: "",
+        }
+    }
+
+    fn test_genome_row<'a>(decision_id: &'a str, description: &'a str) -> GenomeUpsert<'a> {
+        GenomeUpsert {
+            decision_id,
+            date: "2026-01-01",
+            description,
+            rationale: None,
+            tags_json: "[]",
+            search_text: "text",
+            content_hash: "",
+        }
+    }
+
     #[test]
     fn test_open_and_init_schema() {
         let (_tmp, store) = open_test_store();
@@ -1072,18 +1097,15 @@ mod tests {
     fn test_upsert_and_get_history() {
         let (_tmp, store) = open_test_store();
         store
-            .upsert_history(
-                "s1",
-                "Session One",
-                Some("claude"),
-                "2026-01-01T00:00:00Z",
-                "2026-01-01T01:00:00Z",
-                "built retrieval",
-                "[]",
-                "[]",
-                "session one built retrieval",
-                "hash1",
-            )
+            .upsert_history(HistoryUpsert {
+                platform: Some("claude"),
+                started_at: "2026-01-01T00:00:00Z",
+                ended_at: "2026-01-01T01:00:00Z",
+                summary: "built retrieval",
+                search_text: "session one built retrieval",
+                content_hash: "hash1",
+                ..test_history_row("s1", "Session One")
+            })
             .unwrap();
 
         let result = store.get_history_by_id("s1").unwrap();
@@ -1097,15 +1119,13 @@ mod tests {
     fn test_upsert_and_get_genome() {
         let (_tmp, store) = open_test_store();
         store
-            .upsert_genome(
-                "d1",
-                "2026-01-01",
-                "Use Rust for CLI",
-                Some("performance and safety"),
-                "[\"arch\"]",
-                "use rust cli performance",
-                "ghash1",
-            )
+            .upsert_genome(GenomeUpsert {
+                rationale: Some("performance and safety"),
+                tags_json: "[\"arch\"]",
+                search_text: "use rust cli performance",
+                content_hash: "ghash1",
+                ..test_genome_row("d1", "Use Rust for CLI")
+            })
             .unwrap();
 
         let result = store.get_genome_by_id("d1").unwrap();
@@ -1119,18 +1139,10 @@ mod tests {
     fn test_content_hash_tracking() {
         let (_tmp, store) = open_test_store();
         store
-            .upsert_history(
-                "s1",
-                "Sess",
-                None,
-                "2026-01-01",
-                "2026-01-01",
-                "summary",
-                "[]",
-                "[]",
-                "text",
-                "abc123",
-            )
+            .upsert_history(HistoryUpsert {
+                content_hash: "abc123",
+                ..test_history_row("s1", "Sess")
+            })
             .unwrap();
 
         let hash = store.get_history_hash("s1").unwrap();
@@ -1144,19 +1156,16 @@ mod tests {
     fn test_search_history_keyword() {
         let (_tmp, store) = open_test_store();
         for i in 0..3 {
+            let session_id = format!("s{}", i);
+            let session_name = format!("Session {}", i);
+            let summary = format!("summary {}", i);
+            let search_text = format!("retrieval testing session {}", i);
             store
-                .upsert_history(
-                    &format!("s{}", i),
-                    &format!("Session {}", i),
-                    None,
-                    "2026-01-01",
-                    "2026-01-01",
-                    &format!("summary {}", i),
-                    "[]",
-                    "[]",
-                    &format!("retrieval testing session {}", i),
-                    "",
-                )
+                .upsert_history(HistoryUpsert {
+                    summary: &summary,
+                    search_text: &search_text,
+                    ..test_history_row(&session_id, &session_name)
+                })
                 .unwrap();
         }
         store.refresh_fts().unwrap();
@@ -1170,26 +1179,17 @@ mod tests {
     fn test_search_genome_keyword() {
         let (_tmp, store) = open_test_store();
         store
-            .upsert_genome(
-                "d1",
-                "2026-01-01",
-                "Use Rust",
-                None,
-                "[]",
-                "rust performance safety",
-                "",
-            )
+            .upsert_genome(GenomeUpsert {
+                search_text: "rust performance safety",
+                ..test_genome_row("d1", "Use Rust")
+            })
             .unwrap();
         store
-            .upsert_genome(
-                "d2",
-                "2026-01-02",
-                "Use SQLite",
-                None,
-                "[]",
-                "sqlite embedded database",
-                "",
-            )
+            .upsert_genome(GenomeUpsert {
+                date: "2026-01-02",
+                search_text: "sqlite embedded database",
+                ..test_genome_row("d2", "Use SQLite")
+            })
             .unwrap();
         store.refresh_fts().unwrap();
 
@@ -1212,10 +1212,16 @@ mod tests {
     fn test_clear_all() {
         let (_tmp, store) = open_test_store();
         store
-            .upsert_history("s1", "Sess", None, "d", "d", "sum", "[]", "[]", "text", "")
+            .upsert_history(HistoryUpsert {
+                summary: "sum",
+                ..test_history_row("s1", "Sess")
+            })
             .unwrap();
         store
-            .upsert_genome("d1", "d", "desc", None, "[]", "text", "")
+            .upsert_genome(GenomeUpsert {
+                date: "d",
+                ..test_genome_row("d1", "desc")
+            })
             .unwrap();
 
         store.clear_all().unwrap();
@@ -1228,19 +1234,12 @@ mod tests {
     fn test_delete_history_except() {
         let (_tmp, store) = open_test_store();
         for i in 0..3 {
+            let session_id = format!("s{}", i);
             store
-                .upsert_history(
-                    &format!("s{}", i),
-                    "Sess",
-                    None,
-                    "d",
-                    "d",
-                    "sum",
-                    "[]",
-                    "[]",
-                    "text",
-                    "",
-                )
+                .upsert_history(HistoryUpsert {
+                    summary: "sum",
+                    ..test_history_row(&session_id, "Sess")
+                })
                 .unwrap();
         }
 
@@ -1256,18 +1255,11 @@ mod tests {
     fn test_refresh_fts() {
         let (_tmp, store) = open_test_store();
         store
-            .upsert_history(
-                "s1",
-                "Sess",
-                None,
-                "d",
-                "d",
-                "sum",
-                "[]",
-                "[]",
-                "unique_keyword_xyz",
-                "",
-            )
+            .upsert_history(HistoryUpsert {
+                summary: "sum",
+                search_text: "unique_keyword_xyz",
+                ..test_history_row("s1", "Sess")
+            })
             .unwrap();
 
         // Before refresh, FTS should be empty
@@ -1290,7 +1282,10 @@ mod tests {
         for i in 0..3 {
             let sid = format!("s{}", i);
             store
-                .upsert_history(&sid, "Sess", None, "d", "d", "sum", "[]", "[]", "text", "")
+                .upsert_history(HistoryUpsert {
+                    summary: "sum",
+                    ..test_history_row(&sid, "Sess")
+                })
                 .unwrap();
             store
                 .upsert_history_vector(&sid, "[1.0, 2.0, 3.0]")
@@ -1315,9 +1310,7 @@ mod tests {
         let (_tmp, store) = open_test_store();
         for i in 0..3 {
             let did = format!("d{}", i);
-            store
-                .upsert_genome(&did, "2026-01-01", "desc", None, "[]", "text", "")
-                .unwrap();
+            store.upsert_genome(test_genome_row(&did, "desc")).unwrap();
             store.upsert_genome_vector(&did, "[1.0, 2.0, 3.0]").unwrap();
         }
 
@@ -1338,7 +1331,10 @@ mod tests {
         for i in 0..3 {
             let sid = format!("s{}", i);
             store
-                .upsert_history(&sid, "Sess", None, "d", "d", "sum", "[]", "[]", "text", "")
+                .upsert_history(HistoryUpsert {
+                    summary: "sum",
+                    ..test_history_row(&sid, "Sess")
+                })
                 .unwrap();
             store.upsert_history_vector(&sid, "[1.0, 2.0]").unwrap();
         }
@@ -1357,11 +1353,17 @@ mod tests {
     fn test_clear_all_multi_table_consistency() {
         let (_tmp, store) = open_test_store();
         store
-            .upsert_history("s1", "Sess", None, "d", "d", "sum", "[]", "[]", "text", "")
+            .upsert_history(HistoryUpsert {
+                summary: "sum",
+                ..test_history_row("s1", "Sess")
+            })
             .unwrap();
         store.upsert_history_vector("s1", "[1.0]").unwrap();
         store
-            .upsert_genome("d1", "d", "desc", None, "[]", "text", "")
+            .upsert_genome(GenomeUpsert {
+                date: "d",
+                ..test_genome_row("d1", "desc")
+            })
             .unwrap();
         store.upsert_genome_vector("d1", "[1.0]").unwrap();
         store.refresh_fts().unwrap();
@@ -1383,21 +1385,18 @@ mod tests {
     fn test_refresh_fts_atomic_both_tables() {
         let (_tmp, store) = open_test_store();
         store
-            .upsert_history(
-                "s1",
-                "Sess",
-                None,
-                "d",
-                "d",
-                "sum",
-                "[]",
-                "[]",
-                "history_kw",
-                "",
-            )
+            .upsert_history(HistoryUpsert {
+                summary: "sum",
+                search_text: "history_kw",
+                ..test_history_row("s1", "Sess")
+            })
             .unwrap();
         store
-            .upsert_genome("d1", "d", "desc", None, "[]", "genome_kw", "")
+            .upsert_genome(GenomeUpsert {
+                date: "d",
+                search_text: "genome_kw",
+                ..test_genome_row("d1", "desc")
+            })
             .unwrap();
 
         store.refresh_fts().unwrap();
@@ -1473,18 +1472,15 @@ mod tests {
 
         // First insert some data outside the transaction
         store
-            .upsert_history(
-                "before-tx",
-                "Before TX",
-                Some("test"),
-                "2026-01-01T00:00:00Z",
-                "2026-01-01T01:00:00Z",
-                "before",
-                "[]",
-                "[]",
-                "before search",
-                "beforehash",
-            )
+            .upsert_history(HistoryUpsert {
+                platform: Some("test"),
+                started_at: "2026-01-01T00:00:00Z",
+                ended_at: "2026-01-01T01:00:00Z",
+                summary: "before",
+                search_text: "before search",
+                content_hash: "beforehash",
+                ..test_history_row("before-tx", "Before TX")
+            })
             .unwrap();
 
         let result: Result<(), anyhow::Error> = store.with_transaction(|tx| {

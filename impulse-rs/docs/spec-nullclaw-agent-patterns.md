@@ -3,7 +3,7 @@
 > **Date:** 2026-03-02
 > **Status:** Draft
 > **Type:** Impulse-only architectural spec
-> **Source:** [`nullclaw-deep-analysis.md`](~/Documents/Research/AI_ML_Agents/Frameworks/nullclaw-deep-analysis.md)
+> **Source:** External NullClaw research notes, summarized for this public Impulse spec.
 
 ---
 
@@ -367,7 +367,7 @@ manual vtables — the real gaps are in capability metadata and failure resilien
 
 ## 8. Cross-References
 
-- **NullClaw Analysis:** [`nullclaw-deep-analysis.md`](~/Documents/Research/AI_ML_Agents/Frameworks/nullclaw-deep-analysis.md)
+- **NullClaw Analysis:** External research notes summarized in this spec.
 - **Spec 1 — Retrieval Pipeline:** [`spec-retrieval-pipeline-upgrade.md`](./spec-retrieval-pipeline-upgrade.md) — uses BackendDescriptor for stage routing
 - **Spec 2 — Sandbox Integration:** [`spec-sandbox-integration.md`](./spec-sandbox-integration.md) — vtable comparison informs Sandbox trait design
 - **Spec 3 — CLI Provider:** [`spec-cli-provider-extension.md`](./spec-cli-provider-extension.md) — CliProtocol enables NullClaw-as-panel

@@ -298,8 +298,8 @@ mod tests {
     #[test]
     fn test_project_hash() {
         assert_eq!(
-            project_hash("/Users/james/projects/my-app"),
-            "Users-james-projects-my-app"
+            project_hash("/workspace/projects/my-app"),
+            "workspace-projects-my-app"
         );
     }
 

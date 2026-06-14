@@ -236,7 +236,18 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
             json,
         } => {
             handlers::memory::handle_search_history(
-                &state, query, mode, backend, limit, offset, page, total, explain, json,
+                &state,
+                handlers::memory::SearchMemoryOptions {
+                    query,
+                    mode,
+                    backend,
+                    limit,
+                    offset,
+                    page,
+                    total,
+                    explain,
+                    json,
+                },
             )
             .context("Failed to handle search-history command")?;
         }
@@ -252,7 +263,18 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
             json,
         } => {
             handlers::memory::handle_search_genome(
-                &state, query, mode, backend, limit, offset, page, total, explain, json,
+                &state,
+                handlers::memory::SearchMemoryOptions {
+                    query,
+                    mode,
+                    backend,
+                    limit,
+                    offset,
+                    page,
+                    total,
+                    explain,
+                    json,
+                },
             )
             .context("Failed to handle search-genome command")?;
         }

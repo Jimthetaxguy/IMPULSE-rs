@@ -3,7 +3,7 @@ name = "impulse-term"
 version = "0.1.0"
 edition = "2021"
 description = "Custom terminal widget for Impulse GUI with context lifecycle integration"
-authors = ["James Pustorino"]
+authors = ["Impulse Maintainers"]
 license = "MIT"
 
 [features]

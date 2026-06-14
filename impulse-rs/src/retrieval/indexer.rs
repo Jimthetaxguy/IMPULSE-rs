@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use crate::memory::{Decision, Genome};
 use crate::retrieval::embedding::embed_texts;
-use crate::retrieval::store::RetrievalStore;
+use crate::retrieval::store::{GenomeUpsert, HistoryUpsert, RetrievalStore};
 use crate::retrieval::types::{IndexScope, IndexState};
 use crate::state::{Config, HistoryEntry, Platform};
 use crate::storage::Storage;
@@ -284,18 +284,18 @@ pub fn index_memory(
                             .context("Failed to serialize tools_used for history entry")?;
                         let search_text = history_search_text(h);
                         store
-                            .upsert_history(
-                                &id,
-                                &h.session_name,
-                                Some(&platform_str(h.platform)),
-                                &h.started_at.to_rfc3339(),
-                                &h.ended_at.to_rfc3339(),
-                                &h.summary,
-                                &files_json,
-                                &tools_json,
-                                &search_text,
-                                &hash,
-                            )
+                            .upsert_history(HistoryUpsert {
+                                session_id: &id,
+                                session_name: &h.session_name,
+                                platform: Some(&platform_str(h.platform)),
+                                started_at: &h.started_at.to_rfc3339(),
+                                ended_at: &h.ended_at.to_rfc3339(),
+                                summary: &h.summary,
+                                files_touched_json: &files_json,
+                                tools_used_json: &tools_json,
+                                search_text: &search_text,
+                                content_hash: &hash,
+                            })
                             .context("Failed to upsert history entry into retrieval store")?;
                     }
 
@@ -343,15 +343,15 @@ pub fn index_memory(
                             .context("Failed to serialize tags for genome decision")?;
                         let search_text = genome_search_text(d);
                         store
-                            .upsert_genome(
-                                &id,
-                                &d.date.to_rfc3339(),
-                                &d.description,
-                                d.rationale.as_deref(),
-                                &tags_json,
-                                &search_text,
-                                &hash,
-                            )
+                            .upsert_genome(GenomeUpsert {
+                                decision_id: &id,
+                                date: &d.date.to_rfc3339(),
+                                description: &d.description,
+                                rationale: d.rationale.as_deref(),
+                                tags_json: &tags_json,
+                                search_text: &search_text,
+                                content_hash: &hash,
+                            })
                             .context("Failed to upsert genome decision into retrieval store")?;
                     }
 
@@ -513,18 +513,18 @@ pub fn index_memory_from_storage(
                                 .context("Failed to serialize tools_used for history entry")?;
                             let search_text = history_search_text(&h);
                             store
-                                .upsert_history(
-                                    &id,
-                                    &h.session_name,
-                                    Some(&platform_str(h.platform)),
-                                    &h.started_at.to_rfc3339(),
-                                    &h.ended_at.to_rfc3339(),
-                                    &h.summary,
-                                    &files_json,
-                                    &tools_json,
-                                    &search_text,
-                                    &hash,
-                                )
+                                .upsert_history(HistoryUpsert {
+                                    session_id: &id,
+                                    session_name: &h.session_name,
+                                    platform: Some(&platform_str(h.platform)),
+                                    started_at: &h.started_at.to_rfc3339(),
+                                    ended_at: &h.ended_at.to_rfc3339(),
+                                    summary: &h.summary,
+                                    files_touched_json: &files_json,
+                                    tools_used_json: &tools_json,
+                                    search_text: &search_text,
+                                    content_hash: &hash,
+                                })
                                 .context("Failed to upsert history entry into retrieval store")?;
                         }
 
@@ -577,15 +577,15 @@ pub fn index_memory_from_storage(
                             .context("Failed to serialize tags for genome decision")?;
                         let search_text = genome_search_text(d);
                         store
-                            .upsert_genome(
-                                &id,
-                                &d.date.to_rfc3339(),
-                                &d.description,
-                                d.rationale.as_deref(),
-                                &tags_json,
-                                &search_text,
-                                &hash,
-                            )
+                            .upsert_genome(GenomeUpsert {
+                                decision_id: &id,
+                                date: &d.date.to_rfc3339(),
+                                description: &d.description,
+                                rationale: d.rationale.as_deref(),
+                                tags_json: &tags_json,
+                                search_text: &search_text,
+                                content_hash: &hash,
+                            })
                             .context("Failed to upsert genome decision into retrieval store")?;
                     }
 

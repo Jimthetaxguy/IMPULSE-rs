@@ -1453,7 +1453,7 @@ mod tests {
 
         // Set an API key
         let ok = state
-            .set_config("impulse_agent_api_key", "sk-test-secret-key-12345")
+            .set_config("impulse_agent_api_key", "test-api-key-not-real-12345")
             .expect("set_config should not error");
         assert!(ok, "setting API key should succeed");
 
@@ -1473,7 +1473,7 @@ mod tests {
             .expect("config_snapshot should work");
         assert_eq!(
             config.impulse_agent_api_key,
-            Some("sk-test-secret-key-12345".to_string()),
+            Some("test-api-key-not-real-12345".to_string()),
             "underlying config should store the actual key"
         );
 
@@ -1496,7 +1496,7 @@ mod tests {
         // Resolve with provider + key + model
         let agent = resolve_from_config(
             Some("anthropic"),
-            Some("sk-test-key-for-resolve"),
+            Some("test-api-key-for-resolve"),
             Some("claude-sonnet-4-6"),
             None,
         );
@@ -1515,7 +1515,8 @@ mod tests {
         }
 
         // Resolve with openai + key, no model (should use default)
-        let agent = resolve_from_config(Some("openai"), Some("sk-openai-test"), None, None);
+        let agent =
+            resolve_from_config(Some("openai"), Some("test-openai-key-not-real"), None, None);
         assert!(agent.is_some());
         let agent = agent.unwrap();
         assert!(agent.is_ready());
@@ -1957,7 +1958,7 @@ mod tests {
             .set_config("impulse_agent_provider", "anthropic")
             .unwrap());
         assert!(state
-            .set_config("impulse_agent_api_key", "sk-test-all-fields")
+            .set_config("impulse_agent_api_key", "test-api-key-all-fields")
             .unwrap());
         assert!(state
             .set_config("impulse_agent_model", "claude-sonnet-4-6")
@@ -2004,7 +2005,7 @@ mod tests {
         assert_eq!(config.impulse_agent_provider, Some("anthropic".to_string()));
         assert_eq!(
             config.impulse_agent_api_key,
-            Some("sk-test-all-fields".to_string())
+            Some("test-api-key-all-fields".to_string())
         );
         assert_eq!(
             config.impulse_agent_model,

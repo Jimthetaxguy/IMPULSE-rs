@@ -4,8 +4,10 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
 description = "Impulse GUI - Native terminal multiplexer for AI coding agents"
-authors = ["James Pustorino"]
+authors = ["Impulse Maintainers"]
 license = "MIT"
+
+[workspace]
 
 [[bin]]
 name = "impulse-gui"
