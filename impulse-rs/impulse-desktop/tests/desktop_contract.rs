@@ -304,11 +304,13 @@ fn test_dioxus_desktop_launch_binary_is_feature_gated() {
     assert!(manifest_text.contains("required-features = [\"desktop-app\"]"));
     assert!(manifest_text.contains("desktop-app = [\"dep:dioxus-desktop\", \"dioxus/desktop\"]"));
     assert!(manifest_text.contains("dioxus-desktop = { version = \"0.6.3\", optional = true }"));
-    assert!(launcher_text
-        .contains("use impulse_desktop::{desktop_host::desktop_config, DesktopShell};"));
+    assert!(launcher_text.contains("use impulse_desktop::desktop_host::desktop_config;"));
     assert!(launcher_text.contains("dioxus::LaunchBuilder::desktop()"));
     assert!(launcher_text.contains(".with_cfg(desktop_config())"));
-    assert!(launcher_text.contains(".launch(DesktopShell);"));
+    // The launcher now assembles the live host context and launches the
+    // bridge-mounting root component instead of the bare shell.
+    assert!(launcher_text.contains("install_live_host_context(LiveHostContext::new("));
+    assert!(launcher_text.contains(".launch(LiveDesktopApp);"));
 }
 
 #[test]
