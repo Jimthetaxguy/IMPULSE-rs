@@ -88,57 +88,80 @@ impl IntentCategory {
     }
 
     /// Rule-based classification from keywords.
+    ///
+    /// Matches the agent's output words against per-category keyword sets with
+    /// first-match-wins precedence. The order encodes priority when a phrase
+    /// could fit several categories — e.g. "add tests" classifies as Testing
+    /// (not Implementing), "fix the docs" as Debugging (not Documenting).
+    /// Precedence: Testing → Debugging → Refactoring → Implementing →
+    /// Documenting → Configuring → Deploying → Analyzing → Unknown.
+    ///
+    /// Matching is substring-based so inflections are covered for free
+    /// ("testing"/"pytest" hit `test`, "failed"/"failure" hit `fail`,
+    /// "dependencies" hits `depend`). Needles are chosen to avoid noisy
+    /// substrings (e.g. `read` is omitted because it also matches
+    /// "thread"/"already"/"ready").
     pub fn from_keywords(keywords: &[&str]) -> Self {
-        let kw_set: Vec<String> = keywords.iter().map(|s| s.to_lowercase()).collect();
+        let kw: Vec<String> = keywords.iter().map(|s| s.to_lowercase()).collect();
+        let any = |needles: &[&str]| {
+            kw.iter()
+                .any(|k| needles.iter().any(|needle| k.contains(needle)))
+        };
 
-        if kw_set.iter().any(|k| k.contains("test")) {
-            return Self::Testing;
+        if any(&["test", "assert", "coverage"]) {
+            Self::Testing
+        } else if any(&[
+            "fix",
+            "bug",
+            "error",
+            "debug",
+            "panic",
+            "fail",
+            "crash",
+            "exception",
+            "trace",
+        ]) {
+            Self::Debugging
+        } else if any(&[
+            "refactor",
+            "restructure",
+            "cleanup",
+            "simplify",
+            "rename",
+            "extract",
+            "optimize",
+            "dedup",
+        ]) {
+            Self::Refactoring
+        } else if any(&["implement", "add", "create", "new", "feature"]) {
+            Self::Implementing
+        } else if any(&["doc", "comment", "readme", "changelog"]) {
+            Self::Documenting
+        } else if any(&[
+            "config", "setup", "env", "install", "depend", "manifest", "package",
+        ]) {
+            Self::Configuring
+        } else if any(&[
+            "deploy", "release", "build", "publish", "docker", "pipeline",
+        ]) {
+            Self::Deploying
+        } else if any(&[
+            "analyze",
+            "review",
+            "understand",
+            "search",
+            "find",
+            "explore",
+            "grep",
+            "inspect",
+            "investigate",
+            "audit",
+            "scan",
+        ]) {
+            Self::Analyzing
+        } else {
+            Self::Unknown
         }
-        if kw_set.iter().any(|k| {
-            k.contains("fix") || k.contains("bug") || k.contains("error") || k.contains("debug")
-        }) {
-            return Self::Debugging;
-        }
-        if kw_set
-            .iter()
-            .any(|k| k.contains("refactor") || k.contains("restructure") || k.contains("cleanup"))
-        {
-            return Self::Refactoring;
-        }
-        if kw_set.iter().any(|k| {
-            k.contains("implement")
-                || k.contains("add")
-                || k.contains("create")
-                || k.contains("new")
-        }) {
-            return Self::Implementing;
-        }
-        if kw_set
-            .iter()
-            .any(|k| k.contains("doc") || k.contains("comment") || k.contains("readme"))
-        {
-            return Self::Documenting;
-        }
-        if kw_set
-            .iter()
-            .any(|k| k.contains("config") || k.contains("setup") || k.contains("env"))
-        {
-            return Self::Configuring;
-        }
-        if kw_set
-            .iter()
-            .any(|k| k.contains("deploy") || k.contains("release") || k.contains("build"))
-        {
-            return Self::Deploying;
-        }
-        if kw_set
-            .iter()
-            .any(|k| k.contains("analyze") || k.contains("review") || k.contains("understand"))
-        {
-            return Self::Analyzing;
-        }
-
-        Self::Unknown
     }
 }
 
@@ -646,6 +669,59 @@ mod tests {
             IntentCategory::from_keywords(&["add", "function"]),
             IntentCategory::Implementing
         );
+    }
+
+    #[test]
+    fn test_from_keywords_expanded_coverage() {
+        // Failure signals classify as Debugging.
+        assert_eq!(
+            IntentCategory::from_keywords(&["thread", "panicked"]),
+            IntentCategory::Debugging
+        );
+        assert_eq!(
+            IntentCategory::from_keywords(&["build", "failed"]),
+            // "failed" (Debugging) takes precedence over "build" (Deploying).
+            IntentCategory::Debugging
+        );
+        // Dependency / environment work classifies as Configuring.
+        assert_eq!(
+            IntentCategory::from_keywords(&["install", "dependencies"]),
+            IntentCategory::Configuring
+        );
+        // Exploration classifies as Analyzing instead of falling to Unknown.
+        assert_eq!(
+            IntentCategory::from_keywords(&["grep", "the", "codebase"]),
+            IntentCategory::Analyzing
+        );
+        assert_eq!(
+            IntentCategory::from_keywords(&["search", "for", "usages"]),
+            IntentCategory::Analyzing
+        );
+        // Performance / cleanup work classifies as Refactoring.
+        assert_eq!(
+            IntentCategory::from_keywords(&["optimize", "the", "loop"]),
+            IntentCategory::Refactoring
+        );
+        // Publishing classifies as Deploying.
+        assert_eq!(
+            IntentCategory::from_keywords(&["publish", "crate"]),
+            IntentCategory::Deploying
+        );
+    }
+
+    #[test]
+    fn test_from_keywords_precedence_and_unknown() {
+        // "add tests" → Testing wins over Implementing (checked first).
+        assert_eq!(
+            IntentCategory::from_keywords(&["add", "tests"]),
+            IntentCategory::Testing
+        );
+        // Genuinely unclassifiable content stays Unknown.
+        assert_eq!(
+            IntentCategory::from_keywords(&["the", "quick", "brown", "fox"]),
+            IntentCategory::Unknown
+        );
+        assert_eq!(IntentCategory::from_keywords(&[]), IntentCategory::Unknown);
     }
 
     #[test]
