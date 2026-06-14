@@ -2,7 +2,7 @@
 //!
 //! The Impulse Agent can operate in two modes:
 //! 1. **API mode**: Direct LLM API calls (Anthropic, OpenAI, Minimax) using an API key
-//! 2. **Harness mode**: Delegates to a CLI harness (Claude Code, OpenCode, Codex) via subprocess
+//! 2. **Harness mode**: Delegates to a CLI harness (Claude Code, OpenCode, Codex, Gemini) via subprocess
 //!
 //! The agent reads context from all panes via the context lifecycle extractor,
 //! detects coordination needs, and generates actionable recommendations.
@@ -90,6 +90,7 @@ pub enum ImpulseHarness {
     ClaudeCode,
     OpenCode,
     Codex,
+    Gemini,
 }
 
 impl ImpulseHarness {
@@ -98,6 +99,7 @@ impl ImpulseHarness {
             "claude-code" | "claude" => Some(Self::ClaudeCode),
             "opencode" | "open-code" => Some(Self::OpenCode),
             "codex" => Some(Self::Codex),
+            "gemini" | "antigravity" => Some(Self::Gemini),
             _ => None,
         }
     }
@@ -107,6 +109,7 @@ impl ImpulseHarness {
             Self::ClaudeCode => "claude-code",
             Self::OpenCode => "opencode",
             Self::Codex => "codex",
+            Self::Gemini => "gemini",
         }
     }
 
@@ -115,6 +118,7 @@ impl ImpulseHarness {
             Self::ClaudeCode => "claude",
             Self::OpenCode => "opencode",
             Self::Codex => "codex",
+            Self::Gemini => "gemini",
         }
     }
 
@@ -126,11 +130,13 @@ impl ImpulseHarness {
     /// - Claude Code: `claude --print "<prompt>"`
     /// - OpenCode:    `opencode run "<prompt>"`
     /// - Codex:       `codex exec "<prompt>"`
+    /// - Gemini:      `gemini -p "<prompt>"`
     pub fn invocation_args(self) -> &'static [&'static str] {
         match self {
             Self::ClaudeCode => &["--print"],
             Self::OpenCode => &["run"],
             Self::Codex => &["exec"],
+            Self::Gemini => &["-p"],
         }
     }
 }
@@ -144,7 +150,7 @@ pub enum AgentMode {
         provider: ImpulseProvider,
         model: Option<String>,
     },
-    /// Delegate to a CLI harness (Claude Code, OpenCode, Codex).
+    /// Delegate to a CLI harness (Claude Code, OpenCode, Codex, Gemini).
     Harness { harness: ImpulseHarness },
     /// Agent is disabled.
     #[default]
@@ -780,6 +786,14 @@ mod tests {
             Some(ImpulseHarness::OpenCode)
         );
         assert_eq!(ImpulseHarness::parse("codex"), Some(ImpulseHarness::Codex));
+        assert_eq!(
+            ImpulseHarness::parse("gemini"),
+            Some(ImpulseHarness::Gemini)
+        );
+        assert_eq!(
+            ImpulseHarness::parse("antigravity"),
+            Some(ImpulseHarness::Gemini)
+        );
         assert_eq!(ImpulseHarness::parse("invalid"), None);
     }
 
@@ -790,9 +804,12 @@ mod tests {
         assert_eq!(ImpulseHarness::ClaudeCode.invocation_args(), &["--print"]);
         assert_eq!(ImpulseHarness::OpenCode.invocation_args(), &["run"]);
         assert_eq!(ImpulseHarness::Codex.invocation_args(), &["exec"]);
+        assert_eq!(ImpulseHarness::Gemini.invocation_args(), &["-p"]);
         // command() returns the binary name for `which` lookups.
         assert_eq!(ImpulseHarness::Codex.command(), "codex");
         assert_eq!(ImpulseHarness::Codex.as_str(), "codex");
+        assert_eq!(ImpulseHarness::Gemini.command(), "gemini");
+        assert_eq!(ImpulseHarness::Gemini.as_str(), "gemini");
     }
 
     #[test]
