@@ -42,6 +42,12 @@ const WEBHOOK_MAX_RETRIES: u32 = 3;
 /// Webhook retry delay in milliseconds
 const WEBHOOK_RETRY_DELAY_MS: u64 = 500;
 
+/// Per-attempt webhook request timeout. Bounds each retry so a hung or slow
+/// webhook endpoint can never block the notification path indefinitely.
+const WEBHOOK_REQUEST_TIMEOUT_SECS: u64 = 15;
+/// Webhook connection-establishment timeout (fail fast when unreachable).
+const WEBHOOK_CONNECT_TIMEOUT_SECS: u64 = 5;
+
 /// Represents an event that can trigger notifications
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -566,9 +572,12 @@ impl Default for WebhookNotifier {
 
 impl WebhookNotifier {
     pub fn new() -> Self {
-        Self {
-            client: reqwest::Client::new(),
-        }
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(WEBHOOK_REQUEST_TIMEOUT_SECS))
+            .connect_timeout(std::time::Duration::from_secs(WEBHOOK_CONNECT_TIMEOUT_SECS))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self { client }
     }
 
     /// Send conflict notification to webhook URL with retry logic

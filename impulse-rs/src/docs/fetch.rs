@@ -8,7 +8,12 @@ use serde::Deserialize;
 
 /// Fetch models from OpenAI API
 pub async fn fetch_openai_models(api_key: &str) -> Result<Vec<ModelInfo>> {
-    let client = Client::new();
+    // Bounded timeouts so a slow/hung provider endpoint can't stall the fetch.
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_else(|_| Client::new());
 
     let response = client
         .get("https://api.openai.com/v1/models")
