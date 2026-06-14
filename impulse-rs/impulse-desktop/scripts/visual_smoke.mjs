@@ -18,6 +18,7 @@ const routes = [
   {
     slug: "terminal",
     active: ".view-terminal.active",
+    fixtureMode: "seeded-live-agent",
     required: '.view-terminal.active [data-xterm-mount="true"]',
     visibleText: "Codex Live",
   },
@@ -95,6 +96,9 @@ async function assertLayout(page, route, viewport) {
   await expectVisible(page, route.active, `${route.slug} active route selector`);
   if (route.required) {
     await expectVisible(page, route.required, `${route.slug} required route selector`);
+  }
+  if (route.forbidden) {
+    await expectAbsent(page, route.forbidden, `${route.slug} forbidden route selector`);
   }
   await expectTextVisible(page, route.visibleText, route.slug);
 
@@ -189,6 +193,13 @@ async function expectVisible(page, selector, label) {
   const box = await locator.boundingBox();
   if (!box || box.width <= 0 || box.height <= 0) {
     throw new Error(`not visible ${label}: ${selector}`);
+  }
+}
+
+async function expectAbsent(page, selector, label) {
+  const count = await page.locator(selector).count();
+  if (count !== 0) {
+    throw new Error(`unexpected ${label}: ${selector} matched ${count} element(s)`);
   }
 }
 

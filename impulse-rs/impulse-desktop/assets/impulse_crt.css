@@ -564,8 +564,32 @@ body {
   opacity: 0.5;
 }
 
+.terminal-empty-state {
+  display: grid;
+  min-height: 180px;
+  align-content: center;
+  gap: 8px;
+  padding: 24px 28px;
+  border-top: 1px solid var(--c-line);
+  color: var(--c-dim);
+}
+
+.terminal-empty-state h3 {
+  margin: 0;
+  color: var(--c-fg);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.terminal-empty-state p {
+  max-width: 520px;
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
 .xterm-mount[data-xterm-state="degraded"]::after {
-  content: "terminal interop degraded - xterm.js / Tauri not detected";
+  content: "terminal interop degraded - xterm.js / host adapter not detected";
   color: var(--p-red);
   font-size: 11px;
 }

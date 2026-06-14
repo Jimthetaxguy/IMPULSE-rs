@@ -5,12 +5,12 @@ use impulse_ops::{AgentRuntime, ProjectOpsSnapshot};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::host_commands::{McpInvokeRequest, RegisterWorkspaceRequest};
 use crate::mcp::{McpInvocation, ReviewDecision, ReviewQueueItem, ReviewQueueStatus};
 use crate::runtime::{
     default_builtin_mcp_tools, AgentPlatformKind, AgentRuntimeSnapshot, AgentSpawnRequest,
     BuiltInMcpTool, WorkspaceTarget,
 };
-use crate::tauri_commands::{McpInvokeRequest, RegisterWorkspaceRequest};
 use crate::theme::{format_count, status_dot_class, status_label, usage_meter_pct};
 use crate::views::{ArtifactsView, DesktopView, MemoryView, ShellIntent};
 use crate::workspace::WorkspaceEntry;
@@ -24,7 +24,25 @@ pub fn terminal_asset_paths() -> &'static [&'static str] {
     &[XTERM_CSS_PATH, XTERM_JS_PATH, XTERM_FIT_JS_PATH]
 }
 
-const DESKTOP_EVENT_BRIDGE_SCRIPT: &str = r#"
+macro_rules! impulse_host_adapter_resolution_script {
+    () => {
+        r#"
+  const resolveImpulseHostAdapter = () => {
+    const dioxusHost = window.__IMPULSE_DESKTOP_HOST;
+    const legacyTauri = window.__TAURI__;
+    return {
+      invoke: dioxusHost?.invoke || legacyTauri?.core?.invoke,
+      listen: dioxusHost?.listen || legacyTauri?.event?.listen,
+      hostKind: dioxusHost ? "dioxus" : legacyTauri ? "legacy-tauri" : "missing",
+    };
+  };
+  const { invoke, listen, hostKind } = resolveImpulseHostAdapter();
+"#
+    };
+}
+
+const DESKTOP_EVENT_BRIDGE_SCRIPT: &str = concat!(
+    r#"
 (async () => {
   const existing = window.__impulseOpsBridge;
   if (existing?.unlisten?.length) {
@@ -33,16 +51,17 @@ const DESKTOP_EVENT_BRIDGE_SCRIPT: &str = r#"
     }
   }
 
-  const tauri = window.__TAURI__;
-  const invoke = tauri?.core?.invoke;
-  const listen = tauri?.event?.listen;
-
+"#,
+    impulse_host_adapter_resolution_script!(),
+    r#"
   window.__impulseOpsBridge = {
     mounted: true,
     degraded: !listen,
+    hostKind,
     unlisten: [],
   };
-  document.documentElement.setAttribute(
+  document.documentElement?.setAttribute("data-impulse-host-kind", hostKind);
+  document.documentElement?.setAttribute(
     "data-impulse-ops-bridge",
     listen ? "mounted" : "degraded"
   );
@@ -54,10 +73,16 @@ const DESKTOP_EVENT_BRIDGE_SCRIPT: &str = r#"
       console.warn("impulse ops bridge send failed", error);
     }
   };
+  const markEventBridgeDegraded = (reason) => {
+    window.__impulseOpsBridge.degraded = true;
+    document.documentElement?.setAttribute("data-impulse-ops-bridge", "degraded");
+    document.documentElement?.setAttribute("data-impulse-ops-bridge-reason", reason);
+    forward("bridge_status", { status: "degraded", reason });
+  };
 
   const refreshReviewQueue = async () => {
     if (!invoke) {
-      forward("bridge_status", { status: "review_queue_failed", reason: "tauri invoke API unavailable" });
+      forward("bridge_status", { status: "review_queue_failed", reason: "host invoke API unavailable" });
       return [];
     }
     try {
@@ -71,7 +96,7 @@ const DESKTOP_EVENT_BRIDGE_SCRIPT: &str = r#"
   };
   const refreshAgents = async () => {
     if (!invoke) {
-      forward("bridge_status", { status: "agent_snapshot_failed", reason: "tauri invoke API unavailable" });
+      forward("bridge_status", { status: "agent_snapshot_failed", reason: "host invoke API unavailable" });
       return [];
     }
     try {
@@ -85,7 +110,7 @@ const DESKTOP_EVENT_BRIDGE_SCRIPT: &str = r#"
   };
   const refreshWorkspaces = async () => {
     if (!invoke) {
-      forward("bridge_status", { status: "workspaces_failed", reason: "tauri invoke API unavailable" });
+      forward("bridge_status", { status: "workspaces_failed", reason: "host invoke API unavailable" });
       return [];
     }
     try {
@@ -99,7 +124,7 @@ const DESKTOP_EVENT_BRIDGE_SCRIPT: &str = r#"
   };
   const refreshMcpDescriptors = async () => {
     if (!invoke) {
-      forward("bridge_status", { status: "mcp_descriptors_failed", reason: "tauri invoke API unavailable" });
+      forward("bridge_status", { status: "mcp_descriptors_failed", reason: "host invoke API unavailable" });
       return [];
     }
     try {
@@ -118,7 +143,7 @@ const DESKTOP_EVENT_BRIDGE_SCRIPT: &str = r#"
   window.__impulseOpsBridge.refreshReviewQueue = refreshReviewQueue;
   window.__impulseOpsBridge.registerWorkspace = async (request) => {
     if (!invoke) {
-      forward("bridge_status", { status: "register_workspace_failed", reason: "tauri invoke API unavailable" });
+      forward("bridge_status", { status: "register_workspace_failed", reason: "host invoke API unavailable" });
       return null;
     }
     try {
@@ -137,7 +162,7 @@ const DESKTOP_EVENT_BRIDGE_SCRIPT: &str = r#"
   };
   window.__impulseOpsBridge.invokeMcp = async (request) => {
     if (!invoke) {
-      forward("bridge_status", { status: "mcp_invoke_failed", reason: "tauri invoke API unavailable" });
+      forward("bridge_status", { status: "mcp_invoke_failed", reason: "host invoke API unavailable" });
       return null;
     }
     try {
@@ -157,7 +182,7 @@ const DESKTOP_EVENT_BRIDGE_SCRIPT: &str = r#"
   };
   window.__impulseOpsBridge.focusAgent = async (agentId) => {
     if (!invoke) {
-      forward("bridge_status", { status: "agent_focus_failed", reason: "tauri invoke API unavailable" });
+      forward("bridge_status", { status: "agent_focus_failed", reason: "host invoke API unavailable" });
       return null;
     }
     try {
@@ -176,7 +201,7 @@ const DESKTOP_EVENT_BRIDGE_SCRIPT: &str = r#"
   };
   window.__impulseOpsBridge.reviewDecision = async (request) => {
     if (!invoke) {
-      forward("bridge_status", { status: "review_decision_failed", reason: "tauri invoke API unavailable" });
+      forward("bridge_status", { status: "review_decision_failed", reason: "host invoke API unavailable" });
       return null;
     }
     const commandRequest = { ...request, confirmed: true };
@@ -196,7 +221,7 @@ const DESKTOP_EVENT_BRIDGE_SCRIPT: &str = r#"
   };
 
   if (!listen) {
-    forward("bridge_status", { status: "degraded", reason: "tauri event API unavailable" });
+    markEventBridgeDegraded("host event API unavailable");
     await new Promise(() => {});
   }
 
@@ -208,22 +233,24 @@ const DESKTOP_EVENT_BRIDGE_SCRIPT: &str = r#"
   });
   window.__impulseOpsBridge.unlisten = [opsUnlisten, runtimeUnlisten];
 
-    if (invoke) {
-      await refreshAgents();
-      await refreshWorkspaces();
-      await refreshMcpDescriptors();
-      await refreshReviewQueue();
-    }
+  if (invoke) {
+    await refreshAgents();
+    await refreshWorkspaces();
+    await refreshMcpDescriptors();
+    await refreshReviewQueue();
+  }
 
   await new Promise(() => {});
 })();
-"#;
+"#
+);
 
-const TERMINAL_INTEROP_SCRIPT: &str = r#"
+const TERMINAL_INTEROP_SCRIPT: &str = concat!(
+    r#"
 (() => {
-  const tauri = window.__TAURI__;
-  const invoke = tauri?.core?.invoke;
-  const listen = tauri?.event?.listen;
+"#,
+    impulse_host_adapter_resolution_script!(),
+    r#"
   const Terminal = window.Terminal || window.XTerm?.Terminal;
   const FitAddonCtor = window.FitAddon?.FitAddon || window.FitAddon;
   const mounts = Array.from(document.querySelectorAll("[data-xterm-mount='true']"));
@@ -236,7 +263,9 @@ const TERMINAL_INTEROP_SCRIPT: &str = r#"
   };
   interop.mounted = true;
   interop.degraded = !invoke || !listen || !Terminal;
+  interop.hostKind = hostKind;
   window.__impulseTerminalInterop = interop;
+  document.documentElement?.setAttribute("data-impulse-host-kind", hostKind);
 
   if (!invoke || !listen || !Terminal) {
     mounts.forEach((mount) => mount.setAttribute("data-xterm-state", "degraded"));
@@ -311,7 +340,8 @@ const TERMINAL_INTEROP_SCRIPT: &str = r#"
 
   return "mounted";
 })();
-"#;
+"#
+);
 
 pub fn terminal_interop_script() -> &'static str {
     TERMINAL_INTEROP_SCRIPT
@@ -872,7 +902,7 @@ pub fn review_decision_bridge_script(request: &ReviewDecisionUiRequest) -> Strin
 
 /// First-class review queue surface. It shows staged payloads and exposes
 /// apply/skip events to the parent shell, which will route them through the
-/// Tauri/MCP decision path in the live app.
+/// host MCP decision path in the live app.
 #[component]
 fn ReviewConsole(
     items: Vec<ReviewQueueItem>,
@@ -1519,9 +1549,7 @@ pub fn DesktopShellWithSnapshot(
                                     }
                                 }
                             } else {
-                                button { class: "terminal-tab active", "codex" }
-                                button { class: "terminal-tab", "claude" }
-                                button { class: "terminal-tab", "shell" }
+                                button { class: "terminal-tab active", "No agent" }
                             }
                         }
                         if has_runtime_agents {
@@ -1544,24 +1572,9 @@ pub fn DesktopShellWithSnapshot(
                                 }
                             }
                         } else {
-                            div {
-                                id: "terminal-pane-primary",
-                                class: "xterm-mount",
-                                "data-xterm-mount": "true",
-                                "data-agent-id": "shell",
-                                "data-pty-owner": "rust-backend",
-                                "data-command-bus": "agent_write",
-                                "xterm.js terminal mount"
-                            }
-                            div {
-                                id: "terminal-pane-codex",
-                                class: "xterm-mount pending",
-                                "data-xterm-mount": "true",
-                                "data-agent-id": "codex",
-                                "data-platform": "codex",
-                                "data-pty-owner": "rust-backend",
-                                "data-xterm-on-data": "agent_write",
-                                "data-xterm-on-resize": "agent_resize",
+                            div { class: "terminal-empty-state", "data-terminal-state": "empty",
+                                h3 { "No terminal session" }
+                                p { "Launch an agent from the workspace panel to attach a Rust-backed xterm pane." }
                             }
                         }
                     }

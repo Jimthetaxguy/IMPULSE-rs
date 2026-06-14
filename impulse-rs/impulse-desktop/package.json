@@ -6,7 +6,10 @@
     "vendor:xterm": "node scripts/vendor_xterm_assets.mjs",
     "visual:fixtures": "cargo run -p impulse-desktop --example render_visual_fixtures -- ../../output/playwright/impulse-desktop-visual",
     "visual:install": "playwright install chromium",
-    "visual:smoke": "npm run vendor:xterm && npm run visual:fixtures && node scripts/visual_smoke.mjs ../../output/playwright/impulse-desktop-visual ../../output/playwright/impulse-desktop-visual"
+    "visual:smoke": "npm run vendor:xterm && npm run visual:fixtures && node scripts/visual_smoke.mjs ../../output/playwright/impulse-desktop-visual ../../output/playwright/impulse-desktop-visual",
+    "host:smoke": "npm run dioxus:host:smoke",
+    "dioxus:host:smoke": "npm run vendor:xterm && node scripts/host_readiness_smoke.mjs ../../output/playwright/impulse-desktop-dioxus-host-smoke dioxus",
+    "legacy:host:smoke": "npm run vendor:xterm && node scripts/host_readiness_smoke.mjs ../../output/playwright/impulse-desktop-legacy-host-smoke legacy-tauri"
   },
   "devDependencies": {
     "@xterm/addon-fit": "0.11.0",

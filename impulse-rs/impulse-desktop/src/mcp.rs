@@ -4,8 +4,8 @@
 //! built-in tools (descriptors via `crate::runtime::default_builtin_mcp_tools`)
 //! and the same names are *executable* here. The tool bodies are first-class
 //! Rust: there is no separate rmcp transport, no JSON-RPC daemon, and no
-//! child-process indirection for the built-ins. The Tauri command surface
-//! (see `crate::tauri_commands::mcp_invoke`) calls directly into this module,
+//! child-process indirection for the built-ins. The host command surface
+//! (see `crate::host_commands::mcp_invoke`) calls directly into this module,
 //! and the Dioxus UI renders the same descriptors and audit trail.
 //!
 //! Design contract (do not break without ADR):
@@ -13,14 +13,14 @@
 //!   must declare `requires_confirmation: true` in its descriptor AND require
 //!   the caller to pass `confirmed: true` at invocation time.
 //! - Tool results are `serde_json::Value` so Dioxus can render them directly
-//!   and Tauri can serialize them over the IPC boundary without a custom
+//!   and the desktop host can serialize them over the bridge boundary without a custom
 //!   transport.
 //! - The registry keeps an append-only audit log keyed by agent_id so the
 //!   supervisor can review what each terminal-bound agent did.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -335,10 +335,7 @@ impl McpToolRegistry {
                 Some(error)
             }
         };
-        self.audit
-            .lock()
-            .expect("mcp audit mutex poisoned")
-            .push(invocation.clone());
+        self.lock_audit().push(invocation.clone());
         if !invocation.ok {
             return Err(error.unwrap_or_else(|| McpError::Tool {
                 tool: name.to_string(),
@@ -349,13 +346,11 @@ impl McpToolRegistry {
     }
 
     pub fn audit_log(&self) -> Vec<McpInvocation> {
-        self.audit.lock().expect("mcp audit mutex poisoned").clone()
+        self.lock_audit().clone()
     }
 
     pub fn audit_for(&self, agent_id: &str) -> Vec<McpInvocation> {
-        self.audit
-            .lock()
-            .expect("mcp audit mutex poisoned")
+        self.lock_audit()
             .iter()
             .filter(|invocation| invocation.caller_agent_id.as_deref() == Some(agent_id))
             .cloned()
@@ -363,7 +358,13 @@ impl McpToolRegistry {
     }
 
     pub fn clear_audit(&self) {
-        self.audit.lock().expect("mcp audit mutex poisoned").clear();
+        self.lock_audit().clear();
+    }
+
+    fn lock_audit(&self) -> MutexGuard<'_, Vec<McpInvocation>> {
+        self.audit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 

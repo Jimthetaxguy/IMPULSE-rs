@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -148,21 +148,23 @@ pub struct InMemoryTerminalBridge {
 
 impl InMemoryTerminalBridge {
     pub fn write_count(&self, session_id: &str) -> usize {
-        self.sessions
-            .lock()
-            .expect("terminal test mutex poisoned")
+        self.lock_sessions()
             .get(session_id)
             .map(|record| record.writes.len())
             .unwrap_or_default()
     }
 
     pub fn is_focused(&self, session_id: &str) -> bool {
-        self.sessions
-            .lock()
-            .expect("terminal test mutex poisoned")
+        self.lock_sessions()
             .get(session_id)
             .map(|record| record.focused)
             .unwrap_or_default()
+    }
+
+    fn lock_sessions(&self) -> MutexGuard<'_, HashMap<String, TerminalRecord>> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -180,22 +182,19 @@ impl TerminalBridge for InMemoryTerminalBridge {
             rows: request.rows,
             cols: request.cols,
         };
-        self.sessions
-            .lock()
-            .expect("terminal mutex poisoned")
-            .insert(
-                session_id,
-                TerminalRecord {
-                    response: response.clone(),
-                    writes: Vec::new(),
-                    focused: false,
-                },
-            );
+        self.lock_sessions().insert(
+            session_id,
+            TerminalRecord {
+                response: response.clone(),
+                writes: Vec::new(),
+                focused: false,
+            },
+        );
         Ok(response)
     }
 
     fn write(&self, request: TerminalWriteRequest) -> Result<(), DesktopBridgeError> {
-        let mut sessions = self.sessions.lock().expect("terminal mutex poisoned");
+        let mut sessions = self.lock_sessions();
         let record = sessions.get_mut(&request.session_id).ok_or_else(|| {
             DesktopBridgeError::MissingTerminalSession {
                 session_id: request.session_id.clone(),
@@ -206,7 +205,7 @@ impl TerminalBridge for InMemoryTerminalBridge {
     }
 
     fn resize(&self, request: TerminalResizeRequest) -> Result<(), DesktopBridgeError> {
-        let mut sessions = self.sessions.lock().expect("terminal mutex poisoned");
+        let mut sessions = self.lock_sessions();
         let record = sessions.get_mut(&request.session_id).ok_or_else(|| {
             DesktopBridgeError::MissingTerminalSession {
                 session_id: request.session_id.clone(),
@@ -218,7 +217,7 @@ impl TerminalBridge for InMemoryTerminalBridge {
     }
 
     fn close(&self, request: TerminalCloseRequest) -> Result<(), DesktopBridgeError> {
-        let mut sessions = self.sessions.lock().expect("terminal mutex poisoned");
+        let mut sessions = self.lock_sessions();
         sessions.remove(&request.session_id).map(|_| ()).ok_or(
             DesktopBridgeError::MissingTerminalSession {
                 session_id: request.session_id,
@@ -227,7 +226,7 @@ impl TerminalBridge for InMemoryTerminalBridge {
     }
 
     fn focus(&self, request: TerminalFocusRequest) -> Result<(), DesktopBridgeError> {
-        let mut sessions = self.sessions.lock().expect("terminal mutex poisoned");
+        let mut sessions = self.lock_sessions();
         for record in sessions.values_mut() {
             record.focused = false;
         }

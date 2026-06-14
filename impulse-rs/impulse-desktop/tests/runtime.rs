@@ -64,6 +64,41 @@ fn shell_spawn(agent_id: &str, script: &str) -> AgentSpawnRequest {
 }
 
 #[test]
+fn test_desktop_event_names_are_advertised_by_host_manifest() {
+    let runtime = DesktopRuntime::default();
+    let snapshot = runtime
+        .spawn_agent(shell_spawn("event-name-agent", "true"))
+        .expect("spawn event-name agent");
+
+    let events = [
+        DesktopEvent::TerminalOutput {
+            agent_id: "event-name-agent".to_string(),
+            data: b"ok".to_vec(),
+        },
+        DesktopEvent::TerminalExit {
+            agent_id: "event-name-agent".to_string(),
+        },
+        DesktopEvent::AgentRuntimeUpdate {
+            snapshot: Box::new(snapshot),
+        },
+        DesktopEvent::OpsUpdate { payload: json!({}) },
+        DesktopEvent::SupervisorLocalAction {
+            action: LocalSupervisorAction::FocusAgent {
+                agent_id: "event-name-agent".to_string(),
+            },
+        },
+    ];
+
+    for event in events {
+        assert!(
+            DesktopEvent::HOST_EVENT_NAMES.contains(&event.name()),
+            "host manifest missing runtime event {}",
+            event.name()
+        );
+    }
+}
+
+#[test]
 fn test_desktop_runtime_spawns_shell_and_emits_terminal_output() {
     let sink = Arc::new(RecordingSink::default());
     let runtime = DesktopRuntime::builder()
@@ -147,7 +182,7 @@ fn test_terminal_harness_spawn_request_binds_workspace_and_default_tools() {
     let request = AgentSpawnRequest::terminal_harness(
         "codex-harness",
         AgentPlatformKind::Codex,
-        "/Users/jamespustorino/code",
+        "/workspace",
         32,
         100,
     );
@@ -156,13 +191,13 @@ fn test_terminal_harness_spawn_request_binds_workspace_and_default_tools() {
     assert_eq!(request.session_id.as_deref(), Some("codex-harness-session"));
     assert_eq!(request.platform, AgentPlatformKind::Codex);
     assert_eq!(request.command, None);
-    assert_eq!(request.cwd.as_deref(), Some("/Users/jamespustorino/code"));
+    assert_eq!(request.cwd.as_deref(), Some("/workspace"));
     assert_eq!(
         request
             .workspace
             .as_ref()
             .map(|workspace| workspace.root.as_str()),
-        Some("/Users/jamespustorino/code")
+        Some("/workspace")
     );
     assert!(request
         .mcp_tools

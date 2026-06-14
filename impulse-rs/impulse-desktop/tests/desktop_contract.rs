@@ -116,9 +116,9 @@ fn runtime_snapshot(agent_id: &str) -> AgentRuntimeSnapshot {
         platform: AgentPlatformKind::Codex,
         command: "codex".to_string(),
         args: Vec::new(),
-        cwd: Some("/Users/jamespustorino/code/IMPULSE-rs".to_string()),
+        cwd: Some("<repo>".to_string()),
         workspace: Some(WorkspaceTarget {
-            root: "/Users/jamespustorino/code/IMPULSE-rs".to_string(),
+            root: "<repo>".to_string(),
             label: Some("IMPULSE-rs".to_string()),
             purpose: Some("terminal harness".to_string()),
             project_notes: Some("watch Dioxus bridge".to_string()),
@@ -179,10 +179,13 @@ fn test_dioxus_shell_renders_five_panel_layout_without_egui() {
     assert!(html.contains("Register folder"));
     assert!(html.contains("Launch agent"));
     assert!(html.contains("MCP audited"));
-    assert!(html.contains("xterm.js terminal mount"));
-    assert!(html.contains("terminal-pane-codex"));
+    assert!(html.contains("class=\"terminal-empty-state\""));
+    assert!(html.contains("data-terminal-state=\"empty\""));
+    assert!(html.contains("Launch an agent from the workspace panel"));
+    assert!(!html.contains("data-xterm-mount=\"true\""));
+    assert!(!html.contains("terminal-pane-codex"));
     assert!(html.contains("agent_runtime_update stream pending"));
-    assert!(html.contains("data-pty-owner=\"rust-backend\""));
+    assert!(!html.contains("data-pty-owner=\"rust-backend\""));
     assert!(!html.contains("<section class=\"review-console\""));
     assert!(!html.contains("<section class=\"operator-board\""));
     assert!(!html.contains("egui"));
@@ -265,6 +268,65 @@ fn test_xterm_vendor_assets_are_present_and_manifested() {
 }
 
 #[test]
+fn test_host_readiness_smoke_script_is_declared() {
+    let package_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("package.json");
+    let package_text =
+        std::fs::read_to_string(&package_path).expect("impulse-desktop package.json exists");
+    let package: serde_json::Value =
+        serde_json::from_str(&package_text).expect("package.json is valid json");
+
+    assert_eq!(
+        package["scripts"]["host:smoke"],
+        "npm run dioxus:host:smoke"
+    );
+    assert_eq!(
+        package["scripts"]["dioxus:host:smoke"],
+        "npm run vendor:xterm && node scripts/host_readiness_smoke.mjs ../../output/playwright/impulse-desktop-dioxus-host-smoke dioxus"
+    );
+    assert_eq!(
+        package["scripts"]["legacy:host:smoke"],
+        "npm run vendor:xterm && node scripts/host_readiness_smoke.mjs ../../output/playwright/impulse-desktop-legacy-host-smoke legacy-tauri"
+    );
+    assert!(package_text.contains("@xterm/xterm"));
+    assert!(package_text.contains("@xterm/addon-fit"));
+}
+
+#[test]
+fn test_dioxus_desktop_launch_binary_is_feature_gated() {
+    let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let manifest_text =
+        std::fs::read_to_string(&manifest_path).expect("impulse-desktop Cargo.toml exists");
+    let launcher_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/impulse_desktop.rs");
+    let launcher_text =
+        std::fs::read_to_string(&launcher_path).expect("Dioxus desktop launcher exists");
+
+    assert!(manifest_text.contains("name = \"impulse-desktop\""));
+    assert!(manifest_text.contains("required-features = [\"desktop-app\"]"));
+    assert!(manifest_text.contains("desktop-app = [\"dep:dioxus-desktop\", \"dioxus/desktop\"]"));
+    assert!(manifest_text.contains("dioxus-desktop = { version = \"0.6.3\", optional = true }"));
+    assert!(launcher_text
+        .contains("use impulse_desktop::{desktop_host::desktop_config, DesktopShell};"));
+    assert!(launcher_text.contains("dioxus::LaunchBuilder::desktop()"));
+    assert!(launcher_text.contains(".with_cfg(desktop_config())"));
+    assert!(launcher_text.contains(".launch(DesktopShell);"));
+}
+
+#[test]
+fn test_terminal_interop_prefers_dioxus_native_host_adapter() {
+    let script = impulse_desktop::ui::terminal_interop_script();
+
+    assert!(script.contains("resolveImpulseHostAdapter"));
+    assert!(script.contains("window.__IMPULSE_DESKTOP_HOST"));
+    assert!(script.contains("const legacyTauri = window.__TAURI__"));
+    assert!(script.contains("invoke: dioxusHost?.invoke || legacyTauri?.core?.invoke"));
+    assert!(script.contains("listen: dioxusHost?.listen || legacyTauri?.event?.listen"));
+    assert!(script.contains("const { invoke, listen, hostKind } = resolveImpulseHostAdapter();"));
+    assert!(script.contains(r#"hostKind: dioxusHost ? "dioxus""#));
+    assert!(script.contains(r#"legacyTauri ? "legacy-tauri""#));
+    assert!(script.contains("data-impulse-host-kind"));
+}
+
+#[test]
 fn test_retro_shell_binds_project_ops_snapshot() {
     let mut snapshot = ProjectOpsSnapshot {
         generated_at: "2026-06-13T12:00:00Z".to_string(),
@@ -327,9 +389,10 @@ fn test_retro_shell_binds_project_ops_snapshot() {
 }
 
 #[test]
-fn test_desktop_event_bridge_script_subscribes_to_live_tauri_events() {
+fn test_desktop_event_bridge_script_subscribes_to_live_host_events() {
     let script = desktop_event_bridge_script();
 
+    assert!(script.contains("resolveImpulseHostAdapter"));
     assert!(script.contains("dioxus.send"));
     assert!(script.contains(r#"listen("ops_update""#));
     assert!(script.contains(r#"listen("agent_runtime_update""#));
@@ -347,11 +410,98 @@ fn test_desktop_event_bridge_script_subscribes_to_live_tauri_events() {
     assert!(script.contains("confirmed: true"));
     assert!(script.contains("refreshReviewQueue"));
     assert!(script.contains("refreshWorkspaces"));
+    assert!(script.contains("const markEventBridgeDegraded = (reason) =>"));
+    assert!(script.contains(r#"data-impulse-ops-bridge-reason"#));
+    assert!(script.contains(r#"markEventBridgeDegraded("host event API unavailable")"#));
     assert!(script.contains("unlisten"));
 }
 
 #[test]
-fn test_desktop_event_bridge_script_executes_against_mocked_tauri_webview() {
+fn test_desktop_event_bridge_degraded_state_is_explicit() {
+    let Ok(node_version) = Command::new("node").arg("--version").output() else {
+        eprintln!("node is unavailable; skipping degraded JS bridge smoke");
+        return;
+    };
+    if !node_version.status.success() {
+        eprintln!("node is unavailable; skipping degraded JS bridge smoke");
+        return;
+    }
+
+    let smoke_script = format!(
+        r#"
+const bridgeScript = {bridge_script};
+const sent = [];
+const attrs = {{}};
+
+global.window = {{
+  __IMPULSE_DESKTOP_HOST: {{
+    invoke: async () => []
+  }}
+}};
+global.document = {{
+  documentElement: {{
+    setAttribute: (key, value) => {{ attrs[key] = value; }}
+  }}
+}};
+global.dioxus = {{
+  send: (message) => sent.push(message)
+}};
+
+eval(bridgeScript);
+setTimeout(() => {{
+  console.log(JSON.stringify({{ attrs, sent, bridge: window.__impulseOpsBridge }}));
+  process.exit(0);
+}}, 25);
+"#,
+        bridge_script =
+            serde_json::to_string(desktop_event_bridge_script()).expect("serialize bridge script"),
+    );
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let smoke_path = tempdir
+        .path()
+        .join("desktop-event-bridge-degraded-smoke.js");
+    std::fs::write(&smoke_path, smoke_script).expect("write degraded smoke script");
+    let output = Command::new("node")
+        .arg(&smoke_path)
+        .output()
+        .expect("run node degraded bridge smoke");
+
+    assert!(
+        output.status.success(),
+        "degraded bridge smoke failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let smoke: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse degraded bridge smoke output");
+    assert_eq!(
+        smoke["attrs"]["data-impulse-host-kind"],
+        serde_json::Value::String("dioxus".to_string())
+    );
+    assert_eq!(
+        smoke["attrs"]["data-impulse-ops-bridge"],
+        serde_json::Value::String("degraded".to_string())
+    );
+    assert_eq!(
+        smoke["attrs"]["data-impulse-ops-bridge-reason"],
+        serde_json::Value::String("host event API unavailable".to_string())
+    );
+    assert_eq!(smoke["bridge"]["mounted"], serde_json::Value::Bool(true));
+    assert_eq!(smoke["bridge"]["degraded"], serde_json::Value::Bool(true));
+    let sent = smoke["sent"].as_array().expect("sent messages");
+    assert!(
+        sent.iter().any(|message| {
+            message["kind"] == "bridge_status"
+                && message["payload"]["status"] == "degraded"
+                && message["payload"]["reason"] == "host event API unavailable"
+        }),
+        "expected degraded bridge_status message, got {sent:?}"
+    );
+}
+
+#[test]
+fn test_desktop_event_bridge_script_executes_against_mocked_legacy_host_webview() {
     let Ok(node_version) = Command::new("node").arg("--version").output() else {
         eprintln!("node is unavailable; skipping JS bridge smoke");
         return;
@@ -469,7 +619,7 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 (async () => {{
   await delay(25);
   if (!listeners.ops_update || !listeners.agent_runtime_update) {{
-    throw new Error("bridge did not subscribe to expected Tauri events");
+    throw new Error("bridge did not subscribe to expected host events");
   }}
   listeners.ops_update({{ payload: opsSnapshot }});
   listeners.agent_runtime_update({{ payload: runtimeSnapshot }});
@@ -611,7 +761,7 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async fn test_live_desktop_shell_consumes_eval_bridge_messages() {
     let runtime = runtime_snapshot("codex-live");
     let workspace = WorkspaceEntry::new(WorkspaceTarget {
-        root: "/Users/jamespustorino/code/IMPULSE-rs".to_string(),
+        root: "<repo>".to_string(),
         label: Some("IMPULSE-rs".to_string()),
         purpose: Some("terminal harness".to_string()),
         project_notes: Some("review project notes before injection".to_string()),
@@ -637,7 +787,7 @@ async fn test_live_desktop_shell_consumes_eval_bridge_messages() {
         call_id: "call-1".to_string(),
         tool: "impulse.project_context".to_string(),
         caller_agent_id: Some("codex-live".to_string()),
-        arguments: json!({ "root": "/Users/jamespustorino/code/IMPULSE-rs" }),
+        arguments: json!({ "root": "<repo>" }),
         confirmed: true,
         result: json!({ "ok": true }),
         ok: true,
@@ -686,7 +836,7 @@ async fn test_live_desktop_shell_consumes_eval_bridge_messages() {
         scripts
             .iter()
             .any(|script| script.contains("__impulseOpsBridge")),
-        "DesktopShell should evaluate the Tauri/Dioxus event bridge"
+        "DesktopShell should evaluate the host event bridge"
     );
     assert!(
         scripts
@@ -697,6 +847,8 @@ async fn test_live_desktop_shell_consumes_eval_bridge_messages() {
     assert!(html.contains("Codex Live"));
     assert!(html.contains("data-agent-id=\"codex-live\""));
     assert!(html.contains("terminal-pane-codex-live"));
+    assert!(html.contains("data-xterm-mount=\"true\""));
+    assert!(!html.contains("data-terminal-state=\"empty\""));
     assert!(html.contains("IMPULSE-rs"));
     assert!(html.contains("workspace-notes"));
     assert!(html.contains("impulse.project_context"));
@@ -788,7 +940,7 @@ fn test_agent_launch_bridge_script_routes_through_audited_mcp_spawn() {
 
 #[test]
 fn test_mcp_invoke_and_focus_bridge_scripts_serialize_requests() {
-    let mcp_script = mcp_invoke_bridge_script(&impulse_desktop::tauri_commands::McpInvokeRequest {
+    let mcp_script = mcp_invoke_bridge_script(&impulse_desktop::host_commands::McpInvokeRequest {
         tool: "impulse.project_context".to_string(),
         arguments: json!({ "root": "/tmp" }),
         confirmed: true,
@@ -1068,7 +1220,7 @@ fn test_shell_render_accepts_live_agents_workspaces_and_tools() {
     let snapshot = ProjectOpsSnapshot::default();
     let runtime = runtime_snapshot("codex-live");
     let workspace = WorkspaceEntry::new(WorkspaceTarget {
-        root: "/Users/jamespustorino/code/IMPULSE-rs".to_string(),
+        root: "<repo>".to_string(),
         label: Some("IMPULSE-rs".to_string()),
         purpose: Some("terminal harness".to_string()),
         project_notes: Some("review project notes before injection".to_string()),
@@ -1266,18 +1418,14 @@ global.document = {{
   }},
 }};
 global.window = {{
-  __TAURI__: {{
-    core: {{
-      invoke(command, payload) {{
-        invokes.push({{ command, payload }});
-        return Promise.resolve(null);
-      }},
+  __IMPULSE_DESKTOP_HOST: {{
+    invoke(command, payload) {{
+      invokes.push({{ command, payload }});
+      return Promise.resolve(null);
     }},
-    event: {{
-      listen(event, handler) {{
-        listeners.push({{ event, handler }});
-        return Promise.resolve(() => {{}});
-      }},
+    listen(event, handler) {{
+      listeners.push({{ event, handler }});
+      return Promise.resolve(() => {{}});
     }},
   }},
 }};
