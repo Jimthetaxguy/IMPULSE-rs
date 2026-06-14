@@ -267,26 +267,29 @@ impl ConflictResolver {
 
 /// Detects file conflicts across panes (same file modified by multiple agents).
 pub fn detect_file_conflicts(insights: &[ExtractedInsight]) -> Vec<Recommendation> {
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
 
-    // Group file modification insights by content (which contains the file path)
-    let mut file_to_panes: HashMap<String, Vec<String>> = HashMap::new();
+    // Group file modifications by file path, tracking the set of DISTINCT panes
+    // that touched each file. A single pane editing the same file repeatedly is
+    // not a conflict — only 2+ distinct panes are. Using a BTreeSet both
+    // deduplicates panes and yields deterministic, sorted output.
+    let mut file_to_panes: HashMap<String, BTreeSet<usize>> = HashMap::new();
     for insight in insights {
         if insight.insight_type == InsightType::FileModified {
             file_to_panes
                 .entry(insight.content.clone())
                 .or_default()
-                .push(format!("pane-{}", insight.pane_id));
+                .insert(insight.pane_id);
         }
     }
 
-    // Only flag when 2+ panes touch the same file
+    // Only flag when 2+ distinct panes touch the same file
     file_to_panes
         .into_iter()
         .filter(|(_, panes)| panes.len() > 1)
         .map(|(file, panes)| Recommendation {
             recommendation_type: RecommendationType::FileConflict,
-            panes_involved: panes,
+            panes_involved: panes.iter().map(|id| format!("pane-{id}")).collect(),
             description: format!("Multiple agents modifying: {}", file),
             action: "Coordinate changes to avoid merge conflicts".to_string(),
             priority: default_priority(),
@@ -507,6 +510,40 @@ mod tests {
             RecommendationType::FileConflict
         );
         assert_eq!(conflicts[0].panes_involved.len(), 2);
+    }
+
+    #[test]
+    fn test_detect_file_conflicts_single_pane_repeat_is_not_a_conflict() {
+        // One agent editing the same file several times must NOT be flagged —
+        // a conflict requires 2+ distinct panes, not 2+ modification events.
+        let insights = vec![
+            make_insight(1, InsightType::FileModified, "src/main.rs"),
+            make_insight(1, InsightType::FileModified, "src/main.rs"),
+            make_insight(1, InsightType::FileModified, "src/main.rs"),
+        ];
+        let conflicts = detect_file_conflicts(&insights);
+        assert!(
+            conflicts.is_empty(),
+            "single-pane repeated edits should not be a conflict, got {conflicts:?}"
+        );
+    }
+
+    #[test]
+    fn test_detect_file_conflicts_dedupes_distinct_panes() {
+        // Two distinct panes, each editing the file twice → one conflict whose
+        // panes_involved lists each pane exactly once, in sorted order.
+        let insights = vec![
+            make_insight(2, InsightType::FileModified, "src/main.rs"),
+            make_insight(1, InsightType::FileModified, "src/main.rs"),
+            make_insight(2, InsightType::FileModified, "src/main.rs"),
+            make_insight(1, InsightType::FileModified, "src/main.rs"),
+        ];
+        let conflicts = detect_file_conflicts(&insights);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(
+            conflicts[0].panes_involved,
+            vec!["pane-1".to_string(), "pane-2".to_string()]
+        );
     }
 
     #[test]
