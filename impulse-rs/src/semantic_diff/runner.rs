@@ -4,12 +4,72 @@
 //! process, captures JSON output, and parses it into our types.
 
 use anyhow::{Context, Result};
+use std::io::{self, Read};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::storage::sanitize_filename;
 
 use super::types::*;
+
+/// Hard timeout for any `sem` subprocess. A stuck `sem` (e.g. on a pathological
+/// repo) must never hang the caller indefinitely.
+const SEM_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Run a command with a hard timeout.
+///
+/// stdout/stderr are drained on background threads so a child producing more
+/// than the pipe buffer can hold can't deadlock (and thus never exit). If the
+/// child exceeds `timeout` it is killed and a `TimedOut` error is returned.
+fn run_with_timeout(mut command: Command, timeout: Duration) -> io::Result<Output> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let child_stdout = child.stdout.take();
+    let child_stderr = child.stderr.take();
+    let stdout_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut s) = child_stdout {
+            let _ = s.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut s) = child_stderr {
+            let _ = s.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("command timed out after {}s", timeout.as_secs()),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    };
+
+    let stdout = stdout_handle.join().unwrap_or_default();
+    let stderr = stderr_handle.join().unwrap_or_default();
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
 
 /// Check whether the `sem` CLI is available on PATH.
 pub fn sem_available() -> bool {
@@ -39,14 +99,13 @@ pub fn run_semantic_diff(
         format!("{}..{}", base_ref, head_ref)
     };
 
-    let output = Command::new("sem")
-        .arg("diff")
+    let mut cmd = Command::new("sem");
+    cmd.arg("diff")
         .arg(&range)
         .arg("--format")
         .arg("json")
-        .current_dir(repo_path)
-        .output()
-        .context("failed to run `sem diff`")?;
+        .current_dir(repo_path);
+    let output = run_with_timeout(cmd, SEM_TIMEOUT).context("failed to run `sem diff`")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -73,14 +132,13 @@ pub fn run_semantic_blame(repo_path: &Path, file_path: &str) -> Result<Vec<Seman
         );
     }
 
-    let output = Command::new("sem")
-        .arg("blame")
+    let mut cmd = Command::new("sem");
+    cmd.arg("blame")
         .arg(file_path)
         .arg("--format")
         .arg("json")
-        .current_dir(repo_path)
-        .output()
-        .context("failed to run `sem blame`")?;
+        .current_dir(repo_path);
+    let output = run_with_timeout(cmd, SEM_TIMEOUT).context("failed to run `sem blame`")?;
 
     if !output.status.success() {
         anyhow::bail!(
@@ -107,14 +165,13 @@ pub fn run_semantic_impact(repo_path: &Path, entity_name: &str) -> Result<Impact
         );
     }
 
-    let output = Command::new("sem")
-        .arg("impact")
+    let mut cmd = Command::new("sem");
+    cmd.arg("impact")
         .arg(entity_name)
         .arg("--format")
         .arg("json")
-        .current_dir(repo_path)
-        .output()
-        .context("failed to run `sem impact`")?;
+        .current_dir(repo_path);
+    let output = run_with_timeout(cmd, SEM_TIMEOUT).context("failed to run `sem impact`")?;
 
     if !output.status.success() {
         anyhow::bail!(
@@ -347,6 +404,30 @@ mod tests {
     fn test_sem_available_returns_bool() {
         // Just verify it doesn't panic — sem may or may not be installed
         let _ = sem_available();
+    }
+
+    #[test]
+    fn test_run_with_timeout_captures_output() {
+        let mut cmd = Command::new("printf");
+        cmd.arg("hello-sem");
+        let output = run_with_timeout(cmd, Duration::from_secs(5)).unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "hello-sem");
+    }
+
+    #[test]
+    fn test_run_with_timeout_kills_slow_command() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("10");
+        let start = Instant::now();
+        let err = run_with_timeout(cmd, Duration::from_millis(150)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        // The call must return promptly after the timeout, not after `sleep`.
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "timed-out command should return promptly, took {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]
