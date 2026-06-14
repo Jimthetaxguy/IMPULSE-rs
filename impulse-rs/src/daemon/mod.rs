@@ -53,6 +53,9 @@ pub struct Daemon {
     terminal_telemetry: Arc<RwLock<crate::ops_workbench::TerminalOpsTelemetryStore>>,
     supervisor_session_override: Arc<RwLock<Option<impulse_ops::SupervisorPermissionPolicy>>>,
     conflict_resolver: Arc<RwLock<crate::agent::coordinator::ConflictResolver>>,
+    /// Cross-agent delegation tracker (Phase 1B). Backs the
+    /// RegisterDelegation/CompleteDelegation/ListDelegations endpoints.
+    delegation_tracker: Arc<RwLock<crate::delegation::DelegationTracker>>,
     /// Cached ImpulseAgent instance that persists across requests within the
     /// daemon session — enables session history continuity for multi-turn queries.
     cached_agent: Arc<tokio::sync::Mutex<Option<crate::agent::ImpulseAgent>>>,
@@ -104,6 +107,7 @@ impl Daemon {
             conflict_resolver: Arc::new(RwLock::new(
                 crate::agent::coordinator::ConflictResolver::new(),
             )),
+            delegation_tracker: Arc::new(RwLock::new(crate::delegation::DelegationTracker::new())),
             cached_agent: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
@@ -168,26 +172,28 @@ impl Daemon {
                         Ok((stream, _)) => {
                             let state = self.config.state.clone();
                             let shutdown = self.shutdown_flag.clone();
-                            let notify = self.shutdown_notify.clone();
                             let registry = self.tool_registry.clone();
                             let tool_context = self.tool_context.clone();
                             let terminal_telemetry = self.terminal_telemetry.clone();
                             let supervisor_session_override =
                                 self.supervisor_session_override.clone();
                             let conflict_resolver = self.conflict_resolver.clone();
+                            let delegation_tracker = self.delegation_tracker.clone();
                             let cached_agent = self.cached_agent.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = handle_connection(
                                     stream,
-                                    state,
-                                    shutdown,
-                                    notify,
-                                    registry,
-                                    tool_context,
-                                    terminal_telemetry,
-                                    supervisor_session_override,
-                                    conflict_resolver,
-                                    cached_agent,
+                                    ConnectionContext {
+                                        state,
+                                        shutdown,
+                                        registry,
+                                        tool_context,
+                                        terminal_telemetry,
+                                        supervisor_session_override,
+                                        conflict_resolver,
+                                        delegation_tracker,
+                                        cached_agent,
+                                    },
                                 )
                                 .await
                                 {
@@ -211,20 +217,34 @@ impl Daemon {
     }
 }
 
-// TODO(refactor): extract params into struct
-#[allow(clippy::too_many_arguments)]
-async fn handle_connection(
-    mut stream: tokio::net::UnixStream,
+struct ConnectionContext {
     state: SharedState,
     shutdown: Arc<AtomicBool>,
-    _notify: Arc<Notify>,
     registry: Arc<crate::tooling::ToolRegistry>,
     tool_context: crate::tooling::ToolContext,
     terminal_telemetry: Arc<RwLock<crate::ops_workbench::TerminalOpsTelemetryStore>>,
     supervisor_session_override: Arc<RwLock<Option<impulse_ops::SupervisorPermissionPolicy>>>,
     conflict_resolver: Arc<RwLock<crate::agent::coordinator::ConflictResolver>>,
+    delegation_tracker: Arc<RwLock<crate::delegation::DelegationTracker>>,
     cached_agent: Arc<tokio::sync::Mutex<Option<crate::agent::ImpulseAgent>>>,
+}
+
+async fn handle_connection(
+    mut stream: tokio::net::UnixStream,
+    context: ConnectionContext,
 ) -> Result<()> {
+    let ConnectionContext {
+        state,
+        shutdown,
+        registry,
+        tool_context,
+        terminal_telemetry,
+        supervisor_session_override,
+        conflict_resolver,
+        delegation_tracker,
+        cached_agent,
+    } = context;
+
     let (reader, mut writer) = stream.split();
     let mut reader = BufReader::new(reader);
 
@@ -265,13 +285,16 @@ async fn handle_connection(
         let start = std::time::Instant::now();
         let response = handlers::process_request(
             request,
-            state.clone(),
-            &registry,
-            &tool_context,
-            &terminal_telemetry,
-            &supervisor_session_override,
-            &conflict_resolver,
-            &cached_agent,
+            handlers::ProcessRequestContext {
+                state: state.clone(),
+                registry: &registry,
+                tool_context: &tool_context,
+                terminal_telemetry: &terminal_telemetry,
+                supervisor_session_override: &supervisor_session_override,
+                conflict_resolver: &conflict_resolver,
+                delegation_tracker: &delegation_tracker,
+                cached_agent: &cached_agent,
+            },
         )
         .await;
         let elapsed = start.elapsed();

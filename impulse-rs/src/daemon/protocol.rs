@@ -69,20 +69,20 @@ pub enum DaemonRequest {
     },
     /// Export tool schemas in Claude tool-calling format
     ToolSchema,
-    /// Fetch the workbench snapshot used by the egui operator console
+    /// Fetch the workbench snapshot used by operator surfaces.
     GetOpsSnapshot,
     /// Poll for workbench events and a reconciled snapshot
     SubscribeOps {
         #[serde(default)]
         since_seq: Option<u64>,
     },
-    /// Publish live terminal telemetry from the egui workbench
+    /// Publish live terminal telemetry from a workbench surface.
     PublishTerminalOps {
         report: impulse_ops::TerminalOpsReport,
     },
-    /// Read the effective supervisor permissions for the egui control plane
+    /// Read the effective supervisor permissions for the operator control plane.
     GetSupervisorPermissions,
-    /// Structured supervisor chat for the egui control plane
+    /// Structured supervisor chat for the operator control plane.
     SupervisorChat {
         prompt: String,
         context: Option<String>,
@@ -91,7 +91,7 @@ pub enum DaemonRequest {
     RunSupervisorAction {
         action: impulse_ops::SupervisorAction,
     },
-    /// List project-scoped artifacts for the egui workbench
+    /// List project-scoped artifacts for workbench surfaces.
     ListArtifacts {
         #[serde(default)]
         limit: Option<usize>,
@@ -100,7 +100,7 @@ pub enum DaemonRequest {
     GetArtifact {
         artifact_id: String,
     },
-    /// Run an artifact action for the egui workbench
+    /// Run an artifact action for a workbench surface.
     RunArtifactAction {
         artifact_id: String,
         action_id: String,
