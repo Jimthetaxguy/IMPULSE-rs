@@ -4,7 +4,7 @@
 > Contract: [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
 > Collaboration playbook: [`docs/guides/COLLABORATIVE-AGENTIC-CODING.md`](docs/guides/COLLABORATIVE-AGENTIC-CODING.md)
 > Canonical stack: Rust (impulse-rs)
-> Roadmap contract: Now=Rust core + Tauri desktop shell; Next=terminal bridge + daemon parity; Legacy=egui compile-maintenance only
+> Roadmap contract: Now=Rust core + Dioxus desktop host; Next=Dioxus Desktop launch scaffold + terminal bridge parity; Legacy=egui compile-maintenance only; Tauri=legacy compatibility adapter only
 
 ---
 
@@ -85,14 +85,14 @@ Before implementing, consider alternative approaches. Choose the simplest soluti
 - `impulse-rs/` — main CLI + daemon + ratatui TUI
 - `impulse-rs/impulse-ops/` — operations library (shared types: SupervisorAction, TerminalOpsReport, OpsSnapshot, WorkbenchDaemonRequest/Response, DAEMON_PROTOCOL_VERSION, 4 tests)
 - `impulse-rs/impulse-term/` — PTY/session/context core (PTY + vt100 + WriteQueue + context bridge)
-- `impulse-rs/impulse-desktop/` — Tauri+Dioxus desktop shell scaffold and typed bridge contracts
+- `impulse-rs/impulse-desktop/` — Dioxus desktop shell scaffold and typed host bridge contracts
 
-**Legacy:** `impulse-gui` / egui is frozen. It receives compile-maintenance only until the Tauri+Dioxus shell reaches parity.
+**Legacy:** `impulse-gui` / egui is frozen. It receives compile-maintenance only until the Dioxus desktop host reaches parity. Tauri-shaped code is also compatibility-only, not a new product scaffold target.
 
-**Dual mode:**
+**Execution surfaces:**
 - **Direct mode** — stateless, per-action (for hooks). Read → process → write → exit.
 - **Daemon mode** — long-running, Unix socket IPC (for TUI and future desktop shell). In-memory state with periodic sync.
-- **Desktop mode** (in migration) — `Tauri` + `Dioxus` application, connects to daemon via IPC and a terminal bridge.
+- **Desktop mode** (in migration) — Dioxus Desktop host with xterm.js terminal bridge, backed by Rust daemon/runtime state. Tauri-shaped command/event code is compatibility-only.
 
 **IPC Protocol (PROTOCOL_VERSION = 2):**
 

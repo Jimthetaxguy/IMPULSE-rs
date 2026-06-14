@@ -77,7 +77,7 @@ See `cargo run -- --help` for the full command list.
 
 - **Language:** Rust
 - **TUI:** ratatui + crossterm (canonical operator path)
-- **Desktop (in progress):** Tauri + Dioxus via `impulse-desktop`; egui `impulse-gui` is legacy/frozen for compile-maintenance only
+- **Desktop (in progress):** Dioxus Desktop via `impulse-desktop`; egui `impulse-gui` is legacy/frozen for compile-maintenance only; Tauri-shaped code is legacy compatibility only
 - **Storage:** SQLite (FTS5) + JSONL + Markdown
 - **IPC:** Unix domain sockets
 - **LLM:** Anthropic, OpenAI, Minimax (for daemon chat)

@@ -17,12 +17,12 @@ tags: [worktree, daemon, desktop, ops, artifacts, supervisor, telemetry]
 - Owner: Codex Loop 6 worker
 - Role: Daemon truth boundary mapper
 - Branch: `main`
-- Worktree: `/Users/jamespustorino/Desktop/VibeCode_Prime/CLI_CU_L8R`
-- Owned paths: this artifact, `ralph-plan-6.md`, `docs/plans/worktrees/2026-05-22-ralph-plan-6-platform-stabilization.md`
+- Worktree: `<legacy-worktree>`
+- Owned paths: this artifact, `docs/archive/ralph-plans/ralph-plan-6.md`, `docs/plans/worktrees/2026-05-22-ralph-plan-6-platform-stabilization.md`
 - Read-only evidence: `impulse-rs/src/ops_workbench.rs`, `impulse-rs/src/daemon/handlers.rs`, `impulse-rs/src/daemon/protocol.rs`, `impulse-rs/impulse-ops/src/lib.rs`, `impulse-rs/impulse-desktop/src/runtime.rs`, `impulse-rs/impulse-desktop/src/ui.rs`
 - Optional shared path not touched: `impulse-rs/impulse-ops/src/lib.rs`
 - Blocked/shared paths: Cargo files, desktop source, terminal source, protocol docs/specs, validation scripts, root guidance docs, and unrelated dirty files
-- Verification: `cd impulse-rs && cargo test -p impulse-rs ops_workbench`; `bash /Users/jamespustorino/.agents/skills/ralph-plan/scripts/validate-plan.sh --strict-v2 ralph-plan-6.md`; `git diff --check`
+- Verification: `cd impulse-rs && cargo test -p impulse-rs ops_workbench`; `bash <agent-skills>/ralph-plan/scripts/validate-plan.sh --strict-v2 docs/archive/ralph-plans/ralph-plan-6.md`; `git diff --check`
 
 ## Boundary Summary
 
@@ -50,7 +50,7 @@ These surfaces are live runtime mechanics, not project truth:
 | PTY handles | Desktop runtime | `DesktopRuntime` owns `TerminalBackend` records keyed by agent id | Runtime may spawn/kill PTYs; daemon snapshot remains the durable workbench truth and receives terminal state only through `TerminalOpsReport` |
 | Write queue | Desktop runtime | `write_agent` writes `AgentWriteRequest.data` into `TerminalBackend::write_queue` | UI input and supervisor local send-input must become bytes before crossing into Rust runtime; daemon does not own raw PTY stdin buffering |
 | Resize/focus | Desktop runtime | `resize_agent`, `focus_agent`, `close_agent`, `snapshot_agents` | Runtime owns active dimensions and focused pane mechanics; published telemetry reflects those facts into daemon truth |
-| Output event fanout | Desktop runtime | `DesktopEvent::TerminalOutput`, `TerminalExit`, `AgentRuntimeUpdate`; Tauri sink emits named events | Runtime emits byte streams to xterm and runtime snapshots to telemetry/report builders; UI must not infer project status from glyph content |
+| Output event fanout | Desktop runtime | `DesktopEvent::TerminalOutput`, `TerminalExit`, `AgentRuntimeUpdate`; the Dioxus host adapter or legacy compatibility sink emits named events | Runtime emits byte streams to xterm and runtime snapshots to telemetry/report builders; UI must not infer project status from glyph content |
 | `TerminalOpsReport` generation | Desktop runtime integration | `TerminalOpsReport` DTO lives in `impulse-ops`; daemon accepts it through `PublishTerminalOps` | Desktop should transform `snapshot_agents()` plus context/intervention observations into reports and publish them at heartbeat/change boundaries |
 
 ## UI-Rendered Surfaces
@@ -102,7 +102,7 @@ Desktop must publish runtime telemetry and subscribe to daemon truth without bec
    - Treat `PublishTerminalOps` success as acceptance, not durable truth; the next `SubscribeOps` snapshot is the rendered truth.
 3. Subscribe path:
    - Desktop calls `SubscribeOps { since_seq }` at startup and after each publish cycle.
-   - Tauri emits `ops_update` with the returned `OpsSubscription` or snapshot payload.
+   - The Dioxus host adapter emits `ops_update` with the returned `OpsSubscription` or snapshot payload; legacy compatibility sinks may mirror the same event name.
    - Dioxus panels render from the daemon payload and store only render cache plus `next_seq`.
 4. Conflict rule:
    - If runtime local snapshot and daemon `ops_update` disagree, xterm continues rendering live bytes, but panels prefer daemon truth.

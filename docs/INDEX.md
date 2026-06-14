@@ -11,10 +11,10 @@ audience: everyone
 tags: [index, navigation, discovery]
 last_updated: 2026-03-31
 authors:
-  - name: James Pustorino
-    role: Creator
-    email: James.s.Pustorino@gmail.com
-    github: jamespustorino
+  - name: Impulse Maintainers
+    role: Maintainer
+    email: impulse-rs@users.noreply.github.com
+    github: Jimthetaxguy/IMPULSE-rs
 ---
 
 # Documentation Index — Impulse
@@ -23,7 +23,7 @@ authors:
 > **Quick start:** Read [`spec/RUST-CANONICAL-CONTRACT.md`](spec/RUST-CANONICAL-CONTRACT.md) first.
 >
 > **Canonical stack: Rust (impulse-rs)**
-> **Roadmap contract: Now=Rust core + Tauri desktop shell (Phase 0 docs reset), Next=egui boundary cleanup + static shell, Later=live terminal bridge + daemon parity**
+> **Roadmap contract: Now=Rust core + Dioxus desktop host, Next=Dioxus Desktop launch scaffold + terminal bridge parity, Later=daemon parity + artifact polish**
 > **Collaboration playbook:** [`guides/COLLABORATIVE-AGENTIC-CODING.md`](guides/COLLABORATIVE-AGENTIC-CODING.md)
 > **Risk register:** [`HONEST-ROADMAP.md`](HONEST-ROADMAP.md) stays canonical for unvalidated assumptions.
 
@@ -61,6 +61,7 @@ authors:
 | [0003](decisions/0003-progressive-search.md)  | Progressive search (FTS5 → vectors)  | Accepted |
 | [0004](decisions/0004-extraction-strategy.md) | LLM extraction strategy              | Accepted |
 | [0005](decisions/0005-distribution-model.md)  | npm distribution model               | Accepted |
+| [0008](decisions/0008-dioxus-desktop-host.md) | Dioxus Desktop host                  | Accepted |
 
 See [decisions/README.md](decisions/README.md) for full decision log.
 
@@ -93,18 +94,16 @@ See [decisions/README.md](decisions/README.md) for full decision log.
 | [PHASE1.5-COORDINATION.md](phases/PHASE1.5-COORDINATION.md) | Multi-agent coordination |
 | [PHASE2-PERSISTENCE.md](phases/PHASE2-PERSISTENCE.md)       | Persistence layer design |
 | [PHASE2-MIGRATION-PLAN.md](phases/PHASE2-MIGRATION-PLAN.md) | Migration strategy       |
-| [ROADMAP-PLAN.md](ROADMAP-PLAN.md)                          | Active roadmap reset for Rust + Tauri/Dioxus |
-| [TAURI-DIOXUS-MIGRATION-HANDOFF.md](plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md) | Tauri+Dioxus desktop migration sequence |
+| [ROADMAP-PLAN.md](ROADMAP-PLAN.md)                          | Active roadmap reset for Rust + Dioxus Desktop |
 | [IMPLEMENTATION-HANDOFF.md](plans/IMPLEMENTATION-HANDOFF.md)| Desktop migration execution handoff |
 | [LONG-RANGE-ENHANCEMENTS.md](LONG-RANGE-ENHANCEMENTS.md) | PR-organized enhancement backlog across 8 lanes |
 
-### Active Tauri+Dioxus Desktop Track
+### Active Dioxus Desktop Track
 
 | Document | Description |
 | -------- | ----------- |
 | [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) | Authoritative product and desktop shell contract |
-| [DESKTOP-SHELL-ARCHITECTURE.md](spec/DESKTOP-SHELL-ARCHITECTURE.md) | Tauri+Dioxus+xterm.js layer boundaries |
-| [TAURI-DIOXUS-MIGRATION-HANDOFF.md](plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md) | Current desktop shell build sequence |
+| [DESKTOP-SHELL-ARCHITECTURE.md](spec/DESKTOP-SHELL-ARCHITECTURE.md) | Dioxus Desktop + xterm.js layer boundaries |
 | [IMPULSE_TERM_STATUS.md](../impulse-rs/docs/IMPULSE_TERM_STATUS.md) | Terminal backend status and desktop bridge implications |
 | [HONEST-ROADMAP.md](HONEST-ROADMAP.md) | Canonical validation risk register for hooks and memory claims |
 
@@ -113,6 +112,8 @@ See [decisions/README.md](decisions/README.md) for full decision log.
 > **Quick reference:** See `AGENTS.md` for the enforced roadmap contract and `HONEST-ROADMAP.md` for unresolved risks.
 
 ### Research & Analysis
+
+Historical desktop migration notes, including the superseded Tauri+Dioxus handoff, are retained under planning docs for provenance but are not active implementation guidance.
 
 | Document                                                                  | Topic                                                       |
 | ------------------------------------------------------------------------- | ----------------------------------------------------------- |
@@ -160,15 +161,16 @@ See [research/README.md](research/README.md) for reading sequences by phase.
 | Document                                                                       | Superseded By                               |
 | ------------------------------------------------------------------------------ | ------------------------------------------- |
 | [TUI-AUGMENTATION-VISION.md](archive/TUI-AUGMENTATION-VISION.md)              | Current Rust roadmap and workbench docs     |
+| [Ralph plans 1-6](archive/ralph-plans/README.md)                              | Provenance only; use current roadmap/spec/ADR docs |
 | Session logs (11 files)                                                         | [DEVELOPMENT-HISTORY.md](session-logs/DEVELOPMENT-HISTORY.md) |
 
-The broader historical archive referenced by older docs is not fully present in the current workspace and needs a dedicated recovery or cleanup pass.
+Older Ralph loop plans are preserved for provenance only. Use `ROADMAP-PLAN.md`, `spec/RUST-CANONICAL-CONTRACT.md`, and `decisions/0008-dioxus-desktop-host.md` for current guidance.
 
 ---
 
 ## By Phase
 
-### Now: Rust Core + Tauri Desktop Shell
+### Now: Rust Core + Dioxus Desktop Host
 
 Start here:
 
@@ -178,15 +180,15 @@ Start here:
 4. [AGENTS.md](../AGENTS.md) — Current architecture and operational guidance
 5. [COLLABORATIVE-AGENTIC-CODING.md](guides/COLLABORATIVE-AGENTIC-CODING.md) — Agent lane, worktree, and handoff rules
 6. [ROADMAP-PLAN.md](ROADMAP-PLAN.md) — Current roadmap and desktop progress baseline
-7. [plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md](plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md) — Current desktop migration sequence
+7. [plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md](plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md) — Historical desktop migration context
 8. [EFFICIENCY-ANALYSIS.md](research/EFFICIENCY-ANALYSIS.md) — Implementation patterns
 9. [BEST-PRACTICES.md](guides/BEST-PRACTICES.md) — Coding conventions
 
-### Next: Boundary Cleanup + Static Shell + Live Terminal Bridge
+### Next: Dioxus Desktop Launch Scaffold + Live Terminal Bridge
 
 1. [HONEST-ROADMAP.md](HONEST-ROADMAP.md) — Validation risk register
 2. [ROADMAP-PLAN.md](ROADMAP-PLAN.md) — Desktop shell stabilization lane
-3. [plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md](plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md) — Technical execution details
+3. [plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md](plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md) — Superseded technical context
 4. [impulse-rs/docs/IMPULSE_TERM_STATUS.md](../impulse-rs/docs/IMPULSE_TERM_STATUS.md) — Terminal telemetry status
 5. [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md) — Current Rust-first test patterns and gaps
 6. [TESTING-FRAMEWORK.md](guides/TESTING-FRAMEWORK.md) — Historical TypeScript-era reference only

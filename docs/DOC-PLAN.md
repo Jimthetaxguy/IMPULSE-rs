@@ -1,12 +1,15 @@
-# Documentation Plan — Post-Ralph Plan 3
+# Historical Documentation Cleanup Plan — Post-Ralph Plan 3
 
 > **Created:** 2026-03-31
 > **Purpose:** Identify stale docs, missing docs, and cross-doc sync issues
 > **Based on:** Code review of impulse-rs/src after Ralph Plan 3 (Phase 3 agent harness completion)
+> **Archive note (2026-06-14):** Historical cleanup plan retained for provenance.
+> Current documentation hygiene uses archive-first handling for stale docs, and
+> current desktop guidance lives in ADR-0008 plus the Dioxus Desktop specs.
 
 ---
 
-## Critical: Stale Docs (Must Fix)
+## Historical Critical Findings
 
 ### 1. `docs/IPC-PROTOCOL.md` — Severely Stale
 
@@ -75,12 +78,14 @@ Assessment complete (Loop 4):
 
 | Doc | Assessment | Action |
 |-----|-----------|--------|
-| `docs/vision/DASHBOARD-DESIGN.md` | Obsolete — Zellij plugin concept replaced by EGUI workbench | **DELETE** |
-| `docs/vision/TUI-AUGMENTATION-VISION.md` | Superseded — Ralph Plan 4 Phase 3/4 (Loops 7-23) implement the actual TUI/UX work | **ARCHIVE** (move to `docs/archive/`) |
+| `docs/vision/DASHBOARD-DESIGN.md` | Obsolete — Zellij plugin concept replaced by the historical EGUI workbench | **ARCHIVE CANDIDATE** |
+| `docs/vision/TUI-AUGMENTATION-VISION.md` | Superseded by later TUI/UX work | **ARCHIVE CANDIDATE** |
 | `docs/vision/REAL-TIME-INJECTION-VISION.md` | Still relevant — Phase 3 per canonical contract, current phase (Now) covers retrieval/injection | **KEEP** |
-| `docs/AI build_complete_guide.md` | Not Impulse-specific — James's personal 22K-line AI-Native Development guide | **REMOVE from project** (belongs in personal docs) |
+| `docs/AI build_complete_guide.md` | Not Impulse-specific — personal AI-native development guide | **ARCHIVE OR EXTERNALIZE** after public-safety review |
 
-**Actions to take:** Delete DASHBOARD-DESIGN.md and AI build_complete_guide.md; archive TUI-AUGMENTATION-VISION.md.
+**Historical action note:** This plan originally used delete/remove language.
+Current repo hygiene must preserve provenance by archiving stale docs unless the
+user explicitly approves removal.
 
 ---
 

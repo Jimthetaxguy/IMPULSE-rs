@@ -143,7 +143,8 @@ impulse-rs --daemon session-start -n "chat-session"
 | **Guardrail engine**                 | Complete    | `impulse-rs/src/guardrail/`           |
 | **Plugin system**                    | Complete    | `impulse-rs/src/plugin/`              |
 | **Semantic diff**                    | Complete    | `impulse-rs/src/semantic_diff/`       |
-| **GUI (egui native workbench)**     | Complete    | `impulse-rs/impulse-gui/`             |
+| **Desktop host (Dioxus Desktop)**  | In progress | `impulse-rs/impulse-desktop/`         |
+| **GUI (egui native workbench)**     | Legacy / frozen | `impulse-rs/impulse-gui/` compile-maintenance only |
 | **Terminal widget (PTY + vt100)**   | Complete    | `impulse-rs/impulse-term/`            |
 | **IPC protocol versioning**          | Complete    | Daemon + GUI version negotiation      |
 | **Signal bus (GUI)**                 | Complete    | `impulse-gui/src/widgets/signal_bus.rs` |
@@ -307,9 +308,9 @@ cargo run -- run                       # Start TUI
 cargo run -- --daemon status          # Query daemon
 cargo run -- --daemon chat --session-id <id> --message "hi" --inject-mode review --inject-explain
 
-# Build Tauri macOS app
-cd src-tauri && cargo build --release
-open src-tauri/target/release/impulse-tauri
+# Check the Dioxus Desktop host scaffold
+cargo check -p impulse-desktop --features desktop-app --bin impulse-desktop
+cargo run -p impulse-desktop --features desktop-app --bin impulse-desktop
 
 # With custom impulse directory
 cargo run -- -c /path/to/.impulse <command>
@@ -327,9 +328,9 @@ cargo test
 
 ---
 
-## GUI Workbench (impulse-gui)
+## Legacy GUI Workbench (impulse-gui)
 
-Native egui application providing a visual workbench for Impulse. Connects to the daemon via IPC.
+Legacy/frozen egui application that provided the earlier visual workbench for Impulse. Active desktop work now lives in `impulse-rs/impulse-desktop/` as the Dioxus Desktop host; `impulse-gui` is retained for compile-maintenance only.
 
 ### Views
 
@@ -671,15 +672,15 @@ Config at `.opencode/impulse.json` with equivalent hooks.
 | **Now**    | Session tagging                                                        | Rust        | **Complete** |
 | **Now**    | Filter system                                                          | Rust        | **Complete** |
 | **Now**    | Tests (920 passing)                                                    | Rust        | **Complete** |
-| **Now**    | Tauri macOS app                                                        | Rust        | **Complete** |
-| **Now**    | Terminal in Tauri                                                      | xterm.js    | **Complete** |
+| **Now**    | Dioxus Desktop host scaffold                                           | Rust        | **In progress** |
+| **Now**    | Terminal bridge in Dioxus host                                         | xterm.js    | **In progress** |
 | **Now**    | Context stewardship                                                    | Rust        | **Complete** |
 | **Now**    | Token tracking algorithm                                               | Rust        | **Complete** |
 | **Now**    | Tool/model/credential management                                       | Rust        | **Complete** |
 | **Now**    | System utilities (calc, exec, health, system)                          | Rust        | **Complete** |
 | **Next**   | Retrieval + review-first context injection (feature-flagged, additive) | Rust+Python | **Complete** |
 | **Next**   | Monty integration (computed routing, dynamic injection, KDB, SWARM)   | Rust+Python | **Complete** |
-| **Later**  | .dmg bundle                                                            | Tauri       | **Open**     |
+| **Later**  | Desktop bundle                                                         | Dioxus Desktop | **Open**  |
 | **Later**  | DataFusion analytics (optional)                                        | Rust        | **Open**     |
 | **Future** | Agent VCS + dashboard                                                  | +Rust       | Vision       |
 
@@ -692,7 +693,7 @@ Config at `.opencode/impulse.json` with equivalent hooks.
 - File persistence: atomic writes (temp + rename)
 - Session IDs: `{working-dir}-{timestamp}-{uuid8}`
 - Platform detection: `--platform claude-code` or `--platform opencode`
-- Config, hooks, chat with session context, Tauri app
+- Config, hooks, chat with session context, Dioxus Desktop host migration
 - Context stewardship, token tracking, tool/model/credential management
 - System utilities: health check, system info, Python calc/exec
 
@@ -717,11 +718,17 @@ Config at `.opencode/impulse.json` with equivalent hooks.
 
 ---
 
-## Ralph Loop
+## Historical Ralph Loop Protocol
+
+This section is historical methodology from the archived Ralph plans. Current agent process guidance lives in `AGENTS.md` and `docs/guides/COLLABORATIVE-AGENTIC-CODING.md`.
+
+Public contributors do not need to follow the archived Ralph loop protocol for
+new work; use the active roadmap, ADRs, and collaboration guide instead. The
+details below remain only to preserve provenance for older work logs.
 
 ### Requirements
 
-All Ralph Loop agents (both Claude and OpenCode) MUST follow these rules:
+Historical Ralph Loop agents (both Claude and legacy OpenCode) followed these rules:
 
 #### (i) Reflect on Work
 
@@ -739,7 +746,7 @@ Before implementing, agents MUST:
 - Choose the simplest solution that works
 - Avoid over-engineering
 
-### Ralph Loop Template
+### Historical Ralph Loop Template
 
 ```
 # Ralph Loop Session - [Feature Name]
@@ -802,7 +809,7 @@ cd impulse-rs && cargo test
 ### Creating a Release
 
 1. Update version in `impulse-rs/Cargo.toml`
-2. Update version in `impulse-rs/src-tauri/tauri.conf.json`
+2. Update version in `impulse-rs/impulse-desktop/Cargo.toml`
 3. Commit: `git commit -m "chore: bump version to vX.Y.Z"`
 4. Tag: `git tag vX.Y.Z`
 5. Push: `git push && git push --tags`

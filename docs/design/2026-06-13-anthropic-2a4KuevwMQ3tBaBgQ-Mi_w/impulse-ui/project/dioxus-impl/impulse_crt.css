@@ -187,7 +187,7 @@
 .xterm-mount { flex: 1; min-height: 0; padding: 8px 10px; }
 .xterm-mount.pending { opacity: .5; }
 .xterm-mount[data-xterm-state="degraded"]::after {
-  content: "terminal interop degraded — xterm.js / Tauri not detected";
+  content: "terminal interop degraded — xterm.js / host adapter not detected";
   color: var(--p-red); font-size: 11px;
 }
 

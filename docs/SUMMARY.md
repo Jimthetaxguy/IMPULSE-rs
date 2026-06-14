@@ -23,10 +23,10 @@ schema_version: '1.0'
 
 ## Active Track
 
-The active roadmap is now Rust core plus the Tauri+Dioxus desktop shell migration.
+The active roadmap is now Rust core plus the Dioxus Desktop host migration. Tauri-shaped code is retained only as a temporary compatibility adapter.
 
 - [ROADMAP-PLAN.md](ROADMAP-PLAN.md)
-- [plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md](plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md)
+- [plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md](plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md) — historical context, not the current next goal
 - [guides/COLLABORATIVE-AGENTIC-CODING.md](guides/COLLABORATIVE-AGENTIC-CODING.md)
 - [../impulse-rs/docs/IMPULSE_TERM_STATUS.md](../impulse-rs/docs/IMPULSE_TERM_STATUS.md)
 - [HONEST-ROADMAP.md](HONEST-ROADMAP.md)
@@ -36,7 +36,7 @@ The active roadmap is now Rust core plus the Tauri+Dioxus desktop shell migratio
 ### Now
 
 - [ROADMAP-PLAN.md](ROADMAP-PLAN.md)
-- [plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md](plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md)
+- [plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md](plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md) — historical context
 - [spec/RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md)
 
 ### Next
@@ -112,8 +112,9 @@ The active roadmap is now Rust core plus the Tauri+Dioxus desktop shell migratio
 ### Archive
 
 - [archive/TUI-AUGMENTATION-VISION.md](archive/TUI-AUGMENTATION-VISION.md)
+- [archive/ralph-plans/README.md](archive/ralph-plans/README.md)
 
-Historical archive references in older docs need a separate recovery or cleanup pass. The current workspace only contains the surviving archived artifact listed above.
+Historical Ralph loop plans now live under `archive/ralph-plans/` and are provenance only, not current implementation guidance.
 
 ## Metadata
 

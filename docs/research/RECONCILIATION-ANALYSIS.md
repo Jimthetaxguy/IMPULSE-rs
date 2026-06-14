@@ -1,12 +1,14 @@
 ---
-status: active
+status: superseded
 phase: all
 audience: builder
 tags: [research, reconciliation, specs]
-last_updated: 2026-02-20
+last_updated: 2026-06-14
 ---
 
 # Reconciliation Analysis: Cross-Model Consensus & Divergences
+
+> Superseded 2026-06-14: retained as historical meta-analysis. Current native desktop direction is Dioxus Desktop; Tauri references below are historical unless explicitly labeled compatibility.
 
 > **Status:** Meta-Analysis | **Based On:** GPT-5.2 Thinking, Claude Opus 4.6 Thinking, Gemini 3 Pro
 > **Purpose:** Bridge gaps between `ai_coding_impulse_prd_spec_v1.json`, `docs/archive/SPEC-v1.1.md`, and `docs/phases/IMPLEMENTATION-ROADMAP.md`
@@ -82,7 +84,7 @@ Phase 2 (Cross-Session Persistence): RAG + memory tiers
 └─ MCP server exposing retrieval to agents
 
 Phase 3 (Advanced UI): Time Machine, semantic routing, Aider
-Phase 4 (Distribution): Packaging, single-binary, optional Tauri shell
+Phase 4 (Distribution): Packaging, single-binary, optional Dioxus Desktop host
 ```
 
 **All models agree:** This sequence makes sense. You're not overcommitting in Phase 1 (no Mem0, no UI polish). You're validating the riskiest technical dependency (sqlite-vec + embeddings) before adding complexity.

@@ -1,11 +1,15 @@
 # Impulse Code Review & DMG Packaging Summary
 
-## Build Status
+> Historical packaging note from the earlier Tauri build track. This is not the
+> current desktop goal; ADR-0008 and `docs/spec/DESKTOP-SHELL-ARCHITECTURE.md`
+> define the active Dioxus Desktop host direction.
+
+## Historical Build Status
 
 - **Cargo Build**: ✅ PASSING (11 warnings)
 - **Tests**: ✅ 333 PASSING, 1 IGNORED
-- **Tauri Build**: ✅ SUCCESSFUL
-- **DMG Bundle**: ✅ CREATED (2MB)
+- **Legacy Tauri Build**: ✅ SUCCESSFUL at the time of this report
+- **Legacy DMG Bundle**: ✅ CREATED (2MB) at the time of this report
 
 ## Fixed Issues
 
@@ -20,7 +24,7 @@
 - **Fix**: Removed extra empty line
 
 ### 3. Bundle Configuration (Fixed)
-- **File**: `src-tauri/tauri.conf.json`
+- **File**: legacy Tauri bundle configuration
 - **Issue**: Bundle targets set to `["app"]` only, no DMG
 - **Fix**: Changed to `["dmg", "app"]`
 
@@ -74,19 +78,23 @@ These are intentional - they're used when `monty-support` feature is enabled.
 - `token_tracker/` - Token tracking
 - `ui/` - TUI rendering
 
-## DMG Packaging Results
+## Historical DMG Packaging Results
+
+These files and commands refer to the superseded Tauri packaging track. Current
+native desktop work should follow the Dioxus Desktop host path documented in
+`docs/decisions/0008-dioxus-desktop-host.md` and
+`impulse-rs/impulse-desktop/README.md`.
 
 ### Output Files
 ```
-src-tauri/target/release/bundle/
+<legacy-tauri-target>/release/bundle/
 ├── dmg/Impulse_0.1.0_aarch64.dmg (2MB)
 └── macos/Impulse.app/
 ```
 
-### Build Command
+### Historical Build Command
 ```bash
-cd impulse-rs/src-tauri
-npx tauri build
+cargo tauri build
 ```
 
 ### Configuration Changes Made
@@ -98,11 +106,11 @@ npx tauri build
 
 ### High Priority
 1. Address remaining clippy warnings (prefix unused variables with `_`)
-2. Add proper icons for DMG (currently using default)
-3. Consider code signing for distribution
+2. Add Dioxus Desktop packaging and signing guidance before claiming release readiness
+3. Keep any legacy Tauri packaging instructions explicitly marked as compatibility-only
 
 ### Medium Priority
-1. Enable more Tauri features (e.g., updater)
+1. Define Dioxus Desktop update/distribution expectations
 2. Add app metadata (description, copyright)
 3. Consider notarization for distribution
 

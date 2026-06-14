@@ -52,19 +52,19 @@ CONTRACT_REQUIRED_MARKERS = {
         "RUST-CANONICAL-CONTRACT.md",
         "COLLABORATIVE-AGENTIC-CODING.md",
         "Canonical stack: Rust (impulse-rs)",
-        "Roadmap contract: Now=Rust core + Tauri desktop shell; Next=terminal bridge + daemon parity; Legacy=egui compile-maintenance only",
+        "Roadmap contract: Now=Rust core + Dioxus desktop host; Next=Dioxus Desktop launch scaffold + terminal bridge parity; Legacy=egui compile-maintenance only; Tauri=legacy compatibility adapter only",
     ],
     ROOT_DIR / "CLAUDE.md": [
         "RUST-CANONICAL-CONTRACT.md",
         "COLLABORATIVE-AGENTIC-CODING.md",
         "Canonical stack: Rust (impulse-rs)",
-        "Roadmap contract: Now=Rust core + Tauri desktop shell; Next=terminal bridge + daemon parity; Legacy=egui compile-maintenance only",
+        "Roadmap contract: Now=Rust core + Dioxus desktop host; Next=Dioxus Desktop launch scaffold + terminal bridge parity; Legacy=egui compile-maintenance only; Tauri=legacy compatibility adapter only",
     ],
     DOCS_DIR / "INDEX.md": [
         "RUST-CANONICAL-CONTRACT.md",
         "COLLABORATIVE-AGENTIC-CODING.md",
         "Canonical stack: Rust (impulse-rs)",
-        "Roadmap contract: Now=Rust core + Tauri desktop shell (Phase 0 docs reset), Next=egui boundary cleanup + static shell, Later=live terminal bridge + daemon parity",
+        "Roadmap contract: Now=Rust core + Dioxus desktop host, Next=Dioxus Desktop launch scaffold + terminal bridge parity, Later=daemon parity + artifact polish",
     ],
     DOCS_DIR / "SUMMARY.md": [
         "RUST-CANONICAL-CONTRACT.md",

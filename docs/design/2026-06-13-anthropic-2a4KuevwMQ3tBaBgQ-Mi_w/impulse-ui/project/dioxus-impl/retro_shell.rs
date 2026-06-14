@@ -45,7 +45,7 @@ pub fn RetroShell(snapshot: ReadOnlySignal<ProjectOpsSnapshot>) -> Element {
 
     rsx! {
         document::Link { rel: "stylesheet", href: CRT_CSS }
-        // Brand font (Baloo 2) + JetBrains Mono. In Tauri, bundle locally instead.
+        // Brand font (Baloo 2) + JetBrains Mono. Bundle locally for packaged builds.
         document::Link { rel: "preconnect", href: "https://fonts.googleapis.com" }
         document::Link {
             rel: "stylesheet",

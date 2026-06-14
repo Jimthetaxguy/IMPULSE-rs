@@ -51,7 +51,7 @@ These are macOS Finder duplicate files (identical to originals — verified via 
 - [ ] **Step 1: Verify each duplicate matches its original**
 
 ```bash
-cd /Users/jamespustorino/Desktop/VibeCode_Prime/CLI_CU_L8R
+cd <legacy-worktree>
 diff "archive/harness/package 2.json" "archive/harness/package.json"
 diff "archive/harness/tsconfig 2.json" "archive/harness/tsconfig.json"
 diff "archive/harness/vitest.config 2.ts" "archive/harness/vitest.config.ts"
@@ -245,7 +245,7 @@ Expected: All clean. impulse-gui may reference new `impulse-ops` types transitiv
 - [ ] **Step 1: Verify delegation module tests pass in isolation**
 
 ```bash
-cd /Users/jamespustorino/Desktop/VibeCode_Prime/CLI_CU_L8R/impulse-rs
+cd <legacy-worktree>/impulse-rs
 cargo test delegation:: -- --nocapture 2>&1
 ```
 
@@ -296,7 +296,7 @@ Expected: Session tests pass. New fields (`role`, `parent_session_id`, `delegati
 - [ ] **Step 1: Verify doc cross-references are valid**
 
 ```bash
-cd /Users/jamespustorino/Desktop/VibeCode_Prime/CLI_CU_L8R
+cd <legacy-worktree>
 # Check that files referenced in LONG-RANGE-ENHANCEMENTS.md exist
 head -30 docs/LONG-RANGE-ENHANCEMENTS.md
 ls docs/ROADMAP-PLAN.md docs/HONEST-ROADMAP.md docs/spec/RUST-CANONICAL-CONTRACT.md 2>&1
@@ -317,7 +317,7 @@ Expected: Entry for LONG-RANGE-ENHANCEMENTS.md present.
 ### Task 7: Update Project Memory
 
 **Files:**
-- Modify: `.claude/projects/-Users-jamespustorino-Desktop-VibeCode-Prime-CLI-CU-L8R/memory/MEMORY.md`
+- Modify: `.claude/projects/<project-slug>/memory/MEMORY.md`
 
 - [ ] **Step 1: Update MEMORY.md with integration results**
 
@@ -333,7 +333,7 @@ Add entry documenting:
 - [ ] **Step 2: Commit the integration**
 
 ```bash
-cd /Users/jamespustorino/Desktop/VibeCode_Prime/CLI_CU_L8R
+cd <legacy-worktree>
 git add -A
 git commit -m "chore: integrate remote main — PR #8 OpenSquirrel features + cleanup
 

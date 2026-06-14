@@ -324,7 +324,7 @@ cd impulse-rs && cargo check --workspace
 cd impulse-rs && cargo test --workspace
 cd impulse-rs && cargo clippy --workspace -- -D warnings
 cd impulse-rs && cargo fmt --check
-bash /Users/jamespustorino/.agents/skills/ralph-plan/scripts/validate-plan.sh --strict-v2 ralph-plan-6.md
+bash <agent-skills>/ralph-plan/scripts/validate-plan.sh --strict-v2 ralph-plan-6.md
 ```
 
 Focused checks should be added as loops demand:
@@ -335,7 +335,7 @@ Focused checks should be added as loops demand:
 
 ## Assumptions
 
-- The target platform is `/Users/jamespustorino/Desktop/VibeCode_Prime/CLI_CU_L8R`.
+- The target platform is `<legacy-worktree>`.
 - There is no active `.Codex/ralph-loop.local.md`; this is a new planning session.
 - Existing dirty files are presumed user/agent work and must not be reverted.
 - OpenCode inside Impulse is treated as legacy compatibility until James explicitly confirms product-level removal.
@@ -368,7 +368,7 @@ Focused checks should be added as loops demand:
 - Passed: `cd impulse-rs && cargo test --workspace` (1,483 tests passed, 4 ignored)
 - Passed: `cd impulse-rs && cargo clippy --workspace -- -D warnings`
 - Passed: `cd impulse-rs && cargo fmt --check`
-- Passed: `bash /Users/jamespustorino/.agents/skills/ralph-plan/scripts/validate-plan.sh --strict-v2 ralph-plan-6.md`
+- Passed: `bash <agent-skills>/ralph-plan/scripts/validate-plan.sh --strict-v2 ralph-plan-6.md`
 - Passed: `git diff --check`
 
 **Handoff Notes:**
@@ -400,7 +400,7 @@ Focused checks should be added as loops demand:
 - Leave Root loop assignments for 9-15 pending so Loop 8 can formally adopt or revise the map.
 
 **Verification:**
-- Passed: `bash /Users/jamespustorino/.agents/skills/ralph-plan/scripts/validate-plan.sh --strict-v2 ralph-plan-6.md`
+- Passed: `bash <agent-skills>/ralph-plan/scripts/validate-plan.sh --strict-v2 ralph-plan-6.md`
 - Passed: `git diff --check`
 
 **Handoff Notes:**
@@ -434,7 +434,7 @@ Focused checks should be added as loops demand:
 
 **Verification:**
 - Passed: `cd impulse-rs && cargo test -p impulse-rs ops_workbench`
-- Passed: `bash /Users/jamespustorino/.agents/skills/ralph-plan/scripts/validate-plan.sh --strict-v2 ralph-plan-6.md`
+- Passed: `bash <agent-skills>/ralph-plan/scripts/validate-plan.sh --strict-v2 ralph-plan-6.md`
 - Passed: `git diff --check`
 
 **Handoff Notes:**
@@ -473,7 +473,7 @@ Focused checks should be added as loops demand:
 **Verification:**
 - Passed: `cd impulse-rs && cargo test -p impulse-desktop --test runtime --test tauri_surface --test desktop_contract` (16 tests passed, 0 failed)
 - Passed: `cd impulse-rs && cargo fmt -p impulse-desktop`
-- Passed: `bash /Users/jamespustorino/.agents/skills/ralph-plan/scripts/validate-plan.sh --strict-v2 ralph-plan-6.md`
+- Passed: `bash <agent-skills>/ralph-plan/scripts/validate-plan.sh --strict-v2 ralph-plan-6.md`
 - Passed: `git diff --check`
 
 **Handoff Notes:**
@@ -509,7 +509,7 @@ Focused checks should be added as loops demand:
 - Passed: `cd impulse-rs && cargo test -p impulse-term --no-default-features` (54 tests passed, 0 failed)
 - Passed: `cd impulse-rs && cargo test -p impulse-term` (114 tests passed, 0 failed)
 - Passed: `cargo fmt -p impulse-term`
-- Passed: `bash /Users/jamespustorino/.agents/skills/ralph-plan/scripts/validate-plan.sh --strict-v2 ralph-plan-6.md`
+- Passed: `bash <agent-skills>/ralph-plan/scripts/validate-plan.sh --strict-v2 ralph-plan-6.md`
 - Passed: `git diff --check`
 
 **Handoff Notes:**
@@ -544,7 +544,7 @@ Focused checks should be added as loops demand:
 **Verification:**
 - Passed: `cd impulse-rs && cargo test -p impulse-desktop` (10 tests passed, 0 failed)
 - Passed: `cd impulse-rs && cargo check -p impulse-desktop --features tauri-runtime`
-- Passed: `bash /Users/jamespustorino/.agents/skills/ralph-plan/scripts/validate-plan.sh --strict-v2 ralph-plan-6.md`
+- Passed: `bash <agent-skills>/ralph-plan/scripts/validate-plan.sh --strict-v2 ralph-plan-6.md`
 - Passed: `git diff --check`
 
 **Handoff Notes:**
@@ -592,7 +592,7 @@ Focused checks should be added as loops demand:
 - Failed with pre-existing/out-of-scope validator drift: `python3 docs/validate_docs.py --all`
   - `docs/validate_docs.py` still requires the old roadmap marker text containing `Phase 0 docs reset` in `AGENTS.md` and `CLAUDE.md`.
   - The same run reports 30 stale docs last updated `2026-02-20` across research/spec/vision/decision/guide/phase files outside Loop 2 ownership.
-- Passed: `bash /Users/jamespustorino/.agents/skills/ralph-plan/scripts/validate-plan.sh --strict-v2 ralph-plan-6.md`
+- Passed: `bash <agent-skills>/ralph-plan/scripts/validate-plan.sh --strict-v2 ralph-plan-6.md`
 - Passed: `git diff --check -- README.md AGENTS.md CLAUDE.md docs/spec/RUST-CANONICAL-CONTRACT.md docs/guides/COLLABORATIVE-AGENTIC-CODING.md impulse-rs/QUICKSTART.md impulse-rs/impulse-gui/README.md docs/plans/IMPLEMENTATION-HANDOFF.md docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md docs/metadata.yaml ralph-plan-6.md docs/plans/worktrees/2026-05-22-ralph-plan-6-platform-stabilization.md`
 
 **Handoff Notes:**
@@ -612,14 +612,14 @@ Focused checks should be added as loops demand:
 - `docs/plans/worktrees/2026-05-22-ralph-plan-6-platform-stabilization.md`
 
 **Work Completed:**
-- Captured the required repository state: branch `main`, primary worktree at `/Users/jamespustorino/Desktop/VibeCode_Prime/CLI_CU_L8R`, and sibling worktrees `.worktrees/gui-roadmap` plus `.worktrees/impulse-1.0-memory-loop`.
+- Captured the required repository state: branch `main`, primary worktree at `<legacy-worktree>`, and sibling worktrees `.worktrees/gui-roadmap` plus `.worktrees/impulse-1.0-memory-loop`.
 - Classified the dirty tree into shared guidance/root docs, docs indexes/specs/protocols, collaboration docs, research docs, Rust workspace metadata, Rust implementation files, prior plan state, and current Plan 6 lane files.
 - Narrowed Loop 1 ownership to `ralph-plan-6.md` and the Plan 6 work card; `ralph-plan-5.md` is explicitly blocked and preserved.
 - Recorded blocked/shared paths in the work card, including Rust code, manifests, `AGENTS.md`, `CLAUDE.md`, `README.md`, docs indexes/specs, protocol docs, and all existing dirty files outside this lane.
 - Updated the Loop 1 status in Iteration Contents and the Loop 1 Plan without changing Root: Primary Objective or Root: User Vision.
 
 **Verification:**
-- Passed: `bash /Users/jamespustorino/.agents/skills/ralph-plan/scripts/validate-plan.sh --strict-v2 ralph-plan-6.md`
+- Passed: `bash <agent-skills>/ralph-plan/scripts/validate-plan.sh --strict-v2 ralph-plan-6.md`
 - Passed: `git diff --check -- ralph-plan-6.md docs/plans/worktrees/2026-05-22-ralph-plan-6-platform-stabilization.md`
 
 **Handoff Notes:**

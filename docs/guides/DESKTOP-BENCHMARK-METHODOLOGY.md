@@ -3,12 +3,12 @@ title: Desktop Benchmark Methodology
 status: active
 version: 1.0.0
 created: 2026-04-15
-updated: 2026-04-15
+updated: 2026-06-14
 ---
 
 # Desktop Benchmark Methodology
 
-This document defines the exact procedure for benchmarking the desktop shell migration and the acceptance thresholds that determine whether the new stack is accepted.
+This document defines the exact procedure for benchmarking the Dioxus Desktop shell migration and the acceptance thresholds that determine whether the new stack is accepted. Older Tauri measurements are historical comparison data only.
 
 ---
 
@@ -20,9 +20,9 @@ Four baselines must be measured on the **same machine** under the same condition
 |---|---|---|
 | B1 | `impulse-gui` (legacy egui) | Legacy desktop baseline, release build |
 | B2 | `impulse-rs` (ratatui CLI) | Standalone terminal-native operator |
-| B3 | Tauri + Dioxus - static shell | No live PTY, no daemon connection |
-| B4a | Tauri + Dioxus - 2 PTY panes | Two live xterm.js terminal panes |
-| B4b | Tauri + Dioxus - 4 PTY panes | Four live xterm.js terminal panes |
+| B3 | Dioxus Desktop - static shell | No live PTY, no daemon connection |
+| B4a | Dioxus Desktop - 2 PTY panes | Two live xterm.js terminal panes |
+| B4b | Dioxus Desktop - 4 PTY panes | Four live xterm.js terminal panes |
 
 ---
 
@@ -36,7 +36,7 @@ Four baselines must be measured on the **same machine** under the same condition
 ```bash
 time open -W /path/to/ImpulseApp.app
 ```
-Or instrument with a startup timestamp log line at the end of the Tauri `setup()` hook.
+Or instrument with a startup timestamp log line after the Dioxus Desktop launch/bootstrap readiness point.
 
 **Record:** Median of 5 cold launches (process not in memory cache).
 

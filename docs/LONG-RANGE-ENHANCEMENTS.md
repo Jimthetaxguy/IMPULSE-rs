@@ -11,8 +11,8 @@ audience: builder
 tags: [roadmap, enhancements, planning, backlog]
 last_updated: 2026-03-17
 authors:
-  - name: James Pustorino
-    role: Creator
+  - name: Impulse Maintainers
+    role: Maintainer
 ---
 
 # Long-Range Enhancement Roadmap — Impulse
@@ -116,7 +116,7 @@ Apply the extraction prompt to real session transcripts. Measure what it capture
 ## Lane 2: Desktop Daemon-Truth Completion
 
 **Stage:** Next
-**Goal:** Make the daemon the authoritative source of desktop shell state. Completes the execution sequence from [`TAURI-DIOXUS-MIGRATION-HANDOFF.md`](./plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md).
+**Goal:** Make the daemon the authoritative source of Dioxus Desktop shell state. Follows ADR-0008 and the current [`IMPLEMENTATION-HANDOFF.md`](./plans/IMPLEMENTATION-HANDOFF.md); the older [`TAURI-DIOXUS-MIGRATION-HANDOFF.md`](./plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md) is historical sequencing context only.
 
 ### PR 2.1 — Terminal telemetry publication via PublishTerminalOps
 
@@ -363,7 +363,7 @@ Remove local shadow merge logic from desktop views. All workbench surfaces read 
 **Stage:** Later
 **Goal:** Agent control UX, artifact ergonomics, debug tooling. Follows ROADMAP-PLAN.md "Follow-On Order After Daemon Truth."
 
-### PR 7.1 — Blocked-work indicators in the Tauri desktop shell
+### PR 7.1 — Blocked-work indicators in the Dioxus desktop host
 
 | Field | Value |
 |-------|-------|

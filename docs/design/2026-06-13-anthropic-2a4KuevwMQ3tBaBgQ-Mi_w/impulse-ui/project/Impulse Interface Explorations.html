@@ -53,7 +53,7 @@ const Intro = () => (
     <p style={{fontSize:14, lineHeight:1.65, color:"#8fb8c8", margin:0}}>
       Inspired by your reference cockpit-HUD frame and grounded in the actual
       <span style={{color:"#d6f3ff"}}> impulse-rs </span>
-      codebase (ratatui TUI + egui workbench, daemon, retrieval, injection, steward, guardrail,
+      codebase (ratatui TUI + Dioxus Desktop host, daemon, retrieval, injection, steward, guardrail,
       multi-agent orchestration). Three TUI directions, three GUI directions — each pulls a
       different lever (density, narrative, data-viz, operator-board, etc.) so we can mix and
       match before committing.
@@ -63,7 +63,7 @@ const Intro = () => (
         ["TUI · Cockpit Supervisor",   "Brand splash. Hi-density HUD with pixel-grid wordmark, memory stream, agent network, event log.", "#7be0ff"],
         ["TUI · Tmux Workbench",       "Operator path. ratatui-style multipane: sidebar + 2×2 agent panes + status line. What `cargo run -- run` should look like.", "#7be0ff"],
         ["TUI · Minimal Flow",         "Quiet. Narrow column · prose-first · charm/glow-style. For the 'silent' part of the promise.", "#7be0ff"],
-        ["GUI · Workbench Overview",   "egui-native. Stat cards, signal history, subsystem panel, daemon RTT in status bar.", "#ffce6b"],
+        ["Desktop · Workbench Overview", "Dioxus-native. Stat cards, signal history, subsystem panel, daemon RTT in status bar.", "#ffce6b"],
         ["GUI · Memory Map",           "Genome as graph. Force layout + injection diff inspector + 30-day growth timeline.", "#ffce6b"],
         ["GUI · Orchestration Board",  "Kanban for agents. Queue → in-flight → review → done · handoff prep · steward proposal.", "#ffce6b"],
       ].map((c, i) => (

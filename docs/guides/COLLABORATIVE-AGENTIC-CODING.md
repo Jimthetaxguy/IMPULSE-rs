@@ -10,8 +10,8 @@ status: active
 audience: builders
 tags: [agents, collaboration, worktrees, handoff, verification]
 authors:
-  - name: James Pustorino
-    role: Creator
+  - name: Impulse Maintainers
+    role: Maintainer
 ---
 
 # Collaborative Agentic Coding Guide
@@ -223,4 +223,4 @@ If verification fails, record the failure and either fix it within the owned sco
 - Do not delete files as cleanup; archive first and confirm destructive operations.
 - Do not expand scope silently.
 - Do not claim completion without verification.
-- Do not add new egui features; egui is legacy/frozen until Tauri+Dioxus reaches parity.
+- Do not add new egui features; egui is legacy/frozen until the Dioxus Desktop host reaches parity.

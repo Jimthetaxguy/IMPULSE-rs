@@ -163,37 +163,37 @@ Transform Impulse from a codebase with strong architecture but uneven test cover
 
 ```
 Phase 1: Commit + TUI Correctness (sequential start, then parallel)
-  1(commit) → [2, 3, 4](parallel TUI fixes) → [5, 6, 7](parallel handler tests)
+  1(commit) → [2, 3, 4] [parallel TUI fixes] → [5, 6, 7] [parallel handler tests]
 
 Phase 2: Handler Tests Batch 1 (mostly parallel after 8)
-  8(plan) → [9, 10, 11](parallel) → [12, 13, 14](parallel) → 15(commit)
+  8(plan) → [9, 10, 11] [parallel] → [12, 13, 14] [parallel] → 15(commit)
 
 Phase 3: Handler Tests Batch 2 + TUI/UX (parallel tracks)
-  16(plan) → [17, 18, 19, 20](parallel handlers) → [21, 22, 23](parallel TUI/UX)
+  16(plan) → [17, 18, 19, 20] [parallel handlers] → [21, 22, 23] [parallel TUI/UX]
 
 Phase 4: TUI/UX Enhancements (21 must land first, then parallel)
-  24(plan) → [25, 26, 27, 28, 29, 30](parallel) → 31(commit)
+  24(plan) → [25, 26, 27, 28, 29, 30] [parallel] → 31(commit)
 
 Phase 5: Proptest Adoption (all parallel — separate modules)
-  32(plan) → [33, 34, 35, 36, 37, 38](parallel) → 39(commit)
+  32(plan) → [33, 34, 35, 36, 37, 38] [parallel] → 39(commit)
 
 Phase 6: Core Test Density (some sequential)
-  40(plan) → [41, 42](parallel state) → [43, 44](parallel daemon) → [45, 46](parallel agent) → 47(commit)
+  40(plan) → [41, 42] [parallel state] → [43, 44] [parallel daemon] → [45, 46] [parallel agent] → 47(commit)
 
 Phase 7: GUI Test Coverage (all parallel — separate files)
-  48(plan) → [49, 50, 51, 52, 53, 54, 55, 56](parallel) → 57(commit)
+  48(plan) → [49, 50, 51, 52, 53, 54, 55, 56] [parallel] → 57(commit)
 
 Phase 8: Daemon-Truth EGUI (sequential — each builds on prior)
-  58(plan) → 59 → 60 → 61 → [62, 63, 64, 65, 66](parallel) → 67(commit)
+  58(plan) → 59 → 60 → 61 → [62, 63, 64, 65, 66] [parallel] → 67(commit)
 
 Phase 9: Refactors (all parallel — separate files)
-  68(plan) → [69, 70, 71, 72, 73](parallel) → [74, 75, 76](parallel) → 77(commit)
+  68(plan) → [69, 70, 71, 72, 73] [parallel] → [74, 75, 76] [parallel] → 77(commit)
 
 Phase 10: Documentation (parallel docs, then verify)
-  78(plan) → [79, 80, 81, 82, 83, 84](parallel) → 85(verify) → 86 → 87(commit)
+  78(plan) → [79, 80, 81, 82, 83, 84] [parallel] → 85(verify) → 86 → 87(commit)
 
 Phase 11: Integration Tests (parallel)
-  88(plan) → [89, 90, 91, 92, 93, 94](parallel) → 95(commit)
+  88(plan) → [89, 90, 91, 92, 93, 94] [parallel] → 95(commit)
 
 Phase 12: Ship
   96(verify) → 97(verify) → 98(plan) → 99(commit) → 100(archive)

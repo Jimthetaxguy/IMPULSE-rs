@@ -2,6 +2,8 @@
 
 _Started 2026-05-05 02:26 UTC_
 
+> **Historical transcript note:** This imported design transcript predates the 2026-06-14 Dioxus Desktop host pivot. Tauri references below are historical and do not define the active desktop target.
+
 ---
 
 ## User
@@ -276,7 +278,7 @@ _[tool: local_read]_
 
 _[tool: local_ls]_
 
-Now I understand the real architecture: **Dioxus 0.6.3 + Tauri**, RSX in `ui.rs`, CSS-classed elements, backend state via serializable DTOs and Tauri events. Let me read the ops contracts and bridge so I wire to real data, not hardcoded values.
+Now I understand the historical architecture at that point: **Dioxus 0.6.3 with the legacy Tauri-shaped bridge**, RSX in `ui.rs`, CSS-classed elements, backend state via serializable DTOs and host events. Let me read the ops contracts and bridge so I wire to real data, not hardcoded values.
 
 _[tool: local_read]_
 
@@ -334,7 +336,7 @@ _[tool: present_fs_item_for_download]_
 
 _[tool: done]_
 
-Everything renders: pure-black shell, Baloo 2 phosphor wordmark with bloom, `47.2k` bound stat, cyan working-dot, pending bar — the shipped `impulse_crt.css` themes the real `ui.rs` DOM correctly. Let me finalize.I made it work in the real **Dioxus 0.6.3 + Tauri** stack, bound to your actual `impulse-ops` DTOs — not a mockup. The `dioxus-impl/` package (download above) contains:
+Everything renders: pure-black shell, Baloo 2 phosphor wordmark with bloom, `47.2k` bound stat, cyan working-dot, pending bar — the shipped `impulse_crt.css` themes the real `ui.rs` DOM correctly. Let me finalize. I made it work in the historical **Dioxus 0.6.3 with legacy Tauri-shaped bridge** stack, bound to your actual `impulse-ops` DTOs — not a mockup. The `dioxus-impl/` package (download above) contains:
 
 - **`impulse_crt.css`** — the Retro Broadcast skin, keyed on the *exact* class names your `impulse-desktop/src/ui.rs` already emits (`.impulse-shell`, `.top-bar`, `.workspace-grid`, `.rail-item`, `.terminal-stage`, `.event-strip`). Drops in with zero RSX restructuring.
 - **`retro_shell.rs`** — Dioxus RSX components (`RetroShell`, `BrandHero`, `AgentRailItem`, `Stat`, `PendingReview`) that read every value from a `ReadOnlySignal<ProjectOpsSnapshot>` — tokens from `context.estimated_tokens`, agent dots from `AgentStatus`, pending bar from `context.pending_review_count`, etc. The aperture-iris + rocket emblem is inline RSX `svg`.
@@ -344,4 +346,3 @@ Everything renders: pure-black shell, Baloo 2 phosphor wordmark with bloom, `47.
 **V10 · Dioxus desktop shell** on the canvas renders that real `ui.rs` DOM with the shipped stylesheet, so what you see is what the Rust app produces.
 
 Two things worth confirming when you wire it up: (1) whether to enable the `asset` feature or use the `include_str!` inline path (kept your current `minimal`+`document` feature set working), and (2) bundling Baloo 2 locally for offline Tauri builds. Want me to add the event-bridge `App` wrapper as a ready-to-paste `main.rs` snippet next?
-

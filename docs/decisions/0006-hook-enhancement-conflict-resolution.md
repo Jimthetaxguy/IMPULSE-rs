@@ -4,7 +4,7 @@ description: Design decisions for blocking hooks, embedding cache, and conflict 
 status: accepted
 date: 2026-03-02
 authors:
-  - name: James Pustorino
+  - name: Impulse Maintainers
 ---
 
 # ADR 0006: Hook Enhancement and Conflict Resolution

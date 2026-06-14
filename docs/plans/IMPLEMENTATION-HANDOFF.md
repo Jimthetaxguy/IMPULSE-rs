@@ -1,44 +1,45 @@
 ---
 title: Implementation Handoff
-description: Current implementation sequence — Tauri desktop shell migration
+description: Current implementation sequence — Dioxus Desktop host migration
 version: '2.0'
-updated: 2026-05-22
+updated: 2026-06-14
 type: doc
 category: handoff
 phase: all
 status: active
 audience: builder
-tags: [handoff, implementation, tauri, dioxus, desktop, egui-deprecation]
+tags: [handoff, implementation, dioxus, desktop, egui-deprecation]
 authors:
-  - name: James Pustorino
-    role: Creator
+  - name: Impulse Maintainers
+    role: Maintainer
 ---
 
 # Implementation Handoff Document
 
-> **Updated:** 2026-05-22
+> **Updated:** 2026-06-14
 > **Purpose:** Capture the actual next implementation sequence for Impulse.
 > **Risk register:** [`../HONEST-ROADMAP.md`](../HONEST-ROADMAP.md)
 > **Roadmap anchor:** [`../ROADMAP-PLAN.md`](../ROADMAP-PLAN.md)
 > **Desktop architecture:** [`../spec/DESKTOP-SHELL-ARCHITECTURE.md`](../spec/DESKTOP-SHELL-ARCHITECTURE.md)
-> **Migration build sequence:** [`TAURI-DIOXUS-MIGRATION-HANDOFF.md`](TAURI-DIOXUS-MIGRATION-HANDOFF.md)
+> **Historical migration context:** [`TAURI-DIOXUS-MIGRATION-HANDOFF.md`](TAURI-DIOXUS-MIGRATION-HANDOFF.md)
 
 ---
 
 ## Executive Summary
 
-The desktop stack has been formally reset. The previous EGUI-workbench-as-destination direction is superseded. The new desktop contract is:
+The desktop stack has been formally reset again after the Dioxus host decision. The previous EGUI-workbench-as-destination direction and the Tauri-as-target direction are superseded. The new desktop contract is:
 
-- **Desktop shell:** Tauri 2.x
-- **Desktop UI layer:** Dioxus (inside the Tauri webview)
+- **Desktop host:** Dioxus Desktop
+- **Desktop UI layer:** Dioxus
 - **Terminal rendering:** xterm.js terminal bridge
 - **PTY/session/daemon ownership:** existing Rust backend (unchanged)
 - **Terminal-native operator surface:** ratatui (preserved, first-class)
 - **Legacy desktop surface:** egui / impulse-gui (frozen, sunset after parity)
+- **Legacy host adapter:** Tauri-shaped command/event bridge (compatibility only)
 
-Phase 0 established the desktop contract, but Plan 6 found residual active-doc drift. The current implementation stance is: Tauri+Dioxus is active, `impulse-gui` is already frozen, and remaining work should harden the terminal bridge and daemon-backed desktop parity without reviving egui as a product path.
+Phase 0 established the earlier desktop contract, but the current implementation stance is: Dioxus Desktop is active, `impulse-gui` is already frozen, Tauri-shaped code is compatibility-only, and remaining work should build the Dioxus Desktop launch scaffold plus daemon-backed desktop parity without reviving egui or new Tauri scaffolding as product paths.
 
-Full migration build sequence: [`TAURI-DIOXUS-MIGRATION-HANDOFF.md`](TAURI-DIOXUS-MIGRATION-HANDOFF.md)
+Historical migration build sequence: [`TAURI-DIOXUS-MIGRATION-HANDOFF.md`](TAURI-DIOXUS-MIGRATION-HANDOFF.md)
 
 ---
 
@@ -46,12 +47,12 @@ Full migration build sequence: [`TAURI-DIOXUS-MIGRATION-HANDOFF.md`](TAURI-DIOXU
 
 egui's immediate-mode rendering, constrained layout model, and the deep coupling between `impulse-term`'s PTY backend and `eframe` make it unsuitable as the long-term desktop shell. The PTY backend (`backend.rs`, `WriteQueue`, `context.rs`) is already framework-neutral in its logic — the `eframe` dependency is mechanical coupling that predates the current product direction.
 
-Tauri + Dioxus + xterm.js gives us:
+Dioxus Desktop + xterm.js gives us:
 - All application logic stays in Rust
 - xterm.js handles terminal rendering without building a custom cell-grid renderer
 - Dioxus `rsx!` gives declarative component composition without a JS frontend
-- Tauri 2's capability system is the right security model for a tool that spawns arbitrary subprocesses
-- macOS-first delivery, with mobile path available via Tauri 2 when needed
+- A Dioxus-owned host adapter instead of Tauri IPC as the product center
+- macOS-first delivery with native islands added only where needed
 
 Full tradeoff analysis: [`../spec/DESKTOP-STACK-TRADEOFFS.md`](../spec/DESKTOP-STACK-TRADEOFFS.md)
 
@@ -61,7 +62,7 @@ Full tradeoff analysis: [`../spec/DESKTOP-STACK-TRADEOFFS.md`](../spec/DESKTOP-S
 
 ### In Scope
 
-- All canonical contract docs updated to reflect Tauri+Dioxus as desktop target
+- All canonical contract docs updated to reflect Dioxus Desktop as desktop target
 - egui explicitly marked as legacy/freeze in all docs
 - Active docs route users to Claude Code/Codex primary platform truth, with OpenCode marked as legacy compatibility
 - Doc validation passes
@@ -111,14 +112,14 @@ The desktop shell adds the terminal bridge command/event surfaces as **additive*
 
 ## Implementation Phases (Summary)
 
-Full detail in [`TAURI-DIOXUS-MIGRATION-HANDOFF.md`](TAURI-DIOXUS-MIGRATION-HANDOFF.md).
+Historical detail in [`TAURI-DIOXUS-MIGRATION-HANDOFF.md`](TAURI-DIOXUS-MIGRATION-HANDOFF.md); current implementation follows ADR-0008.
 
 | Phase | Goal | Entry Criteria |
 |---|---|---|
 | 0 | Documentation reset | — |
 | 1 | Remove eframe from impulse-term | Active-doc drift resolved |
-| 2 | Static Tauri+Dioxus shell skeleton | Phase 1 complete |
-| 3 | Live terminal bridge (PTY → xterm.js) | Phase 2 complete |
+| 2 | Static Dioxus shell skeleton | Phase 1 complete |
+| 3 | Dioxus Desktop launch scaffold + live terminal bridge (PTY → xterm.js) | Phase 2 complete |
 | 4 | Daemon integration + parity | Phase 3 complete |
 
 ---
@@ -144,6 +145,7 @@ cargo clippy --all-features --all-targets -- -D warnings
 ### Platform Truth Cleanup Complete When
 
 - No doc refers to egui as the active or target desktop surface
-- Tauri+Dioxus is the desktop contract across all top-level docs
+- Dioxus Desktop is the desktop host contract across all top-level docs
+- Tauri-shaped command/event code is described only as a temporary compatibility adapter or historical context
 - `validate_docs.py --contract` passes
 - ratatui is explicitly preserved as first-class standalone operator surface

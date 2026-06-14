@@ -88,7 +88,7 @@ All of Phase 3 is complete. The uncommitted diff spans **36 files, +2,877 / −3
 Run from `impulse-rs/`:
 
 ```bash
-cd /Users/jamespustorino/Desktop/VibeCode_Prime/CLI_CU_L8R/impulse-rs
+cd <legacy-worktree>/impulse-rs
 
 # Full verification first
 cargo build && cargo test -- --skip integration_tests && cargo clippy -- -D warnings && cargo fmt --check
@@ -99,7 +99,7 @@ git add src/agent/ src/context_lifecycle/ src/daemon/ src/handlers/ src/llm_back
   impulse-gui/src/agent_panel/chat.rs impulse-gui/src/app.rs impulse-gui/src/ipc/types.rs \
   impulse-gui/src/state.rs impulse-gui/src/views/artifacts.rs \
   .impulse/GENOME.md .impulse/config.json .impulse/impulse-capabilities.json \
-  Cargo.toml ralph-plan-3.md
+  Cargo.toml docs/archive/ralph-plans/ralph-plan-3.md
 
 # Commit
 git commit -m "$(cat <<'EOF'
@@ -212,7 +212,7 @@ Fix any regressions found.
 - Files >800 lines list
 - `#[allow(dead_code)]` count
 - Final `cargo build + test + clippy + fmt`
-- Document final metrics in `ralph-plan-3.md` Working Log
+- Document final metrics in `docs/archive/ralph-plans/ralph-plan-3.md` Working Log
 
 ---
 
@@ -268,7 +268,7 @@ The 4 files exceeding 1,000 lines in `src/` (integration_tests, daemon/handlers,
 
 ## Ralph Plan Updates Needed
 
-After Phase 3 commit, update `ralph-plan-3.md` line ~52:
+After Phase 3 commit, update `docs/archive/ralph-plans/ralph-plan-3.md` line ~52:
 ```
 | 24 | Commit: Stage and commit Phase 3 agent harness improvements | commit | **done** |
 ```

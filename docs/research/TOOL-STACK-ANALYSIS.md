@@ -312,7 +312,7 @@ IMPULSE_ENV = "development"
 
 **What:** Production-ready memory extraction and management. Uses LLM as intelligent memory manager.
 
-**Why for Impulse:** Phase 2+ knowledge extraction. Instead of raw text search, mem0 extracts semantic facts ("James prefers TypeScript for backends") and manages them with ADD/UPDATE/DELETE operations.
+**Why for Impulse:** Phase 2+ knowledge extraction. Instead of raw text search, mem0 extracts semantic facts ("the project prefers TypeScript for backends") and manages them with ADD/UPDATE/DELETE operations.
 
 **Key technical properties:**
 - Python/JS, Apache 2.0, 42k+ stars

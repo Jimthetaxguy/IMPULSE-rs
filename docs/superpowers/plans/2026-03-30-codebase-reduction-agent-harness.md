@@ -1264,4 +1264,4 @@ cd impulse-rs && cargo fmt --check
 - [ ] **Step 3: Files >800 lines audit**
 - [ ] **Step 4: #[allow(dead_code)] count**
 - [ ] **Step 5: Agent feature matrix — all 7 features wired**
-- [ ] **Step 6: Record in ralph-plan-3.md Working Log**
+- [ ] **Step 6: Record in docs/archive/ralph-plans/ralph-plan-3.md Working Log**

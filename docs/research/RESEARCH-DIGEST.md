@@ -221,7 +221,7 @@ Best for: On-demand recall of specific decisions/implementations.
 ### Pattern 3: Mem0 Persistent Memory (Cross-Session Learning)
 
 Extract and store high-level decisions that persist indefinitely:
-- "James prefers TypeScript for backend services"
+- "The project prefers TypeScript for backend services"
 - "Project uses PostgreSQL 14 with pgvector extension"
 
 These survive compaction and inform future sessions without re-retrieving raw conversations.
@@ -409,7 +409,7 @@ The claude-memory plugin is proof that the "Three Files and a Hook" approach wor
 
 | Surface | Best Fit | Why |
 |--------|----------|-----|
-| **Operator desktop shell / dashboard** | Tauri + Dioxus + xterm.js | Webview UI gives better product-shell layout while xterm.js owns terminal rendering and Rust owns PTY/session state |
+| **Operator desktop shell / dashboard** | Dioxus Desktop + xterm.js | Dioxus owns the product shell while xterm.js owns terminal rendering and Rust owns PTY/session state. The earlier Tauri+Dioxus stack is historical comparison only. |
 | **Terminal-native workflows** | `ratatui` | Constraint-based layouts, keyboard-first flows, and low-latency rendering fit terminal operations well |
 | **Embedded PTY terminal widgets** | Dedicated crate (`impulse-term`) | The PTY surface has correctness and rendering constraints that should not be buried inside broader app views |
 
@@ -429,7 +429,7 @@ The claude-memory plugin is proof that the "Three Files and a Hook" approach wor
 
 7. **Backend failures must surface in the UI as signals, not silent degradation.** For PTY-backed Rust interfaces, the worst UX failure is a dead or stale panel that looks healthy. Error counts, reconnect state, and degraded-mode indicators are worth the screen space.
 
-8. **Choose UI technology per interaction model, not by ecosystem enthusiasm.** Tauri+Dioxus is now the active desktop product shell, xterm.js owns desktop terminal rendering, and `ratatui` remains first-class for terminal-native workflows. `egui` remains historical/legacy context only.
+8. **Choose UI technology per interaction model, not by ecosystem enthusiasm.** Dioxus Desktop is now the active desktop product shell, xterm.js owns desktop terminal rendering, and `ratatui` remains first-class for terminal-native workflows. Tauri-shaped code and `egui` remain historical/legacy context only.
 
 ### Practical Rules for This Repo
 
@@ -452,7 +452,7 @@ The claude-memory plugin is proof that the "Three Files and a Hook" approach wor
 - JSONL storage: Kent Gigger blog post
 - Compaction behavior: Anthropic platform cookbook
 - Documentation frameworks: `docs/AI build_complete_guide.md` (§MD-21.4), `docs/SUMMARY.md`, `docs/DOC-PLAN.md`
-- Rust UI/UX guidance: `ralph-plan-4.md`, `docs/research/TERMINAL-LAYER-ANALYSIS.md`, `docs/research/cross-model-consensus.md`
+- Rust UI/UX guidance: `docs/archive/ralph-plans/ralph-plan-4.md`, `docs/research/TERMINAL-LAYER-ANALYSIS.md`, `docs/research/cross-model-consensus.md`
 
 ---
 

@@ -10,8 +10,8 @@ status: active
 audience: builders
 tags: [stories, acceptance, traceability, rust, roadmap]
 authors:
-  - name: James Pustorino
-    role: Creator
+  - name: Impulse Maintainers
+    role: Maintainer
 ---
 
 # User Story Map
@@ -220,9 +220,9 @@ Primary interfaces:
 - `daemon`
 - JSON-line IPC protocol v2
 
-#### ST-09 Observe work through the Tauri desktop shell
+#### ST-09 Observe work through the Dioxus desktop host
 
-As an operator, I want Overview, Agents, Context, Memory, and Artifacts views in the Tauri+Dioxus desktop shell so I can supervise agent work without reading raw state files.
+As an operator, I want Overview, Agents, Context, Memory, and Artifacts views in the Dioxus Desktop shell so I can supervise agent work without reading raw state files.
 
 Status: In progress
 

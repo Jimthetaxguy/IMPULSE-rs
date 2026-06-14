@@ -1,15 +1,15 @@
 ---
 title: "ADR-0007: Desktop Shell Stack"
-status: accepted
+status: superseded
 created: 2026-04-15
-deciders: [James Pustorino]
+deciders: [Impulse Maintainers]
 ---
 
 # ADR-0007: Desktop Shell Stack
 
 ## Status
 
-Accepted
+Superseded by [`0008-dioxus-desktop-host.md`](0008-dioxus-desktop-host.md) after the 2026-06-14 decision to make Dioxus Desktop the target host and keep Tauri-shaped code as legacy compatibility only.
 
 ## Context
 
@@ -19,7 +19,10 @@ The product goal is a **desktop app that feels polished but is fundamentally ter
 
 Multiple desktop UI stack options were evaluated. The full tradeoff analysis is in `docs/spec/DESKTOP-STACK-TRADEOFFS.md`.
 
-## Decision
+## Superseded Decision
+
+The text below records the decision as originally accepted. It is not the
+current target; see ADR-0008 for the active Dioxus Desktop host decision.
 
 Adopt **Tauri 2.x + Dioxus + xterm.js terminal bridge** as the desktop shell stack.
 
@@ -47,7 +50,7 @@ Adopt **Tauri 2.x + Dioxus + xterm.js terminal bridge** as the desktop shell sta
 - **Pure JS/TS Tauri frontend:** Contradicts the Rust-first stance.
 - **Iced / Slint / GPUI:** No mature terminal widget exists in any of these frameworks.
 
-## Validation
+## Historical Validation
 
 The decision is validated when:
 
