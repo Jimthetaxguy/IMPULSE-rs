@@ -119,6 +119,8 @@ pub enum AgentPlatformKind {
     ClaudeCode,
     Codex,
     OpenCode,
+    Gemini,
+    Cursor,
     Shell,
 }
 
@@ -128,6 +130,8 @@ impl AgentPlatformKind {
             Self::ClaudeCode => "claude-code",
             Self::Codex => "codex",
             Self::OpenCode => "opencode",
+            Self::Gemini => "gemini",
+            Self::Cursor => "cursor",
             Self::Shell => "shell",
         }
     }
@@ -137,6 +141,8 @@ impl AgentPlatformKind {
             Self::ClaudeCode => "Claude Code",
             Self::Codex => "Codex",
             Self::OpenCode => "OpenCode",
+            Self::Gemini => "Gemini",
+            Self::Cursor => "Cursor",
             Self::Shell => "Shell",
         }
     }
@@ -146,6 +152,9 @@ impl AgentPlatformKind {
             Self::ClaudeCode => "claude".to_string(),
             Self::Codex => "codex".to_string(),
             Self::OpenCode => "opencode".to_string(),
+            Self::Gemini => "gemini".to_string(),
+            // Cursor's headless CLI binary is `cursor-agent`.
+            Self::Cursor => "cursor-agent".to_string(),
             Self::Shell => std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string()),
         }
     }
@@ -649,6 +658,10 @@ impl AgentPlatformKind {
             Self::Codex
         } else if command.contains("opencode") {
             Self::OpenCode
+        } else if command.contains("gemini") || command.contains("antigravity") {
+            Self::Gemini
+        } else if command.contains("cursor") {
+            Self::Cursor
         } else {
             Self::Shell
         }
@@ -1028,9 +1041,29 @@ mod tests {
             AgentPlatformKind::OpenCode
         );
         assert_eq!(
+            AgentPlatformKind::from_command("gemini"),
+            AgentPlatformKind::Gemini
+        );
+        assert_eq!(
+            AgentPlatformKind::from_command("/opt/antigravity"),
+            AgentPlatformKind::Gemini
+        );
+        assert_eq!(
+            AgentPlatformKind::from_command("cursor-agent"),
+            AgentPlatformKind::Cursor
+        );
+        assert_eq!(
             AgentPlatformKind::from_command("bash"),
             AgentPlatformKind::Shell
         );
+    }
+
+    #[test]
+    fn test_agent_platform_kind_default_command() {
+        assert_eq!(AgentPlatformKind::ClaudeCode.default_command(), "claude");
+        assert_eq!(AgentPlatformKind::Gemini.default_command(), "gemini");
+        // Cursor's headless binary is `cursor-agent`, not `cursor`.
+        assert_eq!(AgentPlatformKind::Cursor.default_command(), "cursor-agent");
     }
 
     #[test]
@@ -1107,6 +1140,8 @@ mod tests {
             AgentPlatformKind::ClaudeCode,
             AgentPlatformKind::Codex,
             AgentPlatformKind::OpenCode,
+            AgentPlatformKind::Gemini,
+            AgentPlatformKind::Cursor,
             AgentPlatformKind::Shell,
         ] {
             let json = serde_json::to_string(&kind).unwrap();

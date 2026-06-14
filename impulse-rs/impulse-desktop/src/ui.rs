@@ -730,6 +730,8 @@ fn WorkspaceLaunchPanel(
                         option { value: "codex", "Codex" }
                         option { value: "claude-code", "Claude Code" }
                         option { value: "opencode", "OpenCode" }
+                        option { value: "gemini", "Gemini" }
+                        option { value: "cursor", "Cursor" }
                         option { value: "shell", "Shell" }
                     }
                 }
@@ -840,6 +842,8 @@ fn parse_platform_kind(value: &str) -> AgentPlatformKind {
     match value {
         "claude-code" => AgentPlatformKind::ClaudeCode,
         "opencode" => AgentPlatformKind::OpenCode,
+        "gemini" => AgentPlatformKind::Gemini,
+        "cursor" => AgentPlatformKind::Cursor,
         "shell" => AgentPlatformKind::Shell,
         _ => AgentPlatformKind::Codex,
     }
