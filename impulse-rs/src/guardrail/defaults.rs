@@ -19,7 +19,12 @@ pub fn builtin_rules() -> Vec<GuardRule> {
         // ==================================================================
         GuardRule {
             id: "block-force-push-main".to_string(),
-            pattern: r"git\s+push\s+(.*\s+)?(-f|--force)\s+(.*\s+)?(origin\s+)?main\b".to_string(),
+            // Match a force flag and the `main` ref in EITHER order, so
+            // `git push origin main --force` (flag after the branch) can't
+            // bypass the block. Rust's regex engine is linear-time, so the
+            // `.*` alternation has no catastrophic-backtracking risk.
+            pattern: r"git\s+push\b.*(?:\s(?:-f|--force)\b.*\bmain\b|\bmain\b.*\s(?:-f|--force)\b)"
+                .to_string(),
             action: GuardAction::Block,
             target: GuardTarget::Bash,
             reason: "Force-pushing to main rewrites shared history and can cause data loss \
@@ -208,6 +213,20 @@ mod tests {
             "Should block: git push -f origin main"
         );
 
+        // Regression: the force flag placed AFTER the branch must still block
+        // (previously bypassed because the pattern required force before main).
+        let results = engine.evaluate("git push origin main --force", &GuardTarget::Bash);
+        assert!(
+            GuardEngine::has_blocking(&results),
+            "Should block force flag after branch: git push origin main --force"
+        );
+
+        let results = engine.evaluate("git push origin main -f", &GuardTarget::Bash);
+        assert!(
+            GuardEngine::has_blocking(&results),
+            "Should block force flag after branch: git push origin main -f"
+        );
+
         // Should allow
         let results = engine.evaluate("git push origin main", &GuardTarget::Bash);
         assert!(
@@ -219,6 +238,14 @@ mod tests {
         assert!(
             !GuardEngine::has_blocking(&results),
             "Should allow force push to feature branch"
+        );
+
+        // A branch whose name merely contains "main" (e.g. "maintenance") must
+        // not be treated as the main branch.
+        let results = engine.evaluate("git push --force origin maintenance", &GuardTarget::Bash);
+        assert!(
+            !GuardEngine::has_blocking(&results),
+            "Should allow force push to a 'maintenance' branch"
         );
     }
 
