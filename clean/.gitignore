@@ -1,0 +1,14 @@
+# Build artifacts
+target/
+**/target/
+
+# Cargo lock for libraries (commit for binaries; we ship a binary)
+# Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store

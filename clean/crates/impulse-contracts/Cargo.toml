@@ -1,0 +1,24 @@
+[package]
+name = "impulse-contracts"
+description = "Typed vocabulary shared across the Impulse-RS workspace: harnesses, sessions, events, errors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true, features = ["chrono04", "uuid1"] }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+serde_json = { workspace = true }

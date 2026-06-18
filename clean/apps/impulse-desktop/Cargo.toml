@@ -1,0 +1,46 @@
+[package]
+name = "impulse-desktop"
+description = "Dioxus desktop + web host for the Impulse-RS orchestrator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "impulse-desktop"
+path = "src/main.rs"
+
+[features]
+default = ["web"]
+web = ["dep:dioxus-web"]
+desktop = ["dep:dioxus-desktop"]
+ssr = ["dep:dioxus-ssr"]
+
+[dependencies]
+impulse-contracts = { workspace = true }
+impulse-workspace = { workspace = true }
+impulse-runtime = { workspace = true }
+impulse-mcp = { workspace = true }
+
+dioxus = { workspace = true }
+dioxus-web = { workspace = true, optional = true }
+dioxus-desktop = { workspace = true, optional = true }
+dioxus-ssr = { workspace = true, optional = true }
+
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+clap = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+pretty_assertions = { workspace = true }

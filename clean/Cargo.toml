@@ -1,0 +1,96 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/impulse-contracts",
+    "crates/impulse-workspace",
+    "crates/impulse-runtime",
+    "crates/impulse-mcp",
+    "apps/impulse-desktop",
+]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+authors = ["Impulse Maintainers"]
+description = "Terminal-native AI coding agent harness with PTY orchestrator and Dioxus host"
+repository = "https://github.com/Jimthetaxguy/IMPULSE-rs"
+homepage = "https://github.com/Jimthetaxguy/IMPULSE-rs"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "sync", "time", "process", "io-util", "fs", "net", "signal"] }
+tokio-util = { version = "0.7", features = ["io"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+rmp-serde = "1.3"
+schemars = "1"
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# IDs / time / paths
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5"
+url = "2"
+
+# Filesystem / patterns / hashing
+walkdir = "2"
+globset = "0.4"
+sha2 = "0.10"
+hex = "0.4"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# PTY / terminal
+portable-pty = "0.9"
+vt100 = "0.15"
+which = "7"
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled", "load_extension"] }
+
+# MCP
+rmcp = { version = "0.3", features = ["server", "client", "transport-io", "macros"] }
+
+# Dioxus (desktop + web)
+dioxus = { version = "0.6", features = ["macro", "signals", "hooks"] }
+dioxus-desktop = "0.6"
+dioxus-web = "0.6"
+dioxus-ssr = "0.6"
+
+# Inter-crate paths
+impulse-contracts = { path = "crates/impulse-contracts" }
+impulse-workspace = { path = "crates/impulse-workspace" }
+impulse-runtime = { path = "crates/impulse-runtime" }
+impulse-mcp = { path = "crates/impulse-mcp" }
+
+# Dev
+tempfile = "3"
+pretty_assertions = "1.4"
+rstest = "0.23"
+proptest = "1.5"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true
+incremental = true
