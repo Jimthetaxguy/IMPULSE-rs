@@ -1324,7 +1324,7 @@ mod tests {
         let (sink, _rx) = channel_event_sink();
         let runtime = Arc::new(DesktopRuntime::builder().with_event_sink(sink).build());
         let workspaces = Arc::new(WorkspaceRegistry::empty());
-        let mcp_reg = Arc::new(McpToolRegistry::with_builtins());
+        let _mcp_reg = Arc::new(McpToolRegistry::with_builtins());
         let mem = std::env::temp_dir().join("impulse-mcp-test");
         let ctx = McpContext::new(runtime, workspaces, mem);
         let tool = ListAgentPlatformsTool;
@@ -1352,7 +1352,7 @@ mod tests {
             obj.contains_key("live_agents"),
             "missing live_agents in ListAgents"
         );
-        let live_arr = obj["live_agents"].as_array().expect("live_agents array");
+        let _live_arr = obj["live_agents"].as_array().expect("live_agents array");
         // shape check
         assert!(obj.contains_key("available_platforms"));
     }
