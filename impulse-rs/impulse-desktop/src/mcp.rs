@@ -470,10 +470,10 @@ impl McpTool for AgentSpawnTool {
                     tool: "impulse.agent_spawn".to_string(),
                     message: error.to_string(),
                 })?;
-        Ok(serde_json::to_value(&snapshot).map_err(|e| McpError::Tool {
+        serde_json::to_value(&snapshot).map_err(|e| McpError::Tool {
             tool: "impulse.agent_spawn".to_string(),
             message: e.to_string(),
-        })?)
+        })
     }
 }
 
@@ -544,12 +544,10 @@ impl McpTool for ListWorkspacesTool {
         _confirmed: bool,
         ctx: &McpContext,
     ) -> Result<Value, McpError> {
-        Ok(
-            serde_json::to_value(ctx.workspaces().list()).map_err(|e| McpError::Tool {
-                tool: "impulse.list_workspaces".to_string(),
-                message: e.to_string(),
-            })?,
-        )
+        serde_json::to_value(ctx.workspaces().list()).map_err(|e| McpError::Tool {
+            tool: "impulse.list_workspaces".to_string(),
+            message: e.to_string(),
+        })
     }
 }
 
@@ -586,14 +584,14 @@ impl McpTool for ListAgentsTool {
                 }
             })?;
         let report = AgentPlatformsReport::from_registry(&reg);
-        Ok(serde_json::to_value(serde_json::json!({
+        serde_json::to_value(serde_json::json!({
             "live_agents": live,
             "available_platforms": report.platforms,
         }))
         .map_err(|e| McpError::Tool {
             tool: "impulse.list_agents".to_string(),
             message: e.to_string(),
-        })?)
+        })
     }
 }
 
@@ -631,12 +629,10 @@ impl McpTool for ListAgentPlatformsTool {
             })?;
         let report = AgentPlatformsReport::from_registry(&registry);
         // Return structured using the pure report for consistency.
-        Ok(
-            serde_json::to_value(&report.platforms).map_err(|e| McpError::Tool {
-                tool: "impulse.list_agent_platforms".to_string(),
-                message: e.to_string(),
-            })?,
-        )
+        serde_json::to_value(&report.platforms).map_err(|e| McpError::Tool {
+            tool: "impulse.list_agent_platforms".to_string(),
+            message: e.to_string(),
+        })
     }
 }
 
@@ -915,12 +911,10 @@ impl McpTool for ReviewDecisionTool {
         record.decided_at_unix_ms = Some(current_unix_ms());
         write_review_record(ctx.memory_root(), &record)?;
 
-        Ok(
-            serde_json::to_value(record.item(&path)).map_err(|e| McpError::Tool {
-                tool: "impulse.review_decision".to_string(),
-                message: e.to_string(),
-            })?,
-        )
+        serde_json::to_value(record.item(&path)).map_err(|e| McpError::Tool {
+            tool: "impulse.review_decision".to_string(),
+            message: e.to_string(),
+        })
     }
 }
 
