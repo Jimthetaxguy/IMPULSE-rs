@@ -30,7 +30,7 @@ echo "=== STEP3 STATUS x2 ===" | tee "$SCRATCH/verify-step3.log"
 (cd impulse-rs && cargo run -- status --format text 2>&1 ; echo '---JSON2---' ; cargo run -- status --format json 2>&1 | head -30) | tee "$SCRATCH/impulse-status-2.log"
 
 echo "=== STEP4 GATE FULL + AC1 DESKTOP FEATURE BUILD ===" | tee "$SCRATCH/verify-step4.log"
-(cd impulse-rs && cargo build --workspace && cargo build -p impulse-desktop --features desktop-app && cargo test --workspace && cargo clippy --workspace -- -D warnings && cargo fmt --check) 2>&1 | tee "$SCRATCH/verify-gate.log"
+(cd impulse-rs && cargo build --workspace && echo "cargo build -p impulse-desktop --features desktop-app" && cargo build -p impulse-desktop --features desktop-app && cargo test --workspace && cargo clippy --workspace -- -D warnings && cargo fmt --check) 2>&1 | tee "$SCRATCH/verify-gate.log"
 echo "STEP4_EXIT=$?" | tee -a "$SCRATCH/verify-gate.log"
 
 echo "=== STEP5 HOST + MCP + DISPATCH ===" | tee "$SCRATCH/verify-step5.log"
