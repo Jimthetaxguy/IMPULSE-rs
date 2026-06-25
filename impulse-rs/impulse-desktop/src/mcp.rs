@@ -248,6 +248,19 @@ impl McpContext {
     }
 }
 
+/// Small helper to centralize registry load + map to typed McpError.
+/// Deduplicates repeated registry_for_runtime + Tool-error wrapping in
+/// real execute paths (agent_spawn, list_agents, list_platforms).
+/// Returns McpError on failure (no silent fallback).
+fn load_registry_for_tool(
+    tool: &str,
+) -> Result<impulse_ops::agent_registry::AgentRegistry, McpError> {
+    impulse_ops::agent_registry::AgentRegistry::registry_for_runtime().map_err(|e| McpError::Tool {
+        tool: tool.to_string(),
+        message: e.to_string(),
+    })
+}
+
 /// In-process registry. Holds the set of tools and an append-only audit log.
 pub struct McpToolRegistry {
     tools: HashMap<String, Arc<dyn McpTool>>,
@@ -453,13 +466,7 @@ impl McpTool for AgentSpawnTool {
         }
         // Actually drive from canonical AgentRegistry (not discarded): resolve command via the ops helper
         // so launch is uniformly based on registry descriptors.
-        let reg =
-            impulse_ops::agent_registry::AgentRegistry::registry_for_runtime().map_err(|e| {
-                McpError::Tool {
-                    tool: "impulse.agent_spawn".to_string(),
-                    message: e.to_string(),
-                }
-            })?;
+        let reg = load_registry_for_tool("impulse.agent_spawn")?;
         let resolved_cmd = impulse_ops::agent_registry::resolve_launch_command(
             &reg,
             request.platform.as_str(),
@@ -581,13 +588,7 @@ impl McpTool for ListAgentsTool {
         // Monitoring path also driven by registry: include available platforms report alongside live snapshots.
         use impulse_ops::agent_registry::AgentPlatformsReport;
         let live = ctx.runtime().snapshot_agents();
-        let reg =
-            impulse_ops::agent_registry::AgentRegistry::registry_for_runtime().map_err(|e| {
-                McpError::Tool {
-                    tool: "impulse.list_agents".to_string(),
-                    message: e.to_string(),
-                }
-            })?;
+        let reg = load_registry_for_tool("impulse.list_agents")?;
         let report = AgentPlatformsReport::from_registry(&reg);
         serde_json::to_value(serde_json::json!({
             "live_agents": live,
@@ -625,13 +626,7 @@ impl McpTool for ListAgentPlatformsTool {
         _ctx: &McpContext,
     ) -> Result<Value, McpError> {
         use impulse_ops::agent_registry::AgentPlatformsReport;
-        let registry =
-            impulse_ops::agent_registry::AgentRegistry::registry_for_runtime().map_err(|e| {
-                McpError::Tool {
-                    tool: "impulse.list_agent_platforms".to_string(),
-                    message: e.to_string(),
-                }
-            })?;
+        let registry = load_registry_for_tool("impulse.list_agent_platforms")?;
         let report = AgentPlatformsReport::from_registry(&registry);
         // Return structured using the pure report for consistency.
         serde_json::to_value(&report.platforms).map_err(|e| McpError::Tool {
