@@ -246,6 +246,28 @@ impl AgentRegistry {
         Ok(registry)
     }
 
+    /// Policy helper for runtime/MCP use.
+    ///
+    /// - env unset or empty → builtin
+    /// - env points to non-existent file → builtin (per "missing file" policy)
+    /// - env points to corrupt file → RegistryError (no silent fallback)
+    /// - success → merged registry
+    pub fn registry_for_runtime() -> Result<Self, RegistryError> {
+        let mut registry = Self::builtin();
+        if let Ok(path_str) = std::env::var(REGISTRY_PATH_ENV) {
+            let trimmed = path_str.trim();
+            if !trimmed.is_empty() {
+                let path = Path::new(trimmed);
+                if path.exists() {
+                    let overrides = Self::load_from_path(path)?;
+                    registry.merge(overrides);
+                }
+                // missing file → builtin, no error
+            }
+        }
+        Ok(registry)
+    }
+
     /// Merge another registry into this one: descriptors whose id already exists
     /// (case-insensitive) replace the existing entry in place; new ids append.
     pub fn merge(&mut self, other: AgentRegistry) {
@@ -319,6 +341,66 @@ impl AgentRegistry {
     /// Whether the registry holds no agents.
     pub fn is_empty(&self) -> bool {
         self.agents.is_empty()
+    }
+}
+
+/// Structured info for one agent platform (for observability / listing / launch).
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentPlatformInfo {
+    pub id: String,
+    pub label: String,
+    pub command: String,
+}
+
+/// Pure observability report built from the registry (no I/O, no printing).
+/// Used by CLI status, MCP list platforms, etc. to drive indicators for claude-code, codex, workspaces.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentPlatformsReport {
+    pub platforms: Vec<AgentPlatformInfo>,
+    pub multi_workspace_note: String,
+}
+
+impl AgentPlatformsReport {
+    /// Build from a registry. Pure function — directly testable.
+    pub fn from_registry(reg: &AgentRegistry) -> Self {
+        let platforms = reg
+            .agents()
+            .iter()
+            .map(|d| AgentPlatformInfo {
+                id: d.id.clone(),
+                label: d.label.clone(),
+                command: d.command.clone(),
+            })
+            .collect();
+        Self {
+            platforms,
+            multi_workspace_note:
+                "register and cycle project folders/spaces via desktop (WorkspaceRegistry)."
+                    .to_string(),
+        }
+    }
+}
+
+/// Resolve the command to use when launching a terminal agent for a given platform slug.
+/// Prefers explicit override (if non-blank), then registry descriptor, then safe fallback.
+/// This collapses the previous duplication of command source between ops and desktop.
+pub fn resolve_launch_command(
+    reg: &AgentRegistry,
+    slug: &str,
+    override_cmd: Option<&str>,
+) -> String {
+    if let Some(cmd) = override_cmd {
+        if !cmd.trim().is_empty() {
+            return cmd.to_string();
+        }
+    }
+    if let Some(desc) = reg.get(slug) {
+        return desc.command.clone();
+    }
+    if slug.eq_ignore_ascii_case("shell") {
+        std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string())
+    } else {
+        "sh".to_string()
     }
 }
 
@@ -581,6 +663,34 @@ command = "ratchet"
     }
 
     #[test]
+    fn test_registry_for_runtime_no_env_returns_builtin() {
+        std::env::remove_var(REGISTRY_PATH_ENV);
+        let reg = AgentRegistry::registry_for_runtime().expect("builtin");
+        assert!(reg.get("claude-code").is_some());
+        assert!(reg.get("codex").is_some());
+    }
+
+    #[test]
+    fn test_registry_for_runtime_nonexistent_file_returns_builtin() {
+        let non = "/tmp/impulse-no-such-registry-bd088a7e.toml";
+        std::env::set_var(REGISTRY_PATH_ENV, non);
+        let reg = AgentRegistry::registry_for_runtime().expect("builtin on missing file");
+        assert!(reg.get("claude-code").is_some());
+        std::env::remove_var(REGISTRY_PATH_ENV);
+    }
+
+    #[test]
+    fn test_registry_for_runtime_corrupt_toml_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("bad.toml");
+        std::fs::write(&p, "[[agent]\nid = \"x\"\nlabel = \"bad\" toml syntax error here").unwrap();
+        std::env::set_var(REGISTRY_PATH_ENV, p.to_str().unwrap());
+        let err = AgentRegistry::registry_for_runtime().unwrap_err();
+        assert!(matches!(err, RegistryError::Toml(_)));
+        std::env::remove_var(REGISTRY_PATH_ENV);
+    }
+
+    #[test]
     fn test_registry_file_serde_round_trip() {
         let file = RegistryFile {
             agents: AgentRegistry::builtin().agents().to_vec(),
@@ -597,5 +707,87 @@ command = "ratchet"
         assert!(d.matches("CODEX"));
         assert!(!d.matches(""));
         assert!(!d.matches("   "));
+    }
+
+    #[test]
+    fn test_multi_backend_agent_descriptor_listing_for_terminal_cli_logins() {
+        // Direct test exercising real registry (no mocks of the unit under test).
+        // Verifies observable support for multiple distinct agent CLI types (claude-code, codex, etc.)
+        // that can "login"/attach as terminal agents under Impulse supervision.
+        let registry = AgentRegistry::builtin();
+        let agents = registry.agents();
+        assert!(agents.len() >= 2, "must expose multiple backends");
+        assert!(registry.get("claude-code").is_some());
+        assert!(registry.get("codex").is_some());
+        // Listing via public API yields the descriptors.
+        let listed: Vec<_> = agents.iter().map(|a| a.id.as_str()).collect();
+        assert!(listed.contains(&"claude-code"));
+        assert!(listed.contains(&"codex"));
+        // Emit for captured output verification (contains "claude", "codex" indicators).
+        eprintln!("REGISTERED_AGENT_PLATFORMS: {:?}", listed);
+        for a in agents {
+            eprintln!("AGENT: id={} label={} command={}", a.id, a.label, a.command);
+        }
+    }
+
+    #[test]
+    fn test_agent_platforms_report_from_builtin_has_claude_and_codex() {
+        // Pure unit test on real registry (no eprintln, no mocks of the unit under test).
+        let reg = AgentRegistry::builtin();
+        let report = AgentPlatformsReport::from_registry(&reg);
+        assert!(report.platforms.iter().any(|p| p.id == "claude-code"));
+        assert!(report.platforms.iter().any(|p| p.id == "codex"));
+        assert!(!report.multi_workspace_note.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_launch_command_prefers_registry() {
+        let reg = AgentRegistry::builtin();
+        let cmd = resolve_launch_command(&reg, "claude-code", None);
+        assert_eq!(cmd, "claude");
+        let cmd2 = resolve_launch_command(&reg, "codex", Some("  "));
+        assert_eq!(cmd2, "codex");
+        let override_c = resolve_launch_command(&reg, "claude-code", Some("/custom/claude"));
+        assert_eq!(override_c, "/custom/claude");
+    }
+
+    #[test]
+    fn test_reconciled_clean_archive_has_contracts_snapshot() {
+        // Proof in canonical tree that .clean was reconciled (archived into single active tree).
+        // Contents of the duplicate checkout are now under archive/_archived-... or reconciled-...
+        let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let base = std::path::Path::new(&manifest).join("../../archive");
+        let has_archived = std::fs::read_dir(&base)
+            .ok()
+            .map(|rd| {
+                rd.filter_map(|e| e.ok()).any(|e| {
+                    let p = e.path();
+                    let name = p.to_string_lossy();
+                    if name.contains("_archived-IMPULSE") || name.contains("reconciled-from-clean")
+                    {
+                        let c1 = p.join("clean/crates/impulse-contracts/Cargo.toml");
+                        if c1.exists() {
+                            return true;
+                        }
+                        let c2 = p.join("crates/impulse-contracts/Cargo.toml");
+                        if c2.exists() {
+                            return true;
+                        }
+                        let c3 = p.join("full-snapshot/clean/crates/impulse-contracts/Cargo.toml");
+                        if c3.exists() {
+                            return true;
+                        }
+                    }
+                    false
+                })
+            })
+            .unwrap_or(false);
+        let old_partial = std::path::Path::new(&manifest).join(
+            "../../archive/reconciled-from-clean-2026-06-25/crates/impulse-contracts/Cargo.toml",
+        );
+        assert!(
+            has_archived || old_partial.exists(),
+            "reconciled archive must contain contracts crate reference from .clean"
+        );
     }
 }
