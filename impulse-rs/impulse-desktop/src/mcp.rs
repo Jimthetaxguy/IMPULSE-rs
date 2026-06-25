@@ -1046,7 +1046,7 @@ fn review_preview(arguments: &Value) -> String {
         .and_then(Value::as_str)
         .or_else(|| arguments.get("data").and_then(Value::as_str))
         .map(ToString::to_string)
-        .unwrap_or_else(|| serde_json::to_string(arguments).unwrap_or_else(|_| "{}".to_string()));
+        .unwrap_or_else(|| "{}".to_string());
     let mut preview = raw.replace('\n', "\\n");
     if preview.len() > 160 {
         preview.truncate(157);
