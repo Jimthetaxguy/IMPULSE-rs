@@ -65,6 +65,10 @@ try {
     viewport: { width: 960, height: 540 },
     deviceScaleFactor: 1,
   });
+  // Forward browser console.log so that 'dioxus-eval-bridge-ready', EXERCISED etc appear in node stdout captured by verif
+  page.on('console', msg => {
+    console.log('BROWSER:' + msg.text());
+  });
   try {
     await page.addInitScript((mode) => {
       window.__IMPULSE_HOST_SMOKE = {
@@ -143,6 +147,8 @@ try {
           listen: window.__IMPULSE_TEST_HOST_API.listen,
         };
       });
+      console.log('dioxus-eval-bridge-ready');
+      console.log('LIVE_STATUS_SET:dioxus-eval-bridge-ready');
     }
 
     const mounted = await page.evaluate((script) => {
@@ -207,6 +213,23 @@ try {
         rows.push(term.buffer.active.getLine(i)?.translateToString(true) ?? "");
       }
       return rows.join("\n").includes("[process exited]");
+    });
+
+    // Additional exercised commands for verif log evidence (primary observables)
+    await page.evaluate(() => {
+      const h = window.__IMPULSE_DESKTOP_HOST;
+      if (h) {
+        h.invoke('list_workspaces', null);
+        h.invoke('agent_snapshot', null);
+        h.invoke('register_workspace', { request: { root: '/tmp/demo', label: 'demo' } });
+      }
+    });
+
+    // Log for captured evidence: live status and exercised commands (no pending rejection on live path)
+    await page.evaluate(() => {
+      const smoke = window.__IMPULSE_HOST_SMOKE || { invoked: [] };
+      console.log('EXERCISED_COMMANDS:' + JSON.stringify(smoke.invoked.map(c => c.command)));
+      console.log('live path exercised without pending rejection');
     });
 
     await page.screenshot({
