@@ -29,7 +29,7 @@ authors:
 | Stage | Focus | Status |
 |------|-------|--------|
 | **Now** | Rust memory core + hooks + retrieval/injection + Dioxus desktop host | Active |
-| **Next** | Dioxus Desktop launch scaffold + live terminal bridge parity | Active |
+| **Next** | Dioxus Desktop launch scaffold + live terminal bridge parity | Complete (scaffold + bridge parity via smoke + dispatch tests + registry centralization) |
 | **Later** | Daemon parity in desktop shell + agent control + artifact polish | Planned |
 
 This document is intentionally aligned with [`spec/RUST-CANONICAL-CONTRACT.md`](./spec/RUST-CANONICAL-CONTRACT.md). If another active doc conflicts, the contract wins.
@@ -43,7 +43,7 @@ This document is intentionally aligned with [`spec/RUST-CANONICAL-CONTRACT.md`](
 | Area | Status | Reality |
 |------|--------|---------|
 | Rust memory core | Implemented | Session tracking, genome/history, retrieval, injection, stewardship, daemon, and tool/runtime infrastructure are live. |
-| Dioxus desktop host | In migration | `impulse-desktop` contains a Dioxus shell, typed host bridge scaffold, Dioxus-native host smoke, and explicit legacy compatibility adapter; Dioxus Desktop launch and daemon parity remain pending. |
+| Dioxus desktop host | Scaffold parity complete | `impulse-desktop` contains Dioxus shell, typed host bridge, smoke asserting live "dioxus-eval-bridge-ready", exercised commands, real dispatch_host_invoke + body tests; registry central + error prop; daemon parity later. |
 | Agent harness wiring | **COMPLETE** | All 10 features wired: context→prompts, intent classification, full coordination, conflict history IPC, JSON harness protocol, session awareness, specialized IPC (2026-03-31). |
 | Artifact model | In progress | Provider-neutral artifact envelopes and actions exist, but operator ergonomics still need polish. |
 | Daemon-truth desktop panels | Planned | Snapshot/artifact IPC exists; desktop shell must render daemon snapshots rather than frontend-local truth. |
