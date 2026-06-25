@@ -434,7 +434,36 @@ mod tests {
         assert_eq!(bare.agent_id, "claude");
     }
 
-    #[derive(Deserialize)]
+    #[test]
+    fn body_errors_on_non_object_payload() {
+        // Boundary: non-object (e.g. scalar) must error (exercises the serde path in body() helper).
+        let res: Result<AgentWriteBody, _> = body(json!(42));
+        assert!(res.is_err());
+        let msg = res.unwrap_err();
+        assert!(msg.contains("invalid request payload") || msg.contains("invalid"));
+    }
+
+    #[test]
+    fn body_array_payload_errors() {
+        let res: Result<AgentWriteBody, _> = body(json!([1, 2, 3]));
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("invalid request payload"));
+    }
+
+    #[test]
+    fn body_object_without_request_uses_bare_map() {
+        // Exercises the unwrap_or(Value::Object(map)) arm for bare objects (no "request" key).
+        let bare: AgentWriteBody = body(json!({"agent_id": "bare", "data": []})).unwrap();
+        assert_eq!(bare.agent_id, "bare");
+    }
+
+    #[test]
+    fn body_request_not_object_errors() {
+        let res: Result<AgentWriteBody, _> = body(json!({"request": 123}));
+        assert!(res.is_err());
+    }
+
+    #[derive(Deserialize, Debug)]
     struct AgentWriteBody {
         agent_id: String,
         #[allow(dead_code)]
@@ -545,6 +574,25 @@ mod tests {
         .await;
         assert!(!response.ok);
         assert!(response.error.unwrap().contains("invalid request payload"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_array_payload_hits_body_error_path() {
+        // Ensures real dispatch_host_invoke + body() is exercised for malformed array (not just JS sim in smoke).
+        // Use a command that actually calls body(payload) (snapshot ignores payload).
+        let state = test_state();
+        let response = dispatch_host_invoke(
+            &state,
+            HostInvokeRequest {
+                id: "arrbad".to_string(),
+                command: "agent_write".to_string(),
+                payload: json!([1, 2]),
+            },
+        )
+        .await;
+        assert!(!response.ok);
+        let err = response.error.unwrap_or_default();
+        assert!(err.contains("invalid request payload") || err.contains("unknown"));
     }
 
     #[test]

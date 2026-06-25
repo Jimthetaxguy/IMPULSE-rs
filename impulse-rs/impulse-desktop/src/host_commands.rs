@@ -65,6 +65,14 @@ pub const HOST_INVOKE_COMMANDS: &[&str] = &[
     TERMINAL_WRITE_COMMAND,
 ];
 
+/// Small pure helper ratchet (autoresearch-style dedup): converts any
+/// Display error into the `String` surface required by the host command
+/// facade. Eliminates 18+ identical closures while preserving identical
+/// semantics for Tauri + dioxus + tests.
+fn err_to_string<E: std::fmt::Display>(e: E) -> String {
+    e.to_string()
+}
+
 #[cfg(feature = "legacy-tauri-runtime")]
 #[tauri::command]
 pub async fn agent_spawn(
@@ -86,9 +94,7 @@ fn agent_spawn_inner(
     runtime: &DesktopRuntime,
     request: AgentSpawnRequest,
 ) -> Result<AgentRuntimeSnapshot, String> {
-    runtime
-        .spawn_agent(request)
-        .map_err(|error| error.to_string())
+    runtime.spawn_agent(request).map_err(err_to_string)
 }
 
 #[cfg(feature = "legacy-tauri-runtime")]
@@ -109,9 +115,7 @@ pub async fn agent_write(
 }
 
 fn agent_write_inner(runtime: &DesktopRuntime, request: AgentWriteRequest) -> Result<(), String> {
-    runtime
-        .write_agent(request)
-        .map_err(|error| error.to_string())
+    runtime.write_agent(request).map_err(err_to_string)
 }
 
 #[cfg(feature = "legacy-tauri-runtime")]
@@ -135,9 +139,7 @@ fn agent_resize_inner(
     runtime: &DesktopRuntime,
     request: TerminalResizeRequest,
 ) -> Result<AgentRuntimeSnapshot, String> {
-    runtime
-        .resize_agent(request)
-        .map_err(|error| error.to_string())
+    runtime.resize_agent(request).map_err(err_to_string)
 }
 
 #[cfg(feature = "legacy-tauri-runtime")]
@@ -161,9 +163,7 @@ fn agent_focus_inner(
     runtime: &DesktopRuntime,
     request: TerminalFocusRequest,
 ) -> Result<AgentRuntimeSnapshot, String> {
-    runtime
-        .focus_agent(request)
-        .map_err(|error| error.to_string())
+    runtime.focus_agent(request).map_err(err_to_string)
 }
 
 #[cfg(feature = "legacy-tauri-runtime")]
@@ -187,9 +187,7 @@ fn agent_close_inner(
     runtime: &DesktopRuntime,
     request: TerminalCloseRequest,
 ) -> Result<(), String> {
-    runtime
-        .close_agent(request)
-        .map_err(|error| error.to_string())
+    runtime.close_agent(request).map_err(err_to_string)
 }
 
 #[cfg(feature = "legacy-tauri-runtime")]
@@ -232,7 +230,7 @@ fn supervisor_local_action_inner(
 ) -> Result<(), String> {
     runtime
         .dispatch_supervisor_local_action(request)
-        .map_err(|error| error.to_string())
+        .map_err(err_to_string)
 }
 
 #[cfg(feature = "legacy-tauri-runtime")]
@@ -256,7 +254,7 @@ fn terminal_open_inner(
     runtime: &DesktopRuntime,
     request: TerminalOpenRequest,
 ) -> Result<TerminalSessionResponse, String> {
-    runtime.open(request).map_err(|error| error.to_string())
+    runtime.open(request).map_err(err_to_string)
 }
 
 #[cfg(feature = "legacy-tauri-runtime")]
@@ -280,7 +278,7 @@ fn terminal_write_inner(
     runtime: &DesktopRuntime,
     request: TerminalWriteRequest,
 ) -> Result<(), String> {
-    runtime.write(request).map_err(|error| error.to_string())
+    runtime.write(request).map_err(err_to_string)
 }
 
 #[cfg(feature = "legacy-tauri-runtime")]
@@ -304,7 +302,7 @@ fn terminal_resize_inner(
     runtime: &DesktopRuntime,
     request: TerminalResizeRequest,
 ) -> Result<(), String> {
-    runtime.resize(request).map_err(|error| error.to_string())
+    runtime.resize(request).map_err(err_to_string)
 }
 
 #[cfg(feature = "legacy-tauri-runtime")]
@@ -328,7 +326,7 @@ fn terminal_close_inner(
     runtime: &DesktopRuntime,
     request: TerminalCloseRequest,
 ) -> Result<(), String> {
-    runtime.close(request).map_err(|error| error.to_string())
+    runtime.close(request).map_err(err_to_string)
 }
 
 #[cfg(feature = "legacy-tauri-runtime")]
@@ -352,7 +350,7 @@ fn terminal_focus_inner(
     runtime: &DesktopRuntime,
     request: TerminalFocusRequest,
 ) -> Result<(), String> {
-    runtime.focus(request).map_err(|error| error.to_string())
+    runtime.focus(request).map_err(err_to_string)
 }
 
 #[cfg_attr(feature = "legacy-tauri-runtime", tauri::command)]
@@ -361,7 +359,7 @@ pub async fn native_island_request(
 ) -> Result<NativeIslandResult, String> {
     DefaultNativeIslandHost
         .dispatch(request)
-        .map_err(|error| error.to_string())
+        .map_err(err_to_string)
 }
 
 // ──────────────────────────── MCP + workspace surface ───────────────────────────
@@ -494,7 +492,7 @@ fn invoke_blocking(
     state
         .mcp
         .invoke(&tool, caller_agent_id, arguments, confirmed, &context)
-        .map_err(|error| error.to_string())
+        .map_err(err_to_string)
 }
 
 /// host command — list the descriptors of every registered MCP tool.
@@ -520,14 +518,14 @@ pub async fn mcp_descriptors(
 pub async fn review_queue(
     state: tauri::State<'_, DesktopShellState>,
 ) -> Result<Vec<crate::mcp::ReviewQueueItem>, String> {
-    list_review_queue(&state.inner().memory_root).map_err(|error| error.to_string())
+    list_review_queue(&state.inner().memory_root).map_err(err_to_string)
 }
 
 #[cfg(not(feature = "legacy-tauri-runtime"))]
 pub async fn review_queue(
     state: &DesktopShellState,
 ) -> Result<Vec<crate::mcp::ReviewQueueItem>, String> {
-    list_review_queue(&state.memory_root).map_err(|error| error.to_string())
+    list_review_queue(&state.memory_root).map_err(err_to_string)
 }
 
 /// host command — apply or skip one staged review payload through the MCP
@@ -556,7 +554,7 @@ fn review_decision_inner(
     request: ReviewDecisionRequest,
 ) -> Result<McpInvocation, String> {
     let context = state.context();
-    let arguments = serde_json::to_value(&request).map_err(|error| error.to_string())?;
+    let arguments = serde_json::to_value(&request).map_err(err_to_string)?;
     state
         .mcp
         .invoke(
@@ -566,7 +564,7 @@ fn review_decision_inner(
             request.confirmed,
             &context,
         )
-        .map_err(|error| error.to_string())
+        .map_err(err_to_string)
 }
 
 /// host command — list registered workspaces so the Dioxus switcher can
@@ -611,7 +609,7 @@ fn register_workspace_inner(
     state
         .workspaces
         .register_workspace(request.into_target())
-        .map_err(|error| error.to_string())?;
+        .map_err(err_to_string)?;
     state
         .workspaces
         .lookup(&root)
