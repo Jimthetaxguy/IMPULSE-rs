@@ -338,7 +338,13 @@ impl McpToolRegistry {
         };
         self.lock_audit().push(invocation.clone());
         if !invocation.ok {
-            let err = error.expect("McpTool reported !ok but provided no error detail");
+            let err = match error {
+                Some(e) => e,
+                None => McpError::Tool {
+                    tool: name.to_string(),
+                    message: "tool reported failure".to_string(),
+                },
+            };
             return Err(err);
         }
         Ok(invocation)
@@ -361,7 +367,10 @@ impl McpToolRegistry {
     }
 
     fn lock_audit(&self) -> MutexGuard<'_, Vec<McpInvocation>> {
-        self.audit.lock().expect("audit mutex poisoned")
+        match self.audit.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 }
 
@@ -725,11 +734,11 @@ impl McpTool for SearchMemoryTool {
                 arg: "query".to_string(),
             })?
             .to_ascii_lowercase();
-        let limit = arguments
-            .get("limit")
-            .and_then(Value::as_u64)
-            .unwrap_or(20)
-            .min(200) as usize; // default 20 clamped to 200; explicit default per policy
+        let limit = if let Some(v) = arguments.get("limit").and_then(Value::as_u64) {
+            (v.min(200)) as usize
+        } else {
+            20usize
+        };
         let history_path = ctx.memory_root().join("HISTORY.jsonl");
         let mut matches = Vec::new();
         if history_path.is_file() {
@@ -1037,9 +1046,7 @@ fn review_preview(arguments: &Value) -> String {
         .and_then(Value::as_str)
         .or_else(|| arguments.get("data").and_then(Value::as_str))
         .map(ToString::to_string)
-        .unwrap_or_else(|| {
-            serde_json::to_string(arguments).expect("arguments should always serialize")
-        });
+        .unwrap_or_else(|| serde_json::to_string(arguments).unwrap_or_else(|_| "{}".to_string()));
     let mut preview = raw.replace('\n', "\\n");
     if preview.len() > 160 {
         preview.truncate(157);
@@ -1049,10 +1056,10 @@ fn review_preview(arguments: &Value) -> String {
 }
 
 fn current_unix_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0) // epoch fallback on clock error (rare)
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_millis() as i64,
+        Err(_) => 0,
+    }
 }
 
 #[cfg(test)]
