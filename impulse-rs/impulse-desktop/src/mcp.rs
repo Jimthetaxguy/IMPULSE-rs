@@ -544,8 +544,12 @@ impl McpTool for ListWorkspacesTool {
         _confirmed: bool,
         ctx: &McpContext,
     ) -> Result<Value, McpError> {
-        Ok(serde_json::to_value(ctx.workspaces().list())
-            .unwrap_or_else(|_| Value::Array(Vec::new())))
+        Ok(
+            serde_json::to_value(ctx.workspaces().list()).map_err(|e| McpError::Tool {
+                tool: "impulse.list_workspaces".to_string(),
+                message: e.to_string(),
+            })?,
+        )
     }
 }
 
@@ -911,7 +915,12 @@ impl McpTool for ReviewDecisionTool {
         record.decided_at_unix_ms = Some(current_unix_ms());
         write_review_record(ctx.memory_root(), &record)?;
 
-        Ok(serde_json::to_value(record.item(&path)).unwrap_or(Value::Null))
+        Ok(
+            serde_json::to_value(record.item(&path)).map_err(|e| McpError::Tool {
+                tool: "impulse.review_decision".to_string(),
+                message: e.to_string(),
+            })?,
+        )
     }
 }
 
@@ -1337,5 +1346,19 @@ mod tests {
             "missing claude-code: {ids:?}"
         );
         assert!(ids.iter().any(|&i| i == "codex"), "missing codex: {ids:?}");
+
+        // Also exercise ListAgentsTool return shape per skeptic gap
+        let agents_tool = ListAgentsTool;
+        let agents_val = agents_tool
+            .execute(&serde_json::Value::Null, false, &ctx)
+            .expect("list agents execute");
+        let obj = agents_val.as_object().expect("ListAgents response object");
+        assert!(
+            obj.contains_key("live_agents"),
+            "missing live_agents in ListAgents"
+        );
+        let live_arr = obj["live_agents"].as_array().expect("live_agents array");
+        // shape check
+        assert!(obj.contains_key("available_platforms"));
     }
 }
