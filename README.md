@@ -18,6 +18,7 @@ AI coding agents (Claude Code and Codex) forget everything between sessions. You
 - **Context stewardship** — Monitors context window usage and proposes cleanup strategies
 - **Daemon + TUI** — Long-running daemon with 9-tab interactive terminal UI
 - **Platform hooks** — Auto-generated hooks for Claude Code and Codex, with legacy OpenCode compatibility preserved where already implemented
+- **Impulse as always-on tech lead** — Manages/monitors/augments terminal CLI-TUI agents (claude-code, codex, cursor cli and similar) that login/attach to it. The light UI lets you pick and cycle across multiple project folders/workspaces and run one or many agents per space in one interface. Wired agents are augmented with extra tools/capabilities via Rust type-safe built-in plugins. Subagents and workflows are used to scale capabilities while reducing per-agent load on the machine. (See also CONTEXT.md, HANDBOOK ImpulseAgent, and docs/decisions/0009.)
 
 ## Quick Start
 

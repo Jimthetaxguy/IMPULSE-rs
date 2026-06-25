@@ -1299,4 +1299,22 @@ mod tests {
         let back: AgentPlatformKind = serde_json::from_value(value).expect("deserialize");
         assert_eq!(kind, back);
     }
+
+    #[tokio::test]
+    async fn test_mcp_list_agent_platforms_execute_includes_claude_codex() {
+        // Exercises the execute body of ListAgentPlatformsTool (and by registry central) with real types.
+        use crate::host_bridge::channel_event_sink;
+        let (sink, _rx) = channel_event_sink();
+        let runtime = Arc::new(DesktopRuntime::builder().with_event_sink(sink).build());
+        let workspaces = Arc::new(WorkspaceRegistry::empty());
+        let mcp_reg = Arc::new(McpToolRegistry::with_builtins());
+        let mem = std::env::temp_dir().join("impulse-mcp-test");
+        let ctx = McpContext::new(runtime, workspaces, mem);
+        let tool = ListAgentPlatformsTool;
+        let val = tool.execute(&serde_json::Value::Null, false, &ctx).expect("platforms execute");
+        let arr = val.as_array().expect("platforms array");
+        let ids: Vec<&str> = arr.iter().filter_map(|v| v.get("id").and_then(|i| i.as_str())).collect();
+        assert!(ids.iter().any(|&i| i == "claude-code"), "missing claude-code: {ids:?}");
+        assert!(ids.iter().any(|&i| i == "codex"), "missing codex: {ids:?}");
+    }
 }

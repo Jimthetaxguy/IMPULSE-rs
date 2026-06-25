@@ -350,4 +350,36 @@ mod tests {
             Some("operator-authored context")
         );
     }
+
+    #[test]
+    fn test_multi_workspace_registration_and_listing_for_project_spaces() {
+        // Direct test: real WorkspaceRegistry (no mocks). Exercises registration of multiple
+        // distinct project folder roots ("workspaces") so UI can cycle between project spaces
+        // and attach one-or-many terminal agents per space.
+        let registry = WorkspaceRegistry::empty();
+        registry
+            .register(WorkspaceTarget::from_root("/tmp/proj-a"))
+            .expect("register a");
+        registry
+            .register(WorkspaceTarget::from_root("/tmp/proj-b"))
+            .expect("register b");
+        let listed = registry.list();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().any(|e| e.target.root.contains("proj-a")));
+        assert!(listed.iter().any(|e| e.target.root.contains("proj-b")));
+        // Touch + lookup observable on registered multi set.
+        registry
+            .touch("/tmp/proj-a")
+            .expect("touch one of multiple");
+        assert!(registry
+            .lookup("/tmp/proj-a")
+            .unwrap()
+            .last_used_unix_ms
+            .is_some());
+        // Emit for captured verification output (contains "workspace" indicator).
+        eprintln!("REGISTERED_WORKSPACES_COUNT: {}", registry.list().len());
+        for e in registry.list() {
+            eprintln!("WORKSPACE: root={}", e.target.root);
+        }
+    }
 }

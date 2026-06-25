@@ -462,12 +462,19 @@ impulse-rs tooling-run python_exec --params '{"code":"print(42)"}' --json
 
 ## ImpulseAgent
 
-The ImpulseAgent is a coordinating AI that augments other agents' coding progress. It operates in two modes:
+The ImpulseAgent is the always-on tech lead. It manages, monitors, and augments other coding agents. Agents primarily live in the terminal and login/attach as CLI-TUI agents (e.g. "claude code", "codex cli", "cursor cli", and equivalents). The goal is that these agents continue to act normally on tasks while:
+
+1. Impulse helps manage/monitor them and augments their context.
+2. A light UI lets you pick different folders/workspaces in one place and cycle between one or many project spaces + one or many agents per space — without different interfaces per project/agent.
+3. Agents wired into Impulse are augmented with extra tools and capabilities (effectively a built-in, type-safe Rust plugin/extension that is efficient).
+4. Subagents and workflows are used to scale capabilities and reduce the load that coding agents consume on the machine.
+
+It operates in two modes:
 
 | Mode | Description | Use Case |
 |------|-------------|----------|
 | **API mode** | Direct LLM API calls (Anthropic, OpenAI, Minimax) | Full autonomy, needs API key |
-| **Harness mode** | Delegates to a CLI harness (Claude Code, OpenCode) via subprocess | Uses existing agent session |
+| **Harness mode** | Delegates to a CLI harness (Claude Code, Codex, Cursor, etc.) via subprocess + PTY | Uses existing agent session under supervision |
 
 ### How It Works
 

@@ -86,7 +86,7 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
                 .context("Failed to handle session-conflicts command")?;
         }
         Commands::Status => {
-            handlers::config::handle_status(&state)
+            handlers::config::handle_status(&state, format)
                 .await
                 .context("Failed to handle status command")?;
         }
