@@ -338,10 +338,8 @@ impl McpToolRegistry {
         };
         self.lock_audit().push(invocation.clone());
         if !invocation.ok {
-            return Err(error.unwrap_or_else(|| McpError::Tool {
-                tool: name.to_string(),
-                message: "tool reported failure".to_string(),
-            }));
+            let err = error.expect("McpTool reported !ok but provided no error detail");
+            return Err(err);
         }
         Ok(invocation)
     }
@@ -365,7 +363,7 @@ impl McpToolRegistry {
     fn lock_audit(&self) -> MutexGuard<'_, Vec<McpInvocation>> {
         self.audit
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("audit mutex poisoned")
     }
 }
 
@@ -733,7 +731,7 @@ impl McpTool for SearchMemoryTool {
             .get("limit")
             .and_then(Value::as_u64)
             .unwrap_or(20)
-            .min(200) as usize;
+            .min(200) as usize;  // default 20 clamped to 200; explicit default per policy
         let history_path = ctx.memory_root().join("HISTORY.jsonl");
         let mut matches = Vec::new();
         if history_path.is_file() {
@@ -992,7 +990,10 @@ fn write_review_record(
     let temp_path = path.with_extension("json.tmp");
     std::fs::write(
         &temp_path,
-        serde_json::to_vec_pretty(record).unwrap_or_default(),
+        serde_json::to_vec_pretty(record).map_err(|e| McpError::Tool {
+            tool: "impulse.review_queue".to_string(),
+            message: format!("failed to serialize review record: {e}"),
+        })?,
     )
     .map_err(|error| McpError::Tool {
         tool: "impulse.review_queue".to_string(),
@@ -1038,7 +1039,7 @@ fn review_preview(arguments: &Value) -> String {
         .and_then(Value::as_str)
         .or_else(|| arguments.get("data").and_then(Value::as_str))
         .map(ToString::to_string)
-        .unwrap_or_else(|| serde_json::to_string(arguments).unwrap_or_default());
+        .unwrap_or_else(|| serde_json::to_string(arguments).expect("arguments should always serialize"));
     let mut preview = raw.replace('\n', "\\n");
     if preview.len() > 160 {
         preview.truncate(157);
@@ -1051,7 +1052,7 @@ fn current_unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+        .unwrap_or(0)  // epoch fallback on clock error (rare)
 }
 
 #[cfg(test)]
