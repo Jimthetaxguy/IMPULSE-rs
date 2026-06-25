@@ -380,13 +380,9 @@ impl DesktopRuntime {
         request: AgentSpawnRequest,
     ) -> Result<AgentRuntimeSnapshot, DesktopBridgeError> {
         validate_dimensions(request.rows, request.cols)?;
-        // Use the single ops helper for launch command resolution (no or_else default_command after registry lookup).
-        let registry =
-            impulse_ops::agent_registry::AgentRegistry::registry_for_runtime().map_err(|e| {
-                DesktopBridgeError::InvalidTerminalRequest {
-                    message: format!("registry load: {e}"),
-                }
-            })?;
+        // Centralized registry load (symmetric to load_registry_for_tool in mcp.rs).
+        // Keeps the error mapping for spawn in one place and makes future changes cheaper.
+        let registry = load_registry_for_spawn()?;
         let provided_blank = request
             .command
             .as_ref()
@@ -697,6 +693,19 @@ impl DesktopRuntimeBuilder {
             sink: self.sink,
         }
     }
+}
+
+/// Load the canonical AgentRegistry (from impulse-ops) and map failure to the
+/// runtime bridge error used by spawn/terminal paths. Mirrors the pattern
+/// introduced in mcp.rs (load_registry_for_tool) for consistency and to keep
+/// the mapping in one place per domain.
+fn load_registry_for_spawn(
+) -> Result<impulse_ops::agent_registry::AgentRegistry, DesktopBridgeError> {
+    impulse_ops::agent_registry::AgentRegistry::registry_for_runtime().map_err(|e| {
+        DesktopBridgeError::InvalidTerminalRequest {
+            message: format!("registry load: {e}"),
+        }
+    })
 }
 
 fn validate_dimensions(rows: u16, cols: u16) -> Result<(), DesktopBridgeError> {

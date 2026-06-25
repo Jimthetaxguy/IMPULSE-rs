@@ -23,3 +23,6 @@ target-claude/
 impulse-supervisor/
 impulse-term-core/
 impulse-term-dioxus/
+
+# Autoresearch optimization loop artifacts (local only, like scratch)
+.autoresearch/
