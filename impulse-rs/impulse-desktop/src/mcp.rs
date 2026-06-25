@@ -1362,5 +1362,9 @@ mod tests {
         let _live_arr = obj["live_agents"].as_array().expect("live_agents array");
         // shape check
         assert!(obj.contains_key("available_platforms"));
+        eprintln!(
+            "MCP_SHAPE_ASSERT: live_agents present, available_platforms present, keys: {:?}",
+            obj.keys().collect::<Vec<_>>()
+        );
     }
 }
