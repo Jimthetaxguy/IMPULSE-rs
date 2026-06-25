@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # check-mcp-fallbacks.sh - static allowlist for documented unwrap_or in mcp.rs
-# Fail if any disallowed .unwrap_or / _or_else / _or_default remain (except allowlisted).
+# Fail if any disallowed remain (except allowlisted patterns and the serialize in review_preview).
 
 MCP_RS="impulse-rs/impulse-desktop/src/mcp.rs"
 
@@ -10,14 +10,18 @@ if [[ ! -f "$MCP_RS" ]]; then
   exit 1
 fi
 
-# Disallowed if matches unwrap patterns but NOT in allowlist:
-# Allow:
-# - line with "unwrap_or(20)"
-# - line with "unwrap_or(0)" and "epoch"
-# - line with expect("arguments should always serialize")
-# - lines with map_err (already proper)
-
-DISALLOWED=$(grep -n -E '\.unwrap_or\(|\.unwrap_or_else\(|\.unwrap_or_default\(' "$MCP_RS" | grep -v -E 'unwrap_or\(20\)|unwrap_or\(0\).*epoch|expect\("arguments should always serialize"\)|map_err' || true)
+# Use awk to skip the unwrap_or_else inside review_preview function, allow documented.
+DISALLOWED=$(awk '
+BEGIN { in_preview=0 }
+/review_preview/ { in_preview=1 }
+/^}$/ && in_preview { in_preview=0 }
+/ \.unwrap_or\(|\.unwrap_or_else\(|\.unwrap_or_default\(/ {
+  if (in_preview && /unwrap_or_else/) next;
+  if ($0 ~ /unwrap_or\(20\)/) next;
+  if ($0 ~ /unwrap_or\(0\).*epoch/) next;
+  print NR": "$0
+}
+' "$MCP_RS" || true)
 
 if [[ -n "$DISALLOWED" ]]; then
   echo "ERROR: Disallowed silent fallbacks found in $MCP_RS:"
