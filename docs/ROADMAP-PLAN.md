@@ -29,7 +29,7 @@ authors:
 | Stage | Focus | Status |
 |------|-------|--------|
 | **Now** | Rust memory core + hooks + retrieval/injection + Dioxus desktop host | Active |
-| **Next** | Dioxus Desktop launch scaffold + live terminal bridge parity | Complete (scaffold + bridge parity via smoke + dispatch tests + registry centralization) |
+| **Next** | Dioxus Desktop launch scaffold + live terminal bridge parity | [x] Complete (scaffold + bridge parity via smoke + real dispatch_host_invoke/LiveHostContext + Mcp execute unit tests + registry centralization; autoresearch cleanup; capture evidence + full verif gate; pushed) |
 | **Later** | Daemon parity in desktop shell + agent control + artifact polish | Planned |
 
 This document is intentionally aligned with [`spec/RUST-CANONICAL-CONTRACT.md`](./spec/RUST-CANONICAL-CONTRACT.md). If another active doc conflicts, the contract wins.
