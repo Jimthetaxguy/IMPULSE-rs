@@ -32,6 +32,7 @@ use crate::runtime::{
 };
 use crate::WorkspaceRegistry;
 
+
 /// Typed error returned by every MCP tool body.
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {
@@ -282,6 +283,7 @@ impl McpToolRegistry {
         registry.register(Arc::new(AgentWriteTool));
         registry.register(Arc::new(ListWorkspacesTool));
         registry.register(Arc::new(ListAgentsTool));
+        registry.register(Arc::new(ListAgentPlatformsTool));
         registry.register(Arc::new(SearchMemoryTool));
         registry.register(Arc::new(ProjectContextTool));
         registry.register(Arc::new(ReviewInjectionTool));
@@ -432,7 +434,7 @@ impl McpTool for AgentSpawnTool {
                 message: "agent_spawn mutates terminal state".to_string(),
             });
         }
-        let request: AgentSpawnRequest =
+        let mut request: AgentSpawnRequest =
             serde_json::from_value(arguments.clone()).map_err(|error| McpError::Tool {
                 tool: "impulse.agent_spawn".to_string(),
                 message: format!("invalid AgentSpawnRequest payload: {error}"),
@@ -445,6 +447,20 @@ impl McpTool for AgentSpawnTool {
                     message: message.to_string(),
                 })?;
         }
+        // Actually drive from canonical AgentRegistry (not discarded): resolve command via the ops helper
+        // so launch is uniformly based on registry descriptors.
+        let reg = impulse_ops::agent_registry::AgentRegistry::registry_for_runtime().map_err(|e| McpError::Tool {
+            tool: "impulse.agent_spawn".to_string(),
+            message: e.to_string(),
+        })?;
+        let resolved_cmd = impulse_ops::agent_registry::resolve_launch_command(
+            &reg,
+            request.platform.as_str(),
+            request.command.as_deref(),
+        );
+        if request.command.as_ref().is_none_or(|c| c.trim().is_empty()) {
+            request.command = Some(resolved_cmd);
+        }
         let snapshot: AgentRuntimeSnapshot =
             ctx.runtime()
                 .spawn_agent(request)
@@ -452,7 +468,10 @@ impl McpTool for AgentSpawnTool {
                     tool: "impulse.agent_spawn".to_string(),
                     message: error.to_string(),
                 })?;
-        Ok(serde_json::to_value(&snapshot).unwrap_or(Value::Null))
+        Ok(serde_json::to_value(&snapshot).map_err(|e| McpError::Tool {
+            tool: "impulse.agent_spawn".to_string(),
+            message: e.to_string(),
+        })?)
     }
 }
 
@@ -550,8 +569,57 @@ impl McpTool for ListAgentsTool {
         _confirmed: bool,
         ctx: &McpContext,
     ) -> Result<Value, McpError> {
-        Ok(serde_json::to_value(ctx.runtime().snapshot_agents())
-            .unwrap_or_else(|_| Value::Array(Vec::new())))
+        // Monitoring path also driven by registry: include available platforms report alongside live snapshots.
+        use impulse_ops::agent_registry::AgentPlatformsReport;
+        let live = ctx.runtime().snapshot_agents();
+        let reg = impulse_ops::agent_registry::AgentRegistry::registry_for_runtime().map_err(|e| McpError::Tool {
+            tool: "impulse.list_agents".to_string(),
+            message: e.to_string(),
+        })?;
+        let report = AgentPlatformsReport::from_registry(&reg);
+        Ok(serde_json::to_value(serde_json::json!({
+            "live_agents": live,
+            "available_platforms": report.platforms,
+        }))
+        .map_err(|e| McpError::Tool { tool: "impulse.list_agents".to_string(), message: e.to_string() })?)
+    }
+}
+
+/// `impulse.list_agent_platforms` — list the registered agent CLI types (from canonical
+/// impulse-ops AgentRegistry) that can be launched/monitored as terminal agents.
+/// This makes multi-agent registration observable via the tool surface.
+pub struct ListAgentPlatformsTool;
+
+impl McpTool for ListAgentPlatformsTool {
+    fn descriptor(&self) -> &BuiltInMcpTool {
+        static DESCRIPTOR: std::sync::OnceLock<BuiltInMcpTool> = std::sync::OnceLock::new();
+        DESCRIPTOR.get_or_init(|| {
+            BuiltInMcpTool::new(
+                "impulse.list_agent_platforms",
+                "List registered terminal coding agent platforms (claude-code, codex, etc) from the canonical registry.",
+                vec!["agents".to_string(), "read_only".to_string()],
+                false,
+            )
+        })
+    }
+
+    fn execute(
+        &self,
+        _arguments: &Value,
+        _confirmed: bool,
+        _ctx: &McpContext,
+    ) -> Result<Value, McpError> {
+        use impulse_ops::agent_registry::AgentPlatformsReport;
+        let registry = impulse_ops::agent_registry::AgentRegistry::registry_for_runtime().map_err(|e| McpError::Tool {
+            tool: "impulse.list_agent_platforms".to_string(),
+            message: e.to_string(),
+        })?;
+        let report = AgentPlatformsReport::from_registry(&registry);
+        // Return structured using the pure report for consistency.
+        Ok(serde_json::to_value(&report.platforms).map_err(|e| McpError::Tool {
+            tool: "impulse.list_agent_platforms".to_string(),
+            message: e.to_string(),
+        })?)
     }
 }
 
@@ -985,7 +1053,7 @@ mod tests {
     }
 
     #[test]
-    fn test_default_registry_has_eight_unique_builtins() {
+    fn test_default_registry_has_nine_unique_builtins() {
         let registry = McpToolRegistry::with_builtins();
         let names: Vec<String> = registry.descriptors().into_iter().map(|d| d.name).collect();
         assert!(names.contains(&"impulse.agent_spawn".to_string()));
@@ -996,10 +1064,11 @@ mod tests {
         assert!(names.contains(&"impulse.project_context".to_string()));
         assert!(names.contains(&"impulse.list_workspaces".to_string()));
         assert!(names.contains(&"impulse.list_agents".to_string()));
-        // Eight unique names: the documented built-ins plus the two read-only
-        // helpers. Adding a real body for an existing name does not increase
-        // the count.
-        assert_eq!(names.len(), 8, "registry names were: {names:?}");
+        // The new list_agent_platforms wires the canonical ops AgentRegistry so
+        // agent CLI types (claude, codex, ...) are observable/launchable.
+        assert!(names.contains(&"impulse.list_agent_platforms".to_string()));
+        // Nine unique names now.
+        assert_eq!(names.len(), 9, "registry names were: {names:?}");
     }
 
     #[test]

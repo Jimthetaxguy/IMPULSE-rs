@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use impulse_ops::{AgentRole, AgentStatus, ContextHealthSummary, MachineTarget};
+use impulse_ops::{
+    AgentRole, AgentStatus, ContextHealthSummary, MachineTarget,
+};
 use impulse_term::TerminalBackend;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -148,14 +150,12 @@ impl AgentPlatformKind {
     }
 
     pub fn default_command(self) -> String {
-        match self {
-            Self::ClaudeCode => "claude".to_string(),
-            Self::Codex => "codex".to_string(),
-            Self::OpenCode => "opencode".to_string(),
-            Self::Gemini => "gemini".to_string(),
-            // Cursor's headless CLI binary is `cursor-agent`.
-            Self::Cursor => "cursor-agent".to_string(),
-            Self::Shell => std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string()),
+        // Enum is wire slug only. Real command resolution is in
+        // impulse_ops::agent_registry::resolve_launch_command (single source of truth).
+        if self == Self::Shell {
+            std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string())
+        } else {
+            "sh".to_string()
         }
     }
 }
@@ -382,11 +382,20 @@ impl DesktopRuntime {
         request: AgentSpawnRequest,
     ) -> Result<AgentRuntimeSnapshot, DesktopBridgeError> {
         validate_dimensions(request.rows, request.cols)?;
-        let command = request
+        // Use the single ops helper for launch command resolution (no or_else default_command after registry lookup).
+        let registry = impulse_ops::agent_registry::AgentRegistry::registry_for_runtime().map_err(|e| DesktopBridgeError::InvalidTerminalRequest {
+            message: format!("registry load: {e}"),
+        })?;
+        let provided_blank = request
             .command
-            .clone()
-            .unwrap_or_else(|| request.platform.default_command());
-        if command.trim().is_empty() {
+            .as_ref()
+            .is_some_and(|c| c.trim().is_empty());
+        let command = impulse_ops::agent_registry::resolve_launch_command(
+            &registry,
+            request.platform.as_str(),
+            request.command.as_deref(),
+        );
+        if provided_blank || command.trim().is_empty() {
             return Err(DesktopBridgeError::InvalidTerminalRequest {
                 message: "command cannot be empty".to_string(),
             });
@@ -443,7 +452,10 @@ impl DesktopRuntime {
 
         let record = RuntimeRecord {
             platform: request.platform,
-            label: request.platform.label().to_string(),
+            label: registry
+                .get(request.platform.as_str())
+                .map(|d| d.label.clone())
+                .unwrap_or_else(|| request.platform.label().to_string()),
             command,
             args: request.args,
             cwd,
@@ -1060,10 +1072,12 @@ mod tests {
 
     #[test]
     fn test_agent_platform_kind_default_command() {
-        assert_eq!(AgentPlatformKind::ClaudeCode.default_command(), "claude");
-        assert_eq!(AgentPlatformKind::Gemini.default_command(), "gemini");
-        // Cursor's headless binary is `cursor-agent`, not `cursor`.
-        assert_eq!(AgentPlatformKind::Cursor.default_command(), "cursor-agent");
+        // Enum default is now fallback only. Real values come from resolve_launch_command (ops registry).
+        // These assert the minimal fallback behavior for the enum slug.
+        assert_eq!(
+            AgentPlatformKind::Shell.default_command(),
+            std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string())
+        );
     }
 
     #[test]
