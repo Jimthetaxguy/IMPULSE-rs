@@ -2,9 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use impulse_ops::{
-    AgentRole, AgentStatus, ContextHealthSummary, MachineTarget,
-};
+use impulse_ops::{AgentRole, AgentStatus, ContextHealthSummary, MachineTarget};
 use impulse_term::TerminalBackend;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -383,9 +381,12 @@ impl DesktopRuntime {
     ) -> Result<AgentRuntimeSnapshot, DesktopBridgeError> {
         validate_dimensions(request.rows, request.cols)?;
         // Use the single ops helper for launch command resolution (no or_else default_command after registry lookup).
-        let registry = impulse_ops::agent_registry::AgentRegistry::registry_for_runtime().map_err(|e| DesktopBridgeError::InvalidTerminalRequest {
-            message: format!("registry load: {e}"),
-        })?;
+        let registry =
+            impulse_ops::agent_registry::AgentRegistry::registry_for_runtime().map_err(|e| {
+                DesktopBridgeError::InvalidTerminalRequest {
+                    message: format!("registry load: {e}"),
+                }
+            })?;
         let provided_blank = request
             .command
             .as_ref()

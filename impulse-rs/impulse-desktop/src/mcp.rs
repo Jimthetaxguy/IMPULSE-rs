@@ -32,7 +32,6 @@ use crate::runtime::{
 };
 use crate::WorkspaceRegistry;
 
-
 /// Typed error returned by every MCP tool body.
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {
@@ -449,10 +448,13 @@ impl McpTool for AgentSpawnTool {
         }
         // Actually drive from canonical AgentRegistry (not discarded): resolve command via the ops helper
         // so launch is uniformly based on registry descriptors.
-        let reg = impulse_ops::agent_registry::AgentRegistry::registry_for_runtime().map_err(|e| McpError::Tool {
-            tool: "impulse.agent_spawn".to_string(),
-            message: e.to_string(),
-        })?;
+        let reg =
+            impulse_ops::agent_registry::AgentRegistry::registry_for_runtime().map_err(|e| {
+                McpError::Tool {
+                    tool: "impulse.agent_spawn".to_string(),
+                    message: e.to_string(),
+                }
+            })?;
         let resolved_cmd = impulse_ops::agent_registry::resolve_launch_command(
             &reg,
             request.platform.as_str(),
@@ -572,16 +574,22 @@ impl McpTool for ListAgentsTool {
         // Monitoring path also driven by registry: include available platforms report alongside live snapshots.
         use impulse_ops::agent_registry::AgentPlatformsReport;
         let live = ctx.runtime().snapshot_agents();
-        let reg = impulse_ops::agent_registry::AgentRegistry::registry_for_runtime().map_err(|e| McpError::Tool {
-            tool: "impulse.list_agents".to_string(),
-            message: e.to_string(),
-        })?;
+        let reg =
+            impulse_ops::agent_registry::AgentRegistry::registry_for_runtime().map_err(|e| {
+                McpError::Tool {
+                    tool: "impulse.list_agents".to_string(),
+                    message: e.to_string(),
+                }
+            })?;
         let report = AgentPlatformsReport::from_registry(&reg);
         Ok(serde_json::to_value(serde_json::json!({
             "live_agents": live,
             "available_platforms": report.platforms,
         }))
-        .map_err(|e| McpError::Tool { tool: "impulse.list_agents".to_string(), message: e.to_string() })?)
+        .map_err(|e| McpError::Tool {
+            tool: "impulse.list_agents".to_string(),
+            message: e.to_string(),
+        })?)
     }
 }
 
@@ -610,16 +618,21 @@ impl McpTool for ListAgentPlatformsTool {
         _ctx: &McpContext,
     ) -> Result<Value, McpError> {
         use impulse_ops::agent_registry::AgentPlatformsReport;
-        let registry = impulse_ops::agent_registry::AgentRegistry::registry_for_runtime().map_err(|e| McpError::Tool {
-            tool: "impulse.list_agent_platforms".to_string(),
-            message: e.to_string(),
-        })?;
+        let registry =
+            impulse_ops::agent_registry::AgentRegistry::registry_for_runtime().map_err(|e| {
+                McpError::Tool {
+                    tool: "impulse.list_agent_platforms".to_string(),
+                    message: e.to_string(),
+                }
+            })?;
         let report = AgentPlatformsReport::from_registry(&registry);
         // Return structured using the pure report for consistency.
-        Ok(serde_json::to_value(&report.platforms).map_err(|e| McpError::Tool {
-            tool: "impulse.list_agent_platforms".to_string(),
-            message: e.to_string(),
-        })?)
+        Ok(
+            serde_json::to_value(&report.platforms).map_err(|e| McpError::Tool {
+                tool: "impulse.list_agent_platforms".to_string(),
+                message: e.to_string(),
+            })?,
+        )
     }
 }
 
@@ -1311,10 +1324,18 @@ mod tests {
         let mem = std::env::temp_dir().join("impulse-mcp-test");
         let ctx = McpContext::new(runtime, workspaces, mem);
         let tool = ListAgentPlatformsTool;
-        let val = tool.execute(&serde_json::Value::Null, false, &ctx).expect("platforms execute");
+        let val = tool
+            .execute(&serde_json::Value::Null, false, &ctx)
+            .expect("platforms execute");
         let arr = val.as_array().expect("platforms array");
-        let ids: Vec<&str> = arr.iter().filter_map(|v| v.get("id").and_then(|i| i.as_str())).collect();
-        assert!(ids.iter().any(|&i| i == "claude-code"), "missing claude-code: {ids:?}");
+        let ids: Vec<&str> = arr
+            .iter()
+            .filter_map(|v| v.get("id").and_then(|i| i.as_str()))
+            .collect();
+        assert!(
+            ids.iter().any(|&i| i == "claude-code"),
+            "missing claude-code: {ids:?}"
+        );
         assert!(ids.iter().any(|&i| i == "codex"), "missing codex: {ids:?}");
     }
 }

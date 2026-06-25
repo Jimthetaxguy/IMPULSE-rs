@@ -683,7 +683,11 @@ command = "ratchet"
     fn test_registry_for_runtime_corrupt_toml_returns_error() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("bad.toml");
-        std::fs::write(&p, "[[agent]\nid = \"x\"\nlabel = \"bad\" toml syntax error here").unwrap();
+        std::fs::write(
+            &p,
+            "[[agent]\nid = \"x\"\nlabel = \"bad\" toml syntax error here",
+        )
+        .unwrap();
         std::env::set_var(REGISTRY_PATH_ENV, p.to_str().unwrap());
         let err = AgentRegistry::registry_for_runtime().unwrap_err();
         assert!(matches!(err, RegistryError::Toml(_)));
