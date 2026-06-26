@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::Path;
@@ -31,7 +31,12 @@ pub fn quick_estimate_from_file(
     transcript_path: &Path,
     context_window_tokens: usize,
 ) -> Result<(u64, usize, f32)> {
-    let metadata = std::fs::metadata(transcript_path)?;
+    let metadata = std::fs::metadata(transcript_path).with_context(|| {
+        format!(
+            "Failed to read transcript metadata: {}",
+            transcript_path.display()
+        )
+    })?;
     let file_size = metadata.len();
     // JSONL has JSON overhead (~40% non-content), so effective content is ~60%
     let effective_chars = (file_size as f64 * 0.6) as usize;

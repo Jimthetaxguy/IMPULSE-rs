@@ -132,7 +132,6 @@ pub(crate) fn render_stats_panel(
     history: &[crate::state::HistoryEntry],
     retrieval_health: Option<&str>,
 ) {
-    #[allow(clippy::vec_init_then_push)]
     {
         let total_sessions = sessions.len() + history.len();
         let active_sessions = sessions
@@ -142,51 +141,52 @@ pub(crate) fn render_stats_panel(
         let total_files: usize = sessions.iter().map(|s| s.active_files.len()).sum();
         let total_tools: usize = sessions.iter().map(|s| s.recent_tools.len()).sum();
 
-        let mut content = Vec::new();
-        content.push(Line::from(""));
-        content.push(Line::from(vec![
-            Span::styled("▸ ", Style::default().fg(COLOR_ACCENT)),
-            Span::raw("Total Sessions: "),
-            Span::styled(
-                total_sessions.to_string(),
-                Style::default()
-                    .fg(COLOR_TEXT_BRIGHT)
-                    .add_modifier(ratatui::style::Modifier::BOLD),
-            ),
-        ]));
-        content.push(Line::from(""));
-        content.push(Line::from(vec![
-            Span::styled("▸ ", Style::default().fg(COLOR_SUCCESS)),
-            Span::raw("Active: "),
-            Span::styled(
-                active_sessions.to_string(),
-                Style::default()
-                    .fg(COLOR_SUCCESS)
-                    .add_modifier(ratatui::style::Modifier::BOLD),
-            ),
-        ]));
-        content.push(Line::from(""));
-        content.push(Line::from(vec![
-            Span::styled("▸ ", Style::default().fg(COLOR_WARNING)),
-            Span::raw("Files Tracked: "),
-            Span::styled(
-                total_files.to_string(),
-                Style::default()
-                    .fg(COLOR_TEXT_BRIGHT)
-                    .add_modifier(ratatui::style::Modifier::BOLD),
-            ),
-        ]));
-        content.push(Line::from(""));
-        content.push(Line::from(vec![
-            Span::styled("▸ ", Style::default().fg(COLOR_ACCENT)),
-            Span::raw("Tools Used: "),
-            Span::styled(
-                total_tools.to_string(),
-                Style::default()
-                    .fg(COLOR_TEXT_BRIGHT)
-                    .add_modifier(ratatui::style::Modifier::BOLD),
-            ),
-        ]));
+        let mut content = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("▸ ", Style::default().fg(COLOR_ACCENT)),
+                Span::raw("Total Sessions: "),
+                Span::styled(
+                    total_sessions.to_string(),
+                    Style::default()
+                        .fg(COLOR_TEXT_BRIGHT)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("▸ ", Style::default().fg(COLOR_SUCCESS)),
+                Span::raw("Active: "),
+                Span::styled(
+                    active_sessions.to_string(),
+                    Style::default()
+                        .fg(COLOR_SUCCESS)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("▸ ", Style::default().fg(COLOR_WARNING)),
+                Span::raw("Files Tracked: "),
+                Span::styled(
+                    total_files.to_string(),
+                    Style::default()
+                        .fg(COLOR_TEXT_BRIGHT)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("▸ ", Style::default().fg(COLOR_ACCENT)),
+                Span::raw("Tools Used: "),
+                Span::styled(
+                    total_tools.to_string(),
+                    Style::default()
+                        .fg(COLOR_TEXT_BRIGHT)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                ),
+            ]),
+        ];
         if let Some(health) = retrieval_health {
             content.push(Line::from(""));
             content.push(Line::from(vec![
@@ -352,60 +352,59 @@ pub(crate) fn render_analytics(
     sessions: &[crate::state::Session],
     history: &[crate::state::HistoryEntry],
 ) {
-    #[allow(clippy::vec_init_then_push)]
     {
         use crate::ui::visualization::{calculate_analytics, format_duration, horizontal_bar};
 
         let analytics = calculate_analytics(history);
 
-        let mut content = Vec::new();
-        content.push(Line::from(""));
-        content.push(Line::from(Span::styled(
-            "  Analytics  ",
-            Style::default()
-                .fg(COLOR_TEXT_BRIGHT)
-                .add_modifier(ratatui::style::Modifier::BOLD),
-        )));
-        content.push(Line::from(""));
-
-        // Overview stats
-        content.push(Line::from(vec![
-            Span::styled("▸ ", Style::default().fg(COLOR_ACCENT)),
-            Span::raw("Total Sessions: "),
-            Span::styled(
-                analytics.total_sessions.to_string(),
+        let mut content = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Analytics  ",
                 Style::default()
                     .fg(COLOR_TEXT_BRIGHT)
                     .add_modifier(ratatui::style::Modifier::BOLD),
-            ),
-        ]));
-        content.push(Line::from(vec![
-            Span::styled("▸ ", Style::default().fg(COLOR_SUCCESS)),
-            Span::raw("Active Now: "),
-            Span::styled(
-                sessions.len().to_string(),
-                Style::default()
-                    .fg(COLOR_SUCCESS)
-                    .add_modifier(ratatui::style::Modifier::BOLD),
-            ),
-        ]));
-        content.push(Line::from(vec![
-            Span::styled("▸ ", Style::default().fg(COLOR_WARNING)),
-            Span::raw("Total Time: "),
-            Span::styled(
-                format_duration(analytics.total_duration_secs),
-                Style::default().fg(COLOR_TEXT_BRIGHT),
-            ),
-        ]));
-        content.push(Line::from(vec![
-            Span::styled("▸ ", Style::default().fg(COLOR_ACCENT)),
-            Span::raw("Avg Duration: "),
-            Span::styled(
-                format_duration(analytics.avg_duration_secs),
-                Style::default().fg(COLOR_TEXT_BRIGHT),
-            ),
-        ]));
-        content.push(Line::from(""));
+            )),
+            Line::from(""),
+            // Overview stats
+            Line::from(vec![
+                Span::styled("▸ ", Style::default().fg(COLOR_ACCENT)),
+                Span::raw("Total Sessions: "),
+                Span::styled(
+                    analytics.total_sessions.to_string(),
+                    Style::default()
+                        .fg(COLOR_TEXT_BRIGHT)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("▸ ", Style::default().fg(COLOR_SUCCESS)),
+                Span::raw("Active Now: "),
+                Span::styled(
+                    sessions.len().to_string(),
+                    Style::default()
+                        .fg(COLOR_SUCCESS)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("▸ ", Style::default().fg(COLOR_WARNING)),
+                Span::raw("Total Time: "),
+                Span::styled(
+                    format_duration(analytics.total_duration_secs),
+                    Style::default().fg(COLOR_TEXT_BRIGHT),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("▸ ", Style::default().fg(COLOR_ACCENT)),
+                Span::raw("Avg Duration: "),
+                Span::styled(
+                    format_duration(analytics.avg_duration_secs),
+                    Style::default().fg(COLOR_TEXT_BRIGHT),
+                ),
+            ]),
+            Line::from(""),
+        ];
 
         // Platform breakdown
         if !analytics.platform_breakdown.is_empty() {

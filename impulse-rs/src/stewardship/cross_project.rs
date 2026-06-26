@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use std::path::Path;
 
@@ -27,10 +27,14 @@ fn sanitize_path_component(id: &str, label: &str) -> Result<()> {
 /// Ensure the stewardship directory structure exists
 pub fn ensure_dirs(base_path: &Path) -> Result<()> {
     let steward_dir = base_path.join(STEWARDSHIP_DIR);
-    std::fs::create_dir_all(steward_dir.join(PROJECTS_DIR))?;
-    std::fs::create_dir_all(steward_dir.join("proposals").join("pending"))?;
-    std::fs::create_dir_all(steward_dir.join("proposals").join("applied"))?;
-    std::fs::create_dir_all(steward_dir.join("logs"))?;
+    std::fs::create_dir_all(steward_dir.join(PROJECTS_DIR))
+        .context("Failed to create stewardship projects directory")?;
+    std::fs::create_dir_all(steward_dir.join("proposals").join("pending"))
+        .context("Failed to create stewardship proposals/pending directory")?;
+    std::fs::create_dir_all(steward_dir.join("proposals").join("applied"))
+        .context("Failed to create stewardship proposals/applied directory")?;
+    std::fs::create_dir_all(steward_dir.join("logs"))
+        .context("Failed to create stewardship logs directory")?;
     Ok(())
 }
 
@@ -42,7 +46,12 @@ pub fn load_cross_project(base_path: &Path) -> Result<CrossProjectMemory> {
         return Ok(CrossProjectMemory::default());
     }
 
-    let content = std::fs::read_to_string(&path)?;
+    let content = std::fs::read_to_string(&path).with_context(|| {
+        format!(
+            "Failed to read cross-project memory file: {}",
+            path.display()
+        )
+    })?;
     let memory: CrossProjectMemory = serde_yaml::from_str(&content)?;
     Ok(memory)
 }
@@ -67,7 +76,12 @@ pub fn save_session_analysis(base_path: &Path, analysis: &SessionAnalysis) -> Re
         .join(PROJECTS_DIR)
         .join(&analysis.project_hash);
     let sessions_dir = project_dir.join("sessions");
-    std::fs::create_dir_all(&sessions_dir)?;
+    std::fs::create_dir_all(&sessions_dir).with_context(|| {
+        format!(
+            "Failed to create session analysis directory: {}",
+            sessions_dir.display()
+        )
+    })?;
 
     let path = sessions_dir.join(format!("{}.yaml", analysis.session_id));
     let yaml = serde_yaml::to_string(analysis)?;
@@ -88,7 +102,8 @@ pub fn load_project_memory(base_path: &Path, project_hash: &str) -> Result<Proje
         return Ok(ProjectMemory::new(project_hash.to_string(), String::new()));
     }
 
-    let content = std::fs::read_to_string(&path)?;
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read project memory file: {}", path.display()))?;
     let memory: ProjectMemory = serde_yaml::from_str(&content)?;
     Ok(memory)
 }
@@ -101,7 +116,12 @@ pub fn save_project_memory(base_path: &Path, memory: &ProjectMemory) -> Result<(
         .join(STEWARDSHIP_DIR)
         .join(PROJECTS_DIR)
         .join(&memory.project_hash);
-    std::fs::create_dir_all(&project_dir)?;
+    std::fs::create_dir_all(&project_dir).with_context(|| {
+        format!(
+            "Failed to create project memory directory: {}",
+            project_dir.display()
+        )
+    })?;
 
     let path = project_dir.join("project-memory.yaml");
     let yaml = serde_yaml::to_string(memory)?;

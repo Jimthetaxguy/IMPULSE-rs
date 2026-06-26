@@ -560,26 +560,25 @@ pub(crate) fn render_search(
 }
 
 pub(crate) fn render_config(f: &mut Frame, area: Rect, _state: &TuiState) {
-    #[allow(clippy::vec_init_then_push)]
     {
-        let mut content = Vec::new();
-        content.push(Line::from(""));
-        content.push(Line::from(Span::styled(
-            "  Configuration & Help  ",
-            Style::default()
-                .fg(COLOR_TEXT_BRIGHT)
-                .add_modifier(ratatui::style::Modifier::BOLD),
-        )));
-        content.push(Line::from(""));
-
-        // Keyboard shortcuts
-        content.push(Line::from(Span::styled(
-            "  Keyboard Shortcuts  ",
-            Style::default()
-                .fg(COLOR_ACCENT)
-                .add_modifier(ratatui::style::Modifier::BOLD),
-        )));
-        content.push(Line::from(""));
+        let mut content = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Configuration & Help  ",
+                Style::default()
+                    .fg(COLOR_TEXT_BRIGHT)
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+            )),
+            Line::from(""),
+            // Keyboard shortcuts
+            Line::from(Span::styled(
+                "  Keyboard Shortcuts  ",
+                Style::default()
+                    .fg(COLOR_ACCENT)
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+            )),
+            Line::from(""),
+        ];
 
         let shortcuts = vec![
             ("n", "Create new session"),
