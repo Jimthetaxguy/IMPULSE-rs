@@ -24,8 +24,9 @@ use ratatui::{
     Frame, Terminal,
 };
 
-#[allow(unused_imports)]
-use crate::agent::coordinator::RecommendationType;
+// Re-exported for UI submodules that reference it via `use super::*`
+// (runner.rs, render_status.rs, render_tabs.rs).
+pub(crate) use crate::agent::coordinator::RecommendationType;
 use crate::context_lifecycle::detector::CompactionDetector;
 use crate::context_lifecycle::extractor::OutputExtractor;
 use crate::context_lifecycle::injector::ContextInjector;
@@ -61,9 +62,8 @@ pub use types::*;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::coordinator::{
-        ConflictResolution, Recommendation, RecommendationType, TrackedConflict,
-    };
+    // RecommendationType comes from the parent `super::*` re-export.
+    use crate::agent::coordinator::{ConflictResolution, Recommendation, TrackedConflict};
     use tempfile::TempDir;
 
     fn create_test_state() -> TuiState {

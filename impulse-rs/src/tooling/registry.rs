@@ -226,7 +226,12 @@ impl ToolRegistry {
     /// Create a registry with all built-in tools registered.
     pub fn with_defaults() -> Self {
         Self::try_with_defaults().unwrap_or_else(|err| {
-            tracing::error!("failed to register built-in tools: {}", err);
+            tracing::error!(
+                "failed to register built-in tools, returning EMPTY registry (no tools will be \
+                 available); falling back to ToolRegistry::new() — use try_with_defaults() to \
+                 handle this explicitly: {}",
+                err
+            );
             Self::new()
         })
     }

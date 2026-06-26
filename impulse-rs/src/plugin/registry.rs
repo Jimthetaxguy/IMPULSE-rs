@@ -277,8 +277,15 @@ pub fn init_global_registry() -> &'static PluginRegistry {
             OfficeFormat::Xls,
             OfficeFormat::Csv,
         ] {
-            let _ =
-                registry.register_context_provider(format, Arc::new(OfficeContextProvider::new()));
+            if let Err(err) =
+                registry.register_context_provider(format, Arc::new(OfficeContextProvider::new()))
+            {
+                tracing::error!(
+                    "failed to register office context provider for format {}: {}",
+                    format.as_str(),
+                    err
+                );
+            }
         }
     }
 

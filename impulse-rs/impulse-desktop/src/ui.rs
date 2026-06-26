@@ -11,7 +11,9 @@ use crate::runtime::{
     default_builtin_mcp_tools, AgentPlatformKind, AgentRuntimeSnapshot, AgentSpawnRequest,
     BuiltInMcpTool, WorkspaceTarget,
 };
-use crate::theme::{format_count, status_dot_class, status_label, usage_meter_pct};
+use crate::theme::{
+    format_count, format_relative_age, status_dot_class, status_label, usage_meter_pct,
+};
 use crate::views::{ArtifactsView, DesktopView, MemoryView, ShellIntent};
 use crate::workspace::WorkspaceEntry;
 
@@ -1179,24 +1181,35 @@ fn WorkspaceList(workspaces: Vec<WorkspaceEntry>, selected_root: Option<String>)
             if workspaces.is_empty() {
                 p { class: "section-empty", "No workspaces registered" }
             } else {
-                ul { class: "workspace-rows",
-                    for entry in workspaces.iter() {
-                        {
-                            let is_active = selected_root.as_deref() == Some(entry.target.root.as_str());
-                            let last_used = match entry.last_used_unix_ms {
-                                Some(ms) => format!("last used {} ms epoch", ms),
-                                None => "never used".to_string(),
-                            };
-                            let class_name = if is_active { "workspace-row active" } else { "workspace-row" };
-                            rsx! {
-                                li { class: "{class_name}", "data-workspace-root": "{entry.target.root}",
-                                    span { class: "workspace-label", "{entry.label()}" }
-                                    span { class: "workspace-root", title: "{entry.target.root}",
-                                        "{entry.target.root}" }
-                                    if let Some(notes) = entry.target.project_notes.as_deref() {
-                                        span { class: "workspace-notes", title: "{notes}", "notes" }
+                {
+                    // Current wall-clock time in unix millis, captured once per
+                    // render and passed into the pure `format_relative_age`
+                    // helper so it stays deterministic/testable.
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    rsx! {
+                        ul { class: "workspace-rows",
+                            for entry in workspaces.iter() {
+                                {
+                                    let is_active = selected_root.as_deref() == Some(entry.target.root.as_str());
+                                    let last_used = match entry.last_used_unix_ms {
+                                        Some(ms) => format_relative_age(ms, now_ms),
+                                        None => "never used".to_string(),
+                                    };
+                                    let class_name = if is_active { "workspace-row active" } else { "workspace-row" };
+                                    rsx! {
+                                        li { class: "{class_name}", "data-workspace-root": "{entry.target.root}",
+                                            span { class: "workspace-label", "{entry.label()}" }
+                                            span { class: "workspace-root", title: "{entry.target.root}",
+                                                "{entry.target.root}" }
+                                            if let Some(notes) = entry.target.project_notes.as_deref() {
+                                                span { class: "workspace-notes", title: "{notes}", "notes" }
+                                            }
+                                            span { class: "workspace-last-used", "{last_used}" }
+                                        }
                                     }
-                                    span { class: "workspace-last-used", "{last_used}" }
                                 }
                             }
                         }
@@ -1595,9 +1608,26 @@ pub fn DesktopShellWithSnapshot(
                     span { class: "daemon-state", "data-state": "{daemon_state}", "{daemon_label}" }
                 }
                 nav { class: "command-surface",
-                    button { class: "icon-button", title: "Command palette", "Cmd-K" }
-                    button { class: "icon-button", title: "Review context", "Review" }
-                    button { class: "icon-button", title: "Settings", "Settings" }
+                    button {
+                        class: "icon-button is-disabled",
+                        title: "Command palette (coming soon)",
+                        disabled: true,
+                        "aria-disabled": "true",
+                        "Cmd-K"
+                    }
+                    button {
+                        class: "icon-button",
+                        title: "Review context",
+                        onclick: move |_| active_view.set(DesktopView::Review),
+                        "Review"
+                    }
+                    button {
+                        class: "icon-button is-disabled",
+                        title: "Settings (coming soon)",
+                        disabled: true,
+                        "aria-disabled": "true",
+                        "Settings"
+                    }
                 }
             }
             if let Some(status) = bridge_status.as_ref() {

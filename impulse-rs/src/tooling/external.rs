@@ -242,7 +242,10 @@ pub fn load_process_tools_from_dir(dir: &Path) -> Result<Vec<ProcessTool>, ToolE
 
     let mut tools = Vec::new();
     let mut seen = HashSet::new();
-    let mut entries = std::fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
+    let mut entries = std::fs::read_dir(dir)
+        .map_err(ToolError::Io)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(ToolError::Io)?;
     entries.sort_by_key(|entry| entry.path());
 
     for entry in entries {
@@ -250,8 +253,8 @@ pub fn load_process_tools_from_dir(dir: &Path) -> Result<Vec<ProcessTool>, ToolE
         if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
             continue;
         }
-        let content = std::fs::read_to_string(&path)?;
-        let spec: ExternalToolSpec = serde_json::from_str(&content)?;
+        let content = std::fs::read_to_string(&path).map_err(ToolError::Io)?;
+        let spec: ExternalToolSpec = serde_json::from_str(&content).map_err(ToolError::Json)?;
         if !seen.insert(spec.id.clone()) {
             return Err(ToolError::AlreadyRegistered(spec.id));
         }

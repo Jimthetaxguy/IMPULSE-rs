@@ -227,7 +227,15 @@ impl State {
                 conflicting_sessions: conflicting.clone(),
                 detected_at: Utc::now(),
             };
-            let _ = self.storage.append_jsonl(CONFLICTS_FILE, &event);
+            if let Err(err) = self.storage.append_jsonl(CONFLICTS_FILE, &event) {
+                tracing::error!(
+                    "failed to append conflict event to audit trail ({}) for session {} on {}: {}",
+                    CONFLICTS_FILE,
+                    session_id,
+                    file_path,
+                    err
+                );
+            }
         }
 
         Ok(conflicting)

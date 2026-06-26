@@ -121,7 +121,17 @@ pub(crate) fn render_sessions(
     .block(block)
     .highlight_style(Style::default().fg(COLOR_TEXT_BRIGHT).bg(COLOR_PANEL));
 
-    f.render_widget(table, area);
+    // Map the selected session id onto a row index within the filtered list so the
+    // highlight follows navigation. Without a stateful render the highlight_style
+    // above never applies.
+    let selected_index = state
+        .selected_session
+        .as_ref()
+        .and_then(|sel| filtered_sessions.iter().position(|s| s.id == *sel));
+    let mut table_state = ratatui::widgets::TableState::default();
+    table_state.select(selected_index);
+
+    f.render_stateful_widget(table, area, &mut table_state);
 }
 
 pub(crate) fn render_timeline(
@@ -589,6 +599,13 @@ pub(crate) fn render_config(f: &mut Frame, area: Rect, _state: &TuiState) {
             ("a", "Go to Analytics"),
             ("h", "Go to History"),
             ("q", "Quit"),
+            ("Ctrl+n", "New terminal tab"),
+            ("Ctrl+1", "Spawn Claude Code in terminal"),
+            ("Ctrl+2", "Spawn OpenCode in terminal"),
+            ("Ctrl+3", "Spawn Codex in terminal"),
+            ("Ctrl+1-9", "Switch terminal tab"),
+            ("Ctrl+w", "Close terminal tab"),
+            ("Alt+1-9", "Switch project"),
         ];
 
         // Add number shortcuts help
@@ -612,11 +629,29 @@ pub(crate) fn render_config(f: &mut Frame, area: Rect, _state: &TuiState) {
 
         for (key, desc) in shortcuts {
             content.push(Line::from(vec![
-                Span::styled(format!("{:4}", key), Style::default().fg(COLOR_WARNING)),
+                Span::styled(format!("{:8}", key), Style::default().fg(COLOR_WARNING)),
                 Span::raw("  "),
                 Span::raw(desc),
             ]));
         }
+
+        content.push(Line::from(""));
+        content.push(Line::from(Span::styled(
+            "  Injection Mode  ",
+            Style::default()
+                .fg(COLOR_ACCENT)
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        )));
+        content.push(Line::from(""));
+        content.push(Line::from(vec![Span::raw(
+            "  Press i to enter injection mode, type the context",
+        )]));
+        content.push(Line::from(vec![Span::raw(
+            "  to send to the active agent pane, then press i",
+        )]));
+        content.push(Line::from(vec![Span::raw(
+            "  again to inject it (Esc cancels).",
+        )]));
 
         content.push(Line::from(""));
         content.push(Line::from(Span::styled(

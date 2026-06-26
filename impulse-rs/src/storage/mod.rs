@@ -10,8 +10,7 @@
 
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
-#[allow(unused_imports)]
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -206,6 +205,7 @@ pub fn get_working_dir_name() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
     use tempfile::TempDir;
 
     #[test]

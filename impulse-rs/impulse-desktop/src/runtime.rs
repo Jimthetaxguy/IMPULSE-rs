@@ -812,8 +812,10 @@ impl<R: tauri::Runtime> DesktopEventSink for LegacyTauriEventSink<R> {
     }
 }
 
-#[allow(dead_code)]
-fn _assert_path_send_sync(_: &Path) {}
+const _: () = {
+    fn _assert_send_sync<T: Send + Sync>() {}
+    let _ = _assert_send_sync::<DesktopRuntime>;
+};
 
 #[cfg(test)]
 mod tests {

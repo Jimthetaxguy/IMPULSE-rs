@@ -162,7 +162,7 @@ impl TuiState {
             current_session_id: None,
             chat_history: vec![(
                 false,
-                "Welcome to Impulse! Press Tab to switch tabs, m for menu. Use Cmd+1/2/3 to switch projects.".to_string(),
+                "Welcome to Impulse! Press Tab to switch tabs, m for menu. Use Alt+1-9 to switch projects, Ctrl+1/2/3 to spawn agents.".to_string(),
             )],
             last_refresh: std::time::Instant::now(),
             refresh_interval_secs: 5,

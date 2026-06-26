@@ -68,8 +68,16 @@ impl CapabilitiesManifest {
     }
 
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path)?;
-        Ok(serde_json::from_str(&content)?)
+        use anyhow::Context;
+        let content = std::fs::read_to_string(path).with_context(|| {
+            format!("failed to read capabilities manifest at {}", path.display())
+        })?;
+        serde_json::from_str(&content).with_context(|| {
+            format!(
+                "failed to parse capabilities manifest at {}",
+                path.display()
+            )
+        })
     }
 }
 

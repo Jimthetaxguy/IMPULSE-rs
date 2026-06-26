@@ -4,7 +4,7 @@
 > Contract: [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
 > Collaboration playbook: [`docs/guides/COLLABORATIVE-AGENTIC-CODING.md`](docs/guides/COLLABORATIVE-AGENTIC-CODING.md)
 > Canonical stack: Rust (impulse-rs)
-> Roadmap contract: Now=Rust core + Dioxus desktop host; Next=Dioxus Desktop launch scaffold + terminal bridge parity; Legacy=egui compile-maintenance only; Tauri=legacy compatibility adapter only
+> Roadmap contract: Now=Rust core + Dioxus desktop host; Dioxus Desktop launch scaffold + terminal bridge parity=Complete (see docs/ROADMAP-PLAN.md); Next=Daemon parity in desktop shell + agent control + artifact polish; Legacy=egui compile-maintenance only; Tauri=legacy compatibility adapter only
 
 ---
 
@@ -83,7 +83,7 @@ Before implementing, consider alternative approaches. Choose the simplest soluti
 
 **Workspace (Rust-first, desktop shell in migration):**
 - `impulse-rs/` — main CLI + daemon + ratatui TUI
-- `impulse-rs/impulse-ops/` — operations library (shared types: SupervisorAction, TerminalOpsReport, OpsSnapshot, WorkbenchDaemonRequest/Response, DAEMON_PROTOCOL_VERSION, 4 tests)
+- `impulse-rs/impulse-ops/` — operations library (shared types: SupervisorAction, TerminalOpsReport, OpsSnapshot, WorkbenchDaemonRequest/Response, DAEMON_PROTOCOL_VERSION, 31 tests)
 - `impulse-rs/impulse-term/` — PTY/session/context core (PTY + vt100 + WriteQueue + context bridge)
 - `impulse-rs/impulse-desktop/` — Dioxus desktop shell scaffold and typed host bridge contracts
 
@@ -358,7 +358,7 @@ cd impulse-rs && cargo build && cargo test && cargo clippy -- -D warnings && car
 ```
 
 **Expected output (update when counts change):**
-- `cargo test --workspace`: 1,326 unit + 26 integration (impulse-rs) + 4 (impulse-ops) + 114 (impulse-term) + 116 (impulse-desktop) = 1,586 passed, 4 ignored, 0 failed
+- `cargo test --workspace`: 1,363 unit + 26 integration (impulse-rs) + 31 (impulse-ops) + 114 (impulse-term) + 159 (impulse-desktop) = 1,693 passed, 4 ignored, 0 failed (verified 2026-06-26)
 - `cargo clippy`: 0 warnings
 - `cargo fmt --check`: no output (clean)
 
@@ -389,12 +389,12 @@ To verify test counts match expectations:
 ```bash
 cd impulse-rs && cargo test 2>&1 | grep "test result:" | awk '{sum += $4} END {print "Total: " sum " passed"}'
 ```
-Expected: 1,586 passed across the 4 crates (impulse-rs, impulse-ops, impulse-term, impulse-desktop). If this changes, update both this section and the Architecture section.
+Expected: 1,693 passed across the 4 crates (impulse-rs, impulse-ops, impulse-term, impulse-desktop). If this changes, update both this section and the Architecture section.
 
 ### Pre-Commit Checklist
 
 1. `cargo build` — zero warnings
-2. `cargo test` — all tests pass (1,586 workspace total expected: 1326+26 impulse-rs, 4 ops, 114 term, 116 desktop; verify with `cargo test --workspace 2>&1 | grep "test result:"`)
+2. `cargo test` — all tests pass (1,693 workspace total expected: 1363+26 impulse-rs, 31 ops, 114 term, 159 desktop; verify with `cargo test --workspace 2>&1 | grep "test result:"`)
    - **If count changes**: update this line and the Architecture section above
 3. `cargo clippy -- -D warnings` — zero warnings
 4. `cargo fmt --check` — zero diffs

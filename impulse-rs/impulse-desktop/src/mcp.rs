@@ -1338,11 +1338,8 @@ mod tests {
             .iter()
             .filter_map(|v| v.get("id").and_then(|i| i.as_str()))
             .collect();
-        assert!(
-            ids.iter().any(|&i| i == "claude-code"),
-            "missing claude-code: {ids:?}"
-        );
-        assert!(ids.iter().any(|&i| i == "codex"), "missing codex: {ids:?}");
+        assert!(ids.contains(&"claude-code"), "missing claude-code: {ids:?}");
+        assert!(ids.contains(&"codex"), "missing codex: {ids:?}");
 
         // Also exercise ListAgentsTool return shape per skeptic gap
         let agents_tool = ListAgentsTool;

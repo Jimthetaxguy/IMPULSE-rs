@@ -727,7 +727,17 @@ pub fn resolve_from_config(
     // Harness takes priority if specified
     if let Some(h) = harness_str.and_then(ImpulseHarness::parse) {
         let config = ImpulseAgentConfig::harness(h);
-        return ImpulseAgent::new(config).ok();
+        return match ImpulseAgent::new(config) {
+            Ok(agent) => Some(agent),
+            Err(err) => {
+                tracing::error!(
+                    "failed to create harness agent for harness '{}': {}",
+                    h.as_str(),
+                    err
+                );
+                None
+            }
+        };
     }
 
     // Then try API mode
@@ -739,7 +749,17 @@ pub fn resolve_from_config(
         if let Some(m) = model {
             config = config.with_model(m);
         }
-        return ImpulseAgent::new(config).ok();
+        return match ImpulseAgent::new(config) {
+            Ok(agent) => Some(agent),
+            Err(err) => {
+                tracing::error!(
+                    "failed to create API agent for provider '{}': {}",
+                    p.as_str(),
+                    err
+                );
+                None
+            }
+        };
     }
 
     None
