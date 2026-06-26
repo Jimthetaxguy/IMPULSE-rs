@@ -120,7 +120,7 @@ impulse-rs --daemon session-start -n "chat-session"
 | **Daemon socket IPC**                | Complete    | `impulse-rs/src/daemon/mod.rs`        |
 | **Claude Code hooks**                | Complete    | `impulse-rs/.claude/hooks/hooks.json` |
 | **OpenCode integration**             | Complete    | `impulse-rs/.opencode/impulse.json`   |
-| **Tests**                            | 1,698 passing (4 ignored) | `impulse-rs/src/*/tests.rs` |
+| **Tests**                            | 1,701 passing (4 ignored) | `impulse-rs/src/*/tests.rs` |
 | **Branding**                         | Complete    | `impulse-rs/src/branding.rs`          |
 | **Phase 2 (chat context)**           | Complete    | Session context in daemon chat        |
 | **Retrieval foundation**             | Complete    | `impulse-rs/src/retrieval/`           |
@@ -161,7 +161,7 @@ impulse-rs --daemon session-start -n "chat-session"
 | Total Rust source files | 161 (main) + 50+ (impulse-term, impulse-gui) |
 | Total lines of code | ~69K+ (53K main + 2.7K term + 13K gui) |
 | Source modules | 35 declared in `main.rs` |
-| Tests passing (`cargo test`) | 1,698 (1368+26 impulse-rs + 31 ops + 114 term + 159 desktop, 4 ignored; impulse-gui frozen/excluded) |
+| Tests passing (`cargo test`) | 1,701 (1371+26 impulse-rs + 31 ops + 114 term + 159 desktop, 4 ignored; impulse-gui frozen/excluded) |
 | Feature flags | `office-support` (default), `monty-support`, `datafusion-support` |
 | DynamicTools registered | 23 |
 
@@ -678,7 +678,7 @@ Config at `.opencode/impulse.json` with equivalent hooks.
 | **Now**    | Search & Analytics tabs                                                | Rust        | **Complete** |
 | **Now**    | Session tagging                                                        | Rust        | **Complete** |
 | **Now**    | Filter system                                                          | Rust        | **Complete** |
-| **Now**    | Tests (1,698 passing)                                                  | Rust        | **Complete** |
+| **Now**    | Tests (1,701 passing)                                                  | Rust        | **Complete** |
 | **Now**    | Dioxus Desktop host scaffold                                           | Rust        | **Complete** |
 | **Now**    | Terminal bridge in Dioxus host                                         | xterm.js    | **Complete** |
 | **Now**    | Context stewardship                                                    | Rust        | **Complete** |
