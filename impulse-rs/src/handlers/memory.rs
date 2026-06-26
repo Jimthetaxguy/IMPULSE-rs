@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::sync::Arc;
 
+use crate::envelope::{write_envelope, EnvelopeBuilder, OutputFormat};
 use crate::{memory, retrieval, state};
 
 pub struct SearchMemoryOptions {
@@ -17,20 +18,48 @@ pub struct SearchMemoryOptions {
 
 /// Handle the `genome` command.
 ///
-/// Reads `GENOME.md` from storage and prints it as formatted markdown.
-pub fn handle_genome(state: &Arc<state::State>) -> Result<()> {
+/// Reads `GENOME.md` from storage and prints it as formatted markdown. When
+/// format is Json/Ndjson, emits the genome content via an envelope instead.
+pub fn handle_genome(state: &Arc<state::State>, format: Option<OutputFormat>) -> Result<()> {
     let genome = state.storage().read_json::<memory::Genome>("GENOME.md")?;
-    println!("{}", genome.to_markdown());
+    let markdown = genome.to_markdown();
+    if let Some(fmt @ (OutputFormat::Json | OutputFormat::Ndjson)) = format {
+        let data = serde_json::json!({ "markdown": markdown });
+        let env = EnvelopeBuilder::new("genome").ok(data);
+        write_envelope(fmt, &env)?;
+    } else {
+        println!("{}", markdown);
+    }
     Ok(())
 }
 
 /// Handle the `history` command.
 ///
 /// Prints the 20 most recent session history entries in reverse
-/// chronological order with timestamps, names, and summaries.
-pub fn handle_history(state: &Arc<state::State>) -> Result<()> {
+/// chronological order with timestamps, names, and summaries. When format
+/// is Json/Ndjson, emits the same entries via an envelope instead.
+pub fn handle_history(state: &Arc<state::State>, format: Option<OutputFormat>) -> Result<()> {
     let history = state.get_history_sync()?;
-    if history.is_empty() {
+    if let Some(fmt @ (OutputFormat::Json | OutputFormat::Ndjson)) = format {
+        let entries = history
+            .iter()
+            .rev()
+            .take(20)
+            .map(|entry| {
+                serde_json::json!({
+                    "ended_at": entry.ended_at.format("%Y-%m-%d %H:%M").to_string(),
+                    "session_name": entry.session_name,
+                    "summary": entry.summary,
+                })
+            })
+            .collect::<Vec<_>>();
+        let data = serde_json::json!({
+            "count": entries.len(),
+            "entries": entries,
+        });
+        let env = EnvelopeBuilder::new("history").ok(data);
+        write_envelope(fmt, &env)?;
+    } else if history.is_empty() {
         println!("No session history");
     } else {
         for entry in history.iter().rev().take(20) {
@@ -330,7 +359,18 @@ mod tests {
             .write_json("GENOME.md", &memory::Genome::new())
             .unwrap();
         let _ = tmp; // keep alive
-        let result = handle_genome(&st);
+        let result = handle_genome(&st, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn genome_json_succeeds() {
+        let (tmp, st) = test_state();
+        st.storage()
+            .write_json("GENOME.md", &memory::Genome::new())
+            .unwrap();
+        let _ = tmp;
+        let result = handle_genome(&st, Some(OutputFormat::Json));
         assert!(result.is_ok());
     }
 
@@ -394,7 +434,14 @@ mod tests {
     #[test]
     fn history_empty_succeeds() {
         let (_tmp, st) = test_state();
-        let result = handle_history(&st);
+        let result = handle_history(&st, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn history_json_succeeds() {
+        let (_tmp, st) = test_state();
+        let result = handle_history(&st, Some(OutputFormat::Json));
         assert!(result.is_ok());
     }
 

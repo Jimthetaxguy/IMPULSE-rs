@@ -189,6 +189,14 @@ pub(crate) fn run_app(
                     continue;
                 }
 
+                // When the conflicts panel is open, its resolution shortcuts
+                // (m/t/y/r) take priority over the global keybindings that
+                // would otherwise shadow them. Handle them first; if consumed,
+                // skip the global dispatch entirely.
+                if state.conflicts_panel_open && handle_conflicts_keys(&mut state, key.code) {
+                    continue;
+                }
+
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                     KeyCode::Char('c')
@@ -493,54 +501,31 @@ pub(crate) fn run_app(
                             state.status_message = Some("Dashboard".to_string());
                         }
                     }
-                    #[allow(unreachable_patterns)]
-                    KeyCode::Char('m') => {
-                        // Merge conflict resolution
-                        if state.conflicts_panel_open {
-                            handle_conflict_resolution(
-                                &mut state,
-                                crate::agent::coordinator::ConflictResolution::Merge,
-                            );
-                        }
-                    }
-                    #[allow(unreachable_patterns)]
-                    KeyCode::Char('t') => {
-                        // Accept theirs conflict resolution
-                        if state.conflicts_panel_open {
-                            handle_conflict_resolution(
-                                &mut state,
-                                crate::agent::coordinator::ConflictResolution::AcceptTheirs,
-                            );
-                        }
-                    }
-                    KeyCode::Char('y') => {
-                        // Accept mine conflict resolution
-                        if state.conflicts_panel_open {
-                            handle_conflict_resolution(
-                                &mut state,
-                                crate::agent::coordinator::ConflictResolution::AcceptMine,
-                            );
-                        }
-                    }
-                    #[allow(unreachable_patterns)]
-                    KeyCode::Char('r') => {
-                        // Rebase or Refresh (context-dependent)
-                        if state.conflicts_panel_open {
-                            handle_conflict_resolution(
-                                &mut state,
-                                crate::agent::coordinator::ConflictResolution::Rebase,
-                            );
-                        } else {
-                            // Refresh
-                            state.last_refresh = std::time::Instant::now();
-                            state.status_message = Some("Refreshed".to_string());
-                        }
-                    }
                     _ => {}
                 }
             }
         }
     }
+}
+
+/// Handle conflicts-panel resolution shortcuts.
+///
+/// Callers MUST only invoke this while the conflicts panel is open. Returns
+/// `true` if the key was a resolution shortcut and was consumed (so the global
+/// keybinding dispatch should be skipped), or `false` if the key is not a
+/// conflicts-panel shortcut and should fall through to the global handlers
+/// (e.g. navigation, `c` to close the panel, `q`/Esc to quit).
+pub(crate) fn handle_conflicts_keys(state: &mut TuiState, code: KeyCode) -> bool {
+    use crate::agent::coordinator::ConflictResolution;
+    let resolution = match code {
+        KeyCode::Char('m') => ConflictResolution::Merge,
+        KeyCode::Char('t') => ConflictResolution::AcceptTheirs,
+        KeyCode::Char('y') => ConflictResolution::AcceptMine,
+        KeyCode::Char('r') => ConflictResolution::Rebase,
+        _ => return false,
+    };
+    handle_conflict_resolution(state, resolution);
+    true
 }
 
 pub(crate) fn handle_navigation(state: &mut TuiState, dir: i32) {

@@ -191,6 +191,65 @@ mod tests {
         assert!(!state.conflicts_panel_open);
     }
 
+    #[tokio::test]
+    async fn test_handle_conflicts_keys_resolves_and_consumes() {
+        use crossterm::event::KeyCode;
+
+        // Each resolution shortcut must be consumed and resolve the conflict.
+        for code in [
+            KeyCode::Char('m'),
+            KeyCode::Char('t'),
+            KeyCode::Char('y'),
+            KeyCode::Char('r'),
+        ] {
+            let mut state = create_test_state();
+            state.mier_recommendations.push(Recommendation {
+                recommendation_type: RecommendationType::FileConflict,
+                panes_involved: vec!["pane-1".to_string(), "pane-2".to_string()],
+                description: "Multiple agents modifying: src/main.rs".to_string(),
+                action: "Coordinate changes to avoid merge conflicts".to_string(),
+                priority: 50,
+            });
+            state.conflicts_panel_open = true;
+
+            let consumed = handle_conflicts_keys(&mut state, code);
+            assert!(
+                consumed,
+                "{code:?} should be consumed by the conflicts panel"
+            );
+            assert!(
+                state.mier_recommendations[0]
+                    .description
+                    .contains("RESOLVED"),
+                "{code:?} should resolve the conflict"
+            );
+        }
+    }
+
+    #[test]
+    fn test_handle_conflicts_keys_falls_through_for_non_resolution_keys() {
+        use crossterm::event::KeyCode;
+
+        let mut state = create_test_state();
+        state.conflicts_panel_open = true;
+
+        // Navigation, panel-close, and quit keys must NOT be consumed here so
+        // they fall through to the global dispatch.
+        for code in [
+            KeyCode::Char('j'),
+            KeyCode::Char('k'),
+            KeyCode::Char('c'),
+            KeyCode::Char('q'),
+            KeyCode::Up,
+            KeyCode::Esc,
+        ] {
+            assert!(
+                !handle_conflicts_keys(&mut state, code),
+                "{code:?} should fall through to global handlers"
+            );
+        }
+    }
+
     #[test]
     fn test_tracked_conflict_is_resolved() {
         let conflict = TrackedConflict::new(

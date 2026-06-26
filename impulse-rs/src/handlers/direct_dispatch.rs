@@ -40,6 +40,7 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
                 platform,
                 inject_mode,
                 inject_explain,
+                format,
             )
             .await
             .context("Failed to handle session-start command")?;
@@ -56,27 +57,28 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
                 summary,
                 verify,
                 sem_diff_base,
+                format,
             )
             .await
             .context("Failed to handle session-end command")?;
         }
         Commands::TrackWrite { file, session_id } => {
-            handlers::session::handle_track_write(&state, file, session_id)
+            handlers::session::handle_track_write(&state, file, session_id, format)
                 .await
                 .context("Failed to handle track-write command")?;
         }
         Commands::TrackTool { tool, session_id } => {
-            handlers::session::handle_track_tool(&state, tool, session_id)
+            handlers::session::handle_track_tool(&state, tool, session_id, format)
                 .await
                 .context("Failed to handle track-tool command")?;
         }
         Commands::ListSessions => {
-            handlers::session::handle_list_sessions(&state)
+            handlers::session::handle_list_sessions(&state, format)
                 .await
                 .context("Failed to handle list-sessions command")?;
         }
         Commands::SessionInfo { id } => {
-            handlers::session::handle_session_info(&state, id)
+            handlers::session::handle_session_info(&state, id, format)
                 .await
                 .context("Failed to handle session-info command")?;
         }
@@ -113,10 +115,12 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
             .context("Failed to handle chat command")?;
         }
         Commands::Genome => {
-            handlers::memory::handle_genome(&state).context("Failed to handle genome command")?;
+            handlers::memory::handle_genome(&state, format)
+                .context("Failed to handle genome command")?;
         }
         Commands::History => {
-            handlers::memory::handle_history(&state).context("Failed to handle history command")?;
+            handlers::memory::handle_history(&state, format)
+                .context("Failed to handle history command")?;
         }
         Commands::ListProviders => {
             handlers::config::handle_list_providers()

@@ -358,7 +358,7 @@ cd impulse-rs && cargo build && cargo test && cargo clippy -- -D warnings && car
 ```
 
 **Expected output (update when counts change):**
-- `cargo test --workspace`: 1,363 unit + 26 integration (impulse-rs) + 31 (impulse-ops) + 114 (impulse-term) + 159 (impulse-desktop) = 1,693 passed, 4 ignored, 0 failed (verified 2026-06-26)
+- `cargo test --workspace`: 1,368 unit + 26 integration (impulse-rs) + 31 (impulse-ops) + 114 (impulse-term) + 159 (impulse-desktop) = 1,698 passed, 4 ignored, 0 failed (verified 2026-06-26)
 - `cargo clippy`: 0 warnings
 - `cargo fmt --check`: no output (clean)
 
@@ -389,12 +389,12 @@ To verify test counts match expectations:
 ```bash
 cd impulse-rs && cargo test 2>&1 | grep "test result:" | awk '{sum += $4} END {print "Total: " sum " passed"}'
 ```
-Expected: 1,693 passed across the 4 crates (impulse-rs, impulse-ops, impulse-term, impulse-desktop). If this changes, update both this section and the Architecture section.
+Expected: 1,698 passed across the 4 crates (impulse-rs, impulse-ops, impulse-term, impulse-desktop). If this changes, update both this section and the Architecture section.
 
 ### Pre-Commit Checklist
 
 1. `cargo build` — zero warnings
-2. `cargo test` — all tests pass (1,693 workspace total expected: 1363+26 impulse-rs, 31 ops, 114 term, 159 desktop; verify with `cargo test --workspace 2>&1 | grep "test result:"`)
+2. `cargo test` — all tests pass (1,698 workspace total expected: 1368+26 impulse-rs, 31 ops, 114 term, 159 desktop; verify with `cargo test --workspace 2>&1 | grep "test result:"`)
    - **If count changes**: update this line and the Architecture section above
 3. `cargo clippy -- -D warnings` — zero warnings
 4. `cargo fmt --check` — zero diffs

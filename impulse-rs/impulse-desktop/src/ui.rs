@@ -536,6 +536,7 @@ fn WorkspaceSwitcher(
 ) -> Element {
     rsx! {
         section { class: "workspace-picker", "data-source": "workspace_target",
+            "aria-label": "Workspaces",
             h2 { "Workspaces" }
             if workspaces.is_empty() {
                 p { class: "rail-empty", "No workspaces registered" }
@@ -571,6 +572,7 @@ fn AgentPool(
 ) -> Element {
     rsx! {
         section { class: "agent-pool", "data-source": "agent_snapshot",
+            "aria-label": "Agents",
             h2 { "Agents" }
             if agents.is_empty() {
                 p { class: "rail-empty", "No agents running" }
@@ -610,6 +612,7 @@ fn McpToolPalette(
 ) -> Element {
     rsx! {
         section { class: "inspector-section mcp-tools", "data-source": "builtin_mcp_tools",
+            "aria-label": "Rust MCP tools",
             h2 { "Rust MCP Tools" }
             p { class: "section-hint", "agent_spawn and agent_write require confirmation" }
             for tool in tools.iter() {
@@ -764,6 +767,7 @@ fn WorkspaceLaunchPanel(
 
     rsx! {
         section { class: "inspector-section workspace-launch", "data-source": "workspace_launcher",
+            "aria-label": "Workspace launcher",
             header { class: "section-header",
                 div {
                     h2 { "Workspace Launcher" }
@@ -914,11 +918,12 @@ fn WorkspaceLaunchPanel(
 fn AuditTrail(invocations: Vec<McpInvocation>, agent_filter: Option<String>) -> Element {
     rsx! {
         section { class: "inspector-section audit-trail", "data-source": "mcp_audit",
+            "aria-label": "MCP audit trail",
             header { class: "section-header",
                 h2 { "Audit Trail" }
                 span { class: "audit-count", "{invocations.len()} invocations" }
             }
-            div { class: "audit-list",
+            div { class: "audit-list", role: "list", "aria-label": "MCP invocation log",
                 for inv in invocations.iter().take(100) {
                     {
                         let passes_filter = match agent_filter.as_deref() {
@@ -932,7 +937,7 @@ fn AuditTrail(invocations: Vec<McpInvocation>, agent_filter: Option<String>) -> 
                             let caller = inv.caller_agent_id.clone().unwrap_or_else(|| "<supervisor>".to_string());
                             let call_id_short: String = inv.call_id.chars().take(8).collect();
                             rsx! {
-                                div { class: "audit-row state-{state}",
+                                div { class: "audit-row state-{state}", role: "listitem",
                                     span { class: "audit-tool", "{inv.tool}" }
                                     span { class: "audit-state", "{state}" }
                                     span { class: "audit-caller", "{caller}" }
@@ -1017,10 +1022,11 @@ fn ReviewConsole(
         .count();
     rsx! {
         section { class: "review-console", "data-source": "review_queue",
+            "aria-label": "Review queue",
             header { class: "review-console-header",
                 div {
                     h2 { "Review Queue" }
-                    p { "{pending} pending · {items.len()} staged" }
+                    p { "aria-live": "polite", "{pending} pending · {items.len()} staged" }
                 }
                 span { class: "review-console-badge", "review-first" }
             }
@@ -1579,6 +1585,11 @@ pub fn DesktopShellWithSnapshot(
     let has_runtime_agents = !runtime_agents.is_empty();
     let mut active_view = use_signal(|| initial_view);
     let mut latest_shell_intent = use_signal(|| None::<String>);
+    // In-flight feedback for the focus-agent bridge call (a representative
+    // high-traffic async action). Holds the agent id currently being focused so
+    // the triggering terminal tab can render an aria-busy/disabled "…" state
+    // while the host `focusAgent` invoke resolves, then clears on completion.
+    let mut focusing_agent_id = use_signal(|| None::<String>);
     let active_view_value = active_view();
     let terminal_view_class = if active_view_value == DesktopView::Terminal {
         "stage-view view-terminal active"
@@ -1687,17 +1698,25 @@ pub fn DesktopShellWithSnapshot(
                                 {
                                     let class_name = if agent.focused { "terminal-tab active" } else { "terminal-tab" };
                                     let agent_id = agent.agent_id.clone();
+                                    let agent_id_for_click = agent_id.clone();
+                                    let is_focusing = focusing_agent_id().as_deref() == Some(agent_id.as_str());
+                                    let label = agent.label.clone();
                                     rsx! {
                                         button {
                                             class: "{class_name}",
                                                 "data-agent-id": "{agent_id}",
+                                                disabled: is_focusing,
+                                                "aria-busy": if is_focusing { "true" } else { "false" },
                                                 onclick: move |_| {
+                                                    let agent_id = agent_id_for_click.clone();
                                                     let script = agent_focus_bridge_script(&agent_id);
+                                                    focusing_agent_id.set(Some(agent_id));
                                                     spawn(async move {
                                                         let _ = document::eval(&script).await;
+                                                        focusing_agent_id.set(None);
                                                     });
                                                 },
-                                                "{agent.label}" }
+                                                if is_focusing { "focusing…" } else { "{label}" } }
                                         }
                                     }
                                 }
@@ -1773,9 +1792,9 @@ pub fn DesktopShellWithSnapshot(
                         h2 { "Context · {tier}" }
                         p { "{tokens} / {window} tokens · {context.injection_count} injections · {context.compaction_count} compactions" }
                     }
-                    section { class: "inspector-section",
+                    section { class: "inspector-section", "aria-label": "Pending review",
                         h2 { "Pending review" }
-                        p {
+                        p { "aria-live": "polite",
                             if pending_review_count > 0 {
                                 "{pending_review_count} bundle(s) awaiting review-first apply"
                             } else {

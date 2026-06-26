@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::sync::Arc;
 
+use crate::envelope::{write_envelope, EnvelopeBuilder, OutputFormat};
 use crate::{guardrail, injection, semantic_diff, state, validate, verify};
 
 use super::{
@@ -15,6 +16,7 @@ pub async fn handle_session_start(
     platform: Option<String>,
     inject_mode: Option<String>,
     inject_explain: bool,
+    format: Option<OutputFormat>,
 ) -> Result<()> {
     let stdin_payload = read_hook_stdin_payload();
     let name = name.unwrap_or_else(default_session_name);
@@ -38,9 +40,49 @@ pub async fn handle_session_start(
         &query_parts,
     );
 
+    // Structured output: fold the session info and (optionally) the injection
+    // explain block into a single envelope so stdout carries exactly one JSON
+    // document — no mixed-output bug.
+    if let Some(fmt @ (OutputFormat::Json | OutputFormat::Ndjson)) = format {
+        let mut data = serde_json::json!({
+            "id": session.id,
+            "name": session.name,
+            "status": format!("{:?}", session.status),
+            "platform": session.platform.map(|p| p.as_str().to_string()),
+            "injected": injection_result.injected_block.is_some(),
+        });
+        if let Some(block) = injection_result.injected_block.clone() {
+            data["injected_block"] = serde_json::Value::String(block);
+        }
+        if inject_explain {
+            data["injection_explain"] = serde_json::to_value(&injection_result.explain)?;
+        }
+        let env = EnvelopeBuilder::new("session-start").ok(data);
+        write_envelope(fmt, &env)?;
+
+        let (output_preview, output_lines) = match injection_result.injected_block.as_ref() {
+            Some(block) => (Some(preview_block(block, 400)), block.lines().count()),
+            None => (Some("no injection block".to_string()), 0),
+        };
+        capture_hook_evidence(HookEvidenceInput {
+            impulse_dir: state.storage().base_path(),
+            event: "session_start",
+            session_id: Some(session.id.clone()),
+            session_name: Some(session.name.clone()),
+            platform: session.platform.map(|p| p.as_str().to_string()),
+            summary: None,
+            verify_enabled: None,
+            stdin_payload,
+            output_preview,
+            output_lines,
+        })?;
+        return Ok(());
+    }
+
+    // Text mode: keep stdout clean by writing the explain block to stderr.
     if inject_explain {
-        let _ = serde_json::to_writer_pretty(std::io::stdout(), &injection_result.explain);
-        println!();
+        let _ = serde_json::to_writer_pretty(std::io::stderr(), &injection_result.explain);
+        eprintln!();
     }
 
     let mut output_lines = 0usize;
@@ -105,6 +147,7 @@ pub async fn handle_session_end(
     summary: String,
     should_verify: bool,
     sem_diff_base: Option<String>,
+    format: Option<OutputFormat>,
 ) -> Result<()> {
     validate::validate_session_id(&session_id)?;
     validate::reject_control_chars(&summary, "summary")?;
@@ -137,6 +180,7 @@ pub async fn handle_session_end(
             }
         }
     }
+    let structured = matches!(format, Some(OutputFormat::Json | OutputFormat::Ndjson));
     match state.end_session(&session_id, summary.clone()).await {
         Ok(Some(_)) => {
             capture_hook_evidence(HookEvidenceInput {
@@ -151,7 +195,17 @@ pub async fn handle_session_end(
                 output_preview: Some(format!("Session {} ended", session_id)),
                 output_lines: 1,
             })?;
-            println!("Session {} ended", session_id)
+            if let Some(fmt) = format.filter(|_| structured) {
+                let data = serde_json::json!({
+                    "id": session_id,
+                    "status": "ended",
+                    "found": true,
+                });
+                let env = EnvelopeBuilder::new("session-end").ok(data);
+                write_envelope(fmt, &env)?;
+            } else {
+                println!("Session {} ended", session_id)
+            }
         }
         Ok(None) => {
             capture_hook_evidence(HookEvidenceInput {
@@ -166,7 +220,17 @@ pub async fn handle_session_end(
                 output_preview: Some(format!("Session not found: {}", session_id)),
                 output_lines: 1,
             })?;
-            println!("Session not found: {}", session_id)
+            if let Some(fmt) = format.filter(|_| structured) {
+                let data = serde_json::json!({
+                    "id": session_id,
+                    "status": "not_found",
+                    "found": false,
+                });
+                let env = EnvelopeBuilder::new("session-end").ok(data);
+                write_envelope(fmt, &env)?;
+            } else {
+                println!("Session not found: {}", session_id)
+            }
         }
         Err(e) => eprintln!("Error: {}", e),
     }
@@ -177,12 +241,26 @@ pub async fn handle_track_write(
     state: &Arc<state::State>,
     file: String,
     session_id: Option<String>,
+    format: Option<OutputFormat>,
 ) -> Result<()> {
     validate::validate_file_arg(&file)?;
 
+    let structured = matches!(format, Some(OutputFormat::Json | OutputFormat::Ndjson));
     if let Some(sid) = get_session_id(session_id) {
         match state.track_file(&sid, &file).await {
-            Ok(_) => println!("Tracked: {}", file),
+            Ok(_) => {
+                if let Some(fmt) = format.filter(|_| structured) {
+                    let data = serde_json::json!({
+                        "tracked": file,
+                        "kind": "file",
+                        "session_id": sid,
+                    });
+                    let env = EnvelopeBuilder::new("track-write").ok(data);
+                    write_envelope(fmt, &env)?;
+                } else {
+                    println!("Tracked: {}", file)
+                }
+            }
             Err(e) => eprintln!("Error: {}", e),
         }
         evaluate_track_guardrails(state, &sid, &file).await;
@@ -196,12 +274,26 @@ pub async fn handle_track_tool(
     state: &Arc<state::State>,
     tool: String,
     session_id: Option<String>,
+    format: Option<OutputFormat>,
 ) -> Result<()> {
     validate::reject_control_chars(&tool, "tool")?;
 
+    let structured = matches!(format, Some(OutputFormat::Json | OutputFormat::Ndjson));
     if let Some(sid) = get_session_id(session_id) {
         match state.track_tool(&sid, &tool).await {
-            Ok(_) => println!("Tracked: {}", tool),
+            Ok(_) => {
+                if let Some(fmt) = format.filter(|_| structured) {
+                    let data = serde_json::json!({
+                        "tracked": tool,
+                        "kind": "tool",
+                        "session_id": sid,
+                    });
+                    let env = EnvelopeBuilder::new("track-tool").ok(data);
+                    write_envelope(fmt, &env)?;
+                } else {
+                    println!("Tracked: {}", tool)
+                }
+            }
             Err(e) => eprintln!("Error: {}", e),
         }
         evaluate_track_guardrails(state, &sid, &tool).await;
@@ -233,9 +325,25 @@ async fn evaluate_track_guardrails(state: &Arc<state::State>, session_id: &str, 
     }
 }
 
-pub async fn handle_list_sessions(state: &Arc<state::State>) -> Result<()> {
+pub async fn handle_list_sessions(
+    state: &Arc<state::State>,
+    format: Option<OutputFormat>,
+) -> Result<()> {
     let sessions = state.list_sessions().await?;
-    if sessions.is_empty() {
+    if let Some(fmt @ (OutputFormat::Json | OutputFormat::Ndjson)) = format {
+        let data = serde_json::json!({
+            "count": sessions.len(),
+            "sessions": sessions.iter().map(|s| {
+                serde_json::json!({
+                    "id": s.id,
+                    "name": s.name,
+                    "status": format!("{:?}", s.status),
+                })
+            }).collect::<Vec<_>>(),
+        });
+        let env = EnvelopeBuilder::new("list-sessions").ok(data);
+        write_envelope(fmt, &env)?;
+    } else if sessions.is_empty() {
         println!("No active sessions");
     } else {
         for s in sessions {
@@ -245,19 +353,48 @@ pub async fn handle_list_sessions(state: &Arc<state::State>) -> Result<()> {
     Ok(())
 }
 
-pub async fn handle_session_info(state: &Arc<state::State>, id: String) -> Result<()> {
+pub async fn handle_session_info(
+    state: &Arc<state::State>,
+    id: String,
+    format: Option<OutputFormat>,
+) -> Result<()> {
+    let structured = matches!(format, Some(OutputFormat::Json | OutputFormat::Ndjson));
     match state.get_session(&id).await {
         Ok(Some(s)) => {
-            println!("Session: {}", s.name);
-            println!("ID: {}", s.id);
-            println!("Status: {:?}", s.status);
-            println!("Platform: {:?}", s.platform);
-            println!("Working Dir: {}", s.working_directory);
-            println!("Created: {}", s.created_at);
-            println!("Files: {:?}", s.active_files);
-            println!("Tools: {:?}", s.recent_tools);
+            if let Some(fmt) = format.filter(|_| structured) {
+                let data = serde_json::json!({
+                    "id": s.id,
+                    "name": s.name,
+                    "status": format!("{:?}", s.status),
+                    "platform": format!("{:?}", s.platform),
+                    "working_directory": s.working_directory,
+                    "created_at": s.created_at.to_string(),
+                    "active_files": s.active_files,
+                    "recent_tools": s.recent_tools,
+                    "found": true,
+                });
+                let env = EnvelopeBuilder::new("session-info").ok(data);
+                write_envelope(fmt, &env)?;
+            } else {
+                println!("Session: {}", s.name);
+                println!("ID: {}", s.id);
+                println!("Status: {:?}", s.status);
+                println!("Platform: {:?}", s.platform);
+                println!("Working Dir: {}", s.working_directory);
+                println!("Created: {}", s.created_at);
+                println!("Files: {:?}", s.active_files);
+                println!("Tools: {:?}", s.recent_tools);
+            }
         }
-        Ok(None) => println!("Session not found: {}", id),
+        Ok(None) => {
+            if let Some(fmt) = format.filter(|_| structured) {
+                let data = serde_json::json!({ "id": id, "found": false });
+                let env = EnvelopeBuilder::new("session-info").ok(data);
+                write_envelope(fmt, &env)?;
+            } else {
+                println!("Session not found: {}", id)
+            }
+        }
         Err(e) => eprintln!("Error: {}", e),
     }
     Ok(())
@@ -357,7 +494,7 @@ mod tests {
     #[tokio::test]
     async fn list_sessions_empty() {
         let (_tmp, st) = test_state();
-        let result = handle_list_sessions(&st).await;
+        let result = handle_list_sessions(&st, None).await;
         assert!(result.is_ok());
     }
 
@@ -370,7 +507,38 @@ mod tests {
         st.create_session("session-b".to_string(), None)
             .await
             .unwrap();
-        let result = handle_list_sessions(&st).await;
+        let result = handle_list_sessions(&st, None).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn list_sessions_json_emits_single_envelope() {
+        let (_tmp, st) = test_state();
+        st.create_session("session-a".to_string(), None)
+            .await
+            .unwrap();
+        // Build the envelope the same way the handler does and assert it is a
+        // single, valid envelope carrying the session list.
+        let sessions = st.list_sessions().await.unwrap();
+        let data = serde_json::json!({
+            "count": sessions.len(),
+            "sessions": sessions.iter().map(|s| serde_json::json!({
+                "id": s.id,
+                "name": s.name,
+                "status": format!("{:?}", s.status),
+            })).collect::<Vec<_>>(),
+        });
+        let env = crate::envelope::EnvelopeBuilder::new("list-sessions").ok(data);
+        let json = serde_json::to_string(&env).unwrap();
+        // Exactly one JSON document (no trailing concatenated object).
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["ok"], serde_json::json!(true));
+        assert_eq!(parsed["command"], serde_json::json!("list-sessions"));
+        assert_eq!(parsed["data"]["count"], serde_json::json!(1));
+        assert_eq!(parsed["data"]["sessions"][0]["name"], "session-a");
+
+        // The handler itself runs without error in Json mode.
+        let result = handle_list_sessions(&st, Some(OutputFormat::Json)).await;
         assert!(result.is_ok());
     }
 
@@ -383,14 +551,14 @@ mod tests {
             .create_session("test-info".to_string(), None)
             .await
             .unwrap();
-        let result = handle_session_info(&st, session.id).await;
+        let result = handle_session_info(&st, session.id, None).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn session_info_not_found() {
         let (_tmp, st) = test_state();
-        let result = handle_session_info(&st, "nonexistent-id".to_string()).await;
+        let result = handle_session_info(&st, "nonexistent-id".to_string(), None).await;
         assert!(result.is_ok()); // prints "Session not found" but doesn't error
     }
 
@@ -403,8 +571,13 @@ mod tests {
             .create_session("track-test".to_string(), None)
             .await
             .unwrap();
-        let result =
-            handle_track_write(&st, "src/main.rs".to_string(), Some(session.id.clone())).await;
+        let result = handle_track_write(
+            &st,
+            "src/main.rs".to_string(),
+            Some(session.id.clone()),
+            None,
+        )
+        .await;
         assert!(result.is_ok());
         // Verify tracking
         let s = st.get_session(&session.id).await.unwrap().unwrap();
@@ -415,7 +588,7 @@ mod tests {
     async fn track_write_no_session_id() {
         let (_tmp, st) = test_state();
         // No session_id and no env var — should print error but not fail
-        let result = handle_track_write(&st, "src/main.rs".to_string(), None).await;
+        let result = handle_track_write(&st, "src/main.rs".to_string(), None, None).await;
         assert!(result.is_ok());
     }
 
@@ -429,7 +602,7 @@ mod tests {
             .await
             .unwrap();
         let result =
-            handle_track_tool(&st, "read_file".to_string(), Some(session.id.clone())).await;
+            handle_track_tool(&st, "read_file".to_string(), Some(session.id.clone()), None).await;
         assert!(result.is_ok());
         let s = st.get_session(&session.id).await.unwrap().unwrap();
         assert!(s.recent_tools.contains(&"read_file".to_string()));
@@ -450,6 +623,7 @@ mod tests {
             "completed successfully".to_string(),
             false,
             None,
+            None,
         )
         .await;
         assert!(result.is_ok());
@@ -463,6 +637,7 @@ mod tests {
             "nonexistent-session".to_string(),
             "ended".to_string(),
             false,
+            None,
             None,
         )
         .await;

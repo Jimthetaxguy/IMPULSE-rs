@@ -156,8 +156,8 @@ body {
   padding: 6px 12px;
 }
 
-.icon-button:hover,
-.invoke-button:hover {
+.icon-button:not(:disabled):hover,
+.invoke-button:not(:disabled):hover {
   border-color: var(--p-cyan);
   color: var(--p-cyan);
 }
