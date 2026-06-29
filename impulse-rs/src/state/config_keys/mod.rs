@@ -71,6 +71,7 @@ impl Config {
         "retrieval_embedding_provider",
         "embedding_model",
         "retrieval_python_cmd",
+        "retrieval_ollama_url",
         "retrieval_vector_enabled",
         "retrieval_semantic_strategy",
         "retrieval_query_timeout_secs",

@@ -177,11 +177,12 @@ impl Config {
         m.insert("build_hygiene_size_threshold_gb", SetRule::F64);
         m.insert("build_hygiene_age_threshold_days", SetRule::U32);
 
-        // String fields (non-empty required) (4)
+        // String fields (non-empty required) (5)
         for &key in &[
             "retrieval_embedding_provider",
             "embedding_model",
             "retrieval_python_cmd",
+            "retrieval_ollama_url",
             "external_tools_dir",
         ] {
             m.insert(key, SetRule::String);

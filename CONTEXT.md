@@ -62,11 +62,16 @@ versioned protocol. The single coordination point for ops.
 Finding past context: **FTS5 keyword search** + **semantic search** over session history and the
 genome. The retrieval backend is the natural deep-module boundary (see `embedding provider`).
 
-### embedding provider — `[vocabulary]` → *proposed boundary*
-The swappable backend that turns text into vectors for semantic search. Today this is implicit;
-the `interface-boundaries-as-control-plane` rule says it should be an explicit trait so the engine
-(e.g. local Ollama `nomic-embed-text`, or a future in-process Rust embedder) can change without
-touching retrieval internals. **Scaffold:** `_working-files/20260620-054745-claude-impulse-embedding-provider-boundary.md`.
+### embedding provider — `[code]`
+The swappable backend that turns text into vectors for semantic search. Now an explicit trait so
+the engine can change without touching retrieval internals (`interface-boundaries-as-control-plane`).
+- **Source of truth:** `EmbeddingProvider` trait + `ScriptEmbedder` (Python script) and
+  `OllamaEmbedder` (real Ollama `POST /api/embed`) impls in `impulse-rs/src/retrieval/embedding.rs`.
+- **Dispatch:** `provider_for(config)` returns `Box<dyn EmbeddingProvider>` keyed on
+  `retrieval_embedding_provider` (`python-st` default | `ollama` → `retrieval_ollama_url`); an
+  unknown value warns and falls back to the script embedder (no silent no-op).
+- **Next increment:** thread `&dyn EmbeddingProvider` through the `query`/`indexer` call sites
+  (full DI) so retrieval can be tested with an injected provider.
 
 ### context stewardship — `[vocabulary]`
 Monitoring context-window usage and proposing cleanup strategies before the window blows out.
@@ -113,3 +118,6 @@ Multi-workflow augmentation pass (discovery fan-out → batched implementation l
 - **EmbeddingProvider boundary** (`3aef589`): `EmbeddingProvider` trait + real `ScriptEmbedder` (wraps the existing `retrieval_embed.py` path) + `provider_for(config)`; `embed_texts` now routes through the trait; deterministic fake + contract tests. NOTE: full DI (thread `&dyn EmbeddingProvider` into retrieval signatures) + an `OllamaEmbedder` sibling are the documented next increments.
 - **Audit-finding corrections (verified against real code):** (1) the "CliAgent send_message placeholder" finding cited the *Draft spec* (`docs/spec-cli-provider-extension.md`), not real code — `CliAgent`/`CliProtocol`/`cli.rs` DO NOT EXIST; building them would be speculative greenfield with no consumer (agents spawn via impulse-ops registry → desktop runtime/PTY). (2) the "Dioxus live host bridge not wired" finding is stale — `bin/impulse_desktop.rs` already calls `install_live_host_context()` before `LaunchBuilder::desktop().launch(LiveDesktopApp)`; the "manifest-only-pending" stubs are the intentional bootstrap the live `document::eval` bridge replaces at runtime.
 - Decisions this pass: commits kept LOCAL (no push); `specs/horizon-goals-spec.md` committed (`64f397e`, resolves autoresearch C1). Branch still ahead of origin.
+
+## EmbeddingProvider boundary — Ollama backend (2026-06-29)
+Completed the second EmbeddingProvider increment (the first, `3aef589`, added the trait + `ScriptEmbedder`). Added a **real `OllamaEmbedder`** (reqwest blocking `POST {url}/api/embed`, `{model, input:[]}` → `{embeddings:[[..]]}`) and made `provider_for` return `Box<dyn EmbeddingProvider>` dispatching on `retrieval_embedding_provider` (`ollama` | `python-st` default | unknown → warn+fallback). New config field `retrieval_ollama_url` (default `http://localhost:11434`). Shared `validate_embeddings` post-condition (count / non-zero dim / consistent dim). +10 unit tests (hermetic: empty short-circuit, zero-timeout, bound-then-dropped-port connection-refused → ProcessFailed, dispatch, validate matrix) + 1 `#[ignore]` live test **verified green against a real Ollama server** (`nomic-embed-text`, 768-dim) per `real-systems-only`. Gate: clippy `-D warnings` + fmt clean; workspace 1,711 passed / 5 ignored (the lone full-`--workspace` failure, `impulse-term::test_with_parser_reads_screen_size`, is pre-existing parallelism flake — green in isolation). **Still open:** full DI threading of `&dyn EmbeddingProvider` into `query`/`indexer` signatures.
