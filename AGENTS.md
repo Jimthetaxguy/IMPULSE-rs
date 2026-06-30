@@ -45,6 +45,7 @@ The chosen desktop stack is **Dioxus Desktop + xterm.js terminal bridge**. Tauri
 - See `docs/decisions/0008-dioxus-desktop-host.md` for the active ADR
 - See `docs/decisions/0007-desktop-shell-stack.md` for the superseded Tauri-era ADR
 - See `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md` for historical migration context; do not use it as the next product goal
+- See `docs/plans/EGUI-DECOMMISSION.md` for the active, gated plan to fully remove the egui surface (frozen `impulse-gui` crate + `impulse-term` egui rendering layer) once the Dioxus host is operationally authoritative
 
 **Do not add new code to `impulse-gui`.** If you need to touch `impulse-term`, confirm that `eframe` is not re-introduced as a dependency.
 
