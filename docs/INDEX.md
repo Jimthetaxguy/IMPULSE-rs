@@ -1,8 +1,8 @@
 ---
 title: Documentation Index
 description: Master navigation hub for Impulse documentation
-version: '1.1'
-updated: 2026-05-21
+version: '1.2'
+updated: 2026-06-30
 type: doc
 category: navigation
 phase: all
@@ -137,6 +137,7 @@ Historical desktop migration notes, including the superseded Tauri+Dioxus handof
 | [retrieval-perf-report.json](research/retrieval-perf-report.json)         | Retrieval + injection perf benchmark report                 |
 | [algorithm-validation.md](research/algorithm-validation.md)               | Algorithm validation iterations (Ralph Loop)                |
 | [TOKEN-TRACKING-ALGORITHM.md](research/TOKEN-TRACKING-ALGORITHM.md)       | Token tracking algorithm design and metrics                 |
+| [2026-06-30-multi-agent-provenance-divergence.md](research/2026-06-30-multi-agent-provenance-divergence.md) | **Consolidated-view read model** — provenance-tagged, federated per-agent takes; divergence as a settled-facts-only hard gate |
 
 See [research/README.md](research/README.md) for reading sequences by phase.
 
