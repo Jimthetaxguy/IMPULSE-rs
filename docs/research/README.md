@@ -3,7 +3,7 @@ status: active
 phase: all
 audience: builder
 tags: [research, analysis, reference]
-last_updated: 2026-03-31
+last_updated: 2026-06-30
 ---
 
 # Research Index — Impulse
@@ -32,6 +32,7 @@ last_updated: 2026-03-31
 | [META-HARNESS-RUST-MULTI-AGENT.md](META-HARNESS-RUST-MULTI-AGENT.md) | ~10 KB | Meta-Harness + multi-agent + Rust synthesis |
 | [TOOL-STACK-ANALYSIS.md](TOOL-STACK-ANALYSIS.md) | ~15 KB | Tool selection with risk analysis |
 | [RECONCILIATION-ANALYSIS.md](RECONCILIATION-ANALYSIS.md) | ~15 KB | Spec reconciliation analysis |
+| [2026-06-30-multi-agent-provenance-divergence.md](2026-06-30-multi-agent-provenance-divergence.md) | ~15 KB | Consolidated-view read model: provenance, per-entity federation, divergence-as-hard-gate (cross-anchored with ROSA + shared spec) |
 
 ### External Research (moved from project root)
 
@@ -70,6 +71,7 @@ last_updated: 2026-03-31
 | 1 | [TERMINAL-LAYER-ANALYSIS.md](TERMINAL-LAYER-ANALYSIS.md) | Terminal integration patterns | 1 hr |
 | 2 | [META-HARNESS-RUST-MULTI-AGENT.md](META-HARNESS-RUST-MULTI-AGENT.md) | Harness layer + topology synthesis | 35 min |
 | 3 | [../guides/RUST-MULTI-AGENT-PATTERNS.md](../guides/RUST-MULTI-AGENT-PATTERNS.md) | Practical Rust implementation rules | 20 min |
+| 4 | [2026-06-30-multi-agent-provenance-divergence.md](2026-06-30-multi-agent-provenance-divergence.md) | Consolidated-view read model + live-staleness hard gate | 25 min |
 
 ### Current Rust + Multi-Agent Synthesis
 
@@ -95,6 +97,8 @@ last_updated: 2026-03-31
 | Language selection | cli-language-analysis.md | Comparison table |
 | Meta-Harness + Rust synthesis | META-HARNESS-RUST-MULTI-AGENT.md | Executive Summary + Sections 3-5 |
 | Rust multi-agent patterns | ../guides/RUST-MULTI-AGENT-PATTERNS.md | Sections 2-6 |
+| Provenance + federated read model | 2026-06-30-multi-agent-provenance-divergence.md | Design: the `consolidated-view` read model |
+| Live divergence without phantom conflicts | 2026-06-30-multi-agent-provenance-divergence.md | The hardest engineering problem |
 
 ---
 
