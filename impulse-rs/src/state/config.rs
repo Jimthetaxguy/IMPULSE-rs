@@ -48,6 +48,9 @@ pub struct Config {
     pub embedding_model: String,
     /// Python command used for embedding subprocess
     pub retrieval_python_cmd: String,
+    /// Base URL for the Ollama embedding backend (used when
+    /// `retrieval_embedding_provider` is `ollama`)
+    pub retrieval_ollama_url: String,
     /// Feature flag for vector retrieval
     pub retrieval_vector_enabled: bool,
     /// Semantic backend strategy: auto, sqlite-only, rust-only
@@ -222,6 +225,7 @@ impl Default for Config {
             retrieval_embedding_provider: "python-st".to_string(),
             embedding_model: "all-MiniLM-L6-v2".to_string(),
             retrieval_python_cmd: "python3".to_string(),
+            retrieval_ollama_url: "http://localhost:11434".to_string(),
             retrieval_vector_enabled: false,
             retrieval_semantic_strategy: "auto".to_string(),
             retrieval_query_timeout_secs: 10,

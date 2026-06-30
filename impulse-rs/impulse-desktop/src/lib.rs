@@ -9,6 +9,7 @@
 pub mod bridge;
 #[cfg(feature = "desktop-app")]
 pub mod desktop_host;
+pub mod host_bridge;
 pub mod host_commands;
 pub mod mcp;
 pub mod native;

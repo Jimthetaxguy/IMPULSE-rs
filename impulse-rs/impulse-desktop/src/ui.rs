@@ -11,7 +11,9 @@ use crate::runtime::{
     default_builtin_mcp_tools, AgentPlatformKind, AgentRuntimeSnapshot, AgentSpawnRequest,
     BuiltInMcpTool, WorkspaceTarget,
 };
-use crate::theme::{format_count, status_dot_class, status_label, usage_meter_pct};
+use crate::theme::{
+    format_count, format_relative_age, status_dot_class, status_label, usage_meter_pct,
+};
 use crate::views::{ArtifactsView, DesktopView, MemoryView, ShellIntent};
 use crate::workspace::WorkspaceEntry;
 
@@ -27,12 +29,27 @@ pub fn terminal_asset_paths() -> &'static [&'static str] {
 macro_rules! impulse_host_adapter_resolution_script {
     () => {
         r#"
+  // Keep in sync with host_commands::PENDING_HOST_BOOTSTRAP_STATUS — the
+  // manifest-only Dioxus bootstrap installs invoke/listen stubs that always
+  // reject until the live eval bridge replaces them. Treating those stubs as a
+  // live API makes the bridges advertise themselves mounted and then
+  // unhandled-reject on the first call, so we must detect and skip them.
+  const PENDING_IMPULSE_HOST_STATUS = "manifest-only-pending-dioxus-eval-bridge";
+  const impulseHostFnReady = (host, fn) =>
+    !!host &&
+    typeof host[fn] === "function" &&
+    host.status !== PENDING_IMPULSE_HOST_STATUS &&
+    !host[fn].__impulseHostPending;
   const resolveImpulseHostAdapter = () => {
     const dioxusHost = window.__IMPULSE_DESKTOP_HOST;
     const legacyTauri = window.__TAURI__;
     return {
-      invoke: dioxusHost?.invoke || legacyTauri?.core?.invoke,
-      listen: dioxusHost?.listen || legacyTauri?.event?.listen,
+      invoke: impulseHostFnReady(dioxusHost, "invoke")
+        ? dioxusHost.invoke
+        : legacyTauri?.core?.invoke,
+      listen: impulseHostFnReady(dioxusHost, "listen")
+        ? dioxusHost.listen
+        : legacyTauri?.event?.listen,
       hostKind: dioxusHost ? "dioxus" : legacyTauri ? "legacy-tauri" : "missing",
     };
   };
@@ -410,6 +427,78 @@ pub struct DesktopBridgeMessage {
     pub payload: Value,
 }
 
+/// Parsed `bridge_status` signal. The ops/terminal bridges forward these when
+/// the host transport is unavailable (`degraded`) or an individual `invoke`
+/// rejects (`*_failed`), so the shell can show the operator that something is
+/// wrong instead of silently dropping the message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BridgeStatusUpdate {
+    pub status: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+impl BridgeStatusUpdate {
+    /// Extract a status update from a `bridge_status` bridge message, or `None`
+    /// for any other message kind (or a malformed payload missing `status`).
+    pub fn parse(message: &DesktopBridgeMessage) -> Option<Self> {
+        if message.kind != "bridge_status" {
+            return None;
+        }
+        let status = message.payload.get("status").and_then(Value::as_str)?;
+        if status.is_empty() {
+            return None;
+        }
+        let reason = message
+            .payload
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        Some(Self {
+            status: status.to_string(),
+            reason,
+        })
+    }
+
+    /// Every status the host emits is a problem signal; only explicit recovery
+    /// markers clear the banner.
+    pub fn is_degraded(&self) -> bool {
+        !matches!(self.status.as_str(), "mounted" | "ok" | "ready")
+    }
+
+    /// Human-facing one-liner for the banner.
+    pub fn headline(&self) -> String {
+        match self.status.as_str() {
+            "degraded" => "Host bridge degraded".to_string(),
+            other => {
+                let action = other.trim_end_matches("_failed").replace('_', " ");
+                format!("Host call failed: {action}")
+            }
+        }
+    }
+}
+
+/// Degraded-state banner. Rendered in the shell chrome whenever a
+/// [`BridgeStatusUpdate::is_degraded`] status is active so the operator sees
+/// that the Rust host transport is unavailable or a call failed.
+#[component]
+fn BridgeStatusBanner(status: BridgeStatusUpdate) -> Element {
+    let reason = status
+        .reason
+        .clone()
+        .unwrap_or_else(|| "no detail reported".to_string());
+    rsx! {
+        div {
+            class: "bridge-status-banner",
+            role: "alert",
+            "data-bridge-status": "{status.status}",
+            span { class: "bridge-status-mark", "!" }
+            span { class: "bridge-status-headline", "{status.headline()}" }
+            span { class: "bridge-status-reason", "{reason}" }
+        }
+    }
+}
+
 // ──────────────────────────── New components ────────────────────────────
 
 #[component]
@@ -447,6 +536,7 @@ fn WorkspaceSwitcher(
 ) -> Element {
     rsx! {
         section { class: "workspace-picker", "data-source": "workspace_target",
+            "aria-label": "Workspaces",
             h2 { "Workspaces" }
             if workspaces.is_empty() {
                 p { class: "rail-empty", "No workspaces registered" }
@@ -482,6 +572,7 @@ fn AgentPool(
 ) -> Element {
     rsx! {
         section { class: "agent-pool", "data-source": "agent_snapshot",
+            "aria-label": "Agents",
             h2 { "Agents" }
             if agents.is_empty() {
                 p { class: "rail-empty", "No agents running" }
@@ -521,6 +612,7 @@ fn McpToolPalette(
 ) -> Element {
     rsx! {
         section { class: "inspector-section mcp-tools", "data-source": "builtin_mcp_tools",
+            "aria-label": "Rust MCP tools",
             h2 { "Rust MCP Tools" }
             p { class: "section-hint", "agent_spawn and agent_write require confirmation" }
             for tool in tools.iter() {
@@ -675,6 +767,7 @@ fn WorkspaceLaunchPanel(
 
     rsx! {
         section { class: "inspector-section workspace-launch", "data-source": "workspace_launcher",
+            "aria-label": "Workspace launcher",
             header { class: "section-header",
                 div {
                     h2 { "Workspace Launcher" }
@@ -825,11 +918,12 @@ fn WorkspaceLaunchPanel(
 fn AuditTrail(invocations: Vec<McpInvocation>, agent_filter: Option<String>) -> Element {
     rsx! {
         section { class: "inspector-section audit-trail", "data-source": "mcp_audit",
+            "aria-label": "MCP audit trail",
             header { class: "section-header",
                 h2 { "Audit Trail" }
                 span { class: "audit-count", "{invocations.len()} invocations" }
             }
-            div { class: "audit-list",
+            div { class: "audit-list", role: "list", "aria-label": "MCP invocation log",
                 for inv in invocations.iter().take(100) {
                     {
                         let passes_filter = match agent_filter.as_deref() {
@@ -843,7 +937,7 @@ fn AuditTrail(invocations: Vec<McpInvocation>, agent_filter: Option<String>) -> 
                             let caller = inv.caller_agent_id.clone().unwrap_or_else(|| "<supervisor>".to_string());
                             let call_id_short: String = inv.call_id.chars().take(8).collect();
                             rsx! {
-                                div { class: "audit-row state-{state}",
+                                div { class: "audit-row state-{state}", role: "listitem",
                                     span { class: "audit-tool", "{inv.tool}" }
                                     span { class: "audit-state", "{state}" }
                                     span { class: "audit-caller", "{caller}" }
@@ -876,6 +970,20 @@ fn parse_platform_kind(value: &str) -> AgentPlatformKind {
         "cursor" => AgentPlatformKind::Cursor,
         "shell" => AgentPlatformKind::Shell,
         _ => AgentPlatformKind::Codex,
+    }
+}
+
+/// Footer event-stream health label. `down` when the host transport is
+/// degraded (no events can arrive), `live` when data has actually been
+/// observed on the stream, otherwise `idle`. Replaces the previous hardcoded
+/// "stream pending" so the strip reflects real state.
+fn event_stream_state(active: bool, degraded: bool) -> &'static str {
+    if degraded {
+        "down"
+    } else if active {
+        "live"
+    } else {
+        "idle"
     }
 }
 
@@ -914,10 +1022,11 @@ fn ReviewConsole(
         .count();
     rsx! {
         section { class: "review-console", "data-source": "review_queue",
+            "aria-label": "Review queue",
             header { class: "review-console-header",
                 div {
                     h2 { "Review Queue" }
-                    p { "{pending} pending · {items.len()} staged" }
+                    p { "aria-live": "polite", "{pending} pending · {items.len()} staged" }
                 }
                 span { class: "review-console-badge", "review-first" }
             }
@@ -1078,24 +1187,35 @@ fn WorkspaceList(workspaces: Vec<WorkspaceEntry>, selected_root: Option<String>)
             if workspaces.is_empty() {
                 p { class: "section-empty", "No workspaces registered" }
             } else {
-                ul { class: "workspace-rows",
-                    for entry in workspaces.iter() {
-                        {
-                            let is_active = selected_root.as_deref() == Some(entry.target.root.as_str());
-                            let last_used = match entry.last_used_unix_ms {
-                                Some(ms) => format!("last used {} ms epoch", ms),
-                                None => "never used".to_string(),
-                            };
-                            let class_name = if is_active { "workspace-row active" } else { "workspace-row" };
-                            rsx! {
-                                li { class: "{class_name}", "data-workspace-root": "{entry.target.root}",
-                                    span { class: "workspace-label", "{entry.label()}" }
-                                    span { class: "workspace-root", title: "{entry.target.root}",
-                                        "{entry.target.root}" }
-                                    if let Some(notes) = entry.target.project_notes.as_deref() {
-                                        span { class: "workspace-notes", title: "{notes}", "notes" }
+                {
+                    // Current wall-clock time in unix millis, captured once per
+                    // render and passed into the pure `format_relative_age`
+                    // helper so it stays deterministic/testable.
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    rsx! {
+                        ul { class: "workspace-rows",
+                            for entry in workspaces.iter() {
+                                {
+                                    let is_active = selected_root.as_deref() == Some(entry.target.root.as_str());
+                                    let last_used = match entry.last_used_unix_ms {
+                                        Some(ms) => format_relative_age(ms, now_ms),
+                                        None => "never used".to_string(),
+                                    };
+                                    let class_name = if is_active { "workspace-row active" } else { "workspace-row" };
+                                    rsx! {
+                                        li { class: "{class_name}", "data-workspace-root": "{entry.target.root}",
+                                            span { class: "workspace-label", "{entry.label()}" }
+                                            span { class: "workspace-root", title: "{entry.target.root}",
+                                                "{entry.target.root}" }
+                                            if let Some(notes) = entry.target.project_notes.as_deref() {
+                                                span { class: "workspace-notes", title: "{notes}", "notes" }
+                                            }
+                                            span { class: "workspace-last-used", "{last_used}" }
+                                        }
                                     }
-                                    span { class: "workspace-last-used", "{last_used}" }
                                 }
                             }
                         }
@@ -1401,6 +1521,7 @@ pub fn DesktopShellWithSnapshot(
     #[props(default)] mcp_tools: Vec<BuiltInMcpTool>,
     #[props(default)] last_invocations: Vec<McpInvocation>,
     #[props(default)] review_queue: Vec<ReviewQueueItem>,
+    #[props(default)] bridge_status: Option<BridgeStatusUpdate>,
     #[props(default = DesktopView::Terminal)] initial_view: DesktopView,
 ) -> Element {
     let context = &snapshot.context;
@@ -1431,10 +1552,26 @@ pub fn DesktopShellWithSnapshot(
         context.tier.as_str()
     };
     let generated_at = if snapshot.generated_at.is_empty() {
-        "ops_update stream pending"
+        "awaiting first ops_update"
     } else {
         snapshot.generated_at.as_str()
     };
+    // Real footer stream health derived from observed state (replaces the old
+    // permanent "stream pending"). A degraded host transport means no events
+    // can arrive at all, so every stream reads `down`.
+    let bridge_degraded = bridge_status
+        .as_ref()
+        .map(BridgeStatusUpdate::is_degraded)
+        .unwrap_or(false);
+    let terminal_stream = event_stream_state(
+        runtime_agents.iter().any(|agent| agent.output_bytes > 0),
+        bridge_degraded,
+    );
+    let runtime_stream = event_stream_state(!runtime_agents.is_empty(), bridge_degraded);
+    // No UI consumer subscribes to supervisor_local_action yet, so reflect the
+    // transport: `down` when degraded, otherwise `ready` (defined, awaiting a
+    // consumer) — never the misleading permanent "pending".
+    let supervisor_stream = if bridge_degraded { "down" } else { "ready" };
     let first_workspace_root = workspaces
         .first()
         .map(|entry| entry.target.root.clone())
@@ -1448,6 +1585,11 @@ pub fn DesktopShellWithSnapshot(
     let has_runtime_agents = !runtime_agents.is_empty();
     let mut active_view = use_signal(|| initial_view);
     let mut latest_shell_intent = use_signal(|| None::<String>);
+    // In-flight feedback for the focus-agent bridge call (a representative
+    // high-traffic async action). Holds the agent id currently being focused so
+    // the triggering terminal tab can render an aria-busy/disabled "…" state
+    // while the host `focusAgent` invoke resolves, then clears on completion.
+    let mut focusing_agent_id = use_signal(|| None::<String>);
     let active_view_value = active_view();
     let terminal_view_class = if active_view_value == DesktopView::Terminal {
         "stage-view view-terminal active"
@@ -1477,9 +1619,31 @@ pub fn DesktopShellWithSnapshot(
                     span { class: "daemon-state", "data-state": "{daemon_state}", "{daemon_label}" }
                 }
                 nav { class: "command-surface",
-                    button { class: "icon-button", title: "Command palette", "Cmd-K" }
-                    button { class: "icon-button", title: "Review context", "Review" }
-                    button { class: "icon-button", title: "Settings", "Settings" }
+                    button {
+                        class: "icon-button is-disabled",
+                        title: "Command palette (coming soon)",
+                        disabled: true,
+                        "aria-disabled": "true",
+                        "Cmd-K"
+                    }
+                    button {
+                        class: "icon-button",
+                        title: "Review context",
+                        onclick: move |_| active_view.set(DesktopView::Review),
+                        "Review"
+                    }
+                    button {
+                        class: "icon-button is-disabled",
+                        title: "Settings (coming soon)",
+                        disabled: true,
+                        "aria-disabled": "true",
+                        "Settings"
+                    }
+                }
+            }
+            if let Some(status) = bridge_status.as_ref() {
+                if status.is_degraded() {
+                    BridgeStatusBanner { status: status.clone() }
                 }
             }
             div { class: "workspace-grid",
@@ -1534,17 +1698,25 @@ pub fn DesktopShellWithSnapshot(
                                 {
                                     let class_name = if agent.focused { "terminal-tab active" } else { "terminal-tab" };
                                     let agent_id = agent.agent_id.clone();
+                                    let agent_id_for_click = agent_id.clone();
+                                    let is_focusing = focusing_agent_id().as_deref() == Some(agent_id.as_str());
+                                    let label = agent.label.clone();
                                     rsx! {
                                         button {
                                             class: "{class_name}",
                                                 "data-agent-id": "{agent_id}",
+                                                disabled: is_focusing,
+                                                "aria-busy": if is_focusing { "true" } else { "false" },
                                                 onclick: move |_| {
+                                                    let agent_id = agent_id_for_click.clone();
                                                     let script = agent_focus_bridge_script(&agent_id);
+                                                    focusing_agent_id.set(Some(agent_id));
                                                     spawn(async move {
                                                         let _ = document::eval(&script).await;
+                                                        focusing_agent_id.set(None);
                                                     });
                                                 },
-                                                "{agent.label}" }
+                                                if is_focusing { "focusing…" } else { "{label}" } }
                                         }
                                     }
                                 }
@@ -1620,9 +1792,9 @@ pub fn DesktopShellWithSnapshot(
                         h2 { "Context · {tier}" }
                         p { "{tokens} / {window} tokens · {context.injection_count} injections · {context.compaction_count} compactions" }
                     }
-                    section { class: "inspector-section",
+                    section { class: "inspector-section", "aria-label": "Pending review",
                         h2 { "Pending review" }
-                        p {
+                        p { "aria-live": "polite",
                             if pending_review_count > 0 {
                                 "{pending_review_count} bundle(s) awaiting review-first apply"
                             } else {
@@ -1679,13 +1851,13 @@ pub fn DesktopShellWithSnapshot(
                 }
             }
             footer { class: "event-strip", "data-owner": "dioxus",
-                span { "ops_update {generated_at}" }
+                span { "data-stream": "ops_update", "ops_update {generated_at}" }
                 span { "{agents_online} agents" }
                 span { "{snapshot.artifacts.len()} artifacts" }
                 span { "{snapshot.interventions.len()} interventions" }
-                span { "terminal_output stream pending" }
-                span { "agent_runtime_update stream pending" }
-                span { "supervisor_local_action stream pending" }
+                span { "data-stream": "terminal_output", "terminal_output · {terminal_stream}" }
+                span { "data-stream": "agent_runtime_update", "agent_runtime_update · {runtime_stream}" }
+                span { "data-stream": "supervisor_local_action", "supervisor_local_action · {supervisor_stream}" }
                 if let Some(intent) = latest_shell_intent() {
                     span { class: "shell-notice", "{intent}" }
                 }
@@ -1702,6 +1874,7 @@ pub fn DesktopShell() -> Element {
     let mut mcp_tools = use_signal(Vec::<BuiltInMcpTool>::new);
     let mut review_queue = use_signal(Vec::<ReviewQueueItem>::new);
     let mut last_invocations = use_signal(Vec::<McpInvocation>::new);
+    let mut bridge_status = use_signal(|| None::<BridgeStatusUpdate>);
 
     use_effect(move || {
         let _agent_mount_count = runtime_agents().len();
@@ -1714,6 +1887,12 @@ pub fn DesktopShell() -> Element {
         spawn(async move {
             let mut eval = document::eval(DESKTOP_EVENT_BRIDGE_SCRIPT);
             while let Ok(message) = eval.recv::<DesktopBridgeMessage>().await {
+                // `bridge_status` messages carry no state to reduce — they tell
+                // the operator the transport degraded or a call failed.
+                if let Some(update) = BridgeStatusUpdate::parse(&message) {
+                    bridge_status.set(Some(update));
+                    continue;
+                }
                 let mut next_snapshot = snapshot();
                 let mut next_agents = runtime_agents();
                 let mut next_workspaces = workspaces();
@@ -1737,6 +1916,10 @@ pub fn DesktopShell() -> Element {
                     mcp_tools.set(next_mcp_tools);
                     review_queue.set(next_queue);
                     last_invocations.set(next_invocations);
+                    // A successful refresh means the transport recovered.
+                    if bridge_status.read().is_some() {
+                        bridge_status.set(None);
+                    }
                 }
             }
         });
@@ -1750,6 +1933,7 @@ pub fn DesktopShell() -> Element {
             mcp_tools: mcp_tools(),
             review_queue: review_queue(),
             last_invocations: last_invocations(),
+            bridge_status: bridge_status(),
         }
     }
 }

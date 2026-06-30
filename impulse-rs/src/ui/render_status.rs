@@ -76,10 +76,10 @@ pub(crate) fn render_mier_panel(f: &mut Frame, area: Rect, state: &TuiState) {
                 AgentKind::Cursor => "cursor",
                 AgentKind::GenericShell => "shell",
             };
-            // Simple gauge bar
-            let bar_len = (pct as usize).min(20) / 5;
+            // Simple gauge bar: 10-char wide, each segment = 10% of context used.
+            let bar_len = (pct as usize).min(100) / 10;
             let bar: String = "|".repeat(bar_len);
-            let empty: String = ".".repeat(4usize.saturating_sub(bar_len));
+            let empty: String = ".".repeat(10usize.saturating_sub(bar_len));
             lines.push(Line::from(vec![
                 Span::styled(format!("  p{} ", pid), Style::default().fg(COLOR_TEXT)),
                 Span::styled(

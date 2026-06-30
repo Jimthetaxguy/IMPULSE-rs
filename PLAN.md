@@ -1,5 +1,14 @@
 # Plan: State Management Enhancements
 
+> **STATUS: ✅ COMPLETE (verified 2026-06-26).** All six steps below have landed. Evidence in the
+> current tree: `state/mod.rs` is now a 15-line module facade; the daemon `process_request()` lives
+> in `daemon/handlers.rs` (~173 lines, a thin dispatcher) with boundary validation wired
+> (`validate::validate_session_id`/`validate_tool_id`/`reject_control_chars`); `respond_ok` exists in
+> `daemon/protocol.rs`; `evaluate_track_guardrails` in `handlers/session.rs`; and Config get/set/list
+> is driven by the `state/config_keys/` registry (`SetRule`, `build_set_rules`, `set_field_json`).
+> The dead `State::sync`/`LiveState::active_sessions`/`State::get_history` methods are gone. This
+> document is retained as the historical design record for that refactor.
+
 ## Summary
 
 Six incremental steps to simplify state management. Each step builds and tests independently. Total estimated savings: ~700 lines removed, daemon `process_request()` drops from 815 → ~50 lines, Config get/set/list collapses from ~1,000 → ~100 lines.

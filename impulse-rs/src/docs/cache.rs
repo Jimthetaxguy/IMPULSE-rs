@@ -2,7 +2,8 @@
 // Persists model info and docs to local files
 
 use super::{ModelInfo, Provider};
-use anyhow::Result;
+use crate::storage::Storage;
+use anyhow::{Context, Result};
 use std::fs;
 use std::path::Path;
 
@@ -30,8 +31,10 @@ impl DocsCache {
 
     /// Save models to cache
     pub fn save_models(&self, models: &[ModelInfo]) -> Result<()> {
-        let json = serde_json::to_string_pretty(models)?;
-        fs::write(self.models_path(), json)?;
+        let json =
+            serde_json::to_string_pretty(models).context("failed to serialize cached models")?;
+        Storage::atomic_write_path(&self.models_path(), json.as_bytes())
+            .context("failed to write models cache file")?;
         Ok(())
     }
 
@@ -41,15 +44,18 @@ impl DocsCache {
         if !path.exists() {
             return Ok(Vec::new());
         }
-        let json = fs::read_to_string(path)?;
-        let models: Vec<ModelInfo> = serde_json::from_str(&json)?;
+        let json = fs::read_to_string(&path).context("failed to read models cache file")?;
+        let models: Vec<ModelInfo> =
+            serde_json::from_str(&json).context("failed to parse models cache JSON")?;
         Ok(models)
     }
 
     /// Save providers to cache
     pub fn save_providers(&self, providers: &[Provider]) -> Result<()> {
-        let json = serde_json::to_string_pretty(providers)?;
-        fs::write(self.providers_path(), json)?;
+        let json = serde_json::to_string_pretty(providers)
+            .context("failed to serialize cached providers")?;
+        Storage::atomic_write_path(&self.providers_path(), json.as_bytes())
+            .context("failed to write providers cache file")?;
         Ok(())
     }
 
@@ -59,15 +65,18 @@ impl DocsCache {
         if !path.exists() {
             return Ok(Vec::new());
         }
-        let json = fs::read_to_string(path)?;
-        let providers: Vec<Provider> = serde_json::from_str(&json)?;
+        let json = fs::read_to_string(&path).context("failed to read providers cache file")?;
+        let providers: Vec<Provider> =
+            serde_json::from_str(&json).context("failed to parse providers cache JSON")?;
         Ok(providers)
     }
 
     /// Save cache metadata (timestamps, etc.)
     pub fn save_metadata(&self, metadata: &CacheMetadata) -> Result<()> {
-        let json = serde_json::to_string_pretty(metadata)?;
-        fs::write(self.metadata_path(), json)?;
+        let json =
+            serde_json::to_string_pretty(metadata).context("failed to serialize cache metadata")?;
+        Storage::atomic_write_path(&self.metadata_path(), json.as_bytes())
+            .context("failed to write cache metadata file")?;
         Ok(())
     }
 
@@ -77,8 +86,9 @@ impl DocsCache {
         if !path.exists() {
             return Ok(CacheMetadata::default());
         }
-        let json = fs::read_to_string(path)?;
-        let metadata: CacheMetadata = serde_json::from_str(&json)?;
+        let json = fs::read_to_string(&path).context("failed to read cache metadata file")?;
+        let metadata: CacheMetadata =
+            serde_json::from_str(&json).context("failed to parse cache metadata JSON")?;
         Ok(metadata)
     }
 
@@ -136,7 +146,7 @@ impl Default for CacheMetadata {
 /// Create a new cache at the specified path
 pub fn create_cache(base_path: &Path) -> Result<DocsCache> {
     let cache_dir = base_path.join("docs_cache");
-    fs::create_dir_all(&cache_dir)?;
+    fs::create_dir_all(&cache_dir).context("failed to create docs cache directory")?;
     Ok(DocsCache::new(cache_dir))
 }
 

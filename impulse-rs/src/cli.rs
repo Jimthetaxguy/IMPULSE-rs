@@ -95,6 +95,7 @@ pub(crate) enum Commands {
         #[arg(long)]
         session_id: Option<String>,
     },
+    /// Show daemon/session status. Includes registered agent platforms (claude-code, codex, ...) from AgentRegistry and workspace cycling note.
     Status,
     /// Show detailed daemon internal state snapshot (sessions, tools, plugins, config)
     Debug,

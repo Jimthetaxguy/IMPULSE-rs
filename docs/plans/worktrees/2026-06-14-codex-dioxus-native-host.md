@@ -37,7 +37,11 @@ tags: [worktree, lane, dioxus, desktop, xterm, host]
   - CARGO_TARGET_DIR=/tmp/impulse-codex-target cargo test -p impulse-desktop
   - CARGO_TARGET_DIR=/tmp/impulse-codex-target cargo check --workspace
   - git diff --check
-- Latest status: complete for the bounded Dioxus-native host adapter pivot; real Dioxus Desktop launch scaffold remains the next frontier
+- Latest status: complete for the bounded Dioxus-native host adapter pivot + full Dioxus Desktop launch scaffold + live xterm bridge parity (smoke + real dispatch_host_invoke + McpContext units exercised); autoresearch cleanup landed (registry helper dedup, no silents); full capture evidence + verif steps 1-6 + subagent PASS + targeted post-edit; clean (only ??); push + goal complete next.
+- [x] Dioxus host scaffold + bridge parity (AC1)
+- [x] Status (text/json) + ops registry (AC2)
+- [x] Capture script sole producer, no silents, real paths, desktop-app build string (AC3)
+- [x] Cleanup/optimize via subagents + autoresearch ratchet; docs/plan updates; push after clean (AC4)
 
 ## Decisions
 - 2026-06-14: Do not proceed to `src-tauri` packaging scaffold as the next goal.

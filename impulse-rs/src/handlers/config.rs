@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::envelope::{write_envelope, EnvelopeBuilder, OutputFormat};
 use crate::{branding, credentials, memory, orchestration, state};
 
 use super::{
@@ -79,13 +80,43 @@ pub fn handle_init(state: &Arc<state::State>, impulse_dir: &Path) -> Result<()> 
 /// Handle the `status` command.
 ///
 /// Prints the Impulse banner and lists all active sessions with their
-/// names, IDs, and statuses.
-pub async fn handle_status(state: &Arc<state::State>) -> Result<()> {
-    branding::print_banner();
+/// names, IDs, and statuses. When format is Json/Ndjson, emits via envelope
+/// (platforms array + multi-workspace note). Text mode prints human lines
+/// that contain the required indicators (claude-code, codex, workspace).
+pub async fn handle_status(state: &Arc<state::State>, format: Option<OutputFormat>) -> Result<()> {
+    use impulse_ops::agent_registry::{AgentPlatformsReport, AgentRegistry};
     let sessions = state.list_sessions().await?;
-    println!("Active sessions: {}", sessions.len());
-    for s in &sessions {
-        println!("  - {} ({}) [{:?}]", s.name, s.id, s.status);
+    let reg = AgentRegistry::load_with_env().unwrap_or_else(|_| AgentRegistry::builtin());
+    let report = AgentPlatformsReport::from_registry(&reg);
+
+    // Default to Text for human status (banner + indicators); json when explicitly requested.
+    let fmt = format.unwrap_or(OutputFormat::Text);
+    if matches!(fmt, OutputFormat::Json | OutputFormat::Ndjson) {
+        let data = serde_json::json!({
+            "active_sessions": sessions.len(),
+            "sessions": sessions.iter().map(|s| {
+                serde_json::json!({
+                    "name": s.name,
+                    "id": s.id,
+                    "status": format!("{:?}", s.status)
+                })
+            }).collect::<Vec<_>>(),
+            "agent_platforms": report.platforms,
+            "multi_workspace_support": report.multi_workspace_note,
+        });
+        let env = EnvelopeBuilder::new("status").ok(data);
+        write_envelope(fmt, &env)?;
+    } else {
+        branding::print_banner();
+        println!("Active sessions: {}", sessions.len());
+        for s in &sessions {
+            println!("  - {} ({}) [{:?}]", s.name, s.id, s.status);
+        }
+        println!("\nRegistered agent platforms (from impulse-ops::AgentRegistry):");
+        for p in &report.platforms {
+            println!("  - {} ({}): command='{}'", p.id, p.label, p.command);
+        }
+        println!("Multi-workspace support: {}", report.multi_workspace_note);
     }
     Ok(())
 }
@@ -395,7 +426,7 @@ mod tests {
     #[tokio::test]
     async fn status_shows_no_sessions() {
         let (_tmp, st) = test_state();
-        let result = handle_status(&st).await;
+        let result = handle_status(&st, None).await;
         assert!(result.is_ok());
     }
 

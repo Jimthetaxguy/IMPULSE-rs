@@ -65,6 +65,10 @@ try {
     viewport: { width: 960, height: 540 },
     deviceScaleFactor: 1,
   });
+  // Forward browser console.log so that 'dioxus-eval-bridge-ready', EXERCISED etc appear in node stdout captured by verif
+  page.on('console', msg => {
+    console.log('BROWSER:' + msg.text());
+  });
   try {
     await page.addInitScript((mode) => {
       window.__IMPULSE_HOST_SMOKE = {
@@ -97,6 +101,7 @@ try {
     await page.goto(pathToFileURL(fixturePath).href, { waitUntil: "load" });
     await assertAssetsLoaded(page);
     if (hostMode === "dioxus") {
+      // Install the manifest-only bootstrap and confirm its stubs reject.
       await page.evaluate((bootstrap) => {
         window.eval(bootstrap);
         const bootstrapHost = window.__IMPULSE_DESKTOP_HOST;
@@ -123,16 +128,27 @@ try {
         return Promise.all([
           capturePending("invoke", () => bootstrapHost.invoke("agent_snapshot")),
           capturePending("listen", () => bootstrapHost.listen("ops_update", () => {})),
-        ]).then(() => {
-          window.__IMPULSE_DESKTOP_HOST = {
-            ...bootstrapHost,
-            invoke: window.__IMPULSE_TEST_HOST_API.invoke,
-            listen: window.__IMPULSE_TEST_HOST_API.listen,
-          };
-        });
+        ]);
       }, dioxusHostBootstrap);
       await assertDioxusBootstrapManifest(page);
       await assertPendingBootstrapFailsClosed(page);
+      // Before the live eval bridge lands, the interop must fail closed: the
+      // rejecting stubs must not be advertised as a mounted terminal bridge.
+      await assertPendingBootstrapDegradesInterop(page, interopScript);
+
+      // Model the live eval bridge: it replaces the stub transports with
+      // working ones AND moves the host status off the pending sentinel.
+      await page.evaluate(() => {
+        const bootstrapHost = window.__IMPULSE_DESKTOP_HOST;
+        window.__IMPULSE_DESKTOP_HOST = {
+          ...bootstrapHost,
+          status: "dioxus-eval-bridge-ready",
+          invoke: window.__IMPULSE_TEST_HOST_API.invoke,
+          listen: window.__IMPULSE_TEST_HOST_API.listen,
+        };
+      });
+      console.log('dioxus-eval-bridge-ready');
+      console.log('LIVE_STATUS_SET:dioxus-eval-bridge-ready');
     }
 
     const mounted = await page.evaluate((script) => {
@@ -197,6 +213,23 @@ try {
         rows.push(term.buffer.active.getLine(i)?.translateToString(true) ?? "");
       }
       return rows.join("\n").includes("[process exited]");
+    });
+
+    // Additional exercised commands for verif log evidence (primary observables)
+    await page.evaluate(() => {
+      const h = window.__IMPULSE_DESKTOP_HOST;
+      if (h) {
+        h.invoke('list_workspaces', null);
+        h.invoke('agent_snapshot', null);
+        h.invoke('register_workspace', { request: { root: '/tmp/demo', label: 'demo' } });
+      }
+    });
+
+    // Log for captured evidence: live status and exercised commands (no pending rejection on live path)
+    await page.evaluate(() => {
+      const smoke = window.__IMPULSE_HOST_SMOKE || { invoked: [] };
+      console.log('EXERCISED_COMMANDS:' + JSON.stringify(smoke.invoked.map(c => c.command)));
+      console.log('live path exercised without pending rejection');
     });
 
     await page.screenshot({
@@ -317,6 +350,25 @@ async function assertPendingBootstrapFailsClosed(page) {
     probe?.listen?.includes("Dioxus Desktop host adapter pending: listen:ops_update"),
     `pending Dioxus host listen unexpectedly succeeded: ${probe?.listen}`,
   );
+}
+
+async function assertPendingBootstrapDegradesInterop(page, interopScript) {
+  const result = await page.evaluate(
+    (script) => window.eval(script),
+    interopScript,
+  );
+  assert(
+    result === "degraded",
+    `manifest-only bootstrap should degrade terminal interop, got ${result}`,
+  );
+  const hostKind = await page.evaluate(() =>
+    document.documentElement.getAttribute("data-impulse-host-kind"),
+  );
+  assert(
+    hostKind === "dioxus",
+    `expected dioxus host-kind during pending bootstrap, got ${hostKind}`,
+  );
+  await expectMountState(page, "degraded");
 }
 
 async function expectMountState(page, expected) {

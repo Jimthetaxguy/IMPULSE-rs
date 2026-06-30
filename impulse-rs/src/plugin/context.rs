@@ -1,8 +1,5 @@
 // Context plugin types and helpers
 
-#[allow(unused_imports)]
-use super::{PluginInput, PluginOutput};
-
 /// Configuration for context extraction
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ContextConfig {

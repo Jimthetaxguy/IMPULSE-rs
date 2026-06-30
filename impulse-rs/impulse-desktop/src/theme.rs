@@ -63,6 +63,35 @@ pub fn format_count(n: usize) -> String {
     }
 }
 
+/// Render a human-readable relative age from a past unix-millis timestamp `ms`
+/// against a `now_ms` reference (e.g. "just now", "5m ago", "2h ago", "3d ago").
+///
+/// Pure and deterministic so callers pass the current time in for testability.
+/// Future timestamps (`ms > now_ms`, e.g. minor clock skew) and the sub-minute
+/// bucket both collapse to "just now"; coarser buckets truncate toward the
+/// nearest whole unit below.
+pub fn format_relative_age(ms: i64, now_ms: i64) -> String {
+    let delta_ms = now_ms.saturating_sub(ms);
+    if delta_ms < 0 {
+        // Timestamp is in the future (clock skew); treat as the present.
+        return "just now".to_string();
+    }
+    let seconds = delta_ms / 1_000;
+    if seconds < 60 {
+        return "just now".to_string();
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{minutes}m ago");
+    }
+    let hours = minutes / 60;
+    if hours < 24 {
+        return format!("{hours}h ago");
+    }
+    let days = hours / 24;
+    format!("{days}d ago")
+}
+
 /// Clamp a `0.0..=1.0` usage fraction to an integer percentage in `0..=100`.
 ///
 /// Out-of-range inputs (negative, NaN, or `> 1.0`) are clamped so the meter
@@ -140,6 +169,34 @@ mod tests {
         assert_eq!(format_count(999), "999");
         assert_eq!(format_count(1_000), "1.0k");
         assert_eq!(format_count(47_238), "47.2k");
+    }
+
+    #[test]
+    fn test_format_relative_age_buckets() {
+        const SEC: i64 = 1_000;
+        const MIN: i64 = 60 * SEC;
+        const HOUR: i64 = 60 * MIN;
+        const DAY: i64 = 24 * HOUR;
+        let now = 1_000 * DAY;
+        // Sub-minute (and exactly now) collapse to "just now".
+        assert_eq!(format_relative_age(now, now), "just now");
+        assert_eq!(format_relative_age(now - 30 * SEC, now), "just now");
+        assert_eq!(format_relative_age(now - 59 * SEC, now), "just now");
+        // Minute bucket.
+        assert_eq!(format_relative_age(now - MIN, now), "1m ago");
+        assert_eq!(format_relative_age(now - 5 * MIN, now), "5m ago");
+        assert_eq!(format_relative_age(now - 59 * MIN, now), "59m ago");
+        // Hour bucket.
+        assert_eq!(format_relative_age(now - HOUR, now), "1h ago");
+        assert_eq!(format_relative_age(now - 2 * HOUR, now), "2h ago");
+        assert_eq!(format_relative_age(now - 23 * HOUR, now), "23h ago");
+        // Day bucket.
+        assert_eq!(format_relative_age(now - DAY, now), "1d ago");
+        assert_eq!(format_relative_age(now - 3 * DAY, now), "3d ago");
+        // Truncation toward the lower whole unit.
+        assert_eq!(format_relative_age(now - (90 * MIN), now), "1h ago");
+        // Future timestamps (clock skew) collapse to "just now".
+        assert_eq!(format_relative_age(now + 5 * MIN, now), "just now");
     }
 
     #[test]

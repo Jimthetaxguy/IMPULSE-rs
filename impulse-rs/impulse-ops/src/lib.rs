@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+pub mod agent_registry;
+
 /// Shared daemon protocol version for GUI/operator workbench compatibility.
 pub const DAEMON_PROTOCOL_VERSION: u32 = 2;
 

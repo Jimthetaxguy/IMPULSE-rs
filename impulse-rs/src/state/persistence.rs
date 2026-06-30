@@ -227,7 +227,15 @@ impl State {
                 conflicting_sessions: conflicting.clone(),
                 detected_at: Utc::now(),
             };
-            let _ = self.storage.append_jsonl(CONFLICTS_FILE, &event);
+            if let Err(err) = self.storage.append_jsonl(CONFLICTS_FILE, &event) {
+                tracing::error!(
+                    "failed to append conflict event to audit trail ({}) for session {} on {}: {}",
+                    CONFLICTS_FILE,
+                    session_id,
+                    file_path,
+                    err
+                );
+            }
         }
 
         Ok(conflicting)
@@ -554,6 +562,7 @@ mod tests {
         assert_eq!(config.retrieval_similarity_threshold, 0.75);
         assert_eq!(config.retrieval_embedding_provider, "python-st");
         assert_eq!(config.retrieval_python_cmd, "python3");
+        assert_eq!(config.retrieval_ollama_url, "http://localhost:11434");
         assert!(!config.retrieval_vector_enabled);
         assert_eq!(config.retrieval_semantic_strategy, "auto");
         assert_eq!(config.retrieval_query_timeout_secs, 10);
@@ -617,6 +626,9 @@ mod tests {
 
         assert!(config.set("retrieval_embedding_provider", "python-st"));
         assert!(config.set("retrieval_python_cmd", "python3"));
+        assert!(config.set("retrieval_ollama_url", "http://localhost:11500"));
+        assert_eq!(config.retrieval_ollama_url, "http://localhost:11500");
+        assert!(!config.set("retrieval_ollama_url", ""));
         assert!(config.set("retrieval_vector_enabled", "true"));
         assert!(config.retrieval_vector_enabled);
         assert!(!config.set("retrieval_vector_enabled", "enabled"));

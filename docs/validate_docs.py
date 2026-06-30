@@ -84,6 +84,14 @@ FORBIDDEN_ACTIVE_PHRASES = [
 ]
 
 NON_AUTHORITATIVE_STATUSES = {"superseded", "deprecated", "archive", "historical"}
+
+# Point-in-time records that are not expected to track a moving codebase.
+# Staleness (last-updated age) is meaningless for these: an ADR, a research
+# analysis, a vision doc, a session log, or a completed phase checklist
+# documents a moment in time and must not be date-bumped to feign freshness.
+# Living docs (guides/, spec/, top-level references) remain staleness-checked.
+STALENESS_EXEMPT_DIRS = {"decisions", "research", "vision", "session-logs", "phases"}
+STALENESS_EXEMPT_TYPES = {"decision", "research", "vision"}
 DUPLICATE_ARTIFACT_PATTERN = re.compile(r"^(.+)\s2(\.[^.]+)$")
 
 
@@ -195,6 +203,17 @@ def is_non_authoritative(front_matter: Optional[Dict[str, Any]]) -> bool:
     return status in NON_AUTHORITATIVE_STATUSES
 
 
+def is_staleness_exempt(path: Path) -> bool:
+    """True if the doc lives in a point-in-time-record subtree (ADRs, research,
+    vision, session logs, phase records) for which last-updated age is not a
+    drift signal. Frontmatter on these is inconsistent, so exempt by directory."""
+    try:
+        rel_parts = path.relative_to(DOCS_DIR).parts
+    except ValueError:
+        return False
+    return bool(rel_parts) and rel_parts[0] in STALENESS_EXEMPT_DIRS
+
+
 def check_forbidden_active_contradictions(files: List[Path]) -> List[ContractIssue]:
     issues: List[ContractIssue] = []
     for path in files:
@@ -255,9 +274,15 @@ def check_staleness(files: List[Path], threshold_days: int = 120) -> List[Contra
     for path in files:
         if path.suffix.lower() != ".md":
             continue
+        if is_staleness_exempt(path):
+            continue
         content = path.read_text(encoding="utf-8")
         front_matter = extract_front_matter(content)
         if not front_matter:
+            continue
+        if is_non_authoritative(front_matter):
+            continue
+        if str(front_matter.get("type", "")).strip().lower() in STALENESS_EXEMPT_TYPES:
             continue
         updated_raw = front_matter.get("last_updated") or front_matter.get("updated")
         if not updated_raw:

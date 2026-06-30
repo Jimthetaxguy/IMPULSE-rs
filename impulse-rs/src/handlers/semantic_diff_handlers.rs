@@ -7,6 +7,13 @@ use crate::{semantic_diff, state};
 
 use super::print_json;
 
+/// Print the standard "sem CLI not found" guidance to stderr.
+fn print_sem_not_found() {
+    eprintln!("Error: sem CLI not found on PATH.");
+    eprintln!("Install: cargo install --git https://github.com/Ataraxy-Labs/sem sem-cli");
+    eprintln!("  or:    brew install ataraxy-labs/tap/sem");
+}
+
 /// Handle `sem-diff` — compute and display semantic diff between two refs.
 pub fn handle_sem_diff(
     state: &Arc<state::State>,
@@ -16,9 +23,7 @@ pub fn handle_sem_diff(
     session_id: Option<String>,
 ) -> Result<()> {
     if !semantic_diff::sem_available() {
-        eprintln!("Error: sem CLI not found on PATH.");
-        eprintln!("Install: cargo install --git https://github.com/Ataraxy-Labs/sem sem-cli");
-        eprintln!("  or:    brew install ataraxy-labs/tap/sem");
+        print_sem_not_found();
         return Ok(());
     }
 
@@ -64,8 +69,7 @@ pub fn handle_sem_diff(
 /// Handle `sem-blame` — entity-level git blame.
 pub fn handle_sem_blame(file: String, json: bool) -> Result<()> {
     if !semantic_diff::sem_available() {
-        eprintln!("Error: sem CLI not found on PATH.");
-        eprintln!("Install: cargo install --git https://github.com/Ataraxy-Labs/sem sem-cli");
+        print_sem_not_found();
         return Ok(());
     }
 
@@ -100,8 +104,7 @@ pub fn handle_sem_blame(file: String, json: bool) -> Result<()> {
 /// Handle `sem-impact` — blast radius analysis.
 pub fn handle_sem_impact(entity: String, json: bool) -> Result<()> {
     if !semantic_diff::sem_available() {
-        eprintln!("Error: sem CLI not found on PATH.");
-        eprintln!("Install: cargo install --git https://github.com/Ataraxy-Labs/sem sem-cli");
+        print_sem_not_found();
         return Ok(());
     }
 

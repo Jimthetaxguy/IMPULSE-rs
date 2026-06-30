@@ -243,3 +243,223 @@ impl TerminalBridge for InMemoryTerminalBridge {
 pub fn empty_payload() -> Value {
     Value::Object(Default::default())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_req(session: &str) -> TerminalOpenRequest {
+        TerminalOpenRequest {
+            session_id: Some(session.to_string()),
+            command: "bash".to_string(),
+            args: Vec::new(),
+            cwd: None,
+            env: HashMap::new(),
+            workspace: None,
+            mcp_tools: Vec::new(),
+            rows: 24,
+            cols: 80,
+        }
+    }
+
+    #[test]
+    fn test_open_uses_supplied_session_id_and_marks_alive() {
+        let bridge = InMemoryTerminalBridge::default();
+        let resp = bridge.open(open_req("s1")).unwrap();
+        assert_eq!(resp.session_id, "s1");
+        assert!(resp.alive);
+        assert_eq!((resp.rows, resp.cols), (24, 80));
+    }
+
+    #[test]
+    fn test_open_generates_session_id_when_absent() {
+        let bridge = InMemoryTerminalBridge::default();
+        let mut req = open_req("ignored");
+        req.session_id = None;
+        let resp = bridge.open(req).unwrap();
+        assert!(!resp.session_id.is_empty());
+        // The fallback is a UUID v4 (hyphenated).
+        assert!(resp.session_id.contains('-'));
+    }
+
+    #[test]
+    fn test_write_appends_and_counts_per_session() {
+        let bridge = InMemoryTerminalBridge::default();
+        bridge.open(open_req("s1")).unwrap();
+        assert_eq!(bridge.write_count("s1"), 0);
+        bridge
+            .write(TerminalWriteRequest {
+                session_id: "s1".into(),
+                data: b"hi".to_vec(),
+            })
+            .unwrap();
+        bridge
+            .write(TerminalWriteRequest {
+                session_id: "s1".into(),
+                data: b"yo".to_vec(),
+            })
+            .unwrap();
+        assert_eq!(bridge.write_count("s1"), 2);
+        assert_eq!(bridge.write_count("missing"), 0);
+    }
+
+    #[test]
+    fn test_mutations_on_missing_session_return_missing_error() {
+        let bridge = InMemoryTerminalBridge::default();
+        let err = bridge
+            .write(TerminalWriteRequest {
+                session_id: "x".into(),
+                data: vec![],
+            })
+            .unwrap_err();
+        assert_eq!(
+            err,
+            DesktopBridgeError::MissingTerminalSession {
+                session_id: "x".into()
+            }
+        );
+        assert!(bridge
+            .resize(TerminalResizeRequest {
+                session_id: "x".into(),
+                rows: 1,
+                cols: 1
+            })
+            .is_err());
+        assert!(bridge
+            .close(TerminalCloseRequest {
+                session_id: "x".into()
+            })
+            .is_err());
+        assert!(bridge
+            .focus(TerminalFocusRequest {
+                session_id: "x".into()
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn test_resize_persists_and_session_stays_present() {
+        let bridge = InMemoryTerminalBridge::default();
+        bridge.open(open_req("s1")).unwrap();
+        bridge
+            .resize(TerminalResizeRequest {
+                session_id: "s1".into(),
+                rows: 40,
+                cols: 120,
+            })
+            .unwrap();
+        // Session is still present after resize (a second resize succeeds).
+        assert!(bridge
+            .resize(TerminalResizeRequest {
+                session_id: "s1".into(),
+                rows: 10,
+                cols: 10,
+            })
+            .is_ok());
+    }
+
+    #[test]
+    fn test_focus_is_exclusive_across_sessions() {
+        let bridge = InMemoryTerminalBridge::default();
+        bridge.open(open_req("a")).unwrap();
+        bridge.open(open_req("b")).unwrap();
+        bridge
+            .focus(TerminalFocusRequest {
+                session_id: "a".into(),
+            })
+            .unwrap();
+        assert!(bridge.is_focused("a"));
+        assert!(!bridge.is_focused("b"));
+        bridge
+            .focus(TerminalFocusRequest {
+                session_id: "b".into(),
+            })
+            .unwrap();
+        assert!(!bridge.is_focused("a"));
+        assert!(bridge.is_focused("b"));
+    }
+
+    #[test]
+    fn test_close_removes_session() {
+        let bridge = InMemoryTerminalBridge::default();
+        bridge.open(open_req("s1")).unwrap();
+        bridge
+            .close(TerminalCloseRequest {
+                session_id: "s1".into(),
+            })
+            .unwrap();
+        assert!(bridge
+            .write(TerminalWriteRequest {
+                session_id: "s1".into(),
+                data: vec![],
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn test_bridge_error_display_includes_context() {
+        assert!(DesktopBridgeError::MissingTerminalSession {
+            session_id: "s9".into()
+        }
+        .to_string()
+        .contains("s9"));
+        assert!(DesktopBridgeError::InvalidTerminalRequest {
+            message: "bad dims".into()
+        }
+        .to_string()
+        .contains("bad dims"));
+        assert!(DesktopBridgeError::TerminalSpawnFailed {
+            message: "no pty".into()
+        }
+        .to_string()
+        .contains("no pty"));
+        assert!(DesktopBridgeError::TerminalWriteFailed {
+            message: "eof".into()
+        }
+        .to_string()
+        .contains("eof"));
+        assert!(DesktopBridgeError::UnsupportedNativeIsland {
+            kind: "appkit".into()
+        }
+        .to_string()
+        .contains("appkit"));
+        assert!(DesktopBridgeError::NativeIslandFailed {
+            message: "boom".into()
+        }
+        .to_string()
+        .contains("boom"));
+    }
+
+    #[test]
+    fn test_terminal_request_types_serde_round_trip() {
+        let req = TerminalOpenRequest {
+            session_id: Some("s1".into()),
+            command: "bash".into(),
+            args: vec!["-l".into()],
+            cwd: Some("/tmp".into()),
+            env: HashMap::from([("K".to_string(), "V".to_string())]),
+            workspace: None,
+            mcp_tools: Vec::new(),
+            rows: 24,
+            cols: 80,
+        };
+        let back: TerminalOpenRequest =
+            serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert_eq!(req, back);
+
+        let resp = TerminalSessionResponse {
+            session_id: "s1".into(),
+            alive: true,
+            rows: 24,
+            cols: 80,
+        };
+        let back: TerminalSessionResponse =
+            serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert_eq!(resp, back);
+    }
+
+    #[test]
+    fn test_empty_payload_is_empty_object() {
+        assert_eq!(empty_payload(), serde_json::json!({}));
+    }
+}

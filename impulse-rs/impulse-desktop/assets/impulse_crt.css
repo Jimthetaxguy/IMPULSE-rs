@@ -156,8 +156,8 @@ body {
   padding: 6px 12px;
 }
 
-.icon-button:hover,
-.invoke-button:hover {
+.icon-button:not(:disabled):hover,
+.invoke-button:not(:disabled):hover {
   border-color: var(--p-cyan);
   color: var(--p-cyan);
 }
@@ -1163,4 +1163,35 @@ body {
   47% {
     opacity: 0.99;
   }
+}
+
+/* ── Bridge degraded banner ──────────────────────────────────────────── */
+.bridge-status-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 16px;
+  background: rgba(255, 59, 31, 0.12);
+  border-top: 1px solid rgba(255, 106, 0, 0.55);
+  border-bottom: 1px solid rgba(255, 106, 0, 0.55);
+  color: #ffb01a;
+  font-size: 13px;
+  letter-spacing: 0.02em;
+}
+.bridge-status-mark {
+  display: inline-grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #ff3b1f;
+  color: #000;
+  font-weight: 700;
+}
+.bridge-status-headline {
+  font-weight: 600;
+  color: #ff6a00;
+}
+.bridge-status-reason {
+  opacity: 0.85;
 }

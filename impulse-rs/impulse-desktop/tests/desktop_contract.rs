@@ -13,8 +13,9 @@ use dioxus::prelude::*;
 use impulse_desktop::ui::{
     agent_focus_bridge_script, agent_launch_bridge_script, apply_desktop_bridge_message,
     desktop_event_bridge_script, mcp_invoke_bridge_script, review_decision_bridge_script,
-    terminal_asset_paths, workspace_registration_bridge_script, DesktopBridgeMessage,
-    ReviewDecisionUiRequest, XTERM_CSS_PATH, XTERM_FIT_JS_PATH, XTERM_JS_PATH,
+    terminal_asset_paths, workspace_registration_bridge_script, BridgeStatusUpdate,
+    DesktopBridgeMessage, ReviewDecisionUiRequest, XTERM_CSS_PATH, XTERM_FIT_JS_PATH,
+    XTERM_JS_PATH,
 };
 use impulse_desktop::{
     default_builtin_mcp_tools, format_count, status_dot_class, status_label, AgentPlatformKind,
@@ -184,7 +185,12 @@ fn test_dioxus_shell_renders_five_panel_layout_without_egui() {
     assert!(html.contains("Launch an agent from the workspace panel"));
     assert!(!html.contains("data-xterm-mount=\"true\""));
     assert!(!html.contains("terminal-pane-codex"));
-    assert!(html.contains("agent_runtime_update stream pending"));
+    // Footer stream health is derived, not hardcoded: with no agents and a
+    // healthy transport the runtime/terminal streams read `idle`.
+    assert!(!html.contains("stream pending"));
+    assert!(html.contains("data-stream=\"agent_runtime_update\""));
+    assert!(html.contains("agent_runtime_update · idle"));
+    assert!(html.contains("supervisor_local_action · ready"));
     assert!(!html.contains("data-pty-owner=\"rust-backend\""));
     assert!(!html.contains("<section class=\"review-console\""));
     assert!(!html.contains("<section class=\"operator-board\""));
@@ -304,11 +310,13 @@ fn test_dioxus_desktop_launch_binary_is_feature_gated() {
     assert!(manifest_text.contains("required-features = [\"desktop-app\"]"));
     assert!(manifest_text.contains("desktop-app = [\"dep:dioxus-desktop\", \"dioxus/desktop\"]"));
     assert!(manifest_text.contains("dioxus-desktop = { version = \"0.6.3\", optional = true }"));
-    assert!(launcher_text
-        .contains("use impulse_desktop::{desktop_host::desktop_config, DesktopShell};"));
+    assert!(launcher_text.contains("use impulse_desktop::desktop_host::desktop_config;"));
     assert!(launcher_text.contains("dioxus::LaunchBuilder::desktop()"));
     assert!(launcher_text.contains(".with_cfg(desktop_config())"));
-    assert!(launcher_text.contains(".launch(DesktopShell);"));
+    // The launcher now assembles the live host context and launches the
+    // bridge-mounting root component instead of the bare shell.
+    assert!(launcher_text.contains("install_live_host_context(LiveHostContext::new("));
+    assert!(launcher_text.contains(".launch(LiveDesktopApp);"));
 }
 
 #[test]
@@ -318,12 +326,178 @@ fn test_terminal_interop_prefers_dioxus_native_host_adapter() {
     assert!(script.contains("resolveImpulseHostAdapter"));
     assert!(script.contains("window.__IMPULSE_DESKTOP_HOST"));
     assert!(script.contains("const legacyTauri = window.__TAURI__"));
-    assert!(script.contains("invoke: dioxusHost?.invoke || legacyTauri?.core?.invoke"));
-    assert!(script.contains("listen: dioxusHost?.listen || legacyTauri?.event?.listen"));
     assert!(script.contains("const { invoke, listen, hostKind } = resolveImpulseHostAdapter();"));
     assert!(script.contains(r#"hostKind: dioxusHost ? "dioxus""#));
     assert!(script.contains(r#"legacyTauri ? "legacy-tauri""#));
     assert!(script.contains("data-impulse-host-kind"));
+
+    // The resolver must treat the manifest-only bootstrap stubs as unavailable
+    // rather than advertising them as a live host. It keys off both the pending
+    // status sentinel and the `__impulseHostPending` flag the bootstrap stamps
+    // onto its rejecting stubs.
+    assert!(script.contains("impulseHostFnReady"));
+    assert!(script.contains("__impulseHostPending"));
+    assert!(script.contains("legacyTauri?.core?.invoke"));
+    assert!(script.contains("legacyTauri?.event?.listen"));
+    assert!(script.contains(impulse_desktop::host_commands::PENDING_HOST_BOOTSTRAP_STATUS));
+}
+
+/// The manifest-only Dioxus bootstrap installs `invoke`/`listen` that always
+/// reject. Without a real eval bridge or a legacy Tauri host, the ops bridge
+/// must degrade — never advertise itself as mounted over the rejecting stubs.
+#[test]
+fn test_pending_dioxus_host_ops_bridge_fails_closed() {
+    if skip_without_node() {
+        return;
+    }
+
+    let smoke = run_pending_host_bridge_smoke(/* with_legacy = */ false);
+    assert_eq!(
+        smoke["attrs"]["data-impulse-host-kind"],
+        serde_json::Value::String("dioxus".to_string()),
+        "host-kind should still report the present dioxus host object"
+    );
+    assert_eq!(
+        smoke["attrs"]["data-impulse-ops-bridge"],
+        serde_json::Value::String("degraded".to_string()),
+        "pending stub host must not advertise a mounted bridge"
+    );
+    assert_eq!(
+        smoke["attrs"]["data-impulse-ops-bridge-reason"],
+        serde_json::Value::String("host event API unavailable".to_string())
+    );
+    assert_eq!(smoke["bridge"]["degraded"], serde_json::Value::Bool(true));
+    assert_eq!(
+        smoke["invoked"].as_array().map(|calls| calls.len()),
+        Some(0),
+        "pending stub host must not be invoked"
+    );
+}
+
+/// When a legacy Tauri host is present alongside the pending Dioxus stubs, the
+/// resolver must fall back to the working legacy transport and mount the bridge
+/// rather than degrade on the rejecting stubs.
+#[test]
+fn test_pending_dioxus_host_falls_back_to_legacy_tauri() {
+    if skip_without_node() {
+        return;
+    }
+
+    let smoke = run_pending_host_bridge_smoke(/* with_legacy = */ true);
+    assert_eq!(
+        smoke["attrs"]["data-impulse-ops-bridge"],
+        serde_json::Value::String("mounted".to_string()),
+        "legacy fallback should mount the bridge"
+    );
+    assert_eq!(smoke["bridge"]["degraded"], serde_json::Value::Bool(false));
+    let invoked = smoke["invoked"].as_array().expect("invoked array");
+    assert!(
+        invoked
+            .iter()
+            .any(|call| call["command"] == "agent_snapshot"),
+        "legacy transport should receive bridge refresh invokes, got {invoked:?}"
+    );
+}
+
+fn skip_without_node() -> bool {
+    match Command::new("node").arg("--version").output() {
+        Ok(output) if output.status.success() => false,
+        _ => {
+            eprintln!("node is unavailable; skipping pending-host bridge smoke");
+            true
+        }
+    }
+}
+
+/// Drive the ops bridge script against a mocked webview whose
+/// `window.__IMPULSE_DESKTOP_HOST` mirrors the real manifest-only bootstrap:
+/// `invoke`/`listen` are present but flagged `__impulseHostPending` and reject.
+/// Optionally also install a working legacy Tauri host to exercise fallback.
+fn run_pending_host_bridge_smoke(with_legacy: bool) -> serde_json::Value {
+    let legacy_setup = if with_legacy {
+        r#"
+window.__TAURI__ = {
+  core: {
+    invoke: async (command) => {
+      invoked.push({ command });
+      if (command === "agent_snapshot") return [];
+      if (command === "list_workspaces") return [];
+      if (command === "mcp_descriptors") return [];
+      if (command === "review_queue") return [];
+      return null;
+    }
+  },
+  event: {
+    listen: async (name, handler) => { listeners[name] = handler; return async () => {}; }
+  }
+};
+"#
+    } else {
+        ""
+    };
+
+    let smoke_script = format!(
+        r#"
+const bridgeScript = {bridge_script};
+const pendingStatus = {pending_status};
+const sent = [];
+const invoked = [];
+const listeners = {{}};
+const attrs = {{}};
+
+global.window = {{}};
+global.document = {{
+  documentElement: {{
+    setAttribute: (key, value) => {{ attrs[key] = value; }}
+  }}
+}};
+global.dioxus = {{ send: (message) => sent.push(message) }};
+
+const pending = (operation) =>
+  Promise.reject(new Error(`Dioxus Desktop host adapter pending: ${{operation}}`));
+const pendingInvoke = (command) => {{ invoked.push({{ command, pending: true }}); return pending(`invoke:${{command}}`); }};
+const pendingListen = (event) => pending(`listen:${{event}}`);
+pendingInvoke.__impulseHostPending = true;
+pendingListen.__impulseHostPending = true;
+window.__IMPULSE_DESKTOP_HOST = {{
+  invoke: pendingInvoke,
+  listen: pendingListen,
+  hostKind: "dioxus",
+  status: pendingStatus,
+}};
+{legacy_setup}
+
+const bridgePromise = eval(bridgeScript);
+if (bridgePromise && typeof bridgePromise.catch === "function") {{
+  bridgePromise.catch(() => {{}});
+}}
+setTimeout(() => {{
+  console.log(JSON.stringify({{ attrs, sent, invoked, bridge: window.__impulseOpsBridge }}));
+  process.exit(0);
+}}, 40);
+"#,
+        bridge_script =
+            serde_json::to_string(desktop_event_bridge_script()).expect("serialize bridge script"),
+        pending_status =
+            serde_json::to_string(impulse_desktop::host_commands::PENDING_HOST_BOOTSTRAP_STATUS)
+                .expect("serialize pending status"),
+        legacy_setup = legacy_setup,
+    );
+
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let smoke_path = tempdir.path().join("pending-host-bridge-smoke.js");
+    std::fs::write(&smoke_path, smoke_script).expect("write pending-host smoke script");
+    let output = Command::new("node")
+        .arg(&smoke_path)
+        .output()
+        .expect("run node pending-host bridge smoke");
+    assert!(
+        output.status.success(),
+        "pending-host bridge smoke failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("parse pending-host bridge smoke output")
 }
 
 #[test]
@@ -370,6 +544,7 @@ fn test_retro_shell_binds_project_ops_snapshot() {
             mcp_tools: Vec::new(),
             last_invocations: Vec::new(),
             review_queue: Vec::new(),
+            bridge_status: None,
             initial_view: DesktopView::Terminal,
         },
     );
@@ -1257,6 +1432,7 @@ fn test_shell_render_accepts_live_agents_workspaces_and_tools() {
                 path: "/tmp/review-1.json".to_string(),
                 preview: "cargo test\\n".to_string(),
             }],
+            bridge_status: None,
             initial_view: DesktopView::Terminal,
         },
     );
@@ -1301,6 +1477,7 @@ fn test_shell_review_route_gates_review_console() {
                 path: "/tmp/review-1.json".to_string(),
                 preview: "cargo test\\n".to_string(),
             }],
+            bridge_status: None,
             initial_view: DesktopView::Review,
         },
     );
@@ -1337,6 +1514,7 @@ fn test_shell_supervisor_route_gates_operator_board() {
                 ok: true,
             }],
             review_queue: Vec::new(),
+            bridge_status: None,
             initial_view: DesktopView::Supervisor,
         },
     );
@@ -1611,4 +1789,161 @@ fn test_appkit_probe_smoke_uses_objc_bridge() {
     assert!(result.handled);
     assert_eq!(result.payload["bridge"], "objc2");
     assert_eq!(result.payload["framework"], "AppKit");
+}
+
+#[test]
+fn test_bridge_status_update_parses_degraded_and_failed_messages() {
+    let degraded = BridgeStatusUpdate::parse(&DesktopBridgeMessage {
+        kind: "bridge_status".to_string(),
+        payload: json!({ "status": "degraded", "reason": "host event API unavailable" }),
+    })
+    .expect("degraded status parses");
+    assert!(degraded.is_degraded());
+    assert_eq!(degraded.headline(), "Host bridge degraded");
+    assert_eq!(
+        degraded.reason.as_deref(),
+        Some("host event API unavailable")
+    );
+
+    let failed = BridgeStatusUpdate::parse(&DesktopBridgeMessage {
+        kind: "bridge_status".to_string(),
+        payload: json!({ "status": "review_queue_failed", "reason": "boom" }),
+    })
+    .expect("failed status parses");
+    assert!(failed.is_degraded());
+    assert_eq!(failed.headline(), "Host call failed: review queue");
+}
+
+#[test]
+fn test_bridge_status_update_ignores_other_messages_and_empty_status() {
+    assert!(BridgeStatusUpdate::parse(&DesktopBridgeMessage {
+        kind: "ops_update".to_string(),
+        payload: json!({ "status": "degraded" }),
+    })
+    .is_none());
+    assert!(BridgeStatusUpdate::parse(&DesktopBridgeMessage {
+        kind: "bridge_status".to_string(),
+        payload: json!({ "reason": "missing status" }),
+    })
+    .is_none());
+    assert!(BridgeStatusUpdate::parse(&DesktopBridgeMessage {
+        kind: "bridge_status".to_string(),
+        payload: json!({ "status": "" }),
+    })
+    .is_none());
+}
+
+#[test]
+fn test_bridge_status_update_recovery_markers_are_not_degraded() {
+    for status in ["mounted", "ok", "ready"] {
+        let update = BridgeStatusUpdate {
+            status: status.to_string(),
+            reason: None,
+        };
+        assert!(!update.is_degraded(), "{status} should clear the banner");
+    }
+}
+
+#[test]
+fn test_shell_renders_bridge_status_banner_when_degraded() {
+    let mut vdom = VirtualDom::new_with_props(
+        DesktopShellWithSnapshot,
+        DesktopShellWithSnapshotProps {
+            snapshot: ProjectOpsSnapshot::default(),
+            runtime_agents: Vec::new(),
+            workspaces: Vec::new(),
+            mcp_tools: Vec::new(),
+            last_invocations: Vec::new(),
+            review_queue: Vec::new(),
+            bridge_status: Some(BridgeStatusUpdate {
+                status: "degraded".to_string(),
+                reason: Some("host event API unavailable".to_string()),
+            }),
+            initial_view: DesktopView::Terminal,
+        },
+    );
+    vdom.rebuild_in_place();
+    let html = dioxus_ssr::render(&vdom);
+
+    // The class name also appears in the inlined CRT stylesheet, so assert on
+    // the rendered element's marker attribute, which the CSS never emits.
+    assert!(html.contains("data-bridge-status=\"degraded\""));
+    assert!(html.contains("class=\"bridge-status-banner\""));
+    assert!(html.contains("Host bridge degraded"));
+    assert!(html.contains("host event API unavailable"));
+}
+
+#[test]
+fn test_shell_hides_bridge_status_banner_when_healthy() {
+    let mut vdom = VirtualDom::new_with_props(
+        DesktopShellWithSnapshot,
+        DesktopShellWithSnapshotProps {
+            snapshot: ProjectOpsSnapshot::default(),
+            runtime_agents: Vec::new(),
+            workspaces: Vec::new(),
+            mcp_tools: Vec::new(),
+            last_invocations: Vec::new(),
+            review_queue: Vec::new(),
+            bridge_status: None,
+            initial_view: DesktopView::Terminal,
+        },
+    );
+    vdom.rebuild_in_place();
+    let html = dioxus_ssr::render(&vdom);
+
+    // The class is present in the inlined stylesheet; the element's marker
+    // attribute is what proves the banner did (not) render.
+    assert!(!html.contains("data-bridge-status="));
+}
+
+#[test]
+fn test_footer_stream_health_reflects_live_agent() {
+    let mut vdom = VirtualDom::new_with_props(
+        DesktopShellWithSnapshot,
+        DesktopShellWithSnapshotProps {
+            snapshot: ProjectOpsSnapshot::default(),
+            runtime_agents: vec![runtime_snapshot("codex-live")],
+            workspaces: Vec::new(),
+            mcp_tools: Vec::new(),
+            last_invocations: Vec::new(),
+            review_queue: Vec::new(),
+            bridge_status: None,
+            initial_view: DesktopView::Terminal,
+        },
+    );
+    vdom.rebuild_in_place();
+    let html = dioxus_ssr::render(&vdom);
+
+    // runtime_snapshot has output_bytes > 0 and a present agent → both streams live.
+    assert!(html.contains("terminal_output · live"));
+    assert!(html.contains("agent_runtime_update · live"));
+    assert!(html.contains("supervisor_local_action · ready"));
+    assert!(!html.contains("stream pending"));
+}
+
+#[test]
+fn test_footer_stream_health_reads_down_when_transport_degraded() {
+    let mut vdom = VirtualDom::new_with_props(
+        DesktopShellWithSnapshot,
+        DesktopShellWithSnapshotProps {
+            snapshot: ProjectOpsSnapshot::default(),
+            runtime_agents: vec![runtime_snapshot("codex-live")],
+            workspaces: Vec::new(),
+            mcp_tools: Vec::new(),
+            last_invocations: Vec::new(),
+            review_queue: Vec::new(),
+            bridge_status: Some(BridgeStatusUpdate {
+                status: "degraded".to_string(),
+                reason: Some("host event API unavailable".to_string()),
+            }),
+            initial_view: DesktopView::Terminal,
+        },
+    );
+    vdom.rebuild_in_place();
+    let html = dioxus_ssr::render(&vdom);
+
+    // A degraded transport means no events can arrive — every stream reads down.
+    assert!(html.contains("terminal_output · down"));
+    assert!(html.contains("agent_runtime_update · down"));
+    assert!(html.contains("supervisor_local_action · down"));
 }

@@ -155,7 +155,7 @@ pub fn capture_semantic_diff(
     // Store the report — sanitize session_id to prevent path traversal
     let safe_id = sanitize_filename(session_id);
     let diff_dir = impulse_dir.join("semantic_diffs");
-    std::fs::create_dir_all(&diff_dir)?;
+    std::fs::create_dir_all(&diff_dir).context("failed to create semantic_diffs directory")?;
 
     let report_path = diff_dir.join(format!("{}.json", safe_id));
     let json = serde_json::to_string_pretty(&report)
@@ -163,8 +163,10 @@ pub fn capture_semantic_diff(
 
     // Atomic write: temp file + rename
     let tmp_path = diff_dir.join(format!(".{}.{}.tmp", safe_id, std::process::id()));
-    std::fs::write(&tmp_path, json.as_bytes())?;
-    std::fs::rename(&tmp_path, &report_path)?;
+    std::fs::write(&tmp_path, json.as_bytes())
+        .context("failed to write semantic diff temp file")?;
+    std::fs::rename(&tmp_path, &report_path)
+        .context("failed to rename semantic diff report into place")?;
 
     Ok(report)
 }

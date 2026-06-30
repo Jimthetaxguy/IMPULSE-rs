@@ -34,6 +34,13 @@ Thumbs.db
 # Cloned repos (large, re-cloneable)
 cloned-repos/
 
+# Archive snapshots of historical/duplicate trees (reference-only, not source of truth)
+# Per ADR-0009 (docs/decisions/0009-reconcile-impulse-copies.md), these are full
+# relocations of the IMPULSE-rs.clean sibling checkout into the canonical tree;
+# they exist for traceability of the reconcile decision, not for development.
+archive/_archived-*/
+archive/reconciled-from-*/
+
 # Worktrees
 .worktrees/
 

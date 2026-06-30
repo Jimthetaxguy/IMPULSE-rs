@@ -45,6 +45,7 @@ The chosen desktop stack is **Dioxus Desktop + xterm.js terminal bridge**. Tauri
 - See `docs/decisions/0008-dioxus-desktop-host.md` for the active ADR
 - See `docs/decisions/0007-desktop-shell-stack.md` for the superseded Tauri-era ADR
 - See `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md` for historical migration context; do not use it as the next product goal
+- See `docs/plans/EGUI-DECOMMISSION.md` for the active, gated plan to fully remove the egui surface (frozen `impulse-gui` crate + `impulse-term` egui rendering layer) once the Dioxus host is operationally authoritative
 
 **Do not add new code to `impulse-gui`.** If you need to touch `impulse-term`, confirm that `eframe` is not re-introduced as a dependency.
 
@@ -144,7 +145,7 @@ All changes must pass before any commit:
 cd impulse-rs && cargo build && cargo test && cargo clippy -- -D warnings && cargo fmt --check
 ```
 
-**Expected (2026-04-01):** 1,025 tests passed, 0 failed, 3 ignored. Update counts in this file, CLAUDE.md, and RUST-CANONICAL-CONTRACT.md when they change.
+**Expected (2026-06-30):** 1,711 tests passed, 0 failed, 5 ignored. Update counts in this file, CLAUDE.md, and RUST-CANONICAL-CONTRACT.md when they change.
 
 ### Code Requirements
 
@@ -194,7 +195,7 @@ Use descriptive names: `test_<function>_<scenario>_<expected_result>`
 
 New modules must ship meeting the target. Existing modules should trend toward targets.
 
-**Workspace totals (2026-04-01):** 1,025 tests across 4 crates (impulse-rs: 999+26, ops: 4, term: 90, gui: 220).
+**Workspace totals (2026-06-30):** 1,711 tests across the 4 workspace crates (impulse-rs: 1381+26, ops: 31, term: 114, desktop: 159). The legacy impulse-gui crate is frozen/excluded from the workspace and its tests are not counted.
 
 High-risk untested modules (prioritize coverage):
 - `src/handlers/daemon_dispatch.rs` (450 LOC) — routes all IPC, zero tests

@@ -24,8 +24,9 @@ use ratatui::{
     Frame, Terminal,
 };
 
-#[allow(unused_imports)]
-use crate::agent::coordinator::RecommendationType;
+// Re-exported for UI submodules that reference it via `use super::*`
+// (runner.rs, render_status.rs, render_tabs.rs).
+pub(crate) use crate::agent::coordinator::RecommendationType;
 use crate::context_lifecycle::detector::CompactionDetector;
 use crate::context_lifecycle::extractor::OutputExtractor;
 use crate::context_lifecycle::injector::ContextInjector;
@@ -61,9 +62,8 @@ pub use types::*;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::coordinator::{
-        ConflictResolution, Recommendation, RecommendationType, TrackedConflict,
-    };
+    // RecommendationType comes from the parent `super::*` re-export.
+    use crate::agent::coordinator::{ConflictResolution, Recommendation, TrackedConflict};
     use tempfile::TempDir;
 
     fn create_test_state() -> TuiState {
@@ -189,6 +189,65 @@ mod tests {
         // Toggle closed
         state.conflicts_panel_open = false;
         assert!(!state.conflicts_panel_open);
+    }
+
+    #[tokio::test]
+    async fn test_handle_conflicts_keys_resolves_and_consumes() {
+        use crossterm::event::KeyCode;
+
+        // Each resolution shortcut must be consumed and resolve the conflict.
+        for code in [
+            KeyCode::Char('m'),
+            KeyCode::Char('t'),
+            KeyCode::Char('y'),
+            KeyCode::Char('r'),
+        ] {
+            let mut state = create_test_state();
+            state.mier_recommendations.push(Recommendation {
+                recommendation_type: RecommendationType::FileConflict,
+                panes_involved: vec!["pane-1".to_string(), "pane-2".to_string()],
+                description: "Multiple agents modifying: src/main.rs".to_string(),
+                action: "Coordinate changes to avoid merge conflicts".to_string(),
+                priority: 50,
+            });
+            state.conflicts_panel_open = true;
+
+            let consumed = handle_conflicts_keys(&mut state, code);
+            assert!(
+                consumed,
+                "{code:?} should be consumed by the conflicts panel"
+            );
+            assert!(
+                state.mier_recommendations[0]
+                    .description
+                    .contains("RESOLVED"),
+                "{code:?} should resolve the conflict"
+            );
+        }
+    }
+
+    #[test]
+    fn test_handle_conflicts_keys_falls_through_for_non_resolution_keys() {
+        use crossterm::event::KeyCode;
+
+        let mut state = create_test_state();
+        state.conflicts_panel_open = true;
+
+        // Navigation, panel-close, and quit keys must NOT be consumed here so
+        // they fall through to the global dispatch.
+        for code in [
+            KeyCode::Char('j'),
+            KeyCode::Char('k'),
+            KeyCode::Char('c'),
+            KeyCode::Char('q'),
+            KeyCode::Up,
+            KeyCode::Esc,
+        ] {
+            assert!(
+                !handle_conflicts_keys(&mut state, code),
+                "{code:?} should fall through to global handlers"
+            );
+        }
     }
 
     #[test]

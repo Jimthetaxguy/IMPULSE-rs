@@ -23,13 +23,14 @@ authors:
 
 ## 1) Product Purpose
 
-Impulse is a terminal-native sidecar for AI coding agents that preserves session continuity across direct hook invocations and daemon/TUI workflows.
+Impulse is a terminal-native sidecar for AI coding agents that preserves session continuity across direct hook invocations and daemon/TUI workflows. The Impulse Agent acts as an always-on tech lead managing other agents. Terminal CLI-TUI agents (claude-code, codex cli, cursor cli, grok build equivalents, etc.) login/attach and continue acting normally; Impulse manages/monitors/augments context for them. The (light) UI supports picking/cycling multiple project folders and workspaces in one place so you can move across one or many project spaces and one or many agents per space without switching interfaces. Agents wired to Impulse receive extra tools/capabilities as built-in type-safe Rust plugins/extensions. Subagents + workflows are leveraged to scale and to reduce machine load from coding agents.
 
 Core outcomes:
 - Persistent project memory (`GENOME`, session history, active state)
 - Cross-session continuity for Claude Code and Codex integrations, with legacy OpenCode compatibility preserved where already implemented
 - Operationally safe session lifecycle with verification-before-completion gates
 - Human-visible observability through CLI, ratatui TUI, and a Dioxus Desktop shell (in migration)
+- Multi-workspace + multi-agent orchestration surface (observable registration and launch/monitoring of agents across project spaces)
 
 ## 2) Desktop Shell Contract (Updated 2026-06-14)
 
@@ -350,7 +351,7 @@ When adding/changing CLI commands, hooks, state files, or roadmap stage definiti
 | Tooling | ≥2.0 | ~17.1 | MET |
 | Integration | Every stable CLI command | 26 tests | PARTIAL |
 
-**Workspace totals (2026-04-04):** ~111K LOC, 1,344 tests, 237 .rs files across 4 crates.
+**Workspace totals (2026-06-30):** 1,711 tests across the 4 workspace crates (impulse-rs 1381+26, ops 31, term 114, desktop 159).
 
 ### Required Test Patterns
 
