@@ -351,7 +351,7 @@ When adding/changing CLI commands, hooks, state files, or roadmap stage definiti
 | Tooling | ≥2.0 | ~17.1 | MET |
 | Integration | Every stable CLI command | 26 tests | PARTIAL |
 
-**Workspace totals (2026-06-26):** 1,701 tests across the 4 workspace crates (impulse-rs 1371+26, ops 31, term 114, desktop 159).
+**Workspace totals (2026-06-30):** 1,711 tests across the 4 workspace crates (impulse-rs 1381+26, ops 31, term 114, desktop 159).
 
 ### Required Test Patterns
 

@@ -144,7 +144,7 @@ All changes must pass before any commit:
 cd impulse-rs && cargo build && cargo test && cargo clippy -- -D warnings && cargo fmt --check
 ```
 
-**Expected (2026-06-26):** 1,701 tests passed, 0 failed, 4 ignored. Update counts in this file, CLAUDE.md, and RUST-CANONICAL-CONTRACT.md when they change.
+**Expected (2026-06-30):** 1,711 tests passed, 0 failed, 5 ignored. Update counts in this file, CLAUDE.md, and RUST-CANONICAL-CONTRACT.md when they change.
 
 ### Code Requirements
 
@@ -194,7 +194,7 @@ Use descriptive names: `test_<function>_<scenario>_<expected_result>`
 
 New modules must ship meeting the target. Existing modules should trend toward targets.
 
-**Workspace totals (2026-06-26):** 1,701 tests across the 4 workspace crates (impulse-rs: 1371+26, ops: 31, term: 114, desktop: 159). The legacy impulse-gui crate is frozen/excluded from the workspace and its tests are not counted.
+**Workspace totals (2026-06-30):** 1,711 tests across the 4 workspace crates (impulse-rs: 1381+26, ops: 31, term: 114, desktop: 159). The legacy impulse-gui crate is frozen/excluded from the workspace and its tests are not counted.
 
 High-risk untested modules (prioritize coverage):
 - `src/handlers/daemon_dispatch.rs` (450 LOC) — routes all IPC, zero tests

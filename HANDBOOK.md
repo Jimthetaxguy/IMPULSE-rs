@@ -120,7 +120,7 @@ impulse-rs --daemon session-start -n "chat-session"
 | **Daemon socket IPC**                | Complete    | `impulse-rs/src/daemon/mod.rs`        |
 | **Claude Code hooks**                | Complete    | `impulse-rs/.claude/hooks/hooks.json` |
 | **OpenCode integration**             | Complete    | `impulse-rs/.opencode/impulse.json`   |
-| **Tests**                            | 1,701 passing (4 ignored) | `impulse-rs/src/*/tests.rs` |
+| **Tests**                            | 1,711 passing (5 ignored) | `impulse-rs/src/*/tests.rs` |
 | **Branding**                         | Complete    | `impulse-rs/src/branding.rs`          |
 | **Phase 2 (chat context)**           | Complete    | Session context in daemon chat        |
 | **Retrieval foundation**             | Complete    | `impulse-rs/src/retrieval/`           |
@@ -137,9 +137,9 @@ impulse-rs --daemon session-start -n "chat-session"
 | **Orchestration + Handoff**          | Complete    | `impulse-rs/src/orchestration/`       |
 | **TUI + PTY + Pane Manager**         | Complete    | `impulse-rs/src/ui/`                  |
 | **Branding (Shockwave sprites)**     | Complete    | `impulse-rs/src/branding.rs`          |
-| **ImpulseAgent (LLM coordination)** | Complete    | `impulse-rs/src/impulse_agent/`       |
+| **ImpulseAgent (LLM coordination)** | Complete    | `impulse-rs/src/agent/`               |
 | **Context Lifecycle**                | Complete    | `impulse-rs/src/context_lifecycle/`   |
-| **Intent Detection**                 | Complete    | `impulse-rs/src/intent/`              |
+| **Intent Detection**                 | Complete    | `impulse-rs/src/context_lifecycle/intent.rs` |
 | **Guardrail engine**                 | Complete    | `impulse-rs/src/guardrail/`           |
 | **Plugin system**                    | Complete    | `impulse-rs/src/plugin/`              |
 | **Semantic diff**                    | Complete    | `impulse-rs/src/semantic_diff/`       |
@@ -160,10 +160,10 @@ impulse-rs --daemon session-start -n "chat-session"
 |--------|-------|
 | Total Rust source files | 161 (main) + 50+ (impulse-term, impulse-gui) |
 | Total lines of code | ~69K+ (53K main + 2.7K term + 13K gui) |
-| Source modules | 35 declared in `main.rs` |
-| Tests passing (`cargo test`) | 1,701 (1371+26 impulse-rs + 31 ops + 114 term + 159 desktop, 4 ignored; impulse-gui frozen/excluded) |
+| Source modules | 38 declared in `main.rs` |
+| Tests passing (`cargo test`) | 1,711 (1381+26 impulse-rs + 31 ops + 114 term + 159 desktop, 5 ignored; impulse-gui frozen/excluded) |
 | Feature flags | `office-support` (default), `monty-support`, `datafusion-support` |
-| DynamicTools registered | 23 |
+| DynamicTools registered | 22 |
 
 ---
 
@@ -390,7 +390,7 @@ The status bar shows real-time connection health:
 | `impulse-rs/src/memory/mod.rs`      | GENOME, Genome struct                          |
 | `impulse-rs/src/branding.rs`        | UI branding constants                          |
 | `impulse-rs/src/error.rs`           | Global error type definitions                  |
-| `impulse-rs/src/session/mod.rs`     | Session lifecycle management                   |
+| `impulse-rs/src/state/session.rs`   | Session lifecycle management                   |
 | `impulse-rs/src/orchestration/mod.rs` | Multi-step orchestration logic (3 tests)     |
 | `impulse-rs/src/ui/`                | Terminal UI with ratatui (mod.rs + types.rs + runner.rs + agent_terminal.rs + lifecycle.rs + render_panels.rs + pane_manager + visualization, 6 tests) |
 | `impulse-rs/src/verify/mod.rs`      | Verification gate logic (2 tests)              |
@@ -406,9 +406,9 @@ The status bar shows real-time connection health:
 | `impulse-rs/src/tooling/`           | Dynamic tool registry, DynamicTool trait, 19 built-in tools (72 tests) |
 | `impulse-rs/src/office/`            | Office doc parsing — feature-flagged (4 files, 11 tests) |
 | `impulse-rs/src/monty/`             | Computed routing, dynamic injection (6 files, 17 tests) |
-| `impulse-rs/src/impulse_agent/`     | Dual-mode LLM agent: API + CLI harness coordination (3 files, 26 tests) |
-| `impulse-rs/src/context_lifecycle/` | Context window monitor, injector, extractor, detector (7 files, 64 tests) |
-| `impulse-rs/src/intent/`            | Intent detection from agent PTY output (4 files, 11 tests) |
+| `impulse-rs/src/agent/`             | Dual-mode LLM agent: API + CLI harness coordination (coordinator, harness, prompts) |
+| `impulse-rs/src/context_lifecycle/` | Context window monitor, injector, extractor, detector, intent |
+| `impulse-rs/src/context_lifecycle/intent.rs` | Intent detection from agent PTY output |
 | `impulse-rs/src/integration_tests.rs` | Integration test suite with DaemonGuard RAII |
 
 ---
@@ -678,7 +678,7 @@ Config at `.opencode/impulse.json` with equivalent hooks.
 | **Now**    | Search & Analytics tabs                                                | Rust        | **Complete** |
 | **Now**    | Session tagging                                                        | Rust        | **Complete** |
 | **Now**    | Filter system                                                          | Rust        | **Complete** |
-| **Now**    | Tests (1,701 passing)                                                  | Rust        | **Complete** |
+| **Now**    | Tests (1,711 passing)                                                  | Rust        | **Complete** |
 | **Now**    | Dioxus Desktop host scaffold                                           | Rust        | **Complete** |
 | **Now**    | Terminal bridge in Dioxus host                                         | xterm.js    | **Complete** |
 | **Now**    | Context stewardship                                                    | Rust        | **Complete** |
