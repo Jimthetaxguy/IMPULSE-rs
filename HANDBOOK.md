@@ -158,8 +158,8 @@ impulse-rs --daemon session-start -n "chat-session"
 
 | Metric | Value |
 |--------|-------|
-| Total Rust source files | 161 (main) + 50+ (impulse-term, impulse-gui) |
-| Total lines of code | ~69K+ (53K main + 2.7K term + 13K gui) |
+| Total Rust source files | 200 active (176 main + 9 term + 13 desktop + 2 ops); +38 in frozen impulse-gui |
+| Total lines of code | ~80K active (66K main + 4K term + 7.8K desktop + 1.75K ops); +15K in frozen impulse-gui. ~40K impl SLOC vs ~33K test (28K inline + 5K integration). |
 | Source modules | 38 declared in `main.rs` |
 | Tests passing (`cargo test`) | 1,711 (1381+26 impulse-rs + 31 ops + 114 term + 159 desktop, 5 ignored; impulse-gui frozen/excluded) |
 | Feature flags | `office-support` (default), `monty-support`, `datafusion-support` |

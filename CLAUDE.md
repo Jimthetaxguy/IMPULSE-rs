@@ -4,7 +4,7 @@
 > Contract: [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
 > Collaboration playbook: [`docs/guides/COLLABORATIVE-AGENTIC-CODING.md`](docs/guides/COLLABORATIVE-AGENTIC-CODING.md)
 > Canonical stack: Rust (impulse-rs)
-> Roadmap contract: Now=Rust core + Dioxus desktop host; Dioxus Desktop launch scaffold + terminal bridge parity=Complete (see docs/ROADMAP-PLAN.md); Next=Daemon parity in desktop shell + agent control + artifact polish; Legacy=egui compile-maintenance only; Tauri=legacy compatibility adapter only
+> Roadmap contract: Now=Rust core + Dioxus desktop host; Next=Dioxus Desktop launch scaffold + terminal bridge parity; Legacy=egui compile-maintenance only; Tauri=legacy compatibility adapter only
 
 ---
 
