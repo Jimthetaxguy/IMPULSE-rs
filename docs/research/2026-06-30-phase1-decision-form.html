@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Phase-1 Routine Vertical — Decision Form</title>
+<style>
+  :root{
+    --bg:#0f1117; --panel:#171a23; --panel2:#1e222e; --ink:#e7e9ee; --mut:#9aa3b2;
+    --line:#2a2f3c; --acc:#6ea8fe; --acc2:#7ee0a8; --warn:#f2c14e; --rec:#1f6f4a;
+    --recink:#7ee0a8; --chip:#243044;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
+  .wrap{max-width:920px;margin:0 auto;padding:32px 22px 120px;}
+  header h1{font-size:25px;margin:0 0 4px;letter-spacing:-.2px}
+  header .sub{color:var(--mut);margin:0 0 8px}
+  .pill{display:inline-block;background:var(--chip);color:var(--acc);border:1px solid var(--line);
+    border-radius:999px;padding:2px 10px;font-size:12px;margin-right:6px}
+  h2{font-size:15px;text-transform:uppercase;letter-spacing:.6px;color:var(--mut);
+    margin:30px 0 10px;border-bottom:1px solid var(--line);padding-bottom:6px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin:14px 0}
+  .q{font-weight:600;font-size:16px;margin:0 0 4px}
+  .qnote{color:var(--mut);font-size:13px;margin:0 0 12px}
+  .opt{display:flex;gap:11px;align-items:flex-start;padding:11px 12px;border:1px solid var(--line);
+    border-radius:9px;margin:7px 0;cursor:pointer;background:var(--panel2);transition:.12s}
+  .opt:hover{border-color:var(--acc)}
+  .opt.sel{border-color:var(--acc);background:#1b2436;box-shadow:0 0 0 1px var(--acc) inset}
+  .opt input{margin-top:3px;accent-color:var(--acc);transform:scale(1.15)}
+  .opt .body{flex:1}
+  .opt .t{font-weight:600}
+  .opt .d{color:var(--mut);font-size:13px;margin-top:2px}
+  .rec{display:inline-block;background:var(--rec);color:var(--recink);border-radius:6px;
+    font-size:11px;padding:1px 7px;margin-left:7px;vertical-align:middle;font-weight:700;letter-spacing:.3px}
+  .resolved{color:var(--acc2);font-size:13px}
+  textarea.note{width:100%;margin-top:8px;background:var(--bg);color:var(--ink);border:1px solid var(--line);
+    border-radius:8px;padding:9px 11px;font:13px/1.5 inherit;resize:vertical;min-height:42px}
+  .canon li{margin:3px 0;color:var(--mut)}
+  .canon b{color:var(--ink)}
+  .bar{position:fixed;left:0;right:0;bottom:0;background:#0b0d13;border-top:1px solid var(--line);
+    padding:13px 22px;display:flex;gap:12px;align-items:center;justify-content:center}
+  button{font:600 14px inherit;border-radius:9px;border:1px solid var(--line);padding:10px 18px;cursor:pointer}
+  .gen{background:var(--acc);color:#06122b;border-color:var(--acc)}
+  .copy{background:var(--acc2);color:#06200f;border-color:var(--acc2)}
+  .ghost{background:transparent;color:var(--mut)}
+  #out{background:#0b0d13;border:1px solid var(--line);border-radius:10px;padding:14px;margin-top:14px;
+    white-space:pre-wrap;font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;color:#cfe3ff;display:none}
+  .defaults{font-size:12px;color:var(--mut);margin-top:6px}
+  a{color:var(--acc)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div><span class="pill">IMPULSE · ION · ROSA</span><span class="pill">Phase 1</span><span class="pill">brainstorming gate</span></div>
+    <h1>Phase-1 Routine Vertical — Decision Form</h1>
+    <p class="sub">Calendar + Weather → <code>daily-brief</code> Routine. Pick options below (my recommendations are pre-selected). Hit <b>Generate</b> at the bottom, copy the block, paste it back to me — then I move to writing the implementation plan.</p>
+  </header>
+
+  <h2>Decided — canon (read-only, not re-litigating)</h2>
+  <div class="card canon">
+    <ul>
+      <li><b>Stack:</b> ION (L0 exec) ⊂ IMPULSE (L1 orchestration/memory/provenance) ⊂ ROSA (L2 personal-OS).</li>
+      <li><b>R1</b> closed capability universe · <b>R2</b> open-outward/fail-closed-inward · <b>R3</b> typed core + MCP edge.</li>
+      <li><b>Multi-tenancy day one:</b> Tenant→Account→Provider; James-KB / Tiffany-KB federated, never merged.</li>
+      <li><b>First vertical:</b> calendar + weather → <code>daily-brief</code> brain · Approach C (trait first; RuleBasedBrief impl₁, LLM iter₂).</li>
+      <li><b>Home location:</b> Long Island City · <b>LLM-agnostic + modular</b> · risk tiers T0–T4 + prompt-injection fencing folded.</li>
+    </ul>
+    <p class="qnote" style="margin:6px 0 0">If you want to reopen any canon item, note it in the free-text box at the very bottom.</p>
+  </div>
+
+  <h2>Open decisions — your call</h2>
+
+  <!-- Q1 -->
+  <div class="card" data-q="Q1" data-label="Calendar access">
+    <p class="q">1 · Calendar access mechanism</p>
+    <p class="qnote">How the <code>calendar.today</code> sensor reads events (T1 private read — scope by tenant, minimize fields).</p>
+    <label class="opt"><input type="radio" name="q1" value="gws shell-out (read-only)" checked><span class="body"><span class="t">gws shell-out, read-only<span class="rec">RECOMMENDED</span></span><span class="d">Shell to the existing <code>google-workspace-cli</code>. Reuses working auth, zero new OAuth code, ships fastest.</span></span></label>
+    <label class="opt"><input type="radio" name="q1" value="native Rust Google Calendar API client"><span class="body"><span class="t">Native Rust API client</span><span class="d">First-party reqwest client + OAuth refresh in-crate. More control + typed, but more upfront auth plumbing.</span></span></label>
+    <label class="opt"><input type="radio" name="q1" value="MCP Google Calendar tool"><span class="body"><span class="t">MCP Google Calendar tool</span><span class="d">Go through an MCP server. Clean at the edge, but heavier for a local code-tier sensor.</span></span></label>
+  </div>
+
+  <!-- Q2 -->
+  <div class="card" data-q="Q2" data-label="Crate name">
+    <p class="q">2 · Crate name</p>
+    <p class="qnote">The new standalone Rust crate for the Routine engine.</p>
+    <label class="opt"><input type="radio" name="q2" value="routines" checked><span class="body"><span class="t"><code>routines</code><span class="rec">RECOMMENDED</span></span><span class="d">Capability-neutral; reads well if it later lives in a workspace.</span></span></label>
+    <label class="opt"><input type="radio" name="q2" value="rosa-routines"><span class="body"><span class="t"><code>rosa-routines</code></span><span class="d">Namespaced to the flagship; clearer ownership, less reusable-sounding.</span></span></label>
+    <label class="opt"><input type="radio" name="q2" value="impulse-routines"><span class="body"><span class="t"><code>impulse-routines</code></span><span class="d">Namespaces to the orchestration layer where the engine arguably belongs.</span></span></label>
+  </div>
+
+  <!-- Q3 -->
+  <div class="card" data-q="Q3" data-label="Structure">
+    <p class="q">3 · Crate structure</p>
+    <p class="qnote">How adapters (calendar, weather, LLM, secrets) are organized.</p>
+    <label class="opt"><input type="radio" name="q3" value="single crate + feature-gated adapters" checked><span class="body"><span class="t">Single crate + feature-gated adapters<span class="rec">RECOMMENDED</span></span><span class="d">One crate, <code>--features google,weather-gov,llm-anthropic</code>. Simplest now, splits cleanly later.</span></span></label>
+    <label class="opt"><input type="radio" name="q3" value="cargo workspace (multi-crate)"><span class="body"><span class="t">Cargo workspace (multi-crate)</span><span class="d">core / adapters / cli as separate crates. Cleaner boundaries, more overhead for a Phase-1 slice.</span></span></label>
+  </div>
+
+  <!-- Q4 -->
+  <div class="card" data-q="Q4" data-label="Secret backend">
+    <p class="q">4 · Secret backend</p>
+    <p class="qnote"><code>SecretStore</code> trait is in the design; question is which adapter ships first.</p>
+    <label class="opt"><input type="radio" name="q4" value="Keychain first, Infisical adapter stubbed" checked><span class="body"><span class="t">macOS Keychain first<span class="rec">RECOMMENDED</span></span><span class="d">Local-first, no network dep for a single-machine Phase 1. Infisical adapter behind the trait, wired later.</span></span></label>
+    <label class="opt"><input type="radio" name="q4" value="Infisical first"><span class="body"><span class="t">Infisical first</span><span class="d">Matches the rest of your stack + cross-machine sync. More setup for the first slice.</span></span></label>
+    <label class="opt"><input type="radio" name="q4" value="Both adapters now"><span class="body"><span class="t">Both now</span><span class="d">Ship Keychain + Infisical together behind the trait. Most complete, most upfront work.</span></span></label>
+  </div>
+
+  <!-- Q5 -->
+  <div class="card" data-q="Q5" data-label="Config location">
+    <p class="q">5 · Config location</p>
+    <p class="qnote">Per-tenant config (accounts, home location, provider choices) — base code stays personal-data-free.</p>
+    <label class="opt"><input type="radio" name="q5" value="~/.config/routines/<tenant>.toml (XDG)" checked><span class="body"><span class="t"><code>~/.config/routines/&lt;tenant&gt;.toml</code><span class="rec">RECOMMENDED</span></span><span class="d">XDG-standard, per-tenant file, outside the repo.</span></span></label>
+    <label class="opt"><input type="radio" name="q5" value="~/.config/rosa/routines/<tenant>.toml"><span class="body"><span class="t"><code>~/.config/rosa/routines/&lt;tenant&gt;.toml</code></span><span class="d">Nested under a ROSA-wide config root for future shared settings.</span></span></label>
+    <label class="opt"><input type="radio" name="q5" value="single ~/.config/routines/config.toml with [tenant.*] tables"><span class="body"><span class="t">Single file, <code>[tenant.*]</code> tables</span><span class="d">One file, all tenants. Simpler to start; per-tenant files isolate better long-term.</span></span></label>
+  </div>
+
+  <!-- Q6 -->
+  <div class="card" data-q="Q6" data-label="Starter-kit enrichment">
+    <p class="q">6 · Starter-kit enrichment (parallel, optional)</p>
+    <p class="qnote">Add the best-practices doc's remaining additive pieces to <code>~/code/_templates/agent-native-project-starter/</code>.</p>
+    <label class="opt"><input type="radio" name="q6" value="Add SECURITY.md + EVALS.md now" checked><span class="body"><span class="t">Add <code>SECURITY.md</code> + <code>EVALS.md</code> now<span class="rec">RECOMMENDED</span></span><span class="d">T0–T4 tiers + OWASP rules, and the eval template. Cheap, durable, helps every future project.</span></span></label>
+    <label class="opt"><input type="radio" name="q6" value="Defer starter-kit enrichment"><span class="body"><span class="t">Defer</span><span class="d">Stay focused on the Phase-1 build; enrich the kit later.</span></span></label>
+  </div>
+
+  <!-- Q7 -->
+  <div class="card" data-q="Q7" data-label="Execution mode">
+    <p class="q">7 · After the plan — execution mode</p>
+    <p class="qnote">How I build it once the implementation plan is written.</p>
+    <label class="opt"><input type="radio" name="q7" value="Subagent-driven (fresh agent per task, review between)" checked><span class="body"><span class="t">Subagent-driven<span class="rec">RECOMMENDED</span></span><span class="d">Fresh subagent per task, two-stage review between tasks. Fast, clean isolation.</span></span></label>
+    <label class="opt"><input type="radio" name="q7" value="Inline execution in this session"><span class="body"><span class="t">Inline in this session</span><span class="d">Execute tasks here with checkpoints for your review.</span></span></label>
+    <label class="opt"><input type="radio" name="q7" value="Just write the plan, do not build yet"><span class="body"><span class="t">Plan only — pause before building</span><span class="d">Write the plan, then stop so you can review before any code.</span></span></label>
+  </div>
+
+  <h2>Anything else</h2>
+  <div class="card">
+    <p class="qnote">Reopen canon, change scope, add a constraint, or leave a note for any question above.</p>
+    <textarea class="note" id="freeform" placeholder="Free text — optional…"></textarea>
+  </div>
+
+  <div id="out"></div>
+</div>
+
+<div class="bar">
+  <button class="ghost" onclick="useRecs()">Accept all recommendations</button>
+  <button class="gen" onclick="gen()">Generate my answers ▾</button>
+  <button class="copy" onclick="copyOut()">Copy to clipboard</button>
+</div>
+
+<script>
+  // highlight selected option
+  function paint(){
+    document.querySelectorAll('.opt').forEach(o=>{
+      const i=o.querySelector('input'); o.classList.toggle('sel', i.checked);
+    });
+  }
+  document.querySelectorAll('input[type=radio]').forEach(i=>i.addEventListener('change',paint));
+  paint();
+
+  function useRecs(){
+    // recs are the `checked` defaults — just reset every group to its first (recommended) option
+    document.querySelectorAll('.card[data-q]').forEach(card=>{
+      const first=card.querySelector('input[type=radio]');
+      if(first){first.checked=true;}
+    });
+    paint();
+  }
+
+  function gen(){
+    let lines=['PHASE-1 ROUTINE VERTICAL — MY DECISIONS','=====================================',''];
+    document.querySelectorAll('.card[data-q]').forEach(card=>{
+      const q=card.dataset.q, label=card.dataset.label;
+      const sel=card.querySelector('input[type=radio]:checked');
+      lines.push(`${q} (${label}): ${sel?sel.value:'— none —'}`);
+    });
+    const ff=document.getElementById('freeform').value.trim();
+    lines.push('');
+    lines.push('NOTES: '+(ff||'(none)'));
+    lines.push('');
+    lines.push('→ Proceed: write the implementation plan with these choices.');
+    const out=document.getElementById('out');
+    out.textContent=lines.join('\n');
+    out.style.display='block';
+    out.scrollIntoView({behavior:'smooth',block:'center'});
+  }
+
+  function copyOut(){
+    const out=document.getElementById('out');
+    if(out.style.display==='none'){gen();}
+    navigator.clipboard.writeText(out.textContent).then(()=>{
+      const b=document.querySelector('.copy'); const t=b.textContent;
+      b.textContent='Copied ✓'; setTimeout(()=>b.textContent=t,1400);
+    });
+  }
+</script>
+</body>
+</html>
