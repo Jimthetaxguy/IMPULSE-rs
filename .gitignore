@@ -62,3 +62,7 @@ test-hook.sh
 # Local agent working notes / scratch — not for the public repo
 _working-files/
 .remember/
+
+# Claude Code local hookify copies (machine-local; not product source)
+.claude/hookify.*.local.md
+.claude/*.local.md
