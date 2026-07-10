@@ -18,7 +18,7 @@ tags: [rosa, sites-map, maplibre, provenance, phase1, globe]
 ## 1. Goal (thinnest real vertical)
 
 Prove the whole seam — **routines KB → typed site data → frontend → provenance rendered in the UI** —
-using the **one real geocoded point the crate already has: home (home site (geohash at export; never raw lat/lon in docs))
+using the **one real geocoded point the crate already has: home site (geohash at export; never raw lat/lon in docs)
 with its live weather.gov overlay**. No geocoder, no new R1 capability, no deck.gl, no server. Success:
 
 - `routines sites --tenant james [--date YYYY-MM-DD]` emits a typed `SiteCollection` JSON derived from

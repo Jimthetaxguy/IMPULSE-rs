@@ -158,7 +158,7 @@ layers:
 - **Secrets — Infisical + macOS Keychain** via the `SecretStore` trait. No plaintext credentials in
   config or code; refs only.
 - **Weather — weather.gov** (`api.weather.gov`, free, no key, US-only): `/points/{lat,lon}` →
-  forecast URL → periods. Default **home location: Long Island City, NY** (≈ `40.7447, -73.9485`),
+  forecast URL → periods. Default **home location: Long Island City, NY** ([home-geohash-at-export-boundary]),
   config-overridable.
 - **Rust toolchain** (present).
 - Phase 2 only: **any LLM provider** behind the `LlmProvider` trait — Claude / OpenAI / local
@@ -323,7 +323,7 @@ All open items resolved via the Phase-1 decision form. These are now binding for
 1. **Calendar access** — ✅ **native Rust Google Calendar API client** (OAuth in-crate, read-only),
    behind the `CalendarSource` trait. (§4 updated.)
 2. **Crate name** — ✅ **`routines`**.
-3. **Home location** — ✅ Long Island City, NY (`40.7447, -73.9485`), config-overridable.
+3. **Home location** — ✅ Long Island City, NY ([home-geohash-at-export-boundary]), config-overridable.
 4. **Structure** — ✅ **single crate + feature-gated adapter modules** (`cal-google`, `weather-gov`,
    `secret-infisical`, `secret-keychain`, `llm-*`); core compiles with none.
 5. **Secret backend** — ✅ **both adapters now**: `SecretStore` trait with **Infisical** *and* **macOS
