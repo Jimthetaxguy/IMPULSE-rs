@@ -7,6 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod pi_adapter;
+
 pub const CONTRACT_VERSION: &str = "0";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -150,9 +152,14 @@ impl HarnessResponse {
     /// response alone: CRITICAL findings forbid APPROVE, and any verdict other
     /// than NEEDS DISCUSSION must carry evidence (a non-empty `commands_run`).
     pub fn validate(&self) -> Result<(), ContractViolation> {
-        let has_critical = self.findings.iter().any(|f| f.severity == Severity::Critical);
+        let has_critical = self
+            .findings
+            .iter()
+            .any(|f| f.severity == Severity::Critical);
         if has_critical && self.verdict == Verdict::Approve {
-            return Err(ContractViolation::CriticalBlocksApprove(self.verdict.clone()));
+            return Err(ContractViolation::CriticalBlocksApprove(
+                self.verdict.clone(),
+            ));
         }
         if self.verdict != Verdict::NeedsDiscussion && self.commands_run.is_empty() {
             return Err(ContractViolation::MissingCommandsRun(self.verdict.clone()));
@@ -164,7 +171,10 @@ impl HarnessResponse {
     /// and no CRITICAL finding is present. Callers must never do NLP on prose.
     pub fn passed(&self) -> bool {
         self.verdict == Verdict::Approve
-            && !self.findings.iter().any(|f| f.severity == Severity::Critical)
+            && !self
+                .findings
+                .iter()
+                .any(|f| f.severity == Severity::Critical)
     }
 }
 
@@ -267,7 +277,9 @@ mod tests {
         req.capability_allowlist.push("write".to_string());
         assert_eq!(
             req.validate(),
-            Err(ContractViolation::WriteCapabilityRequested("write".to_string()))
+            Err(ContractViolation::WriteCapabilityRequested(
+                "write".to_string()
+            ))
         );
     }
 
