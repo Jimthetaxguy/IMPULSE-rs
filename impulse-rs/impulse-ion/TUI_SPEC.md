@@ -164,6 +164,21 @@ The `ion_verify` tool is a thin wrapper: `HarnessRequest::verify(..)` (G4) →
 never NLP on prose — and verify-intent requests keep write-denial-by-omission
 (`HarnessRequest::validate()` before send).
 
+**Scope clarification (2026-07-11, James):** `ion` is not a read-only verify
+console — it is a coding agent in the same category as `claude`, `codex`, or
+any other CLI/TUI coding agent Impulse instruments, and CRUD/bash/write
+capability is a first-class requirement of the product, not an
+afterthought. `ion_verify` (and future gate tools like `cc-gate`) are *one*
+ReplTool among many, not the whole tool surface. T7 must also register
+write-capable tools from the existing `src/tooling::Tool` registry (file
+read/write/edit, bash execution, etc. — see `src/tooling/builtin/` for what
+already exists) so the chat loop can actually make code changes, not only
+gate them. The write-denial-by-omission rule above is scoped narrowly to
+`HarnessRequest`/verify-intent gate calls (spec-a's contract for *that*
+request type) — it does not mean the `ion` REPL as a whole is write-denied.
+Keep these two capability universes conceptually separate: the verify gate's
+closed read-only allowlist vs. the REPL's full coding-agent tool registry.
+
 ### 2.4 CLI surface of the new binary
 
 ```
