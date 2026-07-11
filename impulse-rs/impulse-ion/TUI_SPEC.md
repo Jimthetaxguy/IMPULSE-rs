@@ -275,6 +275,29 @@ pass the repo gate: `cargo build && cargo test && cargo clippy -- -D warnings &&
   `ion_verify`/`file_read` stay ungated (read-only, and `ion_verify` was
   already ungated via `/verify`). `ChatState::with_confirm` (test-only) is
   the DI seam so tests can drive the gate without blocking on real stdin.
+
+  **Wall-clock timeout (adversarial-review follow-up, finding S2, same-day):**
+  Opus's review also flagged that the tool loop is uninterruptible and had no
+  wall-clock budget — `ReplSession::run` only handles Ctrl-C around
+  `readline()`, not during `handle_line().await`, so a model doing the full
+  `DEFAULT_MAX_TOOL_ROUNDS = 10` rounds, each potentially waiting on a 30s
+  `bash_exec`, could block the REPL for several minutes with no way to abort.
+  Full mid-await interruptibility (cancellation tokens threaded through the
+  readline/event loop) was deliberately left out of scope as a much larger
+  change; instead, `Agent::chat_with_tools`/`chat_with_tools_capped` now wrap
+  the *entire* multi-round exchange (not any single round) in
+  `tokio::time::timeout` against a new `llm_backends::DEFAULT_TOOL_LOOP_TIMEOUT`
+  (180s) constant, erroring with a new `AgentError::ToolLoopTimedOut { seconds
+  }` variant instead of hanging. The round-loop body was extracted to a free
+  fn `run_tool_loop` (takes `&dyn LlmProvider`/`&str`/etc., never `&mut Agent`)
+  so the future passed to `tokio::time::timeout` doesn't hold a long-lived
+  mutable borrow of `Agent`; history is only committed via
+  `self.history = working` on the success path, so both a round-cap error and
+  a timeout leave `self.history` untouched, matching the existing
+  `ToolLoopLimitExceeded` invariant. `ion_repl::mod.rs`'s `respond()` renders
+  the new error through the existing generic `format!("Chat failed: {err}")`
+  branch (same as `ToolLoopLimitExceeded`) rather than adding a dedicated
+  notice — the `Display` message is already self-explanatory.
 - **T10 (optional) — ratatui inline polish.** Spinner during gate runs, colored
   verdict table, status line. *(Depends T7. Do not start before T9 is stable.)*
 

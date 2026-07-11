@@ -18,6 +18,8 @@ pub use crate::error::AgentResult;
 pub use async_trait::async_trait;
 pub use serde::{Deserialize, Serialize};
 
+use std::time::Duration;
+
 use crate::error::AgentError;
 
 // Re-export all providers from consolidated anthropic.rs
@@ -185,6 +187,21 @@ pub struct ToolExecutionResult {
 /// requesting tools instead of ever returning a plain-text stop reason.
 pub const DEFAULT_MAX_TOOL_ROUNDS: usize = 10;
 
+/// Overall wall-clock budget for one [`Agent::chat_with_tools`]/
+/// [`Agent::chat_with_tools_capped`] call -- the *entire* multi-round
+/// exchange, not any single round (same-day Opus adversarial-review
+/// follow-up to TUI_SPEC.md T9, finding S2). [`DEFAULT_MAX_TOOL_ROUNDS`]
+/// rounds, each potentially waiting on a 30s `bash_exec` timeout plus
+/// network latency for the LLM call itself, could otherwise block the REPL
+/// for several minutes with no way to abort (Ctrl-C is only handled around
+/// `readline()`, not mid-`.await` inside the tool loop -- full
+/// interruptibility is a separate, larger change involving cancellation
+/// tokens threaded through the REPL's event loop). This timeout is a
+/// narrower, immediately-actionable mitigation: it guarantees the loop
+/// always returns control to the REPL, even if a provider or tool call
+/// hangs outright.
+pub const DEFAULT_TOOL_LOOP_TIMEOUT: Duration = Duration::from_secs(180);
+
 pub struct Agent {
     pub id: String,
     pub name: String,
@@ -240,9 +257,10 @@ impl Agent {
     /// Sends one user turn with `tools` available for the model to call
     /// (TUI_SPEC.md T9), looping on `tool_use` stop reasons -- executing
     /// each requested call via `executor` and sending the results back --
-    /// until the model returns a plain-text reply or [`DEFAULT_MAX_TOOL_ROUNDS`]
-    /// is hit. Conversation history is only committed on a successful
-    /// (non-error) return, matching [`Agent::chat`]'s error-path behavior.
+    /// until the model returns a plain-text reply, [`DEFAULT_MAX_TOOL_ROUNDS`]
+    /// is hit, or [`DEFAULT_TOOL_LOOP_TIMEOUT`] elapses. Conversation history
+    /// is only committed on a successful (non-error) return, matching
+    /// [`Agent::chat`]'s error-path behavior.
     pub async fn chat_with_tools(
         &mut self,
         user_message: &str,
@@ -255,7 +273,10 @@ impl Agent {
 
     /// Same as [`Agent::chat_with_tools`] with an explicit round cap --
     /// split out so tests can exercise the cap-hit error path without
-    /// looping [`DEFAULT_MAX_TOOL_ROUNDS`] times.
+    /// looping [`DEFAULT_MAX_TOOL_ROUNDS`] times. Uses the default
+    /// [`DEFAULT_TOOL_LOOP_TIMEOUT`] wall-clock budget; see
+    /// [`Agent::chat_with_tools_capped_timeout`] for the test-only seam that
+    /// overrides it.
     pub async fn chat_with_tools_capped(
         &mut self,
         user_message: &str,
@@ -263,55 +284,122 @@ impl Agent {
         executor: &dyn ToolExecutor,
         max_rounds: usize,
     ) -> AgentResult<String> {
+        self.chat_with_tools_capped_timeout(
+            user_message,
+            tools,
+            executor,
+            max_rounds,
+            DEFAULT_TOOL_LOOP_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Same as [`Agent::chat_with_tools_capped`] with an explicit wall-clock
+    /// timeout override -- split out so tests can exercise the timeout error
+    /// path with a short duration instead of waiting on
+    /// [`DEFAULT_TOOL_LOOP_TIMEOUT`]. Wraps the *entire* multi-round
+    /// exchange in [`tokio::time::timeout`], not any single round: the
+    /// round-loop body lives in the free fn [`run_tool_loop`], which takes
+    /// only the borrows it needs (never `&mut self`) so the `.await` inside
+    /// `tokio::time::timeout` doesn't hold a long-lived mutable borrow of
+    /// `self`. History is only committed via `self.history = working` on the
+    /// success path -- both a round-cap error and a timeout leave
+    /// `self.history` exactly as it was before this call, matching
+    /// [`Agent::chat`]'s error-path invariant.
+    async fn chat_with_tools_capped_timeout(
+        &mut self,
+        user_message: &str,
+        tools: &[ToolDefinition],
+        executor: &dyn ToolExecutor,
+        max_rounds: usize,
+        timeout_duration: Duration,
+    ) -> AgentResult<String> {
         let mut working = self.history.clone();
         working.push(Message::text(Role::User, user_message));
 
-        for _round in 0..max_rounds {
-            let mut messages = Vec::new();
-            if let Some(ref system) = self.system_prompt {
-                messages.push(Message::text(Role::System, system.clone()));
+        let loop_future = run_tool_loop(
+            self.provider.as_ref(),
+            &self.model,
+            &self.system_prompt,
+            working,
+            tools,
+            executor,
+            max_rounds,
+        );
+
+        match tokio::time::timeout(timeout_duration, loop_future).await {
+            Ok(Ok((reply, working))) => {
+                self.history = working;
+                Ok(reply)
             }
-            messages.extend(working.clone());
-
-            let request = ChatRequest {
-                model: self.model.clone(),
-                messages,
-                temperature: 0.7,
-                max_tokens: Some(4096),
-                tools: tools.to_vec(),
-            };
-            let response = self.provider.chat(request).await?;
-
-            if response.stop_reason == StopReason::ToolUse && !response.tool_calls.is_empty() {
-                working.push(Message::assistant_tool_use(
-                    response.content.clone(),
-                    response.tool_calls.clone(),
-                ));
-
-                let mut results = Vec::with_capacity(response.tool_calls.len());
-                for call in &response.tool_calls {
-                    let outcome = executor.execute(&call.name, call.input.clone()).await;
-                    results.push(ToolResult {
-                        tool_use_id: call.id.clone(),
-                        content: outcome.content,
-                        is_error: outcome.is_error,
-                    });
-                }
-                working.push(Message::tool_results(results));
-                continue;
-            }
-
-            working.push(Message::text(Role::Assistant, response.content.clone()));
-            self.history = working;
-            return Ok(response.content);
+            Ok(Err(err)) => Err(err),
+            Err(_elapsed) => Err(AgentError::ToolLoopTimedOut {
+                seconds: timeout_duration.as_secs(),
+            }),
         }
-
-        Err(AgentError::ToolLoopLimitExceeded { rounds: max_rounds })
     }
 
     pub fn clear_history(&mut self) {
         self.history.clear();
     }
+}
+
+/// The round-loop body behind [`Agent::chat_with_tools_capped_timeout`],
+/// extracted to a free fn that borrows only `provider`/`model`/
+/// `system_prompt` (never `&mut Agent`) so its returned future can be
+/// wrapped in `tokio::time::timeout` without holding a mutable borrow of the
+/// `Agent` across the `.await`. Returns the final reply and the full
+/// `working` history (system prompt excluded, matching `Agent::history`'s
+/// existing shape) on success, so the caller can decide whether to commit it.
+async fn run_tool_loop(
+    provider: &dyn LlmProvider,
+    model: &str,
+    system_prompt: &Option<String>,
+    mut working: Vec<Message>,
+    tools: &[ToolDefinition],
+    executor: &dyn ToolExecutor,
+    max_rounds: usize,
+) -> AgentResult<(String, Vec<Message>)> {
+    for _round in 0..max_rounds {
+        let mut messages = Vec::new();
+        if let Some(system) = system_prompt {
+            messages.push(Message::text(Role::System, system.clone()));
+        }
+        messages.extend(working.clone());
+
+        let request = ChatRequest {
+            model: model.to_string(),
+            messages,
+            temperature: 0.7,
+            max_tokens: Some(4096),
+            tools: tools.to_vec(),
+        };
+        let response = provider.chat(request).await?;
+
+        if response.stop_reason == StopReason::ToolUse && !response.tool_calls.is_empty() {
+            working.push(Message::assistant_tool_use(
+                response.content.clone(),
+                response.tool_calls.clone(),
+            ));
+
+            let mut results = Vec::with_capacity(response.tool_calls.len());
+            for call in &response.tool_calls {
+                let outcome = executor.execute(&call.name, call.input.clone()).await;
+                results.push(ToolResult {
+                    tool_use_id: call.id.clone(),
+                    content: outcome.content,
+                    is_error: outcome.is_error,
+                });
+            }
+            working.push(Message::tool_results(results));
+            continue;
+        }
+
+        working.push(Message::text(Role::Assistant, response.content.clone()));
+        return Ok((response.content, working));
+    }
+
+    Err(AgentError::ToolLoopLimitExceeded { rounds: max_rounds })
 }
 
 #[cfg(test)]
@@ -704,6 +792,67 @@ mod tests {
         ));
         // History must be left untouched on the error path, matching
         // Agent::chat's existing error-path behavior.
+        assert!(agent.history.is_empty());
+    }
+
+    /// Always sleeps longer than any sane test timeout before returning a
+    /// plain-text reply -- used to prove the wall-clock timeout actually
+    /// fires instead of waiting on a hung provider forever.
+    struct SlowProvider {
+        delay: std::time::Duration,
+    }
+
+    #[async_trait]
+    impl LlmProvider for SlowProvider {
+        fn name(&self) -> &str {
+            "slow-fake"
+        }
+        fn default_model(&self) -> &str {
+            "slow-fake-model"
+        }
+        async fn chat(&self, request: ChatRequest) -> AgentResult<ChatResponse> {
+            tokio::time::sleep(self.delay).await;
+            Ok(ChatResponse {
+                content: "eventually replied".to_string(),
+                model: request.model,
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+                stop_reason: StopReason::EndTurn,
+                tool_calls: Vec::new(),
+            })
+        }
+        fn supported_models(&self) -> Vec<&str> {
+            vec!["slow-fake-model"]
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chat_with_tools_capped_timeout_returns_error_when_timeout_hit() {
+        let mut agent = test_agent(SlowProvider {
+            delay: Duration::from_secs(30),
+        });
+        let executor = EchoExecutor::new();
+
+        let result = agent
+            .chat_with_tools_capped_timeout(
+                "do the thing",
+                &[],
+                &executor,
+                DEFAULT_MAX_TOOL_ROUNDS,
+                Duration::from_millis(100),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(AgentError::ToolLoopTimedOut { seconds: 0 })
+        ));
+        // History must be left untouched on the timeout path too -- the
+        // provider's slow `chat()` call never gets to commit `working` back
+        // onto `self.history`, matching the round-cap-exceeded invariant
+        // above.
         assert!(agent.history.is_empty());
     }
 }

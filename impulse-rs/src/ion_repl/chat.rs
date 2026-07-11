@@ -127,13 +127,20 @@ impl ChatState {
     /// exposed to the model as Anthropic tool-use schemas (T9). Requested
     /// tool calls are executed against `tools`/`ctx` and their results sent
     /// back to the model automatically (`Agent::chat_with_tools`, capped at
-    /// `llm_backends::DEFAULT_MAX_TOOL_ROUNDS` round trips) -- mutating
+    /// `llm_backends::DEFAULT_MAX_TOOL_ROUNDS` round trips and, as of the
+    /// same-day Opus adversarial-review follow-up (finding S2),
+    /// `llm_backends::DEFAULT_TOOL_LOOP_TIMEOUT` wall-clock) -- mutating
     /// calls (`bash_exec`/`file_write`) are gated behind `self.confirm`
     /// first (see module doc comment). Returns the assistant's final reply
     /// text, or the `AgentError` the provider or loop cap failed with
-    /// (including `AgentError::MissingApiKey` for an absent key, and
-    /// `AgentError::ToolLoopLimitExceeded` if the cap is hit) — never
-    /// panics, matching every other `Result`-returning path in this crate.
+    /// (including `AgentError::MissingApiKey` for an absent key,
+    /// `AgentError::ToolLoopLimitExceeded` if the round cap is hit, and
+    /// `AgentError::ToolLoopTimedOut` if the wall-clock budget elapses
+    /// first) — never panics, matching every other `Result`-returning path
+    /// in this crate. The timeout only bounds how long a turn can block;
+    /// it does not make the loop interruptible mid-round (that would need
+    /// cancellation tokens threaded through the REPL's readline/event loop,
+    /// a separate and larger change).
     pub async fn turn(
         &mut self,
         text: &str,

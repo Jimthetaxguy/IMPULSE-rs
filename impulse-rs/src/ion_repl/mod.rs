@@ -174,6 +174,13 @@ async fn respond(
                 Err(crate::error::AgentError::MissingApiKey { .. }) => {
                     MISSING_API_KEY_NOTICE.to_string()
                 }
+                // AgentError::ToolLoopTimedOut (Opus adversarial-review
+                // follow-up to T9, finding S2) falls through to the generic
+                // branch below, same as its sibling ToolLoopLimitExceeded:
+                // the Display message ("Tool-use loop exceeded its Ns
+                // wall-clock budget without a final reply") is already
+                // clear on its own, unlike MissingApiKey which needs a
+                // pointer to /verify and /tools still working.
                 Err(err) => format!("Chat failed: {err}"),
             };
             (reply, false)

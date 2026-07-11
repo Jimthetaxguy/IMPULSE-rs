@@ -48,6 +48,18 @@ pub enum AgentError {
     /// matching every other `AgentError` variant's rendering path.
     #[error("Tool-use loop exceeded the maximum of {rounds} round trip(s) without a final reply")]
     ToolLoopLimitExceeded { rounds: usize },
+
+    /// Surfaced by `llm_backends::Agent::chat_with_tools`/
+    /// `chat_with_tools_capped` (same-day Opus adversarial-review follow-up
+    /// to TUI_SPEC.md T9, finding S2) when the *entire* multi-round
+    /// tool-use exchange exceeds its wall-clock budget
+    /// (`llm_backends::DEFAULT_TOOL_LOOP_TIMEOUT`), regardless of how many
+    /// rounds it took. Bounds a hung provider request or slow tool
+    /// execution so the REPL always regains control instead of blocking
+    /// indefinitely with no way to abort; history is left untouched on this
+    /// path, same as `ToolLoopLimitExceeded`.
+    #[error("Tool-use loop exceeded its {seconds}s wall-clock budget without a final reply")]
+    ToolLoopTimedOut { seconds: u64 },
 }
 
 pub type AgentResult<T> = Result<T, AgentError>;
@@ -136,6 +148,21 @@ mod tests {
         assert!(
             msg.to_lowercase().contains("tool-use loop"),
             "expected tool-use loop wording in: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_agent_error_tool_loop_timed_out_display() {
+        let err = AgentError::ToolLoopTimedOut { seconds: 180 };
+        let msg = format!("{err}");
+        assert!(msg.contains("180"), "expected timeout seconds in: {msg}");
+        assert!(
+            msg.to_lowercase().contains("tool-use loop"),
+            "expected tool-use loop wording in: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("wall-clock"),
+            "expected wall-clock wording in: {msg}"
         );
     }
 }
