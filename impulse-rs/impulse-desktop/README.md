@@ -20,7 +20,8 @@ and requests those capabilities; Rust validates and executes them.
 | --- | --- |
 | Layout, rails, inspectors, command palette, review/apply surfaces | Dioxus |
 | Native window/process/IPC boundary | Dioxus desktop host adapters |
-| PTY lifecycle, daemon snapshots, persistence | Rust backend |
+| PTY lifecycle and live terminal bytes | `DesktopRuntime` / `impulse-term` |
+| Reconciled agents, context, memory, artifacts, and interventions | Impulse daemon |
 | Terminal glyph rendering | xterm.js |
 | Menu bar, panels, notifications, accessibility hooks | Native island bridge |
 | Built-in MCP tools and connector status | Rust runtime snapshots surfaced to Dioxus |
@@ -34,9 +35,22 @@ independent copies of sessions, memory, terminal state, or artifacts.
   runtime derives it from `cwd` when the UI does not provide richer metadata.
 - `AgentSpawnRequest` carries platform, command, workspace, terminal dimensions,
   and optional MCP tool descriptors.
-- `AgentRuntimeSnapshot` is the source of truth for what Dioxus displays:
-  focused state, process status, workspace, context health, output metrics, and
-  built-in Rust MCP tools.
+- `AgentRuntimeSnapshot` is the desktop's local PTY fact model: focused state,
+  process status, workspace, output metrics, and built-in Rust MCP tools.
+- Runtime agent ids are one-use event-routing addresses for the lifetime of a
+  desktop runtime. Natural exits reap their records, and lifecycle events drain
+  through a reentrant FIFO so delayed callbacks cannot resurrect or retarget a
+  different process.
+- `daemon_ops` converts those facts to `TerminalOpsReport`, publishes lifecycle
+  changes plus a two-second heartbeat, and subscribes with the daemon's opaque
+  `next_seq` token. Dioxus workbench panels render only the returned
+  `ProjectOpsSnapshot`; local runtime events never rewrite daemon-owned truth.
+- Daemon read freshness and desktop publish health are distinct: a successful
+  subscription remains current when telemetry publishing is retrying, while a
+  subscription failure marks retained workbench data as cached/stale.
+- The adapter binds one daemon/project and filters agents from other registered
+  workspaces. Cross-project routing requires a future project identity on the
+  publish/subscribe contract rather than mixing workspaces into one snapshot.
 - Built-in MCP tools default to safe descriptors for `impulse.agent_spawn`,
   `impulse.agent_write`, `impulse.search_memory`, and
   `impulse.review_injection`; mutating terminal actions require confirmation.
@@ -45,9 +59,10 @@ The target path is:
 
 ```text
 Dioxus controls -> Dioxus host adapter -> DesktopRuntime -> impulse-term TerminalBackend
-        ^                                                    |
-        |                                                    v
-        +----- terminal_output / agent_runtime_update events +
+        ^                                |                   |
+        |                                | TerminalOpsReport | terminal bytes
+        |                                v                   v
+        +-- daemon ProjectOpsSnapshot <- Impulse daemon   xterm.js
 ```
 
 The compatibility path still covered by tests is:
@@ -60,10 +75,9 @@ Dioxus controls -> legacy Tauri-shaped adapter -> DesktopRuntime -> impulse-term
 
 - `desktop-app` enables the real Dioxus Desktop binary target:
   `cargo run -p impulse-desktop --features desktop-app --bin impulse-desktop`.
-  This is the launch scaffold for the target host path; command/event parity
-  still lands behind `window.__IMPULSE_DESKTOP_HOST`. The current binary
-  installs a fail-visible pending adapter so missing native command/event
-  plumbing is explicit during launch work.
+  The binary installs the live Dioxus eval bridge behind
+  `window.__IMPULSE_DESKTOP_HOST`, starts the daemon-ops publisher/subscriber,
+  and reports subscription freshness separately from telemetry publish health.
 - `native-macos` enables the Objective-C/AppKit compatibility bridge via
   `objc2`.
 - `legacy-tauri-runtime` enables the compatibility Tauri command annotations

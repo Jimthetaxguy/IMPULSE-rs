@@ -1,12 +1,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use impulse_desktop::daemon_ops::{attach_desktop_daemon_ops, DesktopDaemonOpsConfig};
 use impulse_desktop::desktop_host::desktop_config;
 use impulse_desktop::host_bridge::{
     channel_event_sink, install_live_host_context, LiveDesktopApp, LiveHostContext,
 };
 use impulse_desktop::host_commands::DesktopShellState;
-use impulse_desktop::runtime::DesktopRuntime;
+use impulse_desktop::runtime::{DesktopEventSink, DesktopRuntime};
 use impulse_desktop::workspace::WorkspaceRegistry;
 use impulse_desktop::McpToolRegistry;
 
@@ -14,14 +15,26 @@ fn main() {
     // Wire the runtime's event sink to a channel the in-webview bridge drains,
     // then assemble the same command surface the legacy Tauri host exposed.
     let (event_sink, event_rx) = channel_event_sink();
+    let downstream: Arc<dyn DesktopEventSink> = event_sink.clone();
+    let memory_root = resolve_memory_root();
+    let runtime_sink = match attach_desktop_daemon_ops(
+        downstream.clone(),
+        DesktopDaemonOpsConfig::discover(&memory_root),
+    ) {
+        Ok(sink) => sink,
+        Err(error) => {
+            eprintln!("desktop daemon-ops bridge unavailable: {error}");
+            downstream
+        }
+    };
     let runtime = Arc::new(
         DesktopRuntime::builder()
-            .with_event_sink(event_sink)
+            .with_event_sink(runtime_sink)
             .build(),
     );
     let workspaces = Arc::new(WorkspaceRegistry::with_default_workspaces());
     let mcp = Arc::new(McpToolRegistry::with_builtins());
-    let state = DesktopShellState::new(runtime, workspaces, mcp, resolve_memory_root());
+    let state = DesktopShellState::new(runtime, workspaces, mcp, memory_root);
 
     // Hand the state + event stream to the bridge hook before launch.
     install_live_host_context(LiveHostContext::new(state, event_rx));

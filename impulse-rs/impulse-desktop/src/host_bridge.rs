@@ -328,7 +328,6 @@ pub fn use_live_host_bridge() {
 
         loop {
             tokio::select! {
-                biased;
                 event = event_rx.recv() => {
                     match event {
                         Some(event) => {
