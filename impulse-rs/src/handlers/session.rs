@@ -92,7 +92,7 @@ pub async fn handle_session_start(
         output_lines += sentinel.lines().count() + 1;
     }
 
-    if let Some(block) = injection_result.injected_block.clone() {
+    if let Some(block) = injection_result.injected_block.as_ref() {
         let hook_mode = std::env::var("CLAUDE_ENV_FILE").is_ok();
         if hook_mode {
             println!("{}", block);
