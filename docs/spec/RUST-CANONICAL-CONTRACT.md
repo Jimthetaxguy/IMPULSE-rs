@@ -351,7 +351,7 @@ When adding/changing CLI commands, hooks, state files, or roadmap stage definiti
 | Tooling | ≥2.0 | ~17.1 | MET |
 | Integration | Every stable CLI command | 26 tests | PARTIAL |
 
-**Workspace totals (2026-07-11):** 1,922 tests across the 5 workspace crates/packages (impulse-rs 1,550, ops 43 including the canonical-checkout archive proof, term 114, desktop 192, ion 23); 8 ignored, 0 failed. Isolated worktrees without the gitignored reconciliation archive verify 1,921 passed with that one proof explicitly filtered.
+**Workspace totals (2026-07-11):** 1,931 tests across the 5 workspace crates/packages (impulse-rs 1,559, ops 43 including the canonical-checkout archive proof, term 114, desktop 192, ion 23); 8 ignored, 0 failed. Isolated worktrees without the gitignored reconciliation archive verify 1,930 passed with that one proof explicitly filtered.
 
 ### Required Test Patterns
 
