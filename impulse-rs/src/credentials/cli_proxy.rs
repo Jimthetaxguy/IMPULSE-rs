@@ -65,7 +65,7 @@ impl CredentialProvider for CliProxyProvider {
                     args.push("--project");
                     args.push(project);
                 }
-                let output = self.run_cli(&args.to_vec())?;
+                let output = self.run_cli(&args)?;
                 Ok(output
                     .lines()
                     .find(|l| !l.is_empty())
@@ -128,7 +128,7 @@ impl CredentialProvider for CliProxyProvider {
                     args.push("--project");
                     args.push(project);
                 }
-                let output = self.run_cli(&args.to_vec())?;
+                let output = self.run_cli(&args)?;
                 Ok(output
                     .lines()
                     .skip(1)
