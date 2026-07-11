@@ -16,7 +16,7 @@ use super::{
 };
 
 /// Run a CLI command in daemon mode (forwarding over IPC).
-pub(crate) async fn dispatch(
+pub async fn dispatch(
     command: Commands,
     impulse_dir: &Path,
     client: &DaemonClient,

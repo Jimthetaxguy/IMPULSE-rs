@@ -10,7 +10,7 @@ use crate::envelope;
 #[derive(Parser)]
 #[command(name = "impulse-rs")]
 #[command(about = "Terminal-native AI coding agent sidecar", long_about = None)]
-pub(crate) struct Cli {
+pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
 
@@ -32,7 +32,7 @@ pub(crate) struct Cli {
 }
 
 #[derive(Subcommand)]
-pub(crate) enum McpCommands {
+pub enum McpCommands {
     /// Serve the registry-backed MCP interface
     Serve {
         /// Transport: stdio (default) or tcp
@@ -45,7 +45,7 @@ pub(crate) enum McpCommands {
 }
 
 #[derive(Subcommand)]
-pub(crate) enum Commands {
+pub enum Commands {
     Daemon {
         #[arg(long)]
         stop: bool,

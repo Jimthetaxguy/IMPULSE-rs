@@ -10,7 +10,7 @@ use crate::cli::Cli;
 use crate::{daemon, envelope, handlers, state, Commands};
 
 /// Run a CLI command in direct mode (in-process, no daemon IPC).
-pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
+pub async fn dispatch(cli: Cli) -> Result<()> {
     let impulse_dir = cli.impulse_dir.clone();
     let verbose = cli.verbose;
     let format = cli.format;

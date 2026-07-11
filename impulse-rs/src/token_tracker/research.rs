@@ -43,13 +43,13 @@
 //! - Usage >= 90%: Micro-summarize (20 tokens)
 //!
 //! ### Confidence Decay
-//! ```
+//! ```text
 //! confidence_at_time_t = initial_confidence * e^(-0.03 * t)
 //! ```
 //! Where t is minutes since last update.
 //!
 //! ### Stability Score
-//! ```
+//! ```text
 //! stability = time_score * 0.5 + token_score * 0.3 + message_score * 0.2
 //! ```
 //! Where each score is normalized (0-1) based on thresholds.
@@ -67,7 +67,7 @@
 //! ## Usage
 //!
 //! ```rust
-//! use token_tracker::{TokenTracker, Platform, CompactionType};
+//! use impulse_rs::token_tracker::{TokenTracker, Platform, CompactionType};
 //!
 //! let mut tracker = TokenTracker::new();
 //!

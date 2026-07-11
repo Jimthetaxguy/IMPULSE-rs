@@ -16,10 +16,19 @@ rust-version = "1.82"
 description = "Terminal-native AI coding agent sidecar with multi-agent monitoring"
 authors = ["Impulse Maintainers"]
 license = "MIT"
+default-run = "impulse-rs"
+
+[lib]
+name = "impulse_rs"
+path = "src/lib.rs"
 
 [[bin]]
 name = "impulse-rs"
 path = "src/main.rs"
+
+[[bin]]
+name = "ion"
+path = "src/bin/ion.rs"
 
 [package.metadata.bundle]
 name = "Impulse"
