@@ -543,6 +543,67 @@ fn overlay_agent_runtime(target: &mut AgentRuntime, overlay: &AgentRuntime) {
     }
     target.warnings.extend(overlay.warnings.clone());
     dedupe_strings(&mut target.warnings);
+
+    // Structured fields were added after the original telemetry wire shape and
+    // deserialize with serde defaults. Until the report carries a schema
+    // version or presence markers, a default can mean either "explicitly
+    // clear" or "older publisher omitted this field". Preserve durable facts
+    // on omission while still letting populated live telemetry take precedence.
+    // The legacy status string disambiguates defaulted structured status from
+    // explicit lifecycle transitions emitted by older publishers.
+    let live_status = if overlay.agent_status != impulse_ops::AgentStatus::Idle {
+        Some(overlay.agent_status.clone())
+    } else {
+        agent_status_from_legacy(&overlay.status)
+    };
+    if let Some(live_status) = live_status {
+        target.agent_status = live_status;
+    }
+    if overlay.role.is_some() {
+        target.role = overlay.role.clone();
+    }
+    if overlay.group.is_some() {
+        target.group = overlay.group.clone();
+    }
+    if !overlay.tool_invocations.is_empty() {
+        target.tool_invocations = overlay.tool_invocations.clone();
+    }
+    if overlay.diff_summary.is_some() {
+        target.diff_summary = overlay.diff_summary.clone();
+    }
+    if overlay.target.is_some() {
+        target.target = overlay.target.clone();
+    }
+}
+
+fn agent_status_from_legacy(status: &str) -> Option<impulse_ops::AgentStatus> {
+    let status = status.trim();
+    if status.eq_ignore_ascii_case("starting") {
+        return Some(impulse_ops::AgentStatus::Starting);
+    }
+    if status.eq_ignore_ascii_case("idle") {
+        return Some(impulse_ops::AgentStatus::Idle);
+    }
+    if status.eq_ignore_ascii_case("interrupted") {
+        return Some(impulse_ops::AgentStatus::Interrupted);
+    }
+    if status.eq_ignore_ascii_case("completed") {
+        return Some(impulse_ops::AgentStatus::Completed);
+    }
+
+    let (kind, detail) = status.split_once(':')?;
+    let detail = detail.trim();
+    if kind.trim().eq_ignore_ascii_case("working") {
+        return Some(impulse_ops::AgentStatus::Working {
+            task: detail.to_string(),
+        });
+    }
+    if kind.trim().eq_ignore_ascii_case("blocked") {
+        return Some(impulse_ops::AgentStatus::Blocked {
+            reason: detail.to_string(),
+        });
+    }
+    None
 }
 
 fn merge_context_summary(
@@ -997,8 +1058,25 @@ mod tests {
                 },
                 recent_files: vec!["src/main.rs".to_string()],
                 recent_tools: vec!["Write".to_string()],
-                warnings: Vec::new(),
-                ..Default::default()
+                warnings: vec!["live warning".to_string(), "live warning".to_string()],
+                agent_status: impulse_ops::AgentStatus::Blocked {
+                    reason: "merge conflict in src/main.rs".to_string(),
+                },
+                role: Some(impulse_ops::AgentRole::Worker { parent_pane_id: 42 }),
+                group: Some("review-wave-2".to_string()),
+                tool_invocations: vec![impulse_ops::ToolInvocationRecord {
+                    kind: "write".to_string(),
+                    target: "src/main.rs".to_string(),
+                    timestamp: Some("2026-07-11T05:00:00Z".to_string()),
+                }],
+                diff_summary: Some(impulse_ops::DiffSummary {
+                    files_changed: 2,
+                    lines_added: 18,
+                    lines_removed: 4,
+                }),
+                target: Some(impulse_ops::MachineTarget::Local {
+                    workdir: temp.path().display().to_string(),
+                }),
             }],
             context: ContextHealthSummary::default(),
             interventions: Vec::new(),
@@ -1008,12 +1086,211 @@ mod tests {
 
         assert_eq!(snapshot.agents.len(), 1);
         assert_eq!(snapshot.agents[0].id, session.id);
+        assert_eq!(snapshot.agents[0].label, "Daemon Session");
+        assert_eq!(snapshot.agents[0].backend_kind, "Claude Code");
+        assert_eq!(snapshot.agents[0].status, "active");
         assert_eq!(
             snapshot.agents[0].current_task.as_deref(),
             Some("Merged by session id")
         );
+        assert!(snapshot.agents[0].active);
         assert!(!snapshot.agents[0].ephemeral);
         assert_eq!(snapshot.agents[0].context.tier, "essential");
+        assert_eq!(snapshot.agents[0].recent_files, vec!["src/main.rs"]);
+        assert_eq!(snapshot.agents[0].recent_tools, vec!["Write"]);
+        assert_eq!(snapshot.agents[0].warnings, vec!["live warning"]);
+        assert_eq!(
+            snapshot.agents[0].agent_status,
+            impulse_ops::AgentStatus::Blocked {
+                reason: "merge conflict in src/main.rs".to_string(),
+            }
+        );
+        assert_eq!(
+            snapshot.agents[0].role,
+            Some(impulse_ops::AgentRole::Worker { parent_pane_id: 42 })
+        );
+        assert_eq!(snapshot.agents[0].group.as_deref(), Some("review-wave-2"));
+        assert_eq!(snapshot.agents[0].tool_invocations.len(), 1);
+        assert_eq!(snapshot.agents[0].tool_invocations[0].kind, "write");
+        assert_eq!(
+            snapshot.agents[0].diff_summary,
+            Some(impulse_ops::DiffSummary {
+                files_changed: 2,
+                lines_added: 18,
+                lines_removed: 4,
+            })
+        );
+        assert_eq!(
+            snapshot.agents[0].target,
+            Some(impulse_ops::MachineTarget::Local {
+                workdir: temp.path().display().to_string(),
+            })
+        );
+    }
+
+    fn structured_manager_agent() -> AgentRuntime {
+        AgentRuntime {
+            agent_status: impulse_ops::AgentStatus::Working {
+                task: "durable task".to_string(),
+            },
+            role: Some(impulse_ops::AgentRole::Coordinator),
+            group: Some("durable-wave".to_string()),
+            tool_invocations: vec![impulse_ops::ToolInvocationRecord {
+                kind: "read".to_string(),
+                target: "durable.rs".to_string(),
+                timestamp: None,
+            }],
+            diff_summary: Some(impulse_ops::DiffSummary {
+                files_changed: 1,
+                lines_added: 1,
+                lines_removed: 0,
+            }),
+            target: Some(impulse_ops::MachineTarget::Local {
+                workdir: "/durable".to_string(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn legacy_agent_runtime(status: &str) -> AgentRuntime {
+        let mut legacy_value = serde_json::to_value(AgentRuntime {
+            status: status.to_string(),
+            active: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let legacy_object = legacy_value.as_object_mut().unwrap();
+        for field in [
+            "agent_status",
+            "role",
+            "group",
+            "tool_invocations",
+            "diff_summary",
+            "target",
+        ] {
+            assert!(legacy_object.remove(field).is_some());
+        }
+        serde_json::from_value(legacy_value).unwrap()
+    }
+
+    #[test]
+    fn test_overlay_agent_runtime_explicit_idle_preserves_omitted_manager_metadata() {
+        let mut target = structured_manager_agent();
+        let overlay = AgentRuntime {
+            status: "idle".to_string(),
+            agent_status: impulse_ops::AgentStatus::Idle,
+            ..Default::default()
+        };
+
+        overlay_agent_runtime(&mut target, &overlay);
+
+        assert_eq!(target.agent_status, impulse_ops::AgentStatus::Idle);
+        assert_eq!(target.role, Some(impulse_ops::AgentRole::Coordinator));
+        assert_eq!(target.group.as_deref(), Some("durable-wave"));
+        assert_eq!(target.tool_invocations.len(), 1);
+        assert!(target.diff_summary.is_some());
+        assert!(target.target.is_some());
+    }
+
+    #[test]
+    fn test_overlay_agent_runtime_working_status_preserves_task_exactly() {
+        let mut target = AgentRuntime::default();
+        let overlay = AgentRuntime {
+            status: "working: reconcile daemon state".to_string(),
+            agent_status: impulse_ops::AgentStatus::Working {
+                task: "reconcile daemon state".to_string(),
+            },
+            ..Default::default()
+        };
+
+        overlay_agent_runtime(&mut target, &overlay);
+
+        assert_eq!(target.status, "working: reconcile daemon state");
+        assert_eq!(
+            target.agent_status,
+            impulse_ops::AgentStatus::Working {
+                task: "reconcile daemon state".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_overlay_agent_runtime_recognizes_legacy_lifecycle_states() {
+        let cases = [
+            ("starting", impulse_ops::AgentStatus::Starting),
+            ("idle", impulse_ops::AgentStatus::Idle),
+            (
+                "working: compile workspace",
+                impulse_ops::AgentStatus::Working {
+                    task: "compile workspace".to_string(),
+                },
+            ),
+            (
+                "working:",
+                impulse_ops::AgentStatus::Working {
+                    task: String::new(),
+                },
+            ),
+            (
+                "blocked: waiting for review",
+                impulse_ops::AgentStatus::Blocked {
+                    reason: "waiting for review".to_string(),
+                },
+            ),
+            (
+                "blocked:",
+                impulse_ops::AgentStatus::Blocked {
+                    reason: String::new(),
+                },
+            ),
+            ("interrupted", impulse_ops::AgentStatus::Interrupted),
+            ("completed", impulse_ops::AgentStatus::Completed),
+        ];
+
+        for (legacy_status, expected) in cases {
+            let mut target = structured_manager_agent();
+            let overlay = legacy_agent_runtime(legacy_status);
+
+            overlay_agent_runtime(&mut target, &overlay);
+
+            assert_eq!(target.agent_status, expected, "legacy {legacy_status}");
+        }
+    }
+
+    #[test]
+    fn test_overlay_agent_runtime_legacy_json_preserves_structured_manager_state() {
+        let mut target = structured_manager_agent();
+        let overlay = legacy_agent_runtime("active");
+
+        overlay_agent_runtime(&mut target, &overlay);
+
+        assert_eq!(
+            target.agent_status,
+            impulse_ops::AgentStatus::Working {
+                task: "durable task".to_string(),
+            }
+        );
+        assert_eq!(target.role, Some(impulse_ops::AgentRole::Coordinator));
+        assert_eq!(target.group.as_deref(), Some("durable-wave"));
+        assert_eq!(target.tool_invocations.len(), 1);
+        assert!(target.diff_summary.is_some());
+        assert!(target.target.is_some());
+    }
+
+    #[test]
+    fn test_overlay_agent_runtime_unions_and_deduplicates_warnings() {
+        let mut target = AgentRuntime {
+            warnings: vec!["durable".to_string(), "shared".to_string()],
+            ..Default::default()
+        };
+        let overlay = AgentRuntime {
+            warnings: vec!["live".to_string(), "shared".to_string()],
+            ..Default::default()
+        };
+
+        overlay_agent_runtime(&mut target, &overlay);
+
+        assert_eq!(target.warnings, vec!["durable", "shared", "live"]);
     }
 
     #[tokio::test]
