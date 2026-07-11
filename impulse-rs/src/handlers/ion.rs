@@ -29,6 +29,31 @@ pub async fn handle_ion_verify(
     let repo_path = std::fs::canonicalize(&repo_path)
         .with_context(|| format!("Failed to resolve repo path: {repo_path}"))?;
 
+    if !repo_path.join(".git").exists() {
+        anyhow::bail!(
+            "{} is not a git repository (no .git directory found)",
+            repo_path.display()
+        );
+    }
+
+    let rev_parse_status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo_path)
+        .arg("rev-parse")
+        .arg("--quiet")
+        .arg(&diff_ref)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .with_context(|| format!("Failed to run `git rev-parse` for diff_ref: {diff_ref}"))?;
+
+    if !rev_parse_status.success() {
+        anyhow::bail!(
+            "diff_ref {diff_ref} does not resolve in repo {}",
+            repo_path.display()
+        );
+    }
+
     let request = HarnessRequest {
         contract_version: impulse_ion::CONTRACT_VERSION.to_string(),
         request_id: format!("req-ion-verify-{}", uuid::Uuid::new_v4()),
@@ -62,12 +87,16 @@ pub async fn handle_ion_verify(
         .validate()
         .context("HarnessRequest failed spec-a contract validation")?;
 
-    let adapter = PiAdapter::new();
-    let response = adapter
-        .verify(&request)
-        .context("Ion Pi gate verify() call failed")?;
+    let response = tokio::task::spawn_blocking(move || {
+        let adapter = PiAdapter::new();
+        adapter.verify(&request)
+    })
+    .await
+    .context("Ion Pi gate verify() blocking task panicked")?
+    .context("Ion Pi gate verify() call failed")?;
 
-    if let Err(violation) = response.validate() {
+    let contract_violation = response.validate().err();
+    if let Some(violation) = &contract_violation {
         eprintln!("Warning: gate response violated the spec-a contract: {violation}");
     }
 
@@ -77,7 +106,7 @@ pub async fn handle_ion_verify(
         print_response_text(&response);
     }
 
-    if !response.passed() {
+    if !response.passed() || contract_violation.is_some() {
         std::process::exit(1);
     }
 
