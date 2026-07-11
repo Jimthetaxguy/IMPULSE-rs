@@ -2,6 +2,7 @@
 members = [
     ".",
     "impulse-desktop",
+    "impulse-ion",
     "impulse-ops",
     "impulse-term",
 ]

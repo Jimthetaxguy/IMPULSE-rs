@@ -4531,6 +4531,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "impulse-ion"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "impulse-ops"
 version = "0.1.0"
 dependencies = [
