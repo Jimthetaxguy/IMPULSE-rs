@@ -143,17 +143,15 @@ impl LlmProvider for AnthropicProvider {
     async fn chat(&self, request: ChatRequest) -> AgentResult<ChatResponse> {
         self.0.check_api_key()?;
 
-        let system = request
+        let (system_msgs, non_system): (Vec<_>, Vec<_>) = request
             .messages
-            .iter()
-            .find(|m| m.role == Role::System)
-            .map(|m| m.content.clone());
-        let non_system: Vec<_> = request
-            .messages
-            .iter()
-            .filter(|m| m.role != Role::System)
-            .cloned()
-            .collect();
+            .into_iter()
+            .partition(|m| m.role == Role::System);
+
+        let system = system_msgs
+            .into_iter()
+            .next()
+            .map(|m| m.content);
 
         let mut body = serde_json::json!({
             "model": request.model,
