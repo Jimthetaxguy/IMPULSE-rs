@@ -10,21 +10,26 @@
 use anyhow::{Context as AnyhowContext, Result};
 
 use impulse_ion::pi_adapter::PiAdapter;
-use impulse_ion::HarnessRequest;
+use impulse_ion::{HarnessRequest, HarnessResponse};
 
 use super::print_json;
 
-/// Handle `ion-verify` — build a `HarnessRequest` for `diff_ref` in `repo` and
-/// run it through the Ion Pi gate. Exits the process with status 1 if the gate
-/// does not return a PASS verdict (spec-a: APPROVE with no CRITICAL finding),
-/// matching this repo's existing gate-command exit-code convention (see
-/// `handlers::guard`).
-pub async fn handle_ion_verify(
+/// Pure core of `ion-verify` (TUI_SPEC.md T3 / gap G1): resolves the repo
+/// path, sanity-checks `diff_ref` via `git rev-parse`, builds a spec-a
+/// `HarnessRequest` (`HarnessRequest::verify`, T1/G4), validates it, and
+/// drives it through the Ion Pi gate on a blocking thread (G2). Always
+/// returns `Ok(response)` when the round trip succeeds — including when
+/// `response.passed()` is `false` or the response itself violates the
+/// spec-a contract. Pass/fail interpretation, printing, and exit-code
+/// mapping are the caller's job (see [`handle_ion_verify`] below), which is
+/// what lets this function be called in-process by a future chat tool
+/// (T7's `ion_verify` ReplTool) or a fake-gate integration test (T4)
+/// without going through `std::process::exit`.
+pub async fn run_ion_verify(
     repo: Option<String>,
     diff_ref: String,
     description: String,
-    json: bool,
-) -> Result<()> {
+) -> Result<HarnessResponse> {
     let repo_path = repo.unwrap_or_else(|| ".".to_string());
     let repo_path = std::fs::canonicalize(&repo_path)
         .with_context(|| format!("Failed to resolve repo path: {repo_path}"))?;
@@ -68,13 +73,50 @@ pub async fn handle_ion_verify(
     .context("Ion Pi gate verify() blocking task panicked")?
     .context("Ion Pi gate verify() call failed")?;
 
-    let contract_violation = response.validate().err();
+    Ok(response)
+}
+
+/// `--json` output envelope (TUI_SPEC.md gap G6). Flattens the
+/// `HarnessResponse` fields at the top level (via `#[serde(flatten)]`) and
+/// appends `contract_violation` so a scripted caller can branch on a spec-a
+/// contract violation without scraping stderr. Flattening — rather than
+/// nesting under a `response` key — is the less invasive choice: existing
+/// consumers reading `verdict`/`findings`/`request_id`/etc. at the top level
+/// of the emitted JSON keep working unchanged; they simply gain one new
+/// optional field.
+#[derive(serde::Serialize)]
+struct VerifyResponseJson<'a> {
+    #[serde(flatten)]
+    response: &'a HarnessResponse,
+    contract_violation: Option<String>,
+}
+
+/// Handle `ion-verify` — thin CLI wrapper around [`run_ion_verify`]. Prints the
+/// verdict (text or `--json`) and exits the process with status 1 if the gate
+/// does not return a PASS verdict (spec-a: APPROVE with no CRITICAL finding)
+/// or if the response itself violates the spec-a contract, matching this
+/// repo's existing gate-command exit-code convention (see `handlers::guard`).
+pub async fn handle_ion_verify(
+    repo: Option<String>,
+    diff_ref: String,
+    description: String,
+    json: bool,
+) -> Result<()> {
+    let response = run_ion_verify(repo, diff_ref, description).await?;
+
+    let contract_violation = response
+        .validate()
+        .err()
+        .map(|violation| violation.to_string());
     if let Some(violation) = &contract_violation {
         eprintln!("Warning: gate response violated the spec-a contract: {violation}");
     }
 
     if json {
-        print_json(&response)?;
+        print_json(&VerifyResponseJson {
+            response: &response,
+            contract_violation: contract_violation.clone(),
+        })?;
     } else {
         print_response_text(&response);
     }
@@ -106,7 +148,105 @@ fn print_response_text(response: &impulse_ion::HarnessResponse) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use impulse_ion::pi_adapter::ION_GATE_LAUNCHER_ENV;
     use impulse_ion::{CommandRun, Finding, HarnessResponse, Metrics, Severity, Verdict};
+
+    /// Serializes tests that mutate the process-global `ION_GATE_LAUNCHER` env
+    /// var, since `cargo test` runs unit tests in the same process on
+    /// multiple threads by default. Mirrors the identical helper in
+    /// `impulse-ion/src/pi_adapter.rs`'s own env-override tests (T2).
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Creates a throwaway git repo with one empty commit, so `diff_ref`
+    /// values like `HEAD` resolve via `git rev-parse`.
+    fn init_git_repo() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().expect("failed to create tempdir");
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .status()
+                .expect("failed to run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init", "--quiet"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        run(&["commit", "--allow-empty", "--quiet", "-m", "init"]);
+        dir
+    }
+
+    /// T3 item 4: proves `run_ion_verify` returns a `HarnessResponse` without
+    /// going through the CLI print/exit path, by driving `PiAdapter` against
+    /// the stub gate script under `tests/fakes/` (via the `ION_GATE_LAUNCHER`
+    /// env override that `PiAdapter::new()` already respects, T2) instead of
+    /// the real MiniMax-backed gate. This is a lighter-weight substitute for
+    /// T4's dedicated fake-gate integration test suite (pass / changes
+    /// requested / contract-violation / non-zero-exit / timeout), which is
+    /// out of scope here — it only needs to prove the pure function's return
+    /// path works end-to-end through the real adapter/spawn_blocking wiring.
+    #[tokio::test]
+    async fn run_ion_verify_returns_response_via_stub_gate() {
+        let _guard = env_lock();
+        let repo = init_git_repo();
+        let stub_gate = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fakes/ion-verify-stub-gate.sh");
+        std::env::set_var(ION_GATE_LAUNCHER_ENV, &stub_gate);
+
+        let result = run_ion_verify(
+            Some(repo.path().display().to_string()),
+            "HEAD".to_string(),
+            "Test description".to_string(),
+        )
+        .await;
+
+        std::env::remove_var(ION_GATE_LAUNCHER_ENV);
+
+        let response = result.expect("run_ion_verify should succeed against the stub gate");
+        assert_eq!(response.verdict, Verdict::Approve);
+        assert!(response.passed());
+        assert_eq!(response.commands_run.len(), 1);
+        assert!(response.validate().is_ok());
+    }
+
+    /// T3 item 2/G6: proves the `--json` envelope flattens `HarnessResponse`
+    /// fields and includes a machine-readable `contract_violation` alongside
+    /// them, rather than only warning on stderr.
+    #[test]
+    fn verify_response_json_flattens_fields_and_includes_contract_violation() {
+        let response = passing_response();
+        let envelope = VerifyResponseJson {
+            response: &response,
+            contract_violation: Some("verdict Approve forbidden".to_string()),
+        };
+
+        let json = serde_json::to_value(&envelope).expect("envelope should serialize");
+        assert_eq!(json["verdict"], "APPROVE");
+        assert_eq!(json["request_id"], "req-test");
+        assert_eq!(json["contract_violation"], "verdict Approve forbidden");
+    }
+
+    /// Same envelope with no violation — the field must still be present
+    /// (as JSON `null`), not silently dropped, so scripted callers can rely
+    /// on the key always existing.
+    #[test]
+    fn verify_response_json_includes_null_contract_violation_when_absent() {
+        let response = passing_response();
+        let envelope = VerifyResponseJson {
+            response: &response,
+            contract_violation: None,
+        };
+
+        let json = serde_json::to_value(&envelope).expect("envelope should serialize");
+        assert!(json.get("contract_violation").is_some());
+        assert!(json["contract_violation"].is_null());
+    }
 
     fn passing_response() -> HarnessResponse {
         HarnessResponse {
