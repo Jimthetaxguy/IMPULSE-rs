@@ -66,12 +66,12 @@ pub fn list_tools(verbose: bool) -> Result<Vec<CliTool>> {
 
 /// Get tools filtered by installation status
 pub fn list_installed() -> Result<Vec<CliTool>> {
-    let tools = list_tools(false)?;
+    let tools = super::init::check_all_tools();
     Ok(tools.into_iter().filter(|t| t.installed).collect())
 }
 
 pub fn list_not_installed() -> Result<Vec<CliTool>> {
-    let tools = list_tools(false)?;
+    let tools = super::init::check_all_tools();
     Ok(tools.into_iter().filter(|t| !t.installed).collect())
 }
 
