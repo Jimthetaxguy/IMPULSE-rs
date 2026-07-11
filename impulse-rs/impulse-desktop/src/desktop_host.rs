@@ -137,6 +137,7 @@ mod tests {
 
         for event in [
             "agent_runtime_update",
+            "ops_connection_update",
             "ops_update",
             "supervisor_local_action",
             "terminal_exit",

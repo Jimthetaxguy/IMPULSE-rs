@@ -94,6 +94,13 @@ Structural filesystem enforcement depends on the selected runtime or sandbox.
 The long-running coordination point that owns project workbench snapshots, session operations,
 supervisor actions, artifacts, and telemetry overlays over a versioned JSON-line Unix socket.
 - **Source of truth:** `impulse-ops/src/lib.rs` and `src/daemon/{mod,protocol,handlers}.rs`.
+- **Desktop daemon-truth wire:** PTY lifecycle facts publish as `TerminalOpsReport` on change and
+  heartbeat, then return through daemon `SubscribeOps` snapshots. Local
+  `agent_runtime_update`/`agent_snapshot` messages own terminal mechanics only and cannot overwrite
+  `ProjectOpsSnapshot`. Subscription freshness is distinct from publish degradation; lifecycle
+  delivery uses a reentrant FIFO, natural exits reap records, and runtime agent ids remain one-use
+  routing addresses until the protocol carries explicit incarnations. The adapter currently binds
+  one daemon project; cross-workspace daemon routing remains a protocol follow-up.
 
 ### managed agent turn — `[code]`
 One exclusive, bounded use of the cached `ImpulseAgent`. Concurrent turns fail fast with typed
