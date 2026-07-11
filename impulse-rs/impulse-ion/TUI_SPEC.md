@@ -179,6 +179,21 @@ request type) — it does not mean the `ion` REPL as a whole is write-denied.
 Keep these two capability universes conceptually separate: the verify gate's
 closed read-only allowlist vs. the REPL's full coding-agent tool registry.
 
+**Candidate ReplTool: sandboxed Python via Monty (2026-07-11, James's idea).**
+`src/monty/python.rs` currently stubs pydantic-monty integration (pyo3,
+behind the `monty-support` feature) as a *computed-routing* sandbox — an
+external-function registry (`route_to`, `search_history`,
+`get_genome_decisions`, `inject`, `extract_findings`, `search_similar`) that
+Monty's Python code can call, and nothing else. That deny-by-default,
+explicit-registration shape is structurally the same pattern as
+`src/tooling::Tool` and the `ReplTool` trait above — which makes Monty a
+natural fit for a sandboxed Python code-interpreter `ReplTool` (e.g.
+`python_eval` or `run_python`) in T7+: the chat loop hands Monty a snippet,
+Monty can only touch the functions Impulse explicitly registers, and the
+result comes back through the same `ToolOutcome` shape as every other
+ReplTool. Not scoped for T6/T7 — flagging as a concrete future ReplTool
+candidate once `monty-support` is built out past its current stub.
+
 ### 2.4 CLI surface of the new binary
 
 ```
