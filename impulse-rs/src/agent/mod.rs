@@ -612,6 +612,26 @@ impl ImpulseAgent {
         // dropped future send SIGKILL to the child instead.
         cmd.kill_on_drop(true);
 
+        // `kill_on_drop`/SIGKILL only reaches the *direct* child. Harness
+        // CLIs are typically native binaries (exec-replaced directly), but a
+        // harness that's itself a wrapper script forks a grandchild (e.g.
+        // `sh script.sh` running `sleep`/the real work as a child of `sh`,
+        // rather than exec-replacing it the way `sh -c "cmd"` does for a
+        // single simple command) -- SIGKILL-ing just `sh` leaves that
+        // grandchild running, orphaned. Regression test found this exact gap
+        // (`test_harness_query_kills_hung_child_instead_of_orphaning`).
+        // Fixed the same way `impulse_ion::pi_adapter`'s watchdog already
+        // does: put the child in its own process group at spawn
+        // (`process_group(0)`, pgid == the child's own pid) so a timeout can
+        // kill the whole group, not just the direct child.
+        #[cfg(unix)]
+        {
+            // tokio::process::Command exposes `process_group` natively
+            // (unlike `pi_adapter.rs`'s std::process::Command, which needs
+            // the `std::os::unix::process::CommandExt` trait in scope).
+            cmd.process_group(0);
+        }
+
         // Previously this call had no timeout at all: a hung harness CLI
         // (network stall, waiting on stdin, an unattended auth prompt) meant
         // `.output().await` never returned. Combined with the daemon holding
@@ -620,17 +640,44 @@ impl ImpulseAgent {
         // single wedged child could freeze the whole daemon's agent IPC
         // surface indefinitely. `tokio::time::timeout` bounds this call to
         // `timeout`, returning a typed `AgentError::HarnessTimedOut` instead
-        // of hanging; `kill_on_drop` above ensures the timed-out child is
-        // actually killed, not orphaned.
-        let output = tokio::time::timeout(timeout, cmd.output())
-            .await
-            .map_err(|_| AgentError::HarnessTimedOut {
-                command: harness_kind.command().to_string(),
-                seconds: timeout.as_secs(),
-            })?
-            .map_err(|e| {
+        // of hanging.
+        let child = cmd.spawn().map_err(|e| {
+            AgentError::ApiRequest(format!("Failed to spawn {}: {}", harness_kind.command(), e))
+        })?;
+        // Captured before `child` is consumed by `wait_with_output()`, so a
+        // timeout can still target the process group after the future
+        // (and the `Child` it owns) is dropped.
+        let pgid = child.id();
+
+        let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+            Ok(result) => result.map_err(|e| {
                 AgentError::ApiRequest(format!("Failed to run {}: {}", harness_kind.command(), e))
-            })?;
+            })?,
+            Err(_elapsed) => {
+                // `kill_on_drop` already SIGKILLed the direct child as the
+                // dropped future's `Child` handle goes out of scope; this
+                // explicit group-kill catches any grandchild it forked (see
+                // the process_group comment above). Best-effort: shells out
+                // to `kill` rather than pulling in `libc` for one syscall,
+                // matching `pi_adapter::kill_process_group`'s precedent.
+                #[cfg(unix)]
+                if let Some(pgid) = pgid {
+                    let _ = tokio::process::Command::new("kill")
+                        .arg("-KILL")
+                        .arg("--")
+                        .arg(format!("-{pgid}"))
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .await;
+                }
+                return Err(AgentError::HarnessTimedOut {
+                    command: harness_kind.command().to_string(),
+                    seconds: timeout.as_secs(),
+                });
+            }
+        };
 
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
