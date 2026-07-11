@@ -134,7 +134,6 @@ pub fn extract_patterns(sessions: &[SessionAnalysis]) -> Vec<CrossProjectPattern
     use std::collections::HashMap;
 
     let mut tool_failures: HashMap<&str, Vec<&str>> = HashMap::new();
-    let mut file_patterns: HashMap<&str, Vec<&str>> = HashMap::new();
 
     for session in sessions {
         // Track tool usage patterns
@@ -145,14 +144,6 @@ pub fn extract_patterns(sessions: &[SessionAnalysis]) -> Vec<CrossProjectPattern
                     .or_default()
                     .push(session.project_hash.as_str());
             }
-        }
-
-        // Track frequently touched files
-        for file in &session.files_touched {
-            file_patterns
-                .entry(file.as_str())
-                .or_default()
-                .push(session.project_hash.as_str());
         }
     }
 
