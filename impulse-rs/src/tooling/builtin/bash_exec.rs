@@ -454,7 +454,22 @@ mod tests {
         // real argument -- a fractional-second duration unique to this
         // process still sleeps ~5s but is distinguishable in `ps`/`pgrep -f`
         // output.
-        let unique_duration = format!("5.{}", std::process::id() % 1000);
+        //
+        // Regression note (fresh Fable review, same day): `std::process::id()
+        // % 1000` alone is NOT unique across files -- `agent::mod`'s own
+        // orphan-kill test computed its marker the same way and could
+        // collide (same process, same formula), letting one test's pgrep
+        // catch the other's still-legitimately-running sleep. Nanoseconds
+        // (matching `storage::atomic_write_path`'s own PID+nanos precedent)
+        // are effectively unique per call, not just per process.
+        let unique_duration = format!(
+            "5.{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+                % 1000
+        );
         let tool = BashExecTool;
         let ctx = ToolContext::with_all_capabilities();
         let result = tool
@@ -496,7 +511,18 @@ mod tests {
         // wrapper-script harness. Since `bash_exec` runs arbitrary
         // LLM-generated commands, an orphaned backgrounded process is a
         // real resource leak, not a hypothetical.
-        let unique_duration = format!("9.{}", std::process::id() % 1000);
+        //
+        // Nanoseconds, not `std::process::id() % 1000` (fresh Fable review,
+        // same day) -- pid-based markers aren't unique ACROSS files in the
+        // same test process; see the sibling test above for the full note.
+        let unique_duration = format!(
+            "9.{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+                % 1000
+        );
         let tool = BashExecTool;
         let ctx = ToolContext::with_all_capabilities();
         let result = tool

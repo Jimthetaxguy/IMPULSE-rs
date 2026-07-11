@@ -1438,8 +1438,25 @@ mod tests {
         // `bash_exec.rs`'s equivalent test) so a `pgrep -f` check here can't
         // be confused by an unrelated `sleep` from another concurrently
         // running test.
+        //
+        // Nanoseconds, not `std::process::id() % 1000` (fresh Fable review,
+        // same day): `bash_exec.rs`'s equivalent test computed its marker
+        // with the identical pid-based formula -- since `cargo test` runs
+        // the whole crate's tests in one process, both files could produce
+        // the literal same `sleep 9.NNN` command, and a concurrent run of
+        // both tests could see one's `pgrep -f` catch the other's still-
+        // legitimately-running sleep. Nanoseconds (matching
+        // `storage::atomic_write_path`'s own PID+nanos uniqueness
+        // precedent) are effectively unique per call, not just per process.
         let _lock = path_env_lock();
-        let unique_duration = format!("9.{}", std::process::id() % 1000);
+        let unique_duration = format!(
+            "9.{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+                % 1000
+        );
         let dir = tempfile::tempdir().expect("tempdir");
         let script_path = dir.path().join("claude");
         std::fs::write(
