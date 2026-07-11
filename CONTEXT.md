@@ -50,8 +50,12 @@ Claude Code or Codex); Ion is a native direct-provider/tool-loop runtime.
 ### agent platform id — `[aggregate]`
 An open, validated string identity (`AgentPlatformId`) whose metadata and launch command are owned
 by `AgentRegistry`. The pending aggregate carries the registry through desktop runtime, host, MCP,
-and snapshots, adds Ion as a builtin launchable platform, and fails closed on unknown/blank ids.
-Legacy closed enums remain where wire/disk compatibility still requires them.
+browser bridge, reducer, dynamic workspace launcher, and serialized snapshots. It adds Ion as a
+builtin launchable platform, derives capability manifests from the registry, resolves the real
+sibling Ion binary without an override, and fails closed on unknown/blank ids. Runtime output
+canonicalizes aliases and case; the declared platform remains distinct from the observed command,
+so explicit wrapper/alternate-installation overrides stay supported and visible. Legacy closed
+enums remain where wire/disk compatibility still requires them.
 - **Source of truth:** `impulse-ops/src/agent_registry.rs` on the pending aggregate branch.
 
 ### agent instance — `[vocabulary]`
@@ -112,7 +116,8 @@ the cached agent or losing history.
 ### agent registry — `[aggregate]`
 The catalog of platform identity and launch metadata. It answers what can be named, detected, and
 launched; daemon/runtime telemetry separately answers what is currently running.
-- **Invariant:** ids and aliases have one owner; explicit command overrides remain observable.
+- **Invariant:** ids and aliases have one owner, identity-collision registration fails
+  transactionally, and explicit command overrides remain observable.
 
 ### terminal runtime — `[code]`
 The PTY/process lifecycle boundary for spawn, input, resize, focus, exit, and cleanup. Terminal
