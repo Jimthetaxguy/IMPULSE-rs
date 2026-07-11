@@ -4578,6 +4578,7 @@ dependencies = [
  "impulse-ion",
  "impulse-ops",
  "levenshtein",
+ "libc",
  "portable-pty",
  "pyo3",
  "ratatui",

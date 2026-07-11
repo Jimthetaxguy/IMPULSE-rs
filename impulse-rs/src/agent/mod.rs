@@ -340,6 +340,34 @@ impl ImpulseAgent {
         })
     }
 
+    /// Construct an API-mode agent around a deterministic provider for
+    /// in-crate lifecycle tests. Production construction must continue to
+    /// flow through [`Self::new`] so provider credentials and configuration
+    /// are resolved normally.
+    #[cfg(test)]
+    pub(crate) fn with_test_provider(provider: Box<dyn LlmProvider>) -> Self {
+        let model = provider.default_model().to_string();
+        Self {
+            config: ImpulseAgentConfig {
+                mode: AgentMode::Api {
+                    provider: ImpulseProvider::Anthropic,
+                    model: Some(model.clone()),
+                },
+                ..ImpulseAgentConfig::default()
+            },
+            inner: Some(Agent::new(
+                "impulse-agent-test".to_string(),
+                "Impulse Agent Test".to_string(),
+                provider,
+                Some(model),
+                None,
+            )),
+            recommendations: Vec::new(),
+            pane_summaries: Vec::new(),
+            session_history: Vec::new(),
+        }
+    }
+
     /// Check if the agent is enabled and ready.
     pub fn is_ready(&self) -> bool {
         match &self.config.mode {
@@ -634,44 +662,36 @@ impl ImpulseAgent {
 
         // Previously this call had no timeout at all: a hung harness CLI
         // (network stall, waiting on stdin, an unattended auth prompt) meant
-        // `.output().await` never returned. Combined with the daemon holding
-        // the `cached_agent` mutex across this same await (see
-        // `daemon/handlers.rs`'s `checkout_agent`/`checkin_agent` doc), a
-        // single wedged child could freeze the whole daemon's agent IPC
-        // surface indefinitely. `tokio::time::timeout` bounds this call to
-        // `timeout`, returning a typed `AgentError::HarnessTimedOut` instead
-        // of hanging.
+        // `.output().await` never returned. The daemon intentionally
+        // admits only one logical turn on its cached agent so history cannot
+        // fork (concurrent requests receive typed Busy); this timeout bounds
+        // how long a wedged turn can retain that async guard before retries
+        // may proceed. `tokio::time::timeout` returns a typed
+        // `AgentError::HarnessTimedOut` instead of hanging indefinitely.
         let child = cmd.spawn().map_err(|e| {
             AgentError::ApiRequest(format!("Failed to spawn {}: {}", harness_kind.command(), e))
         })?;
-        // Captured before `child` is consumed by `wait_with_output()`, so a
-        // timeout can still target the process group after the future
-        // (and the `Child` it owns) is dropped.
-        let pgid = child.id();
+        // Unlike `kill_on_drop`, this guard targets the whole isolated group
+        // synchronously from Drop, so external task cancellation is covered
+        // as well as the explicit timeout branch below.
+        let mut process_group_guard = crate::process_group::ProcessGroupGuard::new(child.id());
 
         let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-            Ok(result) => result.map_err(|e| {
-                AgentError::ApiRequest(format!("Failed to run {}: {}", harness_kind.command(), e))
-            })?,
+            Ok(result) => {
+                let output = result.map_err(|e| {
+                    AgentError::ApiRequest(format!(
+                        "Failed to run {}: {}",
+                        harness_kind.command(),
+                        e
+                    ))
+                })?;
+                process_group_guard.disarm();
+                output
+            }
             Err(_elapsed) => {
-                // `kill_on_drop` already SIGKILLed the direct child as the
-                // dropped future's `Child` handle goes out of scope; this
-                // explicit group-kill catches any grandchild it forked (see
-                // the process_group comment above). Best-effort: shells out
-                // to `kill` rather than pulling in `libc` for one syscall,
-                // matching `pi_adapter::kill_process_group`'s precedent.
-                #[cfg(unix)]
-                if let Some(pgid) = pgid {
-                    let _ = tokio::process::Command::new("kill")
-                        .arg("-KILL")
-                        .arg("--")
-                        .arg(format!("-{pgid}"))
-                        .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status()
-                        .await;
-                }
+                // Returning drops the still-armed process-group guard after
+                // `wait_with_output` drops its Child, killing wrapper
+                // grandchildren before the caller observes the timeout.
                 return Err(AgentError::HarnessTimedOut {
                     command: harness_kind.command().to_string(),
                     seconds: timeout.as_secs(),
@@ -1503,5 +1523,100 @@ mod tests {
             stray.trim().is_empty(),
             "expected no orphaned harness process after timeout, found pids: {stray}"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_aborting_harness_query_kills_the_whole_process_group() {
+        let _lock = path_env_lock();
+        let unique_duration = format!(
+            "9.{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script_path = dir.path().join("claude");
+        std::fs::write(
+            &script_path,
+            format!("#!/bin/sh\nsleep {unique_duration} & wait\n"),
+        )
+        .expect("write fake harness script");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path)
+                .expect("stat fake harness script")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).expect("chmod fake harness script");
+        }
+        let _path_guard = PathPrependGuard::new(dir.path());
+
+        let config = ImpulseAgentConfig::harness(ImpulseHarness::ClaudeCode);
+        let agent = ImpulseAgent::new(config).expect("harness agent should construct");
+        let task = tokio::spawn(async move {
+            agent
+                .harness_query_structured_with_timeout(
+                    "system",
+                    "hello",
+                    &[],
+                    None,
+                    Duration::from_secs(30),
+                )
+                .await
+        });
+
+        let pattern = format!("sleep {unique_duration}");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let check = tokio::process::Command::new("pgrep")
+                    .arg("-f")
+                    .arg(&pattern)
+                    .output()
+                    .await
+                    .expect("pgrep should run");
+                if !String::from_utf8_lossy(&check.stdout).trim().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("fake harness grandchild did not start");
+
+        task.abort();
+        let _ = task.await;
+        let gone = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let check = tokio::process::Command::new("pgrep")
+                    .arg("-f")
+                    .arg(&pattern)
+                    .output()
+                    .await
+                    .expect("pgrep should run");
+                if String::from_utf8_lossy(&check.stdout).trim().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        if gone.is_err() {
+            let check = tokio::process::Command::new("pgrep")
+                .arg("-f")
+                .arg(&pattern)
+                .output()
+                .await
+                .expect("pgrep should run");
+            let stray = String::from_utf8_lossy(&check.stdout).trim().to_string();
+            let _ = tokio::process::Command::new("pkill")
+                .arg("-f")
+                .arg(&pattern)
+                .status()
+                .await;
+            panic!("aborting a harness query must kill wrapper grandchildren; found pids: {stray}");
+        }
     }
 }

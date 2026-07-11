@@ -134,6 +134,12 @@ impl DaemonClient {
         match resp {
             DaemonResponse::Ok { result } => Ok(result),
             DaemonResponse::Error { message } => Err(message),
+            DaemonResponse::Busy {
+                resource,
+                retry_after_ms,
+            } => Err(format!(
+                "daemon busy ({resource:?}); retry after {retry_after_ms} ms"
+            )),
             DaemonResponse::ConflictCheck { .. } => Err("unexpected ConflictCheck".to_string()),
         }
     }
@@ -339,5 +345,27 @@ impl DaemonClient {
         })?;
         self.ok_result(resp)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ok_result_preserves_busy_resource_and_retry_hint() {
+        let client = DaemonClient::new(PathBuf::from("unused.sock"));
+        let error = client
+            .ok_result(DaemonResponse::Busy {
+                resource: impulse_ops::DaemonBusyResource::AgentTurn,
+                retry_after_ms: 250,
+            })
+            .expect_err("busy responses must remain retryable errors");
+
+        assert!(
+            error.contains("AgentTurn"),
+            "missing busy resource: {error}"
+        );
+        assert!(error.contains("250 ms"), "missing retry hint: {error}");
     }
 }

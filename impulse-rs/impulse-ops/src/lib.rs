@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 pub mod agent_registry;
 
 /// Shared daemon protocol version for GUI/operator workbench compatibility.
-pub const DAEMON_PROTOCOL_VERSION: u32 = 2;
+pub const DAEMON_PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpsError {
@@ -80,10 +80,20 @@ pub enum WorkbenchDaemonResponse {
     Error {
         message: String,
     },
+    Busy {
+        resource: DaemonBusyResource,
+        retry_after_ms: u64,
+    },
     ConflictCheck {
         has_conflict: bool,
         conflicting_sessions: Vec<String>,
     },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonBusyResource {
+    AgentTurn,
 }
 
 pub fn sanitize_id(input: &str) -> String {
@@ -949,5 +959,20 @@ mod tests {
         assert_eq!(state.baseline, baseline);
         assert_eq!(state.effective, baseline);
         assert!(!state.session_override_active());
+    }
+
+    #[test]
+    fn test_workbench_busy_response_roundtrip() {
+        let response = WorkbenchDaemonResponse::Busy {
+            resource: DaemonBusyResource::AgentTurn,
+            retry_after_ms: 250,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains(r#""type":"Busy""#));
+        assert!(json.contains(r#""resource":"agent_turn""#));
+        assert_eq!(
+            serde_json::from_str::<WorkbenchDaemonResponse>(&json).unwrap(),
+            response
+        );
     }
 }

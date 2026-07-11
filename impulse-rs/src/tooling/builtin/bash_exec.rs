@@ -181,38 +181,24 @@ impl DynamicTool for BashExecTool {
         let child = cmd
             .spawn()
             .map_err(|e| ToolError::ExecutionFailed(format!("failed to spawn shell: {e}")))?;
-        // Captured before `child` is consumed by `wait_with_output()`, so a
-        // timeout can still target the process group after the awaited
-        // future (and the `Child` it owns) is dropped.
-        let pgid = child.id();
+        // Synchronous Drop cleanup covers explicit timeout and arbitrary
+        // task cancellation; `kill_on_drop` alone reaches only direct `sh`.
+        let mut process_group_guard = crate::process_group::ProcessGroupGuard::new(child.id());
 
         let output =
             match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
                 .await
             {
-                Ok(result) => result.map_err(|e| {
-                    ToolError::ExecutionFailed(format!("failed to wait on child: {e}"))
-                })?,
+                Ok(result) => {
+                    let output = result.map_err(|e| {
+                        ToolError::ExecutionFailed(format!("failed to wait on child: {e}"))
+                    })?;
+                    process_group_guard.disarm();
+                    output
+                }
                 Err(_elapsed) => {
-                    // `kill_on_drop` already SIGKILLed the direct `sh` child
-                    // as the dropped future's `Child` handle goes out of
-                    // scope; this explicit group-kill catches any real work
-                    // process `sh` forked instead of exec-replacing itself
-                    // with. Best-effort: shells out to `kill` rather than
-                    // pulling in `libc` for one syscall, matching
-                    // `pi_adapter::kill_process_group`'s own precedent.
-                    #[cfg(unix)]
-                    if let Some(pgid) = pgid {
-                        let _ = tokio::process::Command::new("kill")
-                            .arg("-KILL")
-                            .arg("--")
-                            .arg(format!("-{pgid}"))
-                            .stdin(std::process::Stdio::null())
-                            .stdout(std::process::Stdio::null())
-                            .stderr(std::process::Stdio::null())
-                            .status()
-                            .await;
-                    }
+                    // Returning drops the still-armed group guard after the
+                    // Child future is dropped, killing backgrounded work too.
                     return Err(ToolError::ExecutionFailed(format!(
                         "command timed out after {timeout_secs}s: {command}"
                     )));
@@ -551,6 +537,81 @@ mod tests {
             "expected the backgrounded grandchild to be killed via the process group, \
              found pids: {stray}"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_aborting_execute_kills_the_whole_process_group() {
+        let unique_duration = format!(
+            "9.{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let pattern = format!("sleep {unique_duration}");
+        let tool = BashExecTool;
+        let ctx = ToolContext::with_all_capabilities();
+        let task = tokio::spawn(async move {
+            tool.execute(
+                serde_json::json!({
+                    "command": format!("sleep {unique_duration} & wait"),
+                    "timeout_secs": 30
+                }),
+                &ctx,
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let check = tokio::process::Command::new("pgrep")
+                    .arg("-f")
+                    .arg(&pattern)
+                    .output()
+                    .await
+                    .expect("pgrep should run");
+                if !String::from_utf8_lossy(&check.stdout).trim().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("backgrounded command did not start");
+
+        task.abort();
+        let _ = task.await;
+        let gone = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let check = tokio::process::Command::new("pgrep")
+                    .arg("-f")
+                    .arg(&pattern)
+                    .output()
+                    .await
+                    .expect("pgrep should run");
+                if String::from_utf8_lossy(&check.stdout).trim().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        if gone.is_err() {
+            let check = tokio::process::Command::new("pgrep")
+                .arg("-f")
+                .arg(&pattern)
+                .output()
+                .await
+                .expect("pgrep should run");
+            let stray = String::from_utf8_lossy(&check.stdout).trim().to_string();
+            let _ = tokio::process::Command::new("pkill")
+                .arg("-f")
+                .arg(&pattern)
+                .status()
+                .await;
+            panic!("aborting bash_exec must kill backgrounded grandchildren; found pids: {stray}");
+        }
     }
 
     #[tokio::test]

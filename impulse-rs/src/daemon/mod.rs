@@ -140,8 +140,11 @@ pub struct Daemon {
     /// Cross-agent delegation tracker (Phase 1B). Backs the
     /// RegisterDelegation/CompleteDelegation/ListDelegations endpoints.
     delegation_tracker: Arc<RwLock<crate::delegation::DelegationTracker>>,
-    /// Cached ImpulseAgent instance that persists across requests within the
-    /// daemon session — enables session history continuity for multi-turn queries.
+    /// One cached ImpulseAgent for the daemon session. Agent handlers retain
+    /// this async mutex for a complete, bounded logical turn so history,
+    /// recommendations, and pane summaries cannot fork under concurrency.
+    /// Concurrent agent requests receive typed Busy; unrelated daemon request
+    /// groups never acquire it.
     cached_agent: Arc<tokio::sync::Mutex<Option<crate::agent::ImpulseAgent>>>,
 }
 

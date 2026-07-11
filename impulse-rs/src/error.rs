@@ -65,12 +65,10 @@ pub enum AgentError {
     /// Opus sweep, freeze-bug fix) when the spawned harness CLI subprocess
     /// (`claude`/`codex`/`gemini`, etc.) doesn't exit within
     /// `agent::DEFAULT_HARNESS_TIMEOUT`. Previously this `.output().await`
-    /// had no timeout at all; combined with the daemon holding the
-    /// `cached_agent` mutex across the same await (see
-    /// `daemon/handlers.rs`'s `checkout_agent`/`checkin_agent`), a single
-    /// hung harness process could freeze the entire daemon's agent IPC
-    /// surface indefinitely. This bounds that to a fixed wall-clock budget
-    /// instead.
+    /// had no timeout at all. The daemon now deliberately holds one async
+    /// agent-turn guard across the query to preserve ordered state, so this
+    /// error also bounds how long a wedged turn retains exclusive ownership
+    /// before Busy callers can retry.
     #[error("Harness command '{command}' did not complete within {seconds}s")]
     HarnessTimedOut { command: String, seconds: u64 },
 }

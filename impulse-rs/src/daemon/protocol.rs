@@ -196,6 +196,10 @@ pub enum DaemonResponse {
     Error {
         message: String,
     },
+    Busy {
+        resource: impulse_ops::DaemonBusyResource,
+        retry_after_ms: u64,
+    },
     AgentAssistResult {
         success: bool,
         response: String,
@@ -292,7 +296,7 @@ mod tests {
 
     #[test]
     fn test_protocol_version_is_two() {
-        assert_eq!(PROTOCOL_VERSION, 2);
+        assert_eq!(PROTOCOL_VERSION, 3);
     }
 
     // ── request_type_name ───────────────────────────────────────────────
@@ -614,6 +618,25 @@ mod tests {
     }
 
     #[test]
+    fn test_daemon_response_busy_roundtrip() {
+        let resp = DaemonResponse::Busy {
+            resource: impulse_ops::DaemonBusyResource::AgentTurn,
+            retry_after_ms: 250,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains(r#""type":"Busy""#));
+        assert!(json.contains(r#""resource":"agent_turn""#));
+        let parsed: DaemonResponse = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            DaemonResponse::Busy {
+                resource: impulse_ops::DaemonBusyResource::AgentTurn,
+                retry_after_ms: 250,
+            }
+        ));
+    }
+
+    #[test]
     fn test_daemon_response_agent_assist_result_roundtrip() {
         let resp = DaemonResponse::AgentAssistResult {
             success: true,
@@ -826,6 +849,10 @@ mod tests {
             },
             DaemonResponse::Error {
                 message: "boom".into(),
+            },
+            DaemonResponse::Busy {
+                resource: impulse_ops::DaemonBusyResource::AgentTurn,
+                retry_after_ms: 250,
             },
             DaemonResponse::ConflictCheck {
                 has_conflict: true,
