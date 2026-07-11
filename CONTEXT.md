@@ -78,8 +78,19 @@ Monitoring context-window usage and proposing cleanup strategies before the wind
 Impulse's answer to the playbooks' "Headroom" pattern.
 
 ### agent registry — `[code]`
-The record of which agents/tools are active and what they're working on (multi-agent awareness).
+The canonical catalog of agent-platform identities and launch metadata. Runtime activity is a
+separate daemon-owned truth surface; the registry answers which platforms may be named, listed,
+detected, and launched.
 - **Source of truth:** `impulse-rs/impulse-ops/src/agent_registry.rs`.
+- **Identity invariant:** every canonical id and alias has exactly one platform owner; executable
+  commands may be shared intentionally.
+
+### agent platform id — `[code]`
+An open, validated string identity (`AgentPlatformId`) carried across desktop, host, MCP, runtime,
+and serialized snapshots. Metadata remains registry-owned, unknown explicit ids fail closed, and
+runtime output canonicalizes aliases/case to the descriptor's canonical id. The platform is an
+operator declaration, while the separately recorded command is the observed launch target; command
+overrides are intentionally permitted for wrappers and alternate installations.
 
 ### workspace (project space) — `[code]`
 A distinct project folder/root that can be registered so the desktop host (and MCP/tools) can surface it for cycling between multiple project spaces. Multiple agents (terminal CLI sessions) can attach to workspaces.
@@ -103,6 +114,7 @@ The check that a session's claimed work actually holds before the session can cl
 - Dioxus host scaffold + bridge parity + cleanup: smoke captured (ok, live status asserted in sim + real dispatch exercised in unit tests), status consistent, gate 1363 passed 0 failed. Ratchet: err_to_string helper + extended body() + dispatch_host_invoke tests (array/scalar/malformed, agent_write error path, workspaces/mcp). All to correct SCRATCH (bd088a7e3032). Changes committed post-verif.
 - Dioxus Desktop launch scaffold + live terminal bridge parity: complete (smoke asserts "dioxus-eval-bridge-ready" + exercised without pending; real dispatch_host_invoke + body tests cover claude/codex; registry_for_runtime centralized with proper error policy, no silent fallbacks in mcp/runtime; MCP List* execute test added; ROADMAP marked complete; capture script + 3 atomic commits landed).
 - **2026-07-11 daemon-truth wire:** Dioxus desktop PTY lifecycle facts publish as `TerminalOpsReport` on change and heartbeat, then return only through daemon `SubscribeOps` snapshots. Local `agent_runtime_update`/`agent_snapshot` messages own terminal mechanics only and cannot overwrite `ProjectOpsSnapshot`. Subscription freshness is distinct from publish degradation; lifecycle delivery uses a reentrant FIFO, natural exits reap records, and runtime agent ids remain one-use routing addresses until the protocol carries explicit incarnations. The adapter binds one daemon project; cross-workspace daemon routing remains a protocol follow-up.
+- **2026-07-11 registry platform identity:** Desktop platform identity is now open and registry-backed rather than enum-closed. Ion is a builtin interactive platform; the registry catalog flows through MCP, the native host, browser bridge, reducer, and dynamic workspace launcher. Unknown ids and blank commands fail closed, identity collisions are rejected transactionally, runtime snapshots use canonical ids, capabilities manifests derive supported agents from the registry, and the desktop runtime can resolve and launch the real sibling Ion binary without an override. Legacy closed harness/session/context enums remain a deliberate follow-up and prevent a repo-wide unification claim.
 - Open architecture thread: Dioxus host migration (`impulse-interface-dioxus-roadmap-spec`).
 - Proposed next boundary: explicit `EmbeddingProvider` trait for semantic search (scaffold in `_working-files/`).
 
