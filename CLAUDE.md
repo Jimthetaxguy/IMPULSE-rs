@@ -86,6 +86,7 @@ Before implementing, consider alternative approaches. Choose the simplest soluti
 - `impulse-rs/impulse-ops/` — operations library (shared types: SupervisorAction, TerminalOpsReport, OpsSnapshot, WorkbenchDaemonRequest/Response, DAEMON_PROTOCOL_VERSION, 31 tests)
 - `impulse-rs/impulse-term/` — PTY/session/context core (PTY + vt100 + WriteQueue + context bridge)
 - `impulse-rs/impulse-desktop/` — Dioxus desktop shell scaffold and typed host bridge contracts
+- `impulse-rs/impulse-ion/` — Ion harness contract v0 (transport-agnostic `HarnessRequest`/`HarnessResponse` types + `PiAdapter`, the Rust-side caller of harness #2/Pi-on-MiniMax; drives `impulse-rs ion-verify`, see `impulse-ion/TUI_SPEC.md` for the ion-cli agent roadmap, 23 tests)
 
 **Legacy:** `impulse-gui` / egui is frozen. It receives compile-maintenance only until the Dioxus desktop host reaches parity. Tauri-shaped code is also compatibility-only, not a new product scaffold target.
 
@@ -358,7 +359,7 @@ cd impulse-rs && cargo build && cargo test && cargo clippy -- -D warnings && car
 ```
 
 **Expected output (update when counts change):**
-- `cargo test --workspace`: 1,381 unit + 26 integration (impulse-rs) + 31 (impulse-ops) + 114 (impulse-term) + 159 (impulse-desktop) = 1,711 passed, 5 ignored, 0 failed (verified 2026-06-29; +10 EmbeddingProvider/Ollama tests. Note: `impulse-term::test_with_parser_reads_screen_size` is parallelism-flaky under full `--workspace` load — passes in isolation/serial)
+- `cargo test --workspace`: 1,386 unit + 26 integration (impulse-rs) + 31 (impulse-ops) + 114 (impulse-term) + 159 (impulse-desktop) + 23 (impulse-ion) = 1,739 passed, 6 ignored, 0 failed (verified 2026-07-11; +5 impulse-rs unit tests from the ion-verify run_ion_verify split (T3) and +23 impulse-ion tests from the HarnessRequest::verify constructor (T1) and PiAdapter hardening (T2). Note: `impulse-term::test_with_parser_reads_screen_size` and 3 impulse-desktop tests (`test_dioxus_desktop_launch_binary_is_feature_gated`, `test_host_readiness_smoke_script_is_declared`, `test_xterm_vendor_assets_are_present_and_manifested`) are parallelism-flaky under full `--workspace` load — pass in isolation/serial per-crate)
 - `cargo clippy`: 0 warnings
 - `cargo fmt --check`: no output (clean)
 
@@ -389,12 +390,12 @@ To verify test counts match expectations:
 ```bash
 cd impulse-rs && cargo test 2>&1 | grep "test result:" | awk '{sum += $4} END {print "Total: " sum " passed"}'
 ```
-Expected: 1,711 passed across the 4 crates (impulse-rs, impulse-ops, impulse-term, impulse-desktop). If this changes, update both this section and the Architecture section.
+Expected: 1,739 passed across the 5 crates (impulse-rs, impulse-ops, impulse-term, impulse-desktop, impulse-ion). If this changes, update both this section and the Architecture section.
 
 ### Pre-Commit Checklist
 
 1. `cargo build` — zero warnings
-2. `cargo test` — all tests pass (1,711 workspace total expected: 1381+26 impulse-rs, 31 ops, 114 term, 159 desktop; verify with `cargo test --workspace 2>&1 | grep "test result:"`)
+2. `cargo test` — all tests pass (1,739 workspace total expected: 1386+26 impulse-rs, 31 ops, 114 term, 159 desktop, 23 ion; verify with `cargo test --workspace 2>&1 | grep "test result:"`)
    - **If count changes**: update this line and the Architecture section above
 3. `cargo clippy -- -D warnings` — zero warnings
 4. `cargo fmt --check` — zero diffs
