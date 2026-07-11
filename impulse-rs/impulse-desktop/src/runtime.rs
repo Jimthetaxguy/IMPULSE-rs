@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use impulse_ops::{AgentRole, AgentStatus, ContextHealthSummary, MachineTarget};
 use impulse_term::TerminalBackend;
@@ -263,11 +263,27 @@ pub struct AgentRuntimeSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "data")]
 pub enum DesktopEvent {
-    TerminalOutput { agent_id: String, data: Vec<u8> },
-    TerminalExit { agent_id: String },
-    AgentRuntimeUpdate { snapshot: Box<AgentRuntimeSnapshot> },
-    OpsUpdate { payload: serde_json::Value },
-    SupervisorLocalAction { action: LocalSupervisorAction },
+    TerminalOutput {
+        agent_id: String,
+        data: Vec<u8>,
+    },
+    TerminalExit {
+        agent_id: String,
+    },
+    AgentRuntimeUpdate {
+        snapshot: Box<AgentRuntimeSnapshot>,
+    },
+    OpsUpdate {
+        payload: serde_json::Value,
+    },
+    OpsConnectionUpdate {
+        connected: bool,
+        #[serde(default)]
+        error: Option<String>,
+    },
+    SupervisorLocalAction {
+        action: LocalSupervisorAction,
+    },
 }
 
 impl DesktopEvent {
@@ -276,6 +292,7 @@ impl DesktopEvent {
         "terminal_exit",
         "agent_runtime_update",
         "ops_update",
+        "ops_connection_update",
         "supervisor_local_action",
     ];
 
@@ -285,7 +302,8 @@ impl DesktopEvent {
             Self::TerminalExit { .. } => Self::HOST_EVENT_NAMES[1],
             Self::AgentRuntimeUpdate { .. } => Self::HOST_EVENT_NAMES[2],
             Self::OpsUpdate { .. } => Self::HOST_EVENT_NAMES[3],
-            Self::SupervisorLocalAction { .. } => Self::HOST_EVENT_NAMES[4],
+            Self::OpsConnectionUpdate { .. } => Self::HOST_EVENT_NAMES[4],
+            Self::SupervisorLocalAction { .. } => Self::HOST_EVENT_NAMES[5],
         }
     }
 }
@@ -299,6 +317,89 @@ struct NoopEventSink;
 
 impl DesktopEventSink for NoopEventSink {
     fn emit(&self, _event: DesktopEvent) {}
+}
+
+#[derive(Default)]
+struct LifecycleEventQueue {
+    events: VecDeque<DesktopEvent>,
+    dispatching: bool,
+}
+
+/// FIFO lifecycle delivery that permits a public sink to reenter the runtime.
+/// Capture/enqueue happens under `DesktopRuntime::lifecycle_events`; delivery
+/// never does, so a reentrant focus/resize call appends behind the event being
+/// delivered instead of deadlocking on a non-reentrant mutex.
+struct LifecycleEventDispatcher {
+    sink: Arc<dyn DesktopEventSink>,
+    queue: Mutex<LifecycleEventQueue>,
+}
+
+impl LifecycleEventDispatcher {
+    fn new(sink: Arc<dyn DesktopEventSink>) -> Self {
+        Self {
+            sink,
+            queue: Mutex::new(LifecycleEventQueue::default()),
+        }
+    }
+
+    /// Returns true only to the caller that owns the current drain cycle.
+    fn enqueue(&self, event: DesktopEvent) -> bool {
+        let mut queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        queue.events.push_back(event);
+        if queue.dispatching {
+            false
+        } else {
+            queue.dispatching = true;
+            true
+        }
+    }
+
+    fn drain(&self) {
+        let mut reset = DispatchReset {
+            dispatcher: self,
+            armed: true,
+        };
+        loop {
+            let next = {
+                let mut queue = self
+                    .queue
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match queue.events.pop_front() {
+                    Some(event) => Some(event),
+                    None => {
+                        queue.dispatching = false;
+                        reset.armed = false;
+                        None
+                    }
+                }
+            };
+            let Some(event) = next else {
+                return;
+            };
+            self.sink.emit(event);
+        }
+    }
+}
+
+struct DispatchReset<'a> {
+    dispatcher: &'a LifecycleEventDispatcher,
+    armed: bool,
+}
+
+impl Drop for DispatchReset<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.dispatcher
+                .queue
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .dispatching = false;
+        }
+    }
 }
 
 struct RuntimeRecord {
@@ -354,12 +455,56 @@ impl RuntimeRecord {
 #[derive(Default)]
 struct RuntimeState {
     agents: HashMap<String, RuntimeRecord>,
+    /// Agent ids are event-routing addresses. Until lifecycle events carry an
+    /// explicit incarnation, an id is one-use for this runtime so a delayed
+    /// callback can never target a newer process.
+    used_agent_ids: HashSet<String>,
+}
+
+struct DesktopRuntimeInner {
+    state: Mutex<RuntimeState>,
+    sink: Arc<dyn DesktopEventSink>,
+    /// Serializes lifecycle publication with the PTY reader's exit callback.
+    /// A snapshot is always captured while this lock is held, so a stored
+    /// `alive=false` cannot be followed by an older `alive=true` event.
+    lifecycle_events: Mutex<()>,
+    lifecycle_dispatcher: LifecycleEventDispatcher,
+}
+
+impl Drop for DesktopRuntimeInner {
+    fn drop(&mut self) {
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let records = state
+            .agents
+            .drain()
+            .map(|(_, record)| record)
+            .collect::<Vec<_>>();
+        for record in records {
+            record.backend.kill();
+        }
+    }
 }
 
 #[derive(Clone)]
 pub struct DesktopRuntime {
-    state: Arc<Mutex<RuntimeState>>,
-    sink: Arc<dyn DesktopEventSink>,
+    inner: Arc<DesktopRuntimeInner>,
+}
+
+/// Non-owning runtime handle for event sinks that call back into lifecycle
+/// methods. Keeping a strong [`DesktopRuntime`] inside its own sink would form
+/// an ownership cycle; install this handle after building the runtime instead.
+#[derive(Clone)]
+pub struct WeakDesktopRuntime {
+    inner: Weak<DesktopRuntimeInner>,
+}
+
+impl WeakDesktopRuntime {
+    pub fn upgrade(&self) -> Option<DesktopRuntime> {
+        self.inner.upgrade().map(|inner| DesktopRuntime { inner })
+    }
 }
 
 impl Default for DesktopRuntime {
@@ -372,6 +517,12 @@ impl DesktopRuntime {
     pub fn builder() -> DesktopRuntimeBuilder {
         DesktopRuntimeBuilder {
             sink: Arc::new(NoopEventSink),
+        }
+    }
+
+    pub fn downgrade(&self) -> WeakDesktopRuntime {
+        WeakDesktopRuntime {
+            inner: Arc::downgrade(&self.inner),
         }
     }
 
@@ -415,24 +566,83 @@ impl DesktopRuntime {
         } else {
             request.mcp_tools.clone()
         };
+        let lifecycle_guard = self
+            .inner
+            .lifecycle_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        {
+            let mut state = self.lock_state();
+            if !state.used_agent_ids.insert(agent_id.clone()) {
+                return Err(DesktopBridgeError::InvalidTerminalRequest {
+                    message: format!(
+                        "agent id `{agent_id}` has already been used by this runtime; choose a new id"
+                    ),
+                });
+            }
+        }
         let env_pairs = runtime_env(&agent_id, &request, &command, workspace.as_ref());
-        let sink = Arc::clone(&self.sink);
+        let output_runtime = Arc::downgrade(&self.inner);
         let output_agent_id = agent_id.clone();
         let output_callback = Arc::new(move |data: &[u8]| {
-            sink.emit(DesktopEvent::TerminalOutput {
-                agent_id: output_agent_id.clone(),
-                data: data.to_vec(),
-            });
+            let Some(runtime) = output_runtime.upgrade() else {
+                return;
+            };
+            let should_drain = {
+                let _lifecycle_guard = runtime
+                    .lifecycle_events
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let active = runtime
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .agents
+                    .contains_key(&output_agent_id);
+                active
+                    && runtime
+                        .lifecycle_dispatcher
+                        .enqueue(DesktopEvent::TerminalOutput {
+                            agent_id: output_agent_id.clone(),
+                            data: data.to_vec(),
+                        })
+            };
+            if should_drain {
+                runtime.lifecycle_dispatcher.drain();
+            }
         });
-        let sink = Arc::clone(&self.sink);
         let exit_agent_id = agent_id.clone();
+        let exit_runtime = Arc::downgrade(&self.inner);
         let exit_callback = Arc::new(move || {
-            sink.emit(DesktopEvent::TerminalExit {
-                agent_id: exit_agent_id.clone(),
-            });
+            let Some(runtime) = exit_runtime.upgrade() else {
+                return;
+            };
+            let should_drain = {
+                let _lifecycle_guard = runtime
+                    .lifecycle_events
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let removed = runtime
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .agents
+                    .remove(&exit_agent_id);
+                let should_emit = removed.is_some();
+                drop(removed);
+                should_emit
+                    && runtime
+                        .lifecycle_dispatcher
+                        .enqueue(DesktopEvent::TerminalExit {
+                            agent_id: exit_agent_id.clone(),
+                        })
+            };
+            if should_drain {
+                runtime.lifecycle_dispatcher.drain();
+            }
         });
 
-        let backend = TerminalBackend::spawn_with_callbacks(
+        let backend = match TerminalBackend::spawn_with_callbacks(
             &command,
             &request.args,
             cwd.as_deref(),
@@ -442,10 +652,15 @@ impl DesktopRuntime {
             None,
             Some(output_callback),
             Some(exit_callback),
-        )
-        .map_err(|error| DesktopBridgeError::TerminalSpawnFailed {
-            message: error.to_string(),
-        })?;
+        ) {
+            Ok(backend) => backend,
+            Err(error) => {
+                self.lock_state().used_agent_ids.remove(&agent_id);
+                return Err(DesktopBridgeError::TerminalSpawnFailed {
+                    message: error.to_string(),
+                });
+            }
+        };
 
         let record = RuntimeRecord {
             platform: request.platform,
@@ -465,11 +680,26 @@ impl DesktopRuntime {
             status: AgentStatus::Starting,
             backend,
         };
-        let snapshot = record.snapshot(&agent_id);
-        self.lock_state().agents.insert(agent_id, record);
-        self.sink.emit(DesktopEvent::AgentRuntimeUpdate {
-            snapshot: Box::new(snapshot.clone()),
-        });
+        let snapshot = {
+            let mut state = self.lock_state();
+            let replaced = state.agents.insert(agent_id.clone(), record);
+            debug_assert!(replaced.is_none(), "reserved agent id replaced a runtime");
+            state
+                .agents
+                .get(&agent_id)
+                .expect("inserted runtime record")
+                .snapshot(&agent_id)
+        };
+        let should_drain =
+            self.inner
+                .lifecycle_dispatcher
+                .enqueue(DesktopEvent::AgentRuntimeUpdate {
+                    snapshot: Box::new(snapshot.clone()),
+                });
+        drop(lifecycle_guard);
+        if should_drain {
+            self.inner.lifecycle_dispatcher.drain();
+        }
         Ok(snapshot)
     }
 
@@ -494,62 +724,70 @@ impl DesktopRuntime {
         request: TerminalResizeRequest,
     ) -> Result<AgentRuntimeSnapshot, DesktopBridgeError> {
         validate_dimensions(request.rows, request.cols)?;
-        let state = self.lock_state();
-        let record = state.agents.get(&request.session_id).ok_or_else(|| {
-            DesktopBridgeError::MissingTerminalSession {
-                session_id: request.session_id.clone(),
-            }
-        })?;
-        record
-            .backend
-            .resize(request.cols, request.rows)
-            .map_err(|error| DesktopBridgeError::TerminalWriteFailed {
-                message: error.to_string(),
+        {
+            let state = self.lock_state();
+            let record = state.agents.get(&request.session_id).ok_or_else(|| {
+                DesktopBridgeError::MissingTerminalSession {
+                    session_id: request.session_id.clone(),
+                }
             })?;
-        let snapshot = record.snapshot(&request.session_id);
-        self.sink.emit(DesktopEvent::AgentRuntimeUpdate {
-            snapshot: Box::new(snapshot.clone()),
-        });
-        Ok(snapshot)
+            record
+                .backend
+                .resize(request.cols, request.rows)
+                .map_err(|error| DesktopBridgeError::TerminalWriteFailed {
+                    message: error.to_string(),
+                })?;
+        }
+        self.emit_runtime_snapshot(&request.session_id)
     }
 
     pub fn focus_agent(
         &self,
         request: TerminalFocusRequest,
     ) -> Result<AgentRuntimeSnapshot, DesktopBridgeError> {
-        let mut state = self.lock_state();
-        if !state.agents.contains_key(&request.session_id) {
-            return Err(DesktopBridgeError::MissingTerminalSession {
-                session_id: request.session_id,
-            });
+        {
+            let mut state = self.lock_state();
+            if !state.agents.contains_key(&request.session_id) {
+                return Err(DesktopBridgeError::MissingTerminalSession {
+                    session_id: request.session_id,
+                });
+            }
+            for record in state.agents.values_mut() {
+                record.focused = false;
+            }
+            let Some(record) = state.agents.get_mut(&request.session_id) else {
+                return Err(DesktopBridgeError::MissingTerminalSession {
+                    session_id: request.session_id,
+                });
+            };
+            record.focused = true;
         }
-        for record in state.agents.values_mut() {
-            record.focused = false;
-        }
-        let Some(record) = state.agents.get_mut(&request.session_id) else {
-            return Err(DesktopBridgeError::MissingTerminalSession {
-                session_id: request.session_id,
-            });
-        };
-        record.focused = true;
-        let snapshot = record.snapshot(&request.session_id);
-        self.sink.emit(DesktopEvent::AgentRuntimeUpdate {
-            snapshot: Box::new(snapshot.clone()),
-        });
-        Ok(snapshot)
+        self.emit_runtime_snapshot(&request.session_id)
     }
 
     pub fn close_agent(&self, request: TerminalCloseRequest) -> Result<(), DesktopBridgeError> {
-        let mut state = self.lock_state();
-        let record = state.agents.remove(&request.session_id).ok_or(
+        let lifecycle_guard = self
+            .inner
+            .lifecycle_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let record = self.lock_state().agents.remove(&request.session_id).ok_or(
             DesktopBridgeError::MissingTerminalSession {
                 session_id: request.session_id.clone(),
             },
         )?;
         record.backend.kill();
-        self.sink.emit(DesktopEvent::TerminalExit {
-            agent_id: request.session_id,
-        });
+        let should_drain = self
+            .inner
+            .lifecycle_dispatcher
+            .enqueue(DesktopEvent::TerminalExit {
+                agent_id: request.session_id,
+            });
+        drop(record);
+        drop(lifecycle_guard);
+        if should_drain {
+            self.inner.lifecycle_dispatcher.drain();
+        }
         Ok(())
     }
 
@@ -558,7 +796,10 @@ impl DesktopRuntime {
         let mut snapshots = state
             .agents
             .iter()
-            .map(|(agent_id, record)| record.snapshot(agent_id))
+            .filter_map(|(agent_id, record)| {
+                let snapshot = record.snapshot(agent_id);
+                snapshot.alive.then_some(snapshot)
+            })
             .collect::<Vec<_>>();
         snapshots.sort_by(|left, right| {
             right
@@ -569,11 +810,42 @@ impl DesktopRuntime {
         snapshots
     }
 
+    fn emit_runtime_snapshot(
+        &self,
+        agent_id: &str,
+    ) -> Result<AgentRuntimeSnapshot, DesktopBridgeError> {
+        let lifecycle_guard = self
+            .inner
+            .lifecycle_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let snapshot = {
+            let state = self.lock_state();
+            let record = state.agents.get(agent_id).ok_or_else(|| {
+                DesktopBridgeError::MissingTerminalSession {
+                    session_id: agent_id.to_string(),
+                }
+            })?;
+            record.snapshot(agent_id)
+        };
+        let should_drain =
+            self.inner
+                .lifecycle_dispatcher
+                .enqueue(DesktopEvent::AgentRuntimeUpdate {
+                    snapshot: Box::new(snapshot.clone()),
+                });
+        drop(lifecycle_guard);
+        if should_drain {
+            self.inner.lifecycle_dispatcher.drain();
+        }
+        Ok(snapshot)
+    }
+
     pub fn dispatch_supervisor_local_action(
         &self,
         request: SupervisorLocalActionRequest,
     ) -> Result<(), DesktopBridgeError> {
-        self.sink.emit(DesktopEvent::SupervisorLocalAction {
+        self.inner.sink.emit(DesktopEvent::SupervisorLocalAction {
             action: request.action.clone(),
         });
         match request.action {
@@ -602,7 +874,8 @@ impl DesktopRuntime {
     }
 
     fn lock_state(&self) -> MutexGuard<'_, RuntimeState> {
-        self.state
+        self.inner
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -689,8 +962,12 @@ impl DesktopRuntimeBuilder {
 
     pub fn build(self) -> DesktopRuntime {
         DesktopRuntime {
-            state: Arc::new(Mutex::new(RuntimeState::default())),
-            sink: self.sink,
+            inner: Arc::new(DesktopRuntimeInner {
+                state: Mutex::new(RuntimeState::default()),
+                lifecycle_dispatcher: LifecycleEventDispatcher::new(Arc::clone(&self.sink)),
+                sink: self.sink,
+                lifecycle_events: Mutex::new(()),
+            }),
         }
     }
 }
@@ -895,6 +1172,24 @@ mod tests {
             err,
             DesktopBridgeError::MissingTerminalSession { session_id } if session_id == "nope"
         ));
+    }
+
+    #[test]
+    fn test_runtime_drop_releases_inner_while_long_running_reader_exists() {
+        let runtime = DesktopRuntime::default();
+        let runtime_weak = runtime.downgrade();
+        let mut request = spawn_request(24, 80, Some("sh"));
+        request.args = vec!["-lc".to_string(), "sleep 30".to_string()];
+        runtime
+            .spawn_agent(request)
+            .expect("spawn long-running reader");
+
+        drop(runtime);
+
+        assert!(
+            runtime_weak.upgrade().is_none(),
+            "PTY callbacks must not retain DesktopRuntimeInner"
+        );
     }
 
     #[test]
@@ -1138,6 +1433,11 @@ mod tests {
             },
         };
         assert_eq!(supervisor.name(), "supervisor_local_action");
+        let ops_connection = DesktopEvent::OpsConnectionUpdate {
+            connected: false,
+            error: Some("daemon unavailable".to_string()),
+        };
+        assert_eq!(ops_connection.name(), "ops_connection_update");
         // Every advertised host event name is non-empty and unique.
         let names = DesktopEvent::HOST_EVENT_NAMES;
         let mut deduped = names.to_vec();

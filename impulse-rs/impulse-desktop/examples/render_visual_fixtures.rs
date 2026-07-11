@@ -41,6 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 last_invocations: last_invocations.clone(),
                 review_queue: review_queue.clone(),
                 bridge_status: None,
+                daemon_ops_status: None,
                 initial_view: view,
             },
         );
