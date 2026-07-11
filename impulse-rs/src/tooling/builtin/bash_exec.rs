@@ -453,8 +453,7 @@ mod tests {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .subsec_nanos()
-                % 1000
+                .as_nanos()
         );
         let tool = BashExecTool;
         let ctx = ToolContext::with_all_capabilities();
@@ -507,8 +506,7 @@ mod tests {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .subsec_nanos()
-                % 1000
+                .as_nanos()
         );
         let tool = BashExecTool;
         let ctx = ToolContext::with_all_capabilities();
