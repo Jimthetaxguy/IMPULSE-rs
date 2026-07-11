@@ -41,7 +41,7 @@ fn extract_word_content(path: &Path, doc: Docx) -> Result<ExtractionResult, Stri
     for (idx, chunk) in paragraphs.chunks(chunk_size).enumerate() {
         let chunk_content = chunk.join("\n\n");
         chunks.push(ContentChunk {
-            content: chunk_content.clone(),
+            content: chunk_content,
             chunk_type: "paragraph".to_string(),
             index: idx,
         });
@@ -52,7 +52,7 @@ fn extract_word_content(path: &Path, doc: Docx) -> Result<ExtractionResult, Stri
 
     Ok(ExtractionResult {
         document_type: "word".to_string(),
-        content: content.clone(),
+        content,
         metadata: ExtractionMetadata {
             source_path: path.to_string_lossy().to_string(),
             format: "docx".to_string(),
