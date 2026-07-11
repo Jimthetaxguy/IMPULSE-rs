@@ -2,7 +2,7 @@
 title: Test Traceability Matrix
 description: Story-to-test coverage map for the current Rust Impulse workspace and open validation gaps
 version: '1.0'
-updated: 2026-04-02
+updated: 2026-07-11
 type: specification
 category: testing
 phase: all
@@ -40,7 +40,7 @@ authors:
 | ST-06 Stage context before injecting it | `impulse-rs/src/injection/engine.rs`, `src/injection/staging.rs`, `src/handlers/injection_handlers.rs`, `src/orchestration/mod.rs`, integration enhancement paths | Strong | the biggest remaining gap is full-flow end-to-end validation of retrieval-seeded injection effects across output plus on-disk artifacts |
 | ST-07 Produce handoff artifacts for the next agent or session | orchestration tests, injection-handler tests, context artifact contracts, file-path assertions in current Rust modules | Strong | stronger end-to-end artifact assertions would still reduce regression risk |
 | ST-08 Use a daemon as the long-lived source of truth | `impulse-rs/src/daemon/tests.rs`, `src/daemon/protocol.rs`, integration daemon guard flows, daemon-adjacent handler coverage | Strong | the open risk is workbench IPC lifecycle coverage, not the absence of daemon tests |
-| ST-09 Observe work through the Dioxus desktop host | `impulse-rs/impulse-desktop/tests/desktop_contract.rs`, `tests/host_surface.rs`, `impulse-term/tests/backend_tests.rs` | Moderate | the key remaining gap is Dioxus Desktop launch and daemon-truth end-to-end verification across desktop snapshot, terminal bridge, and telemetry overlay behavior |
+| ST-09 Observe work through the Dioxus desktop host | `impulse-rs/impulse-desktop/src/daemon_ops.rs`, `impulse-rs/impulse-desktop/tests/desktop_contract.rs`, `impulse-rs/impulse-desktop/tests/host_surface.rs`, `impulse-rs/impulse-desktop/tests/runtime.rs`, `impulse-rs/impulse-term/tests/backend_tests.rs`, `impulse-rs/src/daemon/tests.rs::test_publish_then_subscribe_reconciles_terminal_agent_through_real_handler`, and `impulse-rs/impulse-desktop/scripts/host_readiness_smoke.mjs` | Strong | compositional coverage proves Unix JSONL client framing, separate real-handler reconciliation, lifecycle reduction, and browser-host readiness; one packaged desktop-to-real-daemon E2E plus multi-workspace routing remain open |
 | ST-10 Review risky context and stewardship actions explicitly | stewardship modules, guardrail and approval surfaces, integration enhancement coverage | Thin | stewardship command dispatch and operator decision paths need clearer regression tests |
 | ST-11 Enforce verification-before-completion | `impulse-rs/src/validate.rs`, recent invalid-direct-request fixes, session-end verify flows | Strong | manual operator acceptance still matters for claim wording, but automated coverage is present |
 | ST-12 Prove the real hook memory loop before expanding claims | `impulse-rs/tests/hook_validation_session_start.rs`, `hook_validation_precompact.rs`, `hook_validation_extraction_benchmark.rs`, `docs/guides/HOOK-VALIDATION-GUIDE.md` | Manual | the code can generate evidence, but product truth still depends on real external hook runs |
@@ -88,15 +88,17 @@ authors:
 
 These gaps matter because they sit on stable or nearly stable public interfaces:
 
-1. Daemon socket end-to-end workbench IPC tests
-   Reason: `GetOpsSnapshot`, `SubscribeOps`, `PublishTerminalOps`, `ListArtifacts`, and `RunArtifactAction` are central to daemon-truth desktop behavior.
-2. Telemetry overlay lifecycle tests
-   Reason: the stale-after-10-seconds and purge-after-60-seconds rules are product-significant and need direct proof.
-3. Stable CLI mutation flow integration tests
+1. Add a packaged desktop-to-real-daemon E2E
+   Reason: Unix client framing, real handler reconciliation, reducer behavior, and browser-host readiness are proven separately; one process-level test must connect those boundaries before calling the full path closed.
+2. Add multi-workspace daemon-routing tests
+   Reason: the delivered desktop adapter intentionally derives one project from one daemon socket; a first-class manager must route distinct workspace agents without cross-project bleed.
+3. Complete daemon socket workbench coverage
+   Reason: `PublishTerminalOps` → `SubscribeOps` has compositional client/handler regressions; `ListArtifacts`, `GetArtifact`, and `RunArtifactAction` still need equivalent desktop-client proof.
+4. Stable CLI mutation flow integration tests
    Reason: `session-start`, `session-end --verify`, `track-write`, and `track-tool` should be asserted against real `.impulse/*` artifacts.
-4. Stewardship integration tests
+5. Stewardship integration tests
    Reason: `steward analyze`, `compact`, `approve`, and `reject` are still underrepresented relative to their safety importance.
-5. End-to-end injection mode tests
+6. End-to-end injection mode tests
    Reason: `off|review|apply` should be proven against both returned output and emitted artifact/log behavior.
 
 ## Documentation Corrections Captured By This Matrix
@@ -111,13 +113,14 @@ These gaps matter because they sit on stable or nearly stable public interfaces:
 ### Still true
 
 - the stable CLI contract needs broader regression coverage than it currently has
-- daemon-truth GUI behavior remains an active delivery lane rather than a closed implementation story
+- single-project daemon-truth GUI behavior has direct automated evidence; multi-workspace routing remains an active delivery lane
 - validation evidence should continue to gate stronger marketing or architectural claims
 
 ## Recommended Test Expansion Order
 
-1. Add daemon socket end-to-end tests for the workbench IPC path.
-2. Add explicit overlay lifecycle tests for telemetry merge, staleness, and purge behavior.
-3. Add stable CLI mutation tests that assert real `.impulse/*` state transitions.
-4. Add stewardship integration tests with proposal and approval artifact assertions.
-5. Keep hook validation evidence generation automated, but treat real external hook runs as release-gating proof.
+1. Add a packaged desktop-to-real-daemon E2E across publish, subscribe, host event, and reducer boundaries.
+2. Add multi-workspace daemon routing and cross-project isolation tests.
+3. Extend daemon client/handler coverage to artifact list/get/action paths.
+4. Add stable CLI mutation tests that assert real `.impulse/*` state transitions.
+5. Add stewardship integration tests with proposal and approval artifact assertions.
+6. Keep hook validation evidence generation automated, but treat real external hook runs as release-gating proof.
