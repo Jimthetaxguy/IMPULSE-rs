@@ -229,28 +229,61 @@ original "reverse-transfer" note.
   drops everything not explicitly named regardless of what it's called.
   **No action needed** — this session's design is already ahead of ROSA's
   on this axis, not behind it.
-- `ApprovalGrant`/`Gate`: ROSA's is meaningfully more sophisticated than
-  `ion`'s `confirm_via_stdin`. It's a type-level unforgeable token (no
-  public constructor; only minted by `Gate::evaluate`/`Gate::resolve`) tied
-  to a `RiskClass` (Low/Medium/High/Special) computed from a guardrail scan
-  across *every* channel that reaches the agent — user prompt, system
-  prompt, AND injected context, never lowering the floor. Only `Low` risk
-  auto-allows; everything else is held for an operator decision, and
-  `ensure_grant_covers` re-checks effective risk at dispatch time so a
-  `Low` grant can't be replayed to launder a `High` action (defeats TOCTOU).
-  `ion`'s current gate is a flat binary y/N with no risk tiering and no
-  scan of *why* the model is requesting a given `bash_exec`/`file_write`
-  call — a prompt-injection scenario (malicious instructions embedded in a
-  file the model read via `file_read`, then surfacing as an
-  innocuous-looking `bash_exec` request) isn't specifically defended
-  against beyond the human reading the raw command string. This is a real,
-  legitimate gap relative to ROSA's design -- but porting `RiskClass` +
-  guardrail-scanning + an unforgeable-token type is a genuine architecture/
-  feature addition (new risk taxonomy, new UX for "held" vs "auto-allow"
-  vs "deny", a prompt/context scanner), not a bounded bug fix like the
-  other same-day findings. **Deferred, not autonomously built** — flagging
-  for explicit prioritization rather than scope-creeping a hardening pass
-  into a new subsystem.
+- `ApprovalGrant`/`Gate`: **implemented (2026-07-11, later the same day) —
+  no longer deferred**, scoped down to what actually fits `ion`'s
+  single-process, single-user REPL rather than porting ROSA's full design.
+  `src/ion_repl/chat.rs` gained: (1) `guard_verdict_for`/`guard_scan`,
+  which scan `bash_exec`'s `command` (`GuardTarget::Bash`) and
+  `file_write`'s `content` (`GuardTarget::FileWrite`) through the
+  pre-existing `src/guardrail` module (`GuardEngine`, already used by
+  PreToolUse hooks — no new risk-scanning subsystem was built, the
+  primitive already existed) before `self.confirm` runs, returning the
+  most severe matching `GuardResult` as a `GuardVerdict`
+  (`Option<GuardResult>`); (2) `ReplToolExecutor::confirm`'s signature grew
+  a third `&GuardVerdict` parameter so the confirmation UX can react to
+  severity — no-match/`Log` keeps the plain y/N, `Warn` keeps y/N but
+  `confirm_via_stdin` now prints the guardrail's reason and rule id,
+  `Block` requires the literal case-sensitive string `CONFIRM` via a new
+  pure `decide_approval(verdict, response)` function (a bare `y`/`yes`
+  does not satisfy it — proven by regression tests); (3) a new
+  `pub(crate) struct ApprovalGrant` with private fields and a private
+  `new()` — the type-level unforgeable-token piece from ROSA's design,
+  minted only after a genuine `true` from `self.confirm` and held in scope
+  through `tool.run()` for gated tools.
+  **What was deliberately NOT ported, and why:** no `RiskClass` taxonomy
+  (`ApprovalGrant` carries only the matched `GuardAction`, if any) — a
+  4-tier risk model would be new architecture for a gate that already has
+  exactly the tiers `GuardAction` provides (Block/Warn/Log); no operator
+  escalation UX ("held for operator decision") — `ion` is single-user, so
+  `CONFIRM` is the adapted equivalent, forcing deliberate action instead of
+  routing to a second party; no `ensure_grant_covers` dispatch-time
+  re-check — the grant is consumed immediately at the same call site it's
+  minted at (synchronous, not queued/async dispatch), so the TOCTOU
+  scenario `ensure_grant_covers` defends against doesn't arise here; `Gate`
+  is not threaded through `ReplTool::run`'s own signature (would require
+  reworking all 4 tools, including the two ungated read-only ones, for a
+  gate that's only meaningful for the 2 mutating ones).
+  **Still deferred, unchanged from before:** scanning the system prompt or
+  injected context (e.g. text a `file_read` pulled in) for danger *before*
+  the model ever decides to request a tool call — ROSA's "never lowering
+  the floor across every channel that reaches the agent" axis. This pass
+  only scans a tool call's own arguments at confirmation time, which does
+  not defend against the prompt-injection scenario described in the
+  original note (malicious instructions embedded in a file the model read,
+  then surfacing as an innocuous-looking `bash_exec` request whose command
+  text itself doesn't match a guardrail pattern). Closing that gap means
+  hooking into the chat loop's message construction — a materially larger
+  change than gating at the confirmation point, and still not
+  autonomously built.
+  **Known gap in the guardrail rule set itself (not this pass's scope):**
+  `guardrail::defaults::builtin_rules()` ships 9 rules, all targeting
+  `GuardTarget::Bash` — there is no built-in `GuardTarget::FileWrite` rule
+  (e.g. secret-shaped content detection) today, so `file_write` scanning is
+  wired correctly but won't match anything against the current defaults;
+  `chat.rs`'s regression tests prove the wiring with an equivalent custom
+  rule rather than a built-in one. Adding real FileWrite-targeted built-in
+  rules is a `src/guardrail/defaults.rs` change, out of scope for this pass
+  (which only consumes the guardrail module, per CLAUDE.md Principle #5).
 
 ### 2.4 CLI surface of the new binary
 
