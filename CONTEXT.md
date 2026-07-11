@@ -58,6 +58,14 @@ versioned protocol. The single coordination point for ops.
 - **Source of truth:** `impulse-rs/impulse-ops/src/lib.rs` (`DAEMON_PROTOCOL_VERSION`,
   `WorkbenchDaemonRequest` / response enums).
 
+### managed agent turn — `[code]`
+One exclusive, bounded use of the daemon's cached `ImpulseAgent`. A concurrent agent request gets
+a typed `Busy { resource: agent_turn, retry_after_ms }` response instead of queueing or forking
+state, so conversation history, recommendations, and pane summaries stay on one instance;
+cancelling a turn drops the guard without removing that instance from the cache.
+- **Source of truth:** `lock_agent_for_turn` and the agent handler call sites in
+  `impulse-rs/src/daemon/handlers.rs`; provider timeouts bound the turn itself.
+
 ### retrieval — `[code]`
 Finding past context: **FTS5 keyword search** + **semantic search** over session history and the
 genome. The retrieval backend is the natural deep-module boundary (see `embedding provider`).
@@ -97,6 +105,11 @@ The check that a session's claimed work actually holds before the session can cl
 
 ## Current state (update at session end)
 
+- **2026-07-11:** Daemon agent requests now use one cache-safe managed-agent turn instead of
+  checkout/checkin ownership transfer. Concurrent requests fail fast with typed Busy, cannot
+  double-initialize or overwrite session state, and never wait past their client lifetime;
+  gated-provider tests prove ordered retry history and recovery after task cancellation. The shared
+  `ProcessGroupGuard` also kills harness and `bash_exec` wrapper grandchildren on timeout or abort.
 - **2026-06-20:** CONTEXT.md created (keystone `project-context-glossary` artifact). Active branch at
   creation: `agent/codex-dioxus-host-goal-cleanup` (concurrent Codex work — file is additive/untracked).
 - **2026-06-25:** Reconciliation of duplicate codebases complete. The IMPULSE-rs.clean sibling checkout was relocated (mv) into the active tree's archive/ (_archived-IMPULSE-rs.clean-... and _archived-...-source); original path removed from active location (git worktree prune + ls confirm only canonical active checkout remains, prunable entry cleaned). Full contents of the duplicate (clean/crates/ with contracts + workspace pure types, etc.) archived inside canonical tree. Centralized pure AgentPlatformsReport + resolve_launch_command in impulse-ops drive status (text/json via envelope), List*Tools, and spawn. --format supported. Committed archive proof test. Vision language embedded. cargo run -- status (and --format json) output the indicators (claude-code, codex, multi-workspace).

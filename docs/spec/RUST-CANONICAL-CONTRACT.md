@@ -234,7 +234,7 @@ Daemon overlay rules:
 - Stop overlaying stale telemetry after 10 seconds.
 - Purge telemetry-only state after 60 seconds.
 
-### Daemon IPC Contract (PROTOCOL_VERSION = 2)
+### Daemon IPC Contract (PROTOCOL_VERSION = 3)
 
 The daemon exposes a JSON-line Unix socket protocol (`impulse.sock`). Full spec: [`docs/IPC-PROTOCOL.md`](../IPC-PROTOCOL.md).
 
@@ -351,7 +351,7 @@ When adding/changing CLI commands, hooks, state files, or roadmap stage definiti
 | Tooling | ≥2.0 | ~17.1 | MET |
 | Integration | Every stable CLI command | 26 tests | PARTIAL |
 
-**Workspace totals (2026-06-30):** 1,711 tests across the 4 workspace crates (impulse-rs 1381+26, ops 31, term 114, desktop 159).
+**Workspace totals (2026-07-11):** 1,889 tests across the 5 workspace crates/packages (impulse-rs 1,561, ops 32 including the canonical-checkout archive proof, term 114, desktop 159, ion 23); 7 ignored, 0 failed. Isolated worktrees without the gitignored reconciliation archive verify 1,888 passed with that one proof explicitly filtered.
 
 ### Required Test Patterns
 
