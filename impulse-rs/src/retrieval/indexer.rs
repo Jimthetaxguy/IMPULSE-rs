@@ -273,6 +273,7 @@ pub fn index_memory(
                             && !store
                                 .has_history_vec0(&id)
                                 .context("Failed to check history vec0 existence")?);
+                    let search_text = history_search_text(h);
 
                     if changed {
                         store
@@ -282,7 +283,6 @@ pub fn index_memory(
                             .context("Failed to serialize files_touched for history entry")?;
                         let tools_json = serde_json::to_string(&h.tools_used)
                             .context("Failed to serialize tools_used for history entry")?;
-                        let search_text = history_search_text(h);
                         store
                             .upsert_history(HistoryUpsert {
                                 session_id: &id,
@@ -303,7 +303,7 @@ pub fn index_memory(
                         && config.retrieval_backend == "fts+vec"
                         && (changed || vector_missing)
                     {
-                        history_embed_jobs.push((id.clone(), history_search_text(h)));
+                        history_embed_jobs.push((id.clone(), search_text));
                     }
 
                     history_seen.insert(id);
@@ -334,6 +334,7 @@ pub fn index_memory(
                             && !store
                                 .has_genome_vec0(&id)
                                 .context("Failed to check genome vec0 existence")?);
+                    let search_text = genome_search_text(d);
 
                     if changed {
                         store
@@ -341,7 +342,6 @@ pub fn index_memory(
                             .context("Failed to delete stale genome vector")?;
                         let tags_json = serde_json::to_string(&d.tags)
                             .context("Failed to serialize tags for genome decision")?;
-                        let search_text = genome_search_text(d);
                         store
                             .upsert_genome(GenomeUpsert {
                                 decision_id: &id,
@@ -359,7 +359,7 @@ pub fn index_memory(
                         && config.retrieval_backend == "fts+vec"
                         && (changed || vector_missing)
                     {
-                        genome_embed_jobs.push((id.clone(), genome_search_text(d)));
+                        genome_embed_jobs.push((id.clone(), search_text));
                     }
 
                     genome_seen.insert(id);
@@ -502,6 +502,7 @@ pub fn index_memory_from_storage(
                                 && !store
                                     .has_history_vec0(&id)
                                     .context("Failed to check history vec0 existence")?);
+                        let search_text = history_search_text(&h);
 
                         if changed {
                             store
@@ -511,7 +512,6 @@ pub fn index_memory_from_storage(
                                 .context("Failed to serialize files_touched for history entry")?;
                             let tools_json = serde_json::to_string(&h.tools_used)
                                 .context("Failed to serialize tools_used for history entry")?;
-                            let search_text = history_search_text(&h);
                             store
                                 .upsert_history(HistoryUpsert {
                                     session_id: &id,
@@ -532,7 +532,7 @@ pub fn index_memory_from_storage(
                             && config.retrieval_backend == "fts+vec"
                             && (changed || vector_missing)
                         {
-                            history_embed_jobs.push((id.clone(), history_search_text(&h)));
+                            history_embed_jobs.push((id.clone(), search_text));
                         }
 
                         history_seen.insert(id);
@@ -568,6 +568,7 @@ pub fn index_memory_from_storage(
                             && !store
                                 .has_genome_vec0(&id)
                                 .context("Failed to check genome vec0 existence")?);
+                    let search_text = genome_search_text(d);
 
                     if changed {
                         store
@@ -575,7 +576,6 @@ pub fn index_memory_from_storage(
                             .context("Failed to delete stale genome vector")?;
                         let tags_json = serde_json::to_string(&d.tags)
                             .context("Failed to serialize tags for genome decision")?;
-                        let search_text = genome_search_text(d);
                         store
                             .upsert_genome(GenomeUpsert {
                                 decision_id: &id,
@@ -593,7 +593,7 @@ pub fn index_memory_from_storage(
                         && config.retrieval_backend == "fts+vec"
                         && (changed || vector_missing)
                     {
-                        genome_embed_jobs.push((id.clone(), genome_search_text(d)));
+                        genome_embed_jobs.push((id.clone(), search_text));
                     }
 
                     genome_seen.insert(id);
