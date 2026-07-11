@@ -11,5 +11,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 dirs = "6"
+uuid = { version = "1", features = ["v4"] }
+# Facade-only (no runtime cost without a subscriber); matches the main crate's
+# tracing pin. Used to surface captured child-process stderr without writing
+# to the parent's stderr (which would corrupt a future TUI).
+tracing = "0.1"
 
 [dev-dependencies]
