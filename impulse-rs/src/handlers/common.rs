@@ -257,6 +257,7 @@ pub(crate) fn tool_capabilities(allow_all_capabilities: bool) -> HashSet<tooling
             Capability::Network,
             Capability::PythonExec,
             Capability::SystemInfo,
+            Capability::ShellExec,
         ]
         .into_iter()
         .collect()
@@ -745,14 +746,15 @@ mod tests {
     // ── tool_capabilities ─────────────────────────────────────────────────
 
     #[test]
-    fn test_tool_capabilities_allow_all_returns_five_caps() {
+    fn test_tool_capabilities_allow_all_returns_six_caps() {
         let caps = tool_capabilities(true);
-        assert_eq!(caps.len(), 5);
+        assert_eq!(caps.len(), 6);
         assert!(caps.contains(&tooling::Capability::FileSystemRead));
         assert!(caps.contains(&tooling::Capability::FileSystemWrite));
         assert!(caps.contains(&tooling::Capability::Network));
         assert!(caps.contains(&tooling::Capability::PythonExec));
         assert!(caps.contains(&tooling::Capability::SystemInfo));
+        assert!(caps.contains(&tooling::Capability::ShellExec));
     }
 
     #[test]
@@ -1035,7 +1037,7 @@ mod tests {
             None,
         );
         assert!(ctx.session_id.is_none());
-        assert_eq!(ctx.allowed_capabilities.len(), 5);
+        assert_eq!(ctx.allowed_capabilities.len(), 6);
     }
 
     // ── build_tool_registry ───────────────────────────────────────────────

@@ -43,6 +43,8 @@ pub mod semantic_diff;
 pub mod state;
 pub mod stewardship;
 pub mod storage;
+#[cfg(test)]
+mod test_support;
 pub mod tooling;
 pub mod tools;
 pub mod ui;

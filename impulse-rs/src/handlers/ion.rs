@@ -129,20 +129,35 @@ pub async fn handle_ion_verify(
 }
 
 fn print_response_text(response: &impulse_ion::HarnessResponse) {
-    println!("Ion gate verdict: {:?}", response.verdict);
+    println!("{}", format_response_text(response));
+}
+
+/// Pure formatting of a `HarnessResponse` verdict/findings/commands-run into
+/// the same human-readable text `handle_ion_verify` prints (TUI_SPEC.md T7:
+/// extracted so `ion_repl::tool_verify`'s `ion_verify` `ReplTool` can render
+/// the identical transcript text without duplicating this logic or shelling
+/// back out to the CLI print path).
+pub(crate) fn format_response_text(response: &impulse_ion::HarnessResponse) -> String {
+    let mut out = format!("Ion gate verdict: {:?}\n", response.verdict);
     if response.findings.is_empty() {
-        println!("No findings.");
+        out.push_str("No findings.");
     } else {
+        let mut lines = Vec::with_capacity(response.findings.len());
         for finding in &response.findings {
-            println!(
+            lines.push(format!(
                 "  [{:?}] {}:{} ({}) — {}",
                 finding.severity, finding.file, finding.line, finding.category, finding.message
-            );
+            ));
         }
+        out.push_str(&lines.join("\n"));
     }
     for run in &response.commands_run {
-        println!("  ran: {} (exit {})", run.command, run.exit_code);
+        out.push_str(&format!(
+            "\n  ran: {} (exit {})",
+            run.command, run.exit_code
+        ));
     }
+    out
 }
 
 #[cfg(test)]
@@ -151,16 +166,15 @@ mod tests {
     use impulse_ion::pi_adapter::ION_GATE_LAUNCHER_ENV;
     use impulse_ion::{CommandRun, Finding, HarnessResponse, Metrics, Severity, Verdict};
 
-    /// Serializes tests that mutate the process-global `ION_GATE_LAUNCHER` env
-    /// var, since `cargo test` runs unit tests in the same process on
-    /// multiple threads by default. Mirrors the identical helper in
-    /// `impulse-ion/src/pi_adapter.rs`'s own env-override tests (T2).
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
+    /// Serializes tests that mutate the process-global `ION_GATE_LAUNCHER`
+    /// env var, since `cargo test` runs unit tests in the same process on
+    /// multiple threads by default. Shared across every module in this
+    /// crate that touches this env var (`ion_repl`, `ion_repl::tool_verify`)
+    /// via `crate::test_support` — TUI_SPEC.md T7 found that per-file
+    /// `static ENV_LOCK`s do NOT serialize across files in the same test
+    /// binary, which silently reintroduced the exact race this lock exists
+    /// to prevent.
+    use crate::test_support::ion_gate_launcher_env_lock as env_lock;
 
     /// Creates a throwaway git repo with one empty commit, so `diff_ref`
     /// values like `HEAD` resolve via `git rev-parse`.
@@ -392,5 +406,25 @@ mod tests {
         response.findings.clear();
         print_response_text(&response);
         assert!(response.findings.is_empty());
+    }
+
+    /// T7: `ion_repl::tool_verify`'s `ion_verify` ReplTool renders this exact
+    /// text into the REPL transcript, so it must contain the verdict and
+    /// each finding's file/line/message — not just "does not panic".
+    #[test]
+    fn format_response_text_includes_verdict_and_findings() {
+        let text = format_response_text(&passing_response());
+        assert!(text.contains("Approve"));
+        assert!(text.contains("src/lib.rs:1"));
+        assert!(text.contains("looks fine"));
+        assert!(text.contains("ran: cargo test (exit 0)"));
+    }
+
+    #[test]
+    fn format_response_text_reports_no_findings_when_empty() {
+        let mut response = passing_response();
+        response.findings.clear();
+        let text = format_response_text(&response);
+        assert!(text.contains("No findings."));
     }
 }

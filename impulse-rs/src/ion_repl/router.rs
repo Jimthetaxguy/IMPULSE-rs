@@ -19,6 +19,9 @@ pub enum SlashCommand {
     Quit,
     Clear,
     Verify(Vec<String>),
+    /// `/tools` -- list the tools registered in the REPL's `ReplToolRegistry`
+    /// (TUI_SPEC.md T7).
+    Tools,
 }
 
 /// The result of routing one line of input.
@@ -38,7 +41,7 @@ pub enum RouterOutcome {
 
 /// Slash commands recognized by [`route`], used to render `/help` and the
 /// unknown-command message so the two never drift out of sync.
-pub const KNOWN_COMMANDS: &[&str] = &["/help", "/quit", "/clear", "/verify"];
+pub const KNOWN_COMMANDS: &[&str] = &["/help", "/quit", "/clear", "/verify", "/tools"];
 
 /// Route one line of raw input. Never reads stdin itself — the caller owns
 /// the readline loop.
@@ -61,6 +64,7 @@ pub fn route(line: &str) -> RouterOutcome {
             "quit" => RouterOutcome::Command(SlashCommand::Quit),
             "clear" => RouterOutcome::Command(SlashCommand::Clear),
             "verify" => RouterOutcome::Command(SlashCommand::Verify(args)),
+            "tools" => RouterOutcome::Command(SlashCommand::Tools),
             other => RouterOutcome::UnknownCommand(other.to_string()),
         };
     }
@@ -218,6 +222,14 @@ mod tests {
 
     #[test]
     fn test_known_commands_lists_all_slash_commands() {
-        assert_eq!(KNOWN_COMMANDS, &["/help", "/quit", "/clear", "/verify"]);
+        assert_eq!(
+            KNOWN_COMMANDS,
+            &["/help", "/quit", "/clear", "/verify", "/tools"]
+        );
+    }
+
+    #[test]
+    fn test_route_tools_returns_tools_command() {
+        assert_eq!(route("/tools"), RouterOutcome::Command(SlashCommand::Tools));
     }
 }

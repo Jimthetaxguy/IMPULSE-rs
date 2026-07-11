@@ -59,6 +59,13 @@ pub enum Capability {
     Network,
     PythonExec,
     SystemInfo,
+    /// Run an arbitrary shell command as a child process. Separate from
+    /// `FileSystemWrite` because a shell command's effects are not limited to
+    /// path-scoped file writes (network, process spawn, etc.) — kept as its
+    /// own deny-by-default capability so a tool that only needs file I/O
+    /// never implicitly gets shell access (TUI_SPEC.md T7: `bash_exec`
+    /// ReplTool bridge).
+    ShellExec,
 }
 
 impl Capability {
@@ -69,6 +76,7 @@ impl Capability {
             Capability::Network => "network",
             Capability::PythonExec => "python_exec",
             Capability::SystemInfo => "system_info",
+            Capability::ShellExec => "shell_exec",
         }
     }
 }
@@ -291,6 +299,7 @@ impl ToolContext {
                 Capability::Network,
                 Capability::PythonExec,
                 Capability::SystemInfo,
+                Capability::ShellExec,
             ]
             .into_iter()
             .collect(),
@@ -449,6 +458,7 @@ mod tests {
         assert!(ctx.has_capability(Capability::Network));
         assert!(ctx.has_capability(Capability::PythonExec));
         assert!(ctx.has_capability(Capability::SystemInfo));
+        assert!(ctx.has_capability(Capability::ShellExec));
         assert!(ctx.allowed_read_roots.is_empty());
         assert!(ctx.allowed_write_roots.is_empty());
     }

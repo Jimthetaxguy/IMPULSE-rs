@@ -38,7 +38,7 @@ enum IonCommand {
 async fn main() -> Result<()> {
     let cli = IonCli::parse();
     match cli.command {
-        None => impulse_rs::ion_repl::run(),
+        None => impulse_rs::ion_repl::run().await,
         Some(IonCommand::Verify {
             repo,
             diff_ref,

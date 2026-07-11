@@ -1,42 +1,48 @@
-//! Ion REPL core (TUI_SPEC.md T6): readline loop -> route -> render.
+//! Ion REPL core (TUI_SPEC.md T6/T7): readline loop -> route -> render.
 //!
 //! [`ReplSession::run`] owns the interactive loop: read a line via
-//! `rustyline`, route it through [`router::route`], and print the rendered
-//! response. Chat turns (T8) and tool-calling (T7/T9) are intentionally
-//! stubbed here — this module wires the deterministic slash-command surface
-//! (`/help`, `/quit`, `/clear`, unknown-command) plus history persistence at
-//! `.impulse/ion_history` (`history.rs`, `IMPULSE_HOME`-aware).
+//! `rustyline`, route it through [`router::route`], dispatch through the
+//! [`registry::ReplToolRegistry`] when the command names a tool, and print
+//! the rendered response. Chat turns (T8) and LLM tool-calling (T9) are
+//! still stubbed here — this module wires the deterministic slash-command
+//! surface (`/help`, `/quit`, `/clear`, `/verify`, `/tools`,
+//! unknown-command) plus history persistence at `.impulse/ion_history`
+//! (`history.rs`, `IMPULSE_HOME`-aware).
 
 pub mod history;
+pub mod registry;
 pub mod router;
+pub mod tool_bridge;
+pub mod tool_verify;
 pub mod tools;
 
 use anyhow::Result;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
+use registry::ReplToolRegistry;
 use router::{RouterOutcome, SlashCommand};
 
 const PROMPT: &str = "ion \u{276f} ";
 
 /// Per-session state handed to `ReplTool::run` (T7) and, later, the chat
-/// backend (T8). Only `repo_root` is populated in T6; kept as a struct (not
-/// inlined args) so future fields (tool registry, `ChatSession`, transcript)
-/// are additive per TUI_SPEC.md section 2.3.
+/// backend (T8). Only `repo_root` is populated so far; kept as a struct
+/// (not inlined args) so future fields (`ChatSession`, transcript) are
+/// additive per TUI_SPEC.md section 2.3.
 #[derive(Debug, Default, Clone)]
 pub struct ReplContext {
-    /// Directory the REPL was launched from. Future `ReplTool`s (T7) use
-    /// this as the default `--repo` for gate calls.
+    /// Directory the REPL was launched from. `ReplTool`s (T7, e.g.
+    /// `ion_verify`) use this as the default `--repo` for gate calls.
     pub repo_root: std::path::PathBuf,
 }
 
-/// Owns the readline editor, history path, and REPL context for one
-/// interactive session.
+/// Owns the readline editor, history path, tool registry, and REPL context
+/// for one interactive session.
 pub struct ReplSession {
     editor: DefaultEditor,
     history_path: std::path::PathBuf,
-    #[allow(dead_code)] // dead_code: consumed by T7 (ReplTool dispatch) / T8 (ChatSession)
     context: ReplContext,
+    tools: ReplToolRegistry,
 }
 
 impl ReplSession {
@@ -57,6 +63,7 @@ impl ReplSession {
             editor,
             history_path,
             context: ReplContext { repo_root },
+            tools: ReplToolRegistry::with_defaults(),
         })
     }
 
@@ -64,12 +71,12 @@ impl ReplSession {
     /// current line only (TUI_SPEC.md section 2.1) and re-prompts. Always
     /// attempts a history save on the way out, even after an editor error,
     /// so a session isn't lost by one bad readline call.
-    pub fn run(&mut self) -> Result<()> {
+    pub async fn run(&mut self) -> Result<()> {
         loop {
             match self.editor.readline(PROMPT) {
                 Ok(line) => {
                     let _ = self.editor.add_history_entry(line.as_str());
-                    if self.handle_line(&line) {
+                    if self.handle_line(&line).await {
                         break;
                     }
                 }
@@ -98,8 +105,8 @@ impl ReplSession {
 
     /// Routes and renders one line of input. Returns `true` if the session
     /// should exit.
-    fn handle_line(&mut self, line: &str) -> bool {
-        let (text, should_exit) = respond(router::route(line));
+    async fn handle_line(&mut self, line: &str) -> bool {
+        let (text, should_exit) = respond(router::route(line), &self.tools, &self.context).await;
         if !text.is_empty() {
             println!("{text}");
         }
@@ -107,26 +114,29 @@ impl ReplSession {
     }
 }
 
-/// Pure rendering step: given a routed outcome, returns the text to print
-/// and whether the session should exit. Kept separate from
+/// Pure-ish rendering step: given a routed outcome, returns the text to
+/// print and whether the session should exit. Kept separate from
 /// `ReplSession::handle_line` so it is unit-testable without constructing a
-/// `rustyline::Editor`.
-fn respond(outcome: RouterOutcome) -> (String, bool) {
+/// `rustyline::Editor` (tools/registry are passed in explicitly).
+async fn respond(
+    outcome: RouterOutcome,
+    tools: &ReplToolRegistry,
+    ctx: &ReplContext,
+) -> (String, bool) {
     match outcome {
         RouterOutcome::Empty => (String::new(), false),
-        RouterOutcome::Command(SlashCommand::Help) => (help_text(), false),
+        RouterOutcome::Command(SlashCommand::Help) => (help_text(tools), false),
         RouterOutcome::Command(SlashCommand::Quit) => ("Goodbye.".to_string(), true),
         RouterOutcome::Command(SlashCommand::Clear) => (
             "Nothing to clear yet -- chat history isn't wired up (TUI_SPEC.md T8 adds it)."
                 .to_string(),
             false,
         ),
-        RouterOutcome::Command(SlashCommand::Verify(_args)) => (
-            "`/verify` isn't wired up in the REPL yet -- run `ion verify` from the shell for now \
-             (TUI_SPEC.md T7 wires it in as a ReplTool)."
-                .to_string(),
+        RouterOutcome::Command(SlashCommand::Verify(args)) => (
+            run_tool_command(tools, "ion_verify", verify_args_to_json(&args), ctx).await,
             false,
         ),
+        RouterOutcome::Command(SlashCommand::Tools) => (tools_text(tools), false),
         RouterOutcome::UnknownCommand(name) => (
             format!(
                 "Unknown command: /{name}. Available: {}",
@@ -135,82 +145,274 @@ fn respond(outcome: RouterOutcome) -> (String, bool) {
             false,
         ),
         RouterOutcome::ChatTurn(_text) => (
-            "Chat isn't wired up yet -- try /verify or /help (TUI_SPEC.md T8 adds chat)."
+            "Chat isn't wired up yet -- try /verify, /tools, or /help (TUI_SPEC.md T8 adds chat)."
                 .to_string(),
             false,
         ),
     }
 }
 
-fn help_text() -> String {
-    [
-        "Available commands:",
-        "  /help    Show this message",
-        "  /verify  (stub) run the Ion verification gate -- wired up in T7",
-        "  /clear   (stub) clear chat history -- wired up in T8",
-        "  /quit    Exit the REPL (Ctrl-D also works)",
-    ]
-    .join("\n")
+/// Dispatches `tool_name` through `tools` with `args`, rendering either the
+/// tool's own `ToolOutcome::rendered` text or an error message. Shared by
+/// every slash command that maps 1:1 onto a `ReplTool` (currently only
+/// `/verify` -> `ion_verify`; future gate/tool commands reuse this).
+async fn run_tool_command(
+    tools: &ReplToolRegistry,
+    tool_name: &str,
+    args: serde_json::Value,
+    ctx: &ReplContext,
+) -> String {
+    match tools.get(tool_name) {
+        Some(tool) => match tool.run(args, ctx).await {
+            Ok(outcome) => outcome.rendered,
+            Err(err) => format!("{tool_name} failed: {err:#}"),
+        },
+        None => format!("Tool '{tool_name}' is not registered."),
+    }
+}
+
+/// Parses `/verify [--repo P] [--diff-ref R] [description...]` tokens
+/// (already shell-split by `router::split_args`) into the `ion_verify`
+/// ReplTool's JSON args shape.
+fn verify_args_to_json(args: &[String]) -> serde_json::Value {
+    let mut repo = None;
+    let mut diff_ref = None;
+    let mut description_parts = Vec::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--repo" if i + 1 < args.len() => {
+                repo = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--diff-ref" if i + 1 < args.len() => {
+                diff_ref = Some(args[i + 1].clone());
+                i += 2;
+            }
+            other => {
+                description_parts.push(other.to_string());
+                i += 1;
+            }
+        }
+    }
+
+    let mut obj = serde_json::Map::new();
+    if let Some(repo) = repo {
+        obj.insert("repo".to_string(), serde_json::Value::String(repo));
+    }
+    if let Some(diff_ref) = diff_ref {
+        obj.insert("diff_ref".to_string(), serde_json::Value::String(diff_ref));
+    }
+    if !description_parts.is_empty() {
+        obj.insert(
+            "description".to_string(),
+            serde_json::Value::String(description_parts.join(" ")),
+        );
+    }
+    serde_json::Value::Object(obj)
+}
+
+fn tools_text(tools: &ReplToolRegistry) -> String {
+    let mut lines = vec!["Available tools:".to_string()];
+    for tool in tools.list() {
+        lines.push(format!("  {}: {}", tool.name(), tool.usage()));
+    }
+    lines.join("\n")
+}
+
+fn help_text(tools: &ReplToolRegistry) -> String {
+    let mut lines = vec![
+        "Available commands:".to_string(),
+        "  /help    Show this message".to_string(),
+        "  /verify  Run the Ion verification gate (ion_verify ReplTool)".to_string(),
+        "  /tools   List available ReplTools".to_string(),
+        "  /clear   (stub) clear chat history -- wired up in T8".to_string(),
+        "  /quit    Exit the REPL (Ctrl-D also works)".to_string(),
+    ];
+    if !tools.is_empty() {
+        lines.push(String::new());
+        lines.push(tools_text(tools));
+    }
+    lines.join("\n")
 }
 
 /// Prints the startup banner, then hands off to the readline loop. Entry
 /// point called from `src/bin/ion.rs` for a bare `ion` invocation.
-pub fn run() -> Result<()> {
+pub async fn run() -> Result<()> {
     println!(
         "ion {} \u{2014} Ion interactive harness. Type /help for commands, /quit or Ctrl-D to exit.",
         env!("CARGO_PKG_VERSION")
     );
-    ReplSession::new()?.run()
+    ReplSession::new()?.run().await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_respond_empty_returns_no_text_and_does_not_exit() {
-        let (text, should_exit) = respond(RouterOutcome::Empty);
+    /// Serializes tests that mutate the process-global `ION_GATE_LAUNCHER`
+    /// env var, shared with `handlers::ion` and `tool_verify` via
+    /// `crate::test_support` (see that module's doc comment for why a
+    /// per-file lock is insufficient).
+    use crate::test_support::ion_gate_launcher_env_lock as env_lock;
+
+    fn init_git_repo() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().expect("failed to create tempdir");
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .status()
+                .expect("failed to run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init", "--quiet"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        run(&["commit", "--allow-empty", "--quiet", "-m", "init"]);
+        dir
+    }
+
+    #[tokio::test]
+    async fn test_respond_empty_returns_no_text_and_does_not_exit() {
+        let tools = ReplToolRegistry::with_defaults();
+        let ctx = ReplContext::default();
+        let (text, should_exit) = respond(RouterOutcome::Empty, &tools, &ctx).await;
         assert_eq!(text, "");
         assert!(!should_exit);
     }
 
-    #[test]
-    fn test_respond_help_lists_all_known_commands() {
-        let (text, should_exit) = respond(RouterOutcome::Command(SlashCommand::Help));
+    #[tokio::test]
+    async fn test_respond_help_lists_all_known_commands_and_tools() {
+        let tools = ReplToolRegistry::with_defaults();
+        let ctx = ReplContext::default();
+        let (text, should_exit) =
+            respond(RouterOutcome::Command(SlashCommand::Help), &tools, &ctx).await;
         assert!(!should_exit);
         for cmd in router::KNOWN_COMMANDS {
             assert!(text.contains(cmd), "help text missing {cmd}: {text}");
         }
+        for tool in tools.list() {
+            assert!(
+                text.contains(tool.name()),
+                "help text missing tool {}: {text}",
+                tool.name()
+            );
+        }
     }
 
-    #[test]
-    fn test_respond_quit_says_goodbye_and_exits() {
-        let (text, should_exit) = respond(RouterOutcome::Command(SlashCommand::Quit));
+    #[tokio::test]
+    async fn test_respond_quit_says_goodbye_and_exits() {
+        let tools = ReplToolRegistry::with_defaults();
+        let ctx = ReplContext::default();
+        let (text, should_exit) =
+            respond(RouterOutcome::Command(SlashCommand::Quit), &tools, &ctx).await;
         assert_eq!(text, "Goodbye.");
         assert!(should_exit);
     }
 
-    #[test]
-    fn test_respond_clear_is_a_placeholder_and_does_not_exit() {
-        let (text, should_exit) = respond(RouterOutcome::Command(SlashCommand::Clear));
+    #[tokio::test]
+    async fn test_respond_clear_is_a_placeholder_and_does_not_exit() {
+        let tools = ReplToolRegistry::with_defaults();
+        let ctx = ReplContext::default();
+        let (text, should_exit) =
+            respond(RouterOutcome::Command(SlashCommand::Clear), &tools, &ctx).await;
         assert!(text.to_lowercase().contains("nothing to clear"));
         assert!(!should_exit);
     }
 
-    #[test]
-    fn test_respond_verify_is_a_stub_and_does_not_exit() {
-        let (text, should_exit) = respond(RouterOutcome::Command(SlashCommand::Verify(vec![
-            "--repo".to_string(),
-            ".".to_string(),
-        ])));
-        assert!(text.contains("/verify"));
-        assert!(text.to_lowercase().contains("isn't wired up"));
+    #[tokio::test]
+    async fn test_respond_tools_lists_registered_tools() {
+        let tools = ReplToolRegistry::with_defaults();
+        let ctx = ReplContext::default();
+        let (text, should_exit) =
+            respond(RouterOutcome::Command(SlashCommand::Tools), &tools, &ctx).await;
         assert!(!should_exit);
+        assert!(text.contains("ion_verify"));
+        assert!(text.contains("file_read"));
+        assert!(text.contains("file_write"));
+        assert!(text.contains("bash_exec"));
+    }
+
+    #[tokio::test]
+    async fn test_respond_verify_runs_ion_verify_tool_against_stub_gate() {
+        let _guard = env_lock();
+        let repo = init_git_repo();
+        let stub_gate = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fakes/ion-verify-stub-gate.sh");
+        std::env::set_var(impulse_ion::pi_adapter::ION_GATE_LAUNCHER_ENV, &stub_gate);
+
+        let tools = ReplToolRegistry::with_defaults();
+        let ctx = ReplContext {
+            repo_root: repo.path().to_path_buf(),
+        };
+        let (text, should_exit) = respond(
+            RouterOutcome::Command(SlashCommand::Verify(vec![
+                "--diff-ref".to_string(),
+                "HEAD".to_string(),
+            ])),
+            &tools,
+            &ctx,
+        )
+        .await;
+
+        std::env::remove_var(impulse_ion::pi_adapter::ION_GATE_LAUNCHER_ENV);
+
+        assert!(!should_exit);
+        assert!(
+            text.contains("Approve"),
+            "unexpected /verify output: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_respond_verify_reports_error_for_unregistered_tool() {
+        let tools = ReplToolRegistry::new(); // deliberately empty
+        let ctx = ReplContext::default();
+        let (text, should_exit) = respond(
+            RouterOutcome::Command(SlashCommand::Verify(Vec::new())),
+            &tools,
+            &ctx,
+        )
+        .await;
+        assert!(!should_exit);
+        assert!(text.contains("not registered"));
     }
 
     #[test]
-    fn test_respond_unknown_command_lists_known_commands() {
-        let (text, should_exit) = respond(RouterOutcome::UnknownCommand("frobnicate".to_string()));
+    fn test_verify_args_to_json_parses_repo_diff_ref_and_description() {
+        let json = verify_args_to_json(&[
+            "--repo".to_string(),
+            "/tmp/foo".to_string(),
+            "--diff-ref".to_string(),
+            "HEAD~1..HEAD".to_string(),
+            "fix".to_string(),
+            "the".to_string(),
+            "thing".to_string(),
+        ]);
+        assert_eq!(json["repo"], "/tmp/foo");
+        assert_eq!(json["diff_ref"], "HEAD~1..HEAD");
+        assert_eq!(json["description"], "fix the thing");
+    }
+
+    #[test]
+    fn test_verify_args_to_json_empty_args_yields_empty_object() {
+        let json = verify_args_to_json(&[]);
+        assert_eq!(json, serde_json::json!({}));
+    }
+
+    #[tokio::test]
+    async fn test_respond_unknown_command_lists_known_commands() {
+        let tools = ReplToolRegistry::with_defaults();
+        let ctx = ReplContext::default();
+        let (text, should_exit) = respond(
+            RouterOutcome::UnknownCommand("frobnicate".to_string()),
+            &tools,
+            &ctx,
+        )
+        .await;
         assert!(text.contains("/frobnicate"));
         for cmd in router::KNOWN_COMMANDS {
             assert!(
@@ -221,9 +423,12 @@ mod tests {
         assert!(!should_exit);
     }
 
-    #[test]
-    fn test_respond_chat_turn_is_a_stub_and_does_not_exit() {
-        let (text, should_exit) = respond(RouterOutcome::ChatTurn("hello".to_string()));
+    #[tokio::test]
+    async fn test_respond_chat_turn_is_a_stub_and_does_not_exit() {
+        let tools = ReplToolRegistry::with_defaults();
+        let ctx = ReplContext::default();
+        let (text, should_exit) =
+            respond(RouterOutcome::ChatTurn("hello".to_string()), &tools, &ctx).await;
         assert!(text.to_lowercase().contains("chat isn't wired up"));
         assert!(!should_exit);
     }
