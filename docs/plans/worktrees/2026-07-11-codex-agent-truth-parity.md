@@ -22,11 +22,12 @@ tags: [worktree, lane, daemon, telemetry, agents, coordination]
   - `docs/plans/worktrees/2026-07-11-codex-agent-truth-parity.md`
   - `_working-files/20260711-050350-codex-agent-truth-parity.md`
 - Blocked/shared paths:
-  - Claude's active Ion T6 files: `impulse-rs/Cargo.toml`, `impulse-rs/Cargo.lock`, `impulse-rs/src/bin/ion.rs`, `impulse-rs/src/lib.rs`, `impulse-rs/src/ion_repl/`, and `impulse-rs/impulse-ion/TUI_SPEC.md`.
+  - Claude's Ion T1-T9, env-scrub, ApprovalGrant, and FileWrite guardrail work is now committed through `a5184e2`; those paths remain outside this lane.
+  - Claude's current daemon-agent timeout/cache work under `impulse-rs/src/{agent,daemon,error,mcp}` is an active semantic neighbor and must stabilize before merge.
   - `AGENTS.md`, `CLAUDE.md`, `CONTEXT.md`, the canonical contract, protocol docs, and docs indexes remain integration-owned shared files.
 - Plan/spec: `docs/spec/USER-STORY-MAP.md` ST-13 and `docs/spec/TEST-TRACEABILITY.md` agent-control gap.
 - Verification: `cargo test -p impulse-rs ops_workbench`, then `cargo check --workspace`, `cargo test --workspace`, `cargo clippy --workspace -- -D warnings`, and `cargo fmt --check` from `impulse-rs/`.
-- Latest status: implementation and three review loops complete; branch is ready for integration after Claude hands off its active Ion T7 lane on `main`.
+- Latest status: forward-ported onto live `main` at `a5184e2` as `dbac22f`; verification is green, but merge waits for Claude's active daemon-agent concurrency lane to stabilize.
 
 ## Goal and User-Visible Outcome
 Preserve blocked/working status, role/group, tool activity, diff summary, and machine target when a live terminal agent overlays its durable daemon session. The Agents surface can then render and act on one authoritative state instead of reconstructing missing facts.
@@ -62,13 +63,14 @@ Preserve blocked/working status, role/group, tool activity, diff summary, and ma
 - PASS: `cargo clippy --workspace -- -D warnings`.
 - PASS: `cargo fmt --all -- --check` and `git diff --check`.
 - PASS: `cargo test --workspace -- --skip test_reconciled_clean_archive_has_contracts_snapshot` — all runnable workspace tests passed; the skipped proof test is worktree-hostile because its required gitignored archive exists only in the canonical checkout.
-- KNOWN EXTERNAL BLOCKER: unskipped `cargo test --workspace` has exactly one failure, `impulse_ops::agent_registry::test_reconciled_clean_archive_has_contracts_snapshot`, for that absent worktree archive fixture.
-- KNOWN EXTERNAL BLOCKER: `cargo clippy --workspace --all-targets -- -D warnings` reaches four pre-existing `await_holding_lock` warnings in Claude-owned `src/handlers/ion.rs` tests. Normal workspace Clippy is green.
+- KNOWN EXTERNAL BLOCKER: unskipped `cargo test --workspace` has exactly one failure, `agent_registry::tests::test_reconciled_clean_archive_has_contracts_snapshot`, for that absent worktree archive fixture.
+- PASS on the live forward-port: `cargo clippy --workspace --all-targets -- -D warnings`; the four historical Ion test warnings no longer reproduce on `a5184e2` plus `dbac22f`/`ae8fcd0`.
 - KNOWN EXTERNAL BLOCKER: `python3 docs/validate_docs.py --contract` reports 17 pre-existing documents older than the 120-day threshold; none is owned by this lane.
 - KNOWN EXTERNAL BLOCKER: `python3 docs/validate_docs.py --all` additionally reports unrelated `research/2026-06-30-sites-map-phase1-spec.md` status `approved-for-planning` outside the allowed vocabulary. The new lane card itself validates.
 - REVIEW: final local architecture review returned `NO_FINDINGS`; MiniMax-M2.7 found the empty `working:` / `blocked:` inverse edge, which is fixed and covered.
 
 ## Handoff Notes
-- Claude Code now owns active Ion T7/tooling work on `main`; do not cherry-pick or merge this branch until that dirty lane is clean or handed off.
-- Integration step: rebase `codex/agent-truth-parity` onto the latest clean `main`, rerun the focused tests plus workspace check/Clippy, then merge or cherry-pick the lane commit.
-- Next product dependency after integration: publish Dioxus `DesktopRuntime` snapshots as `TerminalOpsReport` and subscribe the desktop host to daemon `ProjectOpsSnapshot`; `OpsUpdate` currently has no production Dioxus producer.
+- Forward-port branch: `codex/live-daemon-truth-integration`; commit `dbac22f` preserves this lane before `ae8fcd0` adds desktop publication/subscription.
+- Do not merge while Claude's daemon-agent cache work is dirty. Its current `checkout_agent`/`checkin_agent` design needs explicit serialization or Busy semantics so concurrent requests cannot create two cached agents and lose one history.
+- After Claude commits a concurrency-safe lane, rebase the forward-port onto that clean tip and rerun the focused tests plus workspace check, Clippy, and the complete runnable suite.
+- The Dioxus publication/subscription dependency is implemented by the stacked daemon-truth commit; the next manager dependency is safe daemon-approved control plus multi-workspace daemon routing.

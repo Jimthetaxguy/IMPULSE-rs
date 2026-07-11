@@ -16,7 +16,8 @@ tags: [worktree, dioxus, daemon, telemetry, agent-manager]
 
 - Owner: Codex (`codex/desktop-daemon-truth-wire`)
 - Worktree: `.worktrees/desktop-daemon-truth-wire`
-- Base: `main` at `c35309e`, stacked with the reviewed truth-preserving overlay as `351b820`.
+- Original base: `main` at `c35309e`, stacked with truth-preserving overlay `351b820`.
+- Live forward-port: `a5184e2` with equivalent commits `dbac22f` then `ae8fcd0` on `codex/live-daemon-truth-integration`.
 - Goal: turn desktop PTY state into daemon telemetry input and feed the daemon's
   reconciled snapshot back to Dioxus as `ops_update`.
 - Owned paths:
@@ -25,8 +26,8 @@ tags: [worktree, dioxus, daemon, telemetry, agent-manager]
   - a real daemon-handler reconciliation regression in `impulse-rs/src/daemon/tests.rs`
   - a timestamp helper in `impulse-ops` if needed without adding dependencies
   - this card, this lane's working note, and narrow stable-vocabulary docs
-- Blocked/shared paths: Claude's active Ion files, `CLAUDE.md`, Cargo manifests, and
-  root daemon handler/protocol implementations (already complete and tested).
+- Blocked/shared paths: Claude's Ion/guardrail files, `CLAUDE.md`, Cargo manifests,
+  and the currently active daemon-agent timeout/cache lane under `src/{agent,daemon,error,mcp}`.
 
 ## Ownership invariant
 
@@ -51,8 +52,9 @@ tags: [worktree, dioxus, daemon, telemetry, agent-manager]
 - Runtime lifecycle delivery is FIFO and reentrant, natural exits reap records,
   stale output cannot cross an exit marker, and an agent id cannot be reused
   without a future explicit incarnation token.
-- An actual Unix-socket protocol test proves publish then subscribe framing and the
-  resulting `ops_update`; unit tests prove conversion and lifecycle removal.
+- A Unix-socket client test proves publish then subscribe framing and the resulting
+  `ops_update`; a separate real-handler regression proves daemon reconciliation,
+  while unit tests prove conversion and lifecycle removal.
 - Claude-owned dirty paths and Cargo manifests remain untouched.
 
 ## Verification contract
@@ -119,11 +121,19 @@ tags: [worktree, dioxus, daemon, telemetry, agent-manager]
 
 ## Integration handoff
 
-- Branch: `codex/desktop-daemon-truth-wire`, stacked on reviewed telemetry commit
-  `351b820`.
-- Do not merge blindly while Claude's Ion lane is active. Rebase onto the latest
-  committed `main`, rerun the same gates, then integrate the two commits in
-  order.
+- Original branch: `codex/desktop-daemon-truth-wire`, stacked on `351b820`.
+- Live forward-port branch: `codex/live-daemon-truth-integration`, preserving the
+  dependency order as `dbac22f` then `ae8fcd0` on top of `a5184e2`.
+- The forward-port is conflict-free and fully verified. Do not merge while Claude's
+  daemon-agent cache lane is dirty: its current take/check-in design can initialize
+  concurrent agents and overwrite one request's session history. Rebase onto the
+  final concurrency-safe clean tip, rerun the same gates, then integrate both commits.
+- ST-09 is now backed compositionally by Unix JSONL client framing, a separate real
+  daemon-handler reconciliation test, lifecycle/reducer tests, desktop contracts, and
+  browser-host readiness smoke. A packaged desktop-to-real-daemon E2E remains open.
+  ST-13 remains planned because this adapter intentionally binds one daemon project;
+  multi-workspace routing and daemon-approved control remain prerequisites for a
+  first-class manager claim.
 - The next platform-management slice is the draft
   `2026-07-11-codex-ion-managed-platform.md`: move platform identity to the
   runtime registry, use token-safe command detection, and only then expose Ion
