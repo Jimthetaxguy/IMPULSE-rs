@@ -215,6 +215,112 @@ mod tests {
         assert!(response.validate().is_ok());
     }
 
+    /// T4 scenario 2 ("changes requested"): the gate can run cleanly and
+    /// still flag a real issue. `run_ion_verify` must return `Ok(response)`
+    /// (not an `Err`) — pass/fail interpretation is the caller's job per G1
+    /// — and the response itself must report `passed() == false` with a
+    /// non-empty findings list, while still satisfying the spec-a contract
+    /// (`validate()` succeeds — this is not a contract-violation case).
+    #[tokio::test]
+    async fn run_ion_verify_returns_changes_requested_response_via_stub_gate() {
+        let _guard = env_lock();
+        let repo = init_git_repo();
+        let stub_gate = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fakes/ion-verify-stub-gate-changes-requested.sh");
+        std::env::set_var(ION_GATE_LAUNCHER_ENV, &stub_gate);
+
+        let result = run_ion_verify(
+            Some(repo.path().display().to_string()),
+            "HEAD".to_string(),
+            "Test description".to_string(),
+        )
+        .await;
+
+        std::env::remove_var(ION_GATE_LAUNCHER_ENV);
+
+        let response = result.expect("run_ion_verify should return Ok even for a failing verdict");
+        assert_eq!(response.verdict, Verdict::ChangesRequested);
+        assert!(!response.passed());
+        assert!(!response.findings.is_empty());
+        assert!(
+            response.validate().is_ok(),
+            "a CHANGES REQUESTED verdict with a WARNING finding does not violate spec-a"
+        );
+    }
+
+    /// T4 scenario 3 ("contract-violating response"): the gate can emit a
+    /// syntactically valid `HarnessResponse` that nonetheless violates
+    /// spec-a's invariants (here: `verdict: APPROVE` with a CRITICAL finding
+    /// present). `run_ion_verify` must still return `Ok(response)` — parsing
+    /// succeeded — while a caller invoking `response.validate()` (as
+    /// `handle_ion_verify` does to populate `contract_violation`) must
+    /// detect the violation.
+    #[tokio::test]
+    async fn run_ion_verify_returns_contract_violating_response_ok_but_validate_fails() {
+        let _guard = env_lock();
+        let repo = init_git_repo();
+        let stub_gate = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fakes/ion-verify-stub-gate-contract-violation.sh");
+        std::env::set_var(ION_GATE_LAUNCHER_ENV, &stub_gate);
+
+        let result = run_ion_verify(
+            Some(repo.path().display().to_string()),
+            "HEAD".to_string(),
+            "Test description".to_string(),
+        )
+        .await;
+
+        std::env::remove_var(ION_GATE_LAUNCHER_ENV);
+
+        let response = result
+            .expect("run_ion_verify should return Ok; contract validation is the caller's job");
+        assert_eq!(response.verdict, Verdict::Approve);
+        assert!(
+            !response.passed(),
+            "passed() must also be false: a CRITICAL finding is present"
+        );
+        assert_eq!(
+            response.validate(),
+            Err(impulse_ion::ContractViolation::CriticalBlocksApprove(
+                Verdict::Approve
+            ))
+        );
+    }
+
+    /// T4 scenario 4 ("non-zero exit"): the gate process can crash before
+    /// emitting any parseable response. `run_ion_verify` must propagate this
+    /// as an `Err` whose chain contains `AdapterError::NonZeroExit`, not
+    /// silently return a default/empty `HarnessResponse`.
+    #[tokio::test]
+    async fn run_ion_verify_returns_err_on_nonzero_exit() {
+        let _guard = env_lock();
+        let repo = init_git_repo();
+        let stub_gate = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fakes/ion-verify-stub-gate-nonzero-exit.sh");
+        std::env::set_var(ION_GATE_LAUNCHER_ENV, &stub_gate);
+
+        let result = run_ion_verify(
+            Some(repo.path().display().to_string()),
+            "HEAD".to_string(),
+            "Test description".to_string(),
+        )
+        .await;
+
+        std::env::remove_var(ION_GATE_LAUNCHER_ENV);
+
+        let err = result.expect_err("a crashing gate process must surface as an error");
+        let found_non_zero_exit = err.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<impulse_ion::pi_adapter::AdapterError>(),
+                Some(impulse_ion::pi_adapter::AdapterError::NonZeroExit { code: 7, .. })
+            )
+        });
+        assert!(
+            found_non_zero_exit,
+            "expected AdapterError::NonZeroExit{{code: 7, ..}} in the error chain, got: {err:?}"
+        );
+    }
+
     /// T3 item 2/G6: proves the `--json` envelope flattens `HarnessResponse`
     /// fields and includes a machine-readable `contract_violation` alongside
     /// them, rather than only warning on stderr.
