@@ -275,15 +275,16 @@ original "reverse-transfer" note.
   hooking into the chat loop's message construction — a materially larger
   change than gating at the confirmation point, and still not
   autonomously built.
-  **Known gap in the guardrail rule set itself (not this pass's scope):**
-  `guardrail::defaults::builtin_rules()` ships 9 rules, all targeting
-  `GuardTarget::Bash` — there is no built-in `GuardTarget::FileWrite` rule
-  (e.g. secret-shaped content detection) today, so `file_write` scanning is
-  wired correctly but won't match anything against the current defaults;
-  `chat.rs`'s regression tests prove the wiring with an equivalent custom
-  rule rather than a built-in one. Adding real FileWrite-targeted built-in
-  rules is a `src/guardrail/defaults.rs` change, out of scope for this pass
-  (which only consumes the guardrail module, per CLAUDE.md Principle #5).
+  **Follow-up closed same day:** the gap noted above (no built-in
+  `GuardTarget::FileWrite` rule, so `file_write` scanning was wired but
+  dormant against real defaults) is now fixed. `guardrail::defaults::
+  builtin_rules()` gained a 10th rule, `block-write-secret`
+  (`GuardTarget::FileWrite`, matches `key_name = "value"`/`key_name: value`
+  shapes for `api_key`/`secret`/`token`/`password`-ish names with a 16+
+  char value — ported from a sibling project's equivalent pattern, itself
+  originally from an earlier version of this module). `chat.rs`'s
+  regression tests were simplified to use `GuardConfig::default()` directly
+  against the new real rule instead of an equivalent custom one.
 
 ### 2.4 CLI surface of the new binary
 

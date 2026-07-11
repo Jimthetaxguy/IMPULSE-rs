@@ -94,8 +94,6 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::error::AgentResult;
-#[cfg(test)]
-use crate::guardrail::GuardRule;
 use crate::guardrail::{self, GuardAction, GuardConfig, GuardResult, GuardTarget};
 use crate::llm_backends::{Agent, LlmProvider, ToolDefinition, ToolExecutionResult, ToolExecutor};
 
@@ -1016,26 +1014,14 @@ mod tests {
 
     #[test]
     fn test_guard_verdict_for_file_write_scans_content_against_filewrite_target_not_bash() {
-        // impulse-rs's actual `guardrail::defaults::builtin_rules()` (9
-        // rules, verified against src/guardrail/defaults.rs) all target
-        // GuardTarget::Bash -- there is no built-in FileWrite-targeted
-        // secret-detection rule today, so this proves the *plumbing*
-        // (file_write's `content` field scanned as GuardTarget::FileWrite,
-        // not Bash or Any) with an equivalent custom rule rather than
-        // relying on a built-in that doesn't exist in this codebase.
-        let config = GuardConfig {
-            enabled: true,
-            rules: vec![GuardRule {
-                id: "test-block-write-secret".to_string(),
-                pattern: r#"api_key\s*=\s*"[A-Za-z0-9]+""#.to_string(),
-                action: GuardAction::Block,
-                target: GuardTarget::FileWrite,
-                reason: "Writing what looks like a hardcoded API key to disk".to_string(),
-                suggestion: None,
-                enabled: true,
-                builtin: false,
-            }],
-        };
+        // `guardrail::defaults::builtin_rules()` now ships a real
+        // `block-write-secret` rule targeting GuardTarget::FileWrite
+        // specifically (added as a follow-up to this same feature -- it
+        // used to be that ion's guardrail wiring here was correct but
+        // dormant, since no built-in FileWrite rule existed to match
+        // against). GuardConfig::default() picks up built-ins via
+        // merge_rules, so no custom rule is needed here anymore.
+        let config = GuardConfig::default();
 
         let write_input = serde_json::json!({
             "path": "/tmp/ion-guard-test.rs",
@@ -1044,7 +1030,7 @@ mod tests {
         let verdict = guard_verdict_for("file_write", &write_input, &config);
         let result = verdict.expect("secret-shaped content should match the FileWrite rule");
         assert_eq!(result.action, GuardAction::Block);
-        assert_eq!(result.rule_id, "test-block-write-secret");
+        assert_eq!(result.rule_id, "block-write-secret");
 
         // The same rule must not fire for bash_exec -- confirms file_write
         // is scanned against GuardTarget::FileWrite specifically, not Bash.
@@ -1056,20 +1042,9 @@ mod tests {
     async fn test_file_write_matching_block_tier_rule_is_not_approved_by_plain_yes() {
         // End-to-end mirror of the bash_exec Block-tier test, but for
         // file_write, proving file_write content really is scanned (not
-        // just bash_exec) and gets the same CONFIRM-required treatment.
-        let config = GuardConfig {
-            enabled: true,
-            rules: vec![GuardRule {
-                id: "test-block-write-secret".to_string(),
-                pattern: r#"api_key\s*=\s*"[A-Za-z0-9]+""#.to_string(),
-                action: GuardAction::Block,
-                target: GuardTarget::FileWrite,
-                reason: "Writing what looks like a hardcoded API key to disk".to_string(),
-                suggestion: None,
-                enabled: true,
-                builtin: false,
-            }],
-        };
+        // just bash_exec) and gets the same CONFIRM-required treatment,
+        // against the real `block-write-secret` built-in rule.
+        let config = GuardConfig::default();
         let input = serde_json::json!({
             "path": "/tmp/ion-guard-test-2.rs",
             "content": "let api_key = \"abcdef0123456789ABCDEF\";",

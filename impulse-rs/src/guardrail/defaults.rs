@@ -7,11 +7,14 @@ use super::types::{GuardAction, GuardRule, GuardTarget};
 /// Returns the set of built-in guardrail rules that ship with Impulse.
 ///
 /// These rules provide safety defaults for common dangerous operations:
-/// - 4 Block rules: force-push main, bulk git add, rm -rf root, SQL DROP
+/// - 5 Block rules: force-push main, bulk git add, rm -rf root, SQL DROP,
+///   writing a hardcoded secret to a file
 /// - 4 Warn rules: binary staging, artifact staging, .env staging, chmod 777
 /// - 1 Log rule: deploy/publish/release commands
 ///
-/// All rules target Bash commands, are enabled by default, and marked as builtin.
+/// All rules target Bash commands except `block-write-secret`, which targets
+/// `GuardTarget::FileWrite` (see that rule for why). All are enabled by
+/// default and marked as builtin.
 pub fn builtin_rules() -> Vec<GuardRule> {
     vec![
         // ==================================================================
@@ -72,6 +75,31 @@ pub fn builtin_rules() -> Vec<GuardRule> {
             reason: "DROP TABLE/DATABASE permanently destroys data with no undo.".to_string(),
             suggestion: Some(
                 "Use a migration tool with rollback support, or back up first.".to_string(),
+            ),
+            enabled: true,
+            builtin: true,
+        },
+        GuardRule {
+            id: "block-write-secret".to_string(),
+            // Matches `key_name = "value"`/`key_name: "value"`/`key_name=value`
+            // shapes for common credential-bearing names, with a long-enough
+            // value (16+ chars) to avoid flagging short placeholders/examples.
+            // Ported from a sibling project's `guard::RULES` (which itself
+            // ported this exact pattern from an earlier version of this
+            // module) -- closes the gap where ion's guardrail-scanned
+            // confirmation gate (see ion_repl/chat.rs's guard_verdict_for)
+            // wires file_write's `content` to GuardTarget::FileWrite but had
+            // no FileWrite-targeted rule to actually match against.
+            pattern:
+                r#"(?i)(api[_-]?key|secret|token|password)\s*[:=]\s*['"]?[A-Za-z0-9/\+_\-]{16,}"#
+                    .to_string(),
+            action: GuardAction::Block,
+            target: GuardTarget::FileWrite,
+            reason: "Writing what looks like a hardcoded credential into a file.".to_string(),
+            suggestion: Some(
+                "Load secrets from environment variables or a secrets manager instead of \
+                 hardcoding them."
+                    .to_string(),
             ),
             enabled: true,
             builtin: true,
@@ -189,7 +217,7 @@ mod tests {
     #[test]
     fn test_default_rules_all_enabled() {
         let rules = builtin_rules();
-        assert_eq!(rules.len(), 9, "Expected exactly 9 built-in rules");
+        assert_eq!(rules.len(), 10, "Expected exactly 10 built-in rules");
         for rule in &rules {
             assert!(rule.enabled, "Rule '{}' should be enabled", rule.id);
             assert!(rule.builtin, "Rule '{}' should be marked builtin", rule.id);
@@ -320,6 +348,47 @@ mod tests {
         assert!(
             GuardEngine::has_blocking(&results),
             "Should block: drop database production;"
+        );
+    }
+
+    #[test]
+    fn test_blocks_writing_a_hardcoded_secret_to_a_file() {
+        let engine = GuardEngine::new(&builtin_rules()).unwrap();
+
+        let results = engine.evaluate(
+            r#"let api_key = "sk-ant-abcdef0123456789ABCDEF";"#,
+            &GuardTarget::FileWrite,
+        );
+        assert!(
+            GuardEngine::has_blocking(&results),
+            "Should block a hardcoded api_key written to a file"
+        );
+
+        let results = engine.evaluate(
+            r#"password: "hunter2hunter2hunter2""#,
+            &GuardTarget::FileWrite,
+        );
+        assert!(
+            GuardEngine::has_blocking(&results),
+            "Should block a hardcoded password written to a file"
+        );
+
+        // A short/placeholder-looking value must not be flagged.
+        let results = engine.evaluate(r#"api_key = "test""#, &GuardTarget::FileWrite);
+        assert!(
+            !GuardEngine::has_blocking(&results),
+            "Should not block a short placeholder value"
+        );
+
+        // The rule is FileWrite-scoped -- the same text as a Bash command
+        // must not trip it (mirrors ROSA's target_scoping_respected test).
+        let results = engine.evaluate(
+            r#"echo 'api_key = "abcdef0123456789ABCDEF"'"#,
+            &GuardTarget::Bash,
+        );
+        assert!(
+            !GuardEngine::has_blocking(&results),
+            "block-write-secret must not fire for Bash target"
         );
     }
 
