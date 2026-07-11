@@ -19,6 +19,23 @@ use crate::tooling::traits::*;
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 
+/// Truncate `s` to at most `max_bytes` bytes without panicking when
+/// `max_bytes` falls in the middle of a multi-byte UTF-8 character.
+/// `String::truncate` requires the index to land on a char boundary; since
+/// `s` comes from `from_utf8_lossy`, a byte offset chosen purely by length
+/// (`MAX_OUTPUT_BYTES`) can split a multi-byte char, so this walks backward
+/// to the nearest valid boundary first.
+fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
 /// Execute a shell command (`sh -c <command>`) and return its stdout,
 /// stderr, and exit code.
 pub struct BashExecTool;
@@ -104,6 +121,10 @@ impl DynamicTool for BashExecTool {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
         cmd.stdin(std::process::Stdio::null());
+        // On timeout, the `wait_with_output` future below is dropped along with
+        // the `Child` it owns; `kill_on_drop` ensures that drop sends SIGKILL
+        // instead of leaving an orphaned/zombie process behind.
+        cmd.kill_on_drop(true);
 
         let child = cmd
             .spawn()
@@ -119,12 +140,12 @@ impl DynamicTool for BashExecTool {
                 })?
                 .map_err(|e| ToolError::ExecutionFailed(format!("failed to wait on child: {e}")))?;
 
-        let mut stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        let stdout_truncated = stdout.len() > MAX_OUTPUT_BYTES;
-        let stderr_truncated = stderr.len() > MAX_OUTPUT_BYTES;
-        stdout.truncate(MAX_OUTPUT_BYTES);
-        stderr.truncate(MAX_OUTPUT_BYTES);
+        let stdout_full = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr_full = String::from_utf8_lossy(&output.stderr).into_owned();
+        let stdout_truncated = stdout_full.len() > MAX_OUTPUT_BYTES;
+        let stderr_truncated = stderr_full.len() > MAX_OUTPUT_BYTES;
+        let stdout = truncate_at_char_boundary(&stdout_full, MAX_OUTPUT_BYTES);
+        let stderr = truncate_at_char_boundary(&stderr_full, MAX_OUTPUT_BYTES);
 
         Ok(ToolResult::json(serde_json::json!({
             "command": command,
@@ -206,6 +227,73 @@ mod tests {
             )
             .await;
         assert!(matches!(result, Err(ToolError::ExecutionFailed(_))));
+    }
+
+    #[test]
+    fn test_truncate_at_char_boundary_does_not_panic_mid_multibyte_char() {
+        // Regression test: a byte offset chosen purely by length can land in
+        // the middle of a multi-byte UTF-8 character. `String::truncate`
+        // panics in that case; this helper must back off to a valid boundary
+        // instead of panicking, and must not lose the whole trailing char.
+        let s = "a".repeat(9) + "€"; // '€' is 3 bytes, straddling byte 10 if cut at 10
+        let truncated = truncate_at_char_boundary(&s, 10);
+        assert!(truncated.len() <= 10);
+        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+        assert_eq!(truncated, "a".repeat(9));
+    }
+
+    #[test]
+    fn test_truncate_at_char_boundary_leaves_short_strings_untouched() {
+        assert_eq!(truncate_at_char_boundary("hi", 10), "hi");
+    }
+
+    #[tokio::test]
+    async fn test_execute_kills_child_on_timeout_instead_of_orphaning() {
+        // Regression test: without `kill_on_drop`, dropping the
+        // `wait_with_output` future on timeout left the child process
+        // running as an orphan. Spawn a command that writes a marker file
+        // shortly after a delay long past the timeout; if the process were
+        // still alive it would eventually write the marker. We can't wait
+        // out a real orphan in a unit test, so instead assert the intended
+        // mechanism directly: sh's own child (through `sleep`) must not
+        // still be reachable via its reported pid after the timeout fires.
+        //
+        // Uses a per-invocation unique sleep duration (not a literal
+        // `sleep 5`) because `cargo test` runs tests concurrently and a
+        // sibling test in this same file
+        // (`test_execute_times_out_on_long_running_command`) also spawns
+        // `sleep 5` -- a `pgrep -f "sleep 5"` check would catch that
+        // unrelated, still-legitimately-running process and report a false
+        // positive. A `# comment` marker doesn't survive into the child's
+        // argv (the shell strips it before exec), so the marker has to be a
+        // real argument -- a fractional-second duration unique to this
+        // process still sleeps ~5s but is distinguishable in `ps`/`pgrep -f`
+        // output.
+        let unique_duration = format!("5.{}", std::process::id() % 1000);
+        let tool = BashExecTool;
+        let ctx = ToolContext::with_all_capabilities();
+        let result = tool
+            .execute(
+                serde_json::json!({"command": format!("sleep {unique_duration}"), "timeout_secs": 1}),
+                &ctx,
+            )
+            .await;
+        assert!(matches!(result, Err(ToolError::ExecutionFailed(_))));
+        // Give the OS a moment to process the kill signal, then confirm no
+        // stray process carrying this test's unique duration remains.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let check = tokio::process::Command::new("pgrep")
+            .arg("-f")
+            .arg(format!("sleep {unique_duration}"))
+            .output()
+            .await;
+        if let Ok(check) = check {
+            let stray = String::from_utf8_lossy(&check.stdout);
+            assert!(
+                stray.trim().is_empty(),
+                "expected no orphaned process after timeout, found pids: {stray}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -96,10 +96,24 @@ impl ReplTool for IonVerifyTool {
             .await
             .context("ion_verify tool failed")?;
 
-        let ok = response.passed();
+        // Mirror the CLI's exit-code logic exactly (`handlers::ion::handle_ion_verify`):
+        // `passed()` alone misses `validate()`-only violations like
+        // MissingCommandsRun, which can fire even when the verdict is
+        // Approve with no CRITICAL finding.
+        let contract_violation = response
+            .validate()
+            .err()
+            .map(|violation| violation.to_string());
+        let ok = response.passed() && contract_violation.is_none();
         let rendered = format_response_text(&response);
-        let payload = serde_json::to_value(&response)
+        let mut payload = serde_json::to_value(&response)
             .context("failed to serialize HarnessResponse to JSON")?;
+        if let Value::Object(ref mut map) = payload {
+            map.insert(
+                "contract_violation".to_string(),
+                serde_json::to_value(&contract_violation).unwrap_or(Value::Null),
+            );
+        }
 
         Ok(ToolOutcome {
             rendered,
@@ -110,6 +124,10 @@ impl ReplTool for IonVerifyTool {
 }
 
 #[cfg(test)]
+// See handlers::ion's test module for why holding env_lock() across .await
+// here is intentional (must span the whole gate-launcher round trip) and
+// safe (test-only std::sync::Mutex<()>, never contended by production code).
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
 
@@ -211,12 +229,53 @@ mod tests {
         // No stub gate configured here, so this either fails on git
         // rev-parse (no repo at ".") or on the adapter -- either way it must
         // not panic, and it must not be an empty-path canonicalize error.
-        if let Err(err) = result {
-            let message = format!("{err:#}");
-            assert!(
-                !message.contains("Failed to resolve repo path: \n"),
-                "must not pass an empty repo path through: {message}"
-            );
+        // (Both branches are asserted so the test cannot pass vacuously.)
+        match result {
+            Err(err) => {
+                let message = format!("{err:#}");
+                assert!(
+                    !message.contains("Failed to resolve repo path: \n"),
+                    "must not pass an empty repo path through: {message}"
+                );
+            }
+            Ok(outcome) => {
+                assert!(
+                    !outcome.rendered.is_empty(),
+                    "unexpected success must still produce rendered output"
+                );
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn run_ok_is_false_when_validate_fails_even_though_passed_is_true() {
+        // Regression test: an earlier version set `ok = response.passed()`
+        // only, diverging from the CLI's `!passed() || validate().is_err()`
+        // exit-code logic (handlers::ion::handle_ion_verify). A verdict of
+        // Approve with no CRITICAL finding makes `passed()` true, but an
+        // empty `commands_run` makes `validate()` fail with
+        // MissingCommandsRun -- the tool must report `ok: false` in that
+        // case, and must surface `contract_violation` in the payload.
+        let _guard = env_lock();
+        let repo = init_git_repo();
+        let stub_gate = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fakes/ion-verify-stub-gate-approve-no-commands.sh");
+        std::env::set_var(impulse_ion::pi_adapter::ION_GATE_LAUNCHER_ENV, &stub_gate);
+
+        let ctx = ReplContext {
+            repo_root: repo.path().to_path_buf(),
+        };
+        let outcome = IonVerifyTool
+            .run(serde_json::json!({"diff_ref": "HEAD"}), &ctx)
+            .await;
+
+        std::env::remove_var(impulse_ion::pi_adapter::ION_GATE_LAUNCHER_ENV);
+
+        let outcome = outcome.expect("run should succeed against the stub gate");
+        assert!(
+            !outcome.ok,
+            "validate() failure must make ok false even when passed() is true"
+        );
+        assert!(!outcome.payload["contract_violation"].is_null());
     }
 }

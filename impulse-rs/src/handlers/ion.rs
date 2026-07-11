@@ -161,6 +161,14 @@ pub(crate) fn format_response_text(response: &impulse_ion::HarnessResponse) -> S
 }
 
 #[cfg(test)]
+// The `env_lock()` MutexGuard is intentionally held across `.await` in these
+// tests: it must stay held for the whole gate-launcher round trip, not just
+// the env::set_var call, otherwise a concurrent test on another thread could
+// mutate ION_GATE_LAUNCHER mid-request (see `crate::test_support`'s doc
+// comment for why a narrower lock reintroduces the exact race it prevents).
+// This is test-only code with no real deadlock risk (a single `std::sync::
+// Mutex<()>` never contended by production code).
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use impulse_ion::pi_adapter::ION_GATE_LAUNCHER_ENV;
