@@ -93,10 +93,26 @@ impl ReplTool for DynamicToolBridge {
         let rendered = serde_json::to_string_pretty(&result.output)
             .unwrap_or_else(|_| result.output.to_string());
 
+        // `DynamicTool::execute` only returns `Err` for a failure to run the
+        // tool at all (spawn failure, invalid params, capability denial --
+        // all already mapped to an `Err` above via `?`). A tool that ran
+        // successfully but produced a *logically* failing result (e.g.
+        // bash_exec's command exiting non-zero) reports that via its own
+        // JSON payload, not via `Err` -- so `ok` must be derived from
+        // `output["success"]` when the tool's payload shape declares one,
+        // rather than hardcoded `true`. Tools with no `success` field in
+        // their payload (file_read, file_write) default to `true`, matching
+        // this bridge's pre-existing behavior for them.
+        let ok = result
+            .output
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
         Ok(ToolOutcome {
             rendered,
             payload: result.output,
-            ok: true,
+            ok,
         })
     }
 }
@@ -128,6 +144,48 @@ mod tests {
 
         let result = bridge.run(serde_json::json!({}), &ctx).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn run_reports_ok_false_when_the_tools_own_payload_declares_failure() {
+        // Regression test (fresh Opus sweep, finding G2): DynamicToolBridge
+        // used to hardcode `ok: true` regardless of the tool's own logical
+        // result. bash_exec doesn't return Err on a non-zero exit -- it
+        // returns Ok with `"success": false` in its JSON payload -- so a
+        // failing command must surface as `ok: false` to the model, not get
+        // silently reported as a success.
+        let registry = Arc::new(ToolRegistry::with_defaults());
+        let bridge = DynamicToolBridge::new(registry, "bash_exec", "bash_exec -- run a command");
+        let ctx = ReplContext::default();
+
+        let outcome = bridge
+            .run(serde_json::json!({"command": "exit 1"}), &ctx)
+            .await
+            .expect("bash_exec running a failing command is still an Ok ToolOutcome");
+
+        assert!(
+            !outcome.ok,
+            "a non-zero exit_code must report ok: false, not the previous hardcoded true"
+        );
+        assert_eq!(outcome.payload["success"], false);
+    }
+
+    #[tokio::test]
+    async fn run_reports_ok_true_for_a_tool_with_no_success_field_in_its_payload() {
+        // file_read has no "success" field in its output -- the default
+        // (true) must still apply so this bridge's behavior for tools like
+        // file_read/file_write is unchanged by the G2 fix.
+        let registry = Arc::new(ToolRegistry::with_defaults());
+        let bridge = DynamicToolBridge::new(registry, "system_info", "system_info -- report info");
+        let ctx = ReplContext::default();
+
+        let outcome = bridge
+            .run(serde_json::json!({}), &ctx)
+            .await
+            .expect("system_info should succeed");
+
+        assert!(outcome.payload.get("success").is_none());
+        assert!(outcome.ok);
     }
 
     #[test]

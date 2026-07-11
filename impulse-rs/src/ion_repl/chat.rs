@@ -137,10 +137,26 @@ impl ChatState {
     /// `AgentError::ToolLoopLimitExceeded` if the round cap is hit, and
     /// `AgentError::ToolLoopTimedOut` if the wall-clock budget elapses
     /// first) — never panics, matching every other `Result`-returning path
-    /// in this crate. The timeout only bounds how long a turn can block;
-    /// it does not make the loop interruptible mid-round (that would need
-    /// cancellation tokens threaded through the REPL's readline/event loop,
-    /// a separate and larger change).
+    /// in this crate.
+    ///
+    /// **Timeout caveat (fresh Opus sweep, finding G1):** the wall-clock
+    /// timeout bounds every `.await` point in the loop -- provider calls,
+    /// tool execution -- but a blocking `confirm` prompt
+    /// (`confirm_via_stdin`) is a synchronous `stdin().read_line()`, not an
+    /// `.await`, so `tokio::time::timeout` cannot cancel it. If a user is
+    /// asked `Allow? [y/N]` and walks away, that specific turn blocks
+    /// indefinitely regardless of `DEFAULT_TOOL_LOOP_TIMEOUT` -- it does not
+    /// deadlock the runtime (the default multi-thread `#[tokio::main]`
+    /// flavor just parks the one worker thread), but the REPL itself won't
+    /// proceed until the prompt is answered. Accepted as-is: this is a
+    /// human explicitly being asked to respond, not a hang in automated
+    /// logic, and forcing it through `spawn_blocking` wouldn't make it
+    /// cancellable either (the read would keep blocking on its own thread
+    /// after an abandoned timeout, risking a stray stdin read racing a
+    /// later prompt) -- it would just add complexity without fixing the
+    /// underlying property. Full interruptibility (Ctrl-C mid-round) would
+    /// need cancellation tokens threaded through the REPL's readline/event
+    /// loop, a separate and larger change.
     pub async fn turn(
         &mut self,
         text: &str,
