@@ -82,7 +82,7 @@ Before implementing, consider alternative approaches. Choose the simplest soluti
 ## Architecture
 
 **Workspace (Rust-first, desktop shell in migration):**
-- `impulse-rs/` — main CLI + daemon + ratatui TUI (`impulse-rs` binary); library crate `impulse_rs` (`src/lib.rs`, TUI_SPEC.md T5) also backs a second, independent `ion` binary (`src/bin/ion.rs`) — bare `ion` prints a placeholder banner (REPL lands in T6), `ion verify` shares `handlers::ion::handle_ion_verify` with `impulse-rs ion-verify`
+- `impulse-rs/` — main CLI + daemon + ratatui TUI (`impulse-rs` binary); library crate `impulse_rs` (`src/lib.rs`, TUI_SPEC.md T5) also backs a second, independent `ion` binary (`src/bin/ion.rs`) — bare `ion` drops into a rustyline REPL (`src/ion_repl/`, T6: `/help`/`/quit`/`/clear`/`/verify` slash commands, `.impulse/ion_history` persistence, free text stubbed until T8 chat wiring), `ion verify` shares `handlers::ion::handle_ion_verify` with `impulse-rs ion-verify`
 - `impulse-rs/impulse-ops/` — operations library (shared types: SupervisorAction, TerminalOpsReport, OpsSnapshot, WorkbenchDaemonRequest/Response, DAEMON_PROTOCOL_VERSION, 31 tests)
 - `impulse-rs/impulse-term/` — PTY/session/context core (PTY + vt100 + WriteQueue + context bridge)
 - `impulse-rs/impulse-desktop/` — Dioxus desktop shell scaffold and typed host bridge contracts
@@ -359,7 +359,7 @@ cd impulse-rs && cargo build && cargo test && cargo clippy -- -D warnings && car
 ```
 
 **Expected output (update when counts change):**
-- `cargo test --workspace`: 1,389 unit + 32 integration (impulse-rs, includes T5's `tests/ion_binary.rs`) + 2 doctests (impulse-rs; new since the T5 lib split, 1 ignored) + 31 (impulse-ops) + 114 (impulse-term) + 159 (impulse-desktop) + 23 (impulse-ion) = 1,750 passed, 7 ignored, 0 failed (verified 2026-07-11; T5 adds a `[lib]` target (`impulse_rs`, `src/lib.rs`) backing a second `ion` binary — +4 impulse-rs integration tests (`tests/ion_binary.rs`: bare-run banner, `verify --help`, unknown-subcommand, `--version`) and +2 doctests that now compile for the first time now that the crate has a lib target (1 pre-existing doctest was already `#[ignore]`; 2 formula code-fences in `src/token_tracker/research.rs` were switched to ` ```text ` and its usage example's import path fixed from `token_tracker::` to `impulse_rs::token_tracker::` — both were previously untested dead doc code, invisible before T5 because binary-only crates don't run `cargo test --doc`). Note: `impulse-term::test_with_parser_reads_screen_size` and 3 impulse-desktop tests (`test_dioxus_desktop_launch_binary_is_feature_gated`, `test_host_readiness_smoke_script_is_declared`, `test_xterm_vendor_assets_are_present_and_manifested`) are parallelism-flaky under full `--workspace` load — pass in isolation/serial per-crate)
+- `cargo test --workspace`: 1,420 unit + 32 integration (impulse-rs, includes T5's `tests/ion_binary.rs`) + 2 doctests (impulse-rs, 1 ignored) + 31 (impulse-ops) + 114 (impulse-term) + 159 (impulse-desktop) + 23 (impulse-ion) = 1,781 passed, 7 ignored, 0 failed (verified 2026-07-11; T6 adds `src/ion_repl/{mod,router,history,tools}.rs` — the readline REPL core behind the bare `ion` invocation — +31 unit tests. Note: `impulse-term::test_with_parser_reads_screen_size` and 3 impulse-desktop tests (`test_dioxus_desktop_launch_binary_is_feature_gated`, `test_host_readiness_smoke_script_is_declared`, `test_xterm_vendor_assets_are_present_and_manifested`) are parallelism-flaky under full `--workspace` load — pass in isolation/serial per-crate. Also flaky under `--workspace`: `handlers::common::tests::test_persist_claude_env_var_creates_file_with_assignment` races a sibling test over the shared `CLAUDE_ENV_FILE` env var (no lock) — pre-existing, unrelated to ion work, passes on isolated/serial rerun.)
 - `cargo clippy`: 0 warnings
 - `cargo fmt --check`: no output (clean)
 
@@ -394,12 +394,12 @@ To verify test counts match expectations:
 ```bash
 cd impulse-rs && cargo test 2>&1 | grep "test result:" | awk '{sum += $4} END {print "Total: " sum " passed"}'
 ```
-Expected: 1,750 passed across the 5 crates (impulse-rs, impulse-ops, impulse-term, impulse-desktop, impulse-ion). If this changes, update both this section and the Architecture section.
+Expected: 1,781 passed across the 5 crates (impulse-rs, impulse-ops, impulse-term, impulse-desktop, impulse-ion). If this changes, update both this section and the Architecture section.
 
 ### Pre-Commit Checklist
 
 1. `cargo build` — zero warnings
-2. `cargo test` — all tests pass (1,750 workspace total expected: 1389 unit + 32 integration + 2 doctests impulse-rs, 31 ops, 114 term, 159 desktop, 23 ion; verify with `cargo test --workspace 2>&1 | grep "test result:"`)
+2. `cargo test` — all tests pass (1,781 workspace total expected: 1420 unit + 32 integration + 2 doctests impulse-rs, 31 ops, 114 term, 159 desktop, 23 ion; verify with `cargo test --workspace 2>&1 | grep "test result:"`)
    - **If count changes**: update this line and the Architecture section above
 3. `cargo clippy -- -D warnings` — zero warnings
 4. `cargo fmt --check` — zero diffs
