@@ -194,6 +194,25 @@ result comes back through the same `ToolOutcome` shape as every other
 ReplTool. Not scoped for T6/T7 — flagging as a concrete future ReplTool
 candidate once `monty-support` is built out past its current stub.
 
+**Researched and deferred (2026-07-11, same day, after T9 landed).** Verified
+Monty is real (`github.com/pydantic/monty`, a from-scratch Rust bytecode-VM
+Python interpreter built by the Pydantic team) but explicitly
+"experimental... not ready for prime time" per its own README (v0.0.18,
+no classes/match/generators/context-managers, only a handful of stdlib
+modules, no third-party packages). `src/monty/python.rs`'s stub also targets
+the `pydantic-monty` PyPI package via PyO3 + `pip install`, not the native
+`monty`/`monty-pool` Rust crates — so even finishing the stub wouldn't avoid
+a Python runtime dependency. More importantly: `bash_exec` (T7, hardened
+same-day with env-scrubbing + a confirmation gate) already lets the model
+run `python3 -c '...'` for the kind of short LLM-generated
+calculation/CSV-manipulation snippets this was meant to cover — Monty's
+marginal value (deny-by-default execution *without* the confirmation
+prompt, microsecond cold start, snapshot/resume) doesn't yet address a pain
+point `ion` actually has. **Decision: do not build a `python_eval`/
+`run_python` ReplTool now.** Revisit only if Monty crosses meaningful
+stability (past its own "not production-ready" caveat) *and* `ion`
+develops a concrete need `bash_exec` can't cover.
+
 ### 2.4 CLI surface of the new binary
 
 ```
