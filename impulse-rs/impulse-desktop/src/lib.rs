@@ -41,7 +41,7 @@ pub use native::{
     NativeIslandResult,
 };
 pub use runtime::{
-    default_builtin_mcp_tools, AgentPlatformKind, AgentRuntimeSnapshot, AgentSpawnRequest,
+    default_builtin_mcp_tools, AgentPlatformId, AgentRuntimeSnapshot, AgentSpawnRequest,
     AgentWriteRequest, BuiltInMcpTool, DesktopEvent, DesktopEventSink, DesktopRuntime,
     DesktopRuntimeBuilder, LocalSupervisorAction, SupervisorLocalActionRequest, WeakDesktopRuntime,
     WorkspaceTarget,

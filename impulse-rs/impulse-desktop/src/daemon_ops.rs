@@ -672,7 +672,7 @@ mod unix {
         use impulse_ops::{OpsSubscription, ProjectOpsSnapshot};
 
         use super::*;
-        use crate::runtime::{AgentPlatformKind, BuiltInMcpTool, WorkspaceTarget};
+        use crate::runtime::{AgentPlatformId, BuiltInMcpTool, WorkspaceTarget};
 
         #[derive(Default)]
         struct RecordingSink {
@@ -804,7 +804,7 @@ mod unix {
             AgentRuntimeSnapshot {
                 agent_id: agent_id.to_string(),
                 label: "Codex".to_string(),
-                platform: AgentPlatformKind::Codex,
+                platform: AgentPlatformId::try_new("codex").unwrap(),
                 command: "codex".to_string(),
                 args: vec!["exec".to_string()],
                 cwd: Some("/tmp/project".to_string()),
@@ -1277,13 +1277,13 @@ mod tests {
     use impulse_ops::{AgentRole, AgentStatus};
 
     use super::*;
-    use crate::runtime::{AgentPlatformKind, BuiltInMcpTool, WorkspaceTarget};
+    use crate::runtime::{AgentPlatformId, BuiltInMcpTool, WorkspaceTarget};
 
     fn rich_snapshot(agent_id: &str, cwd: &str) -> AgentRuntimeSnapshot {
         AgentRuntimeSnapshot {
             agent_id: agent_id.to_string(),
             label: "Claude Code".to_string(),
-            platform: AgentPlatformKind::ClaudeCode,
+            platform: AgentPlatformId::try_new("claude-code").unwrap(),
             command: "claude".to_string(),
             args: vec!["--print".to_string()],
             cwd: Some(cwd.to_string()),

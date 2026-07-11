@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
+pub use impulse_ops::agent_registry::AgentPlatformId;
 use impulse_ops::{AgentRole, AgentStatus, ContextHealthSummary, MachineTarget};
 use impulse_term::TerminalBackend;
 use serde::{Deserialize, Serialize};
@@ -113,57 +114,12 @@ pub fn default_builtin_mcp_tools() -> Vec<BuiltInMcpTool> {
     ]
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum AgentPlatformKind {
-    ClaudeCode,
-    Codex,
-    OpenCode,
-    Gemini,
-    Cursor,
-    Shell,
-}
-
-impl AgentPlatformKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::ClaudeCode => "claude-code",
-            Self::Codex => "codex",
-            Self::OpenCode => "opencode",
-            Self::Gemini => "gemini",
-            Self::Cursor => "cursor",
-            Self::Shell => "shell",
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::ClaudeCode => "Claude Code",
-            Self::Codex => "Codex",
-            Self::OpenCode => "OpenCode",
-            Self::Gemini => "Gemini",
-            Self::Cursor => "Cursor",
-            Self::Shell => "Shell",
-        }
-    }
-
-    pub fn default_command(self) -> String {
-        // Enum is wire slug only. Real command resolution is in
-        // impulse_ops::agent_registry::resolve_launch_command (single source of truth).
-        if self == Self::Shell {
-            std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string())
-        } else {
-            "sh".to_string()
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AgentSpawnRequest {
     pub agent_id: Option<String>,
     #[serde(default)]
     pub session_id: Option<String>,
-    pub platform: AgentPlatformKind,
+    pub platform: AgentPlatformId,
     #[serde(default)]
     pub command: Option<String>,
     #[serde(default)]
@@ -187,7 +143,7 @@ pub struct AgentSpawnRequest {
 impl AgentSpawnRequest {
     pub fn terminal_harness(
         agent_id: impl Into<String>,
-        platform: AgentPlatformKind,
+        platform: AgentPlatformId,
         workspace_root: impl Into<String>,
         rows: u16,
         cols: u16,
@@ -240,7 +196,7 @@ pub enum LocalSupervisorAction {
 pub struct AgentRuntimeSnapshot {
     pub agent_id: String,
     pub label: String,
-    pub platform: AgentPlatformKind,
+    pub platform: AgentPlatformId,
     pub command: String,
     pub args: Vec<String>,
     pub cwd: Option<String>,
@@ -403,7 +359,7 @@ impl Drop for DispatchReset<'_> {
 }
 
 struct RuntimeRecord {
-    platform: AgentPlatformKind,
+    platform: AgentPlatformId,
     label: String,
     command: String,
     args: Vec<String>,
@@ -430,7 +386,7 @@ impl RuntimeRecord {
         AgentRuntimeSnapshot {
             agent_id: agent_id.to_string(),
             label: self.label.clone(),
-            platform: self.platform,
+            platform: self.platform.clone(),
             command: self.command.clone(),
             args: self.args.clone(),
             cwd: self.cwd.as_ref().map(|path| path.display().to_string()),
@@ -530,24 +486,28 @@ impl DesktopRuntime {
         &self,
         request: AgentSpawnRequest,
     ) -> Result<AgentRuntimeSnapshot, DesktopBridgeError> {
+        let mut request = request;
         validate_dimensions(request.rows, request.cols)?;
         // Centralized registry load (symmetric to load_registry_for_tool in mcp.rs).
         // Keeps the error mapping for spawn in one place and makes future changes cheaper.
         let registry = load_registry_for_spawn()?;
-        let provided_blank = request
-            .command
-            .as_ref()
-            .is_some_and(|c| c.trim().is_empty());
         let command = impulse_ops::agent_registry::resolve_launch_command(
             &registry,
-            request.platform.as_str(),
+            &request.platform,
             request.command.as_deref(),
-        );
-        if provided_blank || command.trim().is_empty() {
-            return Err(DesktopBridgeError::InvalidTerminalRequest {
-                message: "command cannot be empty".to_string(),
-            });
-        }
+        )
+        .map_err(|error| DesktopBridgeError::InvalidTerminalRequest {
+            message: error.to_string(),
+        })?;
+        let descriptor = registry.resolve(request.platform.as_str()).ok_or_else(|| {
+            DesktopBridgeError::InvalidTerminalRequest {
+                message: format!("unknown agent platform `{}`", request.platform),
+            }
+        })?;
+        let platform_label = descriptor.label.clone();
+        request.platform = descriptor.id.clone();
+        let command =
+            resolve_executable_command(&request.platform, &command, request.command.is_some());
 
         let agent_id = request
             .agent_id
@@ -663,11 +623,8 @@ impl DesktopRuntime {
         };
 
         let record = RuntimeRecord {
-            platform: request.platform,
-            label: registry
-                .get(request.platform.as_str())
-                .map(|d| d.label.clone())
-                .unwrap_or_else(|| request.platform.label().to_string()),
+            platform: request.platform.clone(),
+            label: platform_label,
             command,
             args: request.args,
             cwd,
@@ -886,7 +843,14 @@ impl TerminalBridge for DesktopRuntime {
         &self,
         request: TerminalOpenRequest,
     ) -> Result<TerminalSessionResponse, DesktopBridgeError> {
-        let platform = AgentPlatformKind::from_command(&request.command);
+        let registry = load_registry_for_spawn()?;
+        let platform = registry
+            .detect_from_command(&request.command)
+            .or_else(|| registry.get("shell"))
+            .map(|descriptor| descriptor.id.clone())
+            .ok_or_else(|| DesktopBridgeError::InvalidTerminalRequest {
+                message: "agent registry has no shell fallback".to_string(),
+            })?;
         let agent_id = request.session_id.clone();
         let snapshot = self.spawn_agent(AgentSpawnRequest {
             agent_id,
@@ -931,25 +895,6 @@ impl TerminalBridge for DesktopRuntime {
     }
 }
 
-impl AgentPlatformKind {
-    fn from_command(command: &str) -> Self {
-        let command = command.to_ascii_lowercase();
-        if command.contains("claude") {
-            Self::ClaudeCode
-        } else if command.contains("codex") {
-            Self::Codex
-        } else if command.contains("opencode") {
-            Self::OpenCode
-        } else if command.contains("gemini") || command.contains("antigravity") {
-            Self::Gemini
-        } else if command.contains("cursor") {
-            Self::Cursor
-        } else {
-            Self::Shell
-        }
-    }
-}
-
 pub struct DesktopRuntimeBuilder {
     sink: Arc<dyn DesktopEventSink>,
 }
@@ -983,6 +928,94 @@ fn load_registry_for_spawn(
             message: format!("registry load: {e}"),
         }
     })
+}
+
+fn resolve_executable_command(
+    platform: &AgentPlatformId,
+    command: &str,
+    explicit_override: bool,
+) -> String {
+    if explicit_override {
+        return command.to_string();
+    }
+    let current_exe = std::env::current_exe().ok();
+    let path = std::env::var_os("PATH");
+    resolve_executable_command_with(platform, command, current_exe.as_deref(), path.as_deref())
+}
+
+fn resolve_executable_command_with(
+    platform: &AgentPlatformId,
+    command: &str,
+    current_exe: Option<&Path>,
+    path: Option<&std::ffi::OsStr>,
+) -> String {
+    let command_path = Path::new(command);
+    if command.is_empty() || command.trim() != command || command_path.components().count() != 1 {
+        return command.to_string();
+    }
+
+    let path_roots = path
+        .map(std::env::split_paths)
+        .map(Iterator::collect::<Vec<_>>)
+        .unwrap_or_default();
+    if let Some(resolved) = find_executable_in_roots(command, &path_roots) {
+        return resolved;
+    }
+
+    if platform.as_str() != "ion" {
+        return command.to_string();
+    }
+
+    let mut sibling_roots = Vec::new();
+    if let Some(parent) = current_exe.and_then(Path::parent) {
+        sibling_roots.push(parent.to_path_buf());
+        if parent.file_name().and_then(|value| value.to_str()) == Some("deps") {
+            if let Some(target_profile) = parent.parent() {
+                sibling_roots.push(target_profile.to_path_buf());
+            }
+        }
+    }
+    find_executable_in_roots(command, &sibling_roots).unwrap_or_else(|| command.to_string())
+}
+
+fn find_executable_in_roots(command: &str, roots: &[PathBuf]) -> Option<String> {
+    let command_path = Path::new(command);
+    let mut candidate_names = vec![command_path.to_path_buf()];
+    if !std::env::consts::EXE_SUFFIX.is_empty() && command_path.extension().is_none() {
+        candidate_names.push(PathBuf::from(format!(
+            "{command}{}",
+            std::env::consts::EXE_SUFFIX
+        )));
+    }
+
+    let mut visited = HashSet::new();
+    for root in roots {
+        for candidate_name in &candidate_names {
+            let candidate = root.join(candidate_name);
+            if visited.insert(candidate.clone()) && is_executable_file(&candidate) {
+                return Some(candidate.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 fn validate_dimensions(rows: u16, cols: u16) -> Result<(), DesktopBridgeError> {
@@ -1098,11 +1131,18 @@ const _: () = {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    fn platform_id(value: &str) -> AgentPlatformId {
+        AgentPlatformId::try_new(value).expect("valid test platform id")
+    }
+
     fn spawn_request(rows: u16, cols: u16, command: Option<&str>) -> AgentSpawnRequest {
         AgentSpawnRequest {
             agent_id: Some("agent-1".to_string()),
             session_id: Some("agent-1-session".to_string()),
-            platform: AgentPlatformKind::Shell,
+            platform: platform_id("shell"),
             command: command.map(|value| value.to_string()),
             args: Vec::new(),
             cwd: None,
@@ -1346,44 +1386,69 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_platform_kind_from_command() {
+    fn test_registry_detection_used_by_terminal_bridge_is_token_safe() {
+        let registry = load_registry_for_spawn().unwrap();
         assert_eq!(
-            AgentPlatformKind::from_command("/usr/bin/claude"),
-            AgentPlatformKind::ClaudeCode
+            registry
+                .detect_from_command("/usr/bin/ion")
+                .map(|descriptor| descriptor.id.as_str()),
+            Some("ion")
         );
-        assert_eq!(
-            AgentPlatformKind::from_command("codex"),
-            AgentPlatformKind::Codex
-        );
-        assert_eq!(
-            AgentPlatformKind::from_command("opencode"),
-            AgentPlatformKind::OpenCode
-        );
-        assert_eq!(
-            AgentPlatformKind::from_command("gemini"),
-            AgentPlatformKind::Gemini
-        );
-        assert_eq!(
-            AgentPlatformKind::from_command("/opt/antigravity"),
-            AgentPlatformKind::Gemini
-        );
-        assert_eq!(
-            AgentPlatformKind::from_command("cursor-agent"),
-            AgentPlatformKind::Cursor
-        );
-        assert_eq!(
-            AgentPlatformKind::from_command("bash"),
-            AgentPlatformKind::Shell
+        assert_ne!(
+            registry
+                .detect_from_command("notification")
+                .map(|descriptor| descriptor.id.as_str()),
+            Some("ion")
         );
     }
 
     #[test]
-    fn test_agent_platform_kind_default_command() {
-        // Enum default is now fallback only. Real values come from resolve_launch_command (ops registry).
-        // These assert the minimal fallback behavior for the enum slug.
+    fn test_resolve_executable_command_finds_workspace_sibling_from_deps_layout() {
+        let root = tempfile::tempdir().expect("temporary target directory");
+        let deps = root.path().join("deps");
+        std::fs::create_dir(&deps).expect("create deps directory");
+        let current_exe = deps.join("desktop-runtime-test");
+        std::fs::write(&current_exe, b"test harness").expect("write current executable marker");
+        let ion = root.path().join("ion");
+        std::fs::write(&ion, b"#!/bin/sh\nexit 0\n").expect("write sibling Ion executable");
+        #[cfg(unix)]
+        std::fs::set_permissions(&ion, std::fs::Permissions::from_mode(0o755))
+            .expect("mark sibling executable");
+
         assert_eq!(
-            AgentPlatformKind::Shell.default_command(),
-            std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string())
+            resolve_executable_command_with(&platform_id("ion"), "ion", Some(&current_exe), None,),
+            ion.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn test_resolve_executable_command_prefers_path_over_untrusted_sibling() {
+        let root = tempfile::tempdir().expect("temporary target directory");
+        let deps = root.path().join("deps");
+        let path_dir = root.path().join("path-bin");
+        std::fs::create_dir(&deps).expect("create deps directory");
+        std::fs::create_dir(&path_dir).expect("create PATH directory");
+        let current_exe = deps.join("desktop-runtime-test");
+        std::fs::write(&current_exe, b"test harness").expect("write current executable marker");
+        let sibling = root.path().join("codex");
+        let path_codex = path_dir.join("codex");
+        for executable in [&sibling, &path_codex] {
+            std::fs::write(executable, b"#!/bin/sh\nexit 0\n").expect("write executable");
+            #[cfg(unix)]
+            std::fs::set_permissions(executable, std::fs::Permissions::from_mode(0o755))
+                .expect("mark executable");
+        }
+        let search_path = std::env::join_paths([&path_dir]).expect("join test PATH");
+
+        assert_eq!(
+            resolve_executable_command_with(
+                &platform_id("codex"),
+                "codex",
+                Some(&current_exe),
+                Some(&search_path),
+            ),
+            path_codex.to_string_lossy(),
+            "external agents must keep PATH semantics instead of trusting app siblings"
         );
     }
 
@@ -1461,18 +1526,21 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_platform_kind_round_trip() {
-        for kind in [
-            AgentPlatformKind::ClaudeCode,
-            AgentPlatformKind::Codex,
-            AgentPlatformKind::OpenCode,
-            AgentPlatformKind::Gemini,
-            AgentPlatformKind::Cursor,
-            AgentPlatformKind::Shell,
+    fn test_agent_platform_id_round_trip() {
+        for id in [
+            "claude-code",
+            "codex",
+            "opencode",
+            "gemini",
+            "cursor",
+            "ion",
+            "shell",
+            "custom-agent",
         ] {
-            let json = serde_json::to_string(&kind).unwrap();
-            let recovered: AgentPlatformKind = serde_json::from_str(&json).unwrap();
-            assert_eq!(kind, recovered);
+            let platform = platform_id(id);
+            let json = serde_json::to_string(&platform).unwrap();
+            let recovered: AgentPlatformId = serde_json::from_str(&json).unwrap();
+            assert_eq!(platform, recovered);
         }
     }
 

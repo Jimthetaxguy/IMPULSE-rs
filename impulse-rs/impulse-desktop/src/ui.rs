@@ -1,14 +1,14 @@
 use std::collections::HashMap;
 
 use dioxus::prelude::*;
-use impulse_ops::ProjectOpsSnapshot;
+use impulse_ops::{agent_registry::AgentPlatformInfo, ProjectOpsSnapshot};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::host_commands::{McpInvokeRequest, RegisterWorkspaceRequest};
 use crate::mcp::{McpInvocation, ReviewDecision, ReviewQueueItem, ReviewQueueStatus};
 use crate::runtime::{
-    default_builtin_mcp_tools, AgentPlatformKind, AgentRuntimeSnapshot, AgentSpawnRequest,
+    default_builtin_mcp_tools, AgentPlatformId, AgentRuntimeSnapshot, AgentSpawnRequest,
     BuiltInMcpTool, WorkspaceTarget,
 };
 use crate::theme::{
@@ -153,10 +153,25 @@ const DESKTOP_EVENT_BRIDGE_SCRIPT: &str = concat!(
       return [];
     }
   };
+  const refreshAgentPlatforms = async () => {
+    if (!invoke) {
+      forward("bridge_status", { status: "agent_platforms_failed", reason: "host invoke API unavailable" });
+      return [];
+    }
+    try {
+      const platforms = await invoke("agent_platforms");
+      forward("agent_platforms", { platforms });
+      return platforms;
+    } catch (error) {
+      forward("bridge_status", { status: "agent_platforms_failed", reason: String(error) });
+      return [];
+    }
+  };
 
   window.__impulseOpsBridge.refreshAgents = refreshAgents;
   window.__impulseOpsBridge.refreshWorkspaces = refreshWorkspaces;
   window.__impulseOpsBridge.refreshMcpDescriptors = refreshMcpDescriptors;
+  window.__impulseOpsBridge.refreshAgentPlatforms = refreshAgentPlatforms;
   window.__impulseOpsBridge.refreshReviewQueue = refreshReviewQueue;
   window.__impulseOpsBridge.registerWorkspace = async (request) => {
     if (!invoke) {
@@ -260,6 +275,7 @@ const DESKTOP_EVENT_BRIDGE_SCRIPT: &str = concat!(
     await refreshAgents();
     await refreshWorkspaces();
     await refreshMcpDescriptors();
+    await refreshAgentPlatforms();
     await refreshReviewQueue();
   }
 
@@ -760,6 +776,7 @@ fn McpReadOnlyRow(tool_name: String, on_invoke: EventHandler<McpInvokeRequest>) 
 #[component]
 fn WorkspaceLaunchPanel(
     workspaces: Vec<WorkspaceEntry>,
+    platforms: Vec<AgentPlatformInfo>,
     selected_root: String,
     on_register: EventHandler<RegisterWorkspaceRequest>,
     on_launch: EventHandler<AgentSpawnRequest>,
@@ -791,6 +808,19 @@ fn WorkspaceLaunchPanel(
         .iter()
         .find(|entry| entry.target.root == launch_root)
         .map(|entry| entry.target.clone());
+    let selected_platform = platform();
+    let selected_platform_id = if platforms
+        .iter()
+        .any(|candidate| candidate.id.as_str() == selected_platform)
+    {
+        selected_platform
+    } else {
+        platforms
+            .first()
+            .map(|candidate| candidate.id.to_string())
+            .unwrap_or_default()
+    };
+    let can_launch = can_launch && !selected_platform_id.is_empty();
 
     rsx! {
         section { class: "inspector-section workspace-launch", "data-source": "workspace_launcher",
@@ -798,7 +828,7 @@ fn WorkspaceLaunchPanel(
             header { class: "section-header",
                 div {
                     h2 { "Workspace Launcher" }
-                    p { "Register a folder, then launch Codex, Claude, OpenCode, or Shell inside it." }
+                    p { "Register a folder, then launch any agent from the runtime registry inside it." }
                 }
                 span { class: "workspace-launch-badge", "MCP audited" }
             }
@@ -875,14 +905,15 @@ fn WorkspaceLaunchPanel(
                 label { class: "workspace-field",
                     span { "Agent" }
                     select {
-                        value: "{platform}",
+                        value: "{selected_platform_id}",
                         onchange: move |evt| platform.set(evt.value()),
-                        option { value: "codex", "Codex" }
-                        option { value: "claude-code", "Claude Code" }
-                        option { value: "opencode", "OpenCode" }
-                        option { value: "gemini", "Gemini" }
-                        option { value: "cursor", "Cursor" }
-                        option { value: "shell", "Shell" }
+                        if platforms.is_empty() {
+                            option { value: "", disabled: true, "Agent registry unavailable" }
+                        } else {
+                            for candidate in platforms.iter() {
+                                option { value: "{candidate.id}", "{candidate.label}" }
+                            }
+                        }
                     }
                 }
                 label { class: "workspace-field",
@@ -916,10 +947,13 @@ fn WorkspaceLaunchPanel(
                             .as_ref()
                             .map(|value| format!("{value}-session"));
                         let workspace = launch_workspace.clone().unwrap_or_else(|| WorkspaceTarget::from_root(root.clone()));
+                        let Ok(platform_id) = AgentPlatformId::try_new(selected_platform_id.clone()) else {
+                            return;
+                        };
                         on_launch.call(AgentSpawnRequest {
                             agent_id: agent_id_value,
                             session_id,
-                            platform: parse_platform_kind(&platform()),
+                            platform: platform_id,
                             command: optional_text(command()),
                             args: Vec::new(),
                             cwd: Some(root),
@@ -986,17 +1020,6 @@ fn optional_text(value: String) -> Option<String> {
         None
     } else {
         Some(trimmed.to_string())
-    }
-}
-
-fn parse_platform_kind(value: &str) -> AgentPlatformKind {
-    match value {
-        "claude-code" => AgentPlatformKind::ClaudeCode,
-        "opencode" => AgentPlatformKind::OpenCode,
-        "gemini" => AgentPlatformKind::Gemini,
-        "cursor" => AgentPlatformKind::Cursor,
-        "shell" => AgentPlatformKind::Shell,
-        _ => AgentPlatformKind::Codex,
     }
 }
 
@@ -1253,15 +1276,51 @@ fn WorkspaceList(workspaces: Vec<WorkspaceEntry>, selected_root: Option<String>)
     }
 }
 
+pub struct DesktopBridgeStateMut<'a> {
+    pub snapshot: &'a mut ProjectOpsSnapshot,
+    pub runtime_agents: &'a mut Vec<AgentRuntimeSnapshot>,
+    pub agent_platforms: &'a mut Vec<AgentPlatformInfo>,
+    pub workspaces: &'a mut Vec<WorkspaceEntry>,
+    pub mcp_tools: &'a mut Vec<BuiltInMcpTool>,
+    pub review_queue: &'a mut Vec<ReviewQueueItem>,
+    pub last_invocations: &'a mut Vec<McpInvocation>,
+}
+
+impl<'a> DesktopBridgeStateMut<'a> {
+    pub fn new(
+        snapshot: &'a mut ProjectOpsSnapshot,
+        runtime_agents: &'a mut Vec<AgentRuntimeSnapshot>,
+        agent_platforms: &'a mut Vec<AgentPlatformInfo>,
+        workspaces: &'a mut Vec<WorkspaceEntry>,
+        mcp_tools: &'a mut Vec<BuiltInMcpTool>,
+        review_queue: &'a mut Vec<ReviewQueueItem>,
+        last_invocations: &'a mut Vec<McpInvocation>,
+    ) -> Self {
+        Self {
+            snapshot,
+            runtime_agents,
+            agent_platforms,
+            workspaces,
+            mcp_tools,
+            review_queue,
+            last_invocations,
+        }
+    }
+}
+
 pub fn apply_desktop_bridge_message(
-    snapshot: &mut ProjectOpsSnapshot,
-    runtime_agents: &mut Vec<AgentRuntimeSnapshot>,
-    workspaces: &mut Vec<WorkspaceEntry>,
-    mcp_tools: &mut Vec<BuiltInMcpTool>,
-    review_queue: &mut Vec<ReviewQueueItem>,
-    last_invocations: &mut Vec<McpInvocation>,
+    state: DesktopBridgeStateMut<'_>,
     message: DesktopBridgeMessage,
 ) -> Result<(), String> {
+    let DesktopBridgeStateMut {
+        snapshot,
+        runtime_agents,
+        agent_platforms,
+        workspaces,
+        mcp_tools,
+        review_queue,
+        last_invocations,
+    } = state;
     match message.kind.as_str() {
         "ops_update" => {
             let payload = extract_ops_update_payload(&message.payload);
@@ -1288,6 +1347,16 @@ pub fn apply_desktop_bridge_message(
                 .into_iter()
                 .filter(|snapshot| snapshot.alive)
                 .collect();
+            Ok(())
+        }
+        "agent_platforms" => {
+            let platforms = message
+                .payload
+                .get("platforms")
+                .cloned()
+                .unwrap_or_else(|| message.payload.clone());
+            *agent_platforms = serde_json::from_value::<Vec<AgentPlatformInfo>>(platforms)
+                .map_err(|error| format!("invalid agent_platforms payload: {error}"))?;
             Ok(())
         }
         "terminal_exit" => {
@@ -1516,6 +1585,7 @@ fn BrandHero() -> Element {
 pub fn DesktopShellWithSnapshot(
     snapshot: ProjectOpsSnapshot,
     #[props(default)] runtime_agents: Vec<AgentRuntimeSnapshot>,
+    #[props(default)] agent_platforms: Vec<AgentPlatformInfo>,
     #[props(default)] workspaces: Vec<WorkspaceEntry>,
     #[props(default)] mcp_tools: Vec<BuiltInMcpTool>,
     #[props(default)] last_invocations: Vec<McpInvocation>,
@@ -1884,6 +1954,7 @@ pub fn DesktopShellWithSnapshot(
                     }
                     WorkspaceLaunchPanel {
                         workspaces: workspaces.clone(),
+                        platforms: agent_platforms.clone(),
                         selected_root: selected_root.clone(),
                         on_register: move |request: RegisterWorkspaceRequest| {
                             let script = workspace_registration_bridge_script(&request);
@@ -1946,6 +2017,7 @@ pub fn DesktopShellWithSnapshot(
 pub fn DesktopShell() -> Element {
     let mut snapshot = use_signal(ProjectOpsSnapshot::default);
     let mut runtime_agents = use_signal(Vec::<AgentRuntimeSnapshot>::new);
+    let mut agent_platforms = use_signal(Vec::<AgentPlatformInfo>::new);
     let mut workspaces = use_signal(Vec::<WorkspaceEntry>::new);
     let mut mcp_tools = use_signal(Vec::<BuiltInMcpTool>::new);
     let mut review_queue = use_signal(Vec::<ReviewQueueItem>::new);
@@ -1976,23 +2048,28 @@ pub fn DesktopShell() -> Element {
                 }
                 let mut next_snapshot = snapshot();
                 let mut next_agents = runtime_agents();
+                let mut next_platforms = agent_platforms();
                 let mut next_workspaces = workspaces();
                 let mut next_mcp_tools = mcp_tools();
                 let mut next_queue = review_queue();
                 let mut next_invocations = last_invocations();
                 if apply_desktop_bridge_message(
-                    &mut next_snapshot,
-                    &mut next_agents,
-                    &mut next_workspaces,
-                    &mut next_mcp_tools,
-                    &mut next_queue,
-                    &mut next_invocations,
+                    DesktopBridgeStateMut::new(
+                        &mut next_snapshot,
+                        &mut next_agents,
+                        &mut next_platforms,
+                        &mut next_workspaces,
+                        &mut next_mcp_tools,
+                        &mut next_queue,
+                        &mut next_invocations,
+                    ),
                     message,
                 )
                 .is_ok()
                 {
                     snapshot.set(next_snapshot);
                     runtime_agents.set(next_agents);
+                    agent_platforms.set(next_platforms);
                     workspaces.set(next_workspaces);
                     mcp_tools.set(next_mcp_tools);
                     review_queue.set(next_queue);
@@ -2010,6 +2087,7 @@ pub fn DesktopShell() -> Element {
         DesktopShellWithSnapshot {
             snapshot: snapshot(),
             runtime_agents: runtime_agents(),
+            agent_platforms: agent_platforms(),
             workspaces: workspaces(),
             mcp_tools: mcp_tools(),
             review_queue: review_queue(),
