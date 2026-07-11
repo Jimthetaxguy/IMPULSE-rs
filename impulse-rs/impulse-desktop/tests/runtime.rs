@@ -3,7 +3,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use impulse_desktop::{
-    AgentPlatformKind, AgentSpawnRequest, AgentWriteRequest, DesktopEvent, DesktopEventSink,
+    AgentPlatformId, AgentSpawnRequest, AgentWriteRequest, DesktopEvent, DesktopEventSink,
     DesktopRuntime, LocalSupervisorAction, SupervisorLocalActionRequest, TerminalCloseRequest,
     TerminalFocusRequest, TerminalResizeRequest, WeakDesktopRuntime, WorkspaceTarget,
 };
@@ -123,11 +123,15 @@ fn terminal_output(sink: &RecordingSink, agent_id: &str) -> Vec<u8> {
     output
 }
 
+fn platform_id(value: &str) -> AgentPlatformId {
+    AgentPlatformId::try_new(value).expect("valid test platform id")
+}
+
 fn shell_spawn(agent_id: &str, script: &str) -> AgentSpawnRequest {
     AgentSpawnRequest {
         agent_id: Some(agent_id.to_string()),
         session_id: Some(format!("{agent_id}-session")),
-        platform: AgentPlatformKind::Shell,
+        platform: platform_id("shell"),
         command: Some("sh".to_string()),
         args: vec!["-lc".to_string(), script.to_string()],
         cwd: None,
@@ -389,7 +393,7 @@ fn test_desktop_runtime_spawns_shell_and_emits_terminal_output() {
         .expect("spawn shell agent");
 
     assert_eq!(snapshot.agent_id, "shell-one");
-    assert_eq!(snapshot.platform, AgentPlatformKind::Shell);
+    assert_eq!(snapshot.platform, platform_id("shell"));
     assert_eq!(snapshot.rows, 24);
     assert_eq!(snapshot.cols, 80);
 
@@ -460,7 +464,7 @@ fn test_desktop_runtime_snapshot_carries_workspace_and_builtin_mcp_tools() {
 fn test_terminal_harness_spawn_request_binds_workspace_and_default_tools() {
     let request = AgentSpawnRequest::terminal_harness(
         "codex-harness",
-        AgentPlatformKind::Codex,
+        platform_id("codex"),
         "/workspace",
         32,
         100,
@@ -468,7 +472,7 @@ fn test_terminal_harness_spawn_request_binds_workspace_and_default_tools() {
 
     assert_eq!(request.agent_id.as_deref(), Some("codex-harness"));
     assert_eq!(request.session_id.as_deref(), Some("codex-harness-session"));
-    assert_eq!(request.platform, AgentPlatformKind::Codex);
+    assert_eq!(request.platform, platform_id("codex"));
     assert_eq!(request.command, None);
     assert_eq!(request.cwd.as_deref(), Some("/workspace"));
     assert_eq!(
@@ -495,6 +499,123 @@ fn test_workspace_target_deserializes_without_project_notes() {
     assert_eq!(target.root, "/tmp");
     assert_eq!(target.label.as_deref(), Some("scratch"));
     assert_eq!(target.project_notes, None);
+}
+
+#[test]
+fn test_agent_spawn_request_accepts_open_registry_ids_with_plain_string_wire_shape() {
+    for platform in ["codex", "ion", "custom-agent"] {
+        let request: AgentSpawnRequest = serde_json::from_value(json!({
+            "platform": platform,
+            "rows": 24,
+            "cols": 80
+        }))
+        .expect("registered and custom platform ids must use the same open string wire shape");
+
+        let encoded = serde_json::to_value(request).expect("request serializes");
+        assert_eq!(encoded["platform"], platform);
+    }
+}
+
+#[test]
+fn test_desktop_runtime_rejects_unknown_explicit_platform_before_spawning() {
+    let request: AgentSpawnRequest = serde_json::from_value(json!({
+        "agent_id": "unknown-platform",
+        "platform": "missing-agent",
+        "command": "sh",
+        "args": ["-lc", "true"],
+        "rows": 24,
+        "cols": 80
+    }))
+    .expect("open platform identity must decode before registry validation");
+
+    let error = DesktopRuntime::default()
+        .spawn_agent(request)
+        .expect_err("unknown explicit platform must fail closed");
+    assert!(error.to_string().contains("unknown agent platform"));
+}
+
+#[test]
+fn test_desktop_runtime_canonicalizes_registered_platform_identity() {
+    let runtime = DesktopRuntime::default();
+    let mut request = shell_spawn("canonical-platform", "sleep 2");
+    request.platform = platform_id("ShElL");
+
+    let snapshot = runtime
+        .spawn_agent(request)
+        .expect("case-insensitive registered identity should launch");
+    assert_eq!(snapshot.platform, platform_id("shell"));
+
+    runtime
+        .close_agent(TerminalCloseRequest {
+            session_id: snapshot.agent_id,
+        })
+        .expect("close canonicalization test agent");
+}
+
+#[test]
+fn test_desktop_runtime_canonicalizes_registered_alias_to_platform_id() {
+    let runtime = DesktopRuntime::default();
+    let mut request = shell_spawn("canonical-alias", "sleep 2");
+    request.platform = platform_id("generic_shell");
+
+    let snapshot = runtime
+        .spawn_agent(request)
+        .expect("registered alias should launch through its owning platform");
+    assert_eq!(snapshot.platform, platform_id("shell"));
+
+    runtime
+        .close_agent(TerminalCloseRequest {
+            session_id: snapshot.agent_id,
+        })
+        .expect("close alias canonicalization test agent");
+}
+
+#[test]
+#[ignore = "requires `cargo build -p impulse-rs --bin ion` in the shared target directory"]
+fn test_desktop_runtime_spawns_real_default_ion_sibling_without_override() {
+    let current_exe = std::env::current_exe().expect("locate desktop runtime test binary");
+    let deps_dir = current_exe.parent().expect("test binary parent");
+    let target_profile = if deps_dir.file_name().and_then(|name| name.to_str()) == Some("deps") {
+        deps_dir.parent().expect("target profile directory")
+    } else {
+        deps_dir
+    };
+    let ion = target_profile.join(format!("ion{}", std::env::consts::EXE_SUFFIX));
+    assert!(
+        ion.is_file(),
+        "build the real Ion binary before running this integration test: {}",
+        ion.display()
+    );
+
+    let runtime = DesktopRuntime::default();
+    let request = AgentSpawnRequest {
+        agent_id: Some("real-ion-sibling".to_string()),
+        session_id: Some("real-ion-sibling-session".to_string()),
+        platform: platform_id("ion"),
+        command: None,
+        args: Vec::new(),
+        cwd: None,
+        env: HashMap::new(),
+        workspace: None,
+        mcp_tools: Vec::new(),
+        rows: 24,
+        cols: 80,
+        role: None,
+        target: None,
+    };
+
+    let snapshot = runtime
+        .spawn_agent(request)
+        .expect("launch real Ion through the desktop PTY runtime");
+    assert_eq!(snapshot.platform, platform_id("ion"));
+    assert_eq!(snapshot.command, ion.to_string_lossy());
+    assert!(snapshot.alive);
+
+    runtime
+        .close_agent(TerminalCloseRequest {
+            session_id: snapshot.agent_id,
+        })
+        .expect("close real Ion integration process");
 }
 
 #[test]

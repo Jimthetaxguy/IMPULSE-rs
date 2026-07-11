@@ -3,6 +3,7 @@
 //! Registry-derived manifest describing Impulse capabilities for agents.
 
 use chrono::Utc;
+use impulse_ops::agent_registry::AgentRegistry;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -12,12 +13,6 @@ use crate::tooling::{ManifestTool, ToolRegistry};
 /// Version of the capabilities manifest format.
 pub const MANIFEST_VERSION: &str = "2.0";
 pub const DEFAULT_MANIFEST_FILE: &str = "impulse-capabilities.json";
-
-/// Coding-agent platforms Impulse can detect, monitor, and drive. Kept in sync
-/// with the agent-kind/platform/harness enums (claude-code, codex, opencode,
-/// gemini, cursor). Surfaced so an agent or operator reading the manifest can
-/// see which peers Impulse interoperates with.
-pub const SUPPORTED_AGENTS: &[&str] = &["claude-code", "codex", "opencode", "gemini", "cursor"];
 
 /// The capabilities manifest — describes Impulse capabilities for agents.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,12 +30,16 @@ pub struct CapabilitiesManifest {
 
 impl Default for CapabilitiesManifest {
     fn default() -> Self {
-        Self::from_registry(&ToolRegistry::with_defaults())
+        Self::from_registries(&ToolRegistry::with_defaults(), &AgentRegistry::builtin())
     }
 }
 
 impl CapabilitiesManifest {
     pub fn from_registry(registry: &ToolRegistry) -> Self {
+        Self::from_registries(registry, &AgentRegistry::builtin())
+    }
+
+    pub fn from_registries(registry: &ToolRegistry, agent_registry: &AgentRegistry) -> Self {
         let tools = registry.manifest_tools();
         let mut features = vec![
             "retrieval".to_string(),
@@ -58,7 +57,11 @@ impl CapabilitiesManifest {
             generated_at: Utc::now().to_rfc3339(),
             tools,
             features,
-            supported_agents: SUPPORTED_AGENTS.iter().map(|s| s.to_string()).collect(),
+            supported_agents: agent_registry
+                .agents()
+                .iter()
+                .map(|agent| agent.id.to_string())
+                .collect(),
         }
     }
 
@@ -85,7 +88,8 @@ pub fn write_capabilities_manifest(
     base_path: &Path,
     registry: &ToolRegistry,
 ) -> anyhow::Result<std::path::PathBuf> {
-    let manifest = CapabilitiesManifest::from_registry(registry);
+    let agent_registry = AgentRegistry::registry_for_runtime()?;
+    let manifest = CapabilitiesManifest::from_registries(registry, &agent_registry);
     let path = base_path.join(DEFAULT_MANIFEST_FILE);
     Storage::atomic_write_path(&path, manifest.to_json()?.as_bytes())?;
     Ok(path)
@@ -173,7 +177,14 @@ mod tests {
         let manifest = CapabilitiesManifest::default();
         // The agents added across the multi-agent work (claude/codex/opencode/
         // gemini/cursor) are advertised so peers can discover interop.
-        for agent in ["claude-code", "codex", "opencode", "gemini", "cursor"] {
+        for agent in [
+            "claude-code",
+            "codex",
+            "opencode",
+            "gemini",
+            "cursor",
+            "ion",
+        ] {
             assert!(
                 manifest.supported_agents.iter().any(|a| a == agent),
                 "manifest should advertise support for {agent}"
@@ -187,6 +198,24 @@ mod tests {
         assert!(summary.contains("Monitored Agents"));
         assert!(summary.contains("gemini"));
         assert!(summary.contains("cursor"));
+        assert!(summary.contains("ion"));
+    }
+
+    #[test]
+    fn test_manifest_can_be_driven_by_a_custom_agent_registry() {
+        let agents = AgentRegistry::from_toml_str(
+            r#"
+[[agent]]
+id = "custom-agent"
+label = "Custom Agent"
+command = "custom-agent"
+"#,
+        )
+        .unwrap();
+        let manifest =
+            CapabilitiesManifest::from_registries(&ToolRegistry::with_defaults(), &agents);
+
+        assert_eq!(manifest.supported_agents, vec!["custom-agent"]);
     }
 
     #[test]
