@@ -253,12 +253,10 @@ pub async fn handle_chat(
     let model = std::env::var("IMPULSE_MODEL").unwrap_or_else(|_| "claude-sonnet-4-6".to_string());
     let request = ChatRequest {
         model,
-        messages: vec![Message {
-            role: Role::User,
-            content: context_prompt,
-        }],
+        messages: vec![Message::text(Role::User, context_prompt)],
         temperature: 0.7,
         max_tokens: Some(4096),
+        tools: Vec::new(),
     };
 
     let response = provider

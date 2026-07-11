@@ -3,7 +3,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::sync::Arc;
 
-use super::{ChatRequest, ChatResponse, LlmProvider, Message, Role, Usage};
+use super::{ChatRequest, ChatResponse, LlmProvider, Message, Role, StopReason, ToolCall, Usage};
 use crate::error::{AgentError, AgentResult};
 
 /// Total request timeout for an LLM call. Long enough for slow completions,
@@ -105,21 +105,83 @@ struct AnthropicResponse {
     id: String,
     model: String,
     usage: AnthropicUsage,
+    /// Anthropic's stop reason string (`"end_turn"`, `"tool_use"`,
+    /// `"max_tokens"`, `"stop_sequence"`, ...) — mapped to [`StopReason`] in
+    /// `AnthropicProvider::chat`. Absent on some malformed/legacy responses,
+    /// hence `Option`.
+    stop_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct AnthropicContent {
     #[serde(rename = "type")]
-    // dead_code: deserialized from Anthropic API response; required by serde to round-trip the "type" field
-    #[allow(dead_code)]
-    _type: String,
+    block_type: String,
     text: Option<String>,
+    // Present on `tool_use` blocks only.
+    id: Option<String>,
+    name: Option<String>,
+    input: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
 struct AnthropicUsage {
     input_tokens: u32,
     output_tokens: u32,
+}
+
+/// Renders messages for the Anthropic Messages API. Plain text messages use
+/// the simple `{"role", "content": "..."}` shape (matching
+/// `BaseProvider::format_messages`); messages carrying `tool_calls` or
+/// `tool_results` (TUI_SPEC.md T9) render `content` as a block array per
+/// Anthropic's tool-use protocol instead. Kept Anthropic-specific rather
+/// than folded into `BaseProvider::format_messages` because OpenAI/Minimax
+/// don't support tool-use blocks yet.
+fn format_anthropic_messages(messages: &[Message]) -> Vec<serde_json::Value> {
+    messages
+        .iter()
+        .map(|m| {
+            let role = match m.role {
+                // System messages are filtered out before this is called
+                // (Anthropic takes `system` as a top-level request field),
+                // but map defensively to "user" rather than panic if one
+                // ever slips through.
+                Role::System | Role::User => "user",
+                Role::Assistant => "assistant",
+            };
+
+            if !m.tool_calls.is_empty() {
+                let mut blocks = Vec::new();
+                if !m.content.is_empty() {
+                    blocks.push(serde_json::json!({"type": "text", "text": m.content}));
+                }
+                for call in &m.tool_calls {
+                    blocks.push(serde_json::json!({
+                        "type": "tool_use",
+                        "id": call.id,
+                        "name": call.name,
+                        "input": call.input,
+                    }));
+                }
+                serde_json::json!({"role": role, "content": blocks})
+            } else if !m.tool_results.is_empty() {
+                let blocks: Vec<serde_json::Value> = m
+                    .tool_results
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "type": "tool_result",
+                            "tool_use_id": r.tool_use_id,
+                            "content": r.content,
+                            "is_error": r.is_error,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({"role": role, "content": blocks})
+            } else {
+                serde_json::json!({"role": role, "content": m.content})
+            }
+        })
+        .collect()
 }
 
 pub struct AnthropicProvider(BaseProvider);
@@ -154,11 +216,16 @@ impl LlmProvider for AnthropicProvider {
             "model": request.model,
             "max_tokens": request.max_tokens.unwrap_or(4096),
             "temperature": request.temperature,
-            "messages": BaseProvider::format_messages(&non_system),
+            "messages": format_anthropic_messages(&non_system),
         });
 
         if let Some(sys) = system {
             body["system"] = serde_json::Value::String(sys);
+        }
+
+        if !request.tools.is_empty() {
+            body["tools"] = serde_json::to_value(&request.tools)
+                .map_err(|e| AgentError::InvalidRequest(format!("failed to encode tools: {e}")))?;
         }
 
         let response = self
@@ -192,9 +259,28 @@ impl LlmProvider for AnthropicProvider {
         let content = resp
             .content
             .iter()
+            .filter(|c| c.block_type == "text")
             .filter_map(|c| c.text.clone())
             .collect::<Vec<_>>()
             .join("");
+
+        let tool_calls: Vec<ToolCall> = resp
+            .content
+            .iter()
+            .filter(|c| c.block_type == "tool_use")
+            .map(|c| ToolCall {
+                id: c.id.clone().unwrap_or_default(),
+                name: c.name.clone().unwrap_or_default(),
+                input: c.input.clone().unwrap_or(serde_json::Value::Null),
+            })
+            .collect();
+
+        let stop_reason = match resp.stop_reason.as_deref() {
+            Some("tool_use") => StopReason::ToolUse,
+            Some("max_tokens") => StopReason::MaxTokens,
+            Some("end_turn") | Some("stop_sequence") => StopReason::EndTurn,
+            _ => StopReason::Other,
+        };
 
         Ok(ChatResponse {
             content,
@@ -203,6 +289,8 @@ impl LlmProvider for AnthropicProvider {
                 input_tokens: resp.usage.input_tokens,
                 output_tokens: resp.usage.output_tokens,
             },
+            stop_reason,
+            tool_calls,
         })
     }
 
@@ -319,6 +407,9 @@ impl LlmProvider for OpenAiProvider {
                 input_tokens: resp.usage.prompt_tokens,
                 output_tokens: resp.usage.completion_tokens,
             },
+            // OpenAI tool-calling isn't wired up yet -- always a plain reply.
+            stop_reason: StopReason::EndTurn,
+            tool_calls: Vec::new(),
         })
     }
 
@@ -430,6 +521,9 @@ impl LlmProvider for MinimaxProvider {
                 input_tokens: resp.usage.prompt_tokens,
                 output_tokens: resp.usage.completion_tokens,
             },
+            // Minimax tool-calling isn't wired up yet -- always a plain reply.
+            stop_reason: StopReason::EndTurn,
+            tool_calls: Vec::new(),
         })
     }
 
@@ -483,14 +577,8 @@ mod tests {
     #[test]
     fn test_format_messages() {
         let messages = vec![
-            Message {
-                role: Role::System,
-                content: "You are helpful".to_string(),
-            },
-            Message {
-                role: Role::User,
-                content: "Hello".to_string(),
-            },
+            Message::text(Role::System, "You are helpful"),
+            Message::text(Role::User, "Hello"),
         ];
 
         let formatted = BaseProvider::format_messages(&messages);
@@ -517,5 +605,47 @@ mod tests {
     fn test_minimax_provider_new() {
         let provider = MinimaxProvider::new("test_key".to_string());
         assert_eq!(provider.name(), "minimax");
+    }
+
+    #[test]
+    fn test_format_anthropic_messages_plain_text_uses_string_content() {
+        let messages = vec![Message::text(Role::User, "hello")];
+        let formatted = format_anthropic_messages(&messages);
+        assert_eq!(formatted[0]["role"], "user");
+        assert_eq!(formatted[0]["content"], "hello");
+    }
+
+    #[test]
+    fn test_format_anthropic_messages_tool_use_renders_block_array() {
+        let call = ToolCall {
+            id: "call_1".into(),
+            name: "ion_verify".into(),
+            input: serde_json::json!({"diff_ref": "HEAD"}),
+        };
+        let messages = vec![Message::assistant_tool_use("", vec![call])];
+        let formatted = format_anthropic_messages(&messages);
+        assert_eq!(formatted[0]["role"], "assistant");
+        let blocks = formatted[0]["content"].as_array().expect("block array");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "tool_use");
+        assert_eq!(blocks[0]["id"], "call_1");
+        assert_eq!(blocks[0]["name"], "ion_verify");
+    }
+
+    #[test]
+    fn test_format_anthropic_messages_tool_result_renders_block_array() {
+        let result = crate::llm_backends::ToolResult {
+            tool_use_id: "call_1".into(),
+            content: "Approve".into(),
+            is_error: false,
+        };
+        let messages = vec![Message::tool_results(vec![result])];
+        let formatted = format_anthropic_messages(&messages);
+        assert_eq!(formatted[0]["role"], "user");
+        let blocks = formatted[0]["content"].as_array().expect("block array");
+        assert_eq!(blocks[0]["type"], "tool_result");
+        assert_eq!(blocks[0]["tool_use_id"], "call_1");
+        assert_eq!(blocks[0]["content"], "Approve");
+        assert_eq!(blocks[0]["is_error"], false);
     }
 }

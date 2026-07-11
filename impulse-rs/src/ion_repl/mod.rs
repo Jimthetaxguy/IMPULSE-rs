@@ -1,4 +1,4 @@
-//! Ion REPL core (TUI_SPEC.md T6/T7): readline loop -> route -> render.
+//! Ion REPL core (TUI_SPEC.md T6-T9): readline loop -> route -> render.
 //!
 //! [`ReplSession::run`] owns the interactive loop: read a line via
 //! `rustyline`, route it through [`router::route`], dispatch through the
@@ -6,9 +6,12 @@
 //! the rendered response. This module wires the deterministic slash-command
 //! surface (`/help`, `/quit`, `/clear`, `/verify`, `/tools`,
 //! unknown-command), history persistence at `.impulse/ion_history`
-//! (`history.rs`, `IMPULSE_HOME`-aware), and — as of T8 — free-text chat
-//! turns via [`chat::ChatState`] (`/clear` now really clears its history;
-//! LLM tool-calling, T9, is still a follow-up).
+//! (`history.rs`, `IMPULSE_HOME`-aware), and free-text chat turns via
+//! [`chat::ChatState`] (T8: `/clear` really clears its history; T9: every
+//! chat turn exposes the session's `ReplToolRegistry` to the model as
+//! Anthropic tool-use schemas, so free text like "verify my diff" can
+//! trigger `ion_verify` -- or `file_write`/`bash_exec` -- conversationally
+//! instead of only via `/verify`).
 
 pub mod chat;
 pub mod history;
@@ -166,7 +169,7 @@ async fn respond(
             false,
         ),
         RouterOutcome::ChatTurn(text) => {
-            let reply = match chat.turn(&text).await {
+            let reply = match chat.turn(&text, tools, ctx).await {
                 Ok(reply) => reply,
                 Err(crate::error::AgentError::MissingApiKey { .. }) => {
                     MISSING_API_KEY_NOTICE.to_string()
@@ -377,7 +380,9 @@ mod tests {
             "echo-fake-model".into(),
         );
         // Build up history first, so /clear has something real to clear.
-        chat.turn("hi").await.expect("fake provider succeeds");
+        chat.turn("hi", &tools, &ctx)
+            .await
+            .expect("fake provider succeeds");
         assert_eq!(chat.history_len(), 2);
 
         let (text, should_exit) = respond(

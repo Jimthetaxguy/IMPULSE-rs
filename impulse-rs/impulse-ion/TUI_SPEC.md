@@ -246,10 +246,35 @@ pass the repo gate: `cargo build && cargo test && cargo clippy -- -D warnings &&
   (Anthropic; `IMPULSE_MODEL` override honored); `/clear` clears history; missing
   key → graceful notice. Unit-test routing with a fake `LlmProvider`; live path
   behind an `#[ignore]` test per existing convention. *(Depends T6. Parallel to T7.)*
-- **T9 — LLM tool-calling.** Expose registered ReplTools as Anthropic tool-use
-  schemas; handle tool_use → run → tool_result round trip so "verify this diff"
-  works conversationally. Requires extending the anthropic backend for tool blocks.
-  *(Depends T7+T8.)*
+- **T9 — LLM tool-calling. DONE.** `llm_backends::mod.rs` gained
+  `ToolDefinition`/`ToolCall`/`ToolResult`/`StopReason`, a `ToolExecutor`
+  trait, and `Agent::chat_with_tools` (a request → tool_use → execute →
+  tool_result loop capped at `DEFAULT_MAX_TOOL_ROUNDS = 10`, erroring with
+  `AgentError::ToolLoopLimitExceeded` rather than looping forever). Deliberately
+  provider-agnostic: `llm_backends` never depends on `ion_repl` or
+  `src/tooling` types. `AnthropicProvider::chat` (`anthropic.rs`) sends
+  `ChatRequest::tools` as the wire `"tools"` array and parses `tool_use`
+  content blocks (plus the `stop_reason` field) out of the response;
+  OpenAI/Minimax providers accept the new `ChatResponse` fields but don't
+  populate tool_calls yet. `ion_repl::chat::ChatState::turn` now takes
+  `&ReplToolRegistry` and `&ReplContext`, builds Anthropic tool-use schemas
+  from every registered `ReplTool::json_schema()`, and adapts the registry
+  to `ToolExecutor` via `ReplToolExecutor` so free text like "verify my diff"
+  can trigger `ion_verify` (or `file_write`/`bash_exec`) conversationally,
+  not only via `/verify`. *(Depends T7+T8.)*
+
+  **Confirmation gate (adversarial-review follow-up, same day):** T9's first
+  landing made `file_write`/`bash_exec` reachable from raw model output for
+  the first time (previously they were registered but never dispatched) with
+  no confirmation step — unlike `claude`/`codex`, which prompt before
+  write/bash actions by default. `ion_repl::chat::ReplToolExecutor` now
+  gates `CONFIRMATION_REQUIRED_TOOLS` (`bash_exec`, `file_write`) behind a
+  `confirm` hook (`confirm_via_stdin` in production, printing the pending
+  call and reading `y`/`N`; default deny). A decline short-circuits before
+  `ReplTool::run` is ever called — the mutating call never executes.
+  `ion_verify`/`file_read` stay ungated (read-only, and `ion_verify` was
+  already ungated via `/verify`). `ChatState::with_confirm` (test-only) is
+  the DI seam so tests can drive the gate without blocking on real stdin.
 - **T10 (optional) — ratatui inline polish.** Spinner during gate runs, colored
   verdict table, status line. *(Depends T7. Do not start before T9 is stable.)*
 

@@ -40,6 +40,14 @@ pub enum AgentError {
 
     #[error("Invalid request: {0}")]
     InvalidRequest(String),
+
+    /// Surfaced by `llm_backends::Agent::chat_with_tools` (TUI_SPEC.md T9)
+    /// when a model keeps requesting tool calls without ever returning a
+    /// plain-text stop reason. Bounds a misbehaving model instead of looping
+    /// forever; the caller (ion REPL) renders this as a one-line chat error,
+    /// matching every other `AgentError` variant's rendering path.
+    #[error("Tool-use loop exceeded the maximum of {rounds} round trip(s) without a final reply")]
+    ToolLoopLimitExceeded { rounds: usize },
 }
 
 pub type AgentResult<T> = Result<T, AgentError>;
@@ -118,5 +126,16 @@ mod tests {
         let err = AgentError::InvalidRequest("empty query".into());
         assert!(format!("{err}").contains("empty query"));
         assert!(format!("{err}").contains("Invalid request"));
+    }
+
+    #[test]
+    fn test_agent_error_tool_loop_limit_exceeded_display() {
+        let err = AgentError::ToolLoopLimitExceeded { rounds: 10 };
+        let msg = format!("{err}");
+        assert!(msg.contains("10"), "expected round count in: {msg}");
+        assert!(
+            msg.to_lowercase().contains("tool-use loop"),
+            "expected tool-use loop wording in: {msg}"
+        );
     }
 }
