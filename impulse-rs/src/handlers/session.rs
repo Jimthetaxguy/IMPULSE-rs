@@ -110,7 +110,7 @@ pub async fn handle_session_start(
             summary: None,
             verify_enabled: None,
             stdin_payload,
-            output_preview: Some(preview_block(&block, 400)),
+            output_preview: Some(preview_block(block, 400)),
             output_lines,
         })?;
     } else {

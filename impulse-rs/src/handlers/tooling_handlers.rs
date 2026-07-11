@@ -5,8 +5,8 @@ use std::sync::Arc;
 use crate::{state, tooling, validate};
 
 use super::{
-    build_tool_context, build_tool_registry, get_session_id, parse_tool_category, print_json,
-    refresh_capabilities_manifest, tool_resolution_root,
+    build_tool_context, build_tool_registry, get_session_id, load_tool_registry,
+    parse_tool_category, print_json, refresh_capabilities_manifest, tool_resolution_root,
 };
 
 pub fn handle_tooling_list(
@@ -15,8 +15,7 @@ pub fn handle_tooling_list(
     category: Option<String>,
     json: bool,
 ) -> Result<()> {
-    let config = state.config_snapshot()?;
-    let registry = build_tool_registry(impulse_dir, &config)?;
+    let (_config, registry) = load_tool_registry(state, impulse_dir)?;
     let mut tools = registry.manifest_tools();
 
     if let Some(ref cat) = category {
@@ -57,8 +56,7 @@ pub fn handle_tooling_describe(
 ) -> Result<()> {
     validate::validate_tool_id(&tool_id)?;
 
-    let config = state.config_snapshot()?;
-    let registry = build_tool_registry(impulse_dir, &config)?;
+    let (_config, registry) = load_tool_registry(state, impulse_dir)?;
     match registry.get(&tool_id) {
         Some(tool) => {
             let desc = tool.descriptor();
@@ -121,8 +119,7 @@ pub async fn handle_tooling_run(
 ) -> Result<()> {
     validate::validate_tool_id(&tool_id)?;
 
-    let config = state.config_snapshot()?;
-    let registry = build_tool_registry(impulse_dir, &config)?;
+    let (config, registry) = load_tool_registry(state, impulse_dir)?;
     let params_value: serde_json::Value = if let Some(ref p) = params {
         match serde_json::from_str(p) {
             Ok(value) => value,
@@ -180,8 +177,7 @@ pub fn handle_tooling_schema(
     impulse_dir: &Path,
     format: String,
 ) -> Result<()> {
-    let config = state.config_snapshot()?;
-    let registry = build_tool_registry(impulse_dir, &config)?;
+    let (_config, registry) = load_tool_registry(state, impulse_dir)?;
 
     match format.as_str() {
         "json" => {

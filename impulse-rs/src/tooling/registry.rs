@@ -89,11 +89,11 @@ impl ToolRegistry {
             .map(|entry| {
                 let desc = entry.tool.descriptor();
                 ManifestTool {
-                    id: desc.id.clone(),
-                    name: desc.name.clone(),
-                    description: desc.description.clone(),
+                    id: desc.id,
+                    name: desc.name,
+                    description: desc.description,
                     category: desc.category.to_string(),
-                    params: desc.params.clone(),
+                    params: desc.params,
                     capabilities: entry
                         .tool
                         .required_capabilities()

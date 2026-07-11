@@ -3,6 +3,24 @@ use std::sync::Arc;
 
 use crate::{guardrail, state};
 
+/// Load the current guardrail config and confirm `rule_id` is known (either
+/// a builtin rule or an already-configured rule). Exits the process with
+/// code 1 and prints the standard "not found" error if the rule is unknown.
+fn resolve_known_rule_id(state: &Arc<state::State>, rule_id: &str) -> Result<state::Config> {
+    let all_rules = guardrail::defaults::builtin_rules();
+    let config = state.config_snapshot()?;
+    let known = all_rules.iter().any(|r| r.id == *rule_id)
+        || config.guardrails.rules.iter().any(|r| r.id == *rule_id);
+    if !known {
+        eprintln!(
+            "Error: rule '{}' not found. Use --list to see available rules.",
+            rule_id
+        );
+        std::process::exit(1);
+    }
+    Ok(config)
+}
+
 /// Handle the `guard` command.
 ///
 /// Evaluates an action against guardrail rules, lists active rules, or
@@ -36,17 +54,7 @@ pub fn handle_guard(
             }
         }
     } else if let Some(ref rule_id) = enable {
-        let all_rules = guardrail::defaults::builtin_rules();
-        let mut config = state.config_snapshot()?;
-        let known = all_rules.iter().any(|r| r.id == *rule_id)
-            || config.guardrails.rules.iter().any(|r| r.id == *rule_id);
-        if !known {
-            eprintln!(
-                "Error: rule '{}' not found. Use --list to see available rules.",
-                rule_id
-            );
-            std::process::exit(1);
-        }
+        let mut config = resolve_known_rule_id(state, rule_id)?;
         config
             .guardrails
             .rules
@@ -54,17 +62,7 @@ pub fn handle_guard(
         state.update_guardrail_rules(config.guardrails.rules.clone())?;
         println!("Enabled rule: {}", rule_id);
     } else if let Some(ref rule_id) = disable {
-        let all_rules = guardrail::defaults::builtin_rules();
-        let mut config = state.config_snapshot()?;
-        let known = all_rules.iter().any(|r| r.id == *rule_id)
-            || config.guardrails.rules.iter().any(|r| r.id == *rule_id);
-        if !known {
-            eprintln!(
-                "Error: rule '{}' not found. Use --list to see available rules.",
-                rule_id
-            );
-            std::process::exit(1);
-        }
+        let mut config = resolve_known_rule_id(state, rule_id)?;
         config.guardrails.rules.retain(|r| r.id != *rule_id);
         config.guardrails.rules.push(guardrail::GuardRule {
             id: rule_id.clone(),

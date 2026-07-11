@@ -187,7 +187,7 @@ fn semantic_history_rust(
         &[query.to_string()],
         config.retrieval_query_timeout_secs,
     ) {
-        Ok(v) if !v.is_empty() => v[0].clone(),
+        Ok(v) if !v.is_empty() => v.into_iter().next().unwrap(),
         Ok(_) => {
             return Ok(SearchResponse {
                 mode: "semantic".to_string(),
@@ -291,7 +291,7 @@ fn semantic_history_sqlite_vec(
         &[query.to_string()],
         config.retrieval_query_timeout_secs,
     ) {
-        Ok(v) if !v.is_empty() => v[0].clone(),
+        Ok(v) if !v.is_empty() => v.into_iter().next().unwrap(),
         Ok(_) => {
             return Ok(SearchResponse {
                 mode: "semantic".to_string(),
@@ -382,7 +382,7 @@ fn semantic_genome_rust(
         &[query.to_string()],
         config.retrieval_query_timeout_secs,
     ) {
-        Ok(v) if !v.is_empty() => v[0].clone(),
+        Ok(mut v) if !v.is_empty() => v.swap_remove(0),
         Ok(_) => {
             return Ok(SearchResponse {
                 mode: "semantic".to_string(),
@@ -486,7 +486,7 @@ fn semantic_genome_sqlite_vec(
         &[query.to_string()],
         config.retrieval_query_timeout_secs,
     ) {
-        Ok(v) if !v.is_empty() => v[0].clone(),
+        Ok(mut v) if !v.is_empty() => v.swap_remove(0),
         Ok(_) => {
             return Ok(SearchResponse {
                 mode: "semantic".to_string(),

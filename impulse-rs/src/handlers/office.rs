@@ -1,8 +1,29 @@
+use std::path::PathBuf;
+
 use anyhow::Result;
 
 use crate::office;
+use crate::office::ExtractionResult;
 
 use super::{print_json, require_arg};
+
+/// Resolve the `--file` argument, verify it exists, and parse it into an
+/// `ExtractionResult`. Shared by the `parse`/`extract`, `chunk`, and
+/// `extract-smart` subcommands, which all previously duplicated this
+/// require_arg + exists-check + parse_document + error-context chain.
+fn parse_document_arg(file: Option<String>) -> Result<(PathBuf, ExtractionResult)> {
+    let file = require_arg(file, "file")?;
+    let path = PathBuf::from(&file);
+
+    if !path.exists() {
+        return Err(anyhow::anyhow!("File not found: {}", file));
+    }
+
+    let result = office::parse_document(&path)
+        .map_err(|e| anyhow::anyhow!("Failed to parse document: {}", e))?;
+
+    Ok((path, result))
+}
 
 pub fn handle_office(
     subcommand: String,
@@ -28,15 +49,7 @@ pub fn handle_office(
             }
         }
         "parse" | "extract" => {
-            let file = require_arg(file, "file")?;
-            let path = std::path::Path::new(&file);
-
-            if !path.exists() {
-                return Err(anyhow::anyhow!("File not found: {}", file));
-            }
-
-            let result = office::parse_document(path)
-                .map_err(|e| anyhow::anyhow!("Failed to parse document: {}", e))?;
+            let (_path, result) = parse_document_arg(file)?;
 
             if json {
                 print_json(&result)?;
@@ -78,15 +91,7 @@ pub fn handle_office(
             }
         }
         "chunk" => {
-            let file = require_arg(file, "file")?;
-            let path = std::path::Path::new(&file);
-
-            if !path.exists() {
-                return Err(anyhow::anyhow!("File not found: {}", file));
-            }
-
-            let result = office::parse_document(path)
-                .map_err(|e| anyhow::anyhow!("Failed to parse document: {}", e))?;
+            let (_path, result) = parse_document_arg(file)?;
 
             let chunks = office::extraction::chunk_content(&result.content, 1000, 100);
 
@@ -101,21 +106,13 @@ pub fn handle_office(
             }
         }
         "extract-smart" | "smart" => {
-            let file = require_arg(file, "file")?;
             let goal = goal.unwrap_or_else(|| "extract all key information".to_string());
-            let path = std::path::Path::new(&file);
-
-            if !path.exists() {
-                return Err(anyhow::anyhow!("File not found: {}", file));
-            }
-
-            let result = office::parse_document(path)
-                .map_err(|e| anyhow::anyhow!("Failed to parse document: {}", e))?;
+            let (path, result) = parse_document_arg(file)?;
 
             let chunks = office::extraction::chunk_content(&result.content, 1000, 100);
 
             if json {
-                let target = office::extraction::create_extraction_target(path, &goal)
+                let target = office::extraction::create_extraction_target(&path, &goal)
                     .map_err(|e| anyhow::anyhow!("Failed to create extraction target: {}", e))?;
                 print_json(&serde_json::json!({
                     "goal": goal,

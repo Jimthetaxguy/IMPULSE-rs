@@ -7,6 +7,7 @@ use anyhow::Result;
 use std::collections::HashSet;
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::{agent_discovery, branding, build_hygiene, injection, state, storage, tooling, verify};
 
@@ -276,6 +277,18 @@ pub(crate) fn build_tool_registry(
         .map_err(|err| anyhow::anyhow!("failed to load runtime tool registry: {}", err))
 }
 
+/// Snapshot the current config and build a tool registry from it in one step.
+/// Centralizes the `config_snapshot()` + `build_tool_registry()` pair that was
+/// duplicated across the tooling handlers.
+pub(crate) fn load_tool_registry(
+    state: &Arc<state::State>,
+    impulse_dir: &Path,
+) -> Result<(state::Config, tooling::ToolRegistry)> {
+    let config = state.config_snapshot()?;
+    let registry = build_tool_registry(impulse_dir, &config)?;
+    Ok((config, registry))
+}
+
 pub(crate) fn build_tool_context(
     impulse_dir: &Path,
     config: &state::Config,
@@ -408,7 +421,6 @@ pub(crate) fn print_verification_report(report: &verify::VerificationReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use tempfile::TempDir;
 
     fn test_state() -> (TempDir, Arc<state::State>) {
