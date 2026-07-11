@@ -155,19 +155,69 @@ impl DynamicTool for BashExecTool {
         // instead of leaving an orphaned/zombie process behind.
         cmd.kill_on_drop(true);
 
+        // `kill_on_drop`/SIGKILL only reaches the *direct* `sh` child, not
+        // any process `sh` itself forks. `sh -c "<command>"` only
+        // exec-replaces itself with the child for a single simple command;
+        // a compound command (`cmd1 && cmd2`, `cmd1 | cmd2`) or an
+        // explicitly backgrounded one (`sleep 999 &`) makes `sh` fork real
+        // children instead, which survive a SIGKILL to `sh` alone -- proven
+        // live (`sh -c "sleep 30 & wait"`, kill the `sh` pid, the `sleep`
+        // pid is still running) and by the identical bug this exact session
+        // found and fixed in `agent::harness_query_structured_with_timeout`
+        // for a wrapper-script harness. Since `bash_exec` runs
+        // arbitrary LLM-generated commands -- the primary surface this
+        // session spent the day hardening (env-scrubbing, confirmation
+        // gate, guardrail scanning) -- a hung compound/backgrounded command
+        // would leave an orphan even with `kill_on_drop` alone. Fixed the
+        // same way as `impulse_ion::pi_adapter`'s watchdog and
+        // `agent::harness_query_structured_with_timeout`: put `sh` in its
+        // own process group at spawn (pgid == its own pid) so a timeout can
+        // kill the whole group, not just `sh` itself.
+        #[cfg(unix)]
+        {
+            cmd.process_group(0);
+        }
+
         let child = cmd
             .spawn()
             .map_err(|e| ToolError::ExecutionFailed(format!("failed to spawn shell: {e}")))?;
+        // Captured before `child` is consumed by `wait_with_output()`, so a
+        // timeout can still target the process group after the awaited
+        // future (and the `Child` it owns) is dropped.
+        let pgid = child.id();
 
         let output =
-            tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
+            match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
                 .await
-                .map_err(|_| {
-                    ToolError::ExecutionFailed(format!(
+            {
+                Ok(result) => result.map_err(|e| {
+                    ToolError::ExecutionFailed(format!("failed to wait on child: {e}"))
+                })?,
+                Err(_elapsed) => {
+                    // `kill_on_drop` already SIGKILLed the direct `sh` child
+                    // as the dropped future's `Child` handle goes out of
+                    // scope; this explicit group-kill catches any real work
+                    // process `sh` forked instead of exec-replacing itself
+                    // with. Best-effort: shells out to `kill` rather than
+                    // pulling in `libc` for one syscall, matching
+                    // `pi_adapter::kill_process_group`'s own precedent.
+                    #[cfg(unix)]
+                    if let Some(pgid) = pgid {
+                        let _ = tokio::process::Command::new("kill")
+                            .arg("-KILL")
+                            .arg("--")
+                            .arg(format!("-{pgid}"))
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status()
+                            .await;
+                    }
+                    return Err(ToolError::ExecutionFailed(format!(
                         "command timed out after {timeout_secs}s: {command}"
-                    ))
-                })?
-                .map_err(|e| ToolError::ExecutionFailed(format!("failed to wait on child: {e}")))?;
+                    )));
+                }
+            };
 
         let stdout_full = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr_full = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -427,6 +477,50 @@ mod tests {
             assert!(
                 stray.trim().is_empty(),
                 "expected no orphaned process after timeout, found pids: {stray}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_kills_grandchild_of_a_backgrounded_compound_command_on_timeout() {
+        // Regression test for the gap the above test does NOT cover: `sh -c
+        // "sleep N"` (a single simple command) gets exec-replaced by `sh`,
+        // so killing the `sh` pid alone happens to kill the real work too --
+        // that's a property of *that* invocation shape, not a guarantee.
+        // `sh -c "cmd1 & wait"` (explicitly backgrounded) makes `sh` FORK a
+        // real child instead of exec-replacing itself, so a SIGKILL to `sh`
+        // alone leaves that child running -- confirmed live before this
+        // fix (`sh -c "sleep 30 & wait"`, kill the sh pid, the sleep pid
+        // survives) and matches the identical bug this same session found
+        // in `agent::harness_query_structured_with_timeout` for a
+        // wrapper-script harness. Since `bash_exec` runs arbitrary
+        // LLM-generated commands, an orphaned backgrounded process is a
+        // real resource leak, not a hypothetical.
+        let unique_duration = format!("9.{}", std::process::id() % 1000);
+        let tool = BashExecTool;
+        let ctx = ToolContext::with_all_capabilities();
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "command": format!("sleep {unique_duration} & wait"),
+                    "timeout_secs": 1
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(matches!(result, Err(ToolError::ExecutionFailed(_))));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let check = tokio::process::Command::new("pgrep")
+            .arg("-f")
+            .arg(format!("sleep {unique_duration}"))
+            .output()
+            .await;
+        if let Ok(check) = check {
+            let stray = String::from_utf8_lossy(&check.stdout);
+            assert!(
+                stray.trim().is_empty(),
+                "expected the backgrounded grandchild to be killed via the process group, \
+                 found pids: {stray}"
             );
         }
     }
