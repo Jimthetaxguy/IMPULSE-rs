@@ -11,6 +11,8 @@ pub mod coordinator;
 pub mod harness;
 pub mod prompts;
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
 // Re-export LLM types for backward compatibility.
@@ -18,6 +20,19 @@ use crate::context_lifecycle::types::ExtractedInsight;
 use crate::error::{AgentError, AgentResult};
 pub use crate::llm_backends::anthropic::{AnthropicProvider, MinimaxProvider, OpenAiProvider};
 pub use crate::llm_backends::{Agent, LlmProvider};
+
+/// Wall-clock budget for a single harness CLI subprocess call
+/// (`harness::harness_query_structured`'s `tokio::process::Command::output()`).
+///
+/// Mirrors `tooling::builtin::bash_exec::DEFAULT_TIMEOUT_SECS` (30s) and
+/// `llm_backends::DEFAULT_TOOL_LOOP_TIMEOUT` (180s) as prior art for bounding
+/// subprocess/provider calls in this codebase, but set higher than
+/// `bash_exec`'s default: a harness invocation (`claude --print "..."`,
+/// `codex exec "..."`, etc.) round-trips through a full LLM turn plus that
+/// harness's own tool use, which is plausibly much slower than an arbitrary
+/// shell command. 120s was chosen as a middle ground between `bash_exec`'s
+/// 30s and the REPL tool loop's 180s wall-clock budget.
+pub const DEFAULT_HARNESS_TIMEOUT: Duration = Duration::from_secs(120);
 use coordinator::Recommendation;
 
 /// The LLM provider to use for the Impulse Agent.
@@ -523,6 +538,30 @@ impl ImpulseAgent {
         context: &[ExtractedInsight],
         max_tokens: Option<u32>,
     ) -> AgentResult<harness::HarnessResponse> {
+        self.harness_query_structured_with_timeout(
+            system_prompt,
+            user_prompt,
+            context,
+            max_tokens,
+            DEFAULT_HARNESS_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Test/DI seam for [`harness_query_structured`](Self::harness_query_structured):
+    /// same behavior with an overridable timeout, so tests can prove the
+    /// timeout path fires without waiting out the full production budget.
+    /// Mirrors `llm_backends::Agent::chat_with_tools_capped_timeout`'s
+    /// pattern (a private `_with_timeout`/`_timeout` seam behind the public,
+    /// fixed-default entry point).
+    async fn harness_query_structured_with_timeout(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+        context: &[ExtractedInsight],
+        max_tokens: Option<u32>,
+        timeout: Duration,
+    ) -> AgentResult<harness::HarnessResponse> {
         let harness_kind = match &self.config.mode {
             AgentMode::Harness { harness } => *harness,
             _ => {
@@ -564,9 +603,34 @@ impl ImpulseAgent {
             _request_file.path().to_string_lossy().as_ref(),
         );
 
-        let output = cmd.output().await.map_err(|e| {
-            AgentError::ApiRequest(format!("Failed to run {}: {}", harness_kind.command(), e))
-        })?;
+        // If the timeout below fires, the `cmd.output()` future (and the
+        // `Child` it owns) is dropped. Without `kill_on_drop`, that would
+        // leave the harness CLI running as an orphaned process instead of
+        // being killed -- the same bug class already fixed in
+        // `tooling::builtin::bash_exec::BashExecTool::execute` and
+        // `impulse_ion::pi_adapter`'s watchdog. `kill_on_drop(true)` makes a
+        // dropped future send SIGKILL to the child instead.
+        cmd.kill_on_drop(true);
+
+        // Previously this call had no timeout at all: a hung harness CLI
+        // (network stall, waiting on stdin, an unattended auth prompt) meant
+        // `.output().await` never returned. Combined with the daemon holding
+        // the `cached_agent` mutex across this same await (see
+        // `daemon/handlers.rs`'s `checkout_agent`/`checkin_agent` doc), a
+        // single wedged child could freeze the whole daemon's agent IPC
+        // surface indefinitely. `tokio::time::timeout` bounds this call to
+        // `timeout`, returning a typed `AgentError::HarnessTimedOut` instead
+        // of hanging; `kill_on_drop` above ensures the timed-out child is
+        // actually killed, not orphaned.
+        let output = tokio::time::timeout(timeout, cmd.output())
+            .await
+            .map_err(|_| AgentError::HarnessTimedOut {
+                command: harness_kind.command().to_string(),
+                seconds: timeout.as_secs(),
+            })?
+            .map_err(|e| {
+                AgentError::ApiRequest(format!("Failed to run {}: {}", harness_kind.command(), e))
+            })?;
 
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -1208,5 +1272,171 @@ mod tests {
         assert_eq!(agent.session_turn_count(), 2);
         agent.clear_session();
         assert_eq!(agent.session_turn_count(), 0);
+    }
+
+    // ── Harness subprocess timeout / kill_on_drop regression tests
+    //    (same-day Opus sweep: `harness_query_structured`'s `.output().await`
+    //    previously had no timeout and no `kill_on_drop`) ──────────────────
+
+    /// Serializes tests in this module that prepend a fake-binary directory
+    /// to the process-global `PATH` env var. `cargo test` runs this crate's
+    /// unit tests in one process across multiple threads, and no other test
+    /// file in this crate mutates `PATH` (verified via
+    /// `git grep 'set_var("PATH"'`), so a lock local to this module is
+    /// sufficient — mirrors `tooling::builtin::bash_exec`'s
+    /// `secret_env_lock` pattern for the same reason (a shared mutable
+    /// process resource, not crate state).
+    fn path_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// RAII guard that prepends `dir` to `PATH` for the duration of a test
+    /// and restores the previous `PATH` on drop (even on panic/early
+    /// return), so a fake `claude`/`codex`/etc. binary placed in `dir`
+    /// shadows any real one on the developer's/CI machine without
+    /// permanently mutating process state for sibling tests.
+    struct PathPrependGuard {
+        previous: Option<String>,
+    }
+
+    impl PathPrependGuard {
+        fn new(dir: &std::path::Path) -> Self {
+            let previous = std::env::var("PATH").ok();
+            let new_path = match &previous {
+                Some(p) => format!("{}:{}", dir.display(), p),
+                None => dir.display().to_string(),
+            };
+            std::env::set_var("PATH", new_path);
+            Self { previous }
+        }
+    }
+
+    impl Drop for PathPrependGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var("PATH", value),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+
+    /// Writes an executable shell script named `claude` into a fresh temp
+    /// directory that just sleeps, standing in for a hung harness CLI
+    /// without depending on a real `claude`/`codex`/`gemini` binary being
+    /// installed on the test machine.
+    fn write_hanging_fake_harness_binary() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script_path = dir.path().join("claude");
+        std::fs::write(&script_path, "#!/bin/sh\nsleep 30\n").expect("write fake harness script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path)
+                .expect("stat fake harness script")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).expect("chmod fake harness script");
+        }
+        dir
+    }
+
+    #[tokio::test]
+    // clippy: the lock is a test-only std::sync::Mutex<()> (never contended
+    // by production code) and must span the whole `.await` call so no
+    // sibling test in this module can mutate PATH mid-spawn — matches the
+    // justified pattern in `bash_exec.rs`'s secret-env tests.
+    #[allow(clippy::await_holding_lock)]
+    async fn test_harness_query_times_out_instead_of_hanging_forever() {
+        let _lock = path_env_lock();
+        let fake_bin_dir = write_hanging_fake_harness_binary();
+        let _path_guard = PathPrependGuard::new(fake_bin_dir.path());
+
+        let config = ImpulseAgentConfig::harness(ImpulseHarness::ClaudeCode);
+        let agent = ImpulseAgent::new(config).expect("harness agent should construct");
+
+        let start = std::time::Instant::now();
+        let result = agent
+            .harness_query_structured_with_timeout(
+                "system",
+                "hello",
+                &[],
+                None,
+                Duration::from_millis(300),
+            )
+            .await;
+        let elapsed = start.elapsed();
+
+        match result {
+            Err(AgentError::HarnessTimedOut {
+                command,
+                seconds: _,
+            }) => {
+                assert_eq!(command, "claude");
+            }
+            other => panic!("expected HarnessTimedOut, got: {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "timeout should fire well before the fake harness's 30s sleep, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_harness_query_kills_hung_child_instead_of_orphaning() {
+        // Regression test for `kill_on_drop`: without it, a timed-out
+        // harness subprocess kept running as an orphan after this function
+        // returned. Uses a per-invocation unique sleep duration (mirrors
+        // `bash_exec.rs`'s equivalent test) so a `pgrep -f` check here can't
+        // be confused by an unrelated `sleep` from another concurrently
+        // running test.
+        let _lock = path_env_lock();
+        let unique_duration = format!("9.{}", std::process::id() % 1000);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script_path = dir.path().join("claude");
+        std::fs::write(
+            &script_path,
+            format!("#!/bin/sh\nsleep {unique_duration}\n"),
+        )
+        .expect("write fake harness script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path)
+                .expect("stat fake harness script")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).expect("chmod fake harness script");
+        }
+        let _path_guard = PathPrependGuard::new(dir.path());
+
+        let config = ImpulseAgentConfig::harness(ImpulseHarness::ClaudeCode);
+        let agent = ImpulseAgent::new(config).expect("harness agent should construct");
+
+        let result = agent
+            .harness_query_structured_with_timeout(
+                "system",
+                "hello",
+                &[],
+                None,
+                Duration::from_millis(300),
+            )
+            .await;
+        assert!(matches!(result, Err(AgentError::HarnessTimedOut { .. })));
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let check = tokio::process::Command::new("pgrep")
+            .arg("-f")
+            .arg(format!("sleep {unique_duration}"))
+            .output()
+            .await;
+        if let Ok(check) = check {
+            let stray = String::from_utf8_lossy(&check.stdout);
+            assert!(
+                stray.trim().is_empty(),
+                "expected no orphaned harness process after timeout, found pids: {stray}"
+            );
+        }
     }
 }

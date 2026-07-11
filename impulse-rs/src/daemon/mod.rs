@@ -20,11 +20,95 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::{Notify, RwLock};
 
 use crate::state::SharedState;
+
+/// Per-request line size cap, shared by the daemon's own read loop and (via
+/// [`read_bounded_line`]) reusable by other JSON-line protocol readers in
+/// this codebase (see `mcp::server`).
+pub const MAX_REQUEST_SIZE: usize = 10 * 1024 * 1024; // 10MB limit per request
+
+/// Result of a single bounded line read. See [`read_bounded_line`].
+pub enum BoundedLine {
+    /// A complete line was read (trailing `\n`/`\r\n` stripped), and its
+    /// byte length did not exceed `max_bytes`.
+    Line(String),
+    /// The stream reached EOF with no more data to read (connection closed
+    /// cleanly between requests).
+    Eof,
+    /// More than `max_bytes` bytes were read without finding a `\n` (or
+    /// EOF). The caller must not attempt to keep reading from this
+    /// connection to "recover" the rest of the line -- the remaining bytes
+    /// on the wire are themselves unbounded and of unknown length, so
+    /// draining them would reintroduce the exact unbounded-read problem
+    /// this type exists to prevent. The only bounded response is to close
+    /// the connection.
+    TooLarge,
+}
+
+/// Read a single `\n`-delimited line from `reader`, but never buffer more
+/// than `max_bytes + 1` bytes into memory regardless of how much data the
+/// peer sends before the next newline (or EOF).
+///
+/// **Bug being fixed:** the daemon's connection loop previously called
+/// `reader.read_line(&mut line).await?` — which has no upper bound — and
+/// only checked `line.len() > MAX_REQUEST_SIZE` *after* `read_line` had
+/// already appended the full, arbitrarily large line into `line`. A local
+/// client with socket access could send many gigabytes of non-newline bytes
+/// on one connection and OOM the daemon before the size check ever fired;
+/// the guard existed but ran too late to bound memory. Wrapping the reader
+/// in [`tokio::io::AsyncReadExt::take`] (`max_bytes + 1` per call) bounds
+/// how many bytes the inner `read_until` will ever pull from the stream
+/// before giving up, so peak memory for a single line read is capped at
+/// `max_bytes + 1` bytes no matter what the peer sends -- turning "eventual
+/// check after unbounded growth" into an actually-bounded read.
+///
+/// `reader` must already be a buffered reader (e.g. `BufReader`), since
+/// `Take<R>` only implements `AsyncBufRead` when `R: AsyncBufRead`.
+pub async fn read_bounded_line<R>(reader: &mut R, max_bytes: usize) -> std::io::Result<BoundedLine>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut buf: Vec<u8> = Vec::new();
+    // `+1` so we can distinguish "exactly max_bytes bytes then a newline"
+    // (allowed) from "more than max_bytes bytes with no newline yet"
+    // (rejected) using only the length of what came back.
+    let mut limited = reader.take(max_bytes as u64 + 1);
+    let n = limited.read_until(b'\n', &mut buf).await?;
+
+    if n == 0 {
+        return Ok(BoundedLine::Eof);
+    }
+
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+        if buf.len() > max_bytes {
+            return Ok(BoundedLine::TooLarge);
+        }
+        return Ok(BoundedLine::Line(
+            String::from_utf8_lossy(&buf).into_owned(),
+        ));
+    }
+
+    // No newline was found within `max_bytes + 1` bytes: either the peer
+    // sent more than the cap without a delimiter (reject), or the
+    // underlying stream hit EOF with a final, unterminated line at or under
+    // the cap (accept, matching `read_line`'s existing EOF-without-newline
+    // behavior).
+    if buf.len() > max_bytes {
+        Ok(BoundedLine::TooLarge)
+    } else {
+        Ok(BoundedLine::Line(
+            String::from_utf8_lossy(&buf).into_owned(),
+        ))
+    }
+}
 
 fn build_remote_tool_context(
     impulse_dir: &std::path::Path,
@@ -248,24 +332,31 @@ async fn handle_connection(
     let (reader, mut writer) = stream.split();
     let mut reader = BufReader::new(reader);
 
-    const MAX_REQUEST_SIZE: usize = 10 * 1024 * 1024; // 10MB limit per request
-    let mut line = String::new();
-    while reader.read_line(&mut line).await? > 0 {
-        if line.len() > MAX_REQUEST_SIZE {
-            let err_response = DaemonResponse::Error {
-                message: format!(
-                    "Request too large ({} bytes, max {})",
-                    line.len(),
-                    MAX_REQUEST_SIZE
-                ),
-            };
-            let response_json = serde_json::to_string(&err_response)?;
-            writer.write_all(response_json.as_bytes()).await?;
-            writer.write_all(b"\n").await?;
-            writer.flush().await?;
-            line.clear();
-            continue;
-        }
+    loop {
+        let line = match read_bounded_line(&mut reader, MAX_REQUEST_SIZE).await? {
+            BoundedLine::Eof => break,
+            BoundedLine::TooLarge => {
+                // The oversized line was never fully buffered (bounded read
+                // capped memory at MAX_REQUEST_SIZE + 1 bytes), but the
+                // remaining bytes still on the wire for this "line" are of
+                // unknown length -- there is no bounded way to skip past
+                // them and resynchronize on the next `\n`. Reject this
+                // request and close the connection rather than attempt an
+                // unbounded drain, matching the size guard's original
+                // intent (reject oversized requests) without reintroducing
+                // the unbounded-read bug.
+                let err_response = DaemonResponse::Error {
+                    message: format!("Request too large (max {} bytes)", MAX_REQUEST_SIZE),
+                };
+                let response_json = serde_json::to_string(&err_response)?;
+                writer.write_all(response_json.as_bytes()).await?;
+                writer.write_all(b"\n").await?;
+                writer.flush().await?;
+                break;
+            }
+            BoundedLine::Line(line) => line,
+        };
+
         let request: DaemonRequest = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
@@ -276,7 +367,6 @@ async fn handle_connection(
                     .write_all(serde_json::to_string(&response)?.as_bytes())
                     .await?;
                 writer.write_all(b"\n").await?;
-                line.clear();
                 continue;
             }
         };
@@ -318,14 +408,146 @@ async fn handle_connection(
         writer.write_all(b"\n").await?;
         writer.flush().await?;
 
-        line.clear();
-
         if shutdown.load(Ordering::SeqCst) {
             break;
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod bounded_line_tests {
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+
+    use tokio::io::{AsyncBufRead, AsyncRead, ReadBuf};
+
+    use super::{read_bounded_line, BoundedLine};
+
+    #[tokio::test]
+    async fn test_read_bounded_line_reads_lines_under_cap_normally() {
+        let data = b"hello world\nsecond line\n".to_vec();
+        let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(data));
+
+        match read_bounded_line(&mut reader, 1024).await.unwrap() {
+            BoundedLine::Line(line) => assert_eq!(line, "hello world"),
+            _ => panic!("expected first line to be read normally"),
+        }
+        match read_bounded_line(&mut reader, 1024).await.unwrap() {
+            BoundedLine::Line(line) => assert_eq!(line, "second line"),
+            _ => panic!("expected second line to be read normally"),
+        }
+        match read_bounded_line(&mut reader, 1024).await.unwrap() {
+            BoundedLine::Eof => {}
+            _ => panic!("expected EOF after both lines consumed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_bounded_line_accepts_a_line_exactly_at_the_cap() {
+        // A line whose payload (excluding the trailing \n) is exactly
+        // `max_bytes` long must be accepted, not rejected -- the cap is
+        // inclusive.
+        let payload = "a".repeat(64);
+        let data = format!("{payload}\n").into_bytes();
+        let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(data));
+
+        match read_bounded_line(&mut reader, 64).await.unwrap() {
+            BoundedLine::Line(line) => assert_eq!(line, payload),
+            BoundedLine::TooLarge => {
+                panic!("an exactly-at-cap line must be accepted, not rejected")
+            }
+            BoundedLine::Eof => panic!("expected a line, got EOF"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_bounded_line_rejects_a_line_one_byte_over_the_cap() {
+        let payload = "a".repeat(65);
+        let data = format!("{payload}\n").into_bytes();
+        let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(data));
+
+        let result = read_bounded_line(&mut reader, 64).await.unwrap();
+        assert!(matches!(result, BoundedLine::TooLarge));
+    }
+
+    /// An `AsyncRead + AsyncBufRead` source that never produces a `\n` and
+    /// never reaches EOF -- standing in for an adversarial client sending
+    /// gigabytes of non-newline bytes on one connection. Counts every byte
+    /// actually consumed through the `poll_fill_buf`/`consume` protocol so
+    /// the test can assert `read_bounded_line` only ever pulls a bounded
+    /// amount from it, even though the source itself is unbounded.
+    struct InfiniteByteSource {
+        bytes_consumed: Arc<AtomicUsize>,
+        chunk: [u8; 64],
+    }
+
+    impl InfiniteByteSource {
+        fn new(bytes_consumed: Arc<AtomicUsize>) -> Self {
+            Self {
+                bytes_consumed,
+                chunk: [b'a'; 64],
+            }
+        }
+    }
+
+    impl AsyncRead for InfiniteByteSource {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            // Not exercised by `read_bounded_line` (which only uses the
+            // AsyncBufRead half via `read_until`), but required to satisfy
+            // `AsyncReadExt::take`'s bound on the wrapped reader.
+            let this = self.get_mut();
+            let n = buf.remaining().min(this.chunk.len());
+            buf.put_slice(&this.chunk[..n]);
+            this.bytes_consumed.fetch_add(n, Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncBufRead for InfiniteByteSource {
+        fn poll_fill_buf(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<&[u8]>> {
+            let this = self.get_mut();
+            Poll::Ready(Ok(&this.chunk[..]))
+        }
+
+        fn consume(self: Pin<&mut Self>, amt: usize) {
+            let this = self.get_mut();
+            this.bytes_consumed.fetch_add(amt, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_bounded_line_rejects_oversized_input_without_unbounded_memory_use() {
+        let bytes_consumed = Arc::new(AtomicUsize::new(0));
+        let mut source = InfiniteByteSource::new(bytes_consumed.clone());
+        let max_bytes = 4096;
+
+        let result = read_bounded_line(&mut source, max_bytes).await.unwrap();
+        assert!(
+            matches!(result, BoundedLine::TooLarge),
+            "an infinite non-newline source must be rejected as too-large, not read forever"
+        );
+
+        let pulled = bytes_consumed.load(Ordering::SeqCst);
+        // Bounded by max_bytes + 1 (the read_bounded_line cap) plus at most
+        // one extra chunk's worth of slop from the source's internal
+        // fill_buf granularity -- nowhere close to "as much as the source
+        // would provide" (which is unbounded).
+        assert!(
+            pulled <= max_bytes + 1 + 64,
+            "expected a bounded number of bytes pulled from an infinite source, got {pulled}"
+        );
+    }
 }
 
 #[cfg(test)]

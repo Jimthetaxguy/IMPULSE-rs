@@ -60,6 +60,19 @@ pub enum AgentError {
     /// path, same as `ToolLoopLimitExceeded`.
     #[error("Tool-use loop exceeded its {seconds}s wall-clock budget without a final reply")]
     ToolLoopTimedOut { seconds: u64 },
+
+    /// Surfaced by `agent::ImpulseAgent::harness_query_structured` (same-day
+    /// Opus sweep, freeze-bug fix) when the spawned harness CLI subprocess
+    /// (`claude`/`codex`/`gemini`, etc.) doesn't exit within
+    /// `agent::DEFAULT_HARNESS_TIMEOUT`. Previously this `.output().await`
+    /// had no timeout at all; combined with the daemon holding the
+    /// `cached_agent` mutex across the same await (see
+    /// `daemon/handlers.rs`'s `checkout_agent`/`checkin_agent`), a single
+    /// hung harness process could freeze the entire daemon's agent IPC
+    /// surface indefinitely. This bounds that to a fixed wall-clock budget
+    /// instead.
+    #[error("Harness command '{command}' did not complete within {seconds}s")]
+    HarnessTimedOut { command: String, seconds: u64 },
 }
 
 pub type AgentResult<T> = Result<T, AgentError>;
@@ -164,5 +177,16 @@ mod tests {
             msg.to_lowercase().contains("wall-clock"),
             "expected wall-clock wording in: {msg}"
         );
+    }
+
+    #[test]
+    fn test_agent_error_harness_timed_out_display() {
+        let err = AgentError::HarnessTimedOut {
+            command: "claude".to_string(),
+            seconds: 120,
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("claude"), "expected command name in: {msg}");
+        assert!(msg.contains("120"), "expected timeout seconds in: {msg}");
     }
 }

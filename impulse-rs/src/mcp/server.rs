@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
+use crate::daemon::{read_bounded_line, BoundedLine, MAX_REQUEST_SIZE};
 use crate::tooling::{ToolContext, ToolRegistry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,26 +30,62 @@ impl McpServer {
         }
     }
 
+    /// **Bounded reads (same-day fix; see `daemon::mod::read_bounded_line`'s
+    /// doc for the full rationale):** this loop previously called
+    /// `reader.read_line(&mut line)` with no size cap at all -- unlike
+    /// `daemon::mod`'s connection loop, which at least had a (too-late)
+    /// post-hoc check, this stdio path had no guard whatsoever. Any process
+    /// piping stdin into this server could send unbounded non-newline bytes
+    /// and OOM it. Reuses the daemon's `read_bounded_line`/`MAX_REQUEST_SIZE`
+    /// so both JSON-line protocol readers in this codebase share one bound
+    /// and one implementation.
     async fn serve_stdio(&self) -> Result<()> {
         let stdin = tokio::io::stdin();
         let stdout = tokio::io::stdout();
         let mut reader = BufReader::new(stdin);
         let mut writer = tokio::io::BufWriter::new(stdout);
-        let mut line = String::new();
 
-        while reader.read_line(&mut line).await? > 0 {
+        loop {
+            let line = match read_bounded_line(&mut reader, MAX_REQUEST_SIZE).await? {
+                BoundedLine::Eof => break,
+                BoundedLine::TooLarge => {
+                    let response = serde_json::json!({
+                        "error": {
+                            "code": -32600,
+                            "message": format!("Request too large (max {} bytes)", MAX_REQUEST_SIZE)
+                        }
+                    });
+                    writer
+                        .write_all(serde_json::to_string(&response)?.as_bytes())
+                        .await?;
+                    writer.write_all(b"\n").await?;
+                    writer.flush().await?;
+                    // Same reasoning as `daemon::mod::handle_connection`: the
+                    // remaining bytes of this oversized "line" are of
+                    // unknown length, so there is no bounded way to
+                    // resynchronize on the next `\n`. Close the stream.
+                    break;
+                }
+                BoundedLine::Line(line) => line,
+            };
             let response = self.process_request(&line).await;
             writer
                 .write_all(serde_json::to_string(&response)?.as_bytes())
                 .await?;
             writer.write_all(b"\n").await?;
             writer.flush().await?;
-            line.clear();
         }
 
         Ok(())
     }
 
+    /// **Bounded reads (same-day fix):** `serve_tcp` binds to
+    /// `127.0.0.1`, which is reachable by *any* local process on the
+    /// machine, not just this daemon's own clients -- unlike stdio, this is
+    /// a genuine local-multi-tenant attack surface. It had the same
+    /// unbounded `read_line` with no size guard at all as `serve_stdio`;
+    /// see [`Self::serve_stdio`]'s doc and `daemon::mod::read_bounded_line`
+    /// for the full rationale. Reuses the same helper/constant.
     async fn serve_tcp(&self, port: u16) -> Result<()> {
         let addr = format!("127.0.0.1:{}", port);
         let listener = TcpListener::bind(&addr).await?;
@@ -62,38 +99,53 @@ impl McpServer {
                 let (reader, mut writer) = socket.into_split();
                 let mut reader = BufReader::new(reader);
                 let server = McpServer::new(registry, ctx);
-                let mut line = String::new();
 
                 loop {
-                    match reader.read_line(&mut line).await {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            let response = server.process_request(&line).await;
-                            if writer
+                    let line = match read_bounded_line(&mut reader, MAX_REQUEST_SIZE).await {
+                        Ok(BoundedLine::Eof) => break,
+                        Ok(BoundedLine::TooLarge) => {
+                            let response = serde_json::json!({
+                                "error": {
+                                    "code": -32600,
+                                    "message": format!("Request too large (max {} bytes)", MAX_REQUEST_SIZE)
+                                }
+                            });
+                            let _ = writer
                                 .write_all(
                                     serde_json::to_string(&response)
-                                        .unwrap_or_else(|_| {
-                                            serde_json::json!({
-                                                "error": {
-                                                    "code": -32603,
-                                                    "message": "failed to serialize response"
-                                                }
-                                            })
-                                            .to_string()
-                                        })
+                                        .unwrap_or_default()
                                         .as_bytes(),
                                 )
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                            if writer.write_all(b"\n").await.is_err() {
-                                break;
-                            }
-                            line.clear();
+                                .await;
+                            let _ = writer.write_all(b"\n").await;
+                            break;
                         }
+                        Ok(BoundedLine::Line(line)) => line,
                         Err(_) => break,
+                    };
+
+                    let response = server.process_request(&line).await;
+                    if writer
+                        .write_all(
+                            serde_json::to_string(&response)
+                                .unwrap_or_else(|_| {
+                                    serde_json::json!({
+                                        "error": {
+                                            "code": -32603,
+                                            "message": "failed to serialize response"
+                                        }
+                                    })
+                                    .to_string()
+                                })
+                                .as_bytes(),
+                        )
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    if writer.write_all(b"\n").await.is_err() {
+                        break;
                     }
                 }
             });
