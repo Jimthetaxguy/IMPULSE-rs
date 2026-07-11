@@ -559,6 +559,16 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
             handlers::plugin_handlers::handle_plugin_invoke(name, path, query, options, json)
                 .context("Failed to handle plugin-invoke command")?;
         }
+        Commands::IonVerify {
+            repo,
+            diff_ref,
+            description,
+            json,
+        } => {
+            handlers::ion::handle_ion_verify(repo, diff_ref, description, json)
+                .await
+                .context("Failed to handle ion-verify command")?;
+        }
     }
 
     Ok(())

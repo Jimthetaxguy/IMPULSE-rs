@@ -590,4 +590,19 @@ pub(crate) enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Run the Ion verification gate (harness #2 — Pi on MiniMax) against a diff
+    IonVerify {
+        /// Repository path to verify (defaults to the current directory)
+        #[arg(long)]
+        repo: Option<String>,
+        /// Git ref range to verify, e.g. HEAD~1..HEAD
+        #[arg(long, default_value = "HEAD~1..HEAD")]
+        diff_ref: String,
+        /// Task description passed to the gate
+        #[arg(long, default_value = "Verify the pending diff.")]
+        description: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }

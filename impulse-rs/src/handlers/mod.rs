@@ -17,6 +17,7 @@ pub mod describe;
 pub mod direct_dispatch;
 pub mod guard;
 pub mod injection_handlers;
+pub mod ion;
 pub mod memory;
 pub mod office;
 pub mod plugin_handlers;

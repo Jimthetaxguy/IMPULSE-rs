@@ -4567,6 +4567,7 @@ dependencies = [
  "docx-rs",
  "filetime",
  "glob",
+ "impulse-ion",
  "impulse-ops",
  "levenshtein",
  "portable-pty",
