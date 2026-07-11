@@ -9,6 +9,25 @@
 //! `std::process::Command`) so the command's own I/O doesn't block a runtime
 //! worker thread, with a hard wall-clock timeout that kills the child on
 //! expiry.
+//!
+//! **Env scrubbing (T9 follow-up, same-day adversarial review):** once T9
+//! wired `bash_exec` up to the LLM's own tool-calling loop, a command as
+//! innocuous-looking as `env` or `printenv ANTHROPIC_API_KEY` — run through
+//! this tool after a user's human-confirmation approval — would print the
+//! `ion` process's own secrets straight into `tool_result` content, which
+//! then flows back into the model's context and the REPL transcript. The
+//! confirmation gate in `ion_repl::chat::ReplToolExecutor` reduces but does
+//! not eliminate this: a user can approve a command without realizing it
+//! leaks env vars. This tool now calls `.env_clear()` on the child
+//! `Command` and re-adds only a small, explicit allowlist
+//! (`ENV_ALLOWLIST`) of variables the shell needs to function (`PATH`,
+//! `HOME`, `TERM`, locale/tmp vars). This is allowlist, not denylist —
+//! matching CLAUDE.md Principle #5's deny-by-default capability
+//! philosophy: everything not explicitly named is dropped, rather than
+//! trying to enumerate every possible secret name. `is_secret_like` is an
+//! additional heuristic name-pattern guard applied defensively to the
+//! allowlist copy itself (belt-and-suspenders — none of the allowlisted
+//! names should ever match it, and a test proves that).
 
 use async_trait::async_trait;
 use tokio::time::Duration;
@@ -18,6 +37,33 @@ use crate::tooling::traits::*;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+
+/// Environment variables re-added to the scrubbed child process after
+/// `.env_clear()`, if present in the parent (`ion`) process's own
+/// environment. Deliberately an allowlist (everything else is dropped)
+/// rather than a denylist (drop only what looks like a secret) — matching
+/// CLAUDE.md Principle #5's deny-by-default capability philosophy. Covers
+/// both macOS and Linux, the two platforms this workspace targets:
+/// `PATH`/`HOME`/`TERM` so ordinary commands resolve and run at all,
+/// locale (`LANG`, `LC_ALL`) so text encoding stays consistent, and
+/// temp-dir vars (`TMPDIR` on macOS/BSD, `TMP`/`TEMP` conventionally on
+/// other platforms) so tools that need scratch space still find one.
+const ENV_ALLOWLIST: &[&str] = &[
+    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "TMPDIR", "TMP", "TEMP",
+];
+
+/// Case-insensitive substring heuristic for "this env var name looks like
+/// it holds a credential." Used defensively against `ENV_ALLOWLIST` itself
+/// (see module doc) rather than as the primary scrubbing mechanism — the
+/// primary mechanism is the allowlist's `.env_clear()` + re-add, which
+/// drops everything not explicitly named regardless of whether its name
+/// happens to match this heuristic.
+fn is_secret_like(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    ["KEY", "TOKEN", "SECRET", "PASSWORD", "_PAT", "CREDENTIAL"]
+        .iter()
+        .any(|pattern| upper.contains(pattern))
+}
 
 /// Truncate `s` to at most `max_bytes` bytes without panicking when
 /// `max_bytes` falls in the middle of a multi-byte UTF-8 character.
@@ -118,6 +164,20 @@ impl DynamicTool for BashExecTool {
         if let Some(cwd) = &cwd {
             cmd.current_dir(cwd);
         }
+        // Deny-by-default env: drop the full parent environment (which may
+        // hold API keys/tokens the `ion` process itself needs) and re-add
+        // only the small functional allowlist. See module doc for why this
+        // is an allowlist rather than a denylist.
+        cmd.env_clear();
+        for name in ENV_ALLOWLIST {
+            debug_assert!(
+                !is_secret_like(name),
+                "ENV_ALLOWLIST entry {name:?} matches the secret-name heuristic"
+            );
+            if let Ok(value) = std::env::var(name) {
+                cmd.env(name, value);
+            }
+        }
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
         cmd.stdin(std::process::Stdio::null());
@@ -166,6 +226,134 @@ impl DynamicTool for BashExecTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes tests in this module that mutate process-global secret
+    /// env vars (`ANTHROPIC_API_KEY`/`OPENAI_API_KEY`-shaped names).
+    /// `cargo test` runs this crate's unit tests in one process across
+    /// multiple threads, so a test that sets/removes such a var must not
+    /// race a sibling test doing the same — mirrors the pattern in
+    /// `src/test_support.rs` (a per-file lock is fine as long as no other
+    /// file's tests touch these exact var names, which is true here: the
+    /// names below are test-scoped and not read/set anywhere else).
+    fn secret_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// RAII guard that sets an env var for the duration of a test and
+    /// restores whatever was there before (or removes it if it was unset),
+    /// so a test never permanently mutates process-global state for its
+    /// siblings even on an early return/panic.
+    struct EnvVarGuard {
+        name: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let previous = std::env::var(name).ok();
+            std::env::set_var(name, value);
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+
+    #[test]
+    fn test_is_secret_like_matches_known_credential_shapes() {
+        for name in [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GITHUB_TOKEN",
+            "DB_PASSWORD",
+            "GH_PAT",
+            "AWS_SECRET_ACCESS_KEY",
+            "SOME_CREDENTIAL",
+        ] {
+            assert!(
+                is_secret_like(name),
+                "{name} should be flagged as secret-like"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_secret_like_does_not_flag_allowlisted_names() {
+        for name in ENV_ALLOWLIST {
+            assert!(
+                !is_secret_like(name),
+                "{name} is on ENV_ALLOWLIST and must not match the secret heuristic"
+            );
+        }
+    }
+
+    #[tokio::test]
+    // clippy: the lock is a test-only std::sync::Mutex<()> (never contended
+    // by production code) and must span the whole `execute().await` call so
+    // no sibling test in this file can mutate the same secret env vars
+    // mid-spawn — matches the justified pattern in `ion_repl::chat`'s tests.
+    #[allow(clippy::await_holding_lock)]
+    async fn test_execute_scrubs_secret_env_vars_from_child_process() {
+        let _lock = secret_env_lock();
+        let _anthropic = EnvVarGuard::set("ANTHROPIC_API_KEY", "sk-ant-test-should-not-leak");
+        let _openai = EnvVarGuard::set("OPENAI_API_KEY", "sk-oai-test-should-not-leak");
+
+        let tool = BashExecTool;
+        let ctx = ToolContext::with_all_capabilities();
+        let result = tool
+            .execute(serde_json::json!({"command": "env"}), &ctx)
+            .await
+            .expect("env should succeed");
+        let stdout = result.output["stdout"].as_str().unwrap();
+
+        assert!(
+            !stdout.contains("ANTHROPIC_API_KEY"),
+            "child env leaked ANTHROPIC_API_KEY:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("OPENAI_API_KEY"),
+            "child env leaked OPENAI_API_KEY:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("sk-ant-test-should-not-leak"),
+            "child env leaked the ANTHROPIC_API_KEY value:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("sk-oai-test-should-not-leak"),
+            "child env leaked the OPENAI_API_KEY value:\n{stdout}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_still_has_path_and_can_run_ordinary_commands() {
+        let tool = BashExecTool;
+        let ctx = ToolContext::with_all_capabilities();
+
+        // PATH must survive the scrub so `sh -c` can still resolve builtins
+        // and external commands like `echo`/`ls`.
+        let env_result = tool
+            .execute(serde_json::json!({"command": "env"}), &ctx)
+            .await
+            .expect("env should succeed");
+        assert!(env_result.output["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("PATH="));
+
+        let echo_result = tool
+            .execute(serde_json::json!({"command": "echo still-works"}), &ctx)
+            .await
+            .expect("echo should still succeed after env scrub");
+        assert_eq!(echo_result.output["stdout"], "still-works\n");
+        assert_eq!(echo_result.output["exit_code"], 0);
+    }
 
     #[test]
     fn test_descriptor() {
