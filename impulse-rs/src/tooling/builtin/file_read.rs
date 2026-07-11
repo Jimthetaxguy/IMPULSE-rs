@@ -66,23 +66,34 @@ impl DynamicTool for FileReadTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
         let path_str = params
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidParams("missing 'path'".into()))?;
+        // Clamp to usize::MAX rather than letting a huge model-supplied
+        // start_line (e.g. u64::MAX) overflow the `start_line - 1 + max_lines`
+        // arithmetic below -- overflow panics in debug builds and wraps to a
+        // bogus small `end` in release, producing a slice-index panic either
+        // way once `total_lines` is known.
         let start_line = params
             .get("start_line")
             .and_then(|v| v.as_u64())
             .unwrap_or(1)
-            .max(1) as usize;
+            .max(1)
+            .min(usize::MAX as u64) as usize;
         let max_lines = params
             .get("max_lines")
             .and_then(|v| v.as_u64())
-            .unwrap_or(200) as usize;
+            .unwrap_or(200)
+            .min(usize::MAX as u64) as usize;
 
-        let path = std::path::PathBuf::from(path_str);
+        let path = ctx.resolve_path(path_str);
+
+        if !ctx.is_path_allowed(&path, false) {
+            return Err(ToolError::PathNotAllowed(path.display().to_string()));
+        }
 
         if !path.exists() {
             return Err(ToolError::ExecutionFailed(format!(
@@ -111,8 +122,9 @@ impl DynamicTool for FileReadTool {
         // Collect once to avoid double traversal
         let all_lines: Vec<&str> = content.lines().collect();
         let total_lines = all_lines.len();
-        let end = (start_line - 1 + max_lines).min(total_lines);
-        let lines = &all_lines[(start_line - 1).min(total_lines)..end];
+        let start = start_line.saturating_sub(1).min(total_lines);
+        let end = start.saturating_add(max_lines).min(total_lines);
+        let lines = &all_lines[start..end];
         let truncated = end < total_lines;
 
         Ok(ToolResult::json(serde_json::json!({
@@ -184,5 +196,59 @@ mod tests {
         if let Ok(r) = result {
             assert!(r.output["lines_returned"].as_u64().unwrap() <= 5);
         }
+    }
+
+    #[tokio::test]
+    async fn test_execute_does_not_panic_or_overflow_on_near_u64_max_start_line() {
+        // Regression for a fresh-eyes review finding: start_line/max_lines
+        // come straight from model-supplied tool-call JSON. A near-u64::MAX
+        // start_line used to overflow `start_line - 1 + max_lines` (panics
+        // in debug, wraps to a bogus small `end` in release -> slice-index
+        // panic). Both should now be handled gracefully, returning zero
+        // lines rather than panicking.
+        let tool = FileReadTool;
+        let ctx = ToolContext::with_all_capabilities();
+        let result = tool
+            .execute(
+                serde_json::json!({"path": "Cargo.toml", "start_line": u64::MAX, "max_lines": 200}),
+                &ctx,
+            )
+            .await
+            .expect("should not panic or error, just return an empty range");
+        assert_eq!(result.output["lines_returned"].as_u64().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_execute_denies_a_path_outside_allowed_read_roots() {
+        // Regression for a fresh-eyes review finding: unlike file_write,
+        // file_read never consulted ToolContext's read-root allowlist,
+        // so a model (or prompt-injected content) could read any file
+        // on disk -- e.g. ~/.ssh/id_rsa or a .env -- and have its
+        // contents streamed straight into the model's own context.
+        let tool = FileReadTool;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let allowed_root = temp.path().join("allowed");
+        let outside_root = temp.path().join("outside");
+        std::fs::create_dir_all(&allowed_root).unwrap();
+        std::fs::create_dir_all(&outside_root).unwrap();
+        let secret_file = outside_root.join("secret.txt");
+        std::fs::write(&secret_file, "top-secret-content").unwrap();
+
+        let ctx = ToolContext {
+            allowed_read_roots: vec![allowed_root],
+            ..ToolContext::with_all_capabilities()
+        };
+
+        let result = tool
+            .execute(
+                serde_json::json!({"path": secret_file.display().to_string()}),
+                &ctx,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(ToolError::PathNotAllowed(_))),
+            "expected PathNotAllowed, got: {result:?}"
+        );
     }
 }
