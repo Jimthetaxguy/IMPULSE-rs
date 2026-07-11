@@ -87,6 +87,12 @@ async-trait = "0.1"
 # CLI
 clap = { version = "4", features = ["derive"] }
 
+# Readline REPL (ion binary, TUI_SPEC.md T6). TUI_SPEC.md floated "15" as a
+# candidate pin; 18 is the current major on crates.io as of this task and
+# resolves/builds cleanly against this workspace's MSRV (1.82), so we pin to
+# the current major instead of the stale suggestion.
+rustyline = "18"
+
 # Dynamic command execution
 portable-pty = "0.9"
 vt100 = "0.15"

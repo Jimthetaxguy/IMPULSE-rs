@@ -1,8 +1,9 @@
-//! `ion` — Ion harness binary (TUI_SPEC.md T5 skeleton).
+//! `ion` — Ion harness binary (TUI_SPEC.md T5 skeleton + T6 REPL).
 //!
-//! Bare `ion` prints a placeholder banner (T6 replaces this with the readline
-//! REPL). `ion verify` is a one-shot gate run sharing `handle_ion_verify` with
-//! `impulse-rs ion-verify` — same flags, same exit-code convention.
+//! Bare `ion` prints a startup banner and drops into the readline REPL
+//! (`impulse_rs::ion_repl::run`, TUI_SPEC.md T6). `ion verify` is a one-shot
+//! gate run sharing `handle_ion_verify` with `impulse-rs ion-verify` — same
+//! flags, same exit-code convention.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -37,10 +38,7 @@ enum IonCommand {
 async fn main() -> Result<()> {
     let cli = IonCli::parse();
     match cli.command {
-        None => {
-            print_banner();
-            Ok(())
-        }
+        None => impulse_rs::ion_repl::run(),
         Some(IonCommand::Verify {
             repo,
             diff_ref,
@@ -55,11 +53,4 @@ async fn main() -> Result<()> {
             impulse_rs::handlers::ion::handle_ion_verify(repo, diff_ref, description, json).await
         }
     }
-}
-
-fn print_banner() {
-    println!(
-        "ion {} — Ion interactive harness (REPL coming soon; try 'ion verify --help')",
-        env!("CARGO_PKG_VERSION")
-    );
 }

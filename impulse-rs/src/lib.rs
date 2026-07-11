@@ -27,6 +27,7 @@ pub mod guardrail;
 pub mod handlers;
 pub mod injection;
 pub mod integration_tests;
+pub mod ion_repl;
 pub mod llm_backends;
 pub mod mcp;
 pub mod memory;
