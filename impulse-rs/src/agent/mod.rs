@@ -417,7 +417,8 @@ impl ImpulseAgent {
         insights: &[ExtractedInsight],
     ) -> coordinator::CoordinationResult {
         let result = coordinator::run_full_coordination(insights);
-        self.recommendations.extend(result.recommendations.iter().cloned());
+        self.recommendations
+            .extend(result.recommendations.iter().cloned());
         // Keep only last 50 recommendations
         if self.recommendations.len() > 50 {
             let drain_count = self.recommendations.len() - 50;

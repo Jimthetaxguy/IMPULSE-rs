@@ -148,10 +148,7 @@ impl LlmProvider for AnthropicProvider {
             .into_iter()
             .partition(|m| m.role == Role::System);
 
-        let system = system_msgs
-            .into_iter()
-            .next()
-            .map(|m| m.content);
+        let system = system_msgs.into_iter().next().map(|m| m.content);
 
         let mut body = serde_json::json!({
             "model": request.model,
