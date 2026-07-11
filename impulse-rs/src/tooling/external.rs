@@ -1,9 +1,32 @@
+//! External-manifest process tools (`ProcessTool`) — commands defined by
+//! JSON manifests on disk (e.g. `.impulse/tools.d/*.json`, see
+//! `ExternalToolSpec`), loaded via `ToolRegistry::with_runtime()` (the
+//! daemon's `InvokeTool` IPC endpoint and the `tooling-run` CLI handler).
+//!
+//! **Env scrubbing:** `tokio::process::Command::new(&self.spec.command)`
+//! inherits the full parent process environment by default, exactly the
+//! bug fixed in `src/tooling/builtin/bash_exec.rs` for LLM-triggered shell
+//! commands (see that file's module doc). `ProcessTool` is not currently
+//! reachable from an LLM tool-calling loop — only from the daemon's
+//! `InvokeTool` IPC endpoint (human/GUI-driven, hardcoded tool names) and
+//! the `tooling-run` CLI handler (human-typed `--params`) — but the
+//! `ExternalToolSpec::env_allowlist` field already signals the original
+//! intent to scrub, and this registry is the same one `bash_exec` lives
+//! in and that `ion_repl`'s `DynamicToolBridge` can bridge into a chat
+//! loop. `execute()` now calls the shared
+//! `crate::tooling::env_scrub::scrub_and_allowlist_env` helper (same
+//! `.env_clear()` + fixed functional allowlist as `bash_exec`) before
+//! re-adding the manifest's own `env_allowlist` entries, instead of
+//! relying on full inheritance plus a redundant re-add of already-present
+//! vars.
+
 use std::collections::HashSet;
 use std::path::Path;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use super::env_scrub::scrub_and_allowlist_env;
 use super::error::ToolError;
 use super::traits::{
     Capability, DynamicTool, ParamType, ToolCategory, ToolContext, ToolDescriptor, ToolParam,
@@ -188,11 +211,11 @@ impl DynamicTool for ProcessTool {
             }
         }
 
-        for name in &self.spec.env_allowlist {
-            if let Ok(value) = std::env::var(name) {
-                command.env(name, value);
-            }
-        }
+        // Deny-by-default env: drop the full parent environment and re-add
+        // only the shared functional allowlist plus this manifest's own
+        // declared `env_allowlist` (e.g. a credential the wrapped external
+        // tool genuinely needs). See module doc.
+        scrub_and_allowlist_env(&mut command, &self.spec.env_allowlist);
         command.env("IMPULSE_HOME", &ctx.impulse_dir);
         if let Some(session_id) = &ctx.session_id {
             command.env("IMPULSE_SESSION_ID", session_id);
@@ -527,5 +550,144 @@ mod tests {
         assert_eq!(report.valid_tools, 1);
         assert_eq!(report.invalid_tools, 1);
         assert!(report.issues[0].error.contains("already registered"));
+    }
+
+    /// Serializes tests in this module that mutate process-global secret
+    /// env vars. `cargo test` runs this crate's unit tests in one process
+    /// across multiple threads, so a test that sets/removes such a var
+    /// must not race a sibling test doing the same — mirrors the pattern
+    /// in `builtin/bash_exec.rs`'s test module.
+    fn secret_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// RAII guard that sets an env var for the duration of a test and
+    /// restores whatever was there before (or removes it if it was unset).
+    struct EnvVarGuard {
+        name: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let previous = std::env::var(name).ok();
+            std::env::set_var(name, value);
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+
+    fn env_dumping_spec(env_allowlist: Vec<String>) -> ExternalToolSpec {
+        ExternalToolSpec {
+            id: "env_dump".into(),
+            name: "Env Dump".into(),
+            description: "Dumps the child process environment".into(),
+            source: ExternalToolSource::Process,
+            command: "sh".into(),
+            args: vec!["-c".into(), "env".into()],
+            env_allowlist,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }),
+            output_mode: ExternalToolOutputMode::Text,
+            capabilities: vec![],
+            timeout_ms: Some(5_000),
+            cwd_policy: CwdPolicy::Current,
+        }
+    }
+
+    /// Regression test (mirrors `bash_exec.rs`'s
+    /// `test_execute_scrubs_secret_env_vars_from_child_process`): a
+    /// `ProcessTool` whose manifest does not declare a secret-shaped name
+    /// in `env_allowlist` must not leak the parent `ion`/daemon process's
+    /// own secrets into the child's environment (and therefore into
+    /// `ToolResult` content) even though `tokio::process::Command`
+    /// inherits the full parent environment by default.
+    #[tokio::test]
+    // clippy: the lock is a test-only std::sync::Mutex<()> and must span
+    // the whole `execute().await` call so no sibling test in this file can
+    // mutate the same secret env vars mid-spawn.
+    #[allow(clippy::await_holding_lock)]
+    async fn test_execute_scrubs_secret_env_vars_from_child_process() {
+        let _lock = secret_env_lock();
+        let _anthropic =
+            EnvVarGuard::set("ANTHROPIC_API_KEY", "sk-ant-test-should-not-leak-external");
+        let _openai = EnvVarGuard::set("OPENAI_API_KEY", "sk-oai-test-should-not-leak-external");
+
+        let tool = ProcessTool::new(env_dumping_spec(vec![])).unwrap();
+        let ctx = ToolContext::with_all_capabilities();
+        let result = tool
+            .execute(serde_json::json!({}), &ctx)
+            .await
+            .expect("env should succeed");
+        let stdout = result.output.as_str().unwrap();
+
+        assert!(
+            !stdout.contains("ANTHROPIC_API_KEY"),
+            "child env leaked ANTHROPIC_API_KEY:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("OPENAI_API_KEY"),
+            "child env leaked OPENAI_API_KEY:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("sk-ant-test-should-not-leak-external"),
+            "child env leaked the ANTHROPIC_API_KEY value:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("sk-oai-test-should-not-leak-external"),
+            "child env leaked the OPENAI_API_KEY value:\n{stdout}"
+        );
+    }
+
+    /// A manifest that explicitly opts a var into `env_allowlist` (the
+    /// per-tool credential-passthrough mechanism external tools need, e.g.
+    /// a wrapped CLI that itself requires an API key) must still see that
+    /// var — the scrub must not silently defeat the manifest's own opt-in.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_execute_forwards_explicitly_allowlisted_manifest_vars() {
+        let _lock = secret_env_lock();
+        let _guard = EnvVarGuard::set("EXTERNAL_TOOL_TEST_TOKEN", "forwarded-on-purpose");
+
+        let tool = ProcessTool::new(env_dumping_spec(vec![
+            "EXTERNAL_TOOL_TEST_TOKEN".to_string()
+        ]))
+        .unwrap();
+        let ctx = ToolContext::with_all_capabilities();
+        let result = tool
+            .execute(serde_json::json!({}), &ctx)
+            .await
+            .expect("env should succeed");
+        let stdout = result.output.as_str().unwrap();
+
+        assert!(
+            stdout.contains("EXTERNAL_TOOL_TEST_TOKEN=forwarded-on-purpose"),
+            "manifest-declared env_allowlist entry must still be forwarded:\n{stdout}"
+        );
+    }
+
+    /// PATH must survive the scrub so `sh -c` can still resolve the
+    /// commands it runs.
+    #[tokio::test]
+    async fn test_execute_still_has_path_after_scrub() {
+        let tool = ProcessTool::new(env_dumping_spec(vec![])).unwrap();
+        let ctx = ToolContext::with_all_capabilities();
+        let result = tool
+            .execute(serde_json::json!({}), &ctx)
+            .await
+            .expect("env should succeed");
+        let stdout = result.output.as_str().unwrap();
+        assert!(stdout.contains("PATH="), "PATH must survive the scrub");
     }
 }

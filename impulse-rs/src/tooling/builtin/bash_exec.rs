@@ -20,50 +20,28 @@
 //! not eliminate this: a user can approve a command without realizing it
 //! leaks env vars. This tool now calls `.env_clear()` on the child
 //! `Command` and re-adds only a small, explicit allowlist
-//! (`ENV_ALLOWLIST`) of variables the shell needs to function (`PATH`,
-//! `HOME`, `TERM`, locale/tmp vars). This is allowlist, not denylist —
-//! matching CLAUDE.md Principle #5's deny-by-default capability
-//! philosophy: everything not explicitly named is dropped, rather than
-//! trying to enumerate every possible secret name. `is_secret_like` is an
-//! additional heuristic name-pattern guard applied defensively to the
-//! allowlist copy itself (belt-and-suspenders — none of the allowlisted
-//! names should ever match it, and a test proves that).
+//! (`crate::tooling::env_scrub::ENV_ALLOWLIST`) of variables the shell
+//! needs to function (`PATH`, `HOME`, `TERM`, locale/tmp vars), via the
+//! shared `env_scrub::scrub_and_allowlist_env` helper — also used by
+//! `src/tooling/external.rs`'s `ProcessTool` for the same reason, so the
+//! allowlist/heuristic logic isn't duplicated a second time. This is
+//! allowlist, not denylist — matching CLAUDE.md Principle #5's
+//! deny-by-default capability philosophy: everything not explicitly named
+//! is dropped, rather than trying to enumerate every possible secret name.
+//! `env_scrub::is_secret_like` is an additional heuristic name-pattern
+//! guard applied defensively to the allowlist itself (belt-and-suspenders
+//! — none of the allowlisted names should ever match it, and a test in
+//! `env_scrub` proves that).
 
 use async_trait::async_trait;
 use tokio::time::Duration;
 
+use crate::tooling::env_scrub::scrub_and_allowlist_env;
 use crate::tooling::error::ToolError;
 use crate::tooling::traits::*;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
-
-/// Environment variables re-added to the scrubbed child process after
-/// `.env_clear()`, if present in the parent (`ion`) process's own
-/// environment. Deliberately an allowlist (everything else is dropped)
-/// rather than a denylist (drop only what looks like a secret) — matching
-/// CLAUDE.md Principle #5's deny-by-default capability philosophy. Covers
-/// both macOS and Linux, the two platforms this workspace targets:
-/// `PATH`/`HOME`/`TERM` so ordinary commands resolve and run at all,
-/// locale (`LANG`, `LC_ALL`) so text encoding stays consistent, and
-/// temp-dir vars (`TMPDIR` on macOS/BSD, `TMP`/`TEMP` conventionally on
-/// other platforms) so tools that need scratch space still find one.
-const ENV_ALLOWLIST: &[&str] = &[
-    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "TMPDIR", "TMP", "TEMP",
-];
-
-/// Case-insensitive substring heuristic for "this env var name looks like
-/// it holds a credential." Used defensively against `ENV_ALLOWLIST` itself
-/// (see module doc) rather than as the primary scrubbing mechanism — the
-/// primary mechanism is the allowlist's `.env_clear()` + re-add, which
-/// drops everything not explicitly named regardless of whether its name
-/// happens to match this heuristic.
-fn is_secret_like(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    ["KEY", "TOKEN", "SECRET", "PASSWORD", "_PAT", "CREDENTIAL"]
-        .iter()
-        .any(|pattern| upper.contains(pattern))
-}
 
 /// Truncate `s` to at most `max_bytes` bytes without panicking when
 /// `max_bytes` falls in the middle of a multi-byte UTF-8 character.
@@ -168,16 +146,7 @@ impl DynamicTool for BashExecTool {
         // hold API keys/tokens the `ion` process itself needs) and re-add
         // only the small functional allowlist. See module doc for why this
         // is an allowlist rather than a denylist.
-        cmd.env_clear();
-        for name in ENV_ALLOWLIST {
-            debug_assert!(
-                !is_secret_like(name),
-                "ENV_ALLOWLIST entry {name:?} matches the secret-name heuristic"
-            );
-            if let Ok(value) = std::env::var(name) {
-                cmd.env(name, value);
-            }
-        }
+        scrub_and_allowlist_env(&mut cmd, &[]);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
         cmd.stdin(std::process::Stdio::null());
@@ -266,33 +235,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_is_secret_like_matches_known_credential_shapes() {
-        for name in [
-            "ANTHROPIC_API_KEY",
-            "OPENAI_API_KEY",
-            "GITHUB_TOKEN",
-            "DB_PASSWORD",
-            "GH_PAT",
-            "AWS_SECRET_ACCESS_KEY",
-            "SOME_CREDENTIAL",
-        ] {
-            assert!(
-                is_secret_like(name),
-                "{name} should be flagged as secret-like"
-            );
-        }
-    }
-
-    #[test]
-    fn test_is_secret_like_does_not_flag_allowlisted_names() {
-        for name in ENV_ALLOWLIST {
-            assert!(
-                !is_secret_like(name),
-                "{name} is on ENV_ALLOWLIST and must not match the secret heuristic"
-            );
-        }
-    }
+    // `is_secret_like`/`ENV_ALLOWLIST` themselves are tested in
+    // `crate::tooling::env_scrub`'s own test module (now the shared home of
+    // this logic); this file keeps the integration-level regression test
+    // proving `bash_exec`'s `execute()` actually applies the scrub end to
+    // end (below).
 
     #[tokio::test]
     // clippy: the lock is a test-only std::sync::Mutex<()> (never contended
