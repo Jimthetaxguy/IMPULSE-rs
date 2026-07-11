@@ -213,6 +213,45 @@ point `ion` actually has. **Decision: do not build a `python_eval`/
 stability (past its own "not production-ready" caveat) *and* `ion`
 develops a concrete need `bash_exec` can't cover.
 
+**ROSA reverse-transfer comparison (2026-07-11, same day).** Compared this
+session's `confirm_via_stdin`/`ENV_ALLOWLIST` work against the sibling ROSA
+project's `rosa-harness::{gate.rs, env_scrub.rs}`, which motivated the
+original "reverse-transfer" note.
+
+- `env_scrub`: ROSA's is a *denylist* (`is_secret_var_name`: strip anything
+  matching `_API_KEY`/`_SECRET`/`_TOKEN`/`_ACCESS_KEY` suffix patterns or a
+  few known names, keep everything else). This session's `tooling::env_scrub`
+  is an *allowlist* (`.env_clear()` + re-add only `PATH`/`HOME`/`TERM`/
+  locale/tmp vars). The allowlist is strictly stronger for this threat
+  model: a denylist only catches secrets whose *names* match its patterns
+  (e.g. `DATABASE_URL` with embedded credentials, or any custom-named
+  token, would sail through ROSA's version untouched), while an allowlist
+  drops everything not explicitly named regardless of what it's called.
+  **No action needed** — this session's design is already ahead of ROSA's
+  on this axis, not behind it.
+- `ApprovalGrant`/`Gate`: ROSA's is meaningfully more sophisticated than
+  `ion`'s `confirm_via_stdin`. It's a type-level unforgeable token (no
+  public constructor; only minted by `Gate::evaluate`/`Gate::resolve`) tied
+  to a `RiskClass` (Low/Medium/High/Special) computed from a guardrail scan
+  across *every* channel that reaches the agent — user prompt, system
+  prompt, AND injected context, never lowering the floor. Only `Low` risk
+  auto-allows; everything else is held for an operator decision, and
+  `ensure_grant_covers` re-checks effective risk at dispatch time so a
+  `Low` grant can't be replayed to launder a `High` action (defeats TOCTOU).
+  `ion`'s current gate is a flat binary y/N with no risk tiering and no
+  scan of *why* the model is requesting a given `bash_exec`/`file_write`
+  call — a prompt-injection scenario (malicious instructions embedded in a
+  file the model read via `file_read`, then surfacing as an
+  innocuous-looking `bash_exec` request) isn't specifically defended
+  against beyond the human reading the raw command string. This is a real,
+  legitimate gap relative to ROSA's design -- but porting `RiskClass` +
+  guardrail-scanning + an unforgeable-token type is a genuine architecture/
+  feature addition (new risk taxonomy, new UX for "held" vs "auto-allow"
+  vs "deny", a prompt/context scanner), not a bounded bug fix like the
+  other same-day findings. **Deferred, not autonomously built** — flagging
+  for explicit prioritization rather than scope-creeping a hardening pass
+  into a new subsystem.
+
 ### 2.4 CLI surface of the new binary
 
 ```
