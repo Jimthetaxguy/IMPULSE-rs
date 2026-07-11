@@ -135,7 +135,58 @@ pub enum ContractViolation {
 /// omission checkable instead of trusting every caller to remember it.
 const WRITE_CAPABILITIES: &[&str] = &["write", "edit", "apply_patch", "rm", "mv", "git_push"];
 
+/// Tool names allowed in a verify-intent `capability_allowlist` (spec-a §2):
+/// read-only inspection (`read`, `grep`, `find`, `ls`) plus run-only build/test
+/// tools. No write tool ever appears here — see `WRITE_CAPABILITIES` above.
+const VERIFY_CAPABILITY_ALLOWLIST: &[&str] = &["read", "grep", "find", "ls", "build", "test"];
+
+/// Task verdict-priority order shared by every verify-intent request built via
+/// `HarnessRequest::verify` (spec-a worked example order).
+const VERIFY_VERDICT_PRIORITY: &[&str] = &["correctness", "security", "style", "performance"];
+
 impl HarnessRequest {
+    /// Build a validated verify-intent `HarnessRequest` using the spec-a §2
+    /// defaults: read-only `capability_allowlist`, the standard verdict
+    /// priority order, `model_role = "verifier-cheap"`, and a read-only
+    /// `Context`. This is the single seam for the defaults that used to be
+    /// hand-rolled at every call site (G4) — callers only supply what varies
+    /// per request: the repo path, the diff to inspect, and a task description.
+    ///
+    /// `request_id` is freshly generated per call (`req-ion-verify-<uuid v4>`)
+    /// so concurrent verify requests never collide.
+    pub fn verify(
+        repo_path: impl Into<String>,
+        diff_ref: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
+        Self {
+            contract_version: CONTRACT_VERSION.to_string(),
+            request_id: format!("req-ion-verify-{}", uuid::Uuid::new_v4()),
+            intent: Intent::Verify,
+            repo: RepoRef {
+                path: repo_path.into(),
+                diff_ref: Some(diff_ref.into()),
+                diff_inline: None,
+            },
+            task: Task {
+                description: description.into(),
+                verdict_priority: VERIFY_VERDICT_PRIORITY
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            },
+            capability_allowlist: VERIFY_CAPABILITY_ALLOWLIST
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            model_role: "verifier-cheap".to_string(),
+            context: Context {
+                read_only: true,
+                payload: vec![],
+            },
+        }
+    }
+
     /// Validate the write-denial-by-omission rule (spec-a §2, §6).
     pub fn validate(&self) -> Result<(), ContractViolation> {
         for cap in &self.capability_allowlist {
@@ -183,34 +234,11 @@ mod tests {
     use super::*;
 
     fn worked_example_request() -> HarnessRequest {
-        HarnessRequest {
-            contract_version: CONTRACT_VERSION.to_string(),
-            request_id: "req-2026-05-21-0001".to_string(),
-            intent: Intent::Verify,
-            repo: RepoRef {
-                path: "/Users/.../auth-service".to_string(),
-                diff_ref: Some("HEAD~1..HEAD".to_string()),
-                diff_inline: None,
-            },
-            task: Task {
-                description: "Verify token-expiry off-by-one fix.".to_string(),
-                verdict_priority: vec![
-                    "correctness".into(),
-                    "security".into(),
-                    "style".into(),
-                    "performance".into(),
-                ],
-            },
-            capability_allowlist: vec!["read", "grep", "find", "ls", "build", "test"]
-                .into_iter()
-                .map(String::from)
-                .collect(),
-            model_role: "verifier-cheap".to_string(),
-            context: Context {
-                read_only: true,
-                payload: vec![],
-            },
-        }
+        HarnessRequest::verify(
+            "/Users/.../auth-service",
+            "HEAD~1..HEAD",
+            "Verify token-expiry off-by-one fix.",
+        )
     }
 
     fn worked_example_response() -> HarnessResponse {
@@ -317,5 +345,56 @@ mod tests {
         resp.commands_run.clear();
         assert!(resp.validate().is_ok());
         assert!(!resp.passed());
+    }
+
+    #[test]
+    fn verify_constructor_round_trips_through_json() {
+        let req = HarnessRequest::verify("/repo", "HEAD~1..HEAD", "Verify the diff.");
+        let json = serde_json::to_string(&req).unwrap();
+        let back: HarnessRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn verify_constructor_validates_clean() {
+        let req = HarnessRequest::verify("/repo", "HEAD~1..HEAD", "Verify the diff.");
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn verify_constructor_sets_fields_per_spec_a() {
+        let req = HarnessRequest::verify("/repo", "HEAD~1..HEAD", "Verify the diff.");
+        assert_eq!(req.contract_version, CONTRACT_VERSION);
+        assert!(req.request_id.starts_with("req-ion-verify-"));
+        assert_eq!(req.intent, Intent::Verify);
+        assert_eq!(req.repo.path, "/repo");
+        assert_eq!(req.repo.diff_ref, Some("HEAD~1..HEAD".to_string()));
+        assert_eq!(req.repo.diff_inline, None);
+        assert_eq!(req.task.description, "Verify the diff.");
+        assert_eq!(
+            req.task.verdict_priority,
+            vec!["correctness", "security", "style", "performance"]
+        );
+        assert_eq!(req.model_role, "verifier-cheap");
+        assert!(req.context.read_only);
+        assert!(req.context.payload.is_empty());
+    }
+
+    #[test]
+    fn verify_constructor_capability_allowlist_matches_spec_a_read_only_set() {
+        // spec-a §2 worked example: exactly the read-only inspection tools
+        // plus run-only build/test — no write tool, no extras, no reordering.
+        let req = HarnessRequest::verify("/repo", "HEAD~1..HEAD", "Verify the diff.");
+        assert_eq!(
+            req.capability_allowlist,
+            vec!["read", "grep", "find", "ls", "build", "test"]
+        );
+    }
+
+    #[test]
+    fn verify_constructor_generates_distinct_request_ids() {
+        let a = HarnessRequest::verify("/repo", "HEAD~1..HEAD", "Verify the diff.");
+        let b = HarnessRequest::verify("/repo", "HEAD~1..HEAD", "Verify the diff.");
+        assert_ne!(a.request_id, b.request_id);
     }
 }

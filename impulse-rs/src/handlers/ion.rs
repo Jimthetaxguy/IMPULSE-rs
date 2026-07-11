@@ -10,7 +10,7 @@
 use anyhow::{Context as AnyhowContext, Result};
 
 use impulse_ion::pi_adapter::PiAdapter;
-use impulse_ion::{Context as IonContext, HarnessRequest, Intent, RepoRef, Task};
+use impulse_ion::HarnessRequest;
 
 use super::print_json;
 
@@ -54,34 +54,7 @@ pub async fn handle_ion_verify(
         );
     }
 
-    let request = HarnessRequest {
-        contract_version: impulse_ion::CONTRACT_VERSION.to_string(),
-        request_id: format!("req-ion-verify-{}", uuid::Uuid::new_v4()),
-        intent: Intent::Verify,
-        repo: RepoRef {
-            path: repo_path.display().to_string(),
-            diff_ref: Some(diff_ref),
-            diff_inline: None,
-        },
-        task: Task {
-            description,
-            verdict_priority: vec![
-                "correctness".into(),
-                "security".into(),
-                "style".into(),
-                "performance".into(),
-            ],
-        },
-        capability_allowlist: vec!["read", "grep", "find", "ls", "build", "test"]
-            .into_iter()
-            .map(String::from)
-            .collect(),
-        model_role: "verifier-cheap".to_string(),
-        context: IonContext {
-            read_only: true,
-            payload: vec![],
-        },
-    };
+    let request = HarnessRequest::verify(repo_path.display().to_string(), diff_ref, description);
 
     request
         .validate()
