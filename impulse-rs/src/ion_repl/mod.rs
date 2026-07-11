@@ -3,12 +3,14 @@
 //! [`ReplSession::run`] owns the interactive loop: read a line via
 //! `rustyline`, route it through [`router::route`], dispatch through the
 //! [`registry::ReplToolRegistry`] when the command names a tool, and print
-//! the rendered response. Chat turns (T8) and LLM tool-calling (T9) are
-//! still stubbed here — this module wires the deterministic slash-command
+//! the rendered response. This module wires the deterministic slash-command
 //! surface (`/help`, `/quit`, `/clear`, `/verify`, `/tools`,
-//! unknown-command) plus history persistence at `.impulse/ion_history`
-//! (`history.rs`, `IMPULSE_HOME`-aware).
+//! unknown-command), history persistence at `.impulse/ion_history`
+//! (`history.rs`, `IMPULSE_HOME`-aware), and — as of T8 — free-text chat
+//! turns via [`chat::ChatState`] (`/clear` now really clears its history;
+//! LLM tool-calling, T9, is still a follow-up).
 
+pub mod chat;
 pub mod history;
 pub mod registry;
 pub mod router;
@@ -20,6 +22,7 @@ use anyhow::Result;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
+use chat::ChatState;
 use registry::ReplToolRegistry;
 use router::{RouterOutcome, SlashCommand};
 
@@ -36,13 +39,17 @@ pub struct ReplContext {
     pub repo_root: std::path::PathBuf,
 }
 
-/// Owns the readline editor, history path, tool registry, and REPL context
-/// for one interactive session.
+/// Owns the readline editor, history path, tool registry, chat state, and
+/// REPL context for one interactive session. `chat` (T8) is built once here
+/// and held mutably for the session's lifetime — routing a `ChatTurn`
+/// through a freshly-constructed `ChatState` on every line would silently
+/// drop conversation history after each turn.
 pub struct ReplSession {
     editor: DefaultEditor,
     history_path: std::path::PathBuf,
     context: ReplContext,
     tools: ReplToolRegistry,
+    chat: ChatState,
 }
 
 impl ReplSession {
@@ -64,6 +71,7 @@ impl ReplSession {
             history_path,
             context: ReplContext { repo_root },
             tools: ReplToolRegistry::with_defaults(),
+            chat: ChatState::from_env(),
         })
     }
 
@@ -106,7 +114,13 @@ impl ReplSession {
     /// Routes and renders one line of input. Returns `true` if the session
     /// should exit.
     async fn handle_line(&mut self, line: &str) -> bool {
-        let (text, should_exit) = respond(router::route(line), &self.tools, &self.context).await;
+        let (text, should_exit) = respond(
+            router::route(line),
+            &self.tools,
+            &self.context,
+            &mut self.chat,
+        )
+        .await;
         if !text.is_empty() {
             println!("{text}");
         }
@@ -114,24 +128,31 @@ impl ReplSession {
     }
 }
 
+/// One-line notice shown when a chat turn is attempted with no usable API
+/// key configured (`AgentError::MissingApiKey`). Slash commands (`/verify`,
+/// `/tools`, `/help`, `/clear`) are unaffected — this only fires on the
+/// `ChatTurn` branch below.
+const MISSING_API_KEY_NOTICE: &str =
+    "No ANTHROPIC_API_KEY set -- chat is unavailable, but /verify and /tools still work.";
+
 /// Pure-ish rendering step: given a routed outcome, returns the text to
 /// print and whether the session should exit. Kept separate from
 /// `ReplSession::handle_line` so it is unit-testable without constructing a
-/// `rustyline::Editor` (tools/registry are passed in explicitly).
+/// `rustyline::Editor` (tools/registry/chat are passed in explicitly).
 async fn respond(
     outcome: RouterOutcome,
     tools: &ReplToolRegistry,
     ctx: &ReplContext,
+    chat: &mut ChatState,
 ) -> (String, bool) {
     match outcome {
         RouterOutcome::Empty => (String::new(), false),
         RouterOutcome::Command(SlashCommand::Help) => (help_text(tools), false),
         RouterOutcome::Command(SlashCommand::Quit) => ("Goodbye.".to_string(), true),
-        RouterOutcome::Command(SlashCommand::Clear) => (
-            "Nothing to clear yet -- chat history isn't wired up (TUI_SPEC.md T8 adds it)."
-                .to_string(),
-            false,
-        ),
+        RouterOutcome::Command(SlashCommand::Clear) => {
+            chat.clear();
+            ("Chat history cleared.".to_string(), false)
+        }
         RouterOutcome::Command(SlashCommand::Verify(args)) => (
             run_tool_command(tools, "ion_verify", verify_args_to_json(&args), ctx).await,
             false,
@@ -144,11 +165,16 @@ async fn respond(
             ),
             false,
         ),
-        RouterOutcome::ChatTurn(_text) => (
-            "Chat isn't wired up yet -- try /verify, /tools, or /help (TUI_SPEC.md T8 adds chat)."
-                .to_string(),
-            false,
-        ),
+        RouterOutcome::ChatTurn(text) => {
+            let reply = match chat.turn(&text).await {
+                Ok(reply) => reply,
+                Err(crate::error::AgentError::MissingApiKey { .. }) => {
+                    MISSING_API_KEY_NOTICE.to_string()
+                }
+                Err(err) => format!("Chat failed: {err}"),
+            };
+            (reply, false)
+        }
     }
 }
 
@@ -227,7 +253,7 @@ fn help_text(tools: &ReplToolRegistry) -> String {
         "  /help    Show this message".to_string(),
         "  /verify  Run the Ion verification gate (ion_verify ReplTool)".to_string(),
         "  /tools   List available ReplTools".to_string(),
-        "  /clear   (stub) clear chat history -- wired up in T8".to_string(),
+        "  /clear   Clear chat history".to_string(),
         "  /quit    Exit the REPL (Ctrl-D also works)".to_string(),
     ];
     if !tools.is_empty() {
@@ -248,6 +274,10 @@ pub async fn run() -> Result<()> {
 }
 
 #[cfg(test)]
+// See handlers::ion's test module for why holding env_lock() across .await
+// here is intentional (must span the whole gate-launcher round trip) and
+// safe (test-only std::sync::Mutex<()>, never contended by production code).
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
 
@@ -256,6 +286,18 @@ mod tests {
     /// `crate::test_support` (see that module's doc comment for why a
     /// per-file lock is insufficient).
     use crate::test_support::ion_gate_launcher_env_lock as env_lock;
+    use chat::test_support::{EchoProvider, MissingKeyProvider};
+
+    /// A `ChatState` that always fails with `AgentError::MissingApiKey`,
+    /// deterministic regardless of the test process's ambient
+    /// `ANTHROPIC_API_KEY` env state. Used by every `respond()` test that
+    /// doesn't specifically exercise the chat-turn success path.
+    fn test_chat() -> ChatState {
+        ChatState::with_provider(
+            Box::new(MissingKeyProvider),
+            "missing-key-fake-model".into(),
+        )
+    }
 
     fn init_git_repo() -> tempfile::TempDir {
         let dir = tempfile::TempDir::new().expect("failed to create tempdir");
@@ -279,7 +321,8 @@ mod tests {
     async fn test_respond_empty_returns_no_text_and_does_not_exit() {
         let tools = ReplToolRegistry::with_defaults();
         let ctx = ReplContext::default();
-        let (text, should_exit) = respond(RouterOutcome::Empty, &tools, &ctx).await;
+        let mut chat = test_chat();
+        let (text, should_exit) = respond(RouterOutcome::Empty, &tools, &ctx, &mut chat).await;
         assert_eq!(text, "");
         assert!(!should_exit);
     }
@@ -288,8 +331,14 @@ mod tests {
     async fn test_respond_help_lists_all_known_commands_and_tools() {
         let tools = ReplToolRegistry::with_defaults();
         let ctx = ReplContext::default();
-        let (text, should_exit) =
-            respond(RouterOutcome::Command(SlashCommand::Help), &tools, &ctx).await;
+        let mut chat = test_chat();
+        let (text, should_exit) = respond(
+            RouterOutcome::Command(SlashCommand::Help),
+            &tools,
+            &ctx,
+            &mut chat,
+        )
+        .await;
         assert!(!should_exit);
         for cmd in router::KNOWN_COMMANDS {
             assert!(text.contains(cmd), "help text missing {cmd}: {text}");
@@ -307,28 +356,58 @@ mod tests {
     async fn test_respond_quit_says_goodbye_and_exits() {
         let tools = ReplToolRegistry::with_defaults();
         let ctx = ReplContext::default();
-        let (text, should_exit) =
-            respond(RouterOutcome::Command(SlashCommand::Quit), &tools, &ctx).await;
+        let mut chat = test_chat();
+        let (text, should_exit) = respond(
+            RouterOutcome::Command(SlashCommand::Quit),
+            &tools,
+            &ctx,
+            &mut chat,
+        )
+        .await;
         assert_eq!(text, "Goodbye.");
         assert!(should_exit);
     }
 
     #[tokio::test]
-    async fn test_respond_clear_is_a_placeholder_and_does_not_exit() {
+    async fn test_respond_clear_clears_chat_history_and_does_not_exit() {
         let tools = ReplToolRegistry::with_defaults();
         let ctx = ReplContext::default();
-        let (text, should_exit) =
-            respond(RouterOutcome::Command(SlashCommand::Clear), &tools, &ctx).await;
-        assert!(text.to_lowercase().contains("nothing to clear"));
+        let mut chat = ChatState::with_provider(
+            Box::new(EchoProvider { prefix: "echo:" }),
+            "echo-fake-model".into(),
+        );
+        // Build up history first, so /clear has something real to clear.
+        chat.turn("hi").await.expect("fake provider succeeds");
+        assert_eq!(chat.history_len(), 2);
+
+        let (text, should_exit) = respond(
+            RouterOutcome::Command(SlashCommand::Clear),
+            &tools,
+            &ctx,
+            &mut chat,
+        )
+        .await;
+        assert!(text.to_lowercase().contains("cleared"));
         assert!(!should_exit);
+        assert_eq!(
+            chat.history_len(),
+            0,
+            "/clear must actually clear ChatState history, not just print a message"
+        );
     }
 
     #[tokio::test]
     async fn test_respond_tools_lists_registered_tools() {
         let tools = ReplToolRegistry::with_defaults();
         let ctx = ReplContext::default();
-        let (text, should_exit) =
-            respond(RouterOutcome::Command(SlashCommand::Tools), &tools, &ctx).await;
+        let mut chat = test_chat();
+        let (text, should_exit) = respond(
+            RouterOutcome::Command(SlashCommand::Tools),
+            &tools,
+            &ctx,
+            &mut chat,
+        )
+        .await;
         assert!(!should_exit);
         assert!(text.contains("ion_verify"));
         assert!(text.contains("file_read"));
@@ -348,6 +427,7 @@ mod tests {
         let ctx = ReplContext {
             repo_root: repo.path().to_path_buf(),
         };
+        let mut chat = test_chat();
         let (text, should_exit) = respond(
             RouterOutcome::Command(SlashCommand::Verify(vec![
                 "--diff-ref".to_string(),
@@ -355,6 +435,7 @@ mod tests {
             ])),
             &tools,
             &ctx,
+            &mut chat,
         )
         .await;
 
@@ -371,10 +452,12 @@ mod tests {
     async fn test_respond_verify_reports_error_for_unregistered_tool() {
         let tools = ReplToolRegistry::new(); // deliberately empty
         let ctx = ReplContext::default();
+        let mut chat = test_chat();
         let (text, should_exit) = respond(
             RouterOutcome::Command(SlashCommand::Verify(Vec::new())),
             &tools,
             &ctx,
+            &mut chat,
         )
         .await;
         assert!(!should_exit);
@@ -407,10 +490,12 @@ mod tests {
     async fn test_respond_unknown_command_lists_known_commands() {
         let tools = ReplToolRegistry::with_defaults();
         let ctx = ReplContext::default();
+        let mut chat = test_chat();
         let (text, should_exit) = respond(
             RouterOutcome::UnknownCommand("frobnicate".to_string()),
             &tools,
             &ctx,
+            &mut chat,
         )
         .await;
         assert!(text.contains("/frobnicate"));
@@ -424,13 +509,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_respond_chat_turn_is_a_stub_and_does_not_exit() {
+    async fn test_respond_chat_turn_sends_text_to_chat_session_and_returns_reply() {
+        // Proves a ChatTurn actually reaches ChatState::turn (and therefore
+        // the underlying Agent/LlmProvider), not just a hardcoded stub
+        // string, by asserting the fake provider's echoed reply comes back.
         let tools = ReplToolRegistry::with_defaults();
         let ctx = ReplContext::default();
-        let (text, should_exit) =
-            respond(RouterOutcome::ChatTurn("hello".to_string()), &tools, &ctx).await;
-        assert!(text.to_lowercase().contains("chat isn't wired up"));
+        let mut chat = ChatState::with_provider(
+            Box::new(EchoProvider { prefix: "echo:" }),
+            "echo-fake-model".into(),
+        );
+        let (text, should_exit) = respond(
+            RouterOutcome::ChatTurn("hello".to_string()),
+            &tools,
+            &ctx,
+            &mut chat,
+        )
+        .await;
+        assert_eq!(text, "echo:hello");
         assert!(!should_exit);
+    }
+
+    #[tokio::test]
+    async fn test_respond_chat_turn_missing_api_key_prints_graceful_notice_not_panic() {
+        let tools = ReplToolRegistry::with_defaults();
+        let ctx = ReplContext::default();
+        let mut chat = test_chat(); // MissingKeyProvider
+        let (text, should_exit) = respond(
+            RouterOutcome::ChatTurn("hello".to_string()),
+            &tools,
+            &ctx,
+            &mut chat,
+        )
+        .await;
+        assert_eq!(text, MISSING_API_KEY_NOTICE);
+        assert!(!should_exit);
+        // Slash commands must still work after a missing-key chat turn.
+        let (help_text, _) = respond(
+            RouterOutcome::Command(SlashCommand::Help),
+            &tools,
+            &ctx,
+            &mut chat,
+        )
+        .await;
+        assert!(help_text.contains("/verify"));
     }
 
     #[test]

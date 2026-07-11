@@ -359,7 +359,7 @@ cd impulse-rs && cargo build && cargo test && cargo clippy -- -D warnings && car
 ```
 
 **Expected output (update when counts change):**
-- `cargo test --workspace`: 1,453 unit + 32 integration (impulse-rs, includes T5's `tests/ion_binary.rs`) + 2 doctests (impulse-rs, 1 ignored) + 31 (impulse-ops) + 114 (impulse-term) + 159 (impulse-desktop) + 23 (impulse-ion, 1 ignored) = 1,814 passed, 3 ignored, 0 failed (verified 2026-07-11; T7 adds `src/ion_repl/{registry,tool_bridge,tool_verify}.rs` — the `ReplTool` registry, the `DynamicTool` -> `ReplTool` bridge, and `ion_verify` as a `ReplTool` — plus two new `src/tooling::builtin` tools (`file_write`, `bash_exec`) and a new `Capability::ShellExec`, wiring `/verify` and adding `/tools` for real: net +33 tests vs. T6's 1,781 baseline. Also adds `src/test_support.rs` (`#[cfg(test)]`-only): a single shared `ion_gate_launcher_env_lock()` used by every test module that mutates `ION_GATE_LAUNCHER` in the `impulse-rs` binary test process — per-file `static ENV_LOCK`s do NOT serialize across files in the same test binary, which was silently reintroducing the race the lock pattern exists to prevent once T7 added a second and third file touching that env var. Note: `impulse-term::test_with_parser_reads_screen_size` and 3 impulse-desktop tests (`test_dioxus_desktop_launch_binary_is_feature_gated`, `test_host_readiness_smoke_script_is_declared`, `test_xterm_vendor_assets_are_present_and_manifested`) are parallelism-flaky under full `--workspace` load — pass in isolation/serial per-crate. Also flaky under `--workspace`: `handlers::common::tests::test_persist_claude_env_var_creates_file_with_assignment` races a sibling test over the shared `CLAUDE_ENV_FILE` env var (no lock) — pre-existing, unrelated to ion work, passes on isolated/serial rerun.)
+- `cargo test --workspace`: 1,825 passed, 7 ignored, 0 failed (verified 2026-07-11; impulse-rs unittests alone: 1,464. T7 fixes (Opus adversarial review of commit bf38b06) landed in `bash_exec.rs` — `Command::kill_on_drop(true)` so a timed-out child is actually killed instead of orphaned (matches the earlier `pi_adapter.rs` timeout-kill fix), and a `truncate_at_char_boundary` helper replacing a raw `String::truncate` that could panic mid-multi-byte-char on >256KiB output — plus `tool_verify.rs`'s `ok` now mirrors the CLI's `!passed() || validate().is_err()` logic exactly (was `passed()`-only, missing `MissingCommandsRun`-class violations) and the JSON payload gained the `contract_violation` field the CLI's envelope already had. T8 adds `src/ion_repl/chat.rs` (`ChatState` wrapping `llm_backends::Agent` as the REPL's chat session — free-text lines now reach a real LLM turn, `/clear` truly clears history, missing `ANTHROPIC_API_KEY` degrades to a one-line notice instead of a panic). Net vs. T7's 1,814 baseline: +11. Note: `impulse-term::test_with_parser_reads_screen_size` and 3 impulse-desktop tests (`test_dioxus_desktop_launch_binary_is_feature_gated`, `test_host_readiness_smoke_script_is_declared`, `test_xterm_vendor_assets_are_present_and_manifested`) are parallelism-flaky under full `--workspace` load — pass in isolation/serial per-crate. Also flaky under `--workspace`: `handlers::common::tests::test_persist_claude_env_var_creates_file_with_assignment` races a sibling test over the shared `CLAUDE_ENV_FILE` env var (no lock) — pre-existing, unrelated to ion work, passes on isolated/serial rerun.)
 - `cargo clippy`: 0 warnings
 - `cargo fmt --check`: no output (clean)
 
@@ -394,12 +394,12 @@ To verify test counts match expectations:
 ```bash
 cd impulse-rs && cargo test 2>&1 | grep "test result:" | awk '{sum += $4} END {print "Total: " sum " passed"}'
 ```
-Expected: 1,814 passed across the 5 crates (impulse-rs, impulse-ops, impulse-term, impulse-desktop, impulse-ion). If this changes, update both this section and the Architecture section.
+Expected: 1,825 passed across the 5 crates (impulse-rs, impulse-ops, impulse-term, impulse-desktop, impulse-ion). If this changes, update both this section and the Architecture section.
 
 ### Pre-Commit Checklist
 
 1. `cargo build` — zero warnings
-2. `cargo test` — all tests pass (1,814 workspace total expected: 1453 unit + 32 integration + 2 doctests impulse-rs, 31 ops, 114 term, 159 desktop, 23 ion; verify with `cargo test --workspace 2>&1 | grep "test result:"`)
+2. `cargo test` — all tests pass (1,825 workspace total expected, 7 ignored; verify with `cargo test --workspace 2>&1 | grep "test result:"`)
    - **If count changes**: update this line and the Architecture section above
 3. `cargo clippy -- -D warnings` — zero warnings
 4. `cargo fmt --check` — zero diffs
