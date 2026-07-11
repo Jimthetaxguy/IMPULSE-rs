@@ -401,7 +401,7 @@ impl ImpulseAgent {
     /// Run local coordination checks (no LLM needed).
     pub fn coordinate_local(&mut self, insights: &[ExtractedInsight]) -> Vec<Recommendation> {
         let recs = coordinator::run_local_coordination(insights);
-        self.recommendations.extend(recs.clone());
+        self.recommendations.extend(recs.iter().cloned());
         // Keep only last 50 recommendations
         if self.recommendations.len() > 50 {
             let drain_count = self.recommendations.len() - 50;
@@ -417,7 +417,7 @@ impl ImpulseAgent {
         insights: &[ExtractedInsight],
     ) -> coordinator::CoordinationResult {
         let result = coordinator::run_full_coordination(insights);
-        self.recommendations.extend(result.recommendations.clone());
+        self.recommendations.extend(result.recommendations.iter().cloned());
         // Keep only last 50 recommendations
         if self.recommendations.len() > 50 {
             let drain_count = self.recommendations.len() - 50;
