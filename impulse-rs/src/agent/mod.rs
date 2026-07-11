@@ -1494,13 +1494,14 @@ mod tests {
             .arg("-f")
             .arg(format!("sleep {unique_duration}"))
             .output()
-            .await;
-        if let Ok(check) = check {
-            let stray = String::from_utf8_lossy(&check.stdout);
-            assert!(
-                stray.trim().is_empty(),
-                "expected no orphaned harness process after timeout, found pids: {stray}"
+            .await
+            .expect(
+                "pgrep unavailable -- cannot verify orphan-kill; install pgrep or adjust the check",
             );
-        }
+        let stray = String::from_utf8_lossy(&check.stdout);
+        assert!(
+            stray.trim().is_empty(),
+            "expected no orphaned harness process after timeout, found pids: {stray}"
+        );
     }
 }

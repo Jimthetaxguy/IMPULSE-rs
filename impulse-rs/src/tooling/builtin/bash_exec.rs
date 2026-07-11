@@ -486,14 +486,15 @@ mod tests {
             .arg("-f")
             .arg(format!("sleep {unique_duration}"))
             .output()
-            .await;
-        if let Ok(check) = check {
-            let stray = String::from_utf8_lossy(&check.stdout);
-            assert!(
-                stray.trim().is_empty(),
-                "expected no orphaned process after timeout, found pids: {stray}"
+            .await
+            .expect(
+                "pgrep unavailable -- cannot verify orphan-kill; install pgrep or adjust the check",
             );
-        }
+        let stray = String::from_utf8_lossy(&check.stdout);
+        assert!(
+            stray.trim().is_empty(),
+            "expected no orphaned process after timeout, found pids: {stray}"
+        );
     }
 
     #[tokio::test]
@@ -540,15 +541,16 @@ mod tests {
             .arg("-f")
             .arg(format!("sleep {unique_duration}"))
             .output()
-            .await;
-        if let Ok(check) = check {
-            let stray = String::from_utf8_lossy(&check.stdout);
-            assert!(
-                stray.trim().is_empty(),
-                "expected the backgrounded grandchild to be killed via the process group, \
-                 found pids: {stray}"
+            .await
+            .expect(
+                "pgrep unavailable -- cannot verify orphan-kill; install pgrep or adjust the check",
             );
-        }
+        let stray = String::from_utf8_lossy(&check.stdout);
+        assert!(
+            stray.trim().is_empty(),
+            "expected the backgrounded grandchild to be killed via the process group, \
+             found pids: {stray}"
+        );
     }
 
     #[tokio::test]
