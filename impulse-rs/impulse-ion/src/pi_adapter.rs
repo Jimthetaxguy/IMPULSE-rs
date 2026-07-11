@@ -166,27 +166,31 @@ impl PiAdapter {
             result
         });
 
+        // Wait for the response thread to finish, not for the direct `bash`
+        // child to exit: `launch-gate.sh` can exit quickly after forking node,
+        // and polling `child.try_wait()` alone would declare victory while a
+        // still-running grandchild keeps the stdout pipe open — the
+        // subsequent unconditional `response_handle.join()` would then block
+        // forever. The timeout is the only thing allowed to end the wait.
         let start = Instant::now();
-        let mut timed_out = false;
-        let mut response_ready = false;
-        loop {
-            if let Ok(Some(_status)) = child.try_wait() {
-                break;
-            }
+        let timed_out = loop {
             if start.elapsed() >= self.timeout {
-                timed_out = true;
-                kill_process_group(&mut child);
-                let _ = child.wait();
-                break;
+                break true;
             }
-            if response_ready {
-                // Response bytes are already parsed; keep polling try_wait
-                // (still bounded by the timeout above) without re-touching a
-                // closed channel.
-                std::thread::sleep(POLL_INTERVAL);
-            } else if response_rx.recv_timeout(POLL_INTERVAL).is_ok() {
-                response_ready = true;
+            match response_rx.recv_timeout(POLL_INTERVAL) {
+                Ok(()) => break false,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                // Sender dropped without sending (thread panicked): treat as
+                // done: the panic is captured as an Err by `.join()` below.
+                Err(mpsc::RecvTimeoutError::Disconnected) => break false,
             }
+        };
+
+        if timed_out {
+            // Kills the whole process group (see `process_group(0)` at spawn
+            // time), so an orphaned grandchild closes the pipes and unblocks
+            // the join below promptly instead of hanging alongside it.
+            kill_process_group(&mut child);
         }
 
         let response_result = response_handle
@@ -198,6 +202,8 @@ impl PiAdapter {
             tracing::warn!(stderr = %stderr_output, "pi gate child process wrote to stderr");
         }
 
+        let status = child.wait()?;
+
         if timed_out {
             return Err(AdapterError::TimedOut {
                 timeout_secs: self.timeout.as_secs(),
@@ -205,7 +211,6 @@ impl PiAdapter {
             });
         }
 
-        let status = child.wait()?;
         if !status.success() {
             return Err(AdapterError::NonZeroExit {
                 code: status.code().unwrap_or(-1),
@@ -237,6 +242,10 @@ fn kill_process_group(child: &mut std::process::Child) {
         let pgid = child.id();
         let _ = Command::new("kill")
             .arg("-KILL")
+            // `--` stops `kill` from treating the negative pgid as an option
+            // flag; some `kill` implementations (procps on Linux) reject a
+            // bare `-<pgid>` without it, silently leaving the group alive.
+            .arg("--")
             .arg(format!("-{pgid}"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -466,6 +475,36 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(5),
             "verify should return promptly after the configured timeout, took {elapsed:?}"
+        );
+    }
+
+    /// Regression test: the direct child exiting is NOT the same as the gate
+    /// being done. `orphan-grandchild-gate.sh` exits almost immediately but
+    /// leaves a backgrounded grandchild sleeping in the same process group,
+    /// holding stdout open. A watchdog keyed off `child.try_wait()` alone
+    /// would declare the call finished here and then hang forever in
+    /// `response_handle.join()` waiting for EOF that never comes; `verify`
+    /// must instead keep waiting until the configured timeout, then kill the
+    /// whole process group (including the orphan) and return `TimedOut`.
+    #[test]
+    fn verify_times_out_when_direct_child_exits_but_grandchild_lingers() {
+        let script =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fakes/orphan-grandchild-gate.sh");
+        let adapter =
+            PiAdapter::with_launch_script(script).with_timeout(Duration::from_millis(200));
+        let request = sample_request();
+
+        let start = Instant::now();
+        let err = adapter
+            .verify(&request)
+            .expect_err("orphaned grandchild must still trigger a timeout, not a hang");
+        let elapsed = start.elapsed();
+
+        assert!(matches!(err, AdapterError::TimedOut { .. }));
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "verify should return promptly after the configured timeout even with an orphaned \
+             grandchild alive, took {elapsed:?}"
         );
     }
 
