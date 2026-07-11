@@ -1,15 +1,21 @@
 //! `.impulse/ion_history` persistence for the ion REPL (TUI_SPEC.md T6).
 //!
-//! Resolves the `.impulse/` directory using the same `IMPULSE_HOME`
-//! convention documented in this crate's `CLAUDE.md` (Environment Variables
-//! table) and already implemented by `impulse-desktop`'s
-//! `resolve_memory_root` and `impulse-gui`'s `agent_panel::persistence`:
-//! explicit `IMPULSE_HOME`, else `$HOME/.impulse` (`%USERPROFILE%` on
-//! Windows), else `.impulse` under the current directory. Reimplemented here
-//! (rather than imported) because neither `impulse-desktop` nor
-//! `impulse-gui` is a dependency of `impulse-rs` — `src/lib.rs`'s
-//! `resolve_impulse_dir` is a separate, currently-passthrough seam scoped to
-//! the `--impulse-dir` CLI flag, not this env-var convention.
+//! Resolves the `.impulse/` directory: explicit `IMPULSE_HOME`, else
+//! `$HOME/.impulse` (`%USERPROFILE%` on Windows), else `.impulse` under the
+//! current directory. This is character-for-character identical to
+//! `impulse-desktop`'s `resolve_memory_root` (`impulse-desktop/src/bin/impulse_desktop.rs`).
+//! Reimplemented here (rather than imported) because `impulse-desktop` is not
+//! a dependency of `impulse-rs` — `src/lib.rs`'s `resolve_impulse_dir` is a
+//! separate, currently-passthrough seam scoped to the `--impulse-dir` CLI
+//! flag, not this env-var convention.
+//!
+//! **Not the same convention as `impulse-gui`'s `agent_panel::persistence`**
+//! (a prior version of this doc comment incorrectly claimed it was): that
+//! module accepts a blank `IMPULSE_HOME` as valid, then walks up from the
+//! current directory looking for an *existing* `.impulse/` dir before ever
+//! consulting `HOME`/`USERPROFILE`. The three implementations are not
+//! interchangeable; do not assume they'd resolve to the same path for a
+//! given `cwd`/env combination.
 
 use std::path::{Path, PathBuf};
 
@@ -52,8 +58,16 @@ pub fn load(editor: &mut DefaultEditor, path: &Path) -> Result<()> {
         .with_context(|| format!("Failed to load ion history from {}", path.display()))
 }
 
-/// Save `editor`'s history to `path`, creating the parent directory if
-/// needed.
+/// Append this session's new history entries to `path`, creating the parent
+/// directory (and the file itself) if needed.
+///
+/// Uses rustyline's `append_history` rather than `save_history`
+/// (overwrite-the-whole-file) for two reasons: `save_history` would silently
+/// lose every line typed if the process is killed or panics before this call
+/// runs (nothing is durable until exit), and with two concurrent `ion`
+/// sessions the last one to exit would clobber the other's entries entirely.
+/// Appending only the entries added since `load()` avoids both — prior
+/// sessions' history is preserved regardless of exit order or crashes.
 pub fn save(editor: &mut DefaultEditor, path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
@@ -64,8 +78,8 @@ pub fn save(editor: &mut DefaultEditor, path: &Path) -> Result<()> {
         })?;
     }
     editor
-        .save_history(path)
-        .with_context(|| format!("Failed to save ion history to {}", path.display()))
+        .append_history(path)
+        .with_context(|| format!("Failed to append ion history to {}", path.display()))
 }
 
 #[cfg(test)]
@@ -183,6 +197,36 @@ mod tests {
         let mut reader = DefaultEditor::new().expect("editor");
         load(&mut reader, &path).expect("load should succeed for a file save() just wrote");
         assert_eq!(reader.history().len(), 2);
+    }
+
+    #[test]
+    fn test_save_appends_across_sessions_instead_of_overwriting() {
+        // Regression test: an earlier version used rustyline's save_history,
+        // which overwrites the whole file -- a second session's save() would
+        // silently erase everything a first (still-open or already-exited)
+        // session had written. append_history must preserve prior entries.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("ion_history");
+
+        let mut session_one = DefaultEditor::new().expect("editor");
+        session_one
+            .add_history_entry("/help")
+            .expect("add_history_entry");
+        save(&mut session_one, &path).expect("session one save");
+
+        let mut session_two = DefaultEditor::new().expect("editor");
+        session_two
+            .add_history_entry("/tools")
+            .expect("add_history_entry");
+        save(&mut session_two, &path).expect("session two save");
+
+        let mut reader = DefaultEditor::new().expect("editor");
+        load(&mut reader, &path).expect("load should see both sessions' entries");
+        assert_eq!(
+            reader.history().len(),
+            2,
+            "session two's save() must not have erased session one's entry"
+        );
     }
 
     #[test]
