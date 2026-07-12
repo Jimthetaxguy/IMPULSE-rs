@@ -116,6 +116,11 @@ docx = { version = "0.4", optional = true, package = "docx-rs" }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# Keep Impulse's Rust 1.82 MSRV: security-framework 3.7 requires Rust 1.85.
+security-framework = "=3.6.0"
+security-framework-sys = "=2.17.0"
+
 [features]
 default = ["office-support"]
 # Monty support enables computed routing and dynamic context injection
