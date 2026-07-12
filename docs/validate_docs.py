@@ -41,33 +41,61 @@ PHASES = ["phase0", "phase1", "phase1.5", "phase2", "phase3", "all", "historical
 STATUSES = ["draft", "review", "active", "deprecated", "complete", "superseded", "archive", "accepted"]
 
 CONTRACT_KEY_FILES = [
+    ROOT_DIR / "VISION.md",
     ROOT_DIR / "AGENTS.md",
     ROOT_DIR / "CLAUDE.md",
     DOCS_DIR / "INDEX.md",
+    DOCS_DIR / "SUMMARY.yaml",
     DOCS_DIR / "SUMMARY.md",
 ]
 
+DURABLE_ROADMAP_MARKER = (
+    "Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + "
+    "hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; "
+    "Legacy=egui compile-maintenance only"
+)
+
 CONTRACT_REQUIRED_MARKERS = {
+    ROOT_DIR / "VISION.md": [
+        "IMPULSE — Feed the impulse to build.",
+        "Living product north star",
+        "First complete vertical slice",
+        DURABLE_ROADMAP_MARKER,
+    ],
     ROOT_DIR / "AGENTS.md": [
+        "VISION.md",
+        "Product north star:",
         "RUST-CANONICAL-CONTRACT.md",
         "COLLABORATIVE-AGENTIC-CODING.md",
         "Canonical stack: Rust (impulse-rs)",
-        "Roadmap contract: Now=Rust core + Dioxus desktop host; Next=Dioxus Desktop launch scaffold + terminal bridge parity; Legacy=egui compile-maintenance only; Tauri=legacy compatibility adapter only",
+        DURABLE_ROADMAP_MARKER,
     ],
     ROOT_DIR / "CLAUDE.md": [
+        "VISION.md",
+        "Product north star:",
         "RUST-CANONICAL-CONTRACT.md",
         "COLLABORATIVE-AGENTIC-CODING.md",
         "Canonical stack: Rust (impulse-rs)",
-        "Roadmap contract: Now=Rust core + Dioxus desktop host; Next=Dioxus Desktop launch scaffold + terminal bridge parity; Legacy=egui compile-maintenance only; Tauri=legacy compatibility adapter only",
+        DURABLE_ROADMAP_MARKER,
     ],
     DOCS_DIR / "INDEX.md": [
+        "VISION.md",
+        "living product north star",
         "RUST-CANONICAL-CONTRACT.md",
         "COLLABORATIVE-AGENTIC-CODING.md",
         "Canonical stack: Rust (impulse-rs)",
-        "Roadmap contract: Now=Rust core + Dioxus desktop host, Next=Dioxus Desktop launch scaffold + terminal bridge parity, Later=daemon parity + artifact polish",
+        DURABLE_ROADMAP_MARKER,
     ],
     DOCS_DIR / "SUMMARY.md": [
+        "VISION.md",
+        "Living product north star",
         "RUST-CANONICAL-CONTRACT.md",
+        DURABLE_ROADMAP_MARKER,
+    ],
+    DOCS_DIR / "SUMMARY.yaml": [
+        "VISION.md",
+        "RUST-CANONICAL-CONTRACT.md",
+        DURABLE_ROADMAP_MARKER,
     ],
 }
 

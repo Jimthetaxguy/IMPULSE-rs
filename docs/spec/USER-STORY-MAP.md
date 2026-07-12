@@ -1,8 +1,8 @@
 ---
 title: User Story Map
 description: Rust-first user stories and documentation baseline for the current Impulse product surface
-version: '1.0'
-updated: 2026-04-02
+version: '1.1'
+updated: 2026-07-12
 type: specification
 category: core
 phase: all
@@ -27,8 +27,8 @@ authors:
 These documents describe the current product with the least drift:
 
 - [`RUST-CANONICAL-CONTRACT.md`](./RUST-CANONICAL-CONTRACT.md) for product scope, interfaces, and roadmap
-- [`../ROADMAP-PLAN.md`](../ROADMAP-PLAN.md) for sequencing and active delivery lanes
-- [`../plans/IMPLEMENTATION-HANDOFF.md`](../plans/IMPLEMENTATION-HANDOFF.md) for execution order
+- [`../../VISION.md`](../../VISION.md) for the living product north star and complete vertical slice
+- [`../INDEX.md`](../INDEX.md) for current Now/Next/Later navigation
 - [`../guides/HOOK-VALIDATION-GUIDE.md`](../guides/HOOK-VALIDATION-GUIDE.md) for proof-of-truth validation
 - [`../../AGENTS.md`](../../AGENTS.md) for contributor rules and test expectations
 
@@ -38,7 +38,7 @@ These documents contain good material, but they are not a unified execution base
 
 - [`../../README.md`](../../README.md) explains the product at a high level
 - [`../INDEX.md`](../INDEX.md) is the navigation hub
-- `../SUMMARY.md` and `../SUMMARY.yaml` have been active navigation surfaces, but they drifted from the live Rust docs set and should not be treated as a source of truth until fully re-baselined
+- `../SUMMARY.md` mirrors the `../SUMMARY.yaml` navigation source; use the canonical contract for implementation truth
 - [`../guides/TESTING-STRATEGY-ENHANCEMENTS.md`](../guides/TESTING-STRATEGY-ENHANCEMENTS.md) has reusable testing categories
 
 ### Legacy or drifted
@@ -218,7 +218,7 @@ Acceptance criteria:
 Primary interfaces:
 
 - `daemon`
-- JSON-line IPC protocol v2
+- JSON-line IPC protocol v3
 
 #### ST-09 Observe work through the Dioxus desktop host
 

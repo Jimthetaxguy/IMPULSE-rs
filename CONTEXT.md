@@ -16,7 +16,7 @@
 ## What Impulse is
 
 Impulse is a **terminal-native local control plane and harness manager for AI software-engineering
-agents**. It launches or attaches heterogeneous coding runtimes, supervises their operating
+agents**. It launches and manages heterogeneous coding runtimes, supervises their operating
 conditions, and supplies shared platform services: memory, tools, telemetry, messaging/handoffs,
 policy, credentials, artifacts, and verification.
 
@@ -60,7 +60,8 @@ It is not interchangeable with its session or pane.
 - **Closest in code:** `AgentRuntime`, `AgentRuntimeSnapshot`, and desktop runtime records.
 
 ### session — `[code]`
-A bounded, persisted unit of work with a start, tracked activity, and verified end. A session may
+A bounded, persisted unit of work with a start, tracked activity, and recorded end. The API can
+optionally gate that end on verification. A session may
 be linked to a running agent instance but does not own that process.
 - **Source of truth:** `WorkbenchDaemonRequest::{CreateSession, EndSession}` and CLI
   `session-start` / `session-end --verify`.
@@ -80,8 +81,9 @@ A logical codebase/governance boundary for memory, artifacts, policy, and verifi
 usually represented by one registered workspace root and one daemon-owned `ProjectOpsSnapshot`.
 
 ### workspace target — `[code]`
-The explicit filesystem root in which an agent process operates. Several agent instances may share
-a workspace; a cockpit can register and switch among several workspaces.
+The explicit working-directory/project root in which an agent process operates. Several agent
+instances may share a workspace; a cockpit can register and switch among several workspaces.
+Structural filesystem enforcement depends on the selected runtime or sandbox.
 - **Source of truth:** `impulse-desktop/src/workspace.rs` and `WorkspaceTarget` in runtime models.
 
 ---

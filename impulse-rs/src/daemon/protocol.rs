@@ -295,7 +295,7 @@ mod tests {
     // ── PROTOCOL_VERSION ───────────────────────────────────────────────
 
     #[test]
-    fn test_protocol_version_is_two() {
+    fn test_protocol_version_is_three() {
         assert_eq!(PROTOCOL_VERSION, 3);
     }
 

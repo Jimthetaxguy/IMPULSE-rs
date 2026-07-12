@@ -1,15 +1,23 @@
 ---
 title: Documentation Summary
 description: Unified navigation structure for Impulse documentation
-version: '2.2'
-updated: '2026-05-21'
+version: '2.3'
+updated: '2026-07-12'
 schema_version: '1.0'
 type: navigation
 category: docs
 ---
 # Navigation Tree
 
+roadmap_contract: >-
+  Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; Legacy=egui compile-maintenance only
+
 quick_reference:
+  - name: VISION.md
+    description: Living product north star and complete governed vertical slice
+    path: ../VISION.md
+    start: true
+
   - name: RUST-CANONICAL-CONTRACT.md
     description: Authoritative product contract
     path: spec/RUST-CANONICAL-CONTRACT.md
@@ -23,6 +31,11 @@ quick_reference:
   - name: TEST-TRACEABILITY.md
     description: Current story-to-test coverage map
     path: spec/TEST-TRACEABILITY.md
+    start: true
+
+  - name: ARCHITECTURE-CLARIFICATION.md
+    description: Current control-plane boundary and enforcement map
+    path: ARCHITECTURE-CLARIFICATION.md
     start: true
 
   - name: AGENTS.md
@@ -51,32 +64,37 @@ quick_reference:
     start: true
 
 active_tracks:
-  - name: Rust + Dioxus Desktop Host
-    description: Current product baseline and roadmap contract
+  - name: Control-Plane Foundations
+    description: Current implementation boundary and governed supervisor-builder roadmap
     docs:
+      - ../VISION.md
       - spec/RUST-CANONICAL-CONTRACT.md
+      - ARCHITECTURE-CLARIFICATION.md
       - spec/USER-STORY-MAP.md
       - spec/TEST-TRACEABILITY.md
-      - ROADMAP-PLAN.md
-      - plans/IMPLEMENTATION-HANDOFF.md
       - guides/COLLABORATIVE-AGENTIC-CODING.md
-      - ../impulse-rs/docs/IMPULSE_TERM_STATUS.md
       - HONEST-ROADMAP.md
 
 phases:
   now:
-    - name: Rust Core + Dioxus Desktop Host
-      path: ROADMAP-PLAN.md
-    - name: Dioxus Desktop Implementation Handoff
-      path: plans/IMPLEMENTATION-HANDOFF.md
+    - name: Product North Star
+      path: ../VISION.md
+    - name: Rust Canonical Contract
+      path: spec/RUST-CANONICAL-CONTRACT.md
+    - name: Architecture Clarification
+      path: ARCHITECTURE-CLARIFICATION.md
 
   next:
-    - name: Honest Roadmap
-      path: HONEST-ROADMAP.md
-    - name: impulse-term Status
-      path: ../impulse-rs/docs/IMPULSE_TERM_STATUS.md
+    - name: Governed Supervisor and Builder Vertical Slice
+      path: ../VISION.md
+    - name: User Story Map
+      path: spec/USER-STORY-MAP.md
+    - name: Test Traceability
+      path: spec/TEST-TRACEABILITY.md
 
   later:
+    - name: General Roles and Negotiated Runtimes
+      path: ../VISION.md
     - name: CLI Architecture
       path: vision/CLI-ARCHITECTURE.md
     - name: TUI Augmentation Vision
@@ -97,6 +115,8 @@ categories:
     - ../impulse-rs/docs/IMPULSE_TERM_STATUS.md
 
   architecture:
+    - ../VISION.md
+    - ARCHITECTURE-CLARIFICATION.md
     - vision/CLI-ARCHITECTURE.md
     - vision/DATA-MODELS.md
     - vision/DYNAMIC-CLI-VISION.md
@@ -130,6 +150,9 @@ categories:
     - decisions/0004-extraction-strategy.md
     - decisions/0005-distribution-model.md
     - decisions/0006-hook-enhancement-conflict-resolution.md
+    - decisions/0007-desktop-shell-stack.md
+    - decisions/0008-dioxus-desktop-host.md
+    - decisions/0009-reconcile-impulse-copies.md
 
   session_logs:
     - session-logs/DEVELOPMENT-HISTORY.md
@@ -139,8 +162,8 @@ categories:
     - archive/ralph-plans/README.md
 
 metadata:
-  total_documents: 85
+  total_documents: 131
   categories: 8
-  decisions: 6
+  decisions: 9
   phases: 3
   status: active_development

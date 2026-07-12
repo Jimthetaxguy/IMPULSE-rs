@@ -24,9 +24,7 @@ authors:
 > current implementation contract [`spec/RUST-CANONICAL-CONTRACT.md`](spec/RUST-CANONICAL-CONTRACT.md).
 >
 > **Canonical stack: Rust (impulse-rs)**
-> **Current roadmap:** Now=control-plane foundations + local integration, Next=one governed
-> supervisor/builder vertical slice + hierarchy/enforcement ADR, Later=general roles + negotiated runtimes.
-> **Validator compatibility marker (historical wording): Roadmap contract: Now=Rust core + Dioxus desktop host, Next=Dioxus Desktop launch scaffold + terminal bridge parity, Later=daemon parity + artifact polish**
+> **Roadmap contract:** Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; Legacy=egui compile-maintenance only.
 > **Collaboration playbook:** [`guides/COLLABORATIVE-AGENTIC-CODING.md`](guides/COLLABORATIVE-AGENTIC-CODING.md)
 > **Risk register:** [`HONEST-ROADMAP.md`](HONEST-ROADMAP.md) stays canonical for unvalidated assumptions.
 
@@ -108,11 +106,11 @@ See [decisions/README.md](decisions/README.md) for full decision log.
 | [PHASE1.5-COORDINATION.md](phases/PHASE1.5-COORDINATION.md) | Multi-agent coordination |
 | [PHASE2-PERSISTENCE.md](phases/PHASE2-PERSISTENCE.md)       | Persistence layer design |
 | [PHASE2-MIGRATION-PLAN.md](phases/PHASE2-MIGRATION-PLAN.md) | Migration strategy       |
-| [ROADMAP-PLAN.md](ROADMAP-PLAN.md)                          | Active roadmap reset for Rust + Dioxus Desktop |
-| [IMPLEMENTATION-HANDOFF.md](plans/IMPLEMENTATION-HANDOFF.md)| Desktop migration execution handoff |
+| [ROADMAP-PLAN.md](ROADMAP-PLAN.md)                          | Superseded Rust/Dioxus migration roadmap retained for history |
+| [IMPLEMENTATION-HANDOFF.md](plans/IMPLEMENTATION-HANDOFF.md)| Historical desktop migration execution handoff |
 | [LONG-RANGE-ENHANCEMENTS.md](LONG-RANGE-ENHANCEMENTS.md) | PR-organized enhancement backlog across 8 lanes |
 
-### Active Dioxus Desktop Track
+### Current Control-Plane Foundation
 
 | Document | Description |
 | -------- | ----------- |
@@ -180,13 +178,15 @@ See [research/README.md](research/README.md) for reading sequences by phase.
 | [Ralph plans 1-6](archive/ralph-plans/README.md)                              | Provenance only; use current roadmap/spec/ADR docs |
 | Session logs (11 files)                                                         | [DEVELOPMENT-HISTORY.md](session-logs/DEVELOPMENT-HISTORY.md) |
 
-Older Ralph loop plans are preserved for provenance only. Use `ROADMAP-PLAN.md`, `spec/RUST-CANONICAL-CONTRACT.md`, and `decisions/0008-dioxus-desktop-host.md` for current guidance.
+Older Ralph loop plans and `ROADMAP-PLAN.md` are preserved for provenance only. Use
+[`VISION.md`](../VISION.md),
+`spec/RUST-CANONICAL-CONTRACT.md`, and `decisions/0008-dioxus-desktop-host.md` for current guidance.
 
 ---
 
 ## By Phase
 
-### Now: Rust Core + Dioxus Desktop Host
+### Now: Control-Plane Foundations
 
 Start here:
 
@@ -197,23 +197,23 @@ Start here:
 5. [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md) — Current automated coverage and known gaps
 6. [AGENTS.md](../AGENTS.md) — Current architecture and operational guidance
 7. [COLLABORATIVE-AGENTIC-CODING.md](guides/COLLABORATIVE-AGENTIC-CODING.md) — Agent lane, worktree, and handoff rules
-8. [ROADMAP-PLAN.md](ROADMAP-PLAN.md) — Current roadmap and desktop progress baseline
+8. [ROADMAP-PLAN.md](ROADMAP-PLAN.md) — Superseded desktop implementation history
 9. [BEST-PRACTICES.md](guides/BEST-PRACTICES.md) — Coding conventions
 
-### Next: Dioxus Desktop Launch Scaffold + Live Terminal Bridge
+### Next: Governed Supervisor/Builder Vertical Slice + Hierarchy/Enforcement ADR
 
-1. [HONEST-ROADMAP.md](HONEST-ROADMAP.md) — Validation risk register
-2. [ROADMAP-PLAN.md](ROADMAP-PLAN.md) — Desktop shell stabilization lane
-3. [plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md](plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md) — Superseded technical context
-4. [impulse-rs/docs/IMPULSE_TERM_STATUS.md](../impulse-rs/docs/IMPULSE_TERM_STATUS.md) — Terminal telemetry status
-5. [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md) — Current Rust-first test patterns and gaps
-6. [TESTING-FRAMEWORK.md](guides/TESTING-FRAMEWORK.md) — Historical TypeScript-era reference only
-7. [PHASE1.5-COORDINATION.md](phases/PHASE1.5-COORDINATION.md) — Coordination reference
+1. [VISION.md](../VISION.md) — Ten-step governed workflow and unresolved hierarchy decisions
+2. [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) — Live foundations and contract boundary
+3. [ARCHITECTURE-CLARIFICATION.md](ARCHITECTURE-CLARIFICATION.md) — Enforcement and authority boundary map
+4. [USER-STORY-MAP.md](spec/USER-STORY-MAP.md) — Acceptance criteria for current surfaces
+5. [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md) — Evidence map and known gaps
+6. [HONEST-ROADMAP.md](HONEST-ROADMAP.md) — Validation risk register
 
-### Later: Agent Control + Artifact Polish
+### Later: General Roles + Negotiated Runtimes
 
-1. [TUI-AUGMENTATION-VISION.md](archive/TUI-AUGMENTATION-VISION.md) — Historical UI reference
-2. [CLI-ARCHITECTURE.md](vision/CLI-ARCHITECTURE.md) — CLI evolution
+1. [VISION.md](../VISION.md) — Target role, adapter, messaging, attention, and resource contracts
+2. [CLI-ARCHITECTURE.md](vision/CLI-ARCHITECTURE.md) — Historical/future CLI concepts
+3. [TUI-AUGMENTATION-VISION.md](archive/TUI-AUGMENTATION-VISION.md) — Historical UI reference
 
 ---
 

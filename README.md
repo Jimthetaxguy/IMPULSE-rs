@@ -6,7 +6,7 @@ Impulse names both the creative urge to make something and the force that sets w
 
 Everyone has felt it: the itch to open Claude Code or Codex and disappear into a build. Impulse is built for that moment.
 
-Impulse is a terminal-native **local control plane and harness manager** for AI software-engineering agents. It launches or attaches heterogeneous coding runtimes, places them in explicit workspaces, supervises their processes, and augments them with shared memory, tools, telemetry, artifacts, policy, and verification.
+Impulse is a terminal-native **local control plane and harness manager** for AI software-engineering agents. It launches and manages heterogeneous coding runtimes, places them in explicit workspaces, supervises their processes, and augments them with shared memory, tools, telemetry, artifacts, policy, and verification.
 
 Claude Code, Codex, and similar CLIs keep their own internal coding loops. Ion is the Impulse-native coding runtime. Impulse governs the operating conditions around those loops; it does not claim to replace or fully control proprietary runtime internals.
 
@@ -14,7 +14,7 @@ Claude Code, Codex, and similar CLIs keep their own internal coding loops. Ion i
 
 ## Why
 
-Using several coding agents today usually means several unrelated terminals, permission models, context stores, and completion claims. Impulse brings those runtimes into one observable environment while preserving their terminal-native workflows. Persistent memory solves continuity; the wider control plane solves launch, isolation, coordination, intervention, and evidence-backed completion.
+Using several coding agents today usually means several unrelated terminals, permission models, context stores, and completion claims. Impulse brings those runtimes into one observable environment while preserving their terminal-native workflows. Persistent memory solves continuity; the wider control plane solves managed launch, project scoping, coordination, intervention, and evidence-backed completion. Structural filesystem isolation depends on the selected runtime or sandbox rather than on the cockpit alone.
 
 ## What It Does
 

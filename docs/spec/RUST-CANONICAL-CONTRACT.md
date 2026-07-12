@@ -26,7 +26,7 @@ authors:
 ## 1) Product Purpose
 
 Impulse is a terminal-native **local control plane and harness manager** for AI
-software-engineering agents. It launches or attaches coding runtimes, supervises their operating
+software-engineering agents. It launches and manages coding runtimes, supervises their operating
 conditions, and provides shared memory, tools, telemetry, messaging/handoffs, policy, credentials,
 artifacts, and verification. Claude Code, Codex, and similar CLIs retain their proprietary internal
 loops; Ion is the Impulse-native direct-provider/tool-loop runtime.
@@ -37,12 +37,12 @@ authoritative. Impulse does not claim full structural control over unsupported i
 external runtime.
 
 Core outcomes:
-- Governed launch and PTY/process lifecycle for coding-agent runtimes
+- Governed launch, working-directory/project scoping, and PTY/process lifecycle for coding-agent runtimes; structural filesystem isolation depends on runtime/sandbox support
 - Daemon-owned, inspectable workbench truth for agents, context, interventions, and artifacts
 - Persistent project memory (`GENOME`, session history, active state) with review-first injection
 - Cross-session continuity for Claude Code and Codex integrations, with legacy OpenCode compatibility preserved where already implemented
 - Capability-checked platform tools and supervisor-specific permission/confirmation policy
-- Operationally safe session lifecycle with verification-before-completion gates
+- Operationally safe session lifecycle with recorded endings and optional API-level verification gates
 - Human-visible observability through CLI, ratatui TUI, and the Dioxus Desktop cockpit
 - Multi-workspace + multi-agent orchestration surface (observable registration and launch/monitoring of agents across project spaces)
 
@@ -86,6 +86,7 @@ Historical migration sequence: `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md`
 | **Now** | Rust control-plane foundation: daemon truth, PTY lifecycle, memory/tools/policy/artifacts, Dioxus cockpit, Ion native runtime | Active |
 | **Next** | Preserve registry-backed runtime identity, prove one governed supervisor + builder vertical slice, and define hierarchy/enforcement ADR | Active |
 | **Later** | General role contracts, runtime capability negotiation, typed agent messaging, and multi-project supervisor attention | Planned |
+| **Legacy** | egui / `impulse-gui` compile-maintenance only | Frozen |
 
 ### Out of Scope for Current Contract
 - Full SWARM semantic injection runtime
@@ -367,10 +368,14 @@ active parity.
 | Session lifecycle hooks | Primary | Primary where implemented | Preserve existing generated config | Primary coverage for active platforms; no new OpenCode parity requirement |
 | File write tracking | Supported | Supported where implemented | Preserve existing behavior | Equivalent active-platform behavior |
 | Tool tracking | Supported | Supported where implemented | Preserve existing behavior | Equivalent active-platform behavior |
-| Session end verification (`--verify`) | Required | Required where hook integration exists | Preserve existing generated command | Verification remains required for active platforms |
+| Session end verification (`--verify`) | Available and optional | Available where hook integration exists | Preserve existing generated command | Session end is recorded without the flag; the flag makes verification a hard API gate |
 | Context handoff artifacts | Shared `.impulse/context/*` | Shared `.impulse/context/*` | Shared `.impulse/context/*` | Handoff artifacts stay platform-neutral |
 
-External runtime enforcement is limited to the launch environment and supported integration seams.
+Contributor verification before completion remains mandatory even though the session-end API makes
+`--verify` optional.
+
+External runtime enforcement is limited to launch conditions, working-directory/project scoping,
+and supported integration seams. Structural filesystem isolation depends on runtime/sandbox support.
 The product must not infer that a role is satisfied merely because a prompt was injected or a pane
 was labeled. Ion can support deeper structural enforcement because Impulse owns its tool/model loop,
 but it remains subject to the explicit policies and gaps documented in code and `VISION.md`.
@@ -411,7 +416,7 @@ When adding/changing CLI commands, hooks, state files, or roadmap stage definiti
 | Tooling | ≥2.0 | ~17.1 | MET |
 | Integration | Every stable CLI command | 26 tests | PARTIAL |
 
-**Workspace totals (2026-07-11):** 1,889 tests across the 5 workspace crates/packages (impulse-rs 1,561, ops 32 including the canonical-checkout archive proof, term 114, desktop 159, ion 23); 7 ignored, 0 failed. Isolated worktrees without the gitignored reconciliation archive verify 1,888 passed with that one proof explicitly filtered.
+**Workspace totals (2026-07-12 canonical projection):** 1,895 tests across the 5 workspace crates/packages (impulse-rs 1,567, ops 32 including the canonical-checkout archive proof, term 114, desktop 159, ion 23); 8 ignored, 0 failed. The verified isolated worktree without the gitignored reconciliation archive reports 1,894 passed with that one proof explicitly filtered.
 
 ### Required Test Patterns
 

@@ -4,6 +4,7 @@
 - **Updated:** 2026-07-12
 - **Canonical implementation contract:** [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
 - **Current code boundary map:** [`docs/ARCHITECTURE-CLARIFICATION.md`](docs/ARCHITECTURE-CLARIFICATION.md)
+- **Roadmap contract:** Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; Legacy=egui compile-maintenance only.
 
 ## The promise
 
@@ -110,7 +111,7 @@ described by observed enforcement strength, never by blanket parity claims.
 
 ### Ion native path
 
-Ion calls model providers directly and lets Impulse own prompt construction, tool schemas, loop
+Ion calls model providers directly and can let Impulse own prompt construction, tool schemas, loop
 bounds, context assembly, memory retrieval, events, approvals, and structured results. It is the
 path where role contracts can become most direct and testable.
 

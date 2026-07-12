@@ -15,8 +15,7 @@ authors:
 > Contract: [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
 > Collaboration playbook: [`docs/guides/COLLABORATIVE-AGENTIC-CODING.md`](docs/guides/COLLABORATIVE-AGENTIC-CODING.md)
 > Canonical stack: Rust (impulse-rs)
-> Current roadmap: Now=control-plane foundations + local branch integration; Next=one governed supervisor/builder vertical slice + hierarchy/enforcement ADR; Legacy=egui compile-maintenance only.
-> Validator compatibility marker (historical wording): Roadmap contract: Now=Rust core + Dioxus desktop host; Next=Dioxus Desktop launch scaffold + terminal bridge parity; Legacy=egui compile-maintenance only; Tauri=legacy compatibility adapter only
+> Roadmap contract: Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; Legacy=egui compile-maintenance only.
 
 ---
 
@@ -157,7 +156,7 @@ All changes must pass before any commit:
 cd impulse-rs && cargo build && cargo test && cargo clippy -- -D warnings && cargo fmt --check
 ```
 
-**Expected canonical checkout (2026-07-11):** 1,889 tests passed, 0 failed, 7 ignored. Isolated worktrees without the gitignored reconciliation archive verify 1,888 passed with `test_reconciled_clean_archive_has_contracts_snapshot` explicitly filtered. Update counts in this file, CLAUDE.md, and RUST-CANONICAL-CONTRACT.md when they change.
+**Expected canonical checkout (2026-07-12 projection):** 1,895 tests passed, 0 failed, 8 ignored. The verified isolated worktree reports 1,894 passed with `test_reconciled_clean_archive_has_contracts_snapshot` explicitly filtered; the canonical count restores that one checkout-relative proof. Update counts in this file, CLAUDE.md, and RUST-CANONICAL-CONTRACT.md when they change.
 
 ### Code Requirements
 
@@ -207,7 +206,7 @@ Use descriptive names: `test_<function>_<scenario>_<expected_result>`
 
 New modules must ship meeting the target. Existing modules should trend toward targets.
 
-**Workspace totals (2026-07-11):** 1,889 tests across the 5 workspace crates/packages (impulse-rs: 1,561, ops: 32 including the canonical-checkout archive proof, term: 114, desktop: 159, ion: 23). The legacy impulse-gui crate is frozen/excluded from the workspace and its tests are not counted.
+**Workspace totals (2026-07-12 canonical projection):** 1,895 tests across the 5 workspace crates/packages (impulse-rs: 1,567, ops: 32 including the canonical-checkout archive proof, term: 114, desktop: 159, ion: 23), with 8 ignored and 0 failed. The legacy impulse-gui crate is frozen/excluded from the workspace and its tests are not counted.
 
 High-risk untested modules (prioritize coverage):
 - `src/handlers/daemon_dispatch.rs` (450 LOC) — routes all IPC, zero tests
