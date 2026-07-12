@@ -71,7 +71,7 @@ pub struct TerminalOpsTelemetryStore {
 
 impl TerminalOpsTelemetryStore {
     pub fn publish(&mut self, project_id: &str, report: TerminalOpsReport) {
-        let received_at = parse_report_timestamp(&report).unwrap_or_else(Utc::now);
+        let received_at = Utc::now();
         self.projects
             .entry(project_id.to_string())
             .or_default()
@@ -674,12 +674,6 @@ fn tier_rank(tier: &str) -> u8 {
         "essential" => 1,
         _ => 0,
     }
-}
-
-fn parse_report_timestamp(report: &TerminalOpsReport) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(&report.published_at)
-        .ok()
-        .map(|timestamp| timestamp.with_timezone(&Utc))
 }
 
 fn snapshot_seq(snapshot: &ProjectOpsSnapshot) -> u64 {
@@ -1397,5 +1391,47 @@ mod tests {
         assert_eq!(reports[0].source_id, "fresh");
         assert!(!store.projects["demo"].contains_key("expired"));
         assert!(store.projects["demo"].contains_key("stale"));
+    }
+
+    #[test]
+    fn test_terminal_ops_store_freshness_uses_daemon_receipt_time_for_old_publisher_clock() {
+        let now = Utc::now();
+        let published_at = (now - ChronoDuration::days(1)).to_rfc3339();
+        let mut store = TerminalOpsTelemetryStore::default();
+        store.publish(
+            "demo",
+            TerminalOpsReport {
+                source_id: "clock-behind".to_string(),
+                published_at: published_at.clone(),
+                ..Default::default()
+            },
+        );
+
+        let reports = store.fresh_reports("demo", now);
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].source_id, "clock-behind");
+        assert_eq!(reports[0].published_at, published_at);
+    }
+
+    #[test]
+    fn test_terminal_ops_store_freshness_uses_daemon_receipt_time_for_future_publisher_clock() {
+        let now = Utc::now();
+        let mut store = TerminalOpsTelemetryStore::default();
+        store.publish(
+            "demo",
+            TerminalOpsReport {
+                source_id: "clock-ahead".to_string(),
+                published_at: (now + ChronoDuration::days(1)).to_rfc3339(),
+                ..Default::default()
+            },
+        );
+
+        let reports = store.fresh_reports(
+            "demo",
+            now + ChronoDuration::seconds(TELEMETRY_PURGE_AFTER_SECS + 1),
+        );
+
+        assert!(reports.is_empty());
     }
 }
