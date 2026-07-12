@@ -464,15 +464,12 @@ mod hook_config_tests {
         let dir = TempDir::new().unwrap();
         let env_file = dir.path().join("claude.env");
         std::fs::write(&env_file, "IMPULSE_SESSION_ID=old\nOTHER_KEY=keep\n").unwrap();
-        std::env::set_var("CLAUDE_ENV_FILE", &env_file);
 
-        persist_claude_env_var("IMPULSE_SESSION_ID", "new-session").unwrap();
+        persist_claude_env_var_at(Some(&env_file), "IMPULSE_SESSION_ID", "new-session").unwrap();
 
         let updated = std::fs::read_to_string(&env_file).unwrap();
         assert!(updated.contains("IMPULSE_SESSION_ID=new-session"));
         assert!(updated.contains("OTHER_KEY=keep"));
         assert!(!updated.contains("IMPULSE_SESSION_ID=old"));
-
-        std::env::remove_var("CLAUDE_ENV_FILE");
     }
 }
