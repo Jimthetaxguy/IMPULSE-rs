@@ -159,9 +159,26 @@
 - Consumes: verified cache tip and the six registry commits after `1927149`
 - Produces: one aggregate registry/cache branch containing both contracts
 
-- [ ] Run `git rebase --onto codex/agent-cache-serialization 1927149 codex/registry-platform-identity`.
-- [ ] Resolve conflicts by preserving protocol-v3 Busy and registry/desktop identity behavior together.
-- [ ] Verify no historical branch patch identified in Task 1 is absent.
+- [x] Run `git rebase --onto codex/agent-cache-serialization 1927149 codex/registry-platform-identity`.
+- [x] Resolve conflicts by preserving protocol-v3 Busy and registry/desktop identity behavior together.
+- [x] Verify no historical branch patch identified in Task 1 is absent.
+
+### Task 5A: Repair the live operator entrypoint and product identity
+
+**Files:**
+- Modify: `impulse-rs/src/handlers/direct_dispatch.rs`
+- Modify: `impulse-rs/src/cli.rs`
+- Modify: `impulse-rs/src/handlers/describe.rs`
+
+**Interfaces:**
+- Consumes: `Commands::Run`, `ui::run_ui`, clap help, and ATCC `describe` metadata
+- Produces: a real foreground ratatui launch plus one shared control-plane product description
+
+- [x] Strengthen the existing run-dispatch test so the no-op hint fails.
+- [x] Route `Commands::Run` through the ratatui runner without nesting a Tokio runtime.
+- [x] Reject current-thread Tokio runtimes with an error before calling `block_in_place`.
+- [x] Use one control-plane/harness-manager description for clap and machine-readable introspection.
+- [x] Prove the real PTY launch renders and exits cleanly on `q`.
 
 ### Task 6: Verify aggregate and fast-forward local main
 
@@ -173,14 +190,14 @@
 - Consumes: aggregate registry/cache tip
 - Produces: clean local `main` containing every preserved local change
 
-- [ ] Run `cargo build --workspace`.
-- [ ] Run `cargo clippy --workspace --all-targets -- -D warnings`.
-- [ ] Run `cargo fmt --all -- --check`.
-- [ ] Run isolated workspace tests and capture exact totals.
-- [ ] Run real Ion sibling, supported desktop feature, legacy GUI, and `npm run dioxus:host:smoke` gates.
-- [ ] Run docs validation and distinguish known pre-existing status/freshness failures.
-- [ ] Commit any final count reconciliation on the aggregate branch.
-- [ ] Convert every `[aggregate]`/`pending local aggregate` marker to live local-main wording and keep remote-release status distinct.
-- [ ] Confirm no active document still presents Dioxus launch as the next product phase or memory as the whole product.
+- [x] Run `cargo build --workspace`.
+- [x] Run `cargo clippy --workspace --all-targets -- -D warnings`.
+- [x] Run `cargo fmt --all -- --check`.
+- [x] Run isolated workspace tests and capture exact totals.
+- [x] Run real Ion sibling, supported desktop feature, legacy GUI, and `npm run dioxus:host:smoke` gates.
+- [x] Run docs validation and distinguish known pre-existing status/freshness failures.
+- [x] Commit the final count and product-contract reconciliation on the aggregate branch.
+- [x] Convert every branch-relative integration marker to live local-main wording and keep remote-release status distinct.
+- [x] Confirm no active document still presents Dioxus launch as the next product phase or memory as the whole product.
 - [ ] Confirm every worktree is clean.
 - [ ] Fast-forward local `main` to the aggregate tip; do not push.

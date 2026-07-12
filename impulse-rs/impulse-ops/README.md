@@ -38,4 +38,6 @@ cd impulse-rs/impulse-ops
 cargo build && cargo test && cargo clippy -- -D warnings
 ```
 
-Current: 31 tests, 0 warnings. Part of the workspace gate (`cd impulse-rs && cargo test`).
+Current canonical projection: 44 passing tests, 0 ignored, 0 failed. A linked worktree without the
+gitignored reconciliation archive runs 43 and filters the one checkout-relative archive proof.
+Part of the workspace gate (`cd impulse-rs && cargo test`).

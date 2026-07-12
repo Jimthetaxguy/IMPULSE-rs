@@ -1,6 +1,8 @@
 # impulse-term
 
-Custom terminal widget for Impulse with context lifecycle integration. Replaces `egui_term` with a terminal backend that gives zero-copy, in-process access to both context extraction (reading agent output) and context injection (writing context blocks into agent terminals).
+Framework-neutral PTY and terminal-context core for Impulse. It provides the process backend,
+parser, serialized write queue, and context bridge used by operator surfaces. The optional egui
+renderer remains only for legacy compatibility; Dioxus/xterm.js owns the active desktop cockpit.
 
 ---
 
@@ -99,7 +101,7 @@ cargo clippy -p impulse-term -- -D warnings
 
 ## Testing
 
-110 tests total (91 unit + 19 doc/integration). Key coverage areas:
+114 tests total (92 unit + 19 integration + 3 doc tests). Key coverage areas:
 
 - **backend**: WriteQueue serialization, injection blocking after user input, concurrent write integrity, timestamp tracking
 - **context**: Agent kind detection, tier ordering, token estimation, compaction scanning, insight extraction from realistic agent output fixtures (Claude Code, OpenCode), diff-based content detection, injection wrapping

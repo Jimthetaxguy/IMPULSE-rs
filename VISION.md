@@ -103,7 +103,8 @@ create the role merely by being leftmost or by running a particular model.
 
 Claude Code, Codex, OpenCode-compatible surfaces, and future CLIs already own internal agent loops.
 Impulse wraps them with a controlled working directory, environment, PTY, process lifecycle,
-project instructions, hooks, MCP/tool bridges, credentials, telemetry, and interruption/restart.
+project instructions, hooks, MCP/tool bridges, credentials, and telemetry. Interruption, restart,
+and resume controls remain runtime- and adapter-capability dependent.
 
 Impulse cannot replace hidden vendor prompts, proprietary reasoning, undocumented context
 compression, or unsupported internal tool mechanics. External-runtime governance must therefore be
@@ -208,20 +209,17 @@ needs a reason and an audit path. The user can interrupt, narrow, revoke, review
 - Rust daemon and versioned workbench protocol/read models.
 - PTY spawn/write/resize/focus/exit lifecycle and process cleanup.
 - Dioxus Desktop host/bridge plus ratatui and CLI operator surfaces.
+- Open registry-backed desktop platform identity and launch metadata.
+- Ion as a real desktop-launchable builtin platform.
+- Daemon-truth terminal telemetry across lifecycle and heartbeat.
 - Supervisor-specific permission/confirmation policy and daemon actions.
 - Typed capability-checked tooling, MCP surfaces, and audit paths.
 - Project memory, FTS5/semantic retrieval, context stewardship, and review-first injection.
 - Credential provider abstraction, artifacts, delegations, and verification gates.
 - Ion interactive native coding runtime with direct providers, typed tools, guardrails, and loop bounds.
 
-### Preserved local aggregate implementation
-
-- Open registry-backed desktop platform identity and launch metadata.
-- Ion as a real desktop-launchable builtin platform.
-- Daemon-truth terminal telemetry wiring across lifecycle and heartbeat.
-
-These changes are local integration work until the aggregate reaches local `main`; they are not
-claims about the current remote release.
+This contract describes the verified local implementation. Publishing a remote release is a
+separate action and must not be inferred from local branch integration.
 
 ### Target state
 

@@ -1,13 +1,12 @@
 # impulse-desktop
 
-Active Dioxus desktop shell contract for Impulse.
+Active Dioxus cockpit and typed desktop-host contract for Impulse.
 
-This crate is the active desktop shell path for the Dioxus desktop migration.
-It is not the retired `impulse-gui`/egui workbench path. Dioxus owns the product
-interface and native desktop host direction, Rust owns PTY/session/daemon state,
+This crate is the active desktop product path. It is not the legacy/frozen
+`impulse-gui`/egui workbench. Dioxus owns the product interface, Rust owns PTY/session/daemon state,
 xterm.js owns terminal rendering, and macOS-native islands stay behind typed
-request/result DTOs. Legacy Tauri-shaped code remains a compatibility adapter
-only while the host boundary migrates toward Dioxus-native desktop APIs.
+request/result DTOs. Legacy Tauri-shaped code remains a compatibility adapter only;
+it is not the product authority.
 
 The product model is a terminal-agent harness: each coding agent is a PTY-backed
 actor with an explicit workspace target, a runtime snapshot, and a visible set of
@@ -31,8 +30,10 @@ independent copies of sessions, memory, terminal state, or artifacts.
 
 ## Runtime Contracts
 
-- `WorkspaceTarget` names the folder an agent is allowed to operate in. The
-  runtime derives it from `cwd` when the UI does not provide richer metadata.
+- `WorkspaceTarget` names the cwd/project root in which an agent process starts.
+  The runtime derives it from `cwd` when the UI does not provide richer metadata.
+  This targeting is not a filesystem sandbox or authorization boundary; structural
+  enforcement depends on the selected runtime or sandbox.
 - `AgentSpawnRequest` carries platform, command, workspace, terminal dimensions,
   and optional MCP tool descriptors.
 - `AgentRuntimeSnapshot` is the desktop's local PTY fact model: focused state,
@@ -55,7 +56,7 @@ independent copies of sessions, memory, terminal state, or artifacts.
   `impulse.agent_write`, `impulse.search_memory`, and
   `impulse.review_injection`; mutating terminal actions require confirmation.
 
-The target path is:
+The active Dioxus path is:
 
 ```text
 Dioxus controls -> Dioxus host adapter -> DesktopRuntime -> impulse-term TerminalBackend
@@ -65,7 +66,7 @@ Dioxus controls -> Dioxus host adapter -> DesktopRuntime -> impulse-term Termina
         +-- daemon ProjectOpsSnapshot <- Impulse daemon   xterm.js
 ```
 
-The compatibility path still covered by tests is:
+The legacy compatibility path still covered by tests is:
 
 ```text
 Dioxus controls -> legacy Tauri-shaped adapter -> DesktopRuntime -> impulse-term TerminalBackend
@@ -90,16 +91,16 @@ Dioxus controls -> legacy Tauri-shaped adapter -> DesktopRuntime -> impulse-term
 Before running the visual smoke, `npm run vendor:xterm` copies the pinned
 `@xterm/xterm` and `@xterm/addon-fit` browser assets into
 `assets/vendor/xterm/`. The Dioxus shell declares those local files with
-`data-impulse-terminal-asset` tags; the Dioxus desktop host should load those
-same relative paths instead of a CDN.
+`data-impulse-terminal-asset` tags, and the host contract resolves the same
+relative paths instead of a CDN.
 
 The visual smoke renders static Dioxus SSR fixtures for each `DesktopView`, then
 opens them in headless Chromium to assert non-blank layout, no shell overlap, no
 viewport overflow, route-specific visible content, local xterm globals, and no
 remote font or terminal asset URLs.
 
-The host-readiness smoke is one step closer to the eventual Dioxus desktop host
-without claiming a packaged app exists. It opens a local browser fixture, loads
+The host-readiness smoke exercises the live Dioxus host contract without claiming
+that a packaged release artifact exists. It opens a local browser fixture, loads
 the same vendored xterm assets, stubs either the Dioxus-native
 `window.__IMPULSE_DESKTOP_HOST` adapter or the legacy Tauri-shaped
 `invoke`/`listen` adapter, evaluates the Rust-owned terminal interop script, and
@@ -108,7 +109,7 @@ asserts terminal input is serialized as `agent_write` bytes, resize emits
 
 ```bash
 cd <repo>/impulse-rs/impulse-desktop
-npm install
+npm ci
 npm run vendor:xterm
 npm run visual:install
 CARGO_TARGET_DIR=/tmp/impulse-visual-target npm run visual:smoke

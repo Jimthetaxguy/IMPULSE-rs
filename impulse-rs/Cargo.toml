@@ -13,7 +13,7 @@ name = "impulse-rs"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
-description = "Terminal-native AI coding agent sidecar with multi-agent monitoring"
+description = "Terminal-native local control plane and harness manager for AI coding agents"
 authors = ["Impulse Maintainers"]
 license = "MIT"
 default-run = "impulse-rs"
@@ -34,8 +34,8 @@ path = "src/bin/ion.rs"
 name = "Impulse"
 identifier = "com.impulse.ai"
 category = "Developer Tool"
-short_description = "AI coding agent sidecar"
-long_description = "Your AI remembers. Silently. Terminal-native AI coding agent sidecar with cross-session memory."
+short_description = "Terminal-native AI agent control plane"
+long_description = "Feed the impulse to build with a local harness manager for governed coding-agent runtimes, shared tools, memory, telemetry, and verification."
 
 [dependencies]
 # Async runtime

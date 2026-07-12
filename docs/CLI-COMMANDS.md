@@ -8,8 +8,8 @@
 
 | Command | Direct | Daemon | Description |
 |---------|--------|--------|-------------|
-| `daemon` | — | Yes | Start/stop/status of the daemon process |
-| `run` | Yes | — | Start the daemon (direct entry point) |
+| `daemon` | Yes | — | Run the foreground daemon listener (`--stop` is not wired in direct mode) |
+| `run` | Yes | — | Launch the 10-tab ratatui workbench |
 | `session-start` | Yes | Yes | Begin a new session (`--name`, `--platform`, `--inject-mode`) |
 | `session-end` | Yes | Yes | End session (`--session-id`, `--summary`, `--verify`, `--sem-diff-base`) |
 | `track-write` | Yes | Yes | Record a file write (`--file`, `--session-id`) |
@@ -17,7 +17,7 @@
 | `list-sessions` | Yes | Yes | List all sessions |
 | `session-info` | Yes | Yes | Show details for a session (`<id>`) |
 | `session-conflicts` | Yes | Yes | Check cross-session file conflicts (`--file`, `--session-id`) |
-| `status` | Yes | Yes | Show daemon/sidecar status |
+| `status` | Yes | Yes | Show daemon/control-plane status |
 | `debug` | Yes | Yes | Show internal state snapshot (sessions, tools, plugins, config) |
 | `conflict-history` | Yes | Yes | Show historical file conflict audit trail |
 | `chat` | Yes | Yes | Send a message to the LLM (`--session-id`, `--message`, `--inject-mode`) |

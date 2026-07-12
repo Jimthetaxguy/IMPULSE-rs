@@ -1,7 +1,7 @@
 ---
 title: Documentation Index
 description: Master navigation hub for Impulse documentation
-version: '1.3'
+version: '1.4'
 updated: 2026-07-12
 type: doc
 category: navigation
@@ -9,7 +9,7 @@ phase: all
 status: active
 audience: everyone
 tags: [index, navigation, discovery]
-last_updated: 2026-03-31
+last_updated: 2026-07-12
 authors:
   - name: Impulse Maintainers
     role: Maintainer
@@ -26,7 +26,9 @@ authors:
 > **Canonical stack: Rust (impulse-rs)**
 > **Roadmap contract:** Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; Legacy=egui compile-maintenance only.
 > **Collaboration playbook:** [`guides/COLLABORATIVE-AGENTIC-CODING.md`](guides/COLLABORATIVE-AGENTIC-CODING.md)
-> **Risk register:** [`HONEST-ROADMAP.md`](HONEST-ROADMAP.md) stays canonical for unvalidated assumptions.
+> **Narrow validation register:** [`HONEST-ROADMAP.md`](HONEST-ROADMAP.md) preserves unresolved
+> hook, compaction, extraction, and memory-quality risks from the legacy phase-era design. It is
+> not the current whole-product roadmap or control-plane risk authority.
 
 > **Prefer `kdb` for searching.** The knowledge database indexes canonical docs with FTS5 full-text search:
 >
@@ -49,7 +51,6 @@ authors:
 | [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) | **Authoritative contract for current product behavior**                    | all   |
 | [USER-STORY-MAP.md](spec/USER-STORY-MAP.md)                   | Rust-first product stories, acceptance criteria, and story status          | all   |
 | [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md)             | Story-to-test map for the current Rust workspace                           | all   |
-| [HONEST-ROADMAP.md](HONEST-ROADMAP.md)                        | **⚠️ READ THIS FIRST** — Limitations, unvalidated assumptions, corrections | all   |
 | [COMPETITIVE-POSITIONING.md](spec/COMPETITIVE-POSITIONING.md) | Market analysis and differentiation                                        | all   |
 | [PERFORMANCE-TARGETS.md](spec/PERFORMANCE-TARGETS.md)         | Performance budgets and benchmarks                                         | 1-2   |
 
@@ -64,16 +65,26 @@ authors:
 Do not split separate role/runtime/supervisor schema documents until the hierarchy, adapter, and
 enforcement-strength ADR decisions listed in `VISION.md` are resolved.
 
+### Validation and Historical Risk
+
+| Document | Scope |
+| --- | --- |
+| [HONEST-ROADMAP.md](HONEST-ROADMAP.md) | Historical hook/memory validation register; not current roadmap authority |
+| [HOOK-VALIDATION-GUIDE.md](guides/HOOK-VALIDATION-GUIDE.md) | Current procedure for generating real Claude hook evidence |
+
 ### Architecture Decisions (ADRs)
 
-| ADR                                           | Title                                | Status   |
-| --------------------------------------------- | ------------------------------------ | -------- |
-| [0001](decisions/0001-claude-code-primary.md) | Claude Code as primary agent         | Accepted |
-| [0002](decisions/0002-file-first-memory.md)   | File-first memory (no DB in Phase 1) | Accepted |
-| [0003](decisions/0003-progressive-search.md)  | Progressive search (FTS5 → vectors)  | Accepted |
-| [0004](decisions/0004-extraction-strategy.md) | LLM extraction strategy              | Accepted |
-| [0005](decisions/0005-distribution-model.md)  | npm distribution model               | Accepted |
-| [0008](decisions/0008-dioxus-desktop-host.md) | Dioxus Desktop host                  | Accepted |
+| ADR | Title | Decision status | Current scope |
+| --- | --- | --- | --- |
+| [0001](decisions/0001-claude-code-primary.md) | Claude Code as primary agent | Accepted | Historical integration choice; external runtimes are now registry-backed |
+| [0002](decisions/0002-file-first-memory.md) | File-first memory (no DB in Phase 1) | Accepted | Historical Phase 1 memory decision; not current persistence authority |
+| [0003](decisions/0003-progressive-search.md) | Progressive search (FTS5 → vectors) | Accepted | Historical phase framing; current retrieval behavior comes from Rust code/contract |
+| [0004](decisions/0004-extraction-strategy.md) | LLM extraction strategy | Accepted | Historical extraction design; retained for memory provenance |
+| [0005](decisions/0005-distribution-model.md) | npm distribution model | Accepted | Historical distribution decision superseded in practice by the Rust workspace |
+| [0006](decisions/0006-hook-enhancement-conflict-resolution.md) | Hook enhancement conflict resolution | Accepted | Narrow hook/guardrail policy scope |
+| [0007](decisions/0007-desktop-shell-stack.md) | Desktop shell stack | Superseded | Superseded by ADR-0008 |
+| [0008](decisions/0008-dioxus-desktop-host.md) | Dioxus Desktop host | Accepted | Current desktop host authority |
+| [0009](decisions/0009-reconcile-impulse-copies.md) | Reconcile duplicate Impulse codebases | Accepted | Current canonical-tree decision |
 
 See [decisions/README.md](decisions/README.md) for full decision log.
 
@@ -117,11 +128,11 @@ See [decisions/README.md](decisions/README.md) for full decision log.
 | [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) | Authoritative product and desktop shell contract |
 | [DESKTOP-SHELL-ARCHITECTURE.md](spec/DESKTOP-SHELL-ARCHITECTURE.md) | Dioxus Desktop + xterm.js layer boundaries |
 | [IMPULSE_TERM_STATUS.md](../impulse-rs/docs/IMPULSE_TERM_STATUS.md) | Terminal backend status and desktop bridge implications |
-| [HONEST-ROADMAP.md](HONEST-ROADMAP.md) | Canonical validation risk register for hooks and memory claims |
 
 > **NOTE:** `spec/RUST-CANONICAL-CONTRACT.md` is authoritative for implementation. Legacy TypeScript/Bun docs are retained as historical reference unless explicitly marked active and aligned.
 
-> **Quick reference:** See `AGENTS.md` for the enforced roadmap contract and `HONEST-ROADMAP.md` for unresolved risks.
+> **Quick reference:** See `AGENTS.md` for the enforced roadmap contract. Consult
+> `HONEST-ROADMAP.md` only for the retained hook/memory validation risks.
 
 ### Research & Analysis
 
@@ -153,7 +164,7 @@ Historical desktop migration notes, including the superseded Tauri+Dioxus handof
 
 See [research/README.md](research/README.md) for reading sequences by phase.
 
-### Vision (Phase 2+)
+### Product Vision and Future Concepts
 
 | Document                                              | Topic                   |
 | ----------------------------------------------------- | ----------------------- |
@@ -207,7 +218,11 @@ Start here:
 3. [ARCHITECTURE-CLARIFICATION.md](ARCHITECTURE-CLARIFICATION.md) — Enforcement and authority boundary map
 4. [USER-STORY-MAP.md](spec/USER-STORY-MAP.md) — Acceptance criteria for current surfaces
 5. [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md) — Evidence map and known gaps
-6. [HONEST-ROADMAP.md](HONEST-ROADMAP.md) — Validation risk register
+
+### Validation Side Lane: Hook and Memory Evidence
+
+1. [HOOK-VALIDATION-GUIDE.md](guides/HOOK-VALIDATION-GUIDE.md) — Current evidence procedure
+2. [HONEST-ROADMAP.md](HONEST-ROADMAP.md) — Historical register for the remaining hook/memory hypotheses
 
 ### Later: General Roles + Negotiated Runtimes
 
@@ -224,7 +239,8 @@ Start here:
 | `spec`         | RUST-CANONICAL-CONTRACT, COMPETITIVE-POSITIONING, PERFORMANCE-TARGETS       |
 | `hooks`        | RUST-CANONICAL-CONTRACT, PHASE1-CHECKLIST, BEST-PRACTICES                   |
 | `memory`       | impulse-memory-architecture, MEMORY-EXTRACTION-ANALYSIS, PHASE2-PERSISTENCE |
-| `testing`      | TESTING-FRAMEWORK, SYNTHETIC-TESTING-GUIDE                                  |
+| `testing`      | TEST-TRACEABILITY, TESTING-FRAMEWORK, SYNTHETIC-TESTING-GUIDE               |
+| `validation`   | HOOK-VALIDATION-GUIDE, HONEST-ROADMAP                                        |
 | `architecture` | RESEARCH-DIGEST, ADRs                                                       |
 | `tools`        | TOOL-STACK-ANALYSIS, cross-model-consensus, cli-language-analysis           |
 | `security`     | SECURITY-REVIEW                                                             |

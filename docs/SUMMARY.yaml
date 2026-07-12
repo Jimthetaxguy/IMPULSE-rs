@@ -1,7 +1,7 @@
 ---
 title: Documentation Summary
 description: Unified navigation structure for Impulse documentation
-version: '2.3'
+version: '2.4'
 updated: '2026-07-12'
 schema_version: '1.0'
 type: navigation
@@ -58,11 +58,6 @@ quick_reference:
     path: INDEX.md
     start: true
 
-  - name: HONEST-ROADMAP.md
-    description: Validation risk register
-    path: HONEST-ROADMAP.md
-    start: true
-
 active_tracks:
   - name: Control-Plane Foundations
     description: Current implementation boundary and governed supervisor-builder roadmap
@@ -73,7 +68,6 @@ active_tracks:
       - spec/USER-STORY-MAP.md
       - spec/TEST-TRACEABILITY.md
       - guides/COLLABORATIVE-AGENTIC-CODING.md
-      - HONEST-ROADMAP.md
 
 phases:
   now:
@@ -111,7 +105,6 @@ categories:
   roadmap:
     - ROADMAP-PLAN.md
     - plans/IMPLEMENTATION-HANDOFF.md
-    - HONEST-ROADMAP.md
     - ../impulse-rs/docs/IMPULSE_TERM_STATUS.md
 
   architecture:
@@ -161,8 +154,14 @@ categories:
     - archive/TUI-AUGMENTATION-VISION.md
     - archive/ralph-plans/README.md
 
+validation_and_history:
+  - name: Historical Hook and Memory Validation Register
+    path: HONEST-ROADMAP.md
+  - name: Current Hook Validation Procedure
+    path: guides/HOOK-VALIDATION-GUIDE.md
+
 metadata:
-  total_documents: 131
+  total_documents: 134
   categories: 8
   decisions: 9
   phases: 3

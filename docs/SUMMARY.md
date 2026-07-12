@@ -1,7 +1,7 @@
 ---
 title: Documentation Summary
 description: Unified navigation structure for Impulse documentation
-version: 2.3
+version: 2.4
 updated: 2026-07-12
 schema_version: '1.0'
 ---
@@ -21,11 +21,13 @@ schema_version: '1.0'
 | [COLLABORATIVE-AGENTIC-CODING.md](guides/COLLABORATIVE-AGENTIC-CODING.md) | Agent lane, worktree, and handoff rules | ✅ Yes |
 | [CONTRIBUTING.md](../CONTRIBUTING.md) | Human and agent contribution rules | ✅ Yes |
 | [INDEX.md](INDEX.md) | Master navigation | ✅ Yes |
-| [HONEST-ROADMAP.md](HONEST-ROADMAP.md) | Validation risk register | ✅ Yes |
 
 ## Active Track
 
 Roadmap contract: Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; Legacy=egui compile-maintenance only.
+
+`HONEST-ROADMAP.md` is a historical hook/memory validation register, not the current product
+roadmap or whole-product risk authority.
 
 - [VISION.md](../VISION.md)
 - [spec/RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md)
@@ -33,7 +35,6 @@ Roadmap contract: Now=control-plane foundations; Next=one governed supervisor/bu
 - [spec/USER-STORY-MAP.md](spec/USER-STORY-MAP.md)
 - [spec/TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md)
 - [guides/COLLABORATIVE-AGENTIC-CODING.md](guides/COLLABORATIVE-AGENTIC-CODING.md)
-- [HONEST-ROADMAP.md](HONEST-ROADMAP.md)
 
 ## By Phase
 
@@ -48,7 +49,6 @@ Roadmap contract: Now=control-plane foundations; Next=one governed supervisor/bu
 - [VISION.md](../VISION.md) — governed supervisor/builder slice and hierarchy/enforcement ADR
 - [spec/USER-STORY-MAP.md](spec/USER-STORY-MAP.md)
 - [spec/TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md)
-- [HONEST-ROADMAP.md](HONEST-ROADMAP.md)
 
 ### Later
 
@@ -70,8 +70,12 @@ Roadmap contract: Now=control-plane foundations; Next=one governed supervisor/bu
 
 - [ROADMAP-PLAN.md](ROADMAP-PLAN.md) — superseded Rust/Dioxus implementation history
 - [plans/IMPLEMENTATION-HANDOFF.md](plans/IMPLEMENTATION-HANDOFF.md) — historical desktop handoff
-- [HONEST-ROADMAP.md](HONEST-ROADMAP.md)
 - [../impulse-rs/docs/IMPULSE_TERM_STATUS.md](../impulse-rs/docs/IMPULSE_TERM_STATUS.md)
+
+### Validation and Historical Risk
+
+- [HONEST-ROADMAP.md](HONEST-ROADMAP.md) — historical register for unresolved hook and memory hypotheses
+- [guides/HOOK-VALIDATION-GUIDE.md](guides/HOOK-VALIDATION-GUIDE.md) — current evidence procedure
 
 ### Architecture & Vision
 
@@ -132,7 +136,7 @@ Historical Ralph loop plans now live under `archive/ralph-plans/` and are proven
 
 | Field | Value |
 | ----- | ----- |
-| Total Documents | 131 |
+| Total Documents | 134 |
 | Categories | 8 |
 | Decisions (ADRs) | 9 |
 | Phases | 3 |

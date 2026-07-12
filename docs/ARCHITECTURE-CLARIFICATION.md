@@ -3,7 +3,7 @@
 - **Updated:** 2026-07-12
 - **Status:** Active boundary map
 - **North star:** [`../VISION.md`](../VISION.md)
-**Canonical product contract:** [`spec/RUST-CANONICAL-CONTRACT.md`](spec/RUST-CANONICAL-CONTRACT.md)
+- **Canonical product contract:** [`spec/RUST-CANONICAL-CONTRACT.md`](spec/RUST-CANONICAL-CONTRACT.md)
 
 This replaces the February 2026 "dead code versus scaffolding" inventory. Several files named by
 that inventory no longer exist, and its memory-sidecar framing is no longer the product contract.
@@ -60,7 +60,7 @@ that arbitrary roles can already be assigned to arbitrary runtimes.
 | PTY/process lifecycle | `impulse-rs/impulse-term/src/backend.rs`, `impulse-rs/impulse-desktop/src/runtime.rs` | Spawn, input, resize, focus, output, exit, and cleanup | Live |
 | Dioxus cockpit | `impulse-rs/impulse-desktop/src/{desktop_host,host_bridge,host_commands,views}.rs` | Renders backend state and dispatches typed host actions; does not own durable truth | Live host/bridge foundation |
 | Workspace registration | `impulse-rs/impulse-desktop/src/workspace.rs` | Registered filesystem targets and operator-authored project notes | Live |
-| Platform identity/launch metadata | `impulse-rs/impulse-ops/src/agent_registry.rs`, desktop runtime/MCP/host | Registry-backed open ids, fail-closed resolution, Ion builtin launch | Implemented on pending local aggregate; legacy closed types remain |
+| Platform identity/launch metadata | `impulse-rs/impulse-ops/src/agent_registry.rs`, desktop runtime/MCP/host | Registry-backed open ids, fail-closed resolution, Ion builtin launch | Live; legacy closed types remain where compatibility requires them |
 | External agent harness calls | `impulse-rs/src/agent/{mod,harness,coordinator}.rs` | Bounded CLI request/response integration and shared cached agent state | Live; not a general adapter trait |
 | Ion native coding runtime | `impulse-rs/src/bin/ion.rs`, `impulse-rs/src/ion_repl/`, `impulse-rs/src/llm_backends/` | Interactive direct-provider agent with history, typed tools, approval/guardrail gates, and bounded tool loop | Live |
 | Ion verification harness contract | `impulse-rs/impulse-ion/src/{lib,pi_adapter}.rs` | Transport-neutral verify/review/summarize contract and external adapter | Live; separate from the interactive Ion runtime |

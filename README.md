@@ -10,7 +10,7 @@ Impulse is a terminal-native **local control plane and harness manager** for AI 
 
 Claude Code, Codex, and similar CLIs keep their own internal coding loops. Ion is the Impulse-native coding runtime. Impulse governs the operating conditions around those loops; it does not claim to replace or fully control proprietary runtime internals.
 
-**Live foundation:** the Rust workspace already provides PTY lifecycle, daemon workbench contracts, supervisor-specific permissions, capability-checked tools, memory/retrieval, artifacts, credentials, verification, and Ion's native REPL/tool loop. Local aggregate work adds registry-backed desktop platform identity and daemon-truth telemetry. **Target:** runtime-independent role contracts, adapter capability negotiation, typed agent messaging, and stronger structural enforcement across supported runtimes. See [`VISION.md`](VISION.md) for the north star and explicit live-versus-target boundary.
+**Live foundation:** the Rust workspace provides PTY lifecycle, daemon workbench contracts and telemetry, registry-backed desktop platform identity, supervisor-specific permissions, capability-checked tools, memory/retrieval, artifacts, credentials, verification, and Ion's native REPL/tool loop. **Target:** runtime-independent role contracts, adapter capability negotiation, typed agent messaging, and stronger structural enforcement across supported runtimes. See [`VISION.md`](VISION.md) for the north star and explicit live-versus-target boundary.
 
 ## Why
 
@@ -36,23 +36,25 @@ Using several coding agents today usually means several unrelated terminals, per
 
 ```bash
 cd impulse-rs
-cargo build --release
+cargo build --workspace
 
-# Initialize impulse in your project
-cargo run -- init
+# Terminal 1: start the control-plane daemon
+cargo run -- daemon
 
-# Start a session
-cargo run -- session-start -n "my-project" -p claude-code
+# Terminal 2: launch the feature-gated Dioxus cockpit
+cargo run -p impulse-desktop --features desktop-app --bin impulse-desktop
 
-# Track work (normally done by hooks)
-cargo run -- track-write --file src/main.rs --session-id <id>
-
-# End session with verification gate
-cargo run -- session-end --session-id <id> --summary "Implemented auth" --verify
-
-# Launch TUI
+# Or stay entirely terminal-native
 cargo run -- run
+
+# Launch the Impulse-native coding runtime
+cargo run --bin ion
 ```
+
+The live foundation can launch registered PTY runtimes and project daemon-backed state into the
+cockpit. The complete role-assigned supervisor + builder workflow is the next vertical slice, not
+an undocumented command-line flag. Session, memory, hook, and verification commands remain
+available through `cargo run -- --help`.
 
 ## Architecture
 
@@ -91,15 +93,15 @@ cargo run -- run
 | `search-history` / `search-genome` | Search past sessions and decisions |
 | `steward` | Context window stewardship |
 | `orchestrate` / `handoff` | Cross-tool context sharing |
-| `run` | Launch 9-tab TUI |
-| `daemon` | Start background daemon |
+| `run` | Launch the 10-tab ratatui workbench |
+| `daemon` | Run the foreground control-plane daemon listener |
 
 See `cargo run -- --help` for the full command list.
 
 ## Stack
 
 - **Language:** Rust
-- **TUI:** ratatui + crossterm (canonical operator path)
+- **TUI:** ratatui + crossterm (terminal-native operator surface)
 - **Desktop:** Dioxus Desktop + xterm.js via `impulse-desktop`; egui `impulse-gui` is legacy/frozen for compile-maintenance only; Tauri-shaped code is legacy compatibility only
 - **Storage:** SQLite (FTS5) + JSONL + Markdown
 - **IPC:** Unix domain sockets
@@ -147,16 +149,34 @@ memory-pipeline/     # Python research tooling
 - **Meta-Harness synthesis:** [`docs/research/META-HARNESS-RUST-MULTI-AGENT.md`](docs/research/META-HARNESS-RUST-MULTI-AGENT.md)
 - **Rust multi-agent guide:** [`docs/guides/RUST-MULTI-AGENT-PATTERNS.md`](docs/guides/RUST-MULTI-AGENT-PATTERNS.md)
 - **Full index:** [`docs/INDEX.md`](docs/INDEX.md)
-- **Full reference:** [`HANDBOOK.md`](HANDBOOK.md)
+- **Detailed historical reference:** [`HANDBOOK.md`](HANDBOOK.md)
+
+## Real systems
+
+Production paths use real local processes, operating-system services, and model providers; there
+is no production `MOCK_MODE` switch. Tests use fakes only inside test targets.
+
+| System | Configuration / secret name | Current verification boundary |
+| --- | --- | --- |
+| Claude Code, Codex, shell, and Ion processes | Executable registry + `PATH`; Ion can resolve its built sibling | PTY/runtime tests plus an ignored real-Ion sibling launch proof |
+| Anthropic | `ANTHROPIC_API_KEY` or `CLAUDE_API_KEY` | Real provider path; missing credentials fail explicitly |
+| OpenAI | `OPENAI_API_KEY` | Real provider path; missing credentials fail explicitly |
+| MiniMax | `MINIMAX_API_KEY` | Real provider/harness path; missing credentials fail explicitly |
+| macOS Keychain | Native signed-in-user Keychain; live test additionally requires `IMPULSE_RUN_LIVE_KEYCHAIN_TEST=1` and explicit wire-gate approval | Deterministic native-API tests; ignored live round trip is never part of the default suite |
+| Credential socket / CLI proxy | Provider configuration; the CLI proxy may invoke Infisical, Doppler, or Vault while retaining the provider key names above | Provider contract tests |
+
+There is not yet one budget-capped, opt-in command that exercises every remote LLM provider in a
+single integration suite. Treat that as a real-systems verification gap, not as permission to add
+mock provider behavior to shipping code.
 
 ## Tests
 
 ```bash
 cd impulse-rs
-cargo build
-cargo test
-cargo clippy -- -D warnings
-cargo fmt --check
+cargo build --workspace
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
 ```
 
 ## License

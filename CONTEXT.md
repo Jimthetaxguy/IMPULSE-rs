@@ -3,9 +3,8 @@
 > **Read this first.** Shared L0/L1 vocabulary for Impulse. Update a term here when its stable
 > meaning changes; put detailed history in plans/ADRs rather than growing this glossary.
 >
-> Entries are tagged **`[code]`** (live on the cache/main foundation), **`[aggregate]`**
-> (implemented on the local registry/daemon-truth work that is being preserved into the aggregate),
-> or **`[vocabulary]`** (the product contract; "Closest in code" names today's partial carrier).
+> Entries are tagged **`[code]`** (live in the verified local implementation) or
+> **`[vocabulary]`** (the product contract; "Closest in code" names today's partial carrier).
 >
 > Cross-agent contract: `AGENTS.md`. Product contract:
 > `docs/spec/RUST-CANONICAL-CONTRACT.md`. Product north star: `VISION.md`. Current boundary map:
@@ -47,16 +46,16 @@ Claude Code or Codex); Ion is a native direct-provider/tool-loop runtime.
   `src/llm_backends/`.
 - **Boundary:** there is not yet one common runtime-adapter trait or capability-negotiation protocol.
 
-### agent platform id — `[aggregate]`
+### agent platform id — `[code]`
 An open, validated string identity (`AgentPlatformId`) whose metadata and launch command are owned
-by `AgentRegistry`. The pending aggregate carries the registry through desktop runtime, host, MCP,
+by `AgentRegistry`. The live implementation carries the registry through desktop runtime, host, MCP,
 browser bridge, reducer, dynamic workspace launcher, and serialized snapshots. It adds Ion as a
 builtin launchable platform, derives capability manifests from the registry, resolves the real
 sibling Ion binary without an override, and fails closed on unknown/blank ids. Runtime output
 canonicalizes aliases and case; the declared platform remains distinct from the observed command,
 so explicit wrapper/alternate-installation overrides stay supported and visible. Legacy closed
 enums remain where wire/disk compatibility still requires them.
-- **Source of truth:** `impulse-ops/src/agent_registry.rs` on the pending aggregate branch.
+- **Source of truth:** `impulse-ops/src/agent_registry.rs`.
 
 ### agent instance — `[vocabulary]`
 One running identity with a platform/runtime, role, workspace target, process state, and telemetry.
@@ -113,7 +112,7 @@ the cached agent or losing history.
 - **Source of truth:** `try_lock_agent_for_turn` and agent request handlers in
   `src/daemon/handlers.rs`; provider timeouts bound the turn.
 
-### agent registry — `[aggregate]`
+### agent registry — `[code]`
 The catalog of platform identity and launch metadata. It answers what can be named, detected, and
 launched; daemon/runtime telemetry separately answers what is currently running.
 - **Invariant:** ids and aliases have one owner, identity-collision registration fails
@@ -161,12 +160,10 @@ artifact review, and explicit approval where policy requires it.
 
 ## Live-versus-direction boundary (2026-07-12)
 
-- **Live foundation:** PTY lifecycle, daemon workbench truth, managed agent turns, supervisor-specific
-  permissions, capability-checked tools, memory/retrieval/injection, artifacts, credentials, and
-  Ion's native coding REPL/tool loop.
-- **Pending aggregate implementation:** open registry-backed desktop platform identity, real Ion
-  desktop launch, and daemon-truth terminal telemetry wiring. These local changes are being
-  preserved and integrated; do not describe them as shipped on `origin/main` yet.
+- **Live foundation:** PTY lifecycle, daemon workbench truth, managed agent turns, open
+  registry-backed desktop platform identity, real Ion desktop launch, daemon-truth terminal
+  telemetry, supervisor-specific permissions, capability-checked tools, memory/retrieval/injection,
+  artifacts, credentials, and Ion's native coding REPL/tool loop.
 - **Direction:** generalized role contracts, one runtime-adapter interface, explicit capability
   negotiation/enforcement strength, and typed cross-agent messaging. These require an ADR and
   vertical slice; names and schemas are intentionally not frozen here.

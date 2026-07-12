@@ -1,7 +1,7 @@
 ---
 title: User Story Map
 description: Rust-first user stories and documentation baseline for the current Impulse product surface
-version: '1.1'
+version: '1.2'
 updated: 2026-07-12
 type: specification
 category: core
@@ -281,7 +281,7 @@ Primary interfaces:
 - `verify`
 - `session-end --verify`
 
-### F. Validation and Future Claims
+### F. Validation and Governed Agent Control
 
 #### ST-12 Prove the real hook memory loop before expanding claims
 
@@ -300,21 +300,34 @@ Primary interfaces:
 - `validate-hooks --platform claude-code`
 - validation artifacts under `.impulse/validation/`
 
-#### ST-13 Add agent control after daemon truth is stable
+#### ST-13 Complete one governed supervisor-and-builder vertical slice
 
-As an operator, I want direct supervision affordances for running agents after the workbench state model is authoritative.
+As an operator, I want one supervisor and one builder to complete a scoped task under explicit
+backend policy so Impulse proves that its existing controls compose into a governed workflow.
 
-Status: Planned
+Status: In progress
 
 Acceptance criteria:
 
-- blocked-work indicators and conflict-review entry points exist
-- restart and handoff controls map to daemon-backed state
-- artifact actions and agent control flows do not fork the source of truth
+- the operator launches registered supervisor and builder runtimes against an explicit workspace target
+- the supervisor observes daemon-owned workbench truth and can focus the builder or send confirmed input under `SupervisorPermissionPolicy`
+- the builder receives a bounded assignment and produces reviewable implementation and verification evidence
+- completion distinguishes worker claims, observed evidence, supervisor judgment, and operator approval
+- terminal launch, write, focus, close, and lifecycle telemetry remain projections of daemon/control-plane truth rather than a competing state store
+- role-specific permissions are enforced by the backend for this slice, with unsupported enforcement reported honestly
 
 Primary interfaces:
 
-- future daemon and workbench control surfaces
+- `AgentRegistry` / `AgentPlatformId`
+- `DesktopRuntime::{spawn_agent, write_agent, focus_agent, close_agent}`
+- daemon `PublishTerminalOps`, `SubscribeOps`, and `RunSupervisorAction`
+- `SupervisorPermissionPolicy` / `SupervisorPermissionState`
+
+Live boundary:
+
+- registry-backed platform identity, terminal lifecycle controls, daemon truth, and supervisor-specific policy are implemented foundations
+- one end-to-end supervisor/builder task contract, runtime-bound role assignment, and completion-evidence review are not yet complete
+- generalized roles, a common runtime-adapter trait, and capability negotiation across arbitrary runtimes remain target architecture; this first slice must not imply that every runtime has equal enforcement
 
 ## Story Priority
 
@@ -327,10 +340,13 @@ Primary interfaces:
 
 - ST-09
 - ST-12
-
-### Deferred until current lane is validated
-
 - ST-13
+
+### Later architecture beyond this story map
+
+- generalized runtime-independent role contracts
+- common runtime-adapter operations and enforcement-strength negotiation
+- typed multi-agent delegation and cross-project messaging
 
 ## How To Use This Document
 

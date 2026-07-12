@@ -84,7 +84,7 @@ Historical migration sequence: `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md`
 | Stage | Focus | Status |
 | --- | --- | --- |
 | **Now** | Rust control-plane foundation: daemon truth, PTY lifecycle, memory/tools/policy/artifacts, Dioxus cockpit, Ion native runtime | Active |
-| **Next** | Preserve registry-backed runtime identity, prove one governed supervisor + builder vertical slice, and define hierarchy/enforcement ADR | Active |
+| **Next** | Prove one governed supervisor + builder vertical slice and define the hierarchy/enforcement ADR | Active |
 | **Later** | General role contracts, runtime capability negotiation, typed agent messaging, and multi-project supervisor attention | Planned |
 | **Legacy** | egui / `impulse-gui` compile-maintenance only | Frozen |
 
@@ -115,9 +115,9 @@ verification are peer control-plane services. A runtime may receive them through
 MCP, hooks, sockets, files, generated commands, or mediated PTY operations. Similar conceptual
 capabilities do not imply identical enforcement.
 
-The pending local aggregate makes desktop platform identity registry-backed, carries that catalog
-through MCP/host/runtime/snapshots, and launches Ion as a builtin platform. Until that aggregate is
-integrated, treat it as preserved local implementation rather than remote-release truth.
+Desktop platform identity is registry-backed across MCP, host, runtime, and snapshots, and Ion is
+a builtin launchable platform. This is verified local implementation truth; publishing a remote
+release remains a separate operation.
 
 A future adapter contract must report required, optional, emulated, and unsupported operations plus
 enforcement strength. Mandatory role requirements must eventually block an incompatible launch;
@@ -347,7 +347,7 @@ The daemon exposes a JSON-line Unix socket protocol (`impulse.sock`). Full spec:
 | Daemon workbench truth | Implemented foundation | `ProjectOpsSnapshot`, terminal telemetry overlay, workbench IPC | Ops/daemon/desktop tests |
 | Supervisor-specific policy | Implemented | `SupervisorPermissionPolicy`, `RunSupervisorAction` | Ops + daemon tests |
 | Ion native coding runtime | Implemented foundation | `ion` REPL, provider/tool loop, approvals/guardrails | Rust unit + CLI tests |
-| Registry-backed open desktop platform identity | Pending aggregate implementation | `AgentRegistry`, `AgentPlatformId`, desktop/MCP/host | Registry + desktop tests on aggregate branch |
+| Registry-backed open desktop platform identity | Implemented foundation | `AgentRegistry`, `AgentPlatformId`, desktop/MCP/host | Registry + desktop tests |
 | General role contract | Direction, not implemented | Future ADR | Not applicable |
 | Common runtime adapter + capability negotiation | Direction, not implemented | Future ADR | Not applicable |
 | Typed cross-agent message bus | Partial delegations/handoffs only | `delegation`, `orchestration`, daemon contracts | Rust tests |
@@ -416,7 +416,7 @@ When adding/changing CLI commands, hooks, state files, or roadmap stage definiti
 | Tooling | ≥2.0 | ~17.1 | MET |
 | Integration | Every stable CLI command | 26 tests | PARTIAL |
 
-**Workspace totals (2026-07-12 canonical projection):** 1,895 tests across the 5 workspace crates/packages (impulse-rs 1,567, ops 32 including the canonical-checkout archive proof, term 114, desktop 159, ion 23); 8 ignored, 0 failed. The verified isolated worktree without the gitignored reconciliation archive reports 1,894 passed with that one proof explicitly filtered.
+**Workspace totals (2026-07-12 canonical projection):** 1,948 tests across the 5 workspace crates/packages (impulse-rs 1,574, ops 44 including the canonical-checkout archive proof, term 114, desktop 193, ion 23); 9 ignored, 0 failed. The verified isolated worktree without the gitignored reconciliation archive reports 1,947 passed with that one proof explicitly filtered.
 
 ### Required Test Patterns
 
@@ -432,7 +432,11 @@ When adding/changing CLI commands, hooks, state files, or roadmap stage definiti
 
 All changes must pass before commit:
 ```bash
-cd impulse-rs && cargo build && cargo test && cargo clippy -- -D warnings && cargo fmt --check
+cd impulse-rs
+cargo build --workspace
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
 ```
 
 ## 9) Validation and Drift Prevention
