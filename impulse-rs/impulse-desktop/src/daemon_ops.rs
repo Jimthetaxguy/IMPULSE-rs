@@ -425,6 +425,17 @@ mod unix {
             match response {
                 WorkbenchDaemonResponse::Ok { result } => Ok(result),
                 WorkbenchDaemonResponse::Error { message } => Err(message),
+                WorkbenchDaemonResponse::Busy {
+                    resource,
+                    retry_after_ms,
+                } => {
+                    let resource = match resource {
+                        impulse_ops::DaemonBusyResource::AgentTurn => "agent_turn",
+                    };
+                    Err(format!(
+                        "daemon busy: resource={resource}, retry_after_ms={retry_after_ms}"
+                    ))
+                }
                 WorkbenchDaemonResponse::ConflictCheck { .. } => {
                     Err("unexpected conflict-check response from ops request".to_string())
                 }
@@ -673,6 +684,20 @@ mod unix {
 
         use super::*;
         use crate::runtime::{AgentPlatformId, BuiltInMcpTool, WorkspaceTarget};
+
+        #[test]
+        fn busy_response_preserves_resource_and_retry_guidance() {
+            let error = UnixDaemonOpsClient::ok_result(WorkbenchDaemonResponse::Busy {
+                resource: impulse_ops::DaemonBusyResource::AgentTurn,
+                retry_after_ms: 250,
+            })
+            .expect_err("busy responses must remain retryable errors");
+
+            assert_eq!(
+                error,
+                "daemon busy: resource=agent_turn, retry_after_ms=250"
+            );
+        }
 
         #[derive(Default)]
         struct RecordingSink {
