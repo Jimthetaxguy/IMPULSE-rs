@@ -199,5 +199,6 @@
 - [x] Commit the final count and product-contract reconciliation on the aggregate branch.
 - [x] Convert every branch-relative integration marker to live local-main wording and keep remote-release status distinct.
 - [x] Confirm no active document still presents Dioxus launch as the next product phase or memory as the whole product.
-- [ ] Confirm every worktree is clean.
-- [ ] Fast-forward local `main` to the aggregate tip; do not push.
+- [x] Confirm every worktree is clean.
+- [x] Fast-forward local `main` to the aggregate tip; do not push.
+- [x] Re-run the canonical post-merge gate and observe 1,948 passed, 9 ignored, 0 failed.
