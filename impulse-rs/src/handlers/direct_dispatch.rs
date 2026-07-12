@@ -9,8 +9,27 @@ use std::sync::Arc;
 use crate::cli::Cli;
 use crate::{daemon, envelope, handlers, state, Commands};
 
+fn ui_runtime_supports_block_in_place(flavor: tokio::runtime::RuntimeFlavor) -> Result<()> {
+    match flavor {
+        tokio::runtime::RuntimeFlavor::MultiThread => Ok(()),
+        tokio::runtime::RuntimeFlavor::CurrentThread => {
+            anyhow::bail!("the ratatui workbench requires a Tokio multi-thread runtime")
+        }
+        _ => anyhow::bail!("unsupported Tokio runtime flavor for the ratatui workbench"),
+    }
+}
+
 /// Run a CLI command in direct mode (in-process, no daemon IPC).
 pub async fn dispatch(cli: Cli) -> Result<()> {
+    dispatch_with_ui_runner(cli, crate::ui::run_ui).await
+}
+
+/// Internal dispatch seam that keeps the interactive terminal runner testable
+/// without entering raw mode in the unit-test process.
+async fn dispatch_with_ui_runner<F>(cli: Cli, run_ui: F) -> Result<()>
+where
+    F: FnOnce(state::SharedState) -> Result<()> + Send,
+{
     let impulse_dir = cli.impulse_dir.clone();
     let verbose = cli.verbose;
     let format = cli.format;
@@ -26,7 +45,12 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
                 .context("Failed to start daemon")?;
         }
         Commands::Run => {
-            println!("Use: impulse-rs --daemon for daemon mode");
+            // The ratatui loop is synchronous and intentionally owns this
+            // foreground command. `block_in_place` lets its event handlers use
+            // the current Tokio handle for async state operations without
+            // attempting a nested runtime on the worker thread.
+            ui_runtime_supports_block_in_place(tokio::runtime::Handle::current().runtime_flavor())?;
+            tokio::task::block_in_place(move || run_ui(state.clone()))?;
         }
         Commands::SessionStart {
             name,
@@ -596,14 +620,35 @@ mod tests {
         }
     }
 
-    // ── Commands::Run (prints hint, returns Ok) ───────────────────────────
+    // ── Commands::Run (launches the ratatui runner) ───────────────────────
 
-    #[tokio::test]
-    async fn test_dispatch_run_returns_ok() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dispatch_run_invokes_ui_runner() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        assert!(
+            ui_runtime_supports_block_in_place(tokio::runtime::RuntimeFlavor::MultiThread).is_ok()
+        );
+        let current_thread_error =
+            ui_runtime_supports_block_in_place(tokio::runtime::RuntimeFlavor::CurrentThread)
+                .expect_err("current-thread runtimes cannot host the synchronous TUI loop");
+        assert!(current_thread_error.to_string().contains("multi-thread"));
+
         let tmp = TempDir::new().unwrap();
         let cli = cli_with(&tmp, Commands::Run);
-        let result = dispatch(cli).await;
+        let called = Arc::new(AtomicBool::new(false));
+        let called_by_runner = Arc::clone(&called);
+        let result = dispatch_with_ui_runner(cli, move |_| {
+            called_by_runner.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+
         assert!(result.is_ok(), "Run command should return Ok");
+        assert!(
+            called.load(Ordering::SeqCst),
+            "Run command must invoke the ratatui runner"
+        );
     }
 
     // ── Commands::Debug (prints hint, returns Ok) ─────────────────────────
