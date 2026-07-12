@@ -289,6 +289,10 @@ fn truncate(s: &str, max_len: usize) -> String {
 /// The Impulse Agent — coordinates across agent panes using LLM intelligence.
 pub struct ImpulseAgent {
     config: ImpulseAgentConfig,
+    /// Direct executable injection for subprocess tests. Production always
+    /// resolves the command from [`ImpulseHarness::command`].
+    #[cfg(test)]
+    harness_command_override: Option<std::path::PathBuf>,
     /// Internal Agent instance (for API mode).
     inner: Option<Agent>,
     /// Recent recommendations generated.
@@ -333,6 +337,8 @@ impl ImpulseAgent {
 
         Ok(Self {
             config,
+            #[cfg(test)]
+            harness_command_override: None,
             inner,
             recommendations: Vec::new(),
             pane_summaries: Vec::new(),
@@ -355,6 +361,7 @@ impl ImpulseAgent {
                 },
                 ..ImpulseAgentConfig::default()
             },
+            harness_command_override: None,
             inner: Some(Agent::new(
                 "impulse-agent-test".to_string(),
                 "Impulse Agent Test".to_string(),
@@ -368,13 +375,29 @@ impl ImpulseAgent {
         }
     }
 
+    /// Inject an exact harness executable for subprocess tests without
+    /// mutating process-global `PATH` seen by parallel discovery tests.
+    #[cfg(test)]
+    fn with_test_harness_command(mut self, command: impl Into<std::path::PathBuf>) -> Self {
+        self.harness_command_override = Some(command.into());
+        self
+    }
+
+    fn resolve_harness_command(&self, harness: ImpulseHarness) -> std::path::PathBuf {
+        #[cfg(test)]
+        if let Some(command) = &self.harness_command_override {
+            return command.clone();
+        }
+        std::path::PathBuf::from(harness.command())
+    }
+
     /// Check if the agent is enabled and ready.
     pub fn is_ready(&self) -> bool {
         match &self.config.mode {
             AgentMode::Api { .. } => self.inner.is_some(),
             AgentMode::Harness { harness } => {
                 // Check if the CLI command exists
-                which::which(harness.command()).is_ok()
+                which::which(self.resolve_harness_command(*harness)).is_ok()
             }
             AgentMode::Disabled => false,
         }
@@ -622,7 +645,9 @@ impl ImpulseAgent {
             format!("{}\n\n{}", system_prompt, user_prompt)
         };
 
-        let mut cmd = tokio::process::Command::new(harness_kind.command());
+        let harness_command = self.resolve_harness_command(harness_kind);
+        let harness_command_display = harness_command.display().to_string();
+        let mut cmd = tokio::process::Command::new(&harness_command);
         cmd.args(harness_kind.invocation_args()).arg(&print_arg);
 
         // Set env var pointing to the structured request file
@@ -669,7 +694,7 @@ impl ImpulseAgent {
         // may proceed. `tokio::time::timeout` returns a typed
         // `AgentError::HarnessTimedOut` instead of hanging indefinitely.
         let child = cmd.spawn().map_err(|e| {
-            AgentError::ApiRequest(format!("Failed to spawn {}: {}", harness_kind.command(), e))
+            AgentError::ApiRequest(format!("Failed to spawn {harness_command_display}: {e}"))
         })?;
         // Unlike `kill_on_drop`, this guard targets the whole isolated group
         // synchronously from Drop, so external task cancellation is covered
@@ -681,8 +706,7 @@ impl ImpulseAgent {
                 let output = result.map_err(|e| {
                     AgentError::ApiRequest(format!(
                         "Failed to run {}: {}",
-                        harness_kind.command(),
-                        e
+                        harness_command_display, e
                     ))
                 })?;
                 process_group_guard.disarm();
@@ -693,7 +717,7 @@ impl ImpulseAgent {
                 // `wait_with_output` drops its Child, killing wrapper
                 // grandchildren before the caller observes the timeout.
                 return Err(AgentError::HarnessTimedOut {
-                    command: harness_kind.command().to_string(),
+                    command: harness_command_display,
                     seconds: timeout.as_secs(),
                 });
             }
@@ -706,9 +730,7 @@ impl ImpulseAgent {
             let stderr = String::from_utf8_lossy(&output.stderr);
             Err(AgentError::ApiResponse(format!(
                 "{} exited with {}: {}",
-                harness_kind.command(),
-                output.status,
-                stderr
+                harness_command_display, output.status, stderr
             )))
         }
     }
@@ -1345,54 +1367,11 @@ mod tests {
     //    (same-day Opus sweep: `harness_query_structured`'s `.output().await`
     //    previously had no timeout and no `kill_on_drop`) ──────────────────
 
-    /// Serializes tests in this module that prepend a fake-binary directory
-    /// to the process-global `PATH` env var. `cargo test` runs this crate's
-    /// unit tests in one process across multiple threads, and no other test
-    /// file in this crate mutates `PATH` (verified via
-    /// `git grep 'set_var("PATH"'`), so a lock local to this module is
-    /// sufficient — mirrors `tooling::builtin::bash_exec`'s
-    /// `secret_env_lock` pattern for the same reason (a shared mutable
-    /// process resource, not crate state).
-    fn path_env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// RAII guard that prepends `dir` to `PATH` for the duration of a test
-    /// and restores the previous `PATH` on drop (even on panic/early
-    /// return), so a fake `claude`/`codex`/etc. binary placed in `dir`
-    /// shadows any real one on the developer's/CI machine without
-    /// permanently mutating process state for sibling tests.
-    struct PathPrependGuard {
-        previous: Option<String>,
-    }
-
-    impl PathPrependGuard {
-        fn new(dir: &std::path::Path) -> Self {
-            let previous = std::env::var("PATH").ok();
-            let new_path = match &previous {
-                Some(p) => format!("{}:{}", dir.display(), p),
-                None => dir.display().to_string(),
-            };
-            std::env::set_var("PATH", new_path);
-            Self { previous }
-        }
-    }
-
-    impl Drop for PathPrependGuard {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(value) => std::env::set_var("PATH", value),
-                None => std::env::remove_var("PATH"),
-            }
-        }
-    }
-
-    /// Writes an executable shell script named `claude` into a fresh temp
-    /// directory that just sleeps, standing in for a hung harness CLI
+    /// Writes an executable shell script into a fresh temp directory that
+    /// just sleeps, standing in for a hung harness CLI
     /// without depending on a real `claude`/`codex`/`gemini` binary being
     /// installed on the test machine.
-    fn write_hanging_fake_harness_binary() -> tempfile::TempDir {
+    fn write_hanging_fake_harness_binary() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
         let script_path = dir.path().join("claude");
         std::fs::write(&script_path, "#!/bin/sh\nsleep 30\n").expect("write fake harness script");
@@ -1405,22 +1384,17 @@ mod tests {
             perms.set_mode(0o755);
             std::fs::set_permissions(&script_path, perms).expect("chmod fake harness script");
         }
-        dir
+        (dir, script_path)
     }
 
     #[tokio::test]
-    // clippy: the lock is a test-only std::sync::Mutex<()> (never contended
-    // by production code) and must span the whole `.await` call so no
-    // sibling test in this module can mutate PATH mid-spawn — matches the
-    // justified pattern in `bash_exec.rs`'s secret-env tests.
-    #[allow(clippy::await_holding_lock)]
     async fn test_harness_query_times_out_instead_of_hanging_forever() {
-        let _lock = path_env_lock();
-        let fake_bin_dir = write_hanging_fake_harness_binary();
-        let _path_guard = PathPrependGuard::new(fake_bin_dir.path());
+        let (_fake_bin_dir, fake_command) = write_hanging_fake_harness_binary();
 
         let config = ImpulseAgentConfig::harness(ImpulseHarness::ClaudeCode);
-        let agent = ImpulseAgent::new(config).expect("harness agent should construct");
+        let agent = ImpulseAgent::new(config)
+            .expect("harness agent should construct")
+            .with_test_harness_command(fake_command);
 
         let start = std::time::Instant::now();
         let result = agent
@@ -1439,7 +1413,10 @@ mod tests {
                 command,
                 seconds: _,
             }) => {
-                assert_eq!(command, "claude");
+                assert!(
+                    command.ends_with("claude"),
+                    "timeout must identify the injected harness executable: {command}"
+                );
             }
             other => panic!("expected HarnessTimedOut, got: {other:?}"),
         }
@@ -1450,37 +1427,20 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[cfg(unix)]
     async fn test_harness_query_kills_hung_child_instead_of_orphaning() {
-        // Regression test for `kill_on_drop`: without it, a timed-out
-        // harness subprocess kept running as an orphan after this function
-        // returned. Uses a per-invocation unique sleep duration (mirrors
-        // `bash_exec.rs`'s equivalent test) so a `pgrep -f` check here can't
-        // be confused by an unrelated `sleep` from another concurrently
-        // running test.
-        //
-        // Nanoseconds, not `std::process::id() % 1000` (fresh Fable review,
-        // same day): `bash_exec.rs`'s equivalent test computed its marker
-        // with the identical pid-based formula -- since `cargo test` runs
-        // the whole crate's tests in one process, both files could produce
-        // the literal same `sleep 9.NNN` command, and a concurrent run of
-        // both tests could see one's `pgrep -f` catch the other's still-
-        // legitimately-running sleep. Nanoseconds (matching
-        // `storage::atomic_write_path`'s own PID+nanos uniqueness
-        // precedent) are effectively unique per call, not just per process.
-        let _lock = path_env_lock();
-        let unique_duration = format!(
-            "9.{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
+        // Regression test for full process-group cleanup on the explicit
+        // timeout path. The fake wrapper publishes its own PID and its sleep
+        // child's PID so the proof observes only processes this test owns.
         let dir = tempfile::tempdir().expect("tempdir");
         let script_path = dir.path().join("claude");
+        let pid_file = dir.path().join("harness-pids");
         std::fs::write(
             &script_path,
-            format!("#!/bin/sh\nsleep {unique_duration}\n"),
+            format!(
+                "#!/bin/sh\nsleep 60 &\nchild=$!\nprintf '%s\\n%s\\n' \"$$\" \"$child\" > \"{}\"\nwait\n",
+                pid_file.display()
+            ),
         )
         .expect("write fake harness script");
         #[cfg(unix)]
@@ -1492,10 +1452,10 @@ mod tests {
             perms.set_mode(0o755);
             std::fs::set_permissions(&script_path, perms).expect("chmod fake harness script");
         }
-        let _path_guard = PathPrependGuard::new(dir.path());
-
         let config = ImpulseAgentConfig::harness(ImpulseHarness::ClaudeCode);
-        let agent = ImpulseAgent::new(config).expect("harness agent should construct");
+        let agent = ImpulseAgent::new(config)
+            .expect("harness agent should construct")
+            .with_test_harness_command(script_path.clone());
 
         let result = agent
             .harness_query_structured_with_timeout(
@@ -1503,44 +1463,38 @@ mod tests {
                 "hello",
                 &[],
                 None,
-                Duration::from_millis(300),
+                Duration::from_secs(2),
             )
             .await;
         assert!(matches!(result, Err(AgentError::HarnessTimedOut { .. })));
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let check = tokio::process::Command::new("pgrep")
-            .arg("-f")
-            .arg(format!("sleep {unique_duration}"))
-            .output()
-            .await
-            .expect(
-                "pgrep unavailable -- cannot verify orphan-kill; install pgrep or adjust the check",
-            );
-        let stray = String::from_utf8_lossy(&check.stdout);
-        assert!(
-            stray.trim().is_empty(),
-            "expected no orphaned harness process after timeout, found pids: {stray}"
-        );
+        let contents = std::fs::read_to_string(&pid_file)
+            .expect("fake harness must publish wrapper and child pids before timeout");
+        let pids = contents
+            .lines()
+            .map(|line| line.parse::<u32>().expect("pid file must contain integers"))
+            .collect::<Vec<_>>();
+        assert_eq!(pids.len(), 2, "pid file must identify wrapper and child");
+
+        if let Err(stray) =
+            crate::test_support::wait_for_pids_to_exit(&pids, Duration::from_secs(10)).await
+        {
+            panic!("expected no orphaned harness processes after timeout; survivors: {stray}");
+        }
     }
 
     #[tokio::test]
     #[cfg(unix)]
-    #[allow(clippy::await_holding_lock)]
     async fn test_aborting_harness_query_kills_the_whole_process_group() {
-        let _lock = path_env_lock();
-        let unique_duration = format!(
-            "9.{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
         let dir = tempfile::tempdir().expect("tempdir");
         let script_path = dir.path().join("claude");
+        let pid_file = dir.path().join("harness-pids");
         std::fs::write(
             &script_path,
-            format!("#!/bin/sh\nsleep {unique_duration} & wait\n"),
+            format!(
+                "#!/bin/sh\nsleep 60 &\nchild=$!\nprintf '%s\\n%s\\n' \"$$\" \"$child\" > \"{}\"\nwait\n",
+                pid_file.display()
+            ),
         )
         .expect("write fake harness script");
         {
@@ -1551,10 +1505,10 @@ mod tests {
             perms.set_mode(0o755);
             std::fs::set_permissions(&script_path, perms).expect("chmod fake harness script");
         }
-        let _path_guard = PathPrependGuard::new(dir.path());
-
         let config = ImpulseAgentConfig::harness(ImpulseHarness::ClaudeCode);
-        let agent = ImpulseAgent::new(config).expect("harness agent should construct");
+        let agent = ImpulseAgent::new(config)
+            .expect("harness agent should construct")
+            .with_test_harness_command(script_path.clone());
         let task = tokio::spawn(async move {
             agent
                 .harness_query_structured_with_timeout(
@@ -1567,17 +1521,16 @@ mod tests {
                 .await
         });
 
-        let pattern = format!("sleep {unique_duration}");
-        tokio::time::timeout(Duration::from_secs(2), async {
+        let pids = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                let check = tokio::process::Command::new("pgrep")
-                    .arg("-f")
-                    .arg(&pattern)
-                    .output()
-                    .await
-                    .expect("pgrep should run");
-                if !String::from_utf8_lossy(&check.stdout).trim().is_empty() {
-                    break;
+                if let Ok(contents) = std::fs::read_to_string(&pid_file) {
+                    let pids = contents
+                        .lines()
+                        .filter_map(|line| line.parse::<u32>().ok())
+                        .collect::<Vec<_>>();
+                    if pids.len() == 2 {
+                        break pids;
+                    }
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -1587,35 +1540,18 @@ mod tests {
 
         task.abort();
         let _ = task.await;
-        let gone = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let check = tokio::process::Command::new("pgrep")
-                    .arg("-f")
-                    .arg(&pattern)
-                    .output()
-                    .await
-                    .expect("pgrep should run");
-                if String::from_utf8_lossy(&check.stdout).trim().is_empty() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await;
-        if gone.is_err() {
-            let check = tokio::process::Command::new("pgrep")
-                .arg("-f")
-                .arg(&pattern)
-                .output()
-                .await
-                .expect("pgrep should run");
-            let stray = String::from_utf8_lossy(&check.stdout).trim().to_string();
-            let _ = tokio::process::Command::new("pkill")
-                .arg("-f")
-                .arg(&pattern)
+        if let Err(stray) =
+            crate::test_support::wait_for_pids_to_exit(&pids, Duration::from_secs(10)).await
+        {
+            let _ = tokio::process::Command::new("kill")
+                .arg("-KILL")
+                .args(pids.iter().map(u32::to_string))
                 .status()
                 .await;
-            panic!("aborting a harness query must kill wrapper grandchildren; found pids: {stray}");
+            panic!(
+                "aborting a harness query must kill its exact wrapper and grandchild pids; \
+                 survivors: {stray}"
+            );
         }
     }
 }

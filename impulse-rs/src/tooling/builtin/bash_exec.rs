@@ -419,6 +419,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn test_execute_kills_child_on_timeout_instead_of_orphaning() {
         // Regression test: without `kill_on_drop`, dropping the
         // `wait_with_output` future on timeout left the child process
@@ -464,25 +465,17 @@ mod tests {
             )
             .await;
         assert!(matches!(result, Err(ToolError::ExecutionFailed(_))));
-        // Give the OS a moment to process the kill signal, then confirm no
-        // stray process carrying this test's unique duration remains.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let check = tokio::process::Command::new("pgrep")
-            .arg("-f")
-            .arg(format!("sleep {unique_duration}"))
-            .output()
-            .await
-            .expect(
-                "pgrep unavailable -- cannot verify orphan-kill; install pgrep or adjust the check",
-            );
-        let stray = String::from_utf8_lossy(&check.stdout);
-        assert!(
-            stray.trim().is_empty(),
-            "expected no orphaned process after timeout, found pids: {stray}"
-        );
+        let pattern = format!("sleep {unique_duration}");
+        if let Err(stray) =
+            crate::test_support::wait_for_no_matching_process(&pattern, Duration::from_secs(2))
+                .await
+        {
+            panic!("expected no orphaned process after timeout, found pids: {stray}");
+        }
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn test_execute_kills_grandchild_of_a_backgrounded_compound_command_on_timeout() {
         // Regression test for the gap the above test does NOT cover: `sh -c
         // "sleep N"` (a single simple command) gets exec-replaced by `sh`,
@@ -520,21 +513,16 @@ mod tests {
             )
             .await;
         assert!(matches!(result, Err(ToolError::ExecutionFailed(_))));
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let check = tokio::process::Command::new("pgrep")
-            .arg("-f")
-            .arg(format!("sleep {unique_duration}"))
-            .output()
-            .await
-            .expect(
-                "pgrep unavailable -- cannot verify orphan-kill; install pgrep or adjust the check",
+        let pattern = format!("sleep {unique_duration}");
+        if let Err(stray) =
+            crate::test_support::wait_for_no_matching_process(&pattern, Duration::from_secs(2))
+                .await
+        {
+            panic!(
+                "expected the backgrounded grandchild to be killed via the process group, \
+                 found pids: {stray}"
             );
-        let stray = String::from_utf8_lossy(&check.stdout);
-        assert!(
-            stray.trim().is_empty(),
-            "expected the backgrounded grandchild to be killed via the process group, \
-             found pids: {stray}"
-        );
+        }
     }
 
     #[tokio::test]
@@ -580,29 +568,10 @@ mod tests {
 
         task.abort();
         let _ = task.await;
-        let gone = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let check = tokio::process::Command::new("pgrep")
-                    .arg("-f")
-                    .arg(&pattern)
-                    .output()
-                    .await
-                    .expect("pgrep should run");
-                if String::from_utf8_lossy(&check.stdout).trim().is_empty() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await;
-        if gone.is_err() {
-            let check = tokio::process::Command::new("pgrep")
-                .arg("-f")
-                .arg(&pattern)
-                .output()
+        if let Err(stray) =
+            crate::test_support::wait_for_no_matching_process(&pattern, Duration::from_secs(2))
                 .await
-                .expect("pgrep should run");
-            let stray = String::from_utf8_lossy(&check.stdout).trim().to_string();
+        {
             let _ = tokio::process::Command::new("pkill")
                 .arg("-f")
                 .arg(&pattern)
