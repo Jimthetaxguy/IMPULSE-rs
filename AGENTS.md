@@ -159,7 +159,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-**Expected canonical checkout (2026-07-12 projection):** 1,948 tests passed, 0 failed, 9 ignored. The verified isolated aggregate worktree reports 1,947 passed with `test_reconciled_clean_archive_has_contracts_snapshot` explicitly filtered; the canonical count restores that one checkout-relative proof. Update counts in this file, CLAUDE.md, and RUST-CANONICAL-CONTRACT.md when they change.
+**Expected canonical checkout (2026-07-12 projection):** 1,950 tests passed, 0 failed, 9 ignored. The verified isolated aggregate worktree reports 1,949 passed with `test_reconciled_clean_archive_has_contracts_snapshot` explicitly filtered; the canonical count restores that one checkout-relative proof. Update counts in this file, CLAUDE.md, and RUST-CANONICAL-CONTRACT.md when they change.
 
 ### Code Requirements
 
@@ -212,7 +212,7 @@ baseline above predates substantial handler and control-plane coverage added sin
 it before presenting it as current. `docs/spec/TEST-TRACEABILITY.md` owns the current qualitative
 gap assessment.
 
-**Workspace totals (2026-07-12 canonical projection):** 1,948 tests across the 5 workspace crates/packages (impulse-rs: 1,574, ops: 44 including the canonical-checkout archive proof, term: 114, desktop: 193, ion: 23), with 9 ignored and 0 failed. The verified isolated worktree reports 1,947 passed because that one archive proof is filtered. The legacy impulse-gui crate is frozen/excluded from the workspace and its 252 passing tests are not counted.
+**Workspace totals (2026-07-12 canonical projection):** 1,950 tests across the 5 workspace crates/packages (impulse-rs: 1,576, ops: 44 including the canonical-checkout archive proof, term: 114, desktop: 193, ion: 23), with 9 ignored and 0 failed. The verified isolated worktree reports 1,949 passed because that one archive proof is filtered. The legacy impulse-gui crate is frozen/excluded from the workspace and its 252 passing tests are not counted.
 
 High-risk coverage priorities (despite substantial source-local unit coverage):
 - End-to-end parity between `daemon_dispatch` and `direct_dispatch` for every stable command.

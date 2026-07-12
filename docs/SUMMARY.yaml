@@ -1,7 +1,7 @@
 ---
 title: Documentation Summary
 description: Unified navigation structure for Impulse documentation
-version: '2.4'
+version: '2.5'
 updated: '2026-07-12'
 schema_version: '1.0'
 type: navigation
@@ -99,8 +99,6 @@ categories:
     - spec/RUST-CANONICAL-CONTRACT.md
     - spec/USER-STORY-MAP.md
     - spec/TEST-TRACEABILITY.md
-    - spec/COMPETITIVE-POSITIONING.md
-    - spec/PERFORMANCE-TARGETS.md
 
   roadmap:
     - ROADMAP-PLAN.md
@@ -126,13 +124,27 @@ categories:
     - research/TOKEN-TRACKING-ALGORITHM.md
 
   guides:
-    - guides/TEAM-ONBOARDING.md
     - guides/COLLABORATIVE-AGENTIC-CODING.md
-    - guides/BEST-PRACTICES.md
-    - guides/ERROR-HANDLING-GUIDE.md
-    - guides/DATABASE-GUIDE.md
+    - guides/HOOK-VALIDATION-GUIDE.md
+    - guides/RUST-MULTI-AGENT-PATTERNS.md
+    - FRONTMATTER-SCHEMA.md
+
+  historical_reference:
+    - spec/COMPETITIVE-POSITIONING.md
+    - spec/PERFORMANCE-TARGETS.md
+    - guides/SECURITY-REVIEW.md
     - guides/INTEGRATION-COOKBOOK.md
+    - guides/SYNTHETIC-TESTING-GUIDE.md
+    - guides/BEST-PRACTICES.md
     - guides/DEPLOYMENT-FRAMEWORK.md
+    - guides/TEAM-ONBOARDING.md
+    - guides/TESTING-STRATEGY-ENHANCEMENTS.md
+    - guides/RELEASE-NOTES-TEMPLATE.md
+    - guides/DATABASE-GUIDE.md
+    - guides/PERFORMANCE-PROFILING.md
+    - guides/CLI-REFERENCE-ENHANCEMENTS.md
+    - guides/ERROR-HANDLING-GUIDE.md
+    - guides/TESTING-FRAMEWORK.md
     - guides/TOOLS-STATUS.md
 
   decisions:
@@ -162,7 +174,7 @@ validation_and_history:
 
 metadata:
   total_documents: 134
-  categories: 8
+  categories: 9
   decisions: 9
   phases: 3
   status: active_development

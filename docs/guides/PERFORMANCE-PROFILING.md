@@ -1,5 +1,5 @@
 ---
-status: active
+status: superseded
 phase: 1-2
 audience: builder
 tags: [guide, performance, profiling]
@@ -7,6 +7,10 @@ last_updated: 2026-02-20
 ---
 
 # Performance Profiling & Optimization Guide
+
+> **Historical phase-era guide — superseded.** Its Bun hook budgets and planned components are not
+> current control-plane benchmarks. New performance claims require measured Rust baselines and an
+> explicit canonical-contract update.
 
 > **Version:** 1.0 | **Status:** Framework | **Updated:** 2026-02-20
 

@@ -6,12 +6,16 @@ updated: 2026-02-23
 type: guide
 category: guides
 phase: all
-status: active
+status: superseded
 audience: builders
 tags: [release, template, governance, contract]
 ---
 
 # Release Notes Template
+
+> **Historical template — superseded.** It predates the current workspace-wide Rust, Dioxus, and
+> product-contract verification gates. Release evidence must be generated from the live commands
+> in [`../../AGENTS.md`](../../AGENTS.md) and the canonical Rust contract.
 
 Use this template for all releases that affect CLI interfaces, hooks, state files, or roadmap contract statements.
 
@@ -52,4 +56,3 @@ Use this template for all releases that affect CLI interfaces, hooks, state file
 ## Notes
 
 - Additional context, known limitations, follow-up tasks.
-

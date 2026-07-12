@@ -1,7 +1,7 @@
 ---
 title: Documentation Summary
 description: Unified navigation structure for Impulse documentation
-version: 2.4
+version: 2.5
 updated: 2026-07-12
 schema_version: '1.0'
 ---
@@ -63,8 +63,6 @@ roadmap or whole-product risk authority.
 - [spec/RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md)
 - [spec/USER-STORY-MAP.md](spec/USER-STORY-MAP.md)
 - [spec/TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md)
-- [spec/COMPETITIVE-POSITIONING.md](spec/COMPETITIVE-POSITIONING.md)
-- [spec/PERFORMANCE-TARGETS.md](spec/PERFORMANCE-TARGETS.md)
 
 ### Roadmap
 
@@ -99,13 +97,28 @@ roadmap or whole-product risk authority.
 
 ### Guides
 
-- [guides/TEAM-ONBOARDING.md](guides/TEAM-ONBOARDING.md)
 - [guides/COLLABORATIVE-AGENTIC-CODING.md](guides/COLLABORATIVE-AGENTIC-CODING.md)
-- [guides/BEST-PRACTICES.md](guides/BEST-PRACTICES.md)
-- [guides/ERROR-HANDLING-GUIDE.md](guides/ERROR-HANDLING-GUIDE.md)
-- [guides/DATABASE-GUIDE.md](guides/DATABASE-GUIDE.md)
+- [guides/HOOK-VALIDATION-GUIDE.md](guides/HOOK-VALIDATION-GUIDE.md)
+- [guides/RUST-MULTI-AGENT-PATTERNS.md](guides/RUST-MULTI-AGENT-PATTERNS.md)
+- [FRONTMATTER-SCHEMA.md](FRONTMATTER-SCHEMA.md)
+
+### Historical Reference
+
+- [spec/COMPETITIVE-POSITIONING.md](spec/COMPETITIVE-POSITIONING.md)
+- [spec/PERFORMANCE-TARGETS.md](spec/PERFORMANCE-TARGETS.md)
+- [guides/SECURITY-REVIEW.md](guides/SECURITY-REVIEW.md)
 - [guides/INTEGRATION-COOKBOOK.md](guides/INTEGRATION-COOKBOOK.md)
+- [guides/SYNTHETIC-TESTING-GUIDE.md](guides/SYNTHETIC-TESTING-GUIDE.md)
+- [guides/BEST-PRACTICES.md](guides/BEST-PRACTICES.md)
 - [guides/DEPLOYMENT-FRAMEWORK.md](guides/DEPLOYMENT-FRAMEWORK.md)
+- [guides/TEAM-ONBOARDING.md](guides/TEAM-ONBOARDING.md)
+- [guides/TESTING-STRATEGY-ENHANCEMENTS.md](guides/TESTING-STRATEGY-ENHANCEMENTS.md)
+- [guides/RELEASE-NOTES-TEMPLATE.md](guides/RELEASE-NOTES-TEMPLATE.md)
+- [guides/DATABASE-GUIDE.md](guides/DATABASE-GUIDE.md)
+- [guides/PERFORMANCE-PROFILING.md](guides/PERFORMANCE-PROFILING.md)
+- [guides/CLI-REFERENCE-ENHANCEMENTS.md](guides/CLI-REFERENCE-ENHANCEMENTS.md)
+- [guides/ERROR-HANDLING-GUIDE.md](guides/ERROR-HANDLING-GUIDE.md)
+- [guides/TESTING-FRAMEWORK.md](guides/TESTING-FRAMEWORK.md)
 - [guides/TOOLS-STATUS.md](guides/TOOLS-STATUS.md)
 
 ### Decisions (ADRs)
@@ -137,7 +150,7 @@ Historical Ralph loop plans now live under `archive/ralph-plans/` and are proven
 | Field | Value |
 | ----- | ----- |
 | Total Documents | 134 |
-| Categories | 8 |
+| Categories | 9 |
 | Decisions (ADRs) | 9 |
 | Phases | 3 |
 | Status | Active Development |

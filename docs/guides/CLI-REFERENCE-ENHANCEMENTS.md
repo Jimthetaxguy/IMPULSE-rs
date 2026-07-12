@@ -5,12 +5,15 @@ version: '1.0'
 updated: 2026-03-02
 type: doc
 category: reference
-status: active
+status: superseded
 audience: builder
 tags: [cli, reference, commands]
 ---
 
 # CLI Quick Reference — Enhanced Commands
+
+> **Historical command proposal — superseded.** Several commands here were planned rather than
+> shipped. Use [`../CLI-COMMANDS.md`](../CLI-COMMANDS.md) and `impulse-rs --help` for the live CLI.
 
 > **Generated:** 2026-03-02 | **Applies to:** impulse-rs v0.1.1+
 

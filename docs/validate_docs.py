@@ -386,6 +386,13 @@ def validate_docs() -> Dict[str, Any]:
     return results
 
 
+def json_default(value: Any) -> str:
+    """Serialize YAML date values without masking unsupported payload types."""
+    if isinstance(value, (datetime.date, datetime.datetime)):
+        return value.isoformat()
+    raise TypeError(f"Object of type {value.__class__.__name__} is not JSON serializable")
+
+
 def run_self_test() -> int:
     # Validate that contradiction detection catches active-doc phrases.
     tmp_path = ROOT_DIR / ".tmp_validate_docs_self_test.md"
@@ -426,6 +433,11 @@ updated: 2026-02-23
         dup = detect_duplicate_artifacts([tmp_dup_path])
         if tmp_dup_path not in dup:
             print("SELF-TEST FAILED: expected duplicate artifact issue not found")
+            return 1
+
+        encoded = json.dumps({"updated": datetime.date(2026, 7, 12)}, default=json_default)
+        if encoded != '{"updated": "2026-07-12"}':
+            print("SELF-TEST FAILED: expected YAML date JSON serialization")
             return 1
 
         print("SELF-TEST PASSED")
@@ -472,7 +484,7 @@ def main() -> int:
             exit_code = 1
 
     if args.json:
-        print(json.dumps(payload, indent=2))
+        print(json.dumps(payload, indent=2, default=json_default))
     else:
         if run_meta:
             m = payload["metadata"]

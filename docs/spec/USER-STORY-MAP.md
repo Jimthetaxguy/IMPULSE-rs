@@ -32,28 +32,26 @@ These documents describe the current product with the least drift:
 - [`../guides/HOOK-VALIDATION-GUIDE.md`](../guides/HOOK-VALIDATION-GUIDE.md) for proof-of-truth validation
 - [`../../AGENTS.md`](../../AGENTS.md) for contributor rules and test expectations
 
-### Useful but fragmented
+### Supporting orientation
 
-These documents contain good material, but they are not a unified execution baseline:
+These documents help readers enter or navigate the product, but the canonical contract remains the
+implementation baseline:
 
-- [`../../README.md`](../../README.md) explains the product at a high level
-- [`../INDEX.md`](../INDEX.md) is the navigation hub
+- [`../../README.md`](../../README.md) is the product entry point and quick start
 - `../SUMMARY.md` mirrors the `../SUMMARY.yaml` navigation source; use the canonical contract for implementation truth
-- [`../guides/TESTING-STRATEGY-ENHANCEMENTS.md`](../guides/TESTING-STRATEGY-ENHANCEMENTS.md) has reusable testing categories
 
 ### Legacy or drifted
 
-The following document does not match the current Rust implementation and should only be read as historical context:
+The following documents do not match the current Rust implementation and should only be read as historical context:
 
 - [`../guides/TESTING-FRAMEWORK.md`](../guides/TESTING-FRAMEWORK.md) still describes a TypeScript/Vitest `impulse/` layout instead of the live `impulse-rs` workspace
 - [`../guides/TOOLS-STATUS.md`](../guides/TOOLS-STATUS.md) still reflects earlier TypeScript/Bun-era tool assumptions and should not be used as a current setup contract
-- `README.md` test-count statements are historically useful but not a verification signal; use the live Rust verification gate instead
 
 ## Story Status Scale
 
 | Status | Meaning |
 | --- | --- |
-| Implemented | Shipped in the current Rust workspace and expected to stay working |
+| Implemented | Present in the current Rust workspace and verified by the referenced tests |
 | In progress | Active roadmap work with shipped partial behavior |
 | Planned | On the roadmap but not yet a current delivery claim |
 | Validation required | Implemented code exists, but product claims still depend on real-world proof |

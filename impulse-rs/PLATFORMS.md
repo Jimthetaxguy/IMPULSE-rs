@@ -124,7 +124,8 @@ Impulse works with:
 
 ### Known Issues
 
-- **Keychain** — Falls back to file-based credential storage on Linux
+- **Credentials** — macOS Keychain is unavailable. Use environment variables, a Unix-socket
+  credential agent, or a configured CLI proxy; Impulse does not persist a file-based fallback.
 - **pty** — Requires kernel pty support (standard on all modern Linux)
 
 ---
@@ -181,7 +182,7 @@ export DISPLAY=:0
 |---------|-------|-------|---------|
 | TUI | ✅ | ✅ | ⚠️ WSL |
 | PTY | ✅ | ✅ | ⚠️ WSL |
-| Keychain | ✅ | ❌ (file) | ❌ (file) |
+| Keychain | ✅ | ❌ (use env/socket/proxy) | ❌ (use env/socket/proxy) |
 | Daemon | ✅ | ✅ | ⚠️ WSL |
 | Search | ✅ | ✅ | ⚠️ WSL |
 

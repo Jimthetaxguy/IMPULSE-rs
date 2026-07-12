@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use crate::envelope;
 
 pub const PRODUCT_DESCRIPTION: &str =
-    "Terminal-native local control plane and harness manager for AI coding agents";
+    "Feed the impulse to build — a terminal-native local control plane and harness manager for AI coding agents";
 
 #[derive(Parser)]
 #[command(name = "impulse-rs")]

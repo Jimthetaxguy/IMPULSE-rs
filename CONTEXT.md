@@ -3,7 +3,7 @@
 > **Read this first.** Shared L0/L1 vocabulary for Impulse. Update a term here when its stable
 > meaning changes; put detailed history in plans/ADRs rather than growing this glossary.
 >
-> Entries are tagged **`[code]`** (live in the verified local implementation) or
+> Entries are tagged **`[code]`** (live in the current repository implementation) or
 > **`[vocabulary]`** (the product contract; "Closest in code" names today's partial carrier).
 >
 > Cross-agent contract: `AGENTS.md`. Product contract:

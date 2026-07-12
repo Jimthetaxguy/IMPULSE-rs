@@ -10,11 +10,18 @@ Impulse is a terminal-native **local control plane and harness manager** for AI 
 
 Claude Code, Codex, and similar CLIs keep their own internal coding loops. Ion is the Impulse-native coding runtime. Impulse governs the operating conditions around those loops; it does not claim to replace or fully control proprietary runtime internals.
 
-**Live foundation:** the Rust workspace provides PTY lifecycle, daemon workbench contracts and telemetry, registry-backed desktop platform identity, supervisor-specific permissions, capability-checked tools, memory/retrieval, artifacts, credentials, verification, and Ion's native REPL/tool loop. **Target:** runtime-independent role contracts, adapter capability negotiation, typed agent messaging, and stronger structural enforcement across supported runtimes. See [`VISION.md`](VISION.md) for the north star and explicit live-versus-target boundary.
+> **Live foundation:** the Rust workspace provides PTY lifecycle, daemon workbench contracts and
+> telemetry, registry-backed desktop platform identity, supervisor-specific permissions,
+> capability-checked tools, memory/retrieval, artifacts, credentials, verification, and Ion's
+> native REPL/tool loop.
+>
+> **Target:** runtime-independent role contracts, adapter capability negotiation, typed agent
+> messaging, and stronger structural enforcement across supported runtimes. See
+> [`VISION.md`](VISION.md) for the north star and explicit live-versus-target boundary.
 
 ## Why
 
-Using several coding agents today usually means several unrelated terminals, permission models, context stores, and completion claims. Impulse brings those runtimes into one observable environment while preserving their terminal-native workflows. Persistent memory solves continuity; the wider control plane solves managed launch, project scoping, coordination, intervention, and evidence-backed completion. Structural filesystem isolation depends on the selected runtime or sandbox rather than on the cockpit alone.
+Using several coding agents today usually means several unrelated terminals, permission models, context stores, and completion claims. Impulse brings those runtimes into one observable environment while preserving their terminal-native workflows. Persistent memory preserves continuity; the wider control plane handles managed launch, project scoping, coordination, intervention, and evidence-backed completion. Structural filesystem isolation depends on the selected runtime or sandbox rather than on the cockpit alone.
 
 ## What It Does
 
@@ -26,7 +33,7 @@ Using several coding agents today usually means several unrelated terminals, per
 - **Persistent memory** — Project genome (decisions/preferences) and session history survive across sessions
 - **Context injection** — Relevant past context is surfaced in new sessions via review-first injection
 - **Multi-agent observability** — Tracks active agents, tasks, terminal telemetry, delegations, and intervention recommendations
-- **Retrieval search** — FTS5 keyword search + semantic search across session history and genome
+- **Retrieval search** — FTS5 keyword search plus feature-gated, fallback-safe semantic search across session history and genome
 - **Context stewardship** — Monitors context window usage and proposes cleanup strategies
 - **Artifacts and verification** — Separates worker claims from observed build/test evidence and reviewable outputs
 - **Credential services** — Selects configured credential providers without treating secret values as agent memory
@@ -51,7 +58,7 @@ cargo run -- run
 cargo run --bin ion
 ```
 
-The live foundation can launch registered PTY runtimes and project daemon-backed state into the
+The live foundation can launch registered PTY runtimes and project their daemon-backed state into the
 cockpit. The complete role-assigned supervisor + builder workflow is the next vertical slice, not
 an undocumented command-line flag. Session, memory, hook, and verification commands remain
 available through `cargo run -- --help`.
@@ -181,4 +188,6 @@ cargo fmt --all -- --check
 
 ## License
 
-Private — not yet open-sourced.
+This repository is public, but release licensing is not yet coherent: Cargo manifests declare
+MIT while [`impulse-rs/LICENSE`](impulse-rs/LICENSE) contains Apache-2.0. Treat licensing as an
+explicit pre-release decision; this draft PR does not silently choose or rewrite the license.

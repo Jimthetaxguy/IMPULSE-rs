@@ -10,11 +10,11 @@
 /// Full banner - for status, init, and splash contexts.
 pub const BANNER: &str = "\
  ┌─[ IMPULSE ]────────────────────────────────┐
- │ ▧  your AI remembers                       │
+ │ ▧  Feed the impulse to build.             │
  └────────────────────────────────────────────┘";
 
 /// Compact one-liner — for config, verification, and tight contexts.
-pub const TAGLINE: &str = "━━━━━✈  IMPULSE · your AI remembers";
+pub const TAGLINE: &str = "━━━━━✈  IMPULSE · feed the impulse to build";
 
 /// TUI engine-state ASCII art.
 pub const ENGINE_IDLE: &str = "\
@@ -76,7 +76,7 @@ pub fn print_banner() {
 ///
 /// Example output:
 /// ```text
-/// ━━━━━◆  IMPULSE · your AI remembers
+/// ━━━━━◆  IMPULSE · feed the impulse to build
 /// Configuration
 /// ```
 pub fn print_header(title: &str) {
@@ -119,6 +119,8 @@ mod tests {
     fn test_tagline_not_empty() {
         assert!(!TAGLINE.is_empty());
         assert!(TAGLINE.contains("IMPULSE"));
+        assert!(TAGLINE.contains("feed the impulse to build"));
+        assert!(!TAGLINE.contains("your AI remembers"));
     }
 
     #[test]

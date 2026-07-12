@@ -44,17 +44,17 @@ Impulse is differentiated by treating those agents as workers inside one governe
 These concepts must stay separate:
 
 ```text
-project / workspace scope
+project (governance scope) <------> workspace target (execution root)
+        |                                      |
+        +-- task                               +-- agent process / PTY
+        |   (assignment + criteria)                 |
+        |          |                                +-- terminal/API channel
+        |          +-- agent instance <-------------+
+        |                 +-- role
+        |                 +-- runtime
+        |                 +-- session(s)
         |
-        +-- task (assignment + completion criteria)
-        |      |
-        |      +-- agent instance
-        |             +-- role
-        |             +-- runtime
-        |             +-- session(s)
-        |             +-- terminal/API channel
-        |
-        +-- project memory, artifacts, policy, and verification
+        +-- memory, artifacts, policy, and verification
 
 pane = a cockpit view onto an agent channel, never the authority
 ```
@@ -209,7 +209,7 @@ needs a reason and an audit path. The user can interrupt, narrow, revoke, review
 - Rust daemon and versioned workbench protocol/read models.
 - PTY spawn/write/resize/focus/exit lifecycle and process cleanup.
 - Dioxus Desktop host/bridge plus ratatui and CLI operator surfaces.
-- Open registry-backed desktop platform identity and launch metadata.
+- Registry-backed desktop platform identity and launch metadata.
 - Ion as a real desktop-launchable builtin platform.
 - Daemon-truth terminal telemetry across lifecycle and heartbeat.
 - Supervisor-specific permission/confirmation policy and daemon actions.
@@ -218,8 +218,8 @@ needs a reason and an audit path. The user can interrupt, narrow, revoke, review
 - Credential provider abstraction, artifacts, delegations, and verification gates.
 - Ion interactive native coding runtime with direct providers, typed tools, guardrails, and loop bounds.
 
-This contract describes the verified local implementation. Publishing a remote release is a
-separate action and must not be inferred from local branch integration.
+This contract describes the current repository implementation. Inclusion in a tagged release is
+a separate action and must not be inferred from repository state alone.
 
 ### Target state
 

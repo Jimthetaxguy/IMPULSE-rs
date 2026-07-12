@@ -321,13 +321,9 @@ Returns `AgentAssistResult` with sessions organized by agent role.
 
 ### Search & Retrieval
 
-Search and retrieval requests are dispatched via the daemon when using `--daemon` mode:
-
-| Request | Data | Since | Description |
-|---------|------|-------|-------------|
-| `SearchHistory` | `{query, mode?, limit?}` | v1 | Search session history |
-| `SearchGenome` | `{query, mode?, limit?}` | v1 | Search genome decisions |
-| `IndexMemory` | `{scope, rebuild}` | v1 | Trigger re-indexing |
+Protocol v3 does not define daemon request variants for retrieval. `search-history`,
+`search-genome`, `index-memory`, and `retrieval-status` are direct-mode CLI operations; the
+`--daemon` dispatcher tells callers to retry without the flag.
 
 ### Debug
 

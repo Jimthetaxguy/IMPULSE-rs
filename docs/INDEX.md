@@ -51,8 +51,6 @@ authors:
 | [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) | **Authoritative contract for current product behavior**                    | all   |
 | [USER-STORY-MAP.md](spec/USER-STORY-MAP.md)                   | Rust-first product stories, acceptance criteria, and story status          | all   |
 | [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md)             | Story-to-test map for the current Rust workspace                           | all   |
-| [COMPETITIVE-POSITIONING.md](spec/COMPETITIVE-POSITIONING.md) | Market analysis and differentiation                                        | all   |
-| [PERFORMANCE-TARGETS.md](spec/PERFORMANCE-TARGETS.md)         | Performance budgets and benchmarks                                         | 1-2   |
 
 ### Product North Star and Boundaries
 
@@ -88,26 +86,36 @@ enforcement-strength ADR decisions listed in `VISION.md` are resolved.
 
 See [decisions/README.md](decisions/README.md) for full decision log.
 
-### Developer Guides
+### Current Developer Guides
 
 | Document                                                        | Topic                            |
 | --------------------------------------------------------------- | -------------------------------- |
-| [BEST-PRACTICES.md](guides/BEST-PRACTICES.md)                   | Coding conventions and patterns  |
 | [COLLABORATIVE-AGENTIC-CODING.md](guides/COLLABORATIVE-AGENTIC-CODING.md) | Agent lanes, worktrees, handoffs, and verification |
 | [CONTRIBUTING.md](../CONTRIBUTING.md)                           | Contribution rules for humans and agents |
-| [TESTING-FRAMEWORK.md](guides/TESTING-FRAMEWORK.md)             | Legacy TypeScript-era testing guide |
 | [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md)               | Current Rust-first test baseline and gap map |
-| [SYNTHETIC-TESTING-GUIDE.md](guides/SYNTHETIC-TESTING-GUIDE.md) | Synthetic test generation        |
-| [ERROR-HANDLING-GUIDE.md](guides/ERROR-HANDLING-GUIDE.md)       | Error handling patterns          |
-| [DATABASE-GUIDE.md](guides/DATABASE-GUIDE.md)                   | Database usage (Phase 2+)        |
-| [SECURITY-REVIEW.md](guides/SECURITY-REVIEW.md)                 | Security audit and practices     |
-| [PERFORMANCE-PROFILING.md](guides/PERFORMANCE-PROFILING.md)     | Profiling and optimization       |
-| [DEPLOYMENT-FRAMEWORK.md](guides/DEPLOYMENT-FRAMEWORK.md)       | Deployment and distribution      |
-| [TEAM-ONBOARDING.md](guides/TEAM-ONBOARDING.md)                 | New contributor guide            |
-| [INTEGRATION-COOKBOOK.md](guides/INTEGRATION-COOKBOOK.md)       | Integration patterns and recipes |
-| [TOOLS-STATUS.md](guides/TOOLS-STATUS.md)                     | Tool installation and validation |
 | [HOOK-VALIDATION-GUIDE.md](guides/HOOK-VALIDATION-GUIDE.md)   | Real Claude hook proof before product claims |
 | [RUST-MULTI-AGENT-PATTERNS.md](guides/RUST-MULTI-AGENT-PATTERNS.md) | Rust-first harness and coordination patterns |
+| [FRONTMATTER-SCHEMA.md](FRONTMATTER-SCHEMA.md) | Documentation metadata and authority vocabulary |
+
+### Historical Product and TypeScript/Bun References
+
+These documents are retained for provenance and reusable ideas. Their front matter and opening
+banners mark them non-authoritative; they must not override the product vision, Rust contract, live
+CLI help, or current tests.
+
+| Document | Historical scope | Replaced by |
+| --- | --- | --- |
+| [COMPETITIVE-POSITIONING.md](spec/COMPETITIVE-POSITIONING.md) | Memory-plugin positioning | [VISION.md](../VISION.md) |
+| [PERFORMANCE-TARGETS.md](spec/PERFORMANCE-TARGETS.md) | Hook/plugin budgets | [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) |
+| [BEST-PRACTICES.md](guides/BEST-PRACTICES.md) | TypeScript conventions | [CONTRIBUTING.md](../CONTRIBUTING.md) |
+| [TEAM-ONBOARDING.md](guides/TEAM-ONBOARDING.md) | SWARM onboarding | [COLLABORATIVE-AGENTIC-CODING.md](guides/COLLABORATIVE-AGENTIC-CODING.md) |
+| [SECURITY-REVIEW.md](guides/SECURITY-REVIEW.md) | Phase-1 plugin review | [ARCHITECTURE-CLARIFICATION.md](ARCHITECTURE-CLARIFICATION.md) |
+| [INTEGRATION-COOKBOOK.md](guides/INTEGRATION-COOKBOOK.md) | Phase-era workflows | [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) |
+| [SYNTHETIC-TESTING-GUIDE.md](guides/SYNTHETIC-TESTING-GUIDE.md) and [TESTING-STRATEGY-ENHANCEMENTS.md](guides/TESTING-STRATEGY-ENHANCEMENTS.md) | Planned test designs | [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md) |
+| [DATABASE-GUIDE.md](guides/DATABASE-GUIDE.md), [ERROR-HANDLING-GUIDE.md](guides/ERROR-HANDLING-GUIDE.md), and [PERFORMANCE-PROFILING.md](guides/PERFORMANCE-PROFILING.md) | TypeScript implementation guidance | Live Rust source and canonical contract |
+| [DEPLOYMENT-FRAMEWORK.md](guides/DEPLOYMENT-FRAMEWORK.md) | SWARM deployment design | [README.md](../README.md) real-systems boundary |
+| [CLI-REFERENCE-ENHANCEMENTS.md](guides/CLI-REFERENCE-ENHANCEMENTS.md) | Proposed commands | [CLI-COMMANDS.md](CLI-COMMANDS.md) and live help |
+| [RELEASE-NOTES-TEMPLATE.md](guides/RELEASE-NOTES-TEMPLATE.md) | Earlier release gate | [AGENTS.md](../AGENTS.md) verification contract |
 
 ### Phase Planning
 
@@ -209,7 +217,6 @@ Start here:
 6. [AGENTS.md](../AGENTS.md) — Current architecture and operational guidance
 7. [COLLABORATIVE-AGENTIC-CODING.md](guides/COLLABORATIVE-AGENTIC-CODING.md) — Agent lane, worktree, and handoff rules
 8. [ROADMAP-PLAN.md](ROADMAP-PLAN.md) — Superseded desktop implementation history
-9. [BEST-PRACTICES.md](guides/BEST-PRACTICES.md) — Coding conventions
 
 ### Next: Governed Supervisor/Builder Vertical Slice + Hierarchy/Enforcement ADR
 
@@ -236,12 +243,12 @@ Start here:
 
 | Tag            | Documents                                                                   |
 | -------------- | --------------------------------------------------------------------------- |
-| `spec`         | RUST-CANONICAL-CONTRACT, COMPETITIVE-POSITIONING, PERFORMANCE-TARGETS       |
-| `hooks`        | RUST-CANONICAL-CONTRACT, PHASE1-CHECKLIST, BEST-PRACTICES                   |
+| `spec`         | RUST-CANONICAL-CONTRACT, USER-STORY-MAP, TEST-TRACEABILITY                   |
+| `hooks`        | RUST-CANONICAL-CONTRACT, HOOK-VALIDATION-GUIDE                               |
 | `memory`       | impulse-memory-architecture, MEMORY-EXTRACTION-ANALYSIS, PHASE2-PERSISTENCE |
-| `testing`      | TEST-TRACEABILITY, TESTING-FRAMEWORK, SYNTHETIC-TESTING-GUIDE               |
+| `testing`      | TEST-TRACEABILITY; phase-era testing guides are historical                   |
 | `validation`   | HOOK-VALIDATION-GUIDE, HONEST-ROADMAP                                        |
 | `architecture` | RESEARCH-DIGEST, ADRs                                                       |
 | `tools`        | TOOL-STACK-ANALYSIS, cross-model-consensus, cli-language-analysis           |
-| `security`     | SECURITY-REVIEW                                                             |
-| `deployment`   | DEPLOYMENT-FRAMEWORK, ADR-0005                                              |
+| `security`     | ARCHITECTURE-CLARIFICATION; SECURITY-REVIEW is historical                    |
+| `deployment`   | README real-systems boundary; DEPLOYMENT-FRAMEWORK is historical             |

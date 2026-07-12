@@ -26,8 +26,8 @@ authors:
 ## 1) Product Purpose
 
 Impulse is a terminal-native **local control plane and harness manager** for AI
-software-engineering agents. It launches and manages coding runtimes, supervises their operating
-conditions, and provides shared memory, tools, telemetry, messaging/handoffs, policy, credentials,
+software-engineering agents. It launches and monitors coding runtimes, provides a supervisor
+action surface, and supplies shared memory, tools, telemetry, messaging/handoffs, policy, credentials,
 artifacts, and verification. Claude Code, Codex, and similar CLIs retain their proprietary internal
 loops; Ion is the Impulse-native direct-provider/tool-loop runtime.
 
@@ -41,10 +41,11 @@ Core outcomes:
 - Daemon-owned, inspectable workbench truth for agents, context, interventions, and artifacts
 - Persistent project memory (`GENOME`, session history, active state) with review-first injection
 - Cross-session continuity for Claude Code and Codex integrations, with legacy OpenCode compatibility preserved where already implemented
-- Capability-checked platform tools and supervisor-specific permission/confirmation policy
+- Capability-checked dynamic tools and a supervisor-specific action/permission policy foundation
 - Operationally safe session lifecycle with recorded endings and optional API-level verification gates
 - Human-visible observability through CLI, ratatui TUI, and the Dioxus Desktop cockpit
-- Multi-workspace + multi-agent orchestration surface (observable registration and launch/monitoring of agents across project spaces)
+- Desktop workspace registry plus multi-agent launch/observation surfaces; daemon-side
+  multi-workspace routing remains incomplete
 
 ## 2) Desktop Shell Contract (Updated 2026-07-12)
 
@@ -71,7 +72,7 @@ Historical migration sequence: `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md`
 
 | Phase | Goal | Status |
 |---|---|---|
-| 0 | Documentation contract reset | Completed; Plan 6 is correcting residual active-doc drift |
+| 0 | Documentation contract reset | Complete |
 | 1 | Keep PTY/process lifecycle usable independently of render surface | Core backend live; optional egui renderer still retained for legacy compatibility |
 | 2 | Static Dioxus shell skeleton | Complete foundation |
 | 3 | Dioxus Desktop launch scaffold + live terminal bridge (PTY → xterm.js) | Live host/bridge foundation; operational hardening continues |
@@ -116,8 +117,8 @@ MCP, hooks, sockets, files, generated commands, or mediated PTY operations. Simi
 capabilities do not imply identical enforcement.
 
 Desktop platform identity is registry-backed across MCP, host, runtime, and snapshots, and Ion is
-a builtin launchable platform. This is verified local implementation truth; publishing a remote
-release remains a separate operation.
+a builtin launchable platform. Repository tests exercise that implementation; release packaging
+and distribution remain separate contracts.
 
 A future adapter contract must report required, optional, emulated, and unsupported operations plus
 enforcement strength. Mandatory role requirements must eventually block an incompatible launch;
@@ -127,66 +128,26 @@ advisory degradation must be visible. The schema is reserved for the hierarchy/e
 
 ### CLI Contract (Stable)
 
-Primary commands that must remain documented and regression-tested:
+The executable command registry is defined by Clap in `impulse-rs/src/cli.rs` and exposed by
+`impulse-rs --help`. The current public commands are:
 
-**Session lifecycle:**
-- `session-start`
-- `session-end --verify`
-- `track-write`
-- `track-tool`
+- **Lifecycle and state:** `daemon`, `run`, `init`, `session-start`, `session-end`, `track-write`,
+  `track-tool`, `list-sessions`, `session-info`, `session-conflicts`, `status`, `debug`,
+  `conflict-history`, `history`, `genome`, `add-decision`, `activity`, `summary`, `health`,
+  `system`, `analyze`, `config`
+- **Context, memory, and coordination:** `chat`, `orchestrate`, `handoff`, `sync-context`,
+  `compute-injection`, `verify`, `search-history`, `search-genome`, `index-memory`,
+  `retrieval-status`, `steward`, `swarm`
+- **Agent and platform integration:** `hooks`, `validate-hooks`, `list-providers`,
+  `agent-configure`, `agent-status`, `agent-query`, `guard`, `ion-verify`, `mcp serve`
+- **Tools and content:** `tools`, `tooling-list`, `tooling-describe`, `tooling-run`,
+  `tooling-schema`, `tooling-validate`, `tooling-reload`, `docs`, `model`, `office`,
+  `credentials`, `extract`, `calc`, `exec`
+- **Build and source operations:** `sweep`, `wipe`, `clean-all`, `sccache-setup`, `build-health`,
+  `sem-diff`, `sem-blame`, `sem-impact`, `sem-status`, `analytics`
+- **Machine-readable extension surfaces:** `describe`, `schema`, `plugin-list`, `plugin-invoke`
 
-**Info and status:**
-- `status`
-- `history`
-- `genome`
-- `activity`
-- `summary`
-- `health`
-- `system`
-- `analyze`
-
-**Retrieval and search:**
-- `index-memory`
-- `search-history`
-- `search-genome`
-- `retrieval-status`
-
-**Orchestration and context:**
-- `orchestrate`
-- `handoff`
-- `sync-context`
-- `hooks`
-- `verify`
-
-**Stewardship:**
-- `steward` (subcommands: status, analyze, compact, approve, reject)
-
-**Tool and model management:**
-- `tools` (subcommands: list, init, update)
-- `docs` (subcommands: list, fetch)
-- `model`
-- `credentials` (subcommands: set, get, list, proxy)
-
-**Build hygiene:**
-- `sweep` — clean build artifacts
-- `wipe` — deep clean including caches
-- `clean-all` — comprehensive workspace cleanup
-- `sccache-setup` — configure shared compilation cache
-- `build-health` — report build system health metrics
-
-**Dynamic tooling:**
-- `tooling-list` — list registered dynamic tools
-- `tooling-describe` — describe a specific tool's schema and capabilities
-- `tooling-run` — execute a dynamic tool by name with parameters
-
-**Supervisor:**
-- `panes` — list active terminal panes with context summaries
-
-**Utilities:**
-- `calc`
-- `exec`
-- `run` (TUI mode)
-- `config`
+The exact direct/daemon support matrix and flags live in [`docs/CLI-COMMANDS.md`](../CLI-COMMANDS.md).
 
 ### State and Artifact Contract
 
@@ -331,12 +292,12 @@ The daemon exposes a JSON-line Unix socket protocol (`impulse.sock`). Full spec:
 | Session lifecycle tracking | Implemented | `session-start`, `session-end` | Rust unit + integration |
 | File/tool activity tracking | Implemented | `track-write`, `track-tool` | Rust unit + integration |
 | ratatui TUI tabs | Implemented | `run` TUI mode | Rust UI tests |
-| Daemon socket operations | Implemented | `daemon`, `--daemon ...` | Daemon tests |
+| Daemon socket operations | Implemented for selected commands | `daemon`, CLI matrix IPC entries | Daemon tests |
 | Context-aware chat (daemon) | Implemented | `--daemon chat` | Daemon + provider tests |
 | Hook config generation | Implemented | `hooks --platform ...` | Integration tests |
 | Orchestration handoff/context files | Implemented | `orchestrate`, `handoff`, `sync-context` | Rust tests |
 | Verification gate | Implemented | `verify`, `session-end --verify` | Rust tests |
-| Agent harness | Implemented (2026-03-31) | Multiple IPC endpoints | Rust tests |
+| External agent-assistance harness | Implemented foundation | Agent assistance/review IPC endpoints | Rust tests |
 | Retrieval indexing + keyword search | Implemented | `index-memory`, `search-history`, `search-genome` | Rust unit + integration |
 | Semantic search (feature-flagged) | Implemented (fallback-safe) | `search-* --mode semantic` | Rust unit + integration |
 | Review-first context injection | Implemented (additive) | daemon chat + orchestrate/handoff/sync-context | Rust unit + integration |
@@ -345,7 +306,7 @@ The daemon exposes a JSON-line Unix socket protocol (`impulse.sock`). Full spec:
 | Credential management | Implemented | `credentials` | Rust unit |
 | PTY/process lifecycle | Implemented | `impulse-term::TerminalBackend`, desktop runtime | Rust unit + integration |
 | Daemon workbench truth | Implemented foundation | `ProjectOpsSnapshot`, terminal telemetry overlay, workbench IPC | Ops/daemon/desktop tests |
-| Supervisor-specific policy | Implemented | `SupervisorPermissionPolicy`, `RunSupervisorAction` | Ops + daemon tests |
+| Supervisor-specific action policy | Implemented foundation | `SupervisorPermissionPolicy`, `RunSupervisorAction` | Ops + daemon tests |
 | Ion native coding runtime | Implemented foundation | `ion` REPL, provider/tool loop, approvals/guardrails | Rust unit + CLI tests |
 | Registry-backed open desktop platform identity | Implemented foundation | `AgentRegistry`, `AgentPlatformId`, desktop/MCP/host | Registry + desktop tests |
 | General role contract | Direction, not implemented | Future ADR | Not applicable |
@@ -416,7 +377,7 @@ When adding/changing CLI commands, hooks, state files, or roadmap stage definiti
 | Tooling | ≥2.0 | ~17.1 | MET |
 | Integration | Every stable CLI command | 26 tests | PARTIAL |
 
-**Workspace totals (2026-07-12 canonical projection):** 1,948 tests across the 5 workspace crates/packages (impulse-rs 1,574, ops 44 including the canonical-checkout archive proof, term 114, desktop 193, ion 23); 9 ignored, 0 failed. The verified isolated worktree without the gitignored reconciliation archive reports 1,947 passed with that one proof explicitly filtered.
+**Workspace totals (2026-07-12 canonical projection):** 1,950 tests across the 5 workspace crates/packages (impulse-rs 1,576, ops 44 including the canonical-checkout archive proof, term 114, desktop 193, ion 23); 9 ignored, 0 failed. The verified isolated worktree without the gitignored reconciliation archive reports 1,949 passed with that one proof explicitly filtered.
 
 ### Required Test Patterns
 

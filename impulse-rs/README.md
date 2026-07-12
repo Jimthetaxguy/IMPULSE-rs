@@ -3,7 +3,7 @@
 **Feed the impulse to build.**
 
 This directory contains the canonical Rust implementation of Impulse: a terminal-native local
-control plane and harness manager for AI software-engineering agents. It launches and supervises
+control plane and harness manager for AI software-engineering agents. It launches and monitors
 external coding CLIs, provides the Impulse-native Ion runtime, and supplies shared platform
 services such as memory, tools, telemetry, artifacts, policy, credentials, and verification.
 
@@ -15,7 +15,8 @@ contract.
 ## Operator surfaces
 
 - **Dioxus cockpit:** `impulse-desktop` is the live, feature-gated desktop path. Dioxus and
-  xterm.js render the system; typed Rust host/runtime contracts and the daemon remain authoritative.
+  xterm.js render the system; typed Rust contracts, daemon snapshots, runtime state, and scoped
+  persistence remain authoritative.
 - **ratatui workbench:** the root crate provides the terminal-native TUI.
 - **CLI and hooks:** short-lived commands initialize projects, track sessions, validate hooks, and
   query or update daemon-owned state.
@@ -58,7 +59,9 @@ and retained only for compile maintenance while Dioxus owns the current desktop 
 
 ## Authority boundaries
 
-- The daemon owns durable project/workbench truth.
+- The daemon owns live control-plane and workbench snapshots while it is running.
+- Project-scoped persistence owns durable history, decisions, configuration, and artifacts across
+  process restarts.
 - PTY runtimes own process and terminal mechanics, then publish structured facts.
 - Dioxus owns presentation and operator input, not policy or persistence.
 - Roles describe behavioral obligations and permissions; runtimes are the engines that execute
