@@ -1,8 +1,8 @@
 ---
 title: Documentation Index
 description: Master navigation hub for Impulse documentation
-version: '1.2'
-updated: 2026-06-30
+version: '1.3'
+updated: 2026-07-12
 type: doc
 category: navigation
 phase: all
@@ -20,10 +20,13 @@ authors:
 # Documentation Index — Impulse
 
 > **Master navigation hub.** Find any document by category, phase, or topic.
-> **Quick start:** Read [`spec/RUST-CANONICAL-CONTRACT.md`](spec/RUST-CANONICAL-CONTRACT.md) first.
+> **Quick start:** Read the living product north star [`../VISION.md`](../VISION.md), then the
+> current implementation contract [`spec/RUST-CANONICAL-CONTRACT.md`](spec/RUST-CANONICAL-CONTRACT.md).
 >
 > **Canonical stack: Rust (impulse-rs)**
-> **Roadmap contract: Now=Rust core + Dioxus desktop host, Next=Dioxus Desktop launch scaffold + terminal bridge parity, Later=daemon parity + artifact polish**
+> **Current roadmap:** Now=control-plane foundations + local integration, Next=one governed
+> supervisor/builder vertical slice + hierarchy/enforcement ADR, Later=general roles + negotiated runtimes.
+> **Validator compatibility marker (historical wording): Roadmap contract: Now=Rust core + Dioxus desktop host, Next=Dioxus Desktop launch scaffold + terminal bridge parity, Later=daemon parity + artifact polish**
 > **Collaboration playbook:** [`guides/COLLABORATIVE-AGENTIC-CODING.md`](guides/COLLABORATIVE-AGENTIC-CODING.md)
 > **Risk register:** [`HONEST-ROADMAP.md`](HONEST-ROADMAP.md) stays canonical for unvalidated assumptions.
 
@@ -51,6 +54,17 @@ authors:
 | [HONEST-ROADMAP.md](HONEST-ROADMAP.md)                        | **⚠️ READ THIS FIRST** — Limitations, unvalidated assumptions, corrections | all   |
 | [COMPETITIVE-POSITIONING.md](spec/COMPETITIVE-POSITIONING.md) | Market analysis and differentiation                                        | all   |
 | [PERFORMANCE-TARGETS.md](spec/PERFORMANCE-TARGETS.md)         | Performance budgets and benchmarks                                         | 1-2   |
+
+### Product North Star and Boundaries
+
+| Document | Description |
+| --- | --- |
+| [VISION.md](../VISION.md) | **Living product north star:** control-plane promise, hierarchy, live-versus-target boundary, and complete vertical slice |
+| [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) | Authoritative contract for current implemented behavior |
+| [ARCHITECTURE-CLARIFICATION.md](ARCHITECTURE-CLARIFICATION.md) | Current code boundary matrix and enforcement truth |
+
+Do not split separate role/runtime/supervisor schema documents until the hierarchy, adapter, and
+enforcement-strength ADR decisions listed in `VISION.md` are resolved.
 
 ### Architecture Decisions (ADRs)
 
@@ -145,6 +159,7 @@ See [research/README.md](research/README.md) for reading sequences by phase.
 
 | Document                                              | Topic                   |
 | ----------------------------------------------------- | ----------------------- |
+| [VISION.md](../VISION.md)                             | Living control-plane product north star |
 | [CLI-ARCHITECTURE.md](vision/CLI-ARCHITECTURE.md)     | Future CLI architecture |
 | [TUI-AUGMENTATION-VISION.md](archive/TUI-AUGMENTATION-VISION.md) | Historical UI augmentation reference |
 | [DYNAMIC-CLI-VISION.md](vision/DYNAMIC-CLI-VISION.md) | Dynamic CLI concepts    |
@@ -175,14 +190,14 @@ Older Ralph loop plans are preserved for provenance only. Use `ROADMAP-PLAN.md`,
 
 Start here:
 
-1. [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) — **Start here** - Product contract and interfaces
-2. [USER-STORY-MAP.md](spec/USER-STORY-MAP.md) — Current user stories and acceptance criteria
-3. [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md) — Current automated coverage and known gaps
-4. [AGENTS.md](../AGENTS.md) — Current architecture and operational guidance
-5. [COLLABORATIVE-AGENTIC-CODING.md](guides/COLLABORATIVE-AGENTIC-CODING.md) — Agent lane, worktree, and handoff rules
-6. [ROADMAP-PLAN.md](ROADMAP-PLAN.md) — Current roadmap and desktop progress baseline
-7. [plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md](plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md) — Historical desktop migration context
-8. [EFFICIENCY-ANALYSIS.md](research/EFFICIENCY-ANALYSIS.md) — Implementation patterns
+1. [VISION.md](../VISION.md) — **Start here** - Product north star and live-versus-target boundary
+2. [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) — Current product contract and interfaces
+3. [ARCHITECTURE-CLARIFICATION.md](ARCHITECTURE-CLARIFICATION.md) — Current code boundary matrix
+4. [USER-STORY-MAP.md](spec/USER-STORY-MAP.md) — Current user stories and acceptance criteria
+5. [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md) — Current automated coverage and known gaps
+6. [AGENTS.md](../AGENTS.md) — Current architecture and operational guidance
+7. [COLLABORATIVE-AGENTIC-CODING.md](guides/COLLABORATIVE-AGENTIC-CODING.md) — Agent lane, worktree, and handoff rules
+8. [ROADMAP-PLAN.md](ROADMAP-PLAN.md) — Current roadmap and desktop progress baseline
 9. [BEST-PRACTICES.md](guides/BEST-PRACTICES.md) — Coding conventions
 
 ### Next: Dioxus Desktop Launch Scaffold + Live Terminal Bridge

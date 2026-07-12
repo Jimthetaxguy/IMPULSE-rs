@@ -1,24 +1,36 @@
-# Impulse
+# IMPULSE — Feed the impulse to build.
 
-**Your AI remembers. Silently.**
+**One governed cockpit for many coding agents.**
 
-Impulse is a terminal-native sidecar for AI coding agents that preserves session continuity across tools and conversations. It tracks what you do, remembers what you decided, and injects relevant context into future sessions — automatically.
+Impulse names both the creative urge to make something and the force that sets work in motion. The product exists to protect that first spark, then help it compound across agents, tools, projects, and sessions instead of dissolving into terminal sprawl and repeated context setup.
+
+Everyone has felt it: the itch to open Claude Code or Codex and disappear into a build. Impulse is built for that moment.
+
+Impulse is a terminal-native **local control plane and harness manager** for AI software-engineering agents. It launches or attaches heterogeneous coding runtimes, places them in explicit workspaces, supervises their processes, and augments them with shared memory, tools, telemetry, artifacts, policy, and verification.
+
+Claude Code, Codex, and similar CLIs keep their own internal coding loops. Ion is the Impulse-native coding runtime. Impulse governs the operating conditions around those loops; it does not claim to replace or fully control proprietary runtime internals.
+
+**Live foundation:** the Rust workspace already provides PTY lifecycle, daemon workbench contracts, supervisor-specific permissions, capability-checked tools, memory/retrieval, artifacts, credentials, verification, and Ion's native REPL/tool loop. Local aggregate work adds registry-backed desktop platform identity and daemon-truth telemetry. **Target:** runtime-independent role contracts, adapter capability negotiation, typed agent messaging, and stronger structural enforcement across supported runtimes. See [`VISION.md`](VISION.md) for the north star and explicit live-versus-target boundary.
 
 ## Why
 
-AI coding agents (Claude Code and Codex) forget everything between sessions. You re-explain your architecture, re-discover your preferences, and re-learn your codebase patterns every time. Impulse fixes that. Legacy OpenCode compatibility exists for older projects, but OpenCode is no longer a peer active platform.
+Using several coding agents today usually means several unrelated terminals, permission models, context stores, and completion claims. Impulse brings those runtimes into one observable environment while preserving their terminal-native workflows. Persistent memory solves continuity; the wider control plane solves launch, isolation, coordination, intervention, and evidence-backed completion.
 
 ## What It Does
 
-- **Session tracking** — Automatically records files touched, tools used, and decisions made
+- **Managed agent terminals** — Spawns, monitors, writes to, resizes, focuses, and closes PTY-backed agent processes inside explicit workspace roots
+- **Daemon workbench truth** — Serves the authoritative agent, context, artifact, and intervention snapshot over versioned IPC
+- **Role and policy foundations** — Enforces a concrete supervisor permission policy today; generalized runtime-independent role contracts are the next control-plane boundary
+- **Typed platform tools** — Exposes capability-checked Rust tools through native registries, MCP, and runtime-specific bridges
+- **Session tracking** — Records files touched, tools used, and decisions made
 - **Persistent memory** — Project genome (decisions/preferences) and session history survive across sessions
 - **Context injection** — Relevant past context is surfaced in new sessions via review-first injection
-- **Multi-agent awareness** — Tracks which tools are active and what they're working on
+- **Multi-agent observability** — Tracks active agents, tasks, terminal telemetry, delegations, and intervention recommendations
 - **Retrieval search** — FTS5 keyword search + semantic search across session history and genome
 - **Context stewardship** — Monitors context window usage and proposes cleanup strategies
-- **Daemon + TUI** — Long-running daemon with 9-tab interactive terminal UI
-- **Platform hooks** — Auto-generated hooks for Claude Code and Codex, with legacy OpenCode compatibility preserved where already implemented
-- **Impulse as always-on tech lead** — Manages/monitors/augments terminal CLI-TUI agents (claude-code, codex, cursor cli and similar) that login/attach to it. The light UI lets you pick and cycle across multiple project folders/workspaces and run one or many agents per space in one interface. Wired agents are augmented with extra tools/capabilities via Rust type-safe built-in plugins. Subagents and workflows are used to scale capabilities while reducing per-agent load on the machine. (See also CONTEXT.md, HANDBOOK ImpulseAgent, and docs/decisions/0009.)
+- **Artifacts and verification** — Separates worker claims from observed build/test evidence and reviewable outputs
+- **Credential services** — Selects configured credential providers without treating secret values as agent memory
+- **External + native runtimes** — Wraps terminal CLIs and provides Ion's direct model/tool loop in the same product
 
 ## Quick Start
 
@@ -44,20 +56,30 @@ cargo run -- run
 
 ## Architecture
 
-```
-Direct Mode (per-action, stateless)     Daemon Mode (long-running)
-  Claude Code/Codex hooks                 TUI, interactive chat
-  read -> process -> write -> exit        Unix socket IPC
-                    |
-                    v
-            .impulse/ directory
-  HISTORY.jsonl  GENOME.md  config.json  LIVE_STATE.json
-  retrieval.db   context/*  injections/*
+```text
+ Dioxus cockpit / ratatui / CLI
+              |
+              v
+ Impulse daemon + control-plane contracts
+              |
+    +---------+----------+----------------+
+    |                    |                |
+ PTY/processes      platform registry  shared services
+    |                                  memory, tools,
+    |                                  telemetry, policy,
+    |                                  artifacts, verification
+    +----------+-------------------------+
+               |
+      +--------+---------+
+      |                  |
+ external CLI runtimes   Ion native runtime
+ Claude, Codex, ...      direct model + tool loop
 ```
 
-- **Direct mode:** Each hook invocation reads state, processes, writes, and exits. Sub-millisecond.
-- **Daemon mode:** Long-running process with Unix socket IPC for TUI and chat workflows.
-- **File-based persistence:** All state lives in `.impulse/` — human-readable, git-trackable.
+- **Direct mode:** A short-lived hook path reads state, processes one action, persists its result, and exits.
+- **Daemon mode:** The long-running coordination point for workbench state, agent requests, telemetry, artifacts, and supervisor actions.
+- **Desktop mode:** Dioxus + xterm.js is the cockpit. It renders state and sends commands; backend contracts remain authoritative.
+- **Persistence:** Durable records include human-readable JSONL/Markdown/config artifacts, while SQLite indexes and ephemeral daemon/runtime state are intentionally not all human-readable or git-tracked.
 
 ## Key Commands
 
@@ -78,26 +100,33 @@ See `cargo run -- --help` for the full command list.
 
 - **Language:** Rust
 - **TUI:** ratatui + crossterm (canonical operator path)
-- **Desktop (in progress):** Dioxus Desktop via `impulse-desktop`; egui `impulse-gui` is legacy/frozen for compile-maintenance only; Tauri-shaped code is legacy compatibility only
+- **Desktop:** Dioxus Desktop + xterm.js via `impulse-desktop`; egui `impulse-gui` is legacy/frozen for compile-maintenance only; Tauri-shaped code is legacy compatibility only
 - **Storage:** SQLite (FTS5) + JSONL + Markdown
 - **IPC:** Unix domain sockets
-- **LLM:** Anthropic, OpenAI, Minimax (for daemon chat)
+- **LLM:** Anthropic, OpenAI, and Minimax provider paths for daemon/Ion agent loops
 
 ## Project Structure
 
 ```
 impulse-rs/          # Rust implementation (canonical)
+  impulse-ops/       # Shared control-plane protocol, workbench, policy, artifact models
+  impulse-term/      # PTY lifecycle, parser, write queue, terminal context
+  impulse-desktop/   # Dioxus cockpit, host bridge, workspace/runtime/MCP adapters
+  impulse-ion/       # Ion harness contract + adapter crate
   src/
     main.rs          # CLI entry + command routing
     storage/         # Atomic file operations
     state/           # In-memory state + dirty flag sync
     daemon/          # Unix socket server
-    agent/           # LLM provider abstraction
+    agent/           # External harness coordination
+    ion_repl/        # Impulse-native coding-agent runtime
+    llm_backends/    # Direct model provider/tool-loop boundary
     retrieval/       # FTS5 + semantic search
     injection/       # Context injection engine
     stewardship/     # Context window management
     token_tracker/   # Token tracking algorithm
     credentials/     # Keychain + socket proxy
+    tooling/         # Capability-checked dynamic tools
     tools/           # Tool management + utilities
     docs/            # Documentation fetcher
     ui/              # TUI rendering
@@ -110,6 +139,7 @@ memory-pipeline/     # Python research tooling
 
 ## Documentation
 
+- **Product north star:** [`VISION.md`](VISION.md)
 - **Start here:** [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
 - **User stories:** [`docs/spec/USER-STORY-MAP.md`](docs/spec/USER-STORY-MAP.md)
 - **Test traceability:** [`docs/spec/TEST-TRACEABILITY.md`](docs/spec/TEST-TRACEABILITY.md)

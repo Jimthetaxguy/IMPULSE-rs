@@ -1,8 +1,8 @@
 ---
 title: Rust Canonical Product Contract
 description: Authoritative product contract for Impulse based on impulse-rs
-version: '1.7'
-updated: 2026-05-22
+version: '1.8'
+updated: 2026-07-12
 type: specification
 category: core
 phase: all
@@ -20,19 +20,33 @@ authors:
 
 > **Canonical implementation:** `impulse-rs`
 > **Contract policy:** If a document conflicts with this file, this file wins.
+> **Product north star:** [`../../VISION.md`](../../VISION.md) defines intent and target state;
+> this contract distinguishes what the current implementation actually guarantees.
 
 ## 1) Product Purpose
 
-Impulse is a terminal-native sidecar for AI coding agents that preserves session continuity across direct hook invocations and daemon/TUI workflows. The Impulse Agent acts as an always-on tech lead managing other agents. Terminal CLI-TUI agents (claude-code, codex cli, cursor cli, grok build equivalents, etc.) login/attach and continue acting normally; Impulse manages/monitors/augments context for them. The (light) UI supports picking/cycling multiple project folders and workspaces in one place so you can move across one or many project spaces and one or many agents per space without switching interfaces. Agents wired to Impulse receive extra tools/capabilities as built-in type-safe Rust plugins/extensions. Subagents + workflows are leveraged to scale and to reduce machine load from coding agents.
+Impulse is a terminal-native **local control plane and harness manager** for AI
+software-engineering agents. It launches or attaches coding runtimes, supervises their operating
+conditions, and provides shared memory, tools, telemetry, messaging/handoffs, policy, credentials,
+artifacts, and verification. Claude Code, Codex, and similar CLIs retain their proprietary internal
+loops; Ion is the Impulse-native direct-provider/tool-loop runtime.
+
+The Dioxus application, ratatui TUI, and CLI are operator surfaces. They project and command the
+system; the Rust daemon, shared `impulse-ops` models, runtime/PTY state, and scoped persistence are
+authoritative. Impulse does not claim full structural control over unsupported internals of an
+external runtime.
 
 Core outcomes:
-- Persistent project memory (`GENOME`, session history, active state)
+- Governed launch and PTY/process lifecycle for coding-agent runtimes
+- Daemon-owned, inspectable workbench truth for agents, context, interventions, and artifacts
+- Persistent project memory (`GENOME`, session history, active state) with review-first injection
 - Cross-session continuity for Claude Code and Codex integrations, with legacy OpenCode compatibility preserved where already implemented
+- Capability-checked platform tools and supervisor-specific permission/confirmation policy
 - Operationally safe session lifecycle with verification-before-completion gates
-- Human-visible observability through CLI, ratatui TUI, and a Dioxus Desktop shell (in migration)
+- Human-visible observability through CLI, ratatui TUI, and the Dioxus Desktop cockpit
 - Multi-workspace + multi-agent orchestration surface (observable registration and launch/monitoring of agents across project spaces)
 
-## 2) Desktop Shell Contract (Updated 2026-06-14)
+## 2) Desktop Shell Contract (Updated 2026-07-12)
 
 > **This section supersedes all prior references to the EGUI workbench as the active desktop product.**
 
@@ -43,7 +57,7 @@ Core outcomes:
 | Desktop host | Dioxus Desktop |
 | UI framework | Dioxus (rsx! components, signals, host adapter) |
 | Terminal rendering | xterm.js (mounted via Dioxus eval(), fed by host events) |
-| PTY / session backend | impulse-term (TerminalBackend, WriteQueue) — unchanged |
+| PTY / session backend | `impulse-term` (`TerminalBackend`, parser, `WriteQueue`) plus desktop runtime lifecycle |
 | Standalone operator TUI | ratatui — first-class, preserved throughout migration |
 | **Legacy desktop surface** | **egui / impulse-gui — FROZEN. No new features. Sunset after parity.** |
 | **Legacy host adapter** | **Tauri-shaped command/event bridge — compatibility only, not the next product scaffold.** |
@@ -58,10 +72,10 @@ Historical migration sequence: `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md`
 | Phase | Goal | Status |
 |---|---|---|
 | 0 | Documentation contract reset | Completed; Plan 6 is correcting residual active-doc drift |
-| 1 | Remove eframe from impulse-term, confirm framework-neutral core | Pending |
-| 2 | Static Dioxus shell skeleton | Partial: `impulse-desktop` Dioxus shell + typed bridge scaffold |
-| 3 | Dioxus Desktop launch scaffold + live terminal bridge (PTY → xterm.js) | Pending |
-| 4 | Daemon integration and parity | Pending; `impulse-gui` is already frozen for new features |
+| 1 | Keep PTY/process lifecycle usable independently of render surface | Core backend live; optional egui renderer still retained for legacy compatibility |
+| 2 | Static Dioxus shell skeleton | Complete foundation |
+| 3 | Dioxus Desktop launch scaffold + live terminal bridge (PTY → xterm.js) | Live host/bridge foundation; operational hardening continues |
+| 4 | Daemon-backed workbench truth | Live snapshot/telemetry foundation; multi-workspace routing remains incomplete |
 
 ## 3) Canonical Scope and Roadmap
 
@@ -69,15 +83,44 @@ Historical migration sequence: `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md`
 
 | Stage | Focus | Status |
 | --- | --- | --- |
-| **Now** | Rust memory core + hooks + retrieval/injection + Dioxus desktop host | Active |
-| **Next** | Dioxus Desktop launch scaffold + terminal bridge hardening | Active |
-| **Later** | Daemon parity in desktop shell + agent control + artifact polish | Planned |
+| **Now** | Rust control-plane foundation: daemon truth, PTY lifecycle, memory/tools/policy/artifacts, Dioxus cockpit, Ion native runtime | Active |
+| **Next** | Preserve registry-backed runtime identity, prove one governed supervisor + builder vertical slice, and define hierarchy/enforcement ADR | Active |
+| **Later** | General role contracts, runtime capability negotiation, typed agent messaging, and multi-project supervisor attention | Planned |
 
 ### Out of Scope for Current Contract
 - Full SWARM semantic injection runtime
 - Web UI or non-Rust dashboard surfaces
-- Structural blocking before hook validation evidence exists
+- Claims that every external runtime is structurally governed or capability-equivalent
+- A generalized role/runtime schema before the hierarchy and enforcement ADR lands
 - New egui features (egui is legacy/frozen)
+
+### Control-Plane Object Model
+
+| Concept | Contract meaning | Current implementation boundary |
+| --- | --- | --- |
+| Role | Obligations, permissions, tools, context, communication, and verification duties | Narrow coordinator/worker `AgentRole` plus concrete `SupervisorPermissionPolicy`; general role contract is not implemented |
+| Runtime | External harness or native engine that executes a role | External agent harness calls, desktop PTY runtime, and Ion native provider/tool loop; no common adapter trait yet |
+| Agent instance | One running identity with runtime, role, scope, process state, and telemetry | `AgentRuntime`/`AgentRuntimeSnapshot` and desktop runtime records |
+| Session | Bounded persisted work history | Daemon session lifecycle and `.impulse/` history/state |
+| Task | Assignment plus acceptance/verification criteria | Delegation/current-task/Ion harness carriers; not yet one canonical task model |
+| Pane | Cockpit view/input attachment | TUI panes and desktop terminal ids; never an authority boundary |
+| Workspace target | Explicit filesystem execution root | Desktop `WorkspaceTarget`/`WorkspaceRegistry` |
+| Project | Governance scope for memory, artifacts, policy, and verification | Project-scoped `.impulse/` state and `ProjectOpsSnapshot`; often maps 1:1 to a workspace today |
+
+### Platform Service Contract
+
+Memory/retrieval, tools, telemetry, messaging/handoffs, policy, credentials, artifacts, and
+verification are peer control-plane services. A runtime may receive them through native typed calls,
+MCP, hooks, sockets, files, generated commands, or mediated PTY operations. Similar conceptual
+capabilities do not imply identical enforcement.
+
+The pending local aggregate makes desktop platform identity registry-backed, carries that catalog
+through MCP/host/runtime/snapshots, and launches Ion as a builtin platform. Until that aggregate is
+integrated, treat it as preserved local implementation rather than remote-release truth.
+
+A future adapter contract must report required, optional, emulated, and unsupported operations plus
+enforcement strength. Mandatory role requirements must eventually block an incompatible launch;
+advisory degradation must be visible. The schema is reserved for the hierarchy/enforcement ADR.
 
 ## 4) Public Interface Contract
 
@@ -299,14 +342,25 @@ The daemon exposes a JSON-line Unix socket protocol (`impulse.sock`). Full spec:
 | Context stewardship | Implemented | `steward` | Rust unit + integration |
 | Tool management | Implemented | `tools` | Rust unit |
 | Credential management | Implemented | `credentials` | Rust unit |
-| **Dioxus desktop shell** | **In migration; scaffold partial** | Dioxus Desktop + xterm.js | Pending launch scaffold + live bridge parity |
+| PTY/process lifecycle | Implemented | `impulse-term::TerminalBackend`, desktop runtime | Rust unit + integration |
+| Daemon workbench truth | Implemented foundation | `ProjectOpsSnapshot`, terminal telemetry overlay, workbench IPC | Ops/daemon/desktop tests |
+| Supervisor-specific policy | Implemented | `SupervisorPermissionPolicy`, `RunSupervisorAction` | Ops + daemon tests |
+| Ion native coding runtime | Implemented foundation | `ion` REPL, provider/tool loop, approvals/guardrails | Rust unit + CLI tests |
+| Registry-backed open desktop platform identity | Pending aggregate implementation | `AgentRegistry`, `AgentPlatformId`, desktop/MCP/host | Registry + desktop tests on aggregate branch |
+| General role contract | Direction, not implemented | Future ADR | Not applicable |
+| Common runtime adapter + capability negotiation | Direction, not implemented | Future ADR | Not applicable |
+| Typed cross-agent message bus | Partial delegations/handoffs only | `delegation`, `orchestration`, daemon contracts | Rust tests |
+| **Dioxus desktop shell** | **Live host/bridge foundation; hardening continues** | Dioxus Desktop + xterm.js | Desktop contract/host tests + smoke |
 | **Tauri-shaped host adapter** | **LEGACY — compatibility only** | Optional gated bridge | Remove after Dioxus host command/event parity |
 | **egui operator workbench** | **LEGACY — frozen** | `impulse-gui` (compile-only) | Legacy tests only |
 | SWARM semantic coordination runtime | Planned | Future orchestration engine | Not started |
 
-## 6) Primary Platform And Legacy Compatibility Contract
+## 6) Runtime Platform And Legacy Compatibility Contract
 
-Claude Code and Codex are the current primary coding-agent platforms for active Impulse work. OpenCode support is legacy compatibility: preserve existing behavior unless a removal plan explicitly owns migration risk, but do not treat OpenCode as a peer platform for new roadmap work.
+Claude Code and Codex are the current primary external coding-agent platforms for active Impulse
+work; Ion is the native runtime. OpenCode support is legacy compatibility: preserve existing
+behavior unless a removal plan owns migration risk, but do not treat legacy presence as proof of
+active parity.
 
 | Area | Claude Code | Codex | OpenCode legacy compatibility | Contract Expectation |
 | --- | --- | --- | --- | --- |
@@ -316,11 +370,17 @@ Claude Code and Codex are the current primary coding-agent platforms for active 
 | Session end verification (`--verify`) | Required | Required where hook integration exists | Preserve existing generated command | Verification remains required for active platforms |
 | Context handoff artifacts | Shared `.impulse/context/*` | Shared `.impulse/context/*` | Shared `.impulse/context/*` | Handoff artifacts stay platform-neutral |
 
+External runtime enforcement is limited to the launch environment and supported integration seams.
+The product must not infer that a role is satisfied merely because a prompt was injected or a pane
+was labeled. Ion can support deeper structural enforcement because Impulse owns its tool/model loop,
+but it remains subject to the explicit policies and gaps documented in code and `VISION.md`.
+
 ## 7) Governance and Ownership
 
 ### Contract Ownership
 
 The following files define product truth and must be updated together for contract changes:
+- `VISION.md` (living product north star and target-state boundary)
 - `docs/spec/RUST-CANONICAL-CONTRACT.md` (authoritative contract)
 - `AGENTS.md` (operator-facing guidance)
 - `CLAUDE.md` (project technical context)

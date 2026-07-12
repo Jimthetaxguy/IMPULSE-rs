@@ -11,34 +11,41 @@ authors:
 # AGENTS.md — Impulse
 
 > Guidelines for AI coding agents contributing to this project.
+> Product north star: [`VISION.md`](VISION.md)
 > Contract: [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
 > Collaboration playbook: [`docs/guides/COLLABORATIVE-AGENTIC-CODING.md`](docs/guides/COLLABORATIVE-AGENTIC-CODING.md)
 > Canonical stack: Rust (impulse-rs)
-> Roadmap contract: Now=Rust core + Dioxus desktop host; Next=Dioxus Desktop launch scaffold + terminal bridge parity; Legacy=egui compile-maintenance only; Tauri=legacy compatibility adapter only
+> Current roadmap: Now=control-plane foundations + local branch integration; Next=one governed supervisor/builder vertical slice + hierarchy/enforcement ADR; Legacy=egui compile-maintenance only.
+> Validator compatibility marker (historical wording): Roadmap contract: Now=Rust core + Dioxus desktop host; Next=Dioxus Desktop launch scaffold + terminal bridge parity; Legacy=egui compile-maintenance only; Tauri=legacy compatibility adapter only
 
 ---
 
 ## What This Project Is
 
-Impulse is a **sidecar memory layer** for AI coding agents. It is NOT a coding agent itself.
+Impulse is a terminal-native **local control plane and harness manager** for AI coding agents.
 
 ```
- Coding Agent (Claude Code, Codex; legacy OpenCode compatibility)
-       │
-       │ hooks auto-track files + tools
-       ▼
- Impulse (persists memory across sessions)
+ Dioxus cockpit / TUI / CLI
+              │
+              ▼
+ Impulse daemon + control-plane services
+              │
+       runtime adapters / PTYs
+       ├── external CLI harnesses
+       └── Ion native coding runtime
 ```
 
-**The distinction matters:** Impulse doesn't write code. It remembers what the coding agent did — sessions, file changes, decisions, tool usage — and makes that context available in future sessions.
+Memory is one first-class service, not the whole product. Impulse also owns process lifecycle, workbench truth, capability-checked tools, telemetry, messaging/handoffs, credentials, artifacts, policy, and verification. External runtimes retain their proprietary internal loops; Impulse governs the environment around them.
+
+**Keep these identities separate:** a role defines obligations and permissions; a runtime is the execution engine; an agent instance is one running identity; a session is bounded work history; a task is an assignment and its completion criteria; a pane is only a UI/terminal viewport. Never infer a role from the model, executable, or pane position.
 
 ---
 
-## Desktop Shell Status (as of 2026-06-14)
+## Desktop Shell Status (as of 2026-07-12)
 
 > **egui / impulse-gui is LEGACY.** It is frozen — no new features. It will be removed after the Dioxus desktop host reaches parity.
 
-The chosen desktop stack is **Dioxus Desktop + xterm.js terminal bridge**. Tauri-shaped code is retained only as a temporary compatibility adapter while Dioxus Desktop launch plumbing lands.
+The chosen desktop stack is **Dioxus Desktop + xterm.js terminal bridge**. It is the cockpit, not the source of operational truth: authoritative workbench state and policy live in Rust daemon/control-plane contracts. Tauri-shaped code is retained only as a temporary compatibility adapter.
 
 - See `docs/spec/DESKTOP-SHELL-ARCHITECTURE.md` for canonical layer boundaries
 - See `docs/spec/DESKTOP-STACK-TRADEOFFS.md` for the full option evaluation
@@ -47,7 +54,7 @@ The chosen desktop stack is **Dioxus Desktop + xterm.js terminal bridge**. Tauri
 - See `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md` for historical migration context; do not use it as the next product goal
 - See `docs/plans/EGUI-DECOMMISSION.md` for the active, gated plan to fully remove the egui surface (frozen `impulse-gui` crate + `impulse-term` egui rendering layer) once the Dioxus host is operationally authoritative
 
-**Do not add new code to `impulse-gui`.** If you need to touch `impulse-term`, confirm that `eframe` is not re-introduced as a dependency.
+**Do not add new code to `impulse-gui`.** If you touch `impulse-term`, keep new PTY/process behavior framework-neutral and do not expand its optional egui rendering surface.
 
 ---
 
@@ -93,10 +100,15 @@ Choose the simplest solution that works. Prefer editing existing files over crea
 
 **Execution surfaces:**
 - **Direct** — stateless per-action (hooks). Read → process → write → exit.
-- **Daemon** — long-running with Unix socket IPC (TUI/chat). In-memory state with dirty-flag sync.
-- **Desktop shell** — Dioxus Desktop host target backed by daemon snapshots, Rust host commands, and xterm.js terminal bridge events. Legacy Tauri-shaped adapters remain compatibility-only while the Dioxus host boundary reaches parity.
+- **Daemon/control plane** — long-running Unix socket authority for workbench snapshots, bounded managed-agent turns, supervisor actions, artifacts, and telemetry overlays.
+- **Desktop shell** — Dioxus cockpit backed by daemon snapshots, Rust host commands, PTY lifecycle, and xterm.js events. It must not create a competing state store or policy authority.
 - **ratatui TUI** — standalone terminal-native operator surface. Remains first-class throughout migration.
 - **egui workbench** — LEGACY. Frozen. Compile-maintenance only.
+
+**Live versus direction:**
+- Live foundations include PTY lifecycle, daemon-owned workbench truth, capability-checked tool registries, supervisor-specific permission policy, reviewable artifacts, and Ion's native coding loop.
+- The pending local aggregate makes desktop platform identity registry-driven and adds Ion as a launchable platform while retaining legacy compatibility types.
+- A general `RoleContract`, common runtime-adapter trait, and capability-negotiation contract are product direction, not implemented facts. Do not claim every runtime is structurally governed.
 
 **Data in `.impulse/`:**
 
