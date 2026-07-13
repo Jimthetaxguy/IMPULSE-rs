@@ -133,10 +133,16 @@ legacy GUI compiled with its existing warnings; Dioxus host smoke passed; docume
 136/136 with contract checks; `git diff --check` passed; and Gitleaks found no leaks across all 15
 commits from the PR base.
 
+**Observed canonical-tree integration evidence (2026-07-13):** PR #13 had already been
+squash-merged, and its merged tree matched `92264fc` exactly. The 16 reviewed commits were therefore
+transplanted in order onto current `origin/main` as `agent/governed-role-launch-pr`. The unfiltered
+canonical suite passed 1,996 tests with 9 ignored and 0 filtered; documentation remained 136/136;
+`git diff --check` passed; and Gitleaks found no leaks in the 16-commit PR range.
+
 ## Review and Integration
 
 - [x] Generate an SDD review package from base `92264fcccfad6391645be174f3ff0fde4f37eecb` to the implementation tip.
 - [x] Obtain a fresh task-spec review; fix every accepted finding and re-review.
 - [x] Obtain a fresh broad maintainability/security review; fix every accepted finding and re-review.
 - [x] Re-run the full verification gate after the final review fix.
-- [ ] Fast-forward the reviewed linear commit stack onto `agent/control-plane-vision-integration`, push that PR branch, and verify PR #13 remains mergeable and green.
+- [x] Preserve the original feature branch, transplant the reviewed linear stack onto current `origin/main` as `agent/governed-role-launch-pr`, push it, and open follow-up PR #14.
