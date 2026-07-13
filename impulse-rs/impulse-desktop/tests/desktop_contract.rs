@@ -12,11 +12,11 @@ use dioxus::prelude::document::{Document, Eval, EvalError, Evaluator};
 use dioxus::prelude::*;
 use impulse_desktop::ui::{
     agent_focus_bridge_script, agent_launch_bridge_script, apply_desktop_bridge_message,
-    build_governed_agent_spawn_request, builder_role_assignment, desktop_event_bridge_script,
-    mcp_invoke_bridge_script, review_decision_bridge_script, terminal_asset_paths,
-    workspace_registration_bridge_script, BridgeStatusUpdate, DaemonOpsStatusUpdate,
-    DesktopBridgeMessage, DesktopBridgeStateMut, ReviewDecisionUiRequest, XTERM_CSS_PATH,
-    XTERM_FIT_JS_PATH, XTERM_JS_PATH,
+    apply_desktop_bridge_message_with_status, build_governed_agent_spawn_request,
+    builder_role_assignment, desktop_event_bridge_script, mcp_invoke_bridge_script,
+    review_decision_bridge_script, terminal_asset_paths, workspace_registration_bridge_script,
+    BridgeStatusUpdate, DaemonOpsStatusUpdate, DesktopBridgeMessage, DesktopBridgeStateMut,
+    ReviewDecisionUiRequest, XTERM_CSS_PATH, XTERM_FIT_JS_PATH, XTERM_JS_PATH,
 };
 use impulse_desktop::{
     default_builtin_mcp_tools, format_count, status_dot_class, status_label, AgentPlatformId,
@@ -1485,6 +1485,88 @@ fn test_agent_platform_failure_revokes_catalog_and_blocks_governed_preview() {
 
     assert!(agent_platforms.is_empty());
     assert!(governed_launch(&agent_platforms, "codex", "Build it").is_err());
+}
+
+#[test]
+fn test_malformed_agent_platform_catalog_revokes_stale_compatibility_and_recovers() {
+    let mut snapshot = ProjectOpsSnapshot::default();
+    let mut runtime_agents = Vec::new();
+    let mut agent_platforms = Vec::new();
+    let mut workspaces = Vec::new();
+    let mut mcp_tools = Vec::new();
+    let mut review_queue = Vec::new();
+    let mut last_invocations = Vec::new();
+
+    let compatible = DesktopBridgeMessage {
+        kind: "agent_platforms".to_string(),
+        payload: json!({
+            "platforms": [{
+                "id": "codex",
+                "label": "Codex",
+                "command": "codex",
+                "runtime_capabilities": [
+                    { "capability": "workspace.target", "enforcement": "mediated" },
+                    { "capability": "process.lifecycle", "enforcement": "mediated" }
+                ]
+            }]
+        }),
+    };
+    let malformed = DesktopBridgeMessage {
+        kind: "agent_platforms".to_string(),
+        payload: json!({ "platforms": [{ "id": 42 }] }),
+    };
+
+    let initial_status = apply_desktop_bridge_message_with_status(
+        DesktopBridgeStateMut::new(
+            &mut snapshot,
+            &mut runtime_agents,
+            &mut agent_platforms,
+            &mut workspaces,
+            &mut mcp_tools,
+            &mut review_queue,
+            &mut last_invocations,
+        ),
+        compatible.clone(),
+    )
+    .expect("compatible catalog reduces");
+    assert!(initial_status.is_none());
+    assert!(governed_launch(&agent_platforms, "codex", "Build it").is_ok());
+
+    let failure_status = apply_desktop_bridge_message_with_status(
+        DesktopBridgeStateMut::new(
+            &mut snapshot,
+            &mut runtime_agents,
+            &mut agent_platforms,
+            &mut workspaces,
+            &mut mcp_tools,
+            &mut review_queue,
+            &mut last_invocations,
+        ),
+        malformed,
+    )
+    .expect("malformed catalog becomes an explicit degraded status");
+    assert_eq!(
+        failure_status.as_ref().map(|status| status.status.as_str()),
+        Some("agent_platforms_failed")
+    );
+    assert!(agent_platforms.is_empty());
+    assert!(governed_launch(&agent_platforms, "codex", "Build it").is_err());
+
+    let recovery_status = apply_desktop_bridge_message_with_status(
+        DesktopBridgeStateMut::new(
+            &mut snapshot,
+            &mut runtime_agents,
+            &mut agent_platforms,
+            &mut workspaces,
+            &mut mcp_tools,
+            &mut review_queue,
+            &mut last_invocations,
+        ),
+        compatible,
+    )
+    .expect("valid catalog recovers");
+    assert!(recovery_status.is_none());
+    assert!(governed_launch(&agent_platforms, "codex", "Build it").is_ok());
 }
 
 #[test]
