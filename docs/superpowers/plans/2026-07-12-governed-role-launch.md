@@ -112,15 +112,17 @@
 **Interfaces:**
 - Records: product role versus legacy delegation topology, launch capability versus model-internal capability, UI preview versus backend gate, and the next daemon-owned lifecycle slice
 
+**Verification working directory:** repository/worktree root (the directory containing `docs/` and `impulse-rs/`).
+
 - [x] Write ADR-0010 and link it from the decision and documentation indexes.
 - [x] Update the glossary while keeping `CONTEXT.md` within its L0/L1 budget.
 - [x] Mark only explicit task/role preflight and telemetry live; keep supervisor decisions, evidence, and verification in the Next slice.
-- [ ] Run `cargo fmt --all -- --check`.
-- [ ] Run `cargo check --workspace`.
-- [ ] Run `cargo clippy --workspace --all-targets -- -D warnings`.
-- [ ] Run `cargo test --workspace` and record exact totals.
+- [ ] Run `cargo fmt --manifest-path impulse-rs/Cargo.toml --all -- --check`.
+- [ ] Run `cargo check --manifest-path impulse-rs/Cargo.toml --workspace`.
+- [ ] Run `cargo clippy --manifest-path impulse-rs/Cargo.toml --workspace --all-targets -- -D warnings`.
+- [ ] Run `cargo test --manifest-path impulse-rs/Cargo.toml --workspace` and record exact totals.
 - [ ] Run `python3 docs/validate_docs.py --self-test` and `python3 docs/validate_docs.py --all`.
-- [ ] Run `npm run dioxus:host:smoke`.
+- [ ] Run `npm --prefix impulse-rs/impulse-desktop run dioxus:host:smoke`.
 - [ ] Run `git diff --check` and a focused secret scan.
 - [ ] Commit exact implementation/test files first, then exact ADR/documentation files if review indicates a clean split.
 
