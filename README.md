@@ -12,8 +12,8 @@ Claude Code, Codex, and similar CLIs keep their own internal coding loops. Ion i
 
 > **Live foundation:** the Rust workspace provides PTY lifecycle, daemon workbench contracts and
 > telemetry, registry-backed desktop platform identity, supervisor-specific permissions,
-> capability-checked tools, memory/retrieval, artifacts, credentials, verification, and Ion's
-> native REPL/tool loop.
+> explicit product-role/task launch preflight, capability-checked tools, memory/retrieval,
+> artifacts, credentials, verification, and Ion's native REPL/tool loop.
 >
 > **Target:** runtime-independent role contracts, adapter capability negotiation, typed agent
 > messaging, and stronger structural enforcement across supported runtimes. See
@@ -27,7 +27,7 @@ Using several coding agents today usually means several unrelated terminals, per
 
 - **Managed agent terminals** — Spawns, monitors, writes to, resizes, focuses, and closes PTY-backed agent processes inside explicit workspace roots
 - **Daemon workbench truth** — Serves the authoritative agent, context, artifact, and intervention snapshot over versioned IPC
-- **Role and policy foundations** — Enforces a concrete supervisor permission policy today; generalized runtime-independent role contracts are the next control-plane boundary
+- **Role and policy foundations** — Preflights an explicit Builder role/task against conservative launch capabilities and enforces a concrete supervisor permission policy; generalized role composition remains a later boundary
 - **Typed platform tools** — Exposes capability-checked Rust tools through native registries, MCP, and runtime-specific bridges
 - **Session tracking** — Records files touched, tools used, and decisions made
 - **Persistent memory** — Project genome (decisions/preferences) and session history survive across sessions
@@ -58,10 +58,19 @@ cargo run -- run
 cargo run --bin ion
 ```
 
-The live foundation can launch registered PTY runtimes and project their daemon-backed state into the
-cockpit. The complete role-assigned supervisor + builder workflow is the next vertical slice, not
-an undocumented command-line flag. Session, memory, hook, and verification commands remain
-available through `cargo run -- --help`.
+In the Dioxus cockpit, use the governed Builder launch path:
+
+1. Register an existing absolute workspace directory.
+2. Choose a runtime from the current platform catalog.
+3. Enter the required task and inspect each Builder compatibility requirement.
+4. Launch only after the cockpit reports every mandatory requirement satisfied.
+
+Current built-in profiles mediate workspace targeting and process lifecycle. Structural filesystem
+scope is optional and currently unsupported, so the initial Builder profile is allowed but visibly
+degraded. The canonical working directory selects where the process starts; cwd mediation is not a
+filesystem sandbox. The complete supervisor + builder evidence/decision workflow remains the next
+vertical slice. Session, memory, hook, and verification commands remain available through
+`cargo run -- --help`.
 
 ## Architecture
 
