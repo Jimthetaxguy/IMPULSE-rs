@@ -12,10 +12,10 @@ use dioxus::prelude::document::{Document, Eval, EvalError, Evaluator};
 use dioxus::prelude::*;
 use impulse_desktop::ui::{
     agent_focus_bridge_script, agent_launch_bridge_script, apply_desktop_bridge_message,
-    desktop_event_bridge_script, mcp_invoke_bridge_script, review_decision_bridge_script,
-    terminal_asset_paths, workspace_registration_bridge_script, BridgeStatusUpdate,
-    DaemonOpsStatusUpdate, DesktopBridgeMessage, DesktopBridgeStateMut, ReviewDecisionUiRequest,
-    XTERM_CSS_PATH, XTERM_FIT_JS_PATH, XTERM_JS_PATH,
+    builder_role_assignment, desktop_event_bridge_script, mcp_invoke_bridge_script,
+    review_decision_bridge_script, terminal_asset_paths, workspace_registration_bridge_script,
+    BridgeStatusUpdate, DaemonOpsStatusUpdate, DesktopBridgeMessage, DesktopBridgeStateMut,
+    ReviewDecisionUiRequest, XTERM_CSS_PATH, XTERM_FIT_JS_PATH, XTERM_JS_PATH,
 };
 use impulse_desktop::{
     default_builtin_mcp_tools, format_count, status_dot_class, status_label, AgentPlatformId,
@@ -28,13 +28,122 @@ use impulse_desktop::{
     WorkspaceTarget,
 };
 use impulse_ops::{
-    agent_registry::AgentPlatformInfo, AgentRuntime, AgentStatus, ContextHealthSummary,
-    MemorySummary, ProjectOpsSnapshot, RetrievalSummary,
+    agent_registry::AgentPlatformInfo, role_assignment::EnforcementStrength, AgentRuntime,
+    AgentStatus, ContextHealthSummary, MemorySummary, ProjectOpsSnapshot, RetrievalSummary,
 };
 use serde_json::json;
 
 fn platform_id(value: &str) -> AgentPlatformId {
     AgentPlatformId::try_new(value).expect("valid test platform id")
+}
+
+#[test]
+fn test_agent_platform_info_roundtrips_trusted_runtime_capabilities() {
+    let platform: AgentPlatformInfo = serde_json::from_value(json!({
+        "id": "codex",
+        "label": "Codex",
+        "command": "codex",
+        "runtime_capabilities": [
+            { "capability": "workspace.target", "enforcement": "mediated" },
+            { "capability": "process.lifecycle", "enforcement": "mediated" }
+        ]
+    }))
+    .expect("trusted platform capability DTO should deserialize");
+
+    let roundtrip = serde_json::to_value(platform).expect("platform DTO should serialize");
+    assert_eq!(
+        roundtrip["runtime_capabilities"],
+        json!([
+            { "capability": "workspace.target", "enforcement": "mediated" },
+            { "capability": "process.lifecycle", "enforcement": "mediated" }
+        ])
+    );
+}
+
+#[test]
+fn test_builder_role_assignment_requires_mediated_launch_control_and_optional_filesystem_scope() {
+    let assignment = builder_role_assignment().expect("static Builder role profile");
+
+    assert_eq!(assignment.role.as_str(), "builder");
+    assert_eq!(assignment.requirements.len(), 3);
+    assert!(assignment.requirements.iter().any(|requirement| {
+        requirement.capability.as_str() == "workspace.target"
+            && requirement.minimum_enforcement == EnforcementStrength::Mediated
+            && requirement.mandatory
+    }));
+    assert!(assignment.requirements.iter().any(|requirement| {
+        requirement.capability.as_str() == "process.lifecycle"
+            && requirement.minimum_enforcement == EnforcementStrength::Mediated
+            && requirement.mandatory
+    }));
+    assert!(assignment.requirements.iter().any(|requirement| {
+        requirement.capability.as_str() == "filesystem.scoped"
+            && requirement.minimum_enforcement == EnforcementStrength::Structural
+            && !requirement.mandatory
+    }));
+}
+
+#[test]
+fn test_workspace_launcher_renders_required_builder_compatibility_preflight() {
+    let platform: AgentPlatformInfo = serde_json::from_value(json!({
+        "id": "codex",
+        "label": "Codex",
+        "command": "codex",
+        "runtime_capabilities": [
+            { "capability": "workspace.target", "enforcement": "mediated" },
+            { "capability": "process.lifecycle", "enforcement": "mediated" }
+        ]
+    }))
+    .expect("platform DTO");
+    let workspace = WorkspaceEntry::new(WorkspaceTarget::from_root("/tmp/impulse"));
+    let mut vdom = VirtualDom::new_with_props(
+        DesktopShellWithSnapshot,
+        DesktopShellWithSnapshotProps {
+            snapshot: ProjectOpsSnapshot::default(),
+            runtime_agents: Vec::new(),
+            agent_platforms: vec![platform],
+            workspaces: vec![workspace],
+            mcp_tools: Vec::new(),
+            last_invocations: Vec::new(),
+            review_queue: Vec::new(),
+            bridge_status: None,
+            daemon_ops_status: None,
+            initial_view: DesktopView::Terminal,
+        },
+    );
+    vdom.rebuild_in_place();
+
+    let html = dioxus_ssr::render(&vdom);
+    assert!(html.contains("data-field=\"launch-task\""));
+    assert!(html.contains("aria-required=\"true\""));
+    assert!(html.contains(">Task<"));
+    assert!(html.contains(">Builder<"));
+    assert!(html.contains("degraded"));
+    assert!(html.contains("workspace.target"));
+    assert!(html.contains("process.lifecycle"));
+    assert!(html.contains("filesystem.scoped"));
+    assert!(html.contains("required mediated · available mediated"));
+    assert!(html.contains("required structural · available unsupported"));
+    assert!(html.contains("cwd mediation is not a filesystem sandbox"));
+    assert!(html.contains("data-action=\"launch-governed-agent\""));
+    assert!(html.contains("aria-disabled=\"true\""));
+    assert!(html.contains("disabled=\"true\""));
+}
+
+#[test]
+fn test_workspace_launcher_source_never_emits_absent_governed_role_assignment() {
+    let source = include_str!("../src/ui.rs");
+    let panel = source
+        .split("fn WorkspaceLaunchPanel")
+        .nth(1)
+        .and_then(|tail| tail.split("/// New inspector subsection").next())
+        .expect("workspace launcher source");
+
+    assert!(!panel.contains("task: None"));
+    assert!(!panel.contains("role_assignment: None"));
+    assert!(panel.contains("task: Some"));
+    assert!(panel.contains("role_assignment: Some"));
+    assert!(panel.contains("role: None"));
 }
 
 #[derive(Clone, Default)]
@@ -738,6 +847,7 @@ fn test_desktop_event_bridge_script_executes_against_mocked_legacy_host_webview(
         id: platform_id("ion"),
         label: "Ion".to_string(),
         command: "ion".to_string(),
+        runtime_capabilities: Vec::new(),
     }];
     let workspace = WorkspaceEntry::new(WorkspaceTarget {
         root: "/tmp".to_string(),
@@ -1138,6 +1248,7 @@ fn test_workspace_registration_bridge_script_serializes_project_notes() {
 
 #[test]
 fn test_agent_launch_bridge_script_routes_through_audited_mcp_spawn() {
+    let role_assignment = builder_role_assignment().expect("static Builder role profile");
     let script = agent_launch_bridge_script(&AgentSpawnRequest {
         agent_id: Some("codex-live".to_string()),
         session_id: Some("codex-live-session".to_string()),
@@ -1156,8 +1267,8 @@ fn test_agent_launch_bridge_script_routes_through_audited_mcp_spawn() {
         rows: 32,
         cols: 100,
         role: None,
-        task: None,
-        role_assignment: None,
+        task: Some("Implement the governed launcher".to_string()),
+        role_assignment: Some(role_assignment),
         target: None,
     });
 
@@ -1169,6 +1280,11 @@ fn test_agent_launch_bridge_script_routes_through_audited_mcp_spawn() {
     assert!(script.contains(r#""workspace""#));
     assert!(script.contains(r#""root":"/tmp""#));
     assert!(script.contains(r#""project_notes":"registered workspace context""#));
+    assert!(script.contains(r#""task":"Implement the governed launcher""#));
+    assert!(script.contains(r#""role":"builder""#));
+    assert!(script.contains(r#""capability":"workspace.target""#));
+    assert!(script.contains(r#""capability":"process.lifecycle""#));
+    assert!(script.contains(r#""capability":"filesystem.scoped""#));
 }
 
 #[test]
