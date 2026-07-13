@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 pub mod agent_registry;
+pub mod role_assignment;
 
 /// Shared daemon protocol version for GUI/operator workbench compatibility.
 pub const DAEMON_PROTOCOL_VERSION: u32 = 3;
@@ -608,7 +609,10 @@ impl AgentStatus {
     }
 }
 
-/// Role of an agent in a coordinator/worker delegation pattern.
+/// Legacy topology role in a coordinator/worker delegation pattern.
+///
+/// This is intentionally distinct from [`role_assignment::AgentRoleId`], which
+/// identifies an open product-role contract independent of pane topology.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRole {
@@ -694,6 +698,12 @@ pub struct AgentRuntime {
     /// Role in coordinator/worker pattern.
     #[serde(default)]
     pub role: Option<AgentRole>,
+    /// Explicit product-role contract assigned to this agent runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_assignment: Option<role_assignment::AgentRoleAssignment>,
+    /// Runtime capability evaluation captured for the product-role assignment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_compatibility: Option<role_assignment::RoleCompatibility>,
     /// Grouping label for agent pool display.
     #[serde(default)]
     pub group: Option<String>,
