@@ -189,6 +189,8 @@ pub fn agent_runtime_from_snapshot(snapshot: &AgentRuntimeSnapshot) -> AgentRunt
         warnings: Vec::new(),
         agent_status: snapshot.status.clone(),
         role: snapshot.role.clone(),
+        role_assignment: None,
+        role_compatibility: None,
         group,
         tool_invocations: Vec::new(),
         diff_summary: None,

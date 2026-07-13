@@ -388,6 +388,8 @@ fn build_agent_runtime(
         warnings,
         agent_status: Default::default(),
         role: session.role.clone(),
+        role_assignment: None,
+        role_compatibility: None,
         group: None,
         tool_invocations: Vec::new(),
         diff_summary: None,
@@ -1057,6 +1059,8 @@ mod tests {
                     reason: "merge conflict in src/main.rs".to_string(),
                 },
                 role: Some(impulse_ops::AgentRole::Worker { parent_pane_id: 42 }),
+                role_assignment: None,
+                role_compatibility: None,
                 group: Some("review-wave-2".to_string()),
                 tool_invocations: vec![impulse_ops::ToolInvocationRecord {
                     kind: "write".to_string(),

@@ -151,6 +151,8 @@ fn seeded_snapshot() -> ProjectOpsSnapshot {
                     task: "build visual fixture".to_string(),
                 },
                 role: Some(AgentRole::Coordinator),
+                role_assignment: None,
+                role_compatibility: None,
                 group: Some("desktop".to_string()),
                 tool_invocations: vec![ToolInvocationRecord {
                     kind: "mcp".to_string(),
