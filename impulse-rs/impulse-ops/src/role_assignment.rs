@@ -18,6 +18,8 @@ pub enum RoleAssignmentError {
         "invalid runtime capability id `{0}`: ids must be nonempty and contain no whitespace or control characters"
     )]
     InvalidRuntimeCapabilityId(String),
+    #[error("duplicate runtime capability `{0}` in declared support")]
+    DuplicateRuntimeCapability(RuntimeCapabilityId),
 }
 
 fn is_valid_open_id(value: &str) -> bool {
@@ -209,7 +211,18 @@ pub fn evaluate_role_compatibility(
     platform: &AgentPlatformId,
     declared_support: &[RuntimeCapabilitySupport],
     assignment: &AgentRoleAssignment,
-) -> RoleCompatibility {
+) -> Result<RoleCompatibility, RoleAssignmentError> {
+    for (index, support) in declared_support.iter().enumerate() {
+        if declared_support[..index]
+            .iter()
+            .any(|previous| previous.capability == support.capability)
+        {
+            return Err(RoleAssignmentError::DuplicateRuntimeCapability(
+                support.capability.clone(),
+            ));
+        }
+    }
+
     let checks = assignment
         .requirements
         .iter()
@@ -230,11 +243,11 @@ pub fn evaluate_role_compatibility(
         })
         .collect();
 
-    RoleCompatibility {
+    Ok(RoleCompatibility {
         platform: platform.clone(),
         role: assignment.role.clone(),
         checks,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -313,7 +326,7 @@ mod tests {
             mandatory: true,
         }]);
 
-        let result = evaluate_role_compatibility(&platform, &[], &role_assignment);
+        let result = evaluate_role_compatibility(&platform, &[], &role_assignment).unwrap();
 
         assert!(!result.launch_allowed());
         assert!(result.is_blocked());
@@ -351,7 +364,8 @@ mod tests {
             },
         ]);
 
-        let result = evaluate_role_compatibility(&platform, &declared_support, &role_assignment);
+        let result =
+            evaluate_role_compatibility(&platform, &declared_support, &role_assignment).unwrap();
 
         assert!(result.launch_allowed());
         assert!(!result.is_blocked());
@@ -360,6 +374,36 @@ mod tests {
         assert!(result.checks[0].is_satisfied());
         assert_eq!(result.checks[1].capability, capability("filesystem.scoped"));
         assert!(!result.checks[1].is_satisfied());
+    }
+
+    #[test]
+    fn test_evaluate_role_compatibility_rejects_duplicate_capability_support() {
+        let platform = AgentPlatformId::try_new("custom-runtime").unwrap();
+        let duplicate_capability = capability("workspace.target");
+        let declared_support = vec![
+            RuntimeCapabilitySupport {
+                capability: duplicate_capability.clone(),
+                enforcement: EnforcementStrength::Unsupported,
+            },
+            RuntimeCapabilitySupport {
+                capability: duplicate_capability.clone(),
+                enforcement: EnforcementStrength::Structural,
+            },
+        ];
+        let role_assignment = assignment(vec![RoleCapabilityRequirement {
+            capability: duplicate_capability.clone(),
+            minimum_enforcement: EnforcementStrength::Structural,
+            mandatory: true,
+        }]);
+
+        let error = evaluate_role_compatibility(&platform, &declared_support, &role_assignment)
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            RoleAssignmentError::DuplicateRuntimeCapability(duplicate_capability)
+        );
+        assert!(error.to_string().contains("duplicate runtime capability"));
     }
 
     #[test]
@@ -378,7 +422,7 @@ mod tests {
             },
         ]);
 
-        let result = evaluate_role_compatibility(&platform, &[], &role_assignment);
+        let result = evaluate_role_compatibility(&platform, &[], &role_assignment).unwrap();
 
         assert_eq!(result.checks[0].capability, capability("z-last"));
         assert_eq!(result.checks[1].capability, capability("a-first"));
@@ -399,7 +443,8 @@ mod tests {
                 enforcement: EnforcementStrength::Structural,
             }],
             &role_assignment,
-        );
+        )
+        .unwrap();
 
         let assignment_json = serde_json::to_string(&role_assignment).unwrap();
         let compatibility_json = serde_json::to_string(&compatibility).unwrap();
@@ -458,7 +503,8 @@ mod tests {
             minimum_enforcement: EnforcementStrength::Mediated,
             mandatory: true,
         }]);
-        let role_compatibility = evaluate_role_compatibility(&platform, &[], &role_assignment);
+        let role_compatibility =
+            evaluate_role_compatibility(&platform, &[], &role_assignment).unwrap();
         let runtime = AgentRuntime {
             role_assignment: Some(role_assignment),
             role_compatibility: Some(role_compatibility),
