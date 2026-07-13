@@ -1,7 +1,14 @@
 use std::collections::HashMap;
 
 use dioxus::prelude::*;
-use impulse_ops::{agent_registry::AgentPlatformInfo, ProjectOpsSnapshot};
+use impulse_ops::{
+    agent_registry::AgentPlatformInfo,
+    role_assignment::{
+        evaluate_role_compatibility, AgentRoleAssignment, AgentRoleId, EnforcementStrength,
+        RoleAssignmentError, RoleCapabilityRequirement, RuntimeCapabilityId,
+    },
+    ProjectOpsSnapshot,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -773,6 +780,43 @@ fn McpReadOnlyRow(tool_name: String, on_invoke: EventHandler<McpInvokeRequest>) 
     }
 }
 
+/// Fixed first product-role profile exposed by the Dioxus workspace launcher.
+///
+/// Workspace selection and process lifecycle must be mediated by the desktop
+/// runtime. Structural filesystem scope is requested as an optional capability
+/// so its current absence remains visible without overstating cwd mediation.
+pub fn builder_role_assignment() -> Result<AgentRoleAssignment, RoleAssignmentError> {
+    Ok(AgentRoleAssignment {
+        role: AgentRoleId::try_new("builder")?,
+        requirements: vec![
+            RoleCapabilityRequirement {
+                capability: RuntimeCapabilityId::try_new("workspace.target")?,
+                minimum_enforcement: EnforcementStrength::Mediated,
+                mandatory: true,
+            },
+            RoleCapabilityRequirement {
+                capability: RuntimeCapabilityId::try_new("process.lifecycle")?,
+                minimum_enforcement: EnforcementStrength::Mediated,
+                mandatory: true,
+            },
+            RoleCapabilityRequirement {
+                capability: RuntimeCapabilityId::try_new("filesystem.scoped")?,
+                minimum_enforcement: EnforcementStrength::Structural,
+                mandatory: false,
+            },
+        ],
+    })
+}
+
+fn enforcement_strength_label(strength: EnforcementStrength) -> &'static str {
+    match strength {
+        EnforcementStrength::Unsupported => "unsupported",
+        EnforcementStrength::Advisory => "advisory",
+        EnforcementStrength::Mediated => "mediated",
+        EnforcementStrength::Structural => "structural",
+    }
+}
+
 #[component]
 fn WorkspaceLaunchPanel(
     workspaces: Vec<WorkspaceEntry>,
@@ -789,6 +833,7 @@ fn WorkspaceLaunchPanel(
     let mut platform = use_signal(|| "codex".to_string());
     let mut agent_id = use_signal(String::new);
     let mut command = use_signal(String::new);
+    let mut task = use_signal(String::new);
 
     let first_workspace_root = workspaces
         .first()
@@ -820,7 +865,44 @@ fn WorkspaceLaunchPanel(
             .map(|candidate| candidate.id.to_string())
             .unwrap_or_default()
     };
-    let can_launch = can_launch && !selected_platform_id.is_empty();
+    let selected_platform_descriptor = platforms
+        .iter()
+        .find(|candidate| candidate.id.as_str() == selected_platform_id);
+    let role_assignment = builder_role_assignment();
+    let role_compatibility = selected_platform_descriptor.and_then(|descriptor| {
+        role_assignment.as_ref().ok().map(|assignment| {
+            evaluate_role_compatibility(
+                &descriptor.id,
+                &descriptor.runtime_capabilities,
+                assignment,
+            )
+        })
+    });
+    let compatibility_status = match role_compatibility.as_ref() {
+        Some(Ok(compatibility)) if compatibility.is_blocked() => "blocked",
+        Some(Ok(compatibility)) if compatibility.is_degraded() => "degraded",
+        Some(Ok(_)) => "allowed",
+        Some(Err(_)) | None => "blocked",
+    };
+    let compatibility_copy = match compatibility_status {
+        "allowed" => "Allowed: every Builder launch requirement is satisfied.",
+        "degraded" => {
+            "Degraded: mandatory launch controls are satisfied; optional filesystem scope is unavailable."
+        }
+        _ => "Blocked: this platform does not satisfy every mandatory Builder launch control.",
+    };
+    let compatibility_checks = role_compatibility
+        .as_ref()
+        .and_then(|result| result.as_ref().ok())
+        .map(|compatibility| compatibility.checks.clone())
+        .unwrap_or_default();
+    let assignment_for_launch = role_assignment.ok();
+    let task_is_present = !task().trim().is_empty();
+    let can_launch = can_launch
+        && !selected_platform_id.is_empty()
+        && task_is_present
+        && compatibility_status != "blocked"
+        && assignment_for_launch.is_some();
 
     rsx! {
         section { class: "inspector-section workspace-launch", "data-source": "workspace_launcher",
@@ -934,14 +1016,71 @@ fn WorkspaceLaunchPanel(
                         oninput: move |evt| command.set(evt.value()),
                     }
                 }
+                label {
+                    class: "workspace-field wide",
+                    "data-field": "launch-task",
+                    span { "Task" }
+                    input {
+                        r#type: "text",
+                        required: true,
+                        "aria-required": "true",
+                        placeholder: "Describe the explicit assignment",
+                        value: "{task}",
+                        oninput: move |evt| task.set(evt.value()),
+                    }
+                }
+                div {
+                    class: "workspace-field wide role-compatibility {compatibility_status}",
+                    "data-role": "builder",
+                    "data-compatibility": compatibility_status,
+                    div { class: "role-compatibility-heading",
+                        span { "Product role" }
+                        strong { "Builder" }
+                        span { class: "compatibility-status", "{compatibility_status}" }
+                    }
+                    p { "{compatibility_copy}" }
+                    if compatibility_checks.is_empty() {
+                        p { class: "compatibility-empty", "No trusted runtime capability evidence is available for this platform." }
+                    } else {
+                        ul { class: "compatibility-checks",
+                            for check in compatibility_checks.iter() {
+                                li {
+                                    "data-capability": "{check.capability}",
+                                    "data-required": enforcement_strength_label(check.required),
+                                    "data-available": enforcement_strength_label(check.available),
+                                    strong { "{check.capability}" }
+                                    span { if check.mandatory { "mandatory" } else { "optional" } }
+                                    span {
+                                        "required {enforcement_strength_label(check.required)} · available {enforcement_strength_label(check.available)}"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    p { class: "compatibility-caveat",
+                        "Workspace cwd mediation selects and validates the launch directory; cwd mediation is not a filesystem sandbox."
+                    }
+                }
                 button {
                     class: "invoke-button workspace-primary",
+                    "data-action": "launch-governed-agent",
+                    "aria-disabled": if can_launch { "false" } else { "true" },
                     disabled: !can_launch,
                     onclick: move |_| {
+                        if !can_launch {
+                            return;
+                        }
                         let root = launch_root.trim().to_string();
                         if root.is_empty() {
                             return;
                         }
+                        let task_value = task().trim().to_string();
+                        if task_value.is_empty() {
+                            return;
+                        }
+                        let Some(role_assignment) = assignment_for_launch.clone() else {
+                            return;
+                        };
                         let agent_id_value = optional_text(agent_id());
                         let session_id = agent_id_value
                             .as_ref()
@@ -963,8 +1102,8 @@ fn WorkspaceLaunchPanel(
                             rows: 32,
                             cols: 100,
                             role: None,
-                            task: None,
-                            role_assignment: None,
+                            task: Some(task_value),
+                            role_assignment: Some(role_assignment),
                             target: None,
                         });
                     },

@@ -573,6 +573,10 @@ pub struct AgentPlatformInfo {
     pub id: AgentPlatformId,
     pub label: String,
     pub command: String,
+    /// Trusted launch-capability evidence copied from the backend registry
+    /// descriptor for compatibility preview clients.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_capabilities: Vec<RuntimeCapabilitySupport>,
 }
 
 /// Pure observability report built from the registry (no I/O, no printing).
@@ -593,6 +597,7 @@ impl AgentPlatformsReport {
                 id: d.id.clone(),
                 label: d.label.clone(),
                 command: d.command.clone(),
+                runtime_capabilities: d.runtime_capabilities.clone(),
             })
             .collect();
         Self {
@@ -1358,6 +1363,17 @@ command = "ratchet"
         let report = AgentPlatformsReport::from_registry(&reg);
         assert!(report.platforms.iter().any(|p| p.id == "claude-code"));
         assert!(report.platforms.iter().any(|p| p.id == "codex"));
+        let codex = report
+            .platforms
+            .iter()
+            .find(|platform| platform.id == "codex")
+            .expect("builtin codex platform");
+        assert_eq!(
+            codex.runtime_capabilities,
+            reg.get("codex")
+                .expect("builtin codex descriptor")
+                .runtime_capabilities
+        );
         assert!(!report.multi_workspace_note.is_empty());
     }
 
