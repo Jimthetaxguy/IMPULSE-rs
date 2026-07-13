@@ -12,10 +12,11 @@ use dioxus::prelude::document::{Document, Eval, EvalError, Evaluator};
 use dioxus::prelude::*;
 use impulse_desktop::ui::{
     agent_focus_bridge_script, agent_launch_bridge_script, apply_desktop_bridge_message,
-    builder_role_assignment, desktop_event_bridge_script, mcp_invoke_bridge_script,
-    review_decision_bridge_script, terminal_asset_paths, workspace_registration_bridge_script,
-    BridgeStatusUpdate, DaemonOpsStatusUpdate, DesktopBridgeMessage, DesktopBridgeStateMut,
-    ReviewDecisionUiRequest, XTERM_CSS_PATH, XTERM_FIT_JS_PATH, XTERM_JS_PATH,
+    build_governed_agent_spawn_request, builder_role_assignment, desktop_event_bridge_script,
+    mcp_invoke_bridge_script, review_decision_bridge_script, terminal_asset_paths,
+    workspace_registration_bridge_script, BridgeStatusUpdate, DaemonOpsStatusUpdate,
+    DesktopBridgeMessage, DesktopBridgeStateMut, ReviewDecisionUiRequest, XTERM_CSS_PATH,
+    XTERM_FIT_JS_PATH, XTERM_JS_PATH,
 };
 use impulse_desktop::{
     default_builtin_mcp_tools, format_count, status_dot_class, status_label, AgentPlatformId,
@@ -130,20 +131,114 @@ fn test_workspace_launcher_renders_required_builder_compatibility_preflight() {
     assert!(html.contains("disabled=\"true\""));
 }
 
-#[test]
-fn test_workspace_launcher_source_never_emits_absent_governed_role_assignment() {
-    let source = include_str!("../src/ui.rs");
-    let panel = source
-        .split("fn WorkspaceLaunchPanel")
-        .nth(1)
-        .and_then(|tail| tail.split("/// New inspector subsection").next())
-        .expect("workspace launcher source");
+fn governed_platform(id: &str, runtime_capabilities: serde_json::Value) -> AgentPlatformInfo {
+    serde_json::from_value(json!({
+        "id": id,
+        "label": id,
+        "command": id,
+        "runtime_capabilities": runtime_capabilities,
+    }))
+    .expect("governed platform DTO")
+}
 
-    assert!(!panel.contains("task: None"));
-    assert!(!panel.contains("role_assignment: None"));
-    assert!(panel.contains("task: Some"));
-    assert!(panel.contains("role_assignment: Some"));
-    assert!(panel.contains("role: None"));
+fn governed_workspace() -> WorkspaceEntry {
+    WorkspaceEntry::new(WorkspaceTarget::from_root("/tmp/impulse"))
+}
+
+fn governed_launch(
+    platforms: &[AgentPlatformInfo],
+    selected_platform: &str,
+    task: &str,
+) -> Result<AgentSpawnRequest, String> {
+    build_governed_agent_spawn_request(
+        &[governed_workspace()],
+        platforms,
+        "/tmp/impulse",
+        selected_platform,
+        "builder-1",
+        "",
+        task,
+    )
+}
+
+#[test]
+fn test_governed_request_builder_rejects_blank_task() {
+    let platform = governed_platform(
+        "codex",
+        json!([
+            { "capability": "workspace.target", "enforcement": "mediated" },
+            { "capability": "process.lifecycle", "enforcement": "mediated" }
+        ]),
+    );
+
+    assert!(governed_launch(&[platform], "codex", "  ").is_err());
+}
+
+#[test]
+fn test_governed_request_builder_blocks_untrusted_or_incompatible_profiles() {
+    let blocked = governed_platform(
+        "partial-agent",
+        json!([
+            { "capability": "workspace.target", "enforcement": "mediated" }
+        ]),
+    );
+    let capability_free = governed_platform("custom-agent", json!([]));
+    let evaluator_error = governed_platform(
+        "duplicate-profile",
+        json!([
+            { "capability": "workspace.target", "enforcement": "mediated" },
+            { "capability": "workspace.target", "enforcement": "structural" },
+            { "capability": "process.lifecycle", "enforcement": "mediated" }
+        ]),
+    );
+
+    assert!(governed_launch(&[blocked], "partial-agent", "Build it").is_err());
+    assert!(governed_launch(&[capability_free], "custom-agent", "Build it").is_err());
+    assert!(governed_launch(&[evaluator_error], "duplicate-profile", "Build it").is_err());
+    assert!(governed_launch(&[], "codex", "Build it").is_err());
+}
+
+#[test]
+fn test_governed_request_builder_uses_current_selected_platform() {
+    let capabilities = json!([
+        { "capability": "workspace.target", "enforcement": "mediated" },
+        { "capability": "process.lifecycle", "enforcement": "mediated" }
+    ]);
+    let platforms = vec![
+        governed_platform("codex", capabilities.clone()),
+        governed_platform("ion", capabilities),
+    ];
+
+    let codex_request =
+        governed_launch(&platforms, "codex", "Build it").expect("Codex is compatible");
+    let ion_request = governed_launch(&platforms, "ion", "Build it").expect("Ion is compatible");
+
+    assert_eq!(codex_request.platform, platform_id("codex"));
+    assert_eq!(ion_request.platform, platform_id("ion"));
+}
+
+#[test]
+fn test_governed_request_builder_emits_trimmed_task_builder_assignment_and_legacy_role_none() {
+    let platform = governed_platform(
+        "codex",
+        json!([
+            { "capability": "workspace.target", "enforcement": "mediated" },
+            { "capability": "process.lifecycle", "enforcement": "mediated" }
+        ]),
+    );
+
+    let request = governed_launch(&[platform], "codex", "  Implement the governed launcher  ")
+        .expect("mandatory controls satisfy the Builder role");
+
+    assert_eq!(
+        request.task.as_deref(),
+        Some("Implement the governed launcher")
+    );
+    assert_eq!(
+        request.role_assignment,
+        Some(builder_role_assignment().expect("static Builder role profile"))
+    );
+    assert_eq!(request.role, None);
 }
 
 #[derive(Clone, Default)]
@@ -1334,6 +1429,62 @@ fn test_desktop_reducer_accepts_registry_platform_catalog_messages() {
             .collect::<Vec<_>>(),
         vec!["ion", "custom-agent"]
     );
+}
+
+#[test]
+fn test_agent_platform_failure_revokes_catalog_and_blocks_governed_preview() {
+    let mut snapshot = ProjectOpsSnapshot::default();
+    let mut runtime_agents = Vec::new();
+    let mut agent_platforms = Vec::new();
+    let mut workspaces = Vec::new();
+    let mut mcp_tools = Vec::new();
+    let mut review_queue = Vec::new();
+    let mut last_invocations = Vec::new();
+
+    for message in [
+        DesktopBridgeMessage {
+            kind: "agent_platforms".to_string(),
+            payload: json!({
+                "platforms": [{
+                    "id": "codex",
+                    "label": "Codex",
+                    "command": "codex",
+                    "runtime_capabilities": [
+                        { "capability": "workspace.target", "enforcement": "mediated" },
+                        { "capability": "process.lifecycle", "enforcement": "mediated" }
+                    ]
+                }]
+            }),
+        },
+        DesktopBridgeMessage {
+            kind: "bridge_status".to_string(),
+            payload: json!({
+                "status": "agent_platforms_failed",
+                "reason": "registry unavailable"
+            }),
+        },
+    ] {
+        apply_desktop_bridge_message(
+            DesktopBridgeStateMut::new(
+                &mut snapshot,
+                &mut runtime_agents,
+                &mut agent_platforms,
+                &mut workspaces,
+                &mut mcp_tools,
+                &mut review_queue,
+                &mut last_invocations,
+            ),
+            message,
+        )
+        .expect("platform catalog messages should reduce");
+
+        if !agent_platforms.is_empty() {
+            assert!(governed_launch(&agent_platforms, "codex", "Build it").is_ok());
+        }
+    }
+
+    assert!(agent_platforms.is_empty());
+    assert!(governed_launch(&agent_platforms, "codex", "Build it").is_err());
 }
 
 #[test]

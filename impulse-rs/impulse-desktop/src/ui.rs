@@ -526,6 +526,10 @@ impl BridgeStatusUpdate {
             }
         }
     }
+
+    fn revokes_agent_platform_catalog(&self) -> bool {
+        self.status == "agent_platforms_failed"
+    }
 }
 
 /// Degraded-state banner. Rendered in the shell chrome whenever a
@@ -808,6 +812,75 @@ pub fn builder_role_assignment() -> Result<AgentRoleAssignment, RoleAssignmentEr
     })
 }
 
+/// Builds the exact governed launch request accepted by the workspace launcher.
+///
+/// This is also the launch preflight: missing or stale catalog entries,
+/// evaluator errors, blocked role compatibility, blank tasks, and invalid
+/// launch roots all return an error before a request can reach the host bridge.
+pub fn build_governed_agent_spawn_request(
+    workspaces: &[WorkspaceEntry],
+    platforms: &[AgentPlatformInfo],
+    launch_root: &str,
+    selected_platform_id: &str,
+    agent_id: &str,
+    command: &str,
+    task: &str,
+) -> Result<AgentSpawnRequest, String> {
+    let root = launch_root.trim();
+    if root.is_empty() {
+        return Err("a workspace root is required".to_string());
+    }
+
+    let task = task.trim();
+    if task.is_empty() {
+        return Err("a governed task is required".to_string());
+    }
+
+    let descriptor = platforms
+        .iter()
+        .find(|candidate| candidate.id.as_str() == selected_platform_id)
+        .ok_or_else(|| "the selected platform is absent from the current catalog".to_string())?;
+    let role_assignment = builder_role_assignment()
+        .map_err(|error| format!("invalid Builder role assignment: {error}"))?;
+    let compatibility = evaluate_role_compatibility(
+        &descriptor.id,
+        &descriptor.runtime_capabilities,
+        &role_assignment,
+    )
+    .map_err(|error| format!("invalid platform capability profile: {error}"))?;
+    if compatibility.is_blocked() {
+        return Err("the selected platform is blocked for the Builder role".to_string());
+    }
+
+    let platform = AgentPlatformId::try_new(selected_platform_id.to_string())
+        .map_err(|error| format!("invalid selected platform: {error}"))?;
+    let agent_id = optional_text(agent_id.to_string());
+    let session_id = agent_id.as_ref().map(|value| format!("{value}-session"));
+    let workspace = workspaces
+        .iter()
+        .find(|entry| entry.target.root == root)
+        .map(|entry| entry.target.clone())
+        .unwrap_or_else(|| WorkspaceTarget::from_root(root));
+
+    Ok(AgentSpawnRequest {
+        agent_id,
+        session_id,
+        platform,
+        command: optional_text(command.to_string()),
+        args: Vec::new(),
+        cwd: Some(root.to_string()),
+        env: HashMap::new(),
+        workspace: Some(workspace),
+        mcp_tools: default_builtin_mcp_tools(),
+        rows: 32,
+        cols: 100,
+        role: None,
+        task: Some(task.to_string()),
+        role_assignment: Some(role_assignment),
+        target: None,
+    })
+}
+
 fn enforcement_strength_label(strength: EnforcementStrength) -> &'static str {
     match strength {
         EnforcementStrength::Unsupported => "unsupported",
@@ -830,7 +903,7 @@ fn WorkspaceLaunchPanel(
     let mut purpose = use_signal(String::new);
     let mut project_notes = use_signal(String::new);
     let mut selected_workspace_root = use_signal(String::new);
-    let mut platform = use_signal(|| "codex".to_string());
+    let mut platform = use_signal(String::new);
     let mut agent_id = use_signal(String::new);
     let mut command = use_signal(String::new);
     let mut task = use_signal(String::new);
@@ -848,22 +921,14 @@ fn WorkspaceLaunchPanel(
         first_workspace_root
     };
     let can_register = !register_root().trim().is_empty();
-    let can_launch = !launch_root.trim().is_empty();
-    let launch_workspace = workspaces
-        .iter()
-        .find(|entry| entry.target.root == launch_root)
-        .map(|entry| entry.target.clone());
     let selected_platform = platform();
-    let selected_platform_id = if platforms
-        .iter()
-        .any(|candidate| candidate.id.as_str() == selected_platform)
-    {
-        selected_platform
-    } else {
+    let selected_platform_id = if selected_platform.is_empty() {
         platforms
             .first()
             .map(|candidate| candidate.id.to_string())
             .unwrap_or_default()
+    } else {
+        selected_platform
     };
     let selected_platform_descriptor = platforms
         .iter()
@@ -896,13 +961,17 @@ fn WorkspaceLaunchPanel(
         .and_then(|result| result.as_ref().ok())
         .map(|compatibility| compatibility.checks.clone())
         .unwrap_or_default();
-    let assignment_for_launch = role_assignment.ok();
-    let task_is_present = !task().trim().is_empty();
-    let can_launch = can_launch
-        && !selected_platform_id.is_empty()
-        && task_is_present
-        && compatibility_status != "blocked"
-        && assignment_for_launch.is_some();
+    let launch_request = build_governed_agent_spawn_request(
+        &workspaces,
+        &platforms,
+        &launch_root,
+        &selected_platform_id,
+        &agent_id(),
+        &command(),
+        &task(),
+    );
+    let can_launch = launch_request.is_ok();
+    let request_for_launch = launch_request.ok();
 
     rsx! {
         section { class: "inspector-section workspace-launch", "data-source": "workspace_launcher",
@@ -1067,45 +1136,10 @@ fn WorkspaceLaunchPanel(
                     "aria-disabled": if can_launch { "false" } else { "true" },
                     disabled: !can_launch,
                     onclick: move |_| {
-                        if !can_launch {
-                            return;
-                        }
-                        let root = launch_root.trim().to_string();
-                        if root.is_empty() {
-                            return;
-                        }
-                        let task_value = task().trim().to_string();
-                        if task_value.is_empty() {
-                            return;
-                        }
-                        let Some(role_assignment) = assignment_for_launch.clone() else {
+                        let Some(request) = request_for_launch.clone() else {
                             return;
                         };
-                        let agent_id_value = optional_text(agent_id());
-                        let session_id = agent_id_value
-                            .as_ref()
-                            .map(|value| format!("{value}-session"));
-                        let workspace = launch_workspace.clone().unwrap_or_else(|| WorkspaceTarget::from_root(root.clone()));
-                        let Ok(platform_id) = AgentPlatformId::try_new(selected_platform_id.clone()) else {
-                            return;
-                        };
-                        on_launch.call(AgentSpawnRequest {
-                            agent_id: agent_id_value,
-                            session_id,
-                            platform: platform_id,
-                            command: optional_text(command()),
-                            args: Vec::new(),
-                            cwd: Some(root),
-                            env: HashMap::new(),
-                            workspace: Some(workspace),
-                            mcp_tools: default_builtin_mcp_tools(),
-                            rows: 32,
-                            cols: 100,
-                            role: None,
-                            task: Some(task_value),
-                            role_assignment: Some(role_assignment),
-                            target: None,
-                        });
+                        on_launch.call(request);
                     },
                     "Launch agent"
                 }
@@ -1500,6 +1534,14 @@ pub fn apply_desktop_bridge_message(
                 .map_err(|error| format!("invalid agent_platforms payload: {error}"))?;
             Ok(())
         }
+        "bridge_status" => {
+            let update = BridgeStatusUpdate::parse(&message)
+                .ok_or_else(|| "invalid bridge_status payload: missing status".to_string())?;
+            if update.revokes_agent_platform_catalog() {
+                agent_platforms.clear();
+            }
+            Ok(())
+        }
         "terminal_exit" => {
             let payload = message.payload.get("data").unwrap_or(&message.payload);
             let agent_id = payload
@@ -1573,7 +1615,6 @@ pub fn apply_desktop_bridge_message(
             }
             Ok(())
         }
-        "bridge_status" => Ok(()),
         other => Err(format!("unknown desktop bridge message `{other}`")),
     }
 }
@@ -2181,9 +2222,12 @@ pub fn DesktopShell() -> Element {
                     daemon_ops_status.set(Some(update));
                     continue;
                 }
-                // `bridge_status` messages carry no state to reduce — they tell
-                // the operator the transport degraded or a call failed.
+                // Status messages update the operator banner. A platform
+                // refresh failure also revokes stale compatibility evidence.
                 if let Some(update) = BridgeStatusUpdate::parse(&message) {
+                    if update.revokes_agent_platform_catalog() {
+                        agent_platforms.set(Vec::new());
+                    }
                     bridge_status.set(Some(update));
                     continue;
                 }
