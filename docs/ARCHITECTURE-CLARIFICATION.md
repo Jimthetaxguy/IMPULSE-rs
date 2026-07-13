@@ -47,9 +47,9 @@ workbench authority.
 | Workspace target | Filesystem root assigned at launch | desktop `WorkspaceTarget`/`WorkspaceRegistry` | Not the same as global cockpit scope |
 | Project | Memory/policy/artifact governance boundary | `ProjectOpsSnapshot`, project-scoped `.impulse/` data | Often maps 1:1 to a workspace today, but conceptually distinct |
 
-The generalized role contract is normative product vocabulary, but its Rust schema is deliberately
-not frozen. Today's coordinator/worker enum and supervisor policy are partial carriers, not proof
-that arbitrary roles can already be assigned to arbitrary runtimes.
+A narrow `AgentRoleId` assignment and compatibility schema now carries explicit role/task launch
+preflight. It remains distinct from legacy coordinator/worker topology and does not freeze
+generalized role composition, a common runtime-adapter contract, or capability negotiation.
 
 ## Current boundary matrix
 
