@@ -340,6 +340,8 @@ fn runtime_agent(
         } else {
             Some(AgentRole::Worker { parent_pane_id: 1 })
         },
+        role_assignment: None,
+        role_compatibility: None,
         target: Some(MachineTarget::Local {
             workdir: "<repo>".to_string(),
         }),

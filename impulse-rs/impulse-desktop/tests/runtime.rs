@@ -141,6 +141,8 @@ fn shell_spawn(agent_id: &str, script: &str) -> AgentSpawnRequest {
         rows: 24,
         cols: 80,
         role: None,
+        task: None,
+        role_assignment: None,
         target: None,
     }
 }
@@ -601,6 +603,8 @@ fn test_desktop_runtime_spawns_real_default_ion_sibling_without_override() {
         rows: 24,
         cols: 80,
         role: None,
+        task: None,
+        role_assignment: None,
         target: None,
     };
 

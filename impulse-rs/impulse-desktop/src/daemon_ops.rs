@@ -189,8 +189,8 @@ pub fn agent_runtime_from_snapshot(snapshot: &AgentRuntimeSnapshot) -> AgentRunt
         warnings: Vec::new(),
         agent_status: snapshot.status.clone(),
         role: snapshot.role.clone(),
-        role_assignment: None,
-        role_compatibility: None,
+        role_assignment: snapshot.role_assignment.clone(),
+        role_compatibility: snapshot.role_compatibility.clone(),
         group,
         tool_invocations: Vec::new(),
         diff_summary: None,
@@ -851,6 +851,8 @@ mod unix {
                 },
                 current_task: None,
                 role: Some(impulse_ops::AgentRole::Coordinator),
+                role_assignment: None,
+                role_compatibility: None,
                 target: Some(MachineTarget::Local {
                     workdir: "/tmp/project".to_string(),
                 }),
@@ -1301,6 +1303,10 @@ pub fn attach_desktop_daemon_ops(
 
 #[cfg(test)]
 mod tests {
+    use impulse_ops::role_assignment::{
+        AgentRoleAssignment, AgentRoleId, EnforcementStrength, RoleCapabilityRequirement,
+        RoleCompatibility, RuntimeCapabilityId,
+    };
     use impulse_ops::{AgentRole, AgentStatus};
 
     use super::*;
@@ -1330,6 +1336,8 @@ mod tests {
             },
             current_task: None,
             role: Some(AgentRole::Worker { parent_pane_id: 7 }),
+            role_assignment: None,
+            role_compatibility: None,
             target: Some(MachineTarget::Remote {
                 user: "agent".to_string(),
                 host: "builder".to_string(),
@@ -1379,6 +1387,33 @@ mod tests {
                 session_name: Some("wave".to_string()),
             })
         );
+    }
+
+    #[test]
+    fn rich_snapshot_conversion_preserves_task_assignment_and_compatibility() {
+        let assignment = AgentRoleAssignment {
+            role: AgentRoleId::try_new("builder").unwrap(),
+            requirements: vec![RoleCapabilityRequirement {
+                capability: RuntimeCapabilityId::try_new("workspace.target").unwrap(),
+                minimum_enforcement: EnforcementStrength::Mediated,
+                mandatory: true,
+            }],
+        };
+        let compatibility = RoleCompatibility {
+            platform: AgentPlatformId::try_new("claude-code").unwrap(),
+            role: assignment.role.clone(),
+            checks: Vec::new(),
+        };
+        let mut snapshot = rich_snapshot("claude-live", "/repo");
+        snapshot.current_task = Some("typed launch task".to_string());
+        snapshot.role_assignment = Some(assignment.clone());
+        snapshot.role_compatibility = Some(compatibility.clone());
+
+        let runtime = agent_runtime_from_snapshot(&snapshot);
+
+        assert_eq!(runtime.current_task.as_deref(), Some("typed launch task"));
+        assert_eq!(runtime.role_assignment, Some(assignment));
+        assert_eq!(runtime.role_compatibility, Some(compatibility));
     }
 
     #[test]
