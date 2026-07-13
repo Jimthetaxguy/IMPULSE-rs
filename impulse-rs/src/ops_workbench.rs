@@ -564,6 +564,12 @@ fn overlay_agent_runtime(target: &mut AgentRuntime, overlay: &AgentRuntime) {
     if overlay.role.is_some() {
         target.role = overlay.role.clone();
     }
+    if overlay.role_assignment.is_some() {
+        target.role_assignment = overlay.role_assignment.clone();
+    }
+    if overlay.role_compatibility.is_some() {
+        target.role_compatibility = overlay.role_compatibility.clone();
+    }
     if overlay.group.is_some() {
         target.group = overlay.group.clone();
     }
@@ -1127,11 +1133,21 @@ mod tests {
     }
 
     fn structured_manager_agent() -> AgentRuntime {
+        let role_assignment = impulse_ops::role_assignment::AgentRoleAssignment {
+            role: impulse_ops::role_assignment::AgentRoleId::try_new("builder").unwrap(),
+            requirements: Vec::new(),
+        };
         AgentRuntime {
             agent_status: impulse_ops::AgentStatus::Working {
                 task: "durable task".to_string(),
             },
             role: Some(impulse_ops::AgentRole::Coordinator),
+            role_assignment: Some(role_assignment.clone()),
+            role_compatibility: Some(impulse_ops::role_assignment::RoleCompatibility {
+                platform: impulse_ops::agent_registry::AgentPlatformId::try_new("codex").unwrap(),
+                role: role_assignment.role,
+                checks: Vec::new(),
+            }),
             group: Some("durable-wave".to_string()),
             tool_invocations: vec![impulse_ops::ToolInvocationRecord {
                 kind: "read".to_string(),
@@ -1168,6 +1184,8 @@ mod tests {
         ] {
             assert!(legacy_object.remove(field).is_some());
         }
+        legacy_object.remove("role_assignment");
+        legacy_object.remove("role_compatibility");
         serde_json::from_value(legacy_value).unwrap()
     }
 
@@ -1184,10 +1202,65 @@ mod tests {
 
         assert_eq!(target.agent_status, impulse_ops::AgentStatus::Idle);
         assert_eq!(target.role, Some(impulse_ops::AgentRole::Coordinator));
+        assert_eq!(
+            target
+                .role_assignment
+                .as_ref()
+                .map(|assignment| assignment.role.as_str()),
+            Some("builder")
+        );
+        assert!(target.role_compatibility.is_some());
         assert_eq!(target.group.as_deref(), Some("durable-wave"));
         assert_eq!(target.tool_invocations.len(), 1);
         assert!(target.diff_summary.is_some());
         assert!(target.target.is_some());
+    }
+
+    #[test]
+    fn test_overlay_agent_runtime_preserves_newer_typed_role_facts_from_legacy_overlay() {
+        let mut target = structured_manager_agent();
+        let overlay = legacy_agent_runtime("working: legacy publisher");
+
+        overlay_agent_runtime(&mut target, &overlay);
+
+        assert_eq!(
+            target
+                .role_assignment
+                .as_ref()
+                .map(|assignment| assignment.role.as_str()),
+            Some("builder")
+        );
+        assert_eq!(
+            target
+                .role_compatibility
+                .as_ref()
+                .map(|compatibility| compatibility.platform.as_str()),
+            Some("codex")
+        );
+    }
+
+    #[test]
+    fn test_overlay_agent_runtime_applies_populated_typed_role_facts() {
+        let assignment = impulse_ops::role_assignment::AgentRoleAssignment {
+            role: impulse_ops::role_assignment::AgentRoleId::try_new("reviewer").unwrap(),
+            requirements: Vec::new(),
+        };
+        let compatibility = impulse_ops::role_assignment::RoleCompatibility {
+            platform: impulse_ops::agent_registry::AgentPlatformId::try_new("claude-code").unwrap(),
+            role: assignment.role.clone(),
+            checks: Vec::new(),
+        };
+        let mut target = AgentRuntime::default();
+        let overlay = AgentRuntime {
+            role_assignment: Some(assignment.clone()),
+            role_compatibility: Some(compatibility.clone()),
+            ..Default::default()
+        };
+
+        overlay_agent_runtime(&mut target, &overlay);
+
+        assert_eq!(target.role_assignment, Some(assignment));
+        assert_eq!(target.role_compatibility, Some(compatibility));
     }
 
     #[test]

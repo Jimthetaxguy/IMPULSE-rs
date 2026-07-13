@@ -138,6 +138,8 @@ fn runtime_snapshot(agent_id: &str) -> AgentRuntimeSnapshot {
         },
         current_task: Some("wire live bridge".to_string()),
         role: None,
+        role_assignment: None,
+        role_compatibility: None,
         target: None,
         mcp_tools: vec![BuiltInMcpTool::new(
             "impulse.agent_spawn",
@@ -1154,6 +1156,8 @@ fn test_agent_launch_bridge_script_routes_through_audited_mcp_spawn() {
         rows: 32,
         cols: 100,
         role: None,
+        task: None,
+        role_assignment: None,
         target: None,
     });
 

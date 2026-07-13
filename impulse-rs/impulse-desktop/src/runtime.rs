@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 pub use impulse_ops::agent_registry::AgentPlatformId;
+use impulse_ops::role_assignment::{AgentRoleAssignment, RoleCompatibility};
 use impulse_ops::{AgentRole, AgentStatus, ContextHealthSummary, MachineTarget};
 use impulse_term::TerminalBackend;
 use serde::{Deserialize, Serialize};
@@ -136,6 +137,10 @@ pub struct AgentSpawnRequest {
     pub cols: u16,
     #[serde(default)]
     pub role: Option<AgentRole>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_assignment: Option<AgentRoleAssignment>,
     #[serde(default)]
     pub target: Option<MachineTarget>,
 }
@@ -163,6 +168,8 @@ impl AgentSpawnRequest {
             rows,
             cols,
             role: None,
+            task: None,
+            role_assignment: None,
             target: None,
         }
     }
@@ -209,6 +216,10 @@ pub struct AgentRuntimeSnapshot {
     pub status: AgentStatus,
     pub current_task: Option<String>,
     pub role: Option<AgentRole>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_assignment: Option<AgentRoleAssignment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_compatibility: Option<RoleCompatibility>,
     pub target: Option<MachineTarget>,
     pub mcp_tools: Vec<BuiltInMcpTool>,
     pub output_bytes: u64,
@@ -366,7 +377,10 @@ struct RuntimeRecord {
     cwd: Option<PathBuf>,
     workspace: Option<WorkspaceTarget>,
     session_id: Option<String>,
+    current_task: Option<String>,
     role: Option<AgentRole>,
+    role_assignment: Option<AgentRoleAssignment>,
+    role_compatibility: Option<RoleCompatibility>,
     target: Option<MachineTarget>,
     mcp_tools: Vec<BuiltInMcpTool>,
     focused: bool,
@@ -397,8 +411,10 @@ impl RuntimeRecord {
             alive,
             focused: self.focused,
             status,
-            current_task: None,
+            current_task: self.current_task.clone(),
             role: self.role.clone(),
+            role_assignment: self.role_assignment.clone(),
+            role_compatibility: self.role_compatibility.clone(),
             target: self.target.clone(),
             mcp_tools: self.mcp_tools.clone(),
             output_bytes: self.backend.output_bytes(),
@@ -506,6 +522,35 @@ impl DesktopRuntime {
         })?;
         let platform_label = descriptor.label.clone();
         request.platform = descriptor.id.clone();
+        let role_compatibility = request
+            .role_assignment
+            .as_ref()
+            .map(|assignment| {
+                registry
+                    .evaluate_role_compatibility(&request.platform, assignment)
+                    .map_err(|error| DesktopBridgeError::InvalidTerminalRequest {
+                        message: format!("role compatibility evaluation failed: {error}"),
+                    })
+            })
+            .transpose()?;
+        if let Some(compatibility) = role_compatibility
+            .as_ref()
+            .filter(|result| result.is_blocked())
+        {
+            let missing = compatibility
+                .checks
+                .iter()
+                .filter(|check| check.mandatory && !check.is_satisfied())
+                .map(|check| check.capability.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(DesktopBridgeError::InvalidTerminalRequest {
+                message: format!(
+                    "role `{}` is incompatible with platform `{}`; mandatory capabilities not satisfied: {missing}",
+                    compatibility.role, compatibility.platform
+                ),
+            });
+        }
         let command =
             resolve_executable_command(&request.platform, &command, request.command.is_some());
 
@@ -630,7 +675,10 @@ impl DesktopRuntime {
             cwd,
             workspace,
             session_id: request.session_id,
+            current_task: request.task,
             role: request.role,
+            role_assignment: request.role_assignment,
+            role_compatibility,
             target: request.target,
             mcp_tools,
             focused: false,
@@ -865,6 +913,8 @@ impl TerminalBridge for DesktopRuntime {
             rows: request.rows,
             cols: request.cols,
             role: None,
+            task: None,
+            role_assignment: None,
             target: None,
         })?;
         Ok(TerminalSessionResponse {
@@ -1053,6 +1103,12 @@ fn runtime_env(
     if let Some(session_id) = &request.session_id {
         env.push(("IMPULSE_SESSION_ID", session_id.clone()));
     }
+    if let Some(task) = &request.task {
+        env.push(("IMPULSE_TASK", task.clone()));
+    }
+    if let Some(assignment) = &request.role_assignment {
+        env.push(("IMPULSE_ROLE_ID", assignment.role.to_string()));
+    }
     if let Some(workspace) = workspace {
         env.push(("IMPULSE_WORKSPACE_ROOT", workspace.root.clone()));
         env.push(("IMPULSE_PROJECT", workspace.root.clone()));
@@ -1130,12 +1186,32 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use impulse_ops::role_assignment::{
+        AgentRoleAssignment, AgentRoleId, EnforcementStrength, RoleCapabilityRequirement,
+        RuntimeCapabilityId,
+    };
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     fn platform_id(value: &str) -> AgentPlatformId {
         AgentPlatformId::try_new(value).expect("valid test platform id")
+    }
+
+    fn role_assignment(
+        capability: &str,
+        minimum_enforcement: EnforcementStrength,
+        mandatory: bool,
+    ) -> AgentRoleAssignment {
+        AgentRoleAssignment {
+            role: AgentRoleId::try_new("builder").expect("valid test role id"),
+            requirements: vec![RoleCapabilityRequirement {
+                capability: RuntimeCapabilityId::try_new(capability)
+                    .expect("valid test capability id"),
+                minimum_enforcement,
+                mandatory,
+            }],
+        }
     }
 
     fn spawn_request(rows: u16, cols: u16, command: Option<&str>) -> AgentSpawnRequest {
@@ -1152,6 +1228,8 @@ mod tests {
             rows,
             cols,
             role: None,
+            task: None,
+            role_assignment: None,
             target: None,
         }
     }
@@ -1195,6 +1273,136 @@ mod tests {
             }
             other => panic!("expected InvalidTerminalRequest, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_spawn_request_serde_keeps_task_and_assignment_optional() {
+        let legacy: AgentSpawnRequest =
+            serde_json::from_str(r#"{"platform":"shell","rows":24,"cols":80}"#).unwrap();
+        assert!(legacy.task.is_none());
+        assert!(legacy.role_assignment.is_none());
+
+        let enriched: AgentSpawnRequest = serde_json::from_value(serde_json::json!({
+            "platform": "shell",
+            "rows": 24,
+            "cols": 80,
+            "task": "reconcile daemon truth",
+            "role_assignment": {
+                "role": "builder",
+                "requirements": [{
+                    "capability": "workspace.target",
+                    "minimum_enforcement": "mediated",
+                    "mandatory": true
+                }]
+            }
+        }))
+        .unwrap();
+        assert_eq!(enriched.task.as_deref(), Some("reconcile daemon truth"));
+        assert_eq!(
+            enriched
+                .role_assignment
+                .as_ref()
+                .map(|assignment| assignment.role.as_str()),
+            Some("builder")
+        );
+    }
+
+    #[test]
+    fn test_mandatory_incompatibility_blocks_before_id_reservation_or_pty_spawn() {
+        let runtime = DesktopRuntime::default();
+        let mut blocked = spawn_request(24, 80, Some("definitely-not-an-impulse-executable"));
+        blocked.agent_id = Some("reusable-after-block".to_string());
+        blocked.role_assignment = Some(role_assignment(
+            "network.denied",
+            EnforcementStrength::Structural,
+            true,
+        ));
+
+        let error = runtime.spawn_agent(blocked).unwrap_err();
+        match error {
+            DesktopBridgeError::InvalidTerminalRequest { message } => {
+                assert!(message.contains("incompatible"));
+                assert!(message.contains("network.denied"));
+            }
+            other => panic!("expected compatibility rejection, got {other:?}"),
+        }
+
+        let mut allowed = spawn_request(24, 80, Some("sh"));
+        allowed.agent_id = Some("reusable-after-block".to_string());
+        allowed.args = vec!["-c".to_string(), "sleep 1".to_string()];
+        let snapshot = runtime
+            .spawn_agent(allowed)
+            .expect("blocked launch must not reserve the requested agent id");
+        runtime
+            .close_agent(TerminalCloseRequest {
+                session_id: snapshot.agent_id,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn test_compatible_assignment_and_task_survive_canonicalized_spawn_snapshot() {
+        let runtime = DesktopRuntime::default();
+        let mut request = spawn_request(24, 80, Some("sh"));
+        request.platform = platform_id("generic_shell");
+        request.args = vec!["-c".to_string(), "sleep 1".to_string()];
+        request.task = Some("build governed launch".to_string());
+        request.role_assignment = Some(role_assignment(
+            "workspace.target",
+            EnforcementStrength::Mediated,
+            true,
+        ));
+
+        let snapshot = runtime.spawn_agent(request).unwrap();
+        assert_eq!(snapshot.platform.as_str(), "shell");
+        assert_eq!(
+            snapshot.current_task.as_deref(),
+            Some("build governed launch")
+        );
+        assert_eq!(
+            snapshot
+                .role_assignment
+                .as_ref()
+                .map(|assignment| assignment.role.as_str()),
+            Some("builder")
+        );
+        let compatibility = snapshot
+            .role_compatibility
+            .as_ref()
+            .expect("typed compatibility is retained");
+        assert_eq!(compatibility.platform.as_str(), "shell");
+        assert!(compatibility.launch_allowed());
+        assert!(!compatibility.is_degraded());
+        runtime
+            .close_agent(TerminalCloseRequest {
+                session_id: snapshot.agent_id,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn test_optional_gap_allows_spawn_and_preserves_degraded_snapshot() {
+        let runtime = DesktopRuntime::default();
+        let mut request = spawn_request(24, 80, Some("sh"));
+        request.args = vec!["-c".to_string(), "sleep 1".to_string()];
+        request.role_assignment = Some(role_assignment(
+            "network.denied",
+            EnforcementStrength::Structural,
+            false,
+        ));
+
+        let snapshot = runtime.spawn_agent(request).unwrap();
+        let compatibility = snapshot
+            .role_compatibility
+            .as_ref()
+            .expect("optional compatibility result is retained");
+        assert!(compatibility.launch_allowed());
+        assert!(compatibility.is_degraded());
+        runtime
+            .close_agent(TerminalCloseRequest {
+                session_id: snapshot.agent_id,
+            })
+            .unwrap();
     }
 
     // --- missing-session error paths ---
@@ -1383,6 +1591,25 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert!(a.starts_with("fnv1a64:"));
+    }
+
+    #[test]
+    fn test_runtime_env_includes_optional_task_and_product_role_id() {
+        let mut request = spawn_request(24, 80, Some("sh"));
+        request.task = Some("inspect compatibility".to_string());
+        request.role_assignment = Some(role_assignment(
+            "workspace.target",
+            EnforcementStrength::Mediated,
+            true,
+        ));
+
+        let env = runtime_env("agent-1", &request, "sh", None);
+        assert!(env
+            .iter()
+            .any(|(key, value)| *key == "IMPULSE_TASK" && value == "inspect compatibility"));
+        assert!(env
+            .iter()
+            .any(|(key, value)| *key == "IMPULSE_ROLE_ID" && value == "builder"));
     }
 
     #[test]

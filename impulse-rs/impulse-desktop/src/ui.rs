@@ -963,6 +963,8 @@ fn WorkspaceLaunchPanel(
                             rows: 32,
                             cols: 100,
                             role: None,
+                            task: None,
+                            role_assignment: None,
                             target: None,
                         });
                     },
