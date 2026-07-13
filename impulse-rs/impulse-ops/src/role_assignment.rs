@@ -92,6 +92,14 @@ impl RuntimeCapabilityId {
         Ok(Self(value))
     }
 
+    /// Construct an audited static capability id owned by trusted crate code.
+    ///
+    /// This bypasses dynamic validation and must never receive operator or wire
+    /// input; untrusted values must use [`Self::try_new`].
+    pub(crate) fn builtin(value: &'static str) -> Self {
+        Self(value.to_string())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -288,6 +296,13 @@ mod tests {
         assert_eq!(id.as_str(), "workspace.target/v1");
         assert!(RuntimeCapabilityId::try_new("").is_err());
         assert!(RuntimeCapabilityId::try_new("process\nlifecycle").is_err());
+    }
+
+    #[test]
+    fn test_runtime_capability_id_builtin_constructor_preserves_audited_static_literal() {
+        let id = RuntimeCapabilityId::builtin("workspace.target");
+
+        assert_eq!(id.as_str(), "workspace.target");
     }
 
     #[test]

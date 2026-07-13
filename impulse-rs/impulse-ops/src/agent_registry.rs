@@ -78,6 +78,8 @@ pub enum RegistryError {
     MissingLaunchCommand(String),
     #[error("agent platform `{0}` received a blank command override")]
     BlankLaunchOverride(String),
+    #[error("custom agent platform `{platform}` cannot declare trusted runtime_capabilities")]
+    UntrustedRuntimeCapabilities { platform: String },
     #[error("duplicate agent id in registry: {0}")]
     DuplicateId(String),
     #[error(
@@ -332,6 +334,23 @@ impl AgentRegistry {
     pub fn from_toml_str(toml_str: &str) -> Result<Self, RegistryError> {
         let file: RegistryFile =
             toml::from_str(toml_str).map_err(|e| RegistryError::Toml(e.to_string()))?;
+        Self::from_registry_file(file)
+    }
+
+    /// Build from the operator-editable registry-file shape.
+    ///
+    /// Runtime capability evidence is trusted code-declared adapter metadata,
+    /// so custom files cannot self-assert it for launch authorization.
+    pub fn from_registry_file(file: RegistryFile) -> Result<Self, RegistryError> {
+        if let Some(descriptor) = file
+            .agents
+            .iter()
+            .find(|descriptor| !descriptor.runtime_capabilities.is_empty())
+        {
+            return Err(RegistryError::UntrustedRuntimeCapabilities {
+                platform: descriptor.id.to_string(),
+            });
+        }
         Self::from_descriptors(file.agents)
     }
 
@@ -515,8 +534,7 @@ fn mediated_desktop_wrapper_capabilities() -> Vec<RuntimeCapabilitySupport> {
     ["workspace.target", "process.lifecycle"]
         .into_iter()
         .map(|capability| RuntimeCapabilitySupport {
-            capability: RuntimeCapabilityId::try_new(capability)
-                .expect("builtin runtime capability ids are valid"),
+            capability: RuntimeCapabilityId::builtin(capability),
             enforcement: EnforcementStrength::Mediated,
         })
         .collect()
@@ -863,6 +881,74 @@ command = "legacy-agent"
     }
 
     #[test]
+    fn test_custom_toml_cannot_authorize_structural_filesystem_capability() {
+        use crate::role_assignment::{
+            AgentRoleAssignment, AgentRoleId, EnforcementStrength, RoleCapabilityRequirement,
+            RuntimeCapabilityId,
+        };
+
+        let parsed = AgentRegistry::from_toml_str(
+            r#"
+[[agent]]
+id = "untrusted-agent"
+label = "Untrusted Agent"
+command = "untrusted-agent"
+runtime_capabilities = [
+  { capability = "filesystem.scoped", enforcement = "structural" },
+]
+"#,
+        );
+
+        match parsed {
+            Ok(registry) => {
+                let platform = AgentPlatformId::try_new("untrusted-agent").unwrap();
+                let assignment = AgentRoleAssignment {
+                    role: AgentRoleId::try_new("builder").unwrap(),
+                    requirements: vec![RoleCapabilityRequirement {
+                        capability: RuntimeCapabilityId::try_new("filesystem.scoped").unwrap(),
+                        minimum_enforcement: EnforcementStrength::Structural,
+                        mandatory: true,
+                    }],
+                };
+                let compatibility = registry
+                    .evaluate_role_compatibility(&platform, &assignment)
+                    .unwrap();
+
+                assert!(
+                    !compatibility.launch_allowed(),
+                    "operator TOML must never authorize structural filesystem enforcement"
+                );
+            }
+            Err(error) => assert!(error.to_string().contains("runtime_capabilities")),
+        }
+    }
+
+    #[test]
+    fn test_registry_file_rejects_operator_declared_runtime_capabilities_with_typed_error() {
+        let file: RegistryFile = toml::from_str(
+            r#"
+[[agent]]
+id = "untrusted-agent"
+label = "Untrusted Agent"
+command = "untrusted-agent"
+runtime_capabilities = [
+  { capability = "filesystem.scoped", enforcement = "structural" },
+]
+"#,
+        )
+        .unwrap();
+
+        let error = AgentRegistry::from_registry_file(file).unwrap_err();
+
+        assert!(matches!(
+            error,
+            RegistryError::UntrustedRuntimeCapabilities { ref platform }
+                if platform == "untrusted-agent"
+        ));
+        assert!(error.to_string().contains("runtime_capabilities"));
+    }
+
+    #[test]
     fn test_builtin_runtime_launch_capabilities_are_conservative() {
         use crate::role_assignment::EnforcementStrength;
 
@@ -939,21 +1025,29 @@ command = "legacy-agent"
     #[test]
     fn test_evaluate_role_compatibility_preserves_typed_evaluator_errors() {
         use crate::role_assignment::{
-            AgentRoleAssignment, AgentRoleId, RoleAssignmentError, RuntimeCapabilityId,
+            AgentRoleAssignment, AgentRoleId, EnforcementStrength, RoleAssignmentError,
+            RuntimeCapabilityId, RuntimeCapabilitySupport,
         };
 
-        let registry = AgentRegistry::from_toml_str(
-            r#"
-[[agent]]
-id = "duplicate-support"
-label = "Duplicate Support"
-command = "duplicate-support"
-runtime_capabilities = [
-  { capability = "workspace.target", enforcement = "mediated" },
-  { capability = "workspace.target", enforcement = "structural" },
-]
-"#,
-        )
+        let duplicate_capability = RuntimeCapabilityId::try_new("workspace.target").unwrap();
+        let registry = AgentRegistry::from_descriptors(vec![AgentDescriptor {
+            id: AgentPlatformId::try_new("duplicate-support").unwrap(),
+            label: "Duplicate Support".into(),
+            command: "duplicate-support".into(),
+            invocation_args: Vec::new(),
+            aliases: Vec::new(),
+            capabilities: AgentCapabilities::default(),
+            runtime_capabilities: vec![
+                RuntimeCapabilitySupport {
+                    capability: duplicate_capability.clone(),
+                    enforcement: EnforcementStrength::Mediated,
+                },
+                RuntimeCapabilitySupport {
+                    capability: duplicate_capability,
+                    enforcement: EnforcementStrength::Structural,
+                },
+            ],
+        }])
         .unwrap();
         let platform = AgentPlatformId::try_new("duplicate-support").unwrap();
         let assignment = AgentRoleAssignment {
