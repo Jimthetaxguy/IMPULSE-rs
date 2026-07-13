@@ -117,19 +117,26 @@
 - [x] Write ADR-0010 and link it from the decision and documentation indexes.
 - [x] Update the glossary while keeping `CONTEXT.md` within its L0/L1 budget.
 - [x] Mark only explicit task/role preflight and telemetry live; keep supervisor decisions, evidence, and verification in the Next slice.
-- [ ] Run `cargo fmt --manifest-path impulse-rs/Cargo.toml --all -- --check`.
-- [ ] Run `cargo check --manifest-path impulse-rs/Cargo.toml --workspace`.
-- [ ] Run `cargo clippy --manifest-path impulse-rs/Cargo.toml --workspace --all-targets -- -D warnings`.
-- [ ] Run `cargo test --manifest-path impulse-rs/Cargo.toml --workspace` and record exact totals.
-- [ ] Run `python3 docs/validate_docs.py --self-test` and `python3 docs/validate_docs.py --all`.
-- [ ] Run `npm --prefix impulse-rs/impulse-desktop run dioxus:host:smoke`.
-- [ ] Run `git diff --check` and a focused secret scan.
-- [ ] Commit exact implementation/test files first, then exact ADR/documentation files if review indicates a clean split.
+- [x] Run `cargo fmt --manifest-path impulse-rs/Cargo.toml --all -- --check`.
+- [x] Run `cargo check --manifest-path impulse-rs/Cargo.toml --workspace`.
+- [x] Run `cargo clippy --manifest-path impulse-rs/Cargo.toml --workspace --all-targets -- -D warnings`.
+- [x] Run `cargo test --manifest-path impulse-rs/Cargo.toml --workspace` and record exact totals.
+- [x] Run `python3 docs/validate_docs.py --self-test` and `python3 docs/validate_docs.py --all`.
+- [x] Run `npm --prefix impulse-rs/impulse-desktop run dioxus:host:smoke`.
+- [x] Run `git diff --check` and a focused secret scan.
+- [x] Commit exact implementation/test files first, then exact ADR/documentation files if review indicates a clean split.
+
+**Observed final worktree evidence (2026-07-13):** format, workspace check, and strict
+all-target Clippy passed; the isolated-worktree suite passed 1,995 tests with 9 ignored and only
+the canonical-tree archive proof filtered; the real Ion sibling integration passed; the frozen
+legacy GUI compiled with its existing warnings; Dioxus host smoke passed; documentation validated
+136/136 with contract checks; `git diff --check` passed; and Gitleaks found no leaks across all 15
+commits from the PR base.
 
 ## Review and Integration
 
-- [ ] Generate an SDD review package from base `92264fcccfad6391645be174f3ff0fde4f37eecb` to the implementation tip.
-- [ ] Obtain a fresh task-spec review; fix every accepted finding and re-review.
-- [ ] Obtain a fresh broad maintainability/security review; fix every accepted finding and re-review.
-- [ ] Re-run the full verification gate after the final review fix.
-- [ ] Cherry-pick reviewed commits onto `agent/control-plane-vision-integration`, push that PR branch, and verify PR #13 remains mergeable and green.
+- [x] Generate an SDD review package from base `92264fcccfad6391645be174f3ff0fde4f37eecb` to the implementation tip.
+- [x] Obtain a fresh task-spec review; fix every accepted finding and re-review.
+- [x] Obtain a fresh broad maintainability/security review; fix every accepted finding and re-review.
+- [x] Re-run the full verification gate after the final review fix.
+- [ ] Fast-forward the reviewed linear commit stack onto `agent/control-plane-vision-integration`, push that PR branch, and verify PR #13 remains mergeable and green.
