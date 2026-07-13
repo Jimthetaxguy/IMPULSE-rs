@@ -1530,9 +1530,16 @@ pub fn apply_desktop_bridge_message(
                 .get("platforms")
                 .cloned()
                 .unwrap_or_else(|| message.payload.clone());
-            *agent_platforms = serde_json::from_value::<Vec<AgentPlatformInfo>>(platforms)
-                .map_err(|error| format!("invalid agent_platforms payload: {error}"))?;
-            Ok(())
+            match serde_json::from_value::<Vec<AgentPlatformInfo>>(platforms) {
+                Ok(platforms) => {
+                    *agent_platforms = platforms;
+                    Ok(())
+                }
+                Err(error) => {
+                    agent_platforms.clear();
+                    Err(format!("invalid agent_platforms payload: {error}"))
+                }
+            }
         }
         "bridge_status" => {
             let update = BridgeStatusUpdate::parse(&message)
@@ -1616,6 +1623,23 @@ pub fn apply_desktop_bridge_message(
             Ok(())
         }
         other => Err(format!("unknown desktop bridge message `{other}`")),
+    }
+}
+
+/// Applies one bridge message and turns a malformed platform catalog into an
+/// explicit degraded status after revoking stale compatibility evidence.
+pub fn apply_desktop_bridge_message_with_status(
+    state: DesktopBridgeStateMut<'_>,
+    message: DesktopBridgeMessage,
+) -> Result<Option<BridgeStatusUpdate>, String> {
+    let is_agent_platform_catalog = message.kind == "agent_platforms";
+    match apply_desktop_bridge_message(state, message) {
+        Ok(()) => Ok(None),
+        Err(reason) if is_agent_platform_catalog => Ok(Some(BridgeStatusUpdate {
+            status: "agent_platforms_failed".to_string(),
+            reason: Some(reason),
+        })),
+        Err(error) => Err(error),
     }
 }
 
@@ -2238,7 +2262,7 @@ pub fn DesktopShell() -> Element {
                 let mut next_mcp_tools = mcp_tools();
                 let mut next_queue = review_queue();
                 let mut next_invocations = last_invocations();
-                if apply_desktop_bridge_message(
+                if let Ok(status_update) = apply_desktop_bridge_message_with_status(
                     DesktopBridgeStateMut::new(
                         &mut next_snapshot,
                         &mut next_agents,
@@ -2249,9 +2273,7 @@ pub fn DesktopShell() -> Element {
                         &mut next_invocations,
                     ),
                     message,
-                )
-                .is_ok()
-                {
+                ) {
                     snapshot.set(next_snapshot);
                     runtime_agents.set(next_agents);
                     agent_platforms.set(next_platforms);
@@ -2259,10 +2281,10 @@ pub fn DesktopShell() -> Element {
                     mcp_tools.set(next_mcp_tools);
                     review_queue.set(next_queue);
                     last_invocations.set(next_invocations);
-                    // A successful refresh means the transport recovered.
-                    if bridge_status.read().is_some() {
-                        bridge_status.set(None);
-                    }
+                    // A malformed catalog is a visible degraded state. Any
+                    // later successfully reduced message retains the existing
+                    // recovery behavior by clearing the banner with `None`.
+                    bridge_status.set(status_update);
                 }
             }
         });

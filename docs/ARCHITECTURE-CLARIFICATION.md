@@ -38,7 +38,7 @@ workbench authority.
 
 | Identity | Meaning | Live carrier | Important non-equivalence |
 | --- | --- | --- | --- |
-| Role | Obligations, permissions, tools, context, and completion policy | Narrow `AgentRole` plus `SupervisorPermissionPolicy` | Not a model, executable, or pane |
+| Role | Obligations, permissions, tools, context, and completion policy | Product-role `AgentRoleAssignment`/`AgentRoleId`; legacy coordinator/worker `AgentRole`; `SupervisorPermissionPolicy` for supervisor actions | Not a model, executable, pane, or legacy topology label |
 | Runtime | Execution engine/integration | external harness code, desktop runtime, Ion REPL/provider loop | Not an agent instance |
 | Agent instance | One running identity and its status | `AgentRuntime`, `AgentRuntimeSnapshot`, desktop runtime record | Not a session |
 | Session | Bounded persisted work history | daemon create/end session + `.impulse/LIVE_STATE.json`/history | Not necessarily process lifetime |
@@ -78,6 +78,12 @@ Impulse can structurally control its own tools, daemon actions, PTY lifecycle, w
 credential exposure, and native Ion loop. For external CLIs it can strongly control launch
 arguments, working directory, environment, process tree, injected files/instructions, supported
 hooks/MCP, and observable outputs.
+
+The current governed desktop launch boundary requires a nonblank task of at most 8,192 UTF-8
+bytes with no NUL byte. It also requires both `workspace.root` and `cwd` to name the same absolute,
+existing canonical directory; that canonical root drives the PTY working directory, trusted
+workspace environment, runtime snapshot, and daemon telemetry. This is launch mediation, not a
+filesystem sandbox.
 
 It cannot promise control over a vendor's hidden system prompt, proprietary reasoning loop,
 internal context compression, or unsupported tool mechanics. Therefore every future runtime/role
