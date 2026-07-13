@@ -123,8 +123,8 @@ control plane and should share platform services where their capabilities allow 
 
 ## Capability negotiation
 
-Different runtimes support different operations. A future adapter contract must report rather than
-hide those differences. Relevant capabilities include:
+Different runtimes support different operations. A future generalized/dynamic adapter contract must
+report rather than hide those differences. Relevant capabilities include:
 
 ADR-0010 makes one narrow part live: Dioxus previews a static, trusted code-owned launch-capability
 comparison and the backend repeats it before PTY creation. This is conservative preflight over
@@ -289,7 +289,8 @@ broader decisions remain open and must be resolved before schema-specific docume
 1. Exact hierarchy/cardinality and durable ids for project, workspace, role, runtime, instance,
    session, task, pane, and supervisor scope.
 2. Minimum runtime-adapter interface and semantics for optional/emulated operations.
-3. Capability/enforcement-strength vocabulary and launch-blocking rules.
+3. Generalized and dynamic capability negotiation beyond the static desktop preflight, including
+   discovery, attestation freshness, emulation, and post-launch re-evaluation.
 4. Role contract composition, override, persistence, and migration.
 5. Cross-agent message routing, direct worker communication, acknowledgement, and isolation.
 6. Memory authorship, verification, conflict resolution, correction, forgetting, and inheritance.

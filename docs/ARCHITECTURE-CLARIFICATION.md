@@ -1,6 +1,6 @@
 # Control-Plane Architecture Boundaries
 
-- **Updated:** 2026-07-12
+- **Updated:** 2026-07-13
 - **Status:** Active boundary map
 - **North star:** [`../VISION.md`](../VISION.md)
 - **Canonical product contract:** [`spec/RUST-CANONICAL-CONTRACT.md`](spec/RUST-CANONICAL-CONTRACT.md)
@@ -49,7 +49,7 @@ workbench authority.
 
 A narrow `AgentRoleId` assignment and compatibility schema now carries explicit role/task launch
 preflight. It remains distinct from legacy coordinator/worker topology and does not freeze
-generalized role composition, a common runtime-adapter contract, or capability negotiation.
+generalized role composition, a common runtime-adapter contract, or dynamic capability negotiation.
 
 ## Current boundary matrix
 
@@ -86,8 +86,9 @@ workspace environment, runtime snapshot, and daemon telemetry. This is launch me
 filesystem sandbox.
 
 It cannot promise control over a vendor's hidden system prompt, proprietary reasoning loop,
-internal context compression, or unsupported tool mechanics. Therefore every future runtime/role
-assignment needs an explicit enforcement-strength result rather than a boolean "supported" flag.
+internal context compression, or unsupported tool mechanics. The live static preflight therefore
+uses explicit enforcement strengths rather than a boolean "supported" flag; future generalized
+runtime adapters must preserve that honesty while adding discovery and lifecycle semantics.
 
 ## Direction that is not implemented yet
 
@@ -96,8 +97,8 @@ The next architecture ADR must settle these together:
 1. The exact hierarchy and identifiers for project, workspace, role, runtime, instance, session,
    task, and pane.
 2. The minimum runtime-adapter operations, optional operations, and emulation rules.
-3. A capability-negotiation result that distinguishes structural, mediated, advisory, and
-   unsupported enforcement.
+3. Generalized and dynamic capability negotiation beyond the static desktop preflight, including
+   discovery, attestation freshness, emulation, and post-launch re-evaluation.
 4. Typed message routing and cross-project isolation.
 5. Role-specific credential, context, tool, and verification grants.
 

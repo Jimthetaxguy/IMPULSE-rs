@@ -1,8 +1,8 @@
 ---
 title: Documentation Summary
 description: Unified navigation structure for Impulse documentation
-version: '2.5'
-updated: '2026-07-12'
+version: '2.6'
+updated: '2026-07-13'
 schema_version: '1.0'
 type: navigation
 category: docs
@@ -14,7 +14,7 @@ roadmap_contract: >-
 
 quick_reference:
   - name: VISION.md
-    description: Living product north star and complete governed vertical slice
+    description: Living product north star and target governed vertical slice
     path: ../VISION.md
     start: true
 
@@ -158,6 +158,7 @@ categories:
     - decisions/0007-desktop-shell-stack.md
     - decisions/0008-dioxus-desktop-host.md
     - decisions/0009-reconcile-impulse-copies.md
+    - decisions/0010-product-role-launch-contract.md
 
   session_logs:
     - session-logs/DEVELOPMENT-HISTORY.md
@@ -173,8 +174,8 @@ validation_and_history:
     path: guides/HOOK-VALIDATION-GUIDE.md
 
 metadata:
-  total_documents: 134
+  total_documents: 136
   categories: 9
-  decisions: 9
+  decisions: 10
   phases: 3
   status: active_development

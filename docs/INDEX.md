@@ -1,7 +1,7 @@
 ---
 title: Documentation Index
 description: Master navigation hub for Impulse documentation
-version: '1.4'
+version: '1.5'
 updated: 2026-07-13
 type: doc
 category: navigation
@@ -140,6 +140,7 @@ CLI help, or current tests.
 | [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) | Authoritative product and desktop shell contract |
 | [DESKTOP-SHELL-ARCHITECTURE.md](spec/DESKTOP-SHELL-ARCHITECTURE.md) | Dioxus Desktop + xterm.js layer boundaries |
 | [IMPULSE_TERM_STATUS.md](../impulse-rs/docs/IMPULSE_TERM_STATUS.md) | Terminal backend status and desktop bridge implications |
+| [ADR-0010](decisions/0010-product-role-launch-contract.md) | Current explicit product-role/task launch-preflight boundary |
 
 > **NOTE:** `spec/RUST-CANONICAL-CONTRACT.md` is authoritative for implementation. Legacy TypeScript/Bun docs are retained as historical reference unless explicitly marked active and aligned.
 
@@ -203,7 +204,8 @@ See [research/README.md](research/README.md) for reading sequences by phase.
 
 Older Ralph loop plans and `ROADMAP-PLAN.md` are preserved for provenance only. Use
 [`VISION.md`](../VISION.md),
-`spec/RUST-CANONICAL-CONTRACT.md`, and `decisions/0008-dioxus-desktop-host.md` for current guidance.
+`spec/RUST-CANONICAL-CONTRACT.md`, `decisions/0008-dioxus-desktop-host.md`, and
+`decisions/0010-product-role-launch-contract.md` for current guidance.
 
 ---
 
