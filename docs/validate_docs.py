@@ -41,33 +41,61 @@ PHASES = ["phase0", "phase1", "phase1.5", "phase2", "phase3", "all", "historical
 STATUSES = ["draft", "review", "active", "deprecated", "complete", "superseded", "archive", "accepted"]
 
 CONTRACT_KEY_FILES = [
+    ROOT_DIR / "VISION.md",
     ROOT_DIR / "AGENTS.md",
     ROOT_DIR / "CLAUDE.md",
     DOCS_DIR / "INDEX.md",
+    DOCS_DIR / "SUMMARY.yaml",
     DOCS_DIR / "SUMMARY.md",
 ]
 
+DURABLE_ROADMAP_MARKER = (
+    "Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + "
+    "hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; "
+    "Legacy=egui compile-maintenance only"
+)
+
 CONTRACT_REQUIRED_MARKERS = {
+    ROOT_DIR / "VISION.md": [
+        "IMPULSE — Feed the impulse to build.",
+        "Living product north star",
+        "First complete vertical slice",
+        DURABLE_ROADMAP_MARKER,
+    ],
     ROOT_DIR / "AGENTS.md": [
+        "VISION.md",
+        "Product north star:",
         "RUST-CANONICAL-CONTRACT.md",
         "COLLABORATIVE-AGENTIC-CODING.md",
         "Canonical stack: Rust (impulse-rs)",
-        "Roadmap contract: Now=Rust core + Dioxus desktop host; Next=Dioxus Desktop launch scaffold + terminal bridge parity; Legacy=egui compile-maintenance only; Tauri=legacy compatibility adapter only",
+        DURABLE_ROADMAP_MARKER,
     ],
     ROOT_DIR / "CLAUDE.md": [
+        "VISION.md",
+        "Product north star:",
         "RUST-CANONICAL-CONTRACT.md",
         "COLLABORATIVE-AGENTIC-CODING.md",
         "Canonical stack: Rust (impulse-rs)",
-        "Roadmap contract: Now=Rust core + Dioxus desktop host; Next=Dioxus Desktop launch scaffold + terminal bridge parity; Legacy=egui compile-maintenance only; Tauri=legacy compatibility adapter only",
+        DURABLE_ROADMAP_MARKER,
     ],
     DOCS_DIR / "INDEX.md": [
+        "VISION.md",
+        "living product north star",
         "RUST-CANONICAL-CONTRACT.md",
         "COLLABORATIVE-AGENTIC-CODING.md",
         "Canonical stack: Rust (impulse-rs)",
-        "Roadmap contract: Now=Rust core + Dioxus desktop host, Next=Dioxus Desktop launch scaffold + terminal bridge parity, Later=daemon parity + artifact polish",
+        DURABLE_ROADMAP_MARKER,
     ],
     DOCS_DIR / "SUMMARY.md": [
+        "VISION.md",
+        "Living product north star",
         "RUST-CANONICAL-CONTRACT.md",
+        DURABLE_ROADMAP_MARKER,
+    ],
+    DOCS_DIR / "SUMMARY.yaml": [
+        "VISION.md",
+        "RUST-CANONICAL-CONTRACT.md",
+        DURABLE_ROADMAP_MARKER,
     ],
 }
 
@@ -358,6 +386,13 @@ def validate_docs() -> Dict[str, Any]:
     return results
 
 
+def json_default(value: Any) -> str:
+    """Serialize YAML date values without masking unsupported payload types."""
+    if isinstance(value, (datetime.date, datetime.datetime)):
+        return value.isoformat()
+    raise TypeError(f"Object of type {value.__class__.__name__} is not JSON serializable")
+
+
 def run_self_test() -> int:
     # Validate that contradiction detection catches active-doc phrases.
     tmp_path = ROOT_DIR / ".tmp_validate_docs_self_test.md"
@@ -398,6 +433,11 @@ updated: 2026-02-23
         dup = detect_duplicate_artifacts([tmp_dup_path])
         if tmp_dup_path not in dup:
             print("SELF-TEST FAILED: expected duplicate artifact issue not found")
+            return 1
+
+        encoded = json.dumps({"updated": datetime.date(2026, 7, 12)}, default=json_default)
+        if encoded != '{"updated": "2026-07-12"}':
+            print("SELF-TEST FAILED: expected YAML date JSON serialization")
             return 1
 
         print("SELF-TEST PASSED")
@@ -444,7 +484,7 @@ def main() -> int:
             exit_code = 1
 
     if args.json:
-        print(json.dumps(payload, indent=2))
+        print(json.dumps(payload, indent=2, default=json_default))
     else:
         if run_meta:
             m = payload["metadata"]

@@ -1,5 +1,5 @@
 ---
-status: active
+status: superseded
 phase: all
 audience: stakeholder
 tags: [spec, market, positioning]
@@ -7,6 +7,10 @@ last_updated: 2026-02-20
 ---
 
 # Competitive Positioning: Impulse vs. The Landscape
+
+> **Historical reference — superseded.** This comparison evaluates the earlier memory-plugin
+> product. Use [`../../VISION.md`](../../VISION.md) for current positioning as a local coding-agent
+> control plane and harness manager.
 
 > **Version:** 1.0 | **Updated:** 2026-02-20
 > **Purpose:** Honest assessment of where Impulse fits among existing tools

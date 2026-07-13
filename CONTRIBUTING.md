@@ -31,8 +31,8 @@ Start with:
 cd impulse-rs
 cargo check --workspace
 cargo test --workspace
-cargo clippy --workspace -- -D warnings
-cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
 ```
 
 ## Documentation Gate

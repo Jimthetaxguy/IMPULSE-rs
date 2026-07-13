@@ -1,15 +1,23 @@
 ---
 title: Documentation Summary
 description: Unified navigation structure for Impulse documentation
-version: '2.2'
-updated: '2026-05-21'
+version: '2.5'
+updated: '2026-07-12'
 schema_version: '1.0'
 type: navigation
 category: docs
 ---
 # Navigation Tree
 
+roadmap_contract: >-
+  Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; Legacy=egui compile-maintenance only
+
 quick_reference:
+  - name: VISION.md
+    description: Living product north star and complete governed vertical slice
+    path: ../VISION.md
+    start: true
+
   - name: RUST-CANONICAL-CONTRACT.md
     description: Authoritative product contract
     path: spec/RUST-CANONICAL-CONTRACT.md
@@ -23,6 +31,11 @@ quick_reference:
   - name: TEST-TRACEABILITY.md
     description: Current story-to-test coverage map
     path: spec/TEST-TRACEABILITY.md
+    start: true
+
+  - name: ARCHITECTURE-CLARIFICATION.md
+    description: Current control-plane boundary and enforcement map
+    path: ARCHITECTURE-CLARIFICATION.md
     start: true
 
   - name: AGENTS.md
@@ -45,38 +58,37 @@ quick_reference:
     path: INDEX.md
     start: true
 
-  - name: HONEST-ROADMAP.md
-    description: Validation risk register
-    path: HONEST-ROADMAP.md
-    start: true
-
 active_tracks:
-  - name: Rust + Dioxus Desktop Host
-    description: Current product baseline and roadmap contract
+  - name: Control-Plane Foundations
+    description: Current implementation boundary and governed supervisor-builder roadmap
     docs:
+      - ../VISION.md
       - spec/RUST-CANONICAL-CONTRACT.md
+      - ARCHITECTURE-CLARIFICATION.md
       - spec/USER-STORY-MAP.md
       - spec/TEST-TRACEABILITY.md
-      - ROADMAP-PLAN.md
-      - plans/IMPLEMENTATION-HANDOFF.md
       - guides/COLLABORATIVE-AGENTIC-CODING.md
-      - ../impulse-rs/docs/IMPULSE_TERM_STATUS.md
-      - HONEST-ROADMAP.md
 
 phases:
   now:
-    - name: Rust Core + Dioxus Desktop Host
-      path: ROADMAP-PLAN.md
-    - name: Dioxus Desktop Implementation Handoff
-      path: plans/IMPLEMENTATION-HANDOFF.md
+    - name: Product North Star
+      path: ../VISION.md
+    - name: Rust Canonical Contract
+      path: spec/RUST-CANONICAL-CONTRACT.md
+    - name: Architecture Clarification
+      path: ARCHITECTURE-CLARIFICATION.md
 
   next:
-    - name: Honest Roadmap
-      path: HONEST-ROADMAP.md
-    - name: impulse-term Status
-      path: ../impulse-rs/docs/IMPULSE_TERM_STATUS.md
+    - name: Governed Supervisor and Builder Vertical Slice
+      path: ../VISION.md
+    - name: User Story Map
+      path: spec/USER-STORY-MAP.md
+    - name: Test Traceability
+      path: spec/TEST-TRACEABILITY.md
 
   later:
+    - name: General Roles and Negotiated Runtimes
+      path: ../VISION.md
     - name: CLI Architecture
       path: vision/CLI-ARCHITECTURE.md
     - name: TUI Augmentation Vision
@@ -87,16 +99,15 @@ categories:
     - spec/RUST-CANONICAL-CONTRACT.md
     - spec/USER-STORY-MAP.md
     - spec/TEST-TRACEABILITY.md
-    - spec/COMPETITIVE-POSITIONING.md
-    - spec/PERFORMANCE-TARGETS.md
 
   roadmap:
     - ROADMAP-PLAN.md
     - plans/IMPLEMENTATION-HANDOFF.md
-    - HONEST-ROADMAP.md
     - ../impulse-rs/docs/IMPULSE_TERM_STATUS.md
 
   architecture:
+    - ../VISION.md
+    - ARCHITECTURE-CLARIFICATION.md
     - vision/CLI-ARCHITECTURE.md
     - vision/DATA-MODELS.md
     - vision/DYNAMIC-CLI-VISION.md
@@ -113,13 +124,27 @@ categories:
     - research/TOKEN-TRACKING-ALGORITHM.md
 
   guides:
-    - guides/TEAM-ONBOARDING.md
     - guides/COLLABORATIVE-AGENTIC-CODING.md
-    - guides/BEST-PRACTICES.md
-    - guides/ERROR-HANDLING-GUIDE.md
-    - guides/DATABASE-GUIDE.md
+    - guides/HOOK-VALIDATION-GUIDE.md
+    - guides/RUST-MULTI-AGENT-PATTERNS.md
+    - FRONTMATTER-SCHEMA.md
+
+  historical_reference:
+    - spec/COMPETITIVE-POSITIONING.md
+    - spec/PERFORMANCE-TARGETS.md
+    - guides/SECURITY-REVIEW.md
     - guides/INTEGRATION-COOKBOOK.md
+    - guides/SYNTHETIC-TESTING-GUIDE.md
+    - guides/BEST-PRACTICES.md
     - guides/DEPLOYMENT-FRAMEWORK.md
+    - guides/TEAM-ONBOARDING.md
+    - guides/TESTING-STRATEGY-ENHANCEMENTS.md
+    - guides/RELEASE-NOTES-TEMPLATE.md
+    - guides/DATABASE-GUIDE.md
+    - guides/PERFORMANCE-PROFILING.md
+    - guides/CLI-REFERENCE-ENHANCEMENTS.md
+    - guides/ERROR-HANDLING-GUIDE.md
+    - guides/TESTING-FRAMEWORK.md
     - guides/TOOLS-STATUS.md
 
   decisions:
@@ -130,6 +155,9 @@ categories:
     - decisions/0004-extraction-strategy.md
     - decisions/0005-distribution-model.md
     - decisions/0006-hook-enhancement-conflict-resolution.md
+    - decisions/0007-desktop-shell-stack.md
+    - decisions/0008-dioxus-desktop-host.md
+    - decisions/0009-reconcile-impulse-copies.md
 
   session_logs:
     - session-logs/DEVELOPMENT-HISTORY.md
@@ -138,9 +166,15 @@ categories:
     - archive/TUI-AUGMENTATION-VISION.md
     - archive/ralph-plans/README.md
 
+validation_and_history:
+  - name: Historical Hook and Memory Validation Register
+    path: HONEST-ROADMAP.md
+  - name: Current Hook Validation Procedure
+    path: guides/HOOK-VALIDATION-GUIDE.md
+
 metadata:
-  total_documents: 85
-  categories: 8
-  decisions: 6
+  total_documents: 134
+  categories: 9
+  decisions: 9
   phases: 3
   status: active_development

@@ -311,7 +311,7 @@ fn find_tool_patterns(messages: &[TranscriptMessage]) -> Vec<ToolPattern> {
     for (idx, msg) in messages.iter().enumerate() {
         for tool in &msg.tool_uses {
             // Hash: tool name + first 200 chars of input
-            let hash_input = format!("{}:{}", tool.name, &tool.input_preview);
+            let hash_input = format!("{}:{}", tool.name, tool.input_preview);
             let hash = format!("{:x}", sha2_hash(hash_input.as_bytes()));
 
             let entry = patterns.entry(hash.clone()).or_insert_with(|| ToolPattern {

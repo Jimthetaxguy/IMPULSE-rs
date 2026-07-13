@@ -451,7 +451,7 @@ impl McpTool for AgentSpawnTool {
                 message: "agent_spawn mutates terminal state".to_string(),
             });
         }
-        let mut request: AgentSpawnRequest =
+        let request: AgentSpawnRequest =
             serde_json::from_value(arguments.clone()).map_err(|error| McpError::Tool {
                 tool: "impulse.agent_spawn".to_string(),
                 message: format!("invalid AgentSpawnRequest payload: {error}"),
@@ -463,17 +463,6 @@ impl McpTool for AgentSpawnTool {
                     tool: "impulse.agent_spawn".to_string(),
                     message: message.to_string(),
                 })?;
-        }
-        // Actually drive from canonical AgentRegistry (not discarded): resolve command via the ops helper
-        // so launch is uniformly based on registry descriptors.
-        let reg = load_registry_for_tool("impulse.agent_spawn")?;
-        let resolved_cmd = impulse_ops::agent_registry::resolve_launch_command(
-            &reg,
-            request.platform.as_str(),
-            request.command.as_deref(),
-        );
-        if request.command.as_ref().is_none_or(|c| c.trim().is_empty()) {
-            request.command = Some(resolved_cmd);
         }
         let snapshot: AgentRuntimeSnapshot =
             ctx.runtime()
@@ -1060,7 +1049,7 @@ fn current_unix_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{AgentPlatformKind, WorkspaceTarget};
+    use crate::runtime::{AgentPlatformId, WorkspaceTarget};
     use crate::workspace::WorkspaceRegistry;
 
     fn ctx() -> McpContext {
@@ -1310,17 +1299,17 @@ mod tests {
     }
 
     #[test]
-    fn test_default_platform_kind_serializes_back() {
-        // Sanity: ensure the runtime's AgentPlatformKind can survive a JSON
+    fn test_platform_id_serializes_back() {
+        // Sanity: ensure the open platform id can survive a JSON
         // round-trip through the mcp boundary.
-        let kind = AgentPlatformKind::Shell;
-        let value = serde_json::to_value(kind).expect("serialize");
-        let back: AgentPlatformKind = serde_json::from_value(value).expect("deserialize");
-        assert_eq!(kind, back);
+        let platform = AgentPlatformId::try_new("custom-agent").unwrap();
+        let value = serde_json::to_value(&platform).expect("serialize");
+        let back: AgentPlatformId = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(platform, back);
     }
 
     #[tokio::test]
-    async fn test_mcp_list_agent_platforms_execute_includes_claude_codex() {
+    async fn test_mcp_list_agent_platforms_execute_includes_claude_codex_and_ion() {
         // Exercises the execute body of ListAgentPlatformsTool (and by registry central) with real types.
         use crate::host_bridge::channel_event_sink;
         let (sink, _rx) = channel_event_sink();
@@ -1340,6 +1329,7 @@ mod tests {
             .collect();
         assert!(ids.contains(&"claude-code"), "missing claude-code: {ids:?}");
         assert!(ids.contains(&"codex"), "missing codex: {ids:?}");
+        assert!(ids.contains(&"ion"), "missing ion: {ids:?}");
 
         // Also exercise ListAgentsTool return shape per skeptic gap
         let agents_tool = ListAgentsTool;
@@ -1358,5 +1348,38 @@ mod tests {
             "MCP_SHAPE_ASSERT: live_agents present, available_platforms present, keys: {:?}",
             obj.keys().collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn test_mcp_agent_spawn_rejects_unknown_platform_without_shell_fallback() {
+        let registry = McpToolRegistry::with_builtins();
+        let context = ctx();
+        let result = registry.invoke(
+            "impulse.agent_spawn",
+            Some("supervisor".to_string()),
+            json!({
+                "agent_id": "unknown-platform",
+                "platform": "missing-agent",
+                "command": "sh",
+                "args": ["-lc", "true"],
+                "rows": 24,
+                "cols": 80
+            }),
+            true,
+            &context,
+        );
+
+        assert!(
+            matches!(result, Err(McpError::Tool { message, .. }) if message.contains("unknown agent platform")),
+            "an unknown identity must fail at the MCP boundary before Shell can spawn"
+        );
+        let audit = registry.audit_for("supervisor");
+        assert_eq!(audit.len(), 1);
+        assert!(!audit[0].ok);
+        assert_eq!(audit[0].result["category"], "tool");
+        assert!(audit[0].result["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("unknown agent platform")));
+        assert!(context.runtime().snapshot_agents().is_empty());
     }
 }

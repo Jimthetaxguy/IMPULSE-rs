@@ -1,5 +1,5 @@
 ---
-status: active
+status: superseded
 phase: 1
 audience: builder
 tags: [guide, testing, synthetic]
@@ -7,6 +7,10 @@ last_updated: 2026-02-20
 ---
 
 # Synthetic Testing Guide: CoordinationSimulator & Event Replay
+
+> **Historical design — superseded.** This planned Phase 1.5 simulator is not the current test
+> authority. Use [`../spec/TEST-TRACEABILITY.md`](../spec/TEST-TRACEABILITY.md) for live coverage
+> and known evidence gaps.
 
 > **Version:** 1.0 | **Status:** Design | **Updated:** 2026-02-20
 > **Purpose:** Validate Phase 1.5 coordination without LLM calls, terminal UI, or real agents

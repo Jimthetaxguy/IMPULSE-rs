@@ -14,11 +14,11 @@ use impulse_desktop::ui::{
     agent_focus_bridge_script, agent_launch_bridge_script, apply_desktop_bridge_message,
     desktop_event_bridge_script, mcp_invoke_bridge_script, review_decision_bridge_script,
     terminal_asset_paths, workspace_registration_bridge_script, BridgeStatusUpdate,
-    DesktopBridgeMessage, ReviewDecisionUiRequest, XTERM_CSS_PATH, XTERM_FIT_JS_PATH,
-    XTERM_JS_PATH,
+    DaemonOpsStatusUpdate, DesktopBridgeMessage, DesktopBridgeStateMut, ReviewDecisionUiRequest,
+    XTERM_CSS_PATH, XTERM_FIT_JS_PATH, XTERM_JS_PATH,
 };
 use impulse_desktop::{
-    default_builtin_mcp_tools, format_count, status_dot_class, status_label, AgentPlatformKind,
+    default_builtin_mcp_tools, format_count, status_dot_class, status_label, AgentPlatformId,
     AgentRuntimeSnapshot, AgentSpawnRequest, AgentWriteRequest, BuiltInMcpTool,
     DesktopCommandRouter, DesktopEvent, DesktopShell, DesktopShellWithSnapshot,
     DesktopShellWithSnapshotProps, DesktopView, InMemoryTerminalBridge, McpInvocation,
@@ -28,10 +28,14 @@ use impulse_desktop::{
     WorkspaceTarget,
 };
 use impulse_ops::{
-    AgentRuntime, AgentStatus, ContextHealthSummary, MemorySummary, ProjectOpsSnapshot,
-    RetrievalSummary,
+    agent_registry::AgentPlatformInfo, AgentRuntime, AgentStatus, ContextHealthSummary,
+    MemorySummary, ProjectOpsSnapshot, RetrievalSummary,
 };
 use serde_json::json;
+
+fn platform_id(value: &str) -> AgentPlatformId {
+    AgentPlatformId::try_new(value).expect("valid test platform id")
+}
 
 #[derive(Clone, Default)]
 struct FakeDocument {
@@ -114,7 +118,7 @@ fn runtime_snapshot(agent_id: &str) -> AgentRuntimeSnapshot {
     AgentRuntimeSnapshot {
         agent_id: agent_id.to_string(),
         label: "Codex Live".to_string(),
-        platform: AgentPlatformKind::Codex,
+        platform: platform_id("codex"),
         command: "codex".to_string(),
         args: Vec::new(),
         cwd: Some("<repo>".to_string()),
@@ -540,11 +544,13 @@ fn test_retro_shell_binds_project_ops_snapshot() {
         DesktopShellWithSnapshotProps {
             snapshot,
             runtime_agents: Vec::new(),
+            agent_platforms: Vec::new(),
             workspaces: Vec::new(),
             mcp_tools: Vec::new(),
             last_invocations: Vec::new(),
             review_queue: Vec::new(),
             bridge_status: None,
+            daemon_ops_status: None,
             initial_view: DesktopView::Terminal,
         },
     );
@@ -561,6 +567,37 @@ fn test_retro_shell_binds_project_ops_snapshot() {
     assert!(html.contains("sqlite-vector"));
     assert!(html.contains("12 genome decisions"));
     assert!(html.contains("ops_update 2026-06-13T12:00:00Z"));
+}
+
+#[test]
+fn test_workspace_launcher_renders_registry_platforms_including_ion_and_custom() {
+    let agent_platforms: Vec<AgentPlatformInfo> = serde_json::from_value(json!([
+        {"id": "ion", "label": "Ion", "command": "ion"},
+        {"id": "custom-agent", "label": "Custom Agent", "command": "custom-agent"}
+    ]))
+    .expect("platform fixtures");
+    let mut vdom = VirtualDom::new_with_props(
+        DesktopShellWithSnapshot,
+        DesktopShellWithSnapshotProps {
+            snapshot: ProjectOpsSnapshot::default(),
+            runtime_agents: Vec::new(),
+            agent_platforms,
+            workspaces: Vec::new(),
+            mcp_tools: Vec::new(),
+            last_invocations: Vec::new(),
+            review_queue: Vec::new(),
+            bridge_status: None,
+            daemon_ops_status: None,
+            initial_view: DesktopView::Terminal,
+        },
+    );
+    vdom.rebuild_in_place();
+
+    let html = dioxus_ssr::render(&vdom);
+    assert!(html.contains("Ion"), "{html}");
+    assert!(html.contains("Custom Agent"), "{html}");
+    assert!(html.contains("value=\"ion\""), "{html}");
+    assert!(html.contains("value=\"custom-agent\""), "{html}");
 }
 
 #[test]
@@ -695,6 +732,11 @@ fn test_desktop_event_bridge_script_executes_against_mocked_legacy_host_webview(
         ..Default::default()
     };
     let runtime = runtime_snapshot("codex-live");
+    let agent_platforms = vec![AgentPlatformInfo {
+        id: platform_id("ion"),
+        label: "Ion".to_string(),
+        command: "ion".to_string(),
+    }];
     let workspace = WorkspaceEntry::new(WorkspaceTarget {
         root: "/tmp".to_string(),
         label: Some("scratch".to_string()),
@@ -742,6 +784,7 @@ fn test_desktop_event_bridge_script_executes_against_mocked_legacy_host_webview(
 const bridgeScript = {bridge_script};
 const opsSnapshot = {ops_snapshot};
 const runtimeSnapshot = {runtime_snapshot};
+const agentPlatforms = {agent_platforms};
 const workspace = {workspace};
 const mcpTool = {mcp_tool};
 const reviewItem = {review_item};
@@ -766,6 +809,7 @@ window.__TAURI__ = {{
     invoke: async (command, args) => {{
       invoked.push({{ command, args }});
       if (command === "agent_snapshot") return [runtimeSnapshot];
+      if (command === "agent_platforms") return agentPlatforms;
       if (command === "list_workspaces") return [workspace];
       if (command === "mcp_descriptors") return [mcpTool];
       if (command === "review_queue") return [reviewItem];
@@ -820,6 +864,8 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
             serde_json::to_string(desktop_event_bridge_script()).expect("serialize bridge script"),
         ops_snapshot = serde_json::to_string(&ops_snapshot).expect("serialize ops snapshot"),
         runtime_snapshot = serde_json::to_string(&runtime).expect("serialize runtime snapshot"),
+        agent_platforms =
+            serde_json::to_string(&agent_platforms).expect("serialize agent platforms"),
         workspace = serde_json::to_string(&workspace).expect("serialize workspace"),
         mcp_tool = serde_json::to_string(&mcp_tool).expect("serialize mcp tool"),
         review_item = serde_json::to_string(&review_item).expect("serialize review item"),
@@ -858,6 +904,7 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
         .collect::<Vec<_>>();
     for expected in [
         "agent_snapshot",
+        "agent_platforms",
         "list_workspaces",
         "mcp_descriptors",
         "review_queue",
@@ -884,6 +931,7 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
         .collect::<Vec<_>>();
     for expected in [
         "agent_snapshot",
+        "agent_platforms",
         "workspaces",
         "mcp_descriptors",
         "review_queue",
@@ -899,6 +947,7 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
     let mut snapshot = ProjectOpsSnapshot::default();
     let mut runtime_agents = Vec::new();
+    let mut agent_platforms = Vec::new();
     let mut workspaces = Vec::new();
     let mut mcp_tools = Vec::new();
     let mut review_queue = Vec::new();
@@ -907,12 +956,15 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
         let message = serde_json::from_value::<DesktopBridgeMessage>(message.clone())
             .expect("smoke message should match DesktopBridgeMessage");
         apply_desktop_bridge_message(
-            &mut snapshot,
-            &mut runtime_agents,
-            &mut workspaces,
-            &mut mcp_tools,
-            &mut review_queue,
-            &mut last_invocations,
+            DesktopBridgeStateMut::new(
+                &mut snapshot,
+                &mut runtime_agents,
+                &mut agent_platforms,
+                &mut workspaces,
+                &mut mcp_tools,
+                &mut review_queue,
+                &mut last_invocations,
+            ),
             message,
         )
         .expect("smoke message should reduce into desktop state");
@@ -921,6 +973,8 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
     assert_eq!(snapshot.generated_at, "2026-06-13T23:59:00Z");
     assert_eq!(runtime_agents.len(), 1);
     assert_eq!(runtime_agents[0].agent_id, "codex-live");
+    assert_eq!(agent_platforms.len(), 1);
+    assert_eq!(agent_platforms[0].id, "ion");
     assert_eq!(workspaces.len(), 1);
     assert_eq!(workspaces[0].target.root, "/tmp");
     assert_eq!(mcp_tools.len(), 1);
@@ -1085,7 +1139,7 @@ fn test_agent_launch_bridge_script_routes_through_audited_mcp_spawn() {
     let script = agent_launch_bridge_script(&AgentSpawnRequest {
         agent_id: Some("codex-live".to_string()),
         session_id: Some("codex-live-session".to_string()),
-        platform: AgentPlatformKind::Codex,
+        platform: platform_id("codex"),
         command: None,
         args: Vec::new(),
         cwd: Some("/tmp".to_string()),
@@ -1111,6 +1165,55 @@ fn test_agent_launch_bridge_script_routes_through_audited_mcp_spawn() {
     assert!(script.contains(r#""workspace""#));
     assert!(script.contains(r#""root":"/tmp""#));
     assert!(script.contains(r#""project_notes":"registered workspace context""#));
+}
+
+#[test]
+fn test_host_manifest_exposes_registry_platform_catalog() {
+    assert!(
+        impulse_desktop::host_commands::HOST_INVOKE_COMMANDS.contains(&"agent_platforms"),
+        "the launcher must load platform choices from the runtime registry"
+    );
+}
+
+#[test]
+fn test_desktop_reducer_accepts_registry_platform_catalog_messages() {
+    let mut snapshot = ProjectOpsSnapshot::default();
+    let mut runtime_agents = Vec::new();
+    let mut agent_platforms = Vec::new();
+    let mut workspaces = Vec::new();
+    let mut mcp_tools = Vec::new();
+    let mut review_queue = Vec::new();
+    let mut last_invocations = Vec::new();
+
+    let result = apply_desktop_bridge_message(
+        DesktopBridgeStateMut::new(
+            &mut snapshot,
+            &mut runtime_agents,
+            &mut agent_platforms,
+            &mut workspaces,
+            &mut mcp_tools,
+            &mut review_queue,
+            &mut last_invocations,
+        ),
+        DesktopBridgeMessage {
+            kind: "agent_platforms".to_string(),
+            payload: json!({
+                "platforms": [
+                    {"id": "ion", "label": "Ion", "command": "ion"},
+                    {"id": "custom-agent", "label": "Custom", "command": "custom"}
+                ]
+            }),
+        },
+    );
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        agent_platforms
+            .iter()
+            .map(|platform| platform.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ion", "custom-agent"]
+    );
 }
 
 #[test]
@@ -1143,12 +1246,15 @@ fn test_apply_bridge_message_accepts_full_desktop_event_wrappers() {
     };
 
     apply_desktop_bridge_message(
-        &mut snapshot,
-        &mut runtime_agents,
-        &mut workspaces,
-        &mut mcp_tools,
-        &mut review_queue,
-        &mut last_invocations,
+        DesktopBridgeStateMut::new(
+            &mut snapshot,
+            &mut runtime_agents,
+            &mut Vec::new(),
+            &mut workspaces,
+            &mut mcp_tools,
+            &mut review_queue,
+            &mut last_invocations,
+        ),
         DesktopBridgeMessage {
             kind: "agent_runtime_update".to_string(),
             payload: serde_json::to_value(event).expect("serialize event"),
@@ -1158,14 +1264,174 @@ fn test_apply_bridge_message_accepts_full_desktop_event_wrappers() {
 
     assert_eq!(runtime_agents.len(), 1);
     assert_eq!(runtime_agents[0].agent_id, "codex-live");
-    assert_eq!(snapshot.agents.len(), 1);
-    assert_eq!(snapshot.agents[0].id, "codex-live");
-    assert_eq!(snapshot.agents[0].backend_kind, "codex");
-    assert!(snapshot.agents[0].active);
-    assert!(matches!(
-        snapshot.agents[0].agent_status,
-        AgentStatus::Working { .. }
-    ));
+    assert!(
+        snapshot.agents.is_empty(),
+        "local runtime events are not daemon truth"
+    );
+}
+
+#[test]
+fn test_incremental_focused_runtime_update_clears_peer_focus() {
+    let first = runtime_snapshot("focus-one");
+    let mut second = runtime_snapshot("focus-two");
+    second.focused = false;
+    let mut runtime_agents = vec![first, second];
+    let mut snapshot = ProjectOpsSnapshot::default();
+    let mut workspaces = Vec::new();
+    let mut mcp_tools = Vec::new();
+    let mut review_queue = Vec::new();
+    let mut last_invocations = Vec::new();
+
+    apply_desktop_bridge_message(
+        DesktopBridgeStateMut::new(
+            &mut snapshot,
+            &mut runtime_agents,
+            &mut Vec::new(),
+            &mut workspaces,
+            &mut mcp_tools,
+            &mut review_queue,
+            &mut last_invocations,
+        ),
+        DesktopBridgeMessage {
+            kind: "agent_runtime_update".to_string(),
+            payload: serde_json::to_value(DesktopEvent::AgentRuntimeUpdate {
+                snapshot: Box::new(runtime_snapshot("focus-two")),
+            })
+            .expect("focused runtime event"),
+        },
+    )
+    .expect("apply focused runtime update");
+
+    assert_eq!(
+        runtime_agents.iter().filter(|agent| agent.focused).count(),
+        1
+    );
+    assert!(runtime_agents
+        .iter()
+        .any(|agent| agent.agent_id == "focus-two" && agent.focused));
+    assert!(runtime_agents
+        .iter()
+        .any(|agent| agent.agent_id == "focus-one" && !agent.focused));
+}
+
+#[test]
+fn test_daemon_ops_snapshot_survives_local_runtime_refresh_and_exit() {
+    let daemon_agent = AgentRuntime {
+        id: "daemon-agent".to_string(),
+        label: "Daemon Agent".to_string(),
+        backend_kind: "codex".to_string(),
+        active: true,
+        ..Default::default()
+    };
+    let expected = ProjectOpsSnapshot {
+        generated_at: "daemon-truth".to_string(),
+        agents: vec![daemon_agent],
+        memory: MemorySummary {
+            active_sessions: 4,
+            ..Default::default()
+        },
+        retrieval: RetrievalSummary {
+            backend: "sqlite-vector".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let runtime = runtime_snapshot("codex-live");
+    let mut snapshot = ProjectOpsSnapshot::default();
+    let mut runtime_agents = Vec::new();
+    let mut workspaces = Vec::new();
+    let mut mcp_tools = Vec::new();
+    let mut review_queue = Vec::new();
+    let mut last_invocations = Vec::new();
+
+    for message in [
+        DesktopBridgeMessage {
+            kind: "ops_update".to_string(),
+            payload: serde_json::to_value(&expected).expect("ops snapshot"),
+        },
+        DesktopBridgeMessage {
+            kind: "agent_runtime_update".to_string(),
+            payload: serde_json::to_value(DesktopEvent::AgentRuntimeUpdate {
+                snapshot: Box::new(runtime.clone()),
+            })
+            .expect("runtime event"),
+        },
+        DesktopBridgeMessage {
+            kind: "agent_snapshot".to_string(),
+            payload: json!({"agents": [runtime]}),
+        },
+    ] {
+        apply_desktop_bridge_message(
+            DesktopBridgeStateMut::new(
+                &mut snapshot,
+                &mut runtime_agents,
+                &mut Vec::new(),
+                &mut workspaces,
+                &mut mcp_tools,
+                &mut review_queue,
+                &mut last_invocations,
+            ),
+            message,
+        )
+        .expect("apply message");
+    }
+    assert_eq!(snapshot, expected);
+    assert_eq!(runtime_agents.len(), 1);
+
+    apply_desktop_bridge_message(
+        DesktopBridgeStateMut::new(
+            &mut snapshot,
+            &mut runtime_agents,
+            &mut Vec::new(),
+            &mut workspaces,
+            &mut mcp_tools,
+            &mut review_queue,
+            &mut last_invocations,
+        ),
+        DesktopBridgeMessage {
+            kind: "terminal_exit".to_string(),
+            payload: json!({"agent_id": "codex-live"}),
+        },
+    )
+    .expect("apply terminal exit");
+    assert!(runtime_agents.is_empty());
+    assert_eq!(snapshot, expected);
+
+    let mut dead_runtime = runtime_snapshot("codex-live");
+    dead_runtime.alive = false;
+    dead_runtime.status = AgentStatus::Completed;
+    for message in [
+        DesktopBridgeMessage {
+            kind: "agent_snapshot".to_string(),
+            payload: json!({"agents": [dead_runtime.clone()]}),
+        },
+        DesktopBridgeMessage {
+            kind: "agent_runtime_update".to_string(),
+            payload: serde_json::to_value(DesktopEvent::AgentRuntimeUpdate {
+                snapshot: Box::new(dead_runtime),
+            })
+            .expect("dead runtime event"),
+        },
+    ] {
+        apply_desktop_bridge_message(
+            DesktopBridgeStateMut::new(
+                &mut snapshot,
+                &mut runtime_agents,
+                &mut Vec::new(),
+                &mut workspaces,
+                &mut mcp_tools,
+                &mut review_queue,
+                &mut last_invocations,
+            ),
+            message,
+        )
+        .expect("apply dead runtime refresh");
+    }
+    assert!(
+        runtime_agents.is_empty(),
+        "dead runtime snapshots stay reaped"
+    );
+    assert_eq!(snapshot, expected);
 }
 
 #[test]
@@ -1186,12 +1452,15 @@ fn test_apply_bridge_message_accepts_ops_update_wrapper() {
     let mut last_invocations = Vec::new();
 
     apply_desktop_bridge_message(
-        &mut snapshot,
-        &mut runtime_agents,
-        &mut workspaces,
-        &mut mcp_tools,
-        &mut review_queue,
-        &mut last_invocations,
+        DesktopBridgeStateMut::new(
+            &mut snapshot,
+            &mut runtime_agents,
+            &mut Vec::new(),
+            &mut workspaces,
+            &mut mcp_tools,
+            &mut review_queue,
+            &mut last_invocations,
+        ),
         DesktopBridgeMessage {
             kind: "ops_update".to_string(),
             payload: serde_json::to_value(DesktopEvent::OpsUpdate {
@@ -1216,12 +1485,15 @@ fn test_apply_bridge_message_accepts_review_queue_items() {
     let mut last_invocations = Vec::new();
 
     apply_desktop_bridge_message(
-        &mut snapshot,
-        &mut runtime_agents,
-        &mut workspaces,
-        &mut mcp_tools,
-        &mut review_queue,
-        &mut last_invocations,
+        DesktopBridgeStateMut::new(
+            &mut snapshot,
+            &mut runtime_agents,
+            &mut Vec::new(),
+            &mut workspaces,
+            &mut mcp_tools,
+            &mut review_queue,
+            &mut last_invocations,
+        ),
         DesktopBridgeMessage {
             kind: "review_queue".to_string(),
             payload: json!({
@@ -1254,12 +1526,15 @@ fn test_apply_bridge_message_accepts_workspace_and_mcp_descriptor_payloads() {
     let mut last_invocations = Vec::new();
 
     apply_desktop_bridge_message(
-        &mut snapshot,
-        &mut runtime_agents,
-        &mut workspaces,
-        &mut mcp_tools,
-        &mut review_queue,
-        &mut last_invocations,
+        DesktopBridgeStateMut::new(
+            &mut snapshot,
+            &mut runtime_agents,
+            &mut Vec::new(),
+            &mut workspaces,
+            &mut mcp_tools,
+            &mut review_queue,
+            &mut last_invocations,
+        ),
         DesktopBridgeMessage {
             kind: "workspaces".to_string(),
             payload: json!({
@@ -1278,12 +1553,15 @@ fn test_apply_bridge_message_accepts_workspace_and_mcp_descriptor_payloads() {
     .expect("apply workspaces");
 
     apply_desktop_bridge_message(
-        &mut snapshot,
-        &mut runtime_agents,
-        &mut workspaces,
-        &mut mcp_tools,
-        &mut review_queue,
-        &mut last_invocations,
+        DesktopBridgeStateMut::new(
+            &mut snapshot,
+            &mut runtime_agents,
+            &mut Vec::new(),
+            &mut workspaces,
+            &mut mcp_tools,
+            &mut review_queue,
+            &mut last_invocations,
+        ),
         DesktopBridgeMessage {
             kind: "mcp_descriptors".to_string(),
             payload: json!({
@@ -1320,12 +1598,15 @@ fn test_apply_bridge_message_upserts_workspace_registered_payload() {
 
     for label in ["scratch", "scratch-renamed"] {
         apply_desktop_bridge_message(
-            &mut snapshot,
-            &mut runtime_agents,
-            &mut workspaces,
-            &mut mcp_tools,
-            &mut review_queue,
-            &mut last_invocations,
+            DesktopBridgeStateMut::new(
+                &mut snapshot,
+                &mut runtime_agents,
+                &mut Vec::new(),
+                &mut workspaces,
+                &mut mcp_tools,
+                &mut review_queue,
+                &mut last_invocations,
+            ),
             DesktopBridgeMessage {
                 kind: "workspace_registered".to_string(),
                 payload: json!({
@@ -1361,12 +1642,15 @@ fn test_apply_bridge_message_accepts_mcp_invocation_receipts() {
     let mut last_invocations = Vec::new();
 
     apply_desktop_bridge_message(
-        &mut snapshot,
-        &mut runtime_agents,
-        &mut workspaces,
-        &mut mcp_tools,
-        &mut review_queue,
-        &mut last_invocations,
+        DesktopBridgeStateMut::new(
+            &mut snapshot,
+            &mut runtime_agents,
+            &mut Vec::new(),
+            &mut workspaces,
+            &mut mcp_tools,
+            &mut review_queue,
+            &mut last_invocations,
+        ),
         DesktopBridgeMessage {
             kind: "mcp_invocation".to_string(),
             payload: json!({
@@ -1405,6 +1689,7 @@ fn test_shell_render_accepts_live_agents_workspaces_and_tools() {
         DesktopShellWithSnapshotProps {
             snapshot,
             runtime_agents: vec![runtime],
+            agent_platforms: Vec::new(),
             workspaces: vec![workspace],
             mcp_tools: vec![BuiltInMcpTool::new(
                 "impulse.project_context",
@@ -1433,6 +1718,7 @@ fn test_shell_render_accepts_live_agents_workspaces_and_tools() {
                 preview: "cargo test\\n".to_string(),
             }],
             bridge_status: None,
+            daemon_ops_status: None,
             initial_view: DesktopView::Terminal,
         },
     );
@@ -1463,6 +1749,7 @@ fn test_shell_review_route_gates_review_console() {
         DesktopShellWithSnapshotProps {
             snapshot: ProjectOpsSnapshot::default(),
             runtime_agents: vec![runtime_snapshot("codex-live")],
+            agent_platforms: Vec::new(),
             workspaces: Vec::new(),
             mcp_tools: Vec::new(),
             last_invocations: Vec::new(),
@@ -1478,6 +1765,7 @@ fn test_shell_review_route_gates_review_console() {
                 preview: "cargo test\\n".to_string(),
             }],
             bridge_status: None,
+            daemon_ops_status: None,
             initial_view: DesktopView::Review,
         },
     );
@@ -1502,6 +1790,7 @@ fn test_shell_supervisor_route_gates_operator_board() {
         DesktopShellWithSnapshotProps {
             snapshot: ProjectOpsSnapshot::default(),
             runtime_agents: vec![runtime_snapshot("codex-live")],
+            agent_platforms: Vec::new(),
             workspaces: Vec::new(),
             mcp_tools: Vec::new(),
             last_invocations: vec![McpInvocation {
@@ -1515,6 +1804,7 @@ fn test_shell_supervisor_route_gates_operator_board() {
             }],
             review_queue: Vec::new(),
             bridge_status: None,
+            daemon_ops_status: None,
             initial_view: DesktopView::Supervisor,
         },
     );
@@ -1845,12 +2135,40 @@ fn test_bridge_status_update_recovery_markers_are_not_degraded() {
 }
 
 #[test]
+fn test_daemon_ops_status_update_parses_connection_health() {
+    let degraded = DaemonOpsStatusUpdate::parse(&DesktopBridgeMessage {
+        kind: "ops_connection_update".to_string(),
+        payload: json!({"connected": false, "error": "daemon unavailable"}),
+    })
+    .expect("daemon ops status");
+    assert!(!degraded.connected);
+    assert_eq!(degraded.error.as_deref(), Some("daemon unavailable"));
+    assert!(DaemonOpsStatusUpdate::parse(&DesktopBridgeMessage {
+        kind: "ops_update".to_string(),
+        payload: json!({"connected": true}),
+    })
+    .is_none());
+
+    let wrapped = DaemonOpsStatusUpdate::parse(&DesktopBridgeMessage {
+        kind: "ops_connection_update".to_string(),
+        payload: serde_json::to_value(DesktopEvent::OpsConnectionUpdate {
+            connected: true,
+            error: None,
+        })
+        .expect("wrapped connection event"),
+    })
+    .expect("legacy wrapped daemon status");
+    assert!(wrapped.connected);
+}
+
+#[test]
 fn test_shell_renders_bridge_status_banner_when_degraded() {
     let mut vdom = VirtualDom::new_with_props(
         DesktopShellWithSnapshot,
         DesktopShellWithSnapshotProps {
             snapshot: ProjectOpsSnapshot::default(),
             runtime_agents: Vec::new(),
+            agent_platforms: Vec::new(),
             workspaces: Vec::new(),
             mcp_tools: Vec::new(),
             last_invocations: Vec::new(),
@@ -1859,6 +2177,7 @@ fn test_shell_renders_bridge_status_banner_when_degraded() {
                 status: "degraded".to_string(),
                 reason: Some("host event API unavailable".to_string()),
             }),
+            daemon_ops_status: None,
             initial_view: DesktopView::Terminal,
         },
     );
@@ -1880,11 +2199,13 @@ fn test_shell_hides_bridge_status_banner_when_healthy() {
         DesktopShellWithSnapshotProps {
             snapshot: ProjectOpsSnapshot::default(),
             runtime_agents: Vec::new(),
+            agent_platforms: Vec::new(),
             workspaces: Vec::new(),
             mcp_tools: Vec::new(),
             last_invocations: Vec::new(),
             review_queue: Vec::new(),
             bridge_status: None,
+            daemon_ops_status: None,
             initial_view: DesktopView::Terminal,
         },
     );
@@ -1903,11 +2224,16 @@ fn test_footer_stream_health_reflects_live_agent() {
         DesktopShellWithSnapshotProps {
             snapshot: ProjectOpsSnapshot::default(),
             runtime_agents: vec![runtime_snapshot("codex-live")],
+            agent_platforms: Vec::new(),
             workspaces: Vec::new(),
             mcp_tools: Vec::new(),
             last_invocations: Vec::new(),
             review_queue: Vec::new(),
             bridge_status: None,
+            daemon_ops_status: Some(DaemonOpsStatusUpdate {
+                connected: true,
+                error: None,
+            }),
             initial_view: DesktopView::Terminal,
         },
     );
@@ -1917,8 +2243,51 @@ fn test_footer_stream_health_reflects_live_agent() {
     // runtime_snapshot has output_bytes > 0 and a present agent → both streams live.
     assert!(html.contains("terminal_output · live"));
     assert!(html.contains("agent_runtime_update · live"));
+    assert!(html.contains("ops_update awaiting first ops_update · live"));
+    assert!(html.contains("online · watching"));
+    assert!(html.contains("data-daemon-freshness=\"current\""));
     assert!(html.contains("supervisor_local_action · ready"));
     assert!(!html.contains("stream pending"));
+}
+
+#[test]
+fn test_publish_only_degradation_keeps_subscribed_snapshot_current() {
+    let mut vdom = VirtualDom::new_with_props(
+        DesktopShellWithSnapshot,
+        DesktopShellWithSnapshotProps {
+            snapshot: ProjectOpsSnapshot {
+                generated_at: "fresh-daemon-snapshot".to_string(),
+                agents: vec![AgentRuntime {
+                    id: "daemon-agent".to_string(),
+                    active: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            runtime_agents: vec![runtime_snapshot("codex-live")],
+            agent_platforms: Vec::new(),
+            workspaces: Vec::new(),
+            mcp_tools: Vec::new(),
+            last_invocations: Vec::new(),
+            review_queue: Vec::new(),
+            bridge_status: None,
+            daemon_ops_status: Some(DaemonOpsStatusUpdate {
+                connected: true,
+                error: Some("publish: temporary failure".to_string()),
+            }),
+            initial_view: DesktopView::Terminal,
+        },
+    );
+    vdom.rebuild_in_place();
+    let html = dioxus_ssr::render(&vdom);
+
+    assert!(html.contains("online · publish degraded"));
+    assert!(html.contains("data-daemon-freshness=\"current\""));
+    assert!(html.contains("data-daemon-status=\"publish-degraded\""));
+    assert!(html.contains("Daemon snapshot reads remain live"));
+    assert!(html.contains("online · 0 working"));
+    assert!(!html.contains("Daemon disconnected"));
+    assert!(!html.contains("cached snapshot hidden"));
 }
 
 #[test]
@@ -1928,6 +2297,7 @@ fn test_footer_stream_health_reads_down_when_transport_degraded() {
         DesktopShellWithSnapshotProps {
             snapshot: ProjectOpsSnapshot::default(),
             runtime_agents: vec![runtime_snapshot("codex-live")],
+            agent_platforms: Vec::new(),
             workspaces: Vec::new(),
             mcp_tools: Vec::new(),
             last_invocations: Vec::new(),
@@ -1935,6 +2305,10 @@ fn test_footer_stream_health_reads_down_when_transport_degraded() {
             bridge_status: Some(BridgeStatusUpdate {
                 status: "degraded".to_string(),
                 reason: Some("host event API unavailable".to_string()),
+            }),
+            daemon_ops_status: Some(DaemonOpsStatusUpdate {
+                connected: false,
+                error: Some("daemon unavailable".to_string()),
             }),
             initial_view: DesktopView::Terminal,
         },
@@ -1945,5 +2319,12 @@ fn test_footer_stream_health_reads_down_when_transport_degraded() {
     // A degraded transport means no events can arrive — every stream reads down.
     assert!(html.contains("terminal_output · down"));
     assert!(html.contains("agent_runtime_update · down"));
+    assert!(html.contains("ops_update awaiting first ops_update · down"));
+    assert!(html.contains("daemon offline"));
+    assert!(html.contains("data-daemon-freshness=\"stale\""));
+    assert!(html.contains("data-daemon-status=\"stale\""));
+    assert!(html.contains("Workbench data is cached and may be stale."));
+    assert!(html.contains("0 cached artifacts"));
+    assert!(html.contains("0 cached interventions"));
     assert!(html.contains("supervisor_local_action · down"));
 }

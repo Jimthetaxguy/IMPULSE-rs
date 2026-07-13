@@ -11,34 +11,40 @@ authors:
 # AGENTS.md — Impulse
 
 > Guidelines for AI coding agents contributing to this project.
+> Product north star: [`VISION.md`](VISION.md)
 > Contract: [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
 > Collaboration playbook: [`docs/guides/COLLABORATIVE-AGENTIC-CODING.md`](docs/guides/COLLABORATIVE-AGENTIC-CODING.md)
 > Canonical stack: Rust (impulse-rs)
-> Roadmap contract: Now=Rust core + Dioxus desktop host; Next=Dioxus Desktop launch scaffold + terminal bridge parity; Legacy=egui compile-maintenance only; Tauri=legacy compatibility adapter only
+> Roadmap contract: Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; Legacy=egui compile-maintenance only.
 
 ---
 
 ## What This Project Is
 
-Impulse is a **sidecar memory layer** for AI coding agents. It is NOT a coding agent itself.
+Impulse is a terminal-native **local control plane and harness manager** for AI coding agents.
 
 ```
- Coding Agent (Claude Code, Codex; legacy OpenCode compatibility)
-       │
-       │ hooks auto-track files + tools
-       ▼
- Impulse (persists memory across sessions)
+ Dioxus cockpit / TUI / CLI
+              │
+              ▼
+ Impulse daemon + control-plane services
+              │
+       runtime adapters / PTYs
+       ├── external CLI harnesses
+       └── Ion native coding runtime
 ```
 
-**The distinction matters:** Impulse doesn't write code. It remembers what the coding agent did — sessions, file changes, decisions, tool usage — and makes that context available in future sessions.
+Memory is one first-class service, not the whole product. Impulse also owns process lifecycle, workbench truth, capability-checked tools, telemetry, messaging/handoffs, credentials, artifacts, policy, and verification. External runtimes retain their proprietary internal loops; Impulse governs the environment around them.
+
+**Keep these identities separate:** a role defines obligations and permissions; a runtime is the execution engine; an agent instance is one running identity; a session is bounded work history; a task is an assignment and its completion criteria; a pane is only a UI/terminal viewport. Never infer a role from the model, executable, or pane position.
 
 ---
 
-## Desktop Shell Status (as of 2026-06-14)
+## Desktop Shell Status (as of 2026-07-12)
 
 > **egui / impulse-gui is LEGACY.** It is frozen — no new features. It will be removed after the Dioxus desktop host reaches parity.
 
-The chosen desktop stack is **Dioxus Desktop + xterm.js terminal bridge**. Tauri-shaped code is retained only as a temporary compatibility adapter while Dioxus Desktop launch plumbing lands.
+The chosen desktop stack is **Dioxus Desktop + xterm.js terminal bridge**. It is the cockpit, not the source of operational truth: authoritative workbench state and policy live in Rust daemon/control-plane contracts. Tauri-shaped code is retained only as a temporary compatibility adapter.
 
 - See `docs/spec/DESKTOP-SHELL-ARCHITECTURE.md` for canonical layer boundaries
 - See `docs/spec/DESKTOP-STACK-TRADEOFFS.md` for the full option evaluation
@@ -47,7 +53,7 @@ The chosen desktop stack is **Dioxus Desktop + xterm.js terminal bridge**. Tauri
 - See `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md` for historical migration context; do not use it as the next product goal
 - See `docs/plans/EGUI-DECOMMISSION.md` for the active, gated plan to fully remove the egui surface (frozen `impulse-gui` crate + `impulse-term` egui rendering layer) once the Dioxus host is operationally authoritative
 
-**Do not add new code to `impulse-gui`.** If you need to touch `impulse-term`, confirm that `eframe` is not re-introduced as a dependency.
+**Do not add new code to `impulse-gui`.** If you touch `impulse-term`, keep new PTY/process behavior framework-neutral and do not expand its optional egui rendering surface.
 
 ---
 
@@ -93,10 +99,14 @@ Choose the simplest solution that works. Prefer editing existing files over crea
 
 **Execution surfaces:**
 - **Direct** — stateless per-action (hooks). Read → process → write → exit.
-- **Daemon** — long-running with Unix socket IPC (TUI/chat). In-memory state with dirty-flag sync.
-- **Desktop shell** — Dioxus Desktop host target backed by daemon snapshots, Rust host commands, and xterm.js terminal bridge events. Legacy Tauri-shaped adapters remain compatibility-only while the Dioxus host boundary reaches parity.
+- **Daemon/control plane** — long-running Unix socket authority for workbench snapshots, bounded managed-agent turns, supervisor actions, artifacts, and telemetry overlays.
+- **Desktop shell** — Dioxus cockpit backed by daemon snapshots, Rust host commands, PTY lifecycle, and xterm.js events. It must not create a competing state store or policy authority.
 - **ratatui TUI** — standalone terminal-native operator surface. Remains first-class throughout migration.
 - **egui workbench** — LEGACY. Frozen. Compile-maintenance only.
+
+**Live versus direction:**
+- Live foundations include PTY lifecycle, daemon-owned workbench truth and telemetry, registry-driven desktop platform identity, Ion as a launchable platform, capability-checked tool registries, supervisor-specific permission policy, and reviewable artifacts.
+- A general `RoleContract`, common runtime-adapter trait, and capability-negotiation contract are product direction, not implemented facts. Do not claim every runtime is structurally governed.
 
 **Data in `.impulse/`:**
 
@@ -128,10 +138,10 @@ Choose the simplest solution that works. Prefer editing existing files over crea
 
 ```bash
 cd impulse-rs
-cargo build
-cargo test
-cargo clippy -- -D warnings
-cargo fmt --check
+cargo build --workspace
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
 ```
 
 ---
@@ -142,10 +152,14 @@ cargo fmt --check
 
 All changes must pass before any commit:
 ```bash
-cd impulse-rs && cargo build && cargo test && cargo clippy -- -D warnings && cargo fmt --check
+cd impulse-rs
+cargo build --workspace
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
 ```
 
-**Expected (2026-06-30):** 1,711 tests passed, 0 failed, 5 ignored. Update counts in this file, CLAUDE.md, and RUST-CANONICAL-CONTRACT.md when they change.
+**Expected canonical checkout (2026-07-12 projection):** 1,950 tests passed, 0 failed, 9 ignored. The verified isolated aggregate worktree reports 1,949 passed with `test_reconciled_clean_archive_has_contracts_snapshot` explicitly filtered; the canonical count restores that one checkout-relative proof. Update counts in this file, CLAUDE.md, and RUST-CANONICAL-CONTRACT.md when they change.
 
 ### Code Requirements
 
@@ -185,7 +199,7 @@ Use descriptive names: `test_<function>_<scenario>_<expected_result>`
 
 ### Test Density Targets
 
-| Module Category | Target | Current (2026-04-01) | Why |
+| Module Category | Target | Last measured baseline (2026-04-01) | Why |
 |---|---|---|---|
 | **Core** (state, daemon, agent) | 3.0 tests/KLOC | ~1.5 | Data persistence, IPC safety |
 | **Handlers** (CLI dispatch) | 2.0 tests/KLOC | ~0.8 (13/19 files untested) | User-facing entrypoints |
@@ -193,17 +207,19 @@ Use descriptive names: `test_<function>_<scenario>_<expected_result>`
 | **UI/TUI** (terminal) | 1.0 tests/KLOC | ~0.4 | Layout/rendering correctness |
 | **Integration** | Every stable CLI command | 26 tests | End-to-end verification |
 
-New modules must ship meeting the target. Existing modules should trend toward targets.
+New modules must ship meeting the target. Existing modules should trend toward targets. The
+baseline above predates substantial handler and control-plane coverage added since April; recompute
+it before presenting it as current. `docs/spec/TEST-TRACEABILITY.md` owns the current qualitative
+gap assessment.
 
-**Workspace totals (2026-06-30):** 1,711 tests across the 4 workspace crates (impulse-rs: 1381+26, ops: 31, term: 114, desktop: 159). The legacy impulse-gui crate is frozen/excluded from the workspace and its tests are not counted.
+**Workspace totals (2026-07-12 canonical projection):** 1,950 tests across the 5 workspace crates/packages (impulse-rs: 1,576, ops: 44 including the canonical-checkout archive proof, term: 114, desktop: 193, ion: 23), with 9 ignored and 0 failed. The verified isolated worktree reports 1,949 passed because that one archive proof is filtered. The legacy impulse-gui crate is frozen/excluded from the workspace and its 252 passing tests are not counted.
 
-High-risk untested modules (prioritize coverage):
-- `src/handlers/daemon_dispatch.rs` (450 LOC) — routes all IPC, zero tests
-- `src/handlers/direct_dispatch.rs` (465 LOC) — routes all CLI commands, zero tests
-- `src/handlers/agent.rs` (145 LOC) — agent configuration and query, zero tests
-- `src/handlers/guard.rs` (204 LOC) — action guardrails with `process::exit`, zero tests
-- `src/handlers/injection_handlers.rs` (209 LOC) — context injection routing, zero tests
-- `src/handlers/common.rs` (379 LOC) — shared helpers used by all handlers, zero tests
+High-risk coverage priorities (despite substantial source-local unit coverage):
+- End-to-end parity between `daemon_dispatch` and `direct_dispatch` for every stable command.
+- Agent configuration/query failures across provider, credential, timeout, and daemon boundaries.
+- Guard and confirmation behavior at real dispatch boundaries, including process-exit semantics.
+- Injection/stewardship acceptance evidence across retrieval, review, persistence, and output.
+- Shared handler-helper failure paths under concurrent and cancellation-heavy execution.
 
 ### Error Handling Patterns
 

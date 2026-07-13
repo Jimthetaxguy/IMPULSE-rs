@@ -1,7 +1,7 @@
 # Impulse IPC Protocol
 
 > Unix domain socket protocol between Impulse daemon and clients (GUI, CLI `--daemon` mode).
-> **Protocol version: 2** — see [Version section](#protocol-version) for upgrade notes.
+> **Protocol version: 3** — see [Version section](#protocol-version) for upgrade notes.
 
 ---
 
@@ -39,6 +39,7 @@ Requests with no data omit the `data` field:
 ```json
 {"type": "Ok", "data": {"result": ...}}
 {"type": "Error", "data": {"message": "..."}}
+{"type": "Busy", "data": {"resource": "agent_turn", "retry_after_ms": 250}}
 {"type": "AgentAssistResult", "data": { ... }}
 {"type": "ConflictCheck", "data": {"has_conflict": true, "conflicting_sessions": ["id1"]}}
 ```
@@ -51,12 +52,14 @@ The daemon includes `protocol_version` in its `Status` response. Clients must ch
 
 | Constant | Value | Location |
 |----------|-------|----------|
-| `EXPECTED_PROTOCOL_VERSION` | **2** | GUI client |
-| `PROTOCOL_VERSION` | **2** | Daemon (`src/daemon/protocol.rs`) |
+| `EXPECTED_PROTOCOL_VERSION` | **3** | GUI client |
+| `PROTOCOL_VERSION` | **3** | Daemon (`src/daemon/protocol.rs`) |
 
 Version mismatch triggers a warning in the GUI status bar.
 
-**Upgrading from v1:** v2 adds the full Agent System section, Delegation System, `CheckConflict`, `GetSession`, `TrackTool`, `StewardStatus/Proposals/Memory`, `ListTools`, `DescribeTool`, `Chat`, `GetAgentPool`, and the `AgentAssistResult` / `AgentSpecializedResult` response variants.
+**Upgrading from v2:** v3 adds the typed `Busy` response. Agent-backed requests return `resource: "agent_turn"` with a retry hint when another logical turn owns the cached agent; busy requests never reach a provider or mutate conversation state.
+
+**Upgrading from v1:** v2 added the full Agent System section, Delegation System, `CheckConflict`, `GetSession`, `TrackTool`, `StewardStatus/Proposals/Memory`, `ListTools`, `DescribeTool`, `Chat`, `GetAgentPool`, and the `AgentAssistResult` / `AgentSpecializedResult` response variants.
 
 ---
 
@@ -318,13 +321,9 @@ Returns `AgentAssistResult` with sessions organized by agent role.
 
 ### Search & Retrieval
 
-Search and retrieval requests are dispatched via the daemon when using `--daemon` mode:
-
-| Request | Data | Since | Description |
-|---------|------|-------|-------------|
-| `SearchHistory` | `{query, mode?, limit?}` | v1 | Search session history |
-| `SearchGenome` | `{query, mode?, limit?}` | v1 | Search genome decisions |
-| `IndexMemory` | `{scope, rebuild}` | v1 | Trigger re-indexing |
+Protocol v3 does not define daemon request variants for retrieval. `search-history`,
+`search-genome`, `index-memory`, and `retrieval-status` are direct-mode CLI operations; the
+`--daemon` dispatcher tells callers to retry without the flag.
 
 ### Debug
 
@@ -343,13 +342,23 @@ All responses use the `DaemonResponse` enum.
 Contains the result as a JSON value. The structure depends on the request.
 
 ```json
-{"type": "Ok", "data": {"result": {"sessions": 3, "active": 1, "protocol_version": 2}}}
+{"type": "Ok", "data": {"result": {"sessions": 3, "active": 1, "protocol_version": 3}}}
 ```
 
 ### Error
 
 ```json
 {"type": "Error", "data": {"message": "session not found: abc123"}}
+```
+
+### Busy
+
+Returned when a singleton daemon resource is already owned by another request. The caller may
+retry after the supplied backoff; the rejected request has not reached the provider or changed
+daemon conversation state.
+
+```json
+{"type": "Busy", "data": {"resource": "agent_turn", "retry_after_ms": 250}}
 ```
 
 ### AgentAssistResult
@@ -422,6 +431,14 @@ The GUI maintains a persistent connection via a poller thread that sends periodi
 ---
 
 ## Changelog
+
+### v3 — Managed-agent backpressure
+
+Added 2026-07-11:
+
+- `Busy { resource, retry_after_ms }` response variant shared by daemon, workbench, CLI, and GUI contracts.
+- `agent_turn` busy resource for fail-fast rejection of concurrent singleton-agent turns.
+- Busy requests do not invoke a provider, queue past the client timeout, or mutate cached agent state.
 
 ### v2 — Agent System additions
 

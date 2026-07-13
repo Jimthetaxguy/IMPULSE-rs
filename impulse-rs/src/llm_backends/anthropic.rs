@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -12,14 +12,20 @@ const HTTP_REQUEST_TIMEOUT_SECS: u64 = 120;
 /// Connection-establishment timeout (fail fast when the endpoint is unreachable).
 const HTTP_CONNECT_TIMEOUT_SECS: u64 = 10;
 
-/// Build the shared HTTP client with bounded timeouts. Falls back to a default
-/// client if the builder fails (it never does for static timeout config).
+/// Build the shared HTTP client with bounded defaults. Every provider request
+/// also applies the same request-local timeout, so the fallback client cannot
+/// silently become unbounded if platform TLS/client initialization rejects the
+/// configured builder.
 fn build_http_client() -> Client {
     Client::builder()
         .timeout(std::time::Duration::from_secs(HTTP_REQUEST_TIMEOUT_SECS))
         .connect_timeout(std::time::Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
         .build()
         .unwrap_or_else(|_| Client::new())
+}
+
+fn bounded_request(request: RequestBuilder) -> RequestBuilder {
+    request.timeout(std::time::Duration::from_secs(HTTP_REQUEST_TIMEOUT_SECS))
 }
 
 /// Common provider structure - shared by all LLM providers
@@ -228,17 +234,18 @@ impl LlmProvider for AnthropicProvider {
                 .map_err(|e| AgentError::InvalidRequest(format!("failed to encode tools: {e}")))?;
         }
 
-        let response = self
-            .0
-            .http_client()
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", self.0.api_key())
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AgentError::ApiRequest(e.to_string()))?;
+        let response = bounded_request(
+            self.0
+                .http_client()
+                .post("https://api.anthropic.com/v1/messages"),
+        )
+        .header("x-api-key", self.0.api_key())
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| AgentError::ApiRequest(e.to_string()))?;
 
         // Check status and get error details if failed
         if !response.status().is_success() {
@@ -368,16 +375,17 @@ impl LlmProvider for OpenAiProvider {
             body["max_tokens"] = serde_json::json!(max_tokens);
         }
 
-        let response = self
-            .0
-            .http_client()
-            .post("https://api.openai.com/v1/chat/completions")
-            .header("Authorization", format!("Bearer {}", self.0.api_key()))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AgentError::ApiRequest(e.to_string()))?;
+        let response = bounded_request(
+            self.0
+                .http_client()
+                .post("https://api.openai.com/v1/chat/completions"),
+        )
+        .header("Authorization", format!("Bearer {}", self.0.api_key()))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| AgentError::ApiRequest(e.to_string()))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -482,16 +490,17 @@ impl LlmProvider for MinimaxProvider {
             "max_tokens": request.max_tokens.unwrap_or(4096),
         });
 
-        let response = self
-            .0
-            .http_client()
-            .post("https://api.minimax.chat/v1/text/chatcompletion_v2")
-            .header("Authorization", format!("Bearer {}", self.0.api_key()))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AgentError::ApiRequest(e.to_string()))?;
+        let response = bounded_request(
+            self.0
+                .http_client()
+                .post("https://api.minimax.chat/v1/text/chatcompletion_v2"),
+        )
+        .header("Authorization", format!("Bearer {}", self.0.api_key()))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| AgentError::ApiRequest(e.to_string()))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -551,6 +560,17 @@ mod tests {
         assert!(
             Arc::ptr_eq(&provider.http_client, &cloned.http_client),
             "clone should share the http client Arc"
+        );
+    }
+
+    #[test]
+    fn test_bounded_request_applies_timeout_even_to_fallback_client() {
+        let request = bounded_request(Client::new().get("http://127.0.0.1/"))
+            .build()
+            .unwrap();
+        assert_eq!(
+            request.timeout().copied(),
+            Some(std::time::Duration::from_secs(HTTP_REQUEST_TIMEOUT_SECS))
         );
     }
 

@@ -4,10 +4,11 @@ use std::path::{Path, PathBuf};
 
 use dioxus::prelude::*;
 use impulse_desktop::{
-    default_builtin_mcp_tools, AgentPlatformKind, AgentRuntimeSnapshot, DesktopShellWithSnapshot,
+    default_builtin_mcp_tools, AgentPlatformId, AgentRuntimeSnapshot, DesktopShellWithSnapshot,
     DesktopShellWithSnapshotProps, DesktopView, McpInvocation, ReviewQueueItem, ReviewQueueStatus,
     WorkspaceEntry, WorkspaceTarget,
 };
+use impulse_ops::agent_registry::{AgentPlatformsReport, AgentRegistry};
 use impulse_ops::{
     AgentRole, AgentRuntime, AgentStatus, ArtifactAction, ArtifactEnvelope, ArtifactFileRef,
     ArtifactStatus, ArtifactViewHint, ContextHealthSummary, DelegationSummary, DiffSummary,
@@ -25,6 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let snapshot = seeded_snapshot();
     let runtime_agents = seeded_runtime_agents();
+    let agent_platforms = AgentPlatformsReport::from_registry(&AgentRegistry::builtin()).platforms;
     let workspaces = seeded_workspaces();
     let mcp_tools = default_builtin_mcp_tools();
     let last_invocations = seeded_invocations();
@@ -36,11 +38,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             DesktopShellWithSnapshotProps {
                 snapshot: snapshot.clone(),
                 runtime_agents: runtime_agents.clone(),
+                agent_platforms: agent_platforms.clone(),
                 workspaces: workspaces.clone(),
                 mcp_tools: mcp_tools.clone(),
                 last_invocations: last_invocations.clone(),
                 review_queue: review_queue.clone(),
                 bridge_status: None,
+                daemon_ops_status: None,
                 initial_view: view,
             },
         );
@@ -276,11 +280,16 @@ fn seeded_artifacts() -> Vec<ArtifactEnvelope> {
 
 fn seeded_runtime_agents() -> Vec<AgentRuntimeSnapshot> {
     vec![
-        runtime_agent("codex-live", "Codex Live", AgentPlatformKind::Codex, true),
+        runtime_agent(
+            "codex-live",
+            "Codex Live",
+            AgentPlatformId::try_new("codex").unwrap(),
+            true,
+        ),
         runtime_agent(
             "claude-review",
             "Claude Review",
-            AgentPlatformKind::ClaudeCode,
+            AgentPlatformId::try_new("claude-code").unwrap(),
             false,
         ),
     ]
@@ -289,9 +298,14 @@ fn seeded_runtime_agents() -> Vec<AgentRuntimeSnapshot> {
 fn runtime_agent(
     id: &str,
     label: &str,
-    platform: AgentPlatformKind,
+    platform: AgentPlatformId,
     focused: bool,
 ) -> AgentRuntimeSnapshot {
+    let command = AgentRegistry::builtin()
+        .get(platform.as_str())
+        .expect("visual fixture platform must be registered")
+        .command
+        .clone();
     let workspace = WorkspaceTarget {
         root: "<repo>".to_string(),
         label: Some("IMPULSE-rs".to_string()),
@@ -302,7 +316,7 @@ fn runtime_agent(
         agent_id: id.to_string(),
         label: label.to_string(),
         platform,
-        command: platform.default_command(),
+        command,
         args: Vec::new(),
         cwd: Some(workspace.root.clone()),
         workspace: Some(workspace),

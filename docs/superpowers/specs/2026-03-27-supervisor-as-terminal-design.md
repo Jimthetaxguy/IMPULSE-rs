@@ -1,5 +1,14 @@
 # Supervisor-as-Terminal with Two-Tier Memory — Design Spec
 
+> **Contract status: superseded as a product contract; retained as exploratory provenance.**
+> This document captures a March 2026 UI/prompt-driven design, not the active architecture.
+> The current north star is [`../../../VISION.md`](../../../VISION.md), the active contract is
+> [`../../spec/RUST-CANONICAL-CONTRACT.md`](../../spec/RUST-CANONICAL-CONTRACT.md), and live code
+> enforces a supervisor-specific backend permission policy through the daemon. A supervisor may be
+> rendered in a terminal pane, but pane position and prompt injection do not establish its role.
+> Do not implement the phases below directly until the role/runtime hierarchy and enforcement ADR
+> resolves the open contracts.
+
 **Goal:** Transform the supervisor from a separate chat widget into a real PTY terminal pane that lives at the root `~/.impulse/` level, sees across all projects, and operates at a higher memory tier than per-project agent terminals.
 
 **Architecture:** Option C (Hybrid) — the supervisor is a real agent running in a terminal (Claude Code, OpenCode, or Codex), promoted to supervisor status through context injection. It is NOT a special UI widget — it's a terminal pane like any other, but with cross-project awareness injected by Impulse.

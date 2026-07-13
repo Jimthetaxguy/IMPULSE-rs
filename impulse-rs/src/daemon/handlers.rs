@@ -1387,52 +1387,41 @@ pub(crate) async fn handle_ops_request(
     }
 }
 
-/// Check the daemon-level agent cache out for the duration of a single
-/// request, lazily initializing it from config on first use, and release
-/// the lock immediately rather than holding it across the caller's
-/// subsequent `.await` on the agent.
+const AGENT_BUSY_RETRY_AFTER_MS: u64 = 250;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AgentTurnBusy;
+
+fn agent_turn_busy_response() -> DaemonResponse {
+    DaemonResponse::Busy {
+        resource: impulse_ops::DaemonBusyResource::AgentTurn,
+        retry_after_ms: AGENT_BUSY_RETRY_AFTER_MS,
+    }
+}
+
+/// Try to acquire the daemon's one cached agent for a complete logical turn.
 ///
-/// **Why this exists (freeze bug, same-day Opus sweep):** the previous
-/// version of this helper returned a live `MutexGuard<Option<ImpulseAgent>>`
-/// that callers kept in scope across `agent.query(...).await`. `query()`
-/// eventually reaches `harness::harness_query_structured`'s
-/// `tokio::process::Command::output().await` in harness mode (`agent/mod.rs`),
-/// which had no timeout — if the spawned `claude`/`codex`/`gemini` CLI hung
-/// (network stall, waiting on stdin, an auth prompt), that `.await` never
-/// returned, and the still-held `MutexGuard` meant the mutex itself was
-/// locked indefinitely. Every *other* agent-related daemon request
-/// (`SupervisorChat`, `AgentAssist`, `AgentReviewCode`/`AgentAnalyzeError`/
-/// `AgentSummarizePane`) calls this same helper and would then block on
-/// `cached_agent.lock().await` forever — one wedged child process froze the
-/// entire daemon's agent IPC surface, not just the one hung request.
+/// The returned Tokio mutex guard is intentionally held across the caller's
+/// agent query. A concurrent request receives a typed `Busy` response instead
+/// of queueing beyond its client lifetime or forking the cached state. This
+/// keeps conversation history on one `ImpulseAgent` and makes cache state
+/// cancellation-safe: aborting the handler drops the guard but leaves the agent
+/// in the cache. The previous
+/// checkout/checkin ownership transfer allowed concurrent re-initialization,
+/// last-writer-wins history loss, and permanent cache loss when a task was
+/// cancelled between checkout and checkin.
 ///
-/// This helper now `take()`s the `ImpulseAgent` out of the `Option` and
-/// returns it *owned*, dropping the `MutexGuard` before returning. Callers
-/// run their (possibly slow) query on the owned value with no lock held,
-/// then must call [`checkin_agent`] to put it back — see that function's
-/// doc for why every exit path, including error/not-ready paths, must call
-/// it. Paired with `agent/mod.rs`'s new subprocess timeout, a hung harness
-/// now blocks at most one request for a bounded duration instead of
-/// freezing the daemon indefinitely.
-///
-/// **Accepted tradeoff (fresh Opus review, same day):** while the cache
-/// slot is empty (between one request's checkout and its checkin), a
-/// concurrent request sees `None` here and re-initializes a second, fully
-/// independent `ImpulseAgent` with empty history rather than waiting. Both
-/// requests' agents check in afterward via plain `*guard = Some(agent)` —
-/// last write wins. This can discard the *original* agent's accumulated
-/// session history, not just the freshly-reinitialized one's (empty)
-/// history: if the reinitialized instance happens to check in after the
-/// original, the original's history is the one silently lost. Accepted
-/// because `session_history` is in-memory, already bounded/truncated, and
-/// already lost on daemon restart — the alternative (serializing every
-/// agent request on this mutex across slow LLM/subprocess calls) is
-/// exactly the freeze this fix exists to prevent.
-async fn checkout_agent(
-    cached_agent: &tokio::sync::Mutex<Option<crate::agent::ImpulseAgent>>,
+/// Holding this asynchronous mutex does not block unrelated daemon requests;
+/// only agent handlers acquire it. Harness and API calls are independently
+/// bounded by their provider timeouts, so an in-flight turn cannot retain the
+/// guard forever. Fail-fast acquisition also guarantees a request cannot wait
+/// behind another full provider timeout and later commit a turn after its
+/// client has disconnected.
+fn try_lock_agent_for_turn<'a>(
+    cached_agent: &'a tokio::sync::Mutex<Option<crate::agent::ImpulseAgent>>,
     state: &SharedState,
-) -> Option<crate::agent::ImpulseAgent> {
-    let mut guard = cached_agent.lock().await;
+) -> Result<tokio::sync::MutexGuard<'a, Option<crate::agent::ImpulseAgent>>, AgentTurnBusy> {
+    let mut guard = cached_agent.try_lock().map_err(|_| AgentTurnBusy)?;
     if guard.is_none() {
         if let Ok(config) = state.config_snapshot() {
             *guard = crate::agent::resolve_from_config(
@@ -1443,24 +1432,7 @@ async fn checkout_agent(
             );
         }
     }
-    guard.take()
-}
-
-/// Put an agent checked out via [`checkout_agent`] back into the daemon
-/// cache, re-acquiring the mutex only for the instant it takes to store it.
-///
-/// Must be called on **every** exit path after a successful `checkout_agent`
-/// — including "not configured"/"not ready" early returns and query
-/// errors — not just the success path. Skipping it on any branch would
-/// silently drop the cached agent (losing session history and forcing a
-/// full re-init, including re-resolving config, on the next request) or, if
-/// skipped on a hot path repeatedly, leave the cache permanently `None`.
-async fn checkin_agent(
-    cached_agent: &tokio::sync::Mutex<Option<crate::agent::ImpulseAgent>>,
-    agent: crate::agent::ImpulseAgent,
-) {
-    let mut guard = cached_agent.lock().await;
-    *guard = Some(agent);
+    Ok(guard)
 }
 
 pub(crate) async fn handle_supervisor_request(
@@ -1494,8 +1466,12 @@ pub(crate) async fn handle_supervisor_request(
                         ))
                     }
                 };
-            let mut agent = match checkout_agent(cached_agent, state).await {
-                Some(a) => a,
+            let mut agent_guard = match try_lock_agent_for_turn(cached_agent, state) {
+                Ok(guard) => guard,
+                Err(_) => return agent_turn_busy_response(),
+            };
+            let agent = match agent_guard.as_mut() {
+                Some(agent) => agent,
                 None => {
                     let fallback = impulse_ops::SupervisorChatResult {
                         response: "Impulse Agent not configured. Configure a provider or harness to enable supervisor chat.".to_string(),
@@ -1515,7 +1491,6 @@ pub(crate) async fn handle_supervisor_request(
                     proposals: Vec::new(),
                     permission_state,
                 };
-                checkin_agent(cached_agent, agent).await;
                 return DaemonResponse::Ok {
                     result: serde_json::to_value(fallback)
                         .unwrap_or_else(|_| serde_json::json!({})),
@@ -1525,15 +1500,12 @@ pub(crate) async fn handle_supervisor_request(
             let full_prompt =
                 build_supervisor_prompt(&snapshot, &permission_state, &prompt, context.as_deref());
 
-            // The mutex is NOT held across this `.await` — `agent` is an
-            // owned value checked out above, so a slow/hung harness
-            // subprocess here blocks only this request, not every other
-            // agent-related daemon request. See `checkout_agent`'s doc.
+            // The agent-turn mutex is held across this bounded query so a
+            // second agent request receives Busy instead of forking session
+            // history. Unrelated daemon request groups do not acquire it.
             let query_result = agent
                 .query(crate::agent::prompts::SUPERVISOR_SYSTEM, &full_prompt)
                 .await;
-
-            checkin_agent(cached_agent, agent).await;
 
             match query_result {
                 Ok(response) => {
@@ -1574,8 +1546,12 @@ pub(crate) async fn handle_agent_request(
         return respond_err("Internal routing error: not an agent request");
     };
 
-    let mut agent = match checkout_agent(cached_agent, state).await {
-        Some(a) => a,
+    let mut agent_guard = match try_lock_agent_for_turn(cached_agent, state) {
+        Ok(guard) => guard,
+        Err(_) => return agent_turn_busy_response(),
+    };
+    let agent = match agent_guard.as_mut() {
+        Some(agent) => agent,
         None => {
             return DaemonResponse::AgentAssistResult {
                 success: false,
@@ -1587,7 +1563,6 @@ pub(crate) async fn handle_agent_request(
     };
 
     if !agent.is_ready() {
-        checkin_agent(cached_agent, agent).await;
         return DaemonResponse::AgentAssistResult {
             success: false,
             response:
@@ -1609,9 +1584,8 @@ pub(crate) async fn handle_agent_request(
     };
 
     // Use query_with_context when insights are available to enrich the prompt
-    // with structured cross-pane context from the context lifecycle. Neither
-    // branch holds the cache mutex across its `.await` -- `agent` is owned,
-    // checked out above. See `checkout_agent`'s doc for why this matters.
+    // with structured cross-pane context from the context lifecycle. The
+    // agent-turn mutex remains held so history updates are ordered.
     let result = if insights.is_empty() {
         agent
             .query(crate::agent::prompts::COORDINATION_SYSTEM, &full_prompt)
@@ -1625,8 +1599,6 @@ pub(crate) async fn handle_agent_request(
             )
             .await
     };
-
-    checkin_agent(cached_agent, agent).await;
 
     match result {
         Ok(response) => DaemonResponse::AgentAssistResult {
@@ -1652,8 +1624,12 @@ pub(crate) async fn handle_agent_specialized_request(
     state: &SharedState,
     cached_agent: &Arc<tokio::sync::Mutex<Option<crate::agent::ImpulseAgent>>>,
 ) -> DaemonResponse {
-    let mut agent = match checkout_agent(cached_agent, state).await {
-        Some(a) => a,
+    let mut agent_guard = match try_lock_agent_for_turn(cached_agent, state) {
+        Ok(guard) => guard,
+        Err(_) => return agent_turn_busy_response(),
+    };
+    let agent = match agent_guard.as_mut() {
+        Some(agent) => agent,
         None => {
             return respond_err(
                 "Impulse Agent not configured. Run: impulse-rs agent-configure --provider anthropic --api-key YOUR_KEY",
@@ -1662,16 +1638,13 @@ pub(crate) async fn handle_agent_specialized_request(
     };
 
     if !agent.is_ready() {
-        checkin_agent(cached_agent, agent).await;
         return respond_err(
             "Impulse Agent is configured but not ready (check API key or harness installation)",
         );
     }
 
-    // None of the branches below hold the cache mutex across their
-    // `.await` -- `agent` is an owned value checked out above via
-    // `checkout_agent`, and is checked back in once the match completes
-    // (success or error). See `checkout_agent`'s doc for why this matters.
+    // All branches run under the same agent-turn guard so the one cached
+    // agent's conversation history cannot fork or be overwritten.
     let response = match request {
         DaemonRequest::AgentReviewCode {
             file_path,
@@ -1744,8 +1717,6 @@ pub(crate) async fn handle_agent_specialized_request(
         }
         _ => respond_err("Internal routing error: not a specialized agent request"),
     };
-
-    checkin_agent(cached_agent, agent).await;
 
     response
 }
@@ -1933,11 +1904,75 @@ pub(crate) async fn handle_plugin_request(request: DaemonRequest) -> DaemonRespo
 }
 
 #[cfg(test)]
-mod agent_lock_release_tests {
+mod agent_cache_lifecycle_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
-    use super::{checkin_agent, checkout_agent};
+    use super::{handle_agent_request, handle_status, try_lock_agent_for_turn};
+    use crate::daemon::protocol::{DaemonRequest, DaemonResponse};
+    use crate::llm_backends::{
+        async_trait, AgentResult, ChatRequest, ChatResponse, LlmProvider, StopReason, Usage,
+    };
+    use tokio::sync::Notify;
+
+    struct GatedProviderState {
+        calls: AtomicUsize,
+        requests: std::sync::Mutex<Vec<ChatRequest>>,
+        blocked_call: usize,
+        blocked_call_started: Notify,
+        release_blocked_call: Notify,
+    }
+
+    impl GatedProviderState {
+        fn new(blocked_call: usize) -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicUsize::new(0),
+                requests: std::sync::Mutex::new(Vec::new()),
+                blocked_call,
+                blocked_call_started: Notify::new(),
+                release_blocked_call: Notify::new(),
+            })
+        }
+    }
+
+    struct GatedProvider {
+        state: Arc<GatedProviderState>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for GatedProvider {
+        fn name(&self) -> &str {
+            "gated-test-provider"
+        }
+
+        fn default_model(&self) -> &str {
+            "gated-test-model"
+        }
+
+        async fn chat(&self, request: ChatRequest) -> AgentResult<ChatResponse> {
+            let call = self.state.calls.fetch_add(1, Ordering::SeqCst);
+            self.state.requests.lock().unwrap().push(request);
+            if call == self.state.blocked_call {
+                self.state.blocked_call_started.notify_one();
+                self.state.release_blocked_call.notified().await;
+            }
+            Ok(ChatResponse {
+                content: format!("reply-{}", call + 1),
+                model: self.default_model().to_string(),
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+                stop_reason: StopReason::EndTurn,
+                tool_calls: Vec::new(),
+            })
+        }
+
+        fn supported_models(&self) -> Vec<&str> {
+            vec![self.default_model()]
+        }
+    }
 
     fn test_state() -> (tempfile::TempDir, crate::state::SharedState) {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1945,74 +1980,232 @@ mod agent_lock_release_tests {
         (tmp, Arc::new(st))
     }
 
-    /// Regression test for the freeze bug (same-day Opus sweep): before the
-    /// fix, `get_or_init_agent` returned a live `MutexGuard` that daemon
-    /// handlers kept in scope across `agent.query(...).await`, so the
-    /// `cached_agent` mutex stayed locked for the query's entire duration.
-    /// A slow-but-not-hung query (or a genuinely hung one) meant every
-    /// *other* agent-related request would block on
-    /// `cached_agent.lock().await` until that one query finished. This test
-    /// proves `checkout_agent`/`checkin_agent` no longer has that shape: the
-    /// mutex is only held for the instant it takes to check the agent out,
-    /// not across the caller's subsequent work with it.
-    ///
-    /// Exercises the locking primitive directly (`checkout_agent`/
-    /// `checkin_agent`) rather than a full `handle_agent_request` +
-    /// real/fake harness subprocess round trip -- the subprocess timeout
-    /// itself is covered separately by
-    /// `agent::tests::test_harness_query_times_out_instead_of_hanging_forever`;
-    /// what matters here is specifically that the *mutex* isn't held across
-    /// whatever the caller does with the checked-out agent, which is a
-    /// property of these two functions independent of what runs in between.
+    fn agent_assist(prompt: &str) -> DaemonRequest {
+        DaemonRequest::AgentAssist {
+            prompt: prompt.to_string(),
+            context: None,
+            insights: Vec::new(),
+        }
+    }
+
+    fn assert_agent_success(response: DaemonResponse) {
+        assert!(
+            matches!(
+                response,
+                DaemonResponse::AgentAssistResult { success: true, .. }
+            ),
+            "agent turn should succeed: {response:?}"
+        );
+    }
+
+    fn assert_agent_busy(response: DaemonResponse) {
+        assert!(
+            matches!(
+                response,
+                DaemonResponse::Busy {
+                    resource: impulse_ops::DaemonBusyResource::AgentTurn,
+                    retry_after_ms: 250,
+                }
+            ),
+            "concurrent agent turn should return typed busy: {response:?}"
+        );
+    }
+
+    async fn notified_within(notify: &Notify, message: &'static str) {
+        tokio::time::timeout(Duration::from_secs(2), notify.notified())
+            .await
+            .expect(message);
+    }
+
     #[tokio::test]
-    async fn test_checkout_agent_releases_lock_before_a_slow_query_completes() {
+    async fn test_concurrent_agent_turn_fails_fast_without_forking_the_cache() {
+        let (_tmp, state) = test_state();
+        let agent = crate::agent::ImpulseAgent::new(crate::agent::ImpulseAgentConfig::default())
+            .expect("disabled-mode agent should construct");
+        let cached_agent = tokio::sync::Mutex::new(Some(agent));
+        let first_turn = try_lock_agent_for_turn(&cached_agent, &state)
+            .expect("first turn should acquire the cached agent");
+
+        assert!(
+            try_lock_agent_for_turn(&cached_agent, &state).is_err(),
+            "a concurrent logical turn must fail fast instead of queueing or forking the cache"
+        );
+        drop(first_turn);
+        assert!(
+            try_lock_agent_for_turn(&cached_agent, &state)
+                .expect("the next turn should acquire after release")
+                .is_some(),
+            "the next turn must receive the same cached agent after the first releases it"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_aborted_agent_turn_preserves_the_cached_agent() {
         let (_tmp, state) = test_state();
         let agent = crate::agent::ImpulseAgent::new(crate::agent::ImpulseAgentConfig::default())
             .expect("disabled-mode agent should construct");
         let cached_agent = Arc::new(tokio::sync::Mutex::new(Some(agent)));
+        let turn_started = Arc::new(Notify::new());
 
-        let cached_agent_a = cached_agent.clone();
-        let state_a = state.clone();
-        let task_a = tokio::spawn(async move {
-            let agent = checkout_agent(cached_agent_a.as_ref(), &state_a)
-                .await
-                .expect("agent should be checked out");
-            // Simulate a slow-but-not-hung query in progress. The mutex
-            // must NOT be held across this sleep -- the pre-fix code held
-            // the equivalent `MutexGuard` across `agent.query(...).await`
-            // for exactly this long.
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            checkin_agent(cached_agent_a.as_ref(), agent).await;
-        });
+        let in_flight = {
+            let cached_agent = cached_agent.clone();
+            let state = state.clone();
+            let turn_started = turn_started.clone();
+            tokio::spawn(async move {
+                let guard = try_lock_agent_for_turn(cached_agent.as_ref(), &state)
+                    .expect("turn should acquire the cached agent");
+                assert!(guard.is_some(), "turn should receive the cached agent");
+                turn_started.notify_one();
+                std::future::pending::<()>().await;
+            })
+        };
 
-        // Give task A time to complete its checkout (and start its
-        // simulated slow query) before task B tries its own checkout.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        let start = std::time::Instant::now();
-        let checked_out_b = checkout_agent(cached_agent.as_ref(), &state).await;
-        let elapsed = start.elapsed();
+        notified_within(&turn_started, "agent turn did not acquire the cache").await;
+        in_flight.abort();
+        let _ = in_flight.await;
 
         assert!(
-            elapsed < Duration::from_millis(250),
-            "checkout_agent blocked for {elapsed:?} waiting on task A's in-flight query -- \
-             the cache mutex must be released before the query runs, not held across it"
+            try_lock_agent_for_turn(cached_agent.as_ref(), &state)
+                .expect("aborting the turn must release the async mutex")
+                .is_some(),
+            "cancelling a logical turn must not drop the daemon's only cached agent"
         );
-        // Task A already took the only cached agent out, so B's cache slot
-        // is empty; `state`'s config has no provider/harness configured, so
-        // `resolve_from_config` legitimately returns `None` here rather
-        // than fabricating a second agent. This is the documented tradeoff
-        // of this locking shape (see `checkout_agent`'s doc): concurrent
-        // requests get independent agent instances rather than serializing
-        // on one -- whichever instance checks in LAST wins the cache slot,
-        // which can discard the OTHER instance's session history (not just
-        // a fresh instance's empty history) when they race.
-        assert!(checked_out_b.is_none());
+    }
 
-        task_a.await.expect("task A should complete");
-        assert!(
-            cached_agent.lock().await.is_some(),
-            "task A must have checked its agent back in"
+    #[tokio::test]
+    async fn test_unrelated_daemon_work_is_not_serialized_by_an_agent_turn() {
+        let (_tmp, state) = test_state();
+        let agent = crate::agent::ImpulseAgent::new(crate::agent::ImpulseAgentConfig::default())
+            .expect("disabled-mode agent should construct");
+        let cached_agent = tokio::sync::Mutex::new(Some(agent));
+        let _agent_turn = try_lock_agent_for_turn(&cached_agent, &state)
+            .expect("agent turn should acquire the cache");
+
+        tokio::time::timeout(Duration::from_millis(100), handle_status(&state))
+            .await
+            .expect("non-agent daemon work must remain responsive while an agent turn is held");
+    }
+
+    #[tokio::test]
+    async fn test_busy_agent_request_can_retry_into_one_ordered_conversation() {
+        let (_tmp, state) = test_state();
+        let provider_state = GatedProviderState::new(0);
+        let agent = crate::agent::ImpulseAgent::with_test_provider(Box::new(GatedProvider {
+            state: provider_state.clone(),
+        }));
+        let cached_agent = Arc::new(tokio::sync::Mutex::new(Some(agent)));
+
+        let first_turn = {
+            let state = state.clone();
+            let cached_agent = cached_agent.clone();
+            tokio::spawn(async move {
+                handle_agent_request(agent_assist("first turn"), &state, &cached_agent).await
+            })
+        };
+        notified_within(
+            &provider_state.blocked_call_started,
+            "first provider turn did not start",
+        )
+        .await;
+
+        let mut second_turn = {
+            let state = state.clone();
+            let cached_agent = cached_agent.clone();
+            tokio::spawn(async move {
+                handle_agent_request(agent_assist("second turn"), &state, &cached_agent).await
+            })
+        };
+        let busy_response = tokio::time::timeout(Duration::from_millis(100), &mut second_turn)
+            .await
+            .expect("a concurrent turn must fail fast before the client budget expires")
+            .expect("second turn task should join");
+        assert_agent_busy(busy_response);
+        assert_eq!(
+            provider_state.calls.load(Ordering::SeqCst),
+            1,
+            "a busy request must not reach the provider"
+        );
+
+        provider_state.release_blocked_call.notify_one();
+        assert_agent_success(first_turn.await.expect("first turn task should join"));
+        assert_agent_success(
+            handle_agent_request(agent_assist("second turn"), &state, &cached_agent).await,
+        );
+
+        let second_wire_context = {
+            let requests = provider_state.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            requests[1]
+                .messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(second_wire_context.contains("first turn"));
+        assert!(second_wire_context.contains("reply-1"));
+        assert!(second_wire_context.contains("second turn"));
+
+        let guard = cached_agent.lock().await;
+        let history = guard.as_ref().unwrap().session_history();
+        assert_eq!(
+            history,
+            &[
+                ("first turn".to_string(), "reply-1".to_string()),
+                ("second turn".to_string(), "reply-2".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_aborted_provider_turn_preserves_history_and_allows_recovery() {
+        let (_tmp, state) = test_state();
+        let provider_state = GatedProviderState::new(1);
+        let agent = crate::agent::ImpulseAgent::with_test_provider(Box::new(GatedProvider {
+            state: provider_state.clone(),
+        }));
+        let cached_agent = Arc::new(tokio::sync::Mutex::new(Some(agent)));
+
+        assert_agent_success(
+            handle_agent_request(agent_assist("baseline"), &state, &cached_agent).await,
+        );
+
+        let cancelled_turn = {
+            let state = state.clone();
+            let cached_agent = cached_agent.clone();
+            tokio::spawn(async move {
+                handle_agent_request(agent_assist("cancel me"), &state, &cached_agent).await
+            })
+        };
+        notified_within(
+            &provider_state.blocked_call_started,
+            "cancelled provider turn did not start",
+        )
+        .await;
+        cancelled_turn.abort();
+        let _ = cancelled_turn.await;
+
+        {
+            let guard = tokio::time::timeout(Duration::from_millis(50), cached_agent.lock())
+                .await
+                .expect("aborting the provider turn must release the agent guard");
+            assert_eq!(
+                guard.as_ref().unwrap().session_history(),
+                &[("baseline".to_string(), "reply-1".to_string())],
+                "a cancelled provider turn must preserve committed history and omit the partial conversation turn"
+            );
+        }
+
+        assert_agent_success(
+            handle_agent_request(agent_assist("recovery"), &state, &cached_agent).await,
+        );
+        let guard = cached_agent.lock().await;
+        assert_eq!(
+            guard.as_ref().unwrap().session_history(),
+            &[
+                ("baseline".to_string(), "reply-1".to_string()),
+                ("recovery".to_string(), "reply-3".to_string()),
+            ]
         );
     }
 }

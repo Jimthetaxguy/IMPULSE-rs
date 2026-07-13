@@ -5,12 +5,16 @@ version: '1.0'
 updated: 2026-03-02
 type: doc
 category: testing
-status: active
+status: superseded
 audience: builder
 tags: [testing, strategy, implementation]
 ---
 
 # Testing Strategy — Hooks, Search, and Conflict Resolution
+
+> **Historical phase plan — superseded.** Use
+> [`../spec/TEST-TRACEABILITY.md`](../spec/TEST-TRACEABILITY.md) for the current Rust test map and
+> evidence gaps.
 
 > **Generated:** 2026-03-02 | **Purpose:** Define test coverage for Phase 1-3 enhancements
 

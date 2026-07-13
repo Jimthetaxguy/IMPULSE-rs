@@ -7,9 +7,12 @@ use std::path::PathBuf;
 
 use crate::envelope;
 
+pub const PRODUCT_DESCRIPTION: &str =
+    "Feed the impulse to build — a terminal-native local control plane and harness manager for AI coding agents";
+
 #[derive(Parser)]
 #[command(name = "impulse-rs")]
-#[command(about = "Terminal-native AI coding agent sidecar", long_about = None)]
+#[command(about = PRODUCT_DESCRIPTION, long_about = None)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,

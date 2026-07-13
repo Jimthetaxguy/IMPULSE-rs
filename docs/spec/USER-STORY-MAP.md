@@ -1,8 +1,8 @@
 ---
 title: User Story Map
 description: Rust-first user stories and documentation baseline for the current Impulse product surface
-version: '1.0'
-updated: 2026-04-02
+version: '1.2'
+updated: 2026-07-12
 type: specification
 category: core
 phase: all
@@ -27,33 +27,31 @@ authors:
 These documents describe the current product with the least drift:
 
 - [`RUST-CANONICAL-CONTRACT.md`](./RUST-CANONICAL-CONTRACT.md) for product scope, interfaces, and roadmap
-- [`../ROADMAP-PLAN.md`](../ROADMAP-PLAN.md) for sequencing and active delivery lanes
-- [`../plans/IMPLEMENTATION-HANDOFF.md`](../plans/IMPLEMENTATION-HANDOFF.md) for execution order
+- [`../../VISION.md`](../../VISION.md) for the living product north star and complete vertical slice
+- [`../INDEX.md`](../INDEX.md) for current Now/Next/Later navigation
 - [`../guides/HOOK-VALIDATION-GUIDE.md`](../guides/HOOK-VALIDATION-GUIDE.md) for proof-of-truth validation
 - [`../../AGENTS.md`](../../AGENTS.md) for contributor rules and test expectations
 
-### Useful but fragmented
+### Supporting orientation
 
-These documents contain good material, but they are not a unified execution baseline:
+These documents help readers enter or navigate the product, but the canonical contract remains the
+implementation baseline:
 
-- [`../../README.md`](../../README.md) explains the product at a high level
-- [`../INDEX.md`](../INDEX.md) is the navigation hub
-- `../SUMMARY.md` and `../SUMMARY.yaml` have been active navigation surfaces, but they drifted from the live Rust docs set and should not be treated as a source of truth until fully re-baselined
-- [`../guides/TESTING-STRATEGY-ENHANCEMENTS.md`](../guides/TESTING-STRATEGY-ENHANCEMENTS.md) has reusable testing categories
+- [`../../README.md`](../../README.md) is the product entry point and quick start
+- `../SUMMARY.md` mirrors the `../SUMMARY.yaml` navigation source; use the canonical contract for implementation truth
 
 ### Legacy or drifted
 
-The following document does not match the current Rust implementation and should only be read as historical context:
+The following documents do not match the current Rust implementation and should only be read as historical context:
 
 - [`../guides/TESTING-FRAMEWORK.md`](../guides/TESTING-FRAMEWORK.md) still describes a TypeScript/Vitest `impulse/` layout instead of the live `impulse-rs` workspace
 - [`../guides/TOOLS-STATUS.md`](../guides/TOOLS-STATUS.md) still reflects earlier TypeScript/Bun-era tool assumptions and should not be used as a current setup contract
-- `README.md` test-count statements are historically useful but not a verification signal; use the live Rust verification gate instead
 
 ## Story Status Scale
 
 | Status | Meaning |
 | --- | --- |
-| Implemented | Shipped in the current Rust workspace and expected to stay working |
+| Implemented | Present in the current Rust workspace and verified by the referenced tests |
 | In progress | Active roadmap work with shipped partial behavior |
 | Planned | On the roadmap but not yet a current delivery claim |
 | Validation required | Implemented code exists, but product claims still depend on real-world proof |
@@ -218,7 +216,7 @@ Acceptance criteria:
 Primary interfaces:
 
 - `daemon`
-- JSON-line IPC protocol v2
+- JSON-line IPC protocol v3
 
 #### ST-09 Observe work through the Dioxus desktop host
 
@@ -281,7 +279,7 @@ Primary interfaces:
 - `verify`
 - `session-end --verify`
 
-### F. Validation and Future Claims
+### F. Validation and Governed Agent Control
 
 #### ST-12 Prove the real hook memory loop before expanding claims
 
@@ -300,21 +298,34 @@ Primary interfaces:
 - `validate-hooks --platform claude-code`
 - validation artifacts under `.impulse/validation/`
 
-#### ST-13 Add agent control after daemon truth is stable
+#### ST-13 Complete one governed supervisor-and-builder vertical slice
 
-As an operator, I want direct supervision affordances for running agents after the workbench state model is authoritative.
+As an operator, I want one supervisor and one builder to complete a scoped task under explicit
+backend policy so Impulse proves that its existing controls compose into a governed workflow.
 
-Status: Planned
+Status: In progress
 
 Acceptance criteria:
 
-- blocked-work indicators and conflict-review entry points exist
-- restart and handoff controls map to daemon-backed state
-- artifact actions and agent control flows do not fork the source of truth
+- the operator launches registered supervisor and builder runtimes against an explicit workspace target
+- the supervisor observes daemon-owned workbench truth and can focus the builder or send confirmed input under `SupervisorPermissionPolicy`
+- the builder receives a bounded assignment and produces reviewable implementation and verification evidence
+- completion distinguishes worker claims, observed evidence, supervisor judgment, and operator approval
+- terminal launch, write, focus, close, and lifecycle telemetry remain projections of daemon/control-plane truth rather than a competing state store
+- role-specific permissions are enforced by the backend for this slice, with unsupported enforcement reported honestly
 
 Primary interfaces:
 
-- future daemon and workbench control surfaces
+- `AgentRegistry` / `AgentPlatformId`
+- `DesktopRuntime::{spawn_agent, write_agent, focus_agent, close_agent}`
+- daemon `PublishTerminalOps`, `SubscribeOps`, and `RunSupervisorAction`
+- `SupervisorPermissionPolicy` / `SupervisorPermissionState`
+
+Live boundary:
+
+- registry-backed platform identity, terminal lifecycle controls, daemon truth, and supervisor-specific policy are implemented foundations
+- one end-to-end supervisor/builder task contract, runtime-bound role assignment, and completion-evidence review are not yet complete
+- generalized roles, a common runtime-adapter trait, and capability negotiation across arbitrary runtimes remain target architecture; this first slice must not imply that every runtime has equal enforcement
 
 ## Story Priority
 
@@ -327,10 +338,13 @@ Primary interfaces:
 
 - ST-09
 - ST-12
-
-### Deferred until current lane is validated
-
 - ST-13
+
+### Later architecture beyond this story map
+
+- generalized runtime-independent role contracts
+- common runtime-adapter operations and enforcement-strength negotiation
+- typed multi-agent delegation and cross-project messaging
 
 ## How To Use This Document
 

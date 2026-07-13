@@ -1,9 +1,11 @@
-# Impulse Handbook — Full Project Reference
+# Impulse Handbook — Detailed and Historical Reference
 
-> **"Your AI remembers. Silently."**
+> **Feed the impulse to build.**
 >
-> This is the detailed reference for Impulse. For core principles and quick orientation,
-> see `CLAUDE.md` (Claude Code) or `AGENTS.md` (OpenCode/other agents).
+> This handbook preserves detailed implementation notes and historical context; it is not the
+> active product contract. Start with [`VISION.md`](VISION.md) for the living north star and
+> [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md) for current
+> implementation truth. Use `CLAUDE.md` or `AGENTS.md` for contributor guidance.
 
 ---
 

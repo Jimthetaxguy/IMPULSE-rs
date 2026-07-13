@@ -86,7 +86,7 @@ pub fn handle_init(state: &Arc<state::State>, impulse_dir: &Path) -> Result<()> 
 pub async fn handle_status(state: &Arc<state::State>, format: Option<OutputFormat>) -> Result<()> {
     use impulse_ops::agent_registry::{AgentPlatformsReport, AgentRegistry};
     let sessions = state.list_sessions().await?;
-    let reg = AgentRegistry::load_with_env().unwrap_or_else(|_| AgentRegistry::builtin());
+    let reg = AgentRegistry::registry_for_runtime()?;
     let report = AgentPlatformsReport::from_registry(&reg);
 
     // Default to Text for human status (banner + indicators); json when explicitly requested.

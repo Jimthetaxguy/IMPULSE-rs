@@ -1,6 +1,6 @@
 # Quick Start Guide
 
-Get up and running with Impulse in 5 minutes.
+Get from a source checkout to a tracked project and the terminal-native operator surfaces.
 
 ## Prerequisites
 
@@ -13,14 +13,14 @@ Get up and running with Impulse in 5 minutes.
 
 ```bash
 git clone https://github.com/Jimthetaxguy/IMPULSE-rs.git
-cd impulse-rs
+cd IMPULSE-rs/impulse-rs
 cargo install --path .
 ```
 
 ## Step 2: Initialize a Project
 
 ```bash
-cd your-project
+cd <path-to-your-project>
 impulse-rs init
 ```
 
@@ -29,21 +29,25 @@ Creates `.impulse/` with `config.json`, `GENOME.md`, and `HISTORY.jsonl`.
 ## Step 3: Launch the TUI Workbench
 
 ```bash
-cargo run -- run
+impulse-rs run
 ```
 
 The terminal-native workbench is the current operator path. The Dioxus Desktop host lives in `impulse-desktop`; Tauri-shaped code is legacy compatibility only while host parity moves over. The old egui `impulse-gui` workbench is legacy/frozen and should be used only for compile-maintenance or historical comparison.
 
-### Use the Supervisor
+### Monitor Work in the TUI
 
-The TUI supervisor coordinates agent sessions and context. Type questions or use slash commands:
+The ratatui workbench monitors sessions, history, context, and stewardship. Its input commands are:
 
 ```
-/help      — Show available commands
-/status    — Connection and backend info
-/search    — Search terminal output
-/clear     — Clear chat
+/track <path>    — Track a file in the current session
+/tool <name>     — Track a tool in the current session
+/session <name>  — Create a session
+/search <query>  — Search across sessions
+/tag <name>      — Tag the selected session
 ```
+
+To use the Impulse-native coding-agent REPL instead, launch `ion`. Its `/help`, `/verify`,
+`/tools`, `/clear`, and `/quit` commands belong to the Ion surface, not the ratatui workbench.
 
 ## Step 4: Set Up Agent Hooks
 
@@ -58,10 +62,16 @@ impulse-rs validate-hooks --platform claude-code
 For headless use without the GUI:
 
 ```bash
-impulse-rs daemon                    # Start background daemon
+impulse-rs daemon                    # Start the daemon in the foreground
 impulse-rs session-start -n myproject -p claude-code
 impulse-rs history                   # View session history
 impulse-rs search-history --query "auth"
+```
+
+Keep the foreground daemon in its own terminal when using `--daemon` commands:
+
+```bash
+impulse-rs --daemon status
 ```
 
 ## Environment Variables

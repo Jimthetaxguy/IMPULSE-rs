@@ -7,6 +7,7 @@
 //! session, memory, terminal, or artifact state.
 
 pub mod bridge;
+pub mod daemon_ops;
 #[cfg(feature = "desktop-app")]
 pub mod desktop_host;
 pub mod host_bridge;
@@ -24,6 +25,10 @@ pub use bridge::{
     TerminalCloseRequest, TerminalFocusRequest, TerminalOpenRequest, TerminalResizeRequest,
     TerminalSessionResponse, TerminalWriteRequest,
 };
+pub use daemon_ops::{
+    agent_runtime_from_snapshot, attach_desktop_daemon_ops, DesktopDaemonOpsConfig,
+    DesktopDaemonOpsStartError, DEFAULT_HEARTBEAT_INTERVAL,
+};
 pub use host_commands::{RegisterWorkspaceRequest, ReviewDecisionRequest};
 pub use mcp::{
     AgentSpawnTool, AgentWriteTool, ListAgentsTool, ListWorkspacesTool, McpContext, McpError,
@@ -36,9 +41,10 @@ pub use native::{
     NativeIslandResult,
 };
 pub use runtime::{
-    default_builtin_mcp_tools, AgentPlatformKind, AgentRuntimeSnapshot, AgentSpawnRequest,
+    default_builtin_mcp_tools, AgentPlatformId, AgentRuntimeSnapshot, AgentSpawnRequest,
     AgentWriteRequest, BuiltInMcpTool, DesktopEvent, DesktopEventSink, DesktopRuntime,
-    DesktopRuntimeBuilder, LocalSupervisorAction, SupervisorLocalActionRequest, WorkspaceTarget,
+    DesktopRuntimeBuilder, LocalSupervisorAction, SupervisorLocalActionRequest, WeakDesktopRuntime,
+    WorkspaceTarget,
 };
 pub use theme::{
     artifact_status_class, artifact_status_label, format_count, severity_class, status_dot_class,

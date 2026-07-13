@@ -1,93 +1,91 @@
-# impulse-rs
+# IMPULSE Rust workspace
 
-Rust implementation of Impulse — a sidecar that runs alongside AI coding agents (Claude Code, Codex, OpenCode) and remembers what they did across sessions.
+**Feed the impulse to build.**
 
-## Desktop Shell (in progress)
+This directory contains the canonical Rust implementation of Impulse: a terminal-native local
+control plane and harness manager for AI software-engineering agents. It launches and monitors
+external coding CLIs, provides the Impulse-native Ion runtime, and supplies shared platform
+services such as memory, tools, telemetry, artifacts, policy, credentials, and verification.
 
-The egui-based `impulse-gui` crate was retired 2026-04-17. Its replacement is the Dioxus Desktop host path in `impulse-desktop`: Dioxus owns the shell, xterm.js owns terminal rendering, and Rust owns daemon/runtime state. Tauri-shaped code is retained only as a temporary compatibility adapter.
+Memory is one platform service, not the product boundary. Claude Code, Codex, and similar tools
+retain their own internal coding loops; Impulse governs the operating conditions around those
+loops. See the repository-level [product vision](../VISION.md) for the full live-versus-target
+contract.
 
-For now, use the ratatui TUI:
+## Operator surfaces
+
+- **Dioxus cockpit:** `impulse-desktop` is the live, feature-gated desktop path. Dioxus and
+  xterm.js render the system; typed Rust contracts, daemon snapshots, runtime state, and scoped
+  persistence remain authoritative.
+- **ratatui workbench:** the root crate provides the terminal-native TUI.
+- **CLI and hooks:** short-lived commands initialize projects, track sessions, validate hooks, and
+  query or update daemon-owned state.
+- **Ion:** the workspace includes the native runtime and its transport-agnostic harness contracts.
+
+`WorkspaceTarget` selects the cwd/project root for an agent process. It does not by itself create
+filesystem isolation; structural enforcement depends on the selected runtime or sandbox.
+
+## Run
+
+From this directory:
 
 ```bash
-cargo run -- run                 # ratatui terminal-native workbench
-```
-
-Planned desktop bring-up:
-
-```bash
-# Future: Dioxus Desktop launch scaffold with host adapter parity
-```
-
-**Terminal multiplexer:** Spawn Claude Code, Codex, OpenCode, or shell terminals. Context lifecycle (extraction, injection, compaction detection). PTY writes serialized via WriteQueue to prevent text corruption.
-
-## CLI
-
-```bash
-cargo run -- --help                    # Show all commands
-cargo run -- init                      # Initialize .impulse/
-cargo run -- daemon                    # Start background daemon
+cargo run -- --help
+cargo run -- init
+cargo run -- daemon
+cargo run -- run
 cargo run -- session-start -n myproject -p claude-code
 cargo run -- validate-hooks --platform claude-code
-
-# Agent coordination
-cargo run -- agent-configure --provider anthropic --api-key $KEY
-cargo run -- agent-query "Review cross-pane activity"
 ```
 
-## Building
+Launch the feature-gated Dioxus cockpit with:
 
 ```bash
-cargo build              # Debug
-cargo build --release    # Release
-cargo install --path .   # Install globally
+cargo run -p impulse-desktop --features desktop-app --bin impulse-desktop
 ```
 
-## Testing
+## Workspace packages
+
+| Package | Responsibility |
+| --- | --- |
+| `impulse-rs` | CLI, daemon, ratatui workbench, shared services, and native Ion execution path |
+| `impulse-desktop` | Dioxus cockpit, xterm.js integration, typed host bridge, and desktop runtime adapters |
+| `impulse-ion` | Transport-agnostic Ion harness request/response and adapter contracts |
+| `impulse-ops` | Shared control-plane protocol, workbench, policy, registry, artifact, and telemetry models |
+| `impulse-term` | Framework-neutral PTY lifecycle, terminal parsing, write queue, and context bridge |
+
+`impulse-gui` is the legacy/frozen egui workbench. It is excluded from the active Cargo workspace
+and retained only for compile maintenance while Dioxus owns the current desktop product path.
+
+## Authority boundaries
+
+- The daemon owns live control-plane and workbench snapshots while it is running.
+- Project-scoped persistence owns durable history, decisions, configuration, and artifacts across
+  process restarts.
+- PTY runtimes own process and terminal mechanics, then publish structured facts.
+- Dioxus owns presentation and operator input, not policy or persistence.
+- Roles describe behavioral obligations and permissions; runtimes are the engines that execute
+  them. Generalized runtime-independent role contracts and capability negotiation remain target
+  architecture rather than completed product claims.
+- Worker completion claims remain distinct from observed verification evidence and supervisor or
+  user approval.
+
+## Build and verify
 
 ```bash
-cargo test                        # Workspace (~1,360 tests)
-cargo test -p impulse-term        # Terminal crate (110 tests)
-cargo test -p impulse-ops         # Ops crate (4 tests)
-# impulse-rs main crate: 1,344 tests
+cargo build --workspace
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
 ```
 
-## Architecture
+Exact verified test totals change as branches are integrated. Use the repository-level
+[`AGENTS.md`](../AGENTS.md) and
+[`RUST-CANONICAL-CONTRACT.md`](../docs/spec/RUST-CANONICAL-CONTRACT.md) for the current canonical
+evidence rather than copying counts into this child README.
 
-**4 crates (post-Dioxus shell scaffold):**
+## Durable project data
 
-| Crate | Purpose |
-|-------|---------|
-| `impulse-rs` | CLI + daemon + ratatui TUI (64K LOC, 1,344 tests) |
-| `impulse-desktop` | Dioxus-owned desktop shell, host command DTOs, native island bridge contracts |
-| `impulse-ops` | Shared types (SupervisorAction, OpsSnapshot, IPC protocol) |
-| `impulse-term` | Terminal core (PTY, vt100, WriteQueue, context bridge, 110 tests) |
-
-`impulse-gui` (egui native workbench) retired 2026-04-17. Replacement: Dioxus Desktop shell in `impulse-desktop` (static shell + typed host bridge scaffold).
-
-**Dual mode:**
-- **Direct mode** — stateless CLI, per-action (for hooks)
-- **Daemon mode** — long-running Unix socket IPC (for TUI and future desktop shell)
-
-**Data (`.impulse/`):**
-- `HISTORY.jsonl` — append-only session log
-- `GENOME.md` — permanent decisions
-- `LIVE_STATE.json` — active session state
-- `config.json` — runtime config + theme
-
-## Environment Variables
-
-| Variable | Purpose | Default |
-|----------|---------|---------|
-| `ANTHROPIC_API_KEY` | LLM chat | Required for chat |
-| `IMPULSE_MODEL` | Model override | `claude-sonnet-4-20250514` |
-| `IMPULSE_SESSION_ID` | Session ID override | Auto-generated |
-| `IMPULSE_HOME` | Custom `.impulse/` dir | `$CWD/.impulse/` |
-
-## Code Conventions
-
-- **Error handling:** `thiserror` enums + `anyhow` application errors, `.context()` on all I/O
-- **File I/O:** Atomic writes (temp + rename), unique temp names
-- **State:** Dirty flag pattern, sync on Drop
-- **PTY writes:** Serialized via `WriteQueue` (user input > injection, 500ms quiet period)
-- **Themes:** `ColorPalette` struct, `ThemeName` enum (serde, persisted to config.json)
-- **No panics:** Always return `Result<T>`, no `unwrap()` on production paths
+Project-local `.impulse/` state includes session history, durable decisions, live session state,
+and configuration. SQLite indexes and daemon/runtime state complement those human-readable
+artifacts; not every operational record is intended to be committed.

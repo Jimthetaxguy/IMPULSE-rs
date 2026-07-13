@@ -13,7 +13,7 @@ name = "impulse-rs"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
-description = "Terminal-native AI coding agent sidecar with multi-agent monitoring"
+description = "Terminal-native local control plane and harness manager for AI coding agents"
 authors = ["Impulse Maintainers"]
 license = "MIT"
 default-run = "impulse-rs"
@@ -34,8 +34,8 @@ path = "src/bin/ion.rs"
 name = "Impulse"
 identifier = "com.impulse.ai"
 category = "Developer Tool"
-short_description = "AI coding agent sidecar"
-long_description = "Your AI remembers. Silently. Terminal-native AI coding agent sidecar with cross-session memory."
+short_description = "Terminal-native AI agent control plane"
+long_description = "Feed the impulse to build with a local harness manager for governed coding-agent runtimes, shared tools, memory, telemetry, and verification."
 
 [dependencies]
 # Async runtime
@@ -112,6 +112,14 @@ datafusion = { version = "43", optional = true }
 calamine = { version = "0.26", optional = true }
 rust_xlsxwriter = { version = "0.7", optional = true }
 docx = { version = "0.4", optional = true, package = "docx-rs" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Keep Impulse's Rust 1.82 MSRV: security-framework 3.7 requires Rust 1.85.
+security-framework = "=3.6.0"
+security-framework-sys = "=2.17.0"
 
 [features]
 default = ["office-support"]

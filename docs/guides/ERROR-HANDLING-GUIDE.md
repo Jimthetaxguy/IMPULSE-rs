@@ -1,5 +1,5 @@
 ---
-status: active
+status: superseded
 phase: 1
 audience: builder
 tags: [guide, errors, patterns]
@@ -7,6 +7,9 @@ last_updated: 2026-02-20
 ---
 
 # Error Handling & Recovery Guide
+
+> **Historical TypeScript/Bun design — superseded.** The error taxonomy below is not the current
+> Rust contract. Use the canonical Rust contract and typed errors in the live source.
 
 > **Version:** 1.0 | **Status:** Design | **Updated:** 2026-02-21
 > **Phase 1 note:** Phase 1 (Claude Code hooks) has a much simpler error model than described below.

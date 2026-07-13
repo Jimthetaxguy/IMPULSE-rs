@@ -4,7 +4,7 @@
 //! with the Impulse daemon. Provides typed methods for session lifecycle,
 //! file tracking, conflict detection, chat, and agent assist.
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -16,6 +16,16 @@ use crate::daemon::{DaemonRequest, DaemonResponse};
 /// slow LLM-backed handlers (the daemon's own LLM calls cap at ~120s) but
 /// bounded so a hung/deadlocked daemon can't hang the CLI indefinitely.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(180);
+
+fn daemon_busy_error(
+    resource: impulse_ops::DaemonBusyResource,
+    retry_after_ms: u64,
+) -> anyhow::Error {
+    let resource = match resource {
+        impulse_ops::DaemonBusyResource::AgentTurn => "agent turn",
+    };
+    anyhow!("Daemon {resource} is busy; retry after at least {retry_after_ms}ms")
+}
 
 pub struct DaemonClient {
     socket_path: PathBuf,
@@ -291,6 +301,10 @@ impl DaemonClient {
             DaemonResponse::Error { message } => {
                 anyhow::bail!("Agent assist failed: {}", message)
             }
+            DaemonResponse::Busy {
+                resource,
+                retry_after_ms,
+            } => Err(daemon_busy_error(resource, retry_after_ms)),
             _ => anyhow::bail!("Agent assist: unexpected response type"),
         }
     }
@@ -343,6 +357,10 @@ impl DaemonClient {
             DaemonResponse::Error { message } => {
                 anyhow::bail!("Agent review_code failed: {}", message)
             }
+            DaemonResponse::Busy {
+                resource,
+                retry_after_ms,
+            } => Err(daemon_busy_error(resource, retry_after_ms)),
             _ => anyhow::bail!("Agent review_code: unexpected response type"),
         }
     }
@@ -375,6 +393,10 @@ impl DaemonClient {
             DaemonResponse::Error { message } => {
                 anyhow::bail!("Agent analyze_error failed: {}", message)
             }
+            DaemonResponse::Busy {
+                resource,
+                retry_after_ms,
+            } => Err(daemon_busy_error(resource, retry_after_ms)),
             _ => anyhow::bail!("Agent analyze_error: unexpected response type"),
         }
     }
@@ -407,6 +429,10 @@ impl DaemonClient {
             DaemonResponse::Error { message } => {
                 anyhow::bail!("Agent summarize_pane failed: {}", message)
             }
+            DaemonResponse::Busy {
+                resource,
+                retry_after_ms,
+            } => Err(daemon_busy_error(resource, retry_after_ms)),
             _ => anyhow::bail!("Agent summarize_pane: unexpected response type"),
         }
     }
@@ -436,6 +462,14 @@ mod tests {
     fn test_daemon_client_new_stores_path() {
         let client = DaemonClient::new(PathBuf::from("/tmp/test.sock"));
         assert_eq!(client.socket_path, PathBuf::from("/tmp/test.sock"));
+    }
+
+    #[test]
+    fn test_daemon_busy_error_preserves_resource_and_retry_hint() {
+        let error = daemon_busy_error(impulse_ops::DaemonBusyResource::AgentTurn, 250);
+        let message = error.to_string();
+        assert!(message.contains("agent turn"));
+        assert!(message.contains("250ms"));
     }
 
     #[tokio::test]

@@ -1,15 +1,15 @@
 ---
 title: Documentation Index
 description: Master navigation hub for Impulse documentation
-version: '1.2'
-updated: 2026-06-30
+version: '1.4'
+updated: 2026-07-12
 type: doc
 category: navigation
 phase: all
 status: active
 audience: everyone
 tags: [index, navigation, discovery]
-last_updated: 2026-03-31
+last_updated: 2026-07-12
 authors:
   - name: Impulse Maintainers
     role: Maintainer
@@ -20,12 +20,15 @@ authors:
 # Documentation Index — Impulse
 
 > **Master navigation hub.** Find any document by category, phase, or topic.
-> **Quick start:** Read [`spec/RUST-CANONICAL-CONTRACT.md`](spec/RUST-CANONICAL-CONTRACT.md) first.
+> **Quick start:** Read the living product north star [`../VISION.md`](../VISION.md), then the
+> current implementation contract [`spec/RUST-CANONICAL-CONTRACT.md`](spec/RUST-CANONICAL-CONTRACT.md).
 >
 > **Canonical stack: Rust (impulse-rs)**
-> **Roadmap contract: Now=Rust core + Dioxus desktop host, Next=Dioxus Desktop launch scaffold + terminal bridge parity, Later=daemon parity + artifact polish**
+> **Roadmap contract:** Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; Legacy=egui compile-maintenance only.
 > **Collaboration playbook:** [`guides/COLLABORATIVE-AGENTIC-CODING.md`](guides/COLLABORATIVE-AGENTIC-CODING.md)
-> **Risk register:** [`HONEST-ROADMAP.md`](HONEST-ROADMAP.md) stays canonical for unvalidated assumptions.
+> **Narrow validation register:** [`HONEST-ROADMAP.md`](HONEST-ROADMAP.md) preserves unresolved
+> hook, compaction, extraction, and memory-quality risks from the legacy phase-era design. It is
+> not the current whole-product roadmap or control-plane risk authority.
 
 > **Prefer `kdb` for searching.** The knowledge database indexes canonical docs with FTS5 full-text search:
 >
@@ -48,43 +51,71 @@ authors:
 | [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) | **Authoritative contract for current product behavior**                    | all   |
 | [USER-STORY-MAP.md](spec/USER-STORY-MAP.md)                   | Rust-first product stories, acceptance criteria, and story status          | all   |
 | [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md)             | Story-to-test map for the current Rust workspace                           | all   |
-| [HONEST-ROADMAP.md](HONEST-ROADMAP.md)                        | **⚠️ READ THIS FIRST** — Limitations, unvalidated assumptions, corrections | all   |
-| [COMPETITIVE-POSITIONING.md](spec/COMPETITIVE-POSITIONING.md) | Market analysis and differentiation                                        | all   |
-| [PERFORMANCE-TARGETS.md](spec/PERFORMANCE-TARGETS.md)         | Performance budgets and benchmarks                                         | 1-2   |
+
+### Product North Star and Boundaries
+
+| Document | Description |
+| --- | --- |
+| [VISION.md](../VISION.md) | **Living product north star:** control-plane promise, hierarchy, live-versus-target boundary, and complete vertical slice |
+| [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) | Authoritative contract for current implemented behavior |
+| [ARCHITECTURE-CLARIFICATION.md](ARCHITECTURE-CLARIFICATION.md) | Current code boundary matrix and enforcement truth |
+
+Do not split separate role/runtime/supervisor schema documents until the hierarchy, adapter, and
+enforcement-strength ADR decisions listed in `VISION.md` are resolved.
+
+### Validation and Historical Risk
+
+| Document | Scope |
+| --- | --- |
+| [HONEST-ROADMAP.md](HONEST-ROADMAP.md) | Historical hook/memory validation register; not current roadmap authority |
+| [HOOK-VALIDATION-GUIDE.md](guides/HOOK-VALIDATION-GUIDE.md) | Current procedure for generating real Claude hook evidence |
 
 ### Architecture Decisions (ADRs)
 
-| ADR                                           | Title                                | Status   |
-| --------------------------------------------- | ------------------------------------ | -------- |
-| [0001](decisions/0001-claude-code-primary.md) | Claude Code as primary agent         | Accepted |
-| [0002](decisions/0002-file-first-memory.md)   | File-first memory (no DB in Phase 1) | Accepted |
-| [0003](decisions/0003-progressive-search.md)  | Progressive search (FTS5 → vectors)  | Accepted |
-| [0004](decisions/0004-extraction-strategy.md) | LLM extraction strategy              | Accepted |
-| [0005](decisions/0005-distribution-model.md)  | npm distribution model               | Accepted |
-| [0008](decisions/0008-dioxus-desktop-host.md) | Dioxus Desktop host                  | Accepted |
+| ADR | Title | Decision status | Current scope |
+| --- | --- | --- | --- |
+| [0001](decisions/0001-claude-code-primary.md) | Claude Code as primary agent | Accepted | Historical integration choice; external runtimes are now registry-backed |
+| [0002](decisions/0002-file-first-memory.md) | File-first memory (no DB in Phase 1) | Accepted | Historical Phase 1 memory decision; not current persistence authority |
+| [0003](decisions/0003-progressive-search.md) | Progressive search (FTS5 → vectors) | Accepted | Historical phase framing; current retrieval behavior comes from Rust code/contract |
+| [0004](decisions/0004-extraction-strategy.md) | LLM extraction strategy | Accepted | Historical extraction design; retained for memory provenance |
+| [0005](decisions/0005-distribution-model.md) | npm distribution model | Accepted | Historical distribution decision superseded in practice by the Rust workspace |
+| [0006](decisions/0006-hook-enhancement-conflict-resolution.md) | Hook enhancement conflict resolution | Accepted | Narrow hook/guardrail policy scope |
+| [0007](decisions/0007-desktop-shell-stack.md) | Desktop shell stack | Superseded | Superseded by ADR-0008 |
+| [0008](decisions/0008-dioxus-desktop-host.md) | Dioxus Desktop host | Accepted | Current desktop host authority |
+| [0009](decisions/0009-reconcile-impulse-copies.md) | Reconcile duplicate Impulse codebases | Accepted | Current canonical-tree decision |
 
 See [decisions/README.md](decisions/README.md) for full decision log.
 
-### Developer Guides
+### Current Developer Guides
 
 | Document                                                        | Topic                            |
 | --------------------------------------------------------------- | -------------------------------- |
-| [BEST-PRACTICES.md](guides/BEST-PRACTICES.md)                   | Coding conventions and patterns  |
 | [COLLABORATIVE-AGENTIC-CODING.md](guides/COLLABORATIVE-AGENTIC-CODING.md) | Agent lanes, worktrees, handoffs, and verification |
 | [CONTRIBUTING.md](../CONTRIBUTING.md)                           | Contribution rules for humans and agents |
-| [TESTING-FRAMEWORK.md](guides/TESTING-FRAMEWORK.md)             | Legacy TypeScript-era testing guide |
 | [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md)               | Current Rust-first test baseline and gap map |
-| [SYNTHETIC-TESTING-GUIDE.md](guides/SYNTHETIC-TESTING-GUIDE.md) | Synthetic test generation        |
-| [ERROR-HANDLING-GUIDE.md](guides/ERROR-HANDLING-GUIDE.md)       | Error handling patterns          |
-| [DATABASE-GUIDE.md](guides/DATABASE-GUIDE.md)                   | Database usage (Phase 2+)        |
-| [SECURITY-REVIEW.md](guides/SECURITY-REVIEW.md)                 | Security audit and practices     |
-| [PERFORMANCE-PROFILING.md](guides/PERFORMANCE-PROFILING.md)     | Profiling and optimization       |
-| [DEPLOYMENT-FRAMEWORK.md](guides/DEPLOYMENT-FRAMEWORK.md)       | Deployment and distribution      |
-| [TEAM-ONBOARDING.md](guides/TEAM-ONBOARDING.md)                 | New contributor guide            |
-| [INTEGRATION-COOKBOOK.md](guides/INTEGRATION-COOKBOOK.md)       | Integration patterns and recipes |
-| [TOOLS-STATUS.md](guides/TOOLS-STATUS.md)                     | Tool installation and validation |
 | [HOOK-VALIDATION-GUIDE.md](guides/HOOK-VALIDATION-GUIDE.md)   | Real Claude hook proof before product claims |
 | [RUST-MULTI-AGENT-PATTERNS.md](guides/RUST-MULTI-AGENT-PATTERNS.md) | Rust-first harness and coordination patterns |
+| [FRONTMATTER-SCHEMA.md](FRONTMATTER-SCHEMA.md) | Documentation metadata and authority vocabulary |
+
+### Historical Product and TypeScript/Bun References
+
+These documents are retained for provenance and reusable ideas. Their front matter and opening
+banners mark them non-authoritative; they must not override the product vision, Rust contract, live
+CLI help, or current tests.
+
+| Document | Historical scope | Replaced by |
+| --- | --- | --- |
+| [COMPETITIVE-POSITIONING.md](spec/COMPETITIVE-POSITIONING.md) | Memory-plugin positioning | [VISION.md](../VISION.md) |
+| [PERFORMANCE-TARGETS.md](spec/PERFORMANCE-TARGETS.md) | Hook/plugin budgets | [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) |
+| [BEST-PRACTICES.md](guides/BEST-PRACTICES.md) | TypeScript conventions | [CONTRIBUTING.md](../CONTRIBUTING.md) |
+| [TEAM-ONBOARDING.md](guides/TEAM-ONBOARDING.md) | SWARM onboarding | [COLLABORATIVE-AGENTIC-CODING.md](guides/COLLABORATIVE-AGENTIC-CODING.md) |
+| [SECURITY-REVIEW.md](guides/SECURITY-REVIEW.md) | Phase-1 plugin review | [ARCHITECTURE-CLARIFICATION.md](ARCHITECTURE-CLARIFICATION.md) |
+| [INTEGRATION-COOKBOOK.md](guides/INTEGRATION-COOKBOOK.md) | Phase-era workflows | [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) |
+| [SYNTHETIC-TESTING-GUIDE.md](guides/SYNTHETIC-TESTING-GUIDE.md) and [TESTING-STRATEGY-ENHANCEMENTS.md](guides/TESTING-STRATEGY-ENHANCEMENTS.md) | Planned test designs | [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md) |
+| [DATABASE-GUIDE.md](guides/DATABASE-GUIDE.md), [ERROR-HANDLING-GUIDE.md](guides/ERROR-HANDLING-GUIDE.md), and [PERFORMANCE-PROFILING.md](guides/PERFORMANCE-PROFILING.md) | TypeScript implementation guidance | Live Rust source and canonical contract |
+| [DEPLOYMENT-FRAMEWORK.md](guides/DEPLOYMENT-FRAMEWORK.md) | SWARM deployment design | [README.md](../README.md) real-systems boundary |
+| [CLI-REFERENCE-ENHANCEMENTS.md](guides/CLI-REFERENCE-ENHANCEMENTS.md) | Proposed commands | [CLI-COMMANDS.md](CLI-COMMANDS.md) and live help |
+| [RELEASE-NOTES-TEMPLATE.md](guides/RELEASE-NOTES-TEMPLATE.md) | Earlier release gate | [AGENTS.md](../AGENTS.md) verification contract |
 
 ### Phase Planning
 
@@ -94,22 +125,22 @@ See [decisions/README.md](decisions/README.md) for full decision log.
 | [PHASE1.5-COORDINATION.md](phases/PHASE1.5-COORDINATION.md) | Multi-agent coordination |
 | [PHASE2-PERSISTENCE.md](phases/PHASE2-PERSISTENCE.md)       | Persistence layer design |
 | [PHASE2-MIGRATION-PLAN.md](phases/PHASE2-MIGRATION-PLAN.md) | Migration strategy       |
-| [ROADMAP-PLAN.md](ROADMAP-PLAN.md)                          | Active roadmap reset for Rust + Dioxus Desktop |
-| [IMPLEMENTATION-HANDOFF.md](plans/IMPLEMENTATION-HANDOFF.md)| Desktop migration execution handoff |
+| [ROADMAP-PLAN.md](ROADMAP-PLAN.md)                          | Superseded Rust/Dioxus migration roadmap retained for history |
+| [IMPLEMENTATION-HANDOFF.md](plans/IMPLEMENTATION-HANDOFF.md)| Historical desktop migration execution handoff |
 | [LONG-RANGE-ENHANCEMENTS.md](LONG-RANGE-ENHANCEMENTS.md) | PR-organized enhancement backlog across 8 lanes |
 
-### Active Dioxus Desktop Track
+### Current Control-Plane Foundation
 
 | Document | Description |
 | -------- | ----------- |
 | [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) | Authoritative product and desktop shell contract |
 | [DESKTOP-SHELL-ARCHITECTURE.md](spec/DESKTOP-SHELL-ARCHITECTURE.md) | Dioxus Desktop + xterm.js layer boundaries |
 | [IMPULSE_TERM_STATUS.md](../impulse-rs/docs/IMPULSE_TERM_STATUS.md) | Terminal backend status and desktop bridge implications |
-| [HONEST-ROADMAP.md](HONEST-ROADMAP.md) | Canonical validation risk register for hooks and memory claims |
 
 > **NOTE:** `spec/RUST-CANONICAL-CONTRACT.md` is authoritative for implementation. Legacy TypeScript/Bun docs are retained as historical reference unless explicitly marked active and aligned.
 
-> **Quick reference:** See `AGENTS.md` for the enforced roadmap contract and `HONEST-ROADMAP.md` for unresolved risks.
+> **Quick reference:** See `AGENTS.md` for the enforced roadmap contract. Consult
+> `HONEST-ROADMAP.md` only for the retained hook/memory validation risks.
 
 ### Research & Analysis
 
@@ -141,10 +172,11 @@ Historical desktop migration notes, including the superseded Tauri+Dioxus handof
 
 See [research/README.md](research/README.md) for reading sequences by phase.
 
-### Vision (Phase 2+)
+### Product Vision and Future Concepts
 
 | Document                                              | Topic                   |
 | ----------------------------------------------------- | ----------------------- |
+| [VISION.md](../VISION.md)                             | Living control-plane product north star |
 | [CLI-ARCHITECTURE.md](vision/CLI-ARCHITECTURE.md)     | Future CLI architecture |
 | [TUI-AUGMENTATION-VISION.md](archive/TUI-AUGMENTATION-VISION.md) | Historical UI augmentation reference |
 | [DYNAMIC-CLI-VISION.md](vision/DYNAMIC-CLI-VISION.md) | Dynamic CLI concepts    |
@@ -165,40 +197,45 @@ See [research/README.md](research/README.md) for reading sequences by phase.
 | [Ralph plans 1-6](archive/ralph-plans/README.md)                              | Provenance only; use current roadmap/spec/ADR docs |
 | Session logs (11 files)                                                         | [DEVELOPMENT-HISTORY.md](session-logs/DEVELOPMENT-HISTORY.md) |
 
-Older Ralph loop plans are preserved for provenance only. Use `ROADMAP-PLAN.md`, `spec/RUST-CANONICAL-CONTRACT.md`, and `decisions/0008-dioxus-desktop-host.md` for current guidance.
+Older Ralph loop plans and `ROADMAP-PLAN.md` are preserved for provenance only. Use
+[`VISION.md`](../VISION.md),
+`spec/RUST-CANONICAL-CONTRACT.md`, and `decisions/0008-dioxus-desktop-host.md` for current guidance.
 
 ---
 
 ## By Phase
 
-### Now: Rust Core + Dioxus Desktop Host
+### Now: Control-Plane Foundations
 
 Start here:
 
-1. [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) — **Start here** - Product contract and interfaces
-2. [USER-STORY-MAP.md](spec/USER-STORY-MAP.md) — Current user stories and acceptance criteria
-3. [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md) — Current automated coverage and known gaps
-4. [AGENTS.md](../AGENTS.md) — Current architecture and operational guidance
-5. [COLLABORATIVE-AGENTIC-CODING.md](guides/COLLABORATIVE-AGENTIC-CODING.md) — Agent lane, worktree, and handoff rules
-6. [ROADMAP-PLAN.md](ROADMAP-PLAN.md) — Current roadmap and desktop progress baseline
-7. [plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md](plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md) — Historical desktop migration context
-8. [EFFICIENCY-ANALYSIS.md](research/EFFICIENCY-ANALYSIS.md) — Implementation patterns
-9. [BEST-PRACTICES.md](guides/BEST-PRACTICES.md) — Coding conventions
+1. [VISION.md](../VISION.md) — **Start here** - Product north star and live-versus-target boundary
+2. [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) — Current product contract and interfaces
+3. [ARCHITECTURE-CLARIFICATION.md](ARCHITECTURE-CLARIFICATION.md) — Current code boundary matrix
+4. [USER-STORY-MAP.md](spec/USER-STORY-MAP.md) — Current user stories and acceptance criteria
+5. [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md) — Current automated coverage and known gaps
+6. [AGENTS.md](../AGENTS.md) — Current architecture and operational guidance
+7. [COLLABORATIVE-AGENTIC-CODING.md](guides/COLLABORATIVE-AGENTIC-CODING.md) — Agent lane, worktree, and handoff rules
+8. [ROADMAP-PLAN.md](ROADMAP-PLAN.md) — Superseded desktop implementation history
 
-### Next: Dioxus Desktop Launch Scaffold + Live Terminal Bridge
+### Next: Governed Supervisor/Builder Vertical Slice + Hierarchy/Enforcement ADR
 
-1. [HONEST-ROADMAP.md](HONEST-ROADMAP.md) — Validation risk register
-2. [ROADMAP-PLAN.md](ROADMAP-PLAN.md) — Desktop shell stabilization lane
-3. [plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md](plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md) — Superseded technical context
-4. [impulse-rs/docs/IMPULSE_TERM_STATUS.md](../impulse-rs/docs/IMPULSE_TERM_STATUS.md) — Terminal telemetry status
-5. [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md) — Current Rust-first test patterns and gaps
-6. [TESTING-FRAMEWORK.md](guides/TESTING-FRAMEWORK.md) — Historical TypeScript-era reference only
-7. [PHASE1.5-COORDINATION.md](phases/PHASE1.5-COORDINATION.md) — Coordination reference
+1. [VISION.md](../VISION.md) — Ten-step governed workflow and unresolved hierarchy decisions
+2. [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) — Live foundations and contract boundary
+3. [ARCHITECTURE-CLARIFICATION.md](ARCHITECTURE-CLARIFICATION.md) — Enforcement and authority boundary map
+4. [USER-STORY-MAP.md](spec/USER-STORY-MAP.md) — Acceptance criteria for current surfaces
+5. [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md) — Evidence map and known gaps
 
-### Later: Agent Control + Artifact Polish
+### Validation Side Lane: Hook and Memory Evidence
 
-1. [TUI-AUGMENTATION-VISION.md](archive/TUI-AUGMENTATION-VISION.md) — Historical UI reference
-2. [CLI-ARCHITECTURE.md](vision/CLI-ARCHITECTURE.md) — CLI evolution
+1. [HOOK-VALIDATION-GUIDE.md](guides/HOOK-VALIDATION-GUIDE.md) — Current evidence procedure
+2. [HONEST-ROADMAP.md](HONEST-ROADMAP.md) — Historical register for the remaining hook/memory hypotheses
+
+### Later: General Roles + Negotiated Runtimes
+
+1. [VISION.md](../VISION.md) — Target role, adapter, messaging, attention, and resource contracts
+2. [CLI-ARCHITECTURE.md](vision/CLI-ARCHITECTURE.md) — Historical/future CLI concepts
+3. [TUI-AUGMENTATION-VISION.md](archive/TUI-AUGMENTATION-VISION.md) — Historical UI reference
 
 ---
 
@@ -206,11 +243,12 @@ Start here:
 
 | Tag            | Documents                                                                   |
 | -------------- | --------------------------------------------------------------------------- |
-| `spec`         | RUST-CANONICAL-CONTRACT, COMPETITIVE-POSITIONING, PERFORMANCE-TARGETS       |
-| `hooks`        | RUST-CANONICAL-CONTRACT, PHASE1-CHECKLIST, BEST-PRACTICES                   |
+| `spec`         | RUST-CANONICAL-CONTRACT, USER-STORY-MAP, TEST-TRACEABILITY                   |
+| `hooks`        | RUST-CANONICAL-CONTRACT, HOOK-VALIDATION-GUIDE                               |
 | `memory`       | impulse-memory-architecture, MEMORY-EXTRACTION-ANALYSIS, PHASE2-PERSISTENCE |
-| `testing`      | TESTING-FRAMEWORK, SYNTHETIC-TESTING-GUIDE                                  |
+| `testing`      | TEST-TRACEABILITY; phase-era testing guides are historical                   |
+| `validation`   | HOOK-VALIDATION-GUIDE, HONEST-ROADMAP                                        |
 | `architecture` | RESEARCH-DIGEST, ADRs                                                       |
 | `tools`        | TOOL-STACK-ANALYSIS, cross-model-consensus, cli-language-analysis           |
-| `security`     | SECURITY-REVIEW                                                             |
-| `deployment`   | DEPLOYMENT-FRAMEWORK, ADR-0005                                              |
+| `security`     | ARCHITECTURE-CLARIFICATION; SECURITY-REVIEW is historical                    |
+| `deployment`   | README real-systems boundary; DEPLOYMENT-FRAMEWORK is historical             |

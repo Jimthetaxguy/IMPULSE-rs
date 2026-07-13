@@ -48,7 +48,7 @@ fn build_registry() -> Registry {
     Registry {
         name: "impulse-rs",
         version: env!("CARGO_PKG_VERSION"),
-        description: "Terminal-native AI coding agent sidecar",
+        description: crate::cli::PRODUCT_DESCRIPTION,
         global_flags: vec![
             ParamInfo {
                 name: "--impulse-dir",
@@ -600,6 +600,8 @@ mod tests {
         let json = serde_json::to_string(&reg).unwrap();
         assert!(json.contains("impulse-rs"));
         assert!(json.contains("session-start"));
+        assert!(json.contains("local control plane and harness manager"));
+        assert!(!json.contains("sidecar"));
     }
 
     #[test]

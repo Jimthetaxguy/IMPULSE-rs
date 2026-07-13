@@ -13,7 +13,7 @@ mod tests {
     // Re-import handler functions from the extracted handlers module.
     // super::super = daemon module (tests.rs is daemon::tests, inner mod is daemon::tests::tests)
     use super::super::handlers::{
-        handle_delegation_request, handle_guard_request, handle_plugin_request,
+        handle_delegation_request, handle_guard_request, handle_ops_request, handle_plugin_request,
         handle_session_request, handle_status, handle_steward_request,
     };
 
@@ -814,6 +814,71 @@ mod tests {
             }
             _ => panic!("Expected Ok response"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_publish_then_subscribe_reconciles_terminal_agent_through_real_handler() {
+        let (_tmp, state) = test_state();
+        let telemetry = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::ops_workbench::TerminalOpsTelemetryStore::default(),
+        ));
+        let report = impulse_ops::TerminalOpsReport {
+            source_id: "desktop-handler-proof".to_string(),
+            published_at: impulse_ops::now_rfc3339(),
+            agents: vec![impulse_ops::AgentRuntime {
+                id: "codex-live".to_string(),
+                label: "Codex".to_string(),
+                backend_kind: "codex".to_string(),
+                working_directory: "/tmp/project".to_string(),
+                status: "working: verify daemon truth".to_string(),
+                current_task: Some("verify daemon truth".to_string()),
+                active: true,
+                agent_status: impulse_ops::AgentStatus::Working {
+                    task: "verify daemon truth".to_string(),
+                },
+                ..Default::default()
+            }],
+            context: impulse_ops::ContextHealthSummary::default(),
+            interventions: Vec::new(),
+        };
+
+        let published = handle_ops_request(
+            DaemonRequest::PublishTerminalOps { report },
+            &state,
+            &telemetry,
+        )
+        .await;
+        assert!(matches!(
+            published,
+            DaemonResponse::Ok { result } if result["accepted"] == true
+        ));
+
+        let subscribed = handle_ops_request(
+            DaemonRequest::SubscribeOps { since_seq: None },
+            &state,
+            &telemetry,
+        )
+        .await;
+        let DaemonResponse::Ok { result } = subscribed else {
+            panic!("expected subscribed ops snapshot");
+        };
+        let subscription: impulse_ops::OpsSubscription =
+            serde_json::from_value(result).expect("typed subscription");
+        let agent = subscription
+            .snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.id == "codex-live")
+            .expect("published terminal agent");
+        assert!(agent.ephemeral);
+        assert!(agent.active);
+        assert_eq!(agent.current_task.as_deref(), Some("verify daemon truth"));
+        assert_eq!(
+            agent.agent_status,
+            impulse_ops::AgentStatus::Working {
+                task: "verify daemon truth".to_string(),
+            }
+        );
     }
 
     #[tokio::test]

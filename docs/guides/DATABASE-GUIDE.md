@@ -6,12 +6,16 @@ updated: 2026-02-21
 type: guide
 category: development
 phase: phase2
-status: active
+status: superseded
 audience: builders
 tags: [guide, database, sqlite, vector-search]
 ---
 
 # Database Architecture Guide
+
+> **Historical TypeScript/sqlite-vec design — superseded.** It does not describe the current Rust
+> persistence and retrieval implementation. Use
+> [`../spec/RUST-CANONICAL-CONTRACT.md`](../spec/RUST-CANONICAL-CONTRACT.md) and the live Rust source.
 
 > **Version:** 1.0 | **Status:** Phase 2+ | **Updated:** 2026-02-21
 > ⚠️ **NOT APPLICABLE TO PHASE 1.** Phase 1 uses plain text files, no database.

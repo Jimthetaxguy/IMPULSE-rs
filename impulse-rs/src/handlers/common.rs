@@ -171,13 +171,26 @@ pub(crate) fn capture_hook_evidence(input: HookEvidenceInput<'_>) -> Result<()> 
 }
 
 pub(crate) fn persist_claude_env_var(key: &str, value: &str) -> Result<()> {
-    let Some(env_file) = std::env::var("CLAUDE_ENV_FILE").ok() else {
+    let env_file = std::env::var("CLAUDE_ENV_FILE").ok().map(PathBuf::from);
+    persist_claude_env_var_at(env_file.as_deref(), key, value)
+}
+
+/// Persist one assignment to an explicitly resolved Claude environment file.
+///
+/// Keeping path resolution separate from persistence lets callers use the
+/// process environment while tests inject isolated paths without mutating the
+/// process-global `CLAUDE_ENV_FILE` value seen by parallel session tests.
+pub(crate) fn persist_claude_env_var_at(
+    env_file: Option<&Path>,
+    key: &str,
+    value: &str,
+) -> Result<()> {
+    let Some(path) = env_file else {
         return Ok(());
     };
 
-    let path = PathBuf::from(env_file);
     let mut existing = if path.exists() {
-        std::fs::read_to_string(&path)?
+        std::fs::read_to_string(path)?
     } else {
         String::new()
     };
@@ -194,7 +207,7 @@ pub(crate) fn persist_claude_env_var(key: &str, value: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    storage::Storage::atomic_write_path(&path, existing.as_bytes())?;
+    storage::Storage::atomic_write_path(path, existing.as_bytes())?;
     Ok(())
 }
 
@@ -896,8 +909,7 @@ mod tests {
 
     #[test]
     fn test_persist_claude_env_var_noop_when_no_env_file() {
-        std::env::remove_var("CLAUDE_ENV_FILE");
-        let result = persist_claude_env_var("MY_KEY", "my_value");
+        let result = persist_claude_env_var_at(None, "MY_KEY", "my_value");
         assert!(result.is_ok());
     }
 
@@ -905,9 +917,8 @@ mod tests {
     fn test_persist_claude_env_var_creates_file_with_assignment() {
         let tmp = TempDir::new().unwrap();
         let env_path = tmp.path().join("env_file");
-        std::env::set_var("CLAUDE_ENV_FILE", env_path.to_str().unwrap());
 
-        let result = persist_claude_env_var("IMPULSE_SESSION_ID", "sess-abc");
+        let result = persist_claude_env_var_at(Some(&env_path), "IMPULSE_SESSION_ID", "sess-abc");
         assert!(result.is_ok());
 
         let content = std::fs::read_to_string(&env_path).unwrap();
@@ -915,7 +926,6 @@ mod tests {
             content.contains("IMPULSE_SESSION_ID=sess-abc"),
             "File should contain the assignment, got: {content}"
         );
-        std::env::remove_var("CLAUDE_ENV_FILE");
     }
 
     #[test]
@@ -924,9 +934,8 @@ mod tests {
         let env_path = tmp.path().join("env_file");
         // Pre-populate with an existing assignment
         std::fs::write(&env_path, "IMPULSE_SESSION_ID=old-value\nOTHER_KEY=keep\n").unwrap();
-        std::env::set_var("CLAUDE_ENV_FILE", env_path.to_str().unwrap());
 
-        let result = persist_claude_env_var("IMPULSE_SESSION_ID", "new-value");
+        let result = persist_claude_env_var_at(Some(&env_path), "IMPULSE_SESSION_ID", "new-value");
         assert!(result.is_ok());
 
         let content = std::fs::read_to_string(&env_path).unwrap();
@@ -942,7 +951,6 @@ mod tests {
             content.contains("OTHER_KEY=keep"),
             "Should preserve other keys"
         );
-        std::env::remove_var("CLAUDE_ENV_FILE");
     }
 
     // ── HookEvidenceRecord serde round-trip ───────────────────────────────
@@ -1238,15 +1246,13 @@ mod tests {
     fn test_persist_claude_env_var_creates_parent_dirs() {
         let tmp = TempDir::new().unwrap();
         let env_path = tmp.path().join("deep/nested/env_file");
-        std::env::set_var("CLAUDE_ENV_FILE", env_path.to_str().unwrap());
 
-        let result = persist_claude_env_var("TEST_KEY", "test_value");
+        let result = persist_claude_env_var_at(Some(&env_path), "TEST_KEY", "test_value");
         assert!(result.is_ok());
         assert!(env_path.exists(), "Should create parent directories");
 
         let content = std::fs::read_to_string(&env_path).unwrap();
         assert!(content.contains("TEST_KEY=test_value"));
-        std::env::remove_var("CLAUDE_ENV_FILE");
     }
 
     #[test]
@@ -1254,9 +1260,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let env_path = tmp.path().join("env_file");
         std::fs::write(&env_path, "").unwrap();
-        std::env::set_var("CLAUDE_ENV_FILE", env_path.to_str().unwrap());
 
-        let result = persist_claude_env_var("NEW_KEY", "new_value");
+        let result = persist_claude_env_var_at(Some(&env_path), "NEW_KEY", "new_value");
         assert!(result.is_ok());
 
         let content = std::fs::read_to_string(&env_path).unwrap();
@@ -1264,7 +1269,6 @@ mod tests {
             content.contains("NEW_KEY=new_value"),
             "Should add key to empty file, got: {content}"
         );
-        std::env::remove_var("CLAUDE_ENV_FILE");
     }
 
     // ── build_tool_context edge cases ────────────────────────────────────

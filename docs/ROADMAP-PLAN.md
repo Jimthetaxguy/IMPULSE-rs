@@ -1,15 +1,15 @@
 ---
 title: Dynamic Roadmap Plan
-description: Actionable next steps based on the current Rust and Dioxus desktop host product state
+description: Superseded Rust and Dioxus desktop roadmap retained for historical implementation context
 version: '1.2'
-updated: 2026-06-14
+updated: 2026-07-12
 type: doc
 category: roadmap
 phase: all
-status: active
+status: superseded
 audience: builder
 tags: [roadmap, action, planning, dioxus, desktop, daemon]
-last_updated: 2026-06-14
+last_updated: 2026-07-12
 authors:
   - name: Impulse Maintainers
     role: Maintainer
@@ -17,8 +17,14 @@ authors:
 
 # Dynamic Roadmap Plan — Impulse
 
-> **Updated:** 2026-06-14
-> **Purpose:** Record the active roadmap after the desktop contract reset to Dioxus Desktop.
+> **SUPERSEDED — historical implementation record.** This file preserves the completed
+> Rust/Dioxus migration sequence and must not be used as the active product roadmap. Use
+> [`../VISION.md`](../VISION.md) for the living product north star and
+> [`spec/RUST-CANONICAL-CONTRACT.md`](./spec/RUST-CANONICAL-CONTRACT.md) for the durable
+> Now/Next/Later contract.
+>
+> **Historical snapshot:** 2026-06-14
+> **Historical purpose:** Record the roadmap after the desktop contract reset to Dioxus Desktop.
 > **Risk register:** [`HONEST-ROADMAP.md`](./HONEST-ROADMAP.md)
 > **Execution handoff:** [`plans/IMPLEMENTATION-HANDOFF.md`](./plans/IMPLEMENTATION-HANDOFF.md)
 

@@ -28,12 +28,12 @@ use serde_json::Value;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::host_commands::{
-    self, DesktopShellState, AGENT_CLOSE_COMMAND, AGENT_FOCUS_COMMAND, AGENT_RESIZE_COMMAND,
-    AGENT_SNAPSHOT_COMMAND, AGENT_SPAWN_COMMAND, AGENT_WRITE_COMMAND, LIST_WORKSPACES_COMMAND,
-    MCP_DESCRIPTORS_COMMAND, MCP_INVOKE_COMMAND, NATIVE_ISLAND_REQUEST_COMMAND,
-    REGISTER_WORKSPACE_COMMAND, REVIEW_DECISION_COMMAND, REVIEW_QUEUE_COMMAND,
-    SUPERVISOR_LOCAL_ACTION_COMMAND, TERMINAL_CLOSE_COMMAND, TERMINAL_FOCUS_COMMAND,
-    TERMINAL_OPEN_COMMAND, TERMINAL_RESIZE_COMMAND, TERMINAL_WRITE_COMMAND,
+    self, DesktopShellState, AGENT_CLOSE_COMMAND, AGENT_FOCUS_COMMAND, AGENT_PLATFORMS_COMMAND,
+    AGENT_RESIZE_COMMAND, AGENT_SNAPSHOT_COMMAND, AGENT_SPAWN_COMMAND, AGENT_WRITE_COMMAND,
+    LIST_WORKSPACES_COMMAND, MCP_DESCRIPTORS_COMMAND, MCP_INVOKE_COMMAND,
+    NATIVE_ISLAND_REQUEST_COMMAND, REGISTER_WORKSPACE_COMMAND, REVIEW_DECISION_COMMAND,
+    REVIEW_QUEUE_COMMAND, SUPERVISOR_LOCAL_ACTION_COMMAND, TERMINAL_CLOSE_COMMAND,
+    TERMINAL_FOCUS_COMMAND, TERMINAL_OPEN_COMMAND, TERMINAL_RESIZE_COMMAND, TERMINAL_WRITE_COMMAND,
 };
 use crate::runtime::{DesktopEvent, DesktopEventSink};
 
@@ -110,6 +110,7 @@ async fn dispatch_command(
     let runtime = state.runtime.as_ref();
     match command {
         AGENT_SNAPSHOT_COMMAND => json(host_commands::agent_snapshot(runtime).await?),
+        AGENT_PLATFORMS_COMMAND => json(host_commands::agent_platforms().await?),
         AGENT_SPAWN_COMMAND => json(host_commands::agent_spawn(runtime, body(payload)?).await?),
         AGENT_WRITE_COMMAND => json(host_commands::agent_write(runtime, body(payload)?).await?),
         AGENT_RESIZE_COMMAND => json(host_commands::agent_resize(runtime, body(payload)?).await?),
@@ -328,7 +329,6 @@ pub fn use_live_host_bridge() {
 
         loop {
             tokio::select! {
-                biased;
                 event = event_rx.recv() => {
                     match event {
                         Some(event) => {
@@ -368,7 +368,7 @@ pub fn LiveDesktopApp() -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{AgentPlatformKind, DesktopRuntime, LocalSupervisorAction};
+    use crate::runtime::{AgentPlatformId, DesktopRuntime, LocalSupervisorAction};
     use crate::workspace::WorkspaceRegistry;
     use crate::McpToolRegistry;
     use serde_json::json;
@@ -484,6 +484,30 @@ mod tests {
         .await;
         assert!(response.ok, "{:?}", response.error);
         assert_eq!(response.result, json!([]));
+    }
+
+    #[tokio::test]
+    async fn dispatch_agent_platforms_returns_registry_catalog_with_ion() {
+        let state = test_state();
+        let response = dispatch_host_invoke(
+            &state,
+            HostInvokeRequest {
+                id: "host-platforms".to_string(),
+                command: "agent_platforms".to_string(),
+                payload: Value::Null,
+            },
+        )
+        .await;
+
+        assert!(response.ok, "{:?}", response.error);
+        let ids = response
+            .result
+            .as_array()
+            .expect("platform catalog array")
+            .iter()
+            .filter_map(|value| value.get("id").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&"ion"), "missing Ion platform: {ids:?}");
     }
 
     #[tokio::test]
@@ -656,18 +680,21 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_command_round_trips_through_platform_kind() {
-        // Guards that AgentPlatformKind stays serializable through the bridge
-        // (its variants drive default_command in dispatch'd spawns).
-        for kind in [
-            AgentPlatformKind::Codex,
-            AgentPlatformKind::ClaudeCode,
-            AgentPlatformKind::Gemini,
-            AgentPlatformKind::Cursor,
+    fn open_platform_id_round_trips_through_host_bridge_wire_shape() {
+        // Open registry identities stay plain-string serializable across the
+        // host boundary without reintroducing a closed desktop enum.
+        for id in [
+            "codex",
+            "claude-code",
+            "gemini",
+            "cursor",
+            "ion",
+            "custom-agent",
         ] {
-            let text = serde_json::to_string(&kind).unwrap();
-            let back: AgentPlatformKind = serde_json::from_str(&text).unwrap();
-            assert_eq!(kind, back);
+            let platform = AgentPlatformId::try_new(id).unwrap();
+            let text = serde_json::to_string(&platform).unwrap();
+            let back: AgentPlatformId = serde_json::from_str(&text).unwrap();
+            assert_eq!(platform, back);
         }
     }
 }

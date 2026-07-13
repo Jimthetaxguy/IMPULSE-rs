@@ -1,34 +1,54 @@
 ---
+title: Honest Roadmap - Historical Hook and Memory Validation Register
+description: Historical adversarial risk register retained for unresolved hook, compaction, extraction, and memory-quality validation
+version: '1.2'
 status: active
-phase: all
+phase: historical
+type: reference
+category: validation
 audience: builder
 tags: [roadmap, honest, limitations, critique]
-last_updated: 2026-03-05
+updated: 2026-07-12
+last_updated: 2026-07-12
 ---
 
-# Impulse: Honest Roadmap
+# Impulse: Historical Hook and Memory Validation Register
 
-> **Version:** 1.1 | **Status:** Post-critique | **Updated:** 2026-03-05
+> **Version:** 1.2 | **Status:** Active in narrow historical scope | **Updated:** 2026-07-12
 > **Source:** Session 5 critique (21 iterations of adversarial analysis)
-> **Complements:** PRODUCT-SPEC-v2.md (the "what to build"), this doc is the "what's real"
+> **Current product authority:** [`../VISION.md`](../VISION.md) and
+> [`spec/RUST-CANONICAL-CONTRACT.md`](spec/RUST-CANONICAL-CONTRACT.md)
 
 ---
 
 ## What This Is
 
-This is the adversarial complement to `PRODUCT-SPEC-v2.md`. Where the spec describes the ideal, this document describes the real limitations, validated assumptions, unvalidated risks, and corrected phase sequence.
+This is a **historical TypeScript/Bun-era critique with one retained active purpose**: tracking
+unresolved evidence for Claude hook injection, compaction survival, extraction quality, and the
+behavioral usefulness of durable memory. It is not the current whole-product roadmap, architecture
+contract, control-plane risk register, or implementation sequence.
 
-**Read this alongside the spec. Don't ship without it.**
+Use `VISION.md`, the Rust canonical contract, the user-story map, and test traceability for current
+product direction. Use this file only when validating the hook/memory hypotheses in Assumptions
+A-D below. Phase labels, TypeScript paths, npm distribution, three-file architecture, and claims
+that Impulse has no daemon or database are preserved as historical evidence and must not direct
+current control-plane work.
 
-> **Current routing note (2026-03-05):** [`ROADMAP-PLAN.md`](./ROADMAP-PLAN.md) and [`plans/IMPLEMENTATION-HANDOFF.md`](./plans/IMPLEMENTATION-HANDOFF.md) now treat this file as the canonical risk register for hook validation, compaction survival, and `GENOME.md` usefulness. Those items remain open until evidence is recorded here.
+> **Current routing note (2026-07-12):** this file remains the narrow validation register for hook
+> injection, compaction survival, extraction quality, and `GENOME.md` usefulness. It is not
+> canonical for the governed supervisor/builder slice, runtime roles, capability negotiation,
+> desktop authority, or the Now/Next/Later roadmap.
 
 > **Note (2026-02-24):** This document was originally written during the TypeScript/Bun era (Session 5, pre-Rust pivot). The project has since been rewritten in Rust (`impulse-rs`). Many corrections below have been addressed by the Rust rewrite — see inline status markers. The document is retained for its analytical rigor and as a record of assumptions that were tested.
 
 ---
 
-## The Honest Promise
+## Historical Memory-Sidecar Promise
 
-### What Impulse CAN Deliver (Validated)
+The claims in this section record what the February critique believed or had validated at that
+time. They are not a current inventory of the Rust control plane.
+
+### What the Phase-Era Design Could Deliver
 
 - **Cross-session memory** for solo AI coding workflows
 - **Automatic extraction** of architectural decisions at session end (LLM-based)
@@ -36,7 +56,7 @@ This is the adversarial complement to `PRODUCT-SPEC-v2.md`. Where the spec descr
 - **Zero-infrastructure Phase 1** — no databases, no daemons, no ML models
 - **Human-readable, git-tracked** project memory
 
-### What Impulse CANNOT Deliver (Acknowledge These Explicitly)
+### Phase-Era Limitations Recorded by the Critique
 
 | Limitation | Current Capability | When Fixed | Status |
 |-----------|-------------------|------------|--------|
@@ -49,9 +69,10 @@ This is the adversarial complement to `PRODUCT-SPEC-v2.md`. Where the spec descr
 
 ---
 
-## Critical Unvalidated Assumptions
+## Retained Hook and Memory Validation Risks
 
-**These MUST be validated in the pre-Phase 1 spike. If they fail, the design must be revised.**
+**These remain evidence-gated.** If they fail, revise the affected hook or memory claim; do not
+infer that the wider control-plane architecture has failed.
 
 ### Assumption A: SessionStart stdout injection
 
@@ -95,7 +116,10 @@ This is the adversarial complement to `PRODUCT-SPEC-v2.md`. Where the spec descr
 
 ---
 
-## Architectural Corrections (vs. Current Docs)
+## Historical Architectural Corrections
+
+The corrections below explain the design context in which the original critique was written.
+They do not override current Rust code, the daemon/control-plane contract, or current ADRs.
 
 ### Correction 1: Deferred Extraction Must Be Async
 
@@ -193,7 +217,10 @@ The `union` merge strategy keeps all lines from both versions. For append-only f
 
 ---
 
-## What Best-in-Class CLI Tools Teach Us
+## Historical CLI Product Notes
+
+These setup and UX comparisons are retained for provenance. Current installation and runtime
+claims come from the Rust contract and current release documentation.
 
 ### The "10-Second Setup" Standard
 
@@ -222,9 +249,9 @@ impulse debug                           # Diagnostic: PATH, API key, file states
 
 ---
 
-## Pre-Phase 1 Spike Checklist
+## Retained Hook and Memory Evidence Checklist
 
-**Complete ALL of these before writing src/files.ts:**
+Complete the applicable checks before strengthening hook or durable-memory claims:
 
 - [ ] **Hook injection**: bash SessionStart outputs known text → verify it appears as system context in Claude Code
 - [ ] **PreCompact survival**: bash PreCompact outputs known text → verify it appears post-compaction
@@ -240,9 +267,12 @@ impulse debug                           # Diagnostic: PATH, API key, file states
 
 ---
 
-## The "Do Not Build" List
+## Historical "Do Not Build" List
 
-**Build ONLY when evidence from deployed usage requires it:**
+This table captured February sequencing assumptions. Several entries have since changed or landed;
+it is not an active backlog. Current sequencing comes from `VISION.md` and the user-story map.
+
+The original sequencing rule was to build these only when deployed evidence required them:
 
 | Feature | Current Status | Evidence Required |
 |---------|---------------|-------------------|
@@ -255,9 +285,12 @@ impulse debug                           # Diagnostic: PATH, API key, file states
 
 ---
 
-## Document Correction Queue
+## Historical Document Correction Queue
 
-These documents contain claims that need correction before implementation begins:
+This queue is retained as a record of the TypeScript-era critique. It is not an active correction
+queue and must not be used to route current implementation work.
+
+The original queue recorded these proposed corrections:
 
 1. **PRODUCT-SPEC-v2.md** — Add "Honest Limitations" section. Fix deferred extraction to async. Reframe multi-agent coordination as "advisory."
 
@@ -273,20 +306,25 @@ These documents contain claims that need correction before implementation begins
 
 ---
 
-## Summary: What This Roadmap Changes
+## Current Scope Summary
 
-**This honest roadmap changes three things:**
+This document now has one current job: hold the four hook/memory validation risks and their
+evidence checklist without presenting a legacy phase plan as the product roadmap.
 
-1. **Adds the Pre-Phase 1 spike** — 1-2 days of validation before 3 weeks of coding. Non-optional.
+The original critique changed three things in its historical design context:
 
-2. **Reframes the multi-agent promise** — From "agents coordinate" to "agents are AWARE and CAN coordinate." Structural enforcement is Phase 1.5.
+1. It added a pre-implementation hook and memory validation spike.
 
-3. **Fixes the distribution gap** — Acknowledges npm conflicts with the target persona. Plans binary distribution for Phase 1.5.
+2. It reframed file-based multi-agent awareness as advisory rather than structurally enforced.
 
-**Everything else in the existing spec is sound.** The three-file architecture, the phased approach, the ADR structure, the extraction improvements — all correct.
+3. It identified npm distribution as a mismatch for the target persona.
+
+Those conclusions are provenance, not current control-plane authority. Current live-versus-target
+truth belongs to `VISION.md`, `RUST-CANONICAL-CONTRACT.md`, `USER-STORY-MAP.md`, and
+`TEST-TRACEABILITY.md`.
 
 ---
 
 _Created: 2026-02-21 | Source: Session 5 Ralph Loop, 21 iterations_
 _Updated: 2026-02-24 | Added Rust-era status markers_
-_This document is the honest complement to PRODUCT-SPEC-v2.md_
+_Scoped: 2026-07-12 | Retained only as the hook and memory validation register_

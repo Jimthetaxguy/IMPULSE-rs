@@ -25,6 +25,7 @@ pub const PENDING_HOST_BOOTSTRAP_STATUS: &str = "manifest-only-pending-dioxus-ev
 
 pub const AGENT_CLOSE_COMMAND: &str = "agent_close";
 pub const AGENT_FOCUS_COMMAND: &str = "agent_focus";
+pub const AGENT_PLATFORMS_COMMAND: &str = "agent_platforms";
 pub const AGENT_RESIZE_COMMAND: &str = "agent_resize";
 pub const AGENT_SNAPSHOT_COMMAND: &str = "agent_snapshot";
 pub const AGENT_SPAWN_COMMAND: &str = "agent_spawn";
@@ -46,6 +47,7 @@ pub const TERMINAL_WRITE_COMMAND: &str = "terminal_write";
 pub const HOST_INVOKE_COMMANDS: &[&str] = &[
     AGENT_CLOSE_COMMAND,
     AGENT_FOCUS_COMMAND,
+    AGENT_PLATFORMS_COMMAND,
     AGENT_RESIZE_COMMAND,
     AGENT_SNAPSHOT_COMMAND,
     AGENT_SPAWN_COMMAND,
@@ -205,6 +207,28 @@ pub async fn agent_snapshot(runtime: &DesktopRuntime) -> Result<Vec<AgentRuntime
 
 fn agent_snapshot_inner(runtime: &DesktopRuntime) -> Result<Vec<AgentRuntimeSnapshot>, String> {
     Ok(runtime.snapshot_agents())
+}
+
+/// Return the runtime registry's open platform catalog for launcher rendering.
+/// Registry parse failures are surfaced to the host instead of silently
+/// falling back to a hard-coded list.
+#[cfg(feature = "legacy-tauri-runtime")]
+#[tauri::command]
+pub async fn agent_platforms() -> Result<Vec<impulse_ops::agent_registry::AgentPlatformInfo>, String>
+{
+    agent_platforms_inner()
+}
+
+#[cfg(not(feature = "legacy-tauri-runtime"))]
+pub async fn agent_platforms() -> Result<Vec<impulse_ops::agent_registry::AgentPlatformInfo>, String>
+{
+    agent_platforms_inner()
+}
+
+fn agent_platforms_inner() -> Result<Vec<impulse_ops::agent_registry::AgentPlatformInfo>, String> {
+    let registry = impulse_ops::agent_registry::AgentRegistry::registry_for_runtime()
+        .map_err(err_to_string)?;
+    Ok(impulse_ops::agent_registry::AgentPlatformsReport::from_registry(&registry).platforms)
 }
 
 #[cfg(feature = "legacy-tauri-runtime")]

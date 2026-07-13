@@ -3,7 +3,7 @@ name = "impulse-desktop"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
-description = "Hybrid Dioxus desktop shell contracts for Impulse"
+description = "Dioxus cockpit and typed desktop-host contracts for Impulse"
 authors = ["Impulse Maintainers"]
 license = "MIT"
 
@@ -29,7 +29,7 @@ native-macos = [
     "dep:objc2-app-kit",
     "dep:objc2-foundation",
 ]
-# Temporary compatibility adapter while the desktop host migrates to Dioxus Desktop.
+# Legacy compatibility adapter for older Tauri-shaped host integrations.
 legacy-tauri-runtime = ["dep:tauri"]
 tauri-runtime = ["legacy-tauri-runtime"]
 

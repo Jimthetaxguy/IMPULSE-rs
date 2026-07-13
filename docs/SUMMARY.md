@@ -1,8 +1,8 @@
 ---
 title: Documentation Summary
 description: Unified navigation structure for Impulse documentation
-version: 2.2
-updated: 2026-05-21
+version: 2.5
+updated: 2026-07-12
 schema_version: '1.0'
 ---
 
@@ -12,40 +12,47 @@ schema_version: '1.0'
 
 | Guide | Description | Start Here |
 | ----- | ----------- | ---------- |
+| [VISION.md](../VISION.md) | Living product north star and complete governed vertical slice | ✅ Yes |
 | [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) | Authoritative product contract | ✅ Yes |
 | [USER-STORY-MAP.md](spec/USER-STORY-MAP.md) | Rust-first user stories and acceptance criteria | ✅ Yes |
 | [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md) | Current story-to-test coverage map | ✅ Yes |
+| [ARCHITECTURE-CLARIFICATION.md](ARCHITECTURE-CLARIFICATION.md) | Current control-plane boundary and enforcement map | ✅ Yes |
 | [AGENTS.md](../AGENTS.md) | AI agent guidelines | ✅ Yes |
 | [COLLABORATIVE-AGENTIC-CODING.md](guides/COLLABORATIVE-AGENTIC-CODING.md) | Agent lane, worktree, and handoff rules | ✅ Yes |
 | [CONTRIBUTING.md](../CONTRIBUTING.md) | Human and agent contribution rules | ✅ Yes |
 | [INDEX.md](INDEX.md) | Master navigation | ✅ Yes |
-| [HONEST-ROADMAP.md](HONEST-ROADMAP.md) | Validation risk register | ✅ Yes |
 
 ## Active Track
 
-The active roadmap is now Rust core plus the Dioxus Desktop host migration. Tauri-shaped code is retained only as a temporary compatibility adapter.
+Roadmap contract: Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; Legacy=egui compile-maintenance only.
 
-- [ROADMAP-PLAN.md](ROADMAP-PLAN.md)
-- [plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md](plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md) — historical context, not the current next goal
+`HONEST-ROADMAP.md` is a historical hook/memory validation register, not the current product
+roadmap or whole-product risk authority.
+
+- [VISION.md](../VISION.md)
+- [spec/RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md)
+- [ARCHITECTURE-CLARIFICATION.md](ARCHITECTURE-CLARIFICATION.md)
+- [spec/USER-STORY-MAP.md](spec/USER-STORY-MAP.md)
+- [spec/TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md)
 - [guides/COLLABORATIVE-AGENTIC-CODING.md](guides/COLLABORATIVE-AGENTIC-CODING.md)
-- [../impulse-rs/docs/IMPULSE_TERM_STATUS.md](../impulse-rs/docs/IMPULSE_TERM_STATUS.md)
-- [HONEST-ROADMAP.md](HONEST-ROADMAP.md)
 
 ## By Phase
 
 ### Now
 
-- [ROADMAP-PLAN.md](ROADMAP-PLAN.md)
-- [plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md](plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md) — historical context
+- [VISION.md](../VISION.md)
 - [spec/RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md)
+- [ARCHITECTURE-CLARIFICATION.md](ARCHITECTURE-CLARIFICATION.md)
 
 ### Next
 
-- [HONEST-ROADMAP.md](HONEST-ROADMAP.md)
-- [../impulse-rs/docs/IMPULSE_TERM_STATUS.md](../impulse-rs/docs/IMPULSE_TERM_STATUS.md)
+- [VISION.md](../VISION.md) — governed supervisor/builder slice and hierarchy/enforcement ADR
+- [spec/USER-STORY-MAP.md](spec/USER-STORY-MAP.md)
+- [spec/TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md)
 
 ### Later
 
+- [VISION.md](../VISION.md) — general roles, negotiated runtimes, messaging, and attention
 - [vision/CLI-ARCHITECTURE.md](vision/CLI-ARCHITECTURE.md)
 - [archive/TUI-AUGMENTATION-VISION.md](archive/TUI-AUGMENTATION-VISION.md)
 
@@ -56,18 +63,22 @@ The active roadmap is now Rust core plus the Dioxus Desktop host migration. Taur
 - [spec/RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md)
 - [spec/USER-STORY-MAP.md](spec/USER-STORY-MAP.md)
 - [spec/TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md)
-- [spec/COMPETITIVE-POSITIONING.md](spec/COMPETITIVE-POSITIONING.md)
-- [spec/PERFORMANCE-TARGETS.md](spec/PERFORMANCE-TARGETS.md)
 
 ### Roadmap
 
-- [ROADMAP-PLAN.md](ROADMAP-PLAN.md)
-- [plans/IMPLEMENTATION-HANDOFF.md](plans/IMPLEMENTATION-HANDOFF.md)
-- [HONEST-ROADMAP.md](HONEST-ROADMAP.md)
+- [ROADMAP-PLAN.md](ROADMAP-PLAN.md) — superseded Rust/Dioxus implementation history
+- [plans/IMPLEMENTATION-HANDOFF.md](plans/IMPLEMENTATION-HANDOFF.md) — historical desktop handoff
 - [../impulse-rs/docs/IMPULSE_TERM_STATUS.md](../impulse-rs/docs/IMPULSE_TERM_STATUS.md)
+
+### Validation and Historical Risk
+
+- [HONEST-ROADMAP.md](HONEST-ROADMAP.md) — historical register for unresolved hook and memory hypotheses
+- [guides/HOOK-VALIDATION-GUIDE.md](guides/HOOK-VALIDATION-GUIDE.md) — current evidence procedure
 
 ### Architecture & Vision
 
+- [VISION.md](../VISION.md)
+- [ARCHITECTURE-CLARIFICATION.md](ARCHITECTURE-CLARIFICATION.md)
 - [vision/CLI-ARCHITECTURE.md](vision/CLI-ARCHITECTURE.md)
 - [vision/DATA-MODELS.md](vision/DATA-MODELS.md)
 - [vision/DYNAMIC-CLI-VISION.md](vision/DYNAMIC-CLI-VISION.md)
@@ -86,13 +97,28 @@ The active roadmap is now Rust core plus the Dioxus Desktop host migration. Taur
 
 ### Guides
 
-- [guides/TEAM-ONBOARDING.md](guides/TEAM-ONBOARDING.md)
 - [guides/COLLABORATIVE-AGENTIC-CODING.md](guides/COLLABORATIVE-AGENTIC-CODING.md)
-- [guides/BEST-PRACTICES.md](guides/BEST-PRACTICES.md)
-- [guides/ERROR-HANDLING-GUIDE.md](guides/ERROR-HANDLING-GUIDE.md)
-- [guides/DATABASE-GUIDE.md](guides/DATABASE-GUIDE.md)
+- [guides/HOOK-VALIDATION-GUIDE.md](guides/HOOK-VALIDATION-GUIDE.md)
+- [guides/RUST-MULTI-AGENT-PATTERNS.md](guides/RUST-MULTI-AGENT-PATTERNS.md)
+- [FRONTMATTER-SCHEMA.md](FRONTMATTER-SCHEMA.md)
+
+### Historical Reference
+
+- [spec/COMPETITIVE-POSITIONING.md](spec/COMPETITIVE-POSITIONING.md)
+- [spec/PERFORMANCE-TARGETS.md](spec/PERFORMANCE-TARGETS.md)
+- [guides/SECURITY-REVIEW.md](guides/SECURITY-REVIEW.md)
 - [guides/INTEGRATION-COOKBOOK.md](guides/INTEGRATION-COOKBOOK.md)
+- [guides/SYNTHETIC-TESTING-GUIDE.md](guides/SYNTHETIC-TESTING-GUIDE.md)
+- [guides/BEST-PRACTICES.md](guides/BEST-PRACTICES.md)
 - [guides/DEPLOYMENT-FRAMEWORK.md](guides/DEPLOYMENT-FRAMEWORK.md)
+- [guides/TEAM-ONBOARDING.md](guides/TEAM-ONBOARDING.md)
+- [guides/TESTING-STRATEGY-ENHANCEMENTS.md](guides/TESTING-STRATEGY-ENHANCEMENTS.md)
+- [guides/RELEASE-NOTES-TEMPLATE.md](guides/RELEASE-NOTES-TEMPLATE.md)
+- [guides/DATABASE-GUIDE.md](guides/DATABASE-GUIDE.md)
+- [guides/PERFORMANCE-PROFILING.md](guides/PERFORMANCE-PROFILING.md)
+- [guides/CLI-REFERENCE-ENHANCEMENTS.md](guides/CLI-REFERENCE-ENHANCEMENTS.md)
+- [guides/ERROR-HANDLING-GUIDE.md](guides/ERROR-HANDLING-GUIDE.md)
+- [guides/TESTING-FRAMEWORK.md](guides/TESTING-FRAMEWORK.md)
 - [guides/TOOLS-STATUS.md](guides/TOOLS-STATUS.md)
 
 ### Decisions (ADRs)
@@ -104,6 +130,9 @@ The active roadmap is now Rust core plus the Dioxus Desktop host migration. Taur
 - [decisions/0004-extraction-strategy.md](decisions/0004-extraction-strategy.md)
 - [decisions/0005-distribution-model.md](decisions/0005-distribution-model.md)
 - [decisions/0006-hook-enhancement-conflict-resolution.md](decisions/0006-hook-enhancement-conflict-resolution.md)
+- [decisions/0007-desktop-shell-stack.md](decisions/0007-desktop-shell-stack.md)
+- [decisions/0008-dioxus-desktop-host.md](decisions/0008-dioxus-desktop-host.md)
+- [decisions/0009-reconcile-impulse-copies.md](decisions/0009-reconcile-impulse-copies.md)
 
 ### Session Logs
 
@@ -120,9 +149,9 @@ Historical Ralph loop plans now live under `archive/ralph-plans/` and are proven
 
 | Field | Value |
 | ----- | ----- |
-| Total Documents | 76 |
-| Categories | 8 |
-| Decisions (ADRs) | 6 |
+| Total Documents | 134 |
+| Categories | 9 |
+| Decisions (ADRs) | 9 |
 | Phases | 3 |
 | Status | Active Development |
 

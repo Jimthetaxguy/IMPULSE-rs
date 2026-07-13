@@ -80,7 +80,7 @@ cargo run -p impulse-gui -- --debug   # Run with debug logging
 ## Testing
 
 ```bash
-cargo test -p impulse-gui             # 251 tests
+cargo test -p impulse-gui             # 252 tests
 ```
 
 Tests cover IPC protocol round-trips, theme validation, serde round-trips for wire types, memory persistence, signal bus routing, notification lifecycle, and widget state.

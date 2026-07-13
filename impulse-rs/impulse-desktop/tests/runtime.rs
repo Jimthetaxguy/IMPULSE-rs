@@ -1,11 +1,11 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use impulse_desktop::{
-    AgentPlatformKind, AgentSpawnRequest, AgentWriteRequest, DesktopEvent, DesktopEventSink,
+    AgentPlatformId, AgentSpawnRequest, AgentWriteRequest, DesktopEvent, DesktopEventSink,
     DesktopRuntime, LocalSupervisorAction, SupervisorLocalActionRequest, TerminalCloseRequest,
-    TerminalFocusRequest, TerminalResizeRequest, WorkspaceTarget,
+    TerminalFocusRequest, TerminalResizeRequest, WeakDesktopRuntime, WorkspaceTarget,
 };
 use serde_json::json;
 
@@ -29,6 +29,84 @@ impl DesktopEventSink for RecordingSink {
     }
 }
 
+#[derive(Default)]
+struct ReentrantLifecycleSink {
+    events: Mutex<Vec<DesktopEvent>>,
+    runtime: Mutex<Option<WeakDesktopRuntime>>,
+    reentered: Mutex<bool>,
+}
+
+impl DesktopEventSink for ReentrantLifecycleSink {
+    fn emit(&self, event: DesktopEvent) {
+        self.events
+            .lock()
+            .expect("reentrant events mutex poisoned")
+            .push(event.clone());
+        let agent_id = match event {
+            DesktopEvent::AgentRuntimeUpdate { snapshot } if snapshot.alive => snapshot.agent_id,
+            _ => return,
+        };
+        let should_reenter = {
+            let mut reentered = self.reentered.lock().expect("reentry mutex poisoned");
+            if *reentered {
+                false
+            } else {
+                *reentered = true;
+                true
+            }
+        };
+        if should_reenter {
+            let runtime = self
+                .runtime
+                .lock()
+                .expect("runtime mutex poisoned")
+                .as_ref()
+                .and_then(WeakDesktopRuntime::upgrade)
+                .expect("runtime installed before spawn");
+            runtime
+                .focus_agent(TerminalFocusRequest {
+                    session_id: agent_id,
+                })
+                .expect("reentrant focus succeeds");
+        }
+    }
+}
+
+struct BlockingOutputSink {
+    events: Mutex<Vec<DesktopEvent>>,
+    output_started: mpsc::Sender<()>,
+    output_release: Mutex<mpsc::Receiver<()>>,
+    blocked_once: Mutex<bool>,
+}
+
+impl DesktopEventSink for BlockingOutputSink {
+    fn emit(&self, event: DesktopEvent) {
+        let should_block = if matches!(event, DesktopEvent::TerminalOutput { .. }) {
+            let mut blocked = self.blocked_once.lock().expect("blocked mutex poisoned");
+            if *blocked {
+                false
+            } else {
+                *blocked = true;
+                true
+            }
+        } else {
+            false
+        };
+        if should_block {
+            self.output_started.send(()).expect("signal output start");
+            self.output_release
+                .lock()
+                .expect("release mutex poisoned")
+                .recv_timeout(Duration::from_secs(2))
+                .expect("release blocked output");
+        }
+        self.events
+            .lock()
+            .expect("blocking events mutex poisoned")
+            .push(event);
+    }
+}
+
 fn terminal_output(sink: &RecordingSink, agent_id: &str) -> Vec<u8> {
     let mut output = Vec::new();
     for event in sink.events() {
@@ -45,11 +123,15 @@ fn terminal_output(sink: &RecordingSink, agent_id: &str) -> Vec<u8> {
     output
 }
 
+fn platform_id(value: &str) -> AgentPlatformId {
+    AgentPlatformId::try_new(value).expect("valid test platform id")
+}
+
 fn shell_spawn(agent_id: &str, script: &str) -> AgentSpawnRequest {
     AgentSpawnRequest {
         agent_id: Some(agent_id.to_string()),
         session_id: Some(format!("{agent_id}-session")),
-        platform: AgentPlatformKind::Shell,
+        platform: platform_id("shell"),
         command: Some("sh".to_string()),
         args: vec!["-lc".to_string(), script.to_string()],
         cwd: None,
@@ -82,6 +164,10 @@ fn test_desktop_event_names_are_advertised_by_host_manifest() {
             snapshot: Box::new(snapshot),
         },
         DesktopEvent::OpsUpdate { payload: json!({}) },
+        DesktopEvent::OpsConnectionUpdate {
+            connected: true,
+            error: None,
+        },
         DesktopEvent::SupervisorLocalAction {
             action: LocalSupervisorAction::FocusAgent {
                 agent_id: "event-name-agent".to_string(),
@@ -99,6 +185,203 @@ fn test_desktop_event_names_are_advertised_by_host_manifest() {
 }
 
 #[test]
+fn test_immediate_exit_never_emits_a_live_snapshot_after_terminal_exit() {
+    let sink = Arc::new(RecordingSink::default());
+    let runtime = DesktopRuntime::builder()
+        .with_event_sink(sink.clone())
+        .build();
+    for attempt in 0..16 {
+        let agent_id = format!("immediate-exit-{attempt}");
+        runtime
+            .spawn_agent(shell_spawn(&agent_id, "exit 0"))
+            .expect("spawn immediate-exit agent");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline
+            && !sink.events().iter().any(|event| {
+                matches!(
+                    event,
+                    DesktopEvent::TerminalExit { agent_id: exited } if exited == &agent_id
+                )
+            })
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let events = sink.events();
+        let exit_index = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    DesktopEvent::TerminalExit { agent_id: exited } if exited == &agent_id
+                )
+            })
+            .expect("immediate process emitted terminal_exit");
+        assert!(
+            !events[exit_index + 1..].iter().any(|event| {
+                matches!(
+                    event,
+                    DesktopEvent::AgentRuntimeUpdate { snapshot }
+                        if snapshot.agent_id == agent_id && snapshot.alive
+                )
+            }),
+            "attempt {attempt} resurrected a dead agent: {events:?}"
+        );
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && !runtime.snapshot_agents().is_empty() {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        runtime.snapshot_agents().is_empty(),
+        "naturally exited runtimes must be reaped"
+    );
+}
+
+#[test]
+fn test_runtime_rejects_active_duplicate_and_closed_id_reuse() {
+    let runtime = DesktopRuntime::default();
+    runtime
+        .spawn_agent(shell_spawn("reserved-id", "sleep 2"))
+        .expect("spawn first incarnation");
+
+    let duplicate = runtime
+        .spawn_agent(shell_spawn("reserved-id", "sleep 2"))
+        .expect_err("active duplicate id must be rejected");
+    assert!(duplicate.to_string().contains("has already been used"));
+    assert_eq!(runtime.snapshot_agents().len(), 1);
+
+    runtime
+        .close_agent(TerminalCloseRequest {
+            session_id: "reserved-id".to_string(),
+        })
+        .expect("close first incarnation");
+    let reused = runtime
+        .spawn_agent(shell_spawn("reserved-id", "sleep 2"))
+        .expect_err("closed id must stay reserved against stale callbacks");
+    assert!(reused.to_string().contains("has already been used"));
+    assert!(runtime.snapshot_agents().is_empty());
+}
+
+#[test]
+fn test_lifecycle_dispatch_allows_sink_reentry_without_deadlock() {
+    let sink = Arc::new(ReentrantLifecycleSink::default());
+    let runtime = DesktopRuntime::builder()
+        .with_event_sink(sink.clone())
+        .build();
+    *sink.runtime.lock().expect("runtime mutex poisoned") = Some(runtime.downgrade());
+
+    runtime
+        .spawn_agent(shell_spawn("reentrant-agent", "sleep 2"))
+        .expect("spawn reentrant agent");
+
+    let snapshots = runtime.snapshot_agents();
+    assert_eq!(snapshots.len(), 1);
+    assert!(snapshots[0].focused);
+    let events = sink.events.lock().expect("events mutex poisoned");
+    let runtime_updates = events
+        .iter()
+        .filter_map(|event| match event {
+            DesktopEvent::AgentRuntimeUpdate { snapshot } => Some(snapshot),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(runtime_updates.len(), 2);
+    assert!(!runtime_updates[0].focused);
+    assert!(runtime_updates[1].focused);
+    drop(events);
+
+    runtime
+        .close_agent(TerminalCloseRequest {
+            session_id: "reentrant-agent".to_string(),
+        })
+        .expect("close reentrant agent");
+}
+
+#[test]
+fn test_manual_close_never_delivers_buffered_output_after_exit() {
+    let (output_started_tx, output_started_rx) = mpsc::channel();
+    let (output_release_tx, output_release_rx) = mpsc::channel();
+    let sink = Arc::new(BlockingOutputSink {
+        events: Mutex::new(Vec::new()),
+        output_started: output_started_tx,
+        output_release: Mutex::new(output_release_rx),
+        blocked_once: Mutex::new(false),
+    });
+    let runtime = DesktopRuntime::builder()
+        .with_event_sink(sink.clone())
+        .build();
+    let spawn_runtime = runtime.clone();
+    let spawn_thread = std::thread::spawn(move || {
+        spawn_runtime.spawn_agent(shell_spawn(
+            "buffered-output-agent",
+            "printf buffered-output; sleep 30",
+        ))
+    });
+    output_started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("reader reached output sink");
+
+    let closer = runtime.clone();
+    let close_thread = std::thread::spawn(move || {
+        closer.close_agent(TerminalCloseRequest {
+            session_id: "buffered-output-agent".to_string(),
+        })
+    });
+    close_thread
+        .join()
+        .expect("close thread")
+        .expect("close buffered-output agent");
+    output_release_tx.send(()).expect("release output sink");
+    spawn_thread
+        .join()
+        .expect("spawn thread")
+        .expect("spawn buffered-output agent");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline
+        && !sink
+            .events
+            .lock()
+            .expect("events mutex poisoned")
+            .iter()
+            .any(|event| {
+                matches!(
+                    event,
+                    DesktopEvent::TerminalExit { agent_id }
+                        if agent_id == "buffered-output-agent"
+                )
+            })
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let events = sink.events.lock().expect("events mutex poisoned");
+    let exit_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                DesktopEvent::TerminalExit { agent_id }
+                    if agent_id == "buffered-output-agent"
+            )
+        })
+        .expect("terminal_exit delivered");
+    assert!(events[..exit_index].iter().any(|event| matches!(
+        event,
+        DesktopEvent::TerminalOutput { agent_id, .. }
+            if agent_id == "buffered-output-agent"
+    )));
+    assert!(!events[exit_index + 1..].iter().any(|event| matches!(
+        event,
+        DesktopEvent::TerminalOutput { agent_id, .. }
+            if agent_id == "buffered-output-agent"
+    )));
+}
+
+#[test]
 fn test_desktop_runtime_spawns_shell_and_emits_terminal_output() {
     let sink = Arc::new(RecordingSink::default());
     let runtime = DesktopRuntime::builder()
@@ -110,7 +393,7 @@ fn test_desktop_runtime_spawns_shell_and_emits_terminal_output() {
         .expect("spawn shell agent");
 
     assert_eq!(snapshot.agent_id, "shell-one");
-    assert_eq!(snapshot.platform, AgentPlatformKind::Shell);
+    assert_eq!(snapshot.platform, platform_id("shell"));
     assert_eq!(snapshot.rows, 24);
     assert_eq!(snapshot.cols, 80);
 
@@ -181,7 +464,7 @@ fn test_desktop_runtime_snapshot_carries_workspace_and_builtin_mcp_tools() {
 fn test_terminal_harness_spawn_request_binds_workspace_and_default_tools() {
     let request = AgentSpawnRequest::terminal_harness(
         "codex-harness",
-        AgentPlatformKind::Codex,
+        platform_id("codex"),
         "/workspace",
         32,
         100,
@@ -189,7 +472,7 @@ fn test_terminal_harness_spawn_request_binds_workspace_and_default_tools() {
 
     assert_eq!(request.agent_id.as_deref(), Some("codex-harness"));
     assert_eq!(request.session_id.as_deref(), Some("codex-harness-session"));
-    assert_eq!(request.platform, AgentPlatformKind::Codex);
+    assert_eq!(request.platform, platform_id("codex"));
     assert_eq!(request.command, None);
     assert_eq!(request.cwd.as_deref(), Some("/workspace"));
     assert_eq!(
@@ -216,6 +499,123 @@ fn test_workspace_target_deserializes_without_project_notes() {
     assert_eq!(target.root, "/tmp");
     assert_eq!(target.label.as_deref(), Some("scratch"));
     assert_eq!(target.project_notes, None);
+}
+
+#[test]
+fn test_agent_spawn_request_accepts_open_registry_ids_with_plain_string_wire_shape() {
+    for platform in ["codex", "ion", "custom-agent"] {
+        let request: AgentSpawnRequest = serde_json::from_value(json!({
+            "platform": platform,
+            "rows": 24,
+            "cols": 80
+        }))
+        .expect("registered and custom platform ids must use the same open string wire shape");
+
+        let encoded = serde_json::to_value(request).expect("request serializes");
+        assert_eq!(encoded["platform"], platform);
+    }
+}
+
+#[test]
+fn test_desktop_runtime_rejects_unknown_explicit_platform_before_spawning() {
+    let request: AgentSpawnRequest = serde_json::from_value(json!({
+        "agent_id": "unknown-platform",
+        "platform": "missing-agent",
+        "command": "sh",
+        "args": ["-lc", "true"],
+        "rows": 24,
+        "cols": 80
+    }))
+    .expect("open platform identity must decode before registry validation");
+
+    let error = DesktopRuntime::default()
+        .spawn_agent(request)
+        .expect_err("unknown explicit platform must fail closed");
+    assert!(error.to_string().contains("unknown agent platform"));
+}
+
+#[test]
+fn test_desktop_runtime_canonicalizes_registered_platform_identity() {
+    let runtime = DesktopRuntime::default();
+    let mut request = shell_spawn("canonical-platform", "sleep 2");
+    request.platform = platform_id("ShElL");
+
+    let snapshot = runtime
+        .spawn_agent(request)
+        .expect("case-insensitive registered identity should launch");
+    assert_eq!(snapshot.platform, platform_id("shell"));
+
+    runtime
+        .close_agent(TerminalCloseRequest {
+            session_id: snapshot.agent_id,
+        })
+        .expect("close canonicalization test agent");
+}
+
+#[test]
+fn test_desktop_runtime_canonicalizes_registered_alias_to_platform_id() {
+    let runtime = DesktopRuntime::default();
+    let mut request = shell_spawn("canonical-alias", "sleep 2");
+    request.platform = platform_id("generic_shell");
+
+    let snapshot = runtime
+        .spawn_agent(request)
+        .expect("registered alias should launch through its owning platform");
+    assert_eq!(snapshot.platform, platform_id("shell"));
+
+    runtime
+        .close_agent(TerminalCloseRequest {
+            session_id: snapshot.agent_id,
+        })
+        .expect("close alias canonicalization test agent");
+}
+
+#[test]
+#[ignore = "requires `cargo build -p impulse-rs --bin ion` in the shared target directory"]
+fn test_desktop_runtime_spawns_real_default_ion_sibling_without_override() {
+    let current_exe = std::env::current_exe().expect("locate desktop runtime test binary");
+    let deps_dir = current_exe.parent().expect("test binary parent");
+    let target_profile = if deps_dir.file_name().and_then(|name| name.to_str()) == Some("deps") {
+        deps_dir.parent().expect("target profile directory")
+    } else {
+        deps_dir
+    };
+    let ion = target_profile.join(format!("ion{}", std::env::consts::EXE_SUFFIX));
+    assert!(
+        ion.is_file(),
+        "build the real Ion binary before running this integration test: {}",
+        ion.display()
+    );
+
+    let runtime = DesktopRuntime::default();
+    let request = AgentSpawnRequest {
+        agent_id: Some("real-ion-sibling".to_string()),
+        session_id: Some("real-ion-sibling-session".to_string()),
+        platform: platform_id("ion"),
+        command: None,
+        args: Vec::new(),
+        cwd: None,
+        env: HashMap::new(),
+        workspace: None,
+        mcp_tools: Vec::new(),
+        rows: 24,
+        cols: 80,
+        role: None,
+        target: None,
+    };
+
+    let snapshot = runtime
+        .spawn_agent(request)
+        .expect("launch real Ion through the desktop PTY runtime");
+    assert_eq!(snapshot.platform, platform_id("ion"));
+    assert_eq!(snapshot.command, ion.to_string_lossy());
+    assert!(snapshot.alive);
+
+    runtime
+        .close_agent(TerminalCloseRequest {
+            session_id: snapshot.agent_id,
+        })
+        .expect("close real Ion integration process");
 }
 
 #[test]
