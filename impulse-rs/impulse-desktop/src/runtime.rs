@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 pub use impulse_ops::agent_registry::AgentPlatformId;
-use impulse_ops::role_assignment::{AgentRoleAssignment, RoleCompatibility};
+use impulse_ops::role_assignment::{AgentRoleAssignment, EnforcementStrength, RoleCompatibility};
 use impulse_ops::{AgentRole, AgentStatus, ContextHealthSummary, MachineTarget};
 use impulse_term::TerminalBackend;
 use serde::{Deserialize, Serialize};
@@ -503,6 +503,16 @@ impl DesktopRuntime {
         request: AgentSpawnRequest,
     ) -> Result<AgentRuntimeSnapshot, DesktopBridgeError> {
         let mut request = request;
+        if request.role_assignment.is_some()
+            && request
+                .task
+                .as_deref()
+                .is_none_or(|task| task.trim().is_empty())
+        {
+            return Err(DesktopBridgeError::InvalidTerminalRequest {
+                message: "role assignment requires a nonblank task".to_string(),
+            });
+        }
         validate_dimensions(request.rows, request.cols)?;
         // Centralized registry load (symmetric to load_registry_for_tool in mcp.rs).
         // Keeps the error mapping for spawn in one place and makes future changes cheaper.
@@ -541,12 +551,19 @@ impl DesktopRuntime {
                 .checks
                 .iter()
                 .filter(|check| check.mandatory && !check.is_satisfied())
-                .map(|check| check.capability.to_string())
+                .map(|check| {
+                    format!(
+                        "{} (required={}, available={})",
+                        check.capability,
+                        enforcement_strength_label(check.required),
+                        enforcement_strength_label(check.available)
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             return Err(DesktopBridgeError::InvalidTerminalRequest {
                 message: format!(
-                    "role `{}` is incompatible with platform `{}`; mandatory capabilities not satisfied: {missing}",
+                    "role `{}` is incompatible with platform `{}`; mandatory capabilities not satisfied: {missing}; choose a compatible platform or adjust the role requirement",
                     compatibility.role, compatibility.platform
                 ),
             });
@@ -1077,6 +1094,15 @@ fn validate_dimensions(rows: u16, cols: u16) -> Result<(), DesktopBridgeError> {
     Ok(())
 }
 
+fn enforcement_strength_label(strength: EnforcementStrength) -> &'static str {
+    match strength {
+        EnforcementStrength::Unsupported => "unsupported",
+        EnforcementStrength::Advisory => "advisory",
+        EnforcementStrength::Mediated => "mediated",
+        EnforcementStrength::Structural => "structural",
+    }
+}
+
 fn sanitize_runtime_id(value: &str) -> String {
     let sanitized = impulse_ops::sanitize_id(value);
     if sanitized == "unknown" {
@@ -1312,17 +1338,28 @@ mod tests {
         let runtime = DesktopRuntime::default();
         let mut blocked = spawn_request(24, 80, Some("definitely-not-an-impulse-executable"));
         blocked.agent_id = Some("reusable-after-block".to_string());
-        blocked.role_assignment = Some(role_assignment(
-            "network.denied",
-            EnforcementStrength::Structural,
-            true,
-        ));
+        let mut assignment =
+            role_assignment("network.denied", EnforcementStrength::Structural, true);
+        assignment.requirements.push(RoleCapabilityRequirement {
+            capability: RuntimeCapabilityId::try_new("workspace.target").unwrap(),
+            minimum_enforcement: EnforcementStrength::Structural,
+            mandatory: true,
+        });
+        blocked.role_assignment = Some(assignment);
+        blocked.task = Some("run governed build".to_string());
 
         let error = runtime.spawn_agent(blocked).unwrap_err();
         match error {
             DesktopBridgeError::InvalidTerminalRequest { message } => {
                 assert!(message.contains("incompatible"));
-                assert!(message.contains("network.denied"));
+                assert!(
+                    message.contains("network.denied (required=structural, available=unsupported)")
+                );
+                assert!(
+                    message.contains("workspace.target (required=structural, available=mediated)")
+                );
+                assert!(message.contains("choose a compatible platform"));
+                assert!(message.contains("adjust the role requirement"));
             }
             other => panic!("expected compatibility rejection, got {other:?}"),
         }
@@ -1338,6 +1375,47 @@ mod tests {
                 session_id: snapshot.agent_id,
             })
             .unwrap();
+    }
+
+    #[test]
+    fn test_governed_spawn_requires_nonblank_task_before_registry_id_or_pty_work() {
+        let runtime = DesktopRuntime::default();
+        for (case, task) in [
+            ("missing", None),
+            ("empty", Some(String::new())),
+            ("whitespace", Some(" \t\n ".to_string())),
+        ] {
+            let agent_id = format!("task-required-{case}");
+            let mut invalid = spawn_request(24, 80, Some("definitely-not-an-impulse-executable"));
+            invalid.agent_id = Some(agent_id.clone());
+            invalid.platform = platform_id("missing-agent");
+            invalid.task = task;
+            invalid.role_assignment = Some(role_assignment(
+                "workspace.target",
+                EnforcementStrength::Mediated,
+                true,
+            ));
+
+            let error = runtime.spawn_agent(invalid).unwrap_err();
+            match error {
+                DesktopBridgeError::InvalidTerminalRequest { message } => {
+                    assert!(message.contains("role assignment requires a nonblank task"));
+                }
+                other => panic!("expected task validation rejection, got {other:?}"),
+            }
+
+            let mut allowed = spawn_request(24, 80, Some("sh"));
+            allowed.agent_id = Some(agent_id);
+            allowed.args = vec!["-c".to_string(), "sleep 1".to_string()];
+            let snapshot = runtime
+                .spawn_agent(allowed)
+                .expect("task rejection must not reserve the requested agent id");
+            runtime
+                .close_agent(TerminalCloseRequest {
+                    session_id: snapshot.agent_id,
+                })
+                .unwrap();
+        }
     }
 
     #[test]
@@ -1385,6 +1463,7 @@ mod tests {
         let runtime = DesktopRuntime::default();
         let mut request = spawn_request(24, 80, Some("sh"));
         request.args = vec!["-c".to_string(), "sleep 1".to_string()];
+        request.task = Some("run degraded governed launch".to_string());
         request.role_assignment = Some(role_assignment(
             "network.denied",
             EnforcementStrength::Structural,
