@@ -119,7 +119,7 @@
 - [ ] Run `cargo check --workspace`.
 - [ ] Run `cargo clippy --workspace --all-targets -- -D warnings`.
 - [ ] Run `cargo test --workspace` and record exact totals.
-- [ ] Run `python3 docs/validate_docs.py --self-test` and `python3 docs/validate_docs.py --all --strict-status --skip-freshness`.
+- [ ] Run `python3 docs/validate_docs.py --self-test` and `python3 docs/validate_docs.py --all`.
 - [ ] Run `npm run dioxus:host:smoke`.
 - [ ] Run `git diff --check` and a focused secret scan.
 - [ ] Commit exact implementation/test files first, then exact ADR/documentation files if review indicates a clean split.
