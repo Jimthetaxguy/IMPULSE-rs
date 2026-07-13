@@ -2,14 +2,14 @@
 title: Documentation Index
 description: Master navigation hub for Impulse documentation
 version: '1.4'
-updated: 2026-07-12
+updated: 2026-07-13
 type: doc
 category: navigation
 phase: all
 status: active
 audience: everyone
 tags: [index, navigation, discovery]
-last_updated: 2026-07-12
+last_updated: 2026-07-13
 authors:
   - name: Impulse Maintainers
     role: Maintainer
@@ -25,6 +25,8 @@ authors:
 >
 > **Canonical stack: Rust (impulse-rs)**
 > **Roadmap contract:** Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; Legacy=egui compile-maintenance only.
+> **Current launch slice:** explicit product role/task preflight and typed compatibility telemetry.
+> **Next governed slice:** daemon-owned task evidence, verification results, and supervisor decisions.
 > **Collaboration playbook:** [`guides/COLLABORATIVE-AGENTIC-CODING.md`](guides/COLLABORATIVE-AGENTIC-CODING.md)
 > **Narrow validation register:** [`HONEST-ROADMAP.md`](HONEST-ROADMAP.md) preserves unresolved
 > hook, compaction, extraction, and memory-quality risks from the legacy phase-era design. It is
@@ -60,8 +62,9 @@ authors:
 | [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) | Authoritative contract for current implemented behavior |
 | [ARCHITECTURE-CLARIFICATION.md](ARCHITECTURE-CLARIFICATION.md) | Current code boundary matrix and enforcement truth |
 
-Do not split separate role/runtime/supervisor schema documents until the hierarchy, adapter, and
-enforcement-strength ADR decisions listed in `VISION.md` are resolved.
+ADR-0010 accepts only the explicit role/task launch-preflight boundary. Do not split separate
+role/runtime/supervisor schema documents until the remaining hierarchy, adapter, lifecycle, and
+generalized capability-negotiation decisions listed in `VISION.md` are resolved.
 
 ### Validation and Historical Risk
 
@@ -83,6 +86,7 @@ enforcement-strength ADR decisions listed in `VISION.md` are resolved.
 | [0007](decisions/0007-desktop-shell-stack.md) | Desktop shell stack | Superseded | Superseded by ADR-0008 |
 | [0008](decisions/0008-dioxus-desktop-host.md) | Dioxus Desktop host | Accepted | Current desktop host authority |
 | [0009](decisions/0009-reconcile-impulse-copies.md) | Reconcile duplicate Impulse codebases | Accepted | Current canonical-tree decision |
+| [0010](decisions/0010-product-role-launch-contract.md) | Product role launch contract | Accepted | Current explicit role/task launch-preflight boundary |
 
 See [decisions/README.md](decisions/README.md) for full decision log.
 
@@ -218,13 +222,14 @@ Start here:
 7. [COLLABORATIVE-AGENTIC-CODING.md](guides/COLLABORATIVE-AGENTIC-CODING.md) — Agent lane, worktree, and handoff rules
 8. [ROADMAP-PLAN.md](ROADMAP-PLAN.md) — Superseded desktop implementation history
 
-### Next: Governed Supervisor/Builder Vertical Slice + Hierarchy/Enforcement ADR
+### Next: Daemon-Owned Governed-Run Evidence/Decision Lifecycle
 
-1. [VISION.md](../VISION.md) — Ten-step governed workflow and unresolved hierarchy decisions
-2. [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) — Live foundations and contract boundary
-3. [ARCHITECTURE-CLARIFICATION.md](ARCHITECTURE-CLARIFICATION.md) — Enforcement and authority boundary map
-4. [USER-STORY-MAP.md](spec/USER-STORY-MAP.md) — Acceptance criteria for current surfaces
-5. [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md) — Evidence map and known gaps
+1. [0010-product-role-launch-contract.md](decisions/0010-product-role-launch-contract.md) — Live preflight boundary and explicit next lifecycle
+2. [VISION.md](../VISION.md) — Ten-step governed workflow and unresolved lifecycle/hierarchy decisions
+3. [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) — Live foundations and contract boundary
+4. [ARCHITECTURE-CLARIFICATION.md](ARCHITECTURE-CLARIFICATION.md) — Enforcement and authority boundary map
+5. [USER-STORY-MAP.md](spec/USER-STORY-MAP.md) — Acceptance criteria for current surfaces
+6. [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md) — Evidence map and known gaps
 
 ### Validation Side Lane: Hook and Memory Evidence
 

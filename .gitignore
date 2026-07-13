@@ -43,6 +43,7 @@ archive/reconciled-from-*/
 
 # Worktrees
 .worktrees/
+.superpowers/
 
 # Environment
 .env
