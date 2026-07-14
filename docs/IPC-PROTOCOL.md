@@ -1,7 +1,7 @@
 # Impulse IPC Protocol
 
 > Unix domain socket protocol between Impulse daemon and clients (GUI, CLI `--daemon` mode).
-> **Protocol version: 3** — see [Version section](#protocol-version) for upgrade notes.
+> **Protocol version: 4** — see [Version section](#protocol-version) for upgrade notes.
 
 ---
 
@@ -52,10 +52,16 @@ The daemon includes `protocol_version` in its `Status` response. Clients must ch
 
 | Constant | Value | Location |
 |----------|-------|----------|
-| `EXPECTED_PROTOCOL_VERSION` | **3** | GUI client |
-| `PROTOCOL_VERSION` | **3** | Daemon (`src/daemon/protocol.rs`) |
+| `EXPECTED_PROTOCOL_VERSION` | **4** | Desktop/shared client |
+| `PROTOCOL_VERSION` | **4** | Daemon (`src/daemon/protocol.rs`) |
 
-Version mismatch triggers a warning in the GUI status bar.
+Version mismatch rejects incompatible shared workbench requests and surfaces degraded status in the
+desktop client.
+
+**Upgrading from v3:** v4 adds daemon-owned governed tasks:
+`RegisterGovernedTask`, `GetGovernedTask`, `ListGovernedTasks`, and `MutateGovernedTask`, plus the
+serde-defaulted `ProjectOpsSnapshot.governed_tasks` collection. Mutations carry an expected revision
+and idempotency request ID; process exit and review/acceptance remain independent.
 
 **Upgrading from v2:** v3 adds the typed `Busy` response. Agent-backed requests return `resource: "agent_turn"` with a retry hint when another logical turn owns the cached agent; busy requests never reach a provider or mutate conversation state.
 
@@ -127,6 +133,24 @@ Version mismatch triggers a warning in the GUI status bar.
 | `GetOpsSnapshot` | — | v1 | Full state snapshot for desktop shell rendering |
 | `SubscribeOps` | `{since_seq?}` | v1 | Get ops updates since sequence number |
 | `PublishTerminalOps` | `{report}` | v1 | Push live terminal telemetry from the desktop shell |
+
+### Governed Tasks
+
+| Request | Data | Since | Description |
+|---------|------|-------|-------------|
+| `RegisterGovernedTask` | `{registration}` | v4 | Persist the client-proposed distinct task identity before PTY launch |
+| `GetGovernedTask` | `{project_id, task_id}` | v4 | Return one authoritative governed task, if present |
+| `ListGovernedTasks` | `{project_id}` | v4 | Return the bound project's governed task records |
+| `MutateGovernedTask` | `{request}` | v4 | Apply an expected-revision/idempotency-key lifecycle mutation and return authoritative state |
+
+Governed task actor kinds are typed provenance and transition claims, not cryptographic same-user
+authentication. The daemon socket directory/socket/PID permissions protect the local OS-user
+boundary. Evidence records retain redacted argv and digests/references rather than raw output.
+The daemon validates evidence shape and lifecycle consistency; it does not execute the submitted
+commands or recompute their digests. CAS and transition failures currently use
+`Error { message }`; stable structured error codes/current-revision payloads remain future work.
+`ProjectOpsSnapshot.governed_tasks` is serde-defaulted for older snapshots, while
+`AgentRuntime.governed_task_id` and `governed_task_revision` carry runtime provenance.
 
 #### PublishTerminalOps — TerminalOpsReport fields
 
@@ -321,7 +345,7 @@ Returns `AgentAssistResult` with sessions organized by agent role.
 
 ### Search & Retrieval
 
-Protocol v3 does not define daemon request variants for retrieval. `search-history`,
+Protocol v4 does not define daemon request variants for retrieval. `search-history`,
 `search-genome`, `index-memory`, and `retrieval-status` are direct-mode CLI operations; the
 `--daemon` dispatcher tells callers to retry without the flag.
 
@@ -342,7 +366,7 @@ All responses use the `DaemonResponse` enum.
 Contains the result as a JSON value. The structure depends on the request.
 
 ```json
-{"type": "Ok", "data": {"result": {"sessions": 3, "active": 1, "protocol_version": 3}}}
+{"type": "Ok", "data": {"result": {"sessions": 3, "active": 1, "protocol_version": 4}}}
 ```
 
 ### Error
@@ -431,6 +455,14 @@ The GUI maintains a persistent connection via a poller thread that sends periodi
 ---
 
 ## Changelog
+
+### v4 — Daemon-owned governed tasks
+
+Added 2026-07-13:
+
+- `RegisterGovernedTask`, `GetGovernedTask`, `ListGovernedTasks`, and `MutateGovernedTask` request variants.
+- `ProjectOpsSnapshot.governed_tasks` plus governed-task provenance on `AgentRuntime`.
+- Expected-revision/idempotency-key mutations with execution state independent from review and acceptance.
 
 ### v3 — Managed-agent backpressure
 

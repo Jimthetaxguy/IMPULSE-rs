@@ -92,15 +92,20 @@ fn test_output_bytes_incremented() {
 }
 
 #[test]
-fn test_kill_sets_alive_false() {
+fn test_kill_confirms_exit_reaps_and_is_idempotent() {
     // sleep stays alive so we can kill it.
     let backend = spawn_sleep();
     thread::sleep(Duration::from_millis(50));
     assert!(backend.is_alive(), "should be alive before kill");
 
-    backend.kill();
+    backend
+        .kill()
+        .expect("kill should terminate and reap child");
     thread::sleep(Duration::from_millis(10));
     assert!(!backend.is_alive(), "should not be alive after kill");
+    backend
+        .kill()
+        .expect("repeated kill should observe the already-reaped child");
 }
 
 #[test]

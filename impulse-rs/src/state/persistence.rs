@@ -41,6 +41,7 @@ pub struct HistoryEntry {
 
 pub struct State {
     storage: Storage,
+    pub(super) governed_tasks: std::sync::Mutex<super::governed_task::GovernedTaskLedger>,
     live_state: RwLock<LiveState>,
     /// Set on every mutation, cleared after a sync. A lock-free `AtomicBool`
     /// so `mark_dirty` (sync, called from async mutators) and the `Drop` flush
@@ -84,9 +85,11 @@ impl State {
         let config = storage
             .read_json::<Config>(CONFIG_FILE)
             .context("Failed to read config from disk")?;
+        let governed_tasks = Self::load_governed_task_ledger(&storage)?;
 
         Ok(Self {
             storage,
+            governed_tasks,
             live_state: RwLock::new(live_state),
             dirty: AtomicBool::new(false),
             config: RwLock::new(config),

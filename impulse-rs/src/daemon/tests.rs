@@ -13,8 +13,9 @@ mod tests {
     // Re-import handler functions from the extracted handlers module.
     // super::super = daemon module (tests.rs is daemon::tests, inner mod is daemon::tests::tests)
     use super::super::handlers::{
-        handle_delegation_request, handle_guard_request, handle_ops_request, handle_plugin_request,
-        handle_session_request, handle_status, handle_steward_request,
+        handle_delegation_request, handle_governed_task_request, handle_guard_request,
+        handle_ops_request, handle_plugin_request, handle_session_request, handle_status,
+        handle_steward_request,
     };
 
     /// Test DaemonRequest serialization/deserialization
@@ -882,6 +883,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn governed_task_wire_handler_registers_mutates_gets_and_lists_authoritative_state() {
+        use impulse_ops::governed_task::{
+            GovernedActor, GovernedActorKind, GovernedExecutionState, GovernedRequestId,
+            GovernedTaskMutation, GovernedTaskMutationRequest, GovernedTaskRegistration,
+            GovernedTaskRun,
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path().join("daemon-project");
+        let impulse_dir = project_root.join(".impulse");
+        std::fs::create_dir_all(&impulse_dir).unwrap();
+        let state = std::sync::Arc::new(crate::state::State::new(impulse_dir).unwrap());
+        let registration = GovernedTaskRegistration::builder(
+            "daemon-register-1",
+            "daemon-task-1",
+            "daemon-project",
+            project_root.display().to_string(),
+            "exercise the real governed task route",
+            "worker-1",
+            "codex",
+        )
+        .build()
+        .unwrap();
+        let wire = serde_json::to_string(&DaemonRequest::RegisterGovernedTask { registration })
+            .expect("serialize register request");
+        let request: DaemonRequest =
+            serde_json::from_str(&wire).expect("deserialize register request");
+
+        let registered = handle_governed_task_request(request, &state).await;
+        let DaemonResponse::Ok { result } = registered else {
+            panic!("expected governed task registration success");
+        };
+        let task: GovernedTaskRun = serde_json::from_value(result).unwrap();
+        assert_eq!(task.revision, 0);
+
+        let running = handle_governed_task_request(
+            DaemonRequest::MutateGovernedTask {
+                request: GovernedTaskMutationRequest {
+                    request_id: GovernedRequestId::try_new("daemon-running-1").unwrap(),
+                    project_id: task.project_id.clone(),
+                    task_id: task.id.clone(),
+                    expected_revision: task.revision,
+                    mutation: GovernedTaskMutation::MarkRunning {
+                        actor: GovernedActor {
+                            kind: GovernedActorKind::System,
+                            id: "daemon-handler-test".to_string(),
+                        },
+                    },
+                },
+            },
+            &state,
+        )
+        .await;
+        let DaemonResponse::Ok { result } = running else {
+            panic!("expected governed task mutation success");
+        };
+        let running: GovernedTaskRun = serde_json::from_value(result).unwrap();
+        assert_eq!(running.revision, 1);
+        assert_eq!(running.execution_state, GovernedExecutionState::Running);
+
+        let fetched = handle_governed_task_request(
+            DaemonRequest::GetGovernedTask {
+                project_id: running.project_id.clone(),
+                task_id: running.id.clone(),
+            },
+            &state,
+        )
+        .await;
+        let DaemonResponse::Ok { result } = fetched else {
+            panic!("expected governed task get success");
+        };
+        assert_eq!(
+            serde_json::from_value::<Option<GovernedTaskRun>>(result)
+                .unwrap()
+                .unwrap(),
+            running
+        );
+
+        let listed = handle_governed_task_request(
+            DaemonRequest::ListGovernedTasks {
+                project_id: "daemon-project".to_string(),
+            },
+            &state,
+        )
+        .await;
+        let DaemonResponse::Ok { result } = listed else {
+            panic!("expected governed task list success");
+        };
+        let tasks: Vec<GovernedTaskRun> = serde_json::from_value(result).unwrap();
+        assert_eq!(tasks, vec![running]);
+    }
+
+    #[tokio::test]
     async fn test_handle_status_with_sessions() {
         let (_tmp, state) = test_state();
         state.create_session("s1".to_string(), None).await.unwrap();
@@ -1235,12 +1329,41 @@ mod tests {
             Err(_timeout) => {
                 // Timed out = daemon started listening successfully (expected)
                 // Verify stale files were cleaned up
+                use std::os::unix::fs::PermissionsExt;
+
                 assert!(
                     !pid_path.exists() || {
                         // New PID file should contain our PID
                         let pid = tokio::fs::read_to_string(&pid_path).await.unwrap();
                         pid.trim() == std::process::id().to_string()
                     }
+                );
+                assert_eq!(
+                    tokio::fs::metadata(socket_path.parent().unwrap())
+                        .await
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o700
+                );
+                assert_eq!(
+                    tokio::fs::metadata(&socket_path)
+                        .await
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+                assert_eq!(
+                    tokio::fs::metadata(&pid_path)
+                        .await
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
                 );
             }
         }

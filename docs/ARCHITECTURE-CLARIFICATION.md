@@ -42,7 +42,7 @@ workbench authority.
 | Runtime | Execution engine/integration | external harness code, desktop runtime, Ion REPL/provider loop | Not an agent instance |
 | Agent instance | One running identity and its status | `AgentRuntime`, `AgentRuntimeSnapshot`, desktop runtime record | Not a session |
 | Session | Bounded persisted work history | daemon create/end session + `.impulse/LIVE_STATE.json`/history | Not necessarily process lifetime |
-| Task | Assignment plus acceptance evidence | delegations, `current_task`, Ion harness `Task` | May span sessions |
+| Task | Assignment plus acceptance evidence | daemon-owned `GovernedTaskRun`; delegations, `current_task`, and Ion harness `Task` remain separate carriers | Governed task id is distinct from agent/session ids; current assignment is immutable and resume/reassignment is future work |
 | Pane | View/input attachment | TUI pane manager and desktop terminal ids | Not an authorization boundary |
 | Workspace target | Filesystem root assigned at launch | desktop `WorkspaceTarget`/`WorkspaceRegistry` | Not the same as global cockpit scope |
 | Project | Memory/policy/artifact governance boundary | `ProjectOpsSnapshot`, project-scoped `.impulse/` data | Often maps 1:1 to a workspace today, but conceptually distinct |
@@ -55,10 +55,10 @@ generalized role composition, a common runtime-adapter contract, or dynamic capa
 
 | Boundary | Authoritative paths | Current truth | Status |
 | --- | --- | --- | --- |
-| Shared control-plane wire/read models | `impulse-rs/impulse-ops/src/lib.rs` | Versioned daemon requests/responses, workbench snapshots, telemetry, supervisor policy/actions, artifacts | Live |
-| Daemon coordination | `impulse-rs/src/daemon/{mod,protocol,handlers}.rs` | Workbench authority, session operations, managed agent turns, telemetry overlays, supervisor enforcement | Live |
-| PTY/process lifecycle | `impulse-rs/impulse-term/src/backend.rs`, `impulse-rs/impulse-desktop/src/runtime.rs` | Spawn, input, resize, focus, output, exit, and cleanup | Live |
-| Dioxus cockpit | `impulse-rs/impulse-desktop/src/{desktop_host,host_bridge,host_commands,views}.rs` | Renders backend state and dispatches typed host actions; does not own durable truth | Live host/bridge foundation |
+| Shared control-plane wire/read models | `impulse-rs/impulse-ops/src/{lib,governed_task}.rs` | Versioned daemon requests/responses, workbench snapshots, governed task/evidence/decision types, telemetry, supervisor policy/actions, artifacts | Live |
+| Daemon coordination | `impulse-rs/src/daemon/{mod,protocol,handlers}.rs`, `src/state/governed_task.rs` | Workbench authority, persistent governed-task lifecycle, session operations, managed agent turns, telemetry overlays, supervisor enforcement | Live |
+| PTY/process lifecycle | `impulse-rs/impulse-term/src/backend.rs`, `impulse-rs/impulse-desktop/src/{runtime,daemon_ops}.rs` | Spawn, input, resize, focus, output, exit, cleanup, pre-PTY governed registration, and durable launch/exit reconciliation | Live |
+| Dioxus cockpit | `impulse-rs/impulse-desktop/src/{desktop_host,host_bridge,host_commands,ui}.rs` | Renders backend state/evidence and dispatches acknowledged revisioned decisions; does not own or optimistically mutate durable task truth | Live host/bridge foundation |
 | Workspace registration | `impulse-rs/impulse-desktop/src/workspace.rs` | Registered filesystem targets and operator-authored project notes | Live |
 | Platform identity/launch metadata | `impulse-rs/impulse-ops/src/agent_registry.rs`, desktop runtime/MCP/host | Registry-backed open ids, fail-closed resolution, Ion builtin launch | Live; legacy closed types remain where compatibility requires them |
 | External agent harness calls | `impulse-rs/src/agent/{mod,harness,coordinator}.rs` | Bounded CLI request/response integration and shared cached agent state | Live; not a general adapter trait |
@@ -68,7 +68,7 @@ generalized role composition, a common runtime-adapter contract, or dynamic capa
 | Desktop MCP tools | `impulse-rs/impulse-desktop/src/mcp.rs` | Agent spawn/write, memory search, project context, staged injection/review | Live; exposure differs from native Ion tools |
 | Memory/context | `impulse-rs/src/{state,memory,retrieval,injection,stewardship}/` | Project-scoped persistence, FTS5/semantic retrieval, review-first injection, context health | Live |
 | Credentials | `impulse-rs/src/credentials/` | Provider abstraction for Keychain, socket, CLI proxy, env, and session memory | Live; per-role credential grants are not generalized |
-| Artifacts/evidence | `ArtifactEnvelope` in `impulse-ops`, daemon artifact handlers, `impulse-rs/src/verify/` | Provenance-bearing outputs and verification gates | Live foundation |
+| Artifacts/evidence | governed types and `ArtifactEnvelope` in `impulse-ops`, daemon governed/artifact handlers, `impulse-rs/src/verify/` | Separate worker claims, bounded redacted verifier evidence, supervisor verdicts, operator decisions, and provenance-bearing outputs | Live narrow governed lifecycle + broader artifact foundation |
 | Agent messaging/handoffs | `impulse-rs/src/{delegation,orchestration}/`, daemon delegation contracts | Delegations, handoff artifacts, and routing logs | Live partial; no unified typed message bus |
 | Legacy desktop | `impulse-rs/impulse-gui/`, optional egui modules in `impulse-term` | Compile-maintenance only | Frozen |
 
@@ -85,6 +85,22 @@ existing canonical directory; that canonical root drives the PTY working directo
 workspace environment, runtime snapshot, and daemon telemetry. This is launch mediation, not a
 filesystem sandbox.
 
+After that preflight, a governed Builder launch must register a distinct task with the bound daemon
+before the PTY is created. The daemon serializes expected-revision mutations, persists idempotency
+receipts and typed lifecycle events, and keeps process execution state independent from review. A
+passing verifier record can be recommended by a supervisor; only the operator can accept. Dioxus
+renders this daemon-owned record and waits for acknowledged mutations rather than applying
+optimistic task state. Launch/exit intent is written ahead of daemon I/O to a bounded, owner-only,
+cross-process-locked project outbox and reconciled after daemon recovery. This does not detect an
+abrupt desktop death that occurs before exit intent exists; runtime leases/orphan reconciliation
+remain a separate contract.
+
+Command evidence stores only display-safe executable/redacted arguments, SHA-256 digests, byte
+counts, truncation flags, and project-relative output references. Producers must perform semantic
+redaction before submission. Typed actors are provenance and transition claims, not cryptographic
+identity among processes running as the same user. The socket directory, socket, and PID file use
+`0700`, `0600`, and `0600`, respectively; that is an OS-user boundary, not a same-user role boundary.
+
 It cannot promise control over a vendor's hidden system prompt, proprietary reasoning loop,
 internal context compression, or unsupported tool mechanics. The live static preflight therefore
 uses explicit enforcement strengths rather than a boolean "supported" flag; future generalized
@@ -94,13 +110,15 @@ runtime adapters must preserve that honesty while adding discovery and lifecycle
 
 The next architecture ADR must settle these together:
 
-1. The exact hierarchy and identifiers for project, workspace, role, runtime, instance, session,
-   task, and pane.
+1. The remaining hierarchy and identifiers for project, workspace, role, runtime, instance,
+   session, and pane, plus stable project identity and governed-task reassignment/resume.
 2. The minimum runtime-adapter operations, optional operations, and emulation rules.
 3. Generalized and dynamic capability negotiation beyond the static desktop preflight, including
    discovery, attestation freshness, emulation, and post-launch re-evaluation.
 4. Typed message routing and cross-project isolation.
 5. Role-specific credential, context, tool, and verification grants.
+6. Structured CAS error codes, task/receipt pagination and archival, and stronger same-user actor
+   authorization where deployment profiles require it.
 
 Do **not** create separate `ROLES`, `RUNTIMES`, `SUPERVISOR`, or replacement architecture schema
 documents before those decisions land. `VISION.md` and the canonical contract remain the source of

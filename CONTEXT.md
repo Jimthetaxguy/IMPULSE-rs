@@ -38,7 +38,8 @@ session, and pane.
 - **Closest in code:** the narrow launch-time `AgentRoleId`/`AgentRoleAssignment` contract plus the
   concrete `SupervisorPermissionPolicy`. `AgentRole::{Coordinator, Worker}` remains legacy pane and
   delegation topology, not product-role identity.
-- **Boundary:** generalized role composition and a durable governed-run lifecycle are not live.
+- **Boundary:** generalized role composition is not live. ADR-0011's narrow governed Builder task
+  lifecycle is live and remains distinct from a general role system.
 
 ### runtime — `[vocabulary]`
 The engine that executes an agent role. External runtimes are wrapped CLI harnesses (for example,
@@ -79,10 +80,18 @@ be linked to a running agent instance but does not own that process.
 - **Source of truth:** `WorkbenchDaemonRequest::{CreateSession, EndSession}` and CLI
   `session-start` / `session-end --verify`.
 
+### governed task — `[code]`
+A daemon-owned assignment plus acceptance criteria and four distinct truth layers: worker claim,
+verification evidence, supervisor judgment, and operator decision. Its durable ID is distinct from
+agent/session IDs. Execution state is independent of review state, so launch failure or runtime exit
+never means accepted. The current slice binds one immutable agent/runtime identity; cross-runtime
+resume/reassignment is future work.
+- **Source of truth:** `impulse-ops/src/governed_task.rs`, `src/state/governed_task.rs`, and ADR-0011.
+
 ### task — `[vocabulary]`
-An assignment plus acceptance and verification criteria. A task may span sessions; a session may
-perform more than one task.
-- **Closest in code:** delegation records, `AgentRuntime.current_task`, and Ion `Task` contracts.
+The broader product assignment concept. A governed task is today's durable carrier; delegations,
+`AgentRuntime.current_task`, and Ion `Task` contracts remain separate legacy/specialized carriers
+until a future hierarchy ADR reconciles their cardinalities.
 
 ### pane — `[code]`
 A UI/terminal viewport attached to an agent channel. It is a presentation and input-routing object,
@@ -105,7 +114,8 @@ Structural filesystem enforcement depends on the selected runtime or sandbox.
 
 ### daemon / workbench truth — `[code]`
 The long-running coordination point that owns project workbench snapshots, session operations,
-supervisor actions, artifacts, and telemetry overlays over a versioned JSON-line Unix socket.
+supervisor actions, artifacts, governed tasks, and telemetry overlays over a versioned JSON-line
+Unix socket.
 - **Source of truth:** `impulse-ops/src/lib.rs` and `src/daemon/{mod,protocol,handlers}.rs`.
 - **Desktop daemon-truth wire:** PTY lifecycle facts publish as `TerminalOpsReport` on change and
   heartbeat, then return through daemon `SubscribeOps` snapshots. Local
@@ -114,6 +124,9 @@ supervisor actions, artifacts, and telemetry overlays over a versioned JSON-line
   delivery uses a reentrant FIFO, natural exits reap records, and runtime agent ids remain one-use
   routing addresses until the protocol carries explicit incarnations. The adapter currently binds
   one daemon project; cross-workspace daemon routing remains a protocol follow-up.
+- **Governed task wire:** registration is acknowledged before PTY creation; mutations use expected
+  revision plus an idempotency ID. Launch/exit intent is written before daemon I/O to an owner-only,
+  cross-process-locked outbox. Abrupt pre-intent death still needs lease/orphan reconciliation.
 
 ### managed agent turn — `[code]`
 One exclusive, bounded use of the cached `ImpulseAgent`. Concurrent turns fail fast with typed
@@ -164,7 +177,14 @@ actions. Artifacts keep worker claims separate from evidence and operator decisi
 ### verification gate — `[code]`
 Evidence that claimed work holds before a session/task is accepted: commands run, tests/build/lint,
 artifact review, and explicit approval where policy requires it.
-- **Source of truth:** `session-end --verify`, `src/verify/`, and Ion harness verdict contracts.
+- **Source of truth:** governed verification records in `impulse-ops/src/governed_task.rs`,
+  `session-end --verify`, `src/verify/`, and Ion harness verdict contracts. Governed command
+  records persist redacted argv plus digests/references, never raw output.
+
+### governed actor — `[code]`
+A typed provenance claim (`system`, `worker`, `verifier`, `supervisor`, or `operator`) checked by the
+task transition machine. It is not cryptographic same-user authentication; local processes that can
+reach the user-restricted daemon socket remain inside the current trust boundary.
 
 ---
 
@@ -173,8 +193,8 @@ artifact review, and explicit approval where policy requires it.
 - **Live foundation:** PTY lifecycle, daemon workbench truth, managed agent turns, open
   registry-backed desktop platform identity, real Ion desktop launch, daemon-truth terminal
   telemetry, supervisor-specific permissions, capability-checked tools, memory/retrieval/injection,
-  artifacts, credentials, Ion's native coding REPL/tool loop, and explicit role/task launch
-  preflight with typed compatibility telemetry.
-- **Direction:** daemon-owned task evidence, verification and supervisor decisions; generalized
-  role composition; one runtime-adapter interface; negotiated runtime capabilities; and typed
-  cross-agent messaging.
+  artifacts, credentials, Ion's native coding REPL/tool loop, explicit role/task launch preflight,
+  and the daemon-owned governed-task evidence/decision lifecycle with operator-required acceptance.
+- **Direction:** runtime-native claim/verifier producers, a launched supervisor role, accepted-run
+  memory promotion, task reassignment/resume, generalized role composition, one runtime-adapter
+  interface, negotiated runtime capabilities, multi-project routing, and typed cross-agent messaging.

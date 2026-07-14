@@ -47,12 +47,14 @@ CONTRACT_KEY_FILES = [
     DOCS_DIR / "INDEX.md",
     DOCS_DIR / "SUMMARY.yaml",
     DOCS_DIR / "SUMMARY.md",
+    DOCS_DIR / "IPC-PROTOCOL.md",
 ]
 
 DURABLE_ROADMAP_MARKER = (
-    "Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + "
-    "hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; "
-    "Legacy=egui compile-maintenance only"
+    "Now=control-plane foundations + daemon-owned governed task lifecycle; "
+    "Next=real claim/verification producers + supervisor/builder process proof + "
+    "accepted-run memory promotion; Later=general roles + negotiated runtimes + "
+    "multi-project routing; Legacy=egui compile-maintenance only"
 )
 
 CONTRACT_REQUIRED_MARKERS = {
@@ -85,6 +87,8 @@ CONTRACT_REQUIRED_MARKERS = {
         "COLLABORATIVE-AGENTIC-CODING.md",
         "Canonical stack: Rust (impulse-rs)",
         DURABLE_ROADMAP_MARKER,
+        "Current governed slice:",
+        "Next governed slice:",
     ],
     DOCS_DIR / "SUMMARY.md": [
         "VISION.md",
@@ -96,6 +100,11 @@ CONTRACT_REQUIRED_MARKERS = {
         "VISION.md",
         "RUST-CANONICAL-CONTRACT.md",
         DURABLE_ROADMAP_MARKER,
+    ],
+    DOCS_DIR / "IPC-PROTOCOL.md": [
+        "**Protocol version: 4**",
+        '"protocol_version": 4',
+        "### v4 — Daemon-owned governed tasks",
     ],
 }
 
@@ -109,6 +118,10 @@ FORBIDDEN_ACTIVE_PHRASES = [
     "The active roadmap is now Rust core plus the EGUI operator workbench.",
     "EGUI/operator workbench is marked as active work",
     "active Rust-native EGUI surface",
+    "**Next governed slice:** daemon-owned task evidence",
+    "Protocol v3 does not define daemon request variants for retrieval.",
+    '"protocol_version": 3',
+    "verified-memory promotion",
 ]
 
 NON_AUTHORITATIVE_STATUSES = {"superseded", "deprecated", "archive", "historical"}

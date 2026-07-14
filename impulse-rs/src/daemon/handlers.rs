@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Deserialize;
 use tokio::sync::RwLock;
 
@@ -763,6 +763,13 @@ pub(crate) async fn process_request(
             return respond_err(e);
         }
     }
+    if let DaemonRequest::GetGovernedTask { ref project_id, .. }
+    | DaemonRequest::ListGovernedTasks { ref project_id } = request
+    {
+        if let Err(error) = crate::validate::reject_control_chars(project_id, "project_id") {
+            return respond_err(error);
+        }
+    }
 
     match request {
         DaemonRequest::Ping => DaemonResponse::Ok {
@@ -801,6 +808,15 @@ pub(crate) async fn process_request(
         | DaemonRequest::GetArtifact { .. }
         | DaemonRequest::RunArtifactAction { .. } => {
             handle_ops_request(request, &state, terminal_telemetry).await
+        }
+
+        // Daemon-owned governed task lifecycle. Disk I/O and the serialized
+        // compare-and-set mutation run off Tokio's async worker threads.
+        DaemonRequest::RegisterGovernedTask { .. }
+        | DaemonRequest::GetGovernedTask { .. }
+        | DaemonRequest::ListGovernedTasks { .. }
+        | DaemonRequest::MutateGovernedTask { .. } => {
+            handle_governed_task_request(request, &state).await
         }
 
         // Supervisor group
@@ -884,6 +900,42 @@ pub(crate) async fn process_request(
 }
 
 // ── Sub-handlers ────���───────────────────────────────────────────────────────
+
+pub(crate) async fn handle_governed_task_request(
+    request: DaemonRequest,
+    state: &SharedState,
+) -> DaemonResponse {
+    let state = state.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+        match request {
+            DaemonRequest::RegisterGovernedTask { registration } => {
+                serde_json::to_value(state.register_governed_task(registration)?)
+                    .context("Failed to serialize registered governed task")
+            }
+            DaemonRequest::GetGovernedTask {
+                project_id,
+                task_id,
+            } => serde_json::to_value(state.get_governed_task(&project_id, &task_id)?)
+                .context("Failed to serialize governed task"),
+            DaemonRequest::ListGovernedTasks { project_id } => {
+                serde_json::to_value(state.list_governed_tasks(&project_id)?)
+                    .context("Failed to serialize governed task list")
+            }
+            DaemonRequest::MutateGovernedTask { request } => {
+                serde_json::to_value(state.mutate_governed_task(request)?)
+                    .context("Failed to serialize governed task mutation")
+            }
+            _ => anyhow::bail!("Internal routing error: not a governed task request"),
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Ok(result)) => DaemonResponse::Ok { result },
+        Ok(Err(error)) => respond_err(error),
+        Err(error) => respond_err(format!("Governed task worker failed: {error}")),
+    }
+}
 
 pub(crate) async fn handle_status(state: &SharedState) -> DaemonResponse {
     match state.list_sessions().await {

@@ -17,21 +17,24 @@ fn main() {
     let (event_sink, event_rx) = channel_event_sink();
     let downstream: Arc<dyn DesktopEventSink> = event_sink.clone();
     let memory_root = resolve_memory_root();
-    let runtime_sink = match attach_desktop_daemon_ops(
+    let (runtime_sink, governed_task_gateway) = match attach_desktop_daemon_ops(
         downstream.clone(),
         DesktopDaemonOpsConfig::discover(&memory_root),
     ) {
-        Ok(sink) => sink,
+        Ok(attachment) => (
+            attachment.event_sink,
+            Some(attachment.governed_task_gateway),
+        ),
         Err(error) => {
             eprintln!("desktop daemon-ops bridge unavailable: {error}");
-            downstream
+            (downstream, None)
         }
     };
-    let runtime = Arc::new(
-        DesktopRuntime::builder()
-            .with_event_sink(runtime_sink)
-            .build(),
-    );
+    let mut runtime_builder = DesktopRuntime::builder().with_event_sink(runtime_sink);
+    if let Some(gateway) = governed_task_gateway {
+        runtime_builder = runtime_builder.with_governed_task_gateway(gateway);
+    }
+    let runtime = Arc::new(runtime_builder.build());
     let workspaces = Arc::new(WorkspaceRegistry::with_default_workspaces());
     let mcp = Arc::new(McpToolRegistry::with_builtins());
     let state = DesktopShellState::new(runtime, workspaces, mcp, memory_root);

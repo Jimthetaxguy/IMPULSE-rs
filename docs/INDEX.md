@@ -24,9 +24,11 @@ authors:
 > current implementation contract [`spec/RUST-CANONICAL-CONTRACT.md`](spec/RUST-CANONICAL-CONTRACT.md).
 >
 > **Canonical stack: Rust (impulse-rs)**
-> **Roadmap contract:** Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; Legacy=egui compile-maintenance only.
-> **Current launch slice:** explicit product role/task preflight and typed compatibility telemetry.
-> **Next governed slice:** daemon-owned task evidence, verification results, and supervisor decisions.
+> **Roadmap contract:** Now=control-plane foundations + daemon-owned governed task lifecycle; Next=real claim/verification producers + supervisor/builder process proof + accepted-run memory promotion; Later=general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only.
+> **Current governed slice:** explicit role/task preflight plus daemon-owned task evidence,
+> verification records, supervisor verdicts, and operator-required acceptance.
+> **Next governed slice:** real claim/verification producers, a launched supervisor, process-level
+> proof, and accepted-run memory promotion.
 > **Collaboration playbook:** [`guides/COLLABORATIVE-AGENTIC-CODING.md`](guides/COLLABORATIVE-AGENTIC-CODING.md)
 > **Narrow validation register:** [`HONEST-ROADMAP.md`](HONEST-ROADMAP.md) preserves unresolved
 > hook, compaction, extraction, and memory-quality risks from the legacy phase-era design. It is
@@ -62,9 +64,10 @@ authors:
 | [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) | Authoritative contract for current implemented behavior |
 | [ARCHITECTURE-CLARIFICATION.md](ARCHITECTURE-CLARIFICATION.md) | Current code boundary matrix and enforcement truth |
 
-ADR-0010 accepts only the explicit role/task launch-preflight boundary. Do not split separate
-role/runtime/supervisor schema documents until the remaining hierarchy, adapter, lifecycle, and
-generalized capability-negotiation decisions listed in `VISION.md` are resolved.
+ADR-0010 accepts the role/task launch-preflight boundary and ADR-0011 accepts the daemon-owned
+governed-task lifecycle. Do not split separate role/runtime/supervisor schema documents until the
+remaining hierarchy, adapter, reassignment, and generalized capability-negotiation decisions listed
+in `VISION.md` are resolved.
 
 ### Validation and Historical Risk
 
@@ -87,6 +90,7 @@ generalized capability-negotiation decisions listed in `VISION.md` are resolved.
 | [0008](decisions/0008-dioxus-desktop-host.md) | Dioxus Desktop host | Accepted | Current desktop host authority |
 | [0009](decisions/0009-reconcile-impulse-copies.md) | Reconcile duplicate Impulse codebases | Accepted | Current canonical-tree decision |
 | [0010](decisions/0010-product-role-launch-contract.md) | Product role launch contract | Accepted | Current explicit role/task launch-preflight boundary |
+| [0011](decisions/0011-governed-task-run-lifecycle.md) | Daemon-owned governed task lifecycle | Accepted | Durable task/evidence/review authority and operator-required acceptance |
 
 See [decisions/README.md](decisions/README.md) for full decision log.
 
@@ -141,6 +145,7 @@ CLI help, or current tests.
 | [DESKTOP-SHELL-ARCHITECTURE.md](spec/DESKTOP-SHELL-ARCHITECTURE.md) | Dioxus Desktop + xterm.js layer boundaries |
 | [IMPULSE_TERM_STATUS.md](../impulse-rs/docs/IMPULSE_TERM_STATUS.md) | Terminal backend status and desktop bridge implications |
 | [ADR-0010](decisions/0010-product-role-launch-contract.md) | Current explicit product-role/task launch-preflight boundary |
+| [ADR-0011](decisions/0011-governed-task-run-lifecycle.md) | Current daemon-owned governed task evidence/decision boundary |
 
 > **NOTE:** `spec/RUST-CANONICAL-CONTRACT.md` is authoritative for implementation. Legacy TypeScript/Bun docs are retained as historical reference unless explicitly marked active and aligned.
 
@@ -204,8 +209,9 @@ See [research/README.md](research/README.md) for reading sequences by phase.
 
 Older Ralph loop plans and `ROADMAP-PLAN.md` are preserved for provenance only. Use
 [`VISION.md`](../VISION.md),
-`spec/RUST-CANONICAL-CONTRACT.md`, `decisions/0008-dioxus-desktop-host.md`, and
-`decisions/0010-product-role-launch-contract.md` for current guidance.
+`spec/RUST-CANONICAL-CONTRACT.md`, `decisions/0008-dioxus-desktop-host.md`,
+`decisions/0010-product-role-launch-contract.md`, and
+`decisions/0011-governed-task-run-lifecycle.md` for current guidance.
 
 ---
 
@@ -224,10 +230,10 @@ Start here:
 7. [COLLABORATIVE-AGENTIC-CODING.md](guides/COLLABORATIVE-AGENTIC-CODING.md) — Agent lane, worktree, and handoff rules
 8. [ROADMAP-PLAN.md](ROADMAP-PLAN.md) — Superseded desktop implementation history
 
-### Next: Daemon-Owned Governed-Run Evidence/Decision Lifecycle
+### Next: Agent-Composed Governed Workflow
 
-1. [0010-product-role-launch-contract.md](decisions/0010-product-role-launch-contract.md) — Live preflight boundary and explicit next lifecycle
-2. [VISION.md](../VISION.md) — Ten-step governed workflow and unresolved lifecycle/hierarchy decisions
+1. [0011-governed-task-run-lifecycle.md](decisions/0011-governed-task-run-lifecycle.md) — Live durable lifecycle and explicit integration limits
+2. [VISION.md](../VISION.md) — Ten-step governed workflow and unresolved hierarchy, reassignment, enforcement, and integration decisions
 3. [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) — Live foundations and contract boundary
 4. [ARCHITECTURE-CLARIFICATION.md](ARCHITECTURE-CLARIFICATION.md) — Enforcement and authority boundary map
 5. [USER-STORY-MAP.md](spec/USER-STORY-MAP.md) — Acceptance criteria for current surfaces

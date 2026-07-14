@@ -3,6 +3,11 @@ use std::collections::HashMap;
 use dioxus::prelude::*;
 use impulse_ops::{
     agent_registry::AgentPlatformInfo,
+    governed_task::{
+        GovernedActor, GovernedActorKind, GovernedRequestId, GovernedReviewState,
+        GovernedTaskMutation, GovernedTaskMutationRequest, GovernedTaskRun, OperatorDecisionInput,
+        OperatorDecisionKind, SupervisorVerdictInput, SupervisorVerdictKind,
+    },
     role_assignment::{
         evaluate_role_compatibility, AgentRoleAssignment, AgentRoleId, EnforcementStrength,
         RoleAssignmentError, RoleCapabilityRequirement, RuntimeCapabilityId,
@@ -258,6 +263,25 @@ const DESKTOP_EVENT_BRIDGE_SCRIPT: &str = concat!(
       throw error;
     }
   };
+  window.__impulseOpsBridge.mutateGovernedTask = async (request) => {
+    if (!invoke) {
+      forward("bridge_status", { status: "governed_task_mutation_failed", reason: "host invoke API unavailable" });
+      return null;
+    }
+    try {
+      const task = await invoke("governed_task_mutate", { request });
+      // The return value only acknowledges daemon acceptance. Dioxus still
+      // waits for the authoritative ops_update before changing task cards.
+      return task;
+    } catch (error) {
+      forward("bridge_status", {
+        status: "governed_task_mutation_failed",
+        reason: String(error),
+        request,
+      });
+      throw error;
+    }
+  };
 
   if (!listen) {
     markEventBridgeDegraded("host event API unavailable");
@@ -349,13 +373,21 @@ const TERMINAL_INTEROP_SCRIPT: &str = concat!(
     terminal.open(mount);
     fitAddon?.fit();
 
+    const invokeTerminal = (command, payload) => {
+      void invoke(command, payload).catch((error) => {
+        mount.dataset.xtermError = String(error?.message || error || "host invoke failed");
+        mount.setAttribute("data-xterm-state", "input-error");
+        console.error(`Impulse terminal ${command} failed for ${agentId}:`, error);
+      });
+    };
+
     terminal.onData((data) => {
-      invoke("agent_write", { request: { agent_id: agentId, data: encodeInput(data) } });
+      invokeTerminal("agent_write", { request: { agent_id: agentId, data: encodeInput(data) } });
     });
 
     if (terminal.onResize) {
       terminal.onResize(({ cols, rows }) => {
-        invoke("agent_resize", { request: { session_id: agentId, cols, rows } });
+        invokeTerminal("agent_resize", { request: { session_id: agentId, cols, rows } });
       });
     }
 
@@ -1233,6 +1265,20 @@ pub fn review_decision_bridge_script(request: &ReviewDecisionUiRequest) -> Strin
     )
 }
 
+pub fn governed_task_mutation_bridge_script(request: &GovernedTaskMutationRequest) -> String {
+    let payload = serde_json::to_string(request).unwrap_or_else(|_| "{}".to_string());
+    format!(
+        r#"(async () => {{
+  const bridge = window.__impulseOpsBridge;
+  if (!bridge?.mutateGovernedTask) {{
+    console.warn("impulse governed task bridge unavailable");
+    return "degraded";
+  }}
+  return await bridge.mutateGovernedTask({payload});
+}})();"#
+    )
+}
+
 /// First-class review queue surface. It shows staged payloads and exposes
 /// apply/skip events to the parent shell, which will route them through the
 /// host MCP decision path in the live app.
@@ -1328,37 +1374,71 @@ fn review_status_label(status: &ReviewQueueStatus) -> &'static str {
 #[component]
 fn OperatorBoard(
     runtime_agents: Vec<AgentRuntimeSnapshot>,
-    review_queue: Vec<ReviewQueueItem>,
     last_invocations: Vec<McpInvocation>,
+    governed_tasks: Vec<GovernedTaskRun>,
+    on_governed_mutation: EventHandler<GovernedTaskMutationRequest>,
 ) -> Element {
-    let queued = runtime_agents
+    let queued = governed_tasks
         .iter()
-        .filter(|agent| matches!(agent.status, impulse_ops::AgentStatus::Starting))
+        .filter(|task| {
+            matches!(
+                task.review_state,
+                GovernedReviewState::AwaitingClaim | GovernedReviewState::AwaitingVerification
+            )
+        })
         .count();
-    let in_flight = runtime_agents
+    let in_flight = governed_tasks
         .iter()
-        .filter(|agent| matches!(agent.status, impulse_ops::AgentStatus::Working { .. }))
+        .filter(|task| {
+            task.execution_state == impulse_ops::governed_task::GovernedExecutionState::Running
+        })
         .count();
-    let review = review_queue
+    let review = governed_tasks
         .iter()
-        .filter(|item| item.status == ReviewQueueStatus::Pending)
+        .filter(|task| {
+            matches!(
+                task.review_state,
+                GovernedReviewState::VerificationFailed
+                    | GovernedReviewState::AwaitingSupervisor
+                    | GovernedReviewState::ChangesRequested
+                    | GovernedReviewState::Escalated
+                    | GovernedReviewState::AwaitingOperator
+            )
+        })
         .count();
-    let done = runtime_agents
+    let done = governed_tasks
         .iter()
-        .filter(|agent| matches!(agent.status, impulse_ops::AgentStatus::Completed))
-        .count()
-        + review_queue
-            .iter()
-            .filter(|item| item.status != ReviewQueueStatus::Pending)
-            .count();
+        .filter(|task| {
+            matches!(
+                task.review_state,
+                GovernedReviewState::Accepted | GovernedReviewState::Rejected
+            )
+        })
+        .count();
 
     rsx! {
         section { class: "operator-board", "data-source": "operator_board",
             div { class: "operator-lanes",
                 OperatorLane { label: "Queued".to_string(), count: queued, hint: "starting agents".to_string() }
                 OperatorLane { label: "In flight".to_string(), count: in_flight, hint: "active terminal work".to_string() }
-                OperatorLane { label: "Review".to_string(), count: review, hint: "pending context gates".to_string() }
-                OperatorLane { label: "Done".to_string(), count: done, hint: "completed or decided".to_string() }
+                OperatorLane { label: "Review".to_string(), count: review, hint: "evidence and decisions".to_string() }
+                OperatorLane { label: "Done".to_string(), count: done, hint: "operator decided".to_string() }
+            }
+            if governed_tasks.is_empty() {
+                p { class: "section-empty", "No daemon-owned governed tasks yet." }
+            } else {
+                div { class: "governed-task-grid", "data-source": "governed_tasks",
+                    for task in governed_tasks {
+                        GovernedTaskCard {
+                            // A daemon revision is the authoritative decision epoch.
+                            // Remounting clears rationale text so it cannot bleed into
+                            // a later supervisor/operator decision.
+                            key: "{task.id}:{task.revision}",
+                            task,
+                            on_mutation: on_governed_mutation,
+                        }
+                    }
+                }
             }
             if !runtime_agents.is_empty() {
                 div { class: "operator-agent-strip",
@@ -1389,6 +1469,302 @@ fn OperatorBoard(
             }
         }
     }
+}
+
+#[component]
+fn GovernedTaskCard(
+    task: GovernedTaskRun,
+    on_mutation: EventHandler<GovernedTaskMutationRequest>,
+) -> Element {
+    let mut rationale = use_signal(String::new);
+    let review_state = governed_review_state_label(task.review_state);
+    let execution_state = format!("{:?}", task.execution_state).to_ascii_lowercase();
+    let evidence_count = task.verifications.len();
+    let can_decide = !rationale().trim().is_empty();
+    let latest_claim = task.latest_claim().cloned();
+    let latest_verification = task.latest_verification().cloned();
+    let latest_supervisor_verdict = task.latest_supervisor_verdict().cloned();
+
+    let recommend_task = task.clone();
+    let changes_task = task.clone();
+    let escalate_task = task.clone();
+    let approve_task = task.clone();
+    let reject_task = task.clone();
+
+    rsx! {
+        article {
+            class: "operator-agent-card governed-task-card",
+            "data-governed-task-id": "{task.id}",
+            "data-review-state": "{review_state}",
+            header {
+                h3 { "{task.task}" }
+                span { class: "operator-agent-status", "{review_state}" }
+            }
+            p { "{task.runtime_id} · {task.agent_id} · revision {task.revision}" }
+            p { class: "governed-task-meta", "execution {execution_state} · {evidence_count} verification record(s)" }
+            if !task.acceptance_criteria.is_empty() {
+                section { class: "governed-task-evidence",
+                    h4 { "Acceptance criteria" }
+                    ul {
+                        for criterion in &task.acceptance_criteria {
+                            li { "{criterion}" }
+                        }
+                    }
+                }
+            }
+            section { class: "governed-task-evidence", "aria-label": "Current governed evidence",
+                h4 { "Current evidence" }
+                if let Some(claim) = latest_claim.as_ref() {
+                    div { class: "governed-evidence-block",
+                        span { class: "governed-evidence-label", "Worker claim" }
+                        p { class: "governed-evidence-copy", "{claim.summary}" }
+                        code { "subject {claim.subject_revision} · {claim.id}" }
+                        if let Some(diff_ref) = claim.diff_ref.as_deref() {
+                            code { "diff {diff_ref}" }
+                        }
+                        if !claim.artifact_ids.is_empty() {
+                            code { "artifacts {serde_json::to_string(&claim.artifact_ids).unwrap_or_else(|_| \"[]\".to_string())}" }
+                        }
+                    }
+                } else {
+                    p { class: "section-empty", "No worker completion claim recorded." }
+                }
+                if let Some(verification) = latest_verification.as_ref() {
+                    div { class: "governed-evidence-block",
+                        span { class: "governed-evidence-label", "Verification" }
+                        p { class: "governed-evidence-copy",
+                            "{governed_verification_outcome_label(verification.outcome)} · policy {verification.policy}"
+                        }
+                        code { "{verification.id} · subject {verification.subject_revision}" }
+                        if !verification.artifact_ids.is_empty() {
+                            code { "artifacts {serde_json::to_string(&verification.artifact_ids).unwrap_or_else(|_| \"[]\".to_string())}" }
+                        }
+                        for command in &verification.commands {
+                            {
+                                let redacted_argv = std::iter::once(command.executable.clone())
+                                    .chain(command.redacted_args.iter().cloned())
+                                    .collect::<Vec<_>>();
+                                let command_line = serde_json::to_string(&redacted_argv)
+                                    .unwrap_or_else(|_| "[]".to_string());
+                                let result = if command.success { "pass" } else { "fail" };
+                                let output_ref = command.output_ref.as_deref().unwrap_or("not retained");
+                                let exit_code = command.exit_code
+                                    .map(|code| code.to_string())
+                                    .unwrap_or_else(|| "signal/unknown".to_string());
+                                rsx! {
+                                    div { class: "governed-command-evidence", "data-command-result": "{result}",
+                                        strong { "{result} · {command.name} · exit {exit_code}" }
+                                        code { "redacted argv {command_line}" }
+                                        span { "command digest {command.command_digest}" }
+                                        span { "output digest {command.output_digest} · output {output_ref} · {command.output_bytes} bytes" }
+                                        if command.output_truncated {
+                                            span { class: "governed-evidence-warning", "output truncated" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(notes) = verification.notes.as_deref() {
+                            p { class: "governed-evidence-copy", "Verifier notes: {notes}" }
+                        }
+                    }
+                } else {
+                    p { class: "section-empty", "No verifier evidence recorded." }
+                }
+                if let Some(verdict) = latest_supervisor_verdict.as_ref() {
+                    div { class: "governed-evidence-block",
+                        span { class: "governed-evidence-label", "Supervisor judgment" }
+                        p { class: "governed-evidence-copy",
+                            "{governed_supervisor_verdict_label(verdict.verdict)} · {verdict.rationale}"
+                        }
+                        code { "{verdict.id} · verification {verdict.verification_id}" }
+                    }
+                }
+            }
+            if matches!(
+                task.review_state,
+                GovernedReviewState::VerificationFailed
+                    | GovernedReviewState::AwaitingSupervisor
+                    | GovernedReviewState::AwaitingOperator
+            ) {
+                label { class: "workspace-field wide governed-rationale",
+                    span { "Decision rationale" }
+                    textarea {
+                        placeholder: "State why the evidence supports this decision",
+                        value: "{rationale}",
+                        oninput: move |event| rationale.set(event.value()),
+                    }
+                }
+            }
+            if matches!(
+                task.review_state,
+                GovernedReviewState::VerificationFailed | GovernedReviewState::AwaitingSupervisor
+            ) {
+                div { class: "review-actions governed-task-actions",
+                    if task.review_state == GovernedReviewState::AwaitingSupervisor {
+                        button {
+                            class: "invoke-button",
+                            disabled: !can_decide,
+                            onclick: move |_| {
+                                if let Some(request) = supervisor_mutation(
+                                    &recommend_task,
+                                    SupervisorVerdictKind::RecommendAccept,
+                                    rationale(),
+                                ) {
+                                    on_mutation.call(request);
+                                }
+                            },
+                            "Recommend accept"
+                        }
+                    }
+                    button {
+                        class: "invoke-button secondary",
+                        disabled: !can_decide,
+                        onclick: move |_| {
+                            if let Some(request) = supervisor_mutation(
+                                &changes_task,
+                                SupervisorVerdictKind::ChangesRequested,
+                                rationale(),
+                            ) {
+                                on_mutation.call(request);
+                            }
+                        },
+                        "Request changes"
+                    }
+                    button {
+                        class: "invoke-button secondary",
+                        disabled: !can_decide,
+                        onclick: move |_| {
+                            if let Some(request) = supervisor_mutation(
+                                &escalate_task,
+                                SupervisorVerdictKind::Escalate,
+                                rationale(),
+                            ) {
+                                on_mutation.call(request);
+                            }
+                        },
+                        "Escalate"
+                    }
+                }
+            }
+            if task.review_state == GovernedReviewState::AwaitingOperator {
+                div { class: "review-actions governed-task-actions",
+                    button {
+                        class: "invoke-button",
+                        disabled: !can_decide,
+                        onclick: move |_| {
+                            if let Some(request) = operator_mutation(
+                                &approve_task,
+                                OperatorDecisionKind::Approve,
+                                rationale(),
+                            ) {
+                                on_mutation.call(request);
+                            }
+                        },
+                        "Approve"
+                    }
+                    button {
+                        class: "invoke-button secondary",
+                        disabled: !can_decide,
+                        onclick: move |_| {
+                            if let Some(request) = operator_mutation(
+                                &reject_task,
+                                OperatorDecisionKind::Reject,
+                                rationale(),
+                            ) {
+                                on_mutation.call(request);
+                            }
+                        },
+                        "Reject"
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn governed_review_state_label(state: GovernedReviewState) -> &'static str {
+    match state {
+        GovernedReviewState::AwaitingClaim => "awaiting claim",
+        GovernedReviewState::AwaitingVerification => "awaiting verification",
+        GovernedReviewState::VerificationFailed => "verification failed",
+        GovernedReviewState::AwaitingSupervisor => "awaiting supervisor",
+        GovernedReviewState::ChangesRequested => "changes requested",
+        GovernedReviewState::Escalated => "escalated",
+        GovernedReviewState::AwaitingOperator => "awaiting operator",
+        GovernedReviewState::Accepted => "accepted",
+        GovernedReviewState::Rejected => "rejected",
+    }
+}
+
+fn governed_verification_outcome_label(
+    outcome: impulse_ops::governed_task::GovernedVerificationOutcome,
+) -> &'static str {
+    match outcome {
+        impulse_ops::governed_task::GovernedVerificationOutcome::Passed => "passed",
+        impulse_ops::governed_task::GovernedVerificationOutcome::Failed => "failed",
+        impulse_ops::governed_task::GovernedVerificationOutcome::Inconclusive => "inconclusive",
+    }
+}
+
+fn governed_supervisor_verdict_label(verdict: SupervisorVerdictKind) -> &'static str {
+    match verdict {
+        SupervisorVerdictKind::RecommendAccept => "recommend accept",
+        SupervisorVerdictKind::ChangesRequested => "changes requested",
+        SupervisorVerdictKind::Escalate => "escalated",
+    }
+}
+
+fn supervisor_mutation(
+    task: &GovernedTaskRun,
+    verdict: SupervisorVerdictKind,
+    rationale: String,
+) -> Option<GovernedTaskMutationRequest> {
+    let verification_id = task.latest_verification()?.id.clone();
+    Some(GovernedTaskMutationRequest {
+        request_id: GovernedRequestId::try_new(format!("ui-supervisor-{}", uuid::Uuid::new_v4()))
+            .ok()?,
+        project_id: task.project_id.clone(),
+        task_id: task.id.clone(),
+        expected_revision: task.revision,
+        mutation: GovernedTaskMutation::RecordSupervisorVerdict {
+            verdict: SupervisorVerdictInput {
+                actor: GovernedActor {
+                    kind: GovernedActorKind::Supervisor,
+                    id: "impulse-supervisor-ui".to_string(),
+                },
+                verification_id,
+                verdict,
+                rationale: rationale.trim().to_string(),
+            },
+        },
+    })
+}
+
+fn operator_mutation(
+    task: &GovernedTaskRun,
+    decision: OperatorDecisionKind,
+    rationale: String,
+) -> Option<GovernedTaskMutationRequest> {
+    let supervisor_verdict_id = task.latest_supervisor_verdict()?.id.clone();
+    Some(GovernedTaskMutationRequest {
+        request_id: GovernedRequestId::try_new(format!("ui-operator-{}", uuid::Uuid::new_v4()))
+            .ok()?,
+        project_id: task.project_id.clone(),
+        task_id: task.id.clone(),
+        expected_revision: task.revision,
+        mutation: GovernedTaskMutation::RecordOperatorDecision {
+            decision: OperatorDecisionInput {
+                actor: GovernedActor {
+                    kind: GovernedActorKind::Operator,
+                    id: "local-operator-ui".to_string(),
+                },
+                supervisor_verdict_id,
+                decision,
+                rationale: rationale.trim().to_string(),
+            },
+        },
+    })
 }
 
 #[component]
@@ -1822,6 +2198,10 @@ pub fn DesktopShellWithSnapshot(
     let daemon_publish_degraded = daemon_ops_status
         .as_ref()
         .is_some_and(|status| status.connected && status.error.is_some());
+    let daemon_publish_error = daemon_ops_status
+        .as_ref()
+        .and_then(|status| status.error.as_deref())
+        .unwrap_or("a daemon-owned lifecycle write was not acknowledged");
     let daemon_label = if daemon_publish_degraded {
         "online · publish degraded"
     } else if daemon_online {
@@ -1994,8 +2374,8 @@ pub fn DesktopShellWithSnapshot(
                     class: "bridge-status-banner",
                     "data-daemon-status": "publish-degraded",
                     role: "status",
-                    strong { "Telemetry publish degraded" }
-                    span { "Daemon snapshot reads remain live; desktop lifecycle writes will retry." }
+                    strong { "Lifecycle synchronization degraded" }
+                    span { "{daemon_publish_error}. Daemon snapshot reads remain live; reconcile daemon-owned task state before deciding." }
                 }
             }
             div { class: "workspace-grid",
@@ -2133,8 +2513,14 @@ pub fn DesktopShellWithSnapshot(
                         DesktopView::Supervisor => rsx! {
                             OperatorBoard {
                                 runtime_agents: runtime_agents.clone(),
-                                review_queue: review_queue.clone(),
                                 last_invocations: last_invocations.clone(),
+                                governed_tasks: snapshot.governed_tasks.clone(),
+                                on_governed_mutation: move |request| {
+                                    let script = governed_task_mutation_bridge_script(&request);
+                                    spawn(async move {
+                                        let _ = document::eval(&script).await;
+                                    });
+                                },
                             }
                         },
                     }
