@@ -239,6 +239,7 @@ fn stored_registration(
         task: task.task.clone(),
         acceptance_criteria: task.acceptance_criteria.clone(),
         approval_policy: task.approval_policy,
+        verification_profile: task.verification_profile,
         role_assignment: task.role_assignment.clone(),
         role_compatibility: task.role_compatibility.clone(),
         runtime_id: task.runtime_id.clone(),
@@ -312,6 +313,7 @@ impl State {
             task: registration.task,
             acceptance_criteria: registration.acceptance_criteria,
             approval_policy: registration.approval_policy,
+            verification_profile: registration.verification_profile,
             role_assignment: registration.role_assignment,
             role_compatibility: registration.role_compatibility,
             runtime_id: registration.runtime_id,
@@ -423,6 +425,30 @@ impl State {
             .context("Failed to persist governed task mutation")?;
         *ledger = candidate;
         Ok(updated)
+    }
+
+    /// Check whether a producer request is a replay before any external work.
+    /// A request id already owned by another task is rejected immediately.
+    pub(crate) fn governed_producer_request_is_replay(
+        &self,
+        request_id: &GovernedRequestId,
+        task_id: &GovernedTaskId,
+    ) -> Result<bool> {
+        let ledger = self
+            .governed_tasks
+            .lock()
+            .map_err(|error| anyhow::anyhow!("governed task ledger lock poisoned: {error}"))?;
+        let Some(receipt) = ledger.processed_requests.get(request_id) else {
+            return Ok(false);
+        };
+        if &receipt.task_id != task_id {
+            return Err(GovernedTaskStateError::IdempotencyConflict {
+                request_id: request_id.clone(),
+                task_id: receipt.task_id.clone(),
+            }
+            .into());
+        }
+        Ok(true)
     }
 
     pub fn get_governed_task(

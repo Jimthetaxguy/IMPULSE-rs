@@ -6,7 +6,9 @@
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 
-use crate::role_assignment::{AgentRoleAssignment, RoleCompatibility};
+use crate::role_assignment::{
+    canonical_governed_builder_assignment, AgentRoleAssignment, RoleCompatibility,
+};
 
 pub const MAX_GOVERNED_TASK_BYTES: usize = 8 * 1024;
 pub const MAX_ACCEPTANCE_CRITERIA: usize = 64;
@@ -18,6 +20,11 @@ pub const MAX_GOVERNED_REFERENCE_BYTES: usize = 4 * 1024;
 pub const MAX_GOVERNED_COMMAND_ARG_BYTES: usize = 16 * 1024;
 pub const MAX_GOVERNED_RECORDS_PER_KIND: usize = 256;
 pub const MAX_GOVERNED_EVENTS: usize = 1_024;
+pub const GOVERNED_SUPERVISOR_REVIEW_CONTRACT_VERSION: &str = "1";
+pub const MAX_PROFILED_TASK_BYTES: usize = 2 * 1024;
+pub const MAX_PROFILED_ACCEPTANCE_CRITERIA: usize = 16;
+pub const MAX_PROFILED_ACCEPTANCE_CRITERION_BYTES: usize = 512;
+pub const MAX_PROFILED_CLAIM_SUMMARY_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum GovernedTaskContractError {
@@ -90,6 +97,14 @@ pub enum ApprovalPolicy {
     OperatorRequired,
 }
 
+/// Closed, versioned producer profiles that the daemon can expand without
+/// accepting caller-authored shell commands or evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernedVerificationProfile {
+    RustWorkspaceV1,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum GovernedExecutionState {
@@ -145,6 +160,8 @@ pub struct GovernedTaskRegistration {
     #[serde(default)]
     pub approval_policy: ApprovalPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_profile: Option<GovernedVerificationProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_assignment: Option<AgentRoleAssignment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_compatibility: Option<RoleCompatibility>,
@@ -174,6 +191,7 @@ impl GovernedTaskRegistration {
             task: task.into(),
             acceptance_criteria: Vec::new(),
             approval_policy: ApprovalPolicy::OperatorRequired,
+            verification_profile: None,
             role_assignment: None,
             role_compatibility: None,
             runtime_id: runtime_id.into(),
@@ -211,6 +229,63 @@ impl GovernedTaskRegistration {
         }
         if let Some(subject) = &self.initial_subject_revision {
             validate_nonblank("initial_subject_revision", subject, 1024)?;
+        }
+        if self.verification_profile.is_some() {
+            if self.acceptance_criteria.is_empty() {
+                return Err(GovernedTaskContractError::InvalidField {
+                    field: "acceptance_criteria",
+                    message: "a closed-loop verification profile requires at least one criterion"
+                        .to_string(),
+                });
+            }
+            let subject = self.initial_subject_revision.as_deref().ok_or_else(|| {
+                GovernedTaskContractError::InvalidField {
+                    field: "initial_subject_revision",
+                    message: "a closed-loop verification profile requires a clean Git commit OID"
+                        .to_string(),
+                }
+            })?;
+            validate_git_commit_oid("initial_subject_revision", subject)?;
+            validate_nonblank("task", &self.task, MAX_PROFILED_TASK_BYTES)?;
+            if self.acceptance_criteria.len() > MAX_PROFILED_ACCEPTANCE_CRITERIA {
+                return Err(GovernedTaskContractError::InvalidField {
+                    field: "acceptance_criteria",
+                    message: format!(
+                        "a closed-loop profile supports at most {MAX_PROFILED_ACCEPTANCE_CRITERIA} exact criteria"
+                    ),
+                });
+            }
+            for criterion in &self.acceptance_criteria {
+                validate_nonblank(
+                    "acceptance_criteria",
+                    criterion,
+                    MAX_PROFILED_ACCEPTANCE_CRITERION_BYTES,
+                )?;
+            }
+            let assignment = self.role_assignment.as_ref().ok_or_else(|| {
+                GovernedTaskContractError::InvalidField {
+                    field: "role_assignment",
+                    message:
+                        "a closed-loop verification profile requires the canonical Builder role"
+                            .to_string(),
+                }
+            })?;
+            if assignment != &canonical_governed_builder_assignment() {
+                return Err(GovernedTaskContractError::InvalidField {
+                    field: "role_assignment",
+                    message:
+                        "a closed-loop verification profile requires the canonical Builder role requirements"
+                            .to_string(),
+                });
+            }
+            if self.role_compatibility.is_none() {
+                return Err(GovernedTaskContractError::InvalidField {
+                    field: "role_compatibility",
+                    message:
+                        "a closed-loop verification profile requires a matching runtime compatibility result"
+                            .to_string(),
+                });
+            }
         }
         if self
             .role_compatibility
@@ -282,6 +357,7 @@ pub struct GovernedTaskRegistrationBuilder {
     task: String,
     acceptance_criteria: Vec<String>,
     approval_policy: ApprovalPolicy,
+    verification_profile: Option<GovernedVerificationProfile>,
     role_assignment: Option<AgentRoleAssignment>,
     role_compatibility: Option<RoleCompatibility>,
     runtime_id: String,
@@ -298,6 +374,11 @@ impl GovernedTaskRegistrationBuilder {
 
     pub fn approval_policy(mut self, policy: ApprovalPolicy) -> Self {
         self.approval_policy = policy;
+        self
+    }
+
+    pub fn verification_profile(mut self, profile: GovernedVerificationProfile) -> Self {
+        self.verification_profile = Some(profile);
         self
     }
 
@@ -330,6 +411,7 @@ impl GovernedTaskRegistrationBuilder {
             task: self.task,
             acceptance_criteria: self.acceptance_criteria,
             approval_policy: self.approval_policy,
+            verification_profile: self.verification_profile,
             role_assignment: self.role_assignment,
             role_compatibility: self.role_compatibility,
             runtime_id: self.runtime_id,
@@ -351,6 +433,24 @@ fn validate_nonblank(
         return Err(GovernedTaskContractError::InvalidField {
             field,
             message: format!("must be nonblank, NUL-free, and at most {max_bytes} UTF-8 bytes"),
+        });
+    }
+    Ok(())
+}
+
+fn validate_git_commit_oid(
+    field: &'static str,
+    value: &str,
+) -> Result<(), GovernedTaskContractError> {
+    if !matches!(value.len(), 40 | 64)
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(GovernedTaskContractError::InvalidField {
+            field,
+            message: "must be a 40- or 64-character lowercase hexadecimal Git commit OID"
+                .to_string(),
         });
     }
     Ok(())
@@ -533,6 +633,110 @@ pub struct GovernedTaskMutationRequest {
     pub mutation: GovernedTaskMutation,
 }
 
+/// Agent-facing claim request. Actor identity and subject revision are
+/// intentionally absent: the project daemon derives both from task state and
+/// the canonical Git workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GovernedClaimRequest {
+    pub request_id: GovernedRequestId,
+    pub project_id: String,
+    pub task_id: GovernedTaskId,
+    pub expected_revision: u64,
+    pub summary: String,
+    #[serde(default)]
+    pub artifact_ids: Vec<String>,
+}
+
+impl GovernedClaimRequest {
+    pub fn validate(&self) -> Result<(), GovernedTaskContractError> {
+        validate_nonblank("summary", &self.summary, MAX_PROFILED_CLAIM_SUMMARY_BYTES)?;
+        if self.artifact_ids.len() > MAX_GOVERNED_REFERENCES {
+            return Err(GovernedTaskContractError::InvalidField {
+                field: "artifact_ids",
+                message: format!("must contain at most {MAX_GOVERNED_REFERENCES} entries"),
+            });
+        }
+        for artifact_id in &self.artifact_ids {
+            validate_nonblank("artifact_ids", artifact_id, MAX_GOVERNED_REFERENCE_BYTES)?;
+        }
+        Ok(())
+    }
+}
+
+/// Trigger for daemon-owned verification. The request contains no command or
+/// evidence fields; the daemon expands the task's closed verification profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GovernedVerificationRequest {
+    pub request_id: GovernedRequestId,
+    pub project_id: String,
+    pub task_id: GovernedTaskId,
+    pub expected_revision: u64,
+}
+
+/// Trigger for a daemon-launched Supervisor turn. The verdict payload is
+/// produced and bound by the daemon after the model call returns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GovernedSupervisorReviewRequest {
+    pub request_id: GovernedRequestId,
+    pub project_id: String,
+    pub task_id: GovernedTaskId,
+    pub expected_revision: u64,
+}
+
+/// Strict response contract required from the launched Supervisor. Every
+/// identity field is echoed so a response cannot be applied to another task,
+/// revision, claim, verification, or subject by accident.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GovernedSupervisorReviewEnvelope {
+    pub contract_version: String,
+    pub task_id: GovernedTaskId,
+    pub task_revision: u64,
+    pub claim_id: GovernedRecordId,
+    pub verification_id: GovernedRecordId,
+    pub subject_revision: String,
+    pub acceptance_criteria_count: usize,
+    pub acceptance_criteria_digest: String,
+    pub verdict: SupervisorVerdictKind,
+    pub rationale: String,
+}
+
+impl GovernedSupervisorReviewEnvelope {
+    pub fn validate_shape(&self) -> Result<(), GovernedTaskContractError> {
+        if self.contract_version != GOVERNED_SUPERVISOR_REVIEW_CONTRACT_VERSION {
+            return Err(GovernedTaskContractError::InvalidField {
+                field: "contract_version",
+                message: format!("must equal {GOVERNED_SUPERVISOR_REVIEW_CONTRACT_VERSION}"),
+            });
+        }
+        validate_git_commit_oid("subject_revision", &self.subject_revision)?;
+        validate_sha256_digest(
+            "acceptance_criteria_digest",
+            &self.acceptance_criteria_digest,
+        )?;
+        validate_nonblank("rationale", &self.rationale, MAX_GOVERNED_TEXT_BYTES)
+    }
+}
+
+fn validate_sha256_digest(
+    field: &'static str,
+    value: &str,
+) -> Result<(), GovernedTaskContractError> {
+    let valid = value
+        .strip_prefix("sha256:")
+        .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    if !valid {
+        return Err(GovernedTaskContractError::InvalidField {
+            field,
+            message: "must use the sha256:<64 hexadecimal characters> format".to_string(),
+        });
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GovernedTaskEventKind {
@@ -567,6 +771,8 @@ pub struct GovernedTaskRun {
     pub acceptance_criteria: Vec<String>,
     #[serde(default)]
     pub approval_policy: ApprovalPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_profile: Option<GovernedVerificationProfile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_assignment: Option<AgentRoleAssignment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -14,12 +14,30 @@ pub mod prompts;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 // Re-export LLM types for backward compatibility.
 use crate::context_lifecycle::types::ExtractedInsight;
 use crate::error::{AgentError, AgentResult};
 pub use crate::llm_backends::anthropic::{AnthropicProvider, MinimaxProvider, OpenAiProvider};
 pub use crate::llm_backends::{Agent, LlmProvider};
+
+const GOVERNED_MODEL_SLUG_CHARS: usize = 64;
+
+fn governed_api_actor_id(provider: ImpulseProvider, resolved_model: &str) -> String {
+    // Keep a bounded human-readable hint while binding provenance to the exact
+    // request model. `sanitize_id` alone is intentionally lossy and can map
+    // distinct provider model identifiers to the same slug.
+    let model_slug = impulse_ops::sanitize_id(resolved_model)
+        .chars()
+        .take(GOVERNED_MODEL_SLUG_CHARS)
+        .collect::<String>();
+    let model_digest = Sha256::digest(resolved_model.as_bytes());
+    format!(
+        "impulse-agent:api:{}:{model_slug}:sha256-{model_digest:x}",
+        provider.as_str()
+    )
+}
 
 /// Wall-clock budget for a single harness CLI subprocess call
 /// (`harness::harness_query_structured`'s `tokio::process::Command::output()`).
@@ -357,7 +375,11 @@ impl ImpulseAgent {
             config: ImpulseAgentConfig {
                 mode: AgentMode::Api {
                     provider: ImpulseProvider::Anthropic,
-                    model: Some(model.clone()),
+                    // Keep the raw configuration unresolved so governed
+                    // provenance tests exercise the production `model=None`
+                    // path. `Agent::new` owns the resolved model actually sent
+                    // to the provider.
+                    model: None,
                 },
                 ..ImpulseAgentConfig::default()
             },
@@ -836,6 +858,50 @@ impl ImpulseAgent {
         result
     }
 
+    /// Run one history-free, tool-free turn for a revision-bound control-plane
+    /// decision. Governed Supervisor reviews must not inherit unrelated chat
+    /// history from another task or write their response back into that shared
+    /// conversation.
+    pub async fn query_stateless(
+        &mut self,
+        system_prompt: &str,
+        user_prompt: &str,
+    ) -> AgentResult<String> {
+        match &self.config.mode {
+            AgentMode::Api { .. } => {
+                let agent = self.inner.as_ref().ok_or_else(|| {
+                    AgentError::InvalidRequest("Agent not initialized".to_string())
+                })?;
+                let request = crate::llm_backends::ChatRequest {
+                    model: agent.model.clone(),
+                    messages: vec![
+                        crate::llm_backends::Message::text(
+                            crate::llm_backends::Role::System,
+                            system_prompt,
+                        ),
+                        crate::llm_backends::Message::text(
+                            crate::llm_backends::Role::User,
+                            user_prompt,
+                        ),
+                    ],
+                    temperature: 0.0,
+                    max_tokens: Some(self.config.max_tokens),
+                    tools: Vec::new(),
+                };
+                agent
+                    .provider
+                    .chat(request)
+                    .await
+                    .map(|response| response.content)
+            }
+            AgentMode::Harness { .. } => Err(AgentError::InvalidRequest(
+                "governed stateless review requires an API runtime with an empty tool set; generic coding harnesses are not structurally read-only"
+                    .to_string(),
+            )),
+            AgentMode::Disabled => Err(AgentError::InvalidRequest("Agent is disabled".to_string())),
+        }
+    }
+
     /// Clear conversation history (API mode) and session history.
     pub fn clear_history(&mut self) {
         if let Some(agent) = &mut self.inner {
@@ -866,6 +932,35 @@ impl ImpulseAgent {
                 format!("Harness ({}) [{}]", harness.as_str(), ready)
             }
             AgentMode::Disabled => "Disabled".to_string(),
+        }
+    }
+
+    /// Non-secret execution provenance for a daemon-owned governed review.
+    /// The actor kind still expresses the Supervisor role; this identifier
+    /// records the API provider and resolved model used for the judgment.
+    pub(crate) fn governed_review_actor(&self) -> impulse_ops::governed_task::GovernedActor {
+        let id = match &self.config.mode {
+            AgentMode::Api { provider, model } => {
+                // `ImpulseAgent::new` resolves a missing configured model into
+                // `Agent::model` before any request is sent. Provenance must
+                // use that exact request model rather than mislabeling a
+                // defaulted turn with the provider name.
+                let resolved_model = self
+                    .inner
+                    .as_ref()
+                    .map(|agent| agent.model.as_str())
+                    .or(model.as_deref())
+                    .unwrap_or("model-unavailable");
+                governed_api_actor_id(*provider, resolved_model)
+            }
+            AgentMode::Harness { harness } => {
+                format!("impulse-agent:harness:{}", harness.as_str())
+            }
+            AgentMode::Disabled => "impulse-agent:disabled".to_string(),
+        };
+        impulse_ops::governed_task::GovernedActor {
+            kind: impulse_ops::governed_task::GovernedActorKind::Supervisor,
+            id,
         }
     }
 }
@@ -922,6 +1017,18 @@ pub fn resolve_from_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn governed_api_actor_identity_binds_the_exact_model() {
+        let slash_and_dot = governed_api_actor_id(ImpulseProvider::Anthropic, "org/model.v1");
+        let hyphenated = governed_api_actor_id(ImpulseProvider::Anthropic, "org-model-v1");
+
+        assert_ne!(slash_and_dot, hyphenated);
+        assert!(slash_and_dot.starts_with("impulse-agent:api:anthropic:org-model-v1:sha256-"));
+        assert!(hyphenated.starts_with("impulse-agent:api:anthropic:org-model-v1:sha256-"));
+        assert_eq!(slash_and_dot.rsplit('-').next().unwrap().len(), 64);
+        assert_eq!(hyphenated.rsplit('-').next().unwrap().len(), 64);
+    }
 
     #[test]
     fn test_impulse_provider_parse() {
@@ -1017,6 +1124,37 @@ mod tests {
             }
             _ => panic!("Expected Harness mode"),
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn governed_stateless_review_rejects_generic_harness_before_spawn() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let sentinel = temp.path().join("harness-spawned");
+        let harness = temp.path().join("fake-harness.sh");
+        std::fs::write(
+            &harness,
+            format!(
+                "#!/bin/sh\nprintf spawned > '{}'\nprintf '{{}}'\n",
+                sentinel.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&harness).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&harness, permissions).unwrap();
+
+        let mut agent = ImpulseAgent::new(ImpulseAgentConfig::harness(ImpulseHarness::ClaudeCode))
+            .unwrap()
+            .with_test_harness_command(harness);
+        let error = agent
+            .query_stateless("read-only", "review")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not structurally read-only"));
+        assert!(!sentinel.exists(), "generic harness must not be spawned");
     }
 
     #[test]

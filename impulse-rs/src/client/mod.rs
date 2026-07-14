@@ -16,6 +16,8 @@ use crate::daemon::{DaemonRequest, DaemonResponse};
 /// slow LLM-backed handlers (the daemon's own LLM calls cap at ~120s) but
 /// bounded so a hung/deadlocked daemon can't hang the CLI indefinitely.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(180);
+const GOVERNED_VERIFICATION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(21 * 60);
+const ACKNOWLEDGED_REQUEST_ATTEMPTS: usize = 2;
 
 fn daemon_busy_error(
     resource: impulse_ops::DaemonBusyResource,
@@ -243,6 +245,100 @@ impl DaemonClient {
             DaemonResponse::Error { message } => anyhow::bail!("Get session failed: {}", message),
             _ => anyhow::bail!("Get session: unexpected response type"),
         }
+    }
+
+    async fn governed_task_response(
+        &self,
+        request: DaemonRequest,
+        operation: &str,
+        timeout: Duration,
+    ) -> Result<impulse_ops::governed_task::GovernedTaskRun> {
+        let mut last_error = None;
+        let mut response = None;
+        for _ in 0..ACKNOWLEDGED_REQUEST_ATTEMPTS {
+            match self.send_with_timeout(request.clone(), timeout).await {
+                Ok(value) => {
+                    response = Some(value);
+                    break;
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        let response = response.ok_or_else(|| {
+            last_error.unwrap_or_else(|| anyhow!("{operation}: daemon request failed"))
+        })?;
+        match response {
+            DaemonResponse::Ok { result } => serde_json::from_value(result)
+                .with_context(|| format!("{operation}: invalid governed task response")),
+            DaemonResponse::Error { message } => anyhow::bail!("{operation} failed: {message}"),
+            DaemonResponse::Busy {
+                resource,
+                retry_after_ms,
+            } => Err(daemon_busy_error(resource, retry_after_ms)),
+            _ => anyhow::bail!("{operation}: unexpected response type"),
+        }
+    }
+
+    pub async fn get_governed_task(
+        &self,
+        project_id: String,
+        task_id: impulse_ops::governed_task::GovernedTaskId,
+    ) -> Result<Option<impulse_ops::governed_task::GovernedTaskRun>> {
+        match self
+            .send(DaemonRequest::GetGovernedTask {
+                project_id,
+                task_id,
+            })
+            .await?
+        {
+            DaemonResponse::Ok { result } => {
+                serde_json::from_value(result).context("get governed task: invalid daemon response")
+            }
+            DaemonResponse::Error { message } => {
+                anyhow::bail!("get governed task failed: {message}")
+            }
+            DaemonResponse::Busy {
+                resource,
+                retry_after_ms,
+            } => Err(daemon_busy_error(resource, retry_after_ms)),
+            _ => anyhow::bail!("get governed task: unexpected response type"),
+        }
+    }
+
+    pub async fn submit_governed_claim(
+        &self,
+        request: impulse_ops::governed_task::GovernedClaimRequest,
+    ) -> Result<impulse_ops::governed_task::GovernedTaskRun> {
+        self.governed_task_response(
+            DaemonRequest::SubmitGovernedClaim { request },
+            "submit governed claim",
+            RESPONSE_TIMEOUT,
+        )
+        .await
+    }
+
+    pub async fn run_governed_verification(
+        &self,
+        request: impulse_ops::governed_task::GovernedVerificationRequest,
+    ) -> Result<impulse_ops::governed_task::GovernedTaskRun> {
+        self.governed_task_response(
+            DaemonRequest::RunGovernedVerification { request },
+            "run governed verification",
+            GOVERNED_VERIFICATION_RESPONSE_TIMEOUT,
+        )
+        .await
+    }
+
+    pub async fn run_governed_supervisor_review(
+        &self,
+        request: impulse_ops::governed_task::GovernedSupervisorReviewRequest,
+    ) -> Result<impulse_ops::governed_task::GovernedTaskRun> {
+        self.governed_task_response(
+            DaemonRequest::RunGovernedSupervisorReview { request },
+            "run governed Supervisor review",
+            RESPONSE_TIMEOUT,
+        )
+        .await
     }
 
     pub async fn chat(

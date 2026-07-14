@@ -5,6 +5,7 @@
 //! - Exposes `screen_text()` and `scrollback_text()` for context extraction
 //! - No TUI (ratatui) dependency — rendering is done by `renderer.rs`
 
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
@@ -28,6 +29,28 @@ const DEFAULT_SCROLLBACK_LINES: usize = 10_000;
 
 /// PTY read buffer size (bytes).
 const PTY_READ_BUFFER_SIZE: usize = 4096;
+
+/// Remove every inherited Impulse control-plane variable before a PTY launch.
+///
+/// `portable_pty::CommandBuilder` starts from the parent process environment.
+/// Omitting a key from a launch request therefore does not isolate it: an
+/// ordinary pane could otherwise inherit a daemon socket, producer CLI, task,
+/// or role identity that belongs to the Desktop process. Explicit launch
+/// metadata is overlaid again after this scrub.
+fn remove_inherited_impulse_env<I>(command: &mut CommandBuilder, inherited_keys: I)
+where
+    I: IntoIterator<Item = OsString>,
+{
+    for key in inherited_keys {
+        let rendered = key.to_string_lossy();
+        if rendered
+            .get(.."IMPULSE_".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("IMPULSE_"))
+        {
+            command.env_remove(&key);
+        }
+    }
+}
 
 /// Owns a PTY process and its vt100 parser. The reader thread runs in the
 /// background, continuously feeding PTY output into the parser.
@@ -141,7 +164,10 @@ impl TerminalBackend {
             cmd.cwd(cwd);
         }
 
-        // Inject environment variables.
+        // CommandBuilder inherits the Desktop environment. Remove all Impulse
+        // routing/identity first, then add only the values authorized for this
+        // specific launch.
+        remove_inherited_impulse_env(&mut cmd, std::env::vars_os().map(|(key, _value)| key));
         for (key, value) in env_vars {
             cmd.env(key, value);
         }
@@ -653,6 +679,36 @@ mod tests {
             as_str.matches("msg").count(),
             10,
             "no message should be interleaved"
+        );
+    }
+
+    #[test]
+    fn inherited_impulse_environment_is_removed_before_explicit_overlay() {
+        let mut command = CommandBuilder::new("true");
+        command.env("IMPULSE_SOCKET_PATH", "/tmp/parent.sock");
+        command.env("impulse_control_cli", "/tmp/parent-cli");
+        command.env("PATH", "/usr/bin");
+
+        remove_inherited_impulse_env(
+            &mut command,
+            [
+                OsString::from("IMPULSE_SOCKET_PATH"),
+                OsString::from("impulse_control_cli"),
+                OsString::from("PATH"),
+            ],
+        );
+
+        assert!(command.get_env("IMPULSE_SOCKET_PATH").is_none());
+        assert!(command.get_env("IMPULSE_CONTROL_CLI").is_none());
+        assert_eq!(
+            command.get_env("PATH"),
+            Some(std::ffi::OsStr::new("/usr/bin"))
+        );
+
+        command.env("IMPULSE_SOCKET_PATH", "/tmp/profiled.sock");
+        assert_eq!(
+            command.get_env("IMPULSE_SOCKET_PATH"),
+            Some(std::ffi::OsStr::new("/tmp/profiled.sock"))
         );
     }
 }

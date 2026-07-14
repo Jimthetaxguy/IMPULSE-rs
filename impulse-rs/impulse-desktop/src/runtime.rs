@@ -1,10 +1,18 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, Weak};
+use std::thread;
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 pub use impulse_ops::agent_registry::AgentPlatformId;
 use impulse_ops::governed_task::{
     GovernedTaskMutation, GovernedTaskMutationRequest, GovernedTaskRegistration, GovernedTaskRun,
+    GovernedVerificationProfile,
 };
 use impulse_ops::role_assignment::{AgentRoleAssignment, EnforcementStrength, RoleCompatibility};
 use impulse_ops::{AgentRole, AgentStatus, ContextHealthSummary, MachineTarget};
@@ -20,6 +28,9 @@ use crate::bridge::{
 /// Tasks are copied into `IMPULSE_TASK`; keep that environment value bounded
 /// and measure the wire-compatible UTF-8 representation rather than chars.
 const MAX_GOVERNED_TASK_BYTES: usize = impulse_ops::governed_task::MAX_GOVERNED_TASK_BYTES;
+const GOVERNED_GIT_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+const GOVERNED_GIT_OUTPUT_LIMIT: usize = 64 * 1024;
+const GOVERNED_GIT_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Acknowledged daemon command seam used by the synchronous pre-PTY gate.
 /// Implementations must return daemon-owned task state, never optimistic UI state.
@@ -35,6 +46,16 @@ pub trait GovernedTaskGateway: Send + Sync {
         request_id: impulse_ops::governed_task::GovernedRequestId,
         mutation: GovernedTaskMutation,
     ) -> Result<GovernedTaskRun, String>;
+
+    fn routing_metadata(&self) -> Option<GovernedRoutingMetadata> {
+        None
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GovernedRoutingMetadata {
+    pub socket_path: String,
+    pub control_cli: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -165,6 +186,10 @@ pub struct AgentSpawnRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_assignment: Option<AgentRoleAssignment>,
     #[serde(default)]
+    pub acceptance_criteria: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_profile: Option<GovernedVerificationProfile>,
+    #[serde(default)]
     pub target: Option<MachineTarget>,
 }
 
@@ -193,6 +218,8 @@ impl AgentSpawnRequest {
             role: None,
             task: None,
             role_assignment: None,
+            acceptance_criteria: Vec::new(),
+            verification_profile: None,
             target: None,
         }
     }
@@ -603,6 +630,23 @@ impl DesktopRuntime {
         request: AgentSpawnRequest,
     ) -> Result<AgentRuntimeSnapshot, DesktopBridgeError> {
         let mut request = request;
+        if request.verification_profile.is_some() || !request.acceptance_criteria.is_empty() {
+            let assignment = request.role_assignment.as_ref().ok_or_else(|| {
+                DesktopBridgeError::InvalidTerminalRequest {
+                    message:
+                        "verification profiles and acceptance criteria require the governed Builder role"
+                            .to_string(),
+                }
+            })?;
+            if assignment.role.as_str() != "builder" {
+                return Err(DesktopBridgeError::InvalidTerminalRequest {
+                    message: format!(
+                        "verification profiles and acceptance criteria require role `builder`, not `{}`",
+                        assignment.role
+                    ),
+                });
+            }
+        }
         if request.role_assignment.is_some() {
             let task = request.task.as_deref().ok_or_else(|| {
                 DesktopBridgeError::InvalidTerminalRequest {
@@ -624,6 +668,19 @@ impl DesktopRuntime {
                     message: format!(
                         "governed task must be at most {MAX_GOVERNED_TASK_BYTES} UTF-8 bytes"
                     ),
+                });
+            }
+            if request.verification_profile.is_some() && request.acceptance_criteria.is_empty() {
+                return Err(DesktopBridgeError::InvalidTerminalRequest {
+                    message:
+                        "closed-loop governed launch requires at least one acceptance criterion"
+                            .to_string(),
+                });
+            }
+            if request.verification_profile.is_none() && !request.acceptance_criteria.is_empty() {
+                return Err(DesktopBridgeError::InvalidTerminalRequest {
+                    message: "acceptance criteria require an explicit verification profile"
+                        .to_string(),
                 });
             }
         }
@@ -703,6 +760,20 @@ impl DesktopRuntime {
         } else {
             request.mcp_tools.clone()
         };
+        let governed_routing = if request.verification_profile.is_some() {
+            Some(
+                self.inner
+                    .governed_task_gateway
+                    .as_ref()
+                    .and_then(|gateway| gateway.routing_metadata())
+                    .ok_or_else(|| DesktopBridgeError::GovernedTaskFailed {
+                        message: "profiled governed launch requires an executable Impulse control CLI; configure IMPULSE_CONTROL_CLI with an executable path or make impulse-rs available beside the Desktop binary or on PATH"
+                            .to_string(),
+                    })?,
+            )
+        } else {
+            None
+        };
         let mut governed_task = if let Some(role_assignment) = request.role_assignment.as_ref() {
             let gateway = self.inner.governed_task_gateway.as_ref().ok_or_else(|| {
                 DesktopBridgeError::GovernedTaskFailed {
@@ -725,6 +796,10 @@ impl DesktopRuntime {
                         message: "governed launch lost its validated task description".to_string(),
                     })?;
             let task_id = new_governed_task_id();
+            let initial_subject_revision = request
+                .verification_profile
+                .map(|_| observe_clean_git_head(&workspace_root))
+                .transpose()?;
             let mut registration = GovernedTaskRegistration::builder(
                 new_governed_request_id("register").to_string(),
                 task_id.to_string(),
@@ -735,6 +810,16 @@ impl DesktopRuntime {
                 request.platform.as_str(),
             )
             .role_assignment(role_assignment.clone());
+            if let Some(profile) = request.verification_profile {
+                registration = registration
+                    .verification_profile(profile)
+                    .acceptance_criteria(request.acceptance_criteria.clone())
+                    .initial_subject_revision(
+                        initial_subject_revision
+                            .as_deref()
+                            .expect("profiled launch must observe a Git subject"),
+                    );
+            }
             if let Some(compatibility) = role_compatibility.clone() {
                 registration = registration.role_compatibility(compatibility);
             }
@@ -814,6 +899,7 @@ impl DesktopRuntime {
             &command,
             workspace.as_ref(),
             governed_task.as_ref(),
+            governed_routing.as_ref(),
         );
         // PTY callbacks are per-launch gated until the daemon acknowledges
         // Running and the runtime record is installed. This keeps one slow
@@ -1413,6 +1499,8 @@ impl TerminalBridge for DesktopRuntime {
             role: None,
             task: None,
             role_assignment: None,
+            acceptance_criteria: Vec::new(),
+            verification_profile: None,
             target: None,
         })?;
         Ok(TerminalSessionResponse {
@@ -1489,6 +1577,286 @@ fn governed_project_id(workspace_root: &str) -> Result<String, DesktopBridgeErro
     Ok(project_id)
 }
 
+struct GovernedGitOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stdout_truncated: bool,
+    timed_out: bool,
+}
+
+struct GovernedGitCapturedStream {
+    retained: Vec<u8>,
+    truncated: bool,
+}
+
+fn capture_governed_git_stream<R>(mut reader: R) -> std::io::Result<GovernedGitCapturedStream>
+where
+    R: Read,
+{
+    let mut retained = Vec::with_capacity(GOVERNED_GIT_OUTPUT_LIMIT.min(8 * 1024));
+    let mut total = 0usize;
+    let mut buffer = [0u8; 8 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read);
+        if retained.len() < GOVERNED_GIT_OUTPUT_LIMIT {
+            let remaining = GOVERNED_GIT_OUTPUT_LIMIT - retained.len();
+            retained.extend_from_slice(&buffer[..read.min(remaining)]);
+        }
+    }
+    Ok(GovernedGitCapturedStream {
+        retained,
+        truncated: total > GOVERNED_GIT_OUTPUT_LIMIT,
+    })
+}
+
+struct GovernedGitProcessGroupGuard {
+    #[cfg(unix)]
+    pgid: Option<i32>,
+    armed: bool,
+}
+
+impl GovernedGitProcessGroupGuard {
+    fn new(child_id: u32) -> Self {
+        Self {
+            #[cfg(unix)]
+            pgid: i32::try_from(child_id).ok(),
+            armed: true,
+        }
+    }
+
+    fn kill_now(&mut self) {
+        if !self.armed {
+            return;
+        }
+        #[cfg(unix)]
+        if let Some(pgid) = self.pgid {
+            // SAFETY: the child was spawned with `process_group(0)`, so the
+            // negative id targets only that isolated Git process group.
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+        self.armed = false;
+    }
+}
+
+impl Drop for GovernedGitProcessGroupGuard {
+    fn drop(&mut self) {
+        self.kill_now();
+    }
+}
+
+fn scrub_governed_git_environment(command: &mut Command) {
+    command.env_clear();
+    for name in [
+        "PATH", "HOME", "TERM", "LANG", "LC_ALL", "TMPDIR", "TMP", "TEMP",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+}
+
+fn run_bounded_governed_git(
+    workspace_root: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<GovernedGitOutput, DesktopBridgeError> {
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(workspace_root)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    scrub_governed_git_environment(&mut command);
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| DesktopBridgeError::GovernedTaskFailed {
+            message: format!("run Git governed-launch preflight: {error}"),
+        })?;
+    let mut process_group = GovernedGitProcessGroupGuard::new(child.id());
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| DesktopBridgeError::GovernedTaskFailed {
+            message: "Git governed-launch preflight stdout was unavailable".to_string(),
+        })?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| DesktopBridgeError::GovernedTaskFailed {
+            message: "Git governed-launch preflight stderr was unavailable".to_string(),
+        })?;
+    let (stdout_tx, stdout_rx) = mpsc::sync_channel(1);
+    let (stderr_tx, stderr_rx) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = stdout_tx.send(capture_governed_git_stream(stdout));
+    });
+    thread::spawn(move || {
+        let _ = stderr_tx.send(capture_governed_git_stream(stderr));
+    });
+
+    let started = Instant::now();
+    let (status, timed_out) = loop {
+        if let Some(status) =
+            child
+                .try_wait()
+                .map_err(|error| DesktopBridgeError::GovernedTaskFailed {
+                    message: format!("wait for Git governed-launch preflight: {error}"),
+                })?
+        {
+            // A hook may have backgrounded descendants that inherited the
+            // output pipes. Close the entire isolated group before draining.
+            process_group.kill_now();
+            break (status, false);
+        }
+        if started.elapsed() >= timeout {
+            process_group.kill_now();
+            let _ = child.kill();
+            let reap_deadline = Instant::now() + GOVERNED_GIT_OUTPUT_DRAIN_TIMEOUT;
+            let status =
+                loop {
+                    if let Some(status) = child.try_wait().map_err(|error| {
+                        DesktopBridgeError::GovernedTaskFailed {
+                            message: format!(
+                                "reap timed-out Git governed-launch preflight: {error}"
+                            ),
+                        }
+                    })? {
+                        break status;
+                    }
+                    if Instant::now() >= reap_deadline {
+                        return Err(DesktopBridgeError::GovernedTaskFailed {
+                        message:
+                            "timed-out Git governed-launch preflight did not exit after termination"
+                                .to_string(),
+                    });
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                };
+            break (status, true);
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+
+    let stdout = stdout_rx
+        .recv_timeout(GOVERNED_GIT_OUTPUT_DRAIN_TIMEOUT)
+        .map_err(|_| DesktopBridgeError::GovernedTaskFailed {
+            message: "Git governed-launch preflight stdout did not close within the bound"
+                .to_string(),
+        })?
+        .map_err(|error| DesktopBridgeError::GovernedTaskFailed {
+            message: format!("read Git governed-launch preflight stdout: {error}"),
+        })?;
+    let _stderr = stderr_rx
+        .recv_timeout(GOVERNED_GIT_OUTPUT_DRAIN_TIMEOUT)
+        .map_err(|_| DesktopBridgeError::GovernedTaskFailed {
+            message: "Git governed-launch preflight stderr did not close within the bound"
+                .to_string(),
+        })?
+        .map_err(|error| DesktopBridgeError::GovernedTaskFailed {
+            message: format!("read Git governed-launch preflight stderr: {error}"),
+        })?;
+
+    Ok(GovernedGitOutput {
+        status,
+        stdout: stdout.retained,
+        stdout_truncated: stdout.truncated,
+        timed_out,
+    })
+}
+
+fn observe_clean_git_head_with_timeout(
+    workspace_root: &str,
+    timeout: Duration,
+) -> Result<String, DesktopBridgeError> {
+    fn git_text(
+        workspace_root: &str,
+        args: &[&str],
+        timeout: Duration,
+    ) -> Result<String, DesktopBridgeError> {
+        let output = run_bounded_governed_git(workspace_root, args, timeout)?;
+        if output.timed_out {
+            return Err(DesktopBridgeError::GovernedTaskFailed {
+                message: format!(
+                    "Git governed-launch preflight timed out after {} ms",
+                    timeout.as_millis()
+                ),
+            });
+        }
+        if !output.status.success() {
+            return Err(DesktopBridgeError::GovernedTaskFailed {
+                message: "closed-loop governed launch requires a valid Git worktree".to_string(),
+            });
+        }
+        if output.stdout_truncated {
+            return Err(DesktopBridgeError::GovernedTaskFailed {
+                message: "Git governed-launch preflight exceeded its output bound".to_string(),
+            });
+        }
+        String::from_utf8(output.stdout)
+            .map(|value| value.trim().to_string())
+            .map_err(|_| DesktopBridgeError::GovernedTaskFailed {
+                message: "Git governed-launch preflight returned non-UTF-8 output".to_string(),
+            })
+    }
+
+    let canonical = std::fs::canonicalize(workspace_root).map_err(|error| {
+        DesktopBridgeError::GovernedTaskFailed {
+            message: format!("canonicalize governed Git workspace: {error}"),
+        }
+    })?;
+    let root = git_text(workspace_root, &["rev-parse", "--show-toplevel"], timeout)?;
+    let git_root =
+        std::fs::canonicalize(root).map_err(|error| DesktopBridgeError::GovernedTaskFailed {
+            message: format!("canonicalize governed Git root: {error}"),
+        })?;
+    if canonical != git_root {
+        return Err(DesktopBridgeError::GovernedTaskFailed {
+            message: "closed-loop governed workspace must equal the Git worktree root".to_string(),
+        });
+    }
+    if !git_text(
+        workspace_root,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+        timeout,
+    )?
+    .is_empty()
+    {
+        return Err(DesktopBridgeError::GovernedTaskFailed {
+            message: "closed-loop governed launch requires a clean committed workspace".to_string(),
+        });
+    }
+    let oid = git_text(
+        workspace_root,
+        &["rev-parse", "--verify", "HEAD^{commit}"],
+        timeout,
+    )?;
+    if !matches!(oid.len(), 40 | 64)
+        || !oid
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(DesktopBridgeError::GovernedTaskFailed {
+            message: "closed-loop governed launch could not resolve a commit OID".to_string(),
+        });
+    }
+    Ok(oid)
+}
+
+fn observe_clean_git_head(workspace_root: &str) -> Result<String, DesktopBridgeError> {
+    observe_clean_git_head_with_timeout(workspace_root, GOVERNED_GIT_PROBE_TIMEOUT)
+}
+
 fn new_governed_request_id(prefix: &str) -> impulse_ops::governed_task::GovernedRequestId {
     impulse_ops::governed_task::GovernedRequestId::try_new(format!(
         "desktop-{prefix}-{}",
@@ -1519,6 +1887,7 @@ fn validate_registered_task(
         || task.task != registration.task
         || task.acceptance_criteria != registration.acceptance_criteria
         || task.approval_policy != registration.approval_policy
+        || task.verification_profile != registration.verification_profile
         || task.role_assignment != registration.role_assignment
         || task.role_compatibility != registration.role_compatibility
         || task.agent_id != registration.agent_id
@@ -1588,6 +1957,7 @@ fn same_governed_task_identity(left: &GovernedTaskRun, right: &GovernedTaskRun) 
         && left.task == right.task
         && left.acceptance_criteria == right.acceptance_criteria
         && left.approval_policy == right.approval_policy
+        && left.verification_profile == right.verification_profile
         && left.role_assignment == right.role_assignment
         && left.role_compatibility == right.role_compatibility
         && left.runtime_id == right.runtime_id
@@ -1847,6 +2217,7 @@ fn runtime_env(
     command: &str,
     workspace: Option<&WorkspaceTarget>,
     governed_task: Option<&GovernedTaskRun>,
+    governed_routing: Option<&GovernedRoutingMetadata>,
 ) -> Vec<(&'static str, String)> {
     let mut env = vec![
         ("IMPULSE_AGENT_ID", agent_id.to_string()),
@@ -1864,6 +2235,19 @@ fn runtime_env(
     }
     if let Some(task) = governed_task {
         env.push(("IMPULSE_GOVERNED_TASK_ID", task.id.to_string()));
+        env.push(("IMPULSE_PROJECT_ID", task.project_id.clone()));
+        if let Some(profile) = task.verification_profile {
+            let profile = match profile {
+                GovernedVerificationProfile::RustWorkspaceV1 => "rust_workspace_v1",
+            };
+            env.push(("IMPULSE_GOVERNED_VERIFICATION_PROFILE", profile.to_string()));
+        }
+    }
+    if governed_task.is_some_and(|task| task.verification_profile.is_some()) {
+        if let Some(routing) = governed_routing {
+            env.push(("IMPULSE_SOCKET_PATH", routing.socket_path.clone()));
+            env.push(("IMPULSE_CONTROL_CLI", routing.control_cli.clone()));
+        }
     }
     if let Some(assignment) = &request.role_assignment {
         env.push(("IMPULSE_ROLE_ID", assignment.role.to_string()));
@@ -2042,6 +2426,7 @@ mod tests {
                 task: registration.task,
                 acceptance_criteria: registration.acceptance_criteria,
                 approval_policy: ApprovalPolicy::OperatorRequired,
+                verification_profile: registration.verification_profile,
                 role_assignment: registration.role_assignment,
                 role_compatibility: registration.role_compatibility,
                 runtime_id: registration.runtime_id,
@@ -2161,6 +2546,8 @@ mod tests {
             role: None,
             task: None,
             role_assignment: None,
+            acceptance_criteria: Vec::new(),
+            verification_profile: None,
             target: None,
         }
     }
@@ -2174,6 +2561,136 @@ mod tests {
     }
 
     // --- spawn validation guards (return before any real PTY spawn) ---
+
+    #[test]
+    fn test_profile_without_role_fails_before_registration_or_pty_creation() {
+        let (runtime, gateway) = runtime_with_task_gateway();
+        let workspace = tempfile::tempdir().expect("temporary governed workspace");
+        let marker = workspace.path().join("profile-without-role-created-pty");
+        let mut request = spawn_request(24, 80, Some("sh"));
+        request.agent_id = Some("profile-without-role".to_string());
+        request.args = vec!["-c".to_string(), format!("touch {}", marker.display())];
+        request.cwd = Some(workspace.path().display().to_string());
+        request.workspace = Some(WorkspaceTarget::from_root(
+            workspace.path().display().to_string(),
+        ));
+        request.verification_profile = Some(GovernedVerificationProfile::RustWorkspaceV1);
+
+        let error = runtime.spawn_agent(request).unwrap_err();
+        assert!(matches!(
+            error,
+            DesktopBridgeError::InvalidTerminalRequest { ref message }
+                if message.contains("governed Builder role")
+        ));
+        assert!(
+            gateway
+                .tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty(),
+            "invalid profiled launch must not register a task"
+        );
+        assert!(
+            !marker.exists(),
+            "invalid profiled launch must not create a PTY"
+        );
+    }
+
+    #[test]
+    fn test_acceptance_criteria_without_role_fail_before_registration_or_pty_creation() {
+        let (runtime, gateway) = runtime_with_task_gateway();
+        let workspace = tempfile::tempdir().expect("temporary governed workspace");
+        let marker = workspace.path().join("criteria-without-role-created-pty");
+        let mut request = spawn_request(24, 80, Some("sh"));
+        request.agent_id = Some("criteria-without-role".to_string());
+        request.args = vec!["-c".to_string(), format!("touch {}", marker.display())];
+        request.cwd = Some(workspace.path().display().to_string());
+        request.workspace = Some(WorkspaceTarget::from_root(
+            workspace.path().display().to_string(),
+        ));
+        request.acceptance_criteria = vec!["must remain governed".to_string()];
+
+        let error = runtime.spawn_agent(request).unwrap_err();
+        assert!(matches!(
+            error,
+            DesktopBridgeError::InvalidTerminalRequest { ref message }
+                if message.contains("governed Builder role")
+        ));
+        assert!(
+            gateway
+                .tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty(),
+            "criteria without a role must not register a task"
+        );
+        assert!(
+            !marker.exists(),
+            "criteria without a role must not create a PTY"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_governed_git_preflight_bounds_and_reaps_hanging_fsmonitor_tree() {
+        let temp = tempfile::tempdir().expect("temporary Git preflight fixture");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("create Git workspace");
+        let run_git = |args: &[&str]| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(&workspace)
+                .args(args)
+                .status()
+                .expect("run Git fixture command");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run_git(&["init", "--quiet"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        run_git(&["config", "user.name", "Impulse Test"]);
+        run_git(&["commit", "--allow-empty", "--quiet", "-m", "initial"]);
+
+        let escaped_marker = temp.path().join("escaped-fsmonitor-descendant");
+        let fsmonitor = temp.path().join("hanging-fsmonitor.sh");
+        std::fs::write(
+            &fsmonitor,
+            format!(
+                "#!/bin/sh\n(sleep 1; : > '{}') &\nwait\n",
+                escaped_marker.display()
+            ),
+        )
+        .expect("write hanging fsmonitor");
+        let mut permissions = std::fs::metadata(&fsmonitor).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fsmonitor, permissions).expect("mark fsmonitor executable");
+        run_git(&[
+            "config",
+            "core.fsmonitor",
+            fsmonitor.to_str().expect("UTF-8 fsmonitor path"),
+        ]);
+
+        let started = Instant::now();
+        let error = observe_clean_git_head_with_timeout(
+            workspace.to_str().expect("UTF-8 workspace path"),
+            Duration::from_millis(500),
+        )
+        .expect_err("hanging fsmonitor must hit the bounded Git preflight deadline");
+        assert!(matches!(
+            error,
+            DesktopBridgeError::GovernedTaskFailed { ref message }
+                if message.contains("timed out")
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "Git preflight must return within its cleanup bound"
+        );
+
+        thread::sleep(Duration::from_millis(700));
+        assert!(
+            !escaped_marker.exists(),
+            "timed-out Git preflight must kill background fsmonitor descendants"
+        );
+    }
 
     #[test]
     fn test_spawn_agent_zero_rows_returns_invalid_request() {
@@ -2556,6 +3073,62 @@ mod tests {
                 session_id: snapshot.agent_id,
             })
             .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_profiled_governed_spawn_requires_routing_before_task_registration() {
+        let gateway = Arc::new(TestGovernedTaskGateway::default());
+        let gateway_trait: Arc<dyn GovernedTaskGateway> = gateway.clone();
+        let runtime = DesktopRuntime::builder()
+            .with_governed_task_gateway(gateway_trait)
+            .build();
+        let workspace = tempfile::tempdir().expect("temporary governed workspace");
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(workspace.path())
+                .args(args)
+                .status()
+                .expect("run Git fixture command");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run_git(&["init", "--quiet"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        run_git(&["config", "user.name", "Impulse Test"]);
+        run_git(&["commit", "--allow-empty", "--quiet", "-m", "initial"]);
+
+        let marker = workspace.path().join("profiled-pty-created");
+        let root = workspace.path().display().to_string();
+        let mut request = spawn_request(24, 80, Some("sh"));
+        request.agent_id = Some("missing-profiled-routing".to_string());
+        request.args = vec!["-c".to_string(), format!("touch {}", marker.display())];
+        request.cwd = Some(root.clone());
+        request.workspace = Some(WorkspaceTarget::from_root(root));
+        request.task = Some("prove control CLI pre-registration gate".to_string());
+        request.role_assignment = Some(role_assignment(
+            "workspace.target",
+            EnforcementStrength::Mediated,
+            true,
+        ));
+        request.acceptance_criteria = vec!["the daemon owns evidence production".to_string()];
+        request.verification_profile = Some(GovernedVerificationProfile::RustWorkspaceV1);
+
+        let error = runtime.spawn_agent(request).unwrap_err();
+        assert!(matches!(
+            error,
+            DesktopBridgeError::GovernedTaskFailed { ref message }
+                if message.contains("requires an executable Impulse control CLI")
+        ));
+        assert!(
+            gateway
+                .tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty(),
+            "routing failure must happen before daemon task registration"
+        );
+        assert!(!marker.exists(), "routing failure must prevent PTY work");
     }
 
     #[test]
@@ -2958,7 +3531,7 @@ mod tests {
             true,
         ));
 
-        let env = runtime_env("agent-1", &request, "sh", None, None);
+        let env = runtime_env("agent-1", &request, "sh", None, None, None);
         assert!(env
             .iter()
             .any(|(key, value)| *key == "IMPULSE_TASK" && value == "inspect compatibility"));

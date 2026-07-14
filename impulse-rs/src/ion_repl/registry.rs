@@ -19,6 +19,7 @@ use std::sync::Arc;
 use crate::tooling::ToolRegistry;
 
 use super::tool_bridge::DynamicToolBridge;
+use super::tool_claim::GovernedSubmitClaimTool;
 use super::tool_verify::IonVerifyTool;
 use super::tools::ReplTool;
 
@@ -70,6 +71,7 @@ impl ReplToolRegistry {
     pub fn with_defaults() -> Self {
         let mut registry = Self::new();
         registry.register(Box::new(IonVerifyTool));
+        registry.register(Box::new(GovernedSubmitClaimTool));
 
         let dynamic = Arc::new(ToolRegistry::with_defaults());
         registry.register(Box::new(DynamicToolBridge::new(
@@ -112,7 +114,8 @@ mod tests {
         assert!(registry.get("file_read").is_some());
         assert!(registry.get("file_write").is_some());
         assert!(registry.get("bash_exec").is_some());
-        assert_eq!(registry.len(), 4);
+        assert!(registry.get("governed_submit_claim").is_some());
+        assert_eq!(registry.len(), 5);
     }
 
     #[test]

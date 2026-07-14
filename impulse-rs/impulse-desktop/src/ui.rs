@@ -5,12 +5,13 @@ use impulse_ops::{
     agent_registry::AgentPlatformInfo,
     governed_task::{
         GovernedActor, GovernedActorKind, GovernedRequestId, GovernedReviewState,
-        GovernedTaskMutation, GovernedTaskMutationRequest, GovernedTaskRun, OperatorDecisionInput,
-        OperatorDecisionKind, SupervisorVerdictInput, SupervisorVerdictKind,
+        GovernedTaskMutation, GovernedTaskMutationRequest, GovernedTaskRun,
+        GovernedVerificationProfile, OperatorDecisionInput, OperatorDecisionKind,
+        SupervisorVerdictInput, SupervisorVerdictKind,
     },
     role_assignment::{
-        evaluate_role_compatibility, AgentRoleAssignment, AgentRoleId, EnforcementStrength,
-        RoleAssignmentError, RoleCapabilityRequirement, RuntimeCapabilityId,
+        canonical_governed_builder_assignment, evaluate_role_compatibility, AgentRoleAssignment,
+        EnforcementStrength, RoleAssignmentError,
     },
     ProjectOpsSnapshot,
 };
@@ -822,26 +823,7 @@ fn McpReadOnlyRow(tool_name: String, on_invoke: EventHandler<McpInvokeRequest>) 
 /// runtime. Structural filesystem scope is requested as an optional capability
 /// so its current absence remains visible without overstating cwd mediation.
 pub fn builder_role_assignment() -> Result<AgentRoleAssignment, RoleAssignmentError> {
-    Ok(AgentRoleAssignment {
-        role: AgentRoleId::try_new("builder")?,
-        requirements: vec![
-            RoleCapabilityRequirement {
-                capability: RuntimeCapabilityId::try_new("workspace.target")?,
-                minimum_enforcement: EnforcementStrength::Mediated,
-                mandatory: true,
-            },
-            RoleCapabilityRequirement {
-                capability: RuntimeCapabilityId::try_new("process.lifecycle")?,
-                minimum_enforcement: EnforcementStrength::Mediated,
-                mandatory: true,
-            },
-            RoleCapabilityRequirement {
-                capability: RuntimeCapabilityId::try_new("filesystem.scoped")?,
-                minimum_enforcement: EnforcementStrength::Structural,
-                mandatory: false,
-            },
-        ],
-    })
+    Ok(canonical_governed_builder_assignment())
 }
 
 /// Builds the exact governed launch request accepted by the workspace launcher.
@@ -849,28 +831,43 @@ pub fn builder_role_assignment() -> Result<AgentRoleAssignment, RoleAssignmentEr
 /// This is also the launch preflight: missing or stale catalog entries,
 /// evaluator errors, blocked role compatibility, blank tasks, and invalid
 /// launch roots all return an error before a request can reach the host bridge.
+pub struct GovernedAgentSpawnInput<'a> {
+    pub launch_root: &'a str,
+    pub selected_platform_id: &'a str,
+    pub agent_id: &'a str,
+    pub command: &'a str,
+    pub task: &'a str,
+    pub acceptance_criteria: &'a str,
+}
+
 pub fn build_governed_agent_spawn_request(
     workspaces: &[WorkspaceEntry],
     platforms: &[AgentPlatformInfo],
-    launch_root: &str,
-    selected_platform_id: &str,
-    agent_id: &str,
-    command: &str,
-    task: &str,
+    input: GovernedAgentSpawnInput<'_>,
 ) -> Result<AgentSpawnRequest, String> {
-    let root = launch_root.trim();
+    let root = input.launch_root.trim();
     if root.is_empty() {
         return Err("a workspace root is required".to_string());
     }
 
-    let task = task.trim();
+    let task = input.task.trim();
     if task.is_empty() {
         return Err("a governed task is required".to_string());
+    }
+    let acceptance_criteria = input
+        .acceptance_criteria
+        .lines()
+        .map(str::trim)
+        .filter(|criterion| !criterion.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if acceptance_criteria.is_empty() {
+        return Err("at least one acceptance criterion is required".to_string());
     }
 
     let descriptor = platforms
         .iter()
-        .find(|candidate| candidate.id.as_str() == selected_platform_id)
+        .find(|candidate| candidate.id.as_str() == input.selected_platform_id)
         .ok_or_else(|| "the selected platform is absent from the current catalog".to_string())?;
     let role_assignment = builder_role_assignment()
         .map_err(|error| format!("invalid Builder role assignment: {error}"))?;
@@ -884,9 +881,9 @@ pub fn build_governed_agent_spawn_request(
         return Err("the selected platform is blocked for the Builder role".to_string());
     }
 
-    let platform = AgentPlatformId::try_new(selected_platform_id.to_string())
+    let platform = AgentPlatformId::try_new(input.selected_platform_id.to_string())
         .map_err(|error| format!("invalid selected platform: {error}"))?;
-    let agent_id = optional_text(agent_id.to_string());
+    let agent_id = optional_text(input.agent_id.to_string());
     let session_id = agent_id.as_ref().map(|value| format!("{value}-session"));
     let workspace = workspaces
         .iter()
@@ -898,7 +895,7 @@ pub fn build_governed_agent_spawn_request(
         agent_id,
         session_id,
         platform,
-        command: optional_text(command.to_string()),
+        command: optional_text(input.command.to_string()),
         args: Vec::new(),
         cwd: Some(root.to_string()),
         env: HashMap::new(),
@@ -909,6 +906,10 @@ pub fn build_governed_agent_spawn_request(
         role: None,
         task: Some(task.to_string()),
         role_assignment: Some(role_assignment),
+        acceptance_criteria,
+        verification_profile: Some(
+            impulse_ops::governed_task::GovernedVerificationProfile::RustWorkspaceV1,
+        ),
         target: None,
     })
 }
@@ -939,6 +940,7 @@ fn WorkspaceLaunchPanel(
     let mut agent_id = use_signal(String::new);
     let mut command = use_signal(String::new);
     let mut task = use_signal(String::new);
+    let mut acceptance_criteria = use_signal(String::new);
 
     let first_workspace_root = workspaces
         .first()
@@ -996,11 +998,14 @@ fn WorkspaceLaunchPanel(
     let launch_request = build_governed_agent_spawn_request(
         &workspaces,
         &platforms,
-        &launch_root,
-        &selected_platform_id,
-        &agent_id(),
-        &command(),
-        &task(),
+        GovernedAgentSpawnInput {
+            launch_root: &launch_root,
+            selected_platform_id: &selected_platform_id,
+            agent_id: &agent_id(),
+            command: &command(),
+            task: &task(),
+            acceptance_criteria: &acceptance_criteria(),
+        },
     );
     let can_launch = launch_request.is_ok();
     let request_for_launch = launch_request.ok();
@@ -1011,9 +1016,13 @@ fn WorkspaceLaunchPanel(
             header { class: "section-header",
                 div {
                     h2 { "Workspace Launcher" }
-                    p { "Register a folder, then launch any agent from the runtime registry inside it." }
+                    p { "Register a Rust workspace, then launch a governed Builder from the runtime registry inside it." }
                 }
-                span { class: "workspace-launch-badge", "MCP audited" }
+                span {
+                    class: "workspace-launch-badge",
+                    "data-verification-profile": "rust_workspace_v1",
+                    "MCP audited · Rust-only · rust_workspace_v1"
+                }
             }
             div { class: "workspace-launch-grid",
                 label { class: "workspace-field wide",
@@ -1128,6 +1137,18 @@ fn WorkspaceLaunchPanel(
                         placeholder: "Describe the explicit assignment",
                         value: "{task}",
                         oninput: move |evt| task.set(evt.value()),
+                    }
+                }
+                label {
+                    class: "workspace-field wide",
+                    "data-field": "launch-acceptance-criteria",
+                    span { "Acceptance criteria" }
+                    textarea {
+                        required: true,
+                        "aria-required": "true",
+                        placeholder: "One verifiable criterion per line",
+                        value: "{acceptance_criteria}",
+                        oninput: move |evt| acceptance_criteria.set(evt.value()),
                     }
                 }
                 div {
@@ -1484,6 +1505,9 @@ fn GovernedTaskCard(
     let latest_claim = task.latest_claim().cloned();
     let latest_verification = task.latest_verification().cloned();
     let latest_supervisor_verdict = task.latest_supervisor_verdict().cloned();
+    let verification_profile = task
+        .verification_profile
+        .map(governed_verification_profile_label);
 
     let recommend_task = task.clone();
     let changes_task = task.clone();
@@ -1502,6 +1526,13 @@ fn GovernedTaskCard(
             }
             p { "{task.runtime_id} · {task.agent_id} · revision {task.revision}" }
             p { class: "governed-task-meta", "execution {execution_state} · {evidence_count} verification record(s)" }
+            if let Some(profile) = verification_profile {
+                p {
+                    class: "governed-task-profile",
+                    "data-verification-profile": "{profile}",
+                    "Rust-only verification profile · {profile}"
+                }
+            }
             if !task.acceptance_criteria.is_empty() {
                 section { class: "governed-task-evidence",
                     h4 { "Acceptance criteria" }
@@ -1599,7 +1630,7 @@ fn GovernedTaskCard(
             if matches!(
                 task.review_state,
                 GovernedReviewState::VerificationFailed | GovernedReviewState::AwaitingSupervisor
-            ) {
+            ) && task.verification_profile.is_none() {
                 div { class: "review-actions governed-task-actions",
                     if task.review_state == GovernedReviewState::AwaitingSupervisor {
                         button {
@@ -1645,6 +1676,33 @@ fn GovernedTaskCard(
                         },
                         "Escalate"
                     }
+                }
+            }
+            if task.verification_profile.is_some()
+                && matches!(
+                    task.review_state,
+                    GovernedReviewState::AwaitingClaim
+                        | GovernedReviewState::AwaitingVerification
+                        | GovernedReviewState::VerificationFailed
+                        | GovernedReviewState::AwaitingSupervisor
+                        | GovernedReviewState::ChangesRequested
+                )
+            {
+                div {
+                    class: "governed-producer-guidance",
+                    "data-source": "daemon_owned_producer",
+                    strong { "Daemon-owned evidence path" }
+                    if matches!(
+                        task.review_state,
+                        GovernedReviewState::AwaitingClaim | GovernedReviewState::ChangesRequested
+                    ) {
+                        code { "\"$IMPULSE_CONTROL_CLI\" --daemon governed-claim --summary \"<completion summary>\"" }
+                    } else if task.review_state == GovernedReviewState::AwaitingVerification {
+                        code { "\"$IMPULSE_CONTROL_CLI\" --daemon governed-verify" }
+                    } else {
+                        code { "\"$IMPULSE_CONTROL_CLI\" --daemon governed-review" }
+                    }
+                    p { "Run the command from the governed terminal. Impulse derives the actor, subject, evidence, and Supervisor verdict; this UI cannot compose them." }
                 }
             }
             if task.review_state == GovernedReviewState::AwaitingOperator {
@@ -1694,6 +1752,12 @@ fn governed_review_state_label(state: GovernedReviewState) -> &'static str {
         GovernedReviewState::AwaitingOperator => "awaiting operator",
         GovernedReviewState::Accepted => "accepted",
         GovernedReviewState::Rejected => "rejected",
+    }
+}
+
+fn governed_verification_profile_label(profile: GovernedVerificationProfile) -> &'static str {
+    match profile {
+        GovernedVerificationProfile::RustWorkspaceV1 => "rust_workspace_v1",
     }
 }
 

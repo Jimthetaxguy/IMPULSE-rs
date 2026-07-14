@@ -608,4 +608,40 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Submit a closed-loop Builder claim through the project daemon.
+    GovernedClaim {
+        /// Project id injected by Impulse (`IMPULSE_PROJECT_ID`) when omitted.
+        #[arg(long)]
+        project_id: Option<String>,
+        /// Governed task id injected by Impulse (`IMPULSE_GOVERNED_TASK_ID`) when omitted.
+        #[arg(long)]
+        task_id: Option<String>,
+        /// Builder-authored completion summary. Actor and Git subject are daemon-derived.
+        #[arg(long)]
+        summary: String,
+        /// Project artifact IDs supporting the claim.
+        #[arg(long = "artifact-id")]
+        artifact_ids: Vec<String>,
+        /// Output the acknowledged daemon-owned task as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ask the daemon to execute the governed task's closed verification profile.
+    GovernedVerify {
+        #[arg(long)]
+        project_id: Option<String>,
+        #[arg(long)]
+        task_id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ask the configured Impulse Agent to perform a strict governed Supervisor review.
+    GovernedReview {
+        #[arg(long)]
+        project_id: Option<String>,
+        #[arg(long)]
+        task_id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
 }
