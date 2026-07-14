@@ -91,6 +91,23 @@ pub fn write_capabilities_manifest(
     let agent_registry = AgentRegistry::registry_for_runtime()?;
     let manifest = CapabilitiesManifest::from_registries(registry, &agent_registry);
     let path = base_path.join(DEFAULT_MANIFEST_FILE);
+    if let Ok(existing) = CapabilitiesManifest::load(&path) {
+        let mut existing_semantics = serde_json::to_value(&existing)?;
+        let mut refreshed_semantics = serde_json::to_value(&manifest)?;
+        if let Some(object) = existing_semantics.as_object_mut() {
+            object.remove("generated_at");
+        }
+        if let Some(object) = refreshed_semantics.as_object_mut() {
+            object.remove("generated_at");
+        }
+        if existing_semantics == refreshed_semantics {
+            // `generated_at` describes when this semantic manifest was first
+            // produced, not daemon startup time. Keeping the existing file
+            // avoids dirtying a governed Git subject with a timestamp-only
+            // rewrite on every launch.
+            return Ok(path);
+        }
+    }
     Storage::atomic_write_path(&path, manifest.to_json()?.as_bytes())?;
     Ok(path)
 }
@@ -189,6 +206,31 @@ mod tests {
                 manifest.supported_agents.iter().any(|a| a == agent),
                 "manifest should advertise support for {agent}"
             );
+        }
+    }
+
+    #[test]
+    fn unchanged_manifest_preserves_generated_at_without_rewrite() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let registry = ToolRegistry::with_defaults();
+        let path = write_capabilities_manifest(temp.path(), &registry).unwrap();
+        let mut existing = CapabilitiesManifest::load(&path).unwrap();
+        existing.generated_at = "2026-07-14T00:00:00Z".to_string();
+        Storage::atomic_write_path(&path, existing.to_json().unwrap().as_bytes()).unwrap();
+        #[cfg(unix)]
+        let inode_before = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&path).unwrap().ino()
+        };
+
+        let refreshed_path = write_capabilities_manifest(temp.path(), &registry).unwrap();
+        let refreshed = CapabilitiesManifest::load(&refreshed_path).unwrap();
+
+        assert_eq!(refreshed.generated_at, "2026-07-14T00:00:00Z");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode_before);
         }
     }
 

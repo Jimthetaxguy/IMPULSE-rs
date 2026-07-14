@@ -18,6 +18,7 @@ pub mod history;
 pub mod registry;
 pub mod router;
 pub mod tool_bridge;
+pub mod tool_claim;
 pub mod tool_verify;
 pub mod tools;
 

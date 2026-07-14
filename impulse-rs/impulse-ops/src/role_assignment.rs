@@ -171,6 +171,36 @@ pub struct AgentRoleAssignment {
     pub requirements: Vec<RoleCapabilityRequirement>,
 }
 
+pub const GOVERNED_BUILDER_ROLE_ID: &str = "builder";
+
+/// Canonical first product-role contract for a profiled governed launch.
+///
+/// Keeping this in `impulse-ops` makes Desktop preview, daemon registration,
+/// and raw IPC validation compare the same requirements instead of allowing
+/// the UI to be the only source of truth.
+pub fn canonical_governed_builder_assignment() -> AgentRoleAssignment {
+    AgentRoleAssignment {
+        role: AgentRoleId(GOVERNED_BUILDER_ROLE_ID.to_string()),
+        requirements: vec![
+            RoleCapabilityRequirement {
+                capability: RuntimeCapabilityId::builtin("workspace.target"),
+                minimum_enforcement: EnforcementStrength::Mediated,
+                mandatory: true,
+            },
+            RoleCapabilityRequirement {
+                capability: RuntimeCapabilityId::builtin("process.lifecycle"),
+                minimum_enforcement: EnforcementStrength::Mediated,
+                mandatory: true,
+            },
+            RoleCapabilityRequirement {
+                capability: RuntimeCapabilityId::builtin("filesystem.scoped"),
+                minimum_enforcement: EnforcementStrength::Structural,
+                mandatory: false,
+            },
+        ],
+    }
+}
+
 /// One role requirement compared with the runtime's declared enforcement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityCompatibility {

@@ -10,7 +10,7 @@ pub mod governed_task;
 pub mod role_assignment;
 
 /// Shared daemon protocol version for GUI/operator workbench compatibility.
-pub const DAEMON_PROTOCOL_VERSION: u32 = 4;
+pub const DAEMON_PROTOCOL_VERSION: u32 = 5;
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpsError {
@@ -80,6 +80,15 @@ pub enum WorkbenchDaemonRequest {
     },
     MutateGovernedTask {
         request: governed_task::GovernedTaskMutationRequest,
+    },
+    SubmitGovernedClaim {
+        request: governed_task::GovernedClaimRequest,
+    },
+    RunGovernedVerification {
+        request: governed_task::GovernedVerificationRequest,
+    },
+    RunGovernedSupervisorReview {
+        request: governed_task::GovernedSupervisorReviewRequest,
     },
     GuardList,
     GetConflictHistory,

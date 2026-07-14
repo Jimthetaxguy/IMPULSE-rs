@@ -16,8 +16,8 @@ use impulse_desktop::ui::{
     builder_role_assignment, desktop_event_bridge_script, governed_task_mutation_bridge_script,
     mcp_invoke_bridge_script, review_decision_bridge_script, terminal_asset_paths,
     workspace_registration_bridge_script, BridgeStatusUpdate, DaemonOpsStatusUpdate,
-    DesktopBridgeMessage, DesktopBridgeStateMut, ReviewDecisionUiRequest, XTERM_CSS_PATH,
-    XTERM_FIT_JS_PATH, XTERM_JS_PATH,
+    DesktopBridgeMessage, DesktopBridgeStateMut, GovernedAgentSpawnInput, ReviewDecisionUiRequest,
+    XTERM_CSS_PATH, XTERM_FIT_JS_PATH, XTERM_JS_PATH,
 };
 use impulse_desktop::{
     default_builtin_mcp_tools, format_count, status_dot_class, status_label, AgentPlatformId,
@@ -117,9 +117,13 @@ fn test_workspace_launcher_renders_required_builder_compatibility_preflight() {
 
     let html = dioxus_ssr::render(&vdom);
     assert!(html.contains("data-field=\"launch-task\""));
+    assert!(html.contains("data-field=\"launch-acceptance-criteria\""));
     assert!(html.contains("aria-required=\"true\""));
     assert!(html.contains(">Task<"));
     assert!(html.contains(">Builder<"));
+    assert!(html.contains("data-verification-profile=\"rust_workspace_v1\""));
+    assert!(html.contains("Rust-only · rust_workspace_v1"));
+    assert!(!html.contains("launch any agent"));
     assert!(html.contains("degraded"));
     assert!(html.contains("workspace.target"));
     assert!(html.contains("process.lifecycle"));
@@ -154,11 +158,14 @@ fn governed_launch(
     build_governed_agent_spawn_request(
         &[governed_workspace()],
         platforms,
-        "/tmp/impulse",
-        selected_platform,
-        "builder-1",
-        "",
-        task,
+        GovernedAgentSpawnInput {
+            launch_root: "/tmp/impulse",
+            selected_platform_id: selected_platform,
+            agent_id: "builder-1",
+            command: "",
+            task,
+            acceptance_criteria: "workspace tests pass",
+        },
     )
 }
 
@@ -240,6 +247,11 @@ fn test_governed_request_builder_emits_trimmed_task_builder_assignment_and_legac
         Some(builder_role_assignment().expect("static Builder role profile"))
     );
     assert_eq!(request.role, None);
+    assert_eq!(request.acceptance_criteria, ["workspace tests pass"]);
+    assert_eq!(
+        request.verification_profile,
+        Some(impulse_ops::governed_task::GovernedVerificationProfile::RustWorkspaceV1)
+    );
 }
 
 #[derive(Clone, Default)]
@@ -1367,6 +1379,10 @@ fn test_agent_launch_bridge_script_routes_through_audited_mcp_spawn() {
         role: None,
         task: Some("Implement the governed launcher".to_string()),
         role_assignment: Some(role_assignment),
+        acceptance_criteria: vec!["workspace tests pass".to_string()],
+        verification_profile: Some(
+            impulse_ops::governed_task::GovernedVerificationProfile::RustWorkspaceV1,
+        ),
         target: None,
     });
 
@@ -2306,6 +2322,76 @@ fn test_shell_supervisor_route_renders_authoritative_governed_evidence_and_contr
     assert!(html.contains("Request changes"));
     assert!(html.contains("Escalate"));
     assert!(!html.contains(">Approve<"));
+}
+
+fn profiled_governed_task(
+    id: &str,
+    review_state: &str,
+) -> impulse_ops::governed_task::GovernedTaskRun {
+    serde_json::from_value(json!({
+        "id": id,
+        "revision": 1,
+        "project_id": "impulse-rs",
+        "workspace_root": "/tmp/impulse-rs",
+        "task": format!("Exercise {review_state} producer guidance"),
+        "acceptance_criteria": ["The daemon owns the producer record"],
+        "approval_policy": "operator_required",
+        "verification_profile": "rust_workspace_v1",
+        "runtime_id": "codex",
+        "agent_id": format!("worker-{id}"),
+        "execution_state": "running",
+        "review_state": review_state,
+        "claims": [],
+        "verifications": [],
+        "supervisor_verdicts": [],
+        "operator_decisions": [],
+        "events": [],
+        "created_at": "2026-07-13T20:00:00Z",
+        "updated_at": "2026-07-13T20:00:00Z"
+    }))
+    .expect("profiled governed task fixture")
+}
+
+#[test]
+fn test_profiled_governed_tasks_label_rust_only_and_route_all_producers_via_daemon() {
+    let snapshot = ProjectOpsSnapshot {
+        governed_tasks: vec![
+            profiled_governed_task("task-claim-guidance", "awaiting_claim"),
+            profiled_governed_task("task-verify-guidance", "awaiting_verification"),
+            profiled_governed_task("task-review-guidance", "awaiting_supervisor"),
+        ],
+        ..Default::default()
+    };
+    let mut vdom = VirtualDom::new_with_props(
+        DesktopShellWithSnapshot,
+        DesktopShellWithSnapshotProps {
+            snapshot,
+            runtime_agents: Vec::new(),
+            agent_platforms: Vec::new(),
+            workspaces: Vec::new(),
+            mcp_tools: Vec::new(),
+            last_invocations: Vec::new(),
+            review_queue: Vec::new(),
+            bridge_status: None,
+            daemon_ops_status: None,
+            initial_view: DesktopView::Supervisor,
+        },
+    );
+    vdom.rebuild_in_place();
+    let html = dioxus_ssr::render(&vdom);
+
+    assert!(html.contains("Rust-only verification profile · rust_workspace_v1"));
+    assert_eq!(
+        html.matches("data-verification-profile=\"rust_workspace_v1\"")
+            .count(),
+        4,
+        "the launcher and all three profiled task cards must identify the Rust-only profile"
+    );
+    assert_eq!(html.matches("class=\"governed-task-profile\"").count(), 3);
+    assert!(html.contains("&quot;$IMPULSE_CONTROL_CLI&quot; --daemon governed-claim"));
+    assert!(html.contains("&quot;$IMPULSE_CONTROL_CLI&quot; --daemon governed-verify"));
+    assert!(html.contains("&quot;$IMPULSE_CONTROL_CLI&quot; --daemon governed-review"));
+    assert!(!html.contains("$IMPULSE_CONTROL_CLI governed-"));
 }
 
 #[test]

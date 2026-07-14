@@ -21,6 +21,7 @@ async fn main() -> Result<()> {
     if cli.daemon {
         let socket_path = cli
             .socket
+            .or_else(|| std::env::var_os("IMPULSE_SOCKET_PATH").map(std::path::PathBuf::from))
             .unwrap_or_else(|| cli.impulse_dir.join("sockets").join("impulse.sock"));
         let client = client::DaemonClient::new(socket_path);
         handlers::daemon_dispatch::dispatch(cli.command, &cli.impulse_dir, &client, cli.format)

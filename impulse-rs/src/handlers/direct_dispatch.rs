@@ -593,6 +593,13 @@ where
                 .await
                 .context("Failed to handle ion-verify command")?;
         }
+        Commands::GovernedClaim { .. }
+        | Commands::GovernedVerify { .. }
+        | Commands::GovernedReview { .. } => {
+            anyhow::bail!(
+                "governed producer commands require --daemon so the project daemon remains authoritative"
+            );
+        }
     }
 
     Ok(())

@@ -764,7 +764,16 @@ pub(crate) async fn process_request(
         }
     }
     if let DaemonRequest::GetGovernedTask { ref project_id, .. }
-    | DaemonRequest::ListGovernedTasks { ref project_id } = request
+    | DaemonRequest::ListGovernedTasks { ref project_id }
+    | DaemonRequest::SubmitGovernedClaim {
+        request: impulse_ops::governed_task::GovernedClaimRequest { ref project_id, .. },
+    }
+    | DaemonRequest::RunGovernedVerification {
+        request: impulse_ops::governed_task::GovernedVerificationRequest { ref project_id, .. },
+    }
+    | DaemonRequest::RunGovernedSupervisorReview {
+        request: impulse_ops::governed_task::GovernedSupervisorReviewRequest { ref project_id, .. },
+    } = request
     {
         if let Err(error) = crate::validate::reject_control_chars(project_id, "project_id") {
             return respond_err(error);
@@ -819,10 +828,18 @@ pub(crate) async fn process_request(
             handle_governed_task_request(request, &state).await
         }
 
+        // Closed-loop callers trigger work but never supply derived actor,
+        // subject, command-evidence, or verdict payloads.
+        DaemonRequest::SubmitGovernedClaim { .. }
+        | DaemonRequest::RunGovernedVerification { .. } => {
+            handle_governed_producer_request(request, &state).await
+        }
+
         // Supervisor group
         DaemonRequest::GetSupervisorPermissions
         | DaemonRequest::SupervisorChat { .. }
-        | DaemonRequest::RunSupervisorAction { .. } => {
+        | DaemonRequest::RunSupervisorAction { .. }
+        | DaemonRequest::RunGovernedSupervisorReview { .. } => {
             handle_supervisor_request(
                 request,
                 &state,
@@ -905,10 +922,51 @@ pub(crate) async fn handle_governed_task_request(
     request: DaemonRequest,
     state: &SharedState,
 ) -> DaemonResponse {
+    // Generic lifecycle mutations and daemon-owned producer mutations share
+    // one per-task serialization boundary. Without this guard, a runtime-exit
+    // update can advance the revision while a verifier or Supervisor side
+    // effect is in flight, causing that side effect to be repeated on retry.
+    let _producer_guard = match &request {
+        DaemonRequest::MutateGovernedTask { request } => {
+            Some(state.acquire_governed_producer_lock(&request.task_id).await)
+        }
+        _ => None,
+    };
     let state = state.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
         match request {
             DaemonRequest::RegisterGovernedTask { registration } => {
+                if registration.verification_profile.is_some() {
+                    registration.validate()?;
+                    let assignment = registration
+                        .role_assignment
+                        .as_ref()
+                        .context("profiled governed task lost its Builder assignment")?;
+                    let supplied_compatibility = registration
+                        .role_compatibility
+                        .as_ref()
+                        .context("profiled governed task lost its runtime compatibility")?;
+                    let platform = impulse_ops::agent_registry::AgentPlatformId::try_new(
+                        registration.runtime_id.clone(),
+                    )?;
+                    let observed_compatibility =
+                        impulse_ops::agent_registry::AgentRegistry::registry_for_runtime()?
+                            .evaluate_role_compatibility(&platform, assignment)?;
+                    if supplied_compatibility != &observed_compatibility {
+                        anyhow::bail!(
+                            "profiled governed task compatibility must equal the daemon-observed runtime capability result"
+                        );
+                    }
+                    let observed = crate::governed_producers::observe_clean_git_subject(
+                        std::path::Path::new(&registration.workspace_root),
+                        None,
+                    )?;
+                    if registration.initial_subject_revision.as_deref() != Some(observed.as_str()) {
+                        anyhow::bail!(
+                            "profiled governed task initial revision must equal daemon-observed clean HEAD"
+                        );
+                    }
+                }
                 serde_json::to_value(state.register_governed_task(registration)?)
                     .context("Failed to serialize registered governed task")
             }
@@ -922,6 +980,23 @@ pub(crate) async fn handle_governed_task_request(
                     .context("Failed to serialize governed task list")
             }
             DaemonRequest::MutateGovernedTask { request } => {
+                if matches!(
+                    request.mutation,
+                    impulse_ops::governed_task::GovernedTaskMutation::SubmitClaim { .. }
+                        | impulse_ops::governed_task::GovernedTaskMutation::RecordVerification { .. }
+                        | impulse_ops::governed_task::GovernedTaskMutation::RecordSupervisorVerdict { .. }
+                ) {
+                    let task = state
+                        .get_governed_task(&request.project_id, &request.task_id)?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("governed task `{}` was not found", request.task_id)
+                        })?;
+                    if task.verification_profile.is_some() {
+                        anyhow::bail!(
+                            "profiled governed tasks require daemon-owned claim, verification, and Supervisor producer requests"
+                        );
+                    }
+                }
                 serde_json::to_value(state.mutate_governed_task(request)?)
                     .context("Failed to serialize governed task mutation")
             }
@@ -934,6 +1009,253 @@ pub(crate) async fn handle_governed_task_request(
         Ok(Ok(result)) => DaemonResponse::Ok { result },
         Ok(Err(error)) => respond_err(error),
         Err(error) => respond_err(format!("Governed task worker failed: {error}")),
+    }
+}
+
+fn require_current_governed_task(
+    state: &SharedState,
+    project_id: &str,
+    task_id: &impulse_ops::governed_task::GovernedTaskId,
+) -> Result<impulse_ops::governed_task::GovernedTaskRun> {
+    state
+        .get_governed_task(project_id, task_id)?
+        .ok_or_else(|| anyhow::anyhow!("governed task `{task_id}` was not found"))
+}
+
+async fn persist_governed_mutation(
+    state: &SharedState,
+    request: impulse_ops::governed_task::GovernedTaskMutationRequest,
+) -> Result<impulse_ops::governed_task::GovernedTaskRun> {
+    let state = state.clone();
+    tokio::task::spawn_blocking(move || state.mutate_governed_task(request))
+        .await
+        .context("governed producer persistence worker panicked")?
+}
+
+fn require_producer_request_state(
+    state: &SharedState,
+    task: &impulse_ops::governed_task::GovernedTaskRun,
+    request_id: &impulse_ops::governed_task::GovernedRequestId,
+    expected_revision: u64,
+) -> Result<bool> {
+    let replay = state.governed_producer_request_is_replay(request_id, &task.id)?;
+    if replay {
+        if task.revision <= expected_revision {
+            anyhow::bail!(
+                "governed producer replay receipt does not advance beyond expected revision {expected_revision}"
+            );
+        }
+        return Ok(true);
+    }
+    if task.revision != expected_revision {
+        anyhow::bail!(
+            "governed task revision conflict: expected {expected_revision}, current {}",
+            task.revision
+        );
+    }
+    Ok(false)
+}
+
+fn preflight_claim(
+    task: &impulse_ops::governed_task::GovernedTaskRun,
+    request: &impulse_ops::governed_task::GovernedClaimRequest,
+) -> Result<()> {
+    request.validate()?;
+    if !matches!(
+        task.execution_state,
+        impulse_ops::governed_task::GovernedExecutionState::Running
+            | impulse_ops::governed_task::GovernedExecutionState::RuntimeExited
+    ) {
+        anyhow::bail!("governed claim requires a launched or exited runtime");
+    }
+    if !matches!(
+        task.review_state,
+        impulse_ops::governed_task::GovernedReviewState::AwaitingClaim
+            | impulse_ops::governed_task::GovernedReviewState::ChangesRequested
+            | impulse_ops::governed_task::GovernedReviewState::VerificationFailed
+    ) {
+        anyhow::bail!("governed task review state does not accept a worker claim");
+    }
+    if task.claims.len() >= impulse_ops::governed_task::MAX_GOVERNED_RECORDS_PER_KIND {
+        anyhow::bail!("governed worker claim capacity is exhausted");
+    }
+    Ok(())
+}
+
+fn preflight_verification(task: &impulse_ops::governed_task::GovernedTaskRun) -> Result<()> {
+    if task.review_state != impulse_ops::governed_task::GovernedReviewState::AwaitingVerification {
+        anyhow::bail!("governed verification requires an awaiting-verification task");
+    }
+    if task.latest_claim().is_none() {
+        anyhow::bail!("governed verification requires a current worker claim");
+    }
+    if task.verifications.len() >= impulse_ops::governed_task::MAX_GOVERNED_RECORDS_PER_KIND {
+        anyhow::bail!("governed verification capacity is exhausted");
+    }
+    Ok(())
+}
+
+fn preflight_supervisor_review(task: &impulse_ops::governed_task::GovernedTaskRun) -> Result<()> {
+    if !matches!(
+        task.review_state,
+        impulse_ops::governed_task::GovernedReviewState::AwaitingSupervisor
+            | impulse_ops::governed_task::GovernedReviewState::VerificationFailed
+    ) {
+        anyhow::bail!("governed Supervisor review requires current verification");
+    }
+    if task.latest_verification().is_none() {
+        anyhow::bail!("governed Supervisor review requires a verification record");
+    }
+    if task.supervisor_verdicts.len() >= impulse_ops::governed_task::MAX_GOVERNED_RECORDS_PER_KIND {
+        anyhow::bail!("governed Supervisor verdict capacity is exhausted");
+    }
+    Ok(())
+}
+
+fn replay_claim_input(
+    task: &impulse_ops::governed_task::GovernedTaskRun,
+    request: &impulse_ops::governed_task::GovernedClaimRequest,
+) -> Result<impulse_ops::governed_task::WorkerCompletionClaimInput> {
+    let claim = task
+        .claims
+        .iter()
+        .find(|claim| claim.based_on_revision == request.expected_revision)
+        .context("stale governed claim request has no record at its expected revision")?;
+    if claim.summary != request.summary || claim.artifact_ids != request.artifact_ids {
+        anyhow::bail!("replayed governed claim request changed its summary or artifact IDs");
+    }
+    Ok(impulse_ops::governed_task::WorkerCompletionClaimInput {
+        actor: claim.actor.clone(),
+        summary: claim.summary.clone(),
+        subject_revision: claim.subject_revision.clone(),
+        artifact_ids: claim.artifact_ids.clone(),
+        diff_ref: claim.diff_ref.clone(),
+    })
+}
+
+fn replay_verification_input(
+    task: &impulse_ops::governed_task::GovernedTaskRun,
+    expected_revision: u64,
+) -> Result<impulse_ops::governed_task::GovernedVerificationInput> {
+    let verification = task
+        .verifications
+        .iter()
+        .find(|verification| verification.based_on_revision == expected_revision)
+        .context("stale governed verification request has no record at its expected revision")?;
+    Ok(impulse_ops::governed_task::GovernedVerificationInput {
+        actor: verification.actor.clone(),
+        claim_id: verification.claim_id.clone(),
+        subject_revision: verification.subject_revision.clone(),
+        policy: verification.policy.clone(),
+        outcome: verification.outcome,
+        commands: verification.commands.clone(),
+        artifact_ids: verification.artifact_ids.clone(),
+        notes: verification.notes.clone(),
+    })
+}
+
+fn replay_supervisor_input(
+    task: &impulse_ops::governed_task::GovernedTaskRun,
+    expected_revision: u64,
+) -> Result<impulse_ops::governed_task::SupervisorVerdictInput> {
+    let verdict = task
+        .supervisor_verdicts
+        .iter()
+        .find(|verdict| verdict.based_on_revision == expected_revision)
+        .context("stale governed Supervisor request has no verdict at its expected revision")?;
+    Ok(impulse_ops::governed_task::SupervisorVerdictInput {
+        actor: verdict.actor.clone(),
+        verification_id: verdict.verification_id.clone(),
+        verdict: verdict.verdict,
+        rationale: verdict.rationale.clone(),
+    })
+}
+
+pub(crate) async fn handle_governed_producer_request(
+    request: DaemonRequest,
+    state: &SharedState,
+) -> DaemonResponse {
+    let result = async {
+        let (_producer_guard, mutation_request) = match request {
+            DaemonRequest::SubmitGovernedClaim { request } => {
+                let _producer_guard = state.acquire_governed_producer_lock(&request.task_id).await;
+                let task =
+                    require_current_governed_task(state, &request.project_id, &request.task_id)?;
+                if task.verification_profile.is_none() {
+                    anyhow::bail!("governed claim producer requires a closed-loop task profile");
+                }
+                let replay = require_producer_request_state(
+                    state,
+                    &task,
+                    &request.request_id,
+                    request.expected_revision,
+                )?;
+                let claim = if replay {
+                    replay_claim_input(&task, &request)?
+                } else {
+                    preflight_claim(&task, &request)?;
+                    let task_for_git = task.clone();
+                    let request_for_git = request.clone();
+                    tokio::task::spawn_blocking(move || {
+                        crate::governed_producers::derive_claim(&task_for_git, &request_for_git)
+                    })
+                    .await
+                    .context("governed claim Git observer panicked")??
+                };
+                let mutation_request = impulse_ops::governed_task::GovernedTaskMutationRequest {
+                    request_id: request.request_id,
+                    project_id: request.project_id,
+                    task_id: request.task_id,
+                    expected_revision: request.expected_revision,
+                    mutation: impulse_ops::governed_task::GovernedTaskMutation::SubmitClaim {
+                        claim,
+                    },
+                };
+                (_producer_guard, mutation_request)
+            }
+            DaemonRequest::RunGovernedVerification { request } => {
+                let _producer_guard = state.acquire_governed_producer_lock(&request.task_id).await;
+                let task =
+                    require_current_governed_task(state, &request.project_id, &request.task_id)?;
+                if task.verification_profile.is_none() {
+                    anyhow::bail!(
+                        "governed verification producer requires a closed-loop task profile"
+                    );
+                }
+                let replay = require_producer_request_state(
+                    state,
+                    &task,
+                    &request.request_id,
+                    request.expected_revision,
+                )?;
+                let verification = if replay {
+                    replay_verification_input(&task, request.expected_revision)?
+                } else {
+                    preflight_verification(&task)?;
+                    crate::governed_producers::run_verification(&task).await?
+                };
+                let mutation_request = impulse_ops::governed_task::GovernedTaskMutationRequest {
+                    request_id: request.request_id,
+                    project_id: request.project_id,
+                    task_id: request.task_id,
+                    expected_revision: request.expected_revision,
+                    mutation:
+                        impulse_ops::governed_task::GovernedTaskMutation::RecordVerification {
+                            verification,
+                        },
+                };
+                (_producer_guard, mutation_request)
+            }
+            _ => anyhow::bail!("Internal routing error: not a governed producer request"),
+        };
+
+        persist_governed_mutation(state, mutation_request).await
+    }
+    .await;
+
+    match result {
+        Ok(task) => respond_ok(&task),
+        Err(error) => respond_err(error),
     }
 }
 
@@ -1565,6 +1887,91 @@ pub(crate) async fn handle_supervisor_request(
                     respond_ok(&parsed)
                 }
                 Err(e) => respond_err(format!("Supervisor chat failed: {}", e)),
+            }
+        }
+        DaemonRequest::RunGovernedSupervisorReview { request } => {
+            let _producer_guard = state.acquire_governed_producer_lock(&request.task_id).await;
+            let task =
+                match require_current_governed_task(state, &request.project_id, &request.task_id) {
+                    Ok(task) => task,
+                    Err(error) => return respond_err(error),
+                };
+            if task.verification_profile.is_none() {
+                return respond_err(
+                    "governed Supervisor producer requires a closed-loop task profile",
+                );
+            }
+            let replay = match require_producer_request_state(
+                state,
+                &task,
+                &request.request_id,
+                request.expected_revision,
+            ) {
+                Ok(replay) => replay,
+                Err(error) => return respond_err(error),
+            };
+
+            let verdict = if replay {
+                match replay_supervisor_input(&task, request.expected_revision) {
+                    Ok(verdict) => verdict,
+                    Err(error) => return respond_err(error),
+                }
+            } else {
+                if let Err(error) = preflight_supervisor_review(&task) {
+                    return respond_err(error);
+                }
+                let (system_prompt, user_prompt) =
+                    match crate::governed_producers::supervisor_review_prompt(&task) {
+                        Ok(prompt) => prompt,
+                        Err(error) => return respond_err(error),
+                    };
+                let mut agent_guard = match try_lock_agent_for_turn(cached_agent, state) {
+                    Ok(guard) => guard,
+                    Err(_) => return agent_turn_busy_response(),
+                };
+                let agent = match agent_guard.as_mut() {
+                    Some(agent) if agent.is_ready() => agent,
+                    Some(_) => return respond_err(
+                        "Impulse Agent is configured but not ready for governed Supervisor review",
+                    ),
+                    None => {
+                        return respond_err(
+                            "Impulse Agent must be configured before governed Supervisor review",
+                        )
+                    }
+                };
+                let supervisor_actor = agent.governed_review_actor();
+                let response = match agent.query_stateless(&system_prompt, &user_prompt).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        return respond_err(format!(
+                            "governed Supervisor review turn failed: {error}"
+                        ))
+                    }
+                };
+                match crate::governed_producers::bind_supervisor_review(
+                    &task,
+                    &response,
+                    supervisor_actor,
+                ) {
+                    Ok(verdict) => verdict,
+                    Err(error) => return respond_err(error),
+                }
+            };
+
+            let mutation_request = impulse_ops::governed_task::GovernedTaskMutationRequest {
+                request_id: request.request_id,
+                project_id: request.project_id,
+                task_id: request.task_id,
+                expected_revision: request.expected_revision,
+                mutation:
+                    impulse_ops::governed_task::GovernedTaskMutation::RecordSupervisorVerdict {
+                        verdict,
+                    },
+            };
+            match persist_governed_mutation(state, mutation_request).await {
+                Ok(task) => respond_ok(&task),
+                Err(error) => respond_err(error),
             }
         }
         DaemonRequest::RunSupervisorAction { action } => {
@@ -2259,5 +2666,706 @@ mod agent_cache_lifecycle_tests {
                 ("recovery".to_string(), "reply-3".to_string()),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod governed_producer_handler_tests {
+    use std::process::Command;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use impulse_ops::agent_registry::{AgentPlatformId, AgentRegistry};
+    use impulse_ops::governed_task::{
+        GovernedActor, GovernedActorKind, GovernedClaimRequest, GovernedCommandEvidence,
+        GovernedExecutionState, GovernedRequestId, GovernedReviewState,
+        GovernedSupervisorReviewRequest, GovernedTaskMutation, GovernedTaskMutationRequest,
+        GovernedTaskRegistration, GovernedTaskRun, GovernedVerificationInput,
+        GovernedVerificationOutcome, GovernedVerificationProfile, GovernedVerificationRequest,
+        OperatorDecisionInput, OperatorDecisionKind, SupervisorVerdictInput, SupervisorVerdictKind,
+        WorkerCompletionClaimInput,
+    };
+    use impulse_ops::role_assignment::{
+        canonical_governed_builder_assignment, AgentRoleAssignment, EnforcementStrength,
+        RoleCompatibility,
+    };
+
+    use super::{
+        handle_governed_producer_request, handle_governed_task_request, handle_supervisor_request,
+    };
+    use crate::daemon::protocol::{DaemonRequest, DaemonResponse};
+    use crate::llm_backends::{
+        async_trait, AgentResult, ChatRequest, ChatResponse, LlmProvider, Role, StopReason, Usage,
+    };
+
+    struct BoundSupervisorProvider {
+        calls: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<ChatRequest>>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for BoundSupervisorProvider {
+        fn name(&self) -> &str {
+            "bound-supervisor-test"
+        }
+
+        fn default_model(&self) -> &str {
+            "bound-supervisor-model"
+        }
+
+        async fn chat(&self, request: ChatRequest) -> AgentResult<ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let user = request
+                .messages
+                .iter()
+                .find(|message| message.role == Role::User)
+                .expect("Supervisor request must have a user payload");
+            let payload: serde_json::Value =
+                serde_json::from_str(&user.content).expect("Supervisor payload must be JSON");
+            let response = serde_json::json!({
+                "contract_version": payload["contract_version"],
+                "task_id": payload["task_id"],
+                "task_revision": payload["task_revision"],
+                "claim_id": payload["claim_id"],
+                "verification_id": payload["verification_id"],
+                "subject_revision": payload["subject_revision"],
+                "acceptance_criteria_count": payload["acceptance_criteria_count"],
+                "acceptance_criteria_digest": payload["acceptance_criteria_digest"],
+                "verdict": "recommend_accept",
+                "rationale": "every exact criterion is supported by daemon-observed evidence"
+            });
+            self.requests.lock().unwrap().push(request);
+            Ok(ChatResponse {
+                content: response.to_string(),
+                model: self.default_model().to_string(),
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+                stop_reason: StopReason::EndTurn,
+                tool_calls: Vec::new(),
+            })
+        }
+
+        fn supported_models(&self) -> Vec<&str> {
+            vec![self.default_model()]
+        }
+    }
+
+    fn run_git(root: &std::path::Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("Git command must launch");
+        assert!(output.status.success(), "git {args:?} failed");
+        String::from_utf8(output.stdout)
+            .expect("Git output must be UTF-8")
+            .trim()
+            .to_string()
+    }
+
+    fn rust_repo_state() -> (tempfile::TempDir, crate::state::SharedState, String, String) {
+        let repo = tempfile::Builder::new()
+            .prefix("impulse-governed-handler-")
+            .tempdir()
+            .unwrap();
+        std::fs::create_dir(repo.path().join("src")).unwrap();
+        std::fs::write(
+            repo.path().join("Cargo.toml"),
+            "[package]\nname = \"governed_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("src/lib.rs"),
+            "pub fn governed_fixture() -> bool {\n    true\n}\n",
+        )
+        .unwrap();
+        std::fs::write(repo.path().join(".gitignore"), "target/\n").unwrap();
+        let lock_status = Command::new("cargo")
+            .arg("generate-lockfile")
+            .current_dir(repo.path())
+            .status()
+            .expect("Cargo lockfile generation must launch");
+        assert!(lock_status.success(), "Cargo lockfile generation failed");
+        run_git(repo.path(), &["init", "--quiet"]);
+        run_git(repo.path(), &["config", "user.email", "test@example.com"]);
+        run_git(repo.path(), &["config", "user.name", "Impulse Test"]);
+        run_git(
+            repo.path(),
+            &[
+                "add",
+                ".gitignore",
+                "Cargo.toml",
+                "Cargo.lock",
+                "src/lib.rs",
+            ],
+        );
+        run_git(repo.path(), &["commit", "--quiet", "-m", "initial"]);
+        let oid = run_git(repo.path(), &["rev-parse", "HEAD"]);
+        let project_id = impulse_ops::sanitize_id(
+            &repo
+                .path()
+                .file_name()
+                .expect("temp repo has a name")
+                .to_string_lossy(),
+        );
+        let state = Arc::new(
+            crate::state::State::new(repo.path().join(".impulse"))
+                .expect("project state must initialize"),
+        );
+        (repo, state, project_id, oid)
+    }
+
+    fn task_from_response(response: DaemonResponse) -> GovernedTaskRun {
+        match response {
+            DaemonResponse::Ok { result } => {
+                serde_json::from_value(result).expect("response must contain a governed task")
+            }
+            other => panic!("expected governed task response, received {other:?}"),
+        }
+    }
+
+    fn error_from_response(response: DaemonResponse) -> String {
+        match response {
+            DaemonResponse::Error { message } => message,
+            other => panic!("expected daemon error, received {other:?}"),
+        }
+    }
+
+    fn request_id(value: &str) -> GovernedRequestId {
+        GovernedRequestId::try_new(value).unwrap()
+    }
+
+    fn profiled_role(runtime: &str) -> (AgentRoleAssignment, RoleCompatibility) {
+        let assignment = canonical_governed_builder_assignment();
+        let platform = AgentPlatformId::try_new(runtime).unwrap();
+        let compatibility = AgentRegistry::builtin()
+            .evaluate_role_compatibility(&platform, &assignment)
+            .unwrap();
+        (assignment, compatibility)
+    }
+
+    #[tokio::test]
+    async fn profiled_registration_rejects_caller_forged_runtime_compatibility() {
+        let (repo, state, project_id, oid) = rust_repo_state();
+        let (assignment, mut compatibility) = profiled_role("ion");
+        let optional = compatibility
+            .checks
+            .iter_mut()
+            .find(|check| !check.mandatory)
+            .expect("canonical Builder contract has an optional filesystem check");
+        optional.available = EnforcementStrength::Structural;
+        assert!(compatibility.launch_allowed());
+
+        let registration = GovernedTaskRegistration::builder(
+            "register-forged-profile-compatibility",
+            "task-forged-profile-compatibility",
+            project_id,
+            repo.path().display().to_string(),
+            "reject caller-authored capability strength",
+            "worker-forged-profile-compatibility",
+            "ion",
+        )
+        .acceptance_criteria(vec!["daemon recomputes runtime compatibility".to_string()])
+        .verification_profile(GovernedVerificationProfile::RustWorkspaceV1)
+        .initial_subject_revision(oid)
+        .role_assignment(assignment)
+        .role_compatibility(compatibility)
+        .build()
+        .unwrap();
+
+        let error = error_from_response(
+            handle_governed_task_request(
+                DaemonRequest::RegisterGovernedTask { registration },
+                &state,
+            )
+            .await,
+        );
+        assert!(error.contains("daemon-observed runtime capability result"));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_mutations_wait_for_the_task_producer_lock() {
+        let (repo, state, project_id, oid) = rust_repo_state();
+        let (assignment, compatibility) = profiled_role("ion");
+        let registration = GovernedTaskRegistration::builder(
+            "register-lock-boundary",
+            "task-lock-boundary",
+            project_id.clone(),
+            repo.path().display().to_string(),
+            "serialize lifecycle mutations with producer side effects",
+            "worker-lock-boundary",
+            "ion",
+        )
+        .acceptance_criteria(vec!["the shared lock boundary is enforced".to_string()])
+        .verification_profile(GovernedVerificationProfile::RustWorkspaceV1)
+        .initial_subject_revision(oid)
+        .role_assignment(assignment)
+        .role_compatibility(compatibility)
+        .build()
+        .unwrap();
+        let registered = task_from_response(
+            handle_governed_task_request(
+                DaemonRequest::RegisterGovernedTask { registration },
+                &state,
+            )
+            .await,
+        );
+        let running = task_from_response(
+            handle_governed_task_request(
+                DaemonRequest::MutateGovernedTask {
+                    request: GovernedTaskMutationRequest {
+                        request_id: request_id("running-lock-boundary"),
+                        project_id: project_id.clone(),
+                        task_id: registered.id.clone(),
+                        expected_revision: registered.revision,
+                        mutation: GovernedTaskMutation::MarkRunning {
+                            actor: GovernedActor {
+                                kind: GovernedActorKind::System,
+                                id: "desktop-runtime".to_string(),
+                            },
+                        },
+                    },
+                },
+                &state,
+            )
+            .await,
+        );
+
+        let producer_guard = state.acquire_governed_producer_lock(&running.id).await;
+        let mutation_state = state.clone();
+        let mut mutation = tokio::spawn(async move {
+            handle_governed_task_request(
+                DaemonRequest::MutateGovernedTask {
+                    request: GovernedTaskMutationRequest {
+                        request_id: request_id("runtime-exit-lock-boundary"),
+                        project_id,
+                        task_id: running.id,
+                        expected_revision: running.revision,
+                        mutation: GovernedTaskMutation::MarkRuntimeExited {
+                            actor: GovernedActor {
+                                kind: GovernedActorKind::System,
+                                id: "desktop-runtime".to_string(),
+                            },
+                            reason: Some("fixture exited".to_string()),
+                        },
+                    },
+                },
+                &mutation_state,
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_millis(50), &mut mutation)
+            .await
+            .expect_err("lifecycle mutation must wait while the producer lock is held");
+        drop(producer_guard);
+        let exited = task_from_response(mutation.await.unwrap());
+        assert_eq!(
+            exited.execution_state,
+            GovernedExecutionState::RuntimeExited
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_owned_producers_complete_one_persistent_governed_run() {
+        let (repo, state, project_id, oid) = rust_repo_state();
+        let (assignment, compatibility) = profiled_role("ion");
+        let registration = GovernedTaskRegistration::builder(
+            "register-producer-flow",
+            "task-producer-flow",
+            project_id.clone(),
+            repo.path().display().to_string(),
+            "prove the daemon-owned producer lifecycle",
+            "worker-1",
+            "ion",
+        )
+        .acceptance_criteria(vec!["the Rust workspace gate passes".to_string()])
+        .verification_profile(GovernedVerificationProfile::RustWorkspaceV1)
+        .initial_subject_revision(oid.clone())
+        .role_assignment(assignment)
+        .role_compatibility(compatibility)
+        .build()
+        .unwrap();
+        std::fs::write(repo.path().join("dirty-before-register.txt"), "dirty").unwrap();
+        let dirty_registration = handle_governed_task_request(
+            DaemonRequest::RegisterGovernedTask {
+                registration: registration.clone(),
+            },
+            &state,
+        )
+        .await;
+        assert!(error_from_response(dirty_registration).contains("dirty"));
+        std::fs::remove_file(repo.path().join("dirty-before-register.txt")).unwrap();
+        let registered = task_from_response(
+            handle_governed_task_request(
+                DaemonRequest::RegisterGovernedTask { registration },
+                &state,
+            )
+            .await,
+        );
+        assert_eq!(
+            registered.initial_subject_revision.as_deref(),
+            Some(oid.as_str())
+        );
+
+        let running = task_from_response(
+            handle_governed_task_request(
+                DaemonRequest::MutateGovernedTask {
+                    request: GovernedTaskMutationRequest {
+                        request_id: request_id("running-producer-flow"),
+                        project_id: project_id.clone(),
+                        task_id: registered.id.clone(),
+                        expected_revision: registered.revision,
+                        mutation: GovernedTaskMutation::MarkRunning {
+                            actor: GovernedActor {
+                                kind: GovernedActorKind::System,
+                                id: "desktop-runtime".to_string(),
+                            },
+                        },
+                    },
+                },
+                &state,
+            )
+            .await,
+        );
+        assert_eq!(running.execution_state, GovernedExecutionState::Running);
+
+        let fabricated = handle_governed_task_request(
+            DaemonRequest::MutateGovernedTask {
+                request: GovernedTaskMutationRequest {
+                    request_id: request_id("fabricated-claim"),
+                    project_id: project_id.clone(),
+                    task_id: running.id.clone(),
+                    expected_revision: running.revision,
+                    mutation: GovernedTaskMutation::SubmitClaim {
+                        claim: WorkerCompletionClaimInput {
+                            actor: GovernedActor {
+                                kind: GovernedActorKind::Worker,
+                                id: "forged".to_string(),
+                            },
+                            summary: "forged".to_string(),
+                            subject_revision: oid.clone(),
+                            artifact_ids: Vec::new(),
+                            diff_ref: None,
+                        },
+                    },
+                },
+            },
+            &state,
+        )
+        .await;
+        assert!(error_from_response(fabricated).contains("daemon-owned"));
+
+        let claim_request = GovernedClaimRequest {
+            request_id: request_id("claim-producer-flow"),
+            project_id: project_id.clone(),
+            task_id: running.id.clone(),
+            expected_revision: running.revision,
+            summary: "fixture implementation is complete".to_string(),
+            artifact_ids: vec!["artifact-1".to_string()],
+        };
+        std::fs::write(repo.path().join("dirty.txt"), "dirty").unwrap();
+        let dirty = handle_governed_producer_request(
+            DaemonRequest::SubmitGovernedClaim {
+                request: claim_request.clone(),
+            },
+            &state,
+        )
+        .await;
+        assert!(error_from_response(dirty).contains("dirty"));
+        assert_eq!(
+            state
+                .get_governed_task(&project_id, &running.id)
+                .unwrap()
+                .unwrap()
+                .revision,
+            running.revision
+        );
+        std::fs::remove_file(repo.path().join("dirty.txt")).unwrap();
+
+        let claimed = task_from_response(
+            handle_governed_producer_request(
+                DaemonRequest::SubmitGovernedClaim {
+                    request: claim_request.clone(),
+                },
+                &state,
+            )
+            .await,
+        );
+        let claim = claimed.latest_claim().unwrap();
+        assert_eq!(claim.actor.kind, GovernedActorKind::Worker);
+        assert_eq!(claim.actor.id, "worker-1");
+        assert_eq!(claim.subject_revision, oid);
+        assert_eq!(
+            claimed.review_state,
+            GovernedReviewState::AwaitingVerification
+        );
+
+        let fabricated_verification = handle_governed_task_request(
+            DaemonRequest::MutateGovernedTask {
+                request: GovernedTaskMutationRequest {
+                    request_id: request_id("fabricated-verification"),
+                    project_id: project_id.clone(),
+                    task_id: claimed.id.clone(),
+                    expected_revision: claimed.revision,
+                    mutation: GovernedTaskMutation::RecordVerification {
+                        verification: GovernedVerificationInput {
+                            actor: GovernedActor {
+                                kind: GovernedActorKind::Verifier,
+                                id: "forged-verifier".to_string(),
+                            },
+                            claim_id: claim.id.clone(),
+                            subject_revision: claim.subject_revision.clone(),
+                            policy: "forged".to_string(),
+                            outcome: GovernedVerificationOutcome::Passed,
+                            commands: vec![GovernedCommandEvidence {
+                                name: "forged".to_string(),
+                                executable: "true".to_string(),
+                                redacted_args: Vec::new(),
+                                command_digest: format!("sha256:{}", "a".repeat(64)),
+                                exit_code: Some(0),
+                                success: true,
+                                output_digest: format!("sha256:{}", "b".repeat(64)),
+                                output_ref: None,
+                                output_bytes: 0,
+                                output_truncated: false,
+                            }],
+                            artifact_ids: Vec::new(),
+                            notes: None,
+                        },
+                    },
+                },
+            },
+            &state,
+        )
+        .await;
+        assert!(error_from_response(fabricated_verification).contains("daemon-owned"));
+
+        std::fs::write(repo.path().join("dirty.txt"), "dirty after receipt").unwrap();
+        let replayed_claim = task_from_response(
+            handle_governed_producer_request(
+                DaemonRequest::SubmitGovernedClaim {
+                    request: claim_request.clone(),
+                },
+                &state,
+            )
+            .await,
+        );
+        assert_eq!(replayed_claim, claimed);
+        let mut changed_claim = claim_request;
+        changed_claim.summary = "changed replay payload".to_string();
+        let changed = handle_governed_producer_request(
+            DaemonRequest::SubmitGovernedClaim {
+                request: changed_claim,
+            },
+            &state,
+        )
+        .await;
+        assert!(error_from_response(changed).contains("changed its summary"));
+        std::fs::remove_file(repo.path().join("dirty.txt")).unwrap();
+
+        let verification_request = GovernedVerificationRequest {
+            request_id: request_id("verify-producer-flow"),
+            project_id: project_id.clone(),
+            task_id: claimed.id.clone(),
+            expected_revision: claimed.revision,
+        };
+        let first_state = state.clone();
+        let second_state = state.clone();
+        let first_request = verification_request.clone();
+        let second_request = verification_request.clone();
+        let (first_response, second_response) = tokio::join!(
+            async move {
+                handle_governed_producer_request(
+                    DaemonRequest::RunGovernedVerification {
+                        request: first_request,
+                    },
+                    &first_state,
+                )
+                .await
+            },
+            async move {
+                handle_governed_producer_request(
+                    DaemonRequest::RunGovernedVerification {
+                        request: second_request,
+                    },
+                    &second_state,
+                )
+                .await
+            }
+        );
+        let verified = task_from_response(first_response);
+        assert_eq!(task_from_response(second_response), verified);
+        assert_eq!(
+            crate::governed_producers::verification_execution_count(&verified.id),
+            1
+        );
+        let verification = verified.latest_verification().unwrap();
+        assert_eq!(verification.commands.len(), 4);
+        assert!(verification.commands.iter().all(|command| command.success));
+        assert_eq!(
+            verified.review_state,
+            GovernedReviewState::AwaitingSupervisor
+        );
+
+        std::fs::write(repo.path().join("dirty.txt"), "dirty after verify").unwrap();
+        let replayed_verification = task_from_response(
+            handle_governed_producer_request(
+                DaemonRequest::RunGovernedVerification {
+                    request: verification_request,
+                },
+                &state,
+            )
+            .await,
+        );
+        assert_eq!(replayed_verification, verified);
+        let invalid_repeat = handle_governed_producer_request(
+            DaemonRequest::RunGovernedVerification {
+                request: GovernedVerificationRequest {
+                    request_id: request_id("verify-invalid-repeat"),
+                    project_id: project_id.clone(),
+                    task_id: verified.id.clone(),
+                    expected_revision: verified.revision,
+                },
+            },
+            &state,
+        )
+        .await;
+        assert!(error_from_response(invalid_repeat).contains("awaiting-verification"));
+        std::fs::remove_file(repo.path().join("dirty.txt")).unwrap();
+
+        let fabricated_verdict = handle_governed_task_request(
+            DaemonRequest::MutateGovernedTask {
+                request: GovernedTaskMutationRequest {
+                    request_id: request_id("fabricated-verdict"),
+                    project_id: project_id.clone(),
+                    task_id: verified.id.clone(),
+                    expected_revision: verified.revision,
+                    mutation: GovernedTaskMutation::RecordSupervisorVerdict {
+                        verdict: SupervisorVerdictInput {
+                            actor: GovernedActor {
+                                kind: GovernedActorKind::Supervisor,
+                                id: "forged-supervisor".to_string(),
+                            },
+                            verification_id: verification.id.clone(),
+                            verdict: SupervisorVerdictKind::RecommendAccept,
+                            rationale: "forged".to_string(),
+                        },
+                    },
+                },
+            },
+            &state,
+        )
+        .await;
+        assert!(error_from_response(fabricated_verdict).contains("daemon-owned"));
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let agent =
+            crate::agent::ImpulseAgent::with_test_provider(Box::new(BoundSupervisorProvider {
+                calls: calls.clone(),
+                requests: requests.clone(),
+            }));
+        let cached_agent = Arc::new(tokio::sync::Mutex::new(Some(agent)));
+        let telemetry = Arc::new(tokio::sync::RwLock::new(
+            crate::ops_workbench::TerminalOpsTelemetryStore::default(),
+        ));
+        let permissions = Arc::new(tokio::sync::RwLock::new(None));
+        let review_request = GovernedSupervisorReviewRequest {
+            request_id: request_id("review-producer-flow"),
+            project_id: project_id.clone(),
+            task_id: verified.id.clone(),
+            expected_revision: verified.revision,
+        };
+        let reviewed = task_from_response(
+            handle_supervisor_request(
+                DaemonRequest::RunGovernedSupervisorReview {
+                    request: review_request.clone(),
+                },
+                &state,
+                &telemetry,
+                &permissions,
+                &cached_agent,
+            )
+            .await,
+        );
+        assert_eq!(reviewed.review_state, GovernedReviewState::AwaitingOperator);
+        let supervisor_actor_id = &reviewed.latest_supervisor_verdict().unwrap().actor.id;
+        assert!(supervisor_actor_id
+            .starts_with("impulse-agent:api:anthropic:bound-supervisor-model:sha256-"));
+        assert_eq!(supervisor_actor_id.rsplit('-').next().unwrap().len(), 64);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        {
+            let provider_requests = requests.lock().unwrap();
+            assert_eq!(provider_requests.len(), 1);
+            assert_eq!(provider_requests[0].messages.len(), 2);
+            assert_eq!(provider_requests[0].model, "bound-supervisor-model");
+            assert!(provider_requests[0].tools.is_empty());
+            assert_eq!(provider_requests[0].temperature, 0.0);
+        }
+        assert!(cached_agent
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .session_history()
+            .is_empty());
+
+        let replayed_review = task_from_response(
+            handle_supervisor_request(
+                DaemonRequest::RunGovernedSupervisorReview {
+                    request: review_request,
+                },
+                &state,
+                &telemetry,
+                &permissions,
+                &cached_agent,
+            )
+            .await,
+        );
+        assert_eq!(replayed_review, reviewed);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let accepted = task_from_response(
+            handle_governed_task_request(
+                DaemonRequest::MutateGovernedTask {
+                    request: GovernedTaskMutationRequest {
+                        request_id: request_id("operator-accept-producer-flow"),
+                        project_id: project_id.clone(),
+                        task_id: reviewed.id.clone(),
+                        expected_revision: reviewed.revision,
+                        mutation: GovernedTaskMutation::RecordOperatorDecision {
+                            decision: OperatorDecisionInput {
+                                actor: GovernedActor {
+                                    kind: GovernedActorKind::Operator,
+                                    id: "local-operator-test".to_string(),
+                                },
+                                supervisor_verdict_id: reviewed
+                                    .latest_supervisor_verdict()
+                                    .unwrap()
+                                    .id
+                                    .clone(),
+                                decision: OperatorDecisionKind::Approve,
+                                rationale: "verified evidence accepted".to_string(),
+                            },
+                        },
+                    },
+                },
+                &state,
+            )
+            .await,
+        );
+        assert_eq!(accepted.review_state, GovernedReviewState::Accepted);
+
+        let reloaded = crate::state::State::new(repo.path().join(".impulse")).unwrap();
+        let persisted = reloaded
+            .get_governed_task(&project_id, &accepted.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted, accepted);
     }
 }

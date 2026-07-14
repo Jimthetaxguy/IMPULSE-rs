@@ -42,6 +42,9 @@ pub struct HistoryEntry {
 pub struct State {
     storage: Storage,
     pub(super) governed_tasks: std::sync::Mutex<super::governed_task::GovernedTaskLedger>,
+    governed_producer_locks: tokio::sync::Mutex<
+        HashMap<impulse_ops::governed_task::GovernedTaskId, Arc<tokio::sync::Mutex<()>>>,
+    >,
     live_state: RwLock<LiveState>,
     /// Set on every mutation, cleared after a sync. A lock-free `AtomicBool`
     /// so `mark_dirty` (sync, called from async mutators) and the `Drop` flush
@@ -90,6 +93,7 @@ impl State {
         Ok(Self {
             storage,
             governed_tasks,
+            governed_producer_locks: tokio::sync::Mutex::new(HashMap::new()),
             live_state: RwLock::new(live_state),
             dirty: AtomicBool::new(false),
             config: RwLock::new(config),
@@ -98,6 +102,25 @@ impl State {
 
     pub fn storage(&self) -> &Storage {
         &self.storage
+    }
+
+    /// Serialize daemon-owned producer side effects per governed task.
+    ///
+    /// The guard spans the authoritative re-read, any Git/command/model work,
+    /// and persistence. This keeps duplicate and competing requests from
+    /// executing the same expensive producer before CAS can reject one.
+    pub(crate) async fn acquire_governed_producer_lock(
+        &self,
+        task_id: &impulse_ops::governed_task::GovernedTaskId,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.governed_producer_locks.lock().await;
+            locks
+                .entry(task_id.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        lock.lock_owned().await
     }
 
     fn mark_dirty(&self) {

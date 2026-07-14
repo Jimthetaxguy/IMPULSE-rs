@@ -43,7 +43,7 @@ pub use native::{
 pub use runtime::{
     default_builtin_mcp_tools, AgentPlatformId, AgentRuntimeSnapshot, AgentSpawnRequest,
     AgentWriteRequest, BuiltInMcpTool, DesktopEvent, DesktopEventSink, DesktopRuntime,
-    DesktopRuntimeBuilder, GovernedTaskGateway, LocalSupervisorAction,
+    DesktopRuntimeBuilder, GovernedRoutingMetadata, GovernedTaskGateway, LocalSupervisorAction,
     SupervisorLocalActionRequest, WeakDesktopRuntime, WorkspaceTarget,
 };
 pub use theme::{
