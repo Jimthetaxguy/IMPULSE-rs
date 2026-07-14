@@ -1,7 +1,7 @@
 # Impulse IPC Protocol
 
 > Unix domain socket protocol between Impulse daemon and clients (GUI, CLI `--daemon` mode).
-> **Protocol version: 4** — see [Version section](#protocol-version) for upgrade notes.
+> **Protocol version: 5** — see [Version section](#protocol-version) for upgrade notes.
 
 ---
 
@@ -48,17 +48,25 @@ Requests with no data omit the `data` field:
 
 ## Protocol Version
 
-The daemon includes `protocol_version` in its `Status` response. Clients must check this matches their expected version.
+The daemon reports `protocol_version` in `Ping`/`Status` results.
 
 | Constant | Value | Location |
 |----------|-------|----------|
-| `EXPECTED_PROTOCOL_VERSION` | **4** | Desktop/shared client |
-| `PROTOCOL_VERSION` | **4** | Daemon (`src/daemon/protocol.rs`) |
+| `DAEMON_PROTOCOL_VERSION` / `PROTOCOL_VERSION` | **5** | Shared ops contract / daemon protocol |
 
-Version mismatch rejects incompatible shared workbench requests and surfaces degraded status in the
-desktop client.
+Current clients do **not** perform a version handshake or preflight-reject a mismatched daemon, and
+the protocol does not negotiate a downgrade. Known variants continue through normal JSON-line
+request/response decoding; an unknown request or response variant fails through the ordinary Serde
+or client error path. The reported number is observability, not negotiated compatibility.
 
-**Upgrading from v3:** v4 adds daemon-owned governed tasks:
+**Upgrading from v4:** v5 adds specialized `SubmitGovernedClaim`,
+`RunGovernedVerification`, and `RunGovernedSupervisorReview` requests. Their DTOs intentionally
+omit actor/subject, commands/evidence, and verdict fields so the daemon derives automatic producer
+truth. Profiled registrations add `verification_profile: "rust_workspace_v1"`, exact acceptance
+criteria, and an initial clean Git OID. The generic mutation endpoint rejects automatic
+claim/evidence/Supervisor payloads for these tasks; explicit operator decisions remain generic.
+
+**Upgrading from v3:** v4 added daemon-owned governed tasks:
 `RegisterGovernedTask`, `GetGovernedTask`, `ListGovernedTasks`, and `MutateGovernedTask`, plus the
 serde-defaulted `ProjectOpsSnapshot.governed_tasks` collection. Mutations carry an expected revision
 and idempotency request ID; process exit and review/acceptance remain independent.
@@ -142,12 +150,23 @@ and idempotency request ID; process exit and review/acceptance remain independen
 | `GetGovernedTask` | `{project_id, task_id}` | v4 | Return one authoritative governed task, if present |
 | `ListGovernedTasks` | `{project_id}` | v4 | Return the bound project's governed task records |
 | `MutateGovernedTask` | `{request}` | v4 | Apply an expected-revision/idempotency-key lifecycle mutation and return authoritative state |
+| `SubmitGovernedClaim` | `{request: {request_id, project_id, task_id, expected_revision, summary, artifact_ids[]}}` | v5 | Derive assigned Worker and clean Git subject, then record the claim |
+| `RunGovernedVerification` | `{request: {request_id, project_id, task_id, expected_revision}}` | v5 | Run the task's closed verification profile and derive evidence |
+| `RunGovernedSupervisorReview` | `{request: {request_id, project_id, task_id, expected_revision}}` | v5 | Run one strict API-only Supervisor review and derive its verdict |
 
 Governed task actor kinds are typed provenance and transition claims, not cryptographic same-user
 authentication. The daemon socket directory/socket/PID permissions protect the local OS-user
-boundary. Evidence records retain redacted argv and digests/references rather than raw output.
-The daemon validates evidence shape and lifecycle consistency; it does not execute the submitted
-commands or recompute their digests. CAS and transition failures currently use
+boundary. For unprofiled tasks, the generic mutation endpoint still accepts caller-composed records
+and validates their shape/lifecycle consistency. For `rust_workspace_v1`, automatic producer
+records can only enter through the three v5 requests: the daemon attests the clean Git subject,
+executes fixed Rust commands in a detached worktree, derives evidence, and strictly binds the
+Supervisor response. Evidence retains argv/outcome and digests rather than raw output.
+
+The verifier executes host-trusted project code, including Rust build scripts, proc macros, and
+tests. Detached checkout, environment scrubbing, bounded timeouts, and process-group cleanup are not
+an OS sandbox. Governed Supervisor review uses an API runtime with exactly system+user messages,
+temperature zero, no tools, and no shared chat history. Generic external harness mode fails closed
+before spawning. CAS and transition failures currently use
 `Error { message }`; stable structured error codes/current-revision payloads remain future work.
 `ProjectOpsSnapshot.governed_tasks` is serde-defaulted for older snapshots, while
 `AgentRuntime.governed_task_id` and `governed_task_revision` carry runtime provenance.
@@ -345,7 +364,7 @@ Returns `AgentAssistResult` with sessions organized by agent role.
 
 ### Search & Retrieval
 
-Protocol v4 does not define daemon request variants for retrieval. `search-history`,
+Protocol v5 does not define daemon request variants for retrieval. `search-history`,
 `search-genome`, `index-memory`, and `retrieval-status` are direct-mode CLI operations; the
 `--daemon` dispatcher tells callers to retry without the flag.
 
@@ -366,7 +385,7 @@ All responses use the `DaemonResponse` enum.
 Contains the result as a JSON value. The structure depends on the request.
 
 ```json
-{"type": "Ok", "data": {"result": {"sessions": 3, "active": 1, "protocol_version": 4}}}
+{"type": "Ok", "data": {"result": {"sessions": 3, "active": 1, "protocol_version": 5}}}
 ```
 
 ### Error
@@ -442,6 +461,12 @@ Returned by `CheckConflict`:
 
 The GUI maintains a persistent connection via a poller thread that sends periodic `Ping` requests and measures RTT for the status bar health indicator.
 
+Ordinary Desktop IPC reads and writes use a two-second timeout. A profiled
+`RegisterGovernedTask` read uses a dedicated 90-second bound because the daemon performs bounded Git
+attestation before acknowledging it. Ambiguous transport retries reuse the exact serialized request
+and idempotency key; each acknowledged attempt retains its own bound. Registration also recomputes
+the supplied role compatibility from the daemon-owned runtime registry and rejects any mismatch.
+
 ---
 
 ## Error Handling
@@ -455,6 +480,23 @@ The GUI maintains a persistent connection via a poller thread that sends periodi
 ---
 
 ## Changelog
+
+### v5 — Daemon-owned governed producers
+
+Added 2026-07-13:
+
+- `SubmitGovernedClaim`, `RunGovernedVerification`, and `RunGovernedSupervisorReview` request
+  variants whose callers cannot supply derived producer truth.
+- Optional `rust_workspace_v1` profile, exact acceptance criteria, and daemon-attested initial Git
+  subject on governed task registrations.
+- Detached fixed Rust verification plus strict acceptance-criteria-digest-bound, stateless,
+  tool-free API Supervisor review.
+- Env-routed `"$IMPULSE_CONTROL_CLI" --daemon governed-*` commands and Ion claim bridge; the packaged
+  executable is `impulse-rs`. Same-user actor authorization and accepted-run memory promotion remain
+  outside v5.
+- One per-task lock serializes producer and lifecycle mutations, and persisted receipts deduplicate
+  replay. Crash-safe exactly-once producer execution remains outside v5 until a durable pre-side-effect
+  reservation journal exists.
 
 ### v4 — Daemon-owned governed tasks
 
@@ -486,4 +528,3 @@ Added in Ralph Plan 3 (2026-03-31):
 - `AgentAssistResult` response variant with `recommendations` + `pane_summaries`
 - `AgentSpecializedResult` response variant
 - `TrackTool`, `GetSession`, `StewardStatus/Proposals/Memory`, `ListTools`, `DescribeTool`, `Chat`
-- Updated `EXPECTED_PROTOCOL_VERSION` to **2** (GUI constant)

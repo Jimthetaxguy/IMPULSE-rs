@@ -216,8 +216,9 @@ Acceptance criteria:
 Primary interfaces:
 
 - `daemon`
-- JSON-line IPC protocol v4
+- JSON-line IPC protocol v5
 - `RegisterGovernedTask`, `GetGovernedTask`, `ListGovernedTasks`, `MutateGovernedTask`
+- `SubmitGovernedClaim`, `RunGovernedVerification`, `RunGovernedSupervisorReview`
 
 #### ST-09 Observe work through the Dioxus desktop host
 
@@ -307,13 +308,18 @@ Primary interfaces:
 As an operator, I want one supervisor and one builder to complete a scoped task under explicit
 backend policy so Impulse proves that its existing controls compose into a governed workflow.
 
-Status: In progress — durable governed lifecycle live; agent-composed process E2E pending
+Status: In progress — daemon-owned profiled producers live; full launched-runtime workflow pending
 
 Acceptance criteria:
 
 - the operator launches registered supervisor and builder runtimes against an explicit workspace target
 - the supervisor observes daemon-owned workbench truth and can focus the builder or send confirmed input under `SupervisorPermissionPolicy`
-- the builder receives a bounded assignment and produces reviewable implementation and verification evidence
+- the builder receives a bounded assignment plus exact acceptance criteria, and the profiled path
+  binds its claim to a daemon-attested clean committed Git subject
+- the daemon, rather than the Builder, expands and executes the closed verification profile and
+  derives bounded evidence
+- Supervisor review is a strict criteria-digest-bound API turn with no tools or shared history;
+  unsupported generic harness configuration fails closed
 - completion distinguishes worker claims, observed evidence, supervisor judgment, and operator approval
 - runtime exit and task acceptance remain independent, with final acceptance reserved for an explicit operator decision against current passing evidence
 - terminal launch, write, focus, close, and lifecycle telemetry remain projections of daemon/control-plane truth rather than a competing state store
@@ -325,18 +331,38 @@ Primary interfaces:
 - `AgentRoleId` / `AgentRoleAssignment` / `RoleCompatibility`
 - `GovernedTaskRun` / `GovernedTaskMutationRequest` and the typed claim, verification, supervisor verdict, and operator decision records
 - `DesktopRuntime::{spawn_agent, write_agent, focus_agent, close_agent}`
-- daemon `RegisterGovernedTask`, `GetGovernedTask`, `ListGovernedTasks`, `MutateGovernedTask`, `PublishTerminalOps`, `SubscribeOps`, and `RunSupervisorAction`
+- daemon `RegisterGovernedTask`, `GetGovernedTask`, `ListGovernedTasks`, `MutateGovernedTask`,
+  `SubmitGovernedClaim`, `RunGovernedVerification`, `RunGovernedSupervisorReview`,
+  `PublishTerminalOps`, `SubscribeOps`, and `RunSupervisorAction`
+- CLI `impulse-rs --daemon governed-claim|governed-verify|governed-review` (or the injected
+  `"$IMPULSE_CONTROL_CLI" --daemon ...` path); Ion `governed_submit_claim`
 - `SupervisorPermissionPolicy` / `SupervisorPermissionState`
 
 Live boundary:
 
-- the Dioxus Builder launcher now requires an explicit bounded task and product-role assignment, previews trusted static compatibility, and fails closed when its platform catalog is unavailable
-- the backend canonicalizes the workspace, repeats compatibility evaluation, blocks unsatisfied mandatory requirements before agent-id reservation or PTY creation, and preserves task/assignment/result telemetry
+- the Dioxus Builder launcher requires an explicit bounded task, exact acceptance criteria,
+  `rust_workspace_v1`, and product-role assignment; desktop and daemon both attest the clean
+  canonical Git `HEAD` before PTY launch
+- the backend canonicalizes the workspace, while the daemon independently recomputes exact runtime
+  compatibility from its registry and rejects caller-forged results; unsatisfied mandatory
+  requirements block before agent-id reservation or PTY creation
 - governed Builder launch now registers a distinct durable task before PTY creation; registration failure blocks launch without reserving the agent id
 - daemon state now separates execution from review, persists revisioned/idempotent task mutations and lifecycle events, rejects stale/cross-project transitions, and never infers acceptance from process exit
-- the Dioxus Supervisor surface renders bounded redacted evidence and submits acknowledged, revision-bound supervisor/operator decisions without optimistic state; only the operator can create `accepted`
+- profiled claims arrive through env-routed CLI or Ion's typed tool, while the daemon derives Worker
+  identity and subject; generic automatic producer mutations are rejected
+- verification runs fixed Rust commands in a detached worktree with a scrubbed environment,
+  a committed regular root lockfile, no source-tree symlinks, timeouts, streamed digests,
+  process-group cleanup, and bounded post-kill reaping. It executes host-trusted project code and
+  is not an OS sandbox
+- the daemon runs strict API-only, tool-free, history-free Supervisor review bound to the current
+  evidence and acceptance-criteria digest; generic external harness review fails closed
+- the Dioxus Supervisor surface renders evidence and terminal producer-command guidance, then
+  submits acknowledged operator decisions without optimistic state; it does not expose producer
+  buttons, and only the operator can create `accepted`
 - desktop launch/exit intent is written ahead of daemon I/O to a bounded, owner-only, cross-process-locked project outbox and reconciles after daemon recovery; abrupt process death before exit intent exists still requires runtime leases/orphan reconciliation
-- one process-level E2E with real worker/verifier producers and a launched supervisor runtime is not yet complete; accepted-run memory promotion is also downstream
+- a real daemon/CLI/child-process test proves claim, detached verification, persistence, and restart;
+  daemon handler tests prove strict Supervisor binding and operator-only acceptance. One complete
+  launched Builder/Supervisor workflow and accepted-run memory promotion remain downstream
 - typed actor kinds are provenance rather than same-user cryptographic authentication; project identity, task reassignment, pagination/archive, and structured CAS errors remain explicit follow-ups
 - generalized role composition, a common dynamic runtime-adapter trait, and capability negotiation across arbitrary runtimes remain target architecture; this narrow preflight must not imply that every runtime has equal or continuous enforcement
 

@@ -51,9 +51,9 @@ CONTRACT_KEY_FILES = [
 ]
 
 DURABLE_ROADMAP_MARKER = (
-    "Now=control-plane foundations + daemon-owned governed task lifecycle; "
-    "Next=real claim/verification producers + supervisor/builder process proof + "
-    "accepted-run memory promotion; Later=general roles + negotiated runtimes + "
+    "Now=control-plane foundations + daemon-owned governed runtime producers; "
+    "Next=accepted-run memory promotion + stronger same-user actor authorization + "
+    "full launched-runtime proof; Later=general roles + negotiated runtimes + "
     "multi-project routing; Legacy=egui compile-maintenance only"
 )
 
@@ -102,8 +102,9 @@ CONTRACT_REQUIRED_MARKERS = {
         DURABLE_ROADMAP_MARKER,
     ],
     DOCS_DIR / "IPC-PROTOCOL.md": [
-        "**Protocol version: 4**",
-        '"protocol_version": 4',
+        "**Protocol version: 5**",
+        '"protocol_version": 5',
+        "### v5 — Daemon-owned governed producers",
         "### v4 — Daemon-owned governed tasks",
     ],
 }
@@ -121,6 +122,9 @@ FORBIDDEN_ACTIVE_PHRASES = [
     "**Next governed slice:** daemon-owned task evidence",
     "Protocol v3 does not define daemon request variants for retrieval.",
     '"protocol_version": 3',
+    '"protocol_version": 4',
+    "**Protocol version: 4**",
+    "Now=control-plane foundations + daemon-owned governed task lifecycle; Next=real claim/verification producers + supervisor/builder process proof + accepted-run memory promotion; Later=general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only",
     "verified-memory promotion",
 ]
 

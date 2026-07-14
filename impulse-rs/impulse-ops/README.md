@@ -16,6 +16,7 @@ canonical agent registry. It must not pull in heavy runtime dependencies.
 | **Agent registry** | `agent_registry` module — the single source of truth for known agent platforms (claude-code, codex, …), launch-command resolution, and `AgentPlatformsReport` |
 | **Supervisor model** | `SupervisorAction`, `SupervisorProposal`, `SupervisorChatResult`, `SupervisorActionResult`, `SupervisorPermissionPolicy`/`State`, `SupervisorActionPermission`, `PermissionChangeScope`, `ToolCapabilityId` |
 | **Agent runtime/coordination** | `AgentRuntime`, `AgentStatus`, `AgentRole`, `MachineTarget`, `DelegationSummary`, `DiffSummary`, `ToolInvocationRecord`, `InterventionRecommendation`, `TerminalOpsReport` |
+| **Governed tasks** | Profiled registration, revisioned lifecycle records, claim/verification/review trigger DTOs, and the strict Supervisor response envelope |
 | **Ops snapshot / artifacts** | `ProjectOpsSnapshot`, `OpsEvent`, `OpsSubscription`, `ArtifactEnvelope`, `ArtifactAction`, `ArtifactActionResult`, `ArtifactFileRef`, `ArtifactViewHint`, `ArtifactStatus` |
 | **Summaries** | `ProjectSummary`, `MemorySummary`, `RetrievalSummary`, `ContextHealthSummary`, `InsightRecord` |
 | **Pure helpers** | `sanitize_id`, `atomic_write_path`, `artifact_store_root` |
@@ -38,6 +39,5 @@ cd impulse-rs/impulse-ops
 cargo build && cargo test && cargo clippy -- -D warnings
 ```
 
-Current canonical projection: 44 passing tests, 0 ignored, 0 failed. A linked worktree without the
-gitignored reconciliation archive runs 43 and filters the one checkout-relative archive proof.
-Part of the workspace gate (`cd impulse-rs && cargo test`).
+The default suite uses tracked source and fixtures, so fresh clones, linked worktrees, and CI run the
+same contract proof. It is also part of the workspace gate (`cd impulse-rs && cargo test`).
