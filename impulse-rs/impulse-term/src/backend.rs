@@ -49,6 +49,34 @@ pub struct TerminalBackend {
     working_dir: Option<PathBuf>,
 }
 
+/// Owns a child during fallible PTY setup. `portable_pty::Child` does not
+/// promise kill-on-drop, so every error after `spawn_command` must explicitly
+/// terminate and reap the process before returning control to the harness.
+struct SpawnedChildGuard {
+    child: Option<Box<dyn Child + Send + Sync>>,
+}
+
+impl SpawnedChildGuard {
+    fn new(child: Box<dyn Child + Send + Sync>) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn into_inner(mut self) -> Box<dyn Child + Send + Sync> {
+        self.child
+            .take()
+            .expect("spawned child guard must own a child until disarmed")
+    }
+}
+
+impl Drop for SpawnedChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 impl TerminalBackend {
     /// Spawn a child process in a new PTY.
     ///
@@ -119,6 +147,7 @@ impl TerminalBackend {
         }
 
         let child = pair.slave.spawn_command(cmd)?;
+        let child_guard = SpawnedChildGuard::new(child);
         // Drop the slave side — the child process owns it now.
         drop(pair.slave);
 
@@ -163,6 +192,7 @@ impl TerminalBackend {
 
         let writer_arc = Arc::new(Mutex::new(writer));
         let write_queue = WriteQueue::new(Arc::clone(&writer_arc));
+        let child = child_guard.into_inner();
 
         Ok(Self {
             writer: writer_arc,
@@ -246,9 +276,13 @@ impl TerminalBackend {
                 false
             }
             Ok(None) => true,
-            Err(_) => {
-                self.alive.store(false, Ordering::Relaxed);
-                false
+            Err(error) => {
+                log::error!(
+                    "failed to poll PTY child for '{}'; retaining last live state: {}",
+                    self.command,
+                    error
+                );
+                true
             }
         }
     }
@@ -308,11 +342,31 @@ impl TerminalBackend {
         f(&mut parser)
     }
 
-    /// Kill the child process.
-    pub fn kill(&self) {
+    /// Terminate and reap the child process.
+    ///
+    /// The backend is marked dead only after `try_wait` or `wait` confirms a
+    /// terminal process state. Kill failures for a still-running process are
+    /// returned to the caller so lifecycle truth cannot claim an exit that did
+    /// not happen.
+    pub fn kill(&self) -> Result<(), Box<dyn std::error::Error>> {
         let mut child = self.child.lock();
-        let _ = child.kill();
+        if child.try_wait()?.is_some() {
+            self.alive.store(false, Ordering::Relaxed);
+            return Ok(());
+        }
+        if let Err(kill_error) = child.kill() {
+            // The child may have exited between `try_wait` and `kill`. Confirm
+            // that race before treating the kill error as a live orphan.
+            if child.try_wait()?.is_some() {
+                self.alive.store(false, Ordering::Relaxed);
+                return Ok(());
+            }
+            self.alive.store(true, Ordering::Relaxed);
+            return Err(Box::new(kill_error));
+        }
+        child.wait()?;
         self.alive.store(false, Ordering::Relaxed);
+        Ok(())
     }
 
     /// The command that was spawned.
@@ -345,6 +399,18 @@ impl TerminalBackend {
     /// A non-zero value after the terminal is dead indicates the PTY broke unexpectedly.
     pub fn read_error_count(&self) -> u64 {
         self.read_errors.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for TerminalBackend {
+    fn drop(&mut self) {
+        if let Err(error) = self.kill() {
+            log::error!(
+                "failed to terminate and reap PTY child for '{}': {}",
+                self.command,
+                error
+            );
+        }
     }
 }
 

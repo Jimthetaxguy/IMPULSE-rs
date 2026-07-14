@@ -4,8 +4,13 @@ use std::time::{Duration, Instant};
 
 use impulse_desktop::{
     AgentPlatformId, AgentSpawnRequest, AgentWriteRequest, DesktopEvent, DesktopEventSink,
-    DesktopRuntime, LocalSupervisorAction, SupervisorLocalActionRequest, TerminalCloseRequest,
-    TerminalFocusRequest, TerminalResizeRequest, WeakDesktopRuntime, WorkspaceTarget,
+    DesktopRuntime, GovernedTaskGateway, LocalSupervisorAction, SupervisorLocalActionRequest,
+    TerminalCloseRequest, TerminalFocusRequest, TerminalResizeRequest, WeakDesktopRuntime,
+    WorkspaceTarget,
+};
+use impulse_ops::governed_task::{
+    ApprovalPolicy, GovernedExecutionState, GovernedRequestId, GovernedReviewState, GovernedTaskId,
+    GovernedTaskMutation, GovernedTaskMutationRequest, GovernedTaskRegistration, GovernedTaskRun,
 };
 use impulse_ops::role_assignment::{
     AgentRoleAssignment, AgentRoleId, EnforcementStrength, RoleCapabilityRequirement,
@@ -160,6 +165,86 @@ fn governed_builder_assignment() -> AgentRoleAssignment {
             minimum_enforcement: EnforcementStrength::Mediated,
             mandatory: true,
         }],
+    }
+}
+
+#[derive(Default)]
+struct TestGovernedGateway {
+    tasks: Mutex<HashMap<GovernedTaskId, GovernedTaskRun>>,
+}
+
+impl GovernedTaskGateway for TestGovernedGateway {
+    fn register(&self, registration: GovernedTaskRegistration) -> Result<GovernedTaskRun, String> {
+        let task = GovernedTaskRun {
+            id: registration.task_id,
+            revision: 0,
+            project_id: registration.project_id,
+            workspace_root: registration.workspace_root,
+            task: registration.task,
+            acceptance_criteria: registration.acceptance_criteria,
+            approval_policy: ApprovalPolicy::OperatorRequired,
+            role_assignment: registration.role_assignment,
+            role_compatibility: registration.role_compatibility,
+            runtime_id: registration.runtime_id,
+            agent_id: registration.agent_id,
+            session_id: registration.session_id,
+            initial_subject_revision: registration.initial_subject_revision,
+            execution_state: GovernedExecutionState::Registered,
+            review_state: GovernedReviewState::AwaitingClaim,
+            claims: Vec::new(),
+            verifications: Vec::new(),
+            supervisor_verdicts: Vec::new(),
+            operator_decisions: Vec::new(),
+            events: Vec::new(),
+            created_at: impulse_ops::now_rfc3339(),
+            updated_at: impulse_ops::now_rfc3339(),
+        };
+        self.tasks
+            .lock()
+            .expect("task gateway mutex poisoned")
+            .insert(task.id.clone(), task.clone());
+        Ok(task)
+    }
+
+    fn mutate(&self, request: GovernedTaskMutationRequest) -> Result<GovernedTaskRun, String> {
+        let mut tasks = self.tasks.lock().expect("task gateway mutex poisoned");
+        let task = tasks
+            .get_mut(&request.task_id)
+            .ok_or_else(|| "task missing".to_string())?;
+        if task.revision != request.expected_revision {
+            return Err("revision conflict".to_string());
+        }
+        task.execution_state = match request.mutation {
+            GovernedTaskMutation::MarkRunning { .. } => GovernedExecutionState::Running,
+            GovernedTaskMutation::MarkLaunchFailed { .. } => GovernedExecutionState::LaunchFailed,
+            GovernedTaskMutation::MarkRuntimeExited { .. } => GovernedExecutionState::RuntimeExited,
+            _ => return Err("unsupported test mutation".to_string()),
+        };
+        task.revision += 1;
+        Ok(task.clone())
+    }
+
+    fn mutate_current(
+        &self,
+        project_id: &str,
+        task_id: &GovernedTaskId,
+        request_id: GovernedRequestId,
+        mutation: GovernedTaskMutation,
+    ) -> Result<GovernedTaskRun, String> {
+        let current = self
+            .tasks
+            .lock()
+            .expect("task gateway mutex poisoned")
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| "task missing".to_string())?;
+        self.mutate(GovernedTaskMutationRequest {
+            request_id,
+            project_id: project_id.to_string(),
+            task_id: task_id.clone(),
+            expected_revision: current.revision,
+            mutation,
+        })
     }
 }
 
@@ -492,12 +577,14 @@ fn test_governed_spawn_binds_symlink_equivalent_workspace_to_canonical_pty_direc
     let canonical_text = canonical.display().to_string();
 
     let sink = Arc::new(RecordingSink::default());
+    let gateway: Arc<dyn GovernedTaskGateway> = Arc::new(TestGovernedGateway::default());
     let runtime = DesktopRuntime::builder()
         .with_event_sink(sink.clone())
+        .with_governed_task_gateway(gateway)
         .build();
     let mut request = shell_spawn(
         "canonical-workspace-agent",
-        "printf '%s|%s' \"$PWD\" \"$IMPULSE_WORKSPACE_ROOT\"",
+        "printf '%s|%s|%s' \"$PWD\" \"$IMPULSE_WORKSPACE_ROOT\" \"$IMPULSE_GOVERNED_TASK_ID\"",
     );
     request.cwd = Some(alias.display().to_string());
     request.workspace = Some(WorkspaceTarget {
@@ -522,8 +609,15 @@ fn test_governed_spawn_binds_symlink_equivalent_workspace_to_canonical_pty_direc
     );
     let telemetry = impulse_desktop::daemon_ops::agent_runtime_from_snapshot(&snapshot);
     assert_eq!(telemetry.working_directory, canonical_text);
+    assert_eq!(telemetry.governed_task_id, snapshot.governed_task_id);
 
-    let expected_output = format!("{canonical_text}|{canonical_text}");
+    let expected_output = format!(
+        "{canonical_text}|{canonical_text}|{}",
+        snapshot
+            .governed_task_id
+            .as_ref()
+            .expect("governed task id")
+    );
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         let output = String::from_utf8_lossy(&terminal_output(&sink, "canonical-workspace-agent"))

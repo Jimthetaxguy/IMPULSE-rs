@@ -472,14 +472,16 @@ mod tests {
     #[test]
     fn test_session_info_nonexistent() {
         // Get info for non-existent session
-        let output = run_impulse(&["session-info", "--id", "nonexistent-123"]);
+        let output = run_impulse(&["session-info", "nonexistent-123"]);
+        let stdout = stdout_str(&output);
 
-        // Should fail gracefully
+        // The command handles a missing session as an explicit, successful
+        // lookup result. Do not let an unrelated initialization failure satisfy
+        // this assertion merely because the process exited nonzero.
         assert!(
-            !output.status.success()
-                || stderr_str(&output).contains("not found")
-                || stderr_str(&output).contains("Not found"),
-            "Session info should fail gracefully"
+            output.status.success() && stdout.contains("Session not found"),
+            "Session info should report the missing ID: stdout={stdout:?}, stderr={:?}",
+            stderr_str(&output)
         );
     }
 

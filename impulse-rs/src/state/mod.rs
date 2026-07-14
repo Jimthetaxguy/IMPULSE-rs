@@ -7,9 +7,11 @@
 
 pub mod config;
 mod config_keys;
+mod governed_task;
 pub mod persistence;
 pub mod session;
 
 pub use config::*;
+pub use governed_task::*;
 pub use persistence::*;
 pub use session::*;

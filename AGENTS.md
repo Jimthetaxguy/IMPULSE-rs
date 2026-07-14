@@ -15,7 +15,7 @@ authors:
 > Contract: [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
 > Collaboration playbook: [`docs/guides/COLLABORATIVE-AGENTIC-CODING.md`](docs/guides/COLLABORATIVE-AGENTIC-CODING.md)
 > Canonical stack: Rust (impulse-rs)
-> Roadmap contract: Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; Legacy=egui compile-maintenance only.
+> Roadmap contract: Now=control-plane foundations + daemon-owned governed task lifecycle; Next=real claim/verification producers + supervisor/builder process proof + accepted-run memory promotion; Later=general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only.
 
 ---
 
@@ -40,7 +40,7 @@ Memory is one first-class service, not the whole product. Impulse also owns proc
 
 ---
 
-## Desktop Shell Status (as of 2026-07-12)
+## Desktop Shell Status (as of 2026-07-13)
 
 > **egui / impulse-gui is LEGACY.** It is frozen — no new features. It will be removed after the Dioxus desktop host reaches parity.
 
@@ -105,7 +105,7 @@ Choose the simplest solution that works. Prefer editing existing files over crea
 - **egui workbench** — LEGACY. Frozen. Compile-maintenance only.
 
 **Live versus direction:**
-- Live foundations include PTY lifecycle, daemon-owned workbench truth and telemetry, registry-driven desktop platform identity, Ion as a launchable platform, capability-checked tool registries, supervisor-specific permission policy, and reviewable artifacts.
+- Live foundations include PTY lifecycle, daemon-owned workbench truth and telemetry, registry-driven desktop platform identity, Ion as a launchable platform, capability-checked tool registries, supervisor-specific permission policy, reviewable artifacts, and the revisioned governed-task evidence/decision lifecycle. Only an operator decision can accept a governed task; process exit never does.
 - A general `RoleContract`, common runtime-adapter trait, and capability-negotiation contract are product direction, not implemented facts. Do not claim every runtime is structurally governed.
 
 **Data in `.impulse/`:**
@@ -116,6 +116,8 @@ Choose the simplest solution that works. Prefer editing existing files over crea
 | `GENOME.md` | Decisions & preferences | Committed |
 | `LIVE_STATE.json` | Active session state | Ephemeral |
 | `config.json` | Configuration | Committed |
+| `GOVERNED_TASKS.json` | Governed task records + idempotency receipts | Durable local control-plane state |
+| `DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.json` | Ambiguous launch/exit mutations awaiting daemon reconciliation | Durable local recovery state |
 | `retrieval.db` | Search index | Rebuildable |
 
 ---
@@ -159,7 +161,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-**Expected canonical checkout (2026-07-12 projection):** 1,950 tests passed, 0 failed, 9 ignored. The verified isolated aggregate worktree reports 1,949 passed with `test_reconciled_clean_archive_has_contracts_snapshot` explicitly filtered; the canonical count restores that one checkout-relative proof. Update counts in this file, CLAUDE.md, and RUST-CANONICAL-CONTRACT.md when they change.
+**Final-gate evidence:** Do not rely on a checked-in aggregate test count. Run the complete gate on
+the current checkout and record passed, ignored, and failed totals in the commit/PR evidence. If an
+isolated worktree lacks the gitignored reconciliation archive, identify the filtered checkout-only
+proof explicitly and rerun it from the canonical checkout before release.
 
 ### Code Requirements
 
@@ -212,7 +217,9 @@ baseline above predates substantial handler and control-plane coverage added sin
 it before presenting it as current. `docs/spec/TEST-TRACEABILITY.md` owns the current qualitative
 gap assessment.
 
-**Workspace totals (2026-07-12 canonical projection):** 1,950 tests across the 5 workspace crates/packages (impulse-rs: 1,576, ops: 44 including the canonical-checkout archive proof, term: 114, desktop: 193, ion: 23), with 9 ignored and 0 failed. The verified isolated worktree reports 1,949 passed because that one archive proof is filtered. The legacy impulse-gui crate is frozen/excluded from the workspace and its 252 passing tests are not counted.
+**Workspace totals:** Derive totals from the final `cargo test --workspace` run rather than a static
+projection. The legacy `impulse-gui` crate is frozen and excluded from the canonical workspace gate;
+verify it separately only when legacy compile-maintenance changes require it.
 
 High-risk coverage priorities (despite substantial source-local unit coverage):
 - End-to-end parity between `daemon_dispatch` and `direct_dispatch` for every stable command.

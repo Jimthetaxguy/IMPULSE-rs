@@ -9,6 +9,7 @@ use impulse_desktop::{
     WorkspaceEntry, WorkspaceTarget,
 };
 use impulse_ops::agent_registry::{AgentPlatformsReport, AgentRegistry};
+use impulse_ops::governed_task::GovernedTaskRun;
 use impulse_ops::{
     AgentRole, AgentRuntime, AgentStatus, ArtifactAction, ArtifactEnvelope, ArtifactFileRef,
     ArtifactStatus, ArtifactViewHint, ContextHealthSummary, DelegationSummary, DiffSummary,
@@ -137,6 +138,8 @@ fn seeded_snapshot() -> ProjectOpsSnapshot {
                 label: "Codex Live".to_string(),
                 backend_kind: "pty".to_string(),
                 session_id: Some("codex-live-session".to_string()),
+                governed_task_id: None,
+                governed_task_revision: None,
                 working_directory: "<repo>".to_string(),
                 status: "working".to_string(),
                 current_task: Some(
@@ -229,8 +232,72 @@ fn seeded_snapshot() -> ProjectOpsSnapshot {
                 lines_removed: 4,
             }),
         }],
+        governed_tasks: seeded_governed_tasks(),
         ..Default::default()
     }
+}
+
+fn seeded_governed_tasks() -> Vec<GovernedTaskRun> {
+    vec![
+        serde_json::from_value(json!({
+            "id": "task-governed-visual",
+            "revision": 3,
+            "project_id": "impulse-rs",
+            "workspace_root": "<repo>",
+            "task": "Ship the governed worker claim, verification, supervisor judgment, and operator approval loop",
+            "acceptance_criteria": [
+                "Worker process exit does not imply acceptance",
+                "Verification evidence is redacted and revision-bound"
+            ],
+            "approval_policy": "operator_required",
+            "runtime_id": "codex",
+            "agent_id": "codex-live",
+            "session_id": "codex-live-session",
+            "initial_subject_revision": "visual-base",
+            "execution_state": "runtime_exited",
+            "review_state": "awaiting_supervisor",
+            "claims": [{
+                "id": "claim-governed-visual",
+                "actor": { "kind": "worker", "id": "codex-live" },
+                "summary": "The worker submitted a bounded claim without declaring its own work accepted.",
+                "subject_revision": "visual-head",
+                "artifact_ids": ["artifact-phase-f"],
+                "diff_ref": "artifacts/governed-task.diff",
+                "submitted_at": "2026-07-13T15:26:00Z",
+                "based_on_revision": 1
+            }],
+            "verifications": [{
+                "id": "verification-governed-visual",
+                "actor": { "kind": "verifier", "id": "impulse-verifier" },
+                "claim_id": "claim-governed-visual",
+                "subject_revision": "visual-head",
+                "policy": "rust-workspace",
+                "outcome": "passed",
+                "commands": [{
+                    "name": "workspace tests",
+                    "executable": "cargo",
+                    "redacted_args": ["test", "--workspace", "<redacted>"],
+                    "command_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "exit_code": 0,
+                    "success": true,
+                    "output_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "output_ref": "artifacts/verification/workspace-tests.log",
+                    "output_bytes": 2048,
+                    "output_truncated": false
+                }],
+                "artifact_ids": ["artifact-phase-f"],
+                "notes": "All mandatory checks passed against the claimed subject.",
+                "recorded_at": "2026-07-13T15:28:00Z",
+                "based_on_revision": 2
+            }],
+            "supervisor_verdicts": [],
+            "operator_decisions": [],
+            "events": [],
+            "created_at": "2026-07-13T15:20:00Z",
+            "updated_at": "2026-07-13T15:28:00Z"
+        }))
+        .expect("valid governed visual fixture"),
+    ]
 }
 
 fn seeded_artifacts() -> Vec<ArtifactEnvelope> {
@@ -323,6 +390,8 @@ fn runtime_agent(
         cwd: Some(workspace.root.clone()),
         workspace: Some(workspace),
         session_id: Some(format!("{id}-session")),
+        governed_task_id: None,
+        governed_task_revision: None,
         rows: 32,
         cols: 120,
         alive: true,

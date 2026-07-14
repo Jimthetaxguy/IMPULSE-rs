@@ -13,10 +13,11 @@ use dioxus::prelude::*;
 use impulse_desktop::ui::{
     agent_focus_bridge_script, agent_launch_bridge_script, apply_desktop_bridge_message,
     apply_desktop_bridge_message_with_status, build_governed_agent_spawn_request,
-    builder_role_assignment, desktop_event_bridge_script, mcp_invoke_bridge_script,
-    review_decision_bridge_script, terminal_asset_paths, workspace_registration_bridge_script,
-    BridgeStatusUpdate, DaemonOpsStatusUpdate, DesktopBridgeMessage, DesktopBridgeStateMut,
-    ReviewDecisionUiRequest, XTERM_CSS_PATH, XTERM_FIT_JS_PATH, XTERM_JS_PATH,
+    builder_role_assignment, desktop_event_bridge_script, governed_task_mutation_bridge_script,
+    mcp_invoke_bridge_script, review_decision_bridge_script, terminal_asset_paths,
+    workspace_registration_bridge_script, BridgeStatusUpdate, DaemonOpsStatusUpdate,
+    DesktopBridgeMessage, DesktopBridgeStateMut, ReviewDecisionUiRequest, XTERM_CSS_PATH,
+    XTERM_FIT_JS_PATH, XTERM_JS_PATH,
 };
 use impulse_desktop::{
     default_builtin_mcp_tools, format_count, status_dot_class, status_label, AgentPlatformId,
@@ -333,6 +334,8 @@ fn runtime_snapshot(agent_id: &str) -> AgentRuntimeSnapshot {
             project_notes: Some("watch Dioxus bridge".to_string()),
         }),
         session_id: Some(format!("{agent_id}-session")),
+        governed_task_id: None,
+        governed_task_revision: None,
         rows: 32,
         cols: 100,
         alive: true,
@@ -1391,6 +1394,47 @@ fn test_host_manifest_exposes_registry_platform_catalog() {
 }
 
 #[test]
+fn test_host_manifest_and_bridge_expose_acknowledged_governed_task_mutation() {
+    use impulse_ops::governed_task::{
+        GovernedActor, GovernedActorKind, GovernedRequestId, GovernedTaskId, GovernedTaskMutation,
+        GovernedTaskMutationRequest, SupervisorVerdictInput, SupervisorVerdictKind,
+    };
+
+    assert!(
+        impulse_desktop::host_commands::HOST_INVOKE_COMMANDS
+            .contains(&impulse_desktop::host_commands::GOVERNED_TASK_MUTATE_COMMAND),
+        "the live host must expose the acknowledged governed-task command"
+    );
+
+    let request = GovernedTaskMutationRequest {
+        request_id: GovernedRequestId::try_new("req-ui-supervisor").unwrap(),
+        project_id: "impulse-rs".to_string(),
+        task_id: GovernedTaskId::try_new("task-ui-supervisor").unwrap(),
+        expected_revision: 7,
+        mutation: GovernedTaskMutation::RecordSupervisorVerdict {
+            verdict: SupervisorVerdictInput {
+                actor: GovernedActor {
+                    kind: GovernedActorKind::Supervisor,
+                    id: "supervisor-ui".to_string(),
+                },
+                verification_id: impulse_ops::governed_task::GovernedRecordId::try_new(
+                    "verification-ui",
+                )
+                .unwrap(),
+                verdict: SupervisorVerdictKind::RecommendAccept,
+                rationale: "Evidence satisfies the acceptance criteria".to_string(),
+            },
+        },
+    };
+    let script = governed_task_mutation_bridge_script(&request);
+
+    assert!(script.contains("mutateGovernedTask"));
+    assert!(script.contains(r#""expected_revision":7"#));
+    assert!(script.contains(r#""recommend_accept""#));
+    assert!(!script.contains("confirmed"));
+}
+
+#[test]
 fn test_desktop_reducer_accepts_registry_platform_catalog_messages() {
     let mut snapshot = ProjectOpsSnapshot::default();
     let mut runtime_agents = Vec::new();
@@ -2173,6 +2217,98 @@ fn test_shell_supervisor_route_gates_operator_board() {
 }
 
 #[test]
+fn test_shell_supervisor_route_renders_authoritative_governed_evidence_and_controls() {
+    let governed_task = serde_json::from_value(json!({
+        "id": "task-visual-review",
+        "revision": 3,
+        "project_id": "impulse-rs",
+        "workspace_root": "/tmp/impulse-rs",
+        "task": "Prove the governed completion path with a deliberately long task title",
+        "acceptance_criteria": ["Workspace tests pass", "No raw command output is retained"],
+        "approval_policy": "operator_required",
+        "runtime_id": "codex",
+        "agent_id": "codex-live",
+        "session_id": "codex-live-session",
+        "initial_subject_revision": "abc123",
+        "execution_state": "runtime_exited",
+        "review_state": "awaiting_supervisor",
+        "claims": [{
+            "id": "claim-visual-review",
+            "actor": { "kind": "worker", "id": "codex-live" },
+            "summary": "Implemented the daemon-owned task lifecycle and recovery path.",
+            "subject_revision": "def456",
+            "artifact_ids": ["artifact-governed-diff"],
+            "diff_ref": "artifacts/governed-task.diff",
+            "submitted_at": "2026-07-13T20:00:00Z",
+            "based_on_revision": 1
+        }],
+        "verifications": [{
+            "id": "verification-visual-review",
+            "actor": { "kind": "verifier", "id": "impulse-verifier" },
+            "claim_id": "claim-visual-review",
+            "subject_revision": "def456",
+            "policy": "rust-workspace",
+            "outcome": "passed",
+            "commands": [{
+                "name": "workspace tests",
+                "executable": "cargo",
+                "redacted_args": ["test", "--workspace", "<redacted>"],
+                "command_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "exit_code": 0,
+                "success": true,
+                "output_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "output_ref": "artifacts/verification/workspace-tests.log",
+                "output_bytes": 2048,
+                "output_truncated": true
+            }],
+            "artifact_ids": ["artifact-workspace-tests"],
+            "notes": "All mandatory checks passed against the claimed revision.",
+            "recorded_at": "2026-07-13T20:01:00Z",
+            "based_on_revision": 2
+        }],
+        "supervisor_verdicts": [],
+        "operator_decisions": [],
+        "events": [],
+        "created_at": "2026-07-13T19:59:00Z",
+        "updated_at": "2026-07-13T20:01:00Z"
+    }))
+    .expect("governed task fixture");
+    let snapshot = ProjectOpsSnapshot {
+        governed_tasks: vec![governed_task],
+        ..Default::default()
+    };
+
+    let mut vdom = VirtualDom::new_with_props(
+        DesktopShellWithSnapshot,
+        DesktopShellWithSnapshotProps {
+            snapshot,
+            runtime_agents: Vec::new(),
+            agent_platforms: Vec::new(),
+            workspaces: Vec::new(),
+            mcp_tools: Vec::new(),
+            last_invocations: Vec::new(),
+            review_queue: Vec::new(),
+            bridge_status: None,
+            daemon_ops_status: None,
+            initial_view: DesktopView::Supervisor,
+        },
+    );
+    vdom.rebuild_in_place();
+    let html = dioxus_ssr::render(&vdom);
+
+    assert!(html.contains("data-governed-task-id=\"task-visual-review\""));
+    assert!(html.contains("data-review-state=\"awaiting supervisor\""));
+    assert!(html.contains("Implemented the daemon-owned task lifecycle"));
+    assert!(html.contains("redacted argv"));
+    assert!(html.contains("&lt;redacted&gt;"));
+    assert!(html.contains("output truncated"));
+    assert!(html.contains("Recommend accept"));
+    assert!(html.contains("Request changes"));
+    assert!(html.contains("Escalate"));
+    assert!(!html.contains(">Approve<"));
+}
+
+#[test]
 fn test_retro_theme_helpers_map_backend_statuses() {
     assert_eq!(format_count(999), "999");
     assert_eq!(format_count(47_238), "47.2k");
@@ -2202,8 +2338,9 @@ fn test_terminal_interop_serializes_xterm_input_as_byte_array() {
     assert!(script.contains("listenersMounted"));
     assert!(!script.contains("already-mounted"));
     assert!(script.contains(
-        r#"invoke("agent_write", { request: { agent_id: agentId, data: encodeInput(data) } });"#
+        r#"invokeTerminal("agent_write", { request: { agent_id: agentId, data: encodeInput(data) } });"#
     ));
+    assert!(script.contains(r#"data-xterm-state", "input-error"#));
     assert!(!script.contains("data } });"));
 }
 

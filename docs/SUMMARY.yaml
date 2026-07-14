@@ -10,7 +10,7 @@ category: docs
 # Navigation Tree
 
 roadmap_contract: >-
-  Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; Legacy=egui compile-maintenance only
+  Now=control-plane foundations + daemon-owned governed task lifecycle; Next=real claim/verification producers + supervisor/builder process proof + accepted-run memory promotion; Later=general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only
 
 quick_reference:
   - name: VISION.md
@@ -159,6 +159,7 @@ categories:
     - decisions/0008-dioxus-desktop-host.md
     - decisions/0009-reconcile-impulse-copies.md
     - decisions/0010-product-role-launch-contract.md
+    - decisions/0011-governed-task-run-lifecycle.md
 
   session_logs:
     - session-logs/DEVELOPMENT-HISTORY.md
@@ -174,8 +175,8 @@ validation_and_history:
     path: guides/HOOK-VALIDATION-GUIDE.md
 
 metadata:
-  total_documents: 136
+  total_documents: 138
   categories: 9
-  decisions: 10
+  decisions: 11
   phases: 3
   status: active_development

@@ -1,7 +1,7 @@
 ---
 title: Rust Canonical Product Contract
 description: Authoritative product contract for Impulse based on impulse-rs
-version: '1.9'
+version: '2.0'
 updated: 2026-07-13
 type: specification
 category: core
@@ -42,6 +42,8 @@ Core outcomes:
 - Persistent project memory (`GENOME`, session history, active state) with review-first injection
 - Cross-session continuity for Claude Code and Codex integrations, with legacy OpenCode compatibility preserved where already implemented
 - Capability-checked dynamic tools and a supervisor-specific action/permission policy foundation
+- Daemon-owned governed tasks with pre-PTY registration, revisioned/idempotent mutations,
+  independent execution/review state, typed evidence/judgments, and operator-required acceptance
 - Operationally safe session lifecycle with recorded endings and optional API-level verification gates
 - Human-visible observability through CLI, ratatui TUI, and the Dioxus Desktop cockpit
 - Desktop workspace registry plus multi-agent launch/observation surfaces; daemon-side
@@ -84,8 +86,8 @@ Historical migration sequence: `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md`
 
 | Stage | Focus | Status |
 | --- | --- | --- |
-| **Now** | Rust control-plane foundation: daemon truth, PTY lifecycle, memory/tools/policy/artifacts, Dioxus cockpit, Ion native runtime | Active |
-| **Next** | Prove one governed supervisor + builder vertical slice and define the hierarchy/enforcement ADR | Active |
+| **Now** | Rust control-plane foundation plus the daemon-owned governed-task lifecycle and cockpit decision surface | Active |
+| **Next** | Wire real worker/verifier producers and a launched supervisor through one process-level governed workflow; define remaining hierarchy/enforcement ADRs | Active |
 | **Later** | General role contracts, runtime capability negotiation, typed agent messaging, and multi-project supervisor attention | Planned |
 | **Legacy** | egui / `impulse-gui` compile-maintenance only | Frozen |
 
@@ -104,7 +106,7 @@ Historical migration sequence: `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md`
 | Runtime | External harness or native engine that executes a role | External agent harness calls, desktop PTY runtime, and Ion native provider/tool loop; no common adapter trait yet |
 | Agent instance | One running identity with runtime, role, scope, process state, and telemetry | `AgentRuntime`/`AgentRuntimeSnapshot` and desktop runtime records |
 | Session | Bounded persisted work history | Daemon session lifecycle and `.impulse/` history/state |
-| Task | Assignment plus acceptance/verification criteria | Governed desktop launches require bounded nonblank task metadata and preserve it in runtime/daemon telemetry; there is not yet one durable task/evidence lifecycle |
+| Task | Assignment plus acceptance/verification criteria | `GovernedTaskRun` is a durable daemon-owned identity distinct from agent/session ids; it carries bounded criteria, typed claims/evidence/verdicts/decisions, and independent execution/review state. Reassignment/resume is not implemented |
 | Pane | Cockpit view/input attachment | TUI panes and desktop terminal ids; never an authority boundary |
 | Workspace target | Explicit filesystem execution root | Desktop `WorkspaceTarget`/`WorkspaceRegistry` |
 | Project | Governance scope for memory, artifacts, policy, and verification | Project-scoped `.impulse/` state and `ProjectOpsSnapshot`; often maps 1:1 to a workspace today |
@@ -131,10 +133,39 @@ task, assignment, and compatibility result remain observable through runtime and
 This static preflight does not attest model-internal behavior, and canonical working-directory
 mediation is not a filesystem sandbox.
 
+[ADR-0011](../decisions/0011-governed-task-run-lifecycle.md) adds the next narrow operating
+contract. A governed launch proposes a distinct task ID and must receive authoritative daemon
+registration before PTY creation. The daemon persists the run in `.impulse/GOVERNED_TASKS.json`,
+serializes expected-revision/idempotency-key mutations, and keeps execution state separate from
+review state. Worker claims, verifier records, supervisor verdicts, and operator decisions remain
+distinct typed records; only current passing verification can be recommended, and only an explicit
+operator approval creates `accepted`. Dioxus renders daemon snapshots and uses an acknowledged host
+command without optimistic task updates. Desktop launch/exit intent uses a bounded, owner-only,
+cross-process-locked project outbox written before daemon I/O. The outbox covers queued intent and
+ambiguous transport, but not abrupt desktop death before exit intent exists; runtime leases and
+orphan reconciliation remain downstream. Missing targets stay queued until a future durable
+registration-tombstone/expiry policy can prove they cannot appear.
+
+All governed mutations route through the single project-bound daemon writer. Expected-revision CAS
+and atomic replacement do not authorize two daemon processes to write the same ledger.
+
+On ledger load, the daemon validates canonical task/project/workspace identity, replays the
+contiguous typed record/event chain, and requires exactly one valid idempotency receipt for every
+revision. Forged materialized states, broken history, missing receipts, and malformed persisted
+evidence fail closed before becoming workbench truth.
+
+This is not a generalized role/runtime contract. Typed actor kinds are auditable provenance and
+transition checks, not cryptographic authorization between processes running as the same OS user.
+Evidence producers must redact secret-bearing arguments before submission; the daemon validates
+bounded redacted argv, SHA-256 digest shape, and project-local references but cannot prove complete
+semantic redaction. One daemon adapter remains bound to one project, project identity is currently
+directory-name-derived, tasks cannot be reassigned/resumed, review errors are not yet structured CAS
+codes, and global task/receipt collections are not paginated or archived.
+
 A future generalized/dynamic adapter contract must still define runtime discovery, optional and
 emulated operations, attestation freshness, and post-launch re-evaluation. General role
-composition, daemon-owned task evidence, supervisor decisions, and verified-memory promotion also
-remain outside this launch-preflight foundation.
+composition, runtime-native claim/verifier producers, a launched supervisor role, accepted-run
+memory promotion, and a complete process-level proof remain outside this slice.
 
 ## 4) Public Interface Contract
 
@@ -169,6 +200,8 @@ The exact direct/daemon support matrix and flags live in [`docs/CLI-COMMANDS.md`
 | `.impulse/HISTORY.jsonl` | Session history (append-only) | Durable project memory |
 | `.impulse/GENOME.md` | Durable decisions/preferences | Durable project memory |
 | `.impulse/config.json` | Runtime configuration | Durable config |
+| `.impulse/GOVERNED_TASKS.json` | Daemon-owned governed task records plus idempotency receipts | Durable project control-plane state; atomically replaced at mode `0600` |
+| `.impulse/DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.json` | Bounded write-ahead desktop launch/exit intent awaiting daemon reconciliation | Durable local recovery state; cross-process sibling lock, mode `0600`, removed/emptied after acknowledgment |
 | `.impulse/context/current-task.md` | Shared current context | Generated via `sync-context` |
 | `.impulse/context/handoff-*.md` | Tool handoff artifacts | Generated via `handoff` |
 | `.impulse/context/routing-log.jsonl` | Orchestration log | Append-only audit |
@@ -193,6 +226,7 @@ The desktop shell communicates with the Rust backend through a Dioxus host adapt
 | `terminal_resize` | Resize PTY and vt100 parser |
 | `terminal_close` | Kill PTY and clean up session |
 | `terminal_focus` | Notify backend of focus change |
+| `governed_task_mutate` | Submit an acknowledged revisioned governed-task mutation and return daemon-owned state |
 | `native_island_request` | Request a narrow macOS-native island and receive a serializable result DTO |
 
 **Events (backend → frontend):**
@@ -205,7 +239,7 @@ The desktop shell communicates with the Rust backend through a Dioxus host adapt
 | `ops_update` | Daemon ProjectOpsSnapshot update |
 | native island result | Returned through `native_island_request`; native code does not own session, memory, terminal, or artifact state |
 
-### Daemon Workbench IPC Contract (Preserved — Unchanged)
+### Daemon Workbench IPC Contract (Authoritative — Extended in v4)
 
 The daemon is the authoritative source for workbench surfaces:
 
@@ -213,6 +247,7 @@ The daemon is the authoritative source for workbench surfaces:
 - `Agents`
 - `Context`
 - `Artifacts`
+- governed task evidence and decision cards in the Supervisor view
 - sidebar operator alerts
 - status bar workbench summary
 
@@ -233,6 +268,10 @@ Shared workbench model contract:
 - `ProjectOpsSnapshot` is the canonical read model for the daemon-backed workbench.
 - `TerminalOpsReport` is the ephemeral publication model for live terminal telemetry.
 - `AgentRuntime.ephemeral = true` identifies telemetry-only agents that do not currently map to a durable session.
+- `AgentRuntime.governed_task_id` and `governed_task_revision` retain task provenance in
+  runtime telemetry without making the runtime record authoritative for review state.
+- `ProjectOpsSnapshot.governed_tasks` is the authoritative governed-task collection; old payloads
+  deserialize it as empty.
 
 `TerminalOpsReport` fields:
 
@@ -251,7 +290,7 @@ Daemon overlay rules:
 - Stop overlaying stale telemetry after 10 seconds.
 - Purge telemetry-only state after 60 seconds.
 
-### Daemon IPC Contract (PROTOCOL_VERSION = 3)
+### Daemon IPC Contract (PROTOCOL_VERSION = 4)
 
 The daemon exposes a JSON-line Unix socket protocol (`impulse.sock`). Full spec: [`docs/IPC-PROTOCOL.md`](../IPC-PROTOCOL.md).
 
@@ -293,6 +332,8 @@ The daemon exposes a JSON-line Unix socket protocol (`impulse.sock`). Full spec:
 **Workbench:**
 - `GetOpsSnapshot`, `SubscribeOps { since_seq? }`, `PublishTerminalOps { report: TerminalOpsReport }`
 - `ListArtifacts { limit? }`, `GetArtifact { artifact_id }`, `RunArtifactAction { artifact_id, action_id, params? }`
+- `RegisterGovernedTask { registration }`, `GetGovernedTask { project_id, task_id }`,
+  `ListGovernedTasks { project_id }`, `MutateGovernedTask { request }`
 
 **Chat:**
 - `Chat { session_id, message, inject_mode?, inject_explain? }`
@@ -322,6 +363,7 @@ The daemon exposes a JSON-line Unix socket protocol (`impulse.sock`). Full spec:
 | Ion native coding runtime | Implemented foundation | `ion` REPL, provider/tool loop, approvals/guardrails | Rust unit + CLI tests |
 | Registry-backed open desktop platform identity | Implemented foundation | `AgentRegistry`, `AgentPlatformId`, desktop/MCP/host | Registry + desktop tests |
 | Product-role launch preflight | Implemented narrow foundation | `AgentRoleId`, `AgentRoleAssignment`, static registry support, Dioxus preview, `DesktopRuntime` pre-PTY gate | Ops + desktop runtime/contract tests |
+| Daemon-owned governed-task lifecycle | Implemented narrow foundation | `GovernedTaskRun`, governed workbench IPC, persistent ledger, desktop acknowledged gateway/outbox, Supervisor evidence cards | Ops/state/daemon/desktop contract and recovery tests |
 | General role contract | Direction, not implemented | Future ADR | Not applicable |
 | Common dynamic runtime adapter + generalized capability negotiation | Direction, not implemented | Future ADR | Not applicable |
 | Typed cross-agent message bus | Partial delegations/handoffs only | `delegation`, `orchestration`, daemon contracts | Rust tests |
@@ -349,7 +391,10 @@ Contributor verification before completion remains mandatory even though the ses
 `--verify` optional.
 
 External runtime enforcement is limited to launch conditions, working-directory/project scoping,
-and supported integration seams. Structural filesystem isolation depends on runtime/sandbox support.
+supported integration seams, and the daemon-owned task transition boundary. Structural filesystem
+isolation depends on runtime/sandbox support. The daemon socket directory/socket/PID file are
+restricted to the local user (`0700`/`0600`/`0600`), which protects the OS-user boundary but does
+not authenticate distinct roles among processes owned by that user.
 The product must not infer that a role is satisfied merely because a prompt was injected or a pane
 was labeled. Ion can support deeper structural enforcement because Impulse owns its tool/model loop,
 but it remains subject to the explicit policies and gaps documented in code and `VISION.md`.
@@ -361,13 +406,17 @@ but it remains subject to the explicit policies and gaps documented in code and 
 The following files define product truth and must be updated together for contract changes:
 - `VISION.md` (living product north star and target-state boundary)
 - `docs/spec/RUST-CANONICAL-CONTRACT.md` (authoritative contract)
+- `CONTEXT.md` (stable project vocabulary and live/direction boundary)
 - `AGENTS.md` (operator-facing guidance)
 - `CLAUDE.md` (project technical context)
 - `docs/INDEX.md` (navigation + source-of-truth routing)
 - `docs/SUMMARY.yaml` (navigation source)
 - `docs/SUMMARY.md` (high-level map)
 - `docs/spec/DESKTOP-SHELL-ARCHITECTURE.md` (desktop contract)
+- `docs/spec/USER-STORY-MAP.md` and `docs/spec/TEST-TRACEABILITY.md` (acceptance and evidence map)
 - `docs/decisions/0008-dioxus-desktop-host.md` (desktop ADR)
+- `docs/decisions/0010-product-role-launch-contract.md` and
+  `docs/decisions/0011-governed-task-run-lifecycle.md` (governed launch/lifecycle authority)
 
 ### Required Update Checklist for Any Interface Change
 
@@ -390,7 +439,11 @@ When adding/changing CLI commands, hooks, state files, or roadmap stage definiti
 | Tooling | ≥2.0 | ~17.1 | MET |
 | Integration | Every stable CLI command | 26 tests | PARTIAL |
 
-**Workspace totals (2026-07-12 canonical projection):** 1,950 tests across the 5 workspace crates/packages (impulse-rs 1,576, ops 44 including the canonical-checkout archive proof, term 114, desktop 193, ion 23); 9 ignored, 0 failed. The verified isolated worktree without the gitignored reconciliation archive reports 1,949 passed with that one proof explicitly filtered.
+**Workspace totals:** The final `cargo test --workspace` output for the current checkout is the
+authority; record its package-level passed, ignored, and failed totals in commit/PR evidence rather
+than freezing a moving aggregate in this contract. If an isolated worktree lacks the gitignored
+reconciliation archive, identify the filtered checkout-only proof and rerun it from the canonical
+checkout before release.
 
 ### Required Test Patterns
 
