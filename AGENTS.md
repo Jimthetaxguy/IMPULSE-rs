@@ -15,7 +15,7 @@ authors:
 > Contract: [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
 > Collaboration playbook: [`docs/guides/COLLABORATIVE-AGENTIC-CODING.md`](docs/guides/COLLABORATIVE-AGENTIC-CODING.md)
 > Canonical stack: Rust (impulse-rs)
-> Roadmap contract: Now=control-plane foundations + daemon-owned governed task lifecycle; Next=real claim/verification producers + supervisor/builder process proof + accepted-run memory promotion; Later=general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only.
+> Roadmap contract: Now=control-plane foundations + daemon-owned governed runtime producers; Next=accepted-run memory promotion + stronger same-user actor authorization + full launched-runtime proof; Later=general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only.
 
 ---
 
@@ -105,7 +105,8 @@ Choose the simplest solution that works. Prefer editing existing files over crea
 - **egui workbench** — LEGACY. Frozen. Compile-maintenance only.
 
 **Live versus direction:**
-- Live foundations include PTY lifecycle, daemon-owned workbench truth and telemetry, registry-driven desktop platform identity, Ion as a launchable platform, capability-checked tool registries, supervisor-specific permission policy, reviewable artifacts, and the revisioned governed-task evidence/decision lifecycle. Only an operator decision can accept a governed task; process exit never does.
+- Live foundations include PTY lifecycle, daemon-owned workbench truth and telemetry, registry-driven desktop platform identity, Ion as a launchable platform, capability-checked tool registries, supervisor-specific permission policy, reviewable artifacts, and the profiled governed-task producer lifecycle. A profiled Builder launch records exact acceptance criteria and a daemon-attested clean Git `HEAD`; the daemon derives claims, runs fixed detached Rust verification, and requests strict API-only Supervisor review. Only an operator decision can accept a governed task; process exit and model recommendation never do.
+- `rust_workspace_v1` runs host-trusted Rust code in a detached Git worktree with scrubbed environment, timeouts, output digests, and process-group cleanup. It is not an OS sandbox. Dioxus renders evidence and guides operators to `"$IMPULSE_CONTROL_CLI" --daemon governed-verify` / `"$IMPULSE_CONTROL_CLI" --daemon governed-review`; it does not yet expose producer buttons. The packaged executable is `impulse-rs`; `--daemon` is a required global flag before every governed producer subcommand. Persisted receipts plus the per-task lock cover replay/concurrency, not daemon crash between side effect and receipt; durable producer reservations remain future work.
 - A general `RoleContract`, common runtime-adapter trait, and capability-negotiation contract are product direction, not implemented facts. Do not claim every runtime is structurally governed.
 
 **Data in `.impulse/`:**
@@ -162,9 +163,9 @@ cargo fmt --all -- --check
 ```
 
 **Final-gate evidence:** Do not rely on a checked-in aggregate test count. Run the complete gate on
-the current checkout and record passed, ignored, and failed totals in the commit/PR evidence. If an
-isolated worktree lacks the gitignored reconciliation archive, identify the filtered checkout-only
-proof explicitly and rerun it from the canonical checkout before release.
+the current checkout and record passed, ignored, and failed totals in the commit/PR evidence.
+Default tests must use tracked source/fixtures and remain portable across fresh clones, linked
+worktrees, and CI.
 
 ### Code Requirements
 

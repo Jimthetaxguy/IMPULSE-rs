@@ -1,7 +1,7 @@
 ---
 title: Architecture Decision Records
 description: Decision index separating current control-plane authority from accepted historical phase-era scope
-version: '1.2'
+version: '1.3'
 status: active
 phase: all
 type: reference
@@ -38,6 +38,7 @@ registry-backed runtime identity, daemon truth, or the current Now/Next/Later ro
 | [0009](0009-reconcile-impulse-copies.md) | Reconcile duplicate Impulse codebases | **Accepted** | Current canonical-tree authority | 2026-06-25 | -- |
 | [0010](0010-product-role-launch-contract.md) | Product role launch contract | **Accepted** | Current explicit role/task launch-preflight authority | 2026-07-13 | -- |
 | [0011](0011-governed-task-run-lifecycle.md) | Daemon-owned governed task lifecycle | **Accepted** | Durable evidence/review state and operator-required acceptance | 2026-07-13 | -- |
+| [0012](0012-daemon-owned-governed-runtime-producers.md) | Daemon-owned governed runtime producers | **Accepted** | Clean-Git Builder claims, detached daemon verification, and strict API-only Supervisor review | 2026-07-13 | -- |
 
 ## ADR Format
 

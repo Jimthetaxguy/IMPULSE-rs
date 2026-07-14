@@ -4,9 +4,9 @@
 - **Updated:** 2026-07-13
 - **Canonical implementation contract:** [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
 - **Current code boundary map:** [`docs/ARCHITECTURE-CLARIFICATION.md`](docs/ARCHITECTURE-CLARIFICATION.md)
-- **Roadmap contract:** Now=control-plane foundations + daemon-owned governed task lifecycle; Next=real claim/verification producers + supervisor/builder process proof + accepted-run memory promotion; Later=general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only.
-- **Current governed slice:** pre-PTY task registration, independent execution/review state, typed evidence and decisions, operator-required acceptance, and a daemon-truth cockpit surface.
-- **Next governed slice:** runtime-native claim/verifier producers, a launched supervisor role, accepted-run memory promotion, and one process-level multi-runtime proof.
+- **Roadmap contract:** Now=control-plane foundations + daemon-owned governed runtime producers; Next=accepted-run memory promotion + stronger same-user actor authorization + full launched-runtime proof; Later=general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only.
+- **Current governed slice:** profiled pre-PTY Builder registration, exact acceptance criteria, daemon-attested clean Git subjects, daemon-derived claims and detached Rust verification, strict API-only Supervisor review, and operator-required acceptance.
+- **Next governed slice:** review-only accepted-run memory promotion, stronger local actor authorization, and one full process proof with launched Builder and Supervisor runtimes.
 
 ## The promise
 
@@ -206,8 +206,11 @@ user approval. Each can disagree with the others, and the interface must show th
 
 ### Current governed-task boundary
 
-That distinction is now executable for governed Builder launches. The daemon owns a persistent task
-record and append-only typed events; mutations carry an idempotency request ID and expected revision.
+That distinction is now executable for profiled governed Builder launches. The daemon owns a
+persistent task record and append-only typed events; mutations carry an idempotency request ID and
+expected revision. A `rust_workspace_v1` launch requires exact acceptance criteria, the canonical
+Git worktree root, a clean committed `HEAD`, and an initial OID independently re-observed by the
+daemon before PTY creation.
 Execution state (`registered`, `running`, `launch_failed`, `runtime_exited`) changes independently
 from review state. Passing verification may reach `awaiting_supervisor`; only a supervisor
 `recommend_accept` verdict can reach `awaiting_operator`; only an operator approval can produce
@@ -216,12 +219,37 @@ from review state. Passing verification may reach `awaiting_supervisor`; only a 
 On restart, the daemon replays the stored event/record chain and requires one valid idempotency
 receipt per revision before trusting the materialized state. This catches corrupt or incoherent
 files; it is not a signature against a same-user process capable of rewriting the entire ledger.
+Receipts deduplicate already-persisted requests, and one per-task lock serializes live producer and
+lifecycle mutations. Producer execution is not crash-safe exactly-once: daemon death after a
+command/model side effect but before its durable receipt can cause a retry to repeat that side
+effect. A durable producer reservation journal is required to close that boundary.
 
-Command evidence persists a display-safe executable and redacted arguments plus SHA-256 digests,
-byte counts, truncation flags, and project-local output references. Raw argv and command output are
-not part of the task record. Evidence producers are responsible for replacing secret-bearing
-arguments with `<redacted>` before submission; the daemon validates shape, bounds, digests, and
-relative references but cannot reconstruct whether a producer omitted a secret.
+The Builder supplies only a bounded summary and artifact IDs through the env-routed
+`"$IMPULSE_CONTROL_CLI" --daemon governed-claim` command or Ion's typed
+`governed_submit_claim` tool. The packaged executable is `impulse-rs`; the environment variable
+retains the exact launched path. The daemon derives the assigned Worker actor and current clean Git
+OID. It then verifies the exact claimed commit in a detached Git
+worktree with a closed format/locked-check/locked-strict-Clippy/locked-test argv profile, a required
+committed regular non-symlink root `Cargo.lock`, a symlink-free source tree, a scrubbed environment,
+bounded timeouts, streaming output digests,
+process-group cleanup, and a bounded before/after byte manifest that includes ignored source-tree
+paths. Command evidence persists a
+display-safe executable and fixed arguments plus SHA-256 digests, byte counts, and truncation flags;
+raw output is not part of the task record.
+
+The real daemon/CLI process test proves claim submission, detached verification, durable evidence,
+and restart recovery only through `awaiting_supervisor`. Separate in-process daemon handler tests
+prove strict API-only Supervisor review and operator-only acceptance.
+
+This verifier executes host-trusted Rust build scripts, proc macros, and tests. Detached checkout,
+environment scrubbing, timeout, and cleanup are containment measures, not an OS sandbox. Projects
+that are not trusted to execute locally must not use this profile.
+
+Supervisor review is a stateless, tool-free, temperature-zero API turn. Its strict JSON envelope
+must echo the exact task revision, claim and verification IDs, subject revision, acceptance-criteria
+count, and acceptance-criteria digest. Generic coding-harness configuration fails closed before
+spawn because Impulse cannot guarantee a structurally read-only harness turn. Dioxus shows the
+result and guides the operator to the terminal producer commands; producer buttons are not live.
 
 Typed actor kinds provide provenance and transition checks, not cryptographic same-user role
 authentication. The daemon socket directory/socket/PID file are restricted to the local user, but
@@ -251,8 +279,13 @@ needs a reason and an audit path. The user can interrupt, narrow, revoke, review
   compatibility telemetry.
 - Daemon-owned governed task records with pre-PTY registration, revisioned/idempotent mutations,
   independent execution/review state, durable lifecycle events, and operator-required acceptance.
+- Explicit `rust_workspace_v1` registrations with exact criteria and daemon-attested clean initial
+  Git OIDs; env-routed Builder claims through CLI and Ion's `governed_submit_claim` tool.
+- Daemon-owned detached Rust verification and strict criteria-digest-bound, API-only, tool-free,
+  history-free Supervisor review. Generic external harness review fails closed.
 - Dioxus governed-task evidence and decision cards backed by acknowledged host commands; no
-  optimistic task state.
+  optimistic task state. Profiled cards currently guide terminal producer commands rather than
+  exposing producer buttons.
 - Owner-only, write-ahead desktop lifecycle outbox with cross-process locking for launch/exit
   reconciliation across ambiguous daemon transport failures. Abrupt desktop death before an exit
   intent exists still requires a future runtime lease/orphan-reconciliation contract; missing task
@@ -276,8 +309,8 @@ a separate action and must not be inferred from repository state alone.
 - Typed cross-agent messaging, acknowledgements, routing, and project isolation.
 - Role-scoped tools, credentials, context, memory, and verification policies.
 - Event-driven supervisor attention and resource budgets.
-- Runtime-native claim/verifier producers, a launched supervisor role, accepted-run memory
-  promotion, and a process-level proof across the complete governed workflow.
+- Review-only accepted-run memory promotion, stronger same-user actor authorization, and a
+  process-level proof across launched Builder and Supervisor runtimes.
 
 ## First complete vertical slice
 
@@ -296,11 +329,14 @@ subsystem:
    operator explicitly approves or rejects an accept recommendation.
 10. Only accepted, verified outcomes become scoped durable memory, with an inspectable reason and source.
 
-The explicit Builder preflight and daemon-owned governed-task lifecycle establish the authoritative
-parts of steps 3-5 and 8-9: registration precedes PTY creation, evidence and judgments are typed,
-runtime exit is never acceptance, and the operator owns the terminal approval. The remaining proof
-must wire real worker/verifier producers and a launched supervisor through the full path, then add
-accepted-run memory promotion. The complete multi-runtime workflow is therefore not yet closed.
+The explicit Builder preflight and daemon-owned governed producers establish the authoritative
+parts of steps 3-5 and 8-9: registration precedes PTY creation, exact criteria and a clean Git
+subject are bound to the task, the daemon derives claim and verification truth, strict API review is
+revision-bound, runtime exit is never acceptance, and the operator owns final approval. Real-process
+and restart tests prove the CLI claim and detached verification path; handler tests prove strict
+Supervisor binding and operator-only acceptance. The remaining proof must compose launched Builder
+and Supervisor runtimes through the complete path and promote only an accepted result to a
+review-only memory candidate. The complete multi-runtime workflow is therefore not yet closed.
 
 ## Success criteria
 
@@ -325,9 +361,9 @@ accepted-run memory promotion. The complete multi-runtime workflow is therefore 
 
 ## Open ADR decisions
 
-ADR-0010 accepts the product-role/task launch preflight and ADR-0011 accepts the daemon-owned
-governed-task lifecycle. The following broader decisions remain open and must be resolved before
-schema-specific documents split out:
+ADR-0010 accepts the product-role/task launch preflight, ADR-0011 accepts the daemon-owned
+governed-task lifecycle, and ADR-0012 accepts the first daemon-owned producer profile. The following
+broader decisions remain open and must be resolved before schema-specific documents split out:
 
 1. Remaining hierarchy/cardinality and durable ids for project, workspace, role, runtime, instance,
    session, pane, and supervisor scope, plus governed-task reassignment/resume.

@@ -75,6 +75,10 @@ DAEMON (impulse-rs binary)
 - Subscribes to host events (`terminal_output`, `ops_update`, etc.) and routes them to the correct xterm.js instance or UI component
 - Sends user actions (keyboard input, resize, tab switch, session commands) as host commands to the backend
 - **Does not hold authoritative state.** All panel data (sessions, context, artifacts, supervisor) is read from daemon snapshots, not from frontend-local shadow copies
+- The governed Builder launcher collects exact acceptance criteria and selects the closed
+  `rust_workspace_v1` profile. Profiled evidence cards show
+  `"$IMPULSE_CONTROL_CLI" --daemon governed-verify` and
+  `"$IMPULSE_CONTROL_CLI" --daemon governed-review`; producer buttons are not part of the current host surface.
 
 ### Terminal Panes (xterm.js)
 
@@ -105,6 +109,8 @@ DAEMON (impulse-rs binary)
   onto durable workbench truth, and returns `ProjectOpsSnapshot`/`OpsSubscription` read models
 - Desktop shell panels read exclusively from daemon state, never from frontend-local shadow state
 - Daemon reconnect must restore desktop shell state cleanly without a full restart
+- Protocol v5 owns profiled claim, detached verification, and strict API Supervisor-review
+  producers. The desktop cannot compose actor, subject, evidence, or verdict payloads for them.
 
 ### ratatui (standalone)
 
@@ -167,7 +173,21 @@ Desktop runtime publishes TerminalOpsReport
 ### Governed Task Decision Path
 
 ```text
-Supervisor/operator action in Dioxus
+Profiled Builder launch in Dioxus
+  -> exact task + acceptance criteria + rust_workspace_v1
+  -> desktop observes clean canonical Git HEAD
+  -> daemon independently re-attests HEAD and registers before PTY spawn
+  -> desktop injects project/task/socket/control-CLI/profile routing
+
+Builder terminal or Ion tool
+  -> "$IMPULSE_CONTROL_CLI" --daemon governed-claim / governed_submit_claim
+     (summary + artifact ids only)
+  -> daemon derives Worker + clean subject
+  -> "$IMPULSE_CONTROL_CLI" --daemon governed-verify runs fixed Rust commands in a detached checkout
+  -> "$IMPULSE_CONTROL_CLI" --daemon governed-review runs strict tool-free/stateless API Supervisor review
+  -> ops_update renders daemon-owned evidence
+
+Operator action in Dioxus
   -> governed_task_mutate host command
   -> acknowledged desktop daemon client
   -> daemon expected-revision/idempotency transition
@@ -183,6 +203,13 @@ This table documents the terminal, governed-task, and native-island subset used 
 above. The complete current host-command manifest is `host_commands::HOST_INVOKE_COMMANDS`; it also
 contains the `agent_*`, workspace, MCP, review, and supervisor command families. All host commands
 must remain thin adapters over backend-owned state and policy.
+
+There are intentionally no `governed_verify` or `governed_review` host commands in this table.
+Profiled cards guide the operator to the routed control CLI inside the governed terminal. The
+packaged executable is `impulse-rs`; `$IMPULSE_CONTROL_CLI` retains the exact injected executable
+path, and the global `--daemon` flag must precede the producer subcommand. Adding
+producer buttons requires a separate acknowledged host-command contract; UI-authored automatic
+producer records are forbidden.
 
 ### Commands (frontend -> backend)
 
@@ -217,3 +244,7 @@ must remain thin adapters over backend-owned state and policy.
    capabilities such as governed tasks, but desktop-only shadow state or policy is forbidden.
 6. **Task decisions are acknowledged.** The UI waits for daemon-owned state and never treats a
    terminal exit or optimistic click result as task acceptance.
+7. **Profiled producer truth is daemon-owned.** Dioxus supplies launch criteria and renders results;
+   it never supplies automatic claim actor/subject, command evidence, or Supervisor verdict.
+8. **Verification is host-trusted, not sandboxed.** The detached `rust_workspace_v1` checkout still
+   executes project-authored Rust build scripts, proc macros, and tests on the host.
