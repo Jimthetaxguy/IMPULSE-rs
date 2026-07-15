@@ -1,7 +1,7 @@
 ---
 title: Documentation Summary
 description: Unified navigation structure for Impulse documentation
-version: '2.6'
+version: '2.7'
 updated: '2026-07-13'
 schema_version: '1.0'
 type: navigation
@@ -10,7 +10,7 @@ category: docs
 # Navigation Tree
 
 roadmap_contract: >-
-  Now=control-plane foundations + daemon-owned governed task lifecycle; Next=real claim/verification producers + supervisor/builder process proof + accepted-run memory promotion; Later=general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only
+  Now=control-plane foundations + daemon-owned governed runtime producers; Next=accepted-run memory promotion + stronger same-user actor authorization + full launched-runtime proof; Later=general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only
 
 quick_reference:
   - name: VISION.md
@@ -60,7 +60,7 @@ quick_reference:
 
 active_tracks:
   - name: Control-Plane Foundations
-    description: Current implementation boundary and governed supervisor-builder roadmap
+    description: Current profiled producer boundary and governed supervisor-builder roadmap
     docs:
       - ../VISION.md
       - spec/RUST-CANONICAL-CONTRACT.md
@@ -79,7 +79,7 @@ phases:
       path: ARCHITECTURE-CLARIFICATION.md
 
   next:
-    - name: Governed Supervisor and Builder Vertical Slice
+    - name: Complete Launched-Runtime Governed Workflow
       path: ../VISION.md
     - name: User Story Map
       path: spec/USER-STORY-MAP.md
@@ -160,6 +160,7 @@ categories:
     - decisions/0009-reconcile-impulse-copies.md
     - decisions/0010-product-role-launch-contract.md
     - decisions/0011-governed-task-run-lifecycle.md
+    - decisions/0012-daemon-owned-governed-runtime-producers.md
 
   session_logs:
     - session-logs/DEVELOPMENT-HISTORY.md
@@ -175,8 +176,8 @@ validation_and_history:
     path: guides/HOOK-VALIDATION-GUIDE.md
 
 metadata:
-  total_documents: 138
+  total_documents: 140
   categories: 9
-  decisions: 11
+  decisions: 12
   phases: 3
   status: active_development

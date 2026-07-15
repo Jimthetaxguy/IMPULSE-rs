@@ -1,7 +1,7 @@
 ---
 title: Documentation Summary
 description: Unified navigation structure for Impulse documentation
-version: 2.6
+version: 2.7
 updated: 2026-07-13
 schema_version: '1.0'
 ---
@@ -24,7 +24,7 @@ schema_version: '1.0'
 
 ## Active Track
 
-Roadmap contract: Now=control-plane foundations + daemon-owned governed task lifecycle; Next=real claim/verification producers + supervisor/builder process proof + accepted-run memory promotion; Later=general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only.
+Roadmap contract: Now=control-plane foundations + daemon-owned governed runtime producers; Next=accepted-run memory promotion + stronger same-user actor authorization + full launched-runtime proof; Later=general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only.
 
 `HONEST-ROADMAP.md` is a historical hook/memory validation register, not the current product
 roadmap or whole-product risk authority.
@@ -46,7 +46,7 @@ roadmap or whole-product risk authority.
 
 ### Next
 
-- [VISION.md](../VISION.md) — real claim/verification producers, launched-supervisor proof, accepted-run memory promotion, and remaining hierarchy/enforcement ADRs
+- [VISION.md](../VISION.md) — accepted-run memory promotion, stronger same-user actor authorization, full launched-runtime proof, and remaining hierarchy/enforcement ADRs
 - [spec/USER-STORY-MAP.md](spec/USER-STORY-MAP.md)
 - [spec/TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md)
 
@@ -135,6 +135,7 @@ roadmap or whole-product risk authority.
 - [decisions/0009-reconcile-impulse-copies.md](decisions/0009-reconcile-impulse-copies.md)
 - [decisions/0010-product-role-launch-contract.md](decisions/0010-product-role-launch-contract.md)
 - [decisions/0011-governed-task-run-lifecycle.md](decisions/0011-governed-task-run-lifecycle.md)
+- [decisions/0012-daemon-owned-governed-runtime-producers.md](decisions/0012-daemon-owned-governed-runtime-producers.md)
 
 ### Session Logs
 
@@ -151,9 +152,9 @@ Historical Ralph loop plans now live under `archive/ralph-plans/` and are proven
 
 | Field | Value |
 | ----- | ----- |
-| Total Documents | 138 |
+| Total Documents | 140 |
 | Categories | 9 |
-| Decisions (ADRs) | 11 |
+| Decisions (ADRs) | 12 |
 | Phases | 3 |
 | Status | Active Development |
 

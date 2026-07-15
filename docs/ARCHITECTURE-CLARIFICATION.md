@@ -56,7 +56,7 @@ generalized role composition, a common runtime-adapter contract, or dynamic capa
 | Boundary | Authoritative paths | Current truth | Status |
 | --- | --- | --- | --- |
 | Shared control-plane wire/read models | `impulse-rs/impulse-ops/src/{lib,governed_task}.rs` | Versioned daemon requests/responses, workbench snapshots, governed task/evidence/decision types, telemetry, supervisor policy/actions, artifacts | Live |
-| Daemon coordination | `impulse-rs/src/daemon/{mod,protocol,handlers}.rs`, `src/state/governed_task.rs` | Workbench authority, persistent governed-task lifecycle, session operations, managed agent turns, telemetry overlays, supervisor enforcement | Live |
+| Daemon coordination | `impulse-rs/src/daemon/{mod,protocol,handlers}.rs`, `src/state/governed_task.rs`, `src/governed_producers.rs` | Workbench authority, persistent governed-task lifecycle, profiled claim/verification/Supervisor producers, managed agent turns, telemetry overlays | Live |
 | PTY/process lifecycle | `impulse-rs/impulse-term/src/backend.rs`, `impulse-rs/impulse-desktop/src/{runtime,daemon_ops}.rs` | Spawn, input, resize, focus, output, exit, cleanup, pre-PTY governed registration, and durable launch/exit reconciliation | Live |
 | Dioxus cockpit | `impulse-rs/impulse-desktop/src/{desktop_host,host_bridge,host_commands,ui}.rs` | Renders backend state/evidence and dispatches acknowledged revisioned decisions; does not own or optimistically mutate durable task truth | Live host/bridge foundation |
 | Workspace registration | `impulse-rs/impulse-desktop/src/workspace.rs` | Registered filesystem targets and operator-authored project notes | Live |
@@ -68,7 +68,7 @@ generalized role composition, a common runtime-adapter contract, or dynamic capa
 | Desktop MCP tools | `impulse-rs/impulse-desktop/src/mcp.rs` | Agent spawn/write, memory search, project context, staged injection/review | Live; exposure differs from native Ion tools |
 | Memory/context | `impulse-rs/src/{state,memory,retrieval,injection,stewardship}/` | Project-scoped persistence, FTS5/semantic retrieval, review-first injection, context health | Live |
 | Credentials | `impulse-rs/src/credentials/` | Provider abstraction for Keychain, socket, CLI proxy, env, and session memory | Live; per-role credential grants are not generalized |
-| Artifacts/evidence | governed types and `ArtifactEnvelope` in `impulse-ops`, daemon governed/artifact handlers, `impulse-rs/src/verify/` | Separate worker claims, bounded redacted verifier evidence, supervisor verdicts, operator decisions, and provenance-bearing outputs | Live narrow governed lifecycle + broader artifact foundation |
+| Artifacts/evidence | governed types and `ArtifactEnvelope` in `impulse-ops`, daemon governed/artifact handlers, `impulse-rs/src/governed_producers.rs` | Separate claims, daemon-observed profiled evidence, strict Supervisor verdicts, operator decisions, and provenance-bearing outputs | Live first producer profile + broader artifact foundation |
 | Agent messaging/handoffs | `impulse-rs/src/{delegation,orchestration}/`, daemon delegation contracts | Delegations, handoff artifacts, and routing logs | Live partial; no unified typed message bus |
 | Legacy desktop | `impulse-rs/impulse-gui/`, optional egui modules in `impulse-term` | Compile-maintenance only | Frozen |
 
@@ -79,25 +79,28 @@ credential exposure, and native Ion loop. For external CLIs it can strongly cont
 arguments, working directory, environment, process tree, injected files/instructions, supported
 hooks/MCP, and observable outputs.
 
-The current governed desktop launch boundary requires a nonblank task of at most 8,192 UTF-8
-bytes with no NUL byte. It also requires both `workspace.root` and `cwd` to name the same absolute,
-existing canonical directory; that canonical root drives the PTY working directory, trusted
-workspace environment, runtime snapshot, and daemon telemetry. This is launch mediation, not a
-filesystem sandbox.
+The current profiled governed desktop launch boundary requires a nonblank task, exact non-empty
+acceptance criteria, `rust_workspace_v1`, and both `workspace.root` and `cwd` naming the same
+absolute canonical Git worktree root. The desktop requires a clean committed `HEAD`; the daemon
+independently re-observes that OID before registering the task and creating the PTY. The canonical
+root drives process state and telemetry. Working-directory binding is not filesystem sandboxing.
 
 After that preflight, a governed Builder launch must register a distinct task with the bound daemon
-before the PTY is created. The daemon serializes expected-revision mutations, persists idempotency
-receipts and typed lifecycle events, and keeps process execution state independent from review. A
-passing verifier record can be recommended by a supervisor; only the operator can accept. Dioxus
-renders this daemon-owned record and waits for acknowledged mutations rather than applying
-optimistic task state. Launch/exit intent is written ahead of daemon I/O to a bounded, owner-only,
+before the PTY is created. Env-routed `"$IMPULSE_CONTROL_CLI" --daemon governed-claim` and Ion claim surfaces submit only summary/artifact intent;
+the daemon derives the Worker and clean Git subject. It verifies a detached checkout with fixed locked Rust
+argv and derives evidence. Supervisor review is a strict criteria-digest-bound, tool-free,
+history-free API turn; generic external harness mode fails closed before spawn. A model may
+recommend acceptance, but only the operator can accept. Dioxus renders daemon-owned records and
+terminal command guidance rather than producer buttons. Launch/exit intent is written ahead of
+daemon I/O to a bounded, owner-only,
 cross-process-locked project outbox and reconciled after daemon recovery. This does not detect an
 abrupt desktop death that occurs before exit intent exists; runtime leases/orphan reconciliation
 remain a separate contract.
 
-Command evidence stores only display-safe executable/redacted arguments, SHA-256 digests, byte
-counts, truncation flags, and project-relative output references. Producers must perform semantic
-redaction before submission. Typed actors are provenance and transition claims, not cryptographic
+Profiled command evidence stores fixed argv, SHA-256 digests, byte counts, and truncation flags,
+never raw output. Verification executes host-trusted Rust build scripts/proc macros/tests in a
+detached worktree with a scrubbed environment, bounds, and process cleanup; it is not an OS sandbox.
+Typed actors are provenance and transition claims, not cryptographic
 identity among processes running as the same user. The socket directory, socket, and PID file use
 `0700`, `0600`, and `0600`, respectively; that is an OS-user boundary, not a same-user role boundary.
 
@@ -117,8 +120,10 @@ The next architecture ADR must settle these together:
    discovery, attestation freshness, emulation, and post-launch re-evaluation.
 4. Typed message routing and cross-project isolation.
 5. Role-specific credential, context, tool, and verification grants.
-6. Structured CAS error codes, task/receipt pagination and archival, and stronger same-user actor
-   authorization where deployment profiles require it.
+6. Durable producer reservations for crash-safe replay, structured CAS error codes, task/receipt
+   pagination and archival, and stronger same-user actor authorization where deployment profiles
+   require it.
+7. Review-only accepted-run memory promotion plus a complete launched Builder/Supervisor proof.
 
 Do **not** create separate `ROLES`, `RUNTIMES`, `SUPERVISOR`, or replacement architecture schema
 documents before those decisions land. `VISION.md` and the canonical contract remain the source of

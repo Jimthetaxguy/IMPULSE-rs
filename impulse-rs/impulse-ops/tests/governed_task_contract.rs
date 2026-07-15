@@ -66,6 +66,7 @@ fn task_snapshot_keeps_execution_and_review_state_independent() {
         task: "Prove the lifecycle".into(),
         acceptance_criteria: vec![],
         approval_policy: ApprovalPolicy::OperatorRequired,
+        verification_profile: None,
         role_assignment: None,
         role_compatibility: None,
         runtime_id: "codex".into(),

@@ -13,7 +13,10 @@ use std::time::Duration;
 
 use impulse_ops::{AgentRuntime, ContextHealthSummary, MachineTarget, TerminalOpsReport};
 
-use crate::runtime::{AgentRuntimeSnapshot, DesktopEvent, DesktopEventSink, GovernedTaskGateway};
+use crate::runtime::{
+    AgentRuntimeSnapshot, DesktopEvent, DesktopEventSink, GovernedRoutingMetadata,
+    GovernedTaskGateway,
+};
 
 /// Desktop heartbeats stay well below the daemon's ten-second stale boundary.
 pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
@@ -371,6 +374,7 @@ pub struct DesktopDaemonOpsAttachment {
 #[cfg(unix)]
 mod unix {
     use std::collections::BTreeSet;
+    use std::ffi::OsStr;
     use std::fs::{File, OpenOptions};
     use std::io::{BufRead, BufReader, Write};
     use std::os::fd::AsRawFd;
@@ -385,9 +389,117 @@ mod unix {
     use super::*;
 
     const IO_TIMEOUT: Duration = Duration::from_secs(2);
+    // A profiled registration performs three daemon-owned Git probes. Each
+    // permits 15 seconds of execution plus two sequential five-second pipe
+    // drains, for a 75-second theoretical aggregate. Leave cleanup/persistence
+    // headroom without weakening the two-second bound on ordinary IPC.
+    const GOVERNED_REGISTRATION_READ_TIMEOUT: Duration = Duration::from_secs(90);
     const ACKNOWLEDGED_REQUEST_ATTEMPTS: usize = 3;
     const GOVERNED_LIFECYCLE_OUTBOX_SCHEMA: u32 = 1;
     const MAX_GOVERNED_LIFECYCLE_OUTBOX_ENTRIES: usize = 1_024;
+
+    fn is_executable_file(path: &Path) -> bool {
+        std::fs::metadata(path)
+            .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+
+    fn absolute_candidate(path: &Path, current_dir: &Path) -> PathBuf {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            current_dir.join(path)
+        }
+    }
+
+    fn is_bare_executable_name(path: &Path) -> bool {
+        let mut components = path.components();
+        matches!(components.next(), Some(std::path::Component::Normal(_)))
+            && components.next().is_none()
+    }
+
+    fn resolve_from_path(
+        name: &Path,
+        path: Option<&OsStr>,
+        current_dir: &Path,
+        executable_check: &dyn Fn(&Path) -> bool,
+    ) -> Option<PathBuf> {
+        let path = path?;
+        std::env::split_paths(path).find_map(|directory| {
+            let candidate = absolute_candidate(&directory.join(name), current_dir);
+            executable_check(&candidate).then_some(candidate)
+        })
+    }
+
+    fn utf8_executable_path(path: PathBuf) -> Option<String> {
+        path.into_os_string().into_string().ok()
+    }
+
+    fn utf8_routing_path(path: &Path) -> Option<String> {
+        path.to_str().map(str::to_owned)
+    }
+
+    /// Resolve a genuinely invocable control CLI while preserving the selected
+    /// path (including a PATH shim) instead of canonicalizing to its target.
+    /// An explicit but invalid override fails closed rather than launching a
+    /// different binary than the operator requested.
+    fn resolve_control_cli(
+        configured: Option<&OsStr>,
+        current_executable: Option<&Path>,
+        current_dir: &Path,
+        path: Option<&OsStr>,
+    ) -> Option<String> {
+        // A present but non-UTF-8 override is invalid, not absent. Returning
+        // here prevents a silent fallthrough to a different executable.
+        let configured = match configured {
+            Some(value) => Some(value.to_str()?),
+            None => None,
+        };
+        resolve_control_cli_with(
+            configured,
+            current_executable,
+            current_dir,
+            path,
+            &is_executable_file,
+        )
+    }
+
+    fn resolve_control_cli_with(
+        configured: Option<&str>,
+        current_executable: Option<&Path>,
+        current_dir: &Path,
+        path: Option<&OsStr>,
+        executable_check: &dyn Fn(&Path) -> bool,
+    ) -> Option<String> {
+        if let Some(configured) = configured.map(str::trim).filter(|value| !value.is_empty()) {
+            let configured = Path::new(configured);
+            let candidate = if is_bare_executable_name(configured) {
+                resolve_from_path(configured, path, current_dir, executable_check)?
+            } else {
+                let candidate = absolute_candidate(configured, current_dir);
+                if !executable_check(&candidate) {
+                    return None;
+                }
+                candidate
+            };
+            return utf8_executable_path(candidate);
+        }
+
+        if let Some(current_executable) = current_executable {
+            let current_executable = absolute_candidate(current_executable, current_dir);
+            if let Some(candidate) = current_executable
+                .parent()
+                .map(|parent| parent.join("impulse-rs"))
+            {
+                if executable_check(&candidate) {
+                    return utf8_executable_path(candidate);
+                }
+            }
+        }
+
+        resolve_from_path(Path::new("impulse-rs"), path, current_dir, executable_check)
+            .and_then(utf8_executable_path)
+    }
 
     struct LifecycleOutboxFileLock(File);
 
@@ -450,6 +562,8 @@ mod unix {
         socket_path: PathBuf,
         lifecycle_outbox_path: Option<PathBuf>,
         lifecycle_outbox_lock: Arc<Mutex<()>>,
+        io_timeout: Duration,
+        governed_registration_read_timeout: Duration,
     }
 
     impl UnixDaemonOpsClient {
@@ -458,7 +572,20 @@ mod unix {
                 socket_path,
                 lifecycle_outbox_path: None,
                 lifecycle_outbox_lock: Arc::new(Mutex::new(())),
+                io_timeout: IO_TIMEOUT,
+                governed_registration_read_timeout: GOVERNED_REGISTRATION_READ_TIMEOUT,
             }
+        }
+
+        #[cfg(test)]
+        fn with_io_timeouts(
+            mut self,
+            io_timeout: Duration,
+            governed_registration_read_timeout: Duration,
+        ) -> Self {
+            self.io_timeout = io_timeout;
+            self.governed_registration_read_timeout = governed_registration_read_timeout;
+            self
         }
 
         fn with_lifecycle_outbox(mut self, path: Option<PathBuf>) -> Self {
@@ -466,9 +593,10 @@ mod unix {
             self
         }
 
-        fn send(
+        fn send_with_read_timeout(
             &self,
             request: &WorkbenchDaemonRequest,
+            read_timeout: Duration,
         ) -> Result<WorkbenchDaemonResponse, String> {
             let mut stream = UnixStream::connect(&self.socket_path).map_err(|error| {
                 format!(
@@ -477,10 +605,10 @@ mod unix {
                 )
             })?;
             stream
-                .set_read_timeout(Some(IO_TIMEOUT))
+                .set_read_timeout(Some(read_timeout))
                 .map_err(|error| format!("set daemon read timeout: {error}"))?;
             stream
-                .set_write_timeout(Some(IO_TIMEOUT))
+                .set_write_timeout(Some(self.io_timeout))
                 .map_err(|error| format!("set daemon write timeout: {error}"))?;
 
             let encoded = serde_json::to_vec(request)
@@ -501,6 +629,13 @@ mod unix {
             serde_json::from_str(&line).map_err(|error| format!("parse daemon response: {error}"))
         }
 
+        fn send(
+            &self,
+            request: &WorkbenchDaemonRequest,
+        ) -> Result<WorkbenchDaemonResponse, String> {
+            self.send_with_read_timeout(request, self.io_timeout)
+        }
+
         /// Retry only ambiguous transport failures. The exact serialized
         /// request (including its idempotency key) is reused, so a daemon
         /// commit followed by a lost response is observed, never duplicated.
@@ -508,9 +643,17 @@ mod unix {
             &self,
             request: &WorkbenchDaemonRequest,
         ) -> Result<WorkbenchDaemonResponse, String> {
+            self.send_acknowledged_with_read_timeout(request, self.io_timeout)
+        }
+
+        fn send_acknowledged_with_read_timeout(
+            &self,
+            request: &WorkbenchDaemonRequest,
+            read_timeout: Duration,
+        ) -> Result<WorkbenchDaemonResponse, String> {
             let mut last_error = None;
             for _ in 0..ACKNOWLEDGED_REQUEST_ATTEMPTS {
-                match self.send(request) {
+                match self.send_with_read_timeout(request, read_timeout) {
                     Ok(response) => return Ok(response),
                     Err(error) => last_error = Some(error),
                 }
@@ -840,10 +983,15 @@ mod unix {
             &self,
             registration: impulse_ops::governed_task::GovernedTaskRegistration,
         ) -> Result<impulse_ops::governed_task::GovernedTaskRun, String> {
-            let response =
-                self.send_acknowledged(&WorkbenchDaemonRequest::RegisterGovernedTask {
-                    registration,
-                })?;
+            let read_timeout = if registration.verification_profile.is_some() {
+                self.governed_registration_read_timeout
+            } else {
+                self.io_timeout
+            };
+            let response = self.send_acknowledged_with_read_timeout(
+                &WorkbenchDaemonRequest::RegisterGovernedTask { registration },
+                read_timeout,
+            )?;
             let value = Self::ok_result(response)?;
             serde_json::from_value(value)
                 .map_err(|error| format!("parse registered governed task: {error}"))
@@ -890,6 +1038,23 @@ mod unix {
                     "{error}; lifecycle mutation retained for durable daemon retry"
                 )),
             }
+        }
+
+        fn routing_metadata(&self) -> Option<GovernedRoutingMetadata> {
+            let configured = std::env::var_os("IMPULSE_CONTROL_CLI");
+            let current_executable = std::env::current_exe().ok();
+            let current_dir = std::env::current_dir().ok()?;
+            let path = std::env::var_os("PATH");
+            let control_cli = resolve_control_cli(
+                configured.as_deref(),
+                current_executable.as_deref(),
+                &current_dir,
+                path.as_deref(),
+            )?;
+            Some(GovernedRoutingMetadata {
+                socket_path: utf8_routing_path(&self.socket_path)?,
+                control_cli,
+            })
         }
     }
 
@@ -1163,6 +1328,7 @@ mod unix {
         use std::collections::VecDeque;
         use std::io::{BufRead, BufReader, Write};
         use std::os::unix::net::UnixListener;
+        use std::process::Command;
         use std::sync::mpsc;
         use std::time::Instant;
 
@@ -1170,6 +1336,186 @@ mod unix {
 
         use super::*;
         use crate::runtime::{AgentPlatformId, BuiltInMcpTool, WorkspaceTarget};
+
+        fn write_executable(path: &Path, contents: &[u8]) {
+            std::fs::write(path, contents).expect("write executable fixture");
+            let mut permissions = std::fs::metadata(path)
+                .expect("read executable fixture metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions).expect("mark fixture executable");
+        }
+
+        #[test]
+        fn governed_control_cli_resolves_cwd_relative_override_with_spaces_and_invokes_it() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let configured_cli = dir.path().join("control cli");
+            write_executable(&configured_cli, b"#!/bin/sh\nprintf '%s' control-ok\n");
+
+            let resolved = resolve_control_cli(
+                Some(OsStr::new("  ./control cli  ")),
+                None,
+                dir.path(),
+                Some(OsStr::new("")),
+            )
+            .expect("cwd-relative executable resolves");
+
+            assert_eq!(Path::new(&resolved), configured_cli);
+            let output = Command::new(&resolved)
+                .output()
+                .expect("invoke resolved path containing spaces");
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"control-ok");
+        }
+
+        #[test]
+        fn governed_control_cli_resolves_explicit_bare_name_through_path() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let configured_cli = dir.path().join("impulse-control-shim");
+            write_executable(&configured_cli, b"#!/bin/sh\nexit 0\n");
+            let path = std::env::join_paths([dir.path()]).expect("fixture PATH");
+
+            let resolved = resolve_control_cli(
+                Some(OsStr::new("impulse-control-shim")),
+                None,
+                dir.path(),
+                Some(&path),
+            )
+            .expect("bare override resolves through PATH");
+
+            assert_eq!(Path::new(&resolved), configured_cli);
+        }
+
+        #[test]
+        fn governed_control_cli_resolves_the_executable_packaged_impulse_rs_sibling() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let desktop = dir.path().join("impulse-desktop");
+            let packaged_cli = dir.path().join("impulse-rs");
+            write_executable(&packaged_cli, b"#!/bin/sh\nexit 0\n");
+
+            let resolved =
+                resolve_control_cli(None, Some(&desktop), dir.path(), Some(OsStr::new("")))
+                    .expect("packaged CLI resolves");
+
+            assert_eq!(Path::new(&resolved), packaged_cli);
+        }
+
+        #[test]
+        fn governed_control_cli_falls_back_to_an_executable_path_entry() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path_dir = dir.path().join("bin");
+            std::fs::create_dir(&path_dir).expect("create PATH directory");
+            let fallback = path_dir.join("impulse-rs");
+            write_executable(&fallback, b"#!/bin/sh\nexit 0\n");
+            let path = std::env::join_paths([&path_dir]).expect("fixture PATH");
+
+            let resolved = resolve_control_cli(None, None, dir.path(), Some(&path))
+                .expect("PATH fallback resolves");
+
+            assert_eq!(Path::new(&resolved), fallback);
+        }
+
+        #[test]
+        fn governed_control_cli_rejects_missing_or_non_executable_candidates() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let non_executable = dir.path().join("not-executable");
+            std::fs::write(&non_executable, b"fixture").expect("write fixture");
+            let desktop = dir.path().join("impulse-desktop");
+            let packaged_cli = dir.path().join("impulse-rs");
+            std::fs::write(&packaged_cli, b"fixture").expect("write packaged fixture");
+
+            assert_eq!(
+                resolve_control_cli(
+                    Some(OsStr::new("./missing")),
+                    Some(&desktop),
+                    dir.path(),
+                    Some(OsStr::new("")),
+                ),
+                None,
+                "an invalid explicit override must not fall through"
+            );
+            assert_eq!(
+                resolve_control_cli(
+                    Some(OsStr::new("./not-executable")),
+                    None,
+                    dir.path(),
+                    Some(OsStr::new("")),
+                ),
+                None
+            );
+            assert_eq!(
+                resolve_control_cli(None, Some(&desktop), dir.path(), Some(OsStr::new("")),),
+                None,
+                "a non-executable packaged sibling and empty PATH must fail closed"
+            );
+            assert_eq!(
+                resolve_control_cli(
+                    Some(OsStr::new("missing-from-path")),
+                    None,
+                    dir.path(),
+                    Some(OsStr::new("")),
+                ),
+                None
+            );
+        }
+
+        #[test]
+        fn governed_control_cli_treats_blank_override_as_unconfigured() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let fallback = dir.path().join("impulse-rs");
+            write_executable(&fallback, b"#!/bin/sh\nexit 0\n");
+            let path = std::env::join_paths([dir.path()]).expect("fixture PATH");
+
+            let resolved =
+                resolve_control_cli(Some(OsStr::new("   ")), None, dir.path(), Some(&path))
+                    .expect("blank override permits PATH fallback");
+
+            assert_eq!(Path::new(&resolved), fallback);
+        }
+
+        #[test]
+        fn governed_control_cli_rejects_non_utf8_executable_path() {
+            use std::os::unix::ffi::OsStringExt;
+
+            // macOS filesystems may reject malformed UTF-8 names. Inject the
+            // already-validated executable predicate so this wire-identity
+            // regression remains deterministic on every Unix filesystem.
+            let non_utf8_directory =
+                PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/control-\xff".to_vec()));
+
+            assert_eq!(
+                resolve_control_cli_with(
+                    Some("impulse-rs"),
+                    None,
+                    Path::new("/tmp"),
+                    Some(non_utf8_directory.as_os_str()),
+                    &|candidate| candidate.ends_with("impulse-rs"),
+                ),
+                None,
+                "routing metadata must fail closed instead of lossy path conversion"
+            );
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let fallback = dir.path().join("impulse-rs");
+            write_executable(&fallback, b"#!/bin/sh\nexit 0\n");
+            let path = std::env::join_paths([dir.path()]).expect("fixture PATH");
+            let non_utf8_override = std::ffi::OsString::from_vec(b"control-\xff".to_vec());
+            assert_eq!(
+                resolve_control_cli(
+                    Some(non_utf8_override.as_os_str()),
+                    None,
+                    dir.path(),
+                    Some(&path),
+                ),
+                None,
+                "a present non-UTF-8 override must not disappear into PATH fallback"
+            );
+            assert_eq!(
+                utf8_routing_path(&non_utf8_directory.join("impulse.sock")),
+                None,
+                "socket routing identity must also be lossless"
+            );
+        }
 
         #[test]
         fn busy_response_preserves_resource_and_retry_guidance() {
@@ -1183,6 +1529,126 @@ mod unix {
                 error,
                 "daemon busy: resource=agent_turn, retry_after_ms=250"
             );
+        }
+
+        #[test]
+        fn profiled_registration_waits_past_the_ordinary_timeout_without_duplicate_send() {
+            use impulse_ops::governed_task::{
+                ApprovalPolicy, GovernedExecutionState, GovernedReviewState,
+                GovernedTaskRegistration, GovernedTaskRun, GovernedVerificationProfile,
+            };
+
+            assert_eq!(IO_TIMEOUT, Duration::from_secs(2));
+            assert!(
+                GOVERNED_REGISTRATION_READ_TIMEOUT > Duration::from_secs(75),
+                "profiled registration must exceed all three probe and drain bounds"
+            );
+
+            let ordinary_timeout = Duration::from_millis(40);
+            let registration_timeout = Duration::from_millis(300);
+            let daemon_delay = Duration::from_millis(120);
+            assert!(daemon_delay > ordinary_timeout);
+            assert!(daemon_delay < registration_timeout);
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket = dir.path().join("slow-governed-register.sock");
+            let listener = UnixListener::bind(&socket).expect("bind fake daemon");
+            let assignment = impulse_ops::role_assignment::canonical_governed_builder_assignment();
+            let compatibility = impulse_ops::agent_registry::AgentRegistry::builtin()
+                .evaluate_role_compatibility(
+                    &impulse_ops::agent_registry::AgentPlatformId::try_new("codex").unwrap(),
+                    &assignment,
+                )
+                .unwrap();
+            let registration = GovernedTaskRegistration::builder(
+                "transport-slow-register-1",
+                "transport-slow-task-1",
+                "project",
+                "/tmp/project",
+                "wait for bounded daemon attestation",
+                "worker-1",
+                "codex",
+            )
+            .verification_profile(GovernedVerificationProfile::RustWorkspaceV1)
+            .acceptance_criteria(vec!["registration is acknowledged once".to_string()])
+            .initial_subject_revision("a".repeat(40))
+            .role_assignment(assignment)
+            .role_compatibility(compatibility)
+            .build()
+            .unwrap();
+            let expected = GovernedTaskRun {
+                id: registration.task_id.clone(),
+                revision: 0,
+                project_id: registration.project_id.clone(),
+                workspace_root: registration.workspace_root.clone(),
+                task: registration.task.clone(),
+                acceptance_criteria: registration.acceptance_criteria.clone(),
+                approval_policy: ApprovalPolicy::OperatorRequired,
+                verification_profile: registration.verification_profile,
+                role_assignment: registration.role_assignment.clone(),
+                role_compatibility: registration.role_compatibility.clone(),
+                runtime_id: registration.runtime_id.clone(),
+                agent_id: registration.agent_id.clone(),
+                session_id: None,
+                initial_subject_revision: registration.initial_subject_revision.clone(),
+                execution_state: GovernedExecutionState::Registered,
+                review_state: GovernedReviewState::AwaitingClaim,
+                claims: vec![],
+                verifications: vec![],
+                supervisor_verdicts: vec![],
+                operator_decisions: vec![],
+                events: vec![],
+                created_at: "2026-07-13T00:00:00Z".to_string(),
+                updated_at: "2026-07-13T00:00:00Z".to_string(),
+            };
+            let expected_for_server = expected.clone();
+            let (request_count_tx, request_count_rx) = mpsc::channel();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept registration");
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let request: WorkbenchDaemonRequest = serde_json::from_str(&line).unwrap();
+                assert!(matches!(
+                    request,
+                    WorkbenchDaemonRequest::RegisterGovernedTask { .. }
+                ));
+                thread::sleep(daemon_delay);
+                write_response(
+                    &mut stream,
+                    &WorkbenchDaemonResponse::Ok {
+                        result: serde_json::to_value(&expected_for_server).unwrap(),
+                    },
+                );
+
+                listener.set_nonblocking(true).unwrap();
+                let deadline = Instant::now() + Duration::from_millis(100);
+                let mut request_count = 1;
+                while Instant::now() < deadline {
+                    match listener.accept() {
+                        Ok(_) => request_count += 1,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("accept duplicate registration: {error}"),
+                    }
+                }
+                request_count_tx.send(request_count).unwrap();
+            });
+
+            let client = UnixDaemonOpsClient::new(socket)
+                .with_io_timeouts(ordinary_timeout, registration_timeout);
+            let acknowledged = client.register(registration).unwrap();
+            assert_eq!(acknowledged, expected);
+            assert_eq!(
+                request_count_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap(),
+                1,
+                "a slow but bounded registration must not trigger duplicate mutations"
+            );
+            server.join().unwrap();
         }
 
         #[test]
@@ -1214,6 +1680,7 @@ mod unix {
                 task: registration.task.clone(),
                 acceptance_criteria: registration.acceptance_criteria.clone(),
                 approval_policy: ApprovalPolicy::OperatorRequired,
+                verification_profile: None,
                 role_assignment: None,
                 role_compatibility: None,
                 runtime_id: registration.runtime_id.clone(),
@@ -1285,6 +1752,7 @@ mod unix {
                 task: "persist exit while daemon is down".to_string(),
                 acceptance_criteria: vec![],
                 approval_policy: ApprovalPolicy::OperatorRequired,
+                verification_profile: None,
                 role_assignment: None,
                 role_compatibility: None,
                 runtime_id: "codex".to_string(),
@@ -1413,6 +1881,7 @@ mod unix {
                 task: "prove drain does not block new exit intent".to_string(),
                 acceptance_criteria: vec![],
                 approval_policy: ApprovalPolicy::OperatorRequired,
+                verification_profile: None,
                 role_assignment: None,
                 role_compatibility: None,
                 runtime_id: "codex".to_string(),
@@ -1567,6 +2036,7 @@ mod unix {
                 task: "later valid lifecycle intent".to_string(),
                 acceptance_criteria: vec![],
                 approval_policy: ApprovalPolicy::OperatorRequired,
+                verification_profile: None,
                 role_assignment: None,
                 role_compatibility: None,
                 runtime_id: "codex".to_string(),

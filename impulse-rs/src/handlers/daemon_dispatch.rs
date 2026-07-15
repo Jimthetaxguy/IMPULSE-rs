@@ -158,6 +158,29 @@ pub async fn dispatch(
                 .await
                 .context("Failed to handle plugin-invoke daemon request")?;
         }
+        Commands::GovernedClaim {
+            project_id,
+            task_id,
+            summary,
+            artifact_ids,
+            json,
+        } => {
+            handle_governed_claim(client, project_id, task_id, summary, artifact_ids, json).await?;
+        }
+        Commands::GovernedVerify {
+            project_id,
+            task_id,
+            json,
+        } => {
+            handle_governed_verify(client, project_id, task_id, json).await?;
+        }
+        Commands::GovernedReview {
+            project_id,
+            task_id,
+            json,
+        } => {
+            handle_governed_review(client, project_id, task_id, json).await?;
+        }
         Commands::SearchHistory { .. }
         | Commands::SearchGenome { .. }
         | Commands::IndexMemory { .. }
@@ -167,6 +190,125 @@ pub async fn dispatch(
         _ => println!("Use direct mode (without --daemon) for this command"),
     }
     Ok(())
+}
+
+fn governed_coordinate(
+    explicit: Option<String>,
+    environment_name: &str,
+    label: &str,
+) -> Result<String> {
+    explicit
+        .or_else(|| std::env::var(environment_name).ok())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "missing {label}; pass it explicitly or launch inside an Impulse governed runtime with {environment_name}"
+            )
+        })
+}
+
+fn governed_request_id(prefix: &str) -> impulse_ops::governed_task::GovernedRequestId {
+    impulse_ops::governed_task::GovernedRequestId::try_new(format!(
+        "{prefix}-{}",
+        uuid::Uuid::new_v4()
+    ))
+    .expect("generated governed request UUID must be valid")
+}
+
+async fn current_governed_task(
+    client: &DaemonClient,
+    project_id: Option<String>,
+    task_id: Option<String>,
+) -> Result<(
+    String,
+    impulse_ops::governed_task::GovernedTaskId,
+    impulse_ops::governed_task::GovernedTaskRun,
+)> {
+    let project_id = governed_coordinate(project_id, "IMPULSE_PROJECT_ID", "project id")?;
+    let task_id = governed_coordinate(task_id, "IMPULSE_GOVERNED_TASK_ID", "governed task id")?;
+    let task_id = impulse_ops::governed_task::GovernedTaskId::try_new(task_id)
+        .context("invalid governed task id")?;
+    let task = client
+        .get_governed_task(project_id.clone(), task_id.clone())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("governed task `{task_id}` was not found"))?;
+    Ok((project_id, task_id, task))
+}
+
+fn print_governed_ack(
+    task: &impulse_ops::governed_task::GovernedTaskRun,
+    json: bool,
+    label: &str,
+) -> Result<()> {
+    if json {
+        print_json(task).context("Failed to serialize governed task acknowledgement")?;
+    } else {
+        println!(
+            "{label}: {} revision {} review={:?}",
+            task.id, task.revision, task.review_state
+        );
+    }
+    Ok(())
+}
+
+async fn handle_governed_claim(
+    client: &DaemonClient,
+    project_id: Option<String>,
+    task_id: Option<String>,
+    summary: String,
+    artifact_ids: Vec<String>,
+    json: bool,
+) -> Result<()> {
+    let (project_id, task_id, task) = current_governed_task(client, project_id, task_id).await?;
+    let acknowledged = client
+        .submit_governed_claim(impulse_ops::governed_task::GovernedClaimRequest {
+            request_id: governed_request_id("claim"),
+            project_id,
+            task_id,
+            expected_revision: task.revision,
+            summary,
+            artifact_ids,
+        })
+        .await?;
+    print_governed_ack(&acknowledged, json, "Claim acknowledged")
+}
+
+async fn handle_governed_verify(
+    client: &DaemonClient,
+    project_id: Option<String>,
+    task_id: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let (project_id, task_id, task) = current_governed_task(client, project_id, task_id).await?;
+    let acknowledged = client
+        .run_governed_verification(impulse_ops::governed_task::GovernedVerificationRequest {
+            request_id: governed_request_id("verify"),
+            project_id,
+            task_id,
+            expected_revision: task.revision,
+        })
+        .await?;
+    print_governed_ack(&acknowledged, json, "Verification acknowledged")
+}
+
+async fn handle_governed_review(
+    client: &DaemonClient,
+    project_id: Option<String>,
+    task_id: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let (project_id, task_id, task) = current_governed_task(client, project_id, task_id).await?;
+    let acknowledged = client
+        .run_governed_supervisor_review(
+            impulse_ops::governed_task::GovernedSupervisorReviewRequest {
+                request_id: governed_request_id("review"),
+                project_id,
+                task_id,
+                expected_revision: task.revision,
+            },
+        )
+        .await?;
+    print_governed_ack(&acknowledged, json, "Supervisor review acknowledged")
 }
 
 // ============================================================================

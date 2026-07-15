@@ -1,6 +1,7 @@
 # Impulse CLI Command Reference
 
-> All commands: `impulse-rs <command> [flags]`
+> Packaged executable: `impulse-rs`
+> All commands: `impulse-rs [global flags] <command> [command flags]`
 > Daemon mode: `impulse-rs --daemon <command>` (requires a foreground daemon in another terminal)
 > Direct mode: `impulse-rs <command>` (default, stateless)
 
@@ -28,7 +29,7 @@ locally. `—` means the dispatcher prints a direct-mode instruction instead of 
 | `history` | Yes | — | Display session history |
 | `list-providers` | Yes | — | List available LLM providers |
 | `add-decision` | Yes | — | Add a genome decision (`--description`, `--rationale`) |
-| `init` | Yes | — | Initialize `.impulse/` directory |
+| `init` | Yes | — | Initialize `.impulse/`; in a Git root append exact runtime-only ignore rules and warn on an existing blanket rule |
 | `config` | Yes | — | Get/set config (`<key>`, `--value`, `--list`) |
 | `extract` | Yes | — | Extract structured data using Monty (`--content`, `--json`) |
 | `swarm` | Yes | — | Analyze SWARM patterns (`--agent-a`, `--agent-b`, `--threshold`) |
@@ -82,6 +83,9 @@ locally. `—` means the dispatcher prints a direct-mode instruction instead of 
 | `plugin-list` | Yes | IPC | List registered plugins (`--json`) |
 | `plugin-invoke` | Yes | IPC | Invoke a plugin action handler (`<name>`, `--path`, `--query`) |
 | `ion-verify` | Yes | — | Run the Ion/Pi verification gate (`--repo`, `--diff-ref`, `--description`, `--json`) |
+| `governed-claim` | — | IPC | Submit only Builder intent (`--summary`, repeated `--artifact-id`); daemon derives actor and clean Git subject |
+| `governed-verify` | — | IPC | Trigger the current task's daemon-owned closed verification profile |
+| `governed-review` | — | IPC | Trigger strict API-only, tool-free, stateless Supervisor review |
 
 ## Global Flags
 
@@ -90,7 +94,7 @@ locally. `—` means the dispatcher prints a direct-mode instruction instead of 
 | `-c, --impulse-dir` | Custom `.impulse/` directory (default: `.impulse`) |
 | `-v, --verbose` | Verbose output |
 | `--daemon` | Route command through daemon IPC instead of direct mode |
-| `--socket` | Custom Unix socket path |
+| `--socket` | Custom Unix socket path; otherwise `IMPULSE_SOCKET_PATH`, then `.impulse/sockets/impulse.sock` |
 | `--format` | Output format: `json`, `text`, `ndjson` |
 
 ## Mode Differences
@@ -101,6 +105,37 @@ locally. `—` means the dispatcher prints a direct-mode instruction instead of 
 
 Only entries marked **IPC** are routed through the Unix socket. Entries marked **Local** are accepted
 with the flag but execute in the client process; they do not acquire daemon state or semantics.
+
+### Governed launch routing
+
+The three governed producer commands require `--daemon`; direct mode fails with an explicit retry
+instruction. `--project-id` and `--task-id` are optional only inside a governed launch, where the
+desktop runtime injects `IMPULSE_PROJECT_ID` and `IMPULSE_GOVERNED_TASK_ID`. Only a profiled
+governed pane also receives `IMPULSE_SOCKET_PATH`, `IMPULSE_CONTROL_CLI`, and
+`IMPULSE_GOVERNED_VERIFICATION_PROFILE`; ordinary and unprofiled panes have inherited producer
+routing removed.
+
+```bash
+"$IMPULSE_CONTROL_CLI" --daemon governed-claim --summary "Implemented the exact acceptance criteria"
+"$IMPULSE_CONTROL_CLI" --daemon governed-verify
+"$IMPULSE_CONTROL_CLI" --daemon governed-review
+```
+
+Outside an injected pane, the equivalent prefix is `impulse-rs --daemon`. The executable name is
+not `impulse`; `$IMPULSE_CONTROL_CLI` remains the launch-time path supplied by Impulse.
+
+Ion exposes the same claim path as the typed `governed_submit_claim` tool. Neither transport can
+submit actor identity, subject revision, command evidence, or a Supervisor verdict. Verification
+executes the fixed profile against a detached committed subject and may run project-authored Rust
+build scripts/tests; it is host-trusted execution, not an OS sandbox. Review requires a configured
+API provider. A generic Claude Code/Codex/Gemini harness configuration fails closed before spawn.
+Only the existing operator decision path can accept the task.
+
+`rust_workspace_v1` requires a committed, regular root `Cargo.lock`; dependency-resolving commands
+use `--locked`. It rejects source-tree symlinks, and requires the detached subject to remain
+Git-clean and its bounded source-tree byte manifest, including ignored paths, to remain unchanged
+after all fixed commands. Generated source-tree output makes the result inconclusive rather than
+passing.
 
 ## Feature Flags
 

@@ -9,7 +9,7 @@ deciders: [Impulse Maintainers]
 
 ## Status
 
-Accepted for this goal. Active checkout (`impulse-rs/`) is the single canonical tree. The `.clean` sibling checkout has been relocated (mv) into the canonical tree's archive/ (_archived-IMPULSE-rs.clean-... + -source); original path no longer present as live checkout (git worktree prune confirms only active remains). Full contents archived inside active tree.
+Accepted for this goal. Active checkout (`impulse-rs/`) is the single canonical tree. The `.clean` sibling checkout was relocated (mv) into the maintainer's local canonical-tree archive (`_archived-IMPULSE-rs.clean-...` + `-source`); the original path is no longer a live checkout. Those gitignored snapshots are optional historical provenance, not source or test fixtures.
 
 ## Context
 
@@ -54,11 +54,12 @@ Per plan non-goals: no GUI changes, no new subagent impls, no physical removal o
 
 5. **Docs update responsibility**: Living docs (CONTEXT, README, HANDBOOK ImpulseAgent section, RUST-CANONICAL-CONTRACT) will be updated in the same change set to embed the objective's vision language (always-on tech lead managing terminal agents that "login", UI picker for multiple project spaces + agents per space, Rust type-safe built-in augmentation/plugins, subagents/workflows for load reduction).
 
-6. **.clean disposition**: The sibling checkout has been relocated (mv) into the canonical tree's archive/ as _archived-IMPULSE-rs.clean-YYYY... (full source tree including .git, clean/crates/ with the contracts/workspace pure types, etc.). Original path at sibling level no longer active (git worktree shows prunable). No further writes to the old location. Proof: committed test asserts archived contracts crate; diag captures show only active IMPULSE-rs checkout + archived dirs under active/archive/. Single canonical active development tree achieved.
+6. **.clean disposition and proof boundary**: The sibling checkout was relocated (mv) into the maintainer's local canonical-tree archive as `_archived-IMPULSE-rs.clean-YYYY...` (full source tree including `.git` and `clean/crates/`). The original sibling path is no longer active, and no further writes target it. The ignored archive and diagnostic captures remain optional historical provenance; builds and tests never depend on them. Tracked executable proof is `agent_registry::tests::test_reconciled_backend_contract_lives_in_canonical_registry`, which verifies the reconciled typed identity, alias resolution, launch command, and control-plane reporting in the active implementation. This keeps the single-source decision verifiable in fresh clones, linked worktrees, and CI.
 
 ## Consequences
 
 - Single canonical tree simplifies maintenance.
+- Default workspace tests are portable because they validate tracked canonical behavior rather than maintainer-local archive contents.
 - Existing registries + tests already satisfy "observable registration of multiple distinct workspaces and ... agent CLI types".
 - Vision codified without new runtime surface (per non-goals).
 - Future work that wants the clean/ contracts split will start from this ADR and a new lane (will need to address shared-file rules).

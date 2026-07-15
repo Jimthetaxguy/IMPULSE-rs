@@ -13,7 +13,7 @@ pub const PROTOCOL_VERSION: u32 = impulse_ops::DAEMON_PROTOCOL_VERSION;
 
 pub(crate) const SOCKET_NAME: &str = "impulse.sock";
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum DaemonRequest {
     Ping,
@@ -119,6 +119,15 @@ pub enum DaemonRequest {
     },
     MutateGovernedTask {
         request: impulse_ops::governed_task::GovernedTaskMutationRequest,
+    },
+    SubmitGovernedClaim {
+        request: impulse_ops::governed_task::GovernedClaimRequest,
+    },
+    RunGovernedVerification {
+        request: impulse_ops::governed_task::GovernedVerificationRequest,
+    },
+    RunGovernedSupervisorReview {
+        request: impulse_ops::governed_task::GovernedSupervisorReviewRequest,
     },
     /// Request AI coordination assistance via the Impulse Agent.
     /// When `insights` is provided, they are formatted into a structured
@@ -286,6 +295,9 @@ pub(crate) fn request_type_name(req: &DaemonRequest) -> &'static str {
         DaemonRequest::GetGovernedTask { .. } => "GetGovernedTask",
         DaemonRequest::ListGovernedTasks { .. } => "ListGovernedTasks",
         DaemonRequest::MutateGovernedTask { .. } => "MutateGovernedTask",
+        DaemonRequest::SubmitGovernedClaim { .. } => "SubmitGovernedClaim",
+        DaemonRequest::RunGovernedVerification { .. } => "RunGovernedVerification",
+        DaemonRequest::RunGovernedSupervisorReview { .. } => "RunGovernedSupervisorReview",
         DaemonRequest::AgentAssist { .. } => "AgentAssist",
         DaemonRequest::GuardEvaluate { .. } => "GuardEvaluate",
         DaemonRequest::GuardList => "GuardList",
@@ -312,8 +324,8 @@ mod tests {
     // ── PROTOCOL_VERSION ───────────────────────────────────────────────
 
     #[test]
-    fn test_protocol_version_is_four() {
-        assert_eq!(PROTOCOL_VERSION, 4);
+    fn test_protocol_version_is_five() {
+        assert_eq!(PROTOCOL_VERSION, 5);
     }
 
     // ── request_type_name ───────────────────────────────────────────────
@@ -796,6 +808,15 @@ mod tests {
             impulse_ops::WorkbenchDaemonRequest::GetGovernedTask { .. } => "GetGovernedTask",
             impulse_ops::WorkbenchDaemonRequest::ListGovernedTasks { .. } => "ListGovernedTasks",
             impulse_ops::WorkbenchDaemonRequest::MutateGovernedTask { .. } => "MutateGovernedTask",
+            impulse_ops::WorkbenchDaemonRequest::SubmitGovernedClaim { .. } => {
+                "SubmitGovernedClaim"
+            }
+            impulse_ops::WorkbenchDaemonRequest::RunGovernedVerification { .. } => {
+                "RunGovernedVerification"
+            }
+            impulse_ops::WorkbenchDaemonRequest::RunGovernedSupervisorReview { .. } => {
+                "RunGovernedSupervisorReview"
+            }
             impulse_ops::WorkbenchDaemonRequest::GuardList => "GuardList",
             impulse_ops::WorkbenchDaemonRequest::GetConflictHistory => "GetConflictHistory",
             impulse_ops::WorkbenchDaemonRequest::ClearResolvedConflicts => "ClearResolvedConflicts",
@@ -894,6 +915,47 @@ mod tests {
                 },
             },
         });
+        assert_shared_request_compatible(
+            impulse_ops::WorkbenchDaemonRequest::SubmitGovernedClaim {
+                request: impulse_ops::governed_task::GovernedClaimRequest {
+                    request_id: impulse_ops::governed_task::GovernedRequestId::try_new(
+                        "request-claim",
+                    )
+                    .unwrap(),
+                    project_id: "demo".into(),
+                    task_id: impulse_ops::governed_task::GovernedTaskId::try_new("task-1").unwrap(),
+                    expected_revision: 1,
+                    summary: "done".into(),
+                    artifact_ids: Vec::new(),
+                },
+            },
+        );
+        assert_shared_request_compatible(
+            impulse_ops::WorkbenchDaemonRequest::RunGovernedVerification {
+                request: impulse_ops::governed_task::GovernedVerificationRequest {
+                    request_id: impulse_ops::governed_task::GovernedRequestId::try_new(
+                        "request-verify",
+                    )
+                    .unwrap(),
+                    project_id: "demo".into(),
+                    task_id: impulse_ops::governed_task::GovernedTaskId::try_new("task-1").unwrap(),
+                    expected_revision: 2,
+                },
+            },
+        );
+        assert_shared_request_compatible(
+            impulse_ops::WorkbenchDaemonRequest::RunGovernedSupervisorReview {
+                request: impulse_ops::governed_task::GovernedSupervisorReviewRequest {
+                    request_id: impulse_ops::governed_task::GovernedRequestId::try_new(
+                        "request-review",
+                    )
+                    .unwrap(),
+                    project_id: "demo".into(),
+                    task_id: impulse_ops::governed_task::GovernedTaskId::try_new("task-1").unwrap(),
+                    expected_revision: 3,
+                },
+            },
+        );
         assert_shared_request_compatible(impulse_ops::WorkbenchDaemonRequest::GuardList);
         assert_shared_request_compatible(impulse_ops::WorkbenchDaemonRequest::GetConflictHistory);
         assert_shared_request_compatible(

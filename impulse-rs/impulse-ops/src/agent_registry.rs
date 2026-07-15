@@ -1444,42 +1444,34 @@ command = "ratchet"
     }
 
     #[test]
-    fn test_reconciled_clean_archive_has_contracts_snapshot() {
-        // Proof in canonical tree that .clean was reconciled (archived into single active tree).
-        // Contents of the duplicate checkout are now under archive/_archived-... or reconciled-...
-        let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-        let base = std::path::Path::new(&manifest).join("../../archive");
-        let has_archived = std::fs::read_dir(&base)
-            .ok()
-            .map(|rd| {
-                rd.filter_map(|e| e.ok()).any(|e| {
-                    let p = e.path();
-                    let name = p.to_string_lossy();
-                    if name.contains("_archived-IMPULSE") || name.contains("reconciled-from-clean")
-                    {
-                        let c1 = p.join("clean/crates/impulse-contracts/Cargo.toml");
-                        if c1.exists() {
-                            return true;
-                        }
-                        let c2 = p.join("crates/impulse-contracts/Cargo.toml");
-                        if c2.exists() {
-                            return true;
-                        }
-                        let c3 = p.join("full-snapshot/clean/crates/impulse-contracts/Cargo.toml");
-                        if c3.exists() {
-                            return true;
-                        }
-                    }
-                    false
-                })
-            })
-            .unwrap_or(false);
-        let old_partial = std::path::Path::new(&manifest).join(
-            "../../archive/reconciled-from-clean-2026-06-25/crates/impulse-contracts/Cargo.toml",
+    fn test_reconciled_backend_contract_lives_in_canonical_registry() {
+        // ADR-0009 maps the archived experiment's BackendDescriptor /
+        // BackendRegistry contract to these tracked canonical types. Prove the
+        // resulting behavior rather than depending on a maintainer-local,
+        // gitignored archive that cannot exist in a fresh clone or worktree.
+        let registry = AgentRegistry::builtin();
+        let platform = AgentPlatformId::try_new("claude-code").unwrap();
+        let descriptor = registry
+            .get(platform.as_str())
+            .expect("canonical registry contains the reconciled backend identity");
+
+        assert_eq!(descriptor.id, platform);
+        assert_eq!(descriptor.command, "claude");
+        assert_eq!(
+            registry.resolve("claude").map(|agent| &agent.id),
+            Some(&platform),
+            "the reconciled registry preserves typed alias resolution"
         );
+        assert_eq!(
+            resolve_launch_command(&registry, &platform, None).unwrap(),
+            "claude",
+            "the reconciled descriptor remains executable through the canonical launch API"
+        );
+
+        let report = AgentPlatformsReport::from_registry(&registry);
         assert!(
-            has_archived || old_partial.exists(),
-            "reconciled archive must contain contracts crate reference from .clean"
+            report.platforms.iter().any(|agent| agent.id == platform),
+            "the reconciled backend contract remains observable to control-plane clients"
         );
     }
 }
