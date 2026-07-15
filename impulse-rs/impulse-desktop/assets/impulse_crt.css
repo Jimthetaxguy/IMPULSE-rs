@@ -499,6 +499,13 @@ body {
   margin-top: 8px;
 }
 
+.governed-task-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr));
+  gap: 8px;
+  margin-top: 8px;
+}
+
 .operator-agent-card {
   min-width: 0;
   border-left: 2px solid var(--c-line);
@@ -531,6 +538,117 @@ body {
   margin-top: 6px;
   color: var(--c-dim);
   font-size: 11px;
+}
+
+.governed-task-card {
+  border-left-color: var(--p-amber-h);
+}
+
+.governed-task-card header {
+  align-items: flex-start;
+}
+
+.governed-task-card h3 {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+}
+
+.governed-task-card .governed-task-meta {
+  white-space: normal;
+}
+
+.governed-task-evidence {
+  margin-top: 9px;
+  border-top: 1px solid rgba(120, 200, 255, 0.1);
+  padding-top: 8px;
+}
+
+.governed-task-evidence h4 {
+  margin: 0 0 6px;
+  color: var(--c-label);
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+.governed-task-evidence ul {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--c-fg);
+  font-size: 11px;
+}
+
+.governed-evidence-block {
+  display: grid;
+  gap: 4px;
+  margin-top: 7px;
+}
+
+.governed-evidence-label,
+.governed-command-evidence span {
+  color: var(--c-label);
+  font-size: 9px;
+  text-transform: uppercase;
+}
+
+.governed-task-card .governed-evidence-copy {
+  overflow: visible;
+  white-space: normal;
+}
+
+.governed-evidence-block code,
+.governed-command-evidence code {
+  overflow-wrap: anywhere;
+  color: var(--p-cyan);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.governed-command-evidence {
+  display: grid;
+  gap: 3px;
+  margin-top: 4px;
+  border-left: 2px solid var(--p-lime);
+  background: rgba(47, 208, 255, 0.025);
+  padding: 6px;
+}
+
+.governed-command-evidence[data-command-result="fail"] {
+  border-left-color: var(--p-orange);
+}
+
+.governed-command-evidence strong {
+  color: var(--c-fg);
+  font-size: 10px;
+}
+
+.governed-command-evidence .governed-evidence-warning {
+  color: var(--p-amber-h);
+}
+
+.governed-rationale {
+  margin-top: 9px;
+}
+
+.workspace-field textarea {
+  min-width: 0;
+  min-height: 58px;
+  resize: vertical;
+  border: 1px solid var(--c-line);
+  border-radius: 0;
+  background: #010306;
+  color: var(--c-fg);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.4;
+  padding: 7px 8px;
+}
+
+.governed-task-actions {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  margin-top: 9px;
 }
 
 .terminal-tabs {
@@ -590,6 +708,12 @@ body {
 
 .xterm-mount[data-xterm-state="degraded"]::after {
   content: "terminal interop degraded - xterm.js / host adapter not detected";
+  color: var(--p-red);
+  font-size: 11px;
+}
+
+.xterm-mount[data-xterm-state="input-error"]::after {
+  content: "terminal input delivery failed - inspect the connection status before continuing";
   color: var(--p-red);
   font-size: 11px;
 }

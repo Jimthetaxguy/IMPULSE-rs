@@ -145,6 +145,18 @@ fn preserve_omitted_same_source_agent_facts(
             agent.role_assignment = previous_agent.role_assignment.clone();
             agent.role_compatibility = previous_agent.role_compatibility.clone();
         }
+        if agent.governed_task_id.is_none() {
+            agent.governed_task_id = previous_agent.governed_task_id.clone();
+            agent.governed_task_revision = previous_agent.governed_task_revision;
+        } else if agent.governed_task_id == previous_agent.governed_task_id {
+            agent.governed_task_revision = match (
+                agent.governed_task_revision,
+                previous_agent.governed_task_revision,
+            ) {
+                (Some(incoming), Some(previous)) => Some(incoming.max(previous)),
+                (incoming, previous) => incoming.or(previous),
+            };
+        }
     }
 }
 
@@ -166,6 +178,9 @@ pub async fn build_snapshot(
         load_genome(state.storage().base_path()).context("Failed to load genome for workbench")?;
     let artifacts = list_artifacts(state.storage().base_path(), &project.id)
         .context("Failed to list artifacts for workbench")?;
+    let governed_tasks = state
+        .list_governed_tasks(&project.id)
+        .context("Failed to list governed tasks for workbench")?;
     let recent_insights = load_live_insights(state.storage().base_path(), 20)
         .context("Failed to load live insights for workbench")?;
     let pending_review_count = artifacts
@@ -204,6 +219,7 @@ pub async fn build_snapshot(
             .context("Failed to build retrieval summary for workbench")?,
         artifacts,
         delegations: Vec::new(),
+        governed_tasks,
     };
     overlay_terminal_reports(&mut snapshot, terminal_reports);
 
@@ -401,6 +417,8 @@ fn build_agent_runtime(
         label: session.name.clone(),
         backend_kind,
         session_id: Some(session.id.clone()),
+        governed_task_id: None,
+        governed_task_revision: None,
         ephemeral: false,
         working_directory: session.working_directory.clone(),
         status: status.to_string(),
@@ -1078,6 +1096,8 @@ mod tests {
                 label: "Daemon Session".to_string(),
                 backend_kind: "Claude Code".to_string(),
                 session_id: Some(session.id.clone()),
+                governed_task_id: None,
+                governed_task_revision: None,
                 ephemeral: true,
                 working_directory: temp.path().display().to_string(),
                 status: "active".to_string(),

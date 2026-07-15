@@ -3,7 +3,7 @@ title: Desktop Shell Architecture
 status: active
 version: 1.0.0
 created: 2026-04-15
-updated: 2026-06-14
+updated: 2026-07-13
 ---
 
 # Desktop Shell Architecture
@@ -45,7 +45,7 @@ RUST BACKEND (impulse-desktop / impulse-term)
           | Unix socket / local IPC |
 
 DAEMON (impulse-rs binary)
-  Session lifecycle, context extraction, memory pipeline,
+  Session + governed-task lifecycle, context extraction, memory pipeline,
   agent coordination, snapshot publishing
 ```
 
@@ -94,13 +94,15 @@ DAEMON (impulse-rs binary)
 
 - Owns PTY spawn, stdin/stdout, resize (SIGWINCH), env injection, and session lifecycle
 - Exposes `TerminalBackend` and `WriteQueue` as the authoritative PTY interface
-- Has no rendering dependency - the `eframe` dependency must be removed before desktop wiring begins
+- Keeps new PTY/process behavior framework-neutral; the optional egui renderer is frozen legacy
+  compatibility and must not receive new product behavior
 - `backend.rs`, `context.rs`, and session logic are reusable by both the ratatui path and the desktop path
 
 ### impulse-ops / Daemon
 
-- Source of truth for all session, context, artifact, and supervisor state
-- Publishes `ProjectOpsSnapshot` and `TerminalOpsReport` snapshots
+- Source of truth for all session, governed-task, context, artifact, and supervisor state
+- Accepts desktop-authored `TerminalOpsReport` telemetry through `PublishTerminalOps`, overlays it
+  onto durable workbench truth, and returns `ProjectOpsSnapshot`/`OpsSubscription` read models
 - Desktop shell panels read exclusively from daemon state, never from frontend-local shadow state
 - Daemon reconnect must restore desktop shell state cleanly without a full restart
 
@@ -152,19 +154,35 @@ Pane container resized (CSS layout change)
 ### Daemon State Path
 
 ```
-Daemon publishes ProjectOpsSnapshot / TerminalOpsReport
-  -> Dioxus host receives via daemon IPC subscription
+Desktop runtime publishes TerminalOpsReport
+  -> daemon overlays fresh terminal telemetry onto durable workbench truth
+  -> SubscribeOps returns ProjectOpsSnapshot / OpsSubscription
+  -> Dioxus host receives the authoritative read model
   -> Backend emits ops_update host event {snapshot}
   -> Dioxus component subscribes to ops_update
   -> Component re-renders from new snapshot
   -> Side panels (context, artifacts, supervisor) update
 ```
 
+### Governed Task Decision Path
+
+```text
+Supervisor/operator action in Dioxus
+  -> governed_task_mutate host command
+  -> acknowledged desktop daemon client
+  -> daemon expected-revision/idempotency transition
+  -> authoritative GovernedTaskRun response + next ops_update
+  -> card re-renders; no optimistic task state
+```
+
 ---
 
-## Terminal Bridge API
+## Terminal and Governed Bridge Subset
 
-This is the full public interface between the Dioxus frontend and the Rust backend. It must stay thin.
+This table documents the terminal, governed-task, and native-island subset used in the data flows
+above. The complete current host-command manifest is `host_commands::HOST_INVOKE_COMMANDS`; it also
+contains the `agent_*`, workspace, MCP, review, and supervisor command families. All host commands
+must remain thin adapters over backend-owned state and policy.
 
 ### Commands (frontend -> backend)
 
@@ -175,6 +193,7 @@ This is the full public interface between the Dioxus frontend and the Rust backe
 | `terminal_resize` | `{session_id, cols, rows}` | Resize PTY and parser |
 | `terminal_close` | `{session_id}` | Kill PTY and clean up session |
 | `terminal_focus` | `{session_id}` | Notify backend of focus change |
+| `governed_task_mutate` | `{request: GovernedTaskMutationRequest}` | Apply an acknowledged revisioned task transition and return daemon-owned state |
 | `native_island_request` | `{request_id, kind, payload}` | Invoke a narrow native macOS island and return a serialized result |
 
 ### Events (backend -> frontend)
@@ -194,4 +213,7 @@ This is the full public interface between the Dioxus frontend and the Rust backe
 2. **Panel state comes from daemon, not from terminal scraping.** Context, artifacts, and supervisor panels are populated from `ops_update` snapshots.
 3. **ratatui stays functional.** No migration step should break the standalone ratatui operator surface.
 4. **egui is not extended.** The `impulse-gui` crate receives only compile-maintenance.
-5. **The desktop shell is additive.** Daemon contracts are not changed to serve the desktop.
+5. **The desktop shell does not fork authority.** Shared daemon contracts may evolve for product
+   capabilities such as governed tasks, but desktop-only shadow state or policy is forbidden.
+6. **Task decisions are acknowledged.** The UI waits for daemon-owned state and never treats a
+   terminal exit or optimistic click result as task acceptance.

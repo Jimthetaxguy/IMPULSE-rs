@@ -13,7 +13,9 @@ Claude Code, Codex, and similar CLIs keep their own internal coding loops. Ion i
 > **Live foundation:** the Rust workspace provides PTY lifecycle, daemon workbench contracts and
 > telemetry, registry-backed desktop platform identity, supervisor-specific permissions,
 > explicit product-role/task launch preflight, capability-checked tools, memory/retrieval,
-> artifacts, credentials, verification, and Ion's native REPL/tool loop.
+> artifacts, credentials, verification, Ion's native REPL/tool loop, and a daemon-owned governed
+> task lifecycle that keeps runtime exit, worker claim, verifier evidence, supervisor judgment,
+> and operator approval separate.
 >
 > **Target:** runtime-independent role contracts, adapter capability negotiation, typed agent
 > messaging, and stronger structural enforcement across supported runtimes. See
@@ -28,6 +30,7 @@ Using several coding agents today usually means several unrelated terminals, per
 - **Managed agent terminals** — Spawns, monitors, writes to, resizes, focuses, and closes PTY-backed agent processes inside explicit workspace roots
 - **Daemon workbench truth** — Serves the authoritative agent, context, artifact, and intervention snapshot over versioned IPC
 - **Role and policy foundations** — Preflights an explicit Builder role/task against conservative launch capabilities and enforces a concrete supervisor permission policy; generalized role composition remains a later boundary
+- **Governed task truth** — Registers a durable task before PTY launch, applies revisioned/idempotent lifecycle mutations, and reserves `accepted` for an explicit operator decision against current passing evidence
 - **Typed platform tools** — Exposes capability-checked Rust tools through native registries, MCP, and runtime-specific bridges
 - **Session tracking** — Records files touched, tools used, and decisions made
 - **Persistent memory** — Project genome (decisions/preferences) and session history survive across sessions
@@ -35,7 +38,7 @@ Using several coding agents today usually means several unrelated terminals, per
 - **Multi-agent observability** — Tracks active agents, tasks, terminal telemetry, delegations, and intervention recommendations
 - **Retrieval search** — FTS5 keyword search plus feature-gated, fallback-safe semantic search across session history and genome
 - **Context stewardship** — Monitors context window usage and proposes cleanup strategies
-- **Artifacts and verification** — Separates worker claims from observed build/test evidence and reviewable outputs
+- **Artifacts and verification** — Persists bounded, verifier-supplied redacted command evidence and keeps worker claims, verifier results, supervisor verdicts, and operator decisions as distinct records
 - **Credential services** — Selects configured credential providers without treating secret values as agent memory
 - **External + native runtimes** — Wraps terminal CLIs and provides Ion's direct model/tool loop in the same product
 
@@ -68,9 +71,19 @@ In the Dioxus cockpit, use the governed Builder launch path:
 Current built-in profiles mediate workspace targeting and process lifecycle. Structural filesystem
 scope is optional and currently unsupported, so the initial Builder profile is allowed but visibly
 degraded. The canonical working directory selects where the process starts; cwd mediation is not a
-filesystem sandbox. The complete supervisor + builder evidence/decision workflow remains the next
-vertical slice. Session, memory, hook, and verification commands remain available through
-`cargo run -- --help`.
+filesystem sandbox.
+
+Every governed launch is registered with the daemon before a PTY is created. Runtime exit updates
+execution state but never accepts the work. The Supervisor view renders daemon-owned claims,
+verification records, and revision-bound decision controls: a supervisor can recommend acceptance,
+but the operator must approve it. Worker-claim and verifier automation from each external runtime,
+a launched supervisor agent that drives those decisions, multi-workspace daemon routing, and
+accepted-run memory promotion remain the next end-to-end integration lane. Session, memory, hook,
+and verification commands remain available through `cargo run -- --help`.
+
+The current desktop daemon attachment is single-project: a governed launch must target the project
+root bound to the running daemon. Registering additional cockpit workspace entries does not yet
+provide cross-project daemon routing.
 
 ## Architecture
 
@@ -161,6 +174,7 @@ memory-pipeline/     # Python research tooling
 - **Start here:** [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
 - **User stories:** [`docs/spec/USER-STORY-MAP.md`](docs/spec/USER-STORY-MAP.md)
 - **Test traceability:** [`docs/spec/TEST-TRACEABILITY.md`](docs/spec/TEST-TRACEABILITY.md)
+- **Governed lifecycle ADR:** [`docs/decisions/0011-governed-task-run-lifecycle.md`](docs/decisions/0011-governed-task-run-lifecycle.md)
 - **Agent guidelines:** [`AGENTS.md`](AGENTS.md)
 - **Meta-Harness synthesis:** [`docs/research/META-HARNESS-RUST-MULTI-AGENT.md`](docs/research/META-HARNESS-RUST-MULTI-AGENT.md)
 - **Rust multi-agent guide:** [`docs/guides/RUST-MULTI-AGENT-PATTERNS.md`](docs/guides/RUST-MULTI-AGENT-PATTERNS.md)

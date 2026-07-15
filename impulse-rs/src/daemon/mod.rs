@@ -17,6 +17,7 @@ pub mod protocol;
 pub use protocol::*;
 
 use anyhow::{Context, Result};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -224,6 +225,9 @@ impl Daemon {
         tokio::fs::create_dir_all(socket_dir)
             .await
             .context("Failed to create socket directory")?;
+        tokio::fs::set_permissions(socket_dir, std::fs::Permissions::from_mode(0o700))
+            .await
+            .context("Failed to restrict socket directory permissions")?;
 
         // Stale socket detection: try connecting to distinguish crash residue from running daemon
         let pid_path = self.config.socket_path.with_extension("pid");
@@ -246,9 +250,20 @@ impl Daemon {
 
         let listener =
             UnixListener::bind(&self.config.socket_path).context("Failed to bind socket")?;
+        tokio::fs::set_permissions(
+            &self.config.socket_path,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .await
+        .context("Failed to restrict daemon socket permissions")?;
 
         // Write PID file for stale socket detection on next startup
-        let _ = tokio::fs::write(&pid_path, std::process::id().to_string()).await;
+        tokio::fs::write(&pid_path, std::process::id().to_string())
+            .await
+            .context("Failed to write daemon PID file")?;
+        tokio::fs::set_permissions(&pid_path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .context("Failed to restrict daemon PID file permissions")?;
 
         println!("Daemon listening on {}", self.config.socket_path.display());
 

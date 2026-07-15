@@ -5,7 +5,7 @@
 > Contract: [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
 > Collaboration playbook: [`docs/guides/COLLABORATIVE-AGENTIC-CODING.md`](docs/guides/COLLABORATIVE-AGENTIC-CODING.md)
 > Canonical stack: Rust (impulse-rs)
-> Roadmap contract: Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; Legacy=egui compile-maintenance only.
+> Roadmap contract: Now=control-plane foundations + daemon-owned governed task lifecycle; Next=real claim/verification producers + supervisor/builder process proof + accepted-run memory promotion; Later=general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only.
 
 ---
 
@@ -110,7 +110,7 @@ Before implementing, consider alternative approaches. Choose the simplest soluti
 - **Daemon mode** — long-running Unix socket authority for the TUI and Dioxus cockpit. In-memory state with periodic sync.
 - **Desktop mode** — Dioxus Desktop cockpit with xterm.js terminal bridge, backed by Rust daemon/runtime state. Tauri-shaped command/event code is compatibility-only.
 
-**IPC Protocol (PROTOCOL_VERSION = 3):**
+**IPC Protocol (PROTOCOL_VERSION = 4):**
 
 The daemon exposes a JSON-line Unix socket protocol. Key endpoint groups:
 
@@ -121,18 +121,21 @@ The daemon exposes a JSON-line Unix socket protocol. Key endpoint groups:
 | Delegation | `RegisterDelegation`, `CompleteDelegation`, `ListDelegations` | Phase 1B cross-agent delegation tracking |
 | Conflict Resolution | `GetConflictHistory`, `ClearResolvedConflicts` | File conflict tracking and resolution |
 | Agent Pool | `GetAgentPool` | All sessions grouped by role (Phase 2B) |
+| Governed Tasks | `RegisterGovernedTask`, `GetGovernedTask`, `ListGovernedTasks`, `MutateGovernedTask` | Durable revisioned task evidence, review, and operator-required acceptance |
 
 Responses use `AgentAssistResult` (with `recommendations` + `pane_summaries`) or `AgentSpecializedResult` (for review/analyze/summarize). Full protocol spec: [`docs/IPC-PROTOCOL.md`](docs/IPC-PROTOCOL.md).
 
 **Daemon agent-IPC freeze fix + bounded reads (same-day Opus sweep, outside the `ion_repl` hardening above):** a fresh read-only sweep of `src/daemon/` and `src/agent/` (deliberately outside that day's `ion_repl` work) found two real bugs. **(1) Un-timed harness subprocess held across a shared mutex:** `agent::ImpulseAgent::harness_query_structured` (`src/agent/mod.rs`) spawned the configured CLI harness (`claude`/`codex`/`gemini`) via `tokio::process::Command::output().await` with no timeout and no `kill_on_drop` — matching the bug class already fixed in `bash_exec.rs`/`pi_adapter.rs` earlier that day. Worse, all three daemon call sites (`SupervisorChat`, `AgentAssist`, `AgentReviewCode`/`AgentAnalyzeError`/`AgentSummarizePane` in `src/daemon/handlers.rs`) called `agent.query(...).await` while still holding the `cached_agent: Arc<Mutex<Option<ImpulseAgent>>>` guard returned by `get_or_init_agent` — so a single wedged harness child froze `cached_agent.lock().await` for every other agent-related daemon request, not just the hung one. Fixed in two layers: `agent/mod.rs` gained `cmd.kill_on_drop(true)` plus `tokio::time::timeout(DEFAULT_HARNESS_TIMEOUT = 120s, cmd.output())`, erroring with a new `AgentError::HarnessTimedOut { command, seconds }` variant (test/DI seam: `harness_query_structured_with_timeout`, mirroring `chat_with_tools_capped_timeout`'s pattern). `daemon/handlers.rs`'s `get_or_init_agent` was replaced with a `checkout_agent`/`checkin_agent` pair: `checkout_agent` takes the `ImpulseAgent` out of the `Option` and drops the `MutexGuard` before returning it *owned*; callers run their query on the owned value with no lock held, then `checkin_agent` puts it back with a fresh short lock — the mutex is now held only for the instant of a get/init, never across the subprocess `.await`, at all three call sites. **(2) Unbounded daemon/MCP request-line reads:** `daemon/mod.rs`'s connection loop called `reader.read_line(&mut line).await?` and only checked `line.len() > MAX_REQUEST_SIZE` *after* the full (possibly enormous) line was already buffered — a local client could send unbounded non-newline bytes and OOM the daemon before the check ever ran. `mcp/server.rs`'s stdio and `serve_tcp` (bound to `127.0.0.1`, reachable by any local process) paths had the same read with no size guard at all. Fixed with a new `daemon::{read_bounded_line, BoundedLine, MAX_REQUEST_SIZE}` (wraps the reader in `AsyncReadExt::take(max_bytes + 1)` composed with `AsyncBufRead::read_until`, so peak memory for one line read is capped regardless of what the peer sends) shared by both `daemon/mod.rs` and `mcp/server.rs`; an oversized line closes the connection rather than attempting an unbounded drain to resynchronize.
 
-**Current managed-agent turn invariant (2026-07-11, protocol v3):** The checkout/checkin layer described above was superseded after deterministic tests proved that it could double-initialize the cached agent, overwrite `session_history`/`recommendations`/`pane_summaries`, and leave the cache empty when a handler was cancelled. `try_lock_agent_for_turn` retains the agent in-place under a Tokio mutex for one bounded query. Concurrent turns fail fast with typed `Busy { resource: agent_turn, retry_after_ms: 250 }` instead of queueing past the client's response budget; unrelated daemon endpoint groups remain independent; dropping a cancelled handler releases the guard without removing the cached instance. Provider timeouts prevent the original indefinite-wait failure.
+**Current managed-agent turn invariant (introduced in protocol v3):** The checkout/checkin layer described above was superseded after deterministic tests proved that it could double-initialize the cached agent, overwrite `session_history`/`recommendations`/`pane_summaries`, and leave the cache empty when a handler was cancelled. `try_lock_agent_for_turn` retains the agent in-place under a Tokio mutex for one bounded query. Concurrent turns fail fast with typed `Busy { resource: agent_turn, retry_after_ms: 250 }` instead of queueing past the client's response budget; unrelated daemon endpoint groups remain independent; dropping a cancelled handler releases the guard without removing the cached instance. Provider timeouts prevent the original indefinite-wait failure. Protocol v4 adds the daemon-owned governed-task request family and snapshot state without weakening this turn invariant.
 
 **Data lives in `.impulse/`:**
 - `HISTORY.jsonl` — append-only session log (committed)
 - `GENOME.md` — permanent decisions and preferences (committed)
 - `LIVE_STATE.json` — active session state (ephemeral)
 - `config.json` — runtime configuration
+- `GOVERNED_TASKS.json` — daemon-owned governed task records and idempotency receipts
+- `DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.json` — bounded ambiguous launch/exit mutations awaiting daemon reconciliation
 - `retrieval.db` — search index (rebuildable)
 
 ---
@@ -381,13 +384,16 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-**Current canonical projection (2026-07-12):** 1,950 passed, 9 ignored, 0 failed. The verified isolated aggregate worktree reports 1,949 passed with the canonical-checkout-only archive proof explicitly filtered. Package totals are impulse-rs 1,576 (root library target 1,542), ops 44, term 114, desktop 193, and Ion 23.
+**Final-gate evidence:** Do not rely on a checked-in aggregate test count. Run the complete gate on
+the current checkout and record package-level passed, ignored, and failed totals in the commit/PR
+evidence. If an isolated worktree lacks the gitignored reconciliation archive, identify the filtered
+checkout-only proof explicitly and rerun it from the canonical checkout before release.
 
 **Current verification boundaries:** the canonical Rust gate does not by itself prove a real
 provider-backed Ion round trip, cross-platform Linux/Windows behavior, or generalized runtime-role
 enforcement that has not been implemented. The feature-gated Dioxus binary also retains its
-separate host-readiness smoke check. Re-run the full gate on the current checkout before citing the
-aggregate above.
+separate host-readiness smoke check. Re-run the full gate on the current checkout before citing any
+aggregate.
 
 **Historical verification evidence:** implementation chronology belongs in Git history and
 merged change records; keep this operating guide limited to the current gate and known boundaries.
@@ -423,13 +429,13 @@ To verify test counts match expectations:
 ```bash
 cd impulse-rs && cargo test --workspace 2>&1 | grep "test result:" | awk '{sum += $4} END {print "Total: " sum " passed"}'
 ```
-Expected canonical checkout projection: 1,950 passed across the 5 crates (impulse-rs, impulse-ops, impulse-term, impulse-desktop, impulse-ion), with 9 ignored and 0 failed. The verified isolated worktree without the gitignored reconciliation archive reports 1,949 passed when that one proof is explicitly filtered. Re-run the full gate before treating changed counts as verified; if they change, update both this section and the Architecture section.
+Treat the command output as the authoritative count for that checkout. Preserve the complete output
+in final-gate evidence instead of copying a moving aggregate into this guide.
 
 ### Pre-Commit Checklist
 
 1. `cargo build --workspace` — zero warnings
-2. `cargo test --workspace` — all tests pass (1,950 canonical workspace projection expected, 9 ignored; verify with `cargo test --workspace 2>&1 | grep "test result:"`)
-   - **If count changes**: update this line and the Architecture section above
+2. `cargo test --workspace` — all tests pass; capture the current passed/ignored/failed totals from the command output
 3. `cargo clippy --workspace --all-targets -- -D warnings` — zero warnings
 4. `cargo fmt --all -- --check` — zero diffs
 5. No new `#[allow(...)]` without justification comment

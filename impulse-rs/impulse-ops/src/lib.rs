@@ -6,10 +6,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 pub mod agent_registry;
+pub mod governed_task;
 pub mod role_assignment;
 
 /// Shared daemon protocol version for GUI/operator workbench compatibility.
-pub const DAEMON_PROTOCOL_VERSION: u32 = 3;
+pub const DAEMON_PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpsError {
@@ -66,6 +67,19 @@ pub enum WorkbenchDaemonRequest {
         action_id: String,
         #[serde(default)]
         params: serde_json::Value,
+    },
+    RegisterGovernedTask {
+        registration: governed_task::GovernedTaskRegistration,
+    },
+    GetGovernedTask {
+        project_id: String,
+        task_id: governed_task::GovernedTaskId,
+    },
+    ListGovernedTasks {
+        project_id: String,
+    },
+    MutateGovernedTask {
+        request: governed_task::GovernedTaskMutationRequest,
     },
     GuardList,
     GetConflictHistory,
@@ -682,6 +696,12 @@ pub struct AgentRuntime {
     pub label: String,
     pub backend_kind: String,
     pub session_id: Option<String>,
+    /// Durable daemon-owned task identity, distinct from agent/session routing ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governed_task_id: Option<governed_task::GovernedTaskId>,
+    /// Last daemon lifecycle revision observed by this runtime surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governed_task_revision: Option<u64>,
     #[serde(default)]
     pub ephemeral: bool,
     pub working_directory: String,
@@ -843,6 +863,9 @@ pub struct ProjectOpsSnapshot {
     /// Active and recent delegations for the agent pool view.
     #[serde(default)]
     pub delegations: Vec<DelegationSummary>,
+    /// Daemon-owned governed task truth. Legacy snapshots omit this field.
+    #[serde(default)]
+    pub governed_tasks: Vec<governed_task::GovernedTaskSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]

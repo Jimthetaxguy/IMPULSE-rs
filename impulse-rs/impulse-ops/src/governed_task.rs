@@ -1,0 +1,618 @@
+//! Durable operating contract for daemon-owned governed task runs.
+//!
+//! A governed task is deliberately not a terminal session. Its execution can
+//! stop while review continues, so execution and review state are independent.
+
+use serde::de::Error as _;
+use serde::{Deserialize, Serialize};
+
+use crate::role_assignment::{AgentRoleAssignment, RoleCompatibility};
+
+pub const MAX_GOVERNED_TASK_BYTES: usize = 8 * 1024;
+pub const MAX_ACCEPTANCE_CRITERIA: usize = 64;
+pub const MAX_GOVERNED_TEXT_BYTES: usize = 16 * 1024;
+pub const MAX_GOVERNED_REFERENCES: usize = 64;
+pub const MAX_GOVERNED_COMMANDS: usize = 64;
+pub const MAX_GOVERNED_COMMAND_ARGS: usize = 256;
+pub const MAX_GOVERNED_REFERENCE_BYTES: usize = 4 * 1024;
+pub const MAX_GOVERNED_COMMAND_ARG_BYTES: usize = 16 * 1024;
+pub const MAX_GOVERNED_RECORDS_PER_KIND: usize = 256;
+pub const MAX_GOVERNED_EVENTS: usize = 1_024;
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum GovernedTaskContractError {
+    #[error("invalid {kind} `{value}`: ids must be nonempty and contain no whitespace or control characters")]
+    InvalidId { kind: &'static str, value: String },
+    #[error("invalid governed task field `{field}`: {message}")]
+    InvalidField {
+        field: &'static str,
+        message: String,
+    },
+}
+
+fn validate_open_id(
+    kind: &'static str,
+    value: String,
+) -> Result<String, GovernedTaskContractError> {
+    if value.is_empty()
+        || value.len() > 256
+        || value
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err(GovernedTaskContractError::InvalidId { kind, value });
+    }
+    Ok(value)
+}
+
+macro_rules! governed_id {
+    ($name:ident, $kind:literal) => {
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+        #[serde(transparent)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn try_new(value: impl Into<String>) -> Result<Self, GovernedTaskContractError> {
+                validate_open_id($kind, value.into()).map(Self)
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(self.as_str())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::try_new(value).map_err(D::Error::custom)
+            }
+        }
+    };
+}
+
+governed_id!(GovernedTaskId, "governed_task_id");
+governed_id!(GovernedRequestId, "governed_request_id");
+governed_id!(GovernedRecordId, "governed_record_id");
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalPolicy {
+    #[default]
+    OperatorRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernedExecutionState {
+    #[default]
+    Registered,
+    Running,
+    LaunchFailed,
+    RuntimeExited,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernedReviewState {
+    #[default]
+    AwaitingClaim,
+    AwaitingVerification,
+    VerificationFailed,
+    AwaitingSupervisor,
+    ChangesRequested,
+    Escalated,
+    AwaitingOperator,
+    Accepted,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernedActorKind {
+    System,
+    Worker,
+    Verifier,
+    Supervisor,
+    Operator,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernedActor {
+    pub kind: GovernedActorKind,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernedTaskRegistration {
+    pub request_id: GovernedRequestId,
+    /// Client-proposed durable identity. The daemon validates uniqueness and
+    /// becomes authoritative for all subsequent revisions.
+    pub task_id: GovernedTaskId,
+    pub project_id: String,
+    pub workspace_root: String,
+    pub task: String,
+    #[serde(default)]
+    pub acceptance_criteria: Vec<String>,
+    #[serde(default)]
+    pub approval_policy: ApprovalPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_assignment: Option<AgentRoleAssignment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_compatibility: Option<RoleCompatibility>,
+    pub runtime_id: String,
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_subject_revision: Option<String>,
+}
+
+impl GovernedTaskRegistration {
+    pub fn builder(
+        request_id: impl Into<String>,
+        task_id: impl Into<String>,
+        project_id: impl Into<String>,
+        workspace_root: impl Into<String>,
+        task: impl Into<String>,
+        agent_id: impl Into<String>,
+        runtime_id: impl Into<String>,
+    ) -> GovernedTaskRegistrationBuilder {
+        GovernedTaskRegistrationBuilder {
+            request_id: request_id.into(),
+            task_id: task_id.into(),
+            project_id: project_id.into(),
+            workspace_root: workspace_root.into(),
+            task: task.into(),
+            acceptance_criteria: Vec::new(),
+            approval_policy: ApprovalPolicy::OperatorRequired,
+            role_assignment: None,
+            role_compatibility: None,
+            runtime_id: runtime_id.into(),
+            agent_id: agent_id.into(),
+            session_id: None,
+            initial_subject_revision: None,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), GovernedTaskContractError> {
+        validate_nonblank("project_id", &self.project_id, 256)?;
+        validate_nonblank("workspace_root", &self.workspace_root, 16 * 1024)?;
+        validate_nonblank("task", &self.task, MAX_GOVERNED_TASK_BYTES)?;
+        validate_nonblank("runtime_id", &self.runtime_id, 256)?;
+        validate_nonblank("agent_id", &self.agent_id, 256)?;
+        if self.acceptance_criteria.len() > MAX_ACCEPTANCE_CRITERIA {
+            return Err(GovernedTaskContractError::InvalidField {
+                field: "acceptance_criteria",
+                message: format!("must contain at most {MAX_ACCEPTANCE_CRITERIA} entries"),
+            });
+        }
+        for criterion in &self.acceptance_criteria {
+            validate_nonblank("acceptance_criteria", criterion, MAX_GOVERNED_TEXT_BYTES)?;
+        }
+        if let Some(session_id) = &self.session_id {
+            validate_nonblank("session_id", session_id, 256)?;
+        }
+        if self.task_id.as_str() == self.agent_id
+            || self.session_id.as_deref() == Some(self.task_id.as_str())
+        {
+            return Err(GovernedTaskContractError::InvalidField {
+                field: "task_id",
+                message: "must be distinct from agent_id and session_id".to_string(),
+            });
+        }
+        if let Some(subject) = &self.initial_subject_revision {
+            validate_nonblank("initial_subject_revision", subject, 1024)?;
+        }
+        if self
+            .role_compatibility
+            .as_ref()
+            .is_some_and(|compatibility| compatibility.is_blocked())
+        {
+            return Err(GovernedTaskContractError::InvalidField {
+                field: "role_compatibility",
+                message: "blocked compatibility cannot be registered".to_string(),
+            });
+        }
+        match (&self.role_assignment, &self.role_compatibility) {
+            (Some(assignment), Some(compatibility)) => {
+                if assignment.role != compatibility.role {
+                    return Err(GovernedTaskContractError::InvalidField {
+                        field: "role_compatibility",
+                        message: "compatibility role must match the assigned role".to_string(),
+                    });
+                }
+                if compatibility.platform.as_str() != self.runtime_id {
+                    return Err(GovernedTaskContractError::InvalidField {
+                        field: "role_compatibility",
+                        message: "compatibility platform must match runtime_id".to_string(),
+                    });
+                }
+                if assignment.requirements.len() != compatibility.checks.len()
+                    || assignment.requirements.iter().any(|requirement| {
+                        compatibility
+                            .checks
+                            .iter()
+                            .filter(|check| check.capability == requirement.capability)
+                            .count()
+                            != 1
+                    })
+                    || compatibility.checks.iter().any(|check| {
+                        !assignment.requirements.iter().any(|requirement| {
+                            requirement.capability == check.capability
+                                && requirement.minimum_enforcement == check.required
+                                && requirement.mandatory == check.mandatory
+                        })
+                    })
+                {
+                    return Err(GovernedTaskContractError::InvalidField {
+                        field: "role_compatibility",
+                        message:
+                            "compatibility checks must exactly cover the assigned requirements"
+                                .to_string(),
+                    });
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(GovernedTaskContractError::InvalidField {
+                    field: "role_assignment",
+                    message: "role assignment and compatibility must be supplied together"
+                        .to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+pub struct GovernedTaskRegistrationBuilder {
+    request_id: String,
+    task_id: String,
+    project_id: String,
+    workspace_root: String,
+    task: String,
+    acceptance_criteria: Vec<String>,
+    approval_policy: ApprovalPolicy,
+    role_assignment: Option<AgentRoleAssignment>,
+    role_compatibility: Option<RoleCompatibility>,
+    runtime_id: String,
+    agent_id: String,
+    session_id: Option<String>,
+    initial_subject_revision: Option<String>,
+}
+
+impl GovernedTaskRegistrationBuilder {
+    pub fn acceptance_criteria(mut self, criteria: Vec<String>) -> Self {
+        self.acceptance_criteria = criteria;
+        self
+    }
+
+    pub fn approval_policy(mut self, policy: ApprovalPolicy) -> Self {
+        self.approval_policy = policy;
+        self
+    }
+
+    pub fn role_assignment(mut self, assignment: AgentRoleAssignment) -> Self {
+        self.role_assignment = Some(assignment);
+        self
+    }
+
+    pub fn role_compatibility(mut self, compatibility: RoleCompatibility) -> Self {
+        self.role_compatibility = Some(compatibility);
+        self
+    }
+
+    pub fn session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
+    }
+
+    pub fn initial_subject_revision(mut self, revision: impl Into<String>) -> Self {
+        self.initial_subject_revision = Some(revision.into());
+        self
+    }
+
+    pub fn build(self) -> Result<GovernedTaskRegistration, GovernedTaskContractError> {
+        let registration = GovernedTaskRegistration {
+            request_id: GovernedRequestId::try_new(self.request_id)?,
+            task_id: GovernedTaskId::try_new(self.task_id)?,
+            project_id: self.project_id,
+            workspace_root: self.workspace_root,
+            task: self.task,
+            acceptance_criteria: self.acceptance_criteria,
+            approval_policy: self.approval_policy,
+            role_assignment: self.role_assignment,
+            role_compatibility: self.role_compatibility,
+            runtime_id: self.runtime_id,
+            agent_id: self.agent_id,
+            session_id: self.session_id,
+            initial_subject_revision: self.initial_subject_revision,
+        };
+        registration.validate()?;
+        Ok(registration)
+    }
+}
+
+fn validate_nonblank(
+    field: &'static str,
+    value: &str,
+    max_bytes: usize,
+) -> Result<(), GovernedTaskContractError> {
+    if value.trim().is_empty() || value.contains('\0') || value.len() > max_bytes {
+        return Err(GovernedTaskContractError::InvalidField {
+            field,
+            message: format!("must be nonblank, NUL-free, and at most {max_bytes} UTF-8 bytes"),
+        });
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerCompletionClaimInput {
+    pub actor: GovernedActor,
+    pub summary: String,
+    pub subject_revision: String,
+    #[serde(default)]
+    pub artifact_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerCompletionClaim {
+    pub id: GovernedRecordId,
+    pub actor: GovernedActor,
+    pub summary: String,
+    pub subject_revision: String,
+    #[serde(default)]
+    pub artifact_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_ref: Option<String>,
+    pub submitted_at: String,
+    pub based_on_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernedCommandEvidence {
+    pub name: String,
+    /// Executable name or path with no embedded credentials.
+    pub executable: String,
+    /// Display-safe arguments. Producers must replace secret-bearing values
+    /// with an explicit `<redacted>` token before persistence.
+    #[serde(default)]
+    pub redacted_args: Vec<String>,
+    /// Digest of the exact unredacted argv, which must never be persisted.
+    pub command_digest: String,
+    pub exit_code: Option<i32>,
+    pub success: bool,
+    pub output_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_ref: Option<String>,
+    pub output_bytes: u64,
+    #[serde(default)]
+    pub output_truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernedVerificationOutcome {
+    Passed,
+    Failed,
+    Inconclusive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernedVerificationInput {
+    pub actor: GovernedActor,
+    pub claim_id: GovernedRecordId,
+    pub subject_revision: String,
+    pub policy: String,
+    pub outcome: GovernedVerificationOutcome,
+    #[serde(default)]
+    pub commands: Vec<GovernedCommandEvidence>,
+    #[serde(default)]
+    pub artifact_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernedVerification {
+    pub id: GovernedRecordId,
+    pub actor: GovernedActor,
+    pub claim_id: GovernedRecordId,
+    pub subject_revision: String,
+    pub policy: String,
+    pub outcome: GovernedVerificationOutcome,
+    #[serde(default)]
+    pub commands: Vec<GovernedCommandEvidence>,
+    #[serde(default)]
+    pub artifact_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    pub recorded_at: String,
+    pub based_on_revision: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorVerdictKind {
+    RecommendAccept,
+    ChangesRequested,
+    Escalate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupervisorVerdictInput {
+    pub actor: GovernedActor,
+    pub verification_id: GovernedRecordId,
+    pub verdict: SupervisorVerdictKind,
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupervisorVerdict {
+    pub id: GovernedRecordId,
+    pub actor: GovernedActor,
+    pub verification_id: GovernedRecordId,
+    pub verdict: SupervisorVerdictKind,
+    pub rationale: String,
+    pub decided_at: String,
+    pub based_on_revision: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorDecisionKind {
+    Approve,
+    Reject,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorDecisionInput {
+    pub actor: GovernedActor,
+    pub supervisor_verdict_id: GovernedRecordId,
+    pub decision: OperatorDecisionKind,
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorDecision {
+    pub id: GovernedRecordId,
+    pub actor: GovernedActor,
+    pub supervisor_verdict_id: GovernedRecordId,
+    pub decision: OperatorDecisionKind,
+    pub rationale: String,
+    pub decided_at: String,
+    pub based_on_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+pub enum GovernedTaskMutation {
+    MarkRunning {
+        actor: GovernedActor,
+    },
+    MarkLaunchFailed {
+        actor: GovernedActor,
+        reason: String,
+    },
+    MarkRuntimeExited {
+        actor: GovernedActor,
+        reason: Option<String>,
+    },
+    SubmitClaim {
+        claim: WorkerCompletionClaimInput,
+    },
+    RecordVerification {
+        verification: GovernedVerificationInput,
+    },
+    RecordSupervisorVerdict {
+        verdict: SupervisorVerdictInput,
+    },
+    RecordOperatorDecision {
+        decision: OperatorDecisionInput,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernedTaskMutationRequest {
+    pub request_id: GovernedRequestId,
+    pub project_id: String,
+    pub task_id: GovernedTaskId,
+    pub expected_revision: u64,
+    pub mutation: GovernedTaskMutation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernedTaskEventKind {
+    Registered,
+    Running,
+    LaunchFailed,
+    RuntimeExited,
+    ClaimSubmitted,
+    VerificationRecorded,
+    SupervisorVerdictRecorded,
+    OperatorDecisionRecorded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernedTaskEvent {
+    pub id: GovernedRecordId,
+    pub revision: u64,
+    pub kind: GovernedTaskEventKind,
+    pub actor: GovernedActor,
+    pub detail: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernedTaskRun {
+    pub id: GovernedTaskId,
+    pub revision: u64,
+    pub project_id: String,
+    pub workspace_root: String,
+    pub task: String,
+    #[serde(default)]
+    pub acceptance_criteria: Vec<String>,
+    #[serde(default)]
+    pub approval_policy: ApprovalPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_assignment: Option<AgentRoleAssignment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_compatibility: Option<RoleCompatibility>,
+    pub runtime_id: String,
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_subject_revision: Option<String>,
+    #[serde(default)]
+    pub execution_state: GovernedExecutionState,
+    #[serde(default)]
+    pub review_state: GovernedReviewState,
+    #[serde(default)]
+    pub claims: Vec<WorkerCompletionClaim>,
+    #[serde(default)]
+    pub verifications: Vec<GovernedVerification>,
+    #[serde(default)]
+    pub supervisor_verdicts: Vec<SupervisorVerdict>,
+    #[serde(default)]
+    pub operator_decisions: Vec<OperatorDecision>,
+    #[serde(default)]
+    pub events: Vec<GovernedTaskEvent>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl GovernedTaskRun {
+    pub fn latest_claim(&self) -> Option<&WorkerCompletionClaim> {
+        self.claims.last()
+    }
+
+    pub fn latest_verification(&self) -> Option<&GovernedVerification> {
+        self.verifications.last()
+    }
+
+    pub fn latest_supervisor_verdict(&self) -> Option<&SupervisorVerdict> {
+        self.supervisor_verdicts.last()
+    }
+
+    pub fn is_accepted(&self) -> bool {
+        self.review_state == GovernedReviewState::Accepted
+    }
+}
+
+/// The snapshot intentionally carries the full typed record in the first
+/// protocol version. Raw command output remains out-of-line.
+pub type GovernedTaskSnapshot = GovernedTaskRun;

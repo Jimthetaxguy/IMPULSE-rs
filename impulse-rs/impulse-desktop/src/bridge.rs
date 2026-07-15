@@ -16,8 +16,12 @@ pub enum DesktopBridgeError {
     InvalidTerminalRequest { message: String },
     #[error("failed to spawn terminal agent: {message}")]
     TerminalSpawnFailed { message: String },
+    #[error("governed task lifecycle failed: {message}")]
+    GovernedTaskFailed { message: String },
     #[error("terminal write failed: {message}")]
     TerminalWriteFailed { message: String },
+    #[error("terminal termination failed: {message}")]
+    TerminalTerminationFailed { message: String },
     #[error("native island {kind} is not supported on this platform")]
     UnsupportedNativeIsland { kind: String },
     #[error("native island failed: {message}")]
