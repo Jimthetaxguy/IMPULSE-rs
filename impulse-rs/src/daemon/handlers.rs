@@ -980,6 +980,23 @@ pub(crate) async fn handle_governed_task_request(
                     .context("Failed to serialize governed task list")
             }
             DaemonRequest::MutateGovernedTask { request } => {
+                // Profiled tasks force claim / verification / Supervisor
+                // transitions through the daemon-owned producer requests
+                // (SubmitGovernedClaim / RunGovernedVerification /
+                // RunGovernedSupervisorReview), where the daemon derives actor
+                // identity and *computes* the result — those transitions are
+                // unforgeable by a client. `RecordOperatorDecision` is
+                // deliberately NOT rejected here: the Desktop operator surface
+                // and a profiled Builder both connect as unauthenticated
+                // same-user clients on this single socket, so no request-level
+                // property distinguishes them. Blocking the mutation would break
+                // legitimate approvals without stopping a determined same-user
+                // Builder, so operator decisions inherit the documented
+                // same-user provenance boundary (see CLAUDE.md "profiled
+                // governed-producer invariant" and RUST-CANONICAL-CONTRACT.md).
+                // Enforcing it needs socket peer-credential authorization,
+                // tracked as follow-up in
+                // docs/superpowers/plans/2026-07-13-governed-runtime-producers.md.
                 if matches!(
                     request.mutation,
                     impulse_ops::governed_task::GovernedTaskMutation::SubmitClaim { .. }

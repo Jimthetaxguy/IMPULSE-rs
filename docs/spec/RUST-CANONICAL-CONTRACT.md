@@ -190,6 +190,13 @@ A durable producer reservation journal remains required.
 
 This is not a generalized role/runtime contract. Typed actor kinds are auditable provenance and
 transition checks, not cryptographic authorization between processes running as the same OS user.
+In particular, `RecordOperatorDecision` is gated only on the client-declared actor kind and travels
+the same unauthenticated socket that the Desktop operator surface and profiled Builders both use, so
+a same-user Builder can in principle forge the operator-required acceptance record. The
+daemon-computed claim, verification, and Supervisor producers are the only transitions that are
+structurally unforgeable; enforcing operator-decision provenance requires socket peer-credential
+authorization and is tracked as follow-up (see
+`docs/superpowers/plans/2026-07-13-governed-runtime-producers.md`).
 Unprofiled caller-composed evidence retains its existing validation boundary; profiled automatic
 records are derived by the daemon and cannot enter through generic mutations. One daemon adapter
 remains bound to one project, project identity is currently

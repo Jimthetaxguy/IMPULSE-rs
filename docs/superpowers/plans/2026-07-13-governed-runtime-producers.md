@@ -79,3 +79,25 @@ operator. Automatic producer truth cannot be supplied through the generic mutati
 - UI/host tests prove profiled cards expose command guidance, operator controls wait for daemon
   acknowledgements, and no optimistic state is applied.
 - Full repository gates are green on the final diff.
+
+## Post-review follow-up (2026-07-14)
+
+Adversarial review of the merged stack raised two edge findings on top of the green gates:
+
+1. **Fixed — inherited `IMPULSE_*` env leak in the TUI pane.** `impulse-term::backend` scrubs
+   inherited `IMPULSE_*` before overlaying explicit launch metadata, but the second PTY spawn site,
+   `src/ui/terminal_pane.rs::TerminalPane::spawn`, did not. A pane spawned from a governed context
+   could inherit `IMPULSE_SOCKET_PATH` / `IMPULSE_GOVERNED_TASK_ID` / `IMPULSE_PROJECT_ID`. Now
+   scrubbed with a mirrored `remove_inherited_impulse_env` plus a regression test.
+
+2. **Deferred — operator-decision provenance under the same-user boundary.** `RecordOperatorDecision`
+   is gated only on the client-declared actor kind and rides the same unauthenticated socket the
+   Desktop operator surface and profiled Builders share, so a same-user Builder can in principle
+   forge the operator-required acceptance record. This is consistent with the explicit non-goal
+   above ("Cryptographic same-user process identity, peer-PID binding, or sandbox attestation") — the
+   daemon-computed claim / verification / Supervisor producers remain the structurally unforgeable
+   transitions. The guard site (`daemon/handlers.rs`) and `RUST-CANONICAL-CONTRACT.md` now document
+   this explicitly rather than implying the operator gate is enforced. **Next-slice task:** add
+   socket peer-credential authorization (bind the operator surface to a peer-cred/registered
+   connection; reject operator/lifecycle mutations from other same-user peers) so the acceptance
+   record is provenance-enforced, not just provenance-labeled.
