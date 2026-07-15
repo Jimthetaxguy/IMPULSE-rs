@@ -127,6 +127,8 @@ impl TerminalsView {
                     warnings,
                     agent_status: impulse_ops::AgentStatus::default(),
                     role: None,
+                    role_assignment: None,
+                    role_compatibility: None,
                     group: None,
                     tool_invocations: Vec::new(),
                     diff_summary: None,

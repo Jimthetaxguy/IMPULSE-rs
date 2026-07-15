@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 pub use impulse_ops::agent_registry::AgentPlatformId;
+use impulse_ops::role_assignment::{AgentRoleAssignment, EnforcementStrength, RoleCompatibility};
 use impulse_ops::{AgentRole, AgentStatus, ContextHealthSummary, MachineTarget};
 use impulse_term::TerminalBackend;
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,10 @@ use crate::bridge::{
     DesktopBridgeError, TerminalBridge, TerminalCloseRequest, TerminalFocusRequest,
     TerminalOpenRequest, TerminalResizeRequest, TerminalSessionResponse, TerminalWriteRequest,
 };
+
+/// Tasks are copied into `IMPULSE_TASK`; keep that environment value bounded
+/// and measure the wire-compatible UTF-8 representation rather than chars.
+const MAX_GOVERNED_TASK_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceTarget {
@@ -136,6 +141,10 @@ pub struct AgentSpawnRequest {
     pub cols: u16,
     #[serde(default)]
     pub role: Option<AgentRole>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_assignment: Option<AgentRoleAssignment>,
     #[serde(default)]
     pub target: Option<MachineTarget>,
 }
@@ -163,6 +172,8 @@ impl AgentSpawnRequest {
             rows,
             cols,
             role: None,
+            task: None,
+            role_assignment: None,
             target: None,
         }
     }
@@ -209,6 +220,10 @@ pub struct AgentRuntimeSnapshot {
     pub status: AgentStatus,
     pub current_task: Option<String>,
     pub role: Option<AgentRole>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_assignment: Option<AgentRoleAssignment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_compatibility: Option<RoleCompatibility>,
     pub target: Option<MachineTarget>,
     pub mcp_tools: Vec<BuiltInMcpTool>,
     pub output_bytes: u64,
@@ -366,7 +381,10 @@ struct RuntimeRecord {
     cwd: Option<PathBuf>,
     workspace: Option<WorkspaceTarget>,
     session_id: Option<String>,
+    current_task: Option<String>,
     role: Option<AgentRole>,
+    role_assignment: Option<AgentRoleAssignment>,
+    role_compatibility: Option<RoleCompatibility>,
     target: Option<MachineTarget>,
     mcp_tools: Vec<BuiltInMcpTool>,
     focused: bool,
@@ -397,8 +415,10 @@ impl RuntimeRecord {
             alive,
             focused: self.focused,
             status,
-            current_task: None,
+            current_task: self.current_task.clone(),
             role: self.role.clone(),
+            role_assignment: self.role_assignment.clone(),
+            role_compatibility: self.role_compatibility.clone(),
             target: self.target.clone(),
             mcp_tools: self.mcp_tools.clone(),
             output_bytes: self.backend.output_bytes(),
@@ -487,7 +507,32 @@ impl DesktopRuntime {
         request: AgentSpawnRequest,
     ) -> Result<AgentRuntimeSnapshot, DesktopBridgeError> {
         let mut request = request;
+        if request.role_assignment.is_some() {
+            let task = request.task.as_deref().ok_or_else(|| {
+                DesktopBridgeError::InvalidTerminalRequest {
+                    message: "role assignment requires a nonblank task".to_string(),
+                }
+            })?;
+            if task.trim().is_empty() {
+                return Err(DesktopBridgeError::InvalidTerminalRequest {
+                    message: "role assignment requires a nonblank task".to_string(),
+                });
+            }
+            if task.contains('\0') {
+                return Err(DesktopBridgeError::InvalidTerminalRequest {
+                    message: "governed task must not contain NUL bytes".to_string(),
+                });
+            }
+            if task.len() > MAX_GOVERNED_TASK_BYTES {
+                return Err(DesktopBridgeError::InvalidTerminalRequest {
+                    message: format!(
+                        "governed task must be at most {MAX_GOVERNED_TASK_BYTES} UTF-8 bytes"
+                    ),
+                });
+            }
+        }
         validate_dimensions(request.rows, request.cols)?;
+        bind_governed_workspace(&mut request)?;
         // Centralized registry load (symmetric to load_registry_for_tool in mcp.rs).
         // Keeps the error mapping for spawn in one place and makes future changes cheaper.
         let registry = load_registry_for_spawn()?;
@@ -506,6 +551,42 @@ impl DesktopRuntime {
         })?;
         let platform_label = descriptor.label.clone();
         request.platform = descriptor.id.clone();
+        let role_compatibility = request
+            .role_assignment
+            .as_ref()
+            .map(|assignment| {
+                registry
+                    .evaluate_role_compatibility(&request.platform, assignment)
+                    .map_err(|error| DesktopBridgeError::InvalidTerminalRequest {
+                        message: format!("role compatibility evaluation failed: {error}"),
+                    })
+            })
+            .transpose()?;
+        if let Some(compatibility) = role_compatibility
+            .as_ref()
+            .filter(|result| result.is_blocked())
+        {
+            let missing = compatibility
+                .checks
+                .iter()
+                .filter(|check| check.mandatory && !check.is_satisfied())
+                .map(|check| {
+                    format!(
+                        "{} (required={}, available={})",
+                        check.capability,
+                        enforcement_strength_label(check.required),
+                        enforcement_strength_label(check.available)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(DesktopBridgeError::InvalidTerminalRequest {
+                message: format!(
+                    "role `{}` is incompatible with platform `{}`; mandatory capabilities not satisfied: {missing}; choose a compatible platform or adjust the role requirement",
+                    compatibility.role, compatibility.platform
+                ),
+            });
+        }
         let command =
             resolve_executable_command(&request.platform, &command, request.command.is_some());
 
@@ -630,7 +711,10 @@ impl DesktopRuntime {
             cwd,
             workspace,
             session_id: request.session_id,
+            current_task: request.task,
             role: request.role,
+            role_assignment: request.role_assignment,
+            role_compatibility,
             target: request.target,
             mcp_tools,
             focused: false,
@@ -865,6 +949,8 @@ impl TerminalBridge for DesktopRuntime {
             rows: request.rows,
             cols: request.cols,
             role: None,
+            task: None,
+            role_assignment: None,
             target: None,
         })?;
         Ok(TerminalSessionResponse {
@@ -1027,6 +1113,89 @@ fn validate_dimensions(rows: u16, cols: u16) -> Result<(), DesktopBridgeError> {
     Ok(())
 }
 
+fn bind_governed_workspace(request: &mut AgentSpawnRequest) -> Result<(), DesktopBridgeError> {
+    if request.role_assignment.is_none() {
+        return Ok(());
+    }
+
+    let cwd = request.cwd.as_deref().ok_or_else(|| {
+        DesktopBridgeError::InvalidTerminalRequest {
+            message: "governed role launch requires both `workspace.root` and `cwd`; select an existing workspace directory and retry"
+                .to_string(),
+        }
+    })?;
+    let workspace_root = request
+        .workspace
+        .as_ref()
+        .map(|workspace| workspace.root.as_str())
+        .ok_or_else(|| DesktopBridgeError::InvalidTerminalRequest {
+            message: "governed role launch requires both `workspace.root` and `cwd`; select an existing workspace directory and retry"
+                .to_string(),
+        })?;
+
+    let canonical_cwd = canonical_governed_directory("cwd", cwd)?;
+    let canonical_workspace = canonical_governed_directory("workspace.root", workspace_root)?;
+    if canonical_cwd != canonical_workspace {
+        return Err(DesktopBridgeError::InvalidTerminalRequest {
+            message: format!(
+                "governed role launch requires `workspace.root` and `cwd` to resolve to the same canonical directory (workspace=`{}`, cwd=`{}`); select one workspace directory and retry",
+                canonical_workspace.display(),
+                canonical_cwd.display()
+            ),
+        });
+    }
+
+    let canonical_root = canonical_workspace
+        .to_str()
+        .ok_or_else(|| DesktopBridgeError::InvalidTerminalRequest {
+            message: format!(
+                "governed role launch workspace `{}` cannot be represented as UTF-8; select a different workspace directory",
+                canonical_workspace.display()
+            ),
+        })?
+        .to_string();
+    request.cwd = Some(canonical_root.clone());
+    if let Some(workspace) = request.workspace.as_mut() {
+        workspace.root = canonical_root;
+    }
+    Ok(())
+}
+
+fn canonical_governed_directory(field: &str, value: &str) -> Result<PathBuf, DesktopBridgeError> {
+    let path = Path::new(value);
+    if !path.is_absolute() {
+        return Err(DesktopBridgeError::InvalidTerminalRequest {
+            message: format!(
+                "governed role launch `{field}` path `{value}` must be absolute; select an absolute workspace directory and retry"
+            ),
+        });
+    }
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        DesktopBridgeError::InvalidTerminalRequest {
+            message: format!(
+                "governed role launch `{field}` path `{value}` must resolve to an existing directory: {error}; select a valid workspace directory and retry"
+            ),
+        }
+    })?;
+    if !canonical.is_dir() {
+        return Err(DesktopBridgeError::InvalidTerminalRequest {
+            message: format!(
+                "governed role launch `{field}` path `{value}` is not a directory; select a valid workspace directory and retry"
+            ),
+        });
+    }
+    Ok(canonical)
+}
+
+fn enforcement_strength_label(strength: EnforcementStrength) -> &'static str {
+    match strength {
+        EnforcementStrength::Unsupported => "unsupported",
+        EnforcementStrength::Advisory => "advisory",
+        EnforcementStrength::Mediated => "mediated",
+        EnforcementStrength::Structural => "structural",
+    }
+}
+
 fn sanitize_runtime_id(value: &str) -> String {
     let sanitized = impulse_ops::sanitize_id(value);
     if sanitized == "unknown" {
@@ -1052,6 +1221,12 @@ fn runtime_env(
     ];
     if let Some(session_id) = &request.session_id {
         env.push(("IMPULSE_SESSION_ID", session_id.clone()));
+    }
+    if let Some(task) = &request.task {
+        env.push(("IMPULSE_TASK", task.clone()));
+    }
+    if let Some(assignment) = &request.role_assignment {
+        env.push(("IMPULSE_ROLE_ID", assignment.role.to_string()));
     }
     if let Some(workspace) = workspace {
         env.push(("IMPULSE_WORKSPACE_ROOT", workspace.root.clone()));
@@ -1130,12 +1305,32 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use impulse_ops::role_assignment::{
+        AgentRoleAssignment, AgentRoleId, EnforcementStrength, RoleCapabilityRequirement,
+        RuntimeCapabilityId,
+    };
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     fn platform_id(value: &str) -> AgentPlatformId {
         AgentPlatformId::try_new(value).expect("valid test platform id")
+    }
+
+    fn role_assignment(
+        capability: &str,
+        minimum_enforcement: EnforcementStrength,
+        mandatory: bool,
+    ) -> AgentRoleAssignment {
+        AgentRoleAssignment {
+            role: AgentRoleId::try_new("builder").expect("valid test role id"),
+            requirements: vec![RoleCapabilityRequirement {
+                capability: RuntimeCapabilityId::try_new(capability)
+                    .expect("valid test capability id"),
+                minimum_enforcement,
+                mandatory,
+            }],
+        }
     }
 
     fn spawn_request(rows: u16, cols: u16, command: Option<&str>) -> AgentSpawnRequest {
@@ -1152,8 +1347,18 @@ mod tests {
             rows,
             cols,
             role: None,
+            task: None,
+            role_assignment: None,
             target: None,
         }
+    }
+
+    fn bind_to_temporary_workspace(request: &mut AgentSpawnRequest) -> tempfile::TempDir {
+        let workspace = tempfile::tempdir().expect("temporary governed workspace");
+        let root = workspace.path().display().to_string();
+        request.cwd = Some(root.clone());
+        request.workspace = Some(WorkspaceTarget::from_root(root));
+        workspace
     }
 
     // --- spawn validation guards (return before any real PTY spawn) ---
@@ -1195,6 +1400,372 @@ mod tests {
             }
             other => panic!("expected InvalidTerminalRequest, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_spawn_request_serde_keeps_task_and_assignment_optional() {
+        let legacy: AgentSpawnRequest =
+            serde_json::from_str(r#"{"platform":"shell","rows":24,"cols":80}"#).unwrap();
+        assert!(legacy.task.is_none());
+        assert!(legacy.role_assignment.is_none());
+
+        let enriched: AgentSpawnRequest = serde_json::from_value(serde_json::json!({
+            "platform": "shell",
+            "rows": 24,
+            "cols": 80,
+            "task": "reconcile daemon truth",
+            "role_assignment": {
+                "role": "builder",
+                "requirements": [{
+                    "capability": "workspace.target",
+                    "minimum_enforcement": "mediated",
+                    "mandatory": true
+                }]
+            }
+        }))
+        .unwrap();
+        assert_eq!(enriched.task.as_deref(), Some("reconcile daemon truth"));
+        assert_eq!(
+            enriched
+                .role_assignment
+                .as_ref()
+                .map(|assignment| assignment.role.as_str()),
+            Some("builder")
+        );
+    }
+
+    #[test]
+    fn test_mandatory_incompatibility_blocks_before_id_reservation_or_pty_spawn() {
+        let runtime = DesktopRuntime::default();
+        let mut blocked = spawn_request(24, 80, Some("definitely-not-an-impulse-executable"));
+        let _workspace = bind_to_temporary_workspace(&mut blocked);
+        blocked.agent_id = Some("reusable-after-block".to_string());
+        let mut assignment =
+            role_assignment("network.denied", EnforcementStrength::Structural, true);
+        assignment.requirements.push(RoleCapabilityRequirement {
+            capability: RuntimeCapabilityId::try_new("workspace.target").unwrap(),
+            minimum_enforcement: EnforcementStrength::Structural,
+            mandatory: true,
+        });
+        blocked.role_assignment = Some(assignment);
+        blocked.task = Some("run governed build".to_string());
+
+        let error = runtime.spawn_agent(blocked).unwrap_err();
+        match error {
+            DesktopBridgeError::InvalidTerminalRequest { message } => {
+                assert!(message.contains("incompatible"));
+                assert!(
+                    message.contains("network.denied (required=structural, available=unsupported)")
+                );
+                assert!(
+                    message.contains("workspace.target (required=structural, available=mediated)")
+                );
+                assert!(message.contains("choose a compatible platform"));
+                assert!(message.contains("adjust the role requirement"));
+            }
+            other => panic!("expected compatibility rejection, got {other:?}"),
+        }
+
+        let mut allowed = spawn_request(24, 80, Some("sh"));
+        allowed.agent_id = Some("reusable-after-block".to_string());
+        allowed.args = vec!["-c".to_string(), "sleep 1".to_string()];
+        let snapshot = runtime
+            .spawn_agent(allowed)
+            .expect("blocked launch must not reserve the requested agent id");
+        runtime
+            .close_agent(TerminalCloseRequest {
+                session_id: snapshot.agent_id,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn test_governed_spawn_requires_nonblank_task_before_registry_id_or_pty_work() {
+        let runtime = DesktopRuntime::default();
+        for (case, task) in [
+            ("missing", None),
+            ("empty", Some(String::new())),
+            ("whitespace", Some(" \t\n ".to_string())),
+        ] {
+            let agent_id = format!("task-required-{case}");
+            let mut invalid = spawn_request(24, 80, Some("definitely-not-an-impulse-executable"));
+            invalid.agent_id = Some(agent_id.clone());
+            invalid.platform = platform_id("missing-agent");
+            invalid.task = task;
+            invalid.role_assignment = Some(role_assignment(
+                "workspace.target",
+                EnforcementStrength::Mediated,
+                true,
+            ));
+
+            let error = runtime.spawn_agent(invalid).unwrap_err();
+            match error {
+                DesktopBridgeError::InvalidTerminalRequest { message } => {
+                    assert!(message.contains("role assignment requires a nonblank task"));
+                }
+                other => panic!("expected task validation rejection, got {other:?}"),
+            }
+
+            let mut allowed = spawn_request(24, 80, Some("sh"));
+            allowed.agent_id = Some(agent_id);
+            allowed.args = vec!["-c".to_string(), "sleep 1".to_string()];
+            let snapshot = runtime
+                .spawn_agent(allowed)
+                .expect("task rejection must not reserve the requested agent id");
+            runtime
+                .close_agent(TerminalCloseRequest {
+                    session_id: snapshot.agent_id,
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn test_governed_spawn_requires_explicit_workspace_and_cwd_before_id_reservation_or_pty_work() {
+        let runtime = DesktopRuntime::default();
+        let workspace_root = tempfile::tempdir().expect("temporary governed workspace");
+
+        for (case, cwd, workspace) in [
+            ("both-missing", None, None),
+            (
+                "cwd-missing",
+                None,
+                Some(WorkspaceTarget::from_root(
+                    workspace_root.path().display().to_string(),
+                )),
+            ),
+            (
+                "workspace-missing",
+                Some(workspace_root.path().display().to_string()),
+                None,
+            ),
+        ] {
+            let agent_id = format!("workspace-required-{case}");
+            let mut invalid = spawn_request(24, 80, Some("definitely-not-an-impulse-executable"));
+            invalid.agent_id = Some(agent_id.clone());
+            invalid.cwd = cwd;
+            invalid.workspace = workspace;
+            invalid.task = Some("run governed build".to_string());
+            invalid.role_assignment = Some(role_assignment(
+                "workspace.target",
+                EnforcementStrength::Mediated,
+                true,
+            ));
+
+            let error = runtime.spawn_agent(invalid).unwrap_err();
+            match error {
+                DesktopBridgeError::InvalidTerminalRequest { message } => {
+                    assert!(message.contains("governed role launch"));
+                    assert!(message.contains("workspace"));
+                    assert!(message.contains("cwd"));
+                }
+                other => panic!("expected workspace binding rejection, got {other:?}"),
+            }
+
+            let mut legacy = spawn_request(24, 80, Some("sh"));
+            legacy.agent_id = Some(agent_id);
+            legacy.args = vec!["-c".to_string(), "sleep 1".to_string()];
+            let snapshot = runtime
+                .spawn_agent(legacy)
+                .expect("governed rejection must not reserve the requested agent id");
+            runtime
+                .close_agent(TerminalCloseRequest {
+                    session_id: snapshot.agent_id,
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn test_governed_spawn_rejects_nonexistent_or_mismatched_workspace_binding() {
+        let runtime = DesktopRuntime::default();
+        let first = tempfile::tempdir().expect("first governed workspace");
+        let second = tempfile::tempdir().expect("second governed workspace");
+        let missing = first.path().join("does-not-exist");
+
+        for (case, cwd, workspace_root, expected) in [
+            (
+                "nonexistent",
+                missing.display().to_string(),
+                missing.display().to_string(),
+                "existing directory",
+            ),
+            (
+                "mismatched",
+                first.path().display().to_string(),
+                second.path().display().to_string(),
+                "same canonical directory",
+            ),
+        ] {
+            let mut invalid = spawn_request(24, 80, Some("definitely-not-an-impulse-executable"));
+            invalid.agent_id = Some(format!("invalid-binding-{case}"));
+            invalid.cwd = Some(cwd);
+            invalid.workspace = Some(WorkspaceTarget::from_root(workspace_root));
+            invalid.task = Some("run governed build".to_string());
+            invalid.role_assignment = Some(role_assignment(
+                "workspace.target",
+                EnforcementStrength::Mediated,
+                true,
+            ));
+
+            let error = runtime.spawn_agent(invalid).unwrap_err();
+            match error {
+                DesktopBridgeError::InvalidTerminalRequest { message } => {
+                    assert!(message.contains(expected), "unexpected error: {message}");
+                }
+                other => panic!("expected workspace binding rejection, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_governed_spawn_rejects_relative_or_nondirectory_workspace_binding() {
+        let runtime = DesktopRuntime::default();
+        let file = tempfile::NamedTempFile::new().expect("temporary non-directory target");
+
+        for (case, path, expected) in [
+            ("relative", ".".to_string(), "must be absolute"),
+            (
+                "not-directory",
+                file.path().display().to_string(),
+                "is not a directory",
+            ),
+        ] {
+            let mut invalid = spawn_request(24, 80, Some("definitely-not-an-impulse-executable"));
+            invalid.agent_id = Some(format!("invalid-path-shape-{case}"));
+            invalid.cwd = Some(path.clone());
+            invalid.workspace = Some(WorkspaceTarget::from_root(path));
+            invalid.task = Some("run governed build".to_string());
+            invalid.role_assignment = Some(role_assignment(
+                "workspace.target",
+                EnforcementStrength::Mediated,
+                true,
+            ));
+
+            let error = runtime.spawn_agent(invalid).unwrap_err();
+            match error {
+                DesktopBridgeError::InvalidTerminalRequest { message } => {
+                    assert!(message.contains(expected), "unexpected error: {message}");
+                }
+                other => panic!("expected workspace binding rejection, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_governed_spawn_rejects_nul_or_oversized_task_before_id_reservation_or_pty_work() {
+        let runtime = DesktopRuntime::default();
+        let workspace = tempfile::tempdir().expect("temporary governed workspace");
+
+        for (case, task, expected) in [
+            (
+                "nul",
+                "inspect\0then mutate".to_string(),
+                "must not contain NUL",
+            ),
+            ("oversized", "x".repeat(8_193), "at most 8192 UTF-8 bytes"),
+        ] {
+            let agent_id = format!("unsafe-task-{case}");
+            let root = workspace.path().display().to_string();
+            let mut invalid = spawn_request(24, 80, Some("definitely-not-an-impulse-executable"));
+            invalid.agent_id = Some(agent_id.clone());
+            invalid.cwd = Some(root.clone());
+            invalid.workspace = Some(WorkspaceTarget::from_root(root));
+            invalid.task = Some(task);
+            invalid.role_assignment = Some(role_assignment(
+                "workspace.target",
+                EnforcementStrength::Mediated,
+                true,
+            ));
+
+            let error = runtime.spawn_agent(invalid).unwrap_err();
+            match error {
+                DesktopBridgeError::InvalidTerminalRequest { message } => {
+                    assert!(message.contains(expected), "unexpected error: {message}");
+                }
+                other => panic!("expected task safety rejection, got {other:?}"),
+            }
+
+            let mut legacy = spawn_request(24, 80, Some("sh"));
+            legacy.agent_id = Some(agent_id);
+            legacy.args = vec!["-c".to_string(), "sleep 1".to_string()];
+            let snapshot = runtime
+                .spawn_agent(legacy)
+                .expect("task rejection must not reserve the requested agent id");
+            runtime
+                .close_agent(TerminalCloseRequest {
+                    session_id: snapshot.agent_id,
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn test_compatible_assignment_and_task_survive_canonicalized_spawn_snapshot() {
+        let runtime = DesktopRuntime::default();
+        let mut request = spawn_request(24, 80, Some("sh"));
+        let _workspace = bind_to_temporary_workspace(&mut request);
+        request.platform = platform_id("generic_shell");
+        request.args = vec!["-c".to_string(), "sleep 1".to_string()];
+        request.task = Some("build governed launch".to_string());
+        request.role_assignment = Some(role_assignment(
+            "workspace.target",
+            EnforcementStrength::Mediated,
+            true,
+        ));
+
+        let snapshot = runtime.spawn_agent(request).unwrap();
+        assert_eq!(snapshot.platform.as_str(), "shell");
+        assert_eq!(
+            snapshot.current_task.as_deref(),
+            Some("build governed launch")
+        );
+        assert_eq!(
+            snapshot
+                .role_assignment
+                .as_ref()
+                .map(|assignment| assignment.role.as_str()),
+            Some("builder")
+        );
+        let compatibility = snapshot
+            .role_compatibility
+            .as_ref()
+            .expect("typed compatibility is retained");
+        assert_eq!(compatibility.platform.as_str(), "shell");
+        assert!(compatibility.launch_allowed());
+        assert!(!compatibility.is_degraded());
+        runtime
+            .close_agent(TerminalCloseRequest {
+                session_id: snapshot.agent_id,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn test_optional_gap_allows_spawn_and_preserves_degraded_snapshot() {
+        let runtime = DesktopRuntime::default();
+        let mut request = spawn_request(24, 80, Some("sh"));
+        let _workspace = bind_to_temporary_workspace(&mut request);
+        request.args = vec!["-c".to_string(), "sleep 1".to_string()];
+        request.task = Some("run degraded governed launch".to_string());
+        request.role_assignment = Some(role_assignment(
+            "network.denied",
+            EnforcementStrength::Structural,
+            false,
+        ));
+
+        let snapshot = runtime.spawn_agent(request).unwrap();
+        let compatibility = snapshot
+            .role_compatibility
+            .as_ref()
+            .expect("optional compatibility result is retained");
+        assert!(compatibility.launch_allowed());
+        assert!(compatibility.is_degraded());
+        runtime
+            .close_agent(TerminalCloseRequest {
+                session_id: snapshot.agent_id,
+            })
+            .unwrap();
     }
 
     // --- missing-session error paths ---
@@ -1383,6 +1954,25 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert!(a.starts_with("fnv1a64:"));
+    }
+
+    #[test]
+    fn test_runtime_env_includes_optional_task_and_product_role_id() {
+        let mut request = spawn_request(24, 80, Some("sh"));
+        request.task = Some("inspect compatibility".to_string());
+        request.role_assignment = Some(role_assignment(
+            "workspace.target",
+            EnforcementStrength::Mediated,
+            true,
+        ));
+
+        let env = runtime_env("agent-1", &request, "sh", None);
+        assert!(env
+            .iter()
+            .any(|(key, value)| *key == "IMPULSE_TASK" && value == "inspect compatibility"));
+        assert!(env
+            .iter()
+            .any(|(key, value)| *key == "IMPULSE_ROLE_ID" && value == "builder"));
     }
 
     #[test]

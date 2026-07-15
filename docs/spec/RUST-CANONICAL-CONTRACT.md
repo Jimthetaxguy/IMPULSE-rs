@@ -1,8 +1,8 @@
 ---
 title: Rust Canonical Product Contract
 description: Authoritative product contract for Impulse based on impulse-rs
-version: '1.8'
-updated: 2026-07-12
+version: '1.9'
+updated: 2026-07-13
 type: specification
 category: core
 phase: all
@@ -47,7 +47,7 @@ Core outcomes:
 - Desktop workspace registry plus multi-agent launch/observation surfaces; daemon-side
   multi-workspace routing remains incomplete
 
-## 2) Desktop Shell Contract (Updated 2026-07-12)
+## 2) Desktop Shell Contract (Updated 2026-07-13)
 
 > **This section supersedes all prior references to the EGUI workbench as the active desktop product.**
 
@@ -100,11 +100,11 @@ Historical migration sequence: `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md`
 
 | Concept | Contract meaning | Current implementation boundary |
 | --- | --- | --- |
-| Role | Obligations, permissions, tools, context, communication, and verification duties | Narrow coordinator/worker `AgentRole` plus concrete `SupervisorPermissionPolicy`; general role contract is not implemented |
+| Role | Obligations, permissions, tools, context, communication, and verification duties | Open `AgentRoleId`/`AgentRoleAssignment` for narrow launch requirements; legacy coordinator/worker `AgentRole` topology; concrete `SupervisorPermissionPolicy`; generalized role composition is not implemented |
 | Runtime | External harness or native engine that executes a role | External agent harness calls, desktop PTY runtime, and Ion native provider/tool loop; no common adapter trait yet |
 | Agent instance | One running identity with runtime, role, scope, process state, and telemetry | `AgentRuntime`/`AgentRuntimeSnapshot` and desktop runtime records |
 | Session | Bounded persisted work history | Daemon session lifecycle and `.impulse/` history/state |
-| Task | Assignment plus acceptance/verification criteria | Delegation/current-task/Ion harness carriers; not yet one canonical task model |
+| Task | Assignment plus acceptance/verification criteria | Governed desktop launches require bounded nonblank task metadata and preserve it in runtime/daemon telemetry; there is not yet one durable task/evidence lifecycle |
 | Pane | Cockpit view/input attachment | TUI panes and desktop terminal ids; never an authority boundary |
 | Workspace target | Explicit filesystem execution root | Desktop `WorkspaceTarget`/`WorkspaceRegistry` |
 | Project | Governance scope for memory, artifacts, policy, and verification | Project-scoped `.impulse/` state and `ProjectOpsSnapshot`; often maps 1:1 to a workspace today |
@@ -120,9 +120,21 @@ Desktop platform identity is registry-backed across MCP, host, runtime, and snap
 a builtin launchable platform. Repository tests exercise that implementation; release packaging
 and distribution remain separate contracts.
 
-A future adapter contract must report required, optional, emulated, and unsupported operations plus
-enforcement strength. Mandatory role requirements must eventually block an incompatible launch;
-advisory degradation must be visible. The schema is reserved for the hierarchy/enforcement ADR.
+[ADR-0010](../decisions/0010-product-role-launch-contract.md) makes one narrow product-role launch
+contract live. `AgentRoleAssignment` carries an open
+product-role id plus caller-supplied launch requirements. Trusted Rust-owned registry metadata
+declares conservative wrapper support using ordered `unsupported`, `advisory`, `mediated`, and
+`structural` strengths. Dioxus previews a fixed initial Builder profile; `DesktopRuntime` reloads
+the current registry and re-evaluates the request before agent-id reservation or PTY creation.
+Unsatisfied mandatory requirements block, while optional gaps remain allowed but degraded. The
+task, assignment, and compatibility result remain observable through runtime and daemon telemetry.
+This static preflight does not attest model-internal behavior, and canonical working-directory
+mediation is not a filesystem sandbox.
+
+A future generalized/dynamic adapter contract must still define runtime discovery, optional and
+emulated operations, attestation freshness, and post-launch re-evaluation. General role
+composition, daemon-owned task evidence, supervisor decisions, and verified-memory promotion also
+remain outside this launch-preflight foundation.
 
 ## 4) Public Interface Contract
 
@@ -309,8 +321,9 @@ The daemon exposes a JSON-line Unix socket protocol (`impulse.sock`). Full spec:
 | Supervisor-specific action policy | Implemented foundation | `SupervisorPermissionPolicy`, `RunSupervisorAction` | Ops + daemon tests |
 | Ion native coding runtime | Implemented foundation | `ion` REPL, provider/tool loop, approvals/guardrails | Rust unit + CLI tests |
 | Registry-backed open desktop platform identity | Implemented foundation | `AgentRegistry`, `AgentPlatformId`, desktop/MCP/host | Registry + desktop tests |
+| Product-role launch preflight | Implemented narrow foundation | `AgentRoleId`, `AgentRoleAssignment`, static registry support, Dioxus preview, `DesktopRuntime` pre-PTY gate | Ops + desktop runtime/contract tests |
 | General role contract | Direction, not implemented | Future ADR | Not applicable |
-| Common runtime adapter + capability negotiation | Direction, not implemented | Future ADR | Not applicable |
+| Common dynamic runtime adapter + generalized capability negotiation | Direction, not implemented | Future ADR | Not applicable |
 | Typed cross-agent message bus | Partial delegations/handoffs only | `delegation`, `orchestration`, daemon contracts | Rust tests |
 | **Dioxus desktop shell** | **Live host/bridge foundation; hardening continues** | Dioxus Desktop + xterm.js | Desktop contract/host tests + smoke |
 | **Tauri-shaped host adapter** | **LEGACY — compatibility only** | Optional gated bridge | Remove after Dioxus host command/event parity |

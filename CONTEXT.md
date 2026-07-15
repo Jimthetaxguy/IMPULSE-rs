@@ -35,9 +35,10 @@ Workspace: `impulse-rs/` (Cargo workspace). Main crates: `impulse-rs`, `impulse-
 The stable behavioral contract assigned to an agent: obligations, permissions, tools, context,
 communication rules, and completion evidence. A role is independent of model, runtime, process,
 session, and pane.
-- **Closest in code:** narrow `AgentRole::{Coordinator, Worker}` plus the concrete
-  `SupervisorPermissionPolicy` in `impulse-ops/src/lib.rs`.
-- **Boundary:** a generalized typed role contract is direction for a later ADR, not live today.
+- **Closest in code:** the narrow launch-time `AgentRoleId`/`AgentRoleAssignment` contract plus the
+  concrete `SupervisorPermissionPolicy`. `AgentRole::{Coordinator, Worker}` remains legacy pane and
+  delegation topology, not product-role identity.
+- **Boundary:** generalized role composition and a durable governed-run lifecycle are not live.
 
 ### runtime — `[vocabulary]`
 The engine that executes an agent role. External runtimes are wrapped CLI harnesses (for example,
@@ -56,6 +57,15 @@ canonicalizes aliases and case; the declared platform remains distinct from the 
 so explicit wrapper/alternate-installation overrides stay supported and visible. Legacy closed
 enums remain where wire/disk compatibility still requires them.
 - **Source of truth:** `impulse-ops/src/agent_registry.rs`.
+
+### role launch compatibility — `[code]`
+A static preflight comparing caller-supplied product-role requirements with trusted Rust-owned
+runtime declarations. Strength is ordered `unsupported` < `advisory` < `mediated` < `structural`;
+mandatory gaps block and optional gaps degrade. Dioxus previews the result, while the desktop
+runtime re-evaluates before agent-id reservation or PTY creation. Working-directory mediation is
+not filesystem sandboxing.
+- **Source of truth:** `impulse-ops/src/role_assignment.rs`, `impulse-desktop/src/runtime.rs`, and
+  ADR-0010.
 
 ### agent instance — `[vocabulary]`
 One running identity with a platform/runtime, role, workspace target, process state, and telemetry.
@@ -158,12 +168,13 @@ artifact review, and explicit approval where policy requires it.
 
 ---
 
-## Live-versus-direction boundary (2026-07-12)
+## Live-versus-direction boundary (2026-07-13)
 
 - **Live foundation:** PTY lifecycle, daemon workbench truth, managed agent turns, open
   registry-backed desktop platform identity, real Ion desktop launch, daemon-truth terminal
   telemetry, supervisor-specific permissions, capability-checked tools, memory/retrieval/injection,
-  artifacts, credentials, and Ion's native coding REPL/tool loop.
-- **Direction:** generalized role contracts, one runtime-adapter interface, explicit capability
-  negotiation/enforcement strength, and typed cross-agent messaging. These require an ADR and
-  vertical slice; names and schemas are intentionally not frozen here.
+  artifacts, credentials, Ion's native coding REPL/tool loop, and explicit role/task launch
+  preflight with typed compatibility telemetry.
+- **Direction:** daemon-owned task evidence, verification and supervisor decisions; generalized
+  role composition; one runtime-adapter interface; negotiated runtime capabilities; and typed
+  cross-agent messaging.

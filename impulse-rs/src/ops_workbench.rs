@@ -70,18 +70,19 @@ pub struct TerminalOpsTelemetryStore {
 }
 
 impl TerminalOpsTelemetryStore {
-    pub fn publish(&mut self, project_id: &str, report: TerminalOpsReport) {
+    pub fn publish(&mut self, project_id: &str, mut report: TerminalOpsReport) {
         let received_at = Utc::now();
-        self.projects
-            .entry(project_id.to_string())
-            .or_default()
-            .insert(
-                report.source_id.clone(),
-                TerminalOpsRecord {
-                    report,
-                    received_at,
-                },
-            );
+        let project = self.projects.entry(project_id.to_string()).or_default();
+        if let Some(previous) = project.get(&report.source_id) {
+            preserve_omitted_same_source_agent_facts(&previous.report, &mut report);
+        }
+        project.insert(
+            report.source_id.clone(),
+            TerminalOpsRecord {
+                report,
+                received_at,
+            },
+        );
         self.purge_expired(Utc::now());
     }
 
@@ -113,6 +114,37 @@ impl TerminalOpsTelemetryStore {
             });
             !records.is_empty()
         });
+    }
+}
+
+fn preserve_omitted_same_source_agent_facts(
+    previous: &TerminalOpsReport,
+    incoming: &mut TerminalOpsReport,
+) {
+    let previous_by_id = previous
+        .agents
+        .iter()
+        .filter(|agent| !agent.id.is_empty())
+        .map(|agent| (agent.id.as_str(), agent))
+        .collect::<HashMap<_, _>>();
+
+    for agent in &mut incoming.agents {
+        if agent.id.is_empty() {
+            continue;
+        }
+        let Some(previous_agent) = previous_by_id.get(agent.id.as_str()) else {
+            continue;
+        };
+        if previous_agent.session_id != agent.session_id {
+            continue;
+        }
+        if agent.current_task.is_none() {
+            agent.current_task = previous_agent.current_task.clone();
+        }
+        if agent.role_assignment.is_none() && agent.role_compatibility.is_none() {
+            agent.role_assignment = previous_agent.role_assignment.clone();
+            agent.role_compatibility = previous_agent.role_compatibility.clone();
+        }
     }
 }
 
@@ -388,6 +420,8 @@ fn build_agent_runtime(
         warnings,
         agent_status: Default::default(),
         role: session.role.clone(),
+        role_assignment: None,
+        role_compatibility: None,
         group: None,
         tool_invocations: Vec::new(),
         diff_summary: None,
@@ -561,6 +595,12 @@ fn overlay_agent_runtime(target: &mut AgentRuntime, overlay: &AgentRuntime) {
     }
     if overlay.role.is_some() {
         target.role = overlay.role.clone();
+    }
+    if overlay.role_assignment.is_some() {
+        target.role_assignment = overlay.role_assignment.clone();
+    }
+    if overlay.role_compatibility.is_some() {
+        target.role_compatibility = overlay.role_compatibility.clone();
     }
     if overlay.group.is_some() {
         target.group = overlay.group.clone();
@@ -1057,6 +1097,8 @@ mod tests {
                     reason: "merge conflict in src/main.rs".to_string(),
                 },
                 role: Some(impulse_ops::AgentRole::Worker { parent_pane_id: 42 }),
+                role_assignment: None,
+                role_compatibility: None,
                 group: Some("review-wave-2".to_string()),
                 tool_invocations: vec![impulse_ops::ToolInvocationRecord {
                     kind: "write".to_string(),
@@ -1123,11 +1165,21 @@ mod tests {
     }
 
     fn structured_manager_agent() -> AgentRuntime {
+        let role_assignment = impulse_ops::role_assignment::AgentRoleAssignment {
+            role: impulse_ops::role_assignment::AgentRoleId::try_new("builder").unwrap(),
+            requirements: Vec::new(),
+        };
         AgentRuntime {
             agent_status: impulse_ops::AgentStatus::Working {
                 task: "durable task".to_string(),
             },
             role: Some(impulse_ops::AgentRole::Coordinator),
+            role_assignment: Some(role_assignment.clone()),
+            role_compatibility: Some(impulse_ops::role_assignment::RoleCompatibility {
+                platform: impulse_ops::agent_registry::AgentPlatformId::try_new("codex").unwrap(),
+                role: role_assignment.role,
+                checks: Vec::new(),
+            }),
             group: Some("durable-wave".to_string()),
             tool_invocations: vec![impulse_ops::ToolInvocationRecord {
                 kind: "read".to_string(),
@@ -1155,6 +1207,7 @@ mod tests {
         .unwrap();
         let legacy_object = legacy_value.as_object_mut().unwrap();
         for field in [
+            "current_task",
             "agent_status",
             "role",
             "group",
@@ -1164,6 +1217,8 @@ mod tests {
         ] {
             assert!(legacy_object.remove(field).is_some());
         }
+        legacy_object.remove("role_assignment");
+        legacy_object.remove("role_compatibility");
         serde_json::from_value(legacy_value).unwrap()
     }
 
@@ -1180,10 +1235,65 @@ mod tests {
 
         assert_eq!(target.agent_status, impulse_ops::AgentStatus::Idle);
         assert_eq!(target.role, Some(impulse_ops::AgentRole::Coordinator));
+        assert_eq!(
+            target
+                .role_assignment
+                .as_ref()
+                .map(|assignment| assignment.role.as_str()),
+            Some("builder")
+        );
+        assert!(target.role_compatibility.is_some());
         assert_eq!(target.group.as_deref(), Some("durable-wave"));
         assert_eq!(target.tool_invocations.len(), 1);
         assert!(target.diff_summary.is_some());
         assert!(target.target.is_some());
+    }
+
+    #[test]
+    fn test_overlay_agent_runtime_preserves_newer_typed_role_facts_from_legacy_overlay() {
+        let mut target = structured_manager_agent();
+        let overlay = legacy_agent_runtime("working: legacy publisher");
+
+        overlay_agent_runtime(&mut target, &overlay);
+
+        assert_eq!(
+            target
+                .role_assignment
+                .as_ref()
+                .map(|assignment| assignment.role.as_str()),
+            Some("builder")
+        );
+        assert_eq!(
+            target
+                .role_compatibility
+                .as_ref()
+                .map(|compatibility| compatibility.platform.as_str()),
+            Some("codex")
+        );
+    }
+
+    #[test]
+    fn test_overlay_agent_runtime_applies_populated_typed_role_facts() {
+        let assignment = impulse_ops::role_assignment::AgentRoleAssignment {
+            role: impulse_ops::role_assignment::AgentRoleId::try_new("reviewer").unwrap(),
+            requirements: Vec::new(),
+        };
+        let compatibility = impulse_ops::role_assignment::RoleCompatibility {
+            platform: impulse_ops::agent_registry::AgentPlatformId::try_new("claude-code").unwrap(),
+            role: assignment.role.clone(),
+            checks: Vec::new(),
+        };
+        let mut target = AgentRuntime::default();
+        let overlay = AgentRuntime {
+            role_assignment: Some(assignment.clone()),
+            role_compatibility: Some(compatibility.clone()),
+            ..Default::default()
+        };
+
+        overlay_agent_runtime(&mut target, &overlay);
+
+        assert_eq!(target.role_assignment, Some(assignment));
+        assert_eq!(target.role_compatibility, Some(compatibility));
     }
 
     #[test]
@@ -1412,6 +1522,164 @@ mod tests {
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].source_id, "clock-behind");
         assert_eq!(reports[0].published_at, published_at);
+    }
+
+    #[test]
+    fn test_terminal_ops_store_preserves_omitted_same_source_role_facts_and_accepts_newer_values() {
+        let mut store = TerminalOpsTelemetryStore::default();
+        let mut enriched = structured_manager_agent();
+        enriched.id = "agent-1".to_string();
+        enriched.session_id = Some("session-a".to_string());
+        enriched.current_task = Some("durable task".to_string());
+        store.publish(
+            "demo",
+            TerminalOpsReport {
+                source_id: "desktop-runtime".to_string(),
+                published_at: "2026-07-13T00:00:00Z".to_string(),
+                agents: vec![enriched],
+                ..Default::default()
+            },
+        );
+
+        let mut legacy = legacy_agent_runtime("working: legacy publisher");
+        legacy.id = "agent-1".to_string();
+        legacy.session_id = Some("session-a".to_string());
+        store.publish(
+            "demo",
+            TerminalOpsReport {
+                source_id: "desktop-runtime".to_string(),
+                published_at: "2026-07-13T00:00:01Z".to_string(),
+                agents: vec![legacy],
+                ..Default::default()
+            },
+        );
+
+        let after_legacy = store.fresh_reports("demo", Utc::now());
+        assert_eq!(after_legacy.len(), 1);
+        assert_eq!(after_legacy[0].published_at, "2026-07-13T00:00:01Z");
+        assert_eq!(
+            after_legacy[0].agents[0]
+                .role_assignment
+                .as_ref()
+                .map(|assignment| assignment.role.as_str()),
+            Some("builder")
+        );
+        assert!(after_legacy[0].agents[0].role_compatibility.is_some());
+        assert_eq!(
+            after_legacy[0].agents[0].current_task.as_deref(),
+            Some("durable task")
+        );
+
+        let assignment = impulse_ops::role_assignment::AgentRoleAssignment {
+            role: impulse_ops::role_assignment::AgentRoleId::try_new("reviewer").unwrap(),
+            requirements: Vec::new(),
+        };
+        let compatibility = impulse_ops::role_assignment::RoleCompatibility {
+            platform: impulse_ops::agent_registry::AgentPlatformId::try_new("claude-code").unwrap(),
+            role: assignment.role.clone(),
+            checks: Vec::new(),
+        };
+        let latest = AgentRuntime {
+            id: "agent-1".to_string(),
+            session_id: Some("session-a".to_string()),
+            current_task: Some("review latest diff".to_string()),
+            role_assignment: Some(assignment),
+            role_compatibility: Some(compatibility),
+            ..Default::default()
+        };
+        store.publish(
+            "demo",
+            TerminalOpsReport {
+                source_id: "desktop-runtime".to_string(),
+                published_at: "2026-07-13T00:00:02Z".to_string(),
+                agents: vec![latest],
+                ..Default::default()
+            },
+        );
+
+        let after_enriched = store.fresh_reports("demo", Utc::now());
+        assert_eq!(
+            after_enriched[0].agents[0]
+                .role_assignment
+                .as_ref()
+                .map(|assignment| assignment.role.as_str()),
+            Some("reviewer")
+        );
+        assert_eq!(
+            after_enriched[0].agents[0]
+                .role_compatibility
+                .as_ref()
+                .map(|compatibility| compatibility.platform.as_str()),
+            Some("claude-code")
+        );
+        assert_eq!(
+            after_enriched[0].agents[0].current_task.as_deref(),
+            Some("review latest diff")
+        );
+    }
+
+    #[test]
+    fn test_terminal_ops_store_does_not_inherit_role_facts_across_agent_sessions() {
+        let mut store = TerminalOpsTelemetryStore::default();
+        let mut enriched = structured_manager_agent();
+        enriched.id = "agent-1".to_string();
+        enriched.session_id = Some("session-a".to_string());
+        enriched.current_task = Some("session a task".to_string());
+        store.publish(
+            "demo",
+            TerminalOpsReport {
+                source_id: "desktop-runtime".to_string(),
+                agents: vec![enriched],
+                ..Default::default()
+            },
+        );
+
+        let mut next_session = legacy_agent_runtime("starting");
+        next_session.id = "agent-1".to_string();
+        next_session.session_id = Some("session-b".to_string());
+        store.publish(
+            "demo",
+            TerminalOpsReport {
+                source_id: "desktop-runtime".to_string(),
+                agents: vec![next_session],
+                ..Default::default()
+            },
+        );
+
+        let reports = store.fresh_reports("demo", Utc::now());
+        let agent = &reports[0].agents[0];
+        assert_eq!(agent.session_id.as_deref(), Some("session-b"));
+        assert!(agent.current_task.is_none());
+        assert!(agent.role_assignment.is_none());
+        assert!(agent.role_compatibility.is_none());
+    }
+
+    #[test]
+    fn test_terminal_ops_store_empty_same_source_report_removes_previous_agents() {
+        let mut store = TerminalOpsTelemetryStore::default();
+        let mut enriched = structured_manager_agent();
+        enriched.id = "agent-1".to_string();
+        enriched.session_id = Some("session-a".to_string());
+        store.publish(
+            "demo",
+            TerminalOpsReport {
+                source_id: "desktop-runtime".to_string(),
+                agents: vec![enriched],
+                ..Default::default()
+            },
+        );
+        store.publish(
+            "demo",
+            TerminalOpsReport {
+                source_id: "desktop-runtime".to_string(),
+                agents: Vec::new(),
+                ..Default::default()
+            },
+        );
+
+        let reports = store.fresh_reports("demo", Utc::now());
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].agents.is_empty());
     }
 
     #[test]

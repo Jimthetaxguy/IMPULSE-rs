@@ -31,6 +31,11 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::role_assignment::{
+    evaluate_role_compatibility as evaluate_declared_role_compatibility, AgentRoleAssignment,
+    EnforcementStrength, RoleAssignmentError, RoleCompatibility, RuntimeCapabilityId,
+    RuntimeCapabilitySupport,
+};
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 
@@ -73,6 +78,8 @@ pub enum RegistryError {
     MissingLaunchCommand(String),
     #[error("agent platform `{0}` received a blank command override")]
     BlankLaunchOverride(String),
+    #[error("custom agent platform `{platform}` cannot declare trusted runtime_capabilities")]
+    UntrustedRuntimeCapabilities { platform: String },
     #[error("duplicate agent id in registry: {0}")]
     DuplicateId(String),
     #[error(
@@ -83,6 +90,8 @@ pub enum RegistryError {
         first_platform: String,
         second_platform: String,
     },
+    #[error("failed to evaluate runtime compatibility: {0}")]
+    RoleAssignment(#[from] RoleAssignmentError),
 }
 
 /// Open, stable identity for an agent platform.
@@ -189,6 +198,9 @@ pub struct AgentDescriptor {
     /// Behavioral capabilities.
     #[serde(default)]
     pub capabilities: AgentCapabilities,
+    /// Conservative launch capabilities enforced by the runtime wrapper.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_capabilities: Vec<RuntimeCapabilitySupport>,
 }
 
 impl AgentDescriptor {
@@ -235,6 +247,7 @@ impl AgentRegistry {
                         uses_xml_context: true,
                         startup_delay_ms: 3000,
                     },
+                    runtime_capabilities: mediated_desktop_wrapper_capabilities(),
                 },
                 AgentDescriptor {
                     id: AgentPlatformId::builtin("codex"),
@@ -243,6 +256,7 @@ impl AgentRegistry {
                     invocation_args: vec!["exec".into()],
                     aliases: vec![],
                     capabilities: AgentCapabilities::default(),
+                    runtime_capabilities: mediated_desktop_wrapper_capabilities(),
                 },
                 AgentDescriptor {
                     id: AgentPlatformId::builtin("opencode"),
@@ -251,6 +265,7 @@ impl AgentRegistry {
                     invocation_args: vec!["run".into()],
                     aliases: vec!["open-code".into()],
                     capabilities: AgentCapabilities::default(),
+                    runtime_capabilities: mediated_desktop_wrapper_capabilities(),
                 },
                 AgentDescriptor {
                     id: AgentPlatformId::builtin("gemini"),
@@ -259,6 +274,7 @@ impl AgentRegistry {
                     invocation_args: vec!["-p".into()],
                     aliases: vec!["antigravity".into()],
                     capabilities: AgentCapabilities::default(),
+                    runtime_capabilities: mediated_desktop_wrapper_capabilities(),
                 },
                 AgentDescriptor {
                     id: AgentPlatformId::builtin("cursor"),
@@ -270,6 +286,7 @@ impl AgentRegistry {
                     invocation_args: vec![],
                     aliases: vec!["cursor-agent".into()],
                     capabilities: AgentCapabilities::default(),
+                    runtime_capabilities: mediated_desktop_wrapper_capabilities(),
                 },
                 AgentDescriptor {
                     id: AgentPlatformId::builtin("ion"),
@@ -280,6 +297,7 @@ impl AgentRegistry {
                     invocation_args: vec![],
                     aliases: vec![],
                     capabilities: AgentCapabilities::default(),
+                    runtime_capabilities: mediated_desktop_wrapper_capabilities(),
                 },
                 AgentDescriptor {
                     id: AgentPlatformId::builtin("shell"),
@@ -296,6 +314,7 @@ impl AgentRegistry {
                         uses_xml_context: false,
                         startup_delay_ms: 500,
                     },
+                    runtime_capabilities: mediated_desktop_wrapper_capabilities(),
                 },
             ],
         }
@@ -315,6 +334,23 @@ impl AgentRegistry {
     pub fn from_toml_str(toml_str: &str) -> Result<Self, RegistryError> {
         let file: RegistryFile =
             toml::from_str(toml_str).map_err(|e| RegistryError::Toml(e.to_string()))?;
+        Self::from_registry_file(file)
+    }
+
+    /// Build from the operator-editable registry-file shape.
+    ///
+    /// Runtime capability evidence is trusted code-declared adapter metadata,
+    /// so custom files cannot self-assert it for launch authorization.
+    pub fn from_registry_file(file: RegistryFile) -> Result<Self, RegistryError> {
+        if let Some(descriptor) = file
+            .agents
+            .iter()
+            .find(|descriptor| !descriptor.runtime_capabilities.is_empty())
+        {
+            return Err(RegistryError::UntrustedRuntimeCapabilities {
+                platform: descriptor.id.to_string(),
+            });
+        }
         Self::from_descriptors(file.agents)
     }
 
@@ -433,6 +469,25 @@ impl AgentRegistry {
         self.agents.iter().find(|d| d.matches(needle))
     }
 
+    /// Evaluate a role against a registered platform's launch capabilities.
+    /// Alias inputs resolve through the descriptor, so compatibility always
+    /// records the canonical platform identity.
+    pub fn evaluate_role_compatibility(
+        &self,
+        platform: &AgentPlatformId,
+        assignment: &AgentRoleAssignment,
+    ) -> Result<RoleCompatibility, RegistryError> {
+        let descriptor = self
+            .resolve(platform.as_str())
+            .ok_or_else(|| RegistryError::UnknownPlatform(platform.to_string()))?;
+        evaluate_declared_role_compatibility(
+            &descriptor.id,
+            &descriptor.runtime_capabilities,
+            assignment,
+        )
+        .map_err(RegistryError::from)
+    }
+
     /// Look up a descriptor by exact canonical id (case-insensitive).
     pub fn get(&self, id: &str) -> Option<&AgentDescriptor> {
         self.agents
@@ -475,6 +530,16 @@ impl AgentRegistry {
     }
 }
 
+fn mediated_desktop_wrapper_capabilities() -> Vec<RuntimeCapabilitySupport> {
+    ["workspace.target", "process.lifecycle"]
+        .into_iter()
+        .map(|capability| RuntimeCapabilitySupport {
+            capability: RuntimeCapabilityId::builtin(capability),
+            enforcement: EnforcementStrength::Mediated,
+        })
+        .collect()
+}
+
 fn descriptor_identities(descriptor: &AgentDescriptor) -> impl Iterator<Item = &str> {
     std::iter::once(descriptor.id.as_str()).chain(descriptor.aliases.iter().map(String::as_str))
 }
@@ -508,6 +573,10 @@ pub struct AgentPlatformInfo {
     pub id: AgentPlatformId,
     pub label: String,
     pub command: String,
+    /// Trusted launch-capability evidence copied from the backend registry
+    /// descriptor for compatibility preview clients.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_capabilities: Vec<RuntimeCapabilitySupport>,
 }
 
 /// Pure observability report built from the registry (no I/O, no printing).
@@ -528,6 +597,7 @@ impl AgentPlatformsReport {
                 id: d.id.clone(),
                 label: d.label.clone(),
                 command: d.command.clone(),
+                runtime_capabilities: d.runtime_capabilities.clone(),
             })
             .collect();
         Self {
@@ -794,6 +864,216 @@ command = "bare"
     }
 
     #[test]
+    fn test_legacy_toml_defaults_to_no_runtime_launch_capabilities() {
+        let registry = AgentRegistry::from_toml_str(
+            r#"
+[[agent]]
+id = "legacy-agent"
+label = "Legacy Agent"
+command = "legacy-agent"
+"#,
+        )
+        .unwrap();
+        let agent = registry.get("legacy-agent").unwrap();
+
+        assert!(agent.runtime_capabilities.is_empty());
+
+        let serialized = toml::to_string(&RegistryFile {
+            agents: vec![agent.clone()],
+        })
+        .unwrap();
+        assert!(!serialized.contains("runtime_capabilities"));
+    }
+
+    #[test]
+    fn test_custom_toml_cannot_authorize_structural_filesystem_capability() {
+        use crate::role_assignment::{
+            AgentRoleAssignment, AgentRoleId, EnforcementStrength, RoleCapabilityRequirement,
+            RuntimeCapabilityId,
+        };
+
+        let parsed = AgentRegistry::from_toml_str(
+            r#"
+[[agent]]
+id = "untrusted-agent"
+label = "Untrusted Agent"
+command = "untrusted-agent"
+runtime_capabilities = [
+  { capability = "filesystem.scoped", enforcement = "structural" },
+]
+"#,
+        );
+
+        match parsed {
+            Ok(registry) => {
+                let platform = AgentPlatformId::try_new("untrusted-agent").unwrap();
+                let assignment = AgentRoleAssignment {
+                    role: AgentRoleId::try_new("builder").unwrap(),
+                    requirements: vec![RoleCapabilityRequirement {
+                        capability: RuntimeCapabilityId::try_new("filesystem.scoped").unwrap(),
+                        minimum_enforcement: EnforcementStrength::Structural,
+                        mandatory: true,
+                    }],
+                };
+                let compatibility = registry
+                    .evaluate_role_compatibility(&platform, &assignment)
+                    .unwrap();
+
+                assert!(
+                    !compatibility.launch_allowed(),
+                    "operator TOML must never authorize structural filesystem enforcement"
+                );
+            }
+            Err(error) => assert!(error.to_string().contains("runtime_capabilities")),
+        }
+    }
+
+    #[test]
+    fn test_registry_file_rejects_operator_declared_runtime_capabilities_with_typed_error() {
+        let file: RegistryFile = toml::from_str(
+            r#"
+[[agent]]
+id = "untrusted-agent"
+label = "Untrusted Agent"
+command = "untrusted-agent"
+runtime_capabilities = [
+  { capability = "filesystem.scoped", enforcement = "structural" },
+]
+"#,
+        )
+        .unwrap();
+
+        let error = AgentRegistry::from_registry_file(file).unwrap_err();
+
+        assert!(matches!(
+            error,
+            RegistryError::UntrustedRuntimeCapabilities { ref platform }
+                if platform == "untrusted-agent"
+        ));
+        assert!(error.to_string().contains("runtime_capabilities"));
+    }
+
+    #[test]
+    fn test_builtin_runtime_launch_capabilities_are_conservative() {
+        use crate::role_assignment::EnforcementStrength;
+
+        let registry = AgentRegistry::builtin();
+        for agent in registry.agents() {
+            assert_eq!(
+                agent.runtime_capabilities.len(),
+                2,
+                "{} must advertise only the desktop wrapper facts",
+                agent.id
+            );
+            assert!(agent.runtime_capabilities.iter().any(|support| {
+                support.capability == "workspace.target"
+                    && support.enforcement == EnforcementStrength::Mediated
+            }));
+            assert!(agent.runtime_capabilities.iter().any(|support| {
+                support.capability == "process.lifecycle"
+                    && support.enforcement == EnforcementStrength::Mediated
+            }));
+            assert!(
+                agent
+                    .runtime_capabilities
+                    .iter()
+                    .all(|support| support.capability != "filesystem.scoped"),
+                "{} must not claim scoped filesystem enforcement",
+                agent.id
+            );
+        }
+    }
+
+    #[test]
+    fn test_evaluate_role_compatibility_canonicalizes_alias_identity() {
+        use crate::role_assignment::{
+            AgentRoleAssignment, AgentRoleId, EnforcementStrength, RoleCapabilityRequirement,
+            RuntimeCapabilityId,
+        };
+
+        let registry = AgentRegistry::builtin();
+        let alias = AgentPlatformId::try_new("claude").unwrap();
+        let assignment = AgentRoleAssignment {
+            role: AgentRoleId::try_new("builder").unwrap(),
+            requirements: vec![RoleCapabilityRequirement {
+                capability: RuntimeCapabilityId::try_new("workspace.target").unwrap(),
+                minimum_enforcement: EnforcementStrength::Mediated,
+                mandatory: true,
+            }],
+        };
+
+        let compatibility = registry
+            .evaluate_role_compatibility(&alias, &assignment)
+            .unwrap();
+
+        assert_eq!(compatibility.platform, "claude-code");
+        assert!(compatibility.launch_allowed());
+    }
+
+    #[test]
+    fn test_evaluate_role_compatibility_unknown_platform_returns_typed_error() {
+        use crate::role_assignment::{AgentRoleAssignment, AgentRoleId};
+
+        let registry = AgentRegistry::builtin();
+        let unknown = AgentPlatformId::try_new("unknown-agent").unwrap();
+        let assignment = AgentRoleAssignment {
+            role: AgentRoleId::try_new("builder").unwrap(),
+            requirements: Vec::new(),
+        };
+
+        assert!(matches!(
+            registry.evaluate_role_compatibility(&unknown, &assignment),
+            Err(RegistryError::UnknownPlatform(platform)) if platform == "unknown-agent"
+        ));
+    }
+
+    #[test]
+    fn test_evaluate_role_compatibility_preserves_typed_evaluator_errors() {
+        use crate::role_assignment::{
+            AgentRoleAssignment, AgentRoleId, EnforcementStrength, RoleAssignmentError,
+            RuntimeCapabilityId, RuntimeCapabilitySupport,
+        };
+
+        let duplicate_capability = RuntimeCapabilityId::try_new("workspace.target").unwrap();
+        let registry = AgentRegistry::from_descriptors(vec![AgentDescriptor {
+            id: AgentPlatformId::try_new("duplicate-support").unwrap(),
+            label: "Duplicate Support".into(),
+            command: "duplicate-support".into(),
+            invocation_args: Vec::new(),
+            aliases: Vec::new(),
+            capabilities: AgentCapabilities::default(),
+            runtime_capabilities: vec![
+                RuntimeCapabilitySupport {
+                    capability: duplicate_capability.clone(),
+                    enforcement: EnforcementStrength::Mediated,
+                },
+                RuntimeCapabilitySupport {
+                    capability: duplicate_capability,
+                    enforcement: EnforcementStrength::Structural,
+                },
+            ],
+        }])
+        .unwrap();
+        let platform = AgentPlatformId::try_new("duplicate-support").unwrap();
+        let assignment = AgentRoleAssignment {
+            role: AgentRoleId::try_new("builder").unwrap(),
+            requirements: Vec::new(),
+        };
+
+        let error = registry
+            .evaluate_role_compatibility(&platform, &assignment)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RegistryError::RoleAssignment(
+                RoleAssignmentError::DuplicateRuntimeCapability(ref capability)
+            ) if capability == &RuntimeCapabilityId::try_new("workspace.target").unwrap()
+        ));
+        assert!(error.to_string().contains("duplicate runtime capability"));
+    }
+
+    #[test]
     fn test_from_toml_str_invalid_returns_toml_error() {
         let err = AgentRegistry::from_toml_str("this is not = valid toml [[[").unwrap_err();
         assert!(matches!(err, RegistryError::Toml(_)));
@@ -853,6 +1133,7 @@ aliases = [{alias:?}]
             invocation_args: vec![],
             aliases: vec![],
             capabilities: AgentCapabilities::default(),
+            runtime_capabilities: vec![],
         };
         let mut other = dup.clone();
         other.id = AgentPlatformId::try_new("dup").unwrap(); // case-insensitive collision
@@ -872,6 +1153,7 @@ aliases = [{alias:?}]
             invocation_args: vec![],
             aliases: vec![],
             capabilities: AgentCapabilities::default(),
+            runtime_capabilities: vec![],
         };
         let second = AgentDescriptor {
             id: AgentPlatformId::try_new("ågent").unwrap(),
@@ -880,6 +1162,7 @@ aliases = [{alias:?}]
             invocation_args: vec![],
             aliases: vec![],
             capabilities: AgentCapabilities::default(),
+            runtime_capabilities: vec![],
         };
 
         assert!(
@@ -1080,6 +1363,17 @@ command = "ratchet"
         let report = AgentPlatformsReport::from_registry(&reg);
         assert!(report.platforms.iter().any(|p| p.id == "claude-code"));
         assert!(report.platforms.iter().any(|p| p.id == "codex"));
+        let codex = report
+            .platforms
+            .iter()
+            .find(|platform| platform.id == "codex")
+            .expect("builtin codex platform");
+        assert_eq!(
+            codex.runtime_capabilities,
+            reg.get("codex")
+                .expect("builtin codex descriptor")
+                .runtime_capabilities
+        );
         assert!(!report.multi_workspace_note.is_empty());
     }
 
@@ -1139,6 +1433,7 @@ command = "ratchet"
             invocation_args: Vec::new(),
             aliases: Vec::new(),
             capabilities: AgentCapabilities::default(),
+            runtime_capabilities: Vec::new(),
         }])
         .unwrap();
 

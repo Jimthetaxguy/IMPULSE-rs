@@ -1,10 +1,12 @@
 # IMPULSE — Feed the impulse to build.
 
 - **Status:** Living product north star
-- **Updated:** 2026-07-12
+- **Updated:** 2026-07-13
 - **Canonical implementation contract:** [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
 - **Current code boundary map:** [`docs/ARCHITECTURE-CLARIFICATION.md`](docs/ARCHITECTURE-CLARIFICATION.md)
 - **Roadmap contract:** Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; Legacy=egui compile-maintenance only.
+- **Current launch slice:** explicit product role/task preflight and typed compatibility telemetry.
+- **Next governed slice:** daemon-owned task evidence, verification results, and supervisor decisions.
 
 ## The promise
 
@@ -121,8 +123,13 @@ control plane and should share platform services where their capabilities allow 
 
 ## Capability negotiation
 
-Different runtimes support different operations. A future adapter contract must report rather than
-hide those differences. Relevant capabilities include:
+Different runtimes support different operations. A future generalized/dynamic adapter contract must
+report rather than hide those differences. Relevant capabilities include:
+
+ADR-0010 makes one narrow part live: Dioxus previews a static, trusted code-owned launch-capability
+comparison and the backend repeats it before PTY creation. This is conservative preflight over
+declared wrapper support, not runtime probing, model-internal governance, or the future generalized
+adapter negotiation contract.
 
 - structured tools and MCP;
 - hooks and structured events;
@@ -210,6 +217,8 @@ needs a reason and an audit path. The user can interrupt, narrow, revoke, review
 - PTY spawn/write/resize/focus/exit lifecycle and process cleanup.
 - Dioxus Desktop host/bridge plus ratatui and CLI operator surfaces.
 - Registry-backed desktop platform identity and launch metadata.
+- Explicit product-role/task launch preflight, backend mandatory-capability gate, and typed
+  compatibility telemetry.
 - Ion as a real desktop-launchable builtin platform.
 - Daemon-truth terminal telemetry across lifecycle and heartbeat.
 - Supervisor-specific permission/confirmation policy and daemon actions.
@@ -247,6 +256,10 @@ subsystem:
 9. The supervisor accepts, rejects, or escalates based on evidence; the user sees and controls the decision.
 10. Only verified outcomes become scoped durable memory, with an inspectable reason and source.
 
+The explicit Builder task/role preflight and compatibility telemetry now establish part of steps
+3-5. Daemon-owned task evidence, verification results, supervisor decisions, and durable-memory
+promotion remain the next governed-run slice; the complete workflow is not yet live.
+
 ## Success criteria
 
 - A user can manage heterogeneous coding agents without losing their terminal-native strengths.
@@ -270,12 +283,14 @@ subsystem:
 
 ## Open ADR decisions
 
-The following decisions must be resolved together before schema-specific documents split out:
+ADR-0010 accepts only the explicit product-role/task launch-preflight contract. The following
+broader decisions remain open and must be resolved before schema-specific documents split out:
 
 1. Exact hierarchy/cardinality and durable ids for project, workspace, role, runtime, instance,
    session, task, pane, and supervisor scope.
 2. Minimum runtime-adapter interface and semantics for optional/emulated operations.
-3. Capability/enforcement-strength vocabulary and launch-blocking rules.
+3. Generalized and dynamic capability negotiation beyond the static desktop preflight, including
+   discovery, attestation freshness, emulation, and post-launch re-evaluation.
 4. Role contract composition, override, persistence, and migration.
 5. Cross-agent message routing, direct worker communication, acknowledgement, and isolation.
 6. Memory authorship, verification, conflict resolution, correction, forgetting, and inheritance.

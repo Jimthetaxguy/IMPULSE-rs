@@ -8,6 +8,9 @@
 //! prevent. `ION_GATE_LAUNCHER` (`impulse_ion::pi_adapter::ION_GATE_LAUNCHER_ENV`)
 //! is mutated by tests in `handlers::ion`, `ion_repl` (mod.rs), and
 //! `ion_repl::tool_verify` — all three share this lock (TUI_SPEC.md T7).
+//! `IMPULSE_EMBED_SCRIPT` is likewise mutated by both
+//! `retrieval::embedding` and `retrieval::indexer`, which share a separate
+//! retrieval-specific lock below.
 
 #![cfg(test)]
 
@@ -16,6 +19,18 @@
 /// a prior test panicking while holding the lock must not deadlock every
 /// subsequent test.
 pub(crate) fn ion_gate_launcher_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Acquire the process-wide lock guarding test mutation of
+/// `IMPULSE_EMBED_SCRIPT` and related retrieval-embedding env configuration.
+///
+/// This must be shared by both `retrieval::embedding` and
+/// `retrieval::indexer`; separate module-local locks allow one test to replace
+/// the other test's script path while both run in the same libtest process.
+/// Poison recovery keeps later tests runnable if an earlier assertion panics.
+pub(crate) fn retrieval_embedding_env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }

@@ -12,10 +12,11 @@ use dioxus::prelude::document::{Document, Eval, EvalError, Evaluator};
 use dioxus::prelude::*;
 use impulse_desktop::ui::{
     agent_focus_bridge_script, agent_launch_bridge_script, apply_desktop_bridge_message,
-    desktop_event_bridge_script, mcp_invoke_bridge_script, review_decision_bridge_script,
-    terminal_asset_paths, workspace_registration_bridge_script, BridgeStatusUpdate,
-    DaemonOpsStatusUpdate, DesktopBridgeMessage, DesktopBridgeStateMut, ReviewDecisionUiRequest,
-    XTERM_CSS_PATH, XTERM_FIT_JS_PATH, XTERM_JS_PATH,
+    apply_desktop_bridge_message_with_status, build_governed_agent_spawn_request,
+    builder_role_assignment, desktop_event_bridge_script, mcp_invoke_bridge_script,
+    review_decision_bridge_script, terminal_asset_paths, workspace_registration_bridge_script,
+    BridgeStatusUpdate, DaemonOpsStatusUpdate, DesktopBridgeMessage, DesktopBridgeStateMut,
+    ReviewDecisionUiRequest, XTERM_CSS_PATH, XTERM_FIT_JS_PATH, XTERM_JS_PATH,
 };
 use impulse_desktop::{
     default_builtin_mcp_tools, format_count, status_dot_class, status_label, AgentPlatformId,
@@ -28,13 +29,216 @@ use impulse_desktop::{
     WorkspaceTarget,
 };
 use impulse_ops::{
-    agent_registry::AgentPlatformInfo, AgentRuntime, AgentStatus, ContextHealthSummary,
-    MemorySummary, ProjectOpsSnapshot, RetrievalSummary,
+    agent_registry::AgentPlatformInfo, role_assignment::EnforcementStrength, AgentRuntime,
+    AgentStatus, ContextHealthSummary, MemorySummary, ProjectOpsSnapshot, RetrievalSummary,
 };
 use serde_json::json;
 
 fn platform_id(value: &str) -> AgentPlatformId {
     AgentPlatformId::try_new(value).expect("valid test platform id")
+}
+
+#[test]
+fn test_agent_platform_info_roundtrips_trusted_runtime_capabilities() {
+    let platform: AgentPlatformInfo = serde_json::from_value(json!({
+        "id": "codex",
+        "label": "Codex",
+        "command": "codex",
+        "runtime_capabilities": [
+            { "capability": "workspace.target", "enforcement": "mediated" },
+            { "capability": "process.lifecycle", "enforcement": "mediated" }
+        ]
+    }))
+    .expect("trusted platform capability DTO should deserialize");
+
+    let roundtrip = serde_json::to_value(platform).expect("platform DTO should serialize");
+    assert_eq!(
+        roundtrip["runtime_capabilities"],
+        json!([
+            { "capability": "workspace.target", "enforcement": "mediated" },
+            { "capability": "process.lifecycle", "enforcement": "mediated" }
+        ])
+    );
+}
+
+#[test]
+fn test_builder_role_assignment_requires_mediated_launch_control_and_optional_filesystem_scope() {
+    let assignment = builder_role_assignment().expect("static Builder role profile");
+
+    assert_eq!(assignment.role.as_str(), "builder");
+    assert_eq!(assignment.requirements.len(), 3);
+    assert!(assignment.requirements.iter().any(|requirement| {
+        requirement.capability.as_str() == "workspace.target"
+            && requirement.minimum_enforcement == EnforcementStrength::Mediated
+            && requirement.mandatory
+    }));
+    assert!(assignment.requirements.iter().any(|requirement| {
+        requirement.capability.as_str() == "process.lifecycle"
+            && requirement.minimum_enforcement == EnforcementStrength::Mediated
+            && requirement.mandatory
+    }));
+    assert!(assignment.requirements.iter().any(|requirement| {
+        requirement.capability.as_str() == "filesystem.scoped"
+            && requirement.minimum_enforcement == EnforcementStrength::Structural
+            && !requirement.mandatory
+    }));
+}
+
+#[test]
+fn test_workspace_launcher_renders_required_builder_compatibility_preflight() {
+    let platform: AgentPlatformInfo = serde_json::from_value(json!({
+        "id": "codex",
+        "label": "Codex",
+        "command": "codex",
+        "runtime_capabilities": [
+            { "capability": "workspace.target", "enforcement": "mediated" },
+            { "capability": "process.lifecycle", "enforcement": "mediated" }
+        ]
+    }))
+    .expect("platform DTO");
+    let workspace = WorkspaceEntry::new(WorkspaceTarget::from_root("/tmp/impulse"));
+    let mut vdom = VirtualDom::new_with_props(
+        DesktopShellWithSnapshot,
+        DesktopShellWithSnapshotProps {
+            snapshot: ProjectOpsSnapshot::default(),
+            runtime_agents: Vec::new(),
+            agent_platforms: vec![platform],
+            workspaces: vec![workspace],
+            mcp_tools: Vec::new(),
+            last_invocations: Vec::new(),
+            review_queue: Vec::new(),
+            bridge_status: None,
+            daemon_ops_status: None,
+            initial_view: DesktopView::Terminal,
+        },
+    );
+    vdom.rebuild_in_place();
+
+    let html = dioxus_ssr::render(&vdom);
+    assert!(html.contains("data-field=\"launch-task\""));
+    assert!(html.contains("aria-required=\"true\""));
+    assert!(html.contains(">Task<"));
+    assert!(html.contains(">Builder<"));
+    assert!(html.contains("degraded"));
+    assert!(html.contains("workspace.target"));
+    assert!(html.contains("process.lifecycle"));
+    assert!(html.contains("filesystem.scoped"));
+    assert!(html.contains("required mediated · available mediated"));
+    assert!(html.contains("required structural · available unsupported"));
+    assert!(html.contains("cwd mediation is not a filesystem sandbox"));
+    assert!(html.contains("data-action=\"launch-governed-agent\""));
+    assert!(html.contains("aria-disabled=\"true\""));
+    assert!(html.contains("disabled=\"true\""));
+}
+
+fn governed_platform(id: &str, runtime_capabilities: serde_json::Value) -> AgentPlatformInfo {
+    serde_json::from_value(json!({
+        "id": id,
+        "label": id,
+        "command": id,
+        "runtime_capabilities": runtime_capabilities,
+    }))
+    .expect("governed platform DTO")
+}
+
+fn governed_workspace() -> WorkspaceEntry {
+    WorkspaceEntry::new(WorkspaceTarget::from_root("/tmp/impulse"))
+}
+
+fn governed_launch(
+    platforms: &[AgentPlatformInfo],
+    selected_platform: &str,
+    task: &str,
+) -> Result<AgentSpawnRequest, String> {
+    build_governed_agent_spawn_request(
+        &[governed_workspace()],
+        platforms,
+        "/tmp/impulse",
+        selected_platform,
+        "builder-1",
+        "",
+        task,
+    )
+}
+
+#[test]
+fn test_governed_request_builder_rejects_blank_task() {
+    let platform = governed_platform(
+        "codex",
+        json!([
+            { "capability": "workspace.target", "enforcement": "mediated" },
+            { "capability": "process.lifecycle", "enforcement": "mediated" }
+        ]),
+    );
+
+    assert!(governed_launch(&[platform], "codex", "  ").is_err());
+}
+
+#[test]
+fn test_governed_request_builder_blocks_untrusted_or_incompatible_profiles() {
+    let blocked = governed_platform(
+        "partial-agent",
+        json!([
+            { "capability": "workspace.target", "enforcement": "mediated" }
+        ]),
+    );
+    let capability_free = governed_platform("custom-agent", json!([]));
+    let evaluator_error = governed_platform(
+        "duplicate-profile",
+        json!([
+            { "capability": "workspace.target", "enforcement": "mediated" },
+            { "capability": "workspace.target", "enforcement": "structural" },
+            { "capability": "process.lifecycle", "enforcement": "mediated" }
+        ]),
+    );
+
+    assert!(governed_launch(&[blocked], "partial-agent", "Build it").is_err());
+    assert!(governed_launch(&[capability_free], "custom-agent", "Build it").is_err());
+    assert!(governed_launch(&[evaluator_error], "duplicate-profile", "Build it").is_err());
+    assert!(governed_launch(&[], "codex", "Build it").is_err());
+}
+
+#[test]
+fn test_governed_request_builder_uses_current_selected_platform() {
+    let capabilities = json!([
+        { "capability": "workspace.target", "enforcement": "mediated" },
+        { "capability": "process.lifecycle", "enforcement": "mediated" }
+    ]);
+    let platforms = vec![
+        governed_platform("codex", capabilities.clone()),
+        governed_platform("ion", capabilities),
+    ];
+
+    let codex_request =
+        governed_launch(&platforms, "codex", "Build it").expect("Codex is compatible");
+    let ion_request = governed_launch(&platforms, "ion", "Build it").expect("Ion is compatible");
+
+    assert_eq!(codex_request.platform, platform_id("codex"));
+    assert_eq!(ion_request.platform, platform_id("ion"));
+}
+
+#[test]
+fn test_governed_request_builder_emits_trimmed_task_builder_assignment_and_legacy_role_none() {
+    let platform = governed_platform(
+        "codex",
+        json!([
+            { "capability": "workspace.target", "enforcement": "mediated" },
+            { "capability": "process.lifecycle", "enforcement": "mediated" }
+        ]),
+    );
+
+    let request = governed_launch(&[platform], "codex", "  Implement the governed launcher  ")
+        .expect("mandatory controls satisfy the Builder role");
+
+    assert_eq!(
+        request.task.as_deref(),
+        Some("Implement the governed launcher")
+    );
+    assert_eq!(
+        request.role_assignment,
+        Some(builder_role_assignment().expect("static Builder role profile"))
+    );
+    assert_eq!(request.role, None);
 }
 
 #[derive(Clone, Default)]
@@ -138,6 +342,8 @@ fn runtime_snapshot(agent_id: &str) -> AgentRuntimeSnapshot {
         },
         current_task: Some("wire live bridge".to_string()),
         role: None,
+        role_assignment: None,
+        role_compatibility: None,
         target: None,
         mcp_tools: vec![BuiltInMcpTool::new(
             "impulse.agent_spawn",
@@ -736,6 +942,7 @@ fn test_desktop_event_bridge_script_executes_against_mocked_legacy_host_webview(
         id: platform_id("ion"),
         label: "Ion".to_string(),
         command: "ion".to_string(),
+        runtime_capabilities: Vec::new(),
     }];
     let workspace = WorkspaceEntry::new(WorkspaceTarget {
         root: "/tmp".to_string(),
@@ -1136,6 +1343,7 @@ fn test_workspace_registration_bridge_script_serializes_project_notes() {
 
 #[test]
 fn test_agent_launch_bridge_script_routes_through_audited_mcp_spawn() {
+    let role_assignment = builder_role_assignment().expect("static Builder role profile");
     let script = agent_launch_bridge_script(&AgentSpawnRequest {
         agent_id: Some("codex-live".to_string()),
         session_id: Some("codex-live-session".to_string()),
@@ -1154,6 +1362,8 @@ fn test_agent_launch_bridge_script_routes_through_audited_mcp_spawn() {
         rows: 32,
         cols: 100,
         role: None,
+        task: Some("Implement the governed launcher".to_string()),
+        role_assignment: Some(role_assignment),
         target: None,
     });
 
@@ -1165,6 +1375,11 @@ fn test_agent_launch_bridge_script_routes_through_audited_mcp_spawn() {
     assert!(script.contains(r#""workspace""#));
     assert!(script.contains(r#""root":"/tmp""#));
     assert!(script.contains(r#""project_notes":"registered workspace context""#));
+    assert!(script.contains(r#""task":"Implement the governed launcher""#));
+    assert!(script.contains(r#""role":"builder""#));
+    assert!(script.contains(r#""capability":"workspace.target""#));
+    assert!(script.contains(r#""capability":"process.lifecycle""#));
+    assert!(script.contains(r#""capability":"filesystem.scoped""#));
 }
 
 #[test]
@@ -1214,6 +1429,144 @@ fn test_desktop_reducer_accepts_registry_platform_catalog_messages() {
             .collect::<Vec<_>>(),
         vec!["ion", "custom-agent"]
     );
+}
+
+#[test]
+fn test_agent_platform_failure_revokes_catalog_and_blocks_governed_preview() {
+    let mut snapshot = ProjectOpsSnapshot::default();
+    let mut runtime_agents = Vec::new();
+    let mut agent_platforms = Vec::new();
+    let mut workspaces = Vec::new();
+    let mut mcp_tools = Vec::new();
+    let mut review_queue = Vec::new();
+    let mut last_invocations = Vec::new();
+
+    for message in [
+        DesktopBridgeMessage {
+            kind: "agent_platforms".to_string(),
+            payload: json!({
+                "platforms": [{
+                    "id": "codex",
+                    "label": "Codex",
+                    "command": "codex",
+                    "runtime_capabilities": [
+                        { "capability": "workspace.target", "enforcement": "mediated" },
+                        { "capability": "process.lifecycle", "enforcement": "mediated" }
+                    ]
+                }]
+            }),
+        },
+        DesktopBridgeMessage {
+            kind: "bridge_status".to_string(),
+            payload: json!({
+                "status": "agent_platforms_failed",
+                "reason": "registry unavailable"
+            }),
+        },
+    ] {
+        apply_desktop_bridge_message(
+            DesktopBridgeStateMut::new(
+                &mut snapshot,
+                &mut runtime_agents,
+                &mut agent_platforms,
+                &mut workspaces,
+                &mut mcp_tools,
+                &mut review_queue,
+                &mut last_invocations,
+            ),
+            message,
+        )
+        .expect("platform catalog messages should reduce");
+
+        if !agent_platforms.is_empty() {
+            assert!(governed_launch(&agent_platforms, "codex", "Build it").is_ok());
+        }
+    }
+
+    assert!(agent_platforms.is_empty());
+    assert!(governed_launch(&agent_platforms, "codex", "Build it").is_err());
+}
+
+#[test]
+fn test_malformed_agent_platform_catalog_revokes_stale_compatibility_and_recovers() {
+    let mut snapshot = ProjectOpsSnapshot::default();
+    let mut runtime_agents = Vec::new();
+    let mut agent_platforms = Vec::new();
+    let mut workspaces = Vec::new();
+    let mut mcp_tools = Vec::new();
+    let mut review_queue = Vec::new();
+    let mut last_invocations = Vec::new();
+
+    let compatible = DesktopBridgeMessage {
+        kind: "agent_platforms".to_string(),
+        payload: json!({
+            "platforms": [{
+                "id": "codex",
+                "label": "Codex",
+                "command": "codex",
+                "runtime_capabilities": [
+                    { "capability": "workspace.target", "enforcement": "mediated" },
+                    { "capability": "process.lifecycle", "enforcement": "mediated" }
+                ]
+            }]
+        }),
+    };
+    let malformed = DesktopBridgeMessage {
+        kind: "agent_platforms".to_string(),
+        payload: json!({ "platforms": [{ "id": 42 }] }),
+    };
+
+    let initial_status = apply_desktop_bridge_message_with_status(
+        DesktopBridgeStateMut::new(
+            &mut snapshot,
+            &mut runtime_agents,
+            &mut agent_platforms,
+            &mut workspaces,
+            &mut mcp_tools,
+            &mut review_queue,
+            &mut last_invocations,
+        ),
+        compatible.clone(),
+    )
+    .expect("compatible catalog reduces");
+    assert!(initial_status.is_none());
+    assert!(governed_launch(&agent_platforms, "codex", "Build it").is_ok());
+
+    let failure_status = apply_desktop_bridge_message_with_status(
+        DesktopBridgeStateMut::new(
+            &mut snapshot,
+            &mut runtime_agents,
+            &mut agent_platforms,
+            &mut workspaces,
+            &mut mcp_tools,
+            &mut review_queue,
+            &mut last_invocations,
+        ),
+        malformed,
+    )
+    .expect("malformed catalog becomes an explicit degraded status");
+    assert_eq!(
+        failure_status.as_ref().map(|status| status.status.as_str()),
+        Some("agent_platforms_failed")
+    );
+    assert!(agent_platforms.is_empty());
+    assert!(governed_launch(&agent_platforms, "codex", "Build it").is_err());
+
+    let recovery_status = apply_desktop_bridge_message_with_status(
+        DesktopBridgeStateMut::new(
+            &mut snapshot,
+            &mut runtime_agents,
+            &mut agent_platforms,
+            &mut workspaces,
+            &mut mcp_tools,
+            &mut review_queue,
+            &mut last_invocations,
+        ),
+        compatible,
+    )
+    .expect("valid catalog recovers");
+    assert!(recovery_status.is_none());
+    assert!(governed_launch(&agent_platforms, "codex", "Build it").is_ok());
 }
 
 #[test]

@@ -151,6 +151,8 @@ fn seeded_snapshot() -> ProjectOpsSnapshot {
                     task: "build visual fixture".to_string(),
                 },
                 role: Some(AgentRole::Coordinator),
+                role_assignment: None,
+                role_compatibility: None,
                 group: Some("desktop".to_string()),
                 tool_invocations: vec![ToolInvocationRecord {
                     kind: "mcp".to_string(),
@@ -338,6 +340,8 @@ fn runtime_agent(
         } else {
             Some(AgentRole::Worker { parent_pane_id: 1 })
         },
+        role_assignment: None,
+        role_compatibility: None,
         target: Some(MachineTarget::Local {
             workdir: "<repo>".to_string(),
         }),

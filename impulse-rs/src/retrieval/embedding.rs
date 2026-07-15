@@ -427,14 +427,9 @@ fn embed_texts_with(
 mod tests {
     use super::*;
     use crate::state::Config;
+    use crate::test_support::retrieval_embedding_env_lock;
     use std::fs;
-    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     /// Deterministic, hermetic embedder for exercising the [`EmbeddingProvider`]
     /// contract offline (test-only — the real backend is [`ScriptEmbedder`]).
@@ -649,7 +644,7 @@ mod tests {
 
     #[test]
     fn test_embed_texts_times_out_and_kills_process() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = retrieval_embedding_env_lock();
         if std::process::Command::new("python3")
             .arg("--version")
             .output()

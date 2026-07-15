@@ -1,8 +1,8 @@
 ---
 title: Test Traceability Matrix
 description: Story-to-test coverage map for the current Rust Impulse workspace and open validation gaps
-version: '1.1'
-updated: 2026-07-12
+version: '1.2'
+updated: 2026-07-13
 type: specification
 category: testing
 phase: all
@@ -44,7 +44,7 @@ authors:
 | ST-10 Review risky context and stewardship actions explicitly | stewardship modules, guardrail and approval surfaces, integration enhancement coverage | Thin | stewardship command dispatch and operator decision paths need clearer regression tests |
 | ST-11 Enforce verification-before-completion | `impulse-rs/src/validate.rs`, recent invalid-direct-request fixes, session-end verify flows | Strong | manual operator acceptance still matters for claim wording, but automated coverage is present |
 | ST-12 Prove the real hook memory loop before expanding claims | `impulse-rs/tests/hook_validation_session_start.rs`, `hook_validation_precompact.rs`, `hook_validation_extraction_benchmark.rs`, `docs/guides/HOOK-VALIDATION-GUIDE.md` | Manual | the code can generate evidence, but product truth still depends on real external hook runs |
-| ST-13 Complete one governed supervisor-and-builder vertical slice | `impulse-rs/impulse-desktop/src/runtime.rs`, `host_commands.rs`, `mcp.rs`, `impulse-desktop/tests/runtime.rs`, `desktop_contract.rs`, `impulse-ops/src/{agent_registry.rs,lib.rs}`, and daemon supervisor/publish-subscribe tests | Moderate | launch/write/focus/close, registry identity, daemon truth, and supervisor-specific policy are directly tested; no single E2E yet binds supervisor and builder roles to one scoped task, proves backend role enforcement, and carries builder evidence through supervisor/operator acceptance |
+| ST-13 Complete one governed supervisor-and-builder vertical slice | `impulse-rs/impulse-ops/src/{role_assignment.rs,agent_registry.rs,lib.rs}`, `impulse-rs/impulse-desktop/src/{ui.rs,runtime.rs,daemon_ops.rs,mcp.rs}`, `impulse-rs/impulse-desktop/tests/{runtime.rs,desktop_contract.rs}`, `impulse-rs/src/ops_workbench.rs`, and daemon supervisor/publish-subscribe tests | Moderate | focused tests prove the Builder task/assignment request, static compatibility preview, stale-catalog fail-closed behavior, canonical workspace binding, mandatory rejection before agent-id/PTY creation, optional degradation, and typed telemetry preservation; no single E2E yet binds supervisor and builder governed runs and carries evidence through verification, supervisor judgment, and operator approval |
 
 ## High-Signal Existing Test Surfaces
 
@@ -117,8 +117,8 @@ These gaps matter because they sit on stable or nearly stable public interfaces:
 
 - the stable CLI contract needs broader regression coverage than it currently has
 - single-project daemon-truth GUI behavior has direct automated evidence; multi-workspace routing remains an active delivery lane
-- the governed supervisor/builder claim remains incomplete until one E2E binds roles, assignment, policy enforcement, evidence, and approval
-- generalized role contracts and runtime capability negotiation remain target-only and must not be inferred from the current supervisor-specific policy
+- the governed supervisor/builder claim remains incomplete until one E2E binds the live launch preflight to supervisor policy, evidence, verification, judgment, and approval
+- narrow static product-role launch preflight is live; generalized role composition and dynamic runtime capability negotiation remain target-only and must not be inferred from it
 - validation evidence should continue to gate stronger marketing or architectural claims
 
 ## Recommended Test Expansion Order

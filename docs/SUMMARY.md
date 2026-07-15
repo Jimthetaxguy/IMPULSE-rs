@@ -1,8 +1,8 @@
 ---
 title: Documentation Summary
 description: Unified navigation structure for Impulse documentation
-version: 2.5
-updated: 2026-07-12
+version: 2.6
+updated: 2026-07-13
 schema_version: '1.0'
 ---
 
@@ -12,7 +12,7 @@ schema_version: '1.0'
 
 | Guide | Description | Start Here |
 | ----- | ----------- | ---------- |
-| [VISION.md](../VISION.md) | Living product north star and complete governed vertical slice | ✅ Yes |
+| [VISION.md](../VISION.md) | Living product north star and target governed vertical slice | ✅ Yes |
 | [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) | Authoritative product contract | ✅ Yes |
 | [USER-STORY-MAP.md](spec/USER-STORY-MAP.md) | Rust-first user stories and acceptance criteria | ✅ Yes |
 | [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md) | Current story-to-test coverage map | ✅ Yes |
@@ -133,6 +133,7 @@ roadmap or whole-product risk authority.
 - [decisions/0007-desktop-shell-stack.md](decisions/0007-desktop-shell-stack.md)
 - [decisions/0008-dioxus-desktop-host.md](decisions/0008-dioxus-desktop-host.md)
 - [decisions/0009-reconcile-impulse-copies.md](decisions/0009-reconcile-impulse-copies.md)
+- [decisions/0010-product-role-launch-contract.md](decisions/0010-product-role-launch-contract.md)
 
 ### Session Logs
 
@@ -149,9 +150,9 @@ Historical Ralph loop plans now live under `archive/ralph-plans/` and are proven
 
 | Field | Value |
 | ----- | ----- |
-| Total Documents | 134 |
+| Total Documents | 136 |
 | Categories | 9 |
-| Decisions (ADRs) | 9 |
+| Decisions (ADRs) | 10 |
 | Phases | 3 |
 | Status | Active Development |
 

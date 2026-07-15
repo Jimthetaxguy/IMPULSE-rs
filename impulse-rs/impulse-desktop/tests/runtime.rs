@@ -7,6 +7,10 @@ use impulse_desktop::{
     DesktopRuntime, LocalSupervisorAction, SupervisorLocalActionRequest, TerminalCloseRequest,
     TerminalFocusRequest, TerminalResizeRequest, WeakDesktopRuntime, WorkspaceTarget,
 };
+use impulse_ops::role_assignment::{
+    AgentRoleAssignment, AgentRoleId, EnforcementStrength, RoleCapabilityRequirement,
+    RuntimeCapabilityId,
+};
 use serde_json::json;
 
 #[derive(Default)]
@@ -141,7 +145,21 @@ fn shell_spawn(agent_id: &str, script: &str) -> AgentSpawnRequest {
         rows: 24,
         cols: 80,
         role: None,
+        task: None,
+        role_assignment: None,
         target: None,
+    }
+}
+
+fn governed_builder_assignment() -> AgentRoleAssignment {
+    AgentRoleAssignment {
+        role: AgentRoleId::try_new("builder").expect("valid Builder role id"),
+        requirements: vec![RoleCapabilityRequirement {
+            capability: RuntimeCapabilityId::try_new("workspace.target")
+                .expect("valid workspace capability id"),
+            minimum_enforcement: EnforcementStrength::Mediated,
+            mandatory: true,
+        }],
     }
 }
 
@@ -460,6 +478,73 @@ fn test_desktop_runtime_snapshot_carries_workspace_and_builtin_mcp_tools() {
         .expect("close workspace agent");
 }
 
+#[cfg(unix)]
+#[test]
+fn test_governed_spawn_binds_symlink_equivalent_workspace_to_canonical_pty_directory() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("temporary workspace parent");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("create governed workspace");
+    let alias = temp.path().join("workspace-alias");
+    symlink(&workspace, &alias).expect("create workspace symlink");
+    let canonical = workspace.canonicalize().expect("canonical workspace");
+    let canonical_text = canonical.display().to_string();
+
+    let sink = Arc::new(RecordingSink::default());
+    let runtime = DesktopRuntime::builder()
+        .with_event_sink(sink.clone())
+        .build();
+    let mut request = shell_spawn(
+        "canonical-workspace-agent",
+        "printf '%s|%s' \"$PWD\" \"$IMPULSE_WORKSPACE_ROOT\"",
+    );
+    request.cwd = Some(alias.display().to_string());
+    request.workspace = Some(WorkspaceTarget {
+        root: workspace.display().to_string(),
+        label: Some("governed workspace".to_string()),
+        purpose: None,
+        project_notes: None,
+    });
+    request.task = Some("prove canonical workspace binding".to_string());
+    request.role_assignment = Some(governed_builder_assignment());
+
+    let snapshot = runtime
+        .spawn_agent(request)
+        .expect("symlink-equivalent paths must bind to one canonical workspace");
+    assert_eq!(snapshot.cwd.as_deref(), Some(canonical_text.as_str()));
+    assert_eq!(
+        snapshot
+            .workspace
+            .as_ref()
+            .map(|target| target.root.as_str()),
+        Some(canonical_text.as_str())
+    );
+    let telemetry = impulse_desktop::daemon_ops::agent_runtime_from_snapshot(&snapshot);
+    assert_eq!(telemetry.working_directory, canonical_text);
+
+    let expected_output = format!("{canonical_text}|{canonical_text}");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        let output = String::from_utf8_lossy(&terminal_output(&sink, "canonical-workspace-agent"))
+            .to_string();
+        if output.contains(&expected_output) {
+            runtime
+                .close_agent(TerminalCloseRequest {
+                    session_id: snapshot.agent_id,
+                })
+                .ok();
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    panic!(
+        "expected PTY cwd and trusted workspace env to use `{canonical_text}`, got `{}`",
+        String::from_utf8_lossy(&terminal_output(&sink, "canonical-workspace-agent"))
+    );
+}
+
 #[test]
 fn test_terminal_harness_spawn_request_binds_workspace_and_default_tools() {
     let request = AgentSpawnRequest::terminal_harness(
@@ -601,6 +686,8 @@ fn test_desktop_runtime_spawns_real_default_ion_sibling_without_override() {
         rows: 24,
         cols: 80,
         role: None,
+        task: None,
+        role_assignment: None,
         target: None,
     };
 

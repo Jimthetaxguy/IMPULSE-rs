@@ -681,14 +681,9 @@ pub fn index_memory_from_storage(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::retrieval_embedding_env_lock;
     use chrono::{Duration, Utc};
-    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     fn sample_history(summary: &str) -> HistoryEntry {
         let started = Utc::now() - Duration::minutes(1);
@@ -707,7 +702,7 @@ mod tests {
     #[test]
     #[ignore = "requires vector embedding which is disabled in this environment"]
     fn test_changed_rows_invalidate_existing_vectors_before_reembed() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = retrieval_embedding_env_lock();
         let temp = TempDir::new().unwrap();
 
         std::env::set_var("IMPULSE_EMBED_ALLOW_FAKE", "1");
@@ -759,7 +754,7 @@ mod tests {
 
     #[test]
     fn test_index_succeeds_with_vector_disabled() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = retrieval_embedding_env_lock();
         let temp = TempDir::new().unwrap();
 
         let cfg = Config {
@@ -794,7 +789,7 @@ mod tests {
 
     #[test]
     fn test_index_succeeds_when_embed_script_missing() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = retrieval_embedding_env_lock();
         let temp = TempDir::new().unwrap();
 
         // Point to a nonexistent script so embedding will fail with MissingScript.
@@ -840,7 +835,7 @@ mod tests {
 
     #[test]
     fn test_index_genome_without_vectors() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = retrieval_embedding_env_lock();
         let temp = TempDir::new().unwrap();
 
         let cfg = Config {
@@ -877,7 +872,7 @@ mod tests {
 
     #[test]
     fn test_incremental_index_preserves_existing_fts() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = retrieval_embedding_env_lock();
         let temp = TempDir::new().unwrap();
 
         let cfg = Config {
@@ -946,7 +941,7 @@ mod tests {
 
     #[test]
     fn test_empty_inputs_produce_zero_counts() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = retrieval_embedding_env_lock();
         let temp = TempDir::new().unwrap();
 
         let cfg = Config::default();

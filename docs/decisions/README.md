@@ -8,8 +8,8 @@ type: reference
 category: architecture
 audience: builder
 tags: [decisions, adr, architecture]
-updated: 2026-07-12
-last_updated: 2026-07-12
+updated: 2026-07-13
+last_updated: 2026-07-13
 ---
 
 # Architecture Decision Records
@@ -36,6 +36,7 @@ registry-backed runtime identity, daemon truth, or the current Now/Next/Later ro
 | [0007](0007-desktop-shell-stack.md) | Desktop shell stack | **Superseded** | Historical only | 2026-04-15 | -- |
 | [0008](0008-dioxus-desktop-host.md) | Dioxus Desktop host | **Accepted** | Current desktop host authority | 2026-06-14 | 0007 |
 | [0009](0009-reconcile-impulse-copies.md) | Reconcile duplicate Impulse codebases | **Accepted** | Current canonical-tree authority | 2026-06-25 | -- |
+| [0010](0010-product-role-launch-contract.md) | Product role launch contract | **Accepted** | Current explicit role/task launch-preflight authority | 2026-07-13 | -- |
 
 ## ADR Format
 
