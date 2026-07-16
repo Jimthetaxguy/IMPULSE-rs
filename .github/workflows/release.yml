@@ -64,7 +64,7 @@ jobs:
           path: ${{ matrix.artifact }}
 
   build-dmg:
-    name: Build macOS App (.dmg)
+    name: Build and smoke Dioxus macOS App (.dmg)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -77,17 +77,29 @@ jobs:
         with:
           workspaces: impulse-rs
 
-      - name: Build universal app bundle + DMG
+      - name: Test cross-platform packaging contract
+        working-directory: impulse-rs
+        run: cargo test --locked -p impulse-desktop --test macos_packaging_contract
+
+      - name: Build, verify, and smoke universal Dioxus bundle + DMG
         working-directory: impulse-rs
         env:
           VERSION: ${{ github.ref_name }}
-        run: bash scripts/build-macos-app.sh --universal --dmg --version "${VERSION#v}"
+        run: bash scripts/build-macos-app.sh --universal --dmg --smoke --version "${VERSION#v}"
+
+      - name: Upload package smoke evidence on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: impulse-dioxus-smoke-failure
+          path: impulse-rs/target/package-smoke
+          if-no-files-found: ignore
 
       - name: Upload DMG
         uses: actions/upload-artifact@v4
         with:
-          name: impulse-dmg
-          path: impulse-rs/Impulse-*.dmg
+          name: impulse-dioxus-developer-preview-dmg
+          path: impulse-rs/target/package/Impulse-*.dmg
 
   release:
     name: Create Release

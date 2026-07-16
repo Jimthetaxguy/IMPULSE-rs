@@ -19,6 +19,8 @@
 
 #![cfg(not(feature = "legacy-tauri-runtime"))]
 
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use dioxus::prelude::*;
@@ -29,6 +31,7 @@ use tokio::sync::mpsc::{
     channel, error::TrySendError, unbounded_channel, Receiver, UnboundedReceiver, UnboundedSender,
 };
 
+use crate::desktop_shutdown::DesktopShutdownCoordinator;
 use crate::host_commands::{
     self, DesktopShellState, AGENT_CLOSE_COMMAND, AGENT_FOCUS_COMMAND, AGENT_PLATFORMS_COMMAND,
     AGENT_RESIZE_COMMAND, AGENT_SNAPSHOT_COMMAND, AGENT_SPAWN_COMMAND, AGENT_WRITE_COMMAND,
@@ -44,7 +47,42 @@ use crate::runtime::{DesktopEvent, DesktopEventSink};
 /// stubs. Anything other than [`crate::host_commands::PENDING_HOST_BOOTSTRAP_STATUS`]
 /// reads as "ready" to the host-adapter resolver in `ui.rs`.
 pub const LIVE_HOST_BRIDGE_STATUS: &str = "dioxus-eval-bridge-ready";
+pub const LIVE_HOST_READINESS_COMMAND: &str = "impulse_host_ready";
+pub const PACKAGE_SMOKE_COMPLETE_COMMAND: &str = "impulse_package_smoke_complete";
+pub const PACKAGE_SMOKE_ENV: &str = "IMPULSE_DESKTOP_SMOKE";
+pub const PACKAGE_SMOKE_RECEIPT_PREFIX: &str = "IMPULSE_DESKTOP_SMOKE_RECEIPT ";
+pub const HOST_INVOKE_RESULT_KIND: &str = "host_invoke_result";
 const HOST_INVOKE_QUEUE_CAPACITY: usize = 64;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct HostReadinessProbe {
+    status: String,
+    assets_ready: bool,
+    terminal_constructor_ready: bool,
+    fit_addon_ready: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct HostReadinessAck {
+    status: String,
+    smoke_mode: bool,
+    smoke_cwd: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PackageSmokeReceipt {
+    status: String,
+    session_id: String,
+    bridge_ready: bool,
+    assets_ready: bool,
+    terminal_opened: bool,
+    terminal_output_seen: bool,
+    terminal_resized: bool,
+    terminal_focused: bool,
+    terminal_closed: bool,
+    terminal_exit_seen: bool,
+    ops_update_seen: bool,
+}
 
 /// A single `invoke()` call crossing from JS into Rust.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -60,30 +98,41 @@ pub struct HostInvokeRequest {
 /// failure message (never both).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HostInvokeResponse {
+    pub kind: String,
     pub id: String,
     pub ok: bool,
     #[serde(default)]
     pub result: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub close_desktop: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl HostInvokeResponse {
     fn ok(id: String, result: Value) -> Self {
         Self {
+            kind: HOST_INVOKE_RESULT_KIND.to_string(),
             id,
             ok: true,
             result,
             error: None,
+            close_desktop: false,
         }
     }
 
     fn err(id: String, error: String) -> Self {
         Self {
+            kind: HOST_INVOKE_RESULT_KIND.to_string(),
             id,
             ok: false,
             result: Value::Null,
             error: Some(error),
+            close_desktop: false,
         }
     }
 }
@@ -104,6 +153,92 @@ fn json<T: Serialize>(value: T) -> Result<Value, String> {
     serde_json::to_value(value).map_err(|error| format!("failed to serialize result: {error}"))
 }
 
+fn package_smoke_enabled() -> bool {
+    std::env::var(PACKAGE_SMOKE_ENV).as_deref() == Ok("1")
+}
+
+fn package_smoke_trace(message: impl AsRef<str>) {
+    if package_smoke_enabled() {
+        eprintln!("desktop package smoke: {}", message.as_ref());
+    }
+}
+
+fn acknowledge_live_host(
+    state: &DesktopShellState,
+    probe: HostReadinessProbe,
+) -> Result<HostReadinessAck, String> {
+    if probe.status != LIVE_HOST_BRIDGE_STATUS {
+        return Err(format!(
+            "live host readiness status must be `{LIVE_HOST_BRIDGE_STATUS}`, got `{}`",
+            probe.status
+        ));
+    }
+    if !probe.assets_ready {
+        return Err("packaged xterm assets are not readable from the webview".to_string());
+    }
+    if !probe.terminal_constructor_ready {
+        return Err("xterm Terminal constructor is unavailable in the webview".to_string());
+    }
+    if !probe.fit_addon_ready {
+        return Err("xterm FitAddon constructor is unavailable in the webview".to_string());
+    }
+    let smoke_cwd = state
+        .memory_root()
+        .ok()
+        .and_then(|memory_root| memory_root.parent().map(Path::to_path_buf))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
+        .to_string_lossy()
+        .into_owned();
+    Ok(HostReadinessAck {
+        status: LIVE_HOST_BRIDGE_STATUS.to_string(),
+        smoke_mode: package_smoke_enabled(),
+        smoke_cwd,
+    })
+}
+
+fn emit_package_smoke_receipt(receipt: PackageSmokeReceipt) -> Result<Value, String> {
+    if !package_smoke_enabled() {
+        return Err("package smoke completion is unavailable outside diagnostic mode".to_string());
+    }
+    validate_package_smoke_receipt(&receipt)?;
+
+    let encoded = serde_json::to_string(&receipt)
+        .map_err(|error| format!("serialize package smoke receipt: {error}"))?;
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "{PACKAGE_SMOKE_RECEIPT_PREFIX}{encoded}")
+        .and_then(|_| stdout.flush())
+        .map_err(|error| format!("write package smoke receipt: {error}"))?;
+    json(receipt)
+}
+
+fn validate_package_smoke_receipt(receipt: &PackageSmokeReceipt) -> Result<(), String> {
+    if receipt.status != LIVE_HOST_BRIDGE_STATUS {
+        return Err(format!(
+            "package smoke status must be `{LIVE_HOST_BRIDGE_STATUS}`, got `{}`",
+            receipt.status
+        ));
+    }
+    if receipt.session_id.trim().is_empty() {
+        return Err("package smoke session id must not be blank".to_string());
+    }
+    let checks = [
+        ("bridge_ready", receipt.bridge_ready),
+        ("assets_ready", receipt.assets_ready),
+        ("terminal_opened", receipt.terminal_opened),
+        ("terminal_output_seen", receipt.terminal_output_seen),
+        ("terminal_resized", receipt.terminal_resized),
+        ("terminal_focused", receipt.terminal_focused),
+        ("terminal_closed", receipt.terminal_closed),
+        ("terminal_exit_seen", receipt.terminal_exit_seen),
+        ("ops_update_seen", receipt.ops_update_seen),
+    ];
+    if let Some((name, _)) = checks.into_iter().find(|(_, passed)| !passed) {
+        return Err(format!("package smoke check `{name}` did not pass"));
+    }
+    Ok(())
+}
+
 /// Route one command against the shell state, returning the serialized success
 /// value or an error message. Mirrors the non-legacy `host_commands` surface.
 async fn dispatch_command(
@@ -113,9 +248,18 @@ async fn dispatch_command(
 ) -> Result<Value, String> {
     let runtime = state.runtime.as_ref();
     match command {
+        LIVE_HOST_READINESS_COMMAND => json(acknowledge_live_host(
+            state,
+            body::<HostReadinessProbe>(payload)?,
+        )?),
+        PACKAGE_SMOKE_COMPLETE_COMMAND => {
+            emit_package_smoke_receipt(body::<PackageSmokeReceipt>(payload)?)
+        }
         AGENT_SNAPSHOT_COMMAND => json(host_commands::agent_snapshot(runtime).await?),
         AGENT_PLATFORMS_COMMAND => json(host_commands::agent_platforms().await?),
-        AGENT_SPAWN_COMMAND => json(host_commands::agent_spawn(runtime, body(payload)?).await?),
+        AGENT_SPAWN_COMMAND => {
+            json(host_commands::agent_spawn_with_state(state, body(payload)?).await?)
+        }
         AGENT_WRITE_COMMAND => json(host_commands::agent_write(runtime, body(payload)?).await?),
         GOVERNED_TASK_MUTATE_COMMAND => {
             json(host_commands::governed_task_mutate(state, body(payload)?).await?)
@@ -163,10 +307,18 @@ pub async fn dispatch_host_invoke(
     request: HostInvokeRequest,
 ) -> HostInvokeResponse {
     let id = request.id;
-    match dispatch_command(state, &request.command, request.payload).await {
+    let command = request.command.clone();
+    let mut response = match dispatch_command(state, &request.command, request.payload).await {
         Ok(result) => HostInvokeResponse::ok(id, result),
-        Err(error) => HostInvokeResponse::err(id, error),
+        Err(error) => {
+            eprintln!("Impulse live host command `{command}` failed: {error}");
+            HostInvokeResponse::err(id, error)
+        }
+    };
+    if response.ok && command == PACKAGE_SMOKE_COMPLETE_COMMAND {
+        response.close_desktop = true;
     }
+    response
 }
 
 async fn dispatch_host_invokes_fifo(
@@ -175,8 +327,11 @@ async fn dispatch_host_invokes_fifo(
     responses: UnboundedSender<HostInvokeResponse>,
 ) {
     while let Some(request) = requests.recv().await {
+        package_smoke_trace(format!("dispatching host invoke `{}`", request.command));
         let response = dispatch_host_invoke(&state, request).await;
+        package_smoke_trace(format!("host invoke `{}` completed", response.id));
         if responses.send(response).is_err() {
+            package_smoke_trace("host invoke response channel closed");
             break;
         }
     }
@@ -226,6 +381,7 @@ pub fn channel_event_sink() -> (Arc<ChannelEventSink>, UnboundedReceiver<Desktop
 pub struct LiveHostContext {
     state: DesktopShellState,
     event_rx: Arc<Mutex<Option<UnboundedReceiver<DesktopEvent>>>>,
+    shutdown_coordinator: Option<DesktopShutdownCoordinator>,
 }
 
 impl LiveHostContext {
@@ -233,7 +389,19 @@ impl LiveHostContext {
         Self {
             state,
             event_rx: Arc::new(Mutex::new(Some(event_rx))),
+            shutdown_coordinator: None,
         }
+    }
+
+    /// Share the ordered desktop lifecycle boundary with the native host
+    /// bridge. Programmatic close must drain workers and telemetry before it
+    /// stops an owned companion and asks Dioxus to close its final window.
+    pub fn with_shutdown_coordinator(
+        mut self,
+        shutdown_coordinator: DesktopShutdownCoordinator,
+    ) -> Self {
+        self.shutdown_coordinator = Some(shutdown_coordinator);
+        self
     }
 }
 
@@ -299,6 +467,227 @@ pub const LIVE_HOST_BRIDGE_SCRIPT: &str = concat!(
     "dioxus-eval-bridge-ready",
     r#""
   );
+  window.dispatchEvent?.(new CustomEvent("impulse-host-ready", {
+    detail: { status: host.status },
+  }));
+
+  const requiredAssets = [
+    "assets/vendor/xterm/xterm.css",
+    "assets/vendor/xterm/xterm.js",
+    "assets/vendor/xterm/addon-fit.js",
+  ];
+  const withTimeout = (promise, label, timeoutMs = 12000) =>
+    Promise.race([
+      promise,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`${label} timed out`)), timeoutMs)
+      ),
+    ]);
+  const terminalAssetState = () => {
+    const terminalReady =
+      typeof (window.Terminal || window.XTerm?.Terminal) === "function";
+    const fitReady =
+      typeof (window.FitAddon?.FitAddon || window.FitAddon) === "function";
+    const stylesheetReady = Array.from(document.styleSheets ?? []).some((sheet) =>
+      String(sheet?.href ?? "").endsWith(requiredAssets[0])
+    );
+    return {
+      terminalReady,
+      fitReady,
+      stylesheetReady,
+      assetsReady: terminalReady && fitReady && stylesheetReady,
+    };
+  };
+  const waitForTerminalAssets = async () => {
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      const state = terminalAssetState();
+      if (state.assetsReady) {
+        return state;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    return terminalAssetState();
+  };
+  const runPackageSmoke = async (readiness) => {
+    const expectedOutput = "IMPULSE_PTY_SMOKE_OK";
+    let outputText = "";
+    let resolveOutput;
+    let resolveOps;
+    let resolveExit;
+    let resolveShutdownProbe;
+    const outputSeen = new Promise((resolve) => { resolveOutput = resolve; });
+    const opsSeen = new Promise((resolve) => { resolveOps = resolve; });
+    const exitSeen = new Promise((resolve) => { resolveExit = resolve; });
+    const shutdownProbeReady = new Promise((resolve) => {
+      resolveShutdownProbe = resolve;
+    });
+    let smokeSessionId = "impulse-package-smoke";
+    let outputUnlisten;
+    let opsUnlisten;
+    let exitUnlisten;
+    let terminalOpened = false;
+    let terminalClosed = false;
+    let shutdownProbeOutput = "";
+    let shutdownProbeOpened = false;
+    let shutdownProbeSessionId = "impulse-shutdown-probe";
+    let receiptAcknowledged = false;
+
+    try {
+      outputUnlisten = await host.listen("terminal_output", (event) => {
+        const payload = event?.payload ?? {};
+        const bytes = Array.isArray(payload.data) ? payload.data : [];
+        const decoded = new TextDecoder().decode(new Uint8Array(bytes));
+        if (payload.agent_id === smokeSessionId) {
+          outputText += decoded;
+          if (outputText.includes(expectedOutput)) { resolveOutput(true); }
+        }
+        if (payload.agent_id === shutdownProbeSessionId) {
+          shutdownProbeOutput += decoded;
+          if (shutdownProbeOutput.includes("IMPULSE_SHUTDOWN_PROBE_READY")) {
+            resolveShutdownProbe(true);
+          }
+        }
+      });
+      opsUnlisten = await host.listen("ops_update", (event) => {
+        const envelope = event?.payload ?? {};
+        const snapshot = envelope.payload ?? envelope;
+        const agents = Array.isArray(snapshot?.agents) ? snapshot.agents : [];
+        if (agents.some((agent) =>
+          agent.id === smokeSessionId || agent.session_id === smokeSessionId
+        )) {
+          resolveOps(true);
+        }
+      });
+      exitUnlisten = await host.listen("terminal_exit", (event) => {
+        const payload = event?.payload ?? {};
+        if (payload.agent_id === smokeSessionId) { resolveExit(true); }
+      });
+
+      const opened = await host.invoke("terminal_open", {
+        request: {
+          session_id: smokeSessionId,
+          command: "/bin/sh",
+          args: [],
+          cwd: readiness.smoke_cwd,
+          env: {},
+          workspace: null,
+          mcp_tools: [],
+          rows: 24,
+          cols: 80,
+        },
+      });
+      smokeSessionId = opened.session_id;
+      terminalOpened = !!opened.session_id;
+      await host.invoke("terminal_resize", {
+        request: { session_id: smokeSessionId, rows: 30, cols: 100 },
+      });
+      await host.invoke("terminal_focus", {
+        request: { session_id: smokeSessionId },
+      });
+      await host.invoke("terminal_write", {
+        request: {
+          session_id: smokeSessionId,
+          data: Array.from(
+            new TextEncoder().encode("printf 'IMPULSE_PTY_SMOKE_OK\\n'\\n")
+          ),
+        },
+      });
+      await withTimeout(outputSeen, "terminal output");
+      await withTimeout(opsSeen, "daemon ops update");
+      await host.invoke("terminal_close", {
+        request: { session_id: smokeSessionId },
+      });
+      terminalClosed = true;
+      await withTimeout(exitSeen, "terminal exit");
+
+      // Leave one exact, long-running worker alive when the native desktop
+      // closes. The package verifier reads its PID file and proves the ordered
+      // shutdown coordinator reaps it; the earlier smoke worker still proves
+      // the explicit terminal-close path independently.
+      const shutdownProbe = await host.invoke("terminal_open", {
+        request: {
+          session_id: shutdownProbeSessionId,
+          command: "/bin/sh",
+          args: [
+            "-lc",
+            "printf '%s' $$ > .impulse/desktop-shutdown-worker.pid; printf 'IMPULSE_SHUTDOWN_PROBE_READY\\n'; exec sleep 300",
+          ],
+          cwd: readiness.smoke_cwd,
+          env: {},
+          workspace: null,
+          mcp_tools: [],
+          rows: 24,
+          cols: 80,
+        },
+      });
+      shutdownProbeSessionId = shutdownProbe.session_id;
+      shutdownProbeOpened = shutdownProbe.alive === true;
+      if (!shutdownProbeOpened) {
+        throw new Error("shutdown probe worker did not remain alive");
+      }
+      await withTimeout(shutdownProbeReady, "shutdown probe readiness");
+
+      const receipt = await host.invoke("impulse_package_smoke_complete", {
+        request: {
+          status: host.status,
+          session_id: smokeSessionId,
+          bridge_ready: true,
+          assets_ready: true,
+          terminal_opened: opened.alive === true,
+          terminal_output_seen: true,
+          terminal_resized: true,
+          terminal_focused: true,
+          terminal_closed: true,
+          terminal_exit_seen: true,
+          ops_update_seen: true,
+        },
+      });
+      receiptAcknowledged = true;
+      return receipt;
+    } finally {
+      if (terminalOpened && !terminalClosed) {
+        try {
+          await host.invoke("terminal_close", {
+            request: { session_id: smokeSessionId },
+          });
+        } catch (_) {}
+      }
+      if (shutdownProbeOpened && !receiptAcknowledged) {
+        try {
+          await host.invoke("terminal_close", {
+            request: { session_id: shutdownProbeSessionId },
+          });
+        } catch (_) {}
+      }
+      for (const unlisten of [outputUnlisten, opsUnlisten, exitUnlisten]) {
+        if (typeof unlisten !== "function") { continue; }
+        try { await unlisten(); } catch (_) {}
+      }
+      // The Rust host owns final close and runs the ordered shutdown
+      // coordinator before asking Tao to destroy the window.
+    }
+  };
+  const startReadinessProbe = async () => {
+    // Dioxus serves packaged assets through a custom WKWebView scheme. Fetch
+    // can report those responses as opaque/non-ok even after WebKit has loaded
+    // them successfully, so readiness must be based on observable effects.
+    const assets = await waitForTerminalAssets();
+    const readiness = await host.invoke("impulse_host_ready", {
+      request: {
+        status: host.status,
+        assets_ready: assets.assetsReady,
+        terminal_constructor_ready: assets.terminalReady,
+        fit_addon_ready: assets.fitReady,
+      },
+    });
+    if (readiness.smoke_mode) {
+      await runPackageSmoke(readiness);
+    }
+  };
+  void startReadinessProbe().catch((error) => {
+    console.error("Impulse live host readiness failed", error);
+  });
 
   for (;;) {
     let message;
@@ -341,73 +730,122 @@ pub fn live_host_bridge_script() -> &'static str {
 /// channel closes. This is the only function that touches the Dioxus runtime;
 /// everything it calls is plain data.
 pub fn use_live_host_bridge() {
-    use_future(move || async move {
-        let Some(context) = live_host_context() else {
-            return;
-        };
-        let Some(mut event_rx) = context
-            .event_rx
-            .lock()
-            .ok()
-            .and_then(|mut guard| guard.take())
-        else {
-            // Another mount already claimed the receiver; nothing to do.
-            return;
-        };
-        let state = context.state.clone();
-        let mut eval = document::eval(LIVE_HOST_BRIDGE_SCRIPT);
-        let (invoke_result_tx, mut invoke_result_rx) = unbounded_channel::<HostInvokeResponse>();
-        let (invoke_tx, invoke_rx) = channel::<HostInvokeRequest>(HOST_INVOKE_QUEUE_CAPACITY);
-        let invoke_state = state.clone();
-        let invoke_worker = tokio::spawn(dispatch_host_invokes_fifo(
-            invoke_state,
-            invoke_rx,
-            invoke_result_tx,
-        ));
+    #[cfg(feature = "desktop-app")]
+    let desktop_context = dioxus_desktop::window();
+    use_future(move || {
+        #[cfg(feature = "desktop-app")]
+        let desktop_context = desktop_context.clone();
+        async move {
+            package_smoke_trace("live host bridge future started");
+            let Some(context) = live_host_context() else {
+                package_smoke_trace("live host context is unavailable");
+                return;
+            };
+            let Some(mut event_rx) = context
+                .event_rx
+                .lock()
+                .ok()
+                .and_then(|mut guard| guard.take())
+            else {
+                // Another mount already claimed the receiver; nothing to do.
+                package_smoke_trace("live host event receiver was already claimed");
+                return;
+            };
+            let state = context.state.clone();
+            let shutdown_coordinator = context.shutdown_coordinator.clone();
+            package_smoke_trace("creating Dioxus eval transport");
+            let mut eval = document::eval(LIVE_HOST_BRIDGE_SCRIPT);
+            package_smoke_trace("Dioxus eval transport created");
+            let (invoke_result_tx, mut invoke_result_rx) =
+                unbounded_channel::<HostInvokeResponse>();
+            let (invoke_tx, invoke_rx) = channel::<HostInvokeRequest>(HOST_INVOKE_QUEUE_CAPACITY);
+            let invoke_state = state.clone();
+            let invoke_worker = spawn(dispatch_host_invokes_fifo(
+                invoke_state,
+                invoke_rx,
+                invoke_result_tx,
+            ));
 
-        loop {
-            tokio::select! {
-                event = event_rx.recv() => {
-                    match event {
-                        Some(event) => {
-                            let _ = eval.send(host_event_envelope(&event));
+            loop {
+                tokio::select! {
+                    event = event_rx.recv() => {
+                        match event {
+                            Some(event) => {
+                                let _ = eval.send(host_event_envelope(&event));
+                            }
+                            None => break,
                         }
-                        None => break,
                     }
-                }
-                response = invoke_result_rx.recv() => {
-                    if let Some(response) = response {
-                        if let Ok(value) = serde_json::to_value(&response) {
-                            let _ = eval.send(value);
-                        }
-                        }
-                }
-                request = eval.recv::<HostInvokeRequest>() => {
-                    match request {
-                        Ok(request) => {
-                            let rejected = match invoke_tx.try_send(request) {
-                                Ok(()) => None,
-                                Err(TrySendError::Full(request)) => Some(HostInvokeResponse::err(
-                                    request.id,
-                                    "host invoke queue is full".to_string(),
-                                )),
-                                Err(TrySendError::Closed(request)) => Some(HostInvokeResponse::err(
-                                    request.id,
-                                    "host invoke worker is unavailable".to_string(),
-                                )),
-                            };
-                            if let Some(response) = rejected {
-                                if let Ok(value) = serde_json::to_value(&response) {
-                                    let _ = eval.send(value);
+                    response = invoke_result_rx.recv() => {
+                        if let Some(response) = response {
+                            package_smoke_trace(format!("sending host invoke response `{}`", response.id));
+                            let close_desktop = response.close_desktop;
+                            if let Ok(value) = serde_json::to_value(&response) {
+                                if let Err(error) = eval.send(value) {
+                                    package_smoke_trace(format!("Dioxus eval response send failed: {error}"));
                                 }
                             }
+                            if close_desktop {
+                                package_smoke_trace("requesting graceful native desktop close");
+                                if let Some(coordinator) = shutdown_coordinator.as_ref() {
+                                    match coordinator.shutdown() {
+                                        Some(report) => {
+                                            let daemon_mode = report
+                                                .daemon_sidecar
+                                                .as_ref()
+                                                .map(|outcome| outcome.mode);
+                                            package_smoke_trace(format!(
+                                                "desktop shutdown completed: agents_seen={} agents_closed={} agents_already_exited={} runtime_errors={} daemon={:?} daemon_ops={:?} daemon_sidecar={:?}",
+                                                report.runtime.agents_seen,
+                                                report.runtime.agents_closed,
+                                                report.runtime.agents_already_exited,
+                                                report.runtime.errors.len(),
+                                                daemon_mode,
+                                                report.daemon_ops,
+                                                report.daemon_sidecar,
+                                            ));
+                                        }
+                                        None => package_smoke_trace(
+                                            "desktop shutdown was already completed",
+                                        ),
+                                    }
+                                }
+                                #[cfg(feature = "desktop-app")]
+                                desktop_context.close();
+                            }
                         }
-                        Err(_) => break,
+                    }
+                    request = eval.recv::<HostInvokeRequest>() => {
+                        match request {
+                            Ok(request) => {
+                                package_smoke_trace(format!("received host invoke `{}`", request.command));
+                                let rejected = match invoke_tx.try_send(request) {
+                                    Ok(()) => None,
+                                    Err(TrySendError::Full(request)) => Some(HostInvokeResponse::err(
+                                        request.id,
+                                        "host invoke queue is full".to_string(),
+                                    )),
+                                    Err(TrySendError::Closed(request)) => Some(HostInvokeResponse::err(
+                                        request.id,
+                                        "host invoke worker is unavailable".to_string(),
+                                    )),
+                                };
+                                if let Some(response) = rejected {
+                                    if let Ok(value) = serde_json::to_value(&response) {
+                                        let _ = eval.send(value);
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                package_smoke_trace(format!("Dioxus eval receive failed: {error}"));
+                                break;
+                            }
+                        }
                     }
                 }
             }
+            invoke_worker.cancel();
         }
-        invoke_worker.abort();
     });
 }
 
@@ -417,6 +855,7 @@ pub fn use_live_host_bridge() {
 /// [`install_live_host_context`] before launching this component.
 #[component]
 pub fn LiveDesktopApp() -> Element {
+    package_smoke_trace("LiveDesktopApp rendered");
     use_live_host_bridge();
     rsx! {
         crate::ui::DesktopShell {}
@@ -529,12 +968,79 @@ mod tests {
         assert_eq!(request.command, "list_workspaces");
     }
 
+    fn passing_package_smoke_receipt() -> PackageSmokeReceipt {
+        PackageSmokeReceipt {
+            status: LIVE_HOST_BRIDGE_STATUS.to_string(),
+            session_id: "package-smoke-session".to_string(),
+            bridge_ready: true,
+            assets_ready: true,
+            terminal_opened: true,
+            terminal_output_seen: true,
+            terminal_resized: true,
+            terminal_focused: true,
+            terminal_closed: true,
+            terminal_exit_seen: true,
+            ops_update_seen: true,
+        }
+    }
+
+    #[test]
+    fn live_host_readiness_requires_assets_and_terminal_constructors() {
+        let state = test_state();
+        let ready = HostReadinessProbe {
+            status: LIVE_HOST_BRIDGE_STATUS.to_string(),
+            assets_ready: true,
+            terminal_constructor_ready: true,
+            fit_addon_ready: true,
+        };
+        let ack = acknowledge_live_host(&state, ready.clone()).expect("ready host acknowledged");
+        assert_eq!(ack.status, LIVE_HOST_BRIDGE_STATUS);
+        assert!(!ack.smoke_cwd.trim().is_empty());
+
+        let mut missing_asset = ready.clone();
+        missing_asset.assets_ready = false;
+        assert!(acknowledge_live_host(&state, missing_asset)
+            .unwrap_err()
+            .contains("xterm assets"));
+
+        let mut missing_terminal = ready.clone();
+        missing_terminal.terminal_constructor_ready = false;
+        assert!(acknowledge_live_host(&state, missing_terminal)
+            .unwrap_err()
+            .contains("Terminal constructor"));
+
+        let mut stale_status = ready;
+        stale_status.status = "manifest-only".to_string();
+        assert!(acknowledge_live_host(&state, stale_status)
+            .unwrap_err()
+            .contains(LIVE_HOST_BRIDGE_STATUS));
+    }
+
+    #[test]
+    fn package_smoke_receipt_requires_every_live_boundary() {
+        let passing = passing_package_smoke_receipt();
+        validate_package_smoke_receipt(&passing).expect("complete receipt");
+
+        let mut missing_output = passing.clone();
+        missing_output.terminal_output_seen = false;
+        assert!(validate_package_smoke_receipt(&missing_output)
+            .unwrap_err()
+            .contains("terminal_output_seen"));
+
+        let mut blank_session = passing;
+        blank_session.session_id = "  ".to_string();
+        assert!(validate_package_smoke_receipt(&blank_session)
+            .unwrap_err()
+            .contains("session id"));
+    }
+
     #[test]
     fn host_invoke_response_round_trips_both_arms() {
         let ok = HostInvokeResponse::ok("a".to_string(), json!([1, 2, 3]));
         let err = HostInvokeResponse::err("b".to_string(), "boom".to_string());
         for response in [ok, err] {
             let text = serde_json::to_string(&response).unwrap();
+            assert!(text.contains(&format!(r#""kind":"{HOST_INVOKE_RESULT_KIND}""#)));
             let back: HostInvokeResponse = serde_json::from_str(&text).unwrap();
             assert_eq!(response, back);
         }
@@ -876,11 +1382,174 @@ mod tests {
         assert!(script.contains("let invokeTail = Promise.resolve()"));
         assert!(script.contains("invokeTail = scheduled.then("));
         assert!(script.contains(LIVE_HOST_BRIDGE_STATUS));
+        assert!(script.contains(LIVE_HOST_READINESS_COMMAND));
+        assert!(script.contains(PACKAGE_SMOKE_COMPLETE_COMMAND));
+        assert!(script.contains("IMPULSE_PTY_SMOKE_OK"));
+        assert!(script.contains("assets/vendor/xterm/xterm.css"));
+        assert!(script.contains("document.styleSheets"));
+        assert!(script.contains("assetsReady: terminalReady && fitReady && stylesheetReady"));
+        assert!(!script.contains("await fetch("));
+        assert!(script.contains("terminal_opened"));
+        assert!(script.contains("terminal_output_seen"));
+        assert!(script.contains("ops_update_seen"));
+        assert!(script.contains("finally"));
+        assert!(script.contains("terminalOpened && !terminalClosed"));
+        assert!(script.contains("receiptAcknowledged"));
+        assert!(script.contains("impulse-shutdown-probe"));
+        assert!(script.contains("IMPULSE_SHUTDOWN_PROBE_READY"));
+        assert!(!script.contains("window.close()"));
         // Must NOT advertise the pending sentinel — it is the live transport.
         assert_ne!(
             LIVE_HOST_BRIDGE_STATUS,
             crate::host_commands::PENDING_HOST_BOOTSTRAP_STATUS
         );
+    }
+
+    #[test]
+    fn live_host_smoke_uses_loaded_effects_when_custom_scheme_fetch_is_unavailable() {
+        let Ok(node_version) = std::process::Command::new("node").arg("--version").output() else {
+            eprintln!("node is unavailable; skipping live-host asset readiness smoke");
+            return;
+        };
+        if !node_version.status.success() {
+            eprintln!("node is unavailable; skipping live-host asset readiness smoke");
+            return;
+        }
+
+        let smoke = format!(
+            r#"
+const bridgeScript = {bridge_script};
+const liveStatus = {live_status};
+const calls = [];
+let fetchCalls = 0;
+let openCount = 0;
+let inbox = [];
+let waiters = [];
+
+const push = (message) => {{
+  const waiter = waiters.shift();
+  if (waiter) waiter(message);
+  else inbox.push(message);
+}};
+const respond = (request, result) => push({{
+  kind: "host_invoke_result",
+  id: request.id,
+  ok: true,
+  result,
+}});
+const event = (name, payload) => push({{
+  kind: "host_event",
+  event: name,
+  payload,
+}});
+
+class Terminal {{}}
+class FitAddon {{}}
+global.window = {{
+  Terminal,
+  FitAddon: {{ FitAddon }},
+  dispatchEvent() {{}},
+  close() {{
+    console.log(JSON.stringify({{ calls, fetchCalls }}));
+    process.exit(0);
+  }},
+}};
+global.document = {{
+  styleSheets: [{{ href: "dioxus://index/assets/vendor/xterm/xterm.css" }}],
+  documentElement: {{ setAttribute() {{}} }},
+}};
+global.CustomEvent = class CustomEvent {{
+  constructor(name, init) {{ this.name = name; this.detail = init?.detail; }}
+}};
+global.fetch = async () => {{
+  fetchCalls += 1;
+  throw new Error("custom scheme Fetch is opaque");
+}};
+global.dioxus = {{
+  send(request) {{
+    calls.push(request.command);
+    queueMicrotask(() => {{
+      if (request.command === "impulse_host_ready") {{
+        respond(request, {{ status: liveStatus, smoke_mode: true, smoke_cwd: "/tmp" }});
+      }} else if (request.command === "terminal_open") {{
+        openCount += 1;
+        const sessionId = openCount === 1
+          ? "impulse-package-smoke"
+          : "impulse-shutdown-probe";
+        respond(request, {{ session_id: sessionId, alive: true }});
+        if (openCount === 2) {{
+          event("terminal_output", {{
+            agent_id: sessionId,
+            data: Array.from(new TextEncoder().encode("IMPULSE_SHUTDOWN_PROBE_READY\n")),
+          }});
+        }}
+      }} else if (request.command === "terminal_write") {{
+        respond(request, null);
+        event("terminal_output", {{
+          agent_id: "impulse-package-smoke",
+          data: Array.from(new TextEncoder().encode("IMPULSE_PTY_SMOKE_OK\n")),
+        }});
+        event("ops_update", {{ agents: [{{ id: "impulse-package-smoke" }}] }});
+      }} else if (request.command === "terminal_close") {{
+        respond(request, null);
+        event("terminal_exit", {{ agent_id: "impulse-package-smoke" }});
+      }} else if (request.command === "impulse_package_smoke_complete") {{
+        respond(request, request.payload.request);
+        setTimeout(() => {{
+          console.log(JSON.stringify({{ calls, fetchCalls }}));
+          process.exit(0);
+        }}, 0);
+      }} else {{
+        respond(request, null);
+      }}
+    }});
+  }},
+  recv() {{
+    if (inbox.length) return Promise.resolve(inbox.shift());
+    return new Promise((resolve) => waiters.push(resolve));
+  }},
+}};
+
+eval(bridgeScript);
+setTimeout(() => {{
+  console.error(JSON.stringify({{ error: "smoke timed out", calls, fetchCalls }}));
+  process.exit(1);
+}}, 1000);
+"#,
+            bridge_script =
+                serde_json::to_string(live_host_bridge_script()).expect("serialize bridge script"),
+            live_status =
+                serde_json::to_string(LIVE_HOST_BRIDGE_STATUS).expect("serialize live status"),
+        );
+        let tempdir = tempfile::tempdir().expect("create live-host smoke tempdir");
+        let script_path = tempdir.path().join("live-host-loaded-effects-smoke.js");
+        std::fs::write(&script_path, smoke).expect("write live-host smoke script");
+        let output = std::process::Command::new("node")
+            .arg(&script_path)
+            .output()
+            .expect("run live-host loaded-effects smoke");
+        assert!(
+            output.status.success(),
+            "live-host loaded-effects smoke failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("parse live-host smoke output");
+        assert_eq!(result["fetchCalls"], serde_json::json!(0));
+        let calls = result["calls"].as_array().expect("host call list");
+        for required in [
+            "impulse_host_ready",
+            "terminal_open",
+            "terminal_write",
+            "terminal_close",
+            "impulse_package_smoke_complete",
+        ] {
+            assert!(
+                calls.iter().any(|call| call == required),
+                "missing live-host call {required}: {result}"
+            );
+        }
     }
 
     #[test]

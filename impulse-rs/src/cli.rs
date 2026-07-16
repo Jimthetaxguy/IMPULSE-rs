@@ -29,6 +29,13 @@ pub struct Cli {
     #[arg(long)]
     pub socket: Option<PathBuf>,
 
+    /// Internal lifecycle binding for a desktop-spawned daemon companion.
+    ///
+    /// The daemon accepts this only when the supplied PID is its exact direct
+    /// parent, so operator-started daemons remain independent by default.
+    #[arg(long, hide = true)]
+    pub owner_pid: Option<u32>,
+
     /// Output format: json (default for pipes), text (default for TTY), ndjson (streaming)
     #[arg(long, global = true)]
     pub format: Option<envelope::OutputFormat>,

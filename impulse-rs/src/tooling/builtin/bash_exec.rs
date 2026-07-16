@@ -528,20 +528,18 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn test_aborting_execute_kills_the_whole_process_group() {
-        let unique_duration = format!(
-            "9.{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
-        let pattern = format!("sleep {unique_duration}");
+        let tempdir = tempfile::tempdir().expect("create abort-test tempdir");
+        let child_pid_path = tempdir.path().join("background-child.pid");
         let tool = BashExecTool;
         let ctx = ToolContext::with_all_capabilities();
+        let command = format!(
+            "sleep 30 & child=$!; printf '%s' \"$child\" > \"{}\"; wait",
+            child_pid_path.display()
+        );
         let task = tokio::spawn(async move {
             tool.execute(
                 serde_json::json!({
-                    "command": format!("sleep {unique_duration} & wait"),
+                    "command": command,
                     "timeout_secs": 30
                 }),
                 &ctx,
@@ -549,16 +547,15 @@ mod tests {
             .await
         });
 
-        tokio::time::timeout(Duration::from_secs(2), async {
+        // Wait on an exact child-PID receipt instead of a system-wide `pgrep`.
+        // macOS process enumeration can be unavailable while sysmond is
+        // unhealthy, which must not make cancellation coverage indeterminate.
+        let child_pid = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let check = tokio::process::Command::new("pgrep")
-                    .arg("-f")
-                    .arg(&pattern)
-                    .output()
-                    .await
-                    .expect("pgrep should run");
-                if !String::from_utf8_lossy(&check.stdout).trim().is_empty() {
-                    break;
+                if let Ok(contents) = tokio::fs::read_to_string(&child_pid_path).await {
+                    if let Ok(pid) = contents.trim().parse::<u32>() {
+                        break pid;
+                    }
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -569,15 +566,14 @@ mod tests {
         task.abort();
         let _ = task.await;
         if let Err(stray) =
-            crate::test_support::wait_for_no_matching_process(&pattern, Duration::from_secs(2))
-                .await
+            crate::test_support::wait_for_pids_to_exit(&[child_pid], Duration::from_secs(5)).await
         {
-            let _ = tokio::process::Command::new("pkill")
-                .arg("-f")
-                .arg(&pattern)
-                .status()
-                .await;
-            panic!("aborting bash_exec must kill backgrounded grandchildren; found pids: {stray}");
+            // SAFETY: `child_pid` came from the exact child receipt written by
+            // this test command; cleanup is limited to that process.
+            unsafe {
+                libc::kill(child_pid as i32, libc::SIGKILL);
+            }
+            panic!("aborting bash_exec must kill its exact backgrounded child; survivor: {stray}");
         }
     }
 

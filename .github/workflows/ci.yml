@@ -25,7 +25,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: impulse-rs
-      - run: cargo test
+      - name: Test workspace
+        run: cargo test --workspace --locked
 
   lint:
     name: Lint
@@ -41,8 +42,36 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: impulse-rs
-      - run: cargo clippy -- -D warnings
-      - run: cargo fmt --check
+      - name: Format workspace
+        run: cargo fmt --all -- --check
+      - name: Check workspace
+        run: cargo check --workspace --locked
+      - name: Verify default workspace excludes legacy EGUI
+        run: |
+          if cargo tree --workspace --locked --edges normal | grep -E '(egui|eframe) v[0-9]'; then
+            echo "::error::The default workspace dependency graph includes legacy EGUI/eframe"
+            exit 1
+          fi
+          echo "Default workspace dependency graph excludes legacy EGUI/eframe"
+      - name: Clippy workspace
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  desktop:
+    name: Desktop features (macOS)
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: impulse-rs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: impulse-rs
+      - name: Build Dioxus desktop application
+        run: cargo build -p impulse-desktop --features desktop-app --bin impulse-desktop --locked
+      - name: Check legacy Tauri compatibility adapter
+        run: cargo check -p impulse-desktop --lib --features legacy-tauri-runtime --locked
 
   build:
     name: Build (release)
@@ -56,7 +85,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: impulse-rs
-      - name: Build (default features, includes office-support)
-        run: cargo build --release
-      - name: Build (minimal, no default features)
-        run: cargo build --no-default-features
+      - name: Build workspace (release)
+        run: cargo build --workspace --release --locked
+      - name: Build workspace (minimal, no default features)
+        run: cargo build --workspace --no-default-features --locked

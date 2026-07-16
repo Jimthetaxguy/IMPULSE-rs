@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 
 use dioxus::prelude::*;
 use impulse_ops::{
@@ -24,10 +25,8 @@ use crate::runtime::{
     default_builtin_mcp_tools, AgentPlatformId, AgentRuntimeSnapshot, AgentSpawnRequest,
     BuiltInMcpTool, WorkspaceTarget,
 };
-use crate::theme::{
-    format_count, format_relative_age, status_dot_class, status_label, usage_meter_pct,
-};
-use crate::views::{ArtifactsView, DesktopView, MemoryView, ShellIntent};
+use crate::theme::{format_count, format_relative_age, status_dot_class, status_label};
+use crate::views::{ArtifactsView, DesktopView, MemoryView};
 use crate::workspace::WorkspaceEntry;
 
 const CRT_CSS: &str = include_str!("../assets/impulse_crt.css");
@@ -66,7 +65,41 @@ macro_rules! impulse_host_adapter_resolution_script {
       hostKind: dioxusHost ? "dioxus" : legacyTauri ? "legacy-tauri" : "missing",
     };
   };
-  const { invoke, listen, hostKind } = resolveImpulseHostAdapter();
+  const impulseHostPending = () => {
+    const host = window.__IMPULSE_DESKTOP_HOST;
+    return !!host && (
+      host.status === PENDING_IMPULSE_HOST_STATUS ||
+      !!host.invoke?.__impulseHostPending ||
+      !!host.listen?.__impulseHostPending
+    );
+  };
+  const waitForImpulseHostSignal = (delayMs) => new Promise((resolve) => {
+    let settled = false;
+    let timer;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      window.removeEventListener?.("impulse-host-ready", finish);
+      resolve();
+    };
+    timer = setTimeout(finish, delayMs);
+    window.addEventListener?.("impulse-host-ready", finish, { once: true });
+  });
+  const waitForImpulseHostAdapter = async (timeoutMs = 250) => {
+    let adapter = resolveImpulseHostAdapter();
+    if ((adapter.invoke && adapter.listen) || !impulseHostPending()) {
+      return adapter;
+    }
+    const deadline = Date.now() + timeoutMs;
+    while ((!adapter.invoke || !adapter.listen) && impulseHostPending()) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      await waitForImpulseHostSignal(Math.min(25, remaining));
+      adapter = resolveImpulseHostAdapter();
+    }
+    return adapter;
+  };
 "#
     };
 }
@@ -84,6 +117,7 @@ const DESKTOP_EVENT_BRIDGE_SCRIPT: &str = concat!(
 "#,
     impulse_host_adapter_resolution_script!(),
     r#"
+  const { invoke, listen, hostKind } = await waitForImpulseHostAdapter();
   window.__impulseOpsBridge = {
     mounted: true,
     degraded: !listen,
@@ -215,6 +249,7 @@ const DESKTOP_EVENT_BRIDGE_SCRIPT: &str = concat!(
       forward("mcp_invocation", { invocation });
       await refreshAgents();
       await refreshWorkspaces();
+      await refreshReviewQueue();
       return invocation;
     } catch (error) {
       forward("bridge_status", {
@@ -234,10 +269,29 @@ const DESKTOP_EVENT_BRIDGE_SCRIPT: &str = concat!(
       const snapshot = await invoke("agent_focus", { request: { session_id: agentId } });
       forward("agent_runtime_update", snapshot);
       await refreshAgents();
+      window.setTimeout?.(() => window.__impulseTerminalInterop?.activateAgent?.(agentId), 0);
       return snapshot;
     } catch (error) {
       forward("bridge_status", {
         status: "agent_focus_failed",
+        reason: String(error),
+        agent_id: agentId,
+      });
+      throw error;
+    }
+  };
+  window.__impulseOpsBridge.closeAgent = async (agentId) => {
+    if (!invoke) {
+      forward("bridge_status", { status: "agent_close_failed", reason: "host invoke API unavailable" });
+      return null;
+    }
+    try {
+      const result = await invoke("agent_close", { request: { session_id: agentId } });
+      await refreshAgents();
+      return result;
+    } catch (error) {
+      forward("bridge_status", {
+        status: "agent_close_failed",
         reason: String(error),
         agent_id: agentId,
       });
@@ -322,6 +376,7 @@ const TERMINAL_INTEROP_SCRIPT: &str = concat!(
 "#,
     impulse_host_adapter_resolution_script!(),
     r#"
+  const { invoke, listen, hostKind } = resolveImpulseHostAdapter();
   const Terminal = window.Terminal || window.XTerm?.Terminal;
   const FitAddonCtor = window.FitAddon?.FitAddon || window.FitAddon;
   const mounts = Array.from(document.querySelectorAll("[data-xterm-mount='true']"));
@@ -329,6 +384,9 @@ const TERMINAL_INTEROP_SCRIPT: &str = concat!(
   const interop = window.__impulseTerminalInterop || {
     mounted: true,
     terminals: {},
+    fitAddons: {},
+    mounts: {},
+    resizeObservers: {},
     unlisten: [],
     listenersMounted: false,
   };
@@ -356,12 +414,45 @@ const TERMINAL_INTEROP_SCRIPT: &str = concat!(
     return "";
   };
   const encodeInput = (data) => Array.from(encoder.encode(data));
+  const scheduleLayout = (callback) => {
+    if (typeof requestAnimationFrame === "function") {
+      requestAnimationFrame(() => requestAnimationFrame(callback));
+    } else {
+      callback();
+    }
+  };
+  const mountIsActive = (mount) =>
+    mount?.dataset?.terminalActive === "true" && !mount.hidden;
+  const fitAgentTerminal = (agentId, focus = false) => {
+    const mount = interop.mounts[agentId];
+    const terminal = interop.terminals[agentId];
+    if (!mountIsActive(mount) || !terminal) return;
+    scheduleLayout(() => {
+      if (!mountIsActive(mount)) return;
+      interop.fitAddons[agentId]?.fit();
+      if (focus) terminal.focus?.();
+    });
+  };
+  const observeTerminalMount = (agentId, mount) => {
+    if (interop.mounts[agentId] === mount && interop.resizeObservers[agentId]) {
+      return;
+    }
+    interop.resizeObservers[agentId]?.disconnect?.();
+    interop.mounts[agentId] = mount;
+    if (typeof ResizeObserver !== "function") return;
+    const observer = new ResizeObserver(() => fitAgentTerminal(agentId));
+    observer.observe(mount);
+    interop.resizeObservers[agentId] = observer;
+  };
+  interop.activateAgent = (agentId) => fitAgentTerminal(agentId, true);
 
   const mountAgentTerminal = (mount) => {
     const agentId = mount.dataset.agentId;
-    if (!agentId || interop.terminals[agentId]) {
+    if (!agentId) {
       return;
     }
+    observeTerminalMount(agentId, mount);
+    if (interop.terminals[agentId]) return;
 
     const terminal = new Terminal({
       convertEol: true,
@@ -372,7 +463,6 @@ const TERMINAL_INTEROP_SCRIPT: &str = concat!(
     const fitAddon = FitAddonCtor ? new FitAddonCtor() : null;
     if (fitAddon) terminal.loadAddon(fitAddon);
     terminal.open(mount);
-    fitAddon?.fit();
 
     const invokeTerminal = (command, payload) => {
       void invoke(command, payload).catch((error) => {
@@ -393,10 +483,15 @@ const TERMINAL_INTEROP_SCRIPT: &str = concat!(
     }
 
     interop.terminals[agentId] = terminal;
+    interop.fitAddons[agentId] = fitAddon;
     mount.setAttribute("data-xterm-state", "mounted");
+    fitAgentTerminal(agentId);
   };
 
   mounts.forEach(mountAgentTerminal);
+  mounts.forEach((mount) => {
+    if (mountIsActive(mount)) fitAgentTerminal(mount.dataset.agentId);
+  });
 
   if (interop.listenersMounted) {
     return "mounted";
@@ -478,6 +573,27 @@ pub fn agent_focus_bridge_script(agent_id: &str) -> String {
     return "degraded";
   }}
   return await bridge.focusAgent({payload});
+}})();"#
+    )
+}
+
+pub fn agent_close_bridge_script(agent_id: &str) -> String {
+    let payload = serde_json::to_string(agent_id).unwrap_or_else(|_| "\"\"".to_string());
+    let prompt = serde_json::to_string(&format!(
+        "Close worker {agent_id}? Its managed terminal process will be terminated."
+    ))
+    .unwrap_or_else(|_| "\"Close this worker?\"".to_string());
+    format!(
+        r#"(async () => {{
+  if (!window.confirm({prompt})) {{
+    return "cancelled";
+  }}
+  const bridge = window.__impulseOpsBridge;
+  if (!bridge?.closeAgent) {{
+    console.warn("impulse agent close bridge unavailable");
+    return "degraded";
+  }}
+  return await bridge.closeAgent({payload});
 }})();"#
     )
 }
@@ -592,7 +708,12 @@ fn BridgeStatusBanner(status: BridgeStatusUpdate) -> Element {
 fn ViewRail(active: DesktopView, on_select: EventHandler<DesktopView>) -> Element {
     rsx! {
         nav { class: "view-rail", "aria-label": "Desktop views",
-            for view in DesktopView::ALL {
+            for view in [
+                DesktopView::Terminal,
+                DesktopView::Review,
+                DesktopView::Artifacts,
+                DesktopView::Memory,
+            ] {
                 {
                     let class_name = if view == active { "rail-item active" } else { "rail-item" };
                     rsx! {
@@ -600,6 +721,7 @@ fn ViewRail(active: DesktopView, on_select: EventHandler<DesktopView>) -> Elemen
                             key: "{view.slug()}",
                             class: "{class_name}",
                             "data-view": "{view.slug()}",
+                            "aria-current": if view == active { "page" } else { "false" },
                             onclick: move |_| on_select.call(view),
                             "{view.label()}"
                         }
@@ -619,14 +741,15 @@ fn ViewRail(active: DesktopView, on_select: EventHandler<DesktopView>) -> Elemen
 fn WorkspaceSwitcher(
     workspaces: Vec<WorkspaceEntry>,
     selected_root: String,
+    oversight_scope_label: String,
     on_select: EventHandler<String>,
 ) -> Element {
     rsx! {
         section { class: "workspace-picker", "data-source": "workspace_target",
-            "aria-label": "Workspaces",
-            h2 { "Workspaces" }
+            "aria-label": "Launch targets",
+            h2 { "Launch targets" }
             if workspaces.is_empty() {
-                p { class: "rail-empty", "No workspaces registered" }
+                p { class: "rail-empty", "No projects added" }
             } else {
                 for entry in workspaces.iter() {
                     {
@@ -639,11 +762,16 @@ fn WorkspaceSwitcher(
                             button {
                                 class: "{class_name}",
                                 title: "{entry.target.root}",
+                                "aria-current": if is_active { "true" } else { "false" },
                                 onclick: move |_| on_select.call(root_for_click.clone()),
                                 "{label}" }
                         }
                     }
                 }
+            }
+            p {
+                class: "scope-note",
+                "Selection sets the next Builder root. Worker terminals remain desktop-wide; oversight and evidence stay bound to {oversight_scope_label}."
             }
         }
     }
@@ -658,11 +786,13 @@ fn AgentPool(
     on_focus: EventHandler<String>,
 ) -> Element {
     rsx! {
-        section { class: "agent-pool", "data-source": "agent_snapshot",
-            "aria-label": "Agents",
-            h2 { "Agents" }
+        section {
+            class: "agent-pool",
+            "data-source": "agent_snapshot",
+            "aria-label": "Workers",
+            h2 { "Workers · desktop" }
             if agents.is_empty() {
-                p { class: "rail-empty", "No agents running" }
+                p { class: "rail-empty", "No workers running" }
             } else {
                 for snapshot in agents.iter() {
                     {
@@ -674,6 +804,7 @@ fn AgentPool(
                             button {
                                 class: "{class_name}",
                                 "data-agent-id": "{id}",
+                                "aria-pressed": if is_active { "true" } else { "false" },
                                 onclick: move |_| on_focus.call(id_for_click.clone()),
                                 span { class: "dot {status_dot_class(&snapshot.status)}" }
                                 "{snapshot.label}"
@@ -928,6 +1059,8 @@ fn WorkspaceLaunchPanel(
     workspaces: Vec<WorkspaceEntry>,
     platforms: Vec<AgentPlatformInfo>,
     selected_root: String,
+    launch_in_flight: bool,
+    on_select_root: EventHandler<String>,
     on_register: EventHandler<RegisterWorkspaceRequest>,
     on_launch: EventHandler<AgentSpawnRequest>,
 ) -> Element {
@@ -935,7 +1068,6 @@ fn WorkspaceLaunchPanel(
     let mut label = use_signal(String::new);
     let mut purpose = use_signal(String::new);
     let mut project_notes = use_signal(String::new);
-    let mut selected_workspace_root = use_signal(String::new);
     let mut platform = use_signal(String::new);
     let mut agent_id = use_signal(String::new);
     let mut command = use_signal(String::new);
@@ -946,10 +1078,7 @@ fn WorkspaceLaunchPanel(
         .first()
         .map(|entry| entry.target.root.clone())
         .unwrap_or_default();
-    let selected_from_panel = selected_workspace_root();
-    let launch_root = if !selected_from_panel.trim().is_empty() {
-        selected_from_panel
-    } else if !selected_root.trim().is_empty() {
+    let launch_root = if !selected_root.trim().is_empty() {
         selected_root
     } else {
         first_workspace_root
@@ -1011,17 +1140,22 @@ fn WorkspaceLaunchPanel(
     let request_for_launch = launch_request.ok();
 
     rsx! {
-        section { class: "inspector-section workspace-launch", "data-source": "workspace_launcher",
-            "aria-label": "Workspace launcher",
+        section {
+            id: "workspace-launch",
+            class: "inspector-section workspace-launch",
+            "data-source": "workspace_launcher",
+            "aria-label": "Launch dock",
             header { class: "section-header",
                 div {
-                    h2 { "Workspace Launcher" }
-                    p { "Register a Rust workspace, then launch a governed Builder from the runtime registry inside it." }
+                    span { class: "section-eyebrow", "New mission" }
+                    h2 { "Launch dock" }
+                    p { "Add a project, choose a runtime, and give a governed Builder one explicit assignment." }
                 }
                 span {
                     class: "workspace-launch-badge",
                     "data-verification-profile": "rust_workspace_v1",
-                    "MCP audited · Rust-only · rust_workspace_v1"
+                    title: "Rust-only · rust_workspace_v1",
+                    "Builder · verified"
                 }
             }
             div { class: "workspace-launch-grid",
@@ -1069,6 +1203,7 @@ fn WorkspaceLaunchPanel(
                         if root.is_empty() {
                             return;
                         }
+                        on_select_root.call(root.clone());
                         on_register.call(RegisterWorkspaceRequest {
                             root,
                             label: optional_text(label()),
@@ -1076,7 +1211,7 @@ fn WorkspaceLaunchPanel(
                             project_notes: optional_text(project_notes()),
                         });
                     },
-                    "Register folder"
+                    "Add project"
                 }
             }
             div { class: "workspace-launch-grid launch",
@@ -1084,7 +1219,7 @@ fn WorkspaceLaunchPanel(
                     span { "Launch from" }
                     select {
                         value: "{launch_root}",
-                        onchange: move |evt| selected_workspace_root.set(evt.value()),
+                        onchange: move |evt| on_select_root.call(evt.value()),
                         if workspaces.is_empty() {
                             option { value: "", "Register a workspace first" }
                         } else {
@@ -1095,7 +1230,7 @@ fn WorkspaceLaunchPanel(
                     }
                 }
                 label { class: "workspace-field",
-                    span { "Agent" }
+                    span { "Runtime" }
                     select {
                         value: "{selected_platform_id}",
                         onchange: move |evt| platform.set(evt.value()),
@@ -1186,15 +1321,16 @@ fn WorkspaceLaunchPanel(
                 button {
                     class: "invoke-button workspace-primary",
                     "data-action": "launch-governed-agent",
-                    "aria-disabled": if can_launch { "false" } else { "true" },
-                    disabled: !can_launch,
+                    "aria-disabled": if can_launch && !launch_in_flight { "false" } else { "true" },
+                    "aria-busy": if launch_in_flight { "true" } else { "false" },
+                    disabled: !can_launch || launch_in_flight,
                     onclick: move |_| {
                         let Some(request) = request_for_launch.clone() else {
                             return;
                         };
                         on_launch.call(request);
                     },
-                    "Launch agent"
+                    if launch_in_flight { "Launching…" } else { "Launch Builder" }
                 }
             }
         }
@@ -1312,6 +1448,18 @@ fn ReviewConsole(
         .iter()
         .filter(|item| item.status == ReviewQueueStatus::Pending)
         .count();
+    let mut visible_items = items
+        .iter()
+        .filter(|item| item.status == ReviewQueueStatus::Pending)
+        .cloned()
+        .collect::<Vec<_>>();
+    let decided_items = items
+        .iter()
+        .filter(|item| item.status != ReviewQueueStatus::Pending)
+        .cloned()
+        .collect::<Vec<_>>();
+    let hidden_decided_count = decided_items.len().saturating_sub(6);
+    visible_items.extend(decided_items.into_iter().take(6));
     rsx! {
         section { class: "review-console", "data-source": "review_queue",
             "aria-label": "Review queue",
@@ -1326,12 +1474,12 @@ fn ReviewConsole(
                 p { class: "section-empty", "No staged context awaiting review" }
             } else {
                 div { class: "review-items",
-                    for item in items.iter().take(6) {
+                    for item in visible_items.iter() {
                         {
                             let status = review_status_label(&item.status);
-                            let target = item.target_agent_id.clone().unwrap_or_else(|| "select target".to_string());
+                            let target = item.target_agent_id.clone().unwrap_or_else(|| "target not recorded".to_string());
                             let is_pending = item.status == ReviewQueueStatus::Pending;
-                            let can_apply = is_pending && item.target_agent_id.is_some();
+                            let has_target = item.target_agent_id.is_some();
                             let can_skip = is_pending;
                             let apply_id = item.id.clone();
                             let apply_target = item.target_agent_id.clone();
@@ -1349,17 +1497,24 @@ fn ReviewConsole(
                                     }
                                     pre { class: "review-preview", "{item.preview}" }
                                     div { class: "review-actions",
-                                        button {
-                                            class: "invoke-button",
-                                            disabled: !can_apply,
-                                            onclick: move |_| {
-                                                on_decision.call(ReviewDecisionUiRequest {
-                                                    id: apply_id.clone(),
-                                                    decision: ReviewDecision::Apply,
-                                                    target_agent_id: apply_target.clone(),
-                                                });
-                                            },
-                                            "Apply"
+                                        if has_target {
+                                            button {
+                                                class: "invoke-button",
+                                                disabled: !is_pending,
+                                                onclick: move |_| {
+                                                    on_decision.call(ReviewDecisionUiRequest {
+                                                        id: apply_id.clone(),
+                                                        decision: ReviewDecision::Apply,
+                                                        target_agent_id: apply_target.clone(),
+                                                    });
+                                                },
+                                                "Apply"
+                                            }
+                                        } else if is_pending {
+                                            p {
+                                                class: "review-target-guidance",
+                                                "Apply unavailable: restage this context with a target worker, or skip it."
+                                            }
                                         }
                                         button {
                                             class: "invoke-button secondary",
@@ -1379,6 +1534,12 @@ fn ReviewConsole(
                         }
                     }
                 }
+                if hidden_decided_count > 0 {
+                    p {
+                        class: "section-hint",
+                        "{hidden_decided_count} older decided item(s) hidden; every pending item remains visible."
+                    }
+                }
             }
         }
     }
@@ -1392,11 +1553,29 @@ fn review_status_label(status: &ReviewQueueStatus) -> &'static str {
     }
 }
 
+fn governed_attention_count(tasks: &[GovernedTaskRun]) -> usize {
+    tasks
+        .iter()
+        .filter(|task| {
+            matches!(
+                task.review_state,
+                GovernedReviewState::VerificationFailed
+                    | GovernedReviewState::AwaitingSupervisor
+                    | GovernedReviewState::ChangesRequested
+                    | GovernedReviewState::Escalated
+                    | GovernedReviewState::AwaitingOperator
+            )
+        })
+        .count()
+}
+
 #[component]
 fn OperatorBoard(
     runtime_agents: Vec<AgentRuntimeSnapshot>,
     last_invocations: Vec<McpInvocation>,
     governed_tasks: Vec<GovernedTaskRun>,
+    oversight_scope_root: String,
+    oversight_scope_label: String,
     on_governed_mutation: EventHandler<GovernedTaskMutationRequest>,
 ) -> Element {
     let queued = governed_tasks
@@ -1414,19 +1593,7 @@ fn OperatorBoard(
             task.execution_state == impulse_ops::governed_task::GovernedExecutionState::Running
         })
         .count();
-    let review = governed_tasks
-        .iter()
-        .filter(|task| {
-            matches!(
-                task.review_state,
-                GovernedReviewState::VerificationFailed
-                    | GovernedReviewState::AwaitingSupervisor
-                    | GovernedReviewState::ChangesRequested
-                    | GovernedReviewState::Escalated
-                    | GovernedReviewState::AwaitingOperator
-            )
-        })
-        .count();
+    let review = governed_attention_count(&governed_tasks);
     let done = governed_tasks
         .iter()
         .filter(|task| {
@@ -1436,9 +1603,23 @@ fn OperatorBoard(
             )
         })
         .count();
+    let scoped_runtime_agents = runtime_agents
+        .iter()
+        .filter(|agent| runtime_agent_matches_scope(agent, &oversight_scope_root))
+        .cloned()
+        .collect::<Vec<_>>();
 
     rsx! {
         section { class: "operator-board", "data-source": "operator_board",
+            header { class: "operator-board-header",
+                div {
+                    span { class: "mission-eyebrow", "Oversight lane" }
+                    h2 { "Review work before acceptance." }
+                    p { "Daemon-owned task state and evidence drive this board. A separately launched Supervisor runtime is not implied." }
+                    p { class: "operator-scope", "Evidence scope · {oversight_scope_label}" }
+                }
+                span { class: "operator-board-badge", "review service" }
+            }
             div { class: "operator-lanes",
                 OperatorLane { label: "Queued".to_string(), count: queued, hint: "starting agents".to_string() }
                 OperatorLane { label: "In flight".to_string(), count: in_flight, hint: "active terminal work".to_string() }
@@ -1450,20 +1631,25 @@ fn OperatorBoard(
             } else {
                 div { class: "governed-task-grid", "data-source": "governed_tasks",
                     for task in governed_tasks {
-                        GovernedTaskCard {
+                        {
                             // A daemon revision is the authoritative decision epoch.
-                            // Remounting clears rationale text so it cannot bleed into
-                            // a later supervisor/operator decision.
-                            key: "{task.id}:{task.revision}",
-                            task,
-                            on_mutation: on_governed_mutation,
+                            // Compute the key before moving the task into the card so
+                            // feature-gated Dioxus builds preserve Rust's ownership order.
+                            let task_key = format!("{}:{}", task.id, task.revision);
+                            rsx! {
+                                GovernedTaskCard {
+                                    key: "{task_key}",
+                                    task,
+                                    on_mutation: on_governed_mutation,
+                                }
+                            }
                         }
                     }
                 }
             }
-            if !runtime_agents.is_empty() {
+            if !scoped_runtime_agents.is_empty() {
                 div { class: "operator-agent-strip",
-                    for agent in runtime_agents.iter().take(4) {
+                    for agent in scoped_runtime_agents.iter().take(4) {
                         {
                             let audit_count = last_invocations
                                 .iter()
@@ -1487,9 +1673,24 @@ fn OperatorBoard(
                         }
                     }
                 }
+                if scoped_runtime_agents.len() > 4 {
+                    p { class: "section-hint", "+{scoped_runtime_agents.len() - 4} more scoped workers" }
+                }
             }
         }
     }
+}
+
+fn runtime_agent_matches_scope(agent: &AgentRuntimeSnapshot, scope_root: &str) -> bool {
+    let scope_root = scope_root.trim();
+    if scope_root.is_empty() {
+        return false;
+    }
+    agent
+        .workspace
+        .as_ref()
+        .is_some_and(|workspace| workspace.root == scope_root)
+        || agent.cwd.as_deref() == Some(scope_root)
 }
 
 #[component]
@@ -2125,103 +2326,175 @@ fn extract_agent_snapshot_payload(payload: &Value) -> &Value {
 }
 
 #[component]
-fn Stat(k: String, v: String, s: String) -> Element {
-    rsx! {
-        div { class: "stat",
-            div { class: "k", "{k}" }
-            div { class: "v", "{v}" }
-            div { class: "s", "{s}" }
-        }
-    }
-}
-
-#[component]
-fn PendingReview(count: usize) -> Element {
+fn PendingReview(count: usize, on_open: EventHandler<()>) -> Element {
     rsx! {
         div { class: "pending-bar",
             span { class: "label",
                 span { class: "mark", ">" }
-                "{count} injection(s) awaiting review"
+                "{count} review item(s) awaiting decision"
             }
-            span { class: "keys",
-                b { "[a]" } " apply  " b { "[d]" } " diff  " b { "[s]" } " skip"
+            button {
+                class: "pending-review-action",
+                onclick: move |_| on_open.call(()),
+                "Open review"
             }
         }
     }
 }
 
 #[component]
-fn BrandHero() -> Element {
-    let blade_colors = [
-        "#ff8a1e", "#ff6a00", "#ffb01a", "#2fd6a8", "#2e7bff", "#5b63ff", "#2fd0ff", "#ff8a1e",
-    ];
-    let blades: Vec<(f64, f64, f64, &str)> = blade_colors
-        .iter()
-        .enumerate()
-        .map(|(i, color)| {
-            let angle = (i as f64 / 8.0) * std::f64::consts::TAU;
-            let (cx, cy, radius) = (130.0, 130.0, 78.0);
-            (
-                cx + angle.cos() * radius,
-                cy + angle.sin() * radius,
-                angle.to_degrees() + 90.0,
-                *color,
-            )
-        })
-        .collect();
+fn SupervisorDock(
+    active: bool,
+    context_review_count: usize,
+    governed_review_count: usize,
+    governed_task_count: usize,
+    oversight_scope_label: String,
+    on_open: EventHandler<()>,
+) -> Element {
+    let class_name = if active {
+        "supervisor-dock active"
+    } else {
+        "supervisor-dock"
+    };
+    let attention_count = context_review_count + governed_review_count;
+    let status = if attention_count > 0 {
+        "attention"
+    } else {
+        "idle"
+    };
+    let status_label = if attention_count > 0 {
+        format!("{attention_count} awaiting review")
+    } else {
+        "no review pending".to_string()
+    };
 
     rsx! {
-        div { class: "crt-hero",
-            div { style: "position:relative;width:200px;height:200px;",
-                svg {
-                    width: "200",
-                    height: "200",
-                    view_box: "0 0 260 260",
-                    style: "position:absolute;inset:0;",
-                    for (i, (x, y, rot, color)) in blades.iter().enumerate() {
-                        g {
-                            key: "{i}",
-                            class: "glow-soft",
-                            transform: "translate({x},{y}) rotate({rot})",
-                            rect {
-                                x: "-9",
-                                y: "-30",
-                                width: "18",
-                                height: "52",
-                                fill: "{color}",
-                            }
-                        }
-                    }
-                    circle {
-                        cx: "130",
-                        cy: "130",
-                        r: "46",
-                        fill: "none",
-                        stroke: "#ffb01a",
-                        stroke_width: "3",
-                        style: "filter:drop-shadow(0 0 6px #ff6a00);",
-                    }
+        button {
+            class: "{class_name}",
+            "data-view": "supervisor",
+            "data-supervisor-state": "{status}",
+            "aria-pressed": if active { "true" } else { "false" },
+            onclick: move |_| on_open.call(()),
+            div { class: "supervisor-dock-heading",
+                span { class: "supervisor-avatar", "S" }
+                div {
+                    span { class: "rail-eyebrow", "Review service" }
+                    strong { "Oversight lane" }
                 }
-                div { style: "position:absolute;inset:0;display:grid;place-items:center;",
-                    svg {
-                        width: "64",
-                        height: "99",
-                        view_box: "0 0 60 93",
-                        class: "glow-blue",
-                        path { d: "M30 2 C40 14 44 30 44 48 L44 64 L16 64 L16 48 C16 30 20 14 30 2 Z", fill: "#5b63ff" }
-                        circle { cx: "30", cy: "34", r: "8", fill: "#000" }
-                        circle { cx: "30", cy: "34", r: "5", fill: "#2fd0ff" }
-                        path { d: "M16 50 L4 70 L16 64 Z", fill: "#ff6a00" }
-                        path { d: "M44 50 L56 70 L44 64 Z", fill: "#ff6a00" }
-                        rect { x: "16", y: "64", width: "28", height: "6", fill: "#5b63ff" }
-                        path { d: "M20 70 L30 92 L40 70 Z", fill: "#ffb01a" }
-                        path { d: "M24 70 L30 84 L36 70 Z", fill: "#ff3b1f" }
+                span { class: "supervisor-state {status}", "{status}" }
+            }
+            p { "Inspect evidence and intervene without implying a launched Supervisor runtime." }
+            p { class: "supervisor-scope", "Evidence scope · {oversight_scope_label}" }
+            div { class: "supervisor-dock-meta",
+                span { "{governed_task_count} governed tasks" }
+                span { "{status_label}" }
+            }
+            if attention_count > 0 {
+                span {
+                    class: "supervisor-attention-breakdown",
+                    "{context_review_count} context · {governed_review_count} task review"
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn MissionHeader(
+    workspace_label: String,
+    daemon_label: String,
+    daemon_state: String,
+    worker_count: usize,
+    pending_review_count: usize,
+) -> Element {
+    rsx! {
+        section { class: "mission-header", "aria-labelledby": "mission-title",
+            div { class: "mission-copy",
+                span { class: "mission-eyebrow", "Local agent cockpit" }
+                h2 { id: "mission-title", "Feed the impulse to build." }
+                p { "One launch target. Explicit oversight. Specialized workers. Evidence before acceptance." }
+            }
+            div { class: "mission-signals", "aria-label": "Mission status",
+                div { class: "mission-signal project",
+                    span { "Launch target" }
+                    strong { title: "{workspace_label}", "{workspace_label}" }
+                }
+                div { class: "mission-signal",
+                    span { "Workers" }
+                    strong { "{worker_count}" }
+                }
+                div { class: "mission-signal",
+                    span { "Attention" }
+                    strong { "{pending_review_count}" }
+                }
+                div { class: "mission-signal daemon", "data-state": "{daemon_state}",
+                    span { "Control plane" }
+                    strong { "{daemon_label}" }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn LaunchSequence(
+    has_workspace: bool,
+    on_open_supervisor: EventHandler<()>,
+    on_open_launcher: EventHandler<()>,
+) -> Element {
+    let project_state = if has_workspace { "ready" } else { "next" };
+    let project_copy = if has_workspace {
+        "Launch target selected"
+    } else {
+        "Add your first project"
+    };
+    let launch_label = if has_workspace {
+        "Configure Builder"
+    } else {
+        "Add project"
+    };
+
+    rsx! {
+        section { class: "launch-sequence", "aria-labelledby": "launch-sequence-title",
+            div { class: "launch-sequence-copy",
+                span { class: "mission-eyebrow", "Start a mission" }
+                h3 { id: "launch-sequence-title", "Turn intent into governed work." }
+                p { "Choose a project, inspect the oversight lane, then give a worker one verifiable assignment." }
+                div { class: "launch-sequence-actions",
+                    button {
+                        class: "action-button primary",
+                        onclick: move |_| on_open_launcher.call(()),
+                        "{launch_label}"
+                    }
+                    button {
+                        class: "action-button secondary",
+                        onclick: move |_| on_open_supervisor.call(()),
+                        "Open oversight"
                     }
                 }
             }
-            div { style: "text-align:left;",
-                div { class: "brand-wordmark", "impulse" }
-                div { class: "brand-tagline", "your ai remembers" }
+            ol { class: "launch-steps",
+                li { "data-state": "{project_state}",
+                    span { class: "step-index", "01" }
+                    div {
+                        strong { "Launch target" }
+                        p { "{project_copy}" }
+                    }
+                }
+                li { "data-state": "available",
+                    span { class: "step-index", "02" }
+                    div {
+                        strong { "Oversight" }
+                        p { "Inspect review and evidence policy" }
+                    }
+                }
+                li { "data-state": if has_workspace { "next" } else { "waiting" },
+                    span { class: "step-index", "03" }
+                    div {
+                        strong { "Builder" }
+                        p { "Assign task and acceptance criteria" }
+                    }
+                }
             }
         }
     }
@@ -2243,18 +2516,14 @@ pub fn DesktopShellWithSnapshot(
     let context = &snapshot.context;
     let tokens = format_count(context.estimated_tokens);
     let window = format_count(context.window_tokens);
-    let usage_pct = usage_meter_pct(context.usage_fraction);
     let snapshot_agents_online = snapshot.agents.iter().filter(|agent| agent.active).count();
-    let snapshot_working_agents = snapshot
-        .agents
-        .iter()
-        .filter(|agent| matches!(agent.agent_status, impulse_ops::AgentStatus::Working { .. }))
-        .count();
     let pending_queue_count = review_queue
         .iter()
         .filter(|item| item.status == ReviewQueueStatus::Pending)
         .count();
-    let pending_review_count = context.pending_review_count.max(pending_queue_count);
+    let context_review_count = context.pending_review_count.max(pending_queue_count);
+    let governed_review_count = governed_attention_count(&snapshot.governed_tasks);
+    let attention_count = context_review_count + governed_review_count;
     let daemon_online = daemon_ops_status
         .as_ref()
         .map(|status| status.connected)
@@ -2267,11 +2536,11 @@ pub fn DesktopShellWithSnapshot(
         .and_then(|status| status.error.as_deref())
         .unwrap_or("a daemon-owned lifecycle write was not acknowledged");
     let daemon_label = if daemon_publish_degraded {
-        "online · publish degraded"
+        "connected · writes degraded"
     } else if daemon_online {
-        "online · watching"
+        "connected"
     } else {
-        "daemon offline"
+        "offline"
     };
     let daemon_state = if daemon_publish_degraded {
         "degraded"
@@ -2288,16 +2557,6 @@ pub fn DesktopShellWithSnapshot(
     } else {
         0
     };
-    let working_agents = if daemon_online {
-        snapshot_working_agents
-    } else {
-        0
-    };
-    let agent_summary = if daemon_online {
-        format!("online · {working_agents} working")
-    } else {
-        "daemon offline · cached snapshot hidden".to_string()
-    };
     let artifact_summary = if daemon_online {
         format!("{} artifacts", snapshot.artifacts.len())
     } else {
@@ -2308,10 +2567,6 @@ pub fn DesktopShellWithSnapshot(
     } else {
         format!("{} cached interventions", snapshot.interventions.len())
     };
-    let daemon_detail = daemon_ops_status
-        .as_ref()
-        .and_then(|status| status.error.as_deref())
-        .unwrap_or(daemon_label);
     let ops_stream = match daemon_ops_status.as_ref().map(|status| status.connected) {
         Some(true) => "live",
         Some(false) => "down",
@@ -2353,14 +2608,48 @@ pub fn DesktopShellWithSnapshot(
     } else {
         focused_workspace_root()
     };
+    let has_workspace = !workspaces.is_empty();
+    let selected_workspace_label = workspaces
+        .iter()
+        .find(|entry| entry.target.root == selected_root)
+        .map(|entry| entry.label().to_string())
+        .unwrap_or_else(|| "No project selected".to_string());
+    let oversight_scope_root = snapshot.project.root_path.trim().to_string();
+    let oversight_scope_label = if !snapshot.project.name.trim().is_empty() {
+        snapshot.project.name.trim().to_string()
+    } else if !oversight_scope_root.is_empty() {
+        Path::new(&oversight_scope_root)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or(oversight_scope_root.as_str())
+            .to_string()
+    } else {
+        "the connected daemon project".to_string()
+    };
+    let governed_task_count = snapshot.governed_tasks.len();
+    let review_action_label = if attention_count > 0 {
+        format!("Attention {attention_count}")
+    } else {
+        "Review".to_string()
+    };
+    let attention_view = if governed_review_count > 0 {
+        DesktopView::Supervisor
+    } else {
+        DesktopView::Review
+    };
     let has_runtime_agents = !runtime_agents.is_empty();
+    let focused_agent_id = runtime_agents
+        .iter()
+        .find(|agent| agent.focused)
+        .map(|agent| agent.agent_id.clone());
     let mut active_view = use_signal(|| initial_view);
-    let mut latest_shell_intent = use_signal(|| None::<String>);
     // In-flight feedback for the focus-agent bridge call (a representative
     // high-traffic async action). Holds the agent id currently being focused so
     // the triggering terminal tab can render an aria-busy/disabled "…" state
     // while the host `focusAgent` invoke resolves, then clears on completion.
     let mut focusing_agent_id = use_signal(|| None::<String>);
+    let mut closing_agent_id = use_signal(|| None::<String>);
+    let mut launch_in_flight = use_signal(|| false);
     let active_view_value = active_view();
     let terminal_view_class = if active_view_value == DesktopView::Terminal {
         "stage-view view-terminal active"
@@ -2387,35 +2676,24 @@ pub fn DesktopShellWithSnapshot(
             class: "impulse-shell",
             "data-daemon-freshness": if daemon_snapshot_stale { "stale" } else { "current" },
             header { class: "top-bar",
-                div { class: "brand",
-                    h1 { "impulse" }
-                    span {
-                        class: "daemon-state",
-                        "data-state": "{daemon_state}",
-                        title: "{daemon_detail}",
-                        "{daemon_label}"
+                div { class: "brand-lockup",
+                    span { class: "brand-mark", "I" }
+                    div { class: "brand-copy",
+                        h1 { "IMPULSE" }
+                        span { "Feed the impulse to build." }
                     }
                 }
+                div { class: "top-project", title: "{selected_root}",
+                    span { "Launch target" }
+                    strong { "{selected_workspace_label}" }
+                }
                 nav { class: "command-surface",
+                    span { class: "daemon-state", "data-state": "{daemon_state}", "{daemon_label}" }
                     button {
-                        class: "icon-button is-disabled",
-                        title: "Command palette (coming soon)",
-                        disabled: true,
-                        "aria-disabled": "true",
-                        "Cmd-K"
-                    }
-                    button {
-                        class: "icon-button",
-                        title: "Review context",
-                        onclick: move |_| active_view.set(DesktopView::Review),
-                        "Review"
-                    }
-                    button {
-                        class: "icon-button is-disabled",
-                        title: "Settings (coming soon)",
-                        disabled: true,
-                        "aria-disabled": "true",
-                        "Settings"
+                        class: "icon-button attention-button",
+                        title: "Open review attention",
+                        onclick: move |_| active_view.set(attention_view),
+                        "{review_action_label}"
                     }
                 }
             }
@@ -2444,14 +2722,23 @@ pub fn DesktopShellWithSnapshot(
             }
             div { class: "workspace-grid",
                 aside { class: "left-rail", "data-owner": "dioxus",
-                    h2 { "Views" }
-                    ViewRail {
-                        active: active_view_value,
-                        on_select: move |view: DesktopView| active_view.set(view),
+                    SupervisorDock {
+                        active: active_view_value == DesktopView::Supervisor,
+                        context_review_count,
+                        governed_review_count,
+                        governed_task_count,
+                        oversight_scope_label: oversight_scope_label.clone(),
+                        on_open: move |_| active_view.set(DesktopView::Supervisor),
+                    }
+                    WorkspaceSwitcher {
+                        workspaces: workspaces.clone(),
+                        selected_root: selected_root.clone(),
+                        oversight_scope_label: oversight_scope_label.clone(),
+                        on_select: move |root: String| focused_workspace_root.set(root),
                     }
                     AgentPool {
                         agents: runtime_agents.clone(),
-                        focused_agent_id: None,
+                        focused_agent_id,
                         on_focus: move |id: String| {
                             let script = agent_focus_bridge_script(&id);
                             spawn(async move {
@@ -2459,49 +2746,60 @@ pub fn DesktopShellWithSnapshot(
                             });
                         },
                     }
-                    WorkspaceSwitcher {
-                        workspaces: workspaces.clone(),
-                        selected_root: selected_root.clone(),
-                        on_select: move |root: String| focused_workspace_root.set(root),
+                    section { class: "rail-inspect",
+                        h2 { "Inspect" }
+                        ViewRail {
+                            active: active_view_value,
+                            on_select: move |view: DesktopView| active_view.set(view),
+                        }
                     }
                 }
                 section { class: "terminal-stage", "data-terminal-renderer": "xterm.js",
                     div { class: "{terminal_view_class}", "data-view": "terminal",
-                        BrandHero {}
-                        div { class: "stat-row",
-                            Stat {
-                                k: "Memory".to_string(),
-                                v: tokens.clone(),
-                                s: "tokens · {usage_pct}% of {window}",
-                            }
-                            Stat {
-                                k: "Agents".to_string(),
-                                v: agents_online.to_string(),
-                                s: agent_summary.clone(),
-                            }
-                            Stat {
-                                k: "Retrieval".to_string(),
-                                v: snapshot.retrieval.backend.clone(),
-                                s: "{snapshot.memory.genome_decisions} genome decisions",
+                        if !has_runtime_agents {
+                            MissionHeader {
+                                workspace_label: selected_workspace_label.clone(),
+                                daemon_label: daemon_label.to_string(),
+                                daemon_state: daemon_state.to_string(),
+                                worker_count: agents_online,
+                                pending_review_count: attention_count,
                             }
                         }
-                        if pending_review_count > 0 {
-                            PendingReview { count: pending_review_count }
+                        if context_review_count > 0 {
+                            PendingReview {
+                                count: context_review_count,
+                                on_open: move |_| active_view.set(DesktopView::Review),
+                            }
                         }
-                        div { class: "terminal-tabs", "data-owner": "dioxus",
-                            if has_runtime_agents {
+                        if has_runtime_agents {
+                            div {
+                                class: "terminal-tabs",
+                                "data-owner": "dioxus",
+                                role: "tablist",
+                                "aria-label": "Worker terminals",
                                 for agent in runtime_agents.iter() {
                                 {
-                                    let class_name = if agent.focused { "terminal-tab active" } else { "terminal-tab" };
+                                    let tab_group_class = if agent.focused { "terminal-tab-group active" } else { "terminal-tab-group" };
                                     let agent_id = agent.agent_id.clone();
                                     let agent_id_for_click = agent_id.clone();
+                                    let agent_id_for_close = agent_id.clone();
                                     let is_focusing = focusing_agent_id().as_deref() == Some(agent_id.as_str());
+                                    let is_closing = closing_agent_id().as_deref() == Some(agent_id.as_str());
                                     let label = agent.label.clone();
+                                    let close_label = label.clone();
+                                    let safe_agent_id = impulse_ops::sanitize_id(&agent.agent_id);
+                                    let tab_id = format!("terminal-tab-{safe_agent_id}");
+                                    let pane_id = format!("terminal-pane-{safe_agent_id}");
                                     rsx! {
-                                        button {
-                                            class: "{class_name}",
+                                        div { class: "{tab_group_class}", role: "presentation",
+                                            button {
+                                                id: "{tab_id}",
+                                                class: "terminal-tab",
                                                 "data-agent-id": "{agent_id}",
-                                                disabled: is_focusing,
+                                                role: "tab",
+                                                "aria-controls": "{pane_id}",
+                                                disabled: is_focusing || is_closing,
+                                                "aria-selected": if agent.focused { "true" } else { "false" },
                                                 "aria-busy": if is_focusing { "true" } else { "false" },
                                                 onclick: move |_| {
                                                     let agent_id = agent_id_for_click.clone();
@@ -2512,18 +2810,38 @@ pub fn DesktopShellWithSnapshot(
                                                         focusing_agent_id.set(None);
                                                     });
                                                 },
-                                                if is_focusing { "focusing…" } else { "{label}" } }
+                                                if is_focusing { "focusing…" } else { "{label}" }
+                                            }
+                                            button {
+                                                class: "terminal-tab-close",
+                                                "data-action": "close-agent",
+                                                "data-agent-id": "{agent_id_for_close}",
+                                                title: "Close worker {close_label}",
+                                                "aria-label": "Close worker {close_label}",
+                                                "aria-busy": if is_closing { "true" } else { "false" },
+                                                disabled: is_closing,
+                                                onclick: move |_| {
+                                                    let agent_id = agent_id_for_close.clone();
+                                                    let script = agent_close_bridge_script(&agent_id);
+                                                    closing_agent_id.set(Some(agent_id));
+                                                    spawn(async move {
+                                                        let _ = document::eval(&script).await;
+                                                        closing_agent_id.set(None);
+                                                    });
+                                                },
+                                                if is_closing { "closing…" } else { "Close" }
+                                            }
                                         }
                                     }
                                 }
-                            } else {
-                                button { class: "terminal-tab active", "No agent" }
+                            }
                             }
                         }
                         if has_runtime_agents {
                             for agent in runtime_agents.iter() {
                                 {
                                     let pane_id = format!("terminal-pane-{}", impulse_ops::sanitize_id(&agent.agent_id));
+                                    let tab_id = format!("terminal-tab-{}", impulse_ops::sanitize_id(&agent.agent_id));
                                     let class_name = if agent.focused { "xterm-mount" } else { "xterm-mount pending" };
                                     rsx! {
                                         div {
@@ -2531,18 +2849,42 @@ pub fn DesktopShellWithSnapshot(
                                             class: "{class_name}",
                                             "data-xterm-mount": "true",
                                             "data-agent-id": "{agent.agent_id}",
+                                            "data-terminal-active": if agent.focused { "true" } else { "false" },
                                             "data-platform": "{agent.platform.as_str()}",
                                             "data-pty-owner": "rust-backend",
                                             "data-xterm-on-data": "agent_write",
                                             "data-xterm-on-resize": "agent_resize",
+                                            role: "tabpanel",
+                                            "aria-labelledby": "{tab_id}",
+                                            "aria-hidden": if agent.focused { "false" } else { "true" },
+                                            hidden: !agent.focused,
                                         }
                                     }
                                 }
                             }
                         } else {
                             div { class: "terminal-empty-state", "data-terminal-state": "empty",
-                                h3 { "No terminal session" }
-                                p { "Launch an agent from the workspace panel to attach a Rust-backed xterm pane." }
+                                LaunchSequence {
+                                    has_workspace,
+                                    on_open_supervisor: move |_| active_view.set(DesktopView::Supervisor),
+                                    on_open_launcher: move |_| {
+                                        let selector = if has_workspace {
+                                            "[data-field='launch-task'] input"
+                                        } else {
+                                            ".workspace-launch-grid input"
+                                        };
+                                        let script = format!(
+                                            r#"(() => {{
+                                                const dock = document.getElementById('workspace-launch');
+                                                dock?.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+                                                window.setTimeout(() => dock?.querySelector({selector:?})?.focus(), 180);
+                                            }})();"#
+                                        );
+                                        spawn(async move {
+                                            let _ = document::eval(&script).await;
+                                        });
+                                    },
+                                }
                             }
                         }
                     }
@@ -2570,9 +2912,6 @@ pub fn DesktopShellWithSnapshot(
                         DesktopView::Artifacts => rsx! {
                             ArtifactsView {
                                 artifacts: snapshot.artifacts.clone(),
-                                on_intent: move |intent: ShellIntent| {
-                                    latest_shell_intent.set(Some(intent.describe()));
-                                },
                             }
                         },
                         DesktopView::Supervisor => rsx! {
@@ -2580,6 +2919,8 @@ pub fn DesktopShellWithSnapshot(
                                 runtime_agents: runtime_agents.clone(),
                                 last_invocations: last_invocations.clone(),
                                 governed_tasks: snapshot.governed_tasks.clone(),
+                                oversight_scope_root: oversight_scope_root.clone(),
+                                oversight_scope_label: oversight_scope_label.clone(),
                                 on_governed_mutation: move |request| {
                                     let script = governed_task_mutation_bridge_script(&request);
                                     spawn(async move {
@@ -2590,29 +2931,13 @@ pub fn DesktopShellWithSnapshot(
                         },
                     }
                 }
-                aside { class: "right-inspector", "data-owner": "dioxus",
-                    section { class: "inspector-section",
-                        h2 { "Context · {tier}" }
-                        p { "{tokens} / {window} tokens · {context.injection_count} injections · {context.compaction_count} compactions" }
-                    }
-                    section { class: "inspector-section", "aria-label": "Pending review",
-                        h2 { "Pending review" }
-                        p { "aria-live": "polite",
-                            if pending_review_count > 0 {
-                                "{pending_review_count} bundle(s) awaiting review-first apply"
-                            } else {
-                                "Nothing pending. Memory is quiet."
-                            }
-                        }
-                    }
-                    section { class: "inspector-section",
-                        h2 { "Native Islands" }
-                        p { "macOS affordances report through serializable DTOs" }
-                    }
+                aside { class: "right-inspector control-dock", "data-owner": "dioxus",
                     WorkspaceLaunchPanel {
                         workspaces: workspaces.clone(),
                         platforms: agent_platforms.clone(),
                         selected_root: selected_root.clone(),
+                        launch_in_flight: launch_in_flight(),
+                        on_select_root: move |root: String| focused_workspace_root.set(root),
                         on_register: move |request: RegisterWorkspaceRequest| {
                             let script = workspace_registration_bridge_script(&request);
                             spawn(async move {
@@ -2621,50 +2946,64 @@ pub fn DesktopShellWithSnapshot(
                         },
                         on_launch: move |request: AgentSpawnRequest| {
                             let script = agent_launch_bridge_script(&request);
+                            launch_in_flight.set(true);
                             spawn(async move {
                                 let _ = document::eval(&script).await;
+                                launch_in_flight.set(false);
                             });
                         },
                     }
-                    McpToolPalette {
-                        tools: mcp_tools.clone(),
-                        last_invocations: last_invocations.clone(),
-                        on_invoke: move |request: McpInvokeRequest| {
-                            let script = mcp_invoke_bridge_script(&request);
-                            spawn(async move {
-                                let _ = document::eval(&script).await;
-                            });
-                        },
+                    section { class: "inspector-section attention-summary", "aria-label": "Review attention",
+                        span { class: "section-eyebrow", "Oversight attention" }
+                        h2 {
+                            if attention_count > 0 {
+                                "{attention_count} item(s) need review"
+                            } else {
+                                "Review queue clear"
+                            }
+                        }
+                        p { "{context_review_count} context · {governed_review_count} governed task" }
+                        p { class: "attention-scope", "Evidence scope · {oversight_scope_label}" }
+                        p { "aria-live": "polite", "Completion remains evidence-gated; worker exit never implies acceptance." }
                     }
-                    WorkspaceList {
-                        workspaces: workspaces.clone(),
-                        selected_root: if selected_root.is_empty() { None } else { Some(selected_root.clone()) },
+                    section { class: "inspector-section context-summary",
+                        span { class: "section-eyebrow", "Context budget" }
+                        h2 { "{tokens} / {window} · {tier}" }
+                        p { "{context.injection_count} injections · {context.compaction_count} compactions" }
                     }
-                    section { class: "inspector-section",
-                        h2 { "Supervisor" }
-                        p { "Actions require backend confirmation" }
-                    }
-                    AuditTrail {
-                        invocations: last_invocations,
-                        agent_filter: None,
-                    }
-                    section { class: "inspector-section",
-                        h2 { "Interop" }
-                        p { "Agent runtime updates drive status, files, tools, diffs, and handoffs" }
+                    details { class: "inspector-disclosure",
+                        summary { "Platform tools and audit" }
+                        div { class: "inspector-disclosure-body",
+                            McpToolPalette {
+                                tools: mcp_tools.clone(),
+                                last_invocations: last_invocations.clone(),
+                                on_invoke: move |request: McpInvokeRequest| {
+                                    let script = mcp_invoke_bridge_script(&request);
+                                    spawn(async move {
+                                        let _ = document::eval(&script).await;
+                                    });
+                                },
+                            }
+                            WorkspaceList {
+                                workspaces: workspaces.clone(),
+                                selected_root: if selected_root.is_empty() { None } else { Some(selected_root.clone()) },
+                            }
+                            AuditTrail {
+                                invocations: last_invocations,
+                                agent_filter: None,
+                            }
+                        }
                     }
                 }
             }
             footer { class: "event-strip", "data-owner": "dioxus",
-                span { "data-stream": "ops_update", "ops_update {generated_at} · {ops_stream}" }
-                span { "{agents_online} agents" }
+                span { "data-stream": "ops_update", title: "Last snapshot {generated_at}", "Control plane · {ops_stream}" }
+                span { "{agents_online} workers" }
                 span { "{artifact_summary}" }
                 span { "{intervention_summary}" }
-                span { "data-stream": "terminal_output", "terminal_output · {terminal_stream}" }
-                span { "data-stream": "agent_runtime_update", "agent_runtime_update · {runtime_stream}" }
-                span { "data-stream": "supervisor_local_action", "supervisor_local_action · {supervisor_stream}" }
-                if let Some(intent) = latest_shell_intent() {
-                    span { class: "shell-notice", "{intent}" }
-                }
+                span { "data-stream": "terminal_output", "Terminal · {terminal_stream}" }
+                span { "data-stream": "agent_runtime_update", "Workers · {runtime_stream}" }
+                span { "data-stream": "supervisor_local_action", "Oversight · {supervisor_stream}" }
             }
         }
     }

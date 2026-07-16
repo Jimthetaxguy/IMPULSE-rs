@@ -2,8 +2,13 @@ use crate::bridge::{
     TerminalBridge, TerminalCloseRequest, TerminalFocusRequest, TerminalOpenRequest,
     TerminalResizeRequest, TerminalSessionResponse, TerminalWriteRequest,
 };
-use crate::mcp::{list_review_queue, McpContext, McpInvocation, McpToolRegistry, ReviewDecision};
+use crate::mcp::{
+    list_review_queue, McpContext, McpError, McpInvocation, McpToolRegistry, ReviewDecision,
+};
 use crate::native::{DefaultNativeIslandHost, NativeIslandRequest, NativeIslandResult};
+use crate::project_boundary::{
+    DesktopProjectBoundaryConnector, DesktopProjectBoundaryController, ProjectMemoryScope,
+};
 use crate::runtime::{
     AgentRuntimeSnapshot, AgentSpawnRequest, AgentWriteRequest, DesktopRuntime,
     SupervisorLocalActionRequest, WorkspaceTarget,
@@ -98,6 +103,112 @@ pub async fn agent_spawn(
         agent_spawn_inner(runtime, request)
     })
     .await
+}
+
+pub async fn agent_spawn_with_state(
+    state: &DesktopShellState,
+    request: AgentSpawnRequest,
+) -> Result<AgentRuntimeSnapshot, String> {
+    let state = state.clone();
+    tokio::task::spawn_blocking(move || {
+        prepare_governed_project_boundary(&state, &request)?;
+        state.runtime.spawn_agent(request).map_err(err_to_string)
+    })
+    .await
+    .map_err(|error| format!("agent spawn worker failed: {error}"))?
+}
+
+fn prepare_governed_project_boundary(
+    state: &DesktopShellState,
+    request: &AgentSpawnRequest,
+) -> Result<(), String> {
+    let Some(project_root) = requested_governed_project_root(request)? else {
+        return Ok(());
+    };
+    let project_root_text = project_root.to_str().ok_or_else(|| {
+        format!(
+            "governed project root `{}` cannot be represented as UTF-8",
+            project_root.display()
+        )
+    })?;
+    state
+        .workspaces
+        .touch(project_root_text)
+        .map_err(|error| format!("select a registered workspace before launch: {error}"))?;
+    state.connect_project_boundary(&project_root)
+}
+
+fn requested_governed_project_root(
+    request: &AgentSpawnRequest,
+) -> Result<Option<std::path::PathBuf>, String> {
+    if request.role_assignment.is_none()
+        && request.verification_profile.is_none()
+        && request.acceptance_criteria.is_empty()
+    {
+        return Ok(None);
+    }
+    if request.role_assignment.is_none() {
+        return Err(
+            "verification and acceptance criteria require an explicit governed role assignment"
+                .to_string(),
+        );
+    }
+    let task = request
+        .task
+        .as_deref()
+        .map(str::trim)
+        .filter(|task| !task.is_empty())
+        .ok_or_else(|| "governed launch requires a non-empty task".to_string())?;
+    if task.contains('\0') {
+        return Err("governed launch task must not contain NUL bytes".to_string());
+    }
+    if request.verification_profile.is_some() && request.acceptance_criteria.is_empty() {
+        return Err(
+            "closed-loop governed launch requires at least one acceptance criterion".to_string(),
+        );
+    }
+    if request.verification_profile.is_none() && !request.acceptance_criteria.is_empty() {
+        return Err("acceptance criteria require an explicit verification profile".to_string());
+    }
+    let cwd = request.cwd.as_deref().ok_or_else(|| {
+        "governed launch requires both an absolute cwd and workspace root".to_string()
+    })?;
+    let workspace_root = request
+        .workspace
+        .as_ref()
+        .map(|workspace| workspace.root.as_str())
+        .ok_or_else(|| {
+            "governed launch requires both an absolute cwd and workspace root".to_string()
+        })?;
+    let cwd = canonical_host_project_path("cwd", cwd)?;
+    let workspace_root = canonical_host_project_path("workspace.root", workspace_root)?;
+    if cwd != workspace_root {
+        return Err(format!(
+            "governed launch cwd `{}` and workspace root `{}` must resolve to the same project",
+            cwd.display(),
+            workspace_root.display()
+        ));
+    }
+    Ok(Some(workspace_root))
+}
+
+fn canonical_host_project_path(field: &str, value: &str) -> Result<std::path::PathBuf, String> {
+    let path = std::path::Path::new(value);
+    if !path.is_absolute() {
+        return Err(format!(
+            "governed launch {field} `{value}` must be absolute"
+        ));
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| format!("governed launch {field} `{value}` is unavailable: {error}"))?;
+    if !canonical.is_dir() {
+        return Err(format!(
+            "governed launch {field} `{}` is not a directory",
+            canonical.display()
+        ));
+    }
+    Ok(canonical)
 }
 
 fn agent_spawn_inner(
@@ -507,7 +618,8 @@ pub struct DesktopShellState {
     pub runtime: std::sync::Arc<DesktopRuntime>,
     pub workspaces: std::sync::Arc<WorkspaceRegistry>,
     pub mcp: std::sync::Arc<McpToolRegistry>,
-    pub memory_root: std::path::PathBuf,
+    memory_scope: ProjectMemoryScope,
+    project_boundary: Option<std::sync::Arc<dyn DesktopProjectBoundaryConnector>>,
 }
 
 impl DesktopShellState {
@@ -521,16 +633,63 @@ impl DesktopShellState {
             runtime,
             workspaces,
             mcp,
-            memory_root,
+            memory_scope: ProjectMemoryScope::connected(memory_root),
+            project_boundary: None,
         }
     }
 
-    pub fn context(&self) -> McpContext {
-        McpContext::new(
+    pub fn new_live(
+        runtime: std::sync::Arc<DesktopRuntime>,
+        workspaces: std::sync::Arc<WorkspaceRegistry>,
+        mcp: std::sync::Arc<McpToolRegistry>,
+        memory_scope: ProjectMemoryScope,
+        project_boundary: DesktopProjectBoundaryController,
+    ) -> Self {
+        Self {
+            runtime,
+            workspaces,
+            mcp,
+            memory_scope,
+            project_boundary: Some(std::sync::Arc::new(project_boundary)),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_live_with_connector(
+        runtime: std::sync::Arc<DesktopRuntime>,
+        workspaces: std::sync::Arc<WorkspaceRegistry>,
+        mcp: std::sync::Arc<McpToolRegistry>,
+        memory_scope: ProjectMemoryScope,
+        project_boundary: std::sync::Arc<dyn DesktopProjectBoundaryConnector>,
+    ) -> Self {
+        Self {
+            runtime,
+            workspaces,
+            mcp,
+            memory_scope,
+            project_boundary: Some(project_boundary),
+        }
+    }
+
+    pub fn memory_root(&self) -> Result<std::path::PathBuf, String> {
+        self.memory_scope.root()
+    }
+
+    pub fn context(&self) -> Result<McpContext, String> {
+        Ok(McpContext::new(
             std::sync::Arc::clone(&self.runtime),
             std::sync::Arc::clone(&self.workspaces),
-            self.memory_root.clone(),
-        )
+            self.memory_root()?,
+        ))
+    }
+
+    pub fn connect_project_boundary(&self, project_root: &std::path::Path) -> Result<(), String> {
+        let controller = self.project_boundary.as_ref().ok_or_else(|| {
+            "dynamic project daemon connection is unavailable in this host".to_string()
+        })?;
+        let boundary = controller.connect_project(project_root)?;
+        self.memory_scope.install(boundary.memory_root);
+        Ok(())
     }
 }
 
@@ -562,11 +721,79 @@ async fn invoke_on_blocking_pool(
     request: McpInvokeRequest,
 ) -> Result<McpInvocation, String> {
     tokio::task::spawn_blocking(move || {
-        let context = state.context();
+        if request.tool == "impulse.agent_spawn" {
+            if !request.confirmed {
+                let error = McpError::ConfirmationRequired {
+                    tool: request.tool.clone(),
+                    message: "agent_spawn mutates terminal and project-boundary state".to_string(),
+                };
+                record_mcp_preflight_rejection(&state, &request, &error);
+                return Err(error.to_string());
+            }
+            let spawn_request: AgentSpawnRequest =
+                match serde_json::from_value(request.arguments.clone()) {
+                    Ok(request) => request,
+                    Err(parse_error) => {
+                        let error = McpError::Tool {
+                            tool: request.tool.clone(),
+                            message: format!("invalid AgentSpawnRequest payload: {parse_error}"),
+                        };
+                        record_mcp_preflight_rejection(&state, &request, &error);
+                        return Err(error.to_string());
+                    }
+                };
+            if let Err(message) = prepare_governed_project_boundary(&state, &spawn_request) {
+                let error = McpError::Tool {
+                    tool: request.tool.clone(),
+                    message,
+                };
+                record_mcp_preflight_rejection(&state, &request, &error);
+                return Err(error.to_string());
+            }
+        }
+        let context = match state.context() {
+            Ok(context) => context,
+            Err(message) if request.tool == "impulse.agent_spawn" => {
+                let error = McpError::Tool {
+                    tool: request.tool.clone(),
+                    message,
+                };
+                record_mcp_preflight_rejection(&state, &request, &error);
+                return Err(error.to_string());
+            }
+            Err(message) => return Err(message),
+        };
         invoke_blocking(&state, request, context)
     })
     .await
     .map_err(|error| format!("MCP invocation worker failed: {error}"))?
+}
+
+fn resolved_mcp_caller_agent_id(
+    state: &DesktopShellState,
+    explicit: Option<String>,
+) -> Option<String> {
+    explicit.or_else(|| {
+        state
+            .runtime
+            .snapshot_agents()
+            .first()
+            .map(|agent| agent.agent_id.clone())
+    })
+}
+
+fn record_mcp_preflight_rejection(
+    state: &DesktopShellState,
+    request: &McpInvokeRequest,
+    error: &McpError,
+) {
+    state.mcp.record_rejected_invocation(
+        &request.tool,
+        resolved_mcp_caller_agent_id(state, request.caller_agent_id.clone()),
+        request.arguments.clone(),
+        request.confirmed,
+        error,
+    );
 }
 
 fn invoke_blocking(
@@ -580,13 +807,7 @@ fn invoke_blocking(
         confirmed,
         caller_agent_id,
     } = request;
-    let caller_agent_id = caller_agent_id.or_else(|| {
-        state
-            .runtime
-            .snapshot_agents()
-            .first()
-            .map(|agent| agent.agent_id.clone())
-    });
+    let caller_agent_id = resolved_mcp_caller_agent_id(state, caller_agent_id);
     state
         .mcp
         .invoke(&tool, caller_agent_id, arguments, confirmed, &context)
@@ -616,14 +837,14 @@ pub async fn mcp_descriptors(
 pub async fn review_queue(
     state: tauri::State<'_, DesktopShellState>,
 ) -> Result<Vec<crate::mcp::ReviewQueueItem>, String> {
-    list_review_queue(&state.inner().memory_root).map_err(err_to_string)
+    list_review_queue(&state.inner().memory_root()?).map_err(err_to_string)
 }
 
 #[cfg(not(feature = "legacy-tauri-runtime"))]
 pub async fn review_queue(
     state: &DesktopShellState,
 ) -> Result<Vec<crate::mcp::ReviewQueueItem>, String> {
-    list_review_queue(&state.memory_root).map_err(err_to_string)
+    list_review_queue(&state.memory_root()?).map_err(err_to_string)
 }
 
 /// host command — apply or skip one staged review payload through the MCP
@@ -651,7 +872,7 @@ fn review_decision_inner(
     state: &DesktopShellState,
     request: ReviewDecisionRequest,
 ) -> Result<McpInvocation, String> {
-    let context = state.context();
+    let context = state.context()?;
     let arguments = serde_json::to_value(&request).map_err(err_to_string)?;
     state
         .mcp
@@ -718,6 +939,32 @@ fn register_workspace_inner(
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RecordingBoundaryConnector {
+        calls: AtomicUsize,
+    }
+
+    impl DesktopProjectBoundaryConnector for RecordingBoundaryConnector {
+        fn connect_project(
+            &self,
+            project_root: &std::path::Path,
+        ) -> Result<crate::project_boundary::DesktopProjectBoundary, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let project_root = project_root
+                .canonicalize()
+                .map_err(|error| error.to_string())?;
+            Ok(crate::project_boundary::DesktopProjectBoundary {
+                project_root: project_root.clone(),
+                memory_root: project_root.join(".impulse"),
+                socket_path: project_root
+                    .join(".impulse")
+                    .join("sockets")
+                    .join("impulse.sock"),
+                daemon_mode: crate::daemon_sidecar::DesktopDaemonSidecarMode::Existing,
+            })
+        }
+    }
 
     #[test]
     fn host_invoke_manifest_has_unique_command_names() {
@@ -750,5 +997,154 @@ mod tests {
                 "host invoke manifest missing UI-required command: {command}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn audited_mcp_spawn_connects_registered_project_before_context_lookup() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let canonical = workspace
+            .path()
+            .canonicalize()
+            .expect("canonical workspace");
+        let canonical_text = canonical.display().to_string();
+        let runtime = std::sync::Arc::new(DesktopRuntime::default());
+        let workspaces = std::sync::Arc::new(
+            WorkspaceRegistry::with_workspace_roots([canonical_text.as_str()])
+                .expect("registered workspace"),
+        );
+        let mcp = std::sync::Arc::new(McpToolRegistry::with_builtins());
+        let connector = std::sync::Arc::new(RecordingBoundaryConnector {
+            calls: AtomicUsize::new(0),
+        });
+        let state = DesktopShellState::new_live_with_connector(
+            runtime,
+            workspaces,
+            std::sync::Arc::clone(&mcp),
+            ProjectMemoryScope::default(),
+            connector.clone(),
+        );
+        let mut spawn = AgentSpawnRequest::terminal_harness(
+            "ui-builder",
+            crate::runtime::AgentPlatformId::try_new("missing-runtime").expect("valid platform id"),
+            canonical_text.clone(),
+            24,
+            80,
+        );
+        spawn.task = Some("prove the visible launch path binds scope".to_string());
+        spawn.role_assignment =
+            Some(impulse_ops::role_assignment::canonical_governed_builder_assignment());
+        let request = McpInvokeRequest {
+            tool: "impulse.agent_spawn".to_string(),
+            arguments: serde_json::to_value(spawn).expect("serialize spawn request"),
+            confirmed: true,
+            caller_agent_id: Some("impulse-ui".to_string()),
+        };
+
+        let error = mcp_invoke(&state, request)
+            .await
+            .expect_err("unknown runtime should fail after project activation");
+        assert!(error.contains("unknown agent platform"), "{error}");
+        assert!(!error.contains("project memory is unavailable"), "{error}");
+        assert_eq!(connector.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.memory_root().unwrap(), canonical.join(".impulse"));
+        let audit = mcp.audit_log();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].tool, "impulse.agent_spawn");
+        assert!(!audit[0].ok);
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_mcp_spawn_is_audited_before_project_activation() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let canonical = workspace
+            .path()
+            .canonicalize()
+            .expect("canonical workspace");
+        let canonical_text = canonical.display().to_string();
+        let runtime = std::sync::Arc::new(DesktopRuntime::default());
+        let workspaces = std::sync::Arc::new(
+            WorkspaceRegistry::with_workspace_roots([canonical_text.as_str()])
+                .expect("registered workspace"),
+        );
+        let mcp = std::sync::Arc::new(McpToolRegistry::with_builtins());
+        let connector = std::sync::Arc::new(RecordingBoundaryConnector {
+            calls: AtomicUsize::new(0),
+        });
+        let state = DesktopShellState::new_live_with_connector(
+            runtime,
+            workspaces,
+            std::sync::Arc::clone(&mcp),
+            ProjectMemoryScope::default(),
+            connector.clone(),
+        );
+        let mut spawn = AgentSpawnRequest::terminal_harness(
+            "ui-builder",
+            crate::runtime::AgentPlatformId::try_new("missing-runtime").expect("valid platform id"),
+            canonical_text,
+            24,
+            80,
+        );
+        spawn.task = Some("this must not activate without confirmation".to_string());
+        spawn.role_assignment =
+            Some(impulse_ops::role_assignment::canonical_governed_builder_assignment());
+        let request = McpInvokeRequest {
+            tool: "impulse.agent_spawn".to_string(),
+            arguments: serde_json::to_value(spawn).expect("serialize spawn request"),
+            confirmed: false,
+            caller_agent_id: Some("impulse-ui".to_string()),
+        };
+
+        let error = mcp_invoke(&state, request)
+            .await
+            .expect_err("unconfirmed spawn must fail before project activation");
+        assert!(error.contains("caller did not confirm"), "{error}");
+        assert_eq!(connector.calls.load(Ordering::SeqCst), 0);
+        assert!(state.memory_root().is_err());
+        let audit = mcp.audit_log();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].tool, "impulse.agent_spawn");
+        assert_eq!(audit[0].caller_agent_id.as_deref(), Some("impulse-ui"));
+        assert!(!audit[0].confirmed);
+        assert!(!audit[0].ok);
+        assert_eq!(audit[0].result["category"], "confirmation");
+    }
+
+    #[tokio::test]
+    async fn malformed_mcp_spawn_is_audited_before_project_activation() {
+        let runtime = std::sync::Arc::new(DesktopRuntime::default());
+        let workspaces = std::sync::Arc::new(WorkspaceRegistry::default());
+        let mcp = std::sync::Arc::new(McpToolRegistry::with_builtins());
+        let connector = std::sync::Arc::new(RecordingBoundaryConnector {
+            calls: AtomicUsize::new(0),
+        });
+        let state = DesktopShellState::new_live_with_connector(
+            runtime,
+            workspaces,
+            std::sync::Arc::clone(&mcp),
+            ProjectMemoryScope::default(),
+            connector.clone(),
+        );
+        let request = McpInvokeRequest {
+            tool: "impulse.agent_spawn".to_string(),
+            arguments: serde_json::json!({"not": "an AgentSpawnRequest"}),
+            confirmed: true,
+            caller_agent_id: Some("impulse-ui".to_string()),
+        };
+
+        let error = mcp_invoke(&state, request)
+            .await
+            .expect_err("malformed spawn must fail before project activation");
+        assert!(
+            error.contains("invalid AgentSpawnRequest payload"),
+            "{error}"
+        );
+        assert_eq!(connector.calls.load(Ordering::SeqCst), 0);
+        assert!(state.memory_root().is_err());
+        let audit = mcp.audit_log();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].tool, "impulse.agent_spawn");
+        assert!(audit[0].confirmed);
+        assert!(!audit[0].ok);
+        assert_eq!(audit[0].result["category"], "tool");
     }
 }

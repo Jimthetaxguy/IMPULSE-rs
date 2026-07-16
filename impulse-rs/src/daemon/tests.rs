@@ -17,6 +17,8 @@ mod tests {
         handle_ops_request, handle_plugin_request, handle_session_request, handle_status,
         handle_steward_request,
     };
+    #[cfg(unix)]
+    use super::super::DaemonInstanceLock;
 
     /// Test DaemonRequest serialization/deserialization
     #[test]
@@ -1768,5 +1770,26 @@ mod tests {
         let json = serde_json::to_value(history).unwrap();
         assert!(json.is_array());
         assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_instance_lock_rejects_symlink_without_mutating_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("impulse.sock");
+        let lock_path = socket_path.with_extension("daemon.lock");
+        let external = dir.path().join("external-lock-target");
+        std::fs::write(&external, b"must remain untouched").expect("external target");
+        symlink(&external, &lock_path).expect("hostile daemon lock symlink");
+
+        let error = DaemonInstanceLock::acquire(&socket_path)
+            .err()
+            .expect("daemon lock must reject symlink");
+        assert!(error
+            .to_string()
+            .contains("Failed to open daemon lifecycle lock"));
+        assert_eq!(std::fs::read(&external).unwrap(), b"must remain untouched");
     }
 }

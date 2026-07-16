@@ -363,6 +363,23 @@ impl McpToolRegistry {
         Ok(invocation)
     }
 
+    /// Record a host-side rejection that must occur before a tool context can
+    /// safely exist, such as an unconfirmed disconnected project activation.
+    /// This preserves the same append-only audit shape as an executed tool.
+    pub fn record_rejected_invocation(
+        &self,
+        name: &str,
+        caller_agent_id: Option<String>,
+        arguments: Value,
+        confirmed: bool,
+        error: &McpError,
+    ) -> McpInvocation {
+        let invocation = McpInvocation::new(name, caller_agent_id, arguments, confirmed)
+            .with_result(false, error.to_json());
+        self.lock_audit().push(invocation.clone());
+        invocation
+    }
+
     pub fn audit_log(&self) -> Vec<McpInvocation> {
         self.lock_audit().clone()
     }

@@ -193,7 +193,7 @@ fn test_memory_view_renders_review_only_candidate_provenance_without_actions() {
 #[component]
 fn ArtifactsHarness(artifacts: Vec<ArtifactEnvelope>) -> Element {
     rsx! {
-        ArtifactsView { artifacts, on_intent: move |_| {} }
+        ArtifactsView { artifacts }
     }
 }
 
@@ -233,7 +233,7 @@ fn test_artifacts_view_groups_by_status() {
 }
 
 #[test]
-fn test_artifact_card_renders_summary_hints_and_mutating_action() {
+fn test_artifact_card_renders_envelope_but_never_advertised_actions() {
     let artifacts = vec![ArtifactEnvelope {
         id: "art-1".to_string(),
         agent_id: "codex".to_string(),
@@ -242,9 +242,9 @@ fn test_artifact_card_renders_summary_hints_and_mutating_action() {
         summary: "applies the daemon split".to_string(),
         view_hints: vec![ArtifactViewHint::Diff],
         actions: vec![ArtifactAction {
-            id: "apply".to_string(),
-            label: "Apply".to_string(),
-            kind: "apply".to_string(),
+            id: "dangerous-local-action".to_string(),
+            label: "Execute mutation".to_string(),
+            kind: "local-only-mutation".to_string(),
             requires_confirmation: true,
             ..Default::default()
         }],
@@ -262,7 +262,11 @@ fn test_artifact_card_renders_summary_hints_and_mutating_action() {
     assert!(html.contains("applies the daemon split"));
     assert!(html.contains("hint-chips"));
     assert!(html.contains(">diff<"));
-    assert!(html.contains("action-ghost mutating"));
+    assert!(!html.contains("<button"));
+    assert!(!html.contains("artifact-actions"));
+    assert!(!html.contains("Execute mutation"));
+    assert!(!html.contains("dangerous-local-action"));
+    assert!(!html.contains("local-only-mutation"));
 }
 
 #[test]
@@ -311,7 +315,6 @@ fn test_view_css_contains_stage_and_artifact_contracts() {
         ".view-memory.active",
         ".view-artifacts.active",
         ".artifact-card",
-        ".shell-notice",
     ] {
         assert!(css.contains(selector), "missing CSS selector {selector}");
     }

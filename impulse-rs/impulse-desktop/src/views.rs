@@ -12,7 +12,7 @@
 //!   the Review "apply" affordance and critical interventions earn warm accent.
 //! - Bloom is reserved for the brand lockup, never data screens (P05).
 //!
-//! Invariant: the non-Terminal views (Memory/Review/Artifacts/Supervisor) are
+//! Invariant: the non-Terminal views (Memory/Review/Artifacts/Oversight) are
 //! mounted only while selected (see the `match active` in `ui.rs`), so each
 //! hardcodes the `active` CSS class — correct as long as that mount-when-active
 //! contract holds. Only the Terminal view is kept alive across switches.
@@ -55,7 +55,7 @@ impl DesktopView {
             DesktopView::Memory => "Memory",
             DesktopView::Review => "Review",
             DesktopView::Artifacts => "Artifacts",
-            DesktopView::Supervisor => "Supervisor",
+            DesktopView::Supervisor => "Oversight",
         }
     }
 
@@ -67,26 +67,6 @@ impl DesktopView {
             DesktopView::Review => "review",
             DesktopView::Artifacts => "artifacts",
             DesktopView::Supervisor => "supervisor",
-        }
-    }
-}
-
-/// A user intent emitted by an artifact action button. The shell records the
-/// latest intent in its status line; wiring it to a real host command is a
-/// deliberate follow-up (the command surface stays untouched here).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ShellIntent {
-    ArtifactAction { artifact_id: String, action: String },
-}
-
-impl ShellIntent {
-    /// One-line description shown in the shell's status line.
-    pub fn describe(&self) -> String {
-        match self {
-            ShellIntent::ArtifactAction {
-                artifact_id,
-                action,
-            } => format!("{action} on artifact {artifact_id}"),
         }
     }
 }
@@ -327,7 +307,7 @@ pub fn MemoryView(
 // ──────────────────────────── Artifacts view ────────────────────────────
 
 #[component]
-fn ArtifactCard(artifact: ArtifactEnvelope, on_intent: EventHandler<ShellIntent>) -> Element {
+fn ArtifactCard(artifact: ArtifactEnvelope) -> Element {
     let title = if artifact.title.is_empty() {
         artifact.kind.clone()
     } else {
@@ -354,43 +334,16 @@ fn ArtifactCard(artifact: ArtifactEnvelope, on_intent: EventHandler<ShellIntent>
                     }
                 }
             }
-            if !artifact.actions.is_empty() {
-                div { class: "artifact-actions",
-                    for action in artifact.actions.iter() {
-                        {
-                            let artifact_id = artifact.id.clone();
-                            let action_id = action.id.clone();
-                            let action_label = action.label.clone();
-                            let class_name = if action.requires_confirmation {
-                                "action-ghost mutating"
-                            } else {
-                                "action-ghost"
-                            };
-                            rsx! {
-                                button {
-                                    key: "{action_id}",
-                                    class: "{class_name}",
-                                    onclick: move |_| on_intent.call(ShellIntent::ArtifactAction {
-                                        artifact_id: artifact_id.clone(),
-                                        action: action_id.clone(),
-                                    }),
-                                    "{action_label}"
-                                }
-                            }
-                        }
-                    }
-                }
-            }
         }
     }
 }
 
-/// Artifact envelopes grouped by lifecycle status, attention-first.
+/// Read-only artifact envelopes grouped by lifecycle status, attention-first.
+///
+/// Envelopes retain their declared actions in the shared DTO, but the desktop
+/// does not render them until a real host-command contract can execute them.
 #[component]
-pub fn ArtifactsView(
-    artifacts: Vec<ArtifactEnvelope>,
-    on_intent: EventHandler<ShellIntent>,
-) -> Element {
+pub fn ArtifactsView(artifacts: Vec<ArtifactEnvelope>) -> Element {
     if artifacts.is_empty() {
         return rsx! {
             div { class: "stage-view view-artifacts active", "data-view": "artifacts",
@@ -439,7 +392,6 @@ pub fn ArtifactsView(
                                         ArtifactCard {
                                             key: "{artifact.id}",
                                             artifact: artifact.clone(),
-                                            on_intent,
                                         }
                                     }
                                 }
@@ -475,19 +427,7 @@ mod tests {
         assert_eq!(DesktopView::Terminal.slug(), "terminal");
         assert_eq!(DesktopView::Memory.label(), "Memory");
         assert_eq!(DesktopView::Artifacts.slug(), "artifacts");
-        assert_eq!(DesktopView::Supervisor.label(), "Supervisor");
-    }
-
-    #[test]
-    fn test_shell_intent_describe_is_human_readable() {
-        assert_eq!(
-            ShellIntent::ArtifactAction {
-                artifact_id: "art-1".to_string(),
-                action: "apply".to_string(),
-            }
-            .describe(),
-            "apply on artifact art-1"
-        );
+        assert_eq!(DesktopView::Supervisor.label(), "Oversight");
     }
 
     #[test]

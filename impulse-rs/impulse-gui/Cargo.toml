@@ -16,7 +16,7 @@ path = "src/main.rs"
 [dependencies]
 eframe = "0.31"
 impulse-ops = { path = "../impulse-ops" }
-impulse-term = { path = "../impulse-term" }
+impulse-term = { path = "../impulse-term", default-features = false, features = ["egui"] }
 which = "7"
 env_logger = "0.11"
 log = "0.4"

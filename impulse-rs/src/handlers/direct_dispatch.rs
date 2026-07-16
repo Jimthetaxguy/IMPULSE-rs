@@ -40,6 +40,7 @@ where
     match cli.command {
         Commands::Daemon { .. } => {
             daemon::Daemon::new(state.clone())
+                .with_owner_pid(cli.owner_pid)
                 .start()
                 .await
                 .context("Failed to start daemon")?;
@@ -623,6 +624,7 @@ mod tests {
             verbose: false,
             daemon: false,
             socket: None,
+            owner_pid: None,
             format: None,
         }
     }

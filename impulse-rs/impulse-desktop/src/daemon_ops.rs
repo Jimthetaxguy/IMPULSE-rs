@@ -8,6 +8,8 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::sync::Condvar;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -51,49 +53,80 @@ impl DesktopDaemonOpsConfig {
         }
     }
 
-    /// Resolve the daemon socket without conflating the desktop's global
-    /// memory fallback with the daemon's project-local default.
+    pub fn for_project(project_root: PathBuf) -> Self {
+        let socket_path = project_root
+            .join(".impulse")
+            .join("sockets")
+            .join("impulse.sock");
+        Self::new(socket_path, Some(project_root.clone())).with_relative_cwd_base(project_root)
+    }
+
+    /// Resolve only an operator-supplied standard project socket.
+    ///
+    /// The desktop binary uses this stricter startup path so Finder, shells,
+    /// temporary directories, and unrelated ancestor `.impulse` folders can
+    /// never become implicit governance authority. Without the explicit
+    /// socket, the visible registered-workspace launch activates the boundary.
+    pub fn discover_explicit_project_bound() -> Option<Self> {
+        let socket_path = std::env::var("IMPULSE_SOCKET_PATH")
+            .ok()
+            .filter(|path| !path.trim().is_empty())
+            .map(PathBuf::from)?;
+        if !socket_path.is_absolute() {
+            return None;
+        }
+        let project_root = project_root_from_socket(&socket_path)?;
+        Some(Self::new(socket_path, Some(project_root)))
+    }
+
+    /// Resolve only a project-bound daemon socket.
     ///
     /// Precedence:
     /// 1. explicit `IMPULSE_SOCKET_PATH`;
     /// 2. an existing socket discovered from cwd upward;
-    /// 3. an existing project-local `.impulse` directory from cwd upward;
-    /// 4. an existing socket below `memory_root`;
-    /// 5. the cwd-local daemon default (so a daemon started later is found);
-    /// 6. the provided memory root.
-    pub fn discover(memory_root: &Path) -> Self {
-        if let Ok(path) = std::env::var("IMPULSE_SOCKET_PATH") {
-            if !path.trim().is_empty() {
-                let socket_path = PathBuf::from(path);
-                let project_root =
-                    project_root_from_socket(&socket_path).or_else(|| std::env::current_dir().ok());
-                return Self::new(socket_path, project_root);
-            }
-        }
-
+    /// 3. an existing project-local `.impulse` directory from cwd upward.
+    ///
+    /// The user's home-level `~/.impulse` memory fallback is deliberately not
+    /// a daemon authority. Without an explicit standard socket or a
+    /// project-local discovery, the desktop starts with oversight disconnected
+    /// instead of publishing home-wide telemetry into a pretend project.
+    pub fn discover_project_bound() -> Option<Self> {
+        let explicit_socket = std::env::var("IMPULSE_SOCKET_PATH")
+            .ok()
+            .filter(|path| !path.trim().is_empty())
+            .map(PathBuf::from);
         let cwd = std::env::current_dir().ok();
-        if let Some(root) = cwd.as_deref() {
-            if let Some((socket, project)) = find_project_socket(root, true) {
-                return Self::new(socket, Some(project));
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        Self::discover_project_bound_from(
+            explicit_socket.as_deref(),
+            cwd.as_deref(),
+            home.as_deref(),
+        )
+    }
+
+    fn discover_project_bound_from(
+        explicit_socket: Option<&Path>,
+        cwd: Option<&Path>,
+        home: Option<&Path>,
+    ) -> Option<Self> {
+        if let Some(socket_path) = explicit_socket {
+            if !socket_path.is_absolute() {
+                return None;
             }
-            if let Some((socket, project)) = find_project_socket(root, false) {
-                return Self::new(socket, Some(project));
+            let project_root = project_root_from_socket(socket_path)?;
+            return Some(Self::new(socket_path.to_path_buf(), Some(project_root)));
+        }
+
+        let root = cwd?;
+        for require_socket in [true, false] {
+            if let Some((socket, project)) = find_project_socket(root, require_socket) {
+                if home.is_some_and(|home| paths_refer_to_same_location(home, &project)) {
+                    continue;
+                }
+                return Some(Self::new(socket, Some(project)));
             }
         }
-
-        let memory_socket = memory_root.join("sockets").join("impulse.sock");
-        if memory_socket.exists() {
-            return Self::new(memory_socket, memory_root.parent().map(Path::to_path_buf));
-        }
-
-        if let Some(root) = cwd {
-            return Self::new(
-                root.join(".impulse").join("sockets").join("impulse.sock"),
-                Some(root),
-            );
-        }
-
-        Self::new(memory_socket, memory_root.parent().map(Path::to_path_buf))
+        None
     }
 
     pub fn with_source_id(mut self, source_id: impl Into<String>) -> Self {
@@ -140,6 +173,16 @@ fn project_root_from_socket(socket_path: &Path) -> Option<PathBuf> {
     } else {
         None
     }
+}
+
+fn paths_refer_to_same_location(left: &Path, right: &Path) -> bool {
+    let left = left
+        .canonicalize()
+        .unwrap_or_else(|_| normalize_lexically(left));
+    let right = right
+        .canonicalize()
+        .unwrap_or_else(|_| normalize_lexically(right));
+    left == right
 }
 
 /// Complete conversion from desktop PTY facts to the daemon's telemetry DTO.
@@ -369,6 +412,98 @@ pub enum DesktopDaemonOpsStartError {
 pub struct DesktopDaemonOpsAttachment {
     pub event_sink: Arc<dyn DesktopEventSink>,
     pub governed_task_gateway: Arc<dyn GovernedTaskGateway>,
+    pub shutdown_handle: DesktopDaemonOpsShutdownHandle,
+}
+
+/// Cloneable, idempotent stop handle for the daemon-ops worker.
+///
+/// Dioxus's native event loop exits without unwinding the launch stack, so the
+/// worker cannot rely on its event sink being dropped. Explicit shutdown joins
+/// the worker after it drains the lifecycle outbox and publishes an empty final
+/// terminal report.
+#[derive(Clone)]
+pub struct DesktopDaemonOpsShutdownHandle {
+    shutdown: Arc<dyn Fn() -> DesktopDaemonOpsShutdownOutcome + Send + Sync>,
+}
+
+impl DesktopDaemonOpsShutdownHandle {
+    pub(crate) fn new(
+        shutdown: impl Fn() -> DesktopDaemonOpsShutdownOutcome + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            shutdown: Arc::new(shutdown),
+        }
+    }
+
+    pub fn shutdown(&self) -> DesktopDaemonOpsShutdownOutcome {
+        (self.shutdown)()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopDaemonOpsShutdownOutcome {
+    pub worker_joined: bool,
+    pub lifecycle_outbox_drained: bool,
+    pub final_report_published: bool,
+    pub failures: Vec<DesktopDaemonOpsShutdownFailure>,
+}
+
+impl DesktopDaemonOpsShutdownOutcome {
+    pub fn successful() -> Self {
+        Self {
+            worker_joined: true,
+            lifecycle_outbox_drained: true,
+            final_report_published: true,
+            failures: Vec::new(),
+        }
+    }
+
+    fn from_worker(worker: DesktopDaemonOpsWorkerShutdown) -> Self {
+        let mut failures = Vec::new();
+        if let Some(message) = worker.lifecycle_outbox_error {
+            failures.push(DesktopDaemonOpsShutdownFailure::LifecycleOutboxDrain { message });
+        }
+        if let Some(message) = worker.final_report_error {
+            failures.push(DesktopDaemonOpsShutdownFailure::FinalReportPublish { message });
+        }
+        Self {
+            worker_joined: true,
+            lifecycle_outbox_drained: !failures.iter().any(|failure| {
+                matches!(
+                    failure,
+                    DesktopDaemonOpsShutdownFailure::LifecycleOutboxDrain { .. }
+                )
+            }),
+            final_report_published: !failures.iter().any(|failure| {
+                matches!(
+                    failure,
+                    DesktopDaemonOpsShutdownFailure::FinalReportPublish { .. }
+                )
+            }),
+            failures,
+        }
+    }
+
+    fn worker_join_failed(message: String) -> Self {
+        Self {
+            worker_joined: false,
+            lifecycle_outbox_drained: false,
+            final_report_published: false,
+            failures: vec![DesktopDaemonOpsShutdownFailure::WorkerJoin { message }],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DesktopDaemonOpsShutdownFailure {
+    WorkerJoin { message: String },
+    LifecycleOutboxDrain { message: String },
+    FinalReportPublish { message: String },
+}
+
+struct DesktopDaemonOpsWorkerShutdown {
+    lifecycle_outbox_error: Option<String>,
+    final_report_error: Option<String>,
 }
 
 #[cfg(unix)]
@@ -376,13 +511,14 @@ mod unix {
     use std::collections::BTreeSet;
     use std::ffi::OsStr;
     use std::fs::{File, OpenOptions};
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
     use std::thread::{self, JoinHandle};
+    use std::time::Instant;
 
     use impulse_ops::{OpsSubscription, WorkbenchDaemonRequest, WorkbenchDaemonResponse};
 
@@ -397,6 +533,8 @@ mod unix {
     const ACKNOWLEDGED_REQUEST_ATTEMPTS: usize = 3;
     const GOVERNED_LIFECYCLE_OUTBOX_SCHEMA: u32 = 1;
     const MAX_GOVERNED_LIFECYCLE_OUTBOX_ENTRIES: usize = 1_024;
+    const LIFECYCLE_OUTBOX_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+    const LIFECYCLE_OUTBOX_LOCK_RETRY: Duration = Duration::from_millis(10);
 
     fn is_executable_file(path: &Path) -> bool {
         std::fs::metadata(path)
@@ -443,7 +581,7 @@ mod unix {
     /// path (including a PATH shim) instead of canonicalizing to its target.
     /// An explicit but invalid override fails closed rather than launching a
     /// different binary than the operator requested.
-    fn resolve_control_cli(
+    pub(super) fn resolve_control_cli(
         configured: Option<&OsStr>,
         current_executable: Option<&Path>,
         current_dir: &Path,
@@ -501,6 +639,7 @@ mod unix {
             .and_then(utf8_executable_path)
     }
 
+    #[derive(Debug)]
     struct LifecycleOutboxFileLock(File);
 
     fn flock_retry(file: &File, operation: libc::c_int) -> std::io::Result<()> {
@@ -514,6 +653,44 @@ mod unix {
             if error.kind() != std::io::ErrorKind::Interrupted {
                 return Err(error);
             }
+        }
+    }
+
+    fn flock_exclusive_until(
+        file: &File,
+        timeout: Duration,
+        stop: Option<&AtomicBool>,
+    ) -> std::io::Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            // SAFETY: callers retain ownership of `file` for the duration of
+            // this call, so its descriptor remains valid across `flock`.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            if error.kind() != std::io::ErrorKind::WouldBlock {
+                return Err(error);
+            }
+            if stop.is_some_and(|stop| stop.load(Ordering::Acquire)) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "desktop daemon-ops shutdown requested while waiting for lifecycle outbox lock",
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "timed out after {}ms waiting for lifecycle outbox lock",
+                        timeout.as_millis()
+                    ),
+                ));
+            }
+            thread::sleep(LIFECYCLE_OUTBOX_LOCK_RETRY);
         }
     }
 
@@ -562,6 +739,8 @@ mod unix {
         socket_path: PathBuf,
         lifecycle_outbox_path: Option<PathBuf>,
         lifecycle_outbox_lock: Arc<Mutex<()>>,
+        lifecycle_outbox_stop: Option<Arc<AtomicBool>>,
+        lifecycle_outbox_lock_timeout: Duration,
         io_timeout: Duration,
         governed_registration_read_timeout: Duration,
     }
@@ -572,6 +751,8 @@ mod unix {
                 socket_path,
                 lifecycle_outbox_path: None,
                 lifecycle_outbox_lock: Arc::new(Mutex::new(())),
+                lifecycle_outbox_stop: None,
+                lifecycle_outbox_lock_timeout: LIFECYCLE_OUTBOX_LOCK_TIMEOUT,
                 io_timeout: IO_TIMEOUT,
                 governed_registration_read_timeout: GOVERNED_REGISTRATION_READ_TIMEOUT,
             }
@@ -590,6 +771,17 @@ mod unix {
 
         fn with_lifecycle_outbox(mut self, path: Option<PathBuf>) -> Self {
             self.lifecycle_outbox_path = path;
+            self
+        }
+
+        fn with_lifecycle_outbox_stop(mut self, stop: Arc<AtomicBool>) -> Self {
+            self.lifecycle_outbox_stop = Some(stop);
+            self
+        }
+
+        #[cfg(test)]
+        fn with_lifecycle_outbox_lock_timeout(mut self, timeout: Duration) -> Self {
+            self.lifecycle_outbox_lock_timeout = timeout;
             self
         }
 
@@ -732,7 +924,7 @@ mod unix {
                 .lifecycle_outbox_lock
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let _file_guard = Self::lock_lifecycle_outbox(path)?;
+            let _file_guard = self.lock_lifecycle_outbox(path)?;
             let mut outbox = Self::read_lifecycle_outbox(path)?;
             if let Some(existing) = outbox
                 .entries
@@ -766,7 +958,7 @@ mod unix {
                     .lifecycle_outbox_lock
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let _file_guard = Self::lock_lifecycle_outbox(path)?;
+                let _file_guard = self.lock_lifecycle_outbox(path)?;
                 Self::read_lifecycle_outbox(path)?.entries
             };
             if entries.is_empty() {
@@ -821,7 +1013,7 @@ mod unix {
                     .lifecycle_outbox_lock
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let _file_guard = Self::lock_lifecycle_outbox(path)?;
+                let _file_guard = self.lock_lifecycle_outbox(path)?;
                 let mut latest = Self::read_lifecycle_outbox(path)?;
                 if !resolved.is_empty() {
                     latest
@@ -851,7 +1043,7 @@ mod unix {
                 .lifecycle_outbox_lock
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let _file_guard = Self::lock_lifecycle_outbox(path)?;
+            let _file_guard = self.lock_lifecycle_outbox(path)?;
             let mut outbox = Self::read_lifecycle_outbox(path)?;
             let original_len = outbox.entries.len();
             outbox
@@ -863,7 +1055,7 @@ mod unix {
             Ok(())
         }
 
-        fn lock_lifecycle_outbox(path: &Path) -> Result<LifecycleOutboxFileLock, String> {
+        fn lock_lifecycle_outbox(&self, path: &Path) -> Result<LifecycleOutboxFileLock, String> {
             let parent = path
                 .parent()
                 .ok_or_else(|| "governed lifecycle outbox path has no parent".to_string())?;
@@ -876,20 +1068,54 @@ mod unix {
                 .write(true)
                 .truncate(false)
                 .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
                 .open(&lock_path)
                 .map_err(|error| format!("open governed lifecycle outbox lock: {error}"))?;
+            let metadata = file
+                .metadata()
+                .map_err(|error| format!("inspect governed lifecycle outbox lock: {error}"))?;
+            if !metadata.is_file() {
+                return Err(format!(
+                    "governed lifecycle outbox lock `{}` must be a regular file",
+                    lock_path.display()
+                ));
+            }
             file.set_permissions(std::fs::Permissions::from_mode(0o600))
                 .map_err(|error| format!("restrict governed lifecycle outbox lock: {error}"))?;
-            flock_retry(&file, libc::LOCK_EX)
-                .map_err(|error| format!("lock governed lifecycle outbox: {error}"))?;
+            flock_exclusive_until(
+                &file,
+                self.lifecycle_outbox_lock_timeout,
+                self.lifecycle_outbox_stop.as_deref(),
+            )
+            .map_err(|error| format!("lock governed lifecycle outbox: {error}"))?;
             Ok(LifecycleOutboxFileLock(file))
         }
 
         fn read_lifecycle_outbox(path: &Path) -> Result<GovernedLifecycleOutbox, String> {
-            if !path.exists() {
-                return Ok(GovernedLifecycleOutbox::default());
+            let mut file = match OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(path)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(GovernedLifecycleOutbox::default());
+                }
+                Err(error) => {
+                    return Err(format!("open governed lifecycle outbox: {error}"));
+                }
+            };
+            let metadata = file
+                .metadata()
+                .map_err(|error| format!("inspect governed lifecycle outbox: {error}"))?;
+            if !metadata.is_file() {
+                return Err(format!(
+                    "governed lifecycle outbox `{}` must be a regular file",
+                    path.display()
+                ));
             }
-            let bytes = std::fs::read(path)
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
                 .map_err(|error| format!("read governed lifecycle outbox: {error}"))?;
             let outbox: GovernedLifecycleOutbox = serde_json::from_slice(&bytes)
                 .map_err(|error| format!("parse governed lifecycle outbox: {error}"))?;
@@ -1121,8 +1347,89 @@ mod unix {
         downstream: Arc<dyn DesktopEventSink>,
         telemetry: Arc<Mutex<RuntimeTelemetryState>>,
         wake_tx: SyncSender<()>,
+        worker_control: Arc<DesktopDaemonOpsWorkerControl>,
+    }
+
+    struct DesktopDaemonOpsWorkerControl {
         stop: Arc<AtomicBool>,
-        worker: Mutex<Option<JoinHandle<()>>>,
+        wake_tx: SyncSender<()>,
+        state: Mutex<DesktopDaemonOpsWorkerState>,
+        completed: Condvar,
+    }
+
+    enum DesktopDaemonOpsWorkerState {
+        Running(JoinHandle<DesktopDaemonOpsWorkerShutdown>),
+        Joining,
+        Complete(DesktopDaemonOpsShutdownOutcome),
+    }
+
+    impl DesktopDaemonOpsWorkerControl {
+        fn new(
+            stop: Arc<AtomicBool>,
+            wake_tx: SyncSender<()>,
+            worker: JoinHandle<DesktopDaemonOpsWorkerShutdown>,
+        ) -> Self {
+            Self {
+                stop,
+                wake_tx,
+                state: Mutex::new(DesktopDaemonOpsWorkerState::Running(worker)),
+                completed: Condvar::new(),
+            }
+        }
+
+        fn shutdown(&self) -> DesktopDaemonOpsShutdownOutcome {
+            self.stop.store(true, Ordering::Release);
+            let _ = self.wake_tx.try_send(());
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut state = self
+                .completed
+                .wait_while(state, |state| {
+                    matches!(state, DesktopDaemonOpsWorkerState::Joining)
+                })
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let worker = match std::mem::replace(&mut *state, DesktopDaemonOpsWorkerState::Joining)
+            {
+                DesktopDaemonOpsWorkerState::Running(worker) => worker,
+                DesktopDaemonOpsWorkerState::Complete(outcome) => {
+                    *state = DesktopDaemonOpsWorkerState::Complete(outcome.clone());
+                    return outcome;
+                }
+                DesktopDaemonOpsWorkerState::Joining => {
+                    unreachable!("wait_while must not return a joining daemon-ops state")
+                }
+            };
+            drop(state);
+
+            let outcome = if worker.thread().id() == thread::current().id() {
+                DesktopDaemonOpsShutdownOutcome::worker_join_failed(
+                    "daemon-ops worker attempted to join itself".to_string(),
+                )
+            } else {
+                match worker.join() {
+                    Ok(worker) => DesktopDaemonOpsShutdownOutcome::from_worker(worker),
+                    Err(_) => DesktopDaemonOpsShutdownOutcome::worker_join_failed(
+                        "daemon-ops worker panicked during shutdown".to_string(),
+                    ),
+                }
+            };
+
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *state = DesktopDaemonOpsWorkerState::Complete(outcome.clone());
+            self.completed.notify_all();
+            outcome
+        }
+    }
+
+    impl Drop for DesktopDaemonOpsWorkerControl {
+        fn drop(&mut self) {
+            let _ = self.shutdown();
+        }
     }
 
     impl DesktopEventSink for DesktopDaemonOpsSink {
@@ -1151,18 +1458,7 @@ mod unix {
 
     impl Drop for DesktopDaemonOpsSink {
         fn drop(&mut self) {
-            self.stop.store(true, Ordering::Release);
-            let _ = self.wake_tx.try_send(());
-            let handle = self
-                .worker
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take();
-            if let Some(handle) = handle {
-                if handle.thread().id() != thread::current().id() {
-                    let _ = handle.join();
-                }
-            }
+            let _ = self.worker_control.shutdown();
         }
     }
 
@@ -1186,7 +1482,8 @@ mod unix {
         let worker_downstream = Arc::clone(&downstream);
         let heartbeat_interval = config.heartbeat_interval;
         let client = UnixDaemonOpsClient::new(config.socket_path)
-            .with_lifecycle_outbox(lifecycle_outbox_path);
+            .with_lifecycle_outbox(lifecycle_outbox_path)
+            .with_lifecycle_outbox_stop(Arc::clone(&stop));
         let command_client = Arc::new(client.clone());
         let mut client = client;
         let worker = thread::Builder::new()
@@ -1203,17 +1500,24 @@ mod unix {
             })
             .map_err(DesktopDaemonOpsStartError::WorkerStart)?;
 
+        let worker_control = Arc::new(DesktopDaemonOpsWorkerControl::new(
+            stop,
+            wake_tx.clone(),
+            worker,
+        ));
         let event_sink: Arc<dyn DesktopEventSink> = Arc::new(DesktopDaemonOpsSink {
             downstream,
             telemetry,
             wake_tx,
-            stop,
-            worker: Mutex::new(Some(worker)),
+            worker_control: Arc::clone(&worker_control),
         });
         let governed_task_gateway: Arc<dyn GovernedTaskGateway> = command_client;
+        let shutdown_handle =
+            DesktopDaemonOpsShutdownHandle::new(move || worker_control.shutdown());
         Ok(DesktopDaemonOpsAttachment {
             event_sink,
             governed_task_gateway,
+            shutdown_handle,
         })
     }
 
@@ -1224,7 +1528,7 @@ mod unix {
         wake_rx: Receiver<()>,
         stop: Arc<AtomicBool>,
         heartbeat_interval: Duration,
-    ) {
+    ) -> DesktopDaemonOpsWorkerShutdown {
         let mut cursor = SubscriptionCursor::new();
         let mut last_error = None;
         let mut last_connected = None;
@@ -1247,14 +1551,19 @@ mod unix {
         loop {
             let wake = wake_rx.recv_timeout(heartbeat_interval);
             if stop.load(Ordering::Acquire) || matches!(wake, Err(RecvTimeoutError::Disconnected)) {
-                if let Err(error) = client.drain_governed_lifecycle_outbox() {
+                let lifecycle_outbox_error = client.drain_governed_lifecycle_outbox().err();
+                if let Some(error) = lifecycle_outbox_error.as_deref() {
                     eprintln!("desktop governed lifecycle outbox shutdown drain failed: {error}");
                 }
                 let empty = lock_state(&telemetry).empty_report();
-                if let Err(error) = client.publish(&empty) {
+                let final_report_error = client.publish(&empty).err();
+                if let Some(error) = final_report_error.as_deref() {
                     eprintln!("desktop daemon-ops shutdown publish failed: {error}");
                 }
-                break;
+                return DesktopDaemonOpsWorkerShutdown {
+                    lifecycle_outbox_error,
+                    final_report_error,
+                };
             }
 
             let report = lock_state(&telemetry).report();
@@ -2215,7 +2524,8 @@ mod unix {
             let dir = tempfile::tempdir().expect("tempdir");
             let outbox_path = dir.path().join("governed-lifecycle-outbox.json");
             let ready_path = dir.path().join("child-ready");
-            let file_guard = UnixDaemonOpsClient::lock_lifecycle_outbox(&outbox_path).unwrap();
+            let lock_client = UnixDaemonOpsClient::new(dir.path().join("unused.sock"));
+            let file_guard = lock_client.lock_lifecycle_outbox(&outbox_path).unwrap();
             let helper_module = module_path!()
                 .strip_prefix("impulse_desktop::")
                 .unwrap_or(module_path!());
@@ -2290,6 +2600,63 @@ mod unix {
                 .entries
                 .iter()
                 .any(|entry| entry.request_id.as_str() == "outbox-subprocess"));
+        }
+
+        #[test]
+        fn lifecycle_outbox_use_sites_reject_symlink_leaves() {
+            use std::os::unix::fs::symlink;
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let outbox_path = dir.path().join("DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.json");
+            let external_outbox = dir.path().join("external-outbox");
+            std::fs::write(&external_outbox, b"external outbox").expect("external outbox");
+            symlink(&external_outbox, &outbox_path).expect("outbox symlink");
+            let read_error = UnixDaemonOpsClient::read_lifecycle_outbox(&outbox_path)
+                .expect_err("outbox reader must not follow symlinks");
+            assert!(read_error.contains("open governed lifecycle outbox"));
+            assert_eq!(std::fs::read(&external_outbox).unwrap(), b"external outbox");
+
+            std::fs::remove_file(&outbox_path).expect("remove test symlink");
+            let lock_path = outbox_path.with_extension("lock");
+            let external_lock = dir.path().join("external-lock");
+            std::fs::write(&external_lock, b"external lock").expect("external lock");
+            symlink(&external_lock, &lock_path).expect("lock symlink");
+            let client = UnixDaemonOpsClient::new(dir.path().join("unused.sock"));
+            let lock_error = client
+                .lock_lifecycle_outbox(&outbox_path)
+                .expect_err("outbox lock must not follow symlinks");
+            assert!(lock_error.contains("open governed lifecycle outbox lock"));
+            assert_eq!(std::fs::read(&external_lock).unwrap(), b"external lock");
+        }
+
+        #[test]
+        fn lifecycle_outbox_lock_wait_stops_promptly_during_shutdown() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let outbox_path = dir.path().join("DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.json");
+            let owner = UnixDaemonOpsClient::new(dir.path().join("owner.sock"));
+            let owner_guard = owner
+                .lock_lifecycle_outbox(&outbox_path)
+                .expect("own lifecycle lock");
+            let stop = Arc::new(AtomicBool::new(false));
+            let waiter = UnixDaemonOpsClient::new(dir.path().join("waiter.sock"))
+                .with_lifecycle_outbox_stop(Arc::clone(&stop))
+                .with_lifecycle_outbox_lock_timeout(Duration::from_secs(5));
+            let (result_tx, result_rx) = mpsc::channel();
+            let waiter_path = outbox_path.clone();
+            let worker = thread::spawn(move || {
+                let result = waiter.lock_lifecycle_outbox(&waiter_path);
+                result_tx.send(result.map(drop)).expect("send lock result");
+            });
+
+            thread::sleep(Duration::from_millis(50));
+            stop.store(true, Ordering::Release);
+            let error = result_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("shutdown must interrupt the lock wait")
+                .expect_err("lock wait must stop instead of succeeding");
+            assert!(error.contains("shutdown requested"), "{error}");
+            worker.join().expect("join lock waiter");
+            drop(owner_guard);
         }
 
         #[derive(Default)]
@@ -2384,6 +2751,7 @@ mod unix {
         struct ScriptedTransport {
             publish_results: VecDeque<Result<(), String>>,
             subscribe_results: VecDeque<Result<OpsSubscription, String>>,
+            outbox_results: VecDeque<Result<(), String>>,
             report_tx: mpsc::Sender<TerminalOpsReport>,
             since_tx: mpsc::Sender<Option<u64>>,
         }
@@ -2403,6 +2771,10 @@ mod unix {
                 self.subscribe_results
                     .pop_front()
                     .unwrap_or_else(|| Err("unexpected subscription".to_string()))
+            }
+
+            fn drain_governed_lifecycle_outbox(&mut self) -> Result<(), String> {
+                self.outbox_results.pop_front().unwrap_or(Ok(()))
             }
         }
 
@@ -2658,10 +3030,14 @@ mod unix {
                     .with_heartbeat_interval(Duration::from_secs(60)),
             )
             .expect("attach daemon ops");
-            let sink = attachment.event_sink;
+            let _sink = attachment.event_sink;
+            let shutdown = attachment.shutdown_handle;
             // Give the startup subscription a deterministic completion point.
             thread::sleep(Duration::from_millis(20));
-            drop(sink);
+            let first_outcome = shutdown.shutdown();
+            let second_outcome = shutdown.shutdown();
+            assert_eq!(first_outcome, DesktopDaemonOpsShutdownOutcome::successful());
+            assert_eq!(second_outcome, first_outcome);
 
             let report = report_rx
                 .recv_timeout(Duration::from_secs(3))
@@ -2725,6 +3101,7 @@ mod unix {
                     Ok(subscription(1, Vec::new())),
                     Ok(subscription(2, Vec::new())),
                 ]),
+                outbox_results: VecDeque::new(),
                 report_tx,
                 since_tx,
             };
@@ -2778,6 +3155,7 @@ mod unix {
                     Err("temporary subscribe failure".to_string()),
                     Ok(subscription(20, vec![recovered_agent])),
                 ]),
+                outbox_results: VecDeque::new(),
                 report_tx,
                 since_tx,
             };
@@ -2839,6 +3217,7 @@ mod unix {
                     Ok(subscription(20, vec![recovered_agent.clone()])),
                     Ok(subscription(30, vec![recovered_agent])),
                 ]),
+                outbox_results: VecDeque::new(),
                 report_tx,
                 since_tx,
             };
@@ -2875,7 +3254,110 @@ mod unix {
             let _ = wake_tx.try_send(());
             worker.join().expect("worker shutdown");
         }
+
+        #[test]
+        fn shutdown_outcome_captures_outbox_and_final_publish_failures() {
+            let telemetry = Arc::new(Mutex::new(RuntimeTelemetryState::new(
+                "desktop-shutdown-failure".to_string(),
+                None,
+                PathBuf::from("/tmp/project"),
+            )));
+            let (wake_tx, wake_rx) = sync_channel(1);
+            let (report_tx, _report_rx) = mpsc::channel();
+            let (since_tx, since_rx) = mpsc::channel();
+            let mut transport = ScriptedTransport {
+                publish_results: VecDeque::from([Err("final publish refused".to_string())]),
+                subscribe_results: VecDeque::from([Ok(subscription(1, Vec::new()))]),
+                outbox_results: VecDeque::from([
+                    Ok(()),
+                    Err("outbox persistence unavailable".to_string()),
+                ]),
+                report_tx,
+                since_tx,
+            };
+            let downstream: Arc<dyn DesktopEventSink> = Arc::new(RecordingSink::default());
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker_stop = Arc::clone(&stop);
+            let worker = thread::spawn(move || {
+                run_worker(
+                    &mut transport,
+                    telemetry,
+                    downstream,
+                    wake_rx,
+                    worker_stop,
+                    Duration::from_secs(60),
+                )
+            });
+            let control = DesktopDaemonOpsWorkerControl::new(stop, wake_tx, worker);
+
+            assert_eq!(
+                since_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("initial subscription"),
+                None
+            );
+            let first = control.shutdown();
+            let second = control.shutdown();
+
+            assert!(first.worker_joined);
+            assert!(!first.lifecycle_outbox_drained);
+            assert!(!first.final_report_published);
+            assert_eq!(
+                first.failures,
+                vec![
+                    DesktopDaemonOpsShutdownFailure::LifecycleOutboxDrain {
+                        message: "outbox persistence unavailable".to_string(),
+                    },
+                    DesktopDaemonOpsShutdownFailure::FinalReportPublish {
+                        message: "final publish refused".to_string(),
+                    },
+                ]
+            );
+            assert_eq!(
+                second, first,
+                "repeated shutdown returns the cached outcome"
+            );
+        }
+
+        #[test]
+        fn shutdown_outcome_captures_worker_join_failure() {
+            let stop = Arc::new(AtomicBool::new(false));
+            let (wake_tx, _wake_rx) = sync_channel(1);
+            let worker = thread::spawn(|| -> DesktopDaemonOpsWorkerShutdown {
+                panic!("intentional daemon-ops worker panic")
+            });
+            let control = DesktopDaemonOpsWorkerControl::new(stop, wake_tx, worker);
+
+            let outcome = control.shutdown();
+
+            assert!(!outcome.worker_joined);
+            assert!(!outcome.lifecycle_outbox_drained);
+            assert!(!outcome.final_report_published);
+            assert_eq!(
+                outcome.failures,
+                vec![DesktopDaemonOpsShutdownFailure::WorkerJoin {
+                    message: "daemon-ops worker panicked during shutdown".to_string(),
+                }]
+            );
+        }
     }
+}
+
+/// Resolve the same trusted control binary used for governed task routing so
+/// the desktop sidecar cannot silently launch a different `impulse-rs`.
+#[cfg(unix)]
+pub(crate) fn resolve_desktop_control_cli() -> Option<PathBuf> {
+    let configured = std::env::var_os("IMPULSE_CONTROL_CLI");
+    let current_executable = std::env::current_exe().ok();
+    let current_dir = std::env::current_dir().ok()?;
+    let path = std::env::var_os("PATH");
+    unix::resolve_control_cli(
+        configured.as_deref(),
+        current_executable.as_deref(),
+        &current_dir,
+        path.as_deref(),
+    )
+    .map(PathBuf::from)
 }
 
 /// Wrap the UI event sink with the daemon-truth publisher/subscriber.
@@ -3103,6 +3585,68 @@ mod tests {
             project_root_from_socket(Path::new("/tmp/custom.sock")),
             None
         );
+    }
+
+    #[test]
+    fn default_discovery_does_not_promote_home_memory_to_project_authority() {
+        let home = tempfile::tempdir().expect("home tempdir");
+        std::fs::create_dir_all(home.path().join(".impulse/sockets"))
+            .expect("create home memory root");
+        let cwd = home.path().join("code/project");
+        std::fs::create_dir_all(&cwd).expect("create nested cwd");
+
+        let discovered = DesktopDaemonOpsConfig::discover_project_bound_from(
+            None,
+            Some(&cwd),
+            Some(home.path()),
+        );
+
+        assert!(discovered.is_none());
+    }
+
+    #[test]
+    fn project_local_discovery_binds_the_exact_project() {
+        let home = tempfile::tempdir().expect("home tempdir");
+        let home_socket = home.path().join(".impulse/sockets/impulse.sock");
+        std::fs::create_dir_all(home_socket.parent().expect("home socket parent"))
+            .expect("create home socket directory");
+        std::fs::write(&home_socket, b"stale home socket").expect("create stale home socket");
+        let project = home.path().join("code/project");
+        let nested = project.join("src/module");
+        std::fs::create_dir_all(project.join(".impulse/sockets"))
+            .expect("create project memory root");
+        std::fs::create_dir_all(&nested).expect("create nested cwd");
+
+        let discovered = DesktopDaemonOpsConfig::discover_project_bound_from(
+            None,
+            Some(&nested),
+            Some(home.path()),
+        )
+        .expect("project-local daemon boundary");
+
+        assert_eq!(discovered.project_root.as_deref(), Some(project.as_path()));
+        assert_eq!(
+            discovered.socket_path,
+            project.join(".impulse/sockets/impulse.sock")
+        );
+    }
+
+    #[test]
+    fn explicit_socket_must_use_the_standard_project_shape() {
+        let cwd = Path::new("/repo");
+        assert!(DesktopDaemonOpsConfig::discover_project_bound_from(
+            Some(Path::new("/tmp/custom.sock")),
+            Some(cwd),
+            None,
+        )
+        .is_none());
+        let discovered = DesktopDaemonOpsConfig::discover_project_bound_from(
+            Some(Path::new("/repo/.impulse/sockets/impulse.sock")),
+            Some(cwd),
+            None,
+        )
+        .expect("standard project socket");
+        assert_eq!(discovered.project_root, Some(PathBuf::from("/repo")));
     }
 
     #[test]

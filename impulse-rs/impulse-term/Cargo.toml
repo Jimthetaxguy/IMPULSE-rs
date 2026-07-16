@@ -7,7 +7,9 @@ authors = ["Impulse Maintainers"]
 license = "MIT"
 
 [features]
-default = ["egui"]
+# The active workspace path is framework-neutral. The frozen impulse-gui crate
+# opts into the temporary renderer explicitly while it awaits removal.
+default = []
 egui = ["dep:eframe"]
 
 [dependencies]

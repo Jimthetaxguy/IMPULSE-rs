@@ -95,6 +95,8 @@ impl TerminalsView {
                     label: tab.label.clone(),
                     backend_kind: tab.agent_name.to_string(),
                     session_id: None,
+                    governed_task_id: None,
+                    governed_task_revision: None,
                     ephemeral: true,
                     working_directory: tab.target_dir.display().to_string(),
                     status: if tab.panel.is_alive() {

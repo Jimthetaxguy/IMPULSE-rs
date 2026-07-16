@@ -496,6 +496,98 @@ struct LaunchCallbackGate {
     ready: Condvar,
 }
 
+struct LaunchAdmission {
+    state: Mutex<LaunchAdmissionState>,
+    drained: Condvar,
+}
+
+struct LaunchAdmissionState {
+    accepting: bool,
+    in_flight: usize,
+    shutdown_errors: Vec<DesktopRuntimeShutdownError>,
+}
+
+impl Default for LaunchAdmission {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(LaunchAdmissionState {
+                accepting: true,
+                in_flight: 0,
+                shutdown_errors: Vec::new(),
+            }),
+            drained: Condvar::new(),
+        }
+    }
+}
+
+impl LaunchAdmission {
+    fn acquire(&self) -> Option<LaunchPermit<'_>> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.accepting {
+            return None;
+        }
+        state.in_flight += 1;
+        Some(LaunchPermit { admission: self })
+    }
+
+    fn is_accepting(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .accepting
+    }
+
+    fn close(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .accepting = false;
+    }
+
+    fn record_shutdown_error(&self, error: DesktopRuntimeShutdownError) {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .shutdown_errors
+            .push(error);
+    }
+
+    fn close_wait_and_take_errors(&self) -> Vec<DesktopRuntimeShutdownError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.accepting = false;
+        let mut state = self
+            .drained
+            .wait_while(state, |state| state.in_flight > 0)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut state.shutdown_errors)
+    }
+}
+
+struct LaunchPermit<'a> {
+    admission: &'a LaunchAdmission,
+}
+
+impl Drop for LaunchPermit<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .admission
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        debug_assert!(state.in_flight > 0, "launch permit count underflow");
+        state.in_flight = state.in_flight.saturating_sub(1);
+        if state.in_flight == 0 {
+            self.admission.drained.notify_all();
+        }
+    }
+}
+
 impl LaunchCallbackGate {
     fn wait(&self) {
         let open = self
@@ -527,10 +619,12 @@ struct DesktopRuntimeInner {
     /// `alive=false` cannot be followed by an older `alive=true` event.
     lifecycle_events: Mutex<()>,
     lifecycle_dispatcher: LifecycleEventDispatcher,
+    launch_admission: LaunchAdmission,
 }
 
 impl Drop for DesktopRuntimeInner {
     fn drop(&mut self) {
+        self.launch_admission.close();
         let state = self
             .state
             .get_mut()
@@ -591,6 +685,27 @@ pub struct DesktopRuntime {
     inner: Arc<DesktopRuntimeInner>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DesktopRuntimeShutdownReport {
+    pub agents_seen: usize,
+    pub agents_closed: usize,
+    pub agents_already_exited: usize,
+    pub errors: Vec<DesktopRuntimeShutdownError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DesktopRuntimeShutdownError {
+    AgentClose {
+        agent_id: String,
+        message: String,
+    },
+    GovernedExitRecording {
+        agent_id: String,
+        task_id: String,
+        message: String,
+    },
+}
+
 /// Non-owning runtime handle for event sinks that call back into lifecycle
 /// methods. Keeping a strong [`DesktopRuntime`] inside its own sink would form
 /// an ownership cycle; install this handle after building the runtime instead.
@@ -629,6 +744,12 @@ impl DesktopRuntime {
         &self,
         request: AgentSpawnRequest,
     ) -> Result<AgentRuntimeSnapshot, DesktopBridgeError> {
+        let _launch_permit = self.inner.launch_admission.acquire().ok_or_else(|| {
+            DesktopBridgeError::InvalidTerminalRequest {
+                message: "desktop runtime is shutting down and no longer accepts launches"
+                    .to_string(),
+            }
+        })?;
         let mut request = request;
         if request.verification_profile.is_some() || !request.acceptance_criteria.is_empty() {
             let assignment = request.role_assignment.as_ref().ok_or_else(|| {
@@ -760,17 +881,19 @@ impl DesktopRuntime {
         } else {
             request.mcp_tools.clone()
         };
-        let governed_routing = if request.verification_profile.is_some() {
-            Some(
-                self.inner
-                    .governed_task_gateway
-                    .as_ref()
-                    .and_then(|gateway| gateway.routing_metadata())
-                    .ok_or_else(|| DesktopBridgeError::GovernedTaskFailed {
-                        message: "profiled governed launch requires an executable Impulse control CLI; configure IMPULSE_CONTROL_CLI with an executable path or make impulse-rs available beside the Desktop binary or on PATH"
-                            .to_string(),
-                    })?,
-            )
+        let governed_routing = if request.role_assignment.is_some() {
+            let routing = self
+                .inner
+                .governed_task_gateway
+                .as_ref()
+                .and_then(|gateway| gateway.routing_metadata());
+            if request.verification_profile.is_some() && routing.is_none() {
+                return Err(DesktopBridgeError::GovernedTaskFailed {
+                    message: "profiled governed launch requires an executable Impulse control CLI; configure IMPULSE_CONTROL_CLI with an executable path or make impulse-rs available beside the Desktop binary or on PATH"
+                        .to_string(),
+                });
+            }
+            routing
         } else {
             None
         };
@@ -1140,6 +1263,51 @@ impl DesktopRuntime {
             }
         }
 
+        let lifecycle_guard = self
+            .inner
+            .lifecycle_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !self.inner.launch_admission.is_accepting() {
+            drop(lifecycle_guard);
+            let termination_error = backend.kill().err().map(|error| error.to_string());
+            launch_callback_gate.open();
+            if let (Some(task), Some(gateway)) = (
+                governed_task.as_ref(),
+                self.inner.governed_task_gateway.as_ref(),
+            ) {
+                if let Err(error) = gateway.mutate_current(
+                    &task.project_id,
+                    &task.id,
+                    new_governed_request_id("shutdown-before-install"),
+                    GovernedTaskMutation::MarkRuntimeExited {
+                        actor: governed_system_actor("desktop-runtime"),
+                        reason: Some(
+                            "desktop shutdown began before runtime installation".to_string(),
+                        ),
+                    },
+                ) {
+                    self.inner.launch_admission.record_shutdown_error(
+                        DesktopRuntimeShutdownError::GovernedExitRecording {
+                            agent_id: agent_id.clone(),
+                            task_id: task.id.to_string(),
+                            message: error,
+                        },
+                    );
+                }
+            }
+            return match termination_error {
+                Some(error) => Err(DesktopBridgeError::TerminalTerminationFailed {
+                    message: format!(
+                        "desktop shutdown rejected the launch, but PTY termination was not confirmed: {error}"
+                    ),
+                }),
+                None => Err(DesktopBridgeError::InvalidTerminalRequest {
+                    message: "desktop shutdown rejected the launch before runtime installation"
+                        .to_string(),
+                }),
+            };
+        }
         let record = RuntimeRecord {
             platform: request.platform.clone(),
             label: platform_label,
@@ -1159,11 +1327,6 @@ impl DesktopRuntime {
             status: AgentStatus::Starting,
             backend,
         };
-        let lifecycle_guard = self
-            .inner
-            .lifecycle_events
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let snapshot = {
             let mut state = self.lock_state();
             let replaced = state.agents.insert(agent_id.clone(), record);
@@ -1380,6 +1543,42 @@ impl DesktopRuntime {
         Ok(())
     }
 
+    /// Stop accepting launches, terminate every managed PTY, publish terminal
+    /// exits, and record governed runtime exits while the daemon is still
+    /// reachable. Safe to call repeatedly; subsequent calls observe no agents.
+    pub fn shutdown(&self) -> DesktopRuntimeShutdownReport {
+        let admission_errors = self.inner.launch_admission.close_wait_and_take_errors();
+        let agent_ids = {
+            let _lifecycle_guard = self
+                .inner
+                .lifecycle_events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let state = self.lock_state();
+            state.agents.keys().cloned().collect::<Vec<_>>()
+        };
+        let mut report = DesktopRuntimeShutdownReport {
+            agents_seen: agent_ids.len(),
+            errors: admission_errors,
+            ..DesktopRuntimeShutdownReport::default()
+        };
+        for agent_id in agent_ids {
+            match self.close_agent(TerminalCloseRequest {
+                session_id: agent_id.clone(),
+            }) {
+                Ok(()) => report.agents_closed += 1,
+                Err(DesktopBridgeError::MissingTerminalSession { .. }) => {
+                    report.agents_already_exited += 1;
+                }
+                Err(error) => report.errors.push(DesktopRuntimeShutdownError::AgentClose {
+                    agent_id,
+                    message: error.to_string(),
+                }),
+            }
+        }
+        report
+    }
+
     pub fn snapshot_agents(&self) -> Vec<AgentRuntimeSnapshot> {
         let state = self.lock_state();
         let mut snapshots = state
@@ -1555,6 +1754,7 @@ impl DesktopRuntimeBuilder {
                 sink: self.sink,
                 governed_task_gateway: self.governed_task_gateway,
                 lifecycle_events: Mutex::new(()),
+                launch_admission: LaunchAdmission::default(),
             }),
         }
     }
@@ -2243,7 +2443,7 @@ fn runtime_env(
             env.push(("IMPULSE_GOVERNED_VERIFICATION_PROFILE", profile.to_string()));
         }
     }
-    if governed_task.is_some_and(|task| task.verification_profile.is_some()) {
+    if governed_task.is_some() {
         if let Some(routing) = governed_routing {
             env.push(("IMPULSE_SOCKET_PATH", routing.socket_path.clone()));
             env.push(("IMPULSE_CONTROL_CLI", routing.control_cli.clone()));
@@ -2255,6 +2455,15 @@ fn runtime_env(
     if let Some(workspace) = workspace {
         env.push(("IMPULSE_WORKSPACE_ROOT", workspace.root.clone()));
         env.push(("IMPULSE_PROJECT", workspace.root.clone()));
+        if governed_task.is_some() {
+            env.push((
+                "IMPULSE_HOME",
+                Path::new(&workspace.root)
+                    .join(".impulse")
+                    .display()
+                    .to_string(),
+            ));
+        }
         if let Some(label) = &workspace.label {
             env.push(("IMPULSE_WORKSPACE_LABEL", label.clone()));
             env.push(("IMPULSE_PROJECT_LABEL", label.clone()));
@@ -2285,7 +2494,6 @@ fn runtime_env(
 fn static_env_key(key: &str) -> Option<&'static str> {
     match key {
         "IMPULSE_CAPABILITIES_PATH" => Some("IMPULSE_CAPABILITIES_PATH"),
-        "IMPULSE_HOME" => Some("IMPULSE_HOME"),
         "TERM" => Some("TERM"),
         _ => None,
     }
@@ -2516,6 +2724,59 @@ mod tests {
                 expected_revision: current.revision,
                 mutation,
             })
+        }
+    }
+
+    struct BlockingRunningGateway {
+        inner: TestGovernedTaskGateway,
+        running_entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        running_release: Mutex<std::sync::mpsc::Receiver<()>>,
+        reject_runtime_exit: bool,
+    }
+
+    impl GovernedTaskGateway for BlockingRunningGateway {
+        fn register(
+            &self,
+            registration: GovernedTaskRegistration,
+        ) -> Result<GovernedTaskRun, String> {
+            self.inner.register(registration)
+        }
+
+        fn mutate(&self, request: GovernedTaskMutationRequest) -> Result<GovernedTaskRun, String> {
+            if matches!(&request.mutation, GovernedTaskMutation::MarkRunning { .. }) {
+                if let Some(entered) = self
+                    .running_entered
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+                {
+                    entered
+                        .send(())
+                        .map_err(|_| "running barrier receiver closed".to_string())?;
+                }
+                self.running_release
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .recv()
+                    .map_err(|_| "running barrier release closed".to_string())?;
+            }
+            self.inner.mutate(request)
+        }
+
+        fn mutate_current(
+            &self,
+            project_id: &str,
+            task_id: &GovernedTaskId,
+            request_id: impulse_ops::governed_task::GovernedRequestId,
+            mutation: GovernedTaskMutation,
+        ) -> Result<GovernedTaskRun, String> {
+            if self.reject_runtime_exit
+                && matches!(&mutation, GovernedTaskMutation::MarkRuntimeExited { .. })
+            {
+                return Err("test daemon rejected runtime-exit recording".to_string());
+            }
+            self.inner
+                .mutate_current(project_id, task_id, request_id, mutation)
         }
     }
 
@@ -3365,6 +3626,197 @@ mod tests {
         assert!(
             runtime_weak.upgrade().is_none(),
             "PTY callbacks must not retain DesktopRuntimeInner"
+        );
+    }
+
+    #[test]
+    fn test_runtime_shutdown_reaps_active_agents_and_rejects_new_launches() {
+        let runtime = DesktopRuntime::default();
+        let mut request = spawn_request(24, 80, Some("sh"));
+        request.agent_id = Some("shutdown-worker".to_string());
+        request.args = vec!["-lc".to_string(), "sleep 30".to_string()];
+        runtime
+            .spawn_agent(request.clone())
+            .expect("spawn long-running worker");
+
+        let report = runtime.shutdown();
+        assert_eq!(report.agents_seen, 1);
+        assert_eq!(report.agents_closed, 1);
+        assert_eq!(report.agents_already_exited, 0);
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert!(runtime.snapshot_agents().is_empty());
+
+        let error = runtime.spawn_agent(request).unwrap_err();
+        assert!(matches!(
+            error,
+            DesktopBridgeError::InvalidTerminalRequest { ref message }
+                if message.contains("shutting down")
+        ));
+        assert_eq!(runtime.shutdown(), DesktopRuntimeShutdownReport::default());
+    }
+
+    #[test]
+    fn test_runtime_shutdown_waits_for_in_flight_governed_launch_exit_recording() {
+        let (running_entered_tx, running_entered_rx) = std::sync::mpsc::channel();
+        let (running_release_tx, running_release_rx) = std::sync::mpsc::channel();
+        let gateway = Arc::new(BlockingRunningGateway {
+            inner: TestGovernedTaskGateway::default(),
+            running_entered: Mutex::new(Some(running_entered_tx)),
+            running_release: Mutex::new(running_release_rx),
+            reject_runtime_exit: false,
+        });
+        let gateway_trait: Arc<dyn GovernedTaskGateway> = gateway.clone();
+        let runtime = DesktopRuntime::builder()
+            .with_governed_task_gateway(gateway_trait)
+            .build();
+        let mut request = spawn_request(24, 80, Some("sh"));
+        let _workspace = bind_to_temporary_workspace(&mut request);
+        request.agent_id = Some("shutdown-racing-launch".to_string());
+        request.args = vec!["-c".to_string(), "sleep 30".to_string()];
+        request.task = Some("prove shutdown launch barrier".to_string());
+        request.role_assignment = Some(role_assignment(
+            "workspace.target",
+            EnforcementStrength::Mediated,
+            true,
+        ));
+
+        let spawn_thread = {
+            let runtime = runtime.clone();
+            std::thread::spawn(move || runtime.spawn_agent(request))
+        };
+        running_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("governed launch reached running acknowledgment");
+
+        let (shutdown_done_tx, shutdown_done_rx) = std::sync::mpsc::channel();
+        let shutdown_thread = {
+            let runtime = runtime.clone();
+            std::thread::spawn(move || {
+                shutdown_done_tx
+                    .send(runtime.shutdown())
+                    .expect("return shutdown report");
+            })
+        };
+        assert!(
+            shutdown_done_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "shutdown must keep daemon consumers alive until the in-flight launch resolves"
+        );
+
+        running_release_tx
+            .send(())
+            .expect("release running acknowledgment");
+        let spawn_error = spawn_thread
+            .join()
+            .expect("join governed spawn")
+            .expect_err("shutdown must reject pre-install launch");
+        assert!(matches!(
+            spawn_error,
+            DesktopBridgeError::InvalidTerminalRequest { ref message }
+                if message.contains("shutdown rejected")
+        ));
+        let report = shutdown_done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("shutdown completes after launch exit recording");
+        shutdown_thread.join().expect("join shutdown thread");
+        assert_eq!(report, DesktopRuntimeShutdownReport::default());
+        assert!(runtime.snapshot_agents().is_empty());
+        let tasks = gateway
+            .inner
+            .tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(
+            tasks.values().next().unwrap().execution_state,
+            GovernedExecutionState::RuntimeExited,
+            "the launch permit must not drain until daemon exit state is durable"
+        );
+    }
+
+    #[test]
+    fn test_runtime_shutdown_reports_failed_in_flight_launch_exit_recording_after_barrier() {
+        let (running_entered_tx, running_entered_rx) = std::sync::mpsc::channel();
+        let (running_release_tx, running_release_rx) = std::sync::mpsc::channel();
+        let gateway = Arc::new(BlockingRunningGateway {
+            inner: TestGovernedTaskGateway::default(),
+            running_entered: Mutex::new(Some(running_entered_tx)),
+            running_release: Mutex::new(running_release_rx),
+            reject_runtime_exit: true,
+        });
+        let gateway_trait: Arc<dyn GovernedTaskGateway> = gateway.clone();
+        let runtime = DesktopRuntime::builder()
+            .with_governed_task_gateway(gateway_trait)
+            .build();
+        let mut request = spawn_request(24, 80, Some("sh"));
+        let _workspace = bind_to_temporary_workspace(&mut request);
+        request.agent_id = Some("shutdown-racing-failed-exit".to_string());
+        request.args = vec!["-c".to_string(), "sleep 30".to_string()];
+        request.task = Some("surface failed shutdown exit recording".to_string());
+        request.role_assignment = Some(role_assignment(
+            "workspace.target",
+            EnforcementStrength::Mediated,
+            true,
+        ));
+
+        let spawn_thread = {
+            let runtime = runtime.clone();
+            std::thread::spawn(move || runtime.spawn_agent(request))
+        };
+        running_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("governed launch reached running acknowledgment");
+
+        let (shutdown_done_tx, shutdown_done_rx) = std::sync::mpsc::channel();
+        let shutdown_thread = {
+            let runtime = runtime.clone();
+            std::thread::spawn(move || {
+                shutdown_done_tx
+                    .send(runtime.shutdown())
+                    .expect("return shutdown report");
+            })
+        };
+        assert!(
+            shutdown_done_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "shutdown must wait for the failing durable-exit attempt"
+        );
+
+        running_release_tx
+            .send(())
+            .expect("release running acknowledgment");
+        spawn_thread
+            .join()
+            .expect("join governed spawn")
+            .expect_err("shutdown must reject pre-install launch");
+        let report = shutdown_done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("shutdown returns the durable-exit failure");
+        shutdown_thread.join().expect("join shutdown thread");
+
+        assert_eq!(report.agents_seen, 0);
+        assert_eq!(report.agents_closed, 0);
+        assert_eq!(report.agents_already_exited, 0);
+        assert!(matches!(
+            report.errors.as_slice(),
+            [DesktopRuntimeShutdownError::GovernedExitRecording {
+                agent_id,
+                message,
+                ..
+            }] if agent_id == "shutdown-racing-failed-exit"
+                && message == "test daemon rejected runtime-exit recording"
+        ));
+        let tasks = gateway
+            .inner
+            .tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            tasks.values().next().unwrap().execution_state,
+            GovernedExecutionState::Running,
+            "the report must not pretend the rejected exit mutation was durable"
         );
     }
 

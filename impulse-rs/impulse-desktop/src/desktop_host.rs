@@ -1,9 +1,14 @@
 use crate::host_commands::HOST_INVOKE_COMMANDS;
 use crate::runtime::DesktopEvent;
+use crate::DesktopShutdownCoordinator;
 
 pub const HOST_KIND: &str = "dioxus";
 pub const HOST_BOOTSTRAP_STATUS: &str = crate::host_commands::PENDING_HOST_BOOTSTRAP_STATUS;
 pub const HOST_EVENT_NAMES: &[&str] = DesktopEvent::HOST_EVENT_NAMES;
+const DEFAULT_WINDOW_WIDTH: f64 = 1440.0;
+const DEFAULT_WINDOW_HEIGHT: f64 = 900.0;
+const MINIMUM_COCKPIT_WIDTH: f64 = 1180.0;
+const MINIMUM_COCKPIT_HEIGHT: f64 = 720.0;
 
 pub fn host_bootstrap_script() -> String {
     r#"
@@ -60,10 +65,38 @@ pub fn is_manifest_only_bootstrap() -> bool {
 }
 
 pub fn desktop_config() -> dioxus_desktop::Config {
-    let window = dioxus_desktop::WindowBuilder::new().with_title("Impulse Desktop");
+    let window = dioxus_desktop::WindowBuilder::new()
+        .with_title("Impulse Desktop")
+        .with_inner_size(dioxus_desktop::tao::dpi::LogicalSize::new(
+            DEFAULT_WINDOW_WIDTH,
+            DEFAULT_WINDOW_HEIGHT,
+        ))
+        .with_min_inner_size(dioxus_desktop::tao::dpi::LogicalSize::new(
+            MINIMUM_COCKPIT_WIDTH,
+            MINIMUM_COCKPIT_HEIGHT,
+        ));
     dioxus_desktop::Config::new()
         .with_window(window)
         .with_custom_head(host_bootstrap_script())
+}
+
+/// Build the native desktop configuration with an explicit process lifecycle
+/// boundary. Dioxus's event loop does not return, so final loop destruction
+/// must drain managed workers and telemetry before reaping an owned companion.
+pub fn desktop_config_with_shutdown(
+    shutdown_coordinator: DesktopShutdownCoordinator,
+) -> dioxus_desktop::Config {
+    desktop_config().with_custom_event_handler(move |event, _| {
+        if desktop_event_requests_shutdown(event) {
+            shutdown_coordinator.shutdown();
+        }
+    })
+}
+
+fn desktop_event_requests_shutdown<T: 'static>(
+    event: &dioxus_desktop::tao::event::Event<'_, T>,
+) -> bool {
+    matches!(event, dioxus_desktop::tao::event::Event::LoopDestroyed)
 }
 
 fn javascript_string_array(items: &[&str]) -> String {
@@ -94,6 +127,13 @@ mod tests {
         assert!(script.contains("supportedInvokes"));
         assert!(script.contains("supportedEvents"));
         assert!(is_manifest_only_bootstrap());
+    }
+
+    #[test]
+    fn native_window_defaults_preserve_the_three_lane_cockpit() {
+        assert!(DEFAULT_WINDOW_WIDTH > MINIMUM_COCKPIT_WIDTH);
+        assert!(MINIMUM_COCKPIT_WIDTH > 1120.0);
+        assert!(DEFAULT_WINDOW_HEIGHT >= MINIMUM_COCKPIT_HEIGHT);
     }
 
     #[test]
@@ -148,6 +188,15 @@ mod tests {
                 "missing event name: {event}"
             );
         }
+    }
+
+    #[test]
+    fn only_event_loop_destruction_requests_process_shutdown() {
+        let destroyed = dioxus_desktop::tao::event::Event::<()>::LoopDestroyed;
+        let idle = dioxus_desktop::tao::event::Event::<()>::MainEventsCleared;
+
+        assert!(desktop_event_requests_shutdown(&destroyed));
+        assert!(!desktop_event_requests_shutdown(&idle));
     }
 
     #[test]

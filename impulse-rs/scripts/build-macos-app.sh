@@ -1,125 +1,223 @@
 #!/usr/bin/env bash
-# build-macos-app.sh — Build Impulse.app bundle and optional DMG.
-#
-# Usage:
-#   bash scripts/build-macos-app.sh               # Build .app for current arch
-#   bash scripts/build-macos-app.sh --universal    # Universal binary (arm64+x86_64)
-#   bash scripts/build-macos-app.sh --dmg          # Also create DMG
-#   bash scripts/build-macos-app.sh --universal --dmg --sign "Developer ID Application: ..."
-#
+# Build the real Dioxus Impulse.app bundle and, optionally, a DMG.
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-GUI_RESOURCES="$PROJECT_ROOT/impulse-gui/resources"
+DESKTOP_CRATE="$PROJECT_ROOT/impulse-desktop"
+DESKTOP_RESOURCES="$DESKTOP_CRATE/resources"
+VERIFY_SCRIPT="$SCRIPT_DIR/verify-macos-app.sh"
 APP_NAME="Impulse"
-BUNDLE_ID="com.impulse.ai"
 
-# Parse version from impulse-gui/Cargo.toml
-VERSION=$(grep '^version' "$PROJECT_ROOT/impulse-gui/Cargo.toml" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+usage() {
+    cat <<'EOF'
+Usage: build-macos-app.sh [OPTIONS]
 
-# Defaults
+Build a macOS bundle containing the Dioxus desktop host and its impulse-rs
+control-plane companion. Existing app/DMG outputs are moved into target/package-archives.
+
+Options:
+  --universal          Build arm64 + x86_64 Mach-O binaries with lipo
+  --dmg                Create a DMG after bundle verification
+  --smoke              Launch the packaged app and require its live-host receipt
+  --smoke-timeout SEC  Bound the packaged launch smoke (default: 45)
+  --sign IDENTITY      Sign with IDENTITY instead of the default ad-hoc identity
+  --version VERSION    Override the impulse-desktop package version
+  -h, --help           Show this help
+EOF
+}
+
+fail() {
+    echo "error: $*" >&2
+    exit 1
+}
+
+require_value() {
+    local flag="$1"
+    local value="${2:-}"
+    [[ -n "$value" ]] || fail "$flag requires a value"
+}
+
+archive_existing() {
+    local path="$1"
+    if [[ ! -e "$path" && ! -L "$path" ]]; then
+        return
+    fi
+
+    ARCHIVE_SEQUENCE=$((ARCHIVE_SEQUENCE + 1))
+    local stamp
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)-$$-$ARCHIVE_SEQUENCE"
+    local archive_dir="$ARCHIVE_ROOT/$stamp"
+    mkdir -p "$archive_dir"
+    mv "$path" "$archive_dir/$(basename "$path")"
+    echo "==> Archived existing $(basename "$path") to $archive_dir"
+}
+
+package_version() {
+    awk -F '"' '/^version[[:space:]]*=[[:space:]]*"/ { print $2; exit }' \
+        "$DESKTOP_CRATE/Cargo.toml"
+}
+
 UNIVERSAL=false
 CREATE_DMG=false
-SIGN_IDENTITY=""
-RELEASE_DIR="$PROJECT_ROOT/target/release"
+RUN_SMOKE=false
+SIGN_IDENTITY="-"
+SMOKE_TIMEOUT=45
+VERSION="$(package_version)"
 
-# Parse flags
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --universal) UNIVERSAL=true; shift ;;
-        --dmg)       CREATE_DMG=true; shift ;;
-        --sign)      SIGN_IDENTITY="$2"; shift 2 ;;
-        --version)   VERSION="$2"; shift 2 ;;
-        *) echo "Unknown flag: $1"; exit 1 ;;
+        --universal)
+            UNIVERSAL=true
+            shift
+            ;;
+        --dmg)
+            CREATE_DMG=true
+            shift
+            ;;
+        --smoke)
+            RUN_SMOKE=true
+            shift
+            ;;
+        --smoke-timeout)
+            require_value "$1" "${2:-}"
+            SMOKE_TIMEOUT="$2"
+            shift 2
+            ;;
+        --sign)
+            require_value "$1" "${2:-}"
+            SIGN_IDENTITY="$2"
+            shift 2
+            ;;
+        --version)
+            require_value "$1" "${2:-}"
+            VERSION="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            fail "unknown flag: $1"
+            ;;
     esac
 done
 
-echo "==> Building $APP_NAME v$VERSION"
+[[ "$(uname -s)" == "Darwin" ]] || fail "macOS app bundles must be built on macOS"
+[[ "$VERSION" =~ ^[0-9]+([.][0-9]+){0,3}$ ]] || \
+    fail "bundle version must contain one to four numeric components: $VERSION"
+[[ "$SMOKE_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || fail "smoke timeout must be a positive integer"
+[[ -x "$VERIFY_SCRIPT" ]] || fail "missing executable verifier: $VERIFY_SCRIPT"
+[[ -f "$DESKTOP_RESOURCES/Info.plist" ]] || fail "missing Dioxus Info.plist template"
+[[ -f "$DESKTOP_RESOURCES/Impulse.icns" ]] || fail "missing Dioxus icon"
+[[ -d "$DESKTOP_CRATE/assets/vendor/xterm" ]] || fail "missing vendored Dioxus xterm assets"
 
-# ---------------------------------------------------------------------------
-# Step 1: Build binaries
-# ---------------------------------------------------------------------------
-if $UNIVERSAL; then
-    echo "==> Building universal binaries (aarch64 + x86_64)"
-    (cd "$PROJECT_ROOT" && cargo build --release --target aarch64-apple-darwin)
-    (cd "$PROJECT_ROOT" && cargo build --release --target x86_64-apple-darwin)
-    ARM_DIR="$PROJECT_ROOT/target/aarch64-apple-darwin/release"
-    X86_DIR="$PROJECT_ROOT/target/x86_64-apple-darwin/release"
+if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+    if [[ "$CARGO_TARGET_DIR" = /* ]]; then
+        TARGET_DIR="$CARGO_TARGET_DIR"
+    else
+        TARGET_DIR="$PROJECT_ROOT/$CARGO_TARGET_DIR"
+    fi
 else
-    echo "==> Building for current architecture"
-    (cd "$PROJECT_ROOT" && cargo build --release)
+    TARGET_DIR="$PROJECT_ROOT/target"
 fi
 
-# ---------------------------------------------------------------------------
-# Step 2: Assemble .app bundle
-# ---------------------------------------------------------------------------
 APP_DIR="$PROJECT_ROOT/$APP_NAME.app"
-rm -rf "$APP_DIR"
+ARCHIVE_ROOT="$TARGET_DIR/package-archives"
+ARCHIVE_SEQUENCE=0
 
-mkdir -p "$APP_DIR/Contents/MacOS"
-mkdir -p "$APP_DIR/Contents/Resources"
+echo "==> Building $APP_NAME v$VERSION (Dioxus Desktop + impulse-rs)"
 
-echo "==> Assembling $APP_NAME.app"
+if $UNIVERSAL; then
+    echo "==> Building aarch64 and x86_64 release binaries"
+    for target in aarch64-apple-darwin x86_64-apple-darwin; do
+        (
+            cd "$PROJECT_ROOT"
+            cargo build --locked --release --target "$target" \
+                -p impulse-desktop --features desktop-app --bin impulse-desktop
+            cargo build --locked --release --target "$target" \
+                -p impulse-rs --bin impulse-rs
+        )
+    done
+else
+    echo "==> Building release binaries for the current architecture"
+    (
+        cd "$PROJECT_ROOT"
+        cargo build --locked --release \
+            -p impulse-desktop --features desktop-app --bin impulse-desktop
+        cargo build --locked --release -p impulse-rs --bin impulse-rs
+    )
+fi
 
-# Copy binaries
+archive_existing "$APP_DIR"
+mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
+
+echo "==> Assembling $APP_DIR"
 if $UNIVERSAL; then
     lipo -create \
-        "$ARM_DIR/impulse-gui" "$X86_DIR/impulse-gui" \
-        -output "$APP_DIR/Contents/MacOS/impulse-gui"
+        "$TARGET_DIR/aarch64-apple-darwin/release/impulse-desktop" \
+        "$TARGET_DIR/x86_64-apple-darwin/release/impulse-desktop" \
+        -output "$APP_DIR/Contents/MacOS/impulse-desktop"
     lipo -create \
-        "$ARM_DIR/impulse-rs" "$X86_DIR/impulse-rs" \
+        "$TARGET_DIR/aarch64-apple-darwin/release/impulse-rs" \
+        "$TARGET_DIR/x86_64-apple-darwin/release/impulse-rs" \
         -output "$APP_DIR/Contents/MacOS/impulse-rs"
 else
-    cp "$RELEASE_DIR/impulse-gui" "$APP_DIR/Contents/MacOS/impulse-gui"
-    cp "$RELEASE_DIR/impulse-rs"  "$APP_DIR/Contents/MacOS/impulse-rs"
+    cp "$TARGET_DIR/release/impulse-desktop" "$APP_DIR/Contents/MacOS/impulse-desktop"
+    cp "$TARGET_DIR/release/impulse-rs" "$APP_DIR/Contents/MacOS/impulse-rs"
 fi
+chmod 0755 "$APP_DIR/Contents/MacOS/impulse-desktop" "$APP_DIR/Contents/MacOS/impulse-rs"
 
-chmod +x "$APP_DIR/Contents/MacOS/impulse-gui"
-chmod +x "$APP_DIR/Contents/MacOS/impulse-rs"
-
-# Copy Info.plist and stamp version
-sed "s/__VERSION__/$VERSION/g" "$GUI_RESOURCES/Info.plist" \
+sed "s/__VERSION__/$VERSION/g" "$DESKTOP_RESOURCES/Info.plist" \
     > "$APP_DIR/Contents/Info.plist"
+cp "$DESKTOP_RESOURCES/Impulse.icns" "$APP_DIR/Contents/Resources/Impulse.icns"
+cp -R "$DESKTOP_CRATE/assets" "$APP_DIR/Contents/Resources/assets"
 
-# Copy icon if it exists
-if [[ -f "$GUI_RESOURCES/Impulse.icns" ]]; then
-    cp "$GUI_RESOURCES/Impulse.icns" "$APP_DIR/Contents/Resources/Impulse.icns"
+if [[ "$SIGN_IDENTITY" == "-" ]]; then
+    echo "==> Ad-hoc signing post-build binaries and bundle"
 else
-    echo "  (!) No Impulse.icns found — app will use default icon"
+    echo "==> Signing $APP_NAME.app with: $SIGN_IDENTITY"
 fi
-
-echo "==> $APP_NAME.app created at $APP_DIR"
-
-# ---------------------------------------------------------------------------
-# Step 3: Code signing (optional)
-# ---------------------------------------------------------------------------
-if [[ -n "$SIGN_IDENTITY" ]]; then
-    echo "==> Signing with: $SIGN_IDENTITY"
-    codesign --deep --force --options runtime \
-        --sign "$SIGN_IDENTITY" \
-        "$APP_DIR"
-    echo "==> Verifying signature"
-    codesign --verify --deep --strict "$APP_DIR"
+sign_args=(--force --options runtime --sign "$SIGN_IDENTITY")
+if [[ "$SIGN_IDENTITY" != "-" ]]; then
+    sign_args+=(--timestamp)
 fi
+codesign "${sign_args[@]}" "$APP_DIR/Contents/MacOS/impulse-rs"
+codesign "${sign_args[@]}" "$APP_DIR/Contents/MacOS/impulse-desktop"
+codesign "${sign_args[@]}" "$APP_DIR"
 
-# ---------------------------------------------------------------------------
-# Step 4: Create DMG (optional)
-# ---------------------------------------------------------------------------
+bundle_verify_args=(--macos --signed --version "$VERSION")
+if $UNIVERSAL; then
+    bundle_verify_args+=(--universal)
+fi
+verify_args=("${bundle_verify_args[@]}")
+if $RUN_SMOKE; then
+    verify_args+=(--smoke --timeout "$SMOKE_TIMEOUT")
+fi
+"$VERIFY_SCRIPT" "${verify_args[@]}" "$APP_DIR"
+
 if $CREATE_DMG; then
-    ARCH_SUFFIX="universal"
-    if ! $UNIVERSAL; then
-        ARCH_SUFFIX="$(uname -m)"
+    arch_suffix="$(uname -m)"
+    if $UNIVERSAL; then
+        arch_suffix="universal"
     fi
-    DMG_NAME="$APP_NAME-${VERSION}-macos-${ARCH_SUFFIX}.dmg"
-    DMG_PATH="$PROJECT_ROOT/$DMG_NAME"
+    # Developer ID signing can be supplied, but notarization is deliberately
+    # not implied by this script. Keep the published filename honest until a
+    # notarization/stapling contract is wired into the release workflow.
+    dmg_name="$APP_NAME-${VERSION}-macos-${arch_suffix}-developer-preview.dmg"
+    dmg_dir="$TARGET_DIR/package"
+    dmg_path="$dmg_dir/$dmg_name"
+    stage_stamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    dmg_stage="$TARGET_DIR/package-staging/$stage_stamp"
+    mkdir -p "$dmg_dir"
+    archive_existing "$dmg_path"
+    mkdir -p "$dmg_stage"
+    cp -R "$APP_DIR" "$dmg_stage/$APP_NAME.app"
 
-    echo "==> Creating DMG: $DMG_NAME"
-
-    # Use create-dmg if available (prettier), otherwise hdiutil
-    if command -v create-dmg &>/dev/null; then
-        # create-dmg fails if the dmg already exists
-        rm -f "$DMG_PATH"
+    echo "==> Creating $dmg_name"
+    if command -v create-dmg >/dev/null 2>&1; then
         create-dmg \
             --volname "$APP_NAME" \
             --window-pos 200 120 \
@@ -128,16 +226,36 @@ if $CREATE_DMG; then
             --icon "$APP_NAME.app" 175 190 \
             --app-drop-link 425 190 \
             --hide-extension "$APP_NAME.app" \
-            "$DMG_PATH" \
-            "$APP_DIR"
+            "$dmg_path" \
+            "$dmg_stage"
     else
         hdiutil create -volname "$APP_NAME" \
-            -srcfolder "$APP_DIR" \
-            -ov -format UDZO \
-            "$DMG_PATH"
+            -srcfolder "$dmg_stage" \
+            -format UDZO \
+            "$dmg_path"
     fi
+    [[ -s "$dmg_path" ]] || fail "DMG creation did not produce a non-empty artifact"
+    hdiutil verify "$dmg_path" >/dev/null || fail "DMG checksum verification failed"
 
-    echo "==> DMG created: $DMG_PATH"
+    mount_root="$TARGET_DIR/package-mounts"
+    mount_dir="$mount_root/$stage_stamp"
+    mount_log="$mount_root/$stage_stamp.attach.log"
+    mkdir -p "$mount_dir"
+    DMG_MOUNT_DIR="$mount_dir"
+    cleanup_dmg_mount() {
+        if [[ -n "$DMG_MOUNT_DIR" ]]; then
+            hdiutil detach "$DMG_MOUNT_DIR" >/dev/null 2>&1 || true
+        fi
+    }
+    trap cleanup_dmg_mount EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    hdiutil attach -nobrowse -readonly -mountpoint "$mount_dir" "$dmg_path" >"$mount_log"
+    "$VERIFY_SCRIPT" "${bundle_verify_args[@]}" "$mount_dir/$APP_NAME.app"
+    hdiutil detach "$mount_dir" >/dev/null || fail "failed to detach verified DMG"
+    DMG_MOUNT_DIR=""
+    trap - EXIT INT TERM
+    echo "==> DMG created: $dmg_path"
 fi
 
-echo "==> Done!"
+echo "==> Dioxus macOS package complete"

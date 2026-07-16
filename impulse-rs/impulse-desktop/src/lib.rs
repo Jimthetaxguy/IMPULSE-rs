@@ -8,12 +8,15 @@
 
 pub mod bridge;
 pub mod daemon_ops;
+pub mod daemon_sidecar;
 #[cfg(feature = "desktop-app")]
 pub mod desktop_host;
+pub mod desktop_shutdown;
 pub mod host_bridge;
 pub mod host_commands;
 pub mod mcp;
 pub mod native;
+pub mod project_boundary;
 pub mod runtime;
 pub mod theme;
 pub mod ui;
@@ -29,6 +32,12 @@ pub use daemon_ops::{
     agent_runtime_from_snapshot, attach_desktop_daemon_ops, DesktopDaemonOpsAttachment,
     DesktopDaemonOpsConfig, DesktopDaemonOpsStartError, DEFAULT_HEARTBEAT_INTERVAL,
 };
+pub use daemon_sidecar::{
+    DesktopDaemonProjectIdentity, DesktopDaemonSidecar, DesktopDaemonSidecarError,
+    DesktopDaemonSidecarHandle, DesktopDaemonSidecarMode, DesktopInstanceLease,
+    DEFAULT_DAEMON_STARTUP_TIMEOUT,
+};
+pub use desktop_shutdown::{DesktopShutdownCoordinator, DesktopShutdownReport};
 pub use host_commands::{RegisterWorkspaceRequest, ReviewDecisionRequest};
 pub use mcp::{
     AgentSpawnTool, AgentWriteTool, ListAgentsTool, ListWorkspacesTool, McpContext, McpError,
@@ -39,6 +48,10 @@ pub use mcp::{
 pub use native::{
     DefaultNativeIslandHost, NativeIslandHost, NativeIslandKind, NativeIslandRequest,
     NativeIslandResult,
+};
+pub use project_boundary::{
+    DesktopProjectBoundary, DesktopProjectBoundaryConnector, DesktopProjectBoundaryController,
+    ProjectMemoryScope, SwitchableDesktopEventSink, SwitchableGovernedTaskGateway,
 };
 pub use runtime::{
     default_builtin_mcp_tools, AgentPlatformId, AgentRuntimeSnapshot, AgentSpawnRequest,
@@ -51,7 +64,5 @@ pub use theme::{
     status_label, usage_meter_pct,
 };
 pub use ui::{DesktopShell, DesktopShellWithSnapshot, DesktopShellWithSnapshotProps};
-pub use views::{
-    ArtifactsView, ArtifactsViewProps, DesktopView, MemoryView, MemoryViewProps, ShellIntent,
-};
+pub use views::{ArtifactsView, ArtifactsViewProps, DesktopView, MemoryView, MemoryViewProps};
 pub use workspace::{WorkspaceEntry, WorkspaceRegistry, WorkspaceRegistryError};

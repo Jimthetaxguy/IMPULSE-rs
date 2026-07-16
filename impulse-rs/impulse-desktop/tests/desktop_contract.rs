@@ -11,13 +11,13 @@ use std::{
 use dioxus::prelude::document::{Document, Eval, EvalError, Evaluator};
 use dioxus::prelude::*;
 use impulse_desktop::ui::{
-    agent_focus_bridge_script, agent_launch_bridge_script, apply_desktop_bridge_message,
-    apply_desktop_bridge_message_with_status, build_governed_agent_spawn_request,
-    builder_role_assignment, desktop_event_bridge_script, governed_task_mutation_bridge_script,
-    mcp_invoke_bridge_script, review_decision_bridge_script, terminal_asset_paths,
-    workspace_registration_bridge_script, BridgeStatusUpdate, DaemonOpsStatusUpdate,
-    DesktopBridgeMessage, DesktopBridgeStateMut, GovernedAgentSpawnInput, ReviewDecisionUiRequest,
-    XTERM_CSS_PATH, XTERM_FIT_JS_PATH, XTERM_JS_PATH,
+    agent_close_bridge_script, agent_focus_bridge_script, agent_launch_bridge_script,
+    apply_desktop_bridge_message, apply_desktop_bridge_message_with_status,
+    build_governed_agent_spawn_request, builder_role_assignment, desktop_event_bridge_script,
+    governed_task_mutation_bridge_script, mcp_invoke_bridge_script, review_decision_bridge_script,
+    terminal_asset_paths, workspace_registration_bridge_script, BridgeStatusUpdate,
+    DaemonOpsStatusUpdate, DesktopBridgeMessage, DesktopBridgeStateMut, GovernedAgentSpawnInput,
+    ReviewDecisionUiRequest, XTERM_CSS_PATH, XTERM_FIT_JS_PATH, XTERM_JS_PATH,
 };
 use impulse_desktop::{
     default_builtin_mcp_tools, format_count, status_dot_class, status_label, AgentPlatformId,
@@ -373,7 +373,7 @@ fn runtime_snapshot(agent_id: &str) -> AgentRuntimeSnapshot {
 }
 
 #[test]
-fn test_dioxus_shell_renders_five_panel_layout_without_egui() {
+fn test_dioxus_shell_renders_supervisor_first_cockpit_without_egui() {
     let mut vdom = VirtualDom::new(DesktopShell);
     vdom.rebuild_in_place();
 
@@ -391,35 +391,172 @@ fn test_dioxus_shell_renders_five_panel_layout_without_egui() {
     assert!(html.contains("stage-view view-terminal active"));
     assert!(html.contains("right-inspector"));
     assert!(html.contains("event-strip"));
-    assert!(html.contains("crt-hero"));
-    assert!(html.contains("brand-wordmark"));
-    assert!(html.contains("stat-row"));
-    assert!(html.contains("your ai remembers"));
+    assert!(html.contains("supervisor-dock"));
+    assert!(html.contains("Review service"));
+    assert!(html.contains("Oversight lane"));
+    assert!(html.contains("mission-header"));
+    assert!(html.contains("Feed the impulse to build."));
+    assert!(html.contains("One launch target. Explicit oversight. Specialized workers."));
     assert!(html.contains("agent-pool"));
     assert!(html.contains("workspace-picker"));
+    assert!(html.contains(">Launch targets<"));
+    assert!(html.contains("Worker terminals remain desktop-wide"));
+    assert!(html.contains("oversight and evidence stay bound to the connected daemon project"));
+    assert!(html.contains("Workers · desktop"));
+    assert!(html.contains(">Inspect<"));
     assert!(html.contains("data-source=\"workspace_target\""));
     assert!(html.contains("data-source=\"builtin_mcp_tools\""));
     assert!(html.contains("Rust MCP Tools"));
     assert!(html.contains("agent_spawn and agent_write require confirmation"));
-    assert!(html.contains("Workspace Launcher"));
-    assert!(html.contains("Register folder"));
-    assert!(html.contains("Launch agent"));
-    assert!(html.contains("MCP audited"));
+    assert!(html.contains("Launch dock"));
+    assert!(html.contains("Add project"));
+    assert!(html.contains("Launch Builder"));
+    assert!(html.contains("Builder · verified"));
     assert!(html.contains("class=\"terminal-empty-state\""));
     assert!(html.contains("data-terminal-state=\"empty\""));
-    assert!(html.contains("Launch an agent from the workspace panel"));
+    assert!(html.contains("launch-sequence"));
+    assert!(html.contains("Turn intent into governed work."));
+    assert!(html.contains("Open oversight"));
     assert!(!html.contains("data-xterm-mount=\"true\""));
     assert!(!html.contains("terminal-pane-codex"));
+    assert!(!html.contains("crt-hero"));
+    assert!(!html.contains("brand-wordmark"));
+    assert!(!html.contains("your ai remembers"));
+    assert!(!html.contains("Native Islands"));
+    assert!(!html.contains(">No agent<"));
     // Footer stream health is derived, not hardcoded: with no agents and a
     // healthy transport the runtime/terminal streams read `idle`.
     assert!(!html.contains("stream pending"));
     assert!(html.contains("data-stream=\"agent_runtime_update\""));
-    assert!(html.contains("agent_runtime_update · idle"));
-    assert!(html.contains("supervisor_local_action · ready"));
+    assert!(html.contains("Workers · idle"));
+    assert!(html.contains("Oversight · ready"));
     assert!(!html.contains("data-pty-owner=\"rust-backend\""));
     assert!(!html.contains("<section class=\"review-console\""));
     assert!(!html.contains("<section class=\"operator-board\""));
     assert!(!html.contains("egui"));
+    assert!(!html.contains("coming soon"));
+    assert!(!html.contains(">Cmd-K<"));
+    assert!(!html.contains(">Settings<"));
+    assert!(!html.contains("shell-notice"));
+}
+
+#[test]
+fn test_oversight_dock_does_not_claim_a_supervisor_runtime_is_launched() {
+    let mut vdom = VirtualDom::new(DesktopShell);
+    vdom.rebuild_in_place();
+    let html = dioxus_ssr::render(&vdom);
+
+    assert!(html.contains("Review service"));
+    assert!(html.contains("Oversight lane"));
+    assert!(html.contains("without implying a launched Supervisor runtime"));
+    assert!(html.contains("data-supervisor-state=\"idle\""));
+    assert!(!html.contains("Supervisor runtime running"));
+    assert!(!html.contains("Supervisor online"));
+}
+
+#[test]
+fn test_visible_cockpit_copy_distinguishes_oversight_from_a_supervisor_runtime() {
+    let mut vdom = VirtualDom::new(DesktopShell);
+    vdom.rebuild_in_place();
+    let html = dioxus_ssr::render(&vdom);
+
+    assert!(html.contains("Oversight"));
+    assert!(html.contains("oversight lane"));
+    assert!(html.contains("Oversight attention"));
+    assert!(!html.contains(">Supervisor<"));
+    assert!(!html.contains("supervisor lane"));
+    assert!(!html.contains("Supervisor attention"));
+}
+
+#[test]
+fn test_pending_review_exposes_real_navigation_without_fake_shortcuts() {
+    let snapshot = ProjectOpsSnapshot {
+        context: ContextHealthSummary {
+            pending_review_count: 2,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut vdom = VirtualDom::new_with_props(
+        DesktopShellWithSnapshot,
+        DesktopShellWithSnapshotProps {
+            snapshot,
+            runtime_agents: Vec::new(),
+            agent_platforms: Vec::new(),
+            workspaces: Vec::new(),
+            mcp_tools: Vec::new(),
+            last_invocations: Vec::new(),
+            review_queue: Vec::new(),
+            bridge_status: None,
+            daemon_ops_status: None,
+            initial_view: DesktopView::Terminal,
+        },
+    );
+    vdom.rebuild_in_place();
+    let html = dioxus_ssr::render(&vdom);
+
+    assert!(html.contains("2 review item(s) awaiting decision"));
+    assert!(html.contains("Open review"));
+    assert!(!html.contains("[a]"));
+    assert!(!html.contains("[d]"));
+    assert!(!html.contains("[s]"));
+}
+
+#[test]
+fn test_focused_worker_is_selected_in_rail_and_terminal_tabs() {
+    let mut unfocused = runtime_snapshot("claude-idle");
+    unfocused.label = "Claude Idle".to_string();
+    unfocused.focused = false;
+    unfocused.status = AgentStatus::Idle;
+    let mut vdom = VirtualDom::new_with_props(
+        DesktopShellWithSnapshot,
+        DesktopShellWithSnapshotProps {
+            snapshot: ProjectOpsSnapshot::default(),
+            runtime_agents: vec![runtime_snapshot("codex-live"), unfocused],
+            agent_platforms: Vec::new(),
+            workspaces: Vec::new(),
+            mcp_tools: Vec::new(),
+            last_invocations: Vec::new(),
+            review_queue: Vec::new(),
+            bridge_status: None,
+            daemon_ops_status: None,
+            initial_view: DesktopView::Terminal,
+        },
+    );
+    vdom.rebuild_in_place();
+    let html = dioxus_ssr::render(&vdom);
+
+    assert!(html.contains("data-agent-id=\"codex-live\""));
+    assert!(html.contains("aria-pressed=\"true\""));
+    assert!(html.contains("aria-selected=\"true\""));
+    assert!(html.contains("id=\"terminal-pane-claude-idle\" class=\"xterm-mount pending\""));
+    assert!(html.contains("data-terminal-active=\"false\""));
+    assert!(html.contains("aria-hidden=\"true\""));
+    assert!(html.contains("aria-label=\"Close worker Codex Live\""));
+    assert!(html.contains("aria-label=\"Close worker Claude Idle\""));
+}
+
+#[test]
+fn test_cockpit_css_declares_focus_and_responsive_boundaries() {
+    let mut vdom = VirtualDom::new(DesktopShell);
+    vdom.rebuild_in_place();
+    let html = dioxus_ssr::render(&vdom);
+
+    for contract in [
+        ".supervisor-dock",
+        ".mission-header",
+        ".launch-sequence",
+        ".control-dock",
+        ".terminal-tab-close",
+        ".xterm-mount.pending",
+        ":focus-visible",
+        "@media (max-width: 1120px)",
+    ] {
+        assert!(
+            html.contains(contract),
+            "missing cockpit CSS contract {contract}"
+        );
+    }
 }
 
 #[test]
@@ -431,7 +568,7 @@ fn test_dioxus_shell_is_offline_packaged_for_fonts() {
 
     assert!(html.contains("impulse-shell"));
     assert!(html.contains("ui-monospace"));
-    assert!(html.contains("ui-rounded"));
+    assert!(html.contains("Avenir Next"));
     for forbidden in [
         "fonts.googleapis",
         "fonts.gstatic",
@@ -530,18 +667,38 @@ fn test_dioxus_desktop_launch_binary_is_feature_gated() {
     let launcher_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/impulse_desktop.rs");
     let launcher_text =
         std::fs::read_to_string(&launcher_path).expect("Dioxus desktop launcher exists");
+    let boundary_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/project_boundary.rs");
+    let boundary_text =
+        std::fs::read_to_string(&boundary_path).expect("project boundary controller exists");
 
     assert!(manifest_text.contains("name = \"impulse-desktop\""));
     assert!(manifest_text.contains("required-features = [\"desktop-app\"]"));
     assert!(manifest_text.contains("desktop-app = [\"dep:dioxus-desktop\", \"dioxus/desktop\"]"));
     assert!(manifest_text.contains("dioxus-desktop = { version = \"0.6.3\", optional = true }"));
-    assert!(launcher_text.contains("use impulse_desktop::desktop_host::desktop_config;"));
+    assert!(
+        launcher_text.contains("use impulse_desktop::desktop_host::desktop_config_with_shutdown;")
+    );
     assert!(launcher_text.contains("dioxus::LaunchBuilder::desktop()"));
-    assert!(launcher_text.contains(".with_cfg(desktop_config())"));
+    assert!(launcher_text.contains(".with_cfg(desktop_config_with_shutdown(shutdown_coordinator))"));
     // The launcher now assembles the live host context and launches the
     // bridge-mounting root component instead of the bare shell.
-    assert!(launcher_text.contains("install_live_host_context(LiveHostContext::new("));
+    assert!(launcher_text.contains(".with_shutdown_coordinator(shutdown_coordinator.clone())"));
     assert!(launcher_text.contains(".launch(LiveDesktopApp);"));
+    assert!(launcher_text.contains("DesktopDaemonOpsConfig::discover_explicit_project_bound()"));
+    assert!(!launcher_text.contains("DesktopDaemonOpsConfig::discover(&memory_root)"));
+    assert!(launcher_text.contains("desktop oversight disconnected"));
+    assert!(launcher_text.contains("IMPULSE_DESKTOP_SCOPE_PROBE"));
+    assert!(launcher_text.contains("std::process::exit(2);"));
+    assert!(launcher_text.contains("DesktopShutdownCoordinator::new("));
+    assert!(launcher_text.contains("DesktopProjectBoundaryController::new("));
+    assert!(launcher_text.contains("DesktopShellState::new_live("));
+    assert!(launcher_text.contains("DesktopDaemonSidecarMode::Existing"));
+    assert!(launcher_text.contains("DesktopDaemonSidecarMode::Spawned"));
+    assert!(boundary_text.contains("DesktopInstanceLease::acquire(&config.socket_path)"));
+    assert!(boundary_text.contains("DesktopDaemonSidecar::ensure(&config)"));
+    assert!(boundary_text.contains("attach_desktop_daemon_ops"));
+    assert!(boundary_text.contains("install_daemon_boundary"));
+    assert!(boundary_text.contains("ProjectMemoryScope"));
 }
 
 #[test]
@@ -555,6 +712,10 @@ fn test_terminal_interop_prefers_dioxus_native_host_adapter() {
     assert!(script.contains(r#"hostKind: dioxusHost ? "dioxus""#));
     assert!(script.contains(r#"legacyTauri ? "legacy-tauri""#));
     assert!(script.contains("data-impulse-host-kind"));
+    assert!(script.contains("ResizeObserver"));
+    assert!(script.contains("fitAgentTerminal"));
+    assert!(script.contains("interop.activateAgent"));
+    assert!(script.contains("mount?.dataset?.terminalActive === \"true\""));
 
     // The resolver must treat the manifest-only bootstrap stubs as unavailable
     // rather than advertising them as a live host. It keys off both the pending
@@ -624,6 +785,125 @@ fn test_pending_dioxus_host_falls_back_to_legacy_tauri() {
     );
 }
 
+/// The manifest bootstrap and the live Dioxus eval hook mount in separate
+/// effects. A delayed replacement must wake the ops bridge instead of leaving
+/// it permanently degraded from the first placeholder snapshot.
+#[test]
+fn test_pending_dioxus_host_waits_for_delayed_live_bridge() {
+    if skip_without_node() {
+        return;
+    }
+
+    let smoke_script = format!(
+        r#"
+const bridgeScript = {bridge_script};
+const pendingStatus = {pending_status};
+const liveStatus = {live_status};
+const sent = [];
+const invoked = [];
+const listeners = {{}};
+const attrs = {{}};
+const eventListeners = {{}};
+
+const pending = (operation) =>
+  Promise.reject(new Error(`Dioxus Desktop host adapter pending: ${{operation}}`));
+const pendingInvoke = (command) => {{ invoked.push({{ command, pending: true }}); return pending(`invoke:${{command}}`); }};
+const pendingListen = (event) => pending(`listen:${{event}}`);
+pendingInvoke.__impulseHostPending = true;
+pendingListen.__impulseHostPending = true;
+
+global.window = {{
+  __IMPULSE_DESKTOP_HOST: {{
+    invoke: pendingInvoke,
+    listen: pendingListen,
+    hostKind: "dioxus",
+    status: pendingStatus,
+  }},
+  addEventListener: (name, handler) => {{
+    eventListeners[name] ||= new Set();
+    eventListeners[name].add(handler);
+  }},
+  removeEventListener: (name, handler) => eventListeners[name]?.delete(handler),
+}};
+global.document = {{
+  documentElement: {{
+    setAttribute: (key, value) => {{ attrs[key] = value; }}
+  }}
+}};
+global.dioxus = {{ send: (message) => sent.push(message) }};
+
+const bridgePromise = eval(bridgeScript);
+if (bridgePromise && typeof bridgePromise.catch === "function") {{
+  bridgePromise.catch(() => {{}});
+}}
+
+setTimeout(() => {{
+  window.__IMPULSE_DESKTOP_HOST = {{
+    status: liveStatus,
+    hostKind: "dioxus",
+    invoke: async (command) => {{ invoked.push({{ command, pending: false }}); return []; }},
+    listen: async (name, handler) => {{
+      listeners[name] = handler;
+      return async () => {{ delete listeners[name]; }};
+    }},
+  }};
+  for (const handler of eventListeners["impulse-host-ready"] || []) {{
+    handler({{ type: "impulse-host-ready" }});
+  }}
+}}, 20);
+
+setTimeout(() => {{
+  console.log(JSON.stringify({{ attrs, sent, invoked, bridge: window.__impulseOpsBridge }}));
+  process.exit(0);
+}}, 120);
+"#,
+        bridge_script =
+            serde_json::to_string(desktop_event_bridge_script()).expect("serialize bridge script"),
+        pending_status =
+            serde_json::to_string(impulse_desktop::host_commands::PENDING_HOST_BOOTSTRAP_STATUS)
+                .expect("serialize pending status"),
+        live_status = serde_json::to_string(impulse_desktop::host_bridge::LIVE_HOST_BRIDGE_STATUS)
+            .expect("serialize live status"),
+    );
+
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let smoke_path = tempdir.path().join("delayed-live-host-bridge-smoke.js");
+    std::fs::write(&smoke_path, smoke_script).expect("write delayed-host smoke script");
+    let output = Command::new("node")
+        .arg(&smoke_path)
+        .output()
+        .expect("run delayed-host bridge smoke");
+    assert!(
+        output.status.success(),
+        "delayed-host bridge smoke failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let smoke: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse delayed-host bridge smoke output");
+    assert_eq!(
+        smoke["attrs"]["data-impulse-ops-bridge"],
+        serde_json::Value::String("mounted".to_string())
+    );
+    assert_eq!(smoke["bridge"]["degraded"], serde_json::Value::Bool(false));
+    assert!(
+        smoke["invoked"]
+            .as_array()
+            .expect("invoked array")
+            .iter()
+            .any(|call| call["command"] == "agent_snapshot" && call["pending"] == false),
+        "the live replacement must receive initial refresh calls: {smoke}"
+    );
+    assert!(
+        !smoke["invoked"]
+            .as_array()
+            .expect("invoked array")
+            .iter()
+            .any(|call| call["pending"] == true),
+        "the manifest placeholder must never be invoked: {smoke}"
+    );
+}
+
 fn skip_without_node() -> bool {
     match Command::new("node").arg("--version").output() {
         Ok(output) if output.status.success() => false,
@@ -661,6 +941,7 @@ window.__TAURI__ = {
         ""
     };
 
+    let observation_delay_ms = if with_legacy { 40 } else { 350 };
     let smoke_script = format!(
         r#"
 const bridgeScript = {bridge_script};
@@ -699,7 +980,7 @@ if (bridgePromise && typeof bridgePromise.catch === "function") {{
 setTimeout(() => {{
   console.log(JSON.stringify({{ attrs, sent, invoked, bridge: window.__impulseOpsBridge }}));
   process.exit(0);
-}}, 40);
+}}, {observation_delay_ms});
 "#,
         bridge_script =
             serde_json::to_string(desktop_event_bridge_script()).expect("serialize bridge script"),
@@ -707,6 +988,7 @@ setTimeout(() => {{
             serde_json::to_string(impulse_desktop::host_commands::PENDING_HOST_BOOTSTRAP_STATUS)
                 .expect("serialize pending status"),
         legacy_setup = legacy_setup,
+        observation_delay_ms = observation_delay_ms,
     );
 
     let tempdir = tempfile::tempdir().expect("tempdir");
@@ -726,7 +1008,7 @@ setTimeout(() => {{
 }
 
 #[test]
-fn test_retro_shell_binds_project_ops_snapshot() {
+fn test_cockpit_binds_project_ops_snapshot_without_promoting_memory_metrics() {
     let mut snapshot = ProjectOpsSnapshot {
         generated_at: "2026-06-13T12:00:00Z".to_string(),
         context: ContextHealthSummary {
@@ -779,15 +1061,17 @@ fn test_retro_shell_binds_project_ops_snapshot() {
 
     let html = dioxus_ssr::render(&vdom);
 
-    assert!(html.contains("online · watching"));
-    assert!(html.contains("Context · operator"));
+    assert!(html.contains(">connected<"));
+    assert!(html.contains("Context budget"));
     assert!(html.contains("47.2k"));
     assert!(html.contains("200.0k"));
-    assert!(html.contains("tokens · 24% of 200.0k"));
-    assert!(html.contains("1 injection(s) awaiting review"));
-    assert!(html.contains("sqlite-vector"));
-    assert!(html.contains("12 genome decisions"));
-    assert!(html.contains("ops_update 2026-06-13T12:00:00Z"));
+    assert!(html.contains("47.2k / 200.0k · operator"));
+    assert!(html.contains("1 review item(s) awaiting decision"));
+    assert!(html.contains("1 item(s) need review"));
+    assert!(html.contains("Attention 1"));
+    assert!(html.contains("Last snapshot 2026-06-13T12:00:00Z"));
+    assert!(!html.contains("tokens · 24%"));
+    assert!(!html.contains("genome decisions"));
 }
 
 #[test]
@@ -826,6 +1110,10 @@ fn test_desktop_event_bridge_script_subscribes_to_live_host_events() {
     let script = desktop_event_bridge_script();
 
     assert!(script.contains("resolveImpulseHostAdapter"));
+    assert!(script.contains("waitForImpulseHostAdapter"));
+    assert!(
+        script.contains("const { invoke, listen, hostKind } = await waitForImpulseHostAdapter();")
+    );
     assert!(script.contains("dioxus.send"));
     assert!(script.contains(r#"listen("ops_update""#));
     assert!(script.contains(r#"listen("agent_runtime_update""#));
@@ -1303,8 +1591,9 @@ async fn test_live_desktop_shell_consumes_eval_bridge_messages() {
     assert!(html.contains("IMPULSE-rs"));
     assert!(html.contains("workspace-notes"));
     assert!(html.contains("impulse.project_context"));
-    assert!(html.contains("1 injection(s) awaiting review"));
-    assert!(html.contains("1 bundle(s) awaiting review-first apply"));
+    assert!(html.contains("1 review item(s) awaiting decision"));
+    assert!(html.contains("1 item(s) need review"));
+    assert!(html.contains("Attention 1"));
     assert!(!html.contains("Review Queue"));
     assert!(!html.contains("<section class=\"review-console\""));
     assert!(!html.contains("data-source=\"operator_board\""));
@@ -1638,11 +1927,15 @@ fn test_mcp_invoke_and_focus_bridge_scripts_serialize_requests() {
         caller_agent_id: Some("impulse-ui".to_string()),
     });
     let focus_script = agent_focus_bridge_script("codex-live");
+    let close_script = agent_close_bridge_script("codex-live");
 
     assert!(mcp_script.contains("invokeMcp"));
     assert!(mcp_script.contains(r#""tool":"impulse.project_context""#));
     assert!(focus_script.contains("focusAgent"));
     assert!(focus_script.contains(r#""codex-live""#));
+    assert!(close_script.contains("closeAgent"));
+    assert!(close_script.contains(r#""codex-live""#));
+    assert!(close_script.contains("window.confirm"));
 }
 
 #[test]
@@ -2145,11 +2438,11 @@ fn test_shell_render_accepts_live_agents_workspaces_and_tools() {
     assert!(html.contains("IMPULSE-rs"));
     assert!(html.contains("workspace-notes"));
     assert!(html.contains("impulse.project_context"));
-    assert!(html.contains("Workspace Launcher"));
-    assert!(html.contains("Register folder"));
-    assert!(html.contains("Launch agent"));
-    assert!(html.contains("MCP audited"));
-    assert!(html.contains("1 injection(s) awaiting review"));
+    assert!(html.contains("Launch dock"));
+    assert!(html.contains("Add project"));
+    assert!(html.contains("Launch Builder"));
+    assert!(html.contains("Builder · verified"));
+    assert!(html.contains("1 review item(s) awaiting decision"));
     assert!(!html.contains("Review Queue"));
     assert!(!html.contains("data-source=\"operator_board\""));
     assert!(html.contains("1 invocations"));
@@ -2197,11 +2490,82 @@ fn test_shell_review_route_gates_review_console() {
 }
 
 #[test]
-fn test_shell_supervisor_route_gates_operator_board() {
+fn test_review_console_keeps_every_pending_item_reachable_and_guides_missing_targets() {
+    let mut review_queue = (0..8)
+        .map(|index| ReviewQueueItem {
+            id: format!("decided-{index}"),
+            staged_at_unix_ms: index,
+            status: ReviewQueueStatus::Applied,
+            decided_at_unix_ms: Some(index + 100),
+            decision: Some(ReviewDecision::Apply),
+            target_agent_id: Some("codex-live".to_string()),
+            arguments: json!({ "content": format!("decided {index}") }),
+            path: format!("/tmp/decided-{index}.json"),
+            preview: format!("decided {index}"),
+        })
+        .collect::<Vec<_>>();
+    review_queue.push(ReviewQueueItem {
+        id: "pending-targeted".to_string(),
+        staged_at_unix_ms: 20,
+        status: ReviewQueueStatus::Pending,
+        decided_at_unix_ms: None,
+        decision: None,
+        target_agent_id: Some("codex-live".to_string()),
+        arguments: json!({ "content": "pending targeted" }),
+        path: "/tmp/pending-targeted.json".to_string(),
+        preview: "pending targeted".to_string(),
+    });
+    review_queue.push(ReviewQueueItem {
+        id: "pending-no-target".to_string(),
+        staged_at_unix_ms: 21,
+        status: ReviewQueueStatus::Pending,
+        decided_at_unix_ms: None,
+        decision: None,
+        target_agent_id: None,
+        arguments: json!({ "content": "pending without target" }),
+        path: "/tmp/pending-no-target.json".to_string(),
+        preview: "pending without target".to_string(),
+    });
     let mut vdom = VirtualDom::new_with_props(
         DesktopShellWithSnapshot,
         DesktopShellWithSnapshotProps {
             snapshot: ProjectOpsSnapshot::default(),
+            runtime_agents: vec![runtime_snapshot("codex-live")],
+            agent_platforms: Vec::new(),
+            workspaces: Vec::new(),
+            mcp_tools: Vec::new(),
+            last_invocations: Vec::new(),
+            review_queue,
+            bridge_status: None,
+            daemon_ops_status: None,
+            initial_view: DesktopView::Review,
+        },
+    );
+    vdom.rebuild_in_place();
+    let html = dioxus_ssr::render(&vdom);
+
+    assert!(html.contains("data-review-id=\"pending-targeted\""));
+    assert!(html.contains("data-review-id=\"pending-no-target\""));
+    assert!(
+        html.contains("Apply unavailable: restage this context with a target worker, or skip it.")
+    );
+    assert!(html.contains("2 older decided item(s) hidden; every pending item remains visible."));
+}
+
+#[test]
+fn test_shell_supervisor_route_gates_operator_board() {
+    let snapshot = ProjectOpsSnapshot {
+        project: impulse_ops::ProjectSummary {
+            name: "IMPULSE-rs".to_string(),
+            root_path: "<repo>".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut vdom = VirtualDom::new_with_props(
+        DesktopShellWithSnapshot,
+        DesktopShellWithSnapshotProps {
+            snapshot,
             runtime_agents: vec![runtime_snapshot("codex-live")],
             agent_platforms: Vec::new(),
             workspaces: Vec::new(),
@@ -2228,8 +2592,56 @@ fn test_shell_supervisor_route_gates_operator_board() {
     assert!(!html.contains("stage-view view-terminal active"));
     assert!(html.contains("data-source=\"operator_board\""));
     assert!(html.contains("In flight"));
+    assert!(html.contains("Evidence scope · IMPULSE-rs"));
     assert!(html.contains("1 audit rows"));
     assert!(!html.contains("<section class=\"review-console\""));
+}
+
+#[test]
+fn test_launch_target_has_one_lifted_selection_authority() {
+    let source = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui.rs"))
+        .expect("read desktop UI source");
+
+    assert!(!source.contains("selected_workspace_root"));
+    assert!(source.contains("on_select_root: EventHandler<String>"));
+    assert!(source.contains("onchange: move |evt| on_select_root.call(evt.value())"));
+    assert!(source.contains("\"Configure Builder\""));
+}
+
+#[test]
+fn test_supervisor_route_only_lists_workers_in_daemon_project_scope() {
+    let in_scope = runtime_snapshot("codex-in-scope");
+    let mut out_of_scope = runtime_snapshot("codex-other-project");
+    out_of_scope.cwd = Some("<other-repo>".to_string());
+    out_of_scope.workspace = Some(WorkspaceTarget::from_root("<other-repo>"));
+    let snapshot = ProjectOpsSnapshot {
+        project: impulse_ops::ProjectSummary {
+            name: "IMPULSE-rs".to_string(),
+            root_path: "<repo>".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut vdom = VirtualDom::new_with_props(
+        DesktopShellWithSnapshot,
+        DesktopShellWithSnapshotProps {
+            snapshot,
+            runtime_agents: vec![in_scope, out_of_scope],
+            agent_platforms: Vec::new(),
+            workspaces: Vec::new(),
+            mcp_tools: Vec::new(),
+            last_invocations: Vec::new(),
+            review_queue: Vec::new(),
+            bridge_status: None,
+            daemon_ops_status: None,
+            initial_view: DesktopView::Supervisor,
+        },
+    );
+    vdom.rebuild_in_place();
+    let html = dioxus_ssr::render(&vdom);
+
+    assert!(html.contains("operator-agent-card\" data-agent-id=\"codex-in-scope\""));
+    assert!(!html.contains("operator-agent-card\" data-agent-id=\"codex-other-project\""));
 }
 
 #[test]
@@ -2391,6 +2803,9 @@ fn test_profiled_governed_tasks_label_rust_only_and_route_all_producers_via_daem
     assert!(html.contains("&quot;$IMPULSE_CONTROL_CLI&quot; --daemon governed-claim"));
     assert!(html.contains("&quot;$IMPULSE_CONTROL_CLI&quot; --daemon governed-verify"));
     assert!(html.contains("&quot;$IMPULSE_CONTROL_CLI&quot; --daemon governed-review"));
+    assert!(html.contains("data-supervisor-state=\"attention\""));
+    assert!(html.contains("Attention 1"));
+    assert!(html.contains("0 context · 1 task review"));
     assert!(!html.contains("$IMPULSE_CONTROL_CLI governed-"));
 }
 
@@ -2817,12 +3232,13 @@ fn test_footer_stream_health_reflects_live_agent() {
     let html = dioxus_ssr::render(&vdom);
 
     // runtime_snapshot has output_bytes > 0 and a present agent → both streams live.
-    assert!(html.contains("terminal_output · live"));
-    assert!(html.contains("agent_runtime_update · live"));
-    assert!(html.contains("ops_update awaiting first ops_update · live"));
-    assert!(html.contains("online · watching"));
+    assert!(html.contains("Terminal · live"));
+    assert!(html.contains("Workers · live"));
+    assert!(html.contains("Control plane · live"));
+    assert!(html.contains("Last snapshot awaiting first ops_update"));
+    assert!(html.contains(">connected<"));
     assert!(html.contains("data-daemon-freshness=\"current\""));
-    assert!(html.contains("supervisor_local_action · ready"));
+    assert!(html.contains("Oversight · ready"));
     assert!(!html.contains("stream pending"));
 }
 
@@ -2857,11 +3273,11 @@ fn test_publish_only_degradation_keeps_subscribed_snapshot_current() {
     vdom.rebuild_in_place();
     let html = dioxus_ssr::render(&vdom);
 
-    assert!(html.contains("online · publish degraded"));
+    assert!(html.contains("connected · writes degraded"));
     assert!(html.contains("data-daemon-freshness=\"current\""));
     assert!(html.contains("data-daemon-status=\"publish-degraded\""));
     assert!(html.contains("Daemon snapshot reads remain live"));
-    assert!(html.contains("online · 0 working"));
+    assert!(html.contains("Control plane · live"));
     assert!(!html.contains("Daemon disconnected"));
     assert!(!html.contains("cached snapshot hidden"));
 }
@@ -2893,14 +3309,15 @@ fn test_footer_stream_health_reads_down_when_transport_degraded() {
     let html = dioxus_ssr::render(&vdom);
 
     // A degraded transport means no events can arrive — every stream reads down.
-    assert!(html.contains("terminal_output · down"));
-    assert!(html.contains("agent_runtime_update · down"));
-    assert!(html.contains("ops_update awaiting first ops_update · down"));
-    assert!(html.contains("daemon offline"));
+    assert!(html.contains("Terminal · down"));
+    assert!(html.contains("Workers · down"));
+    assert!(html.contains("Control plane · down"));
+    assert!(html.contains("Last snapshot awaiting first ops_update"));
+    assert!(html.contains(">offline<"));
     assert!(html.contains("data-daemon-freshness=\"stale\""));
     assert!(html.contains("data-daemon-status=\"stale\""));
     assert!(html.contains("Workbench data is cached and may be stale."));
     assert!(html.contains("0 cached artifacts"));
     assert!(html.contains("0 cached interventions"));
-    assert!(html.contains("supervisor_local_action · down"));
+    assert!(html.contains("Oversight · down"));
 }
