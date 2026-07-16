@@ -13,11 +13,12 @@ use dioxus::prelude::*;
 use impulse_desktop::ui::{
     agent_close_bridge_script, agent_focus_bridge_script, agent_launch_bridge_script,
     apply_desktop_bridge_message, apply_desktop_bridge_message_with_status,
-    build_governed_agent_spawn_request, builder_role_assignment, desktop_event_bridge_script,
-    governed_task_mutation_bridge_script, mcp_invoke_bridge_script, review_decision_bridge_script,
-    terminal_asset_paths, workspace_registration_bridge_script, BridgeStatusUpdate,
-    DaemonOpsStatusUpdate, DesktopBridgeMessage, DesktopBridgeStateMut, GovernedAgentSpawnInput,
-    ReviewDecisionUiRequest, XTERM_CSS_PATH, XTERM_FIT_JS_PATH, XTERM_JS_PATH,
+    build_governed_agent_spawn_request, builder_role_assignment, daemon_project_scope_mismatch,
+    desktop_event_bridge_script, governed_task_mutation_bridge_script, mcp_invoke_bridge_script,
+    project_roots_match, review_decision_bridge_script, terminal_asset_paths,
+    workspace_registration_bridge_script, BridgeStatusUpdate, DaemonOpsStatusUpdate,
+    DesktopBridgeMessage, DesktopBridgeStateMut, GovernedAgentSpawnInput, ReviewDecisionUiRequest,
+    XTERM_CSS_PATH, XTERM_FIT_JS_PATH, XTERM_JS_PATH,
 };
 use impulse_desktop::{
     default_builtin_mcp_tools, format_count, status_dot_class, status_label, AgentPlatformId,
@@ -119,10 +120,17 @@ fn test_workspace_launcher_renders_required_builder_compatibility_preflight() {
     assert!(html.contains("data-field=\"launch-task\""));
     assert!(html.contains("data-field=\"launch-acceptance-criteria\""));
     assert!(html.contains("aria-required=\"true\""));
-    assert!(html.contains(">Task<"));
+    assert!(html.contains(">Assignment<"));
+    assert!(html.contains(">Definition of done<"));
     assert!(html.contains(">Builder<"));
     assert!(html.contains("data-verification-profile=\"rust_workspace_v1\""));
     assert!(html.contains("Rust-only · rust_workspace_v1"));
+    assert!(html.contains("Builder · verification required"));
+    assert!(html.contains("Launch worker"));
+    assert!(html.contains("data-step=\"assignment\""));
+    assert!(html.contains("data-launch-validation=\"blocked\""));
+    assert!(html.contains("role=\"status\""));
+    assert!(!html.contains(">Project folder<"));
     assert!(!html.contains("launch any agent"));
     assert!(html.contains("degraded"));
     assert!(html.contains("workspace.target"));
@@ -130,10 +138,248 @@ fn test_workspace_launcher_renders_required_builder_compatibility_preflight() {
     assert!(html.contains("filesystem.scoped"));
     assert!(html.contains("required mediated · available mediated"));
     assert!(html.contains("required structural · available unsupported"));
-    assert!(html.contains("cwd mediation is not a filesystem sandbox"));
+    assert!(html.contains("Working-directory mediation validates the project root"));
     assert!(html.contains("data-action=\"launch-governed-agent\""));
     assert!(html.contains("aria-disabled=\"true\""));
     assert!(html.contains("disabled=\"true\""));
+}
+
+#[test]
+fn test_empty_cockpit_requires_project_before_rendering_worker_assignment_fields() {
+    let platform: AgentPlatformInfo = serde_json::from_value(json!({
+        "id": "codex",
+        "label": "Codex",
+        "command": "codex"
+    }))
+    .expect("platform DTO");
+    let mut vdom = VirtualDom::new_with_props(
+        DesktopShellWithSnapshot,
+        DesktopShellWithSnapshotProps {
+            snapshot: ProjectOpsSnapshot::default(),
+            runtime_agents: Vec::new(),
+            agent_platforms: vec![platform],
+            workspaces: Vec::new(),
+            mcp_tools: Vec::new(),
+            last_invocations: Vec::new(),
+            review_queue: Vec::new(),
+            bridge_status: None,
+            daemon_ops_status: None,
+            initial_view: DesktopView::Terminal,
+        },
+    );
+    vdom.rebuild_in_place();
+
+    let html = dioxus_ssr::render(&vdom);
+    assert!(html.contains("data-step=\"project\""));
+    assert!(html.contains("aria-label=\"Project setup\""));
+    assert!(html.contains("Step 1 of 2"));
+    assert!(html.contains("Project folder"));
+    assert!(html.contains("Enter an absolute project folder to continue."));
+    assert!(!html.contains("data-field=\"launch-task\""));
+    assert!(!html.contains("data-field=\"launch-acceptance-criteria\""));
+    assert!(!html.contains("data-action=\"launch-governed-agent\""));
+    assert!(!html.contains("value=\"codex\""));
+}
+
+#[test]
+fn test_daemon_project_binding_disables_other_projects_in_this_window() {
+    let snapshot = ProjectOpsSnapshot {
+        project: impulse_ops::ProjectSummary {
+            name: "IMPULSE-rs".to_string(),
+            root_path: "/tmp/impulse".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let workspaces = vec![
+        WorkspaceEntry::new(WorkspaceTarget {
+            root: "/tmp/impulse".to_string(),
+            label: Some("IMPULSE-rs".to_string()),
+            purpose: None,
+            project_notes: None,
+        }),
+        WorkspaceEntry::new(WorkspaceTarget {
+            root: "/tmp/other".to_string(),
+            label: Some("Other project".to_string()),
+            purpose: None,
+            project_notes: None,
+        }),
+    ];
+    let mut vdom = VirtualDom::new_with_props(
+        DesktopShellWithSnapshot,
+        DesktopShellWithSnapshotProps {
+            snapshot,
+            runtime_agents: Vec::new(),
+            agent_platforms: Vec::new(),
+            workspaces,
+            mcp_tools: Vec::new(),
+            last_invocations: Vec::new(),
+            review_queue: Vec::new(),
+            bridge_status: None,
+            daemon_ops_status: None,
+            initial_view: DesktopView::Terminal,
+        },
+    );
+    vdom.rebuild_in_place();
+
+    let html = dioxus_ssr::render(&vdom);
+    assert!(html.contains("project-row active"));
+    assert!(html.contains("project-row locked"));
+    assert!(html.contains("aria-current=\"true\""));
+    assert!(html.contains("aria-disabled=\"true\""));
+    assert!(html.contains("Other project"));
+    assert!(html.contains(
+        "This window is bound to IMPULSE-rs. Restart Impulse to bind a different project."
+    ));
+    assert!(html.contains("This window is project-bound."));
+}
+
+#[test]
+fn test_bound_daemon_project_advances_to_assignment_without_registry_entry() {
+    let snapshot = ProjectOpsSnapshot {
+        project: impulse_ops::ProjectSummary {
+            name: "IMPULSE-rs".to_string(),
+            root_path: "/tmp/impulse".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut vdom = VirtualDom::new_with_props(
+        DesktopShellWithSnapshot,
+        DesktopShellWithSnapshotProps {
+            snapshot,
+            runtime_agents: Vec::new(),
+            agent_platforms: Vec::new(),
+            workspaces: Vec::new(),
+            mcp_tools: Vec::new(),
+            last_invocations: Vec::new(),
+            review_queue: Vec::new(),
+            bridge_status: None,
+            daemon_ops_status: None,
+            initial_view: DesktopView::Terminal,
+        },
+    );
+    vdom.rebuild_in_place();
+
+    let html = dioxus_ssr::render(&vdom);
+    assert!(html.contains("data-step=\"assignment\""));
+    assert!(html.contains("bound-project-field"));
+    assert!(html.contains("IMPULSE-rs"));
+    assert!(html.contains("data-field=\"launch-task\""));
+    assert!(html.contains("data-field=\"launch-acceptance-criteria\""));
+    assert!(!html.contains("data-step=\"project\""));
+    assert!(!html.contains(">Project folder<"));
+}
+
+#[test]
+fn test_project_bound_terminal_hides_workers_from_other_projects() {
+    let snapshot = ProjectOpsSnapshot {
+        project: impulse_ops::ProjectSummary {
+            name: "IMPULSE-rs".to_string(),
+            root_path: "<repo>".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut in_scope = runtime_snapshot("codex-in-scope");
+    in_scope.focused = false;
+    let mut out_of_scope = runtime_snapshot("codex-other-project");
+    out_of_scope.label = "Other Project Worker".to_string();
+    out_of_scope.focused = false;
+    out_of_scope.cwd = Some("<other-repo>".to_string());
+    out_of_scope.workspace = Some(WorkspaceTarget::from_root("<other-repo>"));
+    let mut vdom = VirtualDom::new_with_props(
+        DesktopShellWithSnapshot,
+        DesktopShellWithSnapshotProps {
+            snapshot,
+            runtime_agents: vec![out_of_scope, in_scope],
+            agent_platforms: Vec::new(),
+            workspaces: Vec::new(),
+            mcp_tools: Vec::new(),
+            last_invocations: Vec::new(),
+            review_queue: Vec::new(),
+            bridge_status: None,
+            daemon_ops_status: None,
+            initial_view: DesktopView::Terminal,
+        },
+    );
+    vdom.rebuild_in_place();
+
+    let html = dioxus_ssr::render(&vdom);
+    assert!(html.contains("data-agent-id=\"codex-in-scope\""));
+    assert!(html.contains("terminal-pane-codex-in-scope"));
+    assert!(html.contains("id=\"terminal-pane-codex-in-scope\" class=\"xterm-mount\""));
+    assert!(html.contains("data-terminal-active=\"true\""));
+    assert!(!html.contains("data-agent-id=\"codex-other-project\""));
+    assert!(!html.contains("terminal-pane-codex-other-project"));
+    assert!(!html.contains("Other Project Worker"));
+    assert!(html.contains("1 worker(s) hidden because they belong to another project."));
+}
+
+#[test]
+fn test_daemon_project_scope_mismatch_predicate_is_fail_closed() {
+    assert!(!daemon_project_scope_mismatch("", "/tmp/project-b"));
+    assert!(!daemon_project_scope_mismatch("/tmp/project-a", ""));
+    assert!(!daemon_project_scope_mismatch(
+        "/tmp/project-a",
+        "/tmp/project-a"
+    ));
+    assert!(daemon_project_scope_mismatch(
+        "/tmp/project-a",
+        "/tmp/project-b"
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_project_scope_treats_symlinked_workspace_as_the_bound_project() {
+    let tempdir = tempfile::tempdir().expect("project tempdir");
+    let canonical_root = tempdir.path().join("canonical-project");
+    let symlink_root = tempdir.path().join("project-link");
+    std::fs::create_dir_all(&canonical_root).expect("canonical project root");
+    std::os::unix::fs::symlink(&canonical_root, &symlink_root).expect("project symlink");
+
+    let canonical = canonical_root.display().to_string();
+    let linked = symlink_root.display().to_string();
+    assert!(project_roots_match(&canonical, &linked));
+    assert!(!daemon_project_scope_mismatch(&canonical, &linked));
+
+    let snapshot = ProjectOpsSnapshot {
+        project: impulse_ops::ProjectSummary {
+            name: "Canonical project".to_string(),
+            root_path: canonical,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let workspace = WorkspaceEntry::new(WorkspaceTarget {
+        root: linked,
+        label: Some("Symlink project".to_string()),
+        purpose: None,
+        project_notes: Some("SYMLINK_PROJECT_NOTE".to_string()),
+    });
+    let mut vdom = VirtualDom::new_with_props(
+        DesktopShellWithSnapshot,
+        DesktopShellWithSnapshotProps {
+            snapshot,
+            runtime_agents: Vec::new(),
+            agent_platforms: Vec::new(),
+            workspaces: vec![workspace],
+            mcp_tools: Vec::new(),
+            last_invocations: Vec::new(),
+            review_queue: Vec::new(),
+            bridge_status: None,
+            daemon_ops_status: None,
+            initial_view: DesktopView::Terminal,
+        },
+    );
+    vdom.rebuild_in_place();
+    let html = dioxus_ssr::render(&vdom);
+
+    assert!(html.contains("project-row active"));
+    assert!(!html.contains("project-row locked"));
+    assert!(html.contains("SYMLINK_PROJECT_NOTE"));
+    assert!(html.contains("data-project-scope-status=\"accepted\""));
 }
 
 fn governed_platform(id: &str, runtime_capabilities: serde_json::Value) -> AgentPlatformInfo {
@@ -372,6 +618,143 @@ fn runtime_snapshot(agent_id: &str) -> AgentRuntimeSnapshot {
     }
 }
 
+#[component]
+fn ProjectScopeMismatchTransitionHarness() -> Element {
+    let mut snapshot = use_signal(|| ProjectOpsSnapshot {
+        generated_at: "project-a-snapshot".to_string(),
+        project: impulse_ops::ProjectSummary {
+            name: "Project A".to_string(),
+            root_path: "/tmp/project-a".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    use_effect(move || {
+        spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            snapshot.set(ProjectOpsSnapshot {
+                generated_at: "project-b-snapshot".to_string(),
+                project: impulse_ops::ProjectSummary {
+                    name: "Project B".to_string(),
+                    root_path: "/tmp/project-b".to_string(),
+                    ..Default::default()
+                },
+                context: ContextHealthSummary {
+                    tier: "FOREIGN_CONTEXT_SECRET".to_string(),
+                    pending_review_count: 7,
+                    ..Default::default()
+                },
+                artifacts: vec![impulse_ops::ArtifactEnvelope {
+                    id: "foreign-artifact".to_string(),
+                    project_id: "project-b".to_string(),
+                    title: "FOREIGN_ARTIFACT_SECRET".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+        });
+    });
+
+    let mut runtime = runtime_snapshot("project-a-builder");
+    runtime.cwd = Some("/tmp/project-a".to_string());
+    runtime.workspace = Some(WorkspaceTarget {
+        root: "/tmp/project-a".to_string(),
+        label: Some("Project A".to_string()),
+        purpose: None,
+        project_notes: None,
+    });
+    runtime.role_assignment = Some(builder_role_assignment().expect("Builder role"));
+
+    let workspaces = vec![
+        WorkspaceEntry::new(WorkspaceTarget {
+            root: "/tmp/project-a".to_string(),
+            label: Some("Project A".to_string()),
+            purpose: None,
+            project_notes: Some("BOUND_PROJECT_NOTE".to_string()),
+        }),
+        WorkspaceEntry::new(WorkspaceTarget {
+            root: "/tmp/project-b".to_string(),
+            label: Some("Project B".to_string()),
+            purpose: None,
+            project_notes: Some("FOREIGN_WORKSPACE_SECRET".to_string()),
+        }),
+    ];
+    let review_queue = vec![ReviewQueueItem {
+        id: "foreign-review".to_string(),
+        staged_at_unix_ms: 1,
+        status: ReviewQueueStatus::Pending,
+        decided_at_unix_ms: None,
+        decision: None,
+        target_agent_id: None,
+        arguments: json!({ "content": "FOREIGN_REVIEW_SECRET" }),
+        path: "/tmp/project-b/.impulse/review_queue/foreign-review.json".to_string(),
+        preview: "FOREIGN_REVIEW_SECRET".to_string(),
+    }];
+    let last_invocations = vec![McpInvocation {
+        call_id: "foreign-call".to_string(),
+        tool: "foreign.audit.secret".to_string(),
+        caller_agent_id: Some("project-b-builder".to_string()),
+        arguments: json!({}),
+        confirmed: true,
+        result: json!({}),
+        ok: true,
+    }];
+
+    rsx! {
+        DesktopShellWithSnapshot {
+            snapshot: snapshot(),
+            runtime_agents: vec![runtime],
+            agent_platforms: Vec::new(),
+            workspaces,
+            mcp_tools: vec![BuiltInMcpTool::new(
+                "foreign.project.tool",
+                "FOREIGN_TOOL_SECRET",
+                vec!["workspace".to_string()],
+                false,
+            )],
+            last_invocations,
+            review_queue,
+            bridge_status: None,
+            daemon_ops_status: Some(DaemonOpsStatusUpdate {
+                connected: true,
+                error: None,
+            }),
+            initial_view: DesktopView::Artifacts,
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_project_scope_mismatch_hides_foreign_data_and_mutation_controls() {
+    let mut vdom = VirtualDom::new(ProjectScopeMismatchTransitionHarness);
+    vdom.rebuild_in_place();
+
+    for _ in 0..8 {
+        if tokio::time::timeout(Duration::from_millis(100), vdom.wait_for_work())
+            .await
+            .is_err()
+        {
+            break;
+        }
+        let _ = vdom.render_immediate_to_vec();
+    }
+
+    let html = dioxus_ssr::render(&vdom);
+    assert!(html.contains("data-project-scope-status=\"mismatch\""));
+    assert!(html.contains("Project boundary blocked"));
+    assert!(html.contains("data-project-scope-actions=\"blocked\""));
+    assert!(html.contains("Platform tools and audit · blocked"));
+    assert!(!html.contains("FOREIGN_CONTEXT_SECRET"));
+    assert!(!html.contains("FOREIGN_ARTIFACT_SECRET"));
+    assert!(!html.contains("FOREIGN_REVIEW_SECRET"));
+    assert!(!html.contains("FOREIGN_WORKSPACE_SECRET"));
+    assert!(!html.contains("FOREIGN_TOOL_SECRET"));
+    assert!(!html.contains("foreign.audit.secret"));
+    assert!(!html.contains("7 review item(s) awaiting decision"));
+    assert!(!html.contains("Launch worker"));
+    assert!(!html.contains("Rust MCP Tools"));
+}
+
 #[test]
 fn test_dioxus_shell_renders_supervisor_first_cockpit_without_egui() {
     let mut vdom = VirtualDom::new(DesktopShell);
@@ -393,30 +776,37 @@ fn test_dioxus_shell_renders_supervisor_first_cockpit_without_egui() {
     assert!(html.contains("event-strip"));
     assert!(html.contains("supervisor-dock"));
     assert!(html.contains("Review service"));
-    assert!(html.contains("Oversight lane"));
+    assert!(html.contains("Review &amp; evidence"));
+    assert!(html.contains("No Supervisor agent is running."));
+    assert!(html.contains("data-supervisor-runtime=\"not-launched\""));
     assert!(html.contains("mission-header"));
     assert!(html.contains("Feed the impulse to build."));
-    assert!(html.contains("One launch target. Explicit oversight. Specialized workers."));
+    assert!(html.contains(
+        "One project. Explicit review. Specialized workers. Evidence before acceptance."
+    ));
     assert!(html.contains("agent-pool"));
     assert!(html.contains("workspace-picker"));
-    assert!(html.contains(">Launch targets<"));
-    assert!(html.contains("Worker terminals remain desktop-wide"));
-    assert!(html.contains("oversight and evidence stay bound to the connected daemon project"));
-    assert!(html.contains("Workers · desktop"));
+    assert!(html.contains(">Project<"));
+    assert!(html.contains("No projects added"));
+    assert!(html.contains("No workers running"));
+    assert!(html.contains("The first governed worker binds this window"));
     assert!(html.contains(">Inspect<"));
     assert!(html.contains("data-source=\"workspace_target\""));
     assert!(html.contains("data-source=\"builtin_mcp_tools\""));
     assert!(html.contains("Rust MCP Tools"));
     assert!(html.contains("agent_spawn and agent_write require confirmation"));
-    assert!(html.contains("Launch dock"));
+    assert!(html.contains("data-step=\"project\""));
+    assert!(html.contains("aria-label=\"Project setup\""));
+    assert!(html.contains("Add a project"));
+    assert!(html.contains("Project folder"));
+    assert!(html.contains("Project required"));
     assert!(html.contains("Add project"));
-    assert!(html.contains("Launch Builder"));
-    assert!(html.contains("Builder · verified"));
+    assert!(!html.contains("data-field=\"launch-task\""));
     assert!(html.contains("class=\"terminal-empty-state\""));
     assert!(html.contains("data-terminal-state=\"empty\""));
     assert!(html.contains("launch-sequence"));
     assert!(html.contains("Turn intent into governed work."));
-    assert!(html.contains("Open oversight"));
+    assert!(html.contains("Review evidence policy"));
     assert!(!html.contains("data-xterm-mount=\"true\""));
     assert!(!html.contains("terminal-pane-codex"));
     assert!(!html.contains("crt-hero"));
@@ -429,7 +819,7 @@ fn test_dioxus_shell_renders_supervisor_first_cockpit_without_egui() {
     assert!(!html.contains("stream pending"));
     assert!(html.contains("data-stream=\"agent_runtime_update\""));
     assert!(html.contains("Workers · idle"));
-    assert!(html.contains("Oversight · ready"));
+    assert!(html.contains("Review service · ready"));
     assert!(!html.contains("data-pty-owner=\"rust-backend\""));
     assert!(!html.contains("<section class=\"review-console\""));
     assert!(!html.contains("<section class=\"operator-board\""));
@@ -447,9 +837,10 @@ fn test_oversight_dock_does_not_claim_a_supervisor_runtime_is_launched() {
     let html = dioxus_ssr::render(&vdom);
 
     assert!(html.contains("Review service"));
-    assert!(html.contains("Oversight lane"));
-    assert!(html.contains("without implying a launched Supervisor runtime"));
+    assert!(html.contains("Review &amp; evidence"));
+    assert!(html.contains("No Supervisor agent is running."));
     assert!(html.contains("data-supervisor-state=\"idle\""));
+    assert!(html.contains("data-supervisor-runtime=\"not-launched\""));
     assert!(!html.contains("Supervisor runtime running"));
     assert!(!html.contains("Supervisor online"));
 }
@@ -460,12 +851,13 @@ fn test_visible_cockpit_copy_distinguishes_oversight_from_a_supervisor_runtime()
     vdom.rebuild_in_place();
     let html = dioxus_ssr::render(&vdom);
 
-    assert!(html.contains("Oversight"));
-    assert!(html.contains("oversight lane"));
-    assert!(html.contains("Oversight attention"));
-    assert!(!html.contains(">Supervisor<"));
-    assert!(!html.contains("supervisor lane"));
-    assert!(!html.contains("Supervisor attention"));
+    assert!(html.contains(">Supervisor<"));
+    assert!(html.contains("Review &amp; evidence"));
+    assert!(html.contains("Review governed work here."));
+    assert!(html.contains("No Supervisor agent is running."));
+    assert!(html.contains("data-supervisor-runtime=\"not-launched\""));
+    assert!(!html.contains("Supervisor runtime running"));
+    assert!(!html.contains("Supervisor online"));
 }
 
 #[test]
@@ -537,6 +929,119 @@ fn test_focused_worker_is_selected_in_rail_and_terminal_tabs() {
 }
 
 #[test]
+fn test_focused_worker_keeps_project_assignment_role_and_evidence_visible() {
+    let mut runtime = runtime_snapshot("codex-live");
+    runtime.role_assignment = Some(builder_role_assignment().expect("Builder role"));
+    let mut governed_task = profiled_governed_task("task-focused-worker", "awaiting_verification");
+    governed_task.agent_id = runtime.agent_id.clone();
+    governed_task.workspace_root = "<repo>".to_string();
+    runtime.governed_task_id = Some(governed_task.id.clone());
+    runtime.governed_task_revision = Some(governed_task.revision);
+
+    let snapshot = ProjectOpsSnapshot {
+        project: impulse_ops::ProjectSummary {
+            name: "IMPULSE-rs".to_string(),
+            root_path: "<repo>".to_string(),
+            ..Default::default()
+        },
+        governed_tasks: vec![governed_task],
+        ..Default::default()
+    };
+    let workspace = WorkspaceEntry::new(WorkspaceTarget {
+        root: "<repo>".to_string(),
+        label: Some("IMPULSE-rs".to_string()),
+        purpose: Some("terminal harness".to_string()),
+        project_notes: None,
+    });
+    let mut vdom = VirtualDom::new_with_props(
+        DesktopShellWithSnapshot,
+        DesktopShellWithSnapshotProps {
+            snapshot,
+            runtime_agents: vec![runtime],
+            agent_platforms: Vec::new(),
+            workspaces: vec![workspace],
+            mcp_tools: Vec::new(),
+            last_invocations: Vec::new(),
+            review_queue: Vec::new(),
+            bridge_status: None,
+            daemon_ops_status: None,
+            initial_view: DesktopView::Terminal,
+        },
+    );
+    vdom.rebuild_in_place();
+
+    let html = dioxus_ssr::render(&vdom);
+    assert!(html.contains("focused-worker-header"));
+    assert!(html.contains("focused-worker-panel"));
+    assert!(html.contains("data-source=\"focused_worker\""));
+    assert!(html.contains("IMPULSE-rs"));
+    assert!(html.contains(">Builder<"));
+    assert!(html.contains("Exercise awaiting_verification producer guidance"));
+    assert!(html.contains("Definition of done"));
+    assert!(html.contains("The daemon owns the producer record"));
+    assert!(html.contains("Review · awaiting verification"));
+    assert!(html.contains("data-review-state=\"awaiting verification\""));
+    assert!(html.contains(">Evidence<"));
+    assert!(html.contains("0 claim(s) · 0 verification run(s)"));
+    assert!(html.contains("Review evidence"));
+    assert!(html.contains("Add another worker"));
+    assert!(html.contains("worker-row-meta"));
+    assert!(html.contains("worker-row-project"));
+    assert!(html.contains("worker-row-task"));
+}
+
+#[test]
+fn test_focused_worker_prefers_exact_governed_task_over_older_same_agent_record() {
+    let mut runtime = runtime_snapshot("codex-live");
+    runtime.role_assignment = Some(builder_role_assignment().expect("Builder role"));
+
+    let mut stale_task = profiled_governed_task("task-stale", "awaiting_verification");
+    stale_task.agent_id = runtime.agent_id.clone();
+    stale_task.workspace_root = "<repo>".to_string();
+    stale_task.revision = 99;
+    stale_task.task = "STALE_ASSIGNMENT_SECRET".to_string();
+
+    let mut current_task = profiled_governed_task("task-current", "awaiting_supervisor");
+    current_task.agent_id = runtime.agent_id.clone();
+    current_task.workspace_root = "<repo>".to_string();
+    current_task.revision = 2;
+    current_task.task = "Current exact governed assignment".to_string();
+    runtime.governed_task_id = Some(current_task.id.clone());
+    runtime.governed_task_revision = Some(current_task.revision);
+
+    let snapshot = ProjectOpsSnapshot {
+        project: impulse_ops::ProjectSummary {
+            name: "IMPULSE-rs".to_string(),
+            root_path: "<repo>".to_string(),
+            ..Default::default()
+        },
+        governed_tasks: vec![stale_task, current_task],
+        ..Default::default()
+    };
+    let mut vdom = VirtualDom::new_with_props(
+        DesktopShellWithSnapshot,
+        DesktopShellWithSnapshotProps {
+            snapshot,
+            runtime_agents: vec![runtime],
+            agent_platforms: Vec::new(),
+            workspaces: Vec::new(),
+            mcp_tools: Vec::new(),
+            last_invocations: Vec::new(),
+            review_queue: Vec::new(),
+            bridge_status: None,
+            daemon_ops_status: None,
+            initial_view: DesktopView::Terminal,
+        },
+    );
+    vdom.rebuild_in_place();
+
+    let html = dioxus_ssr::render(&vdom);
+    assert!(html.contains("Current exact governed assignment"));
+    assert!(html.contains("Review · awaiting supervisor"));
+    assert!(!html.contains("STALE_ASSIGNMENT_SECRET"));
+}
+
+#[test]
 fn test_cockpit_css_declares_focus_and_responsive_boundaries() {
     let mut vdom = VirtualDom::new(DesktopShell);
     vdom.rebuild_in_place();
@@ -545,12 +1050,16 @@ fn test_cockpit_css_declares_focus_and_responsive_boundaries() {
     for contract in [
         ".supervisor-dock",
         ".mission-header",
+        ".focused-worker-header",
+        ".focused-worker-panel",
+        ".focused-worker-evidence",
+        ".status-stack",
         ".launch-sequence",
         ".control-dock",
         ".terminal-tab-close",
         ".xterm-mount.pending",
         ":focus-visible",
-        "@media (max-width: 1120px)",
+        "@media (max-width: 1240px)",
     ] {
         assert!(
             html.contains(contract),
@@ -1068,7 +1577,7 @@ fn test_cockpit_binds_project_ops_snapshot_without_promoting_memory_metrics() {
     assert!(html.contains("47.2k / 200.0k · operator"));
     assert!(html.contains("1 review item(s) awaiting decision"));
     assert!(html.contains("1 item(s) need review"));
-    assert!(html.contains("Attention 1"));
+    assert!(html.contains("Context 1"));
     assert!(html.contains("Last snapshot 2026-06-13T12:00:00Z"));
     assert!(!html.contains("tokens · 24%"));
     assert!(!html.contains("genome decisions"));
@@ -1081,13 +1590,14 @@ fn test_workspace_launcher_renders_registry_platforms_including_ion_and_custom()
         {"id": "custom-agent", "label": "Custom Agent", "command": "custom-agent"}
     ]))
     .expect("platform fixtures");
+    let workspace = WorkspaceEntry::new(WorkspaceTarget::from_root("/tmp/impulse"));
     let mut vdom = VirtualDom::new_with_props(
         DesktopShellWithSnapshot,
         DesktopShellWithSnapshotProps {
             snapshot: ProjectOpsSnapshot::default(),
             runtime_agents: Vec::new(),
             agent_platforms,
-            workspaces: Vec::new(),
+            workspaces: vec![workspace],
             mcp_tools: Vec::new(),
             last_invocations: Vec::new(),
             review_queue: Vec::new(),
@@ -1593,7 +2103,7 @@ async fn test_live_desktop_shell_consumes_eval_bridge_messages() {
     assert!(html.contains("impulse.project_context"));
     assert!(html.contains("1 review item(s) awaiting decision"));
     assert!(html.contains("1 item(s) need review"));
-    assert!(html.contains("Attention 1"));
+    assert!(html.contains("Context 1"));
     assert!(!html.contains("Review Queue"));
     assert!(!html.contains("<section class=\"review-console\""));
     assert!(!html.contains("data-source=\"operator_board\""));
@@ -2383,7 +2893,8 @@ fn test_apply_bridge_message_accepts_mcp_invocation_receipts() {
 #[test]
 fn test_shell_render_accepts_live_agents_workspaces_and_tools() {
     let snapshot = ProjectOpsSnapshot::default();
-    let runtime = runtime_snapshot("codex-live");
+    let mut runtime = runtime_snapshot("codex-live");
+    runtime.role_assignment = Some(builder_role_assignment().expect("Builder role"));
     let workspace = WorkspaceEntry::new(WorkspaceTarget {
         root: "<repo>".to_string(),
         label: Some("IMPULSE-rs".to_string()),
@@ -2438,10 +2949,16 @@ fn test_shell_render_accepts_live_agents_workspaces_and_tools() {
     assert!(html.contains("IMPULSE-rs"));
     assert!(html.contains("workspace-notes"));
     assert!(html.contains("impulse.project_context"));
-    assert!(html.contains("Launch dock"));
-    assert!(html.contains("Add project"));
-    assert!(html.contains("Launch Builder"));
-    assert!(html.contains("Builder · verified"));
+    assert!(html.contains("focused-worker-header"));
+    assert!(html.contains("focused-worker-panel"));
+    assert!(html.contains("Active assignment"));
+    assert!(html.contains("wire live bridge"));
+    assert!(html.contains("Builder · codex · working"));
+    assert!(html.contains("Add another worker"));
+    assert!(html.contains("Assign work"));
+    assert!(html.contains("Launch worker"));
+    assert!(html.contains("Builder · verification required"));
+    assert!(html.contains("This window is project-bound."));
     assert!(html.contains("1 review item(s) awaiting decision"));
     assert!(!html.contains("Review Queue"));
     assert!(!html.contains("data-source=\"operator_board\""));
@@ -2487,6 +3004,49 @@ fn test_shell_review_route_gates_review_console() {
     assert!(html.contains("Apply"));
     assert!(html.contains("Skip"));
     assert!(!html.contains("data-source=\"operator_board\""));
+}
+
+#[test]
+fn test_project_local_review_item_for_offline_target_remains_visible_and_skippable() {
+    let snapshot = ProjectOpsSnapshot {
+        project: impulse_ops::ProjectSummary {
+            name: "IMPULSE-rs".to_string(),
+            root_path: "<repo>".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut vdom = VirtualDom::new_with_props(
+        DesktopShellWithSnapshot,
+        DesktopShellWithSnapshotProps {
+            snapshot,
+            runtime_agents: Vec::new(),
+            agent_platforms: Vec::new(),
+            workspaces: Vec::new(),
+            mcp_tools: Vec::new(),
+            last_invocations: Vec::new(),
+            review_queue: vec![ReviewQueueItem {
+                id: "offline-review".to_string(),
+                staged_at_unix_ms: 1,
+                status: ReviewQueueStatus::Pending,
+                decided_at_unix_ms: None,
+                decision: None,
+                target_agent_id: Some("exited-builder".to_string()),
+                arguments: json!({ "content": "offline target context\n" }),
+                path: "<repo>/.impulse/review_queue/offline-review.json".to_string(),
+                preview: "offline target context".to_string(),
+            }],
+            bridge_status: None,
+            daemon_ops_status: None,
+            initial_view: DesktopView::Review,
+        },
+    );
+    vdom.rebuild_in_place();
+    let html = dioxus_ssr::render(&vdom);
+
+    assert!(html.contains("offline target context"));
+    assert!(html.contains("exited-builder"));
+    assert!(html.contains(">Skip<"));
 }
 
 #[test]
@@ -2804,7 +3364,7 @@ fn test_profiled_governed_tasks_label_rust_only_and_route_all_producers_via_daem
     assert!(html.contains("&quot;$IMPULSE_CONTROL_CLI&quot; --daemon governed-verify"));
     assert!(html.contains("&quot;$IMPULSE_CONTROL_CLI&quot; --daemon governed-review"));
     assert!(html.contains("data-supervisor-state=\"attention\""));
-    assert!(html.contains("Attention 1"));
+    assert!(html.contains("Evidence 1"));
     assert!(html.contains("0 context · 1 task review"));
     assert!(!html.contains("$IMPULSE_CONTROL_CLI governed-"));
 }
@@ -3178,6 +3738,7 @@ fn test_shell_renders_bridge_status_banner_when_degraded() {
     // The class name also appears in the inlined CRT stylesheet, so assert on
     // the rendered element's marker attribute, which the CSS never emits.
     assert!(html.contains("data-bridge-status=\"degraded\""));
+    assert!(html.contains("aria-label=\"System notices\""));
     assert!(html.contains("class=\"bridge-status-banner\""));
     assert!(html.contains("Host bridge degraded"));
     assert!(html.contains("host event API unavailable"));
@@ -3234,11 +3795,11 @@ fn test_footer_stream_health_reflects_live_agent() {
     // runtime_snapshot has output_bytes > 0 and a present agent → both streams live.
     assert!(html.contains("Terminal · live"));
     assert!(html.contains("Workers · live"));
-    assert!(html.contains("Control plane · live"));
+    assert!(html.contains("System · live"));
     assert!(html.contains("Last snapshot awaiting first ops_update"));
     assert!(html.contains(">connected<"));
     assert!(html.contains("data-daemon-freshness=\"current\""));
-    assert!(html.contains("Oversight · ready"));
+    assert!(html.contains("Review service · ready"));
     assert!(!html.contains("stream pending"));
 }
 
@@ -3277,7 +3838,7 @@ fn test_publish_only_degradation_keeps_subscribed_snapshot_current() {
     assert!(html.contains("data-daemon-freshness=\"current\""));
     assert!(html.contains("data-daemon-status=\"publish-degraded\""));
     assert!(html.contains("Daemon snapshot reads remain live"));
-    assert!(html.contains("Control plane · live"));
+    assert!(html.contains("System · live"));
     assert!(!html.contains("Daemon disconnected"));
     assert!(!html.contains("cached snapshot hidden"));
 }
@@ -3311,7 +3872,7 @@ fn test_footer_stream_health_reads_down_when_transport_degraded() {
     // A degraded transport means no events can arrive — every stream reads down.
     assert!(html.contains("Terminal · down"));
     assert!(html.contains("Workers · down"));
-    assert!(html.contains("Control plane · down"));
+    assert!(html.contains("System · down"));
     assert!(html.contains("Last snapshot awaiting first ops_update"));
     assert!(html.contains(">offline<"));
     assert!(html.contains("data-daemon-freshness=\"stale\""));
@@ -3319,5 +3880,5 @@ fn test_footer_stream_health_reads_down_when_transport_degraded() {
     assert!(html.contains("Workbench data is cached and may be stale."));
     assert!(html.contains("0 cached artifacts"));
     assert!(html.contains("0 cached interventions"));
-    assert!(html.contains("Oversight · down"));
+    assert!(html.contains("Review service · down"));
 }

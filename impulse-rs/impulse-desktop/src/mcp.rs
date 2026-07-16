@@ -796,6 +796,9 @@ impl McpTool for ReviewInjectionTool {
                 message: "review_injection stages payload to disk; user must confirm".to_string(),
             });
         }
+        if let Some(target_agent_id) = arguments.get("target_agent_id").and_then(Value::as_str) {
+            validate_review_target_project(ctx, target_agent_id, "impulse.review_injection")?;
+        }
         let id = uuid::Uuid::new_v4().to_string();
         let record = ReviewQueueRecord {
             id: id.clone(),
@@ -898,6 +901,7 @@ impl McpTool for ReviewDecisionTool {
                     tool: "impulse.review_decision".to_string(),
                     arg: "target_agent_id".to_string(),
                 })?;
+            validate_review_target_project(ctx, &target_agent_id, "impulse.review_decision")?;
             let data = review_payload_bytes(&record.arguments)?;
             ctx.runtime()
                 .write_agent(AgentWriteRequest {
@@ -922,6 +926,62 @@ impl McpTool for ReviewDecisionTool {
             message: e.to_string(),
         })
     }
+}
+
+fn validate_review_target_project(
+    ctx: &McpContext,
+    target_agent_id: &str,
+    tool: &str,
+) -> Result<(), McpError> {
+    let memory_root = ctx.memory_root();
+    if memory_root.file_name().and_then(|name| name.to_str()) != Some(".impulse") {
+        // Legacy embedders may supply an isolated non-standard memory root.
+        // The packaged/live host always installs `<project>/.impulse`, where
+        // this boundary check is mandatory.
+        return Ok(());
+    }
+    let project_root = memory_root.parent().ok_or_else(|| McpError::Tool {
+        tool: tool.to_string(),
+        message: format!(
+            "connected memory root `{}` has no project parent",
+            memory_root.display()
+        ),
+    })?;
+    let target = ctx
+        .runtime()
+        .snapshot_agents()
+        .into_iter()
+        .find(|agent| agent.agent_id == target_agent_id)
+        .ok_or_else(|| McpError::Tool {
+            tool: tool.to_string(),
+            message: format!("target agent `{target_agent_id}` is not running"),
+        })?;
+    let target_root = target
+        .workspace
+        .as_ref()
+        .map(|workspace| workspace.root.as_str())
+        .or(target.cwd.as_deref())
+        .ok_or_else(|| McpError::Tool {
+            tool: tool.to_string(),
+            message: format!("target agent `{target_agent_id}` has no project workspace"),
+        })?;
+    let target_root_path = Path::new(target_root);
+    let matches_project = match (
+        std::fs::canonicalize(project_root),
+        std::fs::canonicalize(target_root_path),
+    ) {
+        (Ok(project_root), Ok(target_root)) => project_root == target_root,
+        _ => project_root == target_root_path,
+    };
+    if !matches_project {
+        return Err(McpError::Tool {
+            tool: tool.to_string(),
+            message: format!(
+                "target agent `{target_agent_id}` is outside the connected project boundary"
+            ),
+        });
+    }
+    Ok(())
 }
 
 pub fn list_review_queue(memory_root: &Path) -> Result<Vec<ReviewQueueItem>, McpError> {

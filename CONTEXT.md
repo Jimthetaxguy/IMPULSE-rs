@@ -1,16 +1,9 @@
 # CONTEXT — Impulse Ubiquitous Language
 
-> **Read this first.** Shared L0/L1 vocabulary for Impulse. Update a term here when its stable
-> meaning changes; put detailed history in plans/ADRs rather than growing this glossary.
->
-> Entries are tagged **`[code]`** (live in the current repository implementation) or
-> **`[vocabulary]`** (the product contract; "Closest in code" names today's partial carrier).
->
-> Cross-agent contract: `AGENTS.md`. Product contract:
-> `docs/spec/RUST-CANONICAL-CONTRACT.md`. Product north star: `VISION.md`. Current boundary map:
+> **Read this first.** Shared L0/L1 vocabulary; put implementation history in plans/ADRs.
+> **`[code]`** is live; **`[vocabulary]`** is the product contract with today's closest carrier.
+> Contracts: `AGENTS.md`, `docs/spec/RUST-CANONICAL-CONTRACT.md`, `VISION.md`, and
 > `docs/ARCHITECTURE-CLARIFICATION.md`.
-
----
 
 ## What Impulse is
 
@@ -20,18 +13,16 @@ policy, credentials, artifacts, and verification. Claude Code, Codex, and simila
 internal loops; Ion is the native runtime. Dioxus is the cockpit, while daemon/runtime contracts
 remain authoritative. Memory is one platform service, not the whole product.
 
-Workspace: `impulse-rs/` (Cargo workspace). Main crates: `impulse-rs`, `impulse-ops`,
-`impulse-term`, `impulse-desktop`, and `impulse-ion`; `impulse-gui` is legacy/frozen.
-
----
+Workspace: `impulse-rs/`. Main crates: `impulse-rs`, `impulse-ops`, `impulse-term`,
+`impulse-desktop`, and `impulse-ion`; `impulse-gui` is legacy/frozen.
 
 ## Identity and hierarchy
 
 ### role — `[vocabulary]`
 The stable behavioral contract assigned to an agent: obligations, permissions, tools, context,
 communication, and evidence; independent of model, runtime, process, session, and pane.
-- **Closest in code:** the narrow launch-time `AgentRoleId`/`AgentRoleAssignment` contract plus the
-  concrete `SupervisorPermissionPolicy`. `AgentRole::{Coordinator, Worker}` remains legacy pane and
+- **Closest in code:** launch-time `AgentRoleId`/`AgentRoleAssignment` plus
+  `SupervisorPermissionPolicy`. `AgentRole::{Coordinator, Worker}` remains legacy pane and
   delegation topology, not product-role identity.
 - **Boundary:** generalized role composition is not live. ADR-0011's narrow governed Builder task
   lifecycle is live and remains distinct from a general role system.
@@ -57,8 +48,7 @@ runtime declarations. Strength is ordered `unsupported` < `advisory` < `mediated
 mandatory gaps block and optional gaps degrade. Dioxus previews the result, while the desktop
 runtime re-evaluates before agent-id reservation or PTY creation. Working-directory mediation is
 not filesystem sandboxing.
-- **Source of truth:** `impulse-ops/src/role_assignment.rs`, `impulse-desktop/src/runtime.rs`, and
-  ADR-0010.
+- **Source:** `impulse-ops/src/role_assignment.rs`, `impulse-desktop/src/runtime.rs`, ADR-0010.
 
 ### agent instance — `[vocabulary]`
 One running identity with a platform/runtime, role, workspace target, process state, and telemetry.
@@ -68,8 +58,7 @@ It is not interchangeable with its session or pane.
 ### session — `[code]`
 A bounded, persisted unit of work with a start, tracked activity, and recorded end. Verification
 may gate that end. A session may link to an agent instance but does not own its process.
-- **Source of truth:** `WorkbenchDaemonRequest::{CreateSession, EndSession}` and CLI
-  `session-start` / `session-end --verify`.
+- **Source:** `WorkbenchDaemonRequest::{CreateSession, EndSession}` and session CLI commands.
 
 ### governed task — `[code]`
 A daemon-owned assignment plus exact acceptance criteria and four distinct truth layers: worker
@@ -78,8 +67,7 @@ the canonical clean Git subject and exact shared Builder assignment; the daemon 
 recomputes runtime compatibility, derives producer actors, and creates automatic records. Execution
 remains independent of review, and only operator approval accepts. Resume/reassignment is future
 work.
-- **Source of truth:** `impulse-ops/src/governed_task.rs`, `src/state/governed_task.rs`, ADR-0011,
-  and ADR-0012.
+- **Source:** `impulse-ops/src/governed_task.rs`, `src/state/governed_task.rs`, ADR-0011/0012.
 
 ### accepted-run memory candidate — `[code]`
 A deterministic pending-review projection of one accepted governed task, persisted in owner-only
@@ -107,8 +95,6 @@ instances may share a workspace; a cockpit can register and switch among several
 Structural filesystem enforcement depends on the selected runtime or sandbox.
 - **Source of truth:** `impulse-desktop/src/workspace.rs` and `WorkspaceTarget` in runtime models.
 
----
-
 ## Platform services
 
 ### daemon / workbench truth — `[code]`
@@ -116,20 +102,9 @@ The long-running coordination point that owns project workbench snapshots, sessi
 supervisor actions, artifacts, governed tasks, and telemetry overlays over a versioned JSON-line
 Unix socket.
 - **Source of truth:** `impulse-ops/src/lib.rs` and `src/daemon/{mod,protocol,handlers}.rs`.
-- **Desktop daemon-truth wire:** PTY lifecycle facts publish as `TerminalOpsReport` on change and
-  heartbeat, then return through daemon `SubscribeOps` snapshots. Local
-  `agent_runtime_update`/`agent_snapshot` messages own terminal mechanics only and cannot overwrite
-  `ProjectOpsSnapshot`. Subscription freshness is distinct from publish degradation; lifecycle
-  delivery uses a reentrant FIFO, natural exits reap records, and runtime agent ids remain one-use
-  routing addresses until the protocol carries explicit incarnations. The adapter currently binds
-  one daemon project; cross-workspace daemon routing remains a protocol follow-up.
-- **Governed task wire:** protocol v5 adds specialized claim/verify/review requests whose callers
-  omit derived truth. The daemon attests clean Git subjects, verifies detached committed code, and
-  binds strict API-only Supervisor output. Profiled registration requires the shared canonical
-  Builder assignment and the exact compatibility result recomputed from the daemon registry;
-  generic producer mutations fail for profiled tasks.
-- **Candidate wire:** protocol v6 adds serde-defaulted `ProjectOpsSnapshot.memory_candidates` only;
-  it defines no candidate mutation request.
+- **Boundary:** desktop PTY events publish into daemon snapshots without becoming durable truth;
+  profiled task transitions derive trusted actors and evidence server-side. Protocol versions,
+  delivery semantics, and candidate-wire details live in ADR-0011 through ADR-0013.
 
 ### managed agent turn — `[code]`
 One exclusive, bounded use of the cached `ImpulseAgent`. Concurrent turns fail fast with typed
@@ -149,36 +124,29 @@ The PTY/process lifecycle boundary for spawn, input, resize, focus, exit, and cl
 mechanics publish state; they do not own durable project truth.
 - **Source of truth:** `impulse-term/src/backend.rs` and `impulse-desktop/src/runtime.rs`.
 
-### launch target — `[code]`
-The one desktop selection used by both the workspace rail and launch dock for the next Builder
-root. Changing it does not re-scope running worker terminals or switch the connected daemon's
-project truth; multi-project daemon routing remains later work. If no standard project-local daemon
-socket is explicitly supplied at process launch, oversight remains disconnected rather than using
-cwd, an ancestor, or the home-level memory root as project authority. The first confirmed governed
-launch must target a registered workspace and atomically binds it as the process-lifetime daemon,
-memory, telemetry, and task boundary before task registration; malformed or unconfirmed MCP
-launches are audited before activation, and switching that boundary then requires restart.
-- **Source of truth:** the lifted `focused_workspace_root` signal in `impulse-desktop/src/ui.rs`.
+### project binding — `[code]`
+The one project root governing a desktop window's workers, terminals, task evidence, memory, and
+daemon truth. The first authoritative daemon or governed-runtime root binds the window; other
+project labels remain visible but locked, and out-of-scope workers and data are hidden. A mismatched
+daemon response fails closed, including actions, until restart. Without an explicit project-local
+daemon socket, review remains disconnected rather than inferring authority from cwd or user memory.
+- **Source of truth:** `window_bound_root`, `focused_workspace_root`, and daemon project identity in
+  `impulse-desktop/src/ui.rs`.
 
 ### Dioxus cockpit — `[code]`
-The operator-facing desktop composition of one shared launch-target selection, an explicit
-daemon-project-scoped oversight lane, desktop-wide specialized workers, focused terminals,
-evidence inspectors, and launch/review controls. It consumes
-daemon/runtime state through typed host commands/events and must not become a second policy or
-persistence authority. The packaged host owns only a daemon companion it starts; an already-running
-operator daemon remains external. A desktop-owned companion validates and watches the exact desktop
-parent PID so owner loss reuses graceful daemon drain/sync/runtime-file cleanup. The oversight dock
-currently represents the connected daemon project's review service and must not imply that a
-model-backed Supervisor runtime is running. The home-level `~/.impulse` fallback can still back
-CLI user memory, but the disconnected desktop does not expose it as project memory or review state.
+The operator-facing desktop composition of progressive project setup, project-bound specialized
+workers, a focused assignment and terminal, evidence review, and secondary platform diagnostics.
+It consumes typed daemon/runtime state and never becomes policy or persistence authority. The host
+owns only a companion it starts; the review dock truthfully distinguishes the governance service
+from a future model-backed Supervisor runtime. Packaging and owner-loss details live in
+`impulse-desktop/README.md` and the desktop host modules.
 - **Source of truth:**
   `impulse-desktop/src/{desktop_host,host_bridge,host_commands,daemon_ops,daemon_sidecar,desktop_shutdown,project_boundary,ui,views}.rs`.
 
 ### governed lifecycle outbox — `[code]`
 An owner-only, project-local write-ahead queue for desktop launch/exit mutations that may outlive an
-ambiguous daemon transport failure. Its data and sibling lock reject symlinks and non-regular leaves;
-the cross-process lock preserves serialization with a bounded, shutdown-aware wait so application
-close cannot hang forever behind another holder.
+ambiguous daemon transport failure. Its symlink-safe, bounded lock preserves serialization without
+allowing application close to hang indefinitely.
 - **Source of truth:** `impulse-desktop/src/{daemon_ops,project_boundary}.rs`.
 
 ### tool capability — `[code]`
@@ -196,7 +164,7 @@ policy, not a generalized role system.
 ### governed producer profile — `[code]`
 `rust_workspace_v1` combines env-routed/typed claim intent, fixed detached Rust verification, and
 criteria-bound, history/tool-free API Supervisor review. It runs host-trusted code, not a sandbox;
-receipts/task locks do not close crash-before-receipt. External harness review fails closed.
+external harness review fails closed.
 
 ### memory / genome — `[code]`
 Scoped durable continuity: session history plus verified decisions/preferences, retrieval indexes,
@@ -211,28 +179,20 @@ actions. Artifacts keep worker claims separate from evidence and operator decisi
 
 ### verification gate — `[code]`
 Evidence that claimed work holds before a session/task is accepted. Governed profiled verification
-is daemon-observed against the claimed commit in a symlink-free detached source tree with a
-committed regular root `Cargo.lock`. It persists fixed argv plus digests, never raw output;
-session-end and Ion verification remain separate contracts.
+is daemon-observed against the claimed commit in a detached source tree and persists fixed argv plus
+digests, never raw output. Session-end and Ion verification remain separate contracts.
 
 ### governed actor — `[code]`
 A typed provenance claim (`system`, `worker`, `verifier`, `supervisor`, or `operator`) checked by the
-task transition machine. It is not cryptographic same-user authentication; local processes that can
-reach the user-restricted daemon socket remain inside the current trust boundary.
-
----
+task transition machine. It is provenance within the user-restricted daemon boundary, not
+cryptographic same-user authentication.
 
 ## Live-versus-direction boundary (2026-07-15)
 
-- **Live foundation:** PTY/workbench truth, managed turns, registry-backed platforms/Ion, shared
-  services, profiled Builder launch, routed claims, detached verification, strict API review,
-  operator acceptance, repairable pending candidates with no `GENOME`/`HISTORY` mutation, and a
-  signed macOS Dioxus package/verifier that requires a fresh real eval-bridge, PTY, local-assets,
-  ops-event, and ordered-host-close receipt for release acceptance. Static/signature and
-  disconnected-scope package proof pass on this branch, but the latest local signed GUI-host smoke
-  abort remains open and historical receipts are not current proof. Real daemon tests separately
-  prove desktop-owner loss cleanup; AppKit Quit plus live-PTY package proof remains release
-  hardening.
+- **Live foundation:** project-bound Dioxus cockpit, PTY/workbench truth, managed turns,
+  registry-backed platforms/Ion, shared services, governed Builder launch and evidence lifecycle,
+  operator acceptance, review-only memory candidates, and a signed macOS package/verifier.
+- **Release boundary:** fresh launched GUI-host, live PTY, and AppKit Quit receipts remain required.
 - **Next:** stronger same-user actor authorization and one full launched Builder/Supervisor proof.
 - **Later:** explicit candidate promotion/dismissal, reassignment/resume, generalized
   roles/adapters/capabilities, multi-project routing, and typed cross-agent messaging.

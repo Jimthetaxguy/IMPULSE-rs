@@ -17,7 +17,7 @@ and requests those capabilities; Rust validates and executes them.
 
 | Layer | Owner |
 | --- | --- |
-| Project/worker rails, oversight lane, terminal, inspectors, and launch/review surfaces | Dioxus |
+| Project/worker rails, focused terminal, evidence review, and progressive setup surfaces | Dioxus |
 | Native window/process/IPC boundary | Dioxus desktop host adapters |
 | PTY lifecycle and live terminal bytes | `DesktopRuntime` / `impulse-term` |
 | Reconciled agents, context, memory, artifacts, and interventions | Impulse daemon |
@@ -105,13 +105,18 @@ Dioxus controls -> legacy Tauri-shaped adapter -> DesktopRuntime -> impulse-term
 
 The active shell is a compact mission-control surface:
 
-- one launch-target selection is shared by the rail and launch dock;
-- desktop-wide workers stay visible in the left rail, while the persistent oversight dock is
-  truthfully scoped to the connected daemon project and does not imply an automatically launched
-  Supervisor model;
-- the focused worker terminal owns the primary center surface;
-- runtime selection and the Builder role remain separate in the launch dock;
-- review, artifact, memory, and telemetry inspectors are secondary evidence surfaces.
+- project setup precedes worker assignment instead of competing with it in one always-open form;
+- the first authoritative daemon or governed-runtime project becomes the window-lifetime binding,
+  registered alternatives stay visible but locked, and their workers, governed tasks, notes,
+  evidence, and audit rows are excluded;
+- a daemon response for a different project shows an explicit boundary error and blocks project
+  tools, review mutations, and worker launch until restart;
+- the focused worker's project, role, runtime, assignment, definition of done, terminal, and
+  evidence state remain visible together;
+- adding another worker is a secondary collapsed action once work is active;
+- the review service is project-scoped and explicitly reports that no Supervisor model is running
+  until a real Supervisor runtime is launched;
+- memory, platform tools, audit details, and transport diagnostics are secondary disclosures.
 
 Visible controls must dispatch an authoritative typed operation. Placeholder command-palette,
 settings, fake-shortcut, and local-only artifact actions are intentionally omitted until their
@@ -125,10 +130,10 @@ Before running the visual smoke, `npm run vendor:xterm` copies the pinned
 `data-impulse-terminal-asset` tags, and the host contract resolves the same
 relative paths instead of a CDN.
 
-The visual smoke renders static Dioxus SSR fixtures for each `DesktopView`, then
-opens them in headless Chromium to assert non-blank layout, no shell overlap, no
-viewport overflow, route-specific visible content, local xterm globals, and no
-remote font or terminal asset URLs.
+The visual smoke renders static Dioxus SSR fixtures for each `DesktopView`, plus distinct empty
+project-setup and active-worker terminal states. It then opens them in headless Chromium to assert
+non-blank responsive layout, no shell overlap, no viewport overflow, route-specific visible
+content, local xterm globals, and no remote font or terminal asset URLs.
 
 The browser host-readiness smoke remains a fast contract test. It opens a local fixture, loads the
 same vendored xterm assets, stubs either the Dioxus-native

@@ -18,7 +18,7 @@
 
   --c-fg: #eef2f3;
   --c-dim: #9ca8ad;
-  --c-label: #718087;
+  --c-label: #87969d;
   --c-faint: #3c494f;
   --c-panel: #0d1215;
   --c-panel-raised: #12191d;
@@ -42,7 +42,7 @@ body {
 .impulse-shell {
   position: relative;
   display: grid;
-  grid-template-rows: auto 1fr auto;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
   height: 100vh;
   margin: 0;
   overflow: hidden;
@@ -71,6 +71,7 @@ body {
 }
 
 .top-bar,
+.status-stack,
 .workspace-grid,
 .event-strip {
   position: relative;
@@ -78,6 +79,7 @@ body {
 }
 
 .top-bar {
+  grid-row: 1;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -171,7 +173,7 @@ body {
 .icon-button,
 .invoke-button {
   border: 1px solid var(--c-line);
-  min-height: 36px;
+  min-height: 44px;
   background: rgba(255, 255, 255, 0.015);
   color: var(--c-dim);
   cursor: pointer;
@@ -196,9 +198,11 @@ summary:focus-visible {
 }
 
 .workspace-grid {
+  grid-row: 3;
   display: grid;
-  grid-template-columns: 264px minmax(520px, 1fr) 380px;
+  grid-template-columns: 224px minmax(560px, 1fr) 360px;
   min-height: 0;
+  overflow: hidden;
 }
 
 .left-rail,
@@ -233,7 +237,7 @@ summary:focus-visible {
 .agent-pool h2 {
   margin: 4px 0 8px;
   color: var(--c-label);
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 500;
   letter-spacing: 0.22em;
   text-transform: uppercase;
@@ -244,7 +248,7 @@ summary:focus-visible {
 }
 
 .rail-item {
-  min-height: 36px;
+  min-height: 44px;
   border: 1px solid transparent;
   background: transparent;
   color: var(--c-dim);
@@ -265,6 +269,90 @@ summary:focus-visible {
   color: var(--c-fg);
 }
 
+.rail-item:disabled {
+  cursor: not-allowed;
+}
+
+.rail-item:disabled:hover {
+  background: transparent;
+  color: var(--c-dim);
+}
+
+.project-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.project-row.locked {
+  opacity: 0.68;
+}
+
+.project-row-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-row-state {
+  flex: 0 0 auto;
+  color: var(--c-label);
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
+.project-row.active .project-row-state {
+  color: var(--p-teal);
+}
+
+.worker-row {
+  display: grid;
+  gap: 4px;
+}
+
+.worker-row-heading {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 6px;
+}
+
+.worker-row-heading strong {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.worker-row-meta,
+.worker-row-project,
+.worker-row-task {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--c-label);
+  font-size: 11px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.worker-row-meta {
+  color: var(--p-teal);
+}
+
+.worker-row-task {
+  color: var(--c-dim);
+}
+
+.agent-status-label {
+  color: var(--c-label);
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
 .rail-empty,
 .section-empty,
 .section-hint,
@@ -279,6 +367,8 @@ summary:focus-visible {
 .terminal-stage {
   display: flex;
   min-height: 0;
+  min-width: 0;
+  overflow: hidden;
   flex-direction: column;
   background: #0a0e10;
 }
@@ -293,13 +383,28 @@ summary:focus-visible {
   color: var(--c-fg);
   font-family: var(--font-mono);
   text-align: left;
-  cursor: pointer;
 }
 
-.supervisor-dock:hover,
 .supervisor-dock.active {
   border-color: var(--c-line-warm);
   background: linear-gradient(145deg, rgba(255, 176, 26, 0.1), rgba(255, 255, 255, 0.02));
+}
+
+.supervisor-dock-trigger {
+  display: block;
+  width: 100%;
+  min-height: 44px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.supervisor-dock-trigger:hover .supervisor-dock-heading {
+  color: var(--p-amber-h);
 }
 
 .supervisor-dock-heading,
@@ -324,7 +429,7 @@ summary:focus-visible {
   font-weight: 700;
 }
 
-.supervisor-dock-heading > div {
+.supervisor-dock-copy {
   display: grid;
   flex: 1;
   gap: 1px;
@@ -334,7 +439,7 @@ summary:focus-visible {
 .mission-eyebrow,
 .section-eyebrow {
   color: var(--c-label);
-  font-size: 9px;
+  font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.16em;
   text-transform: uppercase;
@@ -348,7 +453,7 @@ summary:focus-visible {
   padding: 3px 6px;
   border: 1px solid var(--c-line);
   color: var(--c-label);
-  font-size: 9px;
+  font-size: 10px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
@@ -361,7 +466,7 @@ summary:focus-visible {
 .supervisor-dock p {
   margin: 0;
   color: var(--c-dim);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.45;
 }
 
@@ -369,7 +474,7 @@ summary:focus-visible {
 .operator-scope,
 .attention-scope {
   color: var(--p-teal);
-  font-size: 9px;
+  font-size: 11px;
   letter-spacing: 0.04em;
 }
 
@@ -377,7 +482,7 @@ summary:focus-visible {
   justify-content: space-between;
   gap: 8px;
   color: var(--c-label);
-  font-size: 9px;
+  font-size: 10px;
 }
 
 .supervisor-attention-breakdown {
@@ -445,7 +550,7 @@ summary:focus-visible {
 
 .mission-signal span {
   color: var(--c-label);
-  font-size: 8px;
+  font-size: 10px;
   letter-spacing: 0.12em;
   text-transform: uppercase;
 }
@@ -453,7 +558,7 @@ summary:focus-visible {
 .mission-signal strong {
   overflow: hidden;
   color: var(--c-fg);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -800,14 +905,14 @@ summary:focus-visible {
 
 .workspace-field textarea {
   min-width: 0;
-  min-height: 58px;
+  min-height: 76px;
   resize: vertical;
   border: 1px solid var(--c-line);
   border-radius: 0;
   background: #010306;
   color: var(--c-fg);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.4;
   padding: 7px 8px;
 }
@@ -816,6 +921,82 @@ summary:focus-visible {
   justify-content: flex-start;
   flex-wrap: wrap;
   margin-top: 9px;
+}
+
+.focused-worker-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 7px 18px;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--c-line);
+  background:
+    linear-gradient(100deg, rgba(255, 140, 40, 0.055), transparent 50%),
+    var(--c-panel);
+}
+
+.focused-worker-path {
+  display: flex;
+  grid-column: 1 / -1;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+  overflow: hidden;
+  color: var(--c-label);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.focused-worker-path span,
+.focused-worker-path strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.focused-worker-path strong {
+  color: var(--c-fg);
+}
+
+.focused-worker-assignment {
+  min-width: 0;
+}
+
+.focused-worker-assignment h2 {
+  margin: 3px 0 0;
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--c-fg);
+  font-family: var(--font-display);
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.focused-worker-signals {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.worker-signal {
+  padding: 4px 7px;
+  border: 1px solid var(--c-line);
+  color: var(--c-dim);
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
+.worker-signal.status {
+  border-color: rgba(47, 208, 255, 0.28);
+  color: var(--p-cyan);
+}
+
+.worker-signal.review {
+  border-color: var(--c-line-warm);
+  color: var(--p-amber-h);
 }
 
 .terminal-tabs {
@@ -832,6 +1013,7 @@ summary:focus-visible {
 }
 
 .terminal-tab {
+  min-height: 44px;
   border: 0;
   border-bottom: 2px solid transparent;
   background: transparent;
@@ -847,14 +1029,14 @@ summary:focus-visible {
 }
 
 .terminal-tab-close {
-  min-width: 50px;
+  min-width: 44px;
   border: 0;
   border-left: 1px solid var(--c-line);
   background: transparent;
   color: var(--c-label);
   cursor: pointer;
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 17px;
   padding: 6px 9px;
 }
 
@@ -888,6 +1070,7 @@ summary:focus-visible {
   padding: 28px;
   border-top: 1px solid var(--c-line);
   color: var(--c-dim);
+  overflow: auto;
 }
 
 .launch-sequence {
@@ -911,7 +1094,7 @@ summary:focus-visible {
 }
 
 .action-button {
-  min-height: 40px;
+  min-height: 44px;
   padding: 9px 14px;
   border: 1px solid var(--c-line-strong);
   background: transparent;
@@ -1068,7 +1251,7 @@ summary:focus-visible {
 .workspace-launch-badge {
   border: 1px solid var(--c-line-warm);
   color: var(--p-amber-h);
-  font-size: 9px;
+  font-size: 10px;
   letter-spacing: 0;
   padding: 2px 6px;
   text-transform: uppercase;
@@ -1097,6 +1280,121 @@ summary:focus-visible {
   text-transform: none;
 }
 
+.focused-worker-panel {
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--c-line);
+}
+
+.focused-worker-panel-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 5px;
+}
+
+.focused-worker-panel-heading h2,
+.focused-worker-panel-heading p {
+  margin: 0;
+}
+
+.focused-worker-panel-heading h2 {
+  color: var(--c-fg);
+  font-family: var(--font-display);
+  font-size: 18px;
+  font-weight: 600;
+  text-transform: none;
+}
+
+.focused-worker-panel-heading p {
+  margin-top: 3px;
+  color: var(--p-teal);
+  font-size: 11px;
+}
+
+.focused-worker-facts {
+  display: grid;
+  grid-template-columns: 82px minmax(0, 1fr);
+  gap: 7px 10px;
+  margin: 13px 0 0;
+  font-size: 12px;
+}
+
+.focused-worker-facts dt {
+  color: var(--c-label);
+}
+
+.focused-worker-facts dd {
+  min-width: 0;
+  margin: 0;
+  color: var(--c-fg);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.focused-worker-criteria {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--c-line);
+}
+
+.focused-worker-criteria h3 {
+  margin: 0 0 7px;
+  color: var(--c-label);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.focused-worker-criteria ol {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding-left: 20px;
+  color: var(--c-fg);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.focused-worker-evidence {
+  display: grid;
+  gap: 6px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--c-line);
+}
+
+.focused-worker-evidence h3,
+.focused-worker-evidence p {
+  margin: 0;
+}
+
+.focused-worker-evidence h3 {
+  color: var(--c-label);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.focused-worker-evidence strong {
+  color: var(--p-amber-h);
+  font-size: 13px;
+  text-transform: capitalize;
+}
+
+.focused-worker-evidence .evidence-outcome {
+  color: var(--p-teal);
+}
+
+.focused-worker-evidence.pending {
+  color: var(--c-label);
+}
+
+.evidence-button {
+  width: 100%;
+  margin-top: 4px;
+}
+
 .inspector-disclosure {
   border-top: 1px solid var(--c-line);
 }
@@ -1123,6 +1421,24 @@ summary:focus-visible {
   padding: 0 0 16px;
 }
 
+.add-worker-disclosure {
+  border: 1px solid var(--c-line-strong);
+}
+
+.add-worker-disclosure > summary {
+  padding: 0 12px;
+  color: var(--p-amber-h);
+}
+
+.add-worker-disclosure-body {
+  padding: 0;
+}
+
+.add-worker-disclosure .workspace-launch {
+  border: 0;
+  border-top: 1px solid var(--c-line);
+}
+
 .workspace-launch-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
@@ -1131,8 +1447,7 @@ summary:focus-visible {
 }
 
 .workspace-launch-grid.launch {
-  border-top: 1px solid rgba(120, 200, 255, 0.1);
-  padding-top: 10px;
+  padding-top: 2px;
 }
 
 .workspace-field {
@@ -1147,7 +1462,7 @@ summary:focus-visible {
 
 .workspace-field span {
   color: var(--c-label);
-  font-size: 9px;
+  font-size: 11px;
   letter-spacing: 0.16em;
   text-transform: uppercase;
 }
@@ -1155,7 +1470,7 @@ summary:focus-visible {
 .workspace-field input,
 .workspace-field select {
   min-width: 0;
-  min-height: 36px;
+  min-height: 44px;
   border: 1px solid var(--c-line);
   border-radius: 0;
   background: #010306;
@@ -1172,7 +1487,7 @@ summary:focus-visible {
 .scope-note {
   margin: 2px 0 0;
   color: var(--c-label);
-  font-size: 10px;
+  font-size: 11px;
   line-height: 1.45;
 }
 
@@ -1183,6 +1498,133 @@ summary:focus-visible {
   border-color: rgba(255, 154, 57, 0.5);
   background: rgba(255, 106, 0, 0.12);
   color: var(--p-amber-h);
+}
+
+.bound-project-field {
+  padding: 10px;
+  border: 1px solid var(--c-line);
+  background: rgba(47, 208, 255, 0.025);
+}
+
+.bound-project-field strong {
+  color: var(--c-fg);
+  font-size: 13px;
+}
+
+.bound-project-field p {
+  margin-top: 3px;
+  font-size: 11px;
+}
+
+.launch-advanced {
+  border-top: 1px solid var(--c-line);
+  border-bottom: 1px solid var(--c-line);
+}
+
+.launch-advanced > summary,
+.role-compatibility > summary {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--c-dim);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.launch-advanced[open] {
+  padding-bottom: 9px;
+}
+
+.role-compatibility {
+  border-top: 1px solid var(--c-line);
+  border-bottom: 1px solid var(--c-line);
+}
+
+.role-compatibility.allowed > summary strong {
+  color: var(--p-lime);
+}
+
+.role-compatibility.degraded > summary strong {
+  color: var(--p-amber-h);
+}
+
+.role-compatibility.blocked > summary strong {
+  color: var(--p-red);
+}
+
+.role-compatibility-body {
+  display: grid;
+  gap: 8px;
+  padding: 0 0 10px;
+}
+
+.role-compatibility-heading {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.role-compatibility-heading strong {
+  color: var(--c-fg);
+}
+
+.compatibility-status {
+  padding: 2px 6px;
+  border: 1px solid var(--c-line);
+  color: var(--c-label);
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
+.compatibility-checks {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.compatibility-checks li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 3px 8px;
+  padding: 7px 8px;
+  border: 1px solid rgba(173, 196, 204, 0.1);
+  font-size: 10px;
+}
+
+.compatibility-checks li strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--c-fg);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.compatibility-checks li span:last-child {
+  grid-column: 1 / -1;
+  color: var(--c-label);
+}
+
+.compatibility-caveat,
+.compatibility-empty {
+  color: var(--c-label);
+  font-size: 11px;
+}
+
+.launch-validation {
+  margin: 0;
+  padding: 8px 9px;
+  border-left: 2px solid var(--p-amber);
+  background: rgba(255, 176, 26, 0.05);
+  color: var(--p-amber-h);
+  font-size: 11px;
+  line-height: 1.4;
 }
 
 .mcp-tool-row {
@@ -1249,15 +1691,49 @@ summary:focus-visible {
 }
 
 .event-strip {
+  grid-row: 4;
   display: flex;
   gap: 18px;
-  overflow-x: auto;
+  overflow: visible;
   padding: 7px 18px;
   border-top: 1px solid var(--c-line);
   background: rgba(8, 12, 14, 0.96);
   color: var(--c-label);
   font-size: 10px;
   white-space: nowrap;
+}
+
+.footer-diagnostics {
+  position: relative;
+}
+
+.footer-diagnostics summary {
+  padding: 2px 4px;
+  color: var(--c-label);
+  cursor: pointer;
+  list-style: none;
+}
+
+.footer-diagnostics summary::-webkit-details-marker {
+  display: none;
+}
+
+.footer-diagnostics-panel {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  z-index: 20;
+  display: none;
+  min-width: 280px;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--c-line-strong);
+  background: var(--c-panel-raised);
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.45);
+}
+
+.footer-diagnostics[open] .footer-diagnostics-panel {
+  display: grid;
 }
 
 .event-strip span::before {
@@ -1658,7 +2134,7 @@ summary:focus-visible {
 
 @media (max-width: 1450px) {
   .workspace-grid {
-    grid-template-columns: 232px minmax(460px, 1fr) 340px;
+    grid-template-columns: 216px minmax(460px, 1fr) 328px;
   }
 
   .mission-header {
@@ -1670,10 +2146,10 @@ summary:focus-visible {
   }
 }
 
-@media (max-width: 1120px) {
+@media (max-width: 1240px) {
   .workspace-grid {
-    grid-template-columns: 220px minmax(0, 1fr);
-    grid-template-rows: minmax(360px, 1fr) minmax(240px, 40vh);
+    grid-template-columns: 210px minmax(0, 1fr);
+    grid-template-rows: minmax(260px, 1fr) minmax(190px, 34vh);
   }
 
   .left-rail {
@@ -1696,12 +2172,27 @@ summary:focus-visible {
     grid-template-columns: 1fr;
   }
 
+  .focused-worker-header {
+    grid-template-columns: 1fr;
+  }
+
+  .focused-worker-signals {
+    justify-content: flex-start;
+  }
+
   .top-project {
     display: none;
   }
 }
 
 /* ── Bridge degraded banner ──────────────────────────────────────────── */
+.status-stack {
+  grid-row: 2;
+  display: grid;
+  max-height: 132px;
+  overflow: auto;
+}
+
 .bridge-status-banner {
   display: flex;
   align-items: center;

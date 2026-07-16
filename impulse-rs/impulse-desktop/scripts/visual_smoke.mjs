@@ -17,30 +17,66 @@ const viewports = [
 const routes = [
   {
     slug: "terminal",
+    view: "terminal",
     active: ".view-terminal.active",
-    fixtureMode: "seeded-live-agent",
-    required: '.view-terminal.active [data-xterm-mount="true"]',
-    visibleText: "Codex Live",
+    fixtureState: "active-worker",
+    required: [
+      '.focused-worker-header[data-agent-id="codex-live"]',
+      '[data-source="focused_worker"][data-agent-id="codex-live"]',
+      '.view-terminal.active [data-xterm-mount="true"][data-terminal-active="true"]',
+      ".add-worker-disclosure > summary",
+    ],
+    present: [
+      '[data-source="workspace_launcher"][data-step="assignment"]',
+      ".bound-project-field",
+    ],
+    forbidden: [".terminal-empty-state", '[data-step="project"]'],
+    visibleText: ["Codex Live", "Active assignment", "Review evidence"],
+  },
+  {
+    slug: "terminal-empty",
+    view: "terminal",
+    active: ".view-terminal.active",
+    fixtureState: "empty",
+    required: [
+      '.terminal-empty-state[data-terminal-state="empty"]',
+      '[data-source="workspace_launcher"][data-step="project"]',
+    ],
+    forbidden: [
+      '[data-xterm-mount="true"]',
+      ".focused-worker-header",
+      '[data-source="focused_worker"]',
+      '[data-field="launch-task"]',
+    ],
+    visibleText: ["Add a project", "Project folder"],
   },
   {
     slug: "memory",
+    view: "memory",
     active: ".view-memory.active",
-    visibleText: "Context health",
+    fixtureState: "active-worker",
+    visibleText: ["Context health"],
   },
   {
     slug: "review",
+    view: "review",
     active: ".review-console",
-    visibleText: "Review Queue",
+    fixtureState: "active-worker",
+    visibleText: ["Review Queue"],
   },
   {
     slug: "artifacts",
+    view: "artifacts",
     active: ".view-artifacts.active",
-    visibleText: "Artifacts",
+    fixtureState: "active-worker",
+    visibleText: ["Artifacts"],
   },
   {
     slug: "supervisor",
+    view: "supervisor",
     active: '[data-source="operator_board"]',
-    visibleText: "In flight",
+    fixtureState: "active-worker",
+    visibleText: ["In flight"],
   },
 ];
 
@@ -94,13 +130,23 @@ console.log(
 
 async function assertLayout(page, route, viewport) {
   await expectVisible(page, route.active, `${route.slug} active route selector`);
-  if (route.required) {
-    await expectVisible(page, route.required, `${route.slug} required route selector`);
+  for (const selector of route.required ?? []) {
+    await expectVisible(page, selector, `${route.slug} required route selector`);
   }
-  if (route.forbidden) {
-    await expectAbsent(page, route.forbidden, `${route.slug} forbidden route selector`);
+  for (const selector of route.present ?? []) {
+    await expectPresent(page, selector, `${route.slug} present route selector`);
   }
-  await expectTextVisible(page, route.visibleText, route.slug);
+  for (const selector of route.forbidden ?? []) {
+    await expectAbsent(page, selector, `${route.slug} forbidden route selector`);
+  }
+  for (const text of route.visibleText ?? []) {
+    await expectTextVisible(page, text, route.slug);
+  }
+  await expectVisible(
+    page,
+    `body[data-fixture-route="${route.view}"][data-fixture-state="${route.fixtureState}"]`,
+    `${route.slug} fixture identity`,
+  );
 
   const result = await page.evaluate((routeSlug) => {
     const rectOf = (selector) => {
@@ -166,12 +212,19 @@ async function assertLayout(page, route, viewport) {
   assert(result.top.bottom <= result.grid.top + 1, `${route.slug}: top overlaps grid`);
   assert(result.grid.bottom <= result.footer.top + 1, `${route.slug}: grid overlaps footer`);
   assert(result.left.right <= result.stage.left + 1, `${route.slug}: left rail overlaps stage`);
-  assert(
-    result.stage.right <= result.inspector.left + 1,
-    `${route.slug}: stage overlaps inspector`,
-  );
+  if (viewport.width <= 1240) {
+    assert(
+      result.stage.bottom <= result.inspector.top + 1,
+      `${route.slug}: stage overlaps stacked inspector`,
+    );
+  } else {
+    assert(
+      result.stage.right <= result.inspector.left + 1,
+      `${route.slug}: stage overlaps inspector`,
+    );
+  }
 
-  if (route.slug !== "terminal") {
+  if (route.view !== "terminal") {
     assert(!result.terminalVisible, `${route.slug}: terminal route should not be active`);
   }
 }
@@ -200,6 +253,13 @@ async function expectAbsent(page, selector, label) {
   const count = await page.locator(selector).count();
   if (count !== 0) {
     throw new Error(`unexpected ${label}: ${selector} matched ${count} element(s)`);
+  }
+}
+
+async function expectPresent(page, selector, label) {
+  const count = await page.locator(selector).count();
+  if (count === 0) {
+    throw new Error(`missing ${label}: ${selector}`);
   }
 }
 

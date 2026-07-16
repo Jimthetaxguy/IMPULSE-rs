@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use dioxus::prelude::*;
+use impulse_desktop::ui::{builder_role_assignment, DaemonOpsStatusUpdate};
 use impulse_desktop::{
     default_builtin_mcp_tools, AgentPlatformId, AgentRuntimeSnapshot, DesktopShellWithSnapshot,
     DesktopShellWithSnapshotProps, DesktopView, McpInvocation, ReviewQueueItem, ReviewQueueStatus,
@@ -32,6 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mcp_tools = default_builtin_mcp_tools();
     let last_invocations = seeded_invocations();
     let review_queue = seeded_review_queue();
+    let asset_base_href = asset_base_href()?;
 
     for view in DesktopView::ALL {
         let mut vdom = VirtualDom::new_with_props(
@@ -45,22 +47,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 last_invocations: last_invocations.clone(),
                 review_queue: review_queue.clone(),
                 bridge_status: None,
-                daemon_ops_status: None,
+                daemon_ops_status: Some(DaemonOpsStatusUpdate {
+                    connected: true,
+                    error: None,
+                }),
                 initial_view: view,
             },
         );
         vdom.rebuild_in_place();
         let body = dioxus_ssr::render(&vdom);
-        let html = wrap_html(view, &body, &asset_base_href()?);
+        let html = wrap_html(
+            view.label(),
+            view.slug(),
+            "active-worker",
+            &body,
+            &asset_base_href,
+        );
         let path = output_dir.join(format!("{}.html", view.slug()));
         fs::write(&path, html)?;
         println!("{}", path.display());
     }
 
+    let mut empty_vdom = VirtualDom::new_with_props(
+        DesktopShellWithSnapshot,
+        DesktopShellWithSnapshotProps {
+            snapshot: ProjectOpsSnapshot::default(),
+            runtime_agents: Vec::new(),
+            agent_platforms,
+            workspaces: Vec::new(),
+            mcp_tools,
+            last_invocations: Vec::new(),
+            review_queue: Vec::new(),
+            bridge_status: None,
+            daemon_ops_status: None,
+            initial_view: DesktopView::Terminal,
+        },
+    );
+    empty_vdom.rebuild_in_place();
+    let empty_body = dioxus_ssr::render(&empty_vdom);
+    let empty_path = output_dir.join("terminal-empty.html");
+    fs::write(
+        &empty_path,
+        wrap_html(
+            "Terminal Setup",
+            DesktopView::Terminal.slug(),
+            "empty",
+            &empty_body,
+            &asset_base_href,
+        ),
+    )?;
+    println!("{}", empty_path.display());
+
     Ok(())
 }
 
-fn wrap_html(view: DesktopView, body: &str, asset_base_href: &str) -> String {
+fn wrap_html(
+    title: &str,
+    route: &str,
+    fixture_state: &str,
+    body: &str,
+    asset_base_href: &str,
+) -> String {
     format!(
         r#"<!doctype html>
 <html lang="en">
@@ -68,15 +115,13 @@ fn wrap_html(view: DesktopView, body: &str, asset_base_href: &str) -> String {
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <base href="{asset_base_href}">
-    <title>Impulse Desktop {}</title>
+    <title>Impulse Desktop {title}</title>
   </head>
-  <body data-fixture-route="{}">
+  <body data-fixture-route="{route}" data-fixture-state="{fixture_state}">
 {}
   </body>
 </html>
 "#,
-        view.label(),
-        view.slug(),
         body
     )
 }
@@ -132,14 +177,23 @@ fn seeded_snapshot() -> ProjectOpsSnapshot {
     };
     ProjectOpsSnapshot {
         generated_at: "2026-06-13T15:30:00Z".to_string(),
+        project: impulse_ops::ProjectSummary {
+            id: "impulse-rs".to_string(),
+            name: "IMPULSE-rs".to_string(),
+            root_path: "<repo>".to_string(),
+            impulse_path: "<repo>/.impulse".to_string(),
+        },
         agents: vec![
             AgentRuntime {
                 id: "codex-live".to_string(),
                 label: "Codex Live".to_string(),
                 backend_kind: "pty".to_string(),
                 session_id: Some("codex-live-session".to_string()),
-                governed_task_id: None,
-                governed_task_revision: None,
+                governed_task_id: Some(
+                    impulse_ops::governed_task::GovernedTaskId::try_new("task-governed-visual")
+                        .expect("valid governed task id"),
+                ),
+                governed_task_revision: Some(3),
                 working_directory: "<repo>".to_string(),
                 status: "working".to_string(),
                 current_task: Some(
@@ -154,7 +208,7 @@ fn seeded_snapshot() -> ProjectOpsSnapshot {
                     task: "build visual fixture".to_string(),
                 },
                 role: Some(AgentRole::Coordinator),
-                role_assignment: None,
+                role_assignment: Some(builder_role_assignment().expect("Builder role profile")),
                 role_compatibility: None,
                 group: Some("desktop".to_string()),
                 tool_invocations: vec![ToolInvocationRecord {
@@ -254,7 +308,7 @@ fn seeded_governed_tasks() -> Vec<GovernedTaskRun> {
             "agent_id": "codex-live",
             "session_id": "codex-live-session",
             "initial_subject_revision": "visual-base",
-            "execution_state": "runtime_exited",
+            "execution_state": "running",
             "review_state": "awaiting_supervisor",
             "claims": [{
                 "id": "claim-governed-visual",
@@ -381,6 +435,10 @@ fn runtime_agent(
         purpose: Some("Dioxus terminal harness".to_string()),
         project_notes: Some("Visual smoke uses static SSR fixtures.".to_string()),
     };
+    let governed_task_id = focused.then(|| {
+        impulse_ops::governed_task::GovernedTaskId::try_new("task-governed-visual")
+            .expect("valid governed task id")
+    });
     AgentRuntimeSnapshot {
         agent_id: id.to_string(),
         label: label.to_string(),
@@ -390,8 +448,8 @@ fn runtime_agent(
         cwd: Some(workspace.root.clone()),
         workspace: Some(workspace),
         session_id: Some(format!("{id}-session")),
-        governed_task_id: None,
-        governed_task_revision: None,
+        governed_task_id,
+        governed_task_revision: focused.then_some(3),
         rows: 32,
         cols: 120,
         alive: true,
@@ -409,7 +467,7 @@ fn runtime_agent(
         } else {
             Some(AgentRole::Worker { parent_pane_id: 1 })
         },
-        role_assignment: None,
+        role_assignment: focused.then(|| builder_role_assignment().expect("Builder role profile")),
         role_compatibility: None,
         target: Some(MachineTarget::Local {
             workdir: "<repo>".to_string(),

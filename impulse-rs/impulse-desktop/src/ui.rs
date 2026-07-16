@@ -741,40 +741,90 @@ fn ViewRail(active: DesktopView, on_select: EventHandler<DesktopView>) -> Elemen
 fn WorkspaceSwitcher(
     workspaces: Vec<WorkspaceEntry>,
     selected_root: String,
+    bound_root: Option<String>,
     oversight_scope_label: String,
     on_select: EventHandler<String>,
 ) -> Element {
+    let is_bound = bound_root
+        .as_deref()
+        .is_some_and(|root| !root.trim().is_empty());
     rsx! {
         section { class: "workspace-picker", "data-source": "workspace_target",
-            "aria-label": "Launch targets",
-            h2 { "Launch targets" }
+            "aria-label": "Project",
+            h2 { "Project" }
             if workspaces.is_empty() {
                 p { class: "rail-empty", "No projects added" }
             } else {
                 for entry in workspaces.iter() {
                     {
-                        let is_active = entry.target.root == selected_root;
+                        let is_active = project_roots_match(&entry.target.root, &selected_root);
+                        let is_locked = bound_root
+                            .as_deref()
+                            .is_some_and(|root| !project_roots_match(root, &entry.target.root));
                         let root = entry.target.root.clone();
                         let root_for_click = root.clone();
-                        let class_name = if is_active { "rail-item active" } else { "rail-item" };
+                        let class_name = if is_active {
+                            "rail-item project-row active"
+                        } else if is_locked {
+                            "rail-item project-row locked"
+                        } else {
+                            "rail-item project-row"
+                        };
                         let label = entry.label().to_string();
                         rsx! {
                             button {
                                 class: "{class_name}",
                                 title: "{entry.target.root}",
                                 "aria-current": if is_active { "true" } else { "false" },
+                                "aria-disabled": if is_locked { "true" } else { "false" },
+                                disabled: is_locked,
                                 onclick: move |_| on_select.call(root_for_click.clone()),
-                                "{label}" }
+                                span { class: "project-row-name", "{label}" }
+                                span {
+                                    class: "project-row-state",
+                                    if is_active && is_bound { "bound" } else if is_active { "selected" } else { "available" }
+                                }
+                            }
                         }
                     }
                 }
             }
             p {
                 class: "scope-note",
-                "Selection sets the next Builder root. Worker terminals remain desktop-wide; oversight and evidence stay bound to {oversight_scope_label}."
+                if is_bound {
+                    "This window is bound to {oversight_scope_label}. Restart Impulse to bind a different project."
+                } else {
+                    "The first governed worker binds this window, its terminals, and its evidence to one project."
+                }
             }
         }
     }
+}
+
+fn worker_role_label(snapshot: &AgentRuntimeSnapshot) -> String {
+    snapshot
+        .role_assignment
+        .as_ref()
+        .map(|assignment| match assignment.role.as_str() {
+            "builder" => "Builder".to_string(),
+            other => other.replace(['-', '_'], " "),
+        })
+        .unwrap_or_else(|| "Worker".to_string())
+}
+
+fn worker_project_label(snapshot: &AgentRuntimeSnapshot) -> String {
+    snapshot
+        .workspace
+        .as_ref()
+        .and_then(|workspace| workspace.label.clone())
+        .or_else(|| {
+            snapshot
+                .workspace
+                .as_ref()
+                .map(|workspace| workspace.root.clone())
+        })
+        .or_else(|| snapshot.cwd.clone())
+        .unwrap_or_else(|| "Project unavailable".to_string())
 }
 
 /// Replace the hard-coded agent buttons in the left-rail. Driven by
@@ -783,6 +833,7 @@ fn WorkspaceSwitcher(
 fn AgentPool(
     agents: Vec<AgentRuntimeSnapshot>,
     focused_agent_id: Option<String>,
+    hidden_agent_count: usize,
     on_focus: EventHandler<String>,
 ) -> Element {
     rsx! {
@@ -790,28 +841,52 @@ fn AgentPool(
             class: "agent-pool",
             "data-source": "agent_snapshot",
             "aria-label": "Workers",
-            h2 { "Workers · desktop" }
+            h2 { "Workers" }
             if agents.is_empty() {
-                p { class: "rail-empty", "No workers running" }
+                p {
+                    class: "rail-empty",
+                    if hidden_agent_count > 0 {
+                        "No workers in this project"
+                    } else {
+                        "No workers running"
+                    }
+                }
             } else {
                 for snapshot in agents.iter() {
                     {
                         let is_active = focused_agent_id.as_deref() == Some(snapshot.agent_id.as_str());
-                        let class_name = if is_active { "rail-item active" } else { "rail-item" };
+                        let class_name = if is_active { "rail-item worker-row active" } else { "rail-item worker-row" };
                         let id = snapshot.agent_id.clone();
                         let id_for_click = id.clone();
+                        let role = worker_role_label(snapshot);
+                        let project = worker_project_label(snapshot);
+                        let task = snapshot
+                            .current_task
+                            .clone()
+                            .unwrap_or_else(|| "Waiting for an assignment update".to_string());
                         rsx! {
                             button {
                                 class: "{class_name}",
                                 "data-agent-id": "{id}",
                                 "aria-pressed": if is_active { "true" } else { "false" },
                                 onclick: move |_| on_focus.call(id_for_click.clone()),
-                                span { class: "dot {status_dot_class(&snapshot.status)}" }
-                                "{snapshot.label}"
-                                span { class: "agent-status-label", "{status_label(&snapshot.status)}" }
+                                span { class: "worker-row-heading",
+                                    span { class: "dot {status_dot_class(&snapshot.status)}" }
+                                    strong { "{snapshot.label}" }
+                                    span { class: "agent-status-label", "{status_label(&snapshot.status)}" }
+                                }
+                                span { class: "worker-row-meta", "{role} · {snapshot.platform}" }
+                                span { class: "worker-row-project", "{project}" }
+                                span { class: "worker-row-task", "{task}" }
                             }
                         }
                     }
+                }
+            }
+            if hidden_agent_count > 0 {
+                p {
+                    class: "scope-note worker-scope-note",
+                    "{hidden_agent_count} worker(s) hidden because they belong to another project."
                 }
             }
         }
@@ -911,7 +986,7 @@ fn McpConfirmRow(tool_name: String, on_invoke: EventHandler<McpInvokeRequest>) -
                         tool: tool_name.clone(),
                         arguments,
                         confirmed: confirmed(),
-                        caller_agent_id: None,
+                        caller_agent_id: Some("impulse-ui".to_string()),
                     });
                 },
                 "Invoke" }
@@ -940,7 +1015,7 @@ fn McpReadOnlyRow(tool_name: String, on_invoke: EventHandler<McpInvokeRequest>) 
                         tool: tool_name.clone(),
                         arguments,
                         confirmed: true,
-                        caller_agent_id: None,
+                        caller_agent_id: Some("impulse-ui".to_string()),
                     });
                 },
                 "Invoke" }
@@ -1059,6 +1134,7 @@ fn WorkspaceLaunchPanel(
     workspaces: Vec<WorkspaceEntry>,
     platforms: Vec<AgentPlatformInfo>,
     selected_root: String,
+    project_locked: bool,
     launch_in_flight: bool,
     on_select_root: EventHandler<String>,
     on_register: EventHandler<RegisterWorkspaceRequest>,
@@ -1083,7 +1159,28 @@ fn WorkspaceLaunchPanel(
     } else {
         first_workspace_root
     };
-    let can_register = !register_root().trim().is_empty();
+    let launch_project_label = workspaces
+        .iter()
+        .find(|entry| entry.target.root == launch_root)
+        .map(|entry| entry.label().to_string())
+        .or_else(|| {
+            Path::new(&launch_root)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .map(str::to_string)
+        })
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "Project unavailable".to_string());
+    let needs_project = workspaces.is_empty() && !project_locked;
+    let register_root_value = register_root();
+    let register_root_trimmed = register_root_value.trim();
+    let can_register =
+        !register_root_trimmed.is_empty() && Path::new(register_root_trimmed).is_absolute();
+    let registration_validation = if register_root_trimmed.is_empty() {
+        "Enter an absolute project folder to continue."
+    } else {
+        "Project folder must be an absolute path."
+    };
     let selected_platform = platform();
     let selected_platform_id = if selected_platform.is_empty() {
         platforms
@@ -1137,6 +1234,7 @@ fn WorkspaceLaunchPanel(
         },
     );
     let can_launch = launch_request.is_ok();
+    let launch_error = launch_request.as_ref().err().cloned();
     let request_for_launch = launch_request.ok();
 
     rsx! {
@@ -1144,193 +1242,247 @@ fn WorkspaceLaunchPanel(
             id: "workspace-launch",
             class: "inspector-section workspace-launch",
             "data-source": "workspace_launcher",
-            "aria-label": "Launch dock",
+            "data-step": if needs_project { "project" } else { "assignment" },
+            "aria-label": if needs_project { "Project setup" } else { "Add worker" },
             header { class: "section-header",
                 div {
-                    span { class: "section-eyebrow", "New mission" }
-                    h2 { "Launch dock" }
-                    p { "Add a project, choose a runtime, and give a governed Builder one explicit assignment." }
+                    span { class: "section-eyebrow",
+                        if needs_project { "Step 1 of 2" } else { "Step 2 of 2" }
+                    }
+                    h2 {
+                        if needs_project { "Add a project" } else { "Assign work" }
+                    }
+                    p {
+                        if needs_project {
+                            "Choose the repository this Impulse window will govern."
+                        } else {
+                            "Choose a runtime and give one Builder a verifiable assignment."
+                        }
+                    }
                 }
                 span {
                     class: "workspace-launch-badge",
                     "data-verification-profile": "rust_workspace_v1",
                     title: "Rust-only · rust_workspace_v1",
-                    "Builder · verified"
+                    if needs_project { "Project required" } else { "Builder · verification required" }
                 }
             }
-            div { class: "workspace-launch-grid",
-                label { class: "workspace-field wide",
-                    span { "Folder path" }
-                    input {
-                        r#type: "text",
-                        placeholder: "Absolute project folder",
-                        value: "{register_root}",
-                        oninput: move |evt| register_root.set(evt.value()),
-                    }
-                }
-                label { class: "workspace-field",
-                    span { "Label" }
-                    input {
-                        r#type: "text",
-                        placeholder: "IMPULSE-rs",
-                        value: "{label}",
-                        oninput: move |evt| label.set(evt.value()),
-                    }
-                }
-                label { class: "workspace-field",
-                    span { "Purpose" }
-                    input {
-                        r#type: "text",
-                        placeholder: "terminal harness",
-                        value: "{purpose}",
-                        oninput: move |evt| purpose.set(evt.value()),
-                    }
-                }
-                label { class: "workspace-field wide",
-                    span { "Project notes" }
-                    input {
-                        r#type: "text",
-                        placeholder: "Context the agent should remember before acting",
-                        value: "{project_notes}",
-                        oninput: move |evt| project_notes.set(evt.value()),
-                    }
-                }
-                button {
-                    class: "invoke-button workspace-primary",
-                    disabled: !can_register,
-                    onclick: move |_| {
-                        let root = register_root().trim().to_string();
-                        if root.is_empty() {
-                            return;
+            if needs_project {
+                div { class: "workspace-launch-grid project-setup",
+                    label { class: "workspace-field wide",
+                        span { "Project folder" }
+                        input {
+                            id: "project-folder",
+                            r#type: "text",
+                            placeholder: "/absolute/path/to/project",
+                            value: "{register_root}",
+                            "aria-invalid": if can_register { "false" } else { "true" },
+                            "aria-describedby": "project-folder-validation",
+                            oninput: move |evt| register_root.set(evt.value()),
                         }
-                        on_select_root.call(root.clone());
-                        on_register.call(RegisterWorkspaceRequest {
-                            root,
-                            label: optional_text(label()),
-                            purpose: optional_text(purpose()),
-                            project_notes: optional_text(project_notes()),
-                        });
-                    },
-                    "Add project"
-                }
-            }
-            div { class: "workspace-launch-grid launch",
-                label { class: "workspace-field wide",
-                    span { "Launch from" }
-                    select {
-                        value: "{launch_root}",
-                        onchange: move |evt| on_select_root.call(evt.value()),
-                        if workspaces.is_empty() {
-                            option { value: "", "Register a workspace first" }
-                        } else {
-                            for entry in workspaces.iter() {
-                                option { value: "{entry.target.root}", "{entry.label()}" }
+                    }
+                    label { class: "workspace-field",
+                        span { "Project name" }
+                        input {
+                            r#type: "text",
+                            placeholder: "IMPULSE-rs",
+                            value: "{label}",
+                            oninput: move |evt| label.set(evt.value()),
+                        }
+                    }
+                    label { class: "workspace-field",
+                        span { "Purpose" }
+                        input {
+                            r#type: "text",
+                            placeholder: "Local coding-agent harness",
+                            value: "{purpose}",
+                            oninput: move |evt| purpose.set(evt.value()),
+                        }
+                    }
+                    label { class: "workspace-field wide",
+                        span { "Project guidance" }
+                        input {
+                            r#type: "text",
+                            placeholder: "Constraints every worker should know",
+                            value: "{project_notes}",
+                            oninput: move |evt| project_notes.set(evt.value()),
+                        }
+                    }
+                    button {
+                        class: "invoke-button workspace-primary",
+                        disabled: !can_register,
+                        onclick: move |_| {
+                            let root = register_root().trim().to_string();
+                            if root.is_empty() || !Path::new(&root).is_absolute() {
+                                return;
                             }
+                            on_select_root.call(root.clone());
+                            on_register.call(RegisterWorkspaceRequest {
+                                root,
+                                label: optional_text(label()),
+                                purpose: optional_text(purpose()),
+                                project_notes: optional_text(project_notes()),
+                            });
+                        },
+                        "Add project"
+                    }
+                    if !can_register {
+                        p {
+                            id: "project-folder-validation",
+                            class: "launch-validation",
+                            role: "status",
+                            "{registration_validation}"
                         }
                     }
                 }
-                label { class: "workspace-field",
-                    span { "Runtime" }
-                    select {
-                        value: "{selected_platform_id}",
-                        onchange: move |evt| platform.set(evt.value()),
-                        if platforms.is_empty() {
-                            option { value: "", disabled: true, "Agent registry unavailable" }
-                        } else {
-                            for candidate in platforms.iter() {
-                                option { value: "{candidate.id}", "{candidate.label}" }
-                            }
+            } else {
+                div { class: "workspace-launch-grid launch",
+                    if project_locked {
+                        div { class: "bound-project-field workspace-field wide",
+                            span { "Project" }
+                            strong { "{launch_project_label}" }
+                            p { "This window is project-bound. Restart Impulse to launch work elsewhere." }
                         }
-                    }
-                }
-                label { class: "workspace-field",
-                    span { "Agent id" }
-                    input {
-                        r#type: "text",
-                        placeholder: "optional",
-                        value: "{agent_id}",
-                        oninput: move |evt| agent_id.set(evt.value()),
-                    }
-                }
-                label { class: "workspace-field wide",
-                    span { "Command override" }
-                    input {
-                        r#type: "text",
-                        placeholder: "blank uses platform default",
-                        value: "{command}",
-                        oninput: move |evt| command.set(evt.value()),
-                    }
-                }
-                label {
-                    class: "workspace-field wide",
-                    "data-field": "launch-task",
-                    span { "Task" }
-                    input {
-                        r#type: "text",
-                        required: true,
-                        "aria-required": "true",
-                        placeholder: "Describe the explicit assignment",
-                        value: "{task}",
-                        oninput: move |evt| task.set(evt.value()),
-                    }
-                }
-                label {
-                    class: "workspace-field wide",
-                    "data-field": "launch-acceptance-criteria",
-                    span { "Acceptance criteria" }
-                    textarea {
-                        required: true,
-                        "aria-required": "true",
-                        placeholder: "One verifiable criterion per line",
-                        value: "{acceptance_criteria}",
-                        oninput: move |evt| acceptance_criteria.set(evt.value()),
-                    }
-                }
-                div {
-                    class: "workspace-field wide role-compatibility {compatibility_status}",
-                    "data-role": "builder",
-                    "data-compatibility": compatibility_status,
-                    div { class: "role-compatibility-heading",
-                        span { "Product role" }
-                        strong { "Builder" }
-                        span { class: "compatibility-status", "{compatibility_status}" }
-                    }
-                    p { "{compatibility_copy}" }
-                    if compatibility_checks.is_empty() {
-                        p { class: "compatibility-empty", "No trusted runtime capability evidence is available for this platform." }
                     } else {
-                        ul { class: "compatibility-checks",
-                            for check in compatibility_checks.iter() {
-                                li {
-                                    "data-capability": "{check.capability}",
-                                    "data-required": enforcement_strength_label(check.required),
-                                    "data-available": enforcement_strength_label(check.available),
-                                    strong { "{check.capability}" }
-                                    span { if check.mandatory { "mandatory" } else { "optional" } }
-                                    span {
-                                        "required {enforcement_strength_label(check.required)} · available {enforcement_strength_label(check.available)}"
-                                    }
+                        label { class: "workspace-field wide",
+                            span { "Project" }
+                            select {
+                                value: "{launch_root}",
+                                onchange: move |evt| on_select_root.call(evt.value()),
+                                for entry in workspaces.iter() {
+                                    option { value: "{entry.target.root}", "{entry.label()}" }
                                 }
                             }
                         }
                     }
-                    p { class: "compatibility-caveat",
-                        "Workspace cwd mediation selects and validates the launch directory; cwd mediation is not a filesystem sandbox."
+                    label { class: "workspace-field",
+                        span { "Runtime" }
+                        select {
+                            value: "{selected_platform_id}",
+                            "aria-invalid": if selected_platform_descriptor.is_some() { "false" } else { "true" },
+                            "aria-describedby": "launch-validation",
+                            onchange: move |evt| platform.set(evt.value()),
+                            if platforms.is_empty() {
+                                option { value: "", disabled: true, "Runtime registry unavailable" }
+                            } else {
+                                for candidate in platforms.iter() {
+                                    option { value: "{candidate.id}", "{candidate.label}" }
+                                }
+                            }
+                        }
                     }
-                }
-                button {
-                    class: "invoke-button workspace-primary",
-                    "data-action": "launch-governed-agent",
-                    "aria-disabled": if can_launch && !launch_in_flight { "false" } else { "true" },
-                    "aria-busy": if launch_in_flight { "true" } else { "false" },
-                    disabled: !can_launch || launch_in_flight,
-                    onclick: move |_| {
-                        let Some(request) = request_for_launch.clone() else {
-                            return;
-                        };
-                        on_launch.call(request);
-                    },
-                    if launch_in_flight { "Launching…" } else { "Launch Builder" }
+                    label { class: "workspace-field",
+                        span { "Worker name" }
+                        input {
+                            r#type: "text",
+                            placeholder: "optional",
+                            value: "{agent_id}",
+                            oninput: move |evt| agent_id.set(evt.value()),
+                        }
+                    }
+                    details { class: "launch-advanced workspace-field wide",
+                        summary { "Advanced runtime command" }
+                        label { class: "workspace-field wide",
+                            span { "Command override" }
+                            input {
+                                r#type: "text",
+                                placeholder: "Blank uses the runtime default",
+                                value: "{command}",
+                                oninput: move |evt| command.set(evt.value()),
+                            }
+                        }
+                    }
+                    label {
+                        class: "workspace-field wide",
+                        "data-field": "launch-task",
+                        span { "Assignment" }
+                        input {
+                            r#type: "text",
+                            required: true,
+                            "aria-required": "true",
+                            "aria-invalid": if task().trim().is_empty() { "true" } else { "false" },
+                            "aria-describedby": "launch-validation",
+                            placeholder: "What should this Builder accomplish?",
+                            value: "{task}",
+                            oninput: move |evt| task.set(evt.value()),
+                        }
+                    }
+                    label {
+                        class: "workspace-field wide",
+                        "data-field": "launch-acceptance-criteria",
+                        span { "Definition of done" }
+                        textarea {
+                            required: true,
+                            "aria-required": "true",
+                            "aria-invalid": if acceptance_criteria().trim().is_empty() { "true" } else { "false" },
+                            "aria-describedby": "launch-validation",
+                            placeholder: "One verifiable criterion per line",
+                            value: "{acceptance_criteria}",
+                            oninput: move |evt| acceptance_criteria.set(evt.value()),
+                        }
+                    }
+                    details {
+                        class: "workspace-field wide role-compatibility {compatibility_status}",
+                        "data-role": "builder",
+                        "data-compatibility": compatibility_status,
+                        open: compatibility_status != "allowed",
+                        summary {
+                            span { "Runtime safeguards" }
+                            strong { "{compatibility_status}" }
+                        }
+                        div { class: "role-compatibility-body",
+                            div { class: "role-compatibility-heading",
+                                span { "Product role" }
+                                strong { "Builder" }
+                                span { class: "compatibility-status", "{compatibility_status}" }
+                            }
+                            p { "{compatibility_copy}" }
+                            if compatibility_checks.is_empty() {
+                                p { class: "compatibility-empty", "This runtime cannot prove the required safeguards." }
+                            } else {
+                                ul { class: "compatibility-checks",
+                                    for check in compatibility_checks.iter() {
+                                        li {
+                                            "data-capability": "{check.capability}",
+                                            "data-required": enforcement_strength_label(check.required),
+                                            "data-available": enforcement_strength_label(check.available),
+                                            strong { "{check.capability}" }
+                                            span { if check.mandatory { "mandatory" } else { "optional" } }
+                                            span {
+                                                "required {enforcement_strength_label(check.required)} · available {enforcement_strength_label(check.available)}"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            p { class: "compatibility-caveat",
+                                "Working-directory mediation validates the project root; it is not a filesystem sandbox."
+                            }
+                        }
+                    }
+                    if let Some(error) = launch_error.as_ref() {
+                        p {
+                            id: "launch-validation",
+                            class: "launch-validation",
+                            role: "status",
+                            "data-launch-validation": "blocked",
+                            "{error}"
+                        }
+                    }
+                    button {
+                        class: "invoke-button workspace-primary",
+                        "data-action": "launch-governed-agent",
+                        "aria-disabled": if can_launch && !launch_in_flight { "false" } else { "true" },
+                        "aria-busy": if launch_in_flight { "true" } else { "false" },
+                        disabled: !can_launch || launch_in_flight,
+                        onclick: move |_| {
+                            let Some(request) = request_for_launch.clone() else {
+                                return;
+                            };
+                            on_launch.call(request);
+                        },
+                        if launch_in_flight { "Launching…" } else { "Launch worker" }
+                    }
                 }
             }
         }
@@ -1613,12 +1765,12 @@ fn OperatorBoard(
         section { class: "operator-board", "data-source": "operator_board",
             header { class: "operator-board-header",
                 div {
-                    span { class: "mission-eyebrow", "Oversight lane" }
-                    h2 { "Review work before acceptance." }
-                    p { "Daemon-owned task state and evidence drive this board. A separately launched Supervisor runtime is not implied." }
+                    span { class: "mission-eyebrow", "Supervisor desk" }
+                    h2 { "Review evidence before acceptance." }
+                    p { "Governed task state and evidence drive this desk. No Supervisor agent is running unless a real runtime is launched." }
                     p { class: "operator-scope", "Evidence scope · {oversight_scope_label}" }
                 }
-                span { class: "operator-board-badge", "review service" }
+                span { class: "operator-board-badge", "review service · no agent" }
             }
             div { class: "operator-lanes",
                 OperatorLane { label: "Queued".to_string(), count: queued, hint: "starting agents".to_string() }
@@ -1689,8 +1841,40 @@ fn runtime_agent_matches_scope(agent: &AgentRuntimeSnapshot, scope_root: &str) -
     agent
         .workspace
         .as_ref()
-        .is_some_and(|workspace| workspace.root == scope_root)
-        || agent.cwd.as_deref() == Some(scope_root)
+        .is_some_and(|workspace| project_roots_match(&workspace.root, scope_root))
+        || agent
+            .cwd
+            .as_deref()
+            .is_some_and(|cwd| project_roots_match(cwd, scope_root))
+}
+
+/// Project identity comparison for UI scoping. Raw equality preserves
+/// synthetic/nonexistent fixture paths; canonical equality handles symlinked
+/// roots and macOS aliases such as `/tmp` → `/private/tmp`.
+pub fn project_roots_match(left: &str, right: &str) -> bool {
+    let left = left.trim();
+    let right = right.trim();
+    if left.is_empty() || right.is_empty() {
+        return false;
+    }
+    if left == right {
+        return true;
+    }
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// Whether a daemon snapshot must be rejected for crossing this window's
+/// lifetime project binding. An empty daemon root means no authoritative
+/// project snapshot has arrived yet, so it cannot conflict.
+pub fn daemon_project_scope_mismatch(bound_root: &str, daemon_scope_root: &str) -> bool {
+    let bound_root = bound_root.trim();
+    let daemon_scope_root = daemon_scope_root.trim();
+    !bound_root.is_empty()
+        && !daemon_scope_root.is_empty()
+        && !project_roots_match(bound_root, daemon_scope_root)
 }
 
 #[component]
@@ -2369,21 +2553,25 @@ fn SupervisorDock(
     };
 
     rsx! {
-        button {
+        section {
             class: "{class_name}",
             "data-view": "supervisor",
             "data-supervisor-state": "{status}",
-            "aria-pressed": if active { "true" } else { "false" },
-            onclick: move |_| on_open.call(()),
-            div { class: "supervisor-dock-heading",
-                span { class: "supervisor-avatar", "S" }
-                div {
-                    span { class: "rail-eyebrow", "Review service" }
-                    strong { "Oversight lane" }
+            "data-supervisor-runtime": "not-launched",
+            button {
+                class: "supervisor-dock-trigger",
+                "aria-pressed": if active { "true" } else { "false" },
+                onclick: move |_| on_open.call(()),
+                span { class: "supervisor-dock-heading",
+                    span { class: "supervisor-avatar", "S" }
+                    span { class: "supervisor-dock-copy",
+                        span { class: "rail-eyebrow", "Supervisor" }
+                        strong { "Review & evidence" }
+                    }
+                    span { class: "supervisor-state {status}", "{status}" }
                 }
-                span { class: "supervisor-state {status}", "{status}" }
             }
-            p { "Inspect evidence and intervene without implying a launched Supervisor runtime." }
+            p { "Review governed work here. No Supervisor agent is running." }
             p { class: "supervisor-scope", "Evidence scope · {oversight_scope_label}" }
             div { class: "supervisor-dock-meta",
                 span { "{governed_task_count} governed tasks" }
@@ -2412,11 +2600,11 @@ fn MissionHeader(
             div { class: "mission-copy",
                 span { class: "mission-eyebrow", "Local agent cockpit" }
                 h2 { id: "mission-title", "Feed the impulse to build." }
-                p { "One launch target. Explicit oversight. Specialized workers. Evidence before acceptance." }
+                p { "One project. Explicit review. Specialized workers. Evidence before acceptance." }
             }
             div { class: "mission-signals", "aria-label": "Mission status",
                 div { class: "mission-signal project",
-                    span { "Launch target" }
+                    span { "Project" }
                     strong { title: "{workspace_label}", "{workspace_label}" }
                 }
                 div { class: "mission-signal",
@@ -2437,6 +2625,140 @@ fn MissionHeader(
 }
 
 #[component]
+fn FocusedWorkerHeader(
+    agent: AgentRuntimeSnapshot,
+    governed_task: Option<GovernedTaskRun>,
+) -> Element {
+    let project = worker_project_label(&agent);
+    let role = worker_role_label(&agent);
+    let assignment = governed_task
+        .as_ref()
+        .map(|task| task.task.clone())
+        .or_else(|| agent.current_task.clone())
+        .unwrap_or_else(|| "Waiting for an assignment update".to_string());
+    let review_state = governed_task
+        .as_ref()
+        .map(|task| governed_review_state_label(task.review_state))
+        .unwrap_or("not tracked");
+
+    rsx! {
+        section {
+            class: "focused-worker-header",
+            "data-agent-id": "{agent.agent_id}",
+            "data-worker-status": "{status_label(&agent.status)}",
+            div { class: "focused-worker-path",
+                span { "{project}" }
+                span { "›" }
+                span { "{role}" }
+                span { "›" }
+                strong { "{agent.label}" }
+            }
+            div { class: "focused-worker-assignment",
+                span { class: "section-eyebrow", "Active assignment" }
+                h2 { title: "{assignment}", "{assignment}" }
+            }
+            div { class: "focused-worker-signals", "aria-label": "Focused worker status",
+                span { class: "worker-signal runtime", "{agent.platform}" }
+                span { class: "worker-signal status", "{status_label(&agent.status)}" }
+                span { class: "worker-signal review", "Review · {review_state}" }
+            }
+        }
+    }
+}
+
+#[component]
+fn FocusedWorkerPanel(
+    agent: AgentRuntimeSnapshot,
+    governed_task: Option<GovernedTaskRun>,
+    on_open_evidence: EventHandler<()>,
+) -> Element {
+    let project = worker_project_label(&agent);
+    let role = worker_role_label(&agent);
+    let assignment = governed_task
+        .as_ref()
+        .map(|task| task.task.clone())
+        .or_else(|| agent.current_task.clone())
+        .unwrap_or_else(|| "Waiting for an assignment update".to_string());
+    let criteria = governed_task
+        .as_ref()
+        .map(|task| task.acceptance_criteria.clone())
+        .unwrap_or_default();
+    let review_state = governed_task
+        .as_ref()
+        .map(|task| governed_review_state_label(task.review_state));
+    let claim_count = governed_task
+        .as_ref()
+        .map(|task| task.claims.len())
+        .unwrap_or_default();
+    let verification_count = governed_task
+        .as_ref()
+        .map(|task| task.verifications.len())
+        .unwrap_or_default();
+    let latest_verification = governed_task
+        .as_ref()
+        .and_then(GovernedTaskRun::latest_verification)
+        .map(|verification| governed_verification_outcome_label(verification.outcome));
+
+    rsx! {
+        section {
+            class: "inspector-section focused-worker-panel",
+            "data-source": "focused_worker",
+            "data-agent-id": "{agent.agent_id}",
+            span { class: "section-eyebrow", "Focused worker" }
+            header { class: "focused-worker-panel-heading",
+                div {
+                    h2 { "{agent.label}" }
+                    p { "{role} · {agent.platform} · {status_label(&agent.status)}" }
+                }
+                span { class: "dot {status_dot_class(&agent.status)}" }
+            }
+            dl { class: "focused-worker-facts",
+                dt { "Project" }
+                dd { "{project}" }
+                dt { "Assignment" }
+                dd { "{assignment}" }
+            }
+            if criteria.is_empty() {
+                p { class: "section-hint", "Definition of done has not reached the runtime snapshot yet." }
+            } else {
+                div { class: "focused-worker-criteria",
+                    h3 { "Definition of done" }
+                    ol {
+                        for criterion in criteria {
+                            li { "{criterion}" }
+                        }
+                    }
+                }
+            }
+            if let Some(review_state) = review_state {
+                div {
+                    class: "focused-worker-evidence",
+                    "data-review-state": "{review_state}",
+                    h3 { "Evidence" }
+                    strong { "{review_state}" }
+                    p {
+                        "{claim_count} claim(s) · {verification_count} verification run(s)"
+                    }
+                    if let Some(outcome) = latest_verification {
+                        p { class: "evidence-outcome", "Latest verification · {outcome}" }
+                    }
+                    button {
+                        class: "invoke-button evidence-button",
+                        onclick: move |_| on_open_evidence.call(()),
+                        "Review evidence"
+                    }
+                }
+            } else {
+                div { class: "focused-worker-evidence pending",
+                    h3 { "Evidence" }
+                    p { "Waiting for the daemon-owned task record." }
+                }
+            }
+        }
+    }
+}
+
+#[component]
 fn LaunchSequence(
     has_workspace: bool,
     on_open_supervisor: EventHandler<()>,
@@ -2444,7 +2766,7 @@ fn LaunchSequence(
 ) -> Element {
     let project_state = if has_workspace { "ready" } else { "next" };
     let project_copy = if has_workspace {
-        "Launch target selected"
+        "Project selected"
     } else {
         "Add your first project"
     };
@@ -2459,7 +2781,7 @@ fn LaunchSequence(
             div { class: "launch-sequence-copy",
                 span { class: "mission-eyebrow", "Start a mission" }
                 h3 { id: "launch-sequence-title", "Turn intent into governed work." }
-                p { "Choose a project, inspect the oversight lane, then give a worker one verifiable assignment." }
+                p { "Choose a project, understand the review policy, then give a worker one verifiable assignment." }
                 div { class: "launch-sequence-actions",
                     button {
                         class: "action-button primary",
@@ -2469,7 +2791,7 @@ fn LaunchSequence(
                     button {
                         class: "action-button secondary",
                         onclick: move |_| on_open_supervisor.call(()),
-                        "Open oversight"
+                        "Review evidence policy"
                     }
                 }
             }
@@ -2477,22 +2799,22 @@ fn LaunchSequence(
                 li { "data-state": "{project_state}",
                     span { class: "step-index", "01" }
                     div {
-                        strong { "Launch target" }
+                        strong { "Project" }
                         p { "{project_copy}" }
                     }
                 }
                 li { "data-state": "available",
                     span { class: "step-index", "02" }
                     div {
-                        strong { "Oversight" }
-                        p { "Inspect review and evidence policy" }
+                        strong { "Review & evidence" }
+                        p { "Understand how completion will be judged" }
                     }
                 }
                 li { "data-state": if has_workspace { "next" } else { "waiting" },
                     span { class: "step-index", "03" }
                     div {
                         strong { "Builder" }
-                        p { "Assign task and acceptance criteria" }
+                        p { "Assign work and a definition of done" }
                     }
                 }
             }
@@ -2513,21 +2835,68 @@ pub fn DesktopShellWithSnapshot(
     #[props(default)] daemon_ops_status: Option<DaemonOpsStatusUpdate>,
     #[props(default = DesktopView::Terminal)] initial_view: DesktopView,
 ) -> Element {
-    let context = &snapshot.context;
+    let daemon_scope_root = snapshot.project.root_path.trim().to_string();
+    let first_workspace_root = workspaces
+        .first()
+        .map(|entry| entry.target.root.clone())
+        .unwrap_or_default();
+    let runtime_binding_root = runtime_agents
+        .iter()
+        .filter(|agent| agent.governed_task_id.is_some() || agent.role_assignment.is_some())
+        .find_map(|agent| {
+            agent
+                .workspace
+                .as_ref()
+                .map(|workspace| workspace.root.clone())
+                .or_else(|| agent.cwd.clone())
+        })
+        .unwrap_or_default();
+    let observed_binding_root = if !daemon_scope_root.is_empty() {
+        daemon_scope_root.clone()
+    } else {
+        runtime_binding_root
+    };
+    // The first authoritative project observed by this window becomes its
+    // lifetime binding. Terminal focus can change, but project scope cannot.
+    let mut window_bound_root = use_signal(String::new);
+    let binding_candidate = observed_binding_root.clone();
+    use_effect(use_reactive(
+        (&binding_candidate,),
+        move |(binding_candidate,)| {
+            if window_bound_root().trim().is_empty() && !binding_candidate.trim().is_empty() {
+                window_bound_root.set(binding_candidate);
+            }
+        },
+    ));
+    let persisted_bound_root = window_bound_root();
+    let bound_root = if persisted_bound_root.trim().is_empty() {
+        observed_binding_root
+    } else {
+        persisted_bound_root
+    };
+    let project_locked = !bound_root.is_empty();
+    let daemon_scope_mismatch = daemon_project_scope_mismatch(&bound_root, &daemon_scope_root);
+    // A window never renders or mutates daemon-owned state from outside its
+    // lifetime project binding. Keep the connected-but-wrong snapshot only as
+    // evidence for the operator-facing mismatch notice.
+    let rejected_snapshot = ProjectOpsSnapshot::default();
+    let project_snapshot = if daemon_scope_mismatch {
+        &rejected_snapshot
+    } else {
+        &snapshot
+    };
+    let context = &project_snapshot.context;
     let tokens = format_count(context.estimated_tokens);
     let window = format_count(context.window_tokens);
-    let snapshot_agents_online = snapshot.agents.iter().filter(|agent| agent.active).count();
-    let pending_queue_count = review_queue
+    let snapshot_agents_online = project_snapshot
+        .agents
         .iter()
-        .filter(|item| item.status == ReviewQueueStatus::Pending)
+        .filter(|agent| agent.active)
         .count();
-    let context_review_count = context.pending_review_count.max(pending_queue_count);
-    let governed_review_count = governed_attention_count(&snapshot.governed_tasks);
-    let attention_count = context_review_count + governed_review_count;
     let daemon_online = daemon_ops_status
         .as_ref()
         .map(|status| status.connected)
-        .unwrap_or_else(|| !snapshot.generated_at.is_empty());
+        .unwrap_or_else(|| !project_snapshot.generated_at.is_empty());
     let daemon_publish_degraded = daemon_ops_status
         .as_ref()
         .is_some_and(|status| status.connected && status.error.is_some());
@@ -2535,14 +2904,16 @@ pub fn DesktopShellWithSnapshot(
         .as_ref()
         .and_then(|status| status.error.as_deref())
         .unwrap_or("a daemon-owned lifecycle write was not acknowledged");
-    let daemon_label = if daemon_publish_degraded {
+    let daemon_label = if daemon_scope_mismatch {
+        "project mismatch"
+    } else if daemon_publish_degraded {
         "connected · writes degraded"
     } else if daemon_online {
         "connected"
     } else {
         "offline"
     };
-    let daemon_state = if daemon_publish_degraded {
+    let daemon_state = if daemon_scope_mismatch || daemon_publish_degraded {
         "degraded"
     } else if daemon_online {
         "online"
@@ -2558,29 +2929,38 @@ pub fn DesktopShellWithSnapshot(
         0
     };
     let artifact_summary = if daemon_online {
-        format!("{} artifacts", snapshot.artifacts.len())
+        format!("{} artifacts", project_snapshot.artifacts.len())
     } else {
-        format!("{} cached artifacts", snapshot.artifacts.len())
+        format!("{} cached artifacts", project_snapshot.artifacts.len())
     };
     let intervention_summary = if daemon_online {
-        format!("{} interventions", snapshot.interventions.len())
+        format!("{} interventions", project_snapshot.interventions.len())
     } else {
-        format!("{} cached interventions", snapshot.interventions.len())
+        format!(
+            "{} cached interventions",
+            project_snapshot.interventions.len()
+        )
     };
-    let ops_stream = match daemon_ops_status.as_ref().map(|status| status.connected) {
-        Some(true) => "live",
-        Some(false) => "down",
-        None => "idle",
+    let ops_stream = if daemon_scope_mismatch {
+        "rejected"
+    } else {
+        match daemon_ops_status.as_ref().map(|status| status.connected) {
+            Some(true) => "live",
+            Some(false) => "down",
+            None => "idle",
+        }
     };
     let tier = if context.tier.is_empty() {
         "idle"
     } else {
         context.tier.as_str()
     };
-    let generated_at = if snapshot.generated_at.is_empty() {
+    let generated_at = if daemon_scope_mismatch {
+        "out-of-scope snapshot rejected"
+    } else if project_snapshot.generated_at.is_empty() {
         "awaiting first ops_update"
     } else {
-        snapshot.generated_at.as_str()
+        project_snapshot.generated_at.as_str()
     };
     // Real footer stream health derived from observed state (replaces the old
     // permanent "stream pending"). A degraded host transport means no events
@@ -2589,59 +2969,182 @@ pub fn DesktopShellWithSnapshot(
         .as_ref()
         .map(BridgeStatusUpdate::is_degraded)
         .unwrap_or(false);
-    let terminal_stream = event_stream_state(
-        runtime_agents.iter().any(|agent| agent.output_bytes > 0),
-        bridge_degraded,
-    );
-    let runtime_stream = event_stream_state(!runtime_agents.is_empty(), bridge_degraded);
     // No UI consumer subscribes to supervisor_local_action yet, so reflect the
     // transport: `down` when degraded, otherwise `ready` (defined, awaiting a
     // consumer) — never the misleading permanent "pending".
-    let supervisor_stream = if bridge_degraded { "down" } else { "ready" };
-    let first_workspace_root = workspaces
-        .first()
-        .map(|entry| entry.target.root.clone())
-        .unwrap_or_default();
+    let supervisor_stream = if daemon_scope_mismatch {
+        "blocked"
+    } else if bridge_degraded {
+        "down"
+    } else {
+        "ready"
+    };
+    let scoped_runtime_agents = if project_locked {
+        runtime_agents
+            .iter()
+            .filter(|agent| runtime_agent_matches_scope(agent, &bound_root))
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        runtime_agents.clone()
+    };
+    let scoped_review_queue = if daemon_scope_mismatch {
+        Vec::new()
+    } else {
+        review_queue.clone()
+    };
+    let pending_queue_count = scoped_review_queue
+        .iter()
+        .filter(|item| item.status == ReviewQueueStatus::Pending)
+        .count();
+    let context_review_count = context.pending_review_count.max(pending_queue_count);
+    let hidden_agent_count = runtime_agents
+        .len()
+        .saturating_sub(scoped_runtime_agents.len());
+    let visible_worker_count = if scoped_runtime_agents.is_empty() {
+        agents_online
+    } else {
+        scoped_runtime_agents
+            .iter()
+            .filter(|agent| agent.alive)
+            .count()
+    };
+    let scoped_last_invocations = if daemon_scope_mismatch {
+        Vec::new()
+    } else if project_locked {
+        last_invocations
+            .iter()
+            .filter(|invocation| {
+                invocation.caller_agent_id.as_deref().is_some_and(|caller| {
+                    caller == "impulse-ui"
+                        || scoped_runtime_agents
+                            .iter()
+                            .any(|agent| agent.agent_id == caller)
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        last_invocations.clone()
+    };
+    let scoped_workspace_details = if project_locked {
+        workspaces
+            .iter()
+            .filter(|workspace| project_roots_match(&workspace.target.root, &bound_root))
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        workspaces.clone()
+    };
+    let scoped_governed_tasks = if project_locked {
+        project_snapshot
+            .governed_tasks
+            .iter()
+            .filter(|task| project_roots_match(&task.workspace_root, &bound_root))
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        project_snapshot.governed_tasks.clone()
+    };
+    let governed_review_count = governed_attention_count(&scoped_governed_tasks);
+    let attention_count = context_review_count + governed_review_count;
+    let terminal_stream = event_stream_state(
+        scoped_runtime_agents
+            .iter()
+            .any(|agent| agent.output_bytes > 0),
+        bridge_degraded,
+    );
+    let runtime_stream = event_stream_state(!scoped_runtime_agents.is_empty(), bridge_degraded);
     let mut focused_workspace_root = use_signal(String::new);
-    let selected_root = if focused_workspace_root().trim().is_empty() {
+    let selected_root = if project_locked {
+        bound_root.clone()
+    } else if focused_workspace_root().trim().is_empty() {
         first_workspace_root
     } else {
         focused_workspace_root()
     };
-    let has_workspace = !workspaces.is_empty();
+    let has_workspace = !workspaces.is_empty() || project_locked;
     let selected_workspace_label = workspaces
         .iter()
-        .find(|entry| entry.target.root == selected_root)
+        .find(|entry| project_roots_match(&entry.target.root, &selected_root))
         .map(|entry| entry.label().to_string())
+        .or_else(|| {
+            Path::new(&selected_root)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .map(str::to_string)
+        })
+        .filter(|label| !label.trim().is_empty())
         .unwrap_or_else(|| "No project selected".to_string());
-    let oversight_scope_root = snapshot.project.root_path.trim().to_string();
-    let oversight_scope_label = if !snapshot.project.name.trim().is_empty() {
-        snapshot.project.name.trim().to_string()
-    } else if !oversight_scope_root.is_empty() {
-        Path::new(&oversight_scope_root)
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or(oversight_scope_root.as_str())
-            .to_string()
+    let oversight_scope_root = bound_root.clone();
+    let oversight_scope_label = workspaces
+        .iter()
+        .find(|entry| project_roots_match(&entry.target.root, &oversight_scope_root))
+        .map(|entry| entry.label().to_string())
+        .or_else(|| {
+            runtime_agents.iter().find_map(|agent| {
+                agent.workspace.as_ref().and_then(|workspace| {
+                    project_roots_match(&workspace.root, &oversight_scope_root)
+                        .then(|| workspace.label.clone())
+                        .flatten()
+                })
+            })
+        })
+        .or_else(|| {
+            (!snapshot.project.name.trim().is_empty()
+                && project_roots_match(&daemon_scope_root, &oversight_scope_root))
+            .then(|| snapshot.project.name.trim().to_string())
+        })
+        .or_else(|| {
+            Path::new(&oversight_scope_root)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .map(str::to_string)
+        })
+        .filter(|label| !label.trim().is_empty())
+        .unwrap_or_else(|| "No project selected".to_string());
+    let governed_task_count = scoped_governed_tasks.len();
+    let review_action_label = if governed_review_count > 0 {
+        format!("Evidence {governed_review_count}")
+    } else if context_review_count > 0 {
+        format!("Context {context_review_count}")
     } else {
-        "the connected daemon project".to_string()
-    };
-    let governed_task_count = snapshot.governed_tasks.len();
-    let review_action_label = if attention_count > 0 {
-        format!("Attention {attention_count}")
-    } else {
-        "Review".to_string()
+        "Context review".to_string()
     };
     let attention_view = if governed_review_count > 0 {
         DesktopView::Supervisor
     } else {
         DesktopView::Review
     };
-    let has_runtime_agents = !runtime_agents.is_empty();
-    let focused_agent_id = runtime_agents
+    let review_action_title = if governed_review_count > 0 {
+        "Open governed evidence review"
+    } else {
+        "Open context review"
+    };
+    let has_runtime_agents = !scoped_runtime_agents.is_empty();
+    let focused_agent = scoped_runtime_agents
         .iter()
         .find(|agent| agent.focused)
-        .map(|agent| agent.agent_id.clone());
+        .or_else(|| scoped_runtime_agents.first())
+        .cloned();
+    let focused_agent_id = focused_agent.as_ref().map(|agent| agent.agent_id.clone());
+    let focused_governed_task = focused_agent.as_ref().and_then(|agent| {
+        agent
+            .governed_task_id
+            .as_ref()
+            .and_then(|task_id| {
+                scoped_governed_tasks
+                    .iter()
+                    .find(|task| &task.id == task_id)
+            })
+            .or_else(|| {
+                scoped_governed_tasks
+                    .iter()
+                    .filter(|task| task.agent_id == agent.agent_id)
+                    .max_by_key(|task| task.revision)
+            })
+            .cloned()
+    });
     let mut active_view = use_signal(|| initial_view);
     // In-flight feedback for the focus-agent bridge call (a representative
     // high-traffic async action). Holds the agent id currently being focused so
@@ -2656,6 +3159,12 @@ pub fn DesktopShellWithSnapshot(
     } else {
         "stage-view view-terminal"
     };
+    let has_status_notices = bridge_status
+        .as_ref()
+        .is_some_and(BridgeStatusUpdate::is_degraded)
+        || daemon_snapshot_stale
+        || daemon_publish_degraded
+        || daemon_scope_mismatch;
 
     rsx! {
         link {
@@ -2675,6 +3184,7 @@ pub fn DesktopShellWithSnapshot(
         main {
             class: "impulse-shell",
             "data-daemon-freshness": if daemon_snapshot_stale { "stale" } else { "current" },
+            "data-project-scope-status": if daemon_scope_mismatch { "mismatch" } else { "accepted" },
             header { class: "top-bar",
                 div { class: "brand-lockup",
                     span { class: "brand-mark", "I" }
@@ -2684,40 +3194,55 @@ pub fn DesktopShellWithSnapshot(
                     }
                 }
                 div { class: "top-project", title: "{selected_root}",
-                    span { "Launch target" }
+                    span { "Project" }
                     strong { "{selected_workspace_label}" }
                 }
                 nav { class: "command-surface",
                     span { class: "daemon-state", "data-state": "{daemon_state}", "{daemon_label}" }
                     button {
                         class: "icon-button attention-button",
-                        title: "Open review attention",
+                        title: "{review_action_title}",
                         onclick: move |_| active_view.set(attention_view),
                         "{review_action_label}"
                     }
                 }
             }
-            if let Some(status) = bridge_status.as_ref() {
-                if status.is_degraded() {
-                    BridgeStatusBanner { status: status.clone() }
-                }
-            }
-            if daemon_snapshot_stale {
-                section {
-                    class: "bridge-status-banner",
-                    "data-daemon-status": "stale",
-                    role: "status",
-                    strong { "Daemon disconnected" }
-                    span { "Workbench data is cached and may be stale." }
-                }
-            }
-            if daemon_publish_degraded {
-                section {
-                    class: "bridge-status-banner",
-                    "data-daemon-status": "publish-degraded",
-                    role: "status",
-                    strong { "Lifecycle synchronization degraded" }
-                    span { "{daemon_publish_error}. Daemon snapshot reads remain live; reconcile daemon-owned task state before deciding." }
+            if has_status_notices {
+                div { class: "status-stack", "aria-label": "System notices",
+                    if let Some(status) = bridge_status.as_ref() {
+                        if status.is_degraded() {
+                            BridgeStatusBanner { status: status.clone() }
+                        }
+                    }
+                    if daemon_snapshot_stale {
+                        section {
+                            class: "bridge-status-banner",
+                            "data-daemon-status": "stale",
+                            role: "status",
+                            strong { "Daemon disconnected" }
+                            span { "Workbench data is cached and may be stale." }
+                        }
+                    }
+                    if daemon_scope_mismatch {
+                        section {
+                            class: "bridge-status-banner project-scope-mismatch",
+                            "data-project-scope-status": "mismatch",
+                            role: "alert",
+                            strong { "Project boundary blocked" }
+                            span {
+                                "This window remains bound to {oversight_scope_label}. A different daemon project responded, so its context, evidence, artifacts, audit data, and mutation controls are hidden. Restart Impulse against the intended project."
+                            }
+                        }
+                    }
+                    if daemon_publish_degraded && !daemon_scope_mismatch {
+                        section {
+                            class: "bridge-status-banner",
+                            "data-daemon-status": "publish-degraded",
+                            role: "status",
+                            strong { "Lifecycle synchronization degraded" }
+                            span { "{daemon_publish_error}. Daemon snapshot reads remain live; reconcile daemon-owned task state before deciding." }
+                        }
+                    }
                 }
             }
             div { class: "workspace-grid",
@@ -2733,12 +3258,14 @@ pub fn DesktopShellWithSnapshot(
                     WorkspaceSwitcher {
                         workspaces: workspaces.clone(),
                         selected_root: selected_root.clone(),
+                        bound_root: if project_locked { Some(bound_root.clone()) } else { None },
                         oversight_scope_label: oversight_scope_label.clone(),
                         on_select: move |root: String| focused_workspace_root.set(root),
                     }
                     AgentPool {
-                        agents: runtime_agents.clone(),
-                        focused_agent_id,
+                        agents: scoped_runtime_agents.clone(),
+                        focused_agent_id: focused_agent_id.clone(),
+                        hidden_agent_count,
                         on_focus: move |id: String| {
                             let script = agent_focus_bridge_script(&id);
                             spawn(async move {
@@ -2761,7 +3288,7 @@ pub fn DesktopShellWithSnapshot(
                                 workspace_label: selected_workspace_label.clone(),
                                 daemon_label: daemon_label.to_string(),
                                 daemon_state: daemon_state.to_string(),
-                                worker_count: agents_online,
+                                worker_count: visible_worker_count,
                                 pending_review_count: attention_count,
                             }
                         }
@@ -2772,15 +3299,22 @@ pub fn DesktopShellWithSnapshot(
                             }
                         }
                         if has_runtime_agents {
+                            if let Some(agent) = focused_agent.as_ref() {
+                                FocusedWorkerHeader {
+                                    agent: agent.clone(),
+                                    governed_task: focused_governed_task.clone(),
+                                }
+                            }
                             div {
                                 class: "terminal-tabs",
                                 "data-owner": "dioxus",
                                 role: "tablist",
                                 "aria-label": "Worker terminals",
-                                for agent in runtime_agents.iter() {
+                                for agent in scoped_runtime_agents.iter() {
                                 {
-                                    let tab_group_class = if agent.focused { "terminal-tab-group active" } else { "terminal-tab-group" };
                                     let agent_id = agent.agent_id.clone();
+                                    let is_active = focused_agent_id.as_deref() == Some(agent_id.as_str());
+                                    let tab_group_class = if is_active { "terminal-tab-group active" } else { "terminal-tab-group" };
                                     let agent_id_for_click = agent_id.clone();
                                     let agent_id_for_close = agent_id.clone();
                                     let is_focusing = focusing_agent_id().as_deref() == Some(agent_id.as_str());
@@ -2799,7 +3333,7 @@ pub fn DesktopShellWithSnapshot(
                                                 role: "tab",
                                                 "aria-controls": "{pane_id}",
                                                 disabled: is_focusing || is_closing,
-                                                "aria-selected": if agent.focused { "true" } else { "false" },
+                                                "aria-selected": if is_active { "true" } else { "false" },
                                                 "aria-busy": if is_focusing { "true" } else { "false" },
                                                 onclick: move |_| {
                                                     let agent_id = agent_id_for_click.clone();
@@ -2829,7 +3363,7 @@ pub fn DesktopShellWithSnapshot(
                                                         closing_agent_id.set(None);
                                                     });
                                                 },
-                                                if is_closing { "closing…" } else { "Close" }
+                                                if is_closing { "…" } else { "×" }
                                             }
                                         }
                                     }
@@ -2838,26 +3372,27 @@ pub fn DesktopShellWithSnapshot(
                             }
                         }
                         if has_runtime_agents {
-                            for agent in runtime_agents.iter() {
+                            for agent in scoped_runtime_agents.iter() {
                                 {
+                                    let is_active = focused_agent_id.as_deref() == Some(agent.agent_id.as_str());
                                     let pane_id = format!("terminal-pane-{}", impulse_ops::sanitize_id(&agent.agent_id));
                                     let tab_id = format!("terminal-tab-{}", impulse_ops::sanitize_id(&agent.agent_id));
-                                    let class_name = if agent.focused { "xterm-mount" } else { "xterm-mount pending" };
+                                    let class_name = if is_active { "xterm-mount" } else { "xterm-mount pending" };
                                     rsx! {
                                         div {
                                             id: "{pane_id}",
                                             class: "{class_name}",
                                             "data-xterm-mount": "true",
                                             "data-agent-id": "{agent.agent_id}",
-                                            "data-terminal-active": if agent.focused { "true" } else { "false" },
+                                            "data-terminal-active": if is_active { "true" } else { "false" },
                                             "data-platform": "{agent.platform.as_str()}",
                                             "data-pty-owner": "rust-backend",
                                             "data-xterm-on-data": "agent_write",
                                             "data-xterm-on-resize": "agent_resize",
                                             role: "tabpanel",
                                             "aria-labelledby": "{tab_id}",
-                                            "aria-hidden": if agent.focused { "false" } else { "true" },
-                                            hidden: !agent.focused,
+                                            "aria-hidden": if is_active { "false" } else { "true" },
+                                            hidden: !is_active,
                                         }
                                     }
                                 }
@@ -2892,15 +3427,15 @@ pub fn DesktopShellWithSnapshot(
                         DesktopView::Terminal => rsx! {},
                         DesktopView::Memory => rsx! {
                             MemoryView {
-                                context: snapshot.context.clone(),
-                                memory: snapshot.memory.clone(),
-                                retrieval: snapshot.retrieval.clone(),
-                                memory_candidates: snapshot.memory_candidates.clone(),
+                                context: project_snapshot.context.clone(),
+                                memory: project_snapshot.memory.clone(),
+                                retrieval: project_snapshot.retrieval.clone(),
+                                memory_candidates: project_snapshot.memory_candidates.clone(),
                             }
                         },
                         DesktopView::Review => rsx! {
                             ReviewConsole {
-                                items: review_queue.clone(),
+                                items: scoped_review_queue.clone(),
                                 on_decision: move |request| {
                                     let script = review_decision_bridge_script(&request);
                                     spawn(async move {
@@ -2911,14 +3446,14 @@ pub fn DesktopShellWithSnapshot(
                         },
                         DesktopView::Artifacts => rsx! {
                             ArtifactsView {
-                                artifacts: snapshot.artifacts.clone(),
+                                artifacts: project_snapshot.artifacts.clone(),
                             }
                         },
                         DesktopView::Supervisor => rsx! {
                             OperatorBoard {
-                                runtime_agents: runtime_agents.clone(),
-                                last_invocations: last_invocations.clone(),
-                                governed_tasks: snapshot.governed_tasks.clone(),
+                                runtime_agents: scoped_runtime_agents.clone(),
+                                last_invocations: scoped_last_invocations.clone(),
+                                governed_tasks: scoped_governed_tasks.clone(),
                                 oversight_scope_root: oversight_scope_root.clone(),
                                 oversight_scope_label: oversight_scope_label.clone(),
                                 on_governed_mutation: move |request| {
@@ -2932,29 +3467,75 @@ pub fn DesktopShellWithSnapshot(
                     }
                 }
                 aside { class: "right-inspector control-dock", "data-owner": "dioxus",
-                    WorkspaceLaunchPanel {
-                        workspaces: workspaces.clone(),
-                        platforms: agent_platforms.clone(),
-                        selected_root: selected_root.clone(),
-                        launch_in_flight: launch_in_flight(),
-                        on_select_root: move |root: String| focused_workspace_root.set(root),
-                        on_register: move |request: RegisterWorkspaceRequest| {
-                            let script = workspace_registration_bridge_script(&request);
-                            spawn(async move {
-                                let _ = document::eval(&script).await;
-                            });
-                        },
-                        on_launch: move |request: AgentSpawnRequest| {
-                            let script = agent_launch_bridge_script(&request);
-                            launch_in_flight.set(true);
-                            spawn(async move {
-                                let _ = document::eval(&script).await;
-                                launch_in_flight.set(false);
-                            });
-                        },
+                    if let Some(agent) = focused_agent.as_ref() {
+                        FocusedWorkerPanel {
+                            agent: agent.clone(),
+                            governed_task: focused_governed_task.clone(),
+                            on_open_evidence: move |_| active_view.set(DesktopView::Supervisor),
+                        }
+                    }
+                    if daemon_scope_mismatch {
+                        section {
+                            class: "inspector-section scope-action-blocked",
+                            "data-project-scope-actions": "blocked",
+                            span { class: "section-eyebrow", "Project boundary" }
+                            h2 { "Worker launch paused" }
+                            p { "Restart Impulse against the intended project before launching workers or invoking project tools." }
+                        }
+                    } else if has_runtime_agents {
+                        details { class: "add-worker-disclosure inspector-disclosure",
+                            summary { "Add another worker" }
+                            div { class: "add-worker-disclosure-body",
+                                WorkspaceLaunchPanel {
+                                    workspaces: workspaces.clone(),
+                                    platforms: agent_platforms.clone(),
+                                    selected_root: selected_root.clone(),
+                                    project_locked,
+                                    launch_in_flight: launch_in_flight(),
+                                    on_select_root: move |root: String| focused_workspace_root.set(root),
+                                    on_register: move |request: RegisterWorkspaceRequest| {
+                                        let script = workspace_registration_bridge_script(&request);
+                                        spawn(async move {
+                                            let _ = document::eval(&script).await;
+                                        });
+                                    },
+                                    on_launch: move |request: AgentSpawnRequest| {
+                                        let script = agent_launch_bridge_script(&request);
+                                        launch_in_flight.set(true);
+                                        spawn(async move {
+                                            let _ = document::eval(&script).await;
+                                            launch_in_flight.set(false);
+                                        });
+                                    },
+                                }
+                            }
+                        }
+                    } else {
+                        WorkspaceLaunchPanel {
+                            workspaces: workspaces.clone(),
+                            platforms: agent_platforms.clone(),
+                            selected_root: selected_root.clone(),
+                            project_locked,
+                            launch_in_flight: launch_in_flight(),
+                            on_select_root: move |root: String| focused_workspace_root.set(root),
+                            on_register: move |request: RegisterWorkspaceRequest| {
+                                let script = workspace_registration_bridge_script(&request);
+                                spawn(async move {
+                                    let _ = document::eval(&script).await;
+                                });
+                            },
+                            on_launch: move |request: AgentSpawnRequest| {
+                                let script = agent_launch_bridge_script(&request);
+                                launch_in_flight.set(true);
+                                spawn(async move {
+                                    let _ = document::eval(&script).await;
+                                    launch_in_flight.set(false);
+                                });
+                            },
+                        }
                     }
                     section { class: "inspector-section attention-summary", "aria-label": "Review attention",
-                        span { class: "section-eyebrow", "Oversight attention" }
+                        span { class: "section-eyebrow", "Attention" }
                         h2 {
                             if attention_count > 0 {
                                 "{attention_count} item(s) need review"
@@ -2966,44 +3547,65 @@ pub fn DesktopShellWithSnapshot(
                         p { class: "attention-scope", "Evidence scope · {oversight_scope_label}" }
                         p { "aria-live": "polite", "Completion remains evidence-gated; worker exit never implies acceptance." }
                     }
-                    section { class: "inspector-section context-summary",
-                        span { class: "section-eyebrow", "Context budget" }
-                        h2 { "{tokens} / {window} · {tier}" }
-                        p { "{context.injection_count} injections · {context.compaction_count} compactions" }
+                    details { class: "inspector-disclosure context-disclosure",
+                        summary { "Context & memory" }
+                        section { class: "inspector-section context-summary",
+                            span { class: "section-eyebrow", "Context budget" }
+                            h2 { "{tokens} / {window} · {tier}" }
+                            p { "{context.injection_count} injections · {context.compaction_count} compactions" }
+                        }
                     }
-                    details { class: "inspector-disclosure",
-                        summary { "Platform tools and audit" }
-                        div { class: "inspector-disclosure-body",
-                            McpToolPalette {
-                                tools: mcp_tools.clone(),
-                                last_invocations: last_invocations.clone(),
-                                on_invoke: move |request: McpInvokeRequest| {
-                                    let script = mcp_invoke_bridge_script(&request);
-                                    spawn(async move {
-                                        let _ = document::eval(&script).await;
-                                    });
-                                },
+                    if daemon_scope_mismatch {
+                        details { class: "inspector-disclosure scope-tools-blocked",
+                            summary { "Platform tools and audit · blocked" }
+                            div { class: "inspector-disclosure-body",
+                                p {
+                                    class: "section-empty",
+                                    "No project tools, workspace details, or audit rows are exposed while the daemon project does not match this window."
+                                }
                             }
-                            WorkspaceList {
-                                workspaces: workspaces.clone(),
-                                selected_root: if selected_root.is_empty() { None } else { Some(selected_root.clone()) },
-                            }
-                            AuditTrail {
-                                invocations: last_invocations,
-                                agent_filter: None,
+                        }
+                    } else {
+                        details { class: "inspector-disclosure",
+                            summary { "Platform tools and audit" }
+                            div { class: "inspector-disclosure-body",
+                                McpToolPalette {
+                                    tools: mcp_tools.clone(),
+                                    last_invocations: scoped_last_invocations.clone(),
+                                    on_invoke: move |request: McpInvokeRequest| {
+                                        let script = mcp_invoke_bridge_script(&request);
+                                        spawn(async move {
+                                            let _ = document::eval(&script).await;
+                                        });
+                                    },
+                                }
+                                WorkspaceList {
+                                    workspaces: scoped_workspace_details.clone(),
+                                    selected_root: if selected_root.is_empty() { None } else { Some(selected_root.clone()) },
+                                }
+                                AuditTrail {
+                                    invocations: scoped_last_invocations,
+                                    agent_filter: None,
+                                }
                             }
                         }
                     }
                 }
             }
             footer { class: "event-strip", "data-owner": "dioxus",
-                span { "data-stream": "ops_update", title: "Last snapshot {generated_at}", "Control plane · {ops_stream}" }
-                span { "{agents_online} workers" }
-                span { "{artifact_summary}" }
-                span { "{intervention_summary}" }
+                span { "data-stream": "ops_update", title: "Last snapshot {generated_at}", "System · {ops_stream}" }
+                span { "{visible_worker_count} workers" }
+                span { "Attention · {attention_count}" }
                 span { "data-stream": "terminal_output", "Terminal · {terminal_stream}" }
-                span { "data-stream": "agent_runtime_update", "Workers · {runtime_stream}" }
-                span { "data-stream": "supervisor_local_action", "Oversight · {supervisor_stream}" }
+                details { class: "footer-diagnostics",
+                    summary { "Diagnostics" }
+                    div { class: "footer-diagnostics-panel",
+                        span { "data-stream": "agent_runtime_update", "Workers · {runtime_stream}" }
+                        span { "data-stream": "supervisor_local_action", "Review service · {supervisor_stream}" }
+                        span { "{artifact_summary}" }
+                        span { title: "{intervention_summary}", "{intervention_summary}" }
+                    }
+                }
             }
         }
     }

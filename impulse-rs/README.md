@@ -16,7 +16,9 @@ contract.
 
 - **Dioxus cockpit:** `impulse-desktop` is the live, feature-gated desktop path. Dioxus and
   xterm.js render the system; typed Rust contracts, daemon snapshots, runtime state, and scoped
-  persistence remain authoritative. The macOS package assembles this cockpit with the
+  persistence remain authoritative. The visible workflow is project setup → governed worker
+  assignment → focused terminal → evidence review; one window stays bound to one project until
+  multi-project daemon routing exists. The macOS package assembles this cockpit with the
   `impulse-rs` daemon companion; its verifier requires a fresh real host/PTY/shutdown lifecycle
   receipt before a package can be treated as release-ready.
 - **ratatui workbench:** the root crate provides the terminal-native TUI.

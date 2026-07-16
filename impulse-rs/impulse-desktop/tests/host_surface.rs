@@ -423,6 +423,108 @@ async fn test_host_review_queue_apply_writes_only_after_review_decision_and_audi
 }
 
 #[tokio::test]
+async fn test_review_injection_and_decision_reject_targets_outside_connected_project() {
+    let root = tempfile::tempdir().expect("project tempdir");
+    let project_a = root.path().join("project-a");
+    let project_b = root.path().join("project-b");
+    let memory_root = project_a.join(".impulse");
+    std::fs::create_dir_all(&memory_root).expect("project A memory root");
+    std::fs::create_dir_all(&project_b).expect("project B root");
+
+    let sink = Arc::new(RecordingSink::default());
+    let runtime = Arc::new(
+        DesktopRuntime::builder()
+            .with_event_sink(sink.clone())
+            .build(),
+    );
+    let state = host_commands::DesktopShellState::new(
+        Arc::clone(&runtime),
+        Arc::new(WorkspaceRegistry::empty()),
+        Arc::new(McpToolRegistry::with_builtins()),
+        memory_root,
+    );
+
+    host_commands::terminal_open(
+        runtime.as_ref(),
+        TerminalOpenRequest {
+            session_id: Some("project-b-agent".to_string()),
+            command: "cat".to_string(),
+            args: Vec::new(),
+            cwd: Some(project_b.display().to_string()),
+            env: HashMap::new(),
+            workspace: Some(impulse_desktop::WorkspaceTarget::from_root(
+                project_b.display().to_string(),
+            )),
+            mcp_tools: Vec::new(),
+            rows: 24,
+            cols: 80,
+        },
+    )
+    .await
+    .expect("open project B terminal");
+
+    let stage_error = host_commands::mcp_invoke(
+        &state,
+        host_commands::McpInvokeRequest {
+            tool: "impulse.review_injection".to_string(),
+            arguments: json!({
+                "content": "foreign context\n",
+                "target_agent_id": "project-b-agent"
+            }),
+            confirmed: true,
+            caller_agent_id: Some("supervisor".to_string()),
+        },
+    )
+    .await
+    .expect_err("staging must reject an out-of-project target");
+    assert!(stage_error.contains("outside the connected project boundary"));
+
+    let staged = host_commands::mcp_invoke(
+        &state,
+        host_commands::McpInvokeRequest {
+            tool: "impulse.review_injection".to_string(),
+            arguments: json!({ "content": "unassigned context\n" }),
+            confirmed: true,
+            caller_agent_id: Some("supervisor".to_string()),
+        },
+    )
+    .await
+    .expect("stage unassigned review payload");
+    let id = staged.result["id"].as_str().expect("review id").to_string();
+
+    let decision_error = host_commands::review_decision(
+        &state,
+        ReviewDecisionRequest {
+            id,
+            decision: ReviewDecision::Apply,
+            target_agent_id: Some("project-b-agent".to_string()),
+            confirmed: true,
+        },
+    )
+    .await
+    .expect_err("apply must reject an out-of-project target");
+    assert!(decision_error.contains("outside the connected project boundary"));
+    assert!(!sink
+        .output_for("project-b-agent")
+        .contains("unassigned context"));
+
+    let queued = host_commands::review_queue(&state)
+        .await
+        .expect("review queue remains readable");
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].status, ReviewQueueStatus::Pending);
+
+    host_commands::terminal_close(
+        runtime.as_ref(),
+        TerminalCloseRequest {
+            session_id: "project-b-agent".to_string(),
+        },
+    )
+    .await
+    .ok();
+}
+
+#[tokio::test]
 async fn test_host_review_queue_skip_updates_queue_without_terminal_write_and_audits() {
     let memory_root = tempfile::tempdir().expect("memory tempdir");
     let sink = Arc::new(RecordingSink::default());

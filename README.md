@@ -103,12 +103,16 @@ In the Dioxus cockpit, use the governed Builder launch path:
    attests the initial commit OID.
 
 The current cockpit is organized around the product hierarchy rather than memory statistics:
-a selected launch target, a persistent project-scoped oversight lane, desktop-wide worker
-terminals, the focused terminal, and a launch/review dock. Launch-target selection has one shared
-authority across the rail and launcher. The oversight lane exposes only the connected daemon
-project's review service and evidence queue; it does **not** pretend that a selectable Supervisor
-runtime has been launched. Runtime-powered Supervisor launch remains part of the next complete
-vertical slice. A normal packaged launch no longer promotes the home-level `~/.impulse` memory
+a project boundary, project-scoped workers, the focused assignment and terminal, and
+evidence-before-acceptance review. Project setup and worker assignment are progressive rather than
+one permanent launch form. Once the daemon or first governed runtime establishes the project, the
+window keeps that binding; other project labels remain visible but locked while their workers,
+notes, tasks, evidence, and audit rows stay excluded. A mismatched daemon response blocks
+project-scoped data and mutations until restart. The review surface exposes only that project's
+task evidence and explicitly says
+when no model-backed Supervisor runtime has been launched. Runtime-powered Supervisor launch remains
+part of the next complete vertical slice. A normal packaged launch no longer promotes the
+home-level `~/.impulse` memory
 fallback into a daemon/project boundary. Without an explicit standard project socket, oversight
 starts disconnected; the first governed launch
 atomically attaches or starts the daemon for its selected project before task
@@ -177,10 +181,12 @@ dismissal come later. Session, memory, hook, and verification commands remain av
 
 The current desktop daemon attachment is single-project: a governed launch must target the project
 root bound to the running daemon. Registering additional cockpit workspace entries does not yet
-provide cross-project daemon routing, and selecting a launch target does not yet attach a new
-daemon by itself. The first governed launch establishes the process-lifetime boundary; selecting a
-different project afterward fails closed and requires a desktop restart until multi-project daemon
-routing lands.
+provide cross-project daemon routing. The first governed launch establishes the process-lifetime
+boundary. Other registered project labels remain visible but locked; their workers, tasks,
+evidence, notes, and audit rows are excluded from the bound cockpit. If a different daemon project
+responds, Impulse hides daemon-owned data and mutation controls until the desktop restarts against
+the intended project. Switching the boundary requires a restart until multi-project daemon routing
+lands.
 
 ## Architecture
 

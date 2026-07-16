@@ -12,7 +12,7 @@
 //!   the Review "apply" affordance and critical interventions earn warm accent.
 //! - Bloom is reserved for the brand lockup, never data screens (P05).
 //!
-//! Invariant: the non-Terminal views (Memory/Review/Artifacts/Oversight) are
+//! Invariant: the non-Terminal views (Memory/Context review/Artifacts/Evidence) are
 //! mounted only while selected (see the `match active` in `ui.rs`), so each
 //! hardcodes the `active` CSS class — correct as long as that mount-when-active
 //! contract holds. Only the Terminal view is kept alive across switches.
@@ -53,9 +53,9 @@ impl DesktopView {
         match self {
             DesktopView::Terminal => "Terminal",
             DesktopView::Memory => "Memory",
-            DesktopView::Review => "Review",
+            DesktopView::Review => "Context review",
             DesktopView::Artifacts => "Artifacts",
-            DesktopView::Supervisor => "Oversight",
+            DesktopView::Supervisor => "Evidence",
         }
     }
 
@@ -427,7 +427,8 @@ mod tests {
         assert_eq!(DesktopView::Terminal.slug(), "terminal");
         assert_eq!(DesktopView::Memory.label(), "Memory");
         assert_eq!(DesktopView::Artifacts.slug(), "artifacts");
-        assert_eq!(DesktopView::Supervisor.label(), "Oversight");
+        assert_eq!(DesktopView::Review.label(), "Context review");
+        assert_eq!(DesktopView::Supervisor.label(), "Evidence");
     }
 
     #[test]
