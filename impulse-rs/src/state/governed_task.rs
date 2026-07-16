@@ -380,6 +380,8 @@ impl State {
                 .cloned()
                 .ok_or(GovernedTaskStateError::NotFound(request.task_id))?;
             require_receipt_revision(receipt, &task)?;
+            drop(ledger);
+            self.ensure_accepted_run_memory_candidate(&task)?;
             return Ok(task);
         }
 
@@ -424,6 +426,8 @@ impl State {
             .write_private_json(GOVERNED_TASKS_FILE, &candidate)
             .context("Failed to persist governed task mutation")?;
         *ledger = candidate;
+        drop(ledger);
+        self.ensure_accepted_run_memory_candidate(&updated)?;
         Ok(updated)
     }
 
@@ -473,6 +477,14 @@ impl State {
         let mut tasks = ledger.tasks.values().cloned().collect::<Vec<_>>();
         tasks.sort_by(|left, right| right.created_at.cmp(&left.created_at));
         Ok(tasks)
+    }
+
+    pub(super) fn all_governed_tasks(&self) -> Result<Vec<GovernedTaskRun>> {
+        let ledger = self
+            .governed_tasks
+            .lock()
+            .map_err(|error| anyhow::anyhow!("governed task ledger lock poisoned: {error}"))?;
+        Ok(ledger.tasks.values().cloned().collect())
     }
 
     fn governed_project_id(&self) -> String {
@@ -1526,6 +1538,19 @@ mod tests {
         std::fs::write(path, serde_json::to_vec_pretty(&ledger).unwrap()).unwrap();
     }
 
+    fn rewrite_persisted_candidate_ledger(
+        state: &State,
+        mutate: impl FnOnce(&mut serde_json::Value),
+    ) {
+        let path = state
+            .storage()
+            .path(crate::state::memory_candidate::memory_candidates_file());
+        let mut ledger: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        mutate(&mut ledger);
+        std::fs::write(path, serde_json::to_vec_pretty(&ledger).unwrap()).unwrap();
+    }
+
     fn reload_error(base: std::path::PathBuf, expectation: &str) -> anyhow::Error {
         match State::new(base) {
             Ok(_) => panic!("{expectation}"),
@@ -1607,6 +1632,57 @@ mod tests {
                 },
             ))
             .unwrap()
+    }
+
+    fn operator_decide(
+        state: &State,
+        task: &GovernedTaskRun,
+        request_id: &str,
+        decision: OperatorDecisionKind,
+    ) -> GovernedTaskRun {
+        state
+            .mutate_governed_task(mutation(
+                task,
+                request_id,
+                GovernedTaskMutation::RecordOperatorDecision {
+                    decision: OperatorDecisionInput {
+                        actor: actor(GovernedActorKind::Operator, "james"),
+                        supervisor_verdict_id: task.latest_supervisor_verdict().unwrap().id.clone(),
+                        decision,
+                        rationale: "decided from operator surface".into(),
+                    },
+                },
+            ))
+            .unwrap()
+    }
+
+    fn accept_run(state: &State, suffix: &str) -> GovernedTaskRun {
+        let registered = state
+            .register_governed_task(registration(state, &format!("register-{suffix}")))
+            .unwrap();
+        let running = state
+            .mutate_governed_task(mutation(
+                &registered,
+                &format!("running-{suffix}"),
+                GovernedTaskMutation::MarkRunning {
+                    actor: actor(GovernedActorKind::System, "desktop"),
+                },
+            ))
+            .unwrap();
+        let claimed = claim(state, &running, &format!("claim-{suffix}"));
+        let verified = verify(
+            state,
+            &claimed,
+            &format!("verify-{suffix}"),
+            GovernedVerificationOutcome::Passed,
+        );
+        let judged = recommend_accept(state, &verified, &format!("review-{suffix}"));
+        operator_decide(
+            state,
+            &judged,
+            &format!("approve-{suffix}"),
+            OperatorDecisionKind::Approve,
+        )
     }
 
     #[test]
@@ -1694,6 +1770,236 @@ mod tests {
         assert!(accepted.is_accepted());
         assert_eq!(accepted.revision, 5);
         assert_eq!(accepted.events.len(), 6);
+        let candidates = state
+            .list_accepted_run_memory_candidates("impulse-test")
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.governed_task_id, accepted.id);
+        assert_eq!(candidate.accepted_task_revision, accepted.revision);
+        assert_eq!(
+            candidate.operator_decision_id,
+            accepted.operator_decisions.last().unwrap().id
+        );
+        assert!(!candidate
+            .proposed_summary
+            .contains("implementation complete"));
+        assert!(!candidate
+            .proposed_summary
+            .contains("evidence satisfies acceptance criteria"));
+    }
+
+    #[test]
+    fn accepted_candidate_is_replay_safe_restart_repaired_and_never_mutates_memory() {
+        let (_root, state) = state();
+        let genome_path = state.storage().path("GENOME.md");
+        let history_path = state.storage().path("HISTORY.jsonl");
+        let genome_before = b"# Genome\n\nOperator curated only.\n";
+        let history_before = b"{\"session_id\":\"existing\"}\n";
+        std::fs::write(&genome_path, genome_before).unwrap();
+        std::fs::write(&history_path, history_before).unwrap();
+
+        let registered = state
+            .register_governed_task(registration(&state, "register-candidate-replay"))
+            .unwrap();
+        let running = state
+            .mutate_governed_task(mutation(
+                &registered,
+                "running-candidate-replay",
+                GovernedTaskMutation::MarkRunning {
+                    actor: actor(GovernedActorKind::System, "desktop"),
+                },
+            ))
+            .unwrap();
+        let claimed = claim(&state, &running, "claim-candidate-replay");
+        let verified = verify(
+            &state,
+            &claimed,
+            "verify-candidate-replay",
+            GovernedVerificationOutcome::Passed,
+        );
+        let judged = recommend_accept(&state, &verified, "review-candidate-replay");
+        let approval = mutation(
+            &judged,
+            "approve-candidate-replay",
+            GovernedTaskMutation::RecordOperatorDecision {
+                decision: OperatorDecisionInput {
+                    actor: actor(GovernedActorKind::Operator, "james"),
+                    supervisor_verdict_id: judged.latest_supervisor_verdict().unwrap().id.clone(),
+                    decision: OperatorDecisionKind::Approve,
+                    rationale: "candidate may be reviewed, not promoted".into(),
+                },
+            },
+        );
+        let accepted = state.mutate_governed_task(approval.clone()).unwrap();
+        let first = state
+            .list_accepted_run_memory_candidates("impulse-test")
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = std::fs::metadata(
+                state
+                    .storage()
+                    .path(crate::state::memory_candidate::memory_candidates_file()),
+            )
+            .unwrap()
+            .permissions()
+            .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "candidate ledger must remain owner-only");
+        }
+
+        let replay = state.mutate_governed_task(approval).unwrap();
+        assert_eq!(replay, accepted);
+        let after_replay = state
+            .list_accepted_run_memory_candidates("impulse-test")
+            .unwrap();
+        assert_eq!(after_replay, first);
+        assert_eq!(std::fs::read(&genome_path).unwrap(), genome_before);
+        assert_eq!(std::fs::read(&history_path).unwrap(), history_before);
+
+        let base = state.storage().base_path().to_path_buf();
+        state
+            .storage()
+            .write_private_json(
+                crate::state::memory_candidate::memory_candidates_file(),
+                &serde_json::json!({"schema_version": 1, "candidates": {}}),
+            )
+            .unwrap();
+        drop(state);
+
+        let reloaded = State::new(base).unwrap();
+        let repaired = reloaded
+            .list_accepted_run_memory_candidates("impulse-test")
+            .unwrap();
+        assert_eq!(repaired, first);
+        assert_eq!(std::fs::read(genome_path).unwrap(), genome_before);
+        assert_eq!(std::fs::read(history_path).unwrap(), history_before);
+    }
+
+    #[test]
+    fn operator_rejection_never_creates_a_memory_candidate() {
+        let (_root, state) = state();
+        let registered = state
+            .register_governed_task(registration(&state, "register-candidate-reject"))
+            .unwrap();
+        let running = state
+            .mutate_governed_task(mutation(
+                &registered,
+                "running-candidate-reject",
+                GovernedTaskMutation::MarkRunning {
+                    actor: actor(GovernedActorKind::System, "desktop"),
+                },
+            ))
+            .unwrap();
+        let claimed = claim(&state, &running, "claim-candidate-reject");
+        let verified = verify(
+            &state,
+            &claimed,
+            "verify-candidate-reject",
+            GovernedVerificationOutcome::Passed,
+        );
+        let judged = recommend_accept(&state, &verified, "review-candidate-reject");
+        let rejected = operator_decide(
+            &state,
+            &judged,
+            "reject-candidate",
+            OperatorDecisionKind::Reject,
+        );
+
+        assert_eq!(rejected.review_state, GovernedReviewState::Rejected);
+        assert!(state
+            .list_accepted_run_memory_candidates("impulse-test")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn memory_candidate_reload_rejects_tampered_projection() {
+        let (_root, state) = state();
+        let accepted = accept_run(&state, "candidate-tamper");
+        let candidate = state
+            .list_accepted_run_memory_candidates("impulse-test")
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(candidate.governed_task_id, accepted.id);
+        let candidate_id = candidate.id.to_string();
+        rewrite_persisted_candidate_ledger(&state, |ledger| {
+            ledger["candidates"][candidate_id.as_str()]["proposed_summary"] =
+                serde_json::Value::String("tampered but structurally valid summary".to_string());
+        });
+
+        let error = reload_error(
+            state.storage().base_path().to_path_buf(),
+            "tampered candidate projection must fail closed",
+        );
+        assert!(format!("{error:#}").contains("does not match its accepted governed-task source"));
+    }
+
+    #[test]
+    fn memory_candidate_reload_rejects_orphan_projection() {
+        let (_root, state) = state();
+        accept_run(&state, "candidate-orphan");
+        rewrite_persisted_ledger(&state, |ledger| {
+            ledger["tasks"] = serde_json::json!({});
+            ledger["processed_requests"] = serde_json::json!({});
+        });
+
+        let error = reload_error(
+            state.storage().base_path().to_path_buf(),
+            "orphan candidate projection must fail closed",
+        );
+        assert!(format!("{error:#}").contains("is orphaned from accepted governed-task truth"));
+    }
+
+    #[test]
+    fn accepted_task_is_terminal_and_cannot_orphan_its_candidate_by_later_rejection() {
+        let (_root, state) = state();
+        let accepted = accept_run(&state, "candidate-terminal");
+        let before = state
+            .list_accepted_run_memory_candidates("impulse-test")
+            .unwrap();
+        assert_eq!(before.len(), 1);
+
+        let error = state
+            .mutate_governed_task(mutation(
+                &accepted,
+                "reject-after-accept",
+                GovernedTaskMutation::RecordOperatorDecision {
+                    decision: OperatorDecisionInput {
+                        actor: actor(GovernedActorKind::Operator, "james"),
+                        supervisor_verdict_id: accepted
+                            .latest_supervisor_verdict()
+                            .unwrap()
+                            .id
+                            .clone(),
+                        decision: OperatorDecisionKind::Reject,
+                        rationale: "attempt to reverse terminal acceptance".into(),
+                    },
+                },
+            ))
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("operator decision requires awaiting-operator state"));
+        assert_eq!(
+            state
+                .list_accepted_run_memory_candidates("impulse-test")
+                .unwrap(),
+            before
+        );
+
+        let reloaded = State::new(state.storage().base_path().to_path_buf()).unwrap();
+        assert_eq!(
+            reloaded
+                .list_accepted_run_memory_candidates("impulse-test")
+                .unwrap(),
+            before
+        );
     }
 
     #[test]
@@ -2269,6 +2575,13 @@ mod tests {
         ));
         assert_eq!(final_task.revision, judged.revision + 1);
         assert_eq!(final_task.events.len(), judged.events.len() + 1);
+        let candidates = state
+            .list_accepted_run_memory_candidates("impulse-test")
+            .unwrap();
+        assert_eq!(candidates.len(), usize::from(final_task.is_accepted()));
+        if final_task.is_accepted() {
+            assert_eq!(candidates[0].governed_task_id, final_task.id);
+        }
 
         let reloaded = State::new(state.storage().base_path().to_path_buf()).unwrap();
         assert_eq!(
@@ -2277,6 +2590,12 @@ mod tests {
                 .unwrap()
                 .unwrap(),
             final_task
+        );
+        assert_eq!(
+            reloaded
+                .list_accepted_run_memory_candidates("impulse-test")
+                .unwrap(),
+            candidates
         );
     }
 }

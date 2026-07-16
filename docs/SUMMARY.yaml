@@ -1,8 +1,8 @@
 ---
 title: Documentation Summary
 description: Unified navigation structure for Impulse documentation
-version: '2.7'
-updated: '2026-07-13'
+version: '2.8'
+updated: '2026-07-15'
 schema_version: '1.0'
 type: navigation
 category: docs
@@ -10,7 +10,7 @@ category: docs
 # Navigation Tree
 
 roadmap_contract: >-
-  Now=control-plane foundations + daemon-owned governed runtime producers; Next=accepted-run memory promotion + stronger same-user actor authorization + full launched-runtime proof; Later=general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only
+  Now=control-plane foundations + governed runtime producers + accepted-run review candidates; Next=stronger same-user actor authorization + full launched Builder/Supervisor proof; Later=explicit memory promotion/dismissal + general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only
 
 quick_reference:
   - name: VISION.md
@@ -161,6 +161,7 @@ categories:
     - decisions/0010-product-role-launch-contract.md
     - decisions/0011-governed-task-run-lifecycle.md
     - decisions/0012-daemon-owned-governed-runtime-producers.md
+    - decisions/0013-deterministic-accepted-run-memory-candidates.md
 
   session_logs:
     - session-logs/DEVELOPMENT-HISTORY.md

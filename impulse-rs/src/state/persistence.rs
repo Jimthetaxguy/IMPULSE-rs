@@ -42,6 +42,7 @@ pub struct HistoryEntry {
 pub struct State {
     storage: Storage,
     pub(super) governed_tasks: std::sync::Mutex<super::governed_task::GovernedTaskLedger>,
+    pub(super) memory_candidates: std::sync::Mutex<super::memory_candidate::MemoryCandidateLedger>,
     governed_producer_locks: tokio::sync::Mutex<
         HashMap<impulse_ops::governed_task::GovernedTaskId, Arc<tokio::sync::Mutex<()>>>,
     >,
@@ -89,15 +90,19 @@ impl State {
             .read_json::<Config>(CONFIG_FILE)
             .context("Failed to read config from disk")?;
         let governed_tasks = Self::load_governed_task_ledger(&storage)?;
+        let memory_candidates = Self::load_memory_candidate_ledger(&storage)?;
 
-        Ok(Self {
+        let state = Self {
             storage,
             governed_tasks,
+            memory_candidates,
             governed_producer_locks: tokio::sync::Mutex::new(HashMap::new()),
             live_state: RwLock::new(live_state),
             dirty: AtomicBool::new(false),
             config: RwLock::new(config),
-        })
+        };
+        state.reconcile_accepted_run_memory_candidates()?;
+        Ok(state)
     }
 
     pub fn storage(&self) -> &Storage {

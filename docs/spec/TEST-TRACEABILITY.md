@@ -1,8 +1,8 @@
 ---
 title: Test Traceability Matrix
 description: Story-to-test coverage map for the current Rust Impulse workspace and open validation gaps
-version: '1.2'
-updated: 2026-07-13
+version: '1.3'
+updated: 2026-07-15
 type: specification
 category: testing
 phase: all
@@ -44,7 +44,7 @@ authors:
 | ST-10 Review risky context and stewardship actions explicitly | stewardship modules, guardrail and approval surfaces, integration enhancement coverage | Thin | stewardship command dispatch and operator decision paths need clearer regression tests |
 | ST-11 Enforce verification-before-completion | `impulse-rs/src/validate.rs`, recent invalid-direct-request fixes, session-end verify flows | Strong | manual operator acceptance still matters for claim wording, but automated coverage is present |
 | ST-12 Prove the real hook memory loop before expanding claims | `impulse-rs/tests/hook_validation_session_start.rs`, `hook_validation_precompact.rs`, `hook_validation_extraction_benchmark.rs`, `docs/guides/HOOK-VALIDATION-GUIDE.md` | Manual | the code can generate evidence, but product truth still depends on real external hook runs |
-| ST-13 Complete one governed supervisor-and-builder vertical slice | `impulse-rs/impulse-ops/tests/{governed_task_contract,governed_producer_contract}.rs`; `impulse-rs/src/{governed_producers.rs,state/governed_task.rs,agent/mod.rs}` plus daemon protocol/handler tests; `impulse-rs/tests/governed_process_flow.rs`; desktop runtime/contract tests and `impulse-term` process tests | Moderate | the real daemon/CLI/child-process test proves claim, detached verification, persistence, and restart only through `awaiting_supervisor`; in-process handler tests separately prove strict API review, harness fail-closed behavior, and operator-only acceptance. One full launched-runtime process and accepted-run memory promotion remain open |
+| ST-13 Complete one governed supervisor-and-builder vertical slice | `impulse-rs/impulse-ops/src/memory_candidate.rs` plus governed contract tests; `impulse-rs/src/{governed_producers.rs,state/{governed_task,memory_candidate}.rs,agent/mod.rs}` plus daemon protocol/handler tests; `impulse-rs/tests/governed_process_flow.rs`; desktop runtime/contract/SSR tests and `impulse-term` process tests | Moderate | state/contract/UI tests prove deterministic pending-candidate staging, replay/startup repair, provenance shape, and no `GENOME`/`HISTORY` mutation; the real daemon/CLI/child-process test still stops at `awaiting_supervisor`. One process must compose launched Builder and Supervisor runtimes through acceptance and candidate observation; semantic promotion/dismissal remains later |
 
 ## High-Signal Existing Test Surfaces
 
@@ -84,7 +84,12 @@ authors:
 - `impulse-rs/src/daemon/tests.rs`
   - daemon state and protocol behavior, including the real governed-task register/mutate/get/list handler route
 - `impulse-rs/src/state/governed_task.rs`
-  - durable governed-task transition, evidence-boundary, project-scope, replay, restart, and concurrent-decision coverage
+  - durable governed-task transition, evidence-boundary, project-scope, replay, restart,
+    concurrent-decision, accepted-candidate creation, rejection, repair, and curated-memory
+    non-mutation coverage
+- `impulse-rs/impulse-ops/src/memory_candidate.rs` and `impulse-rs/src/state/memory_candidate.rs`
+  - typed candidate shape/version/source-assurance validation plus deterministic materialization,
+    project scoping, owner-only file replacement, and fail-closed reconciliation
 - `impulse-rs/impulse-ops/tests/governed_task_contract.rs`
   - wire/serde compatibility and identity/role-compatibility invariants for governed tasks
 - `impulse-rs/impulse-ops/tests/governed_producer_contract.rs`
@@ -111,6 +116,8 @@ authors:
   - terminal backend behavior
 - `impulse-rs/impulse-desktop/src/bridge.rs`
   - daemon-backed GUI state and snapshot logic
+- `impulse-rs/impulse-desktop/tests/views_ssr.rs`
+  - read-only candidate rendering with pending/not-in-GENOME status and no promotion control
 
 ## Known Coverage Gaps To Prioritize
 
@@ -120,7 +127,7 @@ These gaps matter because they sit on stable or nearly stable public interfaces:
    Reason: the daemon-owned claim/verification/review chain is proven compositionally, and the
    claim/verification/restart path is proven with real processes. One proof must still launch the
    Builder through DesktopRuntime, run the configured API Supervisor path in the same workflow,
-   carry evidence into operator acceptance, and create only a review-only memory candidate.
+   carry evidence into operator acceptance, and observe exactly one deterministic pending candidate.
 2. Add a packaged desktop-to-real-daemon E2E
    Reason: Unix client framing, real handler reconciliation, reducer behavior, and browser-host readiness are proven separately; one process-level test must connect those boundaries before calling the full desktop path closed.
 3. Add multi-workspace daemon-routing tests
@@ -150,18 +157,22 @@ These gaps matter because they sit on stable or nearly stable public interfaces:
 - single-project daemon-truth GUI behavior has direct automated evidence; multi-workspace routing remains an active delivery lane
 - daemon-owned profiled claims, detached Rust verification, and strict API Supervisor review are live
   and directly tested; the broader supervisor/builder claim remains incomplete until one process
-  composes launched runtimes and promotes only an accepted result to a review-only memory candidate
+  composes launched runtimes through acceptance and observes exactly one staged candidate
+- accepted-run candidate staging is live and directly tested as a review-only materialized view;
+  explicit promotion/dismissal and curated-memory mutation remain later contracts
 - narrow static product-role launch preflight is live; generalized role composition and dynamic runtime capability negotiation remain target-only and must not be inferred from it
 - validation evidence should continue to gate stronger marketing or architectural claims
 
 ## Recommended Test Expansion Order
 
 1. Add the complete launched-runtime governed supervisor/builder E2E across DesktopRuntime launch,
-   daemon-derived claim/verification, API Supervisor review, operator approval, and review-only
-   accepted-run memory promotion.
+   daemon-derived claim/verification, API Supervisor review, operator approval, and exact candidate
+   observation.
 2. Add a packaged desktop-to-real-daemon E2E across publish, subscribe, host event, and reducer boundaries.
 3. Add multi-workspace daemon routing and cross-project isolation tests.
 4. Extend daemon client/handler coverage to artifact list/get/action paths.
 5. Add stable CLI mutation tests that assert real `.impulse/*` state transitions.
 6. Add stewardship integration tests with proposal and approval artifact assertions.
 7. Keep hook validation evidence generation automated, but treat real external hook runs as release-gating proof.
+8. After the launched workflow is closed, define and test explicit candidate promotion/dismissal,
+   semantic conflict handling, and the curated-memory audit boundary.

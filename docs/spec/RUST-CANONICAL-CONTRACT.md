@@ -1,8 +1,8 @@
 ---
 title: Rust Canonical Product Contract
 description: Authoritative product contract for Impulse based on impulse-rs
-version: '2.0'
-updated: 2026-07-13
+version: '2.1'
+updated: 2026-07-15
 type: specification
 category: core
 phase: all
@@ -44,6 +44,8 @@ Core outcomes:
 - Capability-checked dynamic tools and a supervisor-specific action/permission policy foundation
 - Daemon-owned governed tasks with profiled pre-PTY registration, exact acceptance criteria,
   daemon-attested clean Git subjects, derived producer records, and operator-required acceptance
+- Deterministic, pending accepted-run memory candidates with provenance-rich read-only review and
+  no automatic `GENOME`/`HISTORY` mutation
 - Operationally safe session lifecycle with recorded endings and optional API-level verification gates
 - Human-visible observability through CLI, ratatui TUI, and the Dioxus Desktop cockpit
 - Desktop workspace registry plus multi-agent launch/observation surfaces; daemon-side
@@ -86,9 +88,9 @@ Historical migration sequence: `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md`
 
 | Stage | Focus | Status |
 | --- | --- | --- |
-| **Now** | Rust control-plane foundation plus daemon-owned governed runtime producers and the cockpit evidence/decision surface | Active |
-| **Next** | Add review-only accepted-run memory promotion, stronger same-user actor authorization, and one full launched-runtime workflow proof | Active |
-| **Later** | General role contracts, runtime capability negotiation, typed agent messaging, and multi-project supervisor attention | Planned |
+| **Now** | Rust control-plane foundation, daemon-owned governed runtime producers, and deterministic accepted-run review candidates | Active |
+| **Next** | Add stronger same-user actor authorization and one full launched Builder/Supervisor workflow proof | Active |
+| **Later** | Add explicit candidate promotion/dismissal, general role contracts, runtime capability negotiation, typed agent messaging, and multi-project supervisor attention | Planned |
 | **Legacy** | egui / `impulse-gui` compile-maintenance only | Frozen |
 
 ### Out of Scope for Current Contract
@@ -110,6 +112,7 @@ Historical migration sequence: `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md`
 | Pane | Cockpit view/input attachment | TUI panes and desktop terminal ids; never an authority boundary |
 | Workspace target | Explicit filesystem execution root | Desktop `WorkspaceTarget`/`WorkspaceRegistry` |
 | Project | Governance scope for memory, artifacts, policy, and verification | Project-scoped `.impulse/` state and `ProjectOpsSnapshot`; often maps 1:1 to a workspace today |
+| Memory candidate | Review proposal derived from accepted episodic evidence | `AcceptedRunMemoryCandidate` is a deterministic pending projection, not curated memory or a `GENOME` write |
 
 ### Platform Service Contract
 
@@ -203,10 +206,28 @@ remains bound to one project, project identity is currently
 directory-name-derived, tasks cannot be reassigned/resumed, review errors are not yet structured CAS
 codes, and global task/receipt collections are not paginated or archived.
 
+[ADR-0013](../decisions/0013-deterministic-accepted-run-memory-candidates.md) makes accepted-run
+eligibility visible without treating it as semantic truth. After an approval is durably committed to
+`GOVERNED_TASKS.json`, the daemon derives one versioned candidate in owner-only
+`MEMORY_CANDIDATES.json`. The candidate deterministically binds the accepted revision, task and
+criteria, subject, evidence/decision/artifact IDs, successful command digests, runtime routing, and
+source assurance. Its proposed text excludes worker claim prose and Supervisor/operator rationales.
+The digest is over exact JSON bytes emitted by a fixed ordered, versioned source struct with no maps
+or floats; it does not semantically normalize Unicode.
+
+The candidate ledger is a materialized view rather than a second acceptance authority. Identical
+request replay and daemon startup repair missing projections; orphaned, duplicate-task, malformed,
+or source-mismatched records fail closed. V1 has only `pending_review`, adds no mutation endpoint,
+and never writes `GENOME.md` or `HISTORY.jsonl`. Accepted/rejected decisions are terminal, so an
+accepted source cannot later be rejected and orphan its candidate. The ledgers use separate
+private-file replacements; they are not a cross-file transaction, and the helper does not fsync the
+parent directory. Explicit promotion/dismissal is a later contract.
+
 A future generalized/dynamic adapter contract must still define runtime discovery, optional and
 emulated operations, attestation freshness, and post-launch re-evaluation. General role
-composition, stronger same-user actor authorization, accepted-run memory promotion, producer
-profiles beyond Rust, and a complete launched Builder/Supervisor proof remain outside this slice.
+composition, stronger same-user actor authorization, producer profiles beyond Rust, and a complete
+launched Builder/Supervisor proof remain outside this slice. Candidate promotion/dismissal and the
+curated semantic-memory write boundary remain later work.
 
 ## 4) Public Interface Contract
 
@@ -248,6 +269,7 @@ The exact direct/daemon support matrix and flags live in [`docs/CLI-COMMANDS.md`
 | `.impulse/GENOME.md` | Durable decisions/preferences | Durable project memory |
 | `.impulse/config.json` | Runtime configuration | Durable config |
 | `.impulse/GOVERNED_TASKS.json` | Daemon-owned governed task records plus idempotency receipts | Durable project control-plane state; atomically replaced at mode `0600` |
+| `.impulse/MEMORY_CANDIDATES.json` | Deterministic accepted-run pending-review projection | Owner-only local control-plane state; atomically replaced at mode `0600`; not curated memory |
 | `.impulse/DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.json` | Bounded write-ahead desktop launch/exit intent awaiting daemon reconciliation | Durable local recovery state; cross-process sibling lock, mode `0600`, removed/emptied after acknowledgment |
 | `.impulse/context/current-task.md` | Shared current context | Generated via `sync-context` |
 | `.impulse/context/handoff-*.md` | Tool handoff artifacts | Generated via `handoff` |
@@ -261,7 +283,7 @@ The exact direct/daemon support matrix and flags live in [`docs/CLI-COMMANDS.md`
 | `.impulse/projects/<project_id>/agents/<agent_id>/artifacts/*` | Project-organized operator artifacts | Durable workbench artifacts |
 
 At a repository-root `.impulse`, `impulse-rs init` idempotently adds only runtime-owned state,
-socket, retrieval-cache, governed-ledger/temp, and Desktop-outbox/temp paths to `.gitignore`. It
+socket, retrieval-cache, governed-task/candidate ledger/temp, and Desktop-outbox/temp paths to `.gitignore`. It
 never adds `.impulse/` as a blanket rule: `GENOME.md`, `HISTORY.jsonl`, `config.json`, and
 `impulse-capabilities.json` remain deliberate durable project artifacts unless an existing
 operator-owned blanket rule already hides them. Init preserves and warns about that broader rule.
@@ -292,7 +314,7 @@ The desktop shell communicates with the Rust backend through a Dioxus host adapt
 | `ops_update` | Daemon ProjectOpsSnapshot update |
 | native island result | Returned through `native_island_request`; native code does not own session, memory, terminal, or artifact state |
 
-### Daemon Workbench IPC Contract (Authoritative — Extended in v5)
+### Daemon Workbench IPC Contract (Authoritative — Extended in v6)
 
 The daemon is the authoritative source for workbench surfaces:
 
@@ -325,6 +347,8 @@ Shared workbench model contract:
   runtime telemetry without making the runtime record authoritative for review state.
 - `ProjectOpsSnapshot.governed_tasks` is the authoritative governed-task collection; old payloads
   deserialize it as empty.
+- `ProjectOpsSnapshot.memory_candidates` is the serde-defaulted read-only accepted-run review
+  collection. It never implies `GENOME` promotion and old payloads deserialize it as empty.
 
 `TerminalOpsReport` fields:
 
@@ -343,7 +367,7 @@ Daemon overlay rules:
 - Stop overlaying stale telemetry after 10 seconds.
 - Purge telemetry-only state after 60 seconds.
 
-### Daemon IPC Contract (PROTOCOL_VERSION = 5)
+### Daemon IPC Contract (PROTOCOL_VERSION = 6)
 
 The daemon exposes a JSON-line Unix socket protocol (`impulse.sock`). Full spec: [`docs/IPC-PROTOCOL.md`](../IPC-PROTOCOL.md).
 
@@ -420,6 +444,7 @@ The daemon exposes a JSON-line Unix socket protocol (`impulse.sock`). Full spec:
 | Product-role launch preflight | Implemented narrow foundation | `AgentRoleId`, `AgentRoleAssignment`, static registry support, Dioxus preview, `DesktopRuntime` pre-PTY gate | Ops + desktop runtime/contract tests |
 | Daemon-owned governed-task lifecycle | Implemented narrow foundation | `GovernedTaskRun`, governed workbench IPC, persistent ledger, desktop acknowledged gateway/outbox, Supervisor evidence cards | Ops/state/daemon/desktop contract and recovery tests |
 | Daemon-owned governed runtime producers | Implemented first profile | `rust_workspace_v1`, governed CLI/Ion claim, detached verification, strict API Supervisor review | Handler proof covers review/operator; real daemon/CLI/restart proof stops at `awaiting_supervisor` |
+| Accepted-run memory candidates | Implemented review-only foundation | `AcceptedRunMemoryCandidate`, deterministic candidate ledger/reconciliation, protocol-v6 snapshot, Dioxus Memory view | Ops contract, state/restart/tamper, snapshot, and desktop SSR tests |
 | General role contract | Direction, not implemented | Future ADR | Not applicable |
 | Common dynamic runtime adapter + generalized capability negotiation | Direction, not implemented | Future ADR | Not applicable |
 | Typed cross-agent message bus | Partial delegations/handoffs only | `delegation`, `orchestration`, daemon contracts | Rust tests |
@@ -474,6 +499,7 @@ The following files define product truth and must be updated together for contra
 - `docs/decisions/0010-product-role-launch-contract.md` and
   `docs/decisions/0011-governed-task-run-lifecycle.md` (governed launch/lifecycle authority)
 - `docs/decisions/0012-daemon-owned-governed-runtime-producers.md` (profiled producer authority)
+- `docs/decisions/0013-deterministic-accepted-run-memory-candidates.md` (accepted-run review projection authority)
 
 ### Required Update Checklist for Any Interface Change
 

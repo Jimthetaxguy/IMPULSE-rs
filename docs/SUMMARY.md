@@ -1,8 +1,8 @@
 ---
 title: Documentation Summary
 description: Unified navigation structure for Impulse documentation
-version: 2.7
-updated: 2026-07-13
+version: 2.8
+updated: 2026-07-15
 schema_version: '1.0'
 ---
 
@@ -24,7 +24,7 @@ schema_version: '1.0'
 
 ## Active Track
 
-Roadmap contract: Now=control-plane foundations + daemon-owned governed runtime producers; Next=accepted-run memory promotion + stronger same-user actor authorization + full launched-runtime proof; Later=general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only.
+Roadmap contract: Now=control-plane foundations + governed runtime producers + accepted-run review candidates; Next=stronger same-user actor authorization + full launched Builder/Supervisor proof; Later=explicit memory promotion/dismissal + general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only.
 
 `HONEST-ROADMAP.md` is a historical hook/memory validation register, not the current product
 roadmap or whole-product risk authority.
@@ -46,7 +46,7 @@ roadmap or whole-product risk authority.
 
 ### Next
 
-- [VISION.md](../VISION.md) — accepted-run memory promotion, stronger same-user actor authorization, full launched-runtime proof, and remaining hierarchy/enforcement ADRs
+- [VISION.md](../VISION.md) — stronger same-user actor authorization, full launched Builder/Supervisor proof, later candidate promotion/dismissal, and remaining hierarchy/enforcement ADRs
 - [spec/USER-STORY-MAP.md](spec/USER-STORY-MAP.md)
 - [spec/TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md)
 
@@ -136,6 +136,7 @@ roadmap or whole-product risk authority.
 - [decisions/0010-product-role-launch-contract.md](decisions/0010-product-role-launch-contract.md)
 - [decisions/0011-governed-task-run-lifecycle.md](decisions/0011-governed-task-run-lifecycle.md)
 - [decisions/0012-daemon-owned-governed-runtime-producers.md](decisions/0012-daemon-owned-governed-runtime-producers.md)
+- [decisions/0013-deterministic-accepted-run-memory-candidates.md](decisions/0013-deterministic-accepted-run-memory-candidates.md)
 
 ### Session Logs
 
@@ -152,9 +153,9 @@ Historical Ralph loop plans now live under `archive/ralph-plans/` and are proven
 
 | Field | Value |
 | ----- | ----- |
-| Total Documents | 140 |
+| Total Documents | 141 |
 | Categories | 9 |
-| Decisions (ADRs) | 12 |
+| Decisions (ADRs) | 13 |
 | Phases | 3 |
 | Status | Active Development |
 

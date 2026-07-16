@@ -51,9 +51,9 @@ CONTRACT_KEY_FILES = [
 ]
 
 DURABLE_ROADMAP_MARKER = (
-    "Now=control-plane foundations + daemon-owned governed runtime producers; "
-    "Next=accepted-run memory promotion + stronger same-user actor authorization + "
-    "full launched-runtime proof; Later=general roles + negotiated runtimes + "
+    "Now=control-plane foundations + governed runtime producers + accepted-run review candidates; "
+    "Next=stronger same-user actor authorization + full launched Builder/Supervisor proof; "
+    "Later=explicit memory promotion/dismissal + general roles + negotiated runtimes + "
     "multi-project routing; Legacy=egui compile-maintenance only"
 )
 
@@ -102,8 +102,9 @@ CONTRACT_REQUIRED_MARKERS = {
         DURABLE_ROADMAP_MARKER,
     ],
     DOCS_DIR / "IPC-PROTOCOL.md": [
-        "**Protocol version: 5**",
-        '"protocol_version": 5',
+        "**Protocol version: 6**",
+        '"protocol_version": 6',
+        "### v6 — Deterministic accepted-run memory candidates",
         "### v5 — Daemon-owned governed producers",
         "### v4 — Daemon-owned governed tasks",
     ],
@@ -125,6 +126,7 @@ FORBIDDEN_ACTIVE_PHRASES = [
     '"protocol_version": 4',
     "**Protocol version: 4**",
     "Now=control-plane foundations + daemon-owned governed task lifecycle; Next=real claim/verification producers + supervisor/builder process proof + accepted-run memory promotion; Later=general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only",
+    "Now=control-plane foundations + daemon-owned governed runtime producers; Next=accepted-run memory promotion + stronger same-user actor authorization + full launched-runtime proof; Later=general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only",
     "verified-memory promotion",
 ]
 

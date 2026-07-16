@@ -1,12 +1,12 @@
 # IMPULSE — Feed the impulse to build.
 
 - **Status:** Living product north star
-- **Updated:** 2026-07-13
+- **Updated:** 2026-07-15
 - **Canonical implementation contract:** [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
 - **Current code boundary map:** [`docs/ARCHITECTURE-CLARIFICATION.md`](docs/ARCHITECTURE-CLARIFICATION.md)
-- **Roadmap contract:** Now=control-plane foundations + daemon-owned governed runtime producers; Next=accepted-run memory promotion + stronger same-user actor authorization + full launched-runtime proof; Later=general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only.
-- **Current governed slice:** profiled pre-PTY Builder registration, exact acceptance criteria, daemon-attested clean Git subjects, daemon-derived claims and detached Rust verification, strict API-only Supervisor review, and operator-required acceptance.
-- **Next governed slice:** review-only accepted-run memory promotion, stronger local actor authorization, and one full process proof with launched Builder and Supervisor runtimes.
+- **Roadmap contract:** Now=control-plane foundations + governed runtime producers + accepted-run review candidates; Next=stronger same-user actor authorization + full launched Builder/Supervisor proof; Later=explicit memory promotion/dismissal + general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only.
+- **Current governed slice:** profiled pre-PTY Builder registration, exact acceptance criteria, daemon-attested clean Git subjects, daemon-derived claims and detached Rust verification, strict API-only Supervisor review, operator-required acceptance, and deterministic pending memory candidates that do not mutate `GENOME`/`HISTORY`.
+- **Next governed slice:** stronger local actor authorization and one full process proof with launched Builder and Supervisor runtimes; explicit candidate promotion/dismissal remains a later memory-writing contract.
 
 ## The promise
 
@@ -258,6 +258,23 @@ currently derived from the bound project directory name, one daemon adapter is b
 project, task reassignment/resume is not implemented, and the global task/receipt maps do not yet
 have pagination or archival. These limits must remain visible until stronger contracts replace them.
 
+Accepted tasks now produce a separate review projection in owner-only
+`.impulse/MEMORY_CANDIDATES.json`. The governed-task ledger remains the episodic source of truth;
+the candidate ID and source digest are deterministic over a versioned source projection. Acceptance
+persists first, while identical request replay and daemon-start reconciliation repair a missing
+candidate. Orphans and source mismatches fail closed. The candidate exposes task/criteria,
+subject, successful command evidence, artifact/record references, and an honest source-assurance
+class, but structurally excludes worker claim prose and Supervisor/operator rationales.
+The source digest hashes exact JSON bytes from a fixed ordered, versioned struct; it does not claim
+semantic normalization across alternative Unicode spellings.
+
+That candidate is durable review state, not curated semantic memory. V1 supports only
+`pending_review`; Dioxus is read-only and labels it as not stored in `GENOME`. Candidate creation,
+repair, and display do not mutate `GENOME.md`, `HISTORY.jsonl`, retrieval, or injected context.
+Accepted and rejected operator decisions are terminal, so a later opposite decision cannot orphan
+the projection. The two ledgers use separate temp-file-sync-and-rename replacements; reconciliation
+repairs absence, but no cross-file transaction or parent-directory-fsync durability is claimed.
+
 ## User control and trust
 
 Users must be able to inspect which runtime and role are active, what each agent can access, why a
@@ -283,6 +300,9 @@ needs a reason and an audit path. The user can interrupt, narrow, revoke, review
   Git OIDs; env-routed Builder claims through CLI and Ion's `governed_submit_claim` tool.
 - Daemon-owned detached Rust verification and strict criteria-digest-bound, API-only, tool-free,
   history-free Supervisor review. Generic external harness review fails closed.
+- Deterministic accepted-run memory candidates in a separate owner-only ledger, startup/replay
+  repair, typed source assurance, and a read-only Dioxus pending-review view. `GENOME` and `HISTORY`
+  remain unchanged.
 - Dioxus governed-task evidence and decision cards backed by acknowledged host commands; no
   optimistic task state. Profiled cards currently guide terminal producer commands rather than
   exposing producer buttons.
@@ -309,8 +329,10 @@ a separate action and must not be inferred from repository state alone.
 - Typed cross-agent messaging, acknowledgements, routing, and project isolation.
 - Role-scoped tools, credentials, context, memory, and verification policies.
 - Event-driven supervisor attention and resource budgets.
-- Review-only accepted-run memory promotion, stronger same-user actor authorization, and a
-  process-level proof across launched Builder and Supervisor runtimes.
+- Stronger same-user actor authorization and a process-level proof across launched Builder and
+  Supervisor runtimes.
+- Explicit operator promotion/dismissal for pending candidates, including semantic validation,
+  conflict/deduplication policy, audit, and the eventual curated-memory write boundary.
 
 ## First complete vertical slice
 
@@ -334,9 +356,11 @@ parts of steps 3-5 and 8-9: registration precedes PTY creation, exact criteria a
 subject are bound to the task, the daemon derives claim and verification truth, strict API review is
 revision-bound, runtime exit is never acceptance, and the operator owns final approval. Real-process
 and restart tests prove the CLI claim and detached verification path; handler tests prove strict
-Supervisor binding and operator-only acceptance. The remaining proof must compose launched Builder
-and Supervisor runtimes through the complete path and promote only an accepted result to a
-review-only memory candidate. The complete multi-runtime workflow is therefore not yet closed.
+Supervisor binding and operator-only acceptance. Accepted tasks now deterministically stage a
+review-only candidate without changing curated memory. The next forcing proof must compose launched
+Builder and Supervisor runtimes through that complete path and observe exactly one candidate.
+Turning a reviewed candidate into scoped semantic memory remains a later explicit operator action,
+so step 10 and the complete multi-runtime workflow are not yet closed.
 
 ## Success criteria
 
@@ -362,8 +386,9 @@ review-only memory candidate. The complete multi-runtime workflow is therefore n
 ## Open ADR decisions
 
 ADR-0010 accepts the product-role/task launch preflight, ADR-0011 accepts the daemon-owned
-governed-task lifecycle, and ADR-0012 accepts the first daemon-owned producer profile. The following
-broader decisions remain open and must be resolved before schema-specific documents split out:
+governed-task lifecycle, ADR-0012 accepts the first daemon-owned producer profile, and ADR-0013
+accepts the deterministic pending-candidate projection. The following broader decisions remain open
+and must be resolved before schema-specific documents split out:
 
 1. Remaining hierarchy/cardinality and durable ids for project, workspace, role, runtime, instance,
    session, pane, and supervisor scope, plus governed-task reassignment/resume.
@@ -372,7 +397,8 @@ broader decisions remain open and must be resolved before schema-specific docume
    discovery, attestation freshness, emulation, and post-launch re-evaluation.
 4. Role contract composition, override, persistence, and migration.
 5. Cross-agent message routing, direct worker communication, acknowledgement, and isolation.
-6. Memory authorship, verification, conflict resolution, correction, forgetting, and inheritance.
+6. Candidate promotion/dismissal authorization plus memory authorship, semantic verification,
+   conflict resolution, correction, forgetting, and inheritance.
 7. Credential grants, revocation, audit, redaction, and cross-project prevention.
 8. Supervisor scheduling, attention summaries, context budget, and intervention priority.
 9. Verification profiles and whether any future low-risk policy may relax the current

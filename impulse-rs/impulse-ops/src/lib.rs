@@ -7,10 +7,11 @@ use serde::{Deserialize, Serialize};
 
 pub mod agent_registry;
 pub mod governed_task;
+pub mod memory_candidate;
 pub mod role_assignment;
 
 /// Shared daemon protocol version for GUI/operator workbench compatibility.
-pub const DAEMON_PROTOCOL_VERSION: u32 = 5;
+pub const DAEMON_PROTOCOL_VERSION: u32 = 6;
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpsError {
@@ -875,6 +876,10 @@ pub struct ProjectOpsSnapshot {
     /// Daemon-owned governed task truth. Legacy snapshots omit this field.
     #[serde(default)]
     pub governed_tasks: Vec<governed_task::GovernedTaskSnapshot>,
+    /// Review-only semantic proposals derived from accepted governed runs.
+    /// Legacy protocol payloads omit this field.
+    #[serde(default)]
+    pub memory_candidates: Vec<memory_candidate::AcceptedRunMemoryCandidate>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]

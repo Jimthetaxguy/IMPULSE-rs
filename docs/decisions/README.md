@@ -1,15 +1,15 @@
 ---
 title: Architecture Decision Records
 description: Decision index separating current control-plane authority from accepted historical phase-era scope
-version: '1.3'
+version: '1.4'
 status: active
 phase: all
 type: reference
 category: architecture
 audience: builder
 tags: [decisions, adr, architecture]
-updated: 2026-07-13
-last_updated: 2026-07-13
+updated: 2026-07-15
+last_updated: 2026-07-15
 ---
 
 # Architecture Decision Records
@@ -39,6 +39,7 @@ registry-backed runtime identity, daemon truth, or the current Now/Next/Later ro
 | [0010](0010-product-role-launch-contract.md) | Product role launch contract | **Accepted** | Current explicit role/task launch-preflight authority | 2026-07-13 | -- |
 | [0011](0011-governed-task-run-lifecycle.md) | Daemon-owned governed task lifecycle | **Accepted** | Durable evidence/review state and operator-required acceptance | 2026-07-13 | -- |
 | [0012](0012-daemon-owned-governed-runtime-producers.md) | Daemon-owned governed runtime producers | **Accepted** | Clean-Git Builder claims, detached daemon verification, and strict API-only Supervisor review | 2026-07-13 | -- |
+| [0013](0013-deterministic-accepted-run-memory-candidates.md) | Deterministic accepted-run memory candidates | **Accepted** | Owner-only pending review projection and explicit no-promotion boundary | 2026-07-15 | -- |
 
 ## ADR Format
 

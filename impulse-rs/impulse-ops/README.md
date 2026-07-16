@@ -17,6 +17,7 @@ canonical agent registry. It must not pull in heavy runtime dependencies.
 | **Supervisor model** | `SupervisorAction`, `SupervisorProposal`, `SupervisorChatResult`, `SupervisorActionResult`, `SupervisorPermissionPolicy`/`State`, `SupervisorActionPermission`, `PermissionChangeScope`, `ToolCapabilityId` |
 | **Agent runtime/coordination** | `AgentRuntime`, `AgentStatus`, `AgentRole`, `MachineTarget`, `DelegationSummary`, `DiffSummary`, `ToolInvocationRecord`, `InterventionRecommendation`, `TerminalOpsReport` |
 | **Governed tasks** | Profiled registration, revisioned lifecycle records, claim/verification/review trigger DTOs, and the strict Supervisor response envelope |
+| **Accepted-run memory candidates** | Versioned deterministic candidate IDs, pending-review status, source assurance, bounded provenance, and candidate shape validation |
 | **Ops snapshot / artifacts** | `ProjectOpsSnapshot`, `OpsEvent`, `OpsSubscription`, `ArtifactEnvelope`, `ArtifactAction`, `ArtifactActionResult`, `ArtifactFileRef`, `ArtifactViewHint`, `ArtifactStatus` |
 | **Summaries** | `ProjectSummary`, `MemorySummary`, `RetrievalSummary`, `ContextHealthSummary`, `InsightRecord` |
 | **Pure helpers** | `sanitize_id`, `atomic_write_path`, `artifact_store_root` |
@@ -31,6 +32,9 @@ canonical agent registry. It must not pull in heavy runtime dependencies.
   commands are defined; the desktop host and CLI both resolve through it.
 - **Stable protocol.** Bump `DAEMON_PROTOCOL_VERSION` when `WorkbenchDaemonRequest`/`Response`
   change shape, and keep the desktop/daemon sides in lockstep.
+- **Review is not promotion.** `AcceptedRunMemoryCandidate` is a side-effect-free contract for a
+  pending proposal. It has no promote/dismiss action and carries no worker summary or Supervisor
+  rationale; the runtime-owned ledger and reconciliation live in the core crate.
 
 ## Build & test
 
