@@ -1,7 +1,7 @@
 # Impulse IPC Protocol
 
 > Unix domain socket protocol between Impulse daemon and clients (GUI, CLI `--daemon` mode).
-> **Protocol version: 5** — see [Version section](#protocol-version) for upgrade notes.
+> **Protocol version: 6** — see [Version section](#protocol-version) for upgrade notes.
 
 ---
 
@@ -52,12 +52,18 @@ The daemon reports `protocol_version` in `Ping`/`Status` results.
 
 | Constant | Value | Location |
 |----------|-------|----------|
-| `DAEMON_PROTOCOL_VERSION` / `PROTOCOL_VERSION` | **5** | Shared ops contract / daemon protocol |
+| `DAEMON_PROTOCOL_VERSION` / `PROTOCOL_VERSION` | **6** | Shared ops contract / daemon protocol |
 
 Current clients do **not** perform a version handshake or preflight-reject a mismatched daemon, and
 the protocol does not negotiate a downgrade. Known variants continue through normal JSON-line
 request/response decoding; an unknown request or response variant fails through the ordinary Serde
 or client error path. The reported number is observability, not negotiated compatibility.
+
+**Upgrading from v5:** v6 additively exposes the serde-defaulted
+`ProjectOpsSnapshot.memory_candidates` collection. Each entry is a deterministic, pending-review
+projection of an accepted governed run with record/artifact/command provenance and explicit source
+assurance. V6 adds no candidate mutation request, and candidate visibility does not imply a write to
+`GENOME.md` or `HISTORY.jsonl`.
 
 **Upgrading from v4:** v5 adds specialized `SubmitGovernedClaim`,
 `RunGovernedVerification`, and `RunGovernedSupervisorReview` requests. Their DTOs intentionally
@@ -170,6 +176,8 @@ before spawning. CAS and transition failures currently use
 `Error { message }`; stable structured error codes/current-revision payloads remain future work.
 `ProjectOpsSnapshot.governed_tasks` is serde-defaulted for older snapshots, while
 `AgentRuntime.governed_task_id` and `governed_task_revision` carry runtime provenance.
+`ProjectOpsSnapshot.memory_candidates` is also serde-defaulted. It is a read-only projection from
+accepted governed-task truth, not a candidate mutation or semantic-memory promotion surface.
 
 #### PublishTerminalOps — TerminalOpsReport fields
 
@@ -364,7 +372,7 @@ Returns `AgentAssistResult` with sessions organized by agent role.
 
 ### Search & Retrieval
 
-Protocol v5 does not define daemon request variants for retrieval. `search-history`,
+Protocol v6 does not define daemon request variants for retrieval. `search-history`,
 `search-genome`, `index-memory`, and `retrieval-status` are direct-mode CLI operations; the
 `--daemon` dispatcher tells callers to retry without the flag.
 
@@ -385,7 +393,7 @@ All responses use the `DaemonResponse` enum.
 Contains the result as a JSON value. The structure depends on the request.
 
 ```json
-{"type": "Ok", "data": {"result": {"sessions": 3, "active": 1, "protocol_version": 5}}}
+{"type": "Ok", "data": {"result": {"sessions": 3, "active": 1, "protocol_version": 6}}}
 ```
 
 ### Error
@@ -481,6 +489,19 @@ the supplied role compatibility from the daemon-owned runtime registry and rejec
 
 ## Changelog
 
+### v6 — Deterministic accepted-run memory candidates
+
+Added 2026-07-15:
+
+- `ProjectOpsSnapshot.memory_candidates` as a serde-defaulted additive read-model field.
+- Versioned pending candidates derived from accepted governed-task evidence, including source
+  assurance, source digest, task/criteria, subject, record/artifact references, and successful
+  command evidence.
+- Owner-only `MEMORY_CANDIDATES.json` projection repaired by acceptance replay or daemon startup;
+  orphaned or source-mismatched records fail closed.
+- Read-only Dioxus Memory rendering with no promotion, edit, or dismissal request. V6 never mutates
+  `GENOME.md` or `HISTORY.jsonl` through candidate staging.
+
 ### v5 — Daemon-owned governed producers
 
 Added 2026-07-13:
@@ -492,8 +513,8 @@ Added 2026-07-13:
 - Detached fixed Rust verification plus strict acceptance-criteria-digest-bound, stateless,
   tool-free API Supervisor review.
 - Env-routed `"$IMPULSE_CONTROL_CLI" --daemon governed-*` commands and Ion claim bridge; the packaged
-  executable is `impulse-rs`. Same-user actor authorization and accepted-run memory promotion remain
-  outside v5.
+  executable is `impulse-rs`. Same-user actor authorization and any accepted-run memory projection
+  or promotion remain outside v5.
 - One per-task lock serializes producer and lifecycle mutations, and persisted receipts deduplicate
   replay. Crash-safe exactly-once producer execution remains outside v5 until a durable pre-side-effect
   reservation journal exists.

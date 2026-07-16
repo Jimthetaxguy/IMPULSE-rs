@@ -1,9 +1,9 @@
 ---
 title: Desktop Shell Architecture
 status: active
-version: 1.0.0
+version: 1.1.0
 created: 2026-04-15
-updated: 2026-07-13
+updated: 2026-07-15
 ---
 
 # Desktop Shell Architecture
@@ -111,6 +111,9 @@ DAEMON (impulse-rs binary)
 - Daemon reconnect must restore desktop shell state cleanly without a full restart
 - Protocol v5 owns profiled claim, detached verification, and strict API Supervisor-review
   producers. The desktop cannot compose actor, subject, evidence, or verdict payloads for them.
+- Protocol v6 additively exposes deterministic accepted-run candidates through the serde-defaulted
+  `ProjectOpsSnapshot.memory_candidates` read model. The Memory view has no candidate mutation or
+  `GENOME` promotion authority.
 
 ### ratatui (standalone)
 

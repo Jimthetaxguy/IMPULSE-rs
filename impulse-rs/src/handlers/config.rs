@@ -95,6 +95,8 @@ const REPO_RUNTIME_GITIGNORE_ENTRIES: &[&str] = &[
     ".impulse/sockets/",
     ".impulse/GOVERNED_TASKS.json",
     ".impulse/GOVERNED_TASKS.tmp.*",
+    ".impulse/MEMORY_CANDIDATES.json",
+    ".impulse/MEMORY_CANDIDATES.tmp.*",
     ".impulse/DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.json",
     ".impulse/DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.lock",
     ".impulse/DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.tmp-*",

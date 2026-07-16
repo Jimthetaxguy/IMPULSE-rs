@@ -1094,6 +1094,67 @@ body {
   color: var(--c-label);
 }
 
+.memory-candidate-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 12px;
+}
+
+.memory-candidate-card {
+  min-width: 0;
+  padding: 14px 16px;
+  border: 1px solid rgba(47, 208, 255, 0.28);
+  background: rgba(47, 208, 255, 0.035);
+}
+
+.memory-candidate-card h4 {
+  margin: 8px 0 6px;
+  color: #d8faff;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.memory-candidate-summary {
+  margin: 0 0 12px;
+  color: var(--c-fg);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.memory-candidate-evidence {
+  display: grid;
+  grid-template-columns: minmax(92px, auto) minmax(0, 1fr);
+  gap: 5px 12px;
+  margin: 0;
+  padding-top: 10px;
+  border-top: 1px solid rgba(120, 200, 255, 0.1);
+  font-size: 11px;
+}
+
+.memory-candidate-evidence dt {
+  color: var(--c-label);
+}
+
+.memory-candidate-evidence dd {
+  min-width: 0;
+  margin: 0;
+  color: var(--c-dim);
+  overflow-wrap: anywhere;
+}
+
+.memory-candidate-evidence code {
+  color: var(--p-teal);
+  font-family: var(--font-mono);
+}
+
+.memory-candidate-criteria {
+  margin: 12px 0 0;
+  padding-left: 18px;
+  color: var(--c-dim);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
 .kv-grid {
   display: grid;
   grid-template-columns: repeat(2, 1fr);

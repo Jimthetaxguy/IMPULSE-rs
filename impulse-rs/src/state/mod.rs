@@ -8,6 +8,7 @@
 pub mod config;
 mod config_keys;
 mod governed_task;
+mod memory_candidate;
 pub mod persistence;
 pub mod session;
 

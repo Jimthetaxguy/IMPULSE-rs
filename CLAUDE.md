@@ -5,7 +5,7 @@
 > Contract: [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
 > Collaboration playbook: [`docs/guides/COLLABORATIVE-AGENTIC-CODING.md`](docs/guides/COLLABORATIVE-AGENTIC-CODING.md)
 > Canonical stack: Rust (impulse-rs)
-> Roadmap contract: Now=control-plane foundations + daemon-owned governed runtime producers; Next=accepted-run memory promotion + stronger same-user actor authorization + full launched-runtime proof; Later=general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only.
+> Roadmap contract: Now=control-plane foundations + governed runtime producers + accepted-run review candidates; Next=stronger same-user actor authorization + full launched Builder/Supervisor proof; Later=explicit memory promotion/dismissal + general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only.
 
 ---
 
@@ -110,7 +110,7 @@ Before implementing, consider alternative approaches. Choose the simplest soluti
 - **Daemon mode** — long-running Unix socket authority for the TUI and Dioxus cockpit. In-memory state with periodic sync.
 - **Desktop mode** — Dioxus Desktop cockpit with xterm.js terminal bridge, backed by Rust daemon/runtime state. Tauri-shaped command/event code is compatibility-only.
 
-**IPC Protocol (PROTOCOL_VERSION = 5):**
+**IPC Protocol (PROTOCOL_VERSION = 6):**
 
 The daemon exposes a JSON-line Unix socket protocol. Key endpoint groups:
 

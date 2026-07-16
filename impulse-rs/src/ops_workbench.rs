@@ -181,12 +181,16 @@ pub async fn build_snapshot(
     let governed_tasks = state
         .list_governed_tasks(&project.id)
         .context("Failed to list governed tasks for workbench")?;
+    let memory_candidates = state
+        .list_accepted_run_memory_candidates(&project.id)
+        .context("Failed to list accepted-run memory candidates for workbench")?;
     let recent_insights = load_live_insights(state.storage().base_path(), 20)
         .context("Failed to load live insights for workbench")?;
     let pending_review_count = artifacts
         .iter()
         .filter(|artifact| artifact.status == ArtifactStatus::Staged)
-        .count();
+        .count()
+        .saturating_add(memory_candidates.len());
 
     let agents = sessions
         .iter()
@@ -220,6 +224,7 @@ pub async fn build_snapshot(
         artifacts,
         delegations: Vec::new(),
         governed_tasks,
+        memory_candidates,
     };
     overlay_terminal_reports(&mut snapshot, terminal_reports);
 

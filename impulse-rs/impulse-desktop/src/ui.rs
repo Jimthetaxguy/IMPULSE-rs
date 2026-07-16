@@ -2553,6 +2553,7 @@ pub fn DesktopShellWithSnapshot(
                                 context: snapshot.context.clone(),
                                 memory: snapshot.memory.clone(),
                                 retrieval: snapshot.retrieval.clone(),
+                                memory_candidates: snapshot.memory_candidates.clone(),
                             }
                         },
                         DesktopView::Review => rsx! {

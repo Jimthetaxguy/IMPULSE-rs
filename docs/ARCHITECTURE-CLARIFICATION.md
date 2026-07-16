@@ -1,6 +1,6 @@
 # Control-Plane Architecture Boundaries
 
-- **Updated:** 2026-07-13
+- **Updated:** 2026-07-15
 - **Status:** Active boundary map
 - **North star:** [`../VISION.md`](../VISION.md)
 - **Canonical product contract:** [`spec/RUST-CANONICAL-CONTRACT.md`](spec/RUST-CANONICAL-CONTRACT.md)
@@ -55,8 +55,8 @@ generalized role composition, a common runtime-adapter contract, or dynamic capa
 
 | Boundary | Authoritative paths | Current truth | Status |
 | --- | --- | --- | --- |
-| Shared control-plane wire/read models | `impulse-rs/impulse-ops/src/{lib,governed_task}.rs` | Versioned daemon requests/responses, workbench snapshots, governed task/evidence/decision types, telemetry, supervisor policy/actions, artifacts | Live |
-| Daemon coordination | `impulse-rs/src/daemon/{mod,protocol,handlers}.rs`, `src/state/governed_task.rs`, `src/governed_producers.rs` | Workbench authority, persistent governed-task lifecycle, profiled claim/verification/Supervisor producers, managed agent turns, telemetry overlays | Live |
+| Shared control-plane wire/read models | `impulse-rs/impulse-ops/src/{lib,governed_task,memory_candidate}.rs` | Versioned daemon requests/responses, workbench snapshots, governed task/evidence/decision types, accepted-run candidate types, telemetry, supervisor policy/actions, artifacts | Live |
+| Daemon coordination | `impulse-rs/src/daemon/{mod,protocol,handlers}.rs`, `src/state/{governed_task,memory_candidate}.rs`, `src/governed_producers.rs` | Workbench authority, persistent governed-task lifecycle, deterministic accepted-run review projection, profiled claim/verification/Supervisor producers, managed agent turns, telemetry overlays | Live |
 | PTY/process lifecycle | `impulse-rs/impulse-term/src/backend.rs`, `impulse-rs/impulse-desktop/src/{runtime,daemon_ops}.rs` | Spawn, input, resize, focus, output, exit, cleanup, pre-PTY governed registration, and durable launch/exit reconciliation | Live |
 | Dioxus cockpit | `impulse-rs/impulse-desktop/src/{desktop_host,host_bridge,host_commands,ui}.rs` | Renders backend state/evidence and dispatches acknowledged revisioned decisions; does not own or optimistically mutate durable task truth | Live host/bridge foundation |
 | Workspace registration | `impulse-rs/impulse-desktop/src/workspace.rs` | Registered filesystem targets and operator-authored project notes | Live |
@@ -66,9 +66,9 @@ generalized role composition, a common runtime-adapter contract, or dynamic capa
 | Ion verification harness contract | `impulse-rs/impulse-ion/src/{lib,pi_adapter}.rs` | Transport-neutral verify/review/summarize contract and external adapter | Live; separate from the interactive Ion runtime |
 | Dynamic tools | `impulse-rs/src/tooling/`, `impulse-rs/src/mcp/` | Typed schemas, deny-by-default capabilities, validation, execution, audit | Live |
 | Desktop MCP tools | `impulse-rs/impulse-desktop/src/mcp.rs` | Agent spawn/write, memory search, project context, staged injection/review | Live; exposure differs from native Ion tools |
-| Memory/context | `impulse-rs/src/{state,memory,retrieval,injection,stewardship}/` | Project-scoped persistence, FTS5/semantic retrieval, review-first injection, context health | Live |
+| Memory/context | `impulse-rs/src/{state,memory,retrieval,injection,stewardship}/` | Project-scoped persistence, deterministic pending accepted-run candidates, FTS5/semantic retrieval, review-first injection, context health | Live; candidate promotion/dismissal is not implemented |
 | Credentials | `impulse-rs/src/credentials/` | Provider abstraction for Keychain, socket, CLI proxy, env, and session memory | Live; per-role credential grants are not generalized |
-| Artifacts/evidence | governed types and `ArtifactEnvelope` in `impulse-ops`, daemon governed/artifact handlers, `impulse-rs/src/governed_producers.rs` | Separate claims, daemon-observed profiled evidence, strict Supervisor verdicts, operator decisions, and provenance-bearing outputs | Live first producer profile + broader artifact foundation |
+| Artifacts/evidence | governed/candidate types and `ArtifactEnvelope` in `impulse-ops`, daemon governed/artifact handlers, `impulse-rs/src/governed_producers.rs` | Separate claims, daemon-observed profiled evidence, strict Supervisor verdicts, operator decisions, deterministic pending memory candidates, and provenance-bearing outputs | Live first producer profile + review-only candidate foundation |
 | Agent messaging/handoffs | `impulse-rs/src/{delegation,orchestration}/`, daemon delegation contracts | Delegations, handoff artifacts, and routing logs | Live partial; no unified typed message bus |
 | Legacy desktop | `impulse-rs/impulse-gui/`, optional egui modules in `impulse-term` | Compile-maintenance only | Frozen |
 
@@ -104,6 +104,16 @@ Typed actors are provenance and transition claims, not cryptographic
 identity among processes running as the same user. The socket directory, socket, and PID file use
 `0700`, `0600`, and `0600`, respectively; that is an OS-user boundary, not a same-user role boundary.
 
+After operator approval, `GOVERNED_TASKS.json` remains the acceptance authority and the daemon
+derives one pending projection in owner-only `MEMORY_CANDIDATES.json`. The two writes are not one
+filesystem transaction: acceptance replay and daemon-start reconciliation repair a missing
+projection, while orphaned or source-mismatched candidates fail closed. Protocol v6 exposes the
+serde-defaulted candidates through `ProjectOpsSnapshot`; Dioxus renders them read-only. This path
+never mutates `GENOME.md` or `HISTORY.jsonl` and grants no semantic promotion capability.
+Accepted/rejected decisions are terminal. Each ledger uses its own synced-temp-file rename (without
+parent-directory fsync), not a cross-file transaction. Candidate digests cover exact JSON bytes from
+a fixed ordered/versioned source struct, not Unicode semantic normalization.
+
 It cannot promise control over a vendor's hidden system prompt, proprietary reasoning loop,
 internal context compression, or unsupported tool mechanics. The live static preflight therefore
 uses explicit enforcement strengths rather than a boolean "supported" flag; future generalized
@@ -123,7 +133,10 @@ The next architecture ADR must settle these together:
 6. Durable producer reservations for crash-safe replay, structured CAS error codes, task/receipt
    pagination and archival, and stronger same-user actor authorization where deployment profiles
    require it.
-7. Review-only accepted-run memory promotion plus a complete launched Builder/Supervisor proof.
+7. A complete launched Builder/Supervisor proof that reaches acceptance and observes exactly one
+   staged candidate.
+8. Explicit candidate promotion/dismissal with semantic validation, authorization, audit, and the
+   curated-memory write boundary.
 
 Do **not** create separate `ROLES`, `RUNTIMES`, `SUPERVISOR`, or replacement architecture schema
 documents before those decisions land. `VISION.md` and the canonical contract remain the source of

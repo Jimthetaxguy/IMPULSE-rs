@@ -16,7 +16,8 @@ Claude Code, Codex, and similar CLIs keep their own internal coding loops. Ion i
 > artifacts, credentials, verification, Ion's native REPL/tool loop, and daemon-owned governed
 > runtime producers. The profiled path keeps runtime exit, worker claim, verifier evidence,
 > Supervisor judgment, and operator approval separate while deriving producer provenance inside
-> the daemon.
+> the daemon. Accepted runs now stage deterministic, read-only memory candidates with source
+> assurance and evidence references; they do not write curated project memory.
 >
 > **Target:** runtime-independent role contracts, adapter capability negotiation, typed agent
 > messaging, and stronger structural enforcement across supported runtimes. See
@@ -32,6 +33,7 @@ Using several coding agents today usually means several unrelated terminals, per
 - **Daemon workbench truth** — Serves the authoritative agent, context, artifact, and intervention snapshot over versioned IPC
 - **Role and policy foundations** — Preflights an explicit Builder role/task against conservative launch capabilities and enforces a concrete supervisor permission policy; generalized role composition remains a later boundary
 - **Governed task truth** — Registers a durable task before PTY launch, optionally binds it to exact acceptance criteria plus a daemon-attested clean Git `HEAD`, applies revisioned/idempotent lifecycle mutations, and reserves `accepted` for an explicit operator decision against current passing evidence
+- **Accepted-run review queue** — Derives one versioned, provenance-bearing pending memory candidate from each accepted governed run while keeping `GENOME.md` and `HISTORY.jsonl` unchanged
 - **Typed platform tools** — Exposes capability-checked Rust tools through native registries, MCP, and runtime-specific bridges
 - **Session tracking** — Records files touched, tools used, and decisions made
 - **Persistent memory** — Project genome (decisions/preferences) and session history survive across sessions
@@ -70,8 +72,9 @@ required. Ordinary and unprofiled panes have inherited producer-routing variable
 Run the injected path as `"$IMPULSE_CONTROL_CLI" --daemon ...` so paths containing spaces remain
 one executable argument.
 
-`impulse-rs init` adds only exact daemon/runtime-owned state, socket, retrieval-cache, ledger-temp,
-and Desktop-outbox paths to the repository `.gitignore`; it never adds a blanket `.impulse/` rule.
+`impulse-rs init` adds only exact daemon/runtime-owned state, socket, retrieval-cache, governed-task
+and memory-candidate ledger/temp, and Desktop-outbox paths to the repository `.gitignore`; it never
+adds a blanket `.impulse/` rule.
 Durable project inputs such as `.impulse/GENOME.md`, `.impulse/config.json`, and
 `.impulse/impulse-capabilities.json` therefore remain available to commit unless an existing
 operator-owned blanket rule already hides them. Init preserves but warns about that broader rule.
@@ -118,13 +121,29 @@ daemon-owned evidence and currently guides the operator to those terminal comman
 exposing producer buttons. A model may recommend acceptance, but only the operator can approve it.
 That is a transition-policy distinction, not strong actor authentication: another process running
 as the same OS user remains inside the current socket trust boundary.
+Accepted and rejected operator outcomes are terminal; a later opposite decision cannot rewrite that
+result or orphan a staged candidate.
+After approval, the daemon persists the accepted task first and then derives one pending candidate
+in owner-only `.impulse/MEMORY_CANDIDATES.json`. That file is a deterministic materialized view of
+accepted governed evidence, not a second acceptance authority. An identical acceptance replay or
+daemon-start reconciliation repairs a missing projection; orphaned or source-mismatched candidates
+fail closed. The candidate deliberately excludes worker claim prose and Supervisor/operator
+rationales. Its ID hashes the exact JSON bytes from a fixed ordered, versioned source struct (no
+maps, floats, or Unicode semantic normalization), and its source assurance distinguishes
+daemon-profiled evidence from caller-composed evidence without overstating declared operator identity.
+
+The Dioxus Memory view exposes these candidates as **Pending review — not stored in GENOME**. V1
+has no promote, edit, or dismiss action. Candidate staging never mutates `GENOME.md` or
+`HISTORY.jsonl`; explicit semantic promotion/dismissal remains a later contract.
 Persisted request receipts make replay idempotent and the per-task daemon lock prevents concurrent
 duplicate producer execution. This is not crash-safe exactly-once execution: if the daemon exits
 after a command/model side effect but before its receipt is durably stored, a retry can run that
 producer again. A durable producer reservation journal remains the next reliability boundary.
-Stronger same-user actor authorization, accepted-run memory promotion, a full launched-runtime
-proof, and multi-workspace daemon routing remain the next integration lane. Session, memory, hook,
-and verification commands remain available through `cargo run -- --help`.
+The next forcing function is one process-level workflow that launches Builder and Supervisor
+runtimes through acceptance and observes exactly one staged candidate. Stronger same-user actor
+authorization and multi-workspace daemon routing remain open; explicit candidate promotion and
+dismissal come later. Session, memory, hook, and verification commands remain available through
+`cargo run -- --help`.
 
 The current desktop daemon attachment is single-project: a governed launch must target the project
 root bound to the running daemon. Registering additional cockpit workspace entries does not yet
@@ -226,6 +245,7 @@ memory-pipeline/     # Python research tooling
 - **Test traceability:** [`docs/spec/TEST-TRACEABILITY.md`](docs/spec/TEST-TRACEABILITY.md)
 - **Governed lifecycle ADR:** [`docs/decisions/0011-governed-task-run-lifecycle.md`](docs/decisions/0011-governed-task-run-lifecycle.md)
 - **Governed producer ADR:** [`docs/decisions/0012-daemon-owned-governed-runtime-producers.md`](docs/decisions/0012-daemon-owned-governed-runtime-producers.md)
+- **Accepted-run candidate ADR:** [`docs/decisions/0013-deterministic-accepted-run-memory-candidates.md`](docs/decisions/0013-deterministic-accepted-run-memory-candidates.md)
 - **Agent guidelines:** [`AGENTS.md`](AGENTS.md)
 - **Meta-Harness synthesis:** [`docs/research/META-HARNESS-RUST-MULTI-AGENT.md`](docs/research/META-HARNESS-RUST-MULTI-AGENT.md)
 - **Rust multi-agent guide:** [`docs/guides/RUST-MULTI-AGENT-PATTERNS.md`](docs/guides/RUST-MULTI-AGENT-PATTERNS.md)

@@ -1,8 +1,8 @@
 ---
 title: User Story Map
 description: Rust-first user stories and documentation baseline for the current Impulse product surface
-version: '1.3'
-updated: 2026-07-13
+version: '1.4'
+updated: 2026-07-15
 type: specification
 category: core
 phase: all
@@ -216,7 +216,7 @@ Acceptance criteria:
 Primary interfaces:
 
 - `daemon`
-- JSON-line IPC protocol v5
+- JSON-line IPC protocol v6
 - `RegisterGovernedTask`, `GetGovernedTask`, `ListGovernedTasks`, `MutateGovernedTask`
 - `SubmitGovernedClaim`, `RunGovernedVerification`, `RunGovernedSupervisorReview`
 
@@ -359,10 +359,14 @@ Live boundary:
 - the Dioxus Supervisor surface renders evidence and terminal producer-command guidance, then
   submits acknowledged operator decisions without optimistic state; it does not expose producer
   buttons, and only the operator can create `accepted`
+- accepted tasks deterministically stage one pending candidate in owner-only
+  `MEMORY_CANDIDATES.json`; replay/startup repairs absence, contradictions fail closed, and Dioxus
+  renders the candidate read-only without changing `GENOME.md` or `HISTORY.jsonl`
 - desktop launch/exit intent is written ahead of daemon I/O to a bounded, owner-only, cross-process-locked project outbox and reconciles after daemon recovery; abrupt process death before exit intent exists still requires runtime leases/orphan reconciliation
 - a real daemon/CLI/child-process test proves claim, detached verification, persistence, and restart;
   daemon handler tests prove strict Supervisor binding and operator-only acceptance. One complete
-  launched Builder/Supervisor workflow and accepted-run memory promotion remain downstream
+  launched Builder/Supervisor workflow remains downstream; explicit candidate promotion/dismissal
+  is a later memory-writing contract
 - typed actor kinds are provenance rather than same-user cryptographic authentication; project identity, task reassignment, pagination/archive, and structured CAS errors remain explicit follow-ups
 - generalized role composition, a common dynamic runtime-adapter trait, and capability negotiation across arbitrary runtimes remain target architecture; this narrow preflight must not imply that every runtime has equal or continuous enforcement
 

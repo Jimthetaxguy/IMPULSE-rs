@@ -15,14 +15,10 @@
 ## What Impulse is
 
 Impulse is a **terminal-native local control plane and harness manager for AI software-engineering
-agents**. It launches and manages heterogeneous coding runtimes, supervises their operating
-conditions, and supplies shared platform services: memory, tools, telemetry, messaging/handoffs,
-policy, credentials, artifacts, and verification.
-
-Claude Code, Codex, and similar CLIs retain their internal coding loops. Ion is the Impulse-native
-coding runtime. Dioxus is the cockpit that renders and controls the system; backend daemon/runtime
-contracts remain authoritative. Memory is essential, but it is one control-plane service rather
-than the complete product.
+agents**. It manages heterogeneous runtimes and supplies memory, tools, telemetry, handoffs,
+policy, credentials, artifacts, and verification. Claude Code, Codex, and similar CLIs retain their
+internal loops; Ion is the native runtime. Dioxus is the cockpit, while daemon/runtime contracts
+remain authoritative. Memory is one platform service, not the whole product.
 
 Workspace: `impulse-rs/` (Cargo workspace). Main crates: `impulse-rs`, `impulse-ops`,
 `impulse-term`, `impulse-desktop`, and `impulse-ion`; `impulse-gui` is legacy/frozen.
@@ -48,14 +44,11 @@ Claude Code or Codex); Ion is a native direct-provider/tool-loop runtime.
 - **Boundary:** there is not yet one common runtime-adapter trait or capability-negotiation protocol.
 
 ### agent platform id — `[code]`
-An open, validated string identity (`AgentPlatformId`) whose metadata and launch command are owned
-by `AgentRegistry`. The live implementation carries the registry through desktop runtime, host, MCP,
-browser bridge, reducer, dynamic workspace launcher, and serialized snapshots. It adds Ion as a
-builtin launchable platform, derives capability manifests from the registry, resolves the real
-sibling Ion binary without an override, and fails closed on unknown/blank ids. Runtime output
-canonicalizes aliases and case; the declared platform remains distinct from the observed command,
-so explicit wrapper/alternate-installation overrides stay supported and visible. Legacy closed
-enums remain where wire/disk compatibility still requires them.
+An open, validated string identity (`AgentPlatformId`) owned by `AgentRegistry` across desktop,
+host, MCP, browser, reducer, launcher, and snapshot paths. The registry adds Ion, derives capability
+manifests, resolves its sibling binary, and fails closed on unknown/blank IDs. Declared platform and
+observed command remain distinct so wrappers stay visible; legacy closed enums remain only for
+wire/disk compatibility.
 - **Source of truth:** `impulse-ops/src/agent_registry.rs`.
 
 ### role launch compatibility — `[code]`
@@ -87,6 +80,12 @@ remains independent of review, and only operator approval accepts. Resume/reassi
 work.
 - **Source of truth:** `impulse-ops/src/governed_task.rs`, `src/state/governed_task.rs`, ADR-0011,
   and ADR-0012.
+
+### accepted-run memory candidate — `[code]`
+A deterministic pending-review projection of one accepted governed task, persisted in owner-only
+`MEMORY_CANDIDATES.json` with versioned source assurance/evidence and repairable from task truth. It
+is not curated memory, never mutates `GENOME.md`/`HISTORY.jsonl`, and has no v1 mutation action.
+- **Source:** `impulse-ops/src/memory_candidate.rs`, `src/state/memory_candidate.rs`, ADR-0013.
 
 ### task — `[vocabulary]`
 The broader product assignment concept. A governed task is today's durable carrier; delegations,
@@ -129,6 +128,8 @@ Unix socket.
   binds strict API-only Supervisor output. Profiled registration requires the shared canonical
   Builder assignment and the exact compatibility result recomputed from the daemon registry;
   generic producer mutations fail for profiled tasks.
+- **Candidate wire:** protocol v6 adds serde-defaulted `ProjectOpsSnapshot.memory_candidates` only;
+  it defines no candidate mutation request.
 
 ### managed agent turn — `[code]`
 One exclusive, bounded use of the cached `ImpulseAgent`. Concurrent turns fail fast with typed
@@ -167,14 +168,14 @@ policy, not a generalized role system.
   `impulse-ops/src/lib.rs` and enforcement in `src/daemon/handlers.rs`.
 
 ### governed producer profile — `[code]`
-`rust_workspace_v1` is the closed daemon-owned path: `"$IMPULSE_CONTROL_CLI" --daemon
-governed-claim` or Ion claim intent, fixed format/check/strict-Clippy/test execution in a detached worktree, and criteria-digest-bound,
-history-free, tool-free API Supervisor review. It executes host-trusted Rust code, not an OS sandbox. Persisted receipts and the per-task lock deduplicate replay/concurrency,
-not daemon-crash-before-receipt; a durable producer journal remains next. Generic external harness review fails closed. Dioxus currently guides terminal commands.
+`rust_workspace_v1` combines env-routed/typed claim intent, fixed detached Rust verification, and
+criteria-bound, history/tool-free API Supervisor review. It runs host-trusted code, not a sandbox;
+receipts/task locks do not close crash-before-receipt. External harness review fails closed.
 
 ### memory / genome — `[code]`
 Scoped durable continuity: session history plus verified decisions/preferences, retrieval indexes,
 and review-first context injection. Memory records must carry project/session provenance.
+- **Boundary:** pending accepted-run candidates are review state, not curated memory.
 - **Source of truth:** `src/{state,memory,retrieval,injection,stewardship}/`.
 
 ### artifact — `[code]`
@@ -195,12 +196,11 @@ reach the user-restricted daemon socket remain inside the current trust boundary
 
 ---
 
-## Live-versus-direction boundary (2026-07-13)
+## Live-versus-direction boundary (2026-07-15)
 
-- **Live foundation:** PTY/workbench truth, managed turns, registry-backed desktop platforms, Ion,
-  telemetry, policy/tools/memory/artifacts/credentials, profiled Builder launch, env-routed CLI and
-  Ion claims, inherited-routing isolation for ordinary panes, detached daemon verification, strict
-  API Supervisor review, and operator-only acceptance.
-- **Direction:** accepted-run memory candidates, stronger same-user actor authorization, full
-  launched-runtime proof, reassignment/resume, generalized roles/adapters/capabilities,
-  multi-project routing, and typed cross-agent messaging.
+- **Live foundation:** PTY/workbench truth, managed turns, registry-backed platforms/Ion, shared
+  services, profiled Builder launch, routed claims, detached verification, strict API review,
+  operator acceptance, and repairable pending candidates with no `GENOME`/`HISTORY` mutation.
+- **Next:** stronger same-user actor authorization and one full launched Builder/Supervisor proof.
+- **Later:** explicit candidate promotion/dismissal, reassignment/resume, generalized
+  roles/adapters/capabilities, multi-project routing, and typed cross-agent messaging.
