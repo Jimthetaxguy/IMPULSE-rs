@@ -1,8 +1,8 @@
 ---
 title: User Story Map
 description: Rust-first user stories and documentation baseline for the current Impulse product surface
-version: '1.4'
-updated: 2026-07-15
+version: '1.5'
+updated: 2026-07-16
 type: specification
 category: core
 phase: all
@@ -222,17 +222,27 @@ Primary interfaces:
 
 #### ST-09 Observe work through the Dioxus desktop host
 
-As an operator, I want Overview, Agents, Context, Memory, and Artifacts views in the Dioxus Desktop shell so I can supervise agent work without reading raw state files.
+As an operator, I want project and worker rails plus Terminal, Memory, Review, Artifacts, and
+Supervisor routes in the Dioxus cockpit so I can inspect agent work without reading raw state
+files.
 
 Status: In progress
 
 Acceptance criteria:
 
-- `impulse-desktop` renders the current workbench surfaces
+- `impulse-desktop` renders one shared launch-target selection, a truthful connected-daemon-project
+  oversight service, desktop-wide specialized workers, a focused terminal, and launch/review
+  controls
+- Terminal, Memory, Review, Artifacts, and Supervisor routes project typed Rust-owned state; the
+  oversight service does not imply that a selectable Supervisor runtime is already launched
 - daemon snapshots provide the durable read model for the active workbench surfaces
 - live terminal telemetry can be overlaid without replacing durable daemon truth
 - the Supervisor route renders `ProjectOpsSnapshot.governed_tasks` and submits acknowledged
   revision-bound decisions without optimistic task state
+- the Memory route renders accepted-run candidates as pending review and not stored in `GENOME`,
+  with no promotion or dismissal control in this slice
+- the Artifacts route renders typed envelopes read-only and does not advertise backend actions that
+  are not wired into the cockpit
 
 Primary interfaces:
 
@@ -242,7 +252,8 @@ Primary interfaces:
 - `PublishTerminalOps`
 - `ListArtifacts`
 - `GetArtifact`
-- `RunArtifactAction`
+- `ArtifactEnvelope` read models
+- `AcceptedRunMemoryCandidate` read models
 - `governed_task_mutate`
 
 ### E. Stewardship and Safety

@@ -2,7 +2,7 @@
   "plan_path": "ralph-plan-4.md",
   "current_iteration": 16,
   "total_planned": 100,
-  "status": "stopped",
+  "status": "running",
   "started": "2026-03-31T06:56:00Z",
   "last_completed": "Loop 15 (Ralph Plan 4): backend.rs error logging — read_errors counter + log::error!() on PTY failures. Loops 7-15 ALL COMPLETE. 1,020 tests, 0 failures.",
   "completed_steps": [
@@ -15,10 +15,8 @@
     "Loop 14: Animations — tab-switch fade (150ms), spawn fade (200ms), compaction pulse (300ms).",
     "Loop 15: backend.rs error logging — read_errors counter, log::error!() on PTY failures, read_error_count()."
   ],
-  "next_step": "No continuation. New desktop UX work belongs to the Dioxus cockpit in impulse-desktop; EGUI is default-inactive pending gated physical removal.",
-  "blockers": [
-    "Plan retired because it targets the legacy EGUI workbench rather than the active Dioxus product path."
-  ],
+  "next_step": "Loop 17 (Ralph Plan 4): UX — Command Palette (Ctrl+Shift+P) + drag-drop tab reordering",
+  "blockers": [],
   "files_modified": [
     "impulse-rs/impulse-term/src/renderer.rs",
     "impulse-rs/impulse-term/src/panel.rs",
@@ -28,5 +26,5 @@
     "impulse-rs/impulse-term/src/backend.rs",
     "impulse-rs/impulse-gui/src/views/terminals.rs"
   ],
-  "notes": "Stopped 2026-07-16 during Dioxus/EGUI retirement cleanup. Historical running state is preserved at .opencode/_archive-2026-07-16-L1/ralph-loop.json. Do not resume EGUI product work."
+  "notes": "Ralph Plan 4: TUI Correctness (7,9,10) COMPLETE. TUI/UX (11-15) COMPLETE. Validation (PRs 1.1,1.2,1.4) COMPLETE. Phase 6 (Loops 17-23 premium UX) next. 1,020 tests, 0 failures, 0 clippy warnings."
 }

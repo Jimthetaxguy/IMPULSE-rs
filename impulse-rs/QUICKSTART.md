@@ -1,6 +1,7 @@
 # Quick Start Guide
 
-Get from a source checkout to a tracked project and the terminal-native operator surfaces.
+Get from a source checkout to a tracked project and choose the Dioxus cockpit or the first-class
+terminal-only workbench.
 
 ## Prerequisites
 
@@ -26,13 +27,44 @@ impulse-rs init
 
 Creates `.impulse/` with `config.json`, `GENOME.md`, and `HISTORY.jsonl`.
 
-## Step 3: Launch the TUI Workbench
+## Step 3: Choose an Operator Surface
+
+### Dioxus Cockpit (Active Desktop Product Path)
+
+From the Rust workspace root in the source checkout:
+
+```bash
+cd <path-to-IMPULSE-rs>/impulse-rs
+cargo run -p impulse-desktop --features desktop-app --bin impulse-desktop
+```
+
+The cockpit keeps one selected launch target, the connected daemon project's oversight service,
+desktop-wide workers, the focused terminal, and launch/review controls visible together. The rail
+and launch dock share the same target authority. Register the project folder, choose a runtime
+separately from the Builder role, and launch only after the compatibility preview passes. The
+oversight service exposes project-scoped review state; it does not claim that a selectable
+Supervisor runtime has already been launched.
+
+On macOS, build and lifecycle-smoke the local signed application with:
+
+```bash
+bash scripts/build-macos-app.sh --smoke
+open Impulse.app
+```
+
+The package includes the `impulse-rs` daemon companion. It attaches to an already-running daemon
+when available and owns cleanup only for the companion it starts.
+
+### ratatui Workbench (First-Class Terminal-Only Alternative)
 
 ```bash
 impulse-rs run
 ```
 
-The terminal-native workbench is the current operator path. The Dioxus Desktop host lives in `impulse-desktop`; Tauri-shaped code is legacy compatibility only while host parity moves over. The old egui `impulse-gui` workbench is legacy/frozen and should be used only for compile-maintenance or historical comparison.
+The ratatui workbench remains a supported operator surface for terminal-native session, history,
+context, and stewardship workflows. Tauri-shaped code is compatibility-only. The old egui
+`impulse-gui` workbench is legacy/frozen and should be used only for explicit compile maintenance
+or historical comparison.
 
 ### Monitor Work in the TUI
 
@@ -87,4 +119,6 @@ impulse-rs --daemon status
 
 **"No agent backend configured"** — Set `ANTHROPIC_API_KEY` or install Claude Code
 
-**Desktop shell status** — Use the ratatui TUI for current work. The Dioxus Desktop host is the active native-shell target, Tauri-shaped code is legacy compatibility only, and `impulse-gui` is legacy/frozen.
+**Desktop shell status** — Dioxus is the active desktop cockpit. ratatui remains the first-class
+terminal-only alternative, Tauri-shaped code is compatibility-only, and `impulse-gui` is
+legacy/frozen.

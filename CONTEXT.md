@@ -149,11 +149,37 @@ The PTY/process lifecycle boundary for spawn, input, resize, focus, exit, and cl
 mechanics publish state; they do not own durable project truth.
 - **Source of truth:** `impulse-term/src/backend.rs` and `impulse-desktop/src/runtime.rs`.
 
+### launch target — `[code]`
+The one desktop selection used by both the workspace rail and launch dock for the next Builder
+root. Changing it does not re-scope running worker terminals or switch the connected daemon's
+project truth; multi-project daemon routing remains later work. If no standard project-local daemon
+socket is explicitly supplied at process launch, oversight remains disconnected rather than using
+cwd, an ancestor, or the home-level memory root as project authority. The first confirmed governed
+launch must target a registered workspace and atomically binds it as the process-lifetime daemon,
+memory, telemetry, and task boundary before task registration; malformed or unconfirmed MCP
+launches are audited before activation, and switching that boundary then requires restart.
+- **Source of truth:** the lifted `focused_workspace_root` signal in `impulse-desktop/src/ui.rs`.
+
 ### Dioxus cockpit — `[code]`
-The operator-facing desktop composition of terminals, agents, context, artifacts, and controls.
-It consumes daemon/runtime state through typed host commands/events and must not become a second
-policy or persistence authority.
-- **Source of truth:** `impulse-desktop/src/{desktop_host,host_bridge,host_commands,views}.rs`.
+The operator-facing desktop composition of one shared launch-target selection, an explicit
+daemon-project-scoped oversight lane, desktop-wide specialized workers, focused terminals,
+evidence inspectors, and launch/review controls. It consumes
+daemon/runtime state through typed host commands/events and must not become a second policy or
+persistence authority. The packaged host owns only a daemon companion it starts; an already-running
+operator daemon remains external. A desktop-owned companion validates and watches the exact desktop
+parent PID so owner loss reuses graceful daemon drain/sync/runtime-file cleanup. The oversight dock
+currently represents the connected daemon project's review service and must not imply that a
+model-backed Supervisor runtime is running. The home-level `~/.impulse` fallback can still back
+CLI user memory, but the disconnected desktop does not expose it as project memory or review state.
+- **Source of truth:**
+  `impulse-desktop/src/{desktop_host,host_bridge,host_commands,daemon_ops,daemon_sidecar,desktop_shutdown,project_boundary,ui,views}.rs`.
+
+### governed lifecycle outbox — `[code]`
+An owner-only, project-local write-ahead queue for desktop launch/exit mutations that may outlive an
+ambiguous daemon transport failure. Its data and sibling lock reject symlinks and non-regular leaves;
+the cross-process lock preserves serialization with a bounded, shutdown-aware wait so application
+close cannot hang forever behind another holder.
+- **Source of truth:** `impulse-desktop/src/{daemon_ops,project_boundary}.rs`.
 
 ### tool capability — `[code]`
 A deny-by-default permission required by a typed tool. Tool availability varies by runtime bridge;
@@ -200,7 +226,13 @@ reach the user-restricted daemon socket remain inside the current trust boundary
 
 - **Live foundation:** PTY/workbench truth, managed turns, registry-backed platforms/Ion, shared
   services, profiled Builder launch, routed claims, detached verification, strict API review,
-  operator acceptance, and repairable pending candidates with no `GENOME`/`HISTORY` mutation.
+  operator acceptance, repairable pending candidates with no `GENOME`/`HISTORY` mutation, and a
+  signed macOS Dioxus package/verifier that requires a fresh real eval-bridge, PTY, local-assets,
+  ops-event, and ordered-host-close receipt for release acceptance. Static/signature and
+  disconnected-scope package proof pass on this branch, but the latest local signed GUI-host smoke
+  abort remains open and historical receipts are not current proof. Real daemon tests separately
+  prove desktop-owner loss cleanup; AppKit Quit plus live-PTY package proof remains release
+  hardening.
 - **Next:** stronger same-user actor authorization and one full launched Builder/Supervisor proof.
 - **Later:** explicit candidate promotion/dismissal, reassignment/resume, generalized
   roles/adapters/capabilities, multi-project routing, and typed cross-agent messaging.

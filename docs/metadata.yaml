@@ -1,8 +1,8 @@
 ---
 title: Impulse Project Metadata
 description: Centralized metadata for Impulse project
-version: "2.0"
-updated: 2026-05-22
+version: "3.0"
+updated: 2026-07-16
 type: metadata
 ---
 
@@ -13,37 +13,51 @@ type: metadata
 | Field | Value |
 |-------|-------|
 | Name | Impulse |
-| Tagline | "Your AI remembers. Silently." |
-| Type | Terminal-native AI coding agent sidecar |
+| Tagline | "Feed the impulse to build." |
+| Type | Lightweight, terminal-native coding-agent harness and local control plane |
 | Language | Rust |
-| Status | Active Development |
+| Status | Pre-release active development |
 
-## Core Metrics
+Impulse hosts heterogeneous coding runtimes inside one governed environment. Dioxus is the
+desktop cockpit, ratatui is the terminal-only cockpit, roles define behavior, runtime adapters
+launch workers, the daemon owns durable control-plane state, and memory is one curated platform
+service rather than the whole product.
 
-| Metric | Value |
-|--------|-------|
-| Total Source Files | 14 |
-| Total Lines (Rust) | ~3,200 |
-| Total Documents | 68 |
-| Categories | 8 |
-| Decisions (ADRs) | 5 |
+## Authority
+
+| Question | Source of truth |
+|---|---|
+| Product north star | [`../VISION.md`](../VISION.md) |
+| Current implemented behavior | [`spec/RUST-CANONICAL-CONTRACT.md`](spec/RUST-CANONICAL-CONTRACT.md) |
+| Live versus target status | [`spec/TEST-TRACEABILITY.md`](spec/TEST-TRACEABILITY.md) |
+| Desktop stack | [`decisions/0008-dioxus-desktop-host.md`](decisions/0008-dioxus-desktop-host.md) |
+| EGUI retirement | [`plans/EGUI-DECOMMISSION.md`](plans/EGUI-DECOMMISSION.md) |
 
 ## Architecture
 
 dual_mode:
   direct:
-    description: "Per-action, stateless"
-    use_case: "CLI hooks for Claude Code/Codex; legacy OpenCode compatibility where already implemented"
-    flow: "read → process → write → exit"
+    description: "Bounded CLI operations and runtime adapters"
+    use_case: "Hooks, explicit control commands, and external coding-agent launch surfaces"
+    flow: "request → validate role and scope → execute → publish evidence"
     
   daemon:
-    description: "Long-running"
-    use_case: "TUI, interactive chat"
+    description: "Long-running local control-plane authority"
+    use_case: "Durable tasks, review state, telemetry, memory, and cockpit subscriptions"
     socket_path: ".impulse/sockets/impulse.sock"
     features:
-      - "In-memory state"
-      - "Periodic file sync"
-      - "Unix socket IPC"
+      - "Daemon-owned governed task lifecycle"
+      - "Structured operations snapshots and subscriptions"
+      - "Atomic persistence and local Unix-socket IPC"
+      - "Accepted-run memory candidates with explicit review boundaries"
+
+product_layers:
+  - "Dioxus desktop cockpit and ratatui terminal cockpit"
+  - "Supervisor, Builder, and review role contracts"
+  - "Claude Code, Codex, shell, Ion, and future runtime adapters"
+  - "PTY/process supervision and typed tools"
+  - "Daemon-owned tasks, evidence, review, and telemetry"
+  - "Scoped memory, artifacts, and context"
 
 data_files:
   - name: LIVE_STATE.json
@@ -65,91 +79,66 @@ data_files:
 | Language | Rust | stable |
 | CLI Parser | clap | 4.x |
 | TUI | ratatui | 0.28 |
-| Desktop shell | Dioxus Desktop + xterm.js | in migration |
+| Desktop shell | Dioxus Desktop + xterm.js | active primary path |
 | Legacy host adapter | Tauri-shaped bridge | compatibility only |
-| Legacy desktop | egui / impulse-gui | frozen |
+| Legacy desktop | egui / impulse-gui | default-inactive; physical retirement gated |
 | Async | tokio | 1.x |
-| HTTP Client | reqwest | 0.11 |
-| Error Handling | thiserror, anyhow | latest |
+| Control IPC | newline-delimited JSON over local Unix sockets | protocol-versioned |
+| Packaging | signed macOS `.app` plus companion `impulse-rs` | developer preview |
 
-## Providers
+## Runtime and Model Integrations
 
 llm_providers:
   - name: Anthropic
-    status: implemented
-    models:
-      - claude-3-5-sonnet-20241022
-      - claude-3-opus-20240229
+    status: "API adapter implemented; capability depth varies by path"
       
   - name: OpenAI
-    status: implemented
-    models:
-      - gpt-4o
-      - gpt-4o-mini
+    status: "API adapter implemented; tool-calling parity is not complete"
       
-  - name: Minimax
-    status: implemented
-    models:
-      - MiniMax-M2.1
+  - name: MiniMax
+    status: "API adapter plus Ion/Pi verification path implemented; production proof is separately gated"
+
+external_runtimes:
+  - "Claude Code"
+  - "Codex CLI"
+  - "Generic shell"
+
+Runtime presence does not imply equal enforcement. Role compatibility and capability negotiation
+must fail closed when a mandatory control cannot be satisfied.
 
 ## Roadmap Phases
 
 phases:
-  - name: Phase 1
-    focus: "Core CLI + Direct Mode + Daemon + TUI"
-    status: complete
+  - name: Now
+    focus: "Dioxus cockpit, governed Builder flow, daemon-owned evidence, review, packaged live-host proof"
+    status: active
     
-  - name: Phase 2
-    focus: "Claude Code/Codex Hooks + Chat; legacy OpenCode compatibility"
-    status: pending
+  - name: Next
+    focus: "A truly launched Supervisor runtime, stronger actor authorization, and complete Builder/Supervisor end-to-end proof"
+    status: planned
     
-  - name: Phase 3
-    focus: "Semantic Search + Vector Similarity"
+  - name: Later
+    focus: "Generalized roles, negotiated runtimes, multi-project routing, and explicit memory promotion/dismissal"
     status: planned
 
 ## Commands
 
-cli_commands:
-  session:
-    - session-start
-    - session-end
-    - session-info
-    - list-sessions
-    
-  tracking:
-    - track-write
-    - track-tool
-    
-  info:
-    - status
-    - genome
-    - history
-    - list-providers
-    
-  system:
-    - init
-    - daemon
-    - run
+The executable CLI is authoritative. Use `impulse-rs --help` and
+[`CLI-COMMANDS.md`](CLI-COMMANDS.md); this metadata file deliberately does not duplicate a
+drift-prone command inventory.
 
 ## File Structure
 
 ```
 impulse-rs/
-├── src/
-│   ├── main.rs           # CLI entry
-│   ├── state/mod.rs     # State management
-│   ├── daemon/mod.rs    # Unix socket server
-│   ├── client/mod.rs   # Daemon client
-│   ├── storage/mod.rs  # Atomic file ops
-│   ├── ui/mod.rs       # Ratatui TUI
-│   ├── memory/mod.rs   # GENOME system
-│   ├── agent/          # LLM providers
-│   └── error.rs        # Error types
-└── .impulse/           # Runtime data
-    ├── LIVE_STATE.json
-    ├── HISTORY.jsonl
-    ├── GENOME.md
-    └── sockets/
+├── impulse-desktop/     # Dioxus cockpit, host bridge, PTY lifecycle
+├── impulse-ops/         # Typed control-plane and governed-task contracts
+├── impulse-ion/         # Native verification/runtime integration
+├── impulse-term/        # Framework-neutral terminal engine
+├── impulse-tui/         # Ratatui cockpit
+├── impulse-gui/         # Default-inactive EGUI legacy surface pending gated removal
+├── src/                 # CLI, daemon, persistence, memory, providers, tools
+└── scripts/             # Packaging and verification entry points
 ```
 
 ## Authors
@@ -162,5 +151,6 @@ impulse-rs/
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 3.0 | 2026-07-16 | Coding-harness/control-plane framing, Dioxus primary path, governed role and verification truth |
 | 2.0 | 2026-02-23 | Rust rewrite, dual mode architecture |
 | 1.0 | 2024 | Initial TypeScript prototype |

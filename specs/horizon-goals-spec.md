@@ -1,5 +1,13 @@
 # Horizon Goals Framework — Specification
 
+> **NONCANONICAL AND OUTDATED DRAFT.** This point-in-time proposal predates the current Impulse
+> product framing and desktop implementation. Its memory-sidecar description, egui migration state,
+> crate/test counts, dependencies, UI inventory, and implementation roadmap must not be treated as
+> current truth or an approved build plan. Use [`../VISION.md`](../VISION.md),
+> [`../docs/spec/RUST-CANONICAL-CONTRACT.md`](../docs/spec/RUST-CANONICAL-CONTRACT.md),
+> [`../docs/spec/USER-STORY-MAP.md`](../docs/spec/USER-STORY-MAP.md), and
+> [`../docs/spec/TEST-TRACEABILITY.md`](../docs/spec/TEST-TRACEABILITY.md) for current authority.
+
 > **Version:** 0.1.0-draft
 > **Author:** James Pustorino
 > **Date:** 2026-06-25

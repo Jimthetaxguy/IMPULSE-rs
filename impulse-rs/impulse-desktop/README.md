@@ -17,7 +17,7 @@ and requests those capabilities; Rust validates and executes them.
 
 | Layer | Owner |
 | --- | --- |
-| Layout, rails, inspectors, command palette, review/apply surfaces | Dioxus |
+| Project/worker rails, oversight lane, terminal, inspectors, and launch/review surfaces | Dioxus |
 | Native window/process/IPC boundary | Dioxus desktop host adapters |
 | PTY lifecycle and live terminal bytes | `DesktopRuntime` / `impulse-term` |
 | Reconciled agents, context, memory, artifacts, and interventions | Impulse daemon |
@@ -52,6 +52,16 @@ independent copies of sessions, memory, terminal state, or artifacts.
 - The adapter binds one daemon/project and filters agents from other registered
   workspaces. Cross-project routing requires a future project identity on the
   publish/subscribe contract rather than mixing workspaces into one snapshot.
+- A no-environment packaged launch does not treat `~/.impulse`, cwd, or any ancestor `.impulse`
+  directory as project authority. The daemon bridge stays disconnected until a standard
+  project-local socket is explicit;
+  the package verifier executes the real binary in this state and proves that scope resolution
+  creates no project/runtime state. The first governed launch then binds the selected project and
+  installs daemon telemetry, the governed gateway, and project memory as one boundary. Before any
+  lease, process, or PTY mutation, the host rejects project-state/socket/lock symlinks that escape
+  the project; the connected daemon must then attest the exact project id, repository root, and
+  local `.impulse` root. The gateway independently rejects cross-project task registration and
+  mutation.
 - Built-in MCP tools default to safe descriptors for `impulse.agent_spawn`,
   `impulse.agent_write`, `impulse.search_memory`, and
   `impulse.review_injection`; mutating terminal actions require confirmation.
@@ -78,7 +88,12 @@ Dioxus controls -> legacy Tauri-shaped adapter -> DesktopRuntime -> impulse-term
   `cargo run -p impulse-desktop --features desktop-app --bin impulse-desktop`.
   The binary installs the live Dioxus eval bridge behind
   `window.__IMPULSE_DESKTOP_HOST`, starts the daemon-ops publisher/subscriber,
-  and reports subscription freshness separately from telemetry publish health.
+  and reports subscription freshness separately from telemetry publish health. When a
+  project-local boundary is explicit, it attaches to an existing daemon or starts
+  the packaged `impulse-rs` sibling and owns that child's cleanup across bridge-driven and native
+  window shutdown. Otherwise the terminal runtime starts safely disconnected and the first
+  governed launch—including the visible audited `impulse.agent_spawn` path—connects the exact
+  registered project before MCP context lookup, task registration, or PTY creation.
 - `native-macos` enables the Objective-C/AppKit compatibility bridge via
   `objc2`.
 - `legacy-tauri-runtime` enables the compatibility Tauri command annotations
@@ -86,7 +101,23 @@ Dioxus controls -> legacy Tauri-shaped adapter -> DesktopRuntime -> impulse-term
 - `tauri-runtime` remains a deprecated Cargo feature alias for older commands;
   do not use it for new work.
 
-## Visual And Host Smoke
+## Cockpit composition
+
+The active shell is a compact mission-control surface:
+
+- one launch-target selection is shared by the rail and launch dock;
+- desktop-wide workers stay visible in the left rail, while the persistent oversight dock is
+  truthfully scoped to the connected daemon project and does not imply an automatically launched
+  Supervisor model;
+- the focused worker terminal owns the primary center surface;
+- runtime selection and the Builder role remain separate in the launch dock;
+- review, artifact, memory, and telemetry inspectors are secondary evidence surfaces.
+
+Visible controls must dispatch an authoritative typed operation. Placeholder command-palette,
+settings, fake-shortcut, and local-only artifact actions are intentionally omitted until their
+backend contracts exist.
+
+## Visual and packaged host proof
 
 Before running the visual smoke, `npm run vendor:xterm` copies the pinned
 `@xterm/xterm` and `@xterm/addon-fit` browser assets into
@@ -99,13 +130,22 @@ opens them in headless Chromium to assert non-blank layout, no shell overlap, no
 viewport overflow, route-specific visible content, local xterm globals, and no
 remote font or terminal asset URLs.
 
-The host-readiness smoke exercises the live Dioxus host contract without claiming
-that a packaged release artifact exists. It opens a local browser fixture, loads
-the same vendored xterm assets, stubs either the Dioxus-native
+The browser host-readiness smoke remains a fast contract test. It opens a local fixture, loads the
+same vendored xterm assets, stubs either the Dioxus-native
 `window.__IMPULSE_DESKTOP_HOST` adapter or the legacy Tauri-shaped
 `invoke`/`listen` adapter, evaluates the Rust-owned terminal interop script, and
 asserts terminal input is serialized as `agent_write` bytes, resize emits
 `agent_resize`, and terminal output and exit events reach the xterm buffer.
+
+The macOS package smoke is the artifact-level acceptance gate; every candidate needs a fresh
+passing receipt. It launches the assembled signed
+`.app`, requires the real Dioxus eval bridge and local xterm constructors/styles, opens a real PTY,
+proves resize/focus/input/output/exit/close plus daemon ops, receives a structured completion
+receipt, requests the Rust-owned ordered host close, and rejects the package if its worker or
+desktop-owned daemon survives. The daemon companion also validates and watches its exact desktop
+parent; AppKit Quit and abrupt-desktop live-PTY smokes remain separate release-hardening work. The
+active work card records the latest local artifact result so a historical receipt is never mistaken
+for current release proof.
 
 ```bash
 cd <repo>/impulse-rs/impulse-desktop
@@ -118,7 +158,22 @@ CARGO_TARGET_DIR=/tmp/impulse-visual-target npm run dioxus:host:smoke
 CARGO_TARGET_DIR=/tmp/impulse-visual-target npm run legacy:host:smoke
 ```
 
+From the Rust workspace root:
+
+```bash
+CARGO_TARGET_DIR=/tmp/impulse-package-target \
+  bash scripts/build-macos-app.sh --smoke
+
+# Build the developer-preview DMG and mount-verify its nested application too.
+CARGO_TARGET_DIR=/tmp/impulse-package-target \
+  bash scripts/build-macos-app.sh --smoke --dmg
+```
+
 Screenshots are generated under `../../output/playwright/impulse-desktop-visual/`
 plus `../../output/playwright/impulse-desktop-dioxus-host-smoke/` and
 `../../output/playwright/impulse-desktop-host-smoke/`, all ignored by the
 repository root `.gitignore`.
+
+Package-smoke logs and receipts are retained under `../target/package-smoke/`; packaged artifacts
+are written under `../target/package/` (with `Impulse.app` assembled at the workspace root for
+local use).

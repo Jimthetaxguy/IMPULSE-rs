@@ -1,15 +1,15 @@
 ---
 title: Documentation Index
 description: Master navigation hub for Impulse documentation
-version: '1.7'
-updated: 2026-07-15
+version: '1.8'
+updated: 2026-07-16
 type: doc
 category: navigation
 phase: all
 status: active
 audience: everyone
 tags: [index, navigation, discovery]
-last_updated: 2026-07-15
+last_updated: 2026-07-16
 authors:
   - name: Impulse Maintainers
     role: Maintainer
@@ -140,15 +140,14 @@ CLI help, or current tests.
 | [PHASE2-MIGRATION-PLAN.md](phases/PHASE2-MIGRATION-PLAN.md) | Migration strategy       |
 | [ROADMAP-PLAN.md](ROADMAP-PLAN.md)                          | Superseded Rust/Dioxus migration roadmap retained for history |
 | [IMPLEMENTATION-HANDOFF.md](plans/IMPLEMENTATION-HANDOFF.md)| Historical desktop migration execution handoff |
-| [LONG-RANGE-ENHANCEMENTS.md](LONG-RANGE-ENHANCEMENTS.md) | PR-organized enhancement backlog across 8 lanes |
+| [LONG-RANGE-ENHANCEMENTS.md](LONG-RANGE-ENHANCEMENTS.md) | Superseded enhancement backlog retained for historical planning context |
 
 ### Current Control-Plane Foundation
 
 | Document | Description |
 | -------- | ----------- |
 | [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) | Authoritative product and desktop shell contract |
-| [DESKTOP-SHELL-ARCHITECTURE.md](spec/DESKTOP-SHELL-ARCHITECTURE.md) | Dioxus Desktop + xterm.js layer boundaries |
-| [IMPULSE_TERM_STATUS.md](../impulse-rs/docs/IMPULSE_TERM_STATUS.md) | Terminal backend status and desktop bridge implications |
+| [DESKTOP-SHELL-ARCHITECTURE.md](spec/DESKTOP-SHELL-ARCHITECTURE.md) | Dioxus Desktop + xterm.js layer boundaries and current cockpit information hierarchy |
 | [ADR-0010](decisions/0010-product-role-launch-contract.md) | Current explicit product-role/task launch-preflight boundary |
 | [ADR-0011](decisions/0011-governed-task-run-lifecycle.md) | Current daemon-owned governed task evidence/decision boundary |
 | [ADR-0012](decisions/0012-daemon-owned-governed-runtime-producers.md) | Current profiled claim/verification/Supervisor producer boundary |
@@ -211,6 +210,8 @@ See [research/README.md](research/README.md) for reading sequences by phase.
 | Document                                                                       | Superseded By                               |
 | ------------------------------------------------------------------------------ | ------------------------------------------- |
 | [TUI-AUGMENTATION-VISION.md](archive/TUI-AUGMENTATION-VISION.md)              | Current Rust roadmap and workbench docs     |
+| [LONG-RANGE-ENHANCEMENTS.md](LONG-RANGE-ENHANCEMENTS.md)                       | [VISION.md](../VISION.md), the canonical contract, and test traceability |
+| [IMPULSE_TERM_STATUS.md](../impulse-rs/docs/IMPULSE_TERM_STATUS.md)             | Historical egui-only status; use the desktop-shell contract and live source |
 | [Ralph plans 1-6](archive/ralph-plans/README.md)                              | Provenance only; use current roadmap/spec/ADR docs |
 | Session logs (11 files)                                                         | [DEVELOPMENT-HISTORY.md](session-logs/DEVELOPMENT-HISTORY.md) |
 

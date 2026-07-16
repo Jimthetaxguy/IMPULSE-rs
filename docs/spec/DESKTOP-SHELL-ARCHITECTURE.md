@@ -1,9 +1,9 @@
 ---
 title: Desktop Shell Architecture
 status: active
-version: 1.1.0
+version: 1.2.0
 created: 2026-04-15
-updated: 2026-07-15
+updated: 2026-07-16
 ---
 
 # Desktop Shell Architecture
@@ -30,9 +30,9 @@ See `docs/decisions/0008-dioxus-desktop-host.md` for the current ADR.
 
 ```
 DESKTOP SHELL (Dioxus Desktop)
-  Left Rail | Center Terminal Panes (xterm.js) | Right Inspector
-  Top Bar (daemon status)
-  Bottom Strip (event log)
+  Left Oversight Dock | Center Mission + Terminal | Right Launch / Inspector
+  Top Bar (shared launch target + connected-daemon state + review entry)
+  Bottom Strip (meaningful event signals)
 
           | Dioxus host adapter commands + events |
 
@@ -49,6 +49,36 @@ DAEMON (impulse-rs binary)
   agent coordination, snapshot publishing
 ```
 
+## Cockpit Information Hierarchy
+
+The desktop is an operator cockpit for coordinated coding work, not a memory dashboard and not a
+marketing splash screen.
+
+1. **Project and assignment first.** The active project, current task, worker state, and next
+   operator action must dominate the center lane.
+2. **Oversight stays visible.** The left dock exposes daemon-owned review/evidence attention and
+   worker state. It must say `Oversight` until a real Supervisor runtime has been launched; UI
+   location or a review service must never imply a model-backed supervisor exists.
+3. **Role and runtime stay separate.** The right launch dock selects a runtime such as Claude Code
+   or Codex and assigns the governed Builder role as a distinct contract.
+4. **Terminal work remains primary.** xterm panes are the execution surface. Memory, artifacts,
+   evidence, and low-level telemetry support that work through inspectable routes or disclosure.
+5. **Empty state teaches the real loop.** Register project -> choose runtime -> define assignment
+   and acceptance criteria -> launch Builder -> inspect evidence. Zero-value statistics do not earn
+   primary space.
+6. **No implicit home-wide governance.** A packaged launch without a standard project-local daemon
+   socket renders oversight as disconnected. `~/.impulse` memory fallback is not a project scope,
+   and the first governed launch must bind daemon, project memory, telemetry, and task commands to
+   the exact registered target before MCP context lookup or PTY creation. Activation rejects
+   external state/socket/lock symlinks before filesystem or process mutation, then requires daemon
+   attestation of the canonical project id, repository root, and local `.impulse` root. The task
+   gateway rejects cross-project registrations and mutations independently of the UI.
+
+Visual styling is restrained, industrial, and terminal-native. Amber and cyan are status accents,
+not full-screen decoration. Retro texture may appear as a quiet brand detail, but scanline overlays,
+flicker, giant glowing logos, and decorative telemetry must not compete with project work. The
+historical June design exploration is reference material, not a current screen contract.
+
 ---
 
 ## Runtime Responsibilities
@@ -59,6 +89,9 @@ DAEMON (impulse-rs binary)
 - Hosts the Dioxus application and installs `window.__IMPULSE_DESKTOP_HOST`
 - Exposes host command handlers for the terminal bridge API
 - Subscribes to daemon/runtime events and forwards them to the frontend as host events
+- Attaches or starts a daemon companion only when an exact project-local boundary is explicit, or
+  when the first governed launch supplies the exact selected project; otherwise it
+  keeps oversight and project-memory operations disconnected
 - Never becomes the PTY owner
 - Never holds UI state - it relays state from daemon/backend to the frontend
 

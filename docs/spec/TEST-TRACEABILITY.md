@@ -1,8 +1,8 @@
 ---
 title: Test Traceability Matrix
 description: Story-to-test coverage map for the current Rust Impulse workspace and open validation gaps
-version: '1.3'
-updated: 2026-07-15
+version: '1.4'
+updated: 2026-07-16
 type: specification
 category: testing
 phase: all
@@ -40,7 +40,7 @@ authors:
 | ST-06 Stage context before injecting it | `impulse-rs/src/injection/engine.rs`, `src/injection/staging.rs`, `src/handlers/injection_handlers.rs`, `src/orchestration/mod.rs`, integration enhancement paths | Strong | the biggest remaining gap is full-flow end-to-end validation of retrieval-seeded injection effects across output plus on-disk artifacts |
 | ST-07 Produce handoff artifacts for the next agent or session | orchestration tests, injection-handler tests, context artifact contracts, file-path assertions in current Rust modules | Strong | stronger end-to-end artifact assertions would still reduce regression risk |
 | ST-08 Use a daemon as the long-lived source of truth | `impulse-rs/src/daemon/tests.rs`, `src/daemon/protocol.rs`, integration daemon guard flows, daemon-adjacent handler coverage | Strong | the open risk is workbench IPC lifecycle coverage, not the absence of daemon tests |
-| ST-09 Observe work through the Dioxus desktop host | `impulse-rs/impulse-desktop/src/daemon_ops.rs`, `impulse-rs/impulse-desktop/tests/desktop_contract.rs`, `impulse-rs/impulse-desktop/tests/host_surface.rs`, `impulse-rs/impulse-desktop/tests/runtime.rs`, `impulse-rs/impulse-term/tests/backend_tests.rs`, `impulse-rs/src/daemon/tests.rs::test_publish_then_subscribe_reconciles_terminal_agent_through_real_handler`, and `impulse-rs/impulse-desktop/scripts/host_readiness_smoke.mjs` | Strong | compositional coverage proves Unix JSONL client framing, separate real-handler reconciliation, lifecycle reduction, registry-derived platform catalogs across MCP/host/browser/UI, strict unknown-platform rejection, opt-in real sibling-Ion launch, and browser-host readiness; one packaged desktop-to-real-daemon E2E plus multi-workspace routing remain open |
+| ST-09 Observe work through the Dioxus desktop host | `impulse-rs/impulse-desktop/{src/{desktop_host,host_bridge,daemon_ops,daemon_sidecar}.rs,tests/{desktop_contract,host_surface,runtime,views_ssr,macos_packaging_contract}.rs}`, `impulse-rs/impulse-term/tests/backend_tests.rs`, `impulse-rs/src/daemon/tests.rs::test_publish_then_subscribe_reconciles_terminal_agent_through_real_handler`, `impulse-rs/tests/daemon_signal_shutdown.rs`, and `impulse-rs/scripts/{build-macos-app,verify-macos-app}.sh` | Strong | the signed packaged-app gate proves local assets, the real Dioxus eval bridge, real PTY open/resize/focus/input/output/exit/close, ops telemetry, ordered host shutdown, and cleanup of a desktop-owned daemon; real daemon tests separately prove exact-parent validation and cleanup after desktop-owner loss. It does not yet prove AppKit Quit with a live PTY, abrupt desktop death with worker cleanup, a complete launched Builder/Supervisor governed workflow, or multi-project daemon routing |
 | ST-10 Review risky context and stewardship actions explicitly | stewardship modules, guardrail and approval surfaces, integration enhancement coverage | Thin | stewardship command dispatch and operator decision paths need clearer regression tests |
 | ST-11 Enforce verification-before-completion | `impulse-rs/src/validate.rs`, recent invalid-direct-request fixes, session-end verify flows | Strong | manual operator acceptance still matters for claim wording, but automated coverage is present |
 | ST-12 Prove the real hook memory loop before expanding claims | `impulse-rs/tests/hook_validation_session_start.rs`, `hook_validation_precompact.rs`, `hook_validation_extraction_benchmark.rs`, `docs/guides/HOOK-VALIDATION-GUIDE.md` | Manual | the code can generate evidence, but product truth still depends on real external hook runs |
@@ -112,12 +112,20 @@ authors:
     missing or non-executable candidates before profiled registration, use the longer bounded
     profiled-registration read without duplicate sends, quote routed guidance, and prove ordinary
     PTYs cannot inherit governed routing variables from the Desktop parent
+- `impulse-rs/impulse-desktop/src/{desktop_host,host_bridge,daemon_sidecar}.rs`,
+  `impulse-rs/impulse-desktop/tests/macos_packaging_contract.rs`, and
+  `impulse-rs/scripts/{build-macos-app,verify-macos-app}.sh`
+  - assemble and validate the signed macOS app plus daemon companion, then lifecycle-smoke the real
+    Dioxus eval bridge, local xterm assets, PTY operations, daemon ops, ordered host close, and
+    idempotent cleanup of only a desktop-owned daemon; `tests/daemon_signal_shutdown.rs` separately
+    proves exact-parent rejection and owner-loss cleanup
 - `impulse-rs/impulse-term/tests/backend_tests.rs`
   - terminal backend behavior
 - `impulse-rs/impulse-desktop/src/bridge.rs`
   - daemon-backed GUI state and snapshot logic
 - `impulse-rs/impulse-desktop/tests/views_ssr.rs`
-  - read-only candidate rendering with pending/not-in-GENOME status and no promotion control
+  - read-only candidate rendering with pending/not-in-GENOME status and no promotion control, plus
+    read-only artifact envelopes with no advertised action controls
 
 ## Known Coverage Gaps To Prioritize
 
@@ -128,17 +136,17 @@ These gaps matter because they sit on stable or nearly stable public interfaces:
    claim/verification/restart path is proven with real processes. One proof must still launch the
    Builder through DesktopRuntime, run the configured API Supervisor path in the same workflow,
    carry evidence into operator acceptance, and observe exactly one deterministic pending candidate.
-2. Add a packaged desktop-to-real-daemon E2E
-   Reason: Unix client framing, real handler reconciliation, reducer behavior, and browser-host readiness are proven separately; one process-level test must connect those boundaries before calling the full desktop path closed.
-3. Add multi-workspace daemon-routing tests
+2. Add multi-workspace daemon-routing tests
    Reason: the delivered desktop adapter intentionally derives one project from one daemon socket; a first-class manager must route distinct workspace agents without cross-project bleed.
-4. Complete daemon socket workbench coverage
-   Reason: `PublishTerminalOps` → `SubscribeOps` has compositional client/handler regressions; `ListArtifacts`, `GetArtifact`, and `RunArtifactAction` still need equivalent desktop-client proof.
-5. Stable CLI mutation flow integration tests
+3. Complete daemon socket workbench coverage
+   Reason: `PublishTerminalOps` -> `SubscribeOps` has real packaged lifecycle proof, while artifact
+   list/get/action parity still needs equivalent desktop-client coverage before any artifact action
+   can become a visible cockpit control.
+4. Stable CLI mutation flow integration tests
    Reason: `session-start`, `session-end --verify`, `track-write`, and `track-tool` should be asserted against real `.impulse/*` artifacts.
-6. Stewardship integration tests
+5. Stewardship integration tests
    Reason: `steward analyze`, `compact`, `approve`, and `reject` are still underrepresented relative to their safety importance.
-7. End-to-end injection mode tests
+6. End-to-end injection mode tests
    Reason: `off|review|apply` should be proven against both returned output and emitted artifact/log behavior.
 
 ## Documentation Corrections Captured By This Matrix
@@ -155,6 +163,8 @@ These gaps matter because they sit on stable or nearly stable public interfaces:
 
 - the stable CLI contract needs broader regression coverage than it currently has
 - single-project daemon-truth GUI behavior has direct automated evidence; multi-workspace routing remains an active delivery lane
+- the packaged macOS application has real bridge, PTY, ops, native-close, and owned-daemon cleanup
+  proof; this is host-lifecycle evidence, not a full governed role-workflow claim
 - daemon-owned profiled claims, detached Rust verification, and strict API Supervisor review are live
   and directly tested; the broader supervisor/builder claim remains incomplete until one process
   composes launched runtimes through acceptance and observes exactly one staged candidate
@@ -168,11 +178,11 @@ These gaps matter because they sit on stable or nearly stable public interfaces:
 1. Add the complete launched-runtime governed supervisor/builder E2E across DesktopRuntime launch,
    daemon-derived claim/verification, API Supervisor review, operator approval, and exact candidate
    observation.
-2. Add a packaged desktop-to-real-daemon E2E across publish, subscribe, host event, and reducer boundaries.
-3. Add multi-workspace daemon routing and cross-project isolation tests.
-4. Extend daemon client/handler coverage to artifact list/get/action paths.
-5. Add stable CLI mutation tests that assert real `.impulse/*` state transitions.
-6. Add stewardship integration tests with proposal and approval artifact assertions.
-7. Keep hook validation evidence generation automated, but treat real external hook runs as release-gating proof.
-8. After the launched workflow is closed, define and test explicit candidate promotion/dismissal,
+2. Add multi-workspace daemon routing and cross-project isolation tests.
+3. Extend daemon client/handler coverage to artifact list/get/action paths before exposing artifact
+   action controls in Dioxus.
+4. Add stable CLI mutation tests that assert real `.impulse/*` state transitions.
+5. Add stewardship integration tests with proposal and approval artifact assertions.
+6. Keep hook validation evidence generation automated, but treat real external hook runs as release-gating proof.
+7. After the launched workflow is closed, define and test explicit candidate promotion/dismissal,
    semantic conflict handling, and the curated-memory audit boundary.

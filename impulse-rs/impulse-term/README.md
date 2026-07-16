@@ -28,7 +28,11 @@ TerminalPanel (assembled widget: backend + renderer + input + theme + context + 
 
 Data flows in one direction: the agent process writes to the PTY slave, the reader thread feeds bytes into the vt100 parser, the optional egui renderer converts the parsed screen into draw calls, and the context bridge extracts insights from the visible text. Injection flows the opposite way through the WriteQueue.
 
-The core boundary is framework-neutral. `TerminalBackend`, `WriteQueue`, `ContextBridge`, context data types, and bracketed paste helpers compile without egui via `cargo test -p impulse-term --no-default-features`. The default feature set still enables the legacy egui panel, renderer, input, status-bar, and theme modules for compatibility.
+The core boundary is framework-neutral. `TerminalBackend`, `WriteQueue`, `ContextBridge`, context
+data types, and bracketed paste helpers compile without egui in the default feature set. The
+temporary `egui` feature retains the frozen panel, renderer, input, status-bar, and theme modules
+only for explicit legacy consumers. The excluded `impulse-gui` crate requests that feature
+directly; normal workspace builds do not.
 
 ---
 
@@ -84,24 +88,28 @@ The `ContextBridge` is the core integration point between the terminal and Impul
 ```bash
 cd impulse-rs
 
-# Build
-cargo build -p impulse-term
+# Build the framework-neutral default
+cargo build -p impulse-term --locked
 
-# Test
-cargo test -p impulse-term
+# Test the framework-neutral default
+cargo test -p impulse-term --locked
 
-# Test the framework-neutral boundary without egui
-cargo test -p impulse-term --no-default-features
+# Keep the empty-default contract explicit
+cargo test -p impulse-term --no-default-features --locked
 
-# Clippy
-cargo clippy -p impulse-term -- -D warnings
+# Temporary compile-maintenance gate for the frozen renderer
+cargo test -p impulse-term --features egui --locked
+
+# Clippy the active default and the temporary legacy feature
+cargo clippy -p impulse-term --all-targets --locked -- -D warnings
+cargo clippy -p impulse-term --all-targets --features egui --locked -- -D warnings
 ```
 
 ---
 
 ## Testing
 
-114 tests total (92 unit + 19 integration + 3 doc tests). Key coverage areas:
+Coverage spans the framework-neutral default plus opt-in legacy renderer behavior. Key areas:
 
 - **backend**: WriteQueue serialization, injection blocking after user input, concurrent write integrity, timestamp tracking
 - **context**: Agent kind detection, tier ordering, token estimation, compaction scanning, insight extraction from realistic agent output fixtures (Claude Code, OpenCode), diff-based content detection, injection wrapping
@@ -118,7 +126,7 @@ cargo clippy -p impulse-term -- -D warnings
 |-------|---------|---------|
 | `portable-pty` | 0.9 | Cross-platform PTY spawn and management |
 | `vt100` | 0.15 | Terminal state machine (parser + screen model) |
-| `eframe` | 0.31 | Optional egui framework behind the default `egui` feature; used by renderer, input, panel, status bar, and theme |
+| `eframe` | 0.31 | Optional egui framework behind the opt-in `egui` feature; used only by the frozen renderer, input, panel, status bar, and theme |
 | `parking_lot` | 0.12 | `FairMutex` (prevents reader-thread starvation) and `Mutex` |
 | `chrono` | 0.4 | Timestamps on extracted insights |
 | `serde` | 1.0 | Serialization for `AgentTheme`, `AgentKind`, `ContextTier`, `InsightType` |

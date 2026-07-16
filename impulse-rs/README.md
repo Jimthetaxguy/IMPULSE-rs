@@ -16,7 +16,9 @@ contract.
 
 - **Dioxus cockpit:** `impulse-desktop` is the live, feature-gated desktop path. Dioxus and
   xterm.js render the system; typed Rust contracts, daemon snapshots, runtime state, and scoped
-  persistence remain authoritative.
+  persistence remain authoritative. The macOS package assembles this cockpit with the
+  `impulse-rs` daemon companion; its verifier requires a fresh real host/PTY/shutdown lifecycle
+  receipt before a package can be treated as release-ready.
 - **ratatui workbench:** the root crate provides the terminal-native TUI.
 - **CLI and hooks:** short-lived commands initialize projects, track sessions, validate hooks, and
   query or update daemon-owned state.
@@ -44,6 +46,16 @@ Launch the feature-gated Dioxus cockpit with:
 cargo run -p impulse-desktop --features desktop-app --bin impulse-desktop
 ```
 
+Build and prove the local signed macOS application with:
+
+```bash
+bash scripts/build-macos-app.sh --smoke
+open Impulse.app
+
+# Add --dmg to build and mount-verify the developer-preview disk image.
+bash scripts/build-macos-app.sh --smoke --dmg
+```
+
 ## Workspace packages
 
 | Package | Responsibility |
@@ -55,7 +67,10 @@ cargo run -p impulse-desktop --features desktop-app --bin impulse-desktop
 | `impulse-term` | Framework-neutral PTY lifecycle, terminal parsing, write queue, and context bridge |
 
 `impulse-gui` is the legacy/frozen egui workbench. It is excluded from the active Cargo workspace
-and retained only for compile maintenance while Dioxus owns the current desktop product path.
+and retained only for explicit compile maintenance while Dioxus owns the current desktop product
+path. `impulse-term` is framework-neutral by default; only that frozen crate opts into its temporary
+`egui` feature. Physical source removal remains separately gated by a verified recovery artifact
+and explicit approval.
 
 ## Authority boundaries
 

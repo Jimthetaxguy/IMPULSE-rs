@@ -290,7 +290,12 @@ needs a reason and an audit path. The user can interrupt, narrow, revoke, review
 
 - Rust daemon and versioned workbench protocol/read models.
 - PTY spawn/write/resize/focus/exit lifecycle and process cleanup.
-- Dioxus Desktop host/bridge plus ratatui and CLI operator surfaces.
+- Dioxus Desktop host/bridge plus ratatui and CLI operator surfaces. The macOS developer package
+  assembles the Dioxus binary with its `impulse-rs` companion. Its release gate requires a fresh
+  receipt from the real eval bridge, local xterm assets, PTY operations, ops telemetry, ordered host
+  close, and owned-daemon cleanup rather than treating the verifier's presence as proof. A
+  companion owner-parent watchdog separately proves cleanup after abrupt desktop loss; AppKit Quit
+  plus live-PTY package proof remains a release-hardening gate.
 - Registry-backed desktop platform identity and launch metadata.
 - Explicit product-role/task launch preflight, backend mandatory-capability gate, and typed
   compatibility telemetry.
@@ -306,6 +311,13 @@ needs a reason and an audit path. The user can interrupt, narrow, revoke, review
 - Dioxus governed-task evidence and decision cards backed by acknowledged host commands; no
   optimistic task state. Profiled cards currently guide terminal producer commands rather than
   exposing producer buttons.
+- A supervisor-first cockpit composition with one shared launch-target selection, a connected-
+  daemon-project oversight service, desktop-wide workers, terminal focus, and a launch/review dock.
+  The oversight service does not claim that a selectable Supervisor runtime is already launched.
+  A no-environment package launch also refuses to reinterpret home-level memory as project scope;
+  oversight remains disconnected until the first governed launch atomically establishes an exact
+  project-local daemon, memory, telemetry, and task boundary. Confirmation and payload validation
+  happen before activation; rejected launches are audited without connecting or mutating scope.
 - Owner-only, write-ahead desktop lifecycle outbox with cross-process locking for launch/exit
   reconciliation across ambiguous daemon transport failures. Abrupt desktop death before an exit
   intent exists still requires a future runtime lease/orphan-reconciliation contract; missing task

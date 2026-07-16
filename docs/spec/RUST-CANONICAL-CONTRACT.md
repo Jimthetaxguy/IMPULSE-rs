@@ -448,7 +448,7 @@ The daemon exposes a JSON-line Unix socket protocol (`impulse.sock`). Full spec:
 | General role contract | Direction, not implemented | Future ADR | Not applicable |
 | Common dynamic runtime adapter + generalized capability negotiation | Direction, not implemented | Future ADR | Not applicable |
 | Typed cross-agent message bus | Partial delegations/handoffs only | `delegation`, `orchestration`, daemon contracts | Rust tests |
-| **Dioxus desktop shell** | **Live host/bridge foundation; hardening continues** | Dioxus Desktop + xterm.js | Desktop contract/host tests + smoke |
+| **Dioxus desktop shell** | **Packaged live host foundation; role-workflow hardening continues** | Dioxus Desktop + xterm.js + owned `impulse-rs` companion | Desktop/packaging contracts + real app bridge/PTY/ops/shutdown smoke |
 | **Tauri-shaped host adapter** | **LEGACY — compatibility only** | Optional gated bridge | Remove after Dioxus host command/event parity |
 | **egui operator workbench** | **LEGACY — frozen** | `impulse-gui` (compile-only) | Legacy tests only |
 | SWARM semantic coordination runtime | Planned | Future orchestration engine | Not started |

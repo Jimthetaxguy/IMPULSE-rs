@@ -1,7 +1,7 @@
 ---
 name: impulse-development
 description: "Use when adding features to the Impulse codebase — CLI commands, daemon IPC messages, GUI views, dynamic tools, context lifecycle, or guardrails. Routes to detailed step-by-step guides."
-version: 1.0.0
+version: 2.0.0
 domain: engineering
 category: languages
 maturity: silver
@@ -24,7 +24,7 @@ related_skills:
   - rust-programming
   - rust-daemon-ipc
   - pty-terminal-engineering
-  - egui-webgpu-visualization
+  - frontend-design
   - plugin-hooks-guardrails
   - context-engineering
   - ai-sidecar-patterns
@@ -36,7 +36,8 @@ path: ".claude/skills/impulse-development/"
 codebase_source:
   - impulse-rs/src/main.rs
   - impulse-rs/src/daemon/mod.rs
-  - impulse-rs/impulse-gui/src/app.rs
+  - impulse-rs/impulse-desktop/src/ui.rs
+  - impulse-rs/impulse-desktop/src/host_bridge.rs
   - impulse-rs/src/tooling/mod.rs
   - impulse-rs/src/guardrail/engine.rs
   - impulse-rs/impulse-term/src/backend.rs
@@ -55,12 +56,12 @@ right reference file and global skills based on what you're building.
 |---|---|---|---|
 | Add a CLI command | `references/adding-cli-commands.md` | `src/main.rs`, handler module | `rust-programming` |
 | Add a daemon IPC message | `references/adding-daemon-ipc.md` | `src/daemon/mod.rs` | `rust-daemon-ipc` |
-| Add a GUI view | `references/adding-gui-views.md` | `impulse-gui/src/app.rs`, `views/` | `egui-webgpu-visualization` |
+| Add a desktop view | `references/adding-dioxus-views.md` | `impulse-desktop/src/ui.rs`, `views.rs` | `frontend-design` |
 | Add a dynamic tool | `references/adding-dynamic-tools.md` | `src/tooling/mod.rs`, `traits.rs` | `rust-trait-design` |
 | Add a guardrail rule | CLAUDE.md guardrail section | `src/guardrail/` | `plugin-hooks-guardrails` |
 | Add a context lifecycle stage | Context lifecycle docs | `src/context_lifecycle/` | `context-engineering` |
 | Add a terminal feature | impulse-term docs | `impulse-term/src/` | `pty-terminal-engineering` |
-| Add a signal bus signal | Signal bus section in MEMORY.md | `impulse-gui/src/widgets/signal_bus.rs` | `egui-webgpu-visualization` |
+| Add a desktop command/event | `references/adding-dioxus-views.md` + daemon IPC guide | `host_commands.rs`, `host_bridge.rs` | `rust-daemon-ipc` |
 
 ### Module-to-Skill Map (Context-Adaptive Loading)
 
@@ -69,9 +70,9 @@ When working on files in these paths, auto-surface the corresponding skills:
 | Active Module / Path Pattern | Auto-surface Skills |
 |---|---|
 | `src/daemon/**` | `rust-daemon-ipc` + `rust-async-concurrency` |
-| `impulse-gui/src/views/**` | `egui-webgpu-visualization` |
-| `impulse-gui/src/widgets/**` | `egui-webgpu-visualization` |
-| `impulse-term/**` | `pty-terminal-engineering` + `egui-webgpu-visualization` |
+| `impulse-desktop/src/ui.rs`, `views.rs`, `assets/**` | `frontend-design` |
+| `impulse-desktop/src/host_bridge.rs`, `host_commands.rs` | `rust-daemon-ipc` + `pty-terminal-engineering` |
+| `impulse-term/**` | `pty-terminal-engineering` |
 | `src/context_lifecycle/**` | `context-engineering` + `ai-sidecar-patterns` |
 | `src/guardrail/**` | `plugin-hooks-guardrails` |
 | `src/tooling/**` | `rust-trait-design` |
@@ -107,32 +108,25 @@ When working on files in these paths, auto-surface the corresponding skills:
 | `orchestration` | Multi-agent orchestration | `src/orchestration/` |
 | `verify` | Verification commands | `src/verify/` |
 
-### Terminal Crate (`impulse-term/`) — 7 files, ~2.4K lines
+### Terminal Crate (`impulse-term/`) — framework-neutral PTY core
 
 | Module | Purpose |
 |---|---|
 | `backend.rs` | PTY spawn + vt100 parser + reader thread |
-| `renderer.rs` | Run-based rendering for egui |
-| `input.rs` | Key → escape sequence mapping |
-| `theme.rs` | ANSI color resolution + palette |
 | `context.rs` | Context bridge (token estimation, extraction) |
-| `panel.rs` | Assembled egui terminal widget |
+| legacy optional modules | Frozen EGUI compatibility pending gated physical removal; never add product behavior |
 
-### GUI Crate (`impulse-gui/`) — multi-view workbench
+### Desktop Crate (`impulse-desktop/`) — active Dioxus cockpit
 
 | Module | Purpose |
 |---|---|
-| `app.rs` | ImpulseApp coordinator, view dispatch |
-| `views/terminals.rs` | Terminal tab multiplexer |
-| `views/sessions.rs` | Daemon session viewer |
-| `views/genome.rs` | Decision viewer/editor |
-| `views/search.rs` | Memory search |
-| `views/settings.rs` | Configuration panel |
-| `views/overview.rs` | Project overview |
-| `widgets/sidebar.rs` | Navigation sidebar |
-| `widgets/signal_bus.rs` | Event routing + debounce |
-| `widgets/status_bar.rs` | Bottom status bar |
-| `agent_panel/` | Left-side agent chat panel |
+| `ui.rs` | Supervisor-first cockpit composition, signals, launcher, terminal mounting |
+| `views.rs` | Typed Terminal, Memory, Review, Artifacts, and Supervisor routes |
+| `host_commands.rs` | Typed command surface over authoritative Rust state |
+| `host_bridge.rs` | Dioxus eval transport and host event stream |
+| `runtime.rs` | Role-aware PTY/session lifecycle |
+| `daemon_ops.rs` | Daemon telemetry and governed-task gateway |
+| `assets/impulse_crt.css` | Current restrained industrial styling; filename is legacy only |
 
 ---
 
@@ -150,7 +144,8 @@ cargo test                              # All tests
 cargo test -- --skip integration_tests  # Unit only
 cargo test daemon::tests                # Specific module
 cd impulse-term && cargo test           # Terminal crate
-cd impulse-gui && cargo test            # GUI crate
+cargo test -p impulse-desktop --locked  # Dioxus cockpit contracts
+cargo check -p impulse-desktop --locked --features desktop-app
 ```
 
 ### DaemonGuard RAII Pattern
@@ -172,15 +167,16 @@ All four must pass. Never skip with `--no-verify`.
 
 ## Cross-Crate Conventions
 
-### impulse-term → impulse-gui
-- `impulse-gui` depends on `impulse-term` as a workspace member
-- GUI creates `TerminalBackend` + `TerminalPanel` per tab
-- Context bridge data flows: `impulse-term` extracts → `impulse-gui` displays via signal bus
+### impulse-term → impulse-desktop
+- `impulse-desktop` depends on the default, framework-neutral `impulse-term` core
+- Rust owns PTYs and lifecycle; xterm.js owns desktop glyph rendering
+- New terminal behavior must remain independent of Dioxus, ratatui, and EGUI
 
-### impulse-gui → main crate
-- GUI connects to daemon via Unix socket IPC (background poller thread)
-- Shares `DaemonRequest`/`DaemonResponse` types via `impulse-rs` dependency
-- `SharedState` in GUI mirrors daemon state; IPC is the sync mechanism
+### impulse-desktop → control plane
+- Dioxus renders daemon/runtime read models and sends typed host commands
+- `impulse-ops` and the daemon own task, evidence, review, and operations truth
+- UI signals may hold transient selection/focus state only; never shadow authoritative project state
+- The legacy `impulse-gui` crate is default-inactive and must receive no new work
 
 ### Feature Flags
 | Flag | Default | What It Enables |
@@ -208,11 +204,11 @@ All four must pass. Never skip with `--no-verify`.
 5. **Daemon request/response pairs**: Every new `DaemonRequest` variant needs a
    corresponding `DaemonResponse` variant and a match arm in the handler.
 
-6. **GUI view registration**: New views need: ViewId enum variant, sidebar entry,
-   keyboard shortcut (Ctrl+N), and the view struct implementing show().
+6. **Desktop view registration**: New views need a `DesktopView` route, intentional navigation,
+   SSR/contract coverage, and an authoritative backend read model. Do not create a local mock store.
 
-7. **Signal bus debounce**: New signal kinds need a debounce window in the
-   `debounce_window()` method. Missing this causes notification spam.
+7. **Host event order**: Command responses and PTY/ops events share the live bridge. Preserve FIFO
+   invoke ordering, bounded queues, and fail-closed degraded status.
 
 8. **Test isolation**: Integration tests MUST use `tempfile::TempDir` for the
    `.impulse/` directory. Never use the real project directory.

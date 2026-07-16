@@ -1,6 +1,9 @@
-# Adding GUI Views to Impulse
+# Retired EGUI View Guide
 
-Step-by-step guide for adding a new view to the impulse-gui workbench.
+> **Do not follow this guide for new work.** `impulse-gui` is default-inactive legacy code pending
+> gated physical retirement. The active desktop guide is
+> [`adding-dioxus-views.md`](adding-dioxus-views.md). The content below remains only as recovery
+> context for the pre-Dioxus implementation.
 
 ---
 

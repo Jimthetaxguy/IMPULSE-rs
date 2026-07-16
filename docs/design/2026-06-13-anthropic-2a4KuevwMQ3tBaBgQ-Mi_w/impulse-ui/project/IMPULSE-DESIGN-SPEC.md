@@ -1,7 +1,11 @@
-# Impulse — Design System & Implementation Spec
+# Historical Impulse Design Exploration
 
-> **"Your AI remembers. Silently."**
-> Distilled from the TUI/GUI exploration set. This is the contract for every future screen.
+> **Superseded:** this June 2026 memory-dashboard/CRT exploration is retained for provenance and
+> reusable visual ideas. It is not the contract for current or future screens. The active desktop
+> hierarchy lives in [`../../../../spec/DESKTOP-SHELL-ARCHITECTURE.md`](../../../../spec/DESKTOP-SHELL-ARCHITECTURE.md),
+> under the product north star in [`../../../../../VISION.md`](../../../../../VISION.md).
+> In particular, the old "Your AI remembers" framing, giant brand hero, scanline/flicker treatment,
+> and memory-stat-first idle screen must not drive the current coding-agent cockpit.
 
 ---
 

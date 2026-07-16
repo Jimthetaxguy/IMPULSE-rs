@@ -17,7 +17,13 @@ Claude Code, Codex, and similar CLIs keep their own internal coding loops. Ion i
 > runtime producers. The profiled path keeps runtime exit, worker claim, verifier evidence,
 > Supervisor judgment, and operator approval separate while deriving producer provenance inside
 > the daemon. Accepted runs now stage deterministic, read-only memory candidates with source
-> assurance and evidence references; they do not write curated project memory.
+> assurance and evidence references; they do not write curated project memory. The macOS developer
+> package path builds the Dioxus cockpit and `impulse-rs` companion together, verifies signatures
+> and local xterm assets, and defines a real eval-bridge/PTY/ordered-shutdown acceptance smoke. A
+> fresh receipt from that smoke is required release evidence rather than an assumption made from
+> source presence. The companion validates and watches its exact desktop parent so abrupt owner loss
+> drains, syncs, and removes daemon runtime files; AppKit Quit plus live-PTY proof remains a separate
+> release-hardening gate.
 >
 > **Target:** runtime-independent role contracts, adapter capability negotiation, typed agent
 > messaging, and stronger structural enforcement across supported runtimes. See
@@ -57,6 +63,10 @@ cargo run -- daemon
 # Terminal 2: launch the feature-gated Dioxus cockpit
 cargo run -p impulse-desktop --features desktop-app --bin impulse-desktop
 
+# Or build and lifecycle-smoke the signed local macOS application
+bash scripts/build-macos-app.sh --smoke
+open Impulse.app
+
 # Or stay entirely terminal-native
 cargo run -- run
 
@@ -67,8 +77,11 @@ cargo run --bin ion
 The packaged executable is `impulse-rs`. Governed producer commands are daemon-only global-mode
 invocations: `impulse-rs --daemon governed-claim`, `impulse-rs --daemon governed-verify`, and
 `impulse-rs --daemon governed-review`. A governed pane supplies the exact executable path through
-`$IMPULSE_CONTROL_CLI` only for a profiled governed pane, but the global `--daemon` flag is still
-required. Ordinary and unprofiled panes have inherited producer-routing variables removed.
+`$IMPULSE_CONTROL_CLI` when its connected gateway can resolve the packaged/control executable;
+profiled panes require that routing and fail closed without it. Every governed child receives a
+harness-owned `$IMPULSE_HOME` for the exact selected project, and caller overrides cannot replace
+it. Ordinary panes have inherited producer-routing variables removed.
+The global `--daemon` flag is still required.
 Run the injected path as `"$IMPULSE_CONTROL_CLI" --daemon ...` so paths containing spaces remain
 one executable argument.
 
@@ -89,14 +102,31 @@ In the Dioxus cockpit, use the governed Builder launch path:
 5. Launch only after the cockpit reports every mandatory requirement satisfied and the daemon
    attests the initial commit OID.
 
+The current cockpit is organized around the product hierarchy rather than memory statistics:
+a selected launch target, a persistent project-scoped oversight lane, desktop-wide worker
+terminals, the focused terminal, and a launch/review dock. Launch-target selection has one shared
+authority across the rail and launcher. The oversight lane exposes only the connected daemon
+project's review service and evidence queue; it does **not** pretend that a selectable Supervisor
+runtime has been launched. Runtime-powered Supervisor launch remains part of the next complete
+vertical slice. A normal packaged launch no longer promotes the home-level `~/.impulse` memory
+fallback into a daemon/project boundary. Without an explicit standard project socket, oversight
+starts disconnected; the first governed launch
+atomically attaches or starts the daemon for its selected project before task
+registration. The daemon must attest the same canonical project id, repository root, and local
+`.impulse` state root before the gateway becomes launchable; symlinked external state and
+cross-project task registrations fail closed. Confirmation and payload validation occur before
+that activation, and every rejection is audited without mutating project state. Project memory,
+review state, telemetry, and governed commands bind together.
+
 Current built-in profiles mediate workspace targeting and process lifecycle. Structural filesystem
 scope is optional and currently unsupported, so the initial Builder profile is allowed but visibly
 degraded. The canonical working directory selects where the process starts; cwd mediation is not a
 filesystem sandbox.
 
-Every governed launch is registered with the daemon before a PTY is created. For the profiled
-Builder path, the child receives project, task, socket, control-CLI, and profile routing through
-its launch environment. The daemon requires the canonical Builder assignment and recomputes its
+Every governed launch is registered with the daemon before a PTY is created. The child receives
+trusted project, task, memory-root, and available socket/control-CLI routing through its launch
+environment; the profiled Builder path additionally receives and requires its verification
+profile. The daemon requires the canonical Builder assignment and recomputes its
 runtime compatibility from the daemon-owned registry before accepting the task; caller-supplied
 compatibility cannot strengthen that result. External runtimes can submit intent with
 `"$IMPULSE_CONTROL_CLI" --daemon governed-claim --summary "..."`; Ion can call the typed
@@ -147,7 +177,10 @@ dismissal come later. Session, memory, hook, and verification commands remain av
 
 The current desktop daemon attachment is single-project: a governed launch must target the project
 root bound to the running daemon. Registering additional cockpit workspace entries does not yet
-provide cross-project daemon routing.
+provide cross-project daemon routing, and selecting a launch target does not yet attach a new
+daemon by itself. The first governed launch establishes the process-lifetime boundary; selecting a
+different project afterward fails closed and requires a desktop restart until multi-project daemon
+routing lands.
 
 ## Architecture
 
