@@ -1,0 +1,35 @@
+{
+  "type": "client",
+  "name": "system_info",
+  "description": "Collect system information (OS, arch, Python availability, env vars)",
+  "response_timeout_secs": 20,
+  "disable_interruptions": false,
+  "interruption_mode": "allow",
+  "force_pre_tool_speech": false,
+  "pre_tool_speech": "auto",
+  "assignments": [],
+  "tool_call_sound_behavior": "auto",
+  "tool_error_handling_mode": "auto",
+  "parameters": {
+    "type": "object",
+    "required": [],
+    "description": "Impulse tool parameters",
+    "properties": {
+      "include_env": {
+        "type": "boolean",
+        "description": "Include IMPULSE_ environment variables in output",
+        "is_system_provided": false,
+        "dynamic_variable": "",
+        "allowed_values_dynamic_variable": "",
+        "constant_value": "",
+        "is_omitted": false
+      }
+    }
+  },
+  "dynamic_variables": {
+    "dynamic_variable_placeholders": {}
+  },
+  "execution_mode": "immediate",
+  "expects_response": true,
+  "execution_platform": "client"
+}

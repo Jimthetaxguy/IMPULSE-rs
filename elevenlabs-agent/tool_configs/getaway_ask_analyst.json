@@ -1,0 +1,58 @@
+{
+    "type": "webhook",
+    "name": "getaway_ask_analyst",
+    "description": "Ask the AI Trip Analyst for deep, multi-step analysis across all trip data (bookings math, risk checks, comparisons). Slower than the read tools — tell the user you're digging in first.",
+    "response_timeout_secs": 60,
+    "disable_interruptions": false,
+    "interruption_mode": "allow",
+    "force_pre_tool_speech": false,
+    "pre_tool_speech": "auto",
+    "assignments": [],
+    "tool_call_sound_behavior": "auto",
+    "tool_error_handling_mode": "summarized",
+    "dynamic_variables": {
+        "dynamic_variable_placeholders": {}
+    },
+    "execution_mode": "post_tool_speech",
+    "api_schema": {
+        "request_headers": {
+            "X-Voice-Token": {
+                "secret_id": "XWAvn4G63bkRwgzQy56Q"
+            }
+        },
+        "url": "https://getaway-web-production.up.railway.app/api/trips/{trip_slug}/voice/analyst",
+        "method": "POST",
+        "path_params_schema": {
+            "trip_slug": {
+                "type": "string",
+                "description": "",
+                "is_system_provided": false,
+                "dynamic_variable": "trip_slug",
+                "allowed_values_dynamic_variable": "",
+                "constant_value": "",
+                "is_omitted": false
+            }
+        },
+        "request_body_schema": {
+            "type": "object",
+            "required": [
+                "question"
+            ],
+            "description": "",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "The full question for the trip analyst, in plain language, with all context the user gave",
+                    "is_system_provided": false,
+                    "dynamic_variable": "",
+                    "allowed_values_dynamic_variable": "",
+                    "constant_value": "",
+                    "is_omitted": false
+                }
+            }
+        },
+        "response_filter": null,
+        "content_type": "application/json",
+        "auth_resolved_params": []
+    }
+}

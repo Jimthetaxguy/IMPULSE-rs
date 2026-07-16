@@ -1,0 +1,92 @@
+{
+    "type": "webhook",
+    "name": "getaway_list_travel_facts",
+    "description": "List the trip's source-backed research facts — closures, logistics, loyalty mappings, offer states, corrections, and other durable statements that don't fit flights/hotels/risks/rewards. Optionally filter by destination name, scope, status, or subject.",
+    "response_timeout_secs": 20,
+    "disable_interruptions": false,
+    "interruption_mode": "allow",
+    "force_pre_tool_speech": false,
+    "pre_tool_speech": "auto",
+    "assignments": [],
+    "tool_call_sound_behavior": "auto",
+    "tool_error_handling_mode": "summarized",
+    "dynamic_variables": {
+        "dynamic_variable_placeholders": {}
+    },
+    "execution_mode": "immediate",
+    "api_schema": {
+        "request_headers": {
+            "X-Voice-Token": {
+                "secret_id": "XWAvn4G63bkRwgzQy56Q"
+            }
+        },
+        "url": "https://getaway-web-production.up.railway.app/api/trips/{trip_slug}/voice/tools/getaway_list_travel_facts",
+        "method": "POST",
+        "path_params_schema": {
+            "trip_slug": {
+                "type": "string",
+                "description": "",
+                "is_system_provided": false,
+                "dynamic_variable": "trip_slug",
+                "allowed_values_dynamic_variable": "",
+                "constant_value": "",
+                "is_omitted": false
+            }
+        },
+        "request_body_schema": {
+            "type": "object",
+            "required": [],
+            "description": "",
+            "properties": {
+                "destination": {
+                    "type": "string",
+                    "description": "Optional destination name to filter by",
+                    "is_system_provided": false,
+                    "dynamic_variable": "",
+                    "allowed_values_dynamic_variable": "",
+                    "constant_value": "",
+                    "is_omitted": false
+                },
+                "scope": {
+                    "type": "string",
+                    "description": "Optional fact scope filter, e.g. 'hotel' or 'offer'",
+                    "is_system_provided": false,
+                    "dynamic_variable": "",
+                    "allowed_values_dynamic_variable": "",
+                    "constant_value": "",
+                    "is_omitted": false
+                },
+                "status": {
+                    "type": "string",
+                    "description": "Optional fact status filter, e.g. 'confirmed' or 'unverified'",
+                    "is_system_provided": false,
+                    "dynamic_variable": "",
+                    "allowed_values_dynamic_variable": "",
+                    "constant_value": "",
+                    "is_omitted": false
+                },
+                "subject": {
+                    "type": "string",
+                    "description": "Optional subject text filter",
+                    "is_system_provided": false,
+                    "dynamic_variable": "",
+                    "allowed_values_dynamic_variable": "",
+                    "constant_value": "",
+                    "is_omitted": false
+                },
+                "conversation_id": {
+                    "type": "string",
+                    "description": "",
+                    "is_system_provided": false,
+                    "dynamic_variable": "system__conversation_id",
+                    "allowed_values_dynamic_variable": "",
+                    "constant_value": "",
+                    "is_omitted": false
+                }
+            }
+        },
+        "response_filter": null,
+        "content_type": "application/json",
+        "auth_resolved_params": []
+    }
+}

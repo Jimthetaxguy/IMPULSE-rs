@@ -1,0 +1,35 @@
+{
+  "type": "client",
+  "name": "health_check",
+  "description": "Run health checks on the .impulse/ directory",
+  "response_timeout_secs": 20,
+  "disable_interruptions": false,
+  "interruption_mode": "allow",
+  "force_pre_tool_speech": false,
+  "pre_tool_speech": "auto",
+  "assignments": [],
+  "tool_call_sound_behavior": "auto",
+  "tool_error_handling_mode": "auto",
+  "parameters": {
+    "type": "object",
+    "required": [],
+    "description": "Impulse tool parameters",
+    "properties": {
+      "impulse_dir": {
+        "type": "string",
+        "description": "Path to .impulse/ directory (defaults to .impulse in cwd)",
+        "is_system_provided": false,
+        "dynamic_variable": "",
+        "allowed_values_dynamic_variable": "",
+        "constant_value": "",
+        "is_omitted": false
+      }
+    }
+  },
+  "dynamic_variables": {
+    "dynamic_variable_placeholders": {}
+  },
+  "execution_mode": "immediate",
+  "expects_response": true,
+  "execution_platform": "client"
+}

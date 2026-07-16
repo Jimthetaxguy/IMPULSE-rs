@@ -67,3 +67,4 @@ _working-files/
 # Claude Code local hookify copies (machine-local; not product source)
 .claude/hookify.*.local.md
 .claude/*.local.md
+.cargo-target-voice/

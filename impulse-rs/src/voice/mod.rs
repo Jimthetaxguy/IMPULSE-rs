@@ -15,6 +15,7 @@ mod envelope;
 mod policy;
 mod provider;
 mod schema;
+mod secrets;
 mod server;
 mod webhook;
 
@@ -30,6 +31,7 @@ pub use policy::{
 };
 pub use provider::{default_voice_provider, VoiceProvider};
 pub use schema::{elevenlabs_client_tool_schemas, ElevenLabsClientToolSchema};
+pub use secrets::{ensure_elevenlabs_env, load_elevenlabs_api_key, SecretSource};
 pub use server::{VoiceServer, VoiceTransport};
 pub use webhook::{parse_webhook_tool_request, WebhookToolRequest};
 

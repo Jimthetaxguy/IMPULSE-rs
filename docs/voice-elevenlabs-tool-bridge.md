@@ -49,13 +49,22 @@ impulse-rs voice tool-call --name bash_exec --params '{"command":"echo hi"}' --j
 impulse-rs voice docs
 ```
 
-## Env
+## Env / Infisical
 
-| Variable | Use |
-|----------|-----|
-| `ELEVENLABS_API_KEY` | Optional live conversation smoke |
-| `IMPULSE_ELEVENLABS_AGENT_ID` | Optional agent id |
+| Variable / secret | Use |
+|-------------------|-----|
+| `ELEVENLABS_API_KEY` | Process env (highest priority) |
+| Infisical `ElevenLabs_API_Key` (`~/code` project, env `dev`) | Loaded automatically by `voice status` / `ensure_elevenlabs_env()` |
+| `IMPULSE_ELEVENLABS_AGENT_ID` | Optional; live agent is `agent_7001kxmm5n58erer2v0yh73eqepw` |
 | `IMPULSE_VOICE_PROVIDER` | Defaults to ElevenLabs Agent |
+
+```bash
+# Helper (never prints key material)
+./scripts/voice-with-infisical.sh status --json
+./scripts/voice-el-sync-tools.sh
+```
+
+Live agent project: `elevenlabs-agent/` (ElevenLabs CLI workspace).
 
 ## Exposed tools
 

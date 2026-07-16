@@ -1,0 +1,65 @@
+{
+    "type": "webhook",
+    "name": "getaway_list_activities",
+    "description": "List activities and events (dining, beaches, fireworks, wellness, logistics) for the trip with dates, times, and locations.",
+    "response_timeout_secs": 20,
+    "disable_interruptions": false,
+    "interruption_mode": "allow",
+    "force_pre_tool_speech": false,
+    "pre_tool_speech": "auto",
+    "assignments": [],
+    "tool_call_sound_behavior": "auto",
+    "tool_error_handling_mode": "summarized",
+    "dynamic_variables": {
+        "dynamic_variable_placeholders": {}
+    },
+    "execution_mode": "immediate",
+    "api_schema": {
+        "request_headers": {
+            "X-Voice-Token": {
+                "secret_id": "XWAvn4G63bkRwgzQy56Q"
+            }
+        },
+        "url": "https://getaway-web-production.up.railway.app/api/trips/{trip_slug}/voice/tools/getaway_list_activities",
+        "method": "POST",
+        "path_params_schema": {
+            "trip_slug": {
+                "type": "string",
+                "description": "",
+                "is_system_provided": false,
+                "dynamic_variable": "trip_slug",
+                "allowed_values_dynamic_variable": "",
+                "constant_value": "",
+                "is_omitted": false
+            }
+        },
+        "request_body_schema": {
+            "type": "object",
+            "required": [],
+            "description": "",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "description": "Optional type filter: event, dining, beach, wellness, logistics, etc.",
+                    "is_system_provided": false,
+                    "dynamic_variable": "",
+                    "allowed_values_dynamic_variable": "",
+                    "constant_value": "",
+                    "is_omitted": false
+                },
+                "conversation_id": {
+                    "type": "string",
+                    "description": "",
+                    "is_system_provided": false,
+                    "dynamic_variable": "system__conversation_id",
+                    "allowed_values_dynamic_variable": "",
+                    "constant_value": "",
+                    "is_omitted": false
+                }
+            }
+        },
+        "response_filter": null,
+        "content_type": "application/json",
+        "auth_resolved_params": []
+    }
+}

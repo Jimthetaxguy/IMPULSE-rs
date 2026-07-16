@@ -6,16 +6,29 @@ use std::path::Path;
 
 use crate::cli::VoiceCommands;
 use crate::voice::{
-    default_voice_provider, elevenlabs_client_tool_schemas, invoke_elevenlabs_client_tool,
-    parse_webhook_tool_request, voice_engine_docs, ElevenLabsClientToolRequest, VoiceServer,
-    VoiceToolBridge, VoiceTransport, DEFAULT_VOICE_EXPOSED_TOOLS,
+    default_voice_provider, elevenlabs_client_tool_schemas, ensure_elevenlabs_env,
+    invoke_elevenlabs_client_tool, parse_webhook_tool_request, voice_engine_docs,
+    ElevenLabsClientToolRequest, SecretSource, VoiceServer, VoiceToolBridge, VoiceTransport,
+    DEFAULT_VOICE_EXPOSED_TOOLS,
 };
 
 /// Dispatch `impulse-rs voice …` subcommands.
 pub async fn handle_voice(_impulse_dir: &Path, subcommand: VoiceCommands) -> Result<()> {
+    // Best-effort: load ElevenLabs_API_Key from Infisical into env (never log value).
+    let (key_ok, key_source) = ensure_elevenlabs_env();
+
     match subcommand {
         VoiceCommands::Status { json } => {
             let provider = default_voice_provider();
+            let source_label = match &key_source {
+                SecretSource::Env => "env:ELEVENLABS_API_KEY",
+                SecretSource::Infisical { secret_name } => {
+                    // Keep name only — no value.
+                    // Infisical vault key on this machine is typically ElevenLabs_API_Key.
+                    secret_name.as_str()
+                }
+                SecretSource::Missing => "missing",
+            };
             if json {
                 println!(
                     "{}",
@@ -24,6 +37,13 @@ pub async fn handle_voice(_impulse_dir: &Path, subcommand: VoiceCommands) -> Res
                         "is_primary": provider.is_primary(),
                         "backend": "elevenlabs_conversational_agent",
                         "tool_bridge": "ToolRegistry::execute",
+                        "api_key_present": key_ok,
+                        "api_key_source": match &key_source {
+                            SecretSource::Env => "env",
+                            SecretSource::Infisical { .. } => "infisical",
+                            SecretSource::Missing => "missing",
+                        },
+                        "api_key_source_detail": source_label,
                         "docs": "impulse-rs voice docs",
                     })
                 );
@@ -35,6 +55,11 @@ pub async fn handle_voice(_impulse_dir: &Path, subcommand: VoiceCommands) -> Res
                 );
                 println!("Backend: ElevenLabs Conversational Agent (client tools / webhooks)");
                 println!("Tool bridge: real ToolRegistry::execute (not a parallel registry)");
+                println!(
+                    "API key: {} ({})",
+                    if key_ok { "present" } else { "missing" },
+                    source_label
+                );
                 println!("Docs: impulse-rs voice docs");
             }
             Ok(())
