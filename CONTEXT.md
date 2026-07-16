@@ -107,6 +107,30 @@ instances may share a workspace; a cockpit can register and switch among several
 Structural filesystem enforcement depends on the selected runtime or sandbox.
 - **Source of truth:** `impulse-desktop/src/workspace.rs` and `WorkspaceTarget` in runtime models.
 
+### execution posture — `[vocabulary]`
+The approval cadence requested for a run: `observe`, `confirmEach`, or
+`boundedDelegate`. It is not a capability grant, risk class, runtime, or host
+surface. IMPULSE must independently enforce its capability policy regardless of
+the requested posture.
+- **Closest in code:** read-only capability omission, Ion's per-mutation
+  confirmation, and daemon-owned governed-task policy.
+
+### run kind — `[vocabulary]`
+How a run is hosted: `interactive`, `managed`, `background`, or `scheduled`.
+Run kind never widens authority. Background and scheduled kinds are direction,
+not implemented general-purpose IMPULSE run types.
+- **Closest in code:** interactive runtimes, managed agent turns, and
+  `GovernedTaskRun` lifecycle records.
+
+### authority envelope — `[vocabulary]`
+A proposed scoped, expiring, revocable authorization binding one operator
+decision to an immutable plan, canonical workspace, capability set, risk floor,
+limits, and audit identity. No shared ROSA/IMPULSE wire type exists today.
+`SupervisorPermissionState::session_override` and Ion's local `ApprovalGrant`
+are not authority envelopes.
+- **Boundary:** local policy may raise risk or narrow the envelope, never lower
+  or widen it. `YOLO`, `Semi-YOLO`, and `Danger Mode` are not canonical schemas.
+
 ---
 
 ## Platform services
