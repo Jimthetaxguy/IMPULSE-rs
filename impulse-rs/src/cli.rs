@@ -82,6 +82,20 @@ pub enum VoiceCommands {
     },
     /// Print operator documentation for the voice tool bridge
     Docs,
+    /// Export ElevenLabs client-tool schemas from the live ToolRegistry
+    Schema {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Serve registry-backed voice tools (MCP-shaped: stdio/tcp JSON-line or HTTP webhook)
+    Serve {
+        /// Transport: stdio | tcp | webhook (default: webhook)
+        #[arg(long, default_value = "webhook")]
+        transport: String,
+        /// Port for tcp / webhook (default: 8787)
+        #[arg(long, default_value_t = 8787)]
+        port: u16,
+    },
 }
 
 #[derive(Subcommand)]

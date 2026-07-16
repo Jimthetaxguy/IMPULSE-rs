@@ -1,31 +1,21 @@
-//! ElevenLabs-first voice engine adapter for Impulse.
+//! ElevenLabs-first voice engine for Impulse — **MCP-shaped**, registry-backed.
 //!
-//! Primary backend is an **ElevenLabs Conversational Agent** that issues
-//! **client tools** (in-process) or **webhook tools** (HTTP into a local
-//! Impulse endpoint). Both shapes normalize into the same tool-call envelope
-//! and execute against the real [`crate::tooling::ToolRegistry`] — not a
-//! parallel toy registry.
+//! Architecture mirrors [`crate::mcp::server::McpServer`]:
+//! - hold `Arc<ToolRegistry>` + [`ToolContext`](crate::tooling::ToolContext)
+//! - expose `tools/list` + `tools/call` over stdio / TCP JSON-line
+//! - serve `POST /voice/tools` for ElevenLabs **server tools** (webhook)
+//! - export client-tool schemas from the live registry (no second tool list)
 //!
-//! ## Priority
-//!
-//! [`VoiceProvider::ElevenLabsAgent`] is the default and only first-class
-//! voice mode. Other backends are non-default placeholders.
-//!
-//! ## Safety
-//!
-//! Mutating tool classes (`FileSystemWrite`, `ShellExec`, `PythonExec`,
-//! `Network`) are **deny-by-default** on the voice path unless the call carries
-//! an explicit confirmation flag that the policy accepts.
-//!
-//! ## Live network
-//!
-//! Session WebSocket I/O to ElevenLabs is intentionally behind traits /
-//! optional live smoke. Core mapping + policy is unit-tested with fixtures.
+//! Primary backend: **ElevenLabs Conversational Agent**. Mutating capabilities
+//! are deny-by-default unless confirmed. Live EL WebSocket session I/O is
+//! optional; core path is fixture-tested without network.
 
 mod adapter;
 mod envelope;
 mod policy;
 mod provider;
+mod schema;
+mod server;
 mod webhook;
 
 pub use adapter::{
@@ -39,6 +29,8 @@ pub use policy::{
     classify_tool_risk, VoicePolicy, VoicePolicyDecision, VoiceToolRisk, DEFAULT_VOICE_EXPOSED_TOOLS,
 };
 pub use provider::{default_voice_provider, VoiceProvider};
+pub use schema::{elevenlabs_client_tool_schemas, ElevenLabsClientToolSchema};
+pub use server::{VoiceServer, VoiceTransport};
 pub use webhook::{parse_webhook_tool_request, WebhookToolRequest};
 
 /// Module-level docs for operators / agent config (also returned by CLI).
@@ -48,9 +40,19 @@ pub fn voice_engine_docs() -> &'static str {
 ## Primary provider
 ElevenLabs Conversational Agent (Agents product with tools).
 
-## Tool bridge
-Client-tool and webhook invocations map 1:1 to `ToolRegistry::execute` using
-case-sensitive tool ids (e.g. `system_info`, `file_read`, `bash_exec`).
+## Tool bridge (Rust / Impulse-native)
+Implemented like `McpServer`:
+- `VoiceServer` + `VoiceToolBridge` hold `Arc<ToolRegistry>` + `ToolContext`
+- JSON-line: `tools/list`, `tools/call`, `voice/schema` (stdio or TCP)
+- HTTP webhook: `POST /voice/tools` for ElevenLabs server tools
+- Client-tool schemas exported from the live registry for agent config
+- Case-sensitive tool ids (`system_info`, `file_read`, `bash_exec`, …)
+
+```bash
+impulse-rs voice serve --transport webhook --port 8787
+# Point ElevenLabs server tool URL at http://127.0.0.1:8787/voice/tools
+impulse-rs voice schema --json   # register client tools on the agent
+```
 
 ## Default exposed tools (read-oriented)
 - system_info, health_check, config_get, steward_status

@@ -12,29 +12,37 @@ Impulse’s real dynamic tool surface (`ToolRegistry::execute`), with mutating t
 | **ElevenLabs Agent** | Primary / default (`IMPULSE_VOICE_PROVIDER` empty or `elevenlabs_agent`) |
 | Other | Non-default placeholder only |
 
-## Flow
+## Flow (MCP-shaped Rust server)
 
 ```
-ElevenLabs agent tool call
-        │
-        ▼
-ElevenLabsClientToolRequest  (client JSON or webhook body)
-        │
-        ▼
-VoicePolicy  (allowlist + mutate deny-by-default unless confirmed)
-        │
-        ▼
-ToolRegistry::execute  (same as daemon InvokeTool / tooling-run)
-        │
-        ▼
-ElevenLabsToolResult  (ok | denied | error; wait_for_response for agent context)
+ElevenLabs Conversational Agent
+   │ client tools          │ server tools (webhook)
+   ▼                       ▼
+VoiceServer::process_request     POST http://127.0.0.1:8787/voice/tools
+   methods: tools/list, tools/call, voice/schema
+   │
+   ▼
+VoiceToolBridge  (Arc<ToolRegistry> + ToolContext + VoicePolicy)
+   │
+   ▼
+ToolRegistry::execute  (same as MCP tools/call + daemon InvokeTool)
+   │
+   ▼
+ElevenLabsToolResult  (wait_for_response JSON for agent context)
 ```
+
+This is intentional parity with `src/mcp/server.rs`: same registry, same execute
+path, same stdio/TCP JSON-line discipline (bounded reads), plus an HTTP webhook
+transport for ElevenLabs server tools.
 
 ## CLI
 
 ```bash
 impulse-rs voice status --json
 impulse-rs voice list-tools --json
+impulse-rs voice schema --json          # register as EL client tools
+impulse-rs voice serve --transport webhook --port 8787
+impulse-rs voice serve --transport stdio   # JSON-line tools/list|tools/call
 impulse-rs voice tool-call --name system_info --params '{"include_env":false}' --json
 impulse-rs voice tool-call --name bash_exec --params '{"command":"echo hi"}' --json
 # expected: denied without --confirmed

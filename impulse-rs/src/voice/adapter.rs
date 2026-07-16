@@ -8,7 +8,11 @@ use super::envelope::{ElevenLabsClientToolRequest, ElevenLabsToolResult};
 use super::policy::{VoicePolicy, VoicePolicyDecision};
 use super::provider::{default_voice_provider, VoiceProvider};
 
-/// Shared bridge used by CLI, webhook handler, and future session loops.
+/// Shared bridge used by CLI, [`super::server::VoiceServer`], and webhooks.
+///
+/// Construction mirrors [`crate::mcp::server::McpServer`]: hold
+/// `Arc<ToolRegistry>` + `ToolContext`, then dispatch tool calls through the
+/// real registry (plus voice policy).
 pub struct VoiceToolBridge {
     registry: Arc<ToolRegistry>,
     context: ToolContext,
@@ -29,6 +33,7 @@ impl VoiceToolBridge {
         }
     }
 
+    /// Same constructor shape as `McpServer::new(registry, ctx)`.
     pub fn new(registry: Arc<ToolRegistry>, context: ToolContext, policy: VoicePolicy) -> Self {
         Self {
             registry,
@@ -52,6 +57,10 @@ impl VoiceToolBridge {
 
     pub fn context(&self) -> &ToolContext {
         &self.context
+    }
+
+    pub fn policy(&self) -> &VoicePolicy {
+        &self.policy
     }
 
     /// Execute an ElevenLabs-shaped client tool call against Impulse tools.

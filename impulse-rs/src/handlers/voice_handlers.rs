@@ -6,8 +6,9 @@ use std::path::Path;
 
 use crate::cli::VoiceCommands;
 use crate::voice::{
-    invoke_elevenlabs_client_tool, parse_webhook_tool_request, voice_engine_docs,
-    default_voice_provider, ElevenLabsClientToolRequest, VoiceToolBridge, DEFAULT_VOICE_EXPOSED_TOOLS,
+    default_voice_provider, elevenlabs_client_tool_schemas, invoke_elevenlabs_client_tool,
+    parse_webhook_tool_request, voice_engine_docs, ElevenLabsClientToolRequest, VoiceServer,
+    VoiceToolBridge, VoiceTransport, DEFAULT_VOICE_EXPOSED_TOOLS,
 };
 
 /// Dispatch `impulse-rs voice …` subcommands.
@@ -148,6 +149,27 @@ pub async fn handle_voice(_impulse_dir: &Path, subcommand: VoiceCommands) -> Res
         }
         VoiceCommands::Docs => {
             print!("{}", voice_engine_docs());
+            Ok(())
+        }
+        VoiceCommands::Schema { json: _json } => {
+            let bridge = VoiceToolBridge::with_defaults();
+            let schemas =
+                elevenlabs_client_tool_schemas(bridge.registry(), bridge.policy());
+            // Always JSON — this is the agent registration payload.
+            println!("{}", serde_json::to_string_pretty(&schemas)?);
+            Ok(())
+        }
+        VoiceCommands::Serve { transport, port } => {
+            let server = VoiceServer::with_defaults();
+            let t = match transport.to_ascii_lowercase().as_str() {
+                "stdio" => VoiceTransport::Stdio,
+                "tcp" => VoiceTransport::Tcp(port),
+                "webhook" | "http" => VoiceTransport::Webhook(port),
+                other => bail!(
+                    "unknown voice transport `{other}` (use stdio, tcp, or webhook)"
+                ),
+            };
+            server.serve(t).await.context("voice serve failed")?;
             Ok(())
         }
     }
