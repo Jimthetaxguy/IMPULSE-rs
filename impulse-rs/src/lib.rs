@@ -52,6 +52,7 @@ pub mod tools;
 pub mod ui;
 pub mod validate;
 pub mod verify;
+pub mod voice;
 
 // Re-export CLI types at crate root for backward compatibility.
 // Existing code (e.g. handlers/daemon_dispatch.rs) imports `crate::Commands`.

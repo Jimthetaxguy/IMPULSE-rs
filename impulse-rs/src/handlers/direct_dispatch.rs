@@ -491,6 +491,11 @@ where
                 .await
                 .context("Failed to handle mcp command")?;
         }
+        Commands::Voice { subcommand } => {
+            handlers::voice_handlers::handle_voice(&impulse_dir, subcommand)
+                .await
+                .context("Failed to handle voice command")?;
+        }
         Commands::AgentConfigure {
             provider,
             api_key,
