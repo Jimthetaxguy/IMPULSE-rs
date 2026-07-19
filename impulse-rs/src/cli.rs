@@ -47,6 +47,57 @@ pub enum McpCommands {
     },
 }
 
+/// Voice engine subcommands — primary backend is ElevenLabs Agent.
+#[derive(Subcommand)]
+pub enum VoiceCommands {
+    /// Show the primary voice provider (ElevenLabs Agent) and docs pointer
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// List tools exposed to the ElevenLabs agent (policy + registry)
+    ListTools {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Invoke an ElevenLabs-shaped client tool against the real ToolRegistry
+    ToolCall {
+        /// Case-sensitive Impulse tool id (e.g. system_info). Ignored with --stdin.
+        #[arg(long)]
+        name: Option<String>,
+        /// JSON parameters object
+        #[arg(long, default_value = "{}")]
+        params: String,
+        /// Correlation id for the agent turn
+        #[arg(long)]
+        tool_call_id: Option<String>,
+        /// Confirm mutating tools (file_write, bash_exec, …)
+        #[arg(long)]
+        confirmed: bool,
+        /// Read a full ElevenLabs client-tool JSON body from stdin
+        #[arg(long)]
+        stdin: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print operator documentation for the voice tool bridge
+    Docs,
+    /// Export ElevenLabs client-tool schemas from the live ToolRegistry
+    Schema {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Serve registry-backed voice tools (MCP-shaped: stdio/tcp JSON-line or HTTP webhook)
+    Serve {
+        /// Transport: stdio | tcp | webhook (default: webhook)
+        #[arg(long, default_value = "webhook")]
+        transport: String,
+        /// Port for tcp / webhook (default: 8787)
+        #[arg(long, default_value_t = 8787)]
+        port: u16,
+    },
+}
+
 #[derive(Subcommand)]
 pub enum Commands {
     Daemon {
@@ -451,6 +502,11 @@ pub enum Commands {
     Mcp {
         #[command(subcommand)]
         subcommand: McpCommands,
+    },
+    /// ElevenLabs-first voice engine (tool calls into Impulse)
+    Voice {
+        #[command(subcommand)]
+        subcommand: VoiceCommands,
     },
     /// Configure the Impulse Agent (LLM-powered coordination)
     AgentConfigure {

@@ -111,6 +111,8 @@ pub enum ExecutionOrigin {
     Cli,
     Daemon,
     Mcp,
+    /// ElevenLabs-first voice engine tool bridge (client tool / webhook).
+    Voice,
     Test,
 }
 
@@ -120,6 +122,7 @@ impl ExecutionOrigin {
             Self::Cli => "cli",
             Self::Daemon => "daemon",
             Self::Mcp => "mcp",
+            Self::Voice => "voice",
             Self::Test => "test",
         }
     }

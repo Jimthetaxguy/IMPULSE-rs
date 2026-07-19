@@ -1,0 +1,10 @@
+{
+  "agents": [
+    {
+      "config": "agent_configs/Impulse-Control-Plane.json",
+      "id": "agent_7001kxmm5n58erer2v0yh73eqepw",
+      "version_id": "agtvrsn_9801kxmm617hej9bvd97ctx456bs",
+      "branch_id": "agtbrch_4501kxmm5ns0fsfb2zej2504qzqy"
+    }
+  ]
+}

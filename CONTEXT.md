@@ -194,6 +194,18 @@ A typed provenance claim (`system`, `worker`, `verifier`, `supervisor`, or `oper
 task transition machine. It is not cryptographic same-user authentication; local processes that can
 reach the user-restricted daemon socket remain inside the current trust boundary.
 
+### voice engine / ElevenLabs Agent bridge — `[code]`
+ElevenLabs Conversational Agent is the **primary** voice backend. Implemented **MCP-style in Rust**:
+`VoiceServer` holds `Arc<ToolRegistry>` + `ToolContext` (like `McpServer`), exposes JSON-line
+`tools/list` + `tools/call` (stdio/TCP) and HTTP `POST /voice/tools` for server tools, exports
+client-tool schemas from the live registry, then executes through `VoiceToolBridge` → real
+`ToolRegistry::execute` with deny-by-default for mutating capabilities.
+- **Source of truth:** `impulse-rs/src/voice/` (`server`, `adapter`, `schema`, `policy`, `envelope`,
+  `webhook`, `provider`); CLI `impulse-rs voice serve|schema|tool-call`; docs
+  `docs/voice-elevenlabs-tool-bridge.md`.
+- **Boundary:** live ElevenLabs WebSocket session I/O and dashboard agent provisioning are optional;
+  core contract is fixture-tested without network.
+
 ---
 
 ## Live-versus-direction boundary (2026-07-15)

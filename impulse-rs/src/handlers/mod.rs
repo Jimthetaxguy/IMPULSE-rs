@@ -27,6 +27,7 @@ pub mod session;
 pub mod stewardship_handlers;
 pub mod system;
 pub mod tooling_handlers;
+pub mod voice_handlers;
 
 // Re-export all shared helpers so existing `use super::X` imports keep working.
 pub(crate) use common::*;
