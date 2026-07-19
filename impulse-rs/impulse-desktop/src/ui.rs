@@ -53,7 +53,41 @@ macro_rules! impulse_host_adapter_resolution_script {
     typeof host[fn] === "function" &&
     host.status !== PENDING_IMPULSE_HOST_STATUS &&
     !host[fn].__impulseHostPending;
-  const resolveImpulseHostAdapter = () => {
+  // `use_live_host_bridge()` (host_bridge.rs) installs the live host adapter
+  // from an independent `document::eval` call mounted alongside (not before)
+  // this resolver. Dioxus gives no ordering guarantee between the two async
+  // tasks, and the webview gives none between the two separate eval calls
+  // either, so a single unconditional read of `window.__IMPULSE_DESKTOP_HOST`
+  // here is a race: if this script's first tick runs before the live bridge
+  // replaces the manifest-only stub, it would decide the live host is
+  // "missing" and that verdict gets captured for the rest of this script's
+  // lifetime (both callers close over `invoke`/`listen` in long-lived
+  // closures — one of them never re-executes for the life of the component).
+  // Poll with a short bounded backoff until the live bridge (or a legacy
+  // Tauri host) reports ready, or the attempt budget is exhausted, then fall
+  // back to today's resolution exactly as before.
+  const IMPULSE_HOST_ADAPTER_POLL_INTERVAL_MS = 10;
+  const IMPULSE_HOST_ADAPTER_POLL_MAX_ATTEMPTS = 25;
+  const impulseHostAdapterCandidateReady = () => {
+    const dioxusHost = window.__IMPULSE_DESKTOP_HOST;
+    const legacyTauri = window.__TAURI__;
+    return (
+      impulseHostFnReady(dioxusHost, "invoke") ||
+      impulseHostFnReady(dioxusHost, "listen") ||
+      !!legacyTauri?.core?.invoke ||
+      !!legacyTauri?.event?.listen
+    );
+  };
+  const resolveImpulseHostAdapter = async () => {
+    for (
+      let attempt = 0;
+      attempt < IMPULSE_HOST_ADAPTER_POLL_MAX_ATTEMPTS && !impulseHostAdapterCandidateReady();
+      attempt += 1
+    ) {
+      await new Promise((resolve) =>
+        setTimeout(resolve, IMPULSE_HOST_ADAPTER_POLL_INTERVAL_MS)
+      );
+    }
     const dioxusHost = window.__IMPULSE_DESKTOP_HOST;
     const legacyTauri = window.__TAURI__;
     return {
@@ -66,7 +100,7 @@ macro_rules! impulse_host_adapter_resolution_script {
       hostKind: dioxusHost ? "dioxus" : legacyTauri ? "legacy-tauri" : "missing",
     };
   };
-  const { invoke, listen, hostKind } = resolveImpulseHostAdapter();
+  const { invoke, listen, hostKind } = await resolveImpulseHostAdapter();
 "#
     };
 }
@@ -318,7 +352,7 @@ const DESKTOP_EVENT_BRIDGE_SCRIPT: &str = concat!(
 
 const TERMINAL_INTEROP_SCRIPT: &str = concat!(
     r#"
-(() => {
+(async () => {
 "#,
     impulse_host_adapter_resolution_script!(),
     r#"

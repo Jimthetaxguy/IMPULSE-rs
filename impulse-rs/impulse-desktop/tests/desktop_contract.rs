@@ -551,7 +551,9 @@ fn test_terminal_interop_prefers_dioxus_native_host_adapter() {
     assert!(script.contains("resolveImpulseHostAdapter"));
     assert!(script.contains("window.__IMPULSE_DESKTOP_HOST"));
     assert!(script.contains("const legacyTauri = window.__TAURI__"));
-    assert!(script.contains("const { invoke, listen, hostKind } = resolveImpulseHostAdapter();"));
+    assert!(
+        script.contains("const { invoke, listen, hostKind } = await resolveImpulseHostAdapter();")
+    );
     assert!(script.contains(r#"hostKind: dioxusHost ? "dioxus""#));
     assert!(script.contains(r#"legacyTauri ? "legacy-tauri""#));
     assert!(script.contains("data-impulse-host-kind"));
@@ -699,7 +701,7 @@ if (bridgePromise && typeof bridgePromise.catch === "function") {{
 setTimeout(() => {{
   console.log(JSON.stringify({{ attrs, sent, invoked, bridge: window.__impulseOpsBridge }}));
   process.exit(0);
-}}, 40);
+}}, 400);
 "#,
         bridge_script =
             serde_json::to_string(desktop_event_bridge_script()).expect("serialize bridge script"),
@@ -723,6 +725,242 @@ setTimeout(() => {{
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).expect("parse pending-host bridge smoke output")
+}
+
+/// Regression test for the resolver race: `use_live_host_bridge()`
+/// (host_bridge.rs) and this ops-bridge resolver both read/write
+/// `window.__IMPULSE_DESKTOP_HOST` from independent, unordered
+/// `document::eval` calls. This drives the real bridge script against a host
+/// that starts as the manifest-only pending stub and only becomes the live
+/// bridge ~30ms later (well inside the resolver's bounded poll budget),
+/// simulating the live bridge installing *after* this script's first tick.
+/// Before the bounded-retry fix, the one-shot resolver would have
+/// permanently locked onto the pending stub and never recovered.
+#[test]
+fn test_desktop_event_bridge_resolver_recovers_from_late_installing_live_host_bridge() {
+    if skip_without_node() {
+        return;
+    }
+
+    let smoke_script = format!(
+        r#"
+const bridgeScript = {bridge_script};
+const pendingStatus = {pending_status};
+const liveStatus = {live_status};
+const sent = [];
+const invoked = [];
+const listeners = {{}};
+const attrs = {{}};
+
+global.window = {{}};
+global.document = {{
+  documentElement: {{
+    setAttribute: (key, value) => {{ attrs[key] = value; }}
+  }}
+}};
+global.dioxus = {{ send: (message) => sent.push(message) }};
+
+const pending = (operation) =>
+  Promise.reject(new Error(`Dioxus Desktop host adapter pending: ${{operation}}`));
+const pendingInvoke = (command) => pending(`invoke:${{command}}`);
+const pendingListen = (event) => pending(`listen:${{event}}`);
+pendingInvoke.__impulseHostPending = true;
+pendingListen.__impulseHostPending = true;
+window.__IMPULSE_DESKTOP_HOST = {{
+  invoke: pendingInvoke,
+  listen: pendingListen,
+  hostKind: "dioxus",
+  status: pendingStatus,
+}};
+
+// Simulate `use_live_host_bridge()`'s independent `document::eval` call
+// installing the real transport a beat *after* this script starts, well
+// inside the resolver's bounded poll window but strictly after its first
+// (necessarily-not-ready) tick.
+setTimeout(() => {{
+  window.__IMPULSE_DESKTOP_HOST = {{
+    invoke: async (command) => {{ invoked.push({{ command }}); return command === "agent_snapshot" ? [] : null; }},
+    listen: async (event, handler) => {{ listeners[event] = handler; return async () => {{}}; }},
+    hostKind: "dioxus",
+    status: liveStatus,
+  }};
+}}, 30);
+
+const bridgePromise = eval(bridgeScript);
+if (bridgePromise && typeof bridgePromise.catch === "function") {{
+  bridgePromise.catch((error) => {{
+    console.error(error && error.stack ? error.stack : String(error));
+    process.exit(1);
+  }});
+}}
+setTimeout(() => {{
+  console.log(JSON.stringify({{ attrs, sent, invoked, bridge: window.__impulseOpsBridge }}));
+  process.exit(0);
+}}, 400);
+"#,
+        bridge_script =
+            serde_json::to_string(desktop_event_bridge_script()).expect("serialize bridge script"),
+        pending_status =
+            serde_json::to_string(impulse_desktop::host_commands::PENDING_HOST_BOOTSTRAP_STATUS)
+                .expect("serialize pending status"),
+        live_status =
+            serde_json::to_string("dioxus-eval-bridge-ready").expect("serialize live status"),
+    );
+
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let smoke_path = tempdir.path().join("late-installing-host-bridge-smoke.js");
+    std::fs::write(&smoke_path, smoke_script).expect("write late-installing host smoke script");
+    let output = Command::new("node")
+        .arg(&smoke_path)
+        .output()
+        .expect("run node late-installing host bridge smoke");
+    assert!(
+        output.status.success(),
+        "late-installing host bridge smoke failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let smoke: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("parse late-installing host bridge smoke output");
+
+    assert_eq!(
+        smoke["attrs"]["data-impulse-ops-bridge"],
+        serde_json::Value::String("mounted".to_string()),
+        "resolver should have recovered once the live bridge installed: {smoke}"
+    );
+    assert_eq!(smoke["bridge"]["degraded"], serde_json::Value::Bool(false));
+    let invoked = smoke["invoked"].as_array().expect("invoked array");
+    assert!(
+        invoked
+            .iter()
+            .any(|call| call["command"] == "agent_snapshot"),
+        "recovered live transport should receive bridge refresh invokes, got {invoked:?}"
+    );
+}
+
+/// Same regression, isolated to the terminal-interop resolver: a *single*
+/// `eval(interopScript)` invocation must recover mid-poll and mount, not
+/// permanently resolve to "degraded" on the first (necessarily-pending)
+/// check.
+#[test]
+fn test_terminal_interop_resolver_recovers_from_late_installing_live_host_bridge() {
+    if skip_without_node() {
+        return;
+    }
+
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let smoke_path = tempdir.path().join("terminal-interop-late-host-smoke.js");
+    let smoke = format!(
+        r#"
+const assert = require("assert");
+const interopScript = {interop_script};
+const pendingStatus = {pending_status};
+
+(async () => {{
+
+const mounts = [{{
+  dataset: {{ agentId: "codex" }},
+  attrs: {{}},
+  setAttribute(name, value) {{ this.attrs[name] = value; }},
+}}];
+global.document = {{
+  querySelectorAll(selector) {{
+    assert.strictEqual(selector, "[data-xterm-mount='true']");
+    return mounts;
+  }},
+}};
+
+const pending = (operation) =>
+  Promise.reject(new Error(`Dioxus Desktop host adapter pending: ${{operation}}`));
+const pendingInvoke = () => pending("invoke");
+const pendingListen = () => pending("listen");
+pendingInvoke.__impulseHostPending = true;
+pendingListen.__impulseHostPending = true;
+global.window = {{
+  __IMPULSE_DESKTOP_HOST: {{
+    invoke: pendingInvoke,
+    listen: pendingListen,
+    hostKind: "dioxus",
+    status: pendingStatus,
+  }},
+}};
+
+class Terminal {{
+  constructor() {{ this.writes = []; }}
+  loadAddon() {{}}
+  open(mount) {{ mount.opened = true; }}
+  onData() {{}}
+  onResize() {{}}
+  write(value) {{ this.writes.push(value); }}
+}}
+window.Terminal = Terminal;
+window.FitAddon = class {{ fit() {{}} }};
+
+// Simulate the live bridge (host_bridge.rs's `use_live_host_bridge()`)
+// replacing the pending stub partway through this script's own resolution
+// poll, well inside its bounded retry budget.
+setTimeout(() => {{
+  window.__IMPULSE_DESKTOP_HOST = {{
+    invoke: async () => null,
+    listen: async (event, handler) => () => {{}},
+    hostKind: "dioxus",
+    status: "dioxus-eval-bridge-ready",
+  }};
+}}, 30);
+
+const result = await eval(interopScript);
+assert.strictEqual(
+  result,
+  "mounted",
+  `expected the resolver to recover once the live bridge installed, got ${{result}}`
+);
+assert.strictEqual(mounts[0].attrs["data-xterm-state"], "mounted");
+}})().catch((error) => {{
+  console.error(error);
+  process.exit(1);
+}});
+"#,
+        interop_script = serde_json::to_string(impulse_desktop::ui::terminal_interop_script())
+            .expect("serialize interop script"),
+        pending_status =
+            serde_json::to_string(impulse_desktop::host_commands::PENDING_HOST_BOOTSTRAP_STATUS)
+                .expect("serialize pending status"),
+    );
+    std::fs::write(&smoke_path, smoke).expect("write terminal interop late-host smoke");
+
+    let output = Command::new("node")
+        .arg(&smoke_path)
+        .output()
+        .expect("run terminal interop late-host smoke");
+    assert!(
+        output.status.success(),
+        "terminal interop late-host smoke failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Both host-adapter-resolution consumers share one macro; this pins the
+/// bounded-retry contract in place so a future edit can't silently drop the
+/// polling loop from one script while keeping it in the other.
+#[test]
+fn test_impulse_host_adapter_resolution_script_declares_bounded_retry_contract() {
+    for script in [
+        desktop_event_bridge_script(),
+        impulse_desktop::ui::terminal_interop_script(),
+    ] {
+        assert!(script.contains("IMPULSE_HOST_ADAPTER_POLL_INTERVAL_MS"));
+        assert!(script.contains("IMPULSE_HOST_ADAPTER_POLL_MAX_ATTEMPTS"));
+        assert!(script.contains("impulseHostAdapterCandidateReady"));
+        assert!(script.contains("const resolveImpulseHostAdapter = async ()"));
+        assert!(script.contains("await resolveImpulseHostAdapter()"));
+    }
+    assert!(
+        impulse_desktop::ui::terminal_interop_script()
+            .trim_start()
+            .starts_with("(async () => {"),
+        "terminal interop script must be an async IIFE for the resolver's await to be legal"
+    );
 }
 
 #[test]
@@ -2488,7 +2726,7 @@ class Terminal {{
 global.window.Terminal = Terminal;
 global.window.FitAddon = class {{ fit() {{}} }};
 
-const first = eval(interopScript);
+const first = await eval(interopScript);
 await Promise.resolve();
 await Promise.resolve();
 assert.strictEqual(first, "mounted");
@@ -2499,7 +2737,7 @@ assert.strictEqual(mounts[0].attrs["data-xterm-state"], "mounted");
 
 const codexMount = mounts[0];
 mounts = [codexMount, makeMount("claude")];
-const second = eval(interopScript);
+const second = await eval(interopScript);
 await Promise.resolve();
 await Promise.resolve();
 assert.strictEqual(second, "mounted");
