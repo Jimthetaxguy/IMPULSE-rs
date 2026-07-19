@@ -18,9 +18,7 @@ use crate::daemon::{read_bounded_line, BoundedLine, MAX_REQUEST_SIZE};
 use crate::tooling::{ToolContext, ToolRegistry};
 
 use super::adapter::VoiceToolBridge;
-use super::envelope::{
-    ElevenLabsClientToolRequest, ElevenLabsToolResult, VoiceToolCallSource,
-};
+use super::envelope::{ElevenLabsClientToolRequest, ElevenLabsToolResult, VoiceToolCallSource};
 use super::policy::VoicePolicy;
 use super::schema::{elevenlabs_client_tool_schemas, ElevenLabsClientToolSchema};
 use super::webhook::parse_webhook_tool_request;
@@ -142,7 +140,11 @@ impl VoiceServer {
                     };
                     let response = server.process_request(&line).await;
                     if writer
-                        .write_all(serde_json::to_string(&response).unwrap_or_default().as_bytes())
+                        .write_all(
+                            serde_json::to_string(&response)
+                                .unwrap_or_default()
+                                .as_bytes(),
+                        )
                         .await
                         .is_err()
                     {
@@ -234,9 +236,9 @@ impl VoiceServer {
                     source: VoiceToolCallSource::ClientTool,
                 };
                 let result = self.bridge.handle_client_tool(req).await;
-                serde_json::to_value(result).unwrap_or_else(|e| {
-                    serde_json::json!({"error": {"code": -32603, "message": e.to_string()}})
-                })
+                serde_json::to_value(result).unwrap_or_else(
+                    |e| serde_json::json!({"error": {"code": -32603, "message": e.to_string()}}),
+                )
             }
             "voice/schema" => {
                 serde_json::json!({ "client_tools": self.client_tool_schemas() })
@@ -348,9 +350,7 @@ mod tests {
     #[tokio::test]
     async fn tools_list_exports_registry_backed_schemas() {
         let server = VoiceServer::with_defaults();
-        let resp = server
-            .process_request(r#"{"method":"tools/list"}"#)
-            .await;
+        let resp = server.process_request(r#"{"method":"tools/list"}"#).await;
         let tools = resp["tools"].as_array().expect("tools array");
         assert!(
             tools.iter().any(|t| t["name"] == "system_info"),

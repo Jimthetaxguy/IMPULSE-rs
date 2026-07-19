@@ -27,7 +27,8 @@ pub use envelope::{
     VoiceToolCallSource,
 };
 pub use policy::{
-    classify_tool_risk, VoicePolicy, VoicePolicyDecision, VoiceToolRisk, DEFAULT_VOICE_EXPOSED_TOOLS,
+    classify_tool_risk, VoicePolicy, VoicePolicyDecision, VoiceToolRisk,
+    DEFAULT_VOICE_EXPOSED_TOOLS,
 };
 pub use provider::{default_voice_provider, VoiceProvider};
 pub use schema::{elevenlabs_client_tool_schemas, ElevenLabsClientToolSchema};

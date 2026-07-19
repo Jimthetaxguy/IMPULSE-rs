@@ -3,9 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::envelope::{
-    ElevenLabsClientToolRequest, VoiceToolCallSource,
-};
+use super::envelope::{ElevenLabsClientToolRequest, VoiceToolCallSource};
 
 /// Raw webhook body shape (subset of ElevenLabs webhook tool POST).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -21,9 +19,7 @@ pub struct WebhookToolRequest {
 }
 
 /// Parse webhook JSON into the shared client-tool request envelope.
-pub fn parse_webhook_tool_request(
-    body: &[u8],
-) -> Result<ElevenLabsClientToolRequest, String> {
+pub fn parse_webhook_tool_request(body: &[u8]) -> Result<ElevenLabsClientToolRequest, String> {
     let hook: WebhookToolRequest =
         serde_json::from_slice(body).map_err(|e| format!("invalid webhook JSON: {e}"))?;
     if hook.tool.trim().is_empty() {
@@ -37,7 +33,12 @@ pub fn parse_webhook_tool_request(
         } else {
             hook.params
         },
-        confirmed: hook.confirmed,
+        // Never trust a client-supplied confirmation bit: the webhook path is
+        // reachable through the public tunnel, so honoring `confirmed: true`
+        // from the body would let any remote caller run mutating tools as if
+        // an operator had approved them. Webhook requests always arrive
+        // unconfirmed; approval must come from trusted operator-side state.
+        confirmed: false,
         wait_for_response: true,
         source: VoiceToolCallSource::Webhook,
     })
@@ -46,6 +47,17 @@ pub fn parse_webhook_tool_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn webhook_confirmed_bit_is_always_ignored() {
+        let body =
+            br#"{"tool_call_id":"wh-2","tool_name":"bash_exec","parameters":{},"confirmed":true}"#;
+        let req = parse_webhook_tool_request(body).unwrap();
+        assert!(
+            !req.confirmed,
+            "client-supplied confirmed:true must never grant approval on the webhook path"
+        );
+    }
 
     #[test]
     fn parses_elevenlabs_style_webhook_body() {

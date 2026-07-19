@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::tooling::{ExecutionOrigin, ToolContext, ToolRegistry};
+use crate::tooling::{Capability, ExecutionOrigin, ToolContext, ToolRegistry};
 
 use super::envelope::{ElevenLabsClientToolRequest, ElevenLabsToolResult};
 use super::policy::{VoicePolicy, VoicePolicyDecision};
@@ -22,9 +22,22 @@ pub struct VoiceToolBridge {
 
 impl VoiceToolBridge {
     /// Build a bridge against the real default registry + voice-safe context.
+    ///
+    /// Deliberately NOT `ToolContext::with_all_capabilities()`: that variant
+    /// has empty (= unrestricted) read/write roots, which would let any voice
+    /// client `file_read` arbitrary paths and let confirmed mutators escape
+    /// the sandbox. Voice keeps the default scoped roots (cwd + `.impulse`
+    /// read, `.impulse` write) and grants only the capabilities the default
+    /// voice allowlist needs; mutators additionally stay behind the
+    /// confirmation gate in [`VoicePolicy`].
     pub fn with_defaults() -> Self {
-        let mut context = ToolContext::with_all_capabilities();
+        let mut context = ToolContext::default();
         context.execution_origin = ExecutionOrigin::Voice;
+        context.allowed_capabilities.extend([
+            Capability::FileSystemWrite,
+            Capability::PythonExec,
+            Capability::ShellExec,
+        ]);
         Self {
             registry: Arc::new(ToolRegistry::with_defaults()),
             context,
@@ -129,11 +142,8 @@ impl VoiceToolBridge {
                 result
             }
             Err(err) => {
-                let mut result = ElevenLabsToolResult::error(
-                    tool_name,
-                    request.tool_call_id,
-                    err.to_string(),
-                );
+                let mut result =
+                    ElevenLabsToolResult::error(tool_name, request.tool_call_id, err.to_string());
                 result.wait_for_response = request.wait_for_response;
                 result.provider = self.provider.as_str().to_string();
                 result
@@ -161,8 +171,8 @@ pub async fn invoke_elevenlabs_client_tool_with(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::envelope::ElevenLabsToolResultStatus;
+    use super::*;
     use serde_json::json;
 
     #[tokio::test]
@@ -185,7 +195,10 @@ mod tests {
         assert!(out.error.is_none());
         // Real tool output — system_info always includes os/arch.
         let output = out.result.get("output").expect("output wrapper");
-        assert!(output.get("os").is_some(), "expected real system_info os field");
+        assert!(
+            output.get("os").is_some(),
+            "expected real system_info os field"
+        );
         assert!(output.get("arch").is_some());
     }
 
@@ -220,11 +233,7 @@ mod tests {
         // Not on allowlist → denied; use allowlist-open policy for not-found path.
         let mut policy = VoicePolicy::default();
         policy.exposed_tools = None;
-        let bridge = VoiceToolBridge::new(
-            bridge.registry_arc(),
-            bridge.context().clone(),
-            policy,
-        );
+        let bridge = VoiceToolBridge::new(bridge.registry_arc(), bridge.context().clone(), policy);
         let out = bridge
             .handle_client_tool(ElevenLabsClientToolRequest::new(
                 "definitely_not_a_tool",

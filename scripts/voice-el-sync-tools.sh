@@ -6,7 +6,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 AGENT_DIR="$ROOT/elevenlabs-agent"
 CODE_ROOT="${CODE_ROOT:-$HOME/code}"
-SCRATCH="${SCRATCH:-$(mktemp -d)}"
+# Exported here (not later) because the Python sync heredoc below reads it
+# via os.environ before the tail of the script runs.
+export SCRATCH="${SCRATCH:-$(mktemp -d)}"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/.cargo-target-voice}"
 BIN="${IMPULSE_BIN:-$CARGO_TARGET_DIR/debug/impulse-rs}"
 
@@ -93,7 +95,6 @@ tools_path.write_text(json.dumps(data, indent=2) + "\n")
 print("impulse_client_tools", created)
 PY
 
-export SCRATCH
 # push only impulse_* tools if CLI supports filtering; otherwise push all local configs
 printf 'y\n' | elevenlabs tools push 2>&1 | tail -40
 

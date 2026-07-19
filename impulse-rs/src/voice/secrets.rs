@@ -55,7 +55,10 @@ fn infisical_get_plain(secret_name: &str) -> Option<String> {
         "--plain",
         "--silent",
     ]);
-    if let Some(root) = code_root.as_ref().filter(|p| p.join(".infisical.json").is_file()) {
+    if let Some(root) = code_root
+        .as_ref()
+        .filter(|p| p.join(".infisical.json").is_file())
+    {
         cmd.current_dir(root);
     }
     let output = cmd.output().ok()?;

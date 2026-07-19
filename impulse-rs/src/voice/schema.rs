@@ -86,9 +86,7 @@ pub fn elevenlabs_client_tool_schemas(
         // Mutating tools still export so the agent can request them; the
         // voice policy denies execution unless confirmed.
         let desc = if risk == VoiceToolRisk::Mutating {
-            format!(
-                "{description} [Impulse: mutating — requires confirmation on voice path]"
-            )
+            format!("{description} [Impulse: mutating — requires confirmation on voice path]")
         } else {
             description
         };

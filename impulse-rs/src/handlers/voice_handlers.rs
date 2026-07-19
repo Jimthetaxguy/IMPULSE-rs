@@ -178,8 +178,7 @@ pub async fn handle_voice(_impulse_dir: &Path, subcommand: VoiceCommands) -> Res
         }
         VoiceCommands::Schema { json: _json } => {
             let bridge = VoiceToolBridge::with_defaults();
-            let schemas =
-                elevenlabs_client_tool_schemas(bridge.registry(), bridge.policy());
+            let schemas = elevenlabs_client_tool_schemas(bridge.registry(), bridge.policy());
             // Always JSON — this is the agent registration payload.
             println!("{}", serde_json::to_string_pretty(&schemas)?);
             Ok(())
@@ -190,9 +189,7 @@ pub async fn handle_voice(_impulse_dir: &Path, subcommand: VoiceCommands) -> Res
                 "stdio" => VoiceTransport::Stdio,
                 "tcp" => VoiceTransport::Tcp(port),
                 "webhook" | "http" => VoiceTransport::Webhook(port),
-                other => bail!(
-                    "unknown voice transport `{other}` (use stdio, tcp, or webhook)"
-                ),
+                other => bail!("unknown voice transport `{other}` (use stdio, tcp, or webhook)"),
             };
             server.serve(t).await.context("voice serve failed")?;
             Ok(())

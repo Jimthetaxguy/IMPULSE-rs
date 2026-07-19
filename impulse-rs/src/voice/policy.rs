@@ -32,7 +32,12 @@ impl Default for VoicePolicy {
     fn default() -> Self {
         Self {
             allow_confirmed_mutations: true,
-            exposed_tools: Some(DEFAULT_VOICE_EXPOSED_TOOLS.iter().map(|s| (*s).into()).collect()),
+            exposed_tools: Some(
+                DEFAULT_VOICE_EXPOSED_TOOLS
+                    .iter()
+                    .map(|s| (*s).into())
+                    .collect(),
+            ),
         }
     }
 }
@@ -94,9 +99,7 @@ impl VoicePolicy {
         if let Some(exposed) = &self.exposed_tools {
             if !exposed.iter().any(|t| t == tool_name) {
                 return VoicePolicyDecision::Deny {
-                    reason: format!(
-                        "tool `{tool_name}` is not on the voice exposure allowlist"
-                    ),
+                    reason: format!("tool `{tool_name}` is not on the voice exposure allowlist"),
                 };
             }
         }
