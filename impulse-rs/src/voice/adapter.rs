@@ -31,8 +31,10 @@ impl VoiceToolBridge {
     /// voice allowlist needs; mutators additionally stay behind the
     /// confirmation gate in [`VoicePolicy`].
     pub fn with_defaults() -> Self {
-        let mut context = ToolContext::default();
-        context.execution_origin = ExecutionOrigin::Voice;
+        let mut context = ToolContext {
+            execution_origin: ExecutionOrigin::Voice,
+            ..Default::default()
+        };
         context.allowed_capabilities.extend([
             Capability::FileSystemWrite,
             Capability::PythonExec,
