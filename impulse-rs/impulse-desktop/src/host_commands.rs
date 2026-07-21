@@ -3,7 +3,9 @@ use crate::bridge::{
     TerminalResizeRequest, TerminalSessionResponse, TerminalWriteRequest,
 };
 use crate::mcp::{list_review_queue, McpContext, McpInvocation, McpToolRegistry, ReviewDecision};
-use crate::native::{DefaultNativeIslandHost, NativeIslandRequest, NativeIslandResult};
+use crate::native::{
+    DefaultNativeIslandHost, NativeIslandKind, NativeIslandRequest, NativeIslandResult,
+};
 use crate::runtime::{
     AgentRuntimeSnapshot, AgentSpawnRequest, AgentWriteRequest, DesktopRuntime,
     SupervisorLocalActionRequest, WorkspaceTarget,
@@ -445,6 +447,21 @@ fn terminal_focus_inner(
 pub async fn native_island_request(
     request: NativeIslandRequest,
 ) -> Result<NativeIslandResult, String> {
+    // `FileOpenPanel` opens a real, potentially long-lived modal OS dialog.
+    // `dispatch_host_invokes_fifo` (host_bridge.rs) drains host invokes one
+    // at a time on a single tokio task, so calling a blocking dialog inline
+    // here would stall every other host command (terminal writes, agent
+    // snapshots, ...) for as long as the picker stays open. `spawn_blocking`
+    // moves the blocking call onto tokio's dedicated blocking-thread pool
+    // instead — it only needs the already-enabled `rt` Cargo feature and
+    // works even on a current-thread runtime, and it never blocks the FIFO
+    // worker.
+    if matches!(request.kind, NativeIslandKind::FileOpenPanel) {
+        return tokio::task::spawn_blocking(move || DefaultNativeIslandHost.dispatch(request))
+            .await
+            .map_err(err_to_string)?
+            .map_err(err_to_string);
+    }
     DefaultNativeIslandHost
         .dispatch(request)
         .map_err(err_to_string)

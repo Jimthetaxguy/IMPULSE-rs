@@ -14,7 +14,8 @@ use impulse_desktop::ui::{
     agent_focus_bridge_script, agent_launch_bridge_script, apply_desktop_bridge_message,
     apply_desktop_bridge_message_with_status, build_governed_agent_spawn_request,
     builder_role_assignment, desktop_event_bridge_script, governed_task_mutation_bridge_script,
-    mcp_invoke_bridge_script, review_decision_bridge_script, terminal_asset_paths,
+    mcp_invoke_bridge_script, parse_workspace_folder_pick_result, review_decision_bridge_script,
+    terminal_asset_paths, workspace_folder_pick_bridge_script, workspace_folder_pick_request,
     workspace_registration_bridge_script, BridgeStatusUpdate, DaemonOpsStatusUpdate,
     DesktopBridgeMessage, DesktopBridgeStateMut, GovernedAgentSpawnInput, ReviewDecisionUiRequest,
     XTERM_CSS_PATH, XTERM_FIT_JS_PATH, XTERM_JS_PATH,
@@ -533,7 +534,8 @@ fn test_dioxus_desktop_launch_binary_is_feature_gated() {
 
     assert!(manifest_text.contains("name = \"impulse-desktop\""));
     assert!(manifest_text.contains("required-features = [\"desktop-app\"]"));
-    assert!(manifest_text.contains("desktop-app = [\"dep:dioxus-desktop\", \"dioxus/desktop\"]"));
+    assert!(manifest_text
+        .contains("desktop-app = [\"dep:dioxus-desktop\", \"dioxus/desktop\", \"dep:rfd\"]"));
     assert!(manifest_text.contains("dioxus-desktop = { version = \"0.6.3\", optional = true }"));
     assert!(launcher_text.contains("use impulse_desktop::desktop_host::desktop_config;"));
     assert!(launcher_text.contains("dioxus::LaunchBuilder::desktop()"));
@@ -1592,6 +1594,72 @@ fn test_workspace_registration_bridge_script_serializes_project_notes() {
     assert!(script.contains(r#""label":"scratch""#));
     assert!(script.contains(r#""purpose":"terminal harness""#));
     assert!(script.contains(r#""project_notes":"watch Dioxus bridge""#));
+}
+
+#[test]
+fn test_workspace_folder_pick_bridge_script_calls_pick_workspace_folder() {
+    let request = workspace_folder_pick_request("/tmp/project");
+    let script = workspace_folder_pick_bridge_script(&request);
+
+    assert!(script.contains("pickWorkspaceFolder"));
+    assert!(script.contains(r#""kind":"file_open_panel""#));
+    assert!(script.contains(r#""starting_directory":"/tmp/project""#));
+}
+
+#[test]
+fn test_workspace_folder_pick_request_omits_starting_directory_when_root_blank() {
+    let request = workspace_folder_pick_request("   ");
+    assert!(!request
+        .payload
+        .as_object()
+        .unwrap()
+        .contains_key("starting_directory"));
+    assert_eq!(request.payload["title"], "Select a project folder");
+}
+
+#[test]
+fn test_parse_workspace_folder_pick_result_returns_path_on_success() {
+    let value = serde_json::json!({
+        "request_id": "r1",
+        "kind": "file_open_panel",
+        "handled": true,
+        "payload": { "path": "/tmp/project", "cancelled": false }
+    });
+    assert_eq!(
+        parse_workspace_folder_pick_result(Ok(value)),
+        Ok(Some("/tmp/project".to_string()))
+    );
+}
+
+#[test]
+fn test_parse_workspace_folder_pick_result_returns_none_on_cancel() {
+    let value = serde_json::json!({
+        "request_id": "r1",
+        "kind": "file_open_panel",
+        "handled": true,
+        "payload": { "path": null, "cancelled": true }
+    });
+    assert_eq!(parse_workspace_folder_pick_result(Ok(value)), Ok(None));
+}
+
+#[test]
+fn test_parse_workspace_folder_pick_result_returns_none_when_bridge_unavailable() {
+    assert_eq!(
+        parse_workspace_folder_pick_result(Ok(serde_json::Value::Null)),
+        Ok(None)
+    );
+}
+
+#[test]
+fn test_parse_workspace_folder_pick_result_propagates_eval_error() {
+    let result = parse_workspace_folder_pick_result(Err("bridge rejected".to_string()));
+    assert_eq!(result, Err("bridge rejected".to_string()));
+}
+
+#[test]
+fn test_parse_workspace_folder_pick_result_rejects_malformed_payload() {
+    let result = parse_workspace_folder_pick_result(Ok(serde_json::json!({ "unexpected": true })));
+    assert!(result.is_err());
 }
 
 #[test]

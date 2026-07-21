@@ -840,6 +840,22 @@ body {
   cursor: pointer;
 }
 
+.workspace-field-inline {
+  display: flex;
+  gap: 6px;
+  align-items: stretch;
+}
+
+.workspace-field-inline input {
+  flex: 1;
+  min-width: 0;
+}
+
+.workspace-field-inline .invoke-button {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
 .workspace-primary {
   grid-column: 1 / -1;
   justify-self: start;
