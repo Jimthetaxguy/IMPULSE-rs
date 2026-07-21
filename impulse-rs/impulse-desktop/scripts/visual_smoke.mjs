@@ -13,6 +13,7 @@ const outputDir = path.resolve(process.argv[3] ?? fixtureDir);
 const viewports = [
   { label: "desktop", width: 1440, height: 900 },
   { label: "compact", width: 1024, height: 768 },
+  { label: "narrow", width: 900, height: 700 },
 ];
 const routes = [
   {
@@ -119,6 +120,36 @@ async function assertLayout(page, route, viewport) {
       };
     };
     const text = document.body.innerText || "";
+
+    const eventStripSpans = Array.from(document.querySelectorAll(".event-strip span")).map(
+      (span) => {
+        const spanRect = span.getBoundingClientRect();
+        return {
+          scrollWidth: span.scrollWidth,
+          clientWidth: span.clientWidth,
+          right: spanRect.right,
+        };
+      },
+    );
+
+    const gridEl = document.querySelector(".workspace-grid");
+    const gridScrollWidth = gridEl ? gridEl.scrollWidth : null;
+    const gridClientWidth = gridEl ? gridEl.clientWidth : null;
+    let inspectorReachable = null;
+    if (gridEl) {
+      const maxScrollLeft = gridEl.scrollWidth - gridEl.clientWidth;
+      gridEl.scrollLeft = maxScrollLeft;
+      const inspectorEl = document.querySelector(".right-inspector");
+      const shellEl = document.querySelector(".impulse-shell");
+      if (inspectorEl && shellEl) {
+        const inspectorRect = inspectorEl.getBoundingClientRect();
+        const shellRect = shellEl.getBoundingClientRect();
+        inspectorReachable =
+          inspectorRect.left >= shellRect.left - 1 && inspectorRect.right <= shellRect.right + 1;
+      }
+      gridEl.scrollLeft = 0;
+    }
+
     return {
       routeSlug,
       bodyTextLength: text.trim().length,
@@ -134,6 +165,10 @@ async function assertLayout(page, route, viewport) {
       clientWidth: document.documentElement.clientWidth,
       clientHeight: document.documentElement.clientHeight,
       terminalVisible: rectOf(".view-terminal.active"),
+      eventStripSpans,
+      gridScrollWidth,
+      gridClientWidth,
+      inspectorReachable,
     };
   }, route.slug);
 
@@ -173,6 +208,30 @@ async function assertLayout(page, route, viewport) {
 
   if (route.slug !== "terminal") {
     assert(!result.terminalVisible, `${route.slug}: terminal route should not be active`);
+  }
+
+  for (const span of result.eventStripSpans) {
+    assert(
+      span.scrollWidth <= span.clientWidth + 1,
+      `${route.slug}: event-strip span text clipped (scrollWidth ${span.scrollWidth} > clientWidth ${span.clientWidth}) at ${viewport.width}x${viewport.height}`,
+    );
+    assert(
+      span.right <= result.shell.right + 1,
+      `${route.slug}: event-strip span extends past shell edge at ${viewport.width}x${viewport.height}`,
+    );
+  }
+
+  if (result.gridScrollWidth !== null && result.gridClientWidth !== null) {
+    assert(
+      result.grid.width <= viewport.width + 1,
+      `${route.slug}: workspace-grid outer box (${result.grid.width}) wider than viewport (${viewport.width}) - overflow is leaking to the shell instead of scrolling locally`,
+    );
+    if (result.gridScrollWidth > result.gridClientWidth + 1) {
+      assert(
+        result.inspectorReachable,
+        `${route.slug}: workspace-grid overflows (${result.gridScrollWidth} > ${result.gridClientWidth}) but right-inspector is not reachable by scrolling`,
+      );
+    }
   }
 }
 
