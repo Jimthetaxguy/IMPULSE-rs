@@ -1,6 +1,6 @@
 ---
 title: Impulse vs. bbarit-agent-oss — Comparative Analysis
-description: Point-in-time comparison of Impulse against bbarit/bbarit-agent-oss, a single-binary Rust coding agent rewritten from Pi, covering memory design, governance posture, orchestration, and integration surface
+description: Point-in-time comparison of Impulse against bbarit-agent-oss, a single-binary Rust coding agent rewritten from Pi, covering memory design, governance, orchestration, and integration surface
 version: '1.0'
 updated: 2026-08-02
 type: research
