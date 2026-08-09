@@ -2,7 +2,7 @@
 title: Impulse vs. Omnigent — Comparative Analysis
 description: Point-in-time comparison of Impulse against omnigent-ai/omnigent, the open-source Python meta-harness, across architecture, harness integration, governance, sandboxing, and memory
 version: '1.0'
-updated: 2026-07-30
+updated: 2026-08-09
 type: research
 category: competitive-analysis
 phase: all
@@ -13,7 +13,7 @@ tags: [research, meta-harness, competitive, omnigent, harness, governance, sandb
 
 # Impulse vs. Omnigent — Comparative Analysis
 
-> **Point-in-time record (2026-07-30).** Compares the Impulse repository at commit `2504557`
+> **Point-in-time record (2026-08-09).** Compares the Impulse repository at commit `2504557`
 > against [omnigent-ai/omnigent](https://github.com/omnigent-ai/omnigent) at `main`
 > (v0.8.0.dev0, one commit after the v0.7.0 release of 2026-07-27). Omnigent facts come from a
 > fresh source read of that checkout, not from marketing material. This supersedes nothing;

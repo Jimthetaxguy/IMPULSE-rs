@@ -2,7 +2,7 @@
 title: Impulse vs. bbarit-agent-oss — Comparative Analysis
 description: Point-in-time comparison of Impulse against bbarit-agent-oss, a single-binary Rust coding agent rewritten from Pi, covering memory design, governance, orchestration, and integration surface
 version: '1.0'
-updated: 2026-08-02
+updated: 2026-08-09
 type: research
 category: competitive-analysis
 phase: all
@@ -13,10 +13,10 @@ tags: [research, competitive, bbarit, pi, ion, memory, personas, harness, rust]
 
 # Impulse vs. bbarit-agent-oss — Comparative Analysis
 
-> **Point-in-time record (2026-08-02).** Compares the Impulse repository at commit `2504557`
+> **Point-in-time record (2026-08-09).** Compares the Impulse repository at commit `2504557`
 > against [bbarit/bbarit-agent-oss](https://github.com/bbarit/bbarit-agent-oss) at its public
 > HEAD (v0.1.21, single squashed commit dated 2026-07-21). Facts come from a source read of that
-> checkout. Companion analysis: [`2026-07-30-omnigent-comparison.md`](2026-07-30-omnigent-comparison.md).
+> checkout. Companion analysis: [`2026-08-09-omnigent-comparison.md`](2026-08-09-omnigent-comparison.md).
 
 ---
 
