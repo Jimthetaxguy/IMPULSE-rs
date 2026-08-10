@@ -154,8 +154,9 @@ design argues against:
   tool — "no sub-agent fork bombs"), a simpler cousin of omnigent's `spawn_bounds` policy and
   Impulse's loop caps.
 
-No audit trail, no typed events, no verification evidence, no supervisor/operator separation, no
-capability model. None of this is a flaw for its category — a solo-developer pair-programming CLI
+No audit trail, no typed events beyond the session-lifecycle NDJSON stream (§5) — nothing typed
+for audit, verification, or inter-agent messaging — no verification evidence, no
+supervisor/operator separation, no capability model. None of this is a flaw for its category — a solo-developer pair-programming CLI
 — but it delimits sharply what "agent governance" means at the harness tier versus the control-
 plane tier.
 
@@ -189,8 +190,9 @@ Impulse keeps its position that a persona brief is prompt text, not a role contr
 
 Everything control-plane: a daemon and durable source of truth, governed tasks and acceptance
 criteria, verification with evidence, supervisor/operator separation, typed telemetry and audit,
-capability negotiation, credential governance, scoped memory with provenance, and multi-agent
-coordination beyond fan-out/collect. Its Ion-comparable core is ahead of Ion on provider breadth
+a static code-owned capability registry with launch preflight (generalized capability
+*negotiation* remains open ADR #3), credential governance, scoped memory with provenance, and
+multi-agent coordination beyond fan-out/collect. Its Ion-comparable core is ahead of Ion on provider breadth
 (15+ providers vs. Ion's Anthropic-first backends), TUI polish, sessions-as-trees
 (branch/fork/clone/export), personas, and self-update — and behind Ion on governance integration
 (guardrail-scanned confirmation, env scrubbing, loop budgets, typed tool registry with

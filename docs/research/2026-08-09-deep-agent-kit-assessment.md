@@ -18,7 +18,16 @@ tags: [research, deep-agents, reference-architecture, governance, memory, contex
 > sub-guides, 10 validated JSON Schemas, TypeScript reference, diagrams, selection matrix, agent
 > review contract; dated 2026-08-06), an **Integrated Review** of it (2026-08-07), a **Managed
 > Deep Agents Landscape Addendum** (2026-08-07), and a standalone **Deep Agents use-cases PDF**.
-> The uploaded HTML guide is byte-identical to the kit's reading copy. Companion analyses:
+> The uploaded HTML guide is byte-identical to the kit's reading copy.
+>
+> **Source-preservation limitation (added 2026-08-10).** The five-part package was a
+> session-scoped upload; it is not archived in this repo, and a machine-wide search found no
+> local copy. Until the package is re-obtained and archived (e.g. under `docs/research/sources/`
+> or the iCloud knowledge base), the quotes and rule texts embedded in this document are the only
+> preserved excerpts — the 15-rule scorecard below cannot be independently re-derived from
+> source. Treat rubric wording herein as faithful-but-unverifiable transcription.
+>
+> Companion analyses:
 > [`2026-08-09-omnigent-comparison.md`](2026-08-09-omnigent-comparison.md) (product, breadth),
 > [`2026-08-09-bbarit-agent-oss-comparison.md`](2026-08-09-bbarit-agent-oss-comparison.md)
 > (product, harness tier). This one is different in kind: **a prescriptive reference
@@ -81,18 +90,20 @@ from the same failure mode.
 
 ## 3. Constitution scorecard
 
-Grading Impulse against the guide's fifteen non-negotiable rules: **strong on 9, partial on 4,
+Grading Impulse against the guide's fifteen non-negotiable rules: **strong on 8, partial on 5,
 absent on 2.**
 
 **Strong** — chat is not the database (1); model doesn't own authoritative state (2); generated
-UI trusted/server-validated in spirit — Dioxus has no optimistic mutations (4); subagent/role
-boundaries as contract goal (5); deterministic work in deterministic code — the verifier is
-host code, not a model (6); generator never sole evaluator (7); promoted memory needs provenance
-and rollback (9); completion by acceptance checks (13); sandbox-insufficiency honesty — Impulse
-says "containment, not an OS sandbox" where the kit says a sandbox is "necessary but insufficient"
-(10).
+UI trusted/server-validated in spirit — Dioxus has no optimistic mutations (4); deterministic
+work in deterministic code — the verifier is host code, not a model (6); generator never sole
+evaluator (7); promoted memory needs provenance and rollback (9); completion by acceptance
+checks (13); sandbox-insufficiency honesty — Impulse says "containment, not an OS sandbox" where
+the kit says a sandbox is "necessary but insufficient" (10).
 
-**Partial** — artifacts as versioned runtime objects (3): Impulse artifacts carry provenance but
+**Partial** — subagent/role boundaries (5): worker/supervisor separation and the ADR-0010 launch
+contract exist today, but the generalized `RoleContract` is product direction (VISION.md), not
+implemented enforcement — graded on current implementation, not intent. Artifacts as versioned
+runtime objects (3): Impulse artifacts carry provenance but
 lack the kit's manifest richness (versions, `derivedFrom` lineage, per-format validators,
 publication status). Memory retrieval filters scope before ranking (8): retrieval is
 project-scoped, but the kit's explicit policy-first pipeline (identity → scope → freshness →
