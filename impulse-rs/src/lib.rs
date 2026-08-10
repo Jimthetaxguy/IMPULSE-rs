@@ -43,6 +43,7 @@ pub(crate) mod process_group;
 pub mod process_util;
 pub mod retrieval;
 pub mod semantic_diff;
+pub mod settlement;
 pub mod state;
 pub mod stewardship;
 pub mod storage;
