@@ -76,11 +76,16 @@ the missing noun lives and what it is allowed to touch.
    A settlement record carries the per-candidate check matrix, a selection rationale naming the
    concrete difference between the top candidates, a graft record whenever the winner absorbs a piece
    of a loser, and preserved dissent for any losing candidate that passed every check. A record
-   missing any part is not a weaker record; it is not a record. `impulse-rs/src/settlement.rs`
+   missing any part is not a weaker record; it is not a record. An unpopulated matrix counts as a
+   missing part: a settlement whose candidates checked nothing compares nothing, and the record it
+   would produce is a vote rather than a comparison. `impulse-rs/src/settlement.rs`
    enforces this in its constructor, so an invalid settlement has no value to be.
 
-7. **A fatal check failure is disqualifying, not weighable.**
-   A candidate that failed a fatal check cannot be selected regardless of how attractive its diff is,
+7. **A fatal check that did not pass is disqualifying, not weighable.**
+   A fatal check exists to prove safety, so an inconclusive result disqualifies exactly as a failure
+   does: a proof that did not conclude is not a proof, and treating it as one is the fail-open
+   reading of the same evidence. A candidate that did not pass a fatal check cannot be selected
+   regardless of how attractive its diff is,
    how many other checks it passed, or how strong the rationale for it would have been. Eligibility
    is evaluated before comparison and composes with basis freshness: a candidate whose basis moved
    under it is equally ineligible, because its work was planned against state that no longer holds.

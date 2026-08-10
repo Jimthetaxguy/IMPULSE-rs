@@ -4,8 +4,9 @@
 //! Settlement over N candidates is a comparison, not an acceptance. The record
 //! carries four required parts, and none of them is optional:
 //!
-//! 1. a **per-candidate check matrix** — every candidate ran every acceptance
-//!    check, so the comparison is between like and like;
+//! 1. a **per-candidate check matrix** — every candidate ran at least one
+//!    acceptance check and all of them ran the same ones, so the comparison is
+//!    between like and like;
 //! 2. a **selection rationale** naming the concrete difference that decided it;
 //! 3. a **graft record** whenever the winner absorbs a piece of a loser, with
 //!    the loser's archive still on disk to review it against;
@@ -89,10 +90,16 @@ pub enum SettlementError {
     },
 
     #[error(
-        "candidate `{id}` cannot be selected: {check} — a fatal check failure is disqualifying, \
-         not one attribute to weigh against an attractive diff"
+        "candidate `{id}` cannot be selected: {check} — a fatal check that did not pass is \
+         disqualifying, not one attribute to weigh against an attractive diff"
     )]
     IneligibleSelection { id: CandidateId, check: String },
+
+    #[error(
+        "candidate `{id}` carries no acceptance checks: a settlement with nothing to check compares \
+         nothing, so the record would be a vote rather than a comparison"
+    )]
+    NoChecks { id: CandidateId },
 
     #[error(
         "candidate `{candidate}` never ran check `{check}`: the matrix must be complete — a \
@@ -247,8 +254,12 @@ impl CheckResult {
     }
 
     /// Whether this cell alone disqualifies its candidate.
+    ///
+    /// A fatal check exists to prove safety, so anything short of a pass is
+    /// disqualifying: an inconclusive result is a proof that did not conclude,
+    /// which is not a proof.
     pub fn disqualifying(&self) -> bool {
-        self.fatal && self.outcome == CheckOutcome::Failed
+        self.fatal && self.outcome != CheckOutcome::Passed
     }
 }
 
@@ -277,8 +288,8 @@ impl CandidateResult {
     /// Whether this candidate may be selected at all.
     ///
     /// Eligibility composes both companion predicates: the basis must still be
-    /// fresh, and no fatal check may have failed. Neither is weighable against
-    /// the diff.
+    /// fresh, and every fatal check must have passed outright. Neither is
+    /// weighable against the diff.
     pub fn eligible(&self) -> bool {
         self.ineligibility_reason().is_none()
     }
@@ -313,7 +324,10 @@ impl CandidateResult {
         self.checks
             .iter()
             .find(|result| result.disqualifying())
-            .map(|result| format!("fatal check `{}` failed", result.check))
+            .map(|result| match result.outcome {
+                CheckOutcome::Failed => format!("fatal check `{}` failed", result.check),
+                _ => format!("fatal check `{}` did not conclude", result.check),
+            })
     }
 
     fn check_ids(&self) -> HashSet<CheckId> {
@@ -421,12 +435,19 @@ impl SettlementRecord {
             }
         }
 
-        // Part 1: the check matrix must be complete before anything is compared.
+        // Part 1: the check matrix must be populated and complete before
+        // anything is compared. Completeness on top of an empty matrix is
+        // trivially satisfied, so emptiness is rejected first.
         let every_check: HashSet<CheckId> = candidates
             .iter()
             .flat_map(|candidate| candidate.check_ids())
             .collect();
         for candidate in &candidates {
+            if candidate.checks.is_empty() {
+                return Err(SettlementError::NoChecks {
+                    id: candidate.id.clone(),
+                });
+            }
             let ran = candidate.check_ids();
             if let Some(missing) = every_check.difference(&ran).min() {
                 return Err(SettlementError::MissingCheck {
@@ -668,7 +689,8 @@ mod tests {
         }
     }
 
-    // --- Acceptance check 1: a record missing any of the four parts fails ----
+    // --- Acceptance check 1: a record missing any of the four parts fails,
+    //     and an unpopulated check matrix is a missing part ------------------
 
     #[test]
     fn test_new_complete_record_with_all_four_parts_constructs() {
@@ -729,6 +751,54 @@ mod tests {
                 assert_eq!(check, check_id("clippy"));
             }
             other => panic!("expected MissingCheck, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_new_candidates_with_no_checks_returns_no_checks() {
+        let dir = TempDir::new().expect("tempdir");
+        let candidates = vec![
+            candidate(&dir, "a", Vec::new()),
+            candidate(&dir, "b", Vec::new()),
+        ];
+
+        let err = SettlementRecord::new(
+            candidates,
+            candidate_id("b"),
+            RATIONALE,
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect_err("a record that checked nothing is a vote, not a comparison");
+
+        match err {
+            SettlementError::NoChecks { id } => assert_eq!(id, candidate_id("a")),
+            other => panic!("expected NoChecks, got {other:?}"),
+        }
+    }
+
+    /// Emptiness is caught before completeness, which an empty matrix would
+    /// otherwise satisfy trivially.
+    #[test]
+    fn test_new_one_candidate_with_no_checks_returns_no_checks_naming_that_candidate() {
+        let dir = TempDir::new().expect("tempdir");
+        let candidates = vec![
+            candidate(&dir, "a", vec![passed("build")]),
+            candidate(&dir, "b", Vec::new()),
+        ];
+
+        let err = SettlementRecord::new(
+            candidates,
+            candidate_id("a"),
+            RATIONALE,
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect_err("every candidate must carry at least one check");
+
+        match err {
+            SettlementError::NoChecks { id } => assert_eq!(id, candidate_id("b")),
+            other => panic!("expected NoChecks, got {other:?}"),
         }
     }
 
@@ -937,7 +1007,8 @@ mod tests {
         assert_eq!(DEFAULT_CANDIDATE_CAP, 8);
     }
 
-    // --- Acceptance check 2: a fatal failure cannot be selected -------------
+    // --- Acceptance check 2: a fatal check that did not pass cannot be
+    //     selected, whether it failed or never concluded -------------------
 
     /// The temptation the spec asks for: the most attractive diff in the panel,
     /// disqualified by one fatal check, passed as the selection anyway.
@@ -964,6 +1035,47 @@ mod tests {
                 assert!(
                     check.contains("build"),
                     "the error must name the check that disqualified it: {check}"
+                );
+            }
+            other => panic!("expected IneligibleSelection, got {other:?}"),
+        }
+    }
+
+    /// The fail-closed half of the temptation: a fatal check that never reached
+    /// a verdict is not a passed check, and cannot be selected past.
+    #[test]
+    fn test_new_fatal_inconclusive_check_selected_returns_ineligible_selection() {
+        let dir = TempDir::new().expect("tempdir");
+        let unproven = candidate(
+            &dir,
+            "unproven",
+            vec![CheckResult::new(
+                check_id("build"),
+                CheckOutcome::Inconclusive,
+                true,
+            )],
+        );
+        let candidates = vec![unproven, candidate(&dir, "proven", vec![passed("build")])];
+
+        let err = SettlementRecord::new(
+            candidates,
+            candidate_id("unproven"),
+            RATIONALE,
+            Vec::new(),
+            vec![Dissent {
+                candidate: candidate_id("proven"),
+                diff_summary: "candidate proven: 3 files changed".into(),
+                note: None,
+            }],
+        )
+        .expect_err("a fatal check that did not conclude did not prove anything");
+
+        match err {
+            SettlementError::IneligibleSelection { id, check } => {
+                assert_eq!(id, candidate_id("unproven"));
+                assert!(
+                    check.contains("did not conclude"),
+                    "the error must distinguish an unproven check from a failed one: {check}"
                 );
             }
             other => panic!("expected IneligibleSelection, got {other:?}"),
@@ -1041,6 +1153,9 @@ mod tests {
         );
     }
 
+    /// `SettlementError::NoChecks` keeps an empty matrix out of any record, so
+    /// this guards the type directly: a `CandidateResult` built by hand still
+    /// must not report a clean sweep it never earned.
     #[test]
     fn test_passed_all_empty_matrix_is_not_a_clean_sweep() {
         let dir = TempDir::new().expect("tempdir");
@@ -1052,16 +1167,20 @@ mod tests {
     }
 
     #[test]
-    fn test_check_result_disqualifying_only_for_failed_fatal_checks() {
+    fn test_check_result_disqualifying_for_any_fatal_check_that_did_not_pass() {
         assert!(failed_fatal("build").disqualifying());
         assert!(!passed("build").disqualifying());
+        assert!(
+            CheckResult::new(check_id("build"), CheckOutcome::Inconclusive, true).disqualifying(),
+            "a fatal check proves safety; a proof that did not conclude is not a proof"
+        );
         assert!(
             !CheckResult::new(check_id("build"), CheckOutcome::Failed, false).disqualifying(),
             "a non-fatal failure is weighable, not disqualifying"
         );
         assert!(
-            !CheckResult::new(check_id("build"), CheckOutcome::Inconclusive, true).disqualifying(),
-            "inconclusive is not failed"
+            !CheckResult::new(check_id("docs"), CheckOutcome::Inconclusive, false).disqualifying(),
+            "a non-fatal inconclusive is weighable too"
         );
     }
 
@@ -1351,6 +1470,12 @@ mod tests {
         }
         .to_string();
         assert!(ineligible.contains("build") && ineligible.contains("disqualifying"));
+
+        let no_checks = SettlementError::NoChecks {
+            id: candidate_id("a"),
+        }
+        .to_string();
+        assert!(no_checks.contains("`a`") && no_checks.contains("vote rather than a comparison"));
 
         let missing = SettlementError::MissingCheck {
             candidate: candidate_id("a"),
