@@ -46,9 +46,9 @@ cloud-sandbox execution.
 |---|---|---|
 | Language | Rust (workspace of 5 crates) | Python 3.12+ core, TypeScript/React web |
 | Core size | ~131K LOC Rust (incl. in-file tests) | ~362K LOC Python core; ~186K LOC web TS; ~11K Electron; native Swift/Kotlin apps |
-| Tests | ~1,950 `#[test]`/`#[tokio::test]` fns | ~15,246 `def test_*` (~561K LOC under `tests/`) + 269 vitest files + Playwright visual-regression suite |
+| Tests | ~2,380 `#[test]`/`#[tokio::test]` fns (~2,130 in workspace members; `impulse-gui` is workspace-excluded) | ~15,246 `def test_*` (~561K LOC under `tests/`) + 269 vitest files + Playwright visual-regression suite |
 | Persistence | `.impulse/` files (JSONL/JSON/MD) + SQLite retrieval index | SQLAlchemy over Postgres/SQLite (+ Cloudflare D1, Databricks Lakebase), 14 tables, 88 Alembic migrations |
-| Release state | Unreleased; repo history restarted 2026-07-11 (50 commits) | v0.7.0 on PyPI (2026-07-27); PR numbers in the thousands; Homebrew tap, one-line installer, desktop download |
+| Release state | Unreleased; 284 commits since 2026-02-25 (67 of them on/after the 2026-07-11 hardening push) | v0.7.0 on PyPI (2026-07-27); PR numbers in the thousands; Homebrew tap, one-line installer, desktop download |
 | Team shape | Single-operator, agent-assisted | Community project with many contributors and CI at scale (79 workflow files) |
 | Deployment | One machine, Unix socket | 17 deploy targets (Docker, Render, Railway, Fly, Cloudflare, Modal, Databricks Apps, K8s, …) |
 
@@ -173,8 +173,9 @@ the weakest layer Impulse's own principles reject ("prompt text is not enough").
 
 The mirror image: Impulse's in-flight guardrails (the `guardrail` module's nine builtin bash
 rules, the ion REPL confirmation gate with `CONFIRM` escalation) are far thinner than omnigent's
-policy engine — no spend caps, no per-phase stacking, no user-authorable rules, and the known gap
-that `GuardTarget::FileWrite` has zero builtin rules.
+policy engine — no spend caps, no per-phase stacking, no user-authorable rules, and only a single
+builtin `GuardTarget::FileWrite` rule (`block-write-secret`, added 2026-07-11 — the repo's
+own CLAUDE.md still understates this).
 
 ## 6. Sandboxing and secrets
 

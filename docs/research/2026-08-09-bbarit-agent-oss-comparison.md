@@ -57,7 +57,7 @@ aims at.
 | Dimension | Impulse | bbarit-oss |
 |---|---|---|
 | Language / shape | Rust workspace, 5 crates, ~131K LOC | Rust, **one crate**, ~57K LOC in `src/` |
-| Tests | ~1,950 test fns (~15/KLOC) | 346 test fns (~6/KLOC) |
+| Tests | ~2,380 test fns (~18/KLOC) | 346 test fns (~6/KLOC) |
 | Module discipline | Enforced small modules, per-file `mod tests` | Five mega-modules (`commands.rs` 8.1K, `llm.rs` 7.3K, `tui.rs` 7.1K, `tools.rs` 6.5K); splitting them is item #1 of its own refactoring roadmap |
 | Lint gate | `clippy --workspace --all-targets -- -D warnings` mandatory | fmt is the hard CI gate; **clippy is advisory** (zero warnings kept by convention) |
 | Public history | Full commit history | **One squashed commit** — provenance disclosed for code lineage, not development history |
