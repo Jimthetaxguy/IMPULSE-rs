@@ -36,7 +36,7 @@
 
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
 
@@ -136,6 +136,12 @@ pub enum SettlementError {
          one run — narrow the WorkItem instead of widening the panel"
     )]
     OverCap { count: usize, cap: usize },
+
+    #[error(
+        "check `{check}` is fatal on some candidates and not others: the same WorkItem check must \
+         have the same fatal flag on every candidate, or the matrix is not a comparison"
+    )]
+    FatalDisagreement { check: CheckId },
 }
 
 // ============================================================================
@@ -375,6 +381,9 @@ pub struct SettlementRecord {
     rationale: String,
     grafts: Vec<Graft>,
     dissent: Vec<Dissent>,
+    /// Stored at construction so [`Self::winner`] never searches or panics.
+    #[serde(skip)]
+    winner: CandidateResult,
 }
 
 impl SettlementRecord {
@@ -457,13 +466,29 @@ impl SettlementRecord {
             }
         }
 
-        let winner = candidates
+        let mut fatal_by_check: HashMap<CheckId, bool> = HashMap::new();
+        for candidate in &candidates {
+            for result in &candidate.checks {
+                if let Some(&prior) = fatal_by_check.get(&result.check) {
+                    if prior != result.fatal {
+                        return Err(SettlementError::FatalDisagreement {
+                            check: result.check.clone(),
+                        });
+                    }
+                } else {
+                    fatal_by_check.insert(result.check.clone(), result.fatal);
+                }
+            }
+        }
+
+        let winner_index = candidates
             .iter()
-            .find(|candidate| candidate.id == selected)
+            .position(|candidate| candidate.id == selected)
             .ok_or_else(|| SettlementError::UnknownCandidate {
                 field: "selected",
                 id: selected.clone(),
             })?;
+        let winner = candidates[winner_index].clone();
         if let Some(reason) = winner.ineligibility_reason() {
             return Err(SettlementError::IneligibleSelection {
                 id: selected.clone(),
@@ -525,6 +550,7 @@ impl SettlementRecord {
             rationale,
             grafts,
             dissent,
+            winner,
         })
     }
 
@@ -538,10 +564,7 @@ impl SettlementRecord {
 
     /// The winning candidate's full result.
     pub fn winner(&self) -> &CandidateResult {
-        self.candidates
-            .iter()
-            .find(|candidate| candidate.id == self.selected)
-            .unwrap_or_else(|| unreachable!("the selected candidate is validated in new()"))
+        &self.winner
     }
 
     pub fn rationale(&self) -> &str {
@@ -751,6 +774,38 @@ mod tests {
                 assert_eq!(check, check_id("clippy"));
             }
             other => panic!("expected MissingCheck, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_new_mismatched_fatal_flags_for_same_check_returns_fatal_disagreement() {
+        let dir = TempDir::new().expect("tempdir");
+        let loser = candidate(&dir, "a", vec![passed("build")]);
+        let mut winner = candidate(&dir, "b", Vec::new());
+        winner.checks = vec![CheckResult::new(
+            check_id("build"),
+            CheckOutcome::Passed,
+            false,
+        )];
+
+        let err = SettlementRecord::new(
+            vec![loser, winner],
+            candidate_id("b"),
+            RATIONALE,
+            Vec::new(),
+            vec![Dissent {
+                candidate: candidate_id("a"),
+                diff_summary: "candidate a: fatal build on a, non-fatal on b".into(),
+                note: None,
+            }],
+        )
+        .expect_err("the same check cannot be fatal on one candidate and weighable on another");
+
+        match err {
+            SettlementError::FatalDisagreement { check } => {
+                assert_eq!(check, check_id("build"));
+            }
+            other => panic!("expected FatalDisagreement, got {other:?}"),
         }
     }
 
@@ -1507,5 +1562,11 @@ mod tests {
         let over_cap = SettlementError::OverCap { count: 12, cap: 8 }.to_string();
         assert!(over_cap.contains("12") && over_cap.contains("8"));
         assert!(over_cap.contains("N times the tokens"));
+
+        let fatal = SettlementError::FatalDisagreement {
+            check: check_id("build"),
+        }
+        .to_string();
+        assert!(fatal.contains("`build`") && fatal.contains("same fatal flag"));
     }
 }

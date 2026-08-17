@@ -96,11 +96,13 @@ the missing noun lives and what it is allowed to touch.
    filesystem when the settlement record is constructed, not a cleanup task deferred to whoever
    remembers.
 
-9. **The three predicates compose in a fixed order.**
-   Basis freshness gates eligibility per candidate. Effect class gates whether the fan-out was
-   permitted at all. Settlement compares what remains after both. The order matters: comparing first
-   and checking eligibility afterward produces a ranked list whose top entry may be disqualified,
-   which is a comparison that has to be redone.
+9. **The predicates compose in a fixed order, and effect class is not a settlement-time check.**
+   Basis freshness gates eligibility per candidate before comparison. Effect class already gated
+   whether the fan-out was permitted at all (rule 4) — at planning time, before any candidate ran —
+   so settlement has no effect-class field and does not re-check it. Settlement compares the
+   remaining eligible candidates. The order matters: comparing first and checking eligibility
+   afterward produces a ranked list whose top entry may be disqualified, which is a comparison that
+   has to be redone.
 
 10. **The default is N=1, and fan-out is reserved for expensive-to-get-wrong work until cost
     attribution exists.**
