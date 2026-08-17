@@ -41,12 +41,6 @@ use std::process::Command;
 /// entry carries four pairs, not a snapshot of the machine.
 pub const DEFAULT_BASIS_CAP: usize = 32;
 
-/// Number of trailing lines hashed for a [`BasisSource::LedgerSection`].
-///
-/// Fixed rather than per-source so the tail hash is reproducible from the
-/// path alone at settlement time.
-pub const LEDGER_TAIL_LINES: usize = 20;
-
 // ============================================================================
 // Errors
 // ============================================================================
@@ -88,7 +82,9 @@ pub enum BasisDeclaration {
     Git { repo: PathBuf, refname: String },
     /// A JSON registry entry, versioned by the value at a JSON pointer.
     Registry { path: PathBuf, json_pointer: String },
-    /// An append-only ledger, versioned by line count plus a tail hash.
+    /// An append-only ledger, versioned by line count plus a SHA-256 of the
+    /// whole file. Ledgers are small; hashing only a trailing window would
+    /// miss an in-place edit older than that window with the same line count.
     Ledger(PathBuf),
     /// A source with no version handle. Recorded as an assumption.
     Unverifiable(String),
@@ -147,7 +143,7 @@ pub enum BasisSource {
     LedgerSection {
         path: PathBuf,
         line_count: usize,
-        tail_sha256: String,
+        content_sha256: String,
     },
     Unverifiable {
         description: String,
@@ -166,8 +162,8 @@ impl BasisSource {
                 path, json_pointer, ..
             } => registry_value(path, json_pointer)?,
             Self::LedgerSection { path, .. } => {
-                let (line_count, tail) = ledger_handle(path)?;
-                encode_ledger(line_count, &tail)
+                let (line_count, content) = ledger_handle(path)?;
+                encode_ledger(line_count, &content)
             }
             Self::Unverifiable { .. } => return Ok(None),
         };
@@ -182,9 +178,9 @@ impl BasisSource {
             Self::RegistryEntry { updated_at, .. } => Some(updated_at.clone()),
             Self::LedgerSection {
                 line_count,
-                tail_sha256,
+                content_sha256,
                 ..
-            } => Some(encode_ledger(*line_count, tail_sha256)),
+            } => Some(encode_ledger(*line_count, content_sha256)),
             Self::Unverifiable { .. } => None,
         }
     }
@@ -324,10 +320,29 @@ impl BasisVerdict {
 // ============================================================================
 
 /// The bounded set of (source, version) pairs a run planned against.
+///
+/// Construction — including JSON rehydration — runs [`BasisSet::from_sources_with_cap`],
+/// so an empty or over-cap payload cannot deserialize into a value that would
+/// verify Fresh.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "BasisSetWire")]
 pub struct BasisSet {
     sources: Vec<BasisSource>,
     cap: usize,
+}
+
+#[derive(Deserialize)]
+struct BasisSetWire {
+    sources: Vec<BasisSource>,
+    cap: usize,
+}
+
+impl TryFrom<BasisSetWire> for BasisSet {
+    type Error = BasisError;
+
+    fn try_from(wire: BasisSetWire) -> Result<Self, Self::Error> {
+        Self::from_sources_with_cap(wire.sources, wire.cap)
+    }
 }
 
 impl BasisSet {
@@ -441,11 +456,11 @@ fn capture_one(declaration: BasisDeclaration) -> Result<BasisSource, BasisError>
             }
         }
         BasisDeclaration::Ledger(path) => {
-            let (line_count, tail_sha256) = ledger_handle(&path)?;
+            let (line_count, content_sha256) = ledger_handle(&path)?;
             BasisSource::LedgerSection {
                 path,
                 line_count,
-                tail_sha256,
+                content_sha256,
             }
         }
         BasisDeclaration::Unverifiable(description) => BasisSource::Unverifiable { description },
@@ -504,17 +519,18 @@ fn registry_value(path: &Path, json_pointer: &str) -> Result<String, BasisError>
     })
 }
 
-/// Line count plus the SHA-256 of the last [`LEDGER_TAIL_LINES`] lines.
+/// Line count plus the SHA-256 of the whole file.
+///
+/// Line count is a cheap mismatch signal for appends; the content hash is the
+/// freshness handle, so an in-place edit anywhere in the file fails closed.
 fn ledger_handle(path: &Path) -> Result<(usize, String), BasisError> {
     let text = std::fs::read_to_string(path).map_err(|e| unreadable(path.display(), e))?;
-    let lines: Vec<&str> = text.lines().collect();
-    let start = lines.len().saturating_sub(LEDGER_TAIL_LINES);
-    let tail = lines[start..].join("\n");
-    Ok((lines.len(), sha256_hex(tail.as_bytes())))
+    let line_count = text.lines().count();
+    Ok((line_count, sha256_hex(text.as_bytes())))
 }
 
-fn encode_ledger(line_count: usize, tail_sha256: &str) -> String {
-    format!("{line_count}:{tail_sha256}")
+fn encode_ledger(line_count: usize, content_sha256: &str) -> String {
+    format!("{line_count}:{content_sha256}")
 }
 
 // ============================================================================
@@ -669,7 +685,29 @@ mod tests {
         fs::write(&path, "line a\nline B EDITED\n").expect("edit in place");
         assert!(
             !basis.verify().settles(),
-            "same line count with edited tail must still fail closed"
+            "same line count with edited contents must still fail closed"
+        );
+    }
+
+    #[test]
+    fn test_verify_ledger_early_line_edit_same_line_count_returns_stale() {
+        let dir = TempDir::new().expect("tempdir");
+        let original: String = (0..25).map(|i| format!("line {i}\n")).collect();
+        let path = write(&dir, "ledger.md", &original);
+        let basis = BasisSet::capture(vec![BasisDeclaration::ledger(&path)]).expect("capture");
+        assert!(basis.verify().settles());
+
+        let mut lines: Vec<String> = (0..25).map(|i| format!("line {i}")).collect();
+        lines[0] = "line 0 EDITED".into();
+        fs::write(&path, format!("{}\n", lines.join("\n"))).expect("edit first line");
+        assert_eq!(
+            fs::read_to_string(&path).expect("reread").lines().count(),
+            25,
+            "the motivating miss was an in-place edit that kept line count"
+        );
+        assert!(
+            !basis.verify().settles(),
+            "an in-place edit older than a 20-line tail must still fail closed"
         );
     }
 
@@ -895,5 +933,16 @@ mod tests {
         let restored: BasisSet = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(basis, restored);
         assert!(restored.verify().settles());
+    }
+
+    #[test]
+    fn test_basis_set_deserialize_empty_sources_returns_error() {
+        let err = serde_json::from_str::<BasisSet>(r#"{"sources":[],"cap":0}"#)
+            .expect_err("empty basis must not deserialize into a Fresh-settling value");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("empty basis"),
+            "deserialize must surface the constructor error, got {rendered}"
+        );
     }
 }
