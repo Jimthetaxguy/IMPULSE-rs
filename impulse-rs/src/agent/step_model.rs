@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn test_decide_step_model_empty_current_falls_back_to_configured() {
-        let mut ctx = configured_ctx("");
+        let ctx = configured_ctx("");
         let decision = decide_step_model(&ctx, "configured-model");
         assert_eq!(decision.model, "configured-model");
         assert_eq!(decision.reason, StepModelReason::Configured);

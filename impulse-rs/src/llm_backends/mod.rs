@@ -330,10 +330,11 @@ impl Agent {
         let mut working = self.history.clone();
         working.push(Message::text(Role::User, user_message));
 
+        let mut step_context = self.step_context.clone();
+        step_context.current_model = self.model.clone();
         let loop_future = run_tool_loop(
             self.provider.as_ref(),
-            &self.model,
-            &self.step_context,
+            &step_context,
             &self.system_prompt,
             working,
             tools,
@@ -367,7 +368,6 @@ impl Agent {
 /// existing shape) on success, so the caller can decide whether to commit it.
 async fn run_tool_loop(
     provider: &dyn LlmProvider,
-    configured_model: &str,
     step_context: &HarnessStepContext,
     system_prompt: &Option<String>,
     mut working: Vec<Message>,
@@ -383,10 +383,9 @@ async fn run_tool_loop(
         messages.extend(working.clone());
 
         let mut ctx = step_context.clone();
-        ctx.current_model = configured_model.to_string();
         ctx.tool_round = tool_round;
         let request = ChatRequest {
-            model: resolve_step_model(&ctx, configured_model, None),
+            model: resolve_step_model(&ctx, &step_context.current_model, None),
             messages,
             temperature: 0.7,
             max_tokens: Some(4096),

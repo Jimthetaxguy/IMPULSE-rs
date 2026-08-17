@@ -21,7 +21,7 @@ tags: [worktree, lane, handoff, step-model, adr-0015]
 - Blocked/shared paths: `Cargo.toml`; `Cargo.lock`; `AGENTS.md`; `CLAUDE.md`; `docs/validate_docs.py`; protocol/spec docs; `impulse-rs/src/monty/routing.rs`; ADR-0014 / SettlementRecord (absent on main; do not invent); PRs 24–26
 - Plan/spec: harness-owned step model choice (ADR-0015 proposed). Gateway must not pick the model.
 - Verification: `cargo test -p impulse-rs --lib agent::step_model llm_backends::tests agent::tests`; `cargo test -p impulse-rs --lib`; `cargo fmt --all -- --check`
-- Latest status: implementing the smallest hook on main; not stacked on PRs 24–26
+- Latest status: implemented on `cursor/step-model-hook-adr-0015-66c5`; PR #27 opened as draft; not stacked on PRs 24–26
 
 ## Decisions
 - 2026-08-17: Branch from `main` (`d13050c`). Do not stack on PR 24 (base-URL override), PR 25 (stale-basis), or PR 26 (SettlementRecord / ADR-0014).
