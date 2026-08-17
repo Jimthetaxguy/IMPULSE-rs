@@ -40,18 +40,18 @@ Memory is one first-class service, not the whole product. Impulse also owns proc
 
 ---
 
-## Desktop Shell Status (as of 2026-07-13)
+## Desktop Shell Status (as of 2026-08-17)
 
-> **egui / impulse-gui is LEGACY.** It is frozen — no new features. It will be removed after the Dioxus desktop host reaches parity.
+> **egui / impulse-gui is LEGACY.** It is frozen — no new features. The active retirement plan removes it as dead product code after release automation is made truthful; it is not treated as a functional fallback.
 
-The chosen desktop stack is **Dioxus Desktop + xterm.js terminal bridge**. It is the cockpit, not the source of operational truth: authoritative workbench state and policy live in Rust daemon/control-plane contracts. Tauri-shaped code is retained only as a temporary compatibility adapter.
+The chosen desktop stack is **Dioxus Desktop + xterm.js terminal bridge**. It is the cockpit, not the source of operational truth: authoritative workbench state and policy live in Rust daemon/control-plane contracts. Tauri-shaped code is a separate temporary compatibility adapter and remains until a packaged Dioxus app proves the real host bridge and required operator workflows end to end.
 
 - See `docs/spec/DESKTOP-SHELL-ARCHITECTURE.md` for canonical layer boundaries
 - See `docs/spec/DESKTOP-STACK-TRADEOFFS.md` for the full option evaluation
 - See `docs/decisions/0008-dioxus-desktop-host.md` for the active ADR
 - See `docs/decisions/0007-desktop-shell-stack.md` for the superseded Tauri-era ADR
 - See `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md` for historical migration context; do not use it as the next product goal
-- See `docs/plans/EGUI-DECOMMISSION.md` for the active, gated plan to fully remove the egui surface (frozen `impulse-gui` crate + `impulse-term` egui rendering layer) once the Dioxus host is operationally authoritative
+- See `docs/plans/EGUI-DECOMMISSION.md` for the active retirement plan: remove EGUI, remove unwired affordances from retained shells, then retire Tauri compatibility after packaged Dioxus acceptance
 
 **Do not add new code to `impulse-gui`.** If you touch `impulse-term`, keep new PTY/process behavior framework-neutral and do not expand its optional egui rendering surface.
 
