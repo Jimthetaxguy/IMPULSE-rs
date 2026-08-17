@@ -8,8 +8,8 @@ type: reference
 category: architecture
 audience: builder
 tags: [decisions, adr, architecture]
-updated: 2026-07-15
-last_updated: 2026-07-15
+updated: 2026-08-17
+last_updated: 2026-08-17
 ---
 
 # Architecture Decision Records
@@ -40,6 +40,7 @@ registry-backed runtime identity, daemon truth, or the current Now/Next/Later ro
 | [0011](0011-governed-task-run-lifecycle.md) | Daemon-owned governed task lifecycle | **Accepted** | Durable evidence/review state and operator-required acceptance | 2026-07-13 | -- |
 | [0012](0012-daemon-owned-governed-runtime-producers.md) | Daemon-owned governed runtime producers | **Accepted** | Clean-Git Builder claims, detached daemon verification, and strict API-only Supervisor review | 2026-07-13 | -- |
 | [0013](0013-deterministic-accepted-run-memory-candidates.md) | Deterministic accepted-run memory candidates | **Accepted** | Owner-only pending review projection and explicit no-promotion boundary | 2026-07-15 | -- |
+| [0015](0015-harness-owned-step-model.md) | Harness-owned step model choice | **Proposed** | Harness picks the per-step model; gateway must not | 2026-08-17 | -- |
 
 ## ADR Format
 

@@ -2,7 +2,7 @@
 title: Documentation Summary
 description: Unified navigation structure for Impulse documentation
 version: '2.8'
-updated: '2026-07-15'
+updated: '2026-08-17'
 schema_version: '1.0'
 type: navigation
 category: docs
@@ -162,6 +162,7 @@ categories:
     - decisions/0011-governed-task-run-lifecycle.md
     - decisions/0012-daemon-owned-governed-runtime-producers.md
     - decisions/0013-deterministic-accepted-run-memory-candidates.md
+    - decisions/0015-harness-owned-step-model.md
 
   session_logs:
     - session-logs/DEVELOPMENT-HISTORY.md

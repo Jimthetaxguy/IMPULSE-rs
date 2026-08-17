@@ -20,6 +20,7 @@ pub use serde::{Deserialize, Serialize};
 
 use std::time::Duration;
 
+use crate::agent::step_model::{resolve_step_model, HarnessStepContext};
 use crate::error::AgentError;
 
 // Re-export all providers from consolidated anthropic.rs
@@ -209,6 +210,9 @@ pub struct Agent {
     pub model: String,
     pub system_prompt: Option<String>,
     pub history: Vec<Message>,
+    /// Harness step facts for [`resolve_step_model`]. Defaults to an Ion/API
+    /// Worker context with no review/verification state (v0 identity).
+    pub step_context: HarnessStepContext,
 }
 
 impl Agent {
@@ -220,6 +224,7 @@ impl Agent {
         system_prompt: Option<String>,
     ) -> Self {
         let model = model.unwrap_or_else(|| provider.default_model().to_string());
+        let step_context = HarnessStepContext::ion_api(model.clone());
         Self {
             id,
             name,
@@ -227,7 +232,15 @@ impl Agent {
             model,
             system_prompt,
             history: Vec::new(),
+            step_context,
         }
+    }
+
+    fn request_model(&self, tool_round: usize) -> String {
+        let mut ctx = self.step_context.clone();
+        ctx.current_model = self.model.clone();
+        ctx.tool_round = tool_round;
+        resolve_step_model(&ctx, &self.model, None)
     }
 
     pub async fn chat(&mut self, user_message: &str) -> AgentResult<String> {
@@ -239,7 +252,7 @@ impl Agent {
         messages.push(Message::text(Role::User, user_message));
 
         let request = ChatRequest {
-            model: self.model.clone(),
+            model: self.request_model(0),
             messages,
             temperature: 0.7,
             max_tokens: Some(4096),
@@ -317,9 +330,11 @@ impl Agent {
         let mut working = self.history.clone();
         working.push(Message::text(Role::User, user_message));
 
+        let mut step_context = self.step_context.clone();
+        step_context.current_model = self.model.clone();
         let loop_future = run_tool_loop(
             self.provider.as_ref(),
-            &self.model,
+            &step_context,
             &self.system_prompt,
             working,
             tools,
@@ -353,22 +368,24 @@ impl Agent {
 /// existing shape) on success, so the caller can decide whether to commit it.
 async fn run_tool_loop(
     provider: &dyn LlmProvider,
-    model: &str,
+    step_context: &HarnessStepContext,
     system_prompt: &Option<String>,
     mut working: Vec<Message>,
     tools: &[ToolDefinition],
     executor: &dyn ToolExecutor,
     max_rounds: usize,
 ) -> AgentResult<(String, Vec<Message>)> {
-    for _round in 0..max_rounds {
+    for tool_round in 0..max_rounds {
         let mut messages = Vec::new();
         if let Some(system) = system_prompt {
             messages.push(Message::text(Role::System, system.clone()));
         }
         messages.extend(working.clone());
 
+        let mut ctx = step_context.clone();
+        ctx.tool_round = tool_round;
         let request = ChatRequest {
-            model: model.to_string(),
+            model: resolve_step_model(&ctx, &step_context.current_model, None),
             messages,
             temperature: 0.7,
             max_tokens: Some(4096),
@@ -561,6 +578,77 @@ mod tests {
             Some("test-model".to_string()),
             Some("system prompt".to_string()),
         )
+    }
+
+    struct RecordingModelProvider {
+        models: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        tool_first: bool,
+        calls: std::sync::Mutex<usize>,
+    }
+
+    impl RecordingModelProvider {
+        fn new() -> Self {
+            Self {
+                models: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                tool_first: false,
+                calls: std::sync::Mutex::new(0),
+            }
+        }
+
+        fn with_one_tool_round() -> Self {
+            Self {
+                models: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                tool_first: true,
+                calls: std::sync::Mutex::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for RecordingModelProvider {
+        fn name(&self) -> &str {
+            "recording-model-fake"
+        }
+        fn default_model(&self) -> &str {
+            "recording-fake-model"
+        }
+        async fn chat(&self, request: ChatRequest) -> AgentResult<ChatResponse> {
+            self.models
+                .lock()
+                .expect("lock is never poisoned in tests")
+                .push(request.model.clone());
+            let mut calls = self.calls.lock().expect("lock is never poisoned in tests");
+            *calls += 1;
+            if self.tool_first && *calls == 1 {
+                return Ok(ChatResponse {
+                    content: String::new(),
+                    model: request.model,
+                    usage: Usage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                    },
+                    stop_reason: StopReason::ToolUse,
+                    tool_calls: vec![ToolCall {
+                        id: "call_1".to_string(),
+                        name: "echo_tool".to_string(),
+                        input: serde_json::json!({}),
+                    }],
+                });
+            }
+            Ok(ChatResponse {
+                content: "ok".to_string(),
+                model: request.model,
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+                stop_reason: StopReason::EndTurn,
+                tool_calls: Vec::new(),
+            })
+        }
+        fn supported_models(&self) -> Vec<&str> {
+            vec!["recording-fake-model"]
+        }
     }
 
     #[test]
@@ -854,5 +942,49 @@ mod tests {
         // onto `self.history`, matching the round-cap-exceeded invariant
         // above.
         assert!(agent.history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_chat_calls_decide_step_model_identity() {
+        let provider = RecordingModelProvider::new();
+        let recorded = std::sync::Arc::clone(&provider.models);
+        let mut agent = test_agent(provider);
+        let reply = agent.chat("hello").await.expect("chat should succeed");
+        assert_eq!(reply, "ok");
+        assert_eq!(recorded.lock().unwrap().as_slice(), ["test-model"]);
+    }
+
+    #[tokio::test]
+    async fn test_chat_after_verifier_failure_sends_escalate_model() {
+        use impulse_ops::governed_task::GovernedVerificationOutcome;
+
+        let provider = RecordingModelProvider::new();
+        let recorded = std::sync::Arc::clone(&provider.models);
+        let mut agent = test_agent(provider);
+        agent.step_context.latest_verification = Some(GovernedVerificationOutcome::Failed);
+        agent.step_context.escalate_model = Some("escalate-model".to_string());
+        agent.chat("retry").await.expect("chat should succeed");
+        assert_eq!(recorded.lock().unwrap().as_slice(), ["escalate-model"]);
+    }
+
+    #[tokio::test]
+    async fn test_run_tool_loop_calls_decide_step_model_each_round() {
+        use impulse_ops::governed_task::GovernedVerificationOutcome;
+
+        let provider = RecordingModelProvider::with_one_tool_round();
+        let recorded = std::sync::Arc::clone(&provider.models);
+        let mut agent = test_agent(provider);
+        agent.step_context.latest_verification = Some(GovernedVerificationOutcome::Failed);
+        agent.step_context.escalate_model = Some("escalate-model".to_string());
+        let executor = EchoExecutor::new();
+        let reply = agent
+            .chat_with_tools("do it", &[], &executor)
+            .await
+            .expect("tool loop should finish");
+        assert_eq!(reply, "ok");
+        assert_eq!(
+            recorded.lock().unwrap().as_slice(),
+            ["escalate-model", "escalate-model"]
+        );
     }
 }
