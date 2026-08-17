@@ -233,8 +233,10 @@ mod tests {
     async fn unknown_tool_returns_error_envelope_not_panic() {
         let bridge = VoiceToolBridge::with_defaults();
         // Not on allowlist → denied; use allowlist-open policy for not-found path.
-        let mut policy = VoicePolicy::default();
-        policy.exposed_tools = None;
+        let policy = VoicePolicy {
+            exposed_tools: None,
+            ..VoicePolicy::default()
+        };
         let bridge = VoiceToolBridge::new(bridge.registry_arc(), bridge.context().clone(), policy);
         let out = bridge
             .handle_client_tool(ElevenLabsClientToolRequest::new(
