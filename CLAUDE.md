@@ -455,3 +455,17 @@ in final-gate evidence instead of copying a moving aggregate into this guide.
 | `IMPULSE_SOCKET_PATH` | Custom Unix socket path |
 | `ANTHROPIC_API_KEY` | For daemon chat |
 | `IMPULSE_MODEL` | Chat model override |
+| `ANTHROPIC_BASE_URL` | Override the Anthropic API origin (eval-harness interception, local proxy) |
+| `OPENAI_BASE_URL` | Override the OpenAI API origin |
+| `MINIMAX_BASE_URL` | Override the Minimax API origin |
+
+Each `*_BASE_URL` override is the API **origin** only (scheme + host + optional port, e.g.
+`http://127.0.0.1:4010`) — the provider appends its own request path. Values that are blank or
+lack an `http://`/`https://` scheme are ignored in favor of the canonical default, so a typo
+degrades to the real API rather than to a silently broken endpoint. Precedence is
+explicit config (`BaseProvider::with_base_url`) > env var > canonical default.
+
+Accepted risk: any `http(s)` origin is accepted (no host allowlist). An active override is
+logged at provider request time (origin only, never the API key). Cleartext `http://` to a
+non-loopback host is a warning; loopback HTTP (local eval harness) is not. This is a
+transport override, not a model picker — see ADR-0015.
