@@ -162,6 +162,7 @@ categories:
     - decisions/0011-governed-task-run-lifecycle.md
     - decisions/0012-daemon-owned-governed-runtime-producers.md
     - decisions/0013-deterministic-accepted-run-memory-candidates.md
+    - decisions/0014-work-item-and-comparative-settlement.md
     - decisions/0015-harness-owned-step-model.md
 
   session_logs:
