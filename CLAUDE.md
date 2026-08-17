@@ -464,3 +464,8 @@ Each `*_BASE_URL` override is the API **origin** only (scheme + host + optional 
 lack an `http://`/`https://` scheme are ignored in favor of the canonical default, so a typo
 degrades to the real API rather than to a silently broken endpoint. Precedence is
 explicit config (`BaseProvider::with_base_url`) > env var > canonical default.
+
+Accepted risk: any `http(s)` origin is accepted (no host allowlist). An active override is
+logged at provider request time (origin only, never the API key). Cleartext `http://` to a
+non-loopback host is a warning; loopback HTTP (local eval harness) is not. This is a
+transport override, not a model picker — see ADR-0015.

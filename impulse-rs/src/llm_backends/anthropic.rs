@@ -56,6 +56,68 @@ fn select_base_url(explicit: Option<&str>, from_env: Option<&str>, default: &str
         .to_string()
 }
 
+/// How a resolved origin relates to the provider's canonical default.
+///
+/// Any `http(s)` origin is accepted today — there is no host allowlist. The
+/// classification exists so an active override is observable (never the API
+/// key) and so cleartext HTTP to a non-loopback host is a warning, not silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaseUrlKind {
+    Canonical,
+    OverrideHttps,
+    OverrideLoopbackHttp,
+    OverrideCleartextHttp,
+}
+
+fn origin_host(origin: &str) -> Option<&str> {
+    let rest = origin.split_once("://")?.1;
+    if let Some(rest) = rest.strip_prefix('[') {
+        return rest.split(']').next();
+    }
+    rest.split([':', '/']).next()
+}
+
+fn host_is_loopback(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost") || host == "::1" || host.starts_with("127.")
+}
+
+fn classify_base_url(resolved: &str, default: &str) -> BaseUrlKind {
+    let canonical = default.trim_end_matches('/');
+    if resolved == canonical {
+        return BaseUrlKind::Canonical;
+    }
+    if resolved.starts_with("https://") {
+        return BaseUrlKind::OverrideHttps;
+    }
+    if resolved.starts_with("http://") {
+        if origin_host(resolved).is_some_and(host_is_loopback) {
+            return BaseUrlKind::OverrideLoopbackHttp;
+        }
+        return BaseUrlKind::OverrideCleartextHttp;
+    }
+    BaseUrlKind::Canonical
+}
+
+fn log_base_url_override(provider_name: &str, origin: &str, kind: BaseUrlKind) {
+    match kind {
+        BaseUrlKind::Canonical => {}
+        BaseUrlKind::OverrideHttps | BaseUrlKind::OverrideLoopbackHttp => {
+            tracing::info!(
+                provider = provider_name,
+                origin,
+                "LLM provider base-URL override active"
+            );
+        }
+        BaseUrlKind::OverrideCleartextHttp => {
+            tracing::warn!(
+                provider = provider_name,
+                origin,
+                "LLM provider base-URL override uses cleartext HTTP to a non-loopback origin"
+            );
+        }
+    }
+}
+
 /// Common provider structure - shared by all LLM providers
 pub struct BaseProvider {
     api_key: String,
@@ -109,6 +171,11 @@ impl BaseProvider {
             self.base_url.as_deref(),
             from_env.as_deref(),
             default_base_url,
+        );
+        log_base_url_override(
+            self.provider_name,
+            &base,
+            classify_base_url(&base, default_base_url),
         );
         format!("{base}{path}")
     }
@@ -753,6 +820,46 @@ mod tests {
                 "https://api.anthropic.com"
             ),
             "http://127.0.0.1:8080"
+        );
+    }
+
+    #[test]
+    fn test_classify_base_url_canonical_default_is_canonical() {
+        assert_eq!(
+            classify_base_url("https://api.anthropic.com", "https://api.anthropic.com"),
+            BaseUrlKind::Canonical
+        );
+    }
+
+    #[test]
+    fn test_classify_base_url_https_override_is_https() {
+        assert_eq!(
+            classify_base_url("https://proxy.example.test", "https://api.anthropic.com"),
+            BaseUrlKind::OverrideHttps
+        );
+    }
+
+    #[test]
+    fn test_classify_base_url_loopback_http_is_loopback() {
+        assert_eq!(
+            classify_base_url("http://127.0.0.1:4010", "https://api.anthropic.com"),
+            BaseUrlKind::OverrideLoopbackHttp
+        );
+        assert_eq!(
+            classify_base_url("http://localhost:4010", "https://api.anthropic.com"),
+            BaseUrlKind::OverrideLoopbackHttp
+        );
+        assert_eq!(
+            classify_base_url("http://[::1]:4010", "https://api.anthropic.com"),
+            BaseUrlKind::OverrideLoopbackHttp
+        );
+    }
+
+    #[test]
+    fn test_classify_base_url_non_loopback_http_is_cleartext_warning() {
+        assert_eq!(
+            classify_base_url("http://proxy.example.test", "https://api.anthropic.com"),
+            BaseUrlKind::OverrideCleartextHttp
         );
     }
 
