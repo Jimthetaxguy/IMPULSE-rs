@@ -21,7 +21,7 @@ tags: [worktree, lane, handoff, egui, dioxus, retirement]
 - Blocked/shared paths: `CLAUDE.md`; `CONTEXT.md`; `VISION.md`; `README.md`; `docs/INDEX.md`; `docs/SUMMARY.md`; `docs/SUMMARY.yaml`; `docs/validate_docs.py`; protocol/spec docs; daemon/ops Rust; `impulse-gui/` deletion; `.github` workflows; `codex/legacy-ui-retirement-plan` (PR #17); `codex/dioxus-egui-retirement`
 - Plan/spec: rewrite the June 30 egui-only decommission plan as the three-track KEEP/MIGRATE/REMOVE contract on `origin/main` `99396f9`. No ADR. Close PR #17 after a replacement PR exists.
 - Verification: `python3 docs/validate_docs.py --self-test && python3 docs/validate_docs.py --all` (accept known `RUST-MULTI-AGENT` failures only)
-- Latest status: docs rewrite complete; awaiting validator + replacement PR
+- Latest status: replacement PR https://github.com/Jimthetaxguy/IMPULSE-rs/pull/28 opened; GitHub draft #17 closed
 
 ## Decisions
 - 2026-08-17: Do not rebase, cherry-pick, or conflict-resolve `codex/legacy-ui-retirement-plan`. That 21-commit GitHub diff is stale governed-runtime lineage.
