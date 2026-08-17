@@ -2,14 +2,14 @@
 title: Documentation Index
 description: Master navigation hub for Impulse documentation
 version: '1.7'
-updated: 2026-07-15
+updated: 2026-08-17
 type: doc
 category: navigation
 phase: all
 status: active
 audience: everyone
 tags: [index, navigation, discovery]
-last_updated: 2026-07-15
+last_updated: 2026-08-17
 authors:
   - name: Impulse Maintainers
     role: Maintainer
@@ -96,6 +96,7 @@ in `VISION.md` are resolved.
 | [0011](decisions/0011-governed-task-run-lifecycle.md) | Daemon-owned governed task lifecycle | Accepted | Durable task/evidence/review authority and operator-required acceptance |
 | [0012](decisions/0012-daemon-owned-governed-runtime-producers.md) | Daemon-owned governed runtime producers | Accepted | Profiled clean-Git claims, detached Rust verification, and strict API Supervisor review |
 | [0013](decisions/0013-deterministic-accepted-run-memory-candidates.md) | Deterministic accepted-run memory candidates | Accepted | Owner-only pending review projection, provenance/source assurance, and no `GENOME`/`HISTORY` mutation |
+| [0015](decisions/0015-harness-owned-step-model.md) | Harness-owned step model choice | Proposed | Harness-owned per-step model hook; gateway must not pick the model |
 
 See [decisions/README.md](decisions/README.md) for full decision log.
 

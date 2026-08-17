@@ -10,6 +10,7 @@
 pub mod coordinator;
 pub mod harness;
 pub mod prompts;
+pub mod step_model;
 
 use std::time::Duration;
 
@@ -403,6 +404,11 @@ impl ImpulseAgent {
     fn with_test_harness_command(mut self, command: impl Into<std::path::PathBuf>) -> Self {
         self.harness_command_override = Some(command.into());
         self
+    }
+
+    #[cfg(test)]
+    fn inner_agent_mut(&mut self) -> Option<&mut Agent> {
+        self.inner.as_mut()
     }
 
     fn resolve_harness_command(&self, harness: ImpulseHarness) -> std::path::PathBuf {
@@ -872,8 +878,22 @@ impl ImpulseAgent {
                 let agent = self.inner.as_ref().ok_or_else(|| {
                     AgentError::InvalidRequest("Agent not initialized".to_string())
                 })?;
+                let mut ctx = agent.step_context.clone();
+                ctx.actor = impulse_ops::governed_task::GovernedActorKind::Supervisor;
+                ctx.current_model = agent.model.clone();
+                ctx.tool_round = 0;
+                let actor_id = match &self.config.mode {
+                    AgentMode::Api { provider, .. } => {
+                        Some(governed_api_actor_id(*provider, &agent.model))
+                    }
+                    _ => None,
+                };
                 let request = crate::llm_backends::ChatRequest {
-                    model: agent.model.clone(),
+                    model: crate::agent::step_model::resolve_step_model(
+                        &ctx,
+                        &agent.model,
+                        actor_id.as_deref(),
+                    ),
                     messages: vec![
                         crate::llm_backends::Message::text(
                             crate::llm_backends::Role::System,
@@ -1155,6 +1175,72 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("not structurally read-only"));
         assert!(!sentinel.exists(), "generic harness must not be spawned");
+    }
+
+    struct RecordingStatelessProvider {
+        models: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for RecordingStatelessProvider {
+        fn name(&self) -> &str {
+            "recording-stateless"
+        }
+        fn default_model(&self) -> &str {
+            "stateless-default"
+        }
+        async fn chat(
+            &self,
+            request: crate::llm_backends::ChatRequest,
+        ) -> AgentResult<crate::llm_backends::ChatResponse> {
+            self.models.lock().unwrap().push(request.model.clone());
+            Ok(crate::llm_backends::ChatResponse {
+                content: "reviewed".to_string(),
+                model: request.model,
+                usage: crate::llm_backends::Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+                stop_reason: crate::llm_backends::StopReason::EndTurn,
+                tool_calls: Vec::new(),
+            })
+        }
+        fn supported_models(&self) -> Vec<&str> {
+            vec!["stateless-default"]
+        }
+    }
+
+    #[tokio::test]
+    async fn test_query_stateless_calls_decide_step_model_identity() {
+        let models = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = ImpulseAgent::with_test_provider(Box::new(RecordingStatelessProvider {
+            models: std::sync::Arc::clone(&models),
+        }));
+        let reply = agent
+            .query_stateless("read-only", "review")
+            .await
+            .expect("stateless review should succeed");
+        assert_eq!(reply, "reviewed");
+        assert_eq!(models.lock().unwrap().as_slice(), ["stateless-default"]);
+    }
+
+    #[tokio::test]
+    async fn test_query_stateless_after_verifier_failure_sends_escalate_model() {
+        use impulse_ops::governed_task::GovernedVerificationOutcome;
+
+        let models = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = ImpulseAgent::with_test_provider(Box::new(RecordingStatelessProvider {
+            models: std::sync::Arc::clone(&models),
+        }));
+        if let Some(inner) = agent.inner_agent_mut() {
+            inner.step_context.latest_verification = Some(GovernedVerificationOutcome::Failed);
+            inner.step_context.escalate_model = Some("escalate-model".to_string());
+        }
+        agent
+            .query_stateless("read-only", "review")
+            .await
+            .expect("stateless review should succeed");
+        assert_eq!(models.lock().unwrap().as_slice(), ["escalate-model"]);
     }
 
     #[test]
