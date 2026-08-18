@@ -21,7 +21,7 @@ tags: [worktree, lane, handoff, step-model, adr-0015]
 - Blocked/shared paths: `Cargo.toml`; `Cargo.lock`; `AGENTS.md`; `CLAUDE.md`; protocol/spec docs; Origin; `impulse-rs/src/monty/routing.rs`; PRs 24–26; `bind_governed_step` / Ion / `handle_chat` expansion
 - Plan/spec: close the #27 wiring gap. `impulse_agent_escalate_model` must reach CLI query and TUI through the same `resolve_from_config` constructor the daemon cache uses. Not a router.
 - Verification: `cargo test -p impulse-rs --lib --locked resolve_from_config escalate_model step_model`; `cargo test -p impulse-rs --lib --locked`; `cargo fmt --all -- --check`; `cargo clippy -p impulse-rs --lib --locked -- -D warnings`
-- Latest status: constructor wiring implemented; PR to be opened from this branch. Do not merge.
+- Latest status: PR #32 opened (draft). Do not merge. CI green: Test (ubuntu-latest), Test (macos-latest), Lint, Build (release).
 
 ## Decisions
 - 2026-08-18: Branch from current `main`. Do not merge. Do not stack on PRs 24–26. Do not invent a router.
@@ -39,7 +39,10 @@ tags: [worktree, lane, handoff, step-model, adr-0015]
 - `cargo test -p impulse-rs --lib --locked escalate`: 19 passed (constructor, CLI helper, TUI `TuiState::new`, existing AfterVerifierFailure policy).
 - `cargo test -p impulse-rs --lib --locked step_model`: 19 passed.
 - `cargo test -p impulse-rs --lib --locked resolve_from_config`: 8 passed.
+- `cargo test -p impulse-rs --lib --locked`: 1701 passed, 4 ignored, 3 failed (pre-existing governed-verification fixtures; not this lane).
+- `cargo clippy -p impulse-rs --lib --locked -- -D warnings`: passed.
 - `cargo fmt --all -- --check`: passed.
+- GitHub Actions run 32106439814: CI / Test (ubuntu-latest), CI / Test (macos-latest), CI / Lint, CI / Build (release) all green.
 
 ## Handoff Notes
 - On `main` after #27, `set_escalate_model` and `bind_governed_step` do not exist. The daemon cache already calls `resolve_from_config` with four args and never copies an escalate model. This lane closes that gap in the constructor rather than adding a daemon-only setter.
