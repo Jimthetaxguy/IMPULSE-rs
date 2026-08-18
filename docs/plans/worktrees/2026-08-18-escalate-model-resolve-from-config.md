@@ -21,7 +21,7 @@ tags: [worktree, lane, handoff, step-model, adr-0015]
 - Blocked/shared paths: `Cargo.toml`; `Cargo.lock`; `AGENTS.md`; `CLAUDE.md`; protocol/spec docs; Origin; `impulse-rs/src/monty/routing.rs`; PRs 24–26; `bind_governed_step` / Ion / `handle_chat` expansion
 - Plan/spec: close the #27 wiring gap. `impulse_agent_escalate_model` must reach CLI query and TUI through the same `resolve_from_config` constructor the daemon cache uses. Not a router.
 - Verification: `cargo test -p impulse-rs --lib --locked resolve_from_config escalate_model step_model`; `cargo test -p impulse-rs --lib --locked`; `cargo fmt --all -- --check`; `cargo clippy -p impulse-rs --lib --locked -- -D warnings`
-- Latest status: PR #32 opened (draft). Do not merge. CI green: Test (ubuntu-latest), Test (macos-latest), Lint, Build (release).
+- Latest status: PR #32 marked ready for review. CI green: Test (ubuntu-latest), Test (macos-latest), Lint, Build (release).
 
 ## Decisions
 - 2026-08-18: Branch from current `main`. Do not merge. Do not stack on PRs 24–26. Do not invent a router.
