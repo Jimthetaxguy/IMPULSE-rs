@@ -209,6 +209,9 @@ pub struct ImpulseAgentConfig {
     pub max_tokens: u32,
     /// Temperature for LLM requests.
     pub temperature: f32,
+    /// Optional escalate model after verifier/attestation failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalate_model: Option<String>,
 }
 
 impl Default for ImpulseAgentConfig {
@@ -221,6 +224,7 @@ impl Default for ImpulseAgentConfig {
             review_threshold: 5,
             max_tokens: 2048,
             temperature: 0.3,
+            escalate_model: None,
         }
     }
 }
@@ -272,6 +276,18 @@ impl ImpulseAgentConfig {
     /// Enable auto-coordination.
     pub fn with_auto_coordinate(mut self) -> Self {
         self.auto_coordinate = true;
+        self
+    }
+
+    /// Set the optional escalate model used after verifier/attestation failure.
+    pub fn with_escalate_model(mut self, model: impl Into<String>) -> Self {
+        let trimmed = model.into();
+        let trimmed = trimmed.trim();
+        self.escalate_model = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
         self
     }
 
@@ -342,13 +358,15 @@ impl ImpulseAgent {
 
                 let model_name = model.clone().unwrap_or_else(|| provider.default_model());
 
-                Some(Agent::new(
+                let mut agent = Agent::new(
                     "impulse-agent".to_string(),
                     "Impulse Agent".to_string(),
                     llm_provider,
                     Some(model_name),
                     None, // System prompt set per-request
-                ))
+                );
+                agent.step_context.escalate_model = config.escalate_model.clone();
+                Some(agent)
             }
             AgentMode::Harness { .. } => None, // CLI harness doesn't use Agent
             AgentMode::Disabled => None,
@@ -434,6 +452,17 @@ impl ImpulseAgent {
     /// Get the agent's configuration.
     pub fn config(&self) -> &ImpulseAgentConfig {
         &self.config
+    }
+
+    /// Optional escalate model applied at construction.
+    ///
+    /// API mode reads the value copied onto the inner step context. Harness
+    /// mode has no inner `Agent`, so the configured value is returned instead.
+    pub fn escalate_model(&self) -> Option<&str> {
+        self.inner
+            .as_ref()
+            .and_then(|agent| agent.step_context.escalate_model.as_deref())
+            .or(self.config.escalate_model.as_deref())
     }
 
     /// Get recent recommendations.
@@ -992,10 +1021,14 @@ pub fn resolve_from_config(
     api_key: Option<&str>,
     model: Option<&str>,
     harness_str: Option<&str>,
+    escalate_model: Option<&str>,
 ) -> Option<ImpulseAgent> {
     // Harness takes priority if specified
     if let Some(h) = harness_str.and_then(ImpulseHarness::parse) {
-        let config = ImpulseAgentConfig::harness(h);
+        let mut config = ImpulseAgentConfig::harness(h);
+        if let Some(escalate) = escalate_model {
+            config = config.with_escalate_model(escalate);
+        }
         return match ImpulseAgent::new(config) {
             Ok(agent) => Some(agent),
             Err(err) => {
@@ -1017,6 +1050,9 @@ pub fn resolve_from_config(
         }
         if let Some(m) = model {
             config = config.with_model(m);
+        }
+        if let Some(escalate) = escalate_model {
+            config = config.with_escalate_model(escalate);
         }
         return match ImpulseAgent::new(config) {
             Ok(agent) => Some(agent),
@@ -1311,22 +1347,95 @@ mod tests {
 
     #[test]
     fn test_resolve_from_config_disabled() {
-        let agent = resolve_from_config(None, None, None, None);
+        let agent = resolve_from_config(None, None, None, None, None);
         assert!(agent.is_none());
     }
 
     #[test]
     fn test_resolve_from_config_harness() {
-        let agent = resolve_from_config(None, None, None, Some("claude-code"));
+        let agent = resolve_from_config(None, None, None, Some("claude-code"), None);
         assert!(agent.is_some());
     }
 
     #[test]
     fn test_resolve_from_config_api() {
-        let agent = resolve_from_config(Some("anthropic"), Some("test-key"), None, None);
+        let agent = resolve_from_config(Some("anthropic"), Some("test-key"), None, None, None);
         assert!(agent.is_some());
         let agent = agent.unwrap();
         assert!(agent.is_ready());
+    }
+
+    #[test]
+    fn test_resolve_from_config_applies_escalate_model() {
+        let agent = resolve_from_config(
+            Some("anthropic"),
+            Some("test-key"),
+            Some("haiku"),
+            None,
+            Some("claude-opus-4-6"),
+        )
+        .expect("API agent should resolve");
+        assert_eq!(agent.escalate_model(), Some("claude-opus-4-6"));
+        assert_eq!(
+            agent.config().escalate_model.as_deref(),
+            Some("claude-opus-4-6")
+        );
+    }
+
+    #[test]
+    fn test_resolve_from_config_blank_escalate_model_is_none() {
+        let agent = resolve_from_config(
+            Some("anthropic"),
+            Some("test-key"),
+            Some("haiku"),
+            None,
+            Some("   "),
+        )
+        .expect("API agent should resolve");
+        assert!(agent.escalate_model().is_none());
+    }
+
+    #[test]
+    fn test_resolve_from_config_harness_keeps_escalate_model() {
+        let agent = resolve_from_config(
+            None,
+            None,
+            None,
+            Some("claude-code"),
+            Some("claude-opus-4-6"),
+        )
+        .expect("harness agent should resolve");
+        assert_eq!(agent.escalate_model(), Some("claude-opus-4-6"));
+    }
+
+    #[test]
+    fn test_impulse_agent_new_applies_escalate_model_to_step_context() {
+        let config = ImpulseAgentConfig::api(ImpulseProvider::Anthropic)
+            .with_api_key("test-key")
+            .with_escalate_model("claude-opus-4-6");
+        let agent = ImpulseAgent::new(config).expect("API agent should construct");
+        assert_eq!(agent.escalate_model(), Some("claude-opus-4-6"));
+        let inner = agent.inner.as_ref().expect("API mode has an inner agent");
+        assert_eq!(
+            inner.step_context.escalate_model.as_deref(),
+            Some("claude-opus-4-6")
+        );
+    }
+
+    #[test]
+    fn round_trip_impulse_agent_config_includes_escalate_model() {
+        let original = ImpulseAgentConfig::api(ImpulseProvider::Anthropic)
+            .with_api_key("test-key")
+            .with_model("haiku")
+            .with_escalate_model("opus");
+        let json = serde_json::to_string(&original).unwrap();
+        let recovered: ImpulseAgentConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(original.mode, recovered.mode);
+        assert_eq!(original.escalate_model, recovered.escalate_model);
+        assert!(
+            !json.contains("test-key"),
+            "API key must stay skip_serializing"
+        );
     }
 
     #[test]

@@ -1820,6 +1820,7 @@ fn try_lock_agent_for_turn<'a>(
                 config.impulse_agent_api_key.as_deref(),
                 config.impulse_agent_model.as_deref(),
                 config.impulse_agent_harness.as_deref(),
+                config.impulse_agent_escalate_model.as_deref(),
             );
         }
     }
