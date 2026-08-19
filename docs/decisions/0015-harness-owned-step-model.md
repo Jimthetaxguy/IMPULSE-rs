@@ -62,9 +62,9 @@ ledger and it does not rewrite ADR-0014.
   choice is now an explicit harness function instead of a silent copy.
 - A later caller can populate `HarnessStepContext` from governed-task state
   without inventing ExecutionPosture, AuthorityEnvelope, or a new crate.
-- Optional `impulse_agent_escalate_model` is a context field in this slice, not
-  a new State config key. Wiring that key through `resolve_from_config` is
-  later work.
+- Optional `impulse_agent_escalate_model` is a State config key copied onto
+  `HarnessStepContext` by `resolve_from_config`, so CLI query, TUI, and the
+  daemon cache share the same escalate model. Policy is unchanged.
 - Worker CLI protocol is unchanged. PRs that add provider base-URL overrides
   or settlement records are independent and must not be stacked under this
   decision.

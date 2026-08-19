@@ -74,6 +74,27 @@ mod tests {
     }
 
     #[test]
+    fn test_tui_state_new_applies_escalate_model_from_config() {
+        let temp_dir = TempDir::new().unwrap();
+        let state =
+            std::sync::Arc::new(crate::state::State::new(temp_dir.path().to_path_buf()).unwrap());
+        assert!(state
+            .set_config("impulse_agent_provider", "anthropic")
+            .unwrap());
+        assert!(state
+            .set_config("impulse_agent_api_key", "test-key")
+            .unwrap());
+        assert!(state
+            .set_config("impulse_agent_escalate_model", "claude-opus-4-6")
+            .unwrap());
+        let tui = TuiState::new(state);
+        let agent = tui
+            .impulse_agent
+            .expect("TUI constructor should resolve an agent");
+        assert_eq!(agent.escalate_model(), Some("claude-opus-4-6"));
+    }
+
+    #[test]
     fn test_conflict_state_initialization() {
         let state = create_test_state();
         assert!(!state.conflicts_panel_open);

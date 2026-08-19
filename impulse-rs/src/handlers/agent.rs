@@ -48,13 +48,7 @@ pub fn handle_agent_configure(
         println!("Enabled auto-coordinate");
     }
 
-    let config = state.config_snapshot()?;
-    let agent = agent::resolve_from_config(
-        config.impulse_agent_provider.as_deref(),
-        config.impulse_agent_api_key.as_deref(),
-        config.impulse_agent_model.as_deref(),
-        config.impulse_agent_harness.as_deref(),
-    );
+    let agent = resolve_configured_agent(state);
     match agent {
         Some(a) => println!("\nImpulse Agent: {}", a.status_summary()),
         None => println!("\nImpulse Agent: not configured"),
@@ -69,12 +63,7 @@ pub fn handle_agent_configure(
 pub fn handle_agent_status(state: &Arc<state::State>, json: bool) -> Result<()> {
     let config = state.config_snapshot()?;
 
-    let agent = agent::resolve_from_config(
-        config.impulse_agent_provider.as_deref(),
-        config.impulse_agent_api_key.as_deref(),
-        config.impulse_agent_model.as_deref(),
-        config.impulse_agent_harness.as_deref(),
-    );
+    let agent = resolve_configured_agent(state);
 
     if json {
         let status = serde_json::json!({
@@ -120,15 +109,7 @@ pub async fn handle_agent_query(
     prompt: String,
     json: bool,
 ) -> Result<()> {
-    let config = state.config_snapshot()?;
-
-    let mut agent = agent::resolve_from_config(
-        config.impulse_agent_provider.as_deref(),
-        config.impulse_agent_api_key.as_deref(),
-        config.impulse_agent_model.as_deref(),
-        config.impulse_agent_harness.as_deref(),
-    )
-    .ok_or_else(|| {
+    let mut agent = resolve_configured_agent(state).ok_or_else(|| {
         anyhow::anyhow!(
             "Impulse Agent not configured. Run: impulse-rs agent-configure --provider anthropic --api-key YOUR_KEY"
         )
@@ -155,6 +136,18 @@ pub async fn handle_agent_query(
         println!("{}", response);
     }
     Ok(())
+}
+
+/// Single constructor path used by CLI configure/status/query.
+fn resolve_configured_agent(state: &state::State) -> Option<agent::ImpulseAgent> {
+    let config = state.config_snapshot().ok()?;
+    agent::resolve_from_config(
+        config.impulse_agent_provider.as_deref(),
+        config.impulse_agent_api_key.as_deref(),
+        config.impulse_agent_model.as_deref(),
+        config.impulse_agent_harness.as_deref(),
+        config.impulse_agent_escalate_model.as_deref(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -388,6 +381,31 @@ mod tests {
         let (_tmp, st) = test_state();
         let result = handle_agent_query(&st, "test prompt".to_string(), true).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_configured_agent_applies_escalate_model_from_config() {
+        let (_tmp, st) = test_state();
+        assert!(st
+            .set_config("impulse_agent_provider", "anthropic")
+            .unwrap());
+        assert!(st.set_config("impulse_agent_api_key", "test-key").unwrap());
+        assert!(st
+            .set_config("impulse_agent_escalate_model", "claude-opus-4-6")
+            .unwrap());
+        let agent = resolve_configured_agent(&st).expect("CLI path should resolve an agent");
+        assert_eq!(agent.escalate_model(), Some("claude-opus-4-6"));
+    }
+
+    #[test]
+    fn test_resolve_configured_agent_without_escalate_key_is_none() {
+        let (_tmp, st) = test_state();
+        assert!(st
+            .set_config("impulse_agent_provider", "anthropic")
+            .unwrap());
+        assert!(st.set_config("impulse_agent_api_key", "test-key").unwrap());
+        let agent = resolve_configured_agent(&st).expect("CLI path should resolve an agent");
+        assert!(agent.escalate_model().is_none());
     }
 
     #[tokio::test]

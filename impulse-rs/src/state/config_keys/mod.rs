@@ -115,6 +115,7 @@ impl Config {
         "impulse_agent_provider",
         "impulse_agent_api_key",
         "impulse_agent_model",
+        "impulse_agent_escalate_model",
         "impulse_agent_harness",
         "impulse_agent_auto_review",
         "impulse_agent_auto_coordinate",
@@ -330,6 +331,7 @@ impl Config {
                     "impulse_agent_provider"
                     | "impulse_agent_harness"
                     | "impulse_agent_api_key"
+                    | "impulse_agent_escalate_model"
                     | "conflict_webhook_url" => "(not set)".to_string(),
                     "impulse_agent_model" => "(default)".to_string(),
                     _ => String::new(),
