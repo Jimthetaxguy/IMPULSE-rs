@@ -87,3 +87,25 @@ This decision is represented when tests prove:
 - [`0012-daemon-owned-governed-runtime-producers.md`](0012-daemon-owned-governed-runtime-producers.md)
 - [`../../VISION.md`](../../VISION.md)
 - [`../spec/RUST-CANONICAL-CONTRACT.md`](../spec/RUST-CANONICAL-CONTRACT.md)
+
+
+## Addendum: ROSA imports `decide_step_model`
+
+ROSA has no harness-step model policy. Impulse already owns that policy in `decide_step_model`. ROSA must call that function. ROSA must not grow `selector.rs` into a second picker.
+
+Codee mapped rosa-renew-build @ `0f1d4e2` against Impulse main `76ab525`:
+
+| Who | File / fn | What it sets | Step policy? |
+|---|---|---|---|
+| Impulse | `step_model.rs` `decide_step_model` | `ChatRequest.model` | Yes. Admissibility, then verifier-failure escalate, then stay on `current_model`. |
+| Impulse | `Agent::chat`, `run_tool_loop`, `ImpulseAgent::query_stateless` | Calls the hook | Yes. |
+| ROSA | `selector.rs` `select()` | `BackendId` from `ROSA_BACKEND` / catalog score | No. Exported. No production caller. Same class as `monty/routing.rs`. |
+| ROSA | `team.rs` `AgentRole::to_request` | `RunRequest.model` from role model or `Team.default_model` | No. Construction-time string. |
+| ROSA | anthropic/gemini `start_run` | empty → compiled `DEFAULT_MODEL`; same string for the tool loop | No. |
+| ROSA | `dispatch_spawn_subagent` | copies `parent_model` | No. Tool-in-loop inherit. |
+
+`spawn_subagent` is a tool-in-loop. It is not an A2A row.
+
+Jim locked 2026-08-19: Impulse stays the only picker. ROSA has no step picker and should call Impulse's `decide_step_model`.
+
+Do not add LiteLLM, OpenRouter, or a ROSA sibling of `decide_step_model`.
