@@ -138,6 +138,14 @@ the cached agent or losing history.
 - **Source of truth:** `try_lock_agent_for_turn` and agent request handlers in
   `src/daemon/handlers.rs`; provider timeouts bound the turn.
 
+### step-model policy — `[code]`
+The pure, provider-neutral runtime-control policy that selects a final model from a host-resolved
+current/configured model and optional same-provider escalation candidate. Applications decide
+whether inference runs; provider layers own availability and transport; each host records the
+returned reason in its own evidence domain.
+- **Source of truth:** `impulse-step-model`, the adapter and arena record in
+  `src/agent/step_model.rs`, and ADR-0015.
+
 ### agent registry — `[code]`
 The catalog of platform identity and launch metadata. It answers what can be named, detected, and
 launched; daemon/runtime telemetry separately answers what is currently running.

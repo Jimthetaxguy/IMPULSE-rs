@@ -97,7 +97,7 @@ in `VISION.md` are resolved.
 | [0012](decisions/0012-daemon-owned-governed-runtime-producers.md) | Daemon-owned governed runtime producers | Accepted | Profiled clean-Git claims, detached Rust verification, and strict API Supervisor review |
 | [0013](decisions/0013-deterministic-accepted-run-memory-candidates.md) | Deterministic accepted-run memory candidates | Accepted | Owner-only pending review projection, provenance/source assurance, and no `GENOME`/`HISTORY` mutation |
 | [0014](decisions/0014-work-item-and-comparative-settlement.md) | WorkItem identity and comparative settlement | Proposed | Proposed planning identity, fan-out effect bound, and four-part settlement record |
-| [0015](decisions/0015-harness-owned-step-model.md) | Harness-owned step model choice | Proposed | Harness-owned per-step model hook; gateway must not pick the model |
+| [0015](decisions/0015-harness-owned-step-model.md) | Harness-owned step model choice | Accepted | Pure Impulse-owned per-step policy; hosts retain inference, provider, and evidence authority |
 
 See [decisions/README.md](decisions/README.md) for full decision log.
 

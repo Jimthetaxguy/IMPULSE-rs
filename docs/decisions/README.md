@@ -41,7 +41,7 @@ registry-backed runtime identity, daemon truth, or the current Now/Next/Later ro
 | [0012](0012-daemon-owned-governed-runtime-producers.md) | Daemon-owned governed runtime producers | **Accepted** | Clean-Git Builder claims, detached daemon verification, and strict API-only Supervisor review | 2026-07-13 | -- |
 | [0013](0013-deterministic-accepted-run-memory-candidates.md) | Deterministic accepted-run memory candidates | **Accepted** | Owner-only pending review projection and explicit no-promotion boundary | 2026-07-15 | -- |
 | [0014](0014-work-item-and-comparative-settlement.md) | WorkItem identity and comparative settlement | **Proposed** | Proposed planning identity, fan-out effect bound, and four-part settlement record | 2026-08-10 | -- |
-| [0015](0015-harness-owned-step-model.md) | Harness-owned step model choice | **Proposed** | Harness picks the per-step model; gateway must not | 2026-08-17 | -- |
+| [0015](0015-harness-owned-step-model.md) | Harness-owned step model choice | **Accepted** | Pure Impulse-owned per-step policy; applications retain inference and semantic authority | 2026-08-17 | -- |
 
 ## ADR Format
 

@@ -14,6 +14,8 @@
 use impulse_ops::governed_task::{
     GovernedActorKind, GovernedReviewState, GovernedVerificationOutcome,
 };
+use impulse_step_model::{StepActor, StepModelContext, StepReviewSignal, StepVerificationSignal};
+pub use impulse_step_model::{StepModelDecision, StepModelReason};
 use serde::{Deserialize, Serialize};
 
 /// Per-step harness facts used to choose a request model.
@@ -28,21 +30,6 @@ pub struct HarnessStepContext {
     /// a caller has that value). Absent means v0 identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub escalate_model: Option<String>,
-}
-
-/// Why the harness chose `model` for this step.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StepModelReason {
-    Configured,
-    AfterVerifierFailure,
-}
-
-/// Result of [`decide_step_model`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StepModelDecision {
-    pub model: String,
-    pub reason: StepModelReason,
 }
 
 /// Additive arena record logged beside ADR-0011 four-party attestation.
@@ -84,14 +71,31 @@ impl HarnessStepContext {
     }
 }
 
-fn verifier_or_attestation_failed(ctx: &HarnessStepContext) -> bool {
-    matches!(
-        ctx.latest_verification,
-        Some(GovernedVerificationOutcome::Failed) | Some(GovernedVerificationOutcome::Inconclusive)
-    ) || matches!(
-        ctx.review_state,
-        Some(GovernedReviewState::VerificationFailed)
-    )
+fn policy_context(ctx: &HarnessStepContext) -> StepModelContext {
+    let actor = match ctx.actor {
+        GovernedActorKind::System => StepActor::System,
+        GovernedActorKind::Worker => StepActor::Worker,
+        GovernedActorKind::Verifier => StepActor::Verifier,
+        GovernedActorKind::Supervisor => StepActor::Supervisor,
+        GovernedActorKind::Operator => StepActor::Operator,
+    };
+    let review = match ctx.review_state {
+        Some(GovernedReviewState::VerificationFailed) => Some(StepReviewSignal::VerificationFailed),
+        _ => None,
+    };
+    let verification = ctx.latest_verification.map(|outcome| match outcome {
+        GovernedVerificationOutcome::Passed => StepVerificationSignal::Passed,
+        GovernedVerificationOutcome::Failed => StepVerificationSignal::Failed,
+        GovernedVerificationOutcome::Inconclusive => StepVerificationSignal::Inconclusive,
+    });
+    StepModelContext {
+        actor,
+        review,
+        verification,
+        tool_round: ctx.tool_round,
+        current_model: ctx.current_model.clone(),
+        escalate_model: ctx.escalate_model.clone(),
+    }
 }
 
 /// Choose the model for one harness step.
@@ -102,40 +106,7 @@ fn verifier_or_attestation_failed(ctx: &HarnessStepContext) -> bool {
 /// failed and `escalate_model` is set. Cost is unused in v0. Token count is
 /// not an input.
 pub fn decide_step_model(ctx: &HarnessStepContext, configured: &str) -> StepModelDecision {
-    if matches!(
-        ctx.actor,
-        GovernedActorKind::Operator | GovernedActorKind::Verifier
-    ) {
-        return stay_configured(ctx, configured);
-    }
-
-    if verifier_or_attestation_failed(ctx) {
-        if let Some(escalate) = ctx
-            .escalate_model
-            .as_deref()
-            .map(str::trim)
-            .filter(|model| !model.is_empty())
-        {
-            return StepModelDecision {
-                model: escalate.to_string(),
-                reason: StepModelReason::AfterVerifierFailure,
-            };
-        }
-    }
-
-    stay_configured(ctx, configured)
-}
-
-fn stay_configured(ctx: &HarnessStepContext, configured: &str) -> StepModelDecision {
-    let model = if ctx.current_model.trim().is_empty() {
-        configured.to_string()
-    } else {
-        ctx.current_model.clone()
-    };
-    StepModelDecision {
-        model,
-        reason: StepModelReason::Configured,
-    }
+    impulse_step_model::decide_step_model(&policy_context(ctx), configured)
 }
 
 /// Decide and emit a structured arena log. Returns the chosen model string

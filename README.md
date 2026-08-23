@@ -210,6 +210,7 @@ See `cargo run -- --help` for the full command list.
 ```
 impulse-rs/          # Rust implementation (canonical)
   impulse-ops/       # Shared control-plane protocol, workbench, policy, artifact models
+  impulse-step-model/ # Pure provider-neutral per-step model policy (no app graph)
   impulse-term/      # PTY lifecycle, parser, write queue, terminal context
   impulse-desktop/   # Dioxus cockpit, host bridge, workspace/runtime/MCP adapters
   impulse-ion/       # Ion harness contract + adapter crate
