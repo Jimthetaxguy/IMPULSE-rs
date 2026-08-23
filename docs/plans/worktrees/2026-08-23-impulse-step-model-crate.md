@@ -5,7 +5,7 @@ updated: 2026-08-23
 type: doc
 category: planning
 phase: all
-status: active
+status: complete
 audience: builders
 tags: [worktree, lane, step-model, adr-0015, rosa]
 ---
@@ -27,8 +27,9 @@ tags: [worktree, lane, step-model, adr-0015, rosa]
 - Plan/spec: ADR-0015 and this work card.
 - Verification: focused crate and step-model tests, workspace build/fmt/clippy/tests,
   and `python3 docs/validate_docs.py --all`.
-- Latest status: implementation complete; final build/test evidence and remote
-  durability in progress.
+- Latest status: implementation and verification complete; implementation
+  commit `220079e` is durable on
+  `origin/codex/impulse-step-model-crate-20260823`.
 
 ## Decisions
 
@@ -65,9 +66,8 @@ tags: [worktree, lane, step-model, adr-0015, rosa]
 
 ## Handoff Notes
 
-- Done when: the thin crate is independently consumable, Impulse behavior and
-  audit logging are preserved, the branch is verified and remotely durable,
-  and ROSA can pin the exact commit without compiling the application graph.
+- The thin crate is independently consumable, Impulse behavior and audit
+  logging are preserved, and the verified branch is remotely durable.
 - ROSA must pin an exact commit, resolve provider defaults before invoking the
   policy, reject any result outside the admitted candidates, and emit
   ROSA-owned decision evidence.
