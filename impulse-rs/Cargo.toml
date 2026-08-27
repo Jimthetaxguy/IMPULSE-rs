@@ -4,6 +4,8 @@ members = [
     "impulse-desktop",
     "impulse-ion",
     "impulse-ops",
+    "impulse-step-model",
+    "impulse-step-model",
     "impulse-term",
 ]
 exclude = ["impulse-gui"]
@@ -56,6 +58,7 @@ rusqlite = { version = "0.32", features = ["bundled", "load_extension"] }
 sha2 = "0.10"
 impulse-ops = { path = "impulse-ops" }
 impulse-ion = { path = "impulse-ion" }
+impulse-step-model = { path = "impulse-step-model" }
 
 # Date/time
 chrono = { version = "0.4", features = ["serde"] }

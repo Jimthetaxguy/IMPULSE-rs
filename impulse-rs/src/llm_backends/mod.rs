@@ -961,7 +961,11 @@ mod tests {
         let provider = RecordingModelProvider::new();
         let recorded = std::sync::Arc::clone(&provider.models);
         let mut agent = test_agent(provider);
-        agent.step_context.latest_verification = Some(GovernedVerificationOutcome::Failed);
+        agent.step_context.latest_verification = Some(
+            crate::agent::step_model::step_verification_from_governed(
+                GovernedVerificationOutcome::Failed,
+            ),
+        );
         agent.step_context.escalate_model = Some("escalate-model".to_string());
         agent.chat("retry").await.expect("chat should succeed");
         assert_eq!(recorded.lock().unwrap().as_slice(), ["escalate-model"]);
@@ -974,7 +978,11 @@ mod tests {
         let provider = RecordingModelProvider::with_one_tool_round();
         let recorded = std::sync::Arc::clone(&provider.models);
         let mut agent = test_agent(provider);
-        agent.step_context.latest_verification = Some(GovernedVerificationOutcome::Failed);
+        agent.step_context.latest_verification = Some(
+            crate::agent::step_model::step_verification_from_governed(
+                GovernedVerificationOutcome::Failed,
+            ),
+        );
         agent.step_context.escalate_model = Some("escalate-model".to_string());
         let executor = EchoExecutor::new();
         let reply = agent

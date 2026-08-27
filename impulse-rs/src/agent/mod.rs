@@ -908,7 +908,9 @@ impl ImpulseAgent {
                     AgentError::InvalidRequest("Agent not initialized".to_string())
                 })?;
                 let mut ctx = agent.step_context.clone();
-                ctx.actor = impulse_ops::governed_task::GovernedActorKind::Supervisor;
+                ctx.actor = crate::agent::step_model::step_actor_from_governed(
+                    impulse_ops::governed_task::GovernedActorKind::Supervisor,
+                );
                 ctx.current_model = agent.model.clone();
                 ctx.tool_round = 0;
                 let actor_id = match &self.config.mode {
@@ -1269,7 +1271,11 @@ mod tests {
             models: std::sync::Arc::clone(&models),
         }));
         if let Some(inner) = agent.inner_agent_mut() {
-            inner.step_context.latest_verification = Some(GovernedVerificationOutcome::Failed);
+            inner.step_context.latest_verification = Some(
+                crate::agent::step_model::step_verification_from_governed(
+                    GovernedVerificationOutcome::Failed,
+                ),
+            );
             inner.step_context.escalate_model = Some("escalate-model".to_string());
         }
         agent
