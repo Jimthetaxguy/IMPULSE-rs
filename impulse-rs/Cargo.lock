@@ -4578,6 +4578,7 @@ dependencies = [
  "glob",
  "impulse-ion",
  "impulse-ops",
+ "impulse-step-model",
  "levenshtein",
  "libc",
  "portable-pty",
@@ -4603,6 +4604,14 @@ dependencies = [
  "uuid",
  "vt100",
  "which",
+]
+
+[[package]]
+name = "impulse-step-model"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
