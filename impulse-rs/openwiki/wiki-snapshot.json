@@ -1,0 +1,209 @@
+{
+  "schema": "quirewiki-snapshot@1",
+  "snapshot_id": "wikisnap.sha256.74dfd05fca6f88f872f0c3142ca0efddb3550fdd4f0e0bb4c99e0f430dfdb783",
+  "semantic_role": "reference_only",
+  "authority_boundaries": {
+    "memory": false,
+    "task_truth": false,
+    "policy": false,
+    "capability": false,
+    "approval": false,
+    "execution": false,
+    "mutation": false
+  },
+  "subject": {
+    "project_id": "impulse",
+    "scope": "impulse-rs",
+    "source_state": "committed_tree",
+    "git_commit": "d8b35da77ac7ea61a47b901db5ec0ab4824fc9c6",
+    "git_tree": "50839f3ee2f0cd275be5c670248a51a06c4358e6"
+  },
+  "generator": {
+    "name": "quirewiki",
+    "version": "0.1.0",
+    "git_commit": "de833b93a60694117de438600b63e4cda58c8d34",
+    "git_tree": "f7332b5f7f9d700497c60f16c946bee249ef472c",
+    "binary_sha256": "07571c145a5291d901419421b1b336a149d36f3217be6fbe6148a464b7c0985c",
+    "binary_provenance": "digest_only",
+    "attestation": "caller_attested",
+    "mode": "code_extractive",
+    "model_used": false,
+    "network_used": false
+  },
+  "inventory": {
+    "last_update_schema": 2,
+    "last_update_sha256": "3e0c96582e3db409b9c80ff5c52fc541e4fbee9f6de63908a7c949afbb305c0c",
+    "file_count": 360,
+    "chunk_count": 7587,
+    "inventory_blake3": "12956dfaf51b7b7949c262a33541611109cd2f8bba1d576b717d90a7ff5898c5"
+  },
+  "wiki": {
+    "page_schema": "quirewiki-page@1",
+    "generation_status": "complete",
+    "visibility": "public",
+    "document_count": 10,
+    "content_page_count": 8,
+    "wiki_sha256": "9352c406775b1b5cc2f6bdd6b5c51c386ea79204aa30f249b0e72978266cc1fb",
+    "documents": [
+      {
+        "path": ".last-update.json",
+        "role": "producer_manifest",
+        "byte_length": 50748,
+        "sha256": "3e0c96582e3db409b9c80ff5c52fc541e4fbee9f6de63908a7c949afbb305c0c"
+      },
+      {
+        "path": "INSTRUCTIONS.md",
+        "role": "human_receipt",
+        "byte_length": 3633,
+        "sha256": "65eddda37ce61e55dd872497724adc3e384f73506a8c38a76dfe9e6b0a9c511c"
+      },
+      {
+        "path": "code/impulse-desktop.md",
+        "role": "generated_page",
+        "byte_length": 26068,
+        "sha256": "d157ec79189d9bcc0770768ce11fe2245447dbdc2a523c5d69308f74b3e63868",
+        "page": {
+          "schema": "quirewiki-page@1",
+          "id": "concept.code.impulse-desktop",
+          "status": "draft",
+          "confidence": "high",
+          "visibility": "public"
+        }
+      },
+      {
+        "path": "code/impulse-ion.md",
+        "role": "generated_page",
+        "byte_length": 6627,
+        "sha256": "f572a3d149132d8d58e0e29c4474d033b417bbefd5be9e8a9817288928558ad3",
+        "page": {
+          "schema": "quirewiki-page@1",
+          "id": "concept.code.impulse-ion",
+          "status": "draft",
+          "confidence": "high",
+          "visibility": "public"
+        }
+      },
+      {
+        "path": "code/impulse-ops.md",
+        "role": "generated_page",
+        "byte_length": 15087,
+        "sha256": "50a460a022c10f7d367893593b381da8bf88349f0f91580cc312836e4bb78005",
+        "page": {
+          "schema": "quirewiki-page@1",
+          "id": "concept.code.impulse-ops",
+          "status": "draft",
+          "confidence": "high",
+          "visibility": "public"
+        }
+      },
+      {
+        "path": "code/impulse-rs.md",
+        "role": "generated_page",
+        "byte_length": 72654,
+        "sha256": "059e4546e74279905416bbef9339a1b86f3a3b591a06135557a4b82655e20ed9",
+        "page": {
+          "schema": "quirewiki-page@1",
+          "id": "concept.code.impulse-rs",
+          "status": "draft",
+          "confidence": "high",
+          "visibility": "public"
+        }
+      },
+      {
+        "path": "code/impulse-step-model.md",
+        "role": "generated_page",
+        "byte_length": 3207,
+        "sha256": "70cdcb81a0cd1cb9894ce54a310b2d820fc06b3349d8f81ecd787fefcb510cf0",
+        "page": {
+          "schema": "quirewiki-page@1",
+          "id": "concept.code.impulse-step-model",
+          "status": "draft",
+          "confidence": "high",
+          "visibility": "public"
+        }
+      },
+      {
+        "path": "code/impulse-term.md",
+        "role": "generated_page",
+        "byte_length": 18024,
+        "sha256": "1e48e978cd9f8f7c6994a2aa219f6728d857b9599885434227903bda21d69dd7",
+        "page": {
+          "schema": "quirewiki-page@1",
+          "id": "concept.code.impulse-term",
+          "status": "draft",
+          "confidence": "high",
+          "visibility": "public"
+        }
+      },
+      {
+        "path": "index.md",
+        "role": "index",
+        "byte_length": 537,
+        "sha256": "016eeeee67b04471e5a816b8915483447a4d2b7769a4dc94fa658d8deb3cf6f1",
+        "page": {
+          "schema": "quirewiki-page@1",
+          "id": "concept.index",
+          "status": "draft",
+          "confidence": "high",
+          "visibility": "public"
+        }
+      },
+      {
+        "path": "quickstart.md",
+        "role": "generated_page",
+        "byte_length": 9724,
+        "sha256": "adee8d12aa4a6bc8b4c2fdec10f38357c98ccacfad8dbdc505f17f52a4ab83ef",
+        "page": {
+          "schema": "quirewiki-page@1",
+          "id": "concept.quickstart",
+          "status": "draft",
+          "confidence": "high",
+          "visibility": "public"
+        }
+      }
+    ]
+  },
+  "validation": {
+    "producer_gate": {
+      "contract": "quirewiki-gate@1",
+      "status": "passed",
+      "report_sha256": "8db03a984a6e229618914775e3318243ac0443b1279e4c91e1d5687692858930",
+      "pages": [
+        {
+          "path": "code/impulse-desktop.md",
+          "state": "supported"
+        },
+        {
+          "path": "code/impulse-ion.md",
+          "state": "supported"
+        },
+        {
+          "path": "code/impulse-ops.md",
+          "state": "supported"
+        },
+        {
+          "path": "code/impulse-rs.md",
+          "state": "supported"
+        },
+        {
+          "path": "code/impulse-step-model.md",
+          "state": "supported"
+        },
+        {
+          "path": "code/impulse-term.md",
+          "state": "supported"
+        },
+        {
+          "path": "index.md",
+          "state": "supported"
+        },
+        {
+          "path": "quickstart.md",
+          "state": "supported"
+        }
+      ]
+    },
+    "consumer_validation_required": true,
+    "markdown_trust": "untrusted_data"
+  }
+}
