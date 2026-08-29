@@ -52,6 +52,7 @@ cargo run -p impulse-desktop --features desktop-app --bin impulse-desktop
 | `impulse-desktop` | Dioxus cockpit, xterm.js integration, typed host bridge, and desktop runtime adapters |
 | `impulse-ion` | Transport-agnostic Ion harness request/response and adapter contracts |
 | `impulse-ops` | Shared control-plane protocol, workbench, policy, registry, artifact, and telemetry models |
+| `impulse-step-model` | Deterministic per-step model-routing policy shared across governed runtimes |
 | `impulse-term` | Framework-neutral PTY lifecycle, terminal parsing, write queue, and context bridge |
 
 `impulse-gui` is the legacy/frozen egui workbench. It is excluded from the active Cargo workspace

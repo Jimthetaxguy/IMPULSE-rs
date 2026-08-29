@@ -1,8 +1,12 @@
 # T5 Implementation Notes — `ion` binary skeleton
 
-**Status:** ready-to-implement once T3 lands (T5 depends only on T3's `run_ion_verify` split; T1/T2/T4 do not block the skeleton itself, but T4's fake gate is what makes any *behavioral* verify test possible — T5's tests deliberately avoid the gate).
+> Historical implementation plan. T5 has landed: the workspace now builds the
+> `ion` binary and exercises its command surface. The detail below preserves
+> the pre-implementation design record and must not be read as current status.
+
+**Status:** implemented; historical dependency analysis follows (T5 originally depended on T3's `run_ion_verify` split, while T4 supplied the behavioral fake-gate coverage).
 **Spec:** `impulse-rs/impulse-ion/TUI_SPEC.md` §2.2, §2.4, task T5.
-**Written:** 2026-07-11 (read-only spec session; nothing here has been compiled — T3 does not exist yet).
+**Originally written:** 2026-07-11 as a read-only pre-implementation spec session.
 
 Current state verified against the repo as of this note:
 
