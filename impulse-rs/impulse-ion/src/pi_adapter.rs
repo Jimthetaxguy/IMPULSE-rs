@@ -55,15 +55,15 @@ pub enum AdapterError {
     TimedOut { timeout_secs: u64, stderr: String },
 }
 
-/// Locates the promoted Pi gate launcher shipped alongside the Ion harness specs.
+/// Locates the externally managed Pi gate launcher used by the Ion harness adapter.
 ///
 /// Launcher path resolution precedence (highest to lowest):
 /// 1. Explicit constructor argument — [`PiAdapter::with_launch_script`] (test override).
-/// 2. `ION_GATE_LAUNCHER` environment variable — [`ION_GATE_LAUNCHER_ENV`], per the
-///    real-systems rule that paths come from config/env, not hardcoded constants.
-/// 3. Default — `~/.ai-memory/docs/ion-harness/pi-gate/launch-gate.sh`, the single
-///    launcher shared by both Ion harnesses (spec-b: "one gate implementation, two
-///    harnesses, zero drift").
+/// 2. `ION_GATE_LAUNCHER` environment variable — [`ION_GATE_LAUNCHER_ENV`].
+/// 3. Host-local default — `~/.ai-memory/docs/ion-harness/pi-gate/launch-gate.sh`.
+///
+/// The default launcher is not shipped by this repository. A fresh clone must
+/// provide the launcher through configuration or the host-local dependency.
 pub struct PiAdapter {
     launch_script: PathBuf,
     timeout: Duration,
