@@ -1,0 +1,11 @@
+IMPULSE NON-DISTRIBUTABLE DEVELOPER PREVIEW
+
+This bundle is a CI/developer-preview artifact. It has no authorized Developer
+ID bundle signature and is not notarized, stapled, installed, or represented as
+a GitHub Release or end-user deployment. Toolchain-generated ad-hoc signatures
+may be present on individual Mach-O binaries.
+
+Do not promote or distribute it outside controlled evaluation until the
+repository license declarations and tracked license file agree, an authorized
+signing identity is configured, notarization succeeds, and the packaged Dioxus
+runtime passes its live-host acceptance gate.

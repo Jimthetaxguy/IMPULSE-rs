@@ -232,10 +232,11 @@ mod tests {
     #[test]
     fn test_save_returns_err_when_path_has_no_writable_parent() {
         // A path under a file (not a directory) can never have its parent
-        // created, so save() must surface an Err rather than panicking.
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let blocking_file = dir.path().join("not-a-dir");
-        std::fs::write(&blocking_file, b"x").expect("write blocking file");
+        // created, so save() must surface an Err rather than panicking. The
+        // running test image is an existing regular file on every supported
+        // host, which avoids a permission-sensitive setup write under CI.
+        let blocking_file = std::env::current_exe().expect("current test executable");
+        assert!(blocking_file.is_file());
         let bad_path = blocking_file.join("ion_history");
 
         let mut editor = DefaultEditor::new().expect("editor");

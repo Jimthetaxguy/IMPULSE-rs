@@ -360,6 +360,7 @@ fn ArtifactCard(artifact: ArtifactEnvelope, on_intent: EventHandler<ShellIntent>
                         {
                             let artifact_id = artifact.id.clone();
                             let action_id = action.id.clone();
+                            let invoked_action_id = action_id.clone();
                             let action_label = action.label.clone();
                             let class_name = if action.requires_confirmation {
                                 "action-ghost mutating"
@@ -372,7 +373,7 @@ fn ArtifactCard(artifact: ArtifactEnvelope, on_intent: EventHandler<ShellIntent>
                                     class: "{class_name}",
                                     onclick: move |_| on_intent.call(ShellIntent::ArtifactAction {
                                         artifact_id: artifact_id.clone(),
-                                        action: action_id.clone(),
+                                        action: invoked_action_id.clone(),
                                     }),
                                     "{action_label}"
                                 }

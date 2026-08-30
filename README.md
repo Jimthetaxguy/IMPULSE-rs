@@ -275,14 +275,40 @@ mock provider behavior to shipping code.
 
 ```bash
 cd impulse-rs
-cargo build --workspace
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+cargo build --workspace --release --locked
+cargo test --workspace --locked
+cargo check --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo fmt --all -- --check
 ```
+
+## Release readiness
+
+Normal CI requires the complete locked workspace gate before it builds and inspects a native,
+non-distributable Dioxus `.app`/DMG. The manual `Release Readiness` workflow additionally exercises
+three evidenced CLI candidates for Linux x86_64 and macOS Intel/Apple Silicon, plus a universal
+macOS Dioxus package. Linux arm64 remains excluded until its native-TLS/OpenSSL cross-toolchain is
+specified and proven. Both workflows retain no downloadable artifacts: they are build proofs, not
+release or deployment automation.
+
+The macOS recipe explicitly builds `impulse-desktop --features desktop-app --bin
+impulse-desktop` plus the `impulse-rs` companion and native `ion` sibling, packages an explicit
+allowlist of local xterm assets and their licenses, and verifies both the staged bundle and the
+read-only DMG mount. Run a native preview check with:
+
+```bash
+cd impulse-rs
+CARGO_TARGET_DIR=target/release-readiness bash scripts/build-macos-app.sh --dmg
+```
+
+The output is named `non-distributable-developer-preview` and carries a release-candidate notice.
+It has no Developer ID bundle signature, although toolchain-generated ad-hoc Mach-O signatures may
+be present. Public release remains blocked on license reconciliation, an authorized Developer ID
+signing/notarization path, packaged live-host acceptance, and a successful exact-commit hosted
+readiness run.
 
 ## License
 
 This repository is public, but release licensing is not yet coherent: Cargo manifests declare
 MIT while [`impulse-rs/LICENSE`](impulse-rs/LICENSE) contains Apache-2.0. Treat licensing as an
-explicit pre-release decision; this draft PR does not silently choose or rewrite the license.
+explicit pre-release decision; this change does not silently choose or rewrite the license.

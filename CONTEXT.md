@@ -163,6 +163,16 @@ It consumes daemon/runtime state through typed host commands/events and must not
 policy or persistence authority.
 - **Source of truth:** `impulse-desktop/src/{desktop_host,host_bridge,host_commands,views}.rs`.
 
+### release-readiness proof — `[code]`
+An exact-source, locked build/test/package run that produces and inspects an ephemeral candidate.
+It may prove bundle structure, target compilation, executable modes, assets, and checksums; it is
+not a retained artifact, authorized signature, notarization, tag, GitHub Release, installation, or
+end-user deployment. The active macOS proof packages the Dioxus host plus `impulse-rs` companion
+and native `ion` sibling, then verifies both the `.app` and its read-only DMG mount. A candidate has
+no Developer ID bundle signature; toolchain-generated ad-hoc Mach-O signatures may still exist.
+- **Source of truth:** `.github/workflows/{ci,release}.yml`,
+  `impulse-rs/scripts/{build-macos-app,verify-macos-app}.sh`, and the packaging contract tests.
+
 ### tool capability — `[code]`
 A deny-by-default permission required by a typed tool. Tool availability varies by runtime bridge;
 conceptual parity does not imply identical enforcement.

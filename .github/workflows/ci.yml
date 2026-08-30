@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -14,6 +17,7 @@ jobs:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     defaults:
@@ -25,10 +29,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: impulse-rs
-      - run: cargo test
+      - run: cargo test --workspace --locked
 
   lint:
-    name: Lint
+    name: Locked workspace gate
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -41,8 +45,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: impulse-rs
-      - run: cargo clippy -- -D warnings
-      - run: cargo fmt --check
+      - run: cargo fmt --all -- --check
+      - run: cargo check --workspace --all-targets --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   build:
     name: Build (release)
@@ -56,7 +61,31 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: impulse-rs
-      - name: Build (default features, includes office-support)
-        run: cargo build --release
-      - name: Build (minimal, no default features)
-        run: cargo build --no-default-features
+      - name: Build locked workspace
+        run: cargo build --workspace --release --locked
+      - name: Build minimal control plane
+        run: cargo build -p impulse-rs --bin impulse-rs --no-default-features --locked
+
+  macos-dioxus-candidate:
+    name: Non-distributable Dioxus package contract
+    needs: [test, lint, build]
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: impulse-rs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: impulse-rs
+      - name: Lint active Dioxus desktop binary
+        run: cargo clippy -p impulse-desktop --features desktop-app --bin impulse-desktop --locked -- -D warnings
+      - name: Test portable packaging contract
+        run: cargo test -p impulse-desktop --test macos_packaging_contract --locked
+      - name: Build and inspect native developer-preview DMG
+        env:
+          CARGO_TARGET_DIR: target/ci-package
+        run: bash scripts/build-macos-app.sh --dmg

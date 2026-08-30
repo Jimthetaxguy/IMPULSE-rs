@@ -1484,13 +1484,20 @@ fn OperatorBoard(
             } else {
                 div { class: "governed-task-grid", "data-source": "governed_tasks",
                     for task in governed_tasks {
-                        GovernedTaskCard {
+                        {
                             // A daemon revision is the authoritative decision epoch.
-                            // Remounting clears rationale text so it cannot bleed into
-                            // a later supervisor/operator decision.
-                            key: "{task.id}:{task.revision}",
-                            task,
-                            on_mutation: on_governed_mutation,
+                            // Derive the reconciliation key before moving the task into
+                            // the child component so the rsx expansion owns each value.
+                            let task_key = format!("{}:{}", task.id, task.revision);
+                            rsx! {
+                                GovernedTaskCard {
+                                    // Remounting clears rationale text so it cannot bleed
+                                    // into a later supervisor/operator decision.
+                                    key: "{task_key}",
+                                    task,
+                                    on_mutation: on_governed_mutation,
+                                }
+                            }
                         }
                     }
                 }

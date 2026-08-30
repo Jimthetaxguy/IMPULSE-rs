@@ -179,7 +179,8 @@ Preferred Dioxus packaging path:
 
 - [ ] Build `impulse-desktop` with `--features desktop-app --bin impulse-desktop` for each target.
 - [ ] Move bundle metadata/icon ownership out of `impulse-gui`.
-- [ ] Package the Dioxus binary and required `impulse-rs` companion binary explicitly.
+- [ ] Package the Dioxus binary, required `impulse-rs` companion, and native `ion` sibling
+      explicitly.
 - [ ] Add an artifact inspection and macOS launch smoke that fails if the app exits immediately,
       cannot load local xterm assets, or never reports the live Dioxus bridge status.
 - [ ] Make the tag release consume only the proven Dioxus package recipe.
@@ -191,6 +192,18 @@ Fallback CLI-only path, only if explicitly chosen:
 - [ ] Keep Track C blocked; CLI-only release truth is not Dioxus operational acceptance.
 
 **Gate:** no active release script or workflow may reference `impulse-gui`.
+
+#### 2026-08-29 release-truth checkpoint
+
+The isolated `agent/codex-dioxus-release-truth-20260829` lane removes `impulse-gui` from active
+CI/release-readiness automation, explicitly builds the Dioxus host, control-plane companion, and
+native Ion sibling, then adds portable structure checks plus real native `.app`/DMG mount
+inspection. Candidate outputs are non-distributable developer previews with no Developer ID bundle
+signature and are not retained by public-repository workflows; ad-hoc Mach-O signatures may exist.
+
+This checkpoint does not close R1. A hosted universal run, packaged live-host acceptance, license
+reconciliation, authorized signing, notarization/stapling, and explicit public-release authority
+remain required. The tag-triggered publisher stays removed until those gates exist.
 
 ### R2 — Remove resurrection vectors and dead affordances
 
