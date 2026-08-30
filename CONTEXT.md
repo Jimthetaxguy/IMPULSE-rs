@@ -184,6 +184,14 @@ It consumes daemon/runtime state through typed host commands/events and must not
 policy or persistence authority.
 - **Source of truth:** `impulse-desktop/src/{desktop_host,host_bridge,host_commands,views}.rs`.
 
+### Dioxus host invoke wire — `[code]`
+The id-correlated request/response channel between the cockpit JavaScript and Rust host. Requests
+use `kind: host_invoke`; every normal or rejected Rust response must use
+`kind: host_invoke_result` so the strict JavaScript router can settle the matching promise. Host
+events remain a separate `kind: host_event` stream. A missing discriminator is a protocol failure,
+not a browser fallback opportunity.
+- **Source of truth:** `impulse-desktop/src/host_bridge.rs`.
+
 ### tool capability — `[code]`
 A deny-by-default permission required by a typed tool. Tool availability varies by runtime bridge;
 conceptual parity does not imply identical enforcement.
