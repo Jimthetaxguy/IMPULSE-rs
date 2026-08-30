@@ -47,6 +47,8 @@ const ACCEPTANCE_NONCE_ENV: &str = "IMPULSE_PACKAGED_ACCEPTANCE_NONCE";
 const ACCEPTANCE_ROOT_ENV: &str = "IMPULSE_PACKAGED_ACCEPTANCE_ROOT";
 const RECEIPT_PREFIX: &str = "IMPULSE_PACKAGED_HOST_RECEIPT ";
 const RECEIPT_SCHEMA: &str = "impulse.packaged-host/v1";
+const MAX_RECEIPT_FAILURE_REASONS: usize = 24;
+const MAX_RECEIPT_FAILURE_REASON_CHARS: usize = 240;
 const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const RECEIPT_TIMEOUT_GRACE_SECS: u64 = 15;
 const RECEIPT_TIMEOUT: Duration =
@@ -936,13 +938,22 @@ fn validate_receipt(
     if &daemon_identity != expected_daemon_identity {
         return Err("receipt daemon_identity did not match the launched child".to_string());
     }
-    require_bool(object, "rust_host_transcript_validated", true)?;
+    let failure_reasons = receipt_failure_reasons(object)?;
+    if object
+        .get("rust_host_transcript_validated")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        let detail = if failure_reasons.is_empty() {
+            "no bounded failure reason was supplied".to_string()
+        } else {
+            failure_reasons.join("; ")
+        };
+        return Err(format!(
+            "packaged-host Rust transcript validation failed: {detail}"
+        ));
+    }
     require_string(object, "outcome", "passed")?;
-
-    let failure_reasons = object
-        .get("failure_reasons")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "receipt failure_reasons must be an array".to_string())?;
     if !failure_reasons.is_empty() {
         return Err("passing receipt contains failure reasons".to_string());
     }
@@ -989,6 +1000,37 @@ fn validate_receipt(
     require_bool(observation, "terminal_interop_degraded", false)?;
     require_string_contains(observation, "unknown_command_error", "unknown host command")?;
     Ok(())
+}
+
+fn receipt_failure_reasons(object: &Map<String, Value>) -> Result<Vec<String>, String> {
+    let values = object
+        .get("failure_reasons")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "receipt failure_reasons must be an array".to_string())?;
+    if values.len() > MAX_RECEIPT_FAILURE_REASONS {
+        return Err("receipt carried too many failure reasons".to_string());
+    }
+    values
+        .iter()
+        .map(|value| {
+            let reason = value
+                .as_str()
+                .ok_or_else(|| "receipt failure reason must be a string".to_string())?;
+            if reason.chars().count() > MAX_RECEIPT_FAILURE_REASON_CHARS {
+                return Err("receipt failure reason exceeded its character bound".to_string());
+            }
+            Ok(reason
+                .chars()
+                .map(|character| {
+                    if character.is_control() {
+                        ' '
+                    } else {
+                        character
+                    }
+                })
+                .collect())
+        })
+        .collect()
 }
 
 fn require_string(object: &Map<String, Value>, field: &str, expected: &str) -> Result<(), String> {
@@ -1721,6 +1763,23 @@ fn test_validate_receipt_rejects_wrong_nonce_and_missing_observation() {
     )
     .expect_err("untyped unknown-command failure must fail closed");
     assert!(error.contains("unknown_command_error"));
+}
+
+#[test]
+fn test_validate_receipt_surfaces_transcript_failure_reasons() {
+    let identity = receipt_identity_fixture("expected");
+    let mut receipt = valid_receipt_fixture("expected", 42, &"a".repeat(64), &identity);
+    receipt["rust_host_transcript_validated"] = Value::Bool(false);
+    receipt["outcome"] = Value::String("failed".to_string());
+    receipt["failure_reasons"] = serde_json::json!([
+        "Rust host transcript did not prove terminal output marker",
+        "Rust host transcript did not prove terminal exit event"
+    ]);
+
+    let error = validate_receipt(&receipt, "expected", 42, &"a".repeat(64), &identity)
+        .expect_err("a failed transcript must remain rejected");
+    assert!(error.contains("terminal output marker"), "{error}");
+    assert!(error.contains("terminal exit event"), "{error}");
 }
 
 fn receipt_identity_fixture(nonce: &str) -> DaemonInstanceIdentity {
