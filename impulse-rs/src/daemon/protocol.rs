@@ -324,8 +324,8 @@ mod tests {
     // ── PROTOCOL_VERSION ───────────────────────────────────────────────
 
     #[test]
-    fn test_protocol_version_is_six() {
-        assert_eq!(PROTOCOL_VERSION, 6);
+    fn test_protocol_version_is_seven() {
+        assert_eq!(PROTOCOL_VERSION, 7);
     }
 
     // ── request_type_name ───────────────────────────────────────────────

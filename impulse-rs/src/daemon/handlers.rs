@@ -698,6 +698,7 @@ async fn run_supervisor_action(
 
 pub(crate) struct ProcessRequestContext<'a> {
     pub state: SharedState,
+    pub daemon_identity: &'a impulse_ops::DaemonInstanceIdentity,
     pub registry: &'a crate::tooling::ToolRegistry,
     pub tool_context: &'a crate::tooling::ToolContext,
     pub terminal_telemetry: &'a Arc<RwLock<crate::ops_workbench::TerminalOpsTelemetryStore>>,
@@ -715,6 +716,7 @@ pub(crate) async fn process_request(
 ) -> DaemonResponse {
     let ProcessRequestContext {
         state,
+        daemon_identity,
         registry,
         tool_context,
         terminal_telemetry,
@@ -781,9 +783,7 @@ pub(crate) async fn process_request(
     }
 
     match request {
-        DaemonRequest::Ping => DaemonResponse::Ok {
-            result: serde_json::json!({"pong": true, "protocol_version": PROTOCOL_VERSION}),
-        },
+        DaemonRequest::Ping => handle_ping(daemon_identity),
         DaemonRequest::Status => handle_status(&state).await,
 
         // Session group
@@ -914,6 +914,14 @@ pub(crate) async fn process_request(
             Err(e) => respond_err(e),
         },
     }
+}
+
+pub(crate) fn handle_ping(daemon_identity: &impulse_ops::DaemonInstanceIdentity) -> DaemonResponse {
+    respond_ok(&impulse_ops::DaemonPingResponse {
+        pong: true,
+        protocol_version: PROTOCOL_VERSION,
+        daemon_instance: daemon_identity.clone(),
+    })
 }
 
 // ── Sub-handlers ────���───────────────────────────────────────────────────────

@@ -17,10 +17,18 @@ fn main() {
     let (event_sink, event_rx) = channel_event_sink();
     let downstream: Arc<dyn DesktopEventSink> = event_sink.clone();
     let memory_root = resolve_memory_root();
-    let (runtime_sink, governed_task_gateway) = match attach_desktop_daemon_ops(
-        downstream.clone(),
-        DesktopDaemonOpsConfig::discover(&memory_root),
-    ) {
+    let daemon_attachment =
+        impulse_desktop::packaged_acceptance::expected_daemon_identity_for_packaged_acceptance(
+            &memory_root,
+        )
+        .and_then(|expected_identity| {
+            let mut config = DesktopDaemonOpsConfig::discover(&memory_root);
+            if let Some(identity) = expected_identity {
+                config = config.with_expected_daemon_identity(identity);
+            }
+            attach_desktop_daemon_ops(downstream.clone(), config).map_err(|error| error.to_string())
+        });
+    let (runtime_sink, governed_task_gateway) = match daemon_attachment {
         Ok(attachment) => (
             attachment.event_sink,
             Some(attachment.governed_task_gateway),

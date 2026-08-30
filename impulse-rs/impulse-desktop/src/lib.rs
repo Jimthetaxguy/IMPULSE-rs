@@ -14,6 +14,7 @@ pub mod host_bridge;
 pub mod host_commands;
 pub mod mcp;
 pub mod native;
+pub mod packaged_acceptance;
 pub mod runtime;
 pub mod theme;
 pub mod ui;

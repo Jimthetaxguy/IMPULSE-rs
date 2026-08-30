@@ -63,11 +63,13 @@ macro_rules! impulse_host_adapter_resolution_script {
   // "missing" and that verdict gets captured for the rest of this script's
   // lifetime (both callers close over `invoke`/`listen` in long-lived
   // closures — one of them never re-executes for the life of the component).
-  // Poll with a short bounded backoff until the live bridge (or a legacy
-  // Tauri host) reports ready, or the attempt budget is exhausted, then fall
-  // back to today's resolution exactly as before.
-  const IMPULSE_HOST_ADAPTER_POLL_INTERVAL_MS = 10;
-  const IMPULSE_HOST_ADAPTER_POLL_MAX_ATTEMPTS = 25;
+  // Poll with the same bounded cold-load budget used by the local terminal
+  // assets until the live bridge (or a legacy Tauri host) reports ready. Both
+  // long-lived consumers capture the resolved invoke/listen functions, so a
+  // shorter host deadline would permanently degrade an otherwise healthy
+  // cold launch.
+  const IMPULSE_HOST_ADAPTER_POLL_INTERVAL_MS = 25;
+  const IMPULSE_HOST_ADAPTER_POLL_MAX_ATTEMPTS = 400;
   const impulseHostAdapterCandidateReady = () => {
     const dioxusHost = window.__IMPULSE_DESKTOP_HOST;
     const legacyTauri = window.__TAURI__;
@@ -122,6 +124,12 @@ const DESKTOP_EVENT_BRIDGE_SCRIPT: &str = concat!(
     mounted: true,
     degraded: !listen,
     hostKind,
+    // Preserve the latest daemon connection truth across bridge remounts. The
+    // event bridge is the browser-side owner of this transport observation;
+    // acceptance and UI consumers may inspect it without inventing a second
+    // daemon health API.
+    daemonConnected: existing?.daemonConnected ?? null,
+    daemonError: existing?.daemonError ?? null,
     unlisten: [],
   };
   document.documentElement?.setAttribute("data-impulse-host-kind", hostKind);
@@ -333,7 +341,14 @@ const DESKTOP_EVENT_BRIDGE_SCRIPT: &str = concat!(
     forward("terminal_exit", event?.payload ?? event);
   });
   const opsConnectionUnlisten = await listen("ops_connection_update", (event) => {
-    forward("ops_connection_update", event?.payload ?? event);
+    const connection = event?.payload ?? event;
+    window.__impulseOpsBridge.daemonConnected = connection?.connected === true;
+    window.__impulseOpsBridge.daemonError = connection?.error ?? null;
+    document.documentElement?.setAttribute(
+      "data-impulse-daemon-connected",
+      connection?.connected === true ? "true" : "false"
+    );
+    forward("ops_connection_update", connection);
   });
   window.__impulseOpsBridge.unlisten = [opsUnlisten, runtimeUnlisten, exitUnlisten, opsConnectionUnlisten];
 
@@ -356,8 +371,68 @@ const TERMINAL_INTEROP_SCRIPT: &str = concat!(
 "#,
     impulse_host_adapter_resolution_script!(),
     r#"
-  const Terminal = window.Terminal || window.XTerm?.Terminal;
-  const FitAddonCtor = window.FitAddon?.FitAddon || window.FitAddon;
+  // The Dioxus host and the three local xterm assets are installed by
+  // independent asynchronous browser work. Poll the actual product surface as
+  // one bounded readiness condition so the first shell effect cannot
+  // permanently degrade merely because a local script or stylesheet was still
+  // loading.
+  const IMPULSE_TERMINAL_ASSET_POLL_INTERVAL_MS = 25;
+  const IMPULSE_TERMINAL_ASSET_POLL_MAX_ATTEMPTS = 400;
+  const EXPECTED_XTERM_CSS_PATH = "assets/vendor/xterm/xterm.css";
+  const EXPECTED_XTERM_JS_PATH = "assets/vendor/xterm/xterm.js";
+  const EXPECTED_XTERM_FIT_PATH = "assets/vendor/xterm/addon-fit.js";
+
+  const readTerminalAssetState = () => {
+    const Terminal = window.Terminal || window.XTerm?.Terminal;
+    const FitAddonCtor = window.FitAddon?.FitAddon || window.FitAddon;
+    const css = document.querySelector(
+      '[data-impulse-terminal-asset="xterm-css"]'
+    );
+    const terminalScript = document.querySelector(
+      '[data-impulse-terminal-asset="xterm-js"]'
+    );
+    const fitScript = document.querySelector(
+      '[data-impulse-terminal-asset="xterm-fit-addon"]'
+    );
+    const cssPath = css?.getAttribute?.("href") ?? null;
+    const terminalPath = terminalScript?.getAttribute?.("src") ?? null;
+    const fitPath = fitScript?.getAttribute?.("src") ?? null;
+    const exactPaths =
+      cssPath === EXPECTED_XTERM_CSS_PATH &&
+      terminalPath === EXPECTED_XTERM_JS_PATH &&
+      fitPath === EXPECTED_XTERM_FIT_PATH;
+    const resolvedCssHref = css?.href ?? cssPath;
+    const cssLoaded = Array.from(document.styleSheets ?? []).some(
+      (sheet) => sheet?.href === resolvedCssHref
+    );
+    return {
+      Terminal,
+      FitAddonCtor,
+      terminalLoaded: typeof Terminal === "function",
+      fitAddonLoaded: typeof FitAddonCtor === "function",
+      cssLoaded,
+      exactPaths,
+      ready:
+        typeof Terminal === "function" &&
+        typeof FitAddonCtor === "function" &&
+        cssLoaded &&
+        exactPaths,
+    };
+  };
+
+  let terminalAssets = readTerminalAssetState();
+  for (
+    let attempt = 0;
+    attempt < IMPULSE_TERMINAL_ASSET_POLL_MAX_ATTEMPTS && !terminalAssets.ready;
+    attempt += 1
+  ) {
+    await new Promise((resolve) =>
+      setTimeout(resolve, IMPULSE_TERMINAL_ASSET_POLL_INTERVAL_MS)
+    );
+    terminalAssets = readTerminalAssetState();
+  }
+
+  const { Terminal, FitAddonCtor } = terminalAssets;
   const mounts = Array.from(document.querySelectorAll("[data-xterm-mount='true']"));
 
   const interop = window.__impulseTerminalInterop || {
@@ -367,13 +442,30 @@ const TERMINAL_INTEROP_SCRIPT: &str = concat!(
     listenersMounted: false,
   };
   interop.mounted = true;
-  interop.degraded = !invoke || !listen || !Terminal;
+  interop.assets = {
+    terminalLoaded: terminalAssets.terminalLoaded,
+    fitAddonLoaded: terminalAssets.fitAddonLoaded,
+    cssLoaded: terminalAssets.cssLoaded,
+    exactPaths: terminalAssets.exactPaths,
+  };
+  interop.mountErrors = [];
+  interop.degraded =
+    !invoke ||
+    !listen ||
+    !Terminal ||
+    !FitAddonCtor ||
+    !terminalAssets.ready;
   interop.hostKind = hostKind;
   window.__impulseTerminalInterop = interop;
   document.documentElement?.setAttribute("data-impulse-host-kind", hostKind);
+  document.documentElement?.setAttribute(
+    "data-impulse-terminal-assets",
+    terminalAssets.ready ? "ready" : "degraded"
+  );
 
-  if (!invoke || !listen || !Terminal) {
+  if (!invoke || !listen || !Terminal || !FitAddonCtor || !terminalAssets.ready) {
     mounts.forEach((mount) => mount.setAttribute("data-xterm-state", "degraded"));
+    document.documentElement?.setAttribute("data-impulse-terminal-interop", "degraded");
     return "degraded";
   }
 
@@ -397,16 +489,29 @@ const TERMINAL_INTEROP_SCRIPT: &str = concat!(
       return;
     }
 
-    const terminal = new Terminal({
-      convertEol: true,
-      cursorBlink: true,
-      fontFamily: "SFMono-Regular, Menlo, Monaco, monospace",
-      fontSize: 13,
-    });
-    const fitAddon = FitAddonCtor ? new FitAddonCtor() : null;
-    if (fitAddon) terminal.loadAddon(fitAddon);
-    terminal.open(mount);
-    fitAddon?.fit();
+    let terminal;
+    try {
+      terminal = new Terminal({
+        convertEol: true,
+        cursorBlink: true,
+        fontFamily: "SFMono-Regular, Menlo, Monaco, monospace",
+        fontSize: 13,
+      });
+      const fitAddon = new FitAddonCtor();
+      terminal.loadAddon(fitAddon);
+      terminal.open(mount);
+      fitAddon.fit();
+    } catch (error) {
+      try { terminal?.dispose?.(); } catch (_) {}
+      const message = String(error?.message || error || "xterm mount failed").slice(0, 240);
+      interop.degraded = true;
+      interop.mountErrors.push({ agentId, message });
+      mount.dataset.xtermError = message;
+      mount.setAttribute("data-xterm-state", "degraded");
+      document.documentElement?.setAttribute("data-impulse-terminal-interop", "degraded");
+      console.error(`Impulse xterm mount failed for ${agentId}:`, error);
+      return;
+    }
 
     const invokeTerminal = (command, payload) => {
       void invoke(command, payload).catch((error) => {
@@ -431,6 +536,11 @@ const TERMINAL_INTEROP_SCRIPT: &str = concat!(
   };
 
   mounts.forEach(mountAgentTerminal);
+
+  if (interop.degraded) {
+    return "degraded";
+  }
+  document.documentElement?.setAttribute("data-impulse-terminal-interop", "mounted");
 
   if (interop.listenersMounted) {
     return "mounted";

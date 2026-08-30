@@ -38,7 +38,7 @@ use crate::host_commands::{
     TERMINAL_CLOSE_COMMAND, TERMINAL_FOCUS_COMMAND, TERMINAL_OPEN_COMMAND, TERMINAL_RESIZE_COMMAND,
     TERMINAL_WRITE_COMMAND,
 };
-use crate::runtime::{DesktopEvent, DesktopEventSink};
+use crate::runtime::{DesktopEvent, DesktopEventSink, DesktopRuntime};
 
 /// Status the live bridge publishes once it has replaced the manifest-only
 /// stubs. Anything other than [`crate::host_commands::PENDING_HOST_BOOTSTRAP_STATUS`]
@@ -158,15 +158,83 @@ async fn dispatch_command(
 
 /// Dispatch a single `invoke` request, always producing a response addressed to
 /// the same `id` (success or error). Never panics.
+async fn reap_cancelled_acceptance_terminal_open(
+    state: &DesktopShellState,
+    command: &str,
+    acceptance_tagged: bool,
+    cancelled: bool,
+    mut response: HostInvokeResponse,
+) -> HostInvokeResponse {
+    if !acceptance_tagged || !cancelled || command != TERMINAL_OPEN_COMMAND || !response.ok {
+        return response;
+    }
+    let session_id = response
+        .result
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let cleanup_message = match session_id {
+        Some(session_id) => {
+            match close_packaged_acceptance_terminal_on_runtime(
+                state.runtime.as_ref(),
+                session_id.clone(),
+            )
+            .await
+            {
+                Ok(()) => {
+                    crate::packaged_acceptance::record_terminal_cleanup_succeeded(&session_id);
+                    "late terminal open was reaped".to_string()
+                }
+                Err(error) => format!("late terminal cleanup failed: {error}"),
+            }
+        }
+        None => "late terminal open returned no session id".to_string(),
+    };
+    response = HostInvokeResponse::err(
+        response.id.clone(),
+        format!("packaged acceptance was cancelled; {cleanup_message}"),
+    );
+    response
+}
+
 pub async fn dispatch_host_invoke(
     state: &DesktopShellState,
     request: HostInvokeRequest,
 ) -> HostInvokeResponse {
-    let id = request.id;
-    match dispatch_command(state, &request.command, request.payload).await {
+    let HostInvokeRequest {
+        id,
+        command,
+        payload,
+    } = request;
+    let acceptance_guard = match crate::packaged_acceptance::begin_acceptance_invoke(&payload) {
+        Ok(guard) => guard,
+        Err(error) => return HostInvokeResponse::err(id, error),
+    };
+    let acceptance_payload = acceptance_guard.as_ref().map(|_| payload.clone());
+    let acceptance_tagged = acceptance_payload.is_some();
+    let mut response = match dispatch_command(state, &command, payload).await {
         Ok(result) => HostInvokeResponse::ok(id, result),
         Err(error) => HostInvokeResponse::err(id, error),
+    };
+    if let Some(acceptance_payload) = acceptance_payload {
+        crate::packaged_acceptance::record_host_invoke(
+            &command,
+            &acceptance_payload,
+            response.ok,
+            &response.result,
+            response.error.as_deref(),
+        );
     }
+    response = reap_cancelled_acceptance_terminal_open(
+        state,
+        &command,
+        acceptance_tagged,
+        crate::packaged_acceptance::acceptance_is_cancelled(),
+        response,
+    )
+    .await;
+    drop(acceptance_guard);
+    response
 }
 
 async fn dispatch_host_invokes_fifo(
@@ -251,6 +319,23 @@ fn live_host_context() -> Option<LiveHostContext> {
     LIVE_HOST_CONTEXT.get().cloned()
 }
 
+/// Close the real PTY opened by the packaged-acceptance observer without
+/// depending on the webview eval future still being alive. The observer uses
+/// this only on a failed/timed-out run; successful runs must still prove the
+/// normal JS-to-Rust `terminal_close` dispatch in the Rust transcript.
+pub(crate) async fn close_packaged_acceptance_terminal(session_id: String) -> Result<(), String> {
+    let context = live_host_context()
+        .ok_or_else(|| "live host context is unavailable for PTY cleanup".to_string())?;
+    close_packaged_acceptance_terminal_on_runtime(context.state.runtime.as_ref(), session_id).await
+}
+
+pub(crate) async fn close_packaged_acceptance_terminal_on_runtime(
+    runtime: &DesktopRuntime,
+    session_id: String,
+) -> Result<(), String> {
+    host_commands::terminal_close(runtime, crate::bridge::TerminalCloseRequest { session_id }).await
+}
+
 /// The JS transport. It replaces the manifest-only stubs with a real
 /// `invoke`/`listen` pair, then loops on `dioxus.recv()` routing invoke results
 /// to pending promises and host events to registered listeners.
@@ -259,6 +344,12 @@ pub const LIVE_HOST_BRIDGE_SCRIPT: &str = concat!(
 (async () => {
   const pendingInvokes = new Map();
   const listeners = new Map();
+  // Connection health and the aggregate ops snapshot describe current state,
+  // not one-shot effects. Preserve their newest payload so a Dioxus effect
+  // that subscribes after the Rust event queue begins draining still receives
+  // authoritative state. Terminal output/exit intentionally remain non-sticky.
+  const latestStateEvents = new Map();
+  const latestStateEventVersions = new Map();
   let nextId = 0;
   let invokeTail = Promise.resolve();
   const host = {
@@ -284,6 +375,18 @@ pub const LIVE_HOST_BRIDGE_SCRIPT: &str = concat!(
       let set = listeners.get(event);
       if (!set) { set = new Set(); listeners.set(event, set); }
       set.add(handler);
+      if (latestStateEvents.has(event)) {
+        const payload = latestStateEvents.get(event);
+        const replayVersion = latestStateEventVersions.get(event);
+        queueMicrotask(() => {
+          if (!set.has(handler)) return;
+          // A newer recv continuation may already have been queued when this
+          // listener subscribed. Never deliver the captured replay after that
+          // newer state has reached the same listener.
+          if (latestStateEventVersions.get(event) !== replayVersion) return;
+          try { handler({ payload }); } catch (_) {}
+        });
+      }
       return Promise.resolve(() => { set.delete(handler); });
     },
     hostKind: "dioxus",
@@ -316,6 +419,16 @@ pub const LIVE_HOST_BRIDGE_SCRIPT: &str = concat!(
         else { entry.reject(new Error(message.error || "host invoke failed")); }
       }
     } else if (message.kind === "host_event") {
+      if (
+        message.event === "ops_connection_update" ||
+        message.event === "ops_update"
+      ) {
+        latestStateEvents.set(message.event, message.payload);
+        latestStateEventVersions.set(
+          message.event,
+          (latestStateEventVersions.get(message.event) || 0) + 1
+        );
+      }
       const set = listeners.get(message.event);
       if (set) {
         for (const handler of set) {
@@ -370,6 +483,7 @@ pub fn use_live_host_bridge() {
                 event = event_rx.recv() => {
                     match event {
                         Some(event) => {
+                            crate::packaged_acceptance::record_host_event(&event);
                             let _ = eval.send(host_event_envelope(&event));
                         }
                         None => break,
@@ -418,6 +532,7 @@ pub fn use_live_host_bridge() {
 #[component]
 pub fn LiveDesktopApp() -> Element {
     use_live_host_bridge();
+    crate::packaged_acceptance::use_packaged_acceptance();
     rsx! {
         crate::ui::DesktopShell {}
     }
@@ -864,6 +979,64 @@ mod tests {
         assert!(second.is_none(), "receiver must only be claimed once");
     }
 
+    #[tokio::test]
+    async fn cancelled_late_terminal_open_is_reaped_before_dispatch_completion() {
+        let state = test_state();
+        let cwd = tempfile::tempdir().expect("temporary late-open cwd");
+        let opened = host_commands::terminal_open(
+            state.runtime.as_ref(),
+            crate::bridge::TerminalOpenRequest {
+                session_id: Some("cancelled-late-terminal-open".to_string()),
+                command: "/bin/sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "trap '' HUP TERM; while :; do read ignored || :; done".to_string(),
+                ],
+                cwd: Some(cwd.path().to_string_lossy().into_owned()),
+                env: std::collections::HashMap::new(),
+                workspace: None,
+                mcp_tools: Vec::new(),
+                rows: 24,
+                cols: 80,
+            },
+        )
+        .await
+        .expect("open late acceptance PTY");
+        let response = HostInvokeResponse::ok(
+            "late-open".to_string(),
+            serde_json::to_value(&opened).expect("serialize opened terminal"),
+        );
+        let response = reap_cancelled_acceptance_terminal_open(
+            &state,
+            TERMINAL_OPEN_COMMAND,
+            true,
+            true,
+            response,
+        )
+        .await;
+        let session_still_present = state
+            .runtime
+            .snapshot_agents()
+            .iter()
+            .any(|snapshot| snapshot.agent_id == opened.session_id);
+        if session_still_present {
+            let _ = state
+                .runtime
+                .close_agent(crate::bridge::TerminalCloseRequest {
+                    session_id: opened.session_id,
+                });
+        }
+        assert!(!response.ok);
+        assert!(response
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("late terminal open was reaped")));
+        assert!(
+            !session_still_present,
+            "late acceptance PTY survived reaper"
+        );
+    }
+
     #[test]
     fn live_host_bridge_script_declares_transport_contract() {
         let script = live_host_bridge_script();
@@ -875,6 +1048,12 @@ mod tests {
         assert!(script.contains("dioxus.send("));
         assert!(script.contains("let invokeTail = Promise.resolve()"));
         assert!(script.contains("invokeTail = scheduled.then("));
+        assert!(script.contains("const latestStateEvents = new Map()"));
+        assert!(script.contains("const latestStateEventVersions = new Map()"));
+        assert!(script.contains("latestStateEvents.has(event)"));
+        assert!(script.contains("latestStateEventVersions.get(event) !== replayVersion"));
+        assert!(script.contains("latestStateEvents.set(message.event, message.payload)"));
+        assert!(script.contains(r#"message.event === "ops_connection_update""#));
         assert!(script.contains(LIVE_HOST_BRIDGE_STATUS));
         // Must NOT advertise the pending sentinel — it is the live transport.
         assert_ne!(

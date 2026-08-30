@@ -205,6 +205,31 @@ This checkpoint does not close R1. A hosted universal run, packaged live-host ac
 reconciliation, authorized signing, notarization/stapling, and explicit public-release authority
 remain required. The tag-triggered publisher stays removed until those gates exist.
 
+#### 2026-08-30 packaged-host gate implementation checkpoint
+
+The isolated `agent/codex-dioxus-packaged-acceptance-20260830` lane adds a deterministic embedded
+source/payload manifest, closes the complete bundle and mounted-volume root inventories, and wires
+a real mounted-DMG acceptance gate into the active package recipe. Build and verification execute
+from a detached worktree at the exact commit with a stable authorized output root and fresh empty
+private Cargo targets beneath it; final image verification and a post-detach digest match protect
+the DMG bytes across the live check. The opt-in observer is passive: it neither replaces the host
+API nor loads fallback assets, and JavaScript cannot award itself a passing result. Rust validates
+one fresh nonce-bound receipt after real host round trips, public xterm input/resize and
+rendered-buffer evidence, same-stream protocol-v7 identity plus kernel peer PID checks for every
+identity-sensitive packaged-daemon operation, isolated workspace evidence, and a temporary PTY
+lifecycle. The external runner owns process-group cleanup and precise Git-visible, project-local
+`.impulse`, and live-home wardens for completed runs. A macOS controller regression separately
+proves the real PTY shell exits when its harness parent is killed without an opportunity to run
+Rust cleanup code.
+
+Focused post-fix contracts are green (`macos_packaging_contract` 32/32, desktop library 164/164,
+and external packaged-host harness 13 passed with only the real mounted-app case intentionally
+ignored). The complete locked workspace test/check/strict-Clippy gates and independent whole-diff
+review also pass, but this checkpoint records the implemented gate, not a passing candidate. The
+R1 and R6 boxes remain open until the exact reviewed snapshot is committed, rebuilt, and its
+read-only mounted app passes the gate. Even a pass would leave role-aware agent launch, review
+mutation, signing, notarization, installation, and deployment unproven.
+
 ### R2 — Remove resurrection vectors and dead affordances
 
 - [ ] Rewrite the project development skill to route graphical view work to Dioxus.

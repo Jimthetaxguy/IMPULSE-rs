@@ -130,6 +130,10 @@ Unix socket.
   generic producer mutations fail for profiled tasks.
 - **Candidate wire:** protocol v6 adds serde-defaulted `ProjectOpsSnapshot.memory_candidates` only;
   it defines no candidate mutation request.
+- **Daemon identity wire:** protocol v7 adds a typed Ping identity containing protocol version,
+  process id, canonical Impulse root, and an optional domain-separated instance-nonce digest. A
+  desktop that is given an expected identity validates Ping and sends `SubscribeOps` on that same
+  Unix stream before accepting daemon connection state; ordinary desktops may omit the expectation.
 
 ### managed agent turn — `[code]`
 One exclusive, bounded use of the cached `ImpulseAgent`. Concurrent turns fail fast with typed
@@ -167,11 +171,20 @@ policy or persistence authority.
 An exact-source, locked build/test/package run that produces and inspects an ephemeral candidate.
 It may prove bundle structure, target compilation, executable modes, assets, and checksums; it is
 not a retained artifact, authorized signature, notarization, tag, GitHub Release, installation, or
-end-user deployment. The active macOS proof packages the Dioxus host plus `impulse-rs` companion
-and native `ion` sibling, then verifies both the `.app` and its read-only DMG mount. A candidate has
-no Developer ID bundle signature; toolchain-generated ad-hoc Mach-O signatures may still exist.
+end-user deployment. The active macOS proof builds and verifies from a detached worktree at the
+exact commit, with a stable authorized output root and fresh empty private Cargo targets isolated
+from source, canonical/live state, and the mounted app. It packages the Dioxus host plus
+`impulse-rs` companion and native `ion` sibling, embeds a deterministic
+`ReleaseProvenance.v1.tsv` binding source and payload bytes, then verifies both the `.app` and its
+read-only DMG mount, the closed mounted-volume root, and the unchanged post-detach DMG digest. A
+fresh nonce-bound `impulse.packaged-host/v1` stderr receipt is valid only after Rust confirms the
+mounted app's real Dioxus bridge, public xterm input/resize and rendered-buffer path,
+same-stream typed packaged-daemon identity plus kernel peer PID for each identity-sensitive
+operation, isolated workspace, and temporary PTY lifecycle. A candidate has no Developer ID
+bundle signature; toolchain-generated ad-hoc Mach-O signatures may still exist.
 - **Source of truth:** `.github/workflows/{ci,release}.yml`,
-  `impulse-rs/scripts/{build-macos-app,verify-macos-app}.sh`, and the packaging contract tests.
+  `impulse-rs/scripts/{build-macos-app,verify-macos-app,write-macos-provenance,verify-packaged-host}.sh`,
+  `impulse-desktop/src/packaged_acceptance.rs`, and the packaging/live-host contract tests.
 
 ### tool capability — `[code]`
 A deny-by-default permission required by a typed tool. Tool availability varies by runtime bridge;

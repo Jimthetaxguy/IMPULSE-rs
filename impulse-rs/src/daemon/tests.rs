@@ -14,8 +14,8 @@ mod tests {
     // super::super = daemon module (tests.rs is daemon::tests, inner mod is daemon::tests::tests)
     use super::super::handlers::{
         handle_delegation_request, handle_governed_task_request, handle_guard_request,
-        handle_ops_request, handle_plugin_request, handle_session_request, handle_status,
-        handle_steward_request,
+        handle_ops_request, handle_ping, handle_plugin_request, handle_session_request,
+        handle_status, handle_steward_request,
     };
 
     /// Test DaemonRequest serialization/deserialization
@@ -773,13 +773,39 @@ mod tests {
     }
 
     #[test]
-    fn test_ping_response_includes_protocol_version() {
-        let ping_response =
-            serde_json::json!({"pong": true, "protocol_version": crate::daemon::PROTOCOL_VERSION});
+    fn test_ping_response_binds_typed_identity_without_raw_nonce() {
+        use super::super::Daemon;
+
+        let raw_nonce = "acceptance-secret-never-on-wire";
+        let (tmp, state) = test_state();
+        let daemon = Daemon::new_with_test_instance_nonce(state, Some(raw_nonce));
+        let identity = daemon.instance_identity();
+
+        assert_eq!(identity.protocol_version, crate::daemon::PROTOCOL_VERSION);
+        assert_eq!(identity.pid, std::process::id());
         assert_eq!(
-            ping_response["protocol_version"].as_u64().unwrap(),
-            crate::daemon::PROTOCOL_VERSION as u64
+            identity.impulse_root,
+            tmp.path()
+                .canonicalize()
+                .expect("canonical test root")
+                .to_string_lossy()
         );
+        assert_eq!(
+            identity.instance_nonce_sha256.as_deref(),
+            Some(impulse_ops::daemon_instance_nonce_sha256(raw_nonce).as_str())
+        );
+
+        let response = handle_ping(identity);
+        let serialized = serde_json::to_string(&response).expect("serialize ping response");
+        assert!(!serialized.contains(raw_nonce));
+        let DaemonResponse::Ok { result } = response else {
+            panic!("expected ping response");
+        };
+        let ping: impulse_ops::DaemonPingResponse =
+            serde_json::from_value(result).expect("parse typed ping response");
+        assert!(ping.pong);
+        assert_eq!(ping.protocol_version, crate::daemon::PROTOCOL_VERSION);
+        assert_eq!(ping.daemon_instance, identity.clone());
     }
 
     #[test]

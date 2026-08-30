@@ -680,6 +680,15 @@ global.document = {{
 }};
 global.dioxus = {{ send: (message) => sent.push(message) }};
 
+// Fast-forward only the resolver's 25ms polling sleeps. The final observation
+// still uses the real timer, so this fail-closed fixture exercises all 400
+// attempts without making the contract suite wait ten seconds.
+const realSetTimeout = global.setTimeout;
+global.setTimeout = (callback, delay, ...args) => {{
+  if (delay === 25) {{ queueMicrotask(() => callback(...args)); return 0; }}
+  return realSetTimeout(callback, delay, ...args);
+}};
+
 const pending = (operation) =>
   Promise.reject(new Error(`Dioxus Desktop host adapter pending: ${{operation}}`));
 const pendingInvoke = (command) => {{ invoked.push({{ command, pending: true }}); return pending(`invoke:${{command}}`); }};
@@ -698,7 +707,7 @@ const bridgePromise = eval(bridgeScript);
 if (bridgePromise && typeof bridgePromise.catch === "function") {{
   bridgePromise.catch(() => {{}});
 }}
-setTimeout(() => {{
+realSetTimeout(() => {{
   console.log(JSON.stringify({{ attrs, sent, invoked, bridge: window.__impulseOpsBridge }}));
   process.exit(0);
 }}, 400);
@@ -732,7 +741,7 @@ setTimeout(() => {{
 /// `window.__IMPULSE_DESKTOP_HOST` from independent, unordered
 /// `document::eval` calls. This drives the real bridge script against a host
 /// that starts as the manifest-only pending stub and only becomes the live
-/// bridge ~30ms later (well inside the resolver's bounded poll budget),
+/// bridge ~1.25s later (beyond the former 250ms retry budget),
 /// simulating the live bridge installing *after* this script's first tick.
 /// Before the bounded-retry fix, the one-shot resolver would have
 /// permanently locked onto the pending stub and never recovered.
@@ -774,9 +783,8 @@ window.__IMPULSE_DESKTOP_HOST = {{
 }};
 
 // Simulate `use_live_host_bridge()`'s independent `document::eval` call
-// installing the real transport a beat *after* this script starts, well
-// inside the resolver's bounded poll window but strictly after its first
-// (necessarily-not-ready) tick.
+// installing the real transport after the former 250ms ceiling but inside the
+// shared cold-load budget.
 setTimeout(() => {{
   window.__IMPULSE_DESKTOP_HOST = {{
     invoke: async (command) => {{ invoked.push({{ command }}); return command === "agent_snapshot" ? [] : null; }},
@@ -784,7 +792,7 @@ setTimeout(() => {{
     hostKind: "dioxus",
     status: liveStatus,
   }};
-}}, 30);
+}}, 1250);
 
 const bridgePromise = eval(bridgeScript);
 if (bridgePromise && typeof bridgePromise.catch === "function") {{
@@ -796,7 +804,7 @@ if (bridgePromise && typeof bridgePromise.catch === "function") {{
 setTimeout(() => {{
   console.log(JSON.stringify({{ attrs, sent, invoked, bridge: window.__impulseOpsBridge }}));
   process.exit(0);
-}}, 400);
+}}, 1600);
 "#,
         bridge_script =
             serde_json::to_string(desktop_event_bridge_script()).expect("serialize bridge script"),
@@ -863,10 +871,29 @@ const mounts = [{{
   attrs: {{}},
   setAttribute(name, value) {{ this.attrs[name] = value; }},
 }}];
+const assetElements = {{
+  css: {{
+    href: "assets/vendor/xterm/xterm.css",
+    getAttribute(name) {{ return name === "href" ? this.href : null; }},
+  }},
+  terminal: {{
+    getAttribute(name) {{ return name === "src" ? "assets/vendor/xterm/xterm.js" : null; }},
+  }},
+  fit: {{
+    getAttribute(name) {{ return name === "src" ? "assets/vendor/xterm/addon-fit.js" : null; }},
+  }},
+}};
 global.document = {{
+  styleSheets: [],
   querySelectorAll(selector) {{
     assert.strictEqual(selector, "[data-xterm-mount='true']");
     return mounts;
+  }},
+  querySelector(selector) {{
+    if (selector === '[data-impulse-terminal-asset="xterm-css"]') return assetElements.css;
+    if (selector === '[data-impulse-terminal-asset="xterm-js"]') return assetElements.terminal;
+    if (selector === '[data-impulse-terminal-asset="xterm-fit-addon"]') return assetElements.fit;
+    return null;
   }},
 }};
 
@@ -893,8 +920,14 @@ class Terminal {{
   onResize() {{}}
   write(value) {{ this.writes.push(value); }}
 }}
-window.Terminal = Terminal;
-window.FitAddon = class {{ fit() {{}} }};
+// Simulate a cold local WebView load that completes after the former one-second
+// deadline. The real product resolver must keep waiting without the acceptance
+// observer repairing product state.
+setTimeout(() => {{
+  window.Terminal = Terminal;
+  window.FitAddon = class {{ fit() {{}} }};
+  document.styleSheets.push({{ href: assetElements.css.href }});
+}}, 1250);
 
 // Simulate the live bridge (host_bridge.rs's `use_live_host_bridge()`)
 // replacing the pending stub partway through this script's own resolution
@@ -951,6 +984,8 @@ fn test_impulse_host_adapter_resolution_script_declares_bounded_retry_contract()
     ] {
         assert!(script.contains("IMPULSE_HOST_ADAPTER_POLL_INTERVAL_MS"));
         assert!(script.contains("IMPULSE_HOST_ADAPTER_POLL_MAX_ATTEMPTS"));
+        assert!(script.contains("IMPULSE_HOST_ADAPTER_POLL_INTERVAL_MS = 25"));
+        assert!(script.contains("IMPULSE_HOST_ADAPTER_POLL_MAX_ATTEMPTS = 400"));
         assert!(script.contains("impulseHostAdapterCandidateReady"));
         assert!(script.contains("const resolveImpulseHostAdapter = async ()"));
         assert!(script.contains("await resolveImpulseHostAdapter()"));
@@ -1067,6 +1102,8 @@ fn test_desktop_event_bridge_script_subscribes_to_live_host_events() {
     assert!(script.contains("dioxus.send"));
     assert!(script.contains(r#"listen("ops_update""#));
     assert!(script.contains(r#"listen("agent_runtime_update""#));
+    assert!(script.contains("window.__impulseOpsBridge.daemonConnected"));
+    assert!(script.contains("data-impulse-daemon-connected"));
     assert!(script.contains(r#"invoke("agent_snapshot")"#));
     assert!(script.contains(r#"invoke("list_workspaces")"#));
     assert!(script.contains(r#"invoke("mcp_descriptors")"#));
@@ -1297,11 +1334,12 @@ if (bridgePromise && typeof bridgePromise.catch === "function") {{
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 (async () => {{
   await delay(25);
-  if (!listeners.ops_update || !listeners.agent_runtime_update) {{
+  if (!listeners.ops_update || !listeners.agent_runtime_update || !listeners.ops_connection_update) {{
     throw new Error("bridge did not subscribe to expected host events");
   }}
   listeners.ops_update({{ payload: opsSnapshot }});
   listeners.agent_runtime_update({{ payload: runtimeSnapshot }});
+  listeners.ops_connection_update({{ payload: {{ connected: true, error: null }} }});
   await window.__impulseOpsBridge.invokeMcp({{
     tool: "impulse.agent_spawn",
     arguments: runtimeSnapshot,
@@ -1313,7 +1351,7 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
     decision: "skip",
     target_agent_id: null
   }});
-  console.log(JSON.stringify({{ attrs, invoked, sent }}));
+  console.log(JSON.stringify({{ attrs, invoked, sent, bridge: window.__impulseOpsBridge }}));
   process.exit(0);
 }})().catch((error) => {{
   console.error(error && error.stack ? error.stack : String(error));
@@ -1354,6 +1392,14 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
     assert_eq!(
         smoke["attrs"]["data-impulse-ops-bridge"],
         serde_json::Value::String("mounted".to_string())
+    );
+    assert_eq!(
+        smoke["attrs"]["data-impulse-daemon-connected"],
+        serde_json::Value::String("true".to_string())
+    );
+    assert_eq!(
+        smoke["bridge"]["daemonConnected"],
+        serde_json::Value::Bool(true)
     );
     let invoked = smoke["invoked"]
         .as_array()
@@ -2691,12 +2737,31 @@ const makeMount = (agentId) => ({{
   attrs: {{}},
   setAttribute(name, value) {{ this.attrs[name] = value; }},
 }});
+const assetElements = {{
+  css: {{
+    href: "assets/vendor/xterm/xterm.css",
+    getAttribute(name) {{ return name === "href" ? this.href : null; }},
+  }},
+  terminal: {{
+    getAttribute(name) {{ return name === "src" ? "assets/vendor/xterm/xterm.js" : null; }},
+  }},
+  fit: {{
+    getAttribute(name) {{ return name === "src" ? "assets/vendor/xterm/addon-fit.js" : null; }},
+  }},
+}};
 
 let mounts = [makeMount("codex")];
 global.document = {{
+  styleSheets: [{{ href: assetElements.css.href }}],
   querySelectorAll(selector) {{
     assert.strictEqual(selector, "[data-xterm-mount='true']");
     return mounts;
+  }},
+  querySelector(selector) {{
+    if (selector === '[data-impulse-terminal-asset="xterm-css"]') return assetElements.css;
+    if (selector === '[data-impulse-terminal-asset="xterm-js"]') return assetElements.terminal;
+    if (selector === '[data-impulse-terminal-asset="xterm-fit-addon"]') return assetElements.fit;
+    return null;
   }},
 }};
 global.window = {{
@@ -3141,4 +3206,168 @@ fn test_footer_stream_health_reads_down_when_transport_degraded() {
     assert!(html.contains("0 cached artifacts"));
     assert!(html.contains("0 cached interventions"));
     assert!(html.contains("supervisor_local_action · down"));
+}
+
+#[test]
+fn test_terminal_interop_waits_for_real_host_and_all_packaged_xterm_assets() {
+    let script = impulse_desktop::ui::terminal_interop_script();
+
+    assert!(script.contains("IMPULSE_TERMINAL_ASSET_POLL_MAX_ATTEMPTS"));
+    assert!(script.contains("IMPULSE_TERMINAL_ASSET_POLL_INTERVAL_MS = 25"));
+    assert!(script.contains("IMPULSE_TERMINAL_ASSET_POLL_MAX_ATTEMPTS = 400"));
+    assert!(script.contains("document.styleSheets"));
+    assert!(script.contains("FitAddonCtor"));
+    assert!(script.contains("!FitAddonCtor"));
+    assert!(script.contains("assets/vendor/xterm/xterm.css"));
+    assert!(script.contains("assets/vendor/xterm/xterm.js"));
+    assert!(script.contains("assets/vendor/xterm/addon-fit.js"));
+    assert!(script.contains("data-impulse-terminal-assets"));
+    assert!(script.contains("data-impulse-terminal-interop"));
+    assert!(script.contains("interop.mountErrors"));
+    assert!(script.contains("xterm mount failed"));
+}
+
+#[test]
+fn test_terminal_interop_mount_exception_fails_closed() {
+    if skip_without_node() {
+        return;
+    }
+
+    let smoke = format!(
+        r#"
+const script = {script};
+const rootAttrs = {{}};
+const mount = {{
+  dataset: {{ agentId: "packaged-session" }},
+  attrs: {{}},
+  setAttribute(name, value) {{ this.attrs[name] = value; }},
+  getAttribute(name) {{ return this.attrs[name] ?? null; }},
+}};
+const assets = {{
+  css: {{
+    href: "assets/vendor/xterm/xterm.css",
+    getAttribute(name) {{ return name === "href" ? this.href : null; }},
+  }},
+  terminal: {{
+    getAttribute(name) {{ return name === "src" ? "assets/vendor/xterm/xterm.js" : null; }},
+  }},
+  fit: {{
+    getAttribute(name) {{ return name === "src" ? "assets/vendor/xterm/addon-fit.js" : null; }},
+  }},
+}};
+global.document = {{
+  styleSheets: [{{ href: assets.css.href }}],
+  documentElement: {{ setAttribute(name, value) {{ rootAttrs[name] = value; }} }},
+  querySelectorAll(selector) {{
+    if (selector === "[data-xterm-mount='true']") return [mount];
+    return [];
+  }},
+  querySelector(selector) {{
+    if (selector === '[data-impulse-terminal-asset="xterm-css"]') return assets.css;
+    if (selector === '[data-impulse-terminal-asset="xterm-js"]') return assets.terminal;
+    if (selector === '[data-impulse-terminal-asset="xterm-fit-addon"]') return assets.fit;
+    return null;
+  }},
+}};
+global.window = {{
+  __IMPULSE_DESKTOP_HOST: {{
+    invoke: async () => null,
+    listen: async () => () => {{}},
+    hostKind: "dioxus",
+    status: "dioxus-eval-bridge-ready",
+  }},
+  Terminal: class {{ constructor() {{ throw new Error("constructor sentinel"); }} }},
+  FitAddon: class {{ fit() {{}} }},
+}};
+
+Promise.resolve(eval(script)).then((result) => {{
+  console.log(JSON.stringify({{
+    result,
+    rootAttrs,
+    mount,
+    interop: window.__impulseTerminalInterop,
+  }}));
+}}).catch((error) => {{
+  console.error(error && error.stack ? error.stack : String(error));
+  process.exit(1);
+}});
+"#,
+        script = serde_json::to_string(impulse_desktop::ui::terminal_interop_script())
+            .expect("serialize terminal interop script"),
+    );
+    let tempdir = tempfile::tempdir().expect("temporary xterm failure smoke root");
+    let smoke_path = tempdir.path().join("xterm-mount-failure-smoke.js");
+    std::fs::write(&smoke_path, smoke).expect("write xterm failure smoke");
+    let output = Command::new("node")
+        .arg(&smoke_path)
+        .output()
+        .expect("run xterm failure smoke");
+    assert!(
+        output.status.success(),
+        "xterm failure smoke failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let smoke: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse xterm failure smoke");
+    assert_eq!(smoke["result"], "degraded");
+    assert_eq!(smoke["interop"]["degraded"], true);
+    assert_eq!(
+        smoke["interop"]["mountErrors"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(smoke["mount"]["attrs"]["data-xterm-state"], "degraded");
+    assert_eq!(
+        smoke["rootAttrs"]["data-impulse-terminal-interop"],
+        "degraded"
+    );
+}
+
+#[test]
+fn test_packaged_acceptance_requires_rust_dispatch_and_event_transcript() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let observer = std::fs::read_to_string(manifest_dir.join("src/packaged_acceptance.rs"))
+        .expect("read packaged acceptance source");
+    let host_bridge = std::fs::read_to_string(manifest_dir.join("src/host_bridge.rs"))
+        .expect("read live host bridge source");
+
+    assert!(observer.contains("acceptance_nonce"));
+    assert!(observer.contains("rust_host_transcript_validated"));
+    assert!(observer.contains("IMPULSE_PACKAGED_PTY_RESULT_%s%s"));
+    assert!(host_bridge.contains("record_host_invoke"));
+    assert!(host_bridge.contains("record_host_event"));
+}
+
+#[test]
+fn test_packaged_acceptance_observer_is_passive_product_bridge_evidence() {
+    let source = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/packaged_acceptance.rs"),
+    )
+    .expect("packaged acceptance module must exist");
+
+    assert!(source.contains("IMPULSE_PACKAGED_ACCEPTANCE_NONCE"));
+    assert!(source.contains("IMPULSE_PACKAGED_ACCEPTANCE_ROOT"));
+    assert!(source.contains("IMPULSE_PACKAGED_PROVENANCE_SHA256"));
+    for command in [
+        "agent_snapshot",
+        "agent_platforms",
+        "list_workspaces",
+        "mcp_descriptors",
+        "review_queue",
+        "register_workspace",
+        "terminal_open",
+        "terminal_write",
+        "terminal_resize",
+        "terminal_focus",
+        "terminal_close",
+    ] {
+        assert!(source.contains(command), "observer missing {command}");
+    }
+    assert!(source.contains("ops_connection_update"));
+    assert!(source.contains("unknown host command"));
+    assert!(source.contains("IMPULSE_PACKAGED_HOST_RECEIPT "));
+    assert!(!source.contains("window.__IMPULSE_DESKTOP_HOST ="));
+    assert!(!source.contains("window.__IMPULSE_TEST_HOST_API ="));
+    assert!(!source.contains("window.__TAURI__ ="));
+    assert!(!source.contains("std::fs::write"));
 }

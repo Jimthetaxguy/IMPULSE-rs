@@ -40,9 +40,10 @@ impulse-ops = { path = "../impulse-ops" }
 impulse-term = { path = "../impulse-term", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
-tokio = { version = "1", default-features = false, features = ["sync", "macros", "rt"] }
+tokio = { version = "1", default-features = false, features = ["sync", "macros", "rt", "time"] }
 tauri = { version = "2.11.2", optional = true, default-features = false }
 
 [target.'cfg(unix)'.dependencies]

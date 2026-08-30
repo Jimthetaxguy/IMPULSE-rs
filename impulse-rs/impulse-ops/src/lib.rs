@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 pub mod agent_registry;
 pub mod governed_task;
@@ -11,7 +12,39 @@ pub mod memory_candidate;
 pub mod role_assignment;
 
 /// Shared daemon protocol version for GUI/operator workbench compatibility.
-pub const DAEMON_PROTOCOL_VERSION: u32 = 6;
+pub const DAEMON_PROTOCOL_VERSION: u32 = 7;
+
+/// Opt-in launch nonce captured by the daemon once at startup.
+///
+/// The raw value is never returned on the wire. Daemon identity responses carry
+/// only a domain-separated SHA-256 digest so a release harness can bind a
+/// desktop connection to the daemon process it launched.
+pub const DAEMON_INSTANCE_NONCE_ENV: &str = "IMPULSE_DAEMON_INSTANCE_NONCE";
+pub const DAEMON_INSTANCE_NONCE_DIGEST_DOMAIN: &[u8] = b"impulse.daemon-instance/v1\0";
+
+/// Digest a launch nonce without exposing the raw value on the daemon wire.
+pub fn daemon_instance_nonce_sha256(nonce: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(DAEMON_INSTANCE_NONCE_DIGEST_DOMAIN);
+    hasher.update(nonce.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonInstanceIdentity {
+    pub protocol_version: u32,
+    pub pid: u32,
+    pub impulse_root: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_nonce_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonPingResponse {
+    pub pong: bool,
+    pub protocol_version: u32,
+    pub daemon_instance: DaemonInstanceIdentity,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpsError {
@@ -942,6 +975,14 @@ pub fn file_modified_to_rfc3339(path: &Path) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn daemon_instance_nonce_digest_is_domain_separated_sha256() {
+        assert_eq!(
+            daemon_instance_nonce_sha256("nonce-value"),
+            "10b87b17840750f863837f2e0ea4797777cfcc6457d5774719ed19d46fb9d24c"
+        );
+    }
 
     #[test]
     fn test_sanitize_id_collapses_noise() {

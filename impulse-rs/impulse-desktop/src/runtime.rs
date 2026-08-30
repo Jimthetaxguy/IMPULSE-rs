@@ -302,6 +302,9 @@ pub enum DesktopEvent {
         #[serde(default)]
         error: Option<String>,
     },
+    DaemonIdentityVerified {
+        identity: impulse_ops::DaemonInstanceIdentity,
+    },
     SupervisorLocalAction {
         action: LocalSupervisorAction,
     },
@@ -315,6 +318,7 @@ impl DesktopEvent {
         "ops_update",
         "ops_connection_update",
         "supervisor_local_action",
+        "daemon_identity_verified",
     ];
 
     pub fn name(&self) -> &'static str {
@@ -325,6 +329,7 @@ impl DesktopEvent {
             Self::OpsUpdate { .. } => Self::HOST_EVENT_NAMES[3],
             Self::OpsConnectionUpdate { .. } => Self::HOST_EVENT_NAMES[4],
             Self::SupervisorLocalAction { .. } => Self::HOST_EVENT_NAMES[5],
+            Self::DaemonIdentityVerified { .. } => Self::HOST_EVENT_NAMES[6],
         }
     }
 }
@@ -3658,6 +3663,15 @@ mod tests {
             error: Some("daemon unavailable".to_string()),
         };
         assert_eq!(ops_connection.name(), "ops_connection_update");
+        let identity = DesktopEvent::DaemonIdentityVerified {
+            identity: impulse_ops::DaemonInstanceIdentity {
+                protocol_version: impulse_ops::DAEMON_PROTOCOL_VERSION,
+                pid: 4242,
+                impulse_root: "/tmp/project".to_string(),
+                instance_nonce_sha256: Some("a".repeat(64)),
+            },
+        };
+        assert_eq!(identity.name(), "daemon_identity_verified");
         // Every advertised host event name is non-empty and unique.
         let names = DesktopEvent::HOST_EVENT_NAMES;
         let mut deduped = names.to_vec();

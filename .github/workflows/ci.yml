@@ -87,5 +87,5 @@ jobs:
         run: cargo test -p impulse-desktop --test macos_packaging_contract --locked
       - name: Build and inspect native developer-preview DMG
         env:
-          CARGO_TARGET_DIR: target/ci-package
+          CARGO_TARGET_DIR: ${{ runner.temp }}/impulse-ci-package
         run: bash scripts/build-macos-app.sh --dmg

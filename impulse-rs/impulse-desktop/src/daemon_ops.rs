@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use impulse_ops::{AgentRuntime, ContextHealthSummary, MachineTarget, TerminalOpsReport};
+use impulse_ops::{
+    AgentRuntime, ContextHealthSummary, DaemonInstanceIdentity, MachineTarget, TerminalOpsReport,
+};
 
 use crate::runtime::{
     AgentRuntimeSnapshot, DesktopEvent, DesktopEventSink, GovernedRoutingMetadata,
@@ -34,6 +36,10 @@ pub struct DesktopDaemonOpsConfig {
     pub relative_cwd_base: PathBuf,
     pub source_id: String,
     pub heartbeat_interval: Duration,
+    /// Optional exact daemon identity required by packaged/live acceptance.
+    /// Normal desktop operation accepts the typed identity returned by any
+    /// protocol-compatible daemon at the configured socket.
+    pub expected_daemon_identity: Option<DaemonInstanceIdentity>,
 }
 
 impl DesktopDaemonOpsConfig {
@@ -48,6 +54,7 @@ impl DesktopDaemonOpsConfig {
             relative_cwd_base,
             source_id: format!("desktop-{}", uuid::Uuid::new_v4()),
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+            expected_daemon_identity: None,
         }
     }
 
@@ -110,6 +117,11 @@ impl DesktopDaemonOpsConfig {
 
     pub fn with_relative_cwd_base(mut self, base: PathBuf) -> Self {
         self.relative_cwd_base = base;
+        self
+    }
+
+    pub fn with_expected_daemon_identity(mut self, identity: DaemonInstanceIdentity) -> Self {
+        self.expected_daemon_identity = Some(identity);
         self
     }
 }
@@ -384,7 +396,10 @@ mod unix {
     use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
     use std::thread::{self, JoinHandle};
 
-    use impulse_ops::{OpsSubscription, WorkbenchDaemonRequest, WorkbenchDaemonResponse};
+    use impulse_ops::{
+        DaemonPingResponse, OpsSubscription, WorkbenchDaemonRequest, WorkbenchDaemonResponse,
+        DAEMON_PROTOCOL_VERSION,
+    };
 
     use super::*;
 
@@ -397,6 +412,76 @@ mod unix {
     const ACKNOWLEDGED_REQUEST_ATTEMPTS: usize = 3;
     const GOVERNED_LIFECYCLE_OUTBOX_SCHEMA: u32 = 1;
     const MAX_GOVERNED_LIFECYCLE_OUTBOX_ENTRIES: usize = 1_024;
+
+    #[cfg(target_os = "macos")]
+    fn kernel_peer_pid(stream: &UnixStream) -> Result<u32, String> {
+        let mut peer_pid: libc::pid_t = 0;
+        let mut length = libc::socklen_t::try_from(std::mem::size_of_val(&peer_pid))
+            .map_err(|_| "kernel peer PID size did not fit socklen_t".to_string())?;
+        // SAFETY: `stream` owns a live connected descriptor; `peer_pid` and
+        // `length` point to writable storage of the exact sizes passed to the
+        // kernel, and both remain alive for the duration of `getsockopt`.
+        let result = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERPID,
+                (&mut peer_pid as *mut libc::pid_t).cast::<libc::c_void>(),
+                &mut length,
+            )
+        };
+        if result != 0 {
+            return Err(format!(
+                "read daemon kernel peer PID with LOCAL_PEERPID: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if usize::try_from(length).ok() != Some(std::mem::size_of_val(&peer_pid)) {
+            return Err("daemon kernel peer PID returned an unexpected size".to_string());
+        }
+        u32::try_from(peer_pid)
+            .ok()
+            .filter(|pid| *pid != 0)
+            .ok_or_else(|| "daemon kernel peer PID must be positive".to_string())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn kernel_peer_pid(stream: &UnixStream) -> Result<u32, String> {
+        // SAFETY: all-zero `ucred` is a valid output buffer for getsockopt and
+        // is not inspected unless the syscall succeeds with the exact size.
+        let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut length = libc::socklen_t::try_from(std::mem::size_of_val(&credentials))
+            .map_err(|_| "kernel peer credentials size did not fit socklen_t".to_string())?;
+        // SAFETY: `stream` owns a live connected descriptor; `credentials`
+        // and `length` are writable buffers that remain valid for this call.
+        let result = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut credentials as *mut libc::ucred).cast::<libc::c_void>(),
+                &mut length,
+            )
+        };
+        if result != 0 {
+            return Err(format!(
+                "read daemon kernel peer PID with SO_PEERCRED: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if usize::try_from(length).ok() != Some(std::mem::size_of_val(&credentials)) {
+            return Err("daemon kernel peer credentials returned an unexpected size".to_string());
+        }
+        u32::try_from(credentials.pid)
+            .ok()
+            .filter(|pid| *pid != 0)
+            .ok_or_else(|| "daemon kernel peer PID must be positive".to_string())
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    fn kernel_peer_pid(_stream: &UnixStream) -> Result<u32, String> {
+        Err("daemon kernel peer PID verification is unsupported on this platform".to_string())
+    }
 
     fn is_executable_file(path: &Path) -> bool {
         std::fs::metadata(path)
@@ -549,9 +634,15 @@ mod unix {
         }
     }
 
+    #[derive(Debug, Clone)]
+    struct VerifiedOpsSubscription {
+        subscription: OpsSubscription,
+        daemon_identity: DaemonInstanceIdentity,
+    }
+
     trait DaemonOpsTransport: Send {
         fn publish(&mut self, report: &TerminalOpsReport) -> Result<(), String>;
-        fn subscribe(&mut self, since_seq: Option<u64>) -> Result<OpsSubscription, String>;
+        fn subscribe(&mut self, since_seq: Option<u64>) -> Result<VerifiedOpsSubscription, String>;
         fn drain_governed_lifecycle_outbox(&mut self) -> Result<(), String> {
             Ok(())
         }
@@ -564,6 +655,7 @@ mod unix {
         lifecycle_outbox_lock: Arc<Mutex<()>>,
         io_timeout: Duration,
         governed_registration_read_timeout: Duration,
+        expected_daemon_identity: Option<DaemonInstanceIdentity>,
     }
 
     impl UnixDaemonOpsClient {
@@ -574,6 +666,7 @@ mod unix {
                 lifecycle_outbox_lock: Arc::new(Mutex::new(())),
                 io_timeout: IO_TIMEOUT,
                 governed_registration_read_timeout: GOVERNED_REGISTRATION_READ_TIMEOUT,
+                expected_daemon_identity: None,
             }
         }
 
@@ -593,12 +686,28 @@ mod unix {
             self
         }
 
+        fn with_expected_daemon_identity(
+            mut self,
+            identity: Option<DaemonInstanceIdentity>,
+        ) -> Self {
+            self.expected_daemon_identity = identity;
+            self
+        }
+
         fn send_with_read_timeout(
             &self,
             request: &WorkbenchDaemonRequest,
             read_timeout: Duration,
         ) -> Result<WorkbenchDaemonResponse, String> {
-            let mut stream = UnixStream::connect(&self.socket_path).map_err(|error| {
+            let mut stream = self.connect_with_read_timeout(read_timeout)?;
+            if self.expected_daemon_identity.is_some() {
+                self.verify_connected_stream_identity(&mut stream)?;
+            }
+            self.send_on_stream(&mut stream, request)
+        }
+
+        fn connect_with_read_timeout(&self, read_timeout: Duration) -> Result<UnixStream, String> {
+            let stream = UnixStream::connect(&self.socket_path).map_err(|error| {
                 format!(
                     "connect to daemon at {}: {error}",
                     self.socket_path.display()
@@ -610,7 +719,14 @@ mod unix {
             stream
                 .set_write_timeout(Some(self.io_timeout))
                 .map_err(|error| format!("set daemon write timeout: {error}"))?;
+            Ok(stream)
+        }
 
+        fn send_on_stream(
+            &self,
+            stream: &mut UnixStream,
+            request: &WorkbenchDaemonRequest,
+        ) -> Result<WorkbenchDaemonResponse, String> {
             let encoded = serde_json::to_vec(request)
                 .map_err(|error| format!("serialize daemon request: {error}"))?;
             stream
@@ -620,7 +736,7 @@ mod unix {
                 .map_err(|error| format!("write daemon request: {error}"))?;
 
             let mut line = String::new();
-            let bytes = BufReader::new(stream)
+            let bytes = BufReader::new(&mut *stream)
                 .read_line(&mut line)
                 .map_err(|error| format!("read daemon response: {error}"))?;
             if bytes == 0 {
@@ -936,6 +1052,60 @@ mod unix {
             Ok(())
         }
 
+        fn parse_and_validate_ping(
+            &self,
+            response: WorkbenchDaemonResponse,
+        ) -> Result<DaemonInstanceIdentity, String> {
+            let result = Self::ok_result(response)?;
+            let ping: DaemonPingResponse = serde_json::from_value(result)
+                .map_err(|error| format!("parse daemon identity ping: {error}"))?;
+            if !ping.pong {
+                return Err("daemon identity ping did not acknowledge pong".to_string());
+            }
+            if ping.protocol_version != ping.daemon_instance.protocol_version {
+                return Err(
+                    "daemon identity ping carried conflicting protocol versions".to_string()
+                );
+            }
+            validate_daemon_identity(
+                &ping.daemon_instance,
+                self.expected_daemon_identity.as_ref(),
+            )?;
+            Ok(ping.daemon_instance)
+        }
+
+        fn verify_connected_stream_identity(
+            &self,
+            stream: &mut UnixStream,
+        ) -> Result<DaemonInstanceIdentity, String> {
+            // Read the credential from this exact stream, but retain it until
+            // after the typed Ping so a copied protocol identity is explicitly
+            // rejected before any protected request is sent.
+            let kernel_pid = self
+                .expected_daemon_identity
+                .as_ref()
+                .map(|_| kernel_peer_pid(stream))
+                .transpose()?;
+            let ping = self.send_on_stream(stream, &WorkbenchDaemonRequest::Ping)?;
+            let daemon_identity = self.parse_and_validate_ping(ping)?;
+            if let (Some(expected), Some(kernel_pid)) =
+                (self.expected_daemon_identity.as_ref(), kernel_pid)
+            {
+                if kernel_pid != expected.pid {
+                    return Err(format!(
+                        "daemon kernel peer PID mismatch: expected {}, observed {kernel_pid}",
+                        expected.pid
+                    ));
+                }
+                if kernel_pid != daemon_identity.pid {
+                    return Err(
+                        "daemon kernel peer PID did not match the typed Ping identity".to_string(),
+                    );
+                }
+            }
+            Ok(daemon_identity)
+        }
+
         fn ok_result(response: WorkbenchDaemonResponse) -> Result<serde_json::Value, String> {
             match response {
                 WorkbenchDaemonResponse::Ok { result } => Ok(result),
@@ -958,6 +1128,53 @@ mod unix {
         }
     }
 
+    fn validate_daemon_identity(
+        observed: &DaemonInstanceIdentity,
+        expected: Option<&DaemonInstanceIdentity>,
+    ) -> Result<(), String> {
+        if observed.protocol_version != DAEMON_PROTOCOL_VERSION {
+            return Err(format!(
+                "daemon identity protocol mismatch: expected {DAEMON_PROTOCOL_VERSION}, observed {}",
+                observed.protocol_version
+            ));
+        }
+        if observed.pid == 0 {
+            return Err("daemon identity PID must be non-zero".to_string());
+        }
+        if observed.impulse_root.trim().is_empty()
+            || !Path::new(&observed.impulse_root).is_absolute()
+        {
+            return Err("daemon identity Impulse root must be an absolute path".to_string());
+        }
+        if let Some(digest) = observed.instance_nonce_sha256.as_deref() {
+            if digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(
+                    "daemon identity nonce digest must be 64 lowercase hexadecimal characters"
+                        .to_string(),
+                );
+            }
+        }
+        if let Some(expected) = expected {
+            if observed.protocol_version != expected.protocol_version {
+                return Err("daemon identity did not match expected protocol version".to_string());
+            }
+            if observed.pid != expected.pid {
+                return Err("daemon identity did not match expected PID".to_string());
+            }
+            if observed.impulse_root != expected.impulse_root {
+                return Err("daemon identity did not match expected Impulse root".to_string());
+            }
+            if observed.instance_nonce_sha256 != expected.instance_nonce_sha256 {
+                return Err("daemon identity did not match expected nonce digest".to_string());
+            }
+        }
+        Ok(())
+    }
+
     impl DaemonOpsTransport for UnixDaemonOpsClient {
         fn publish(&mut self, report: &TerminalOpsReport) -> Result<(), String> {
             let response = self.send(&WorkbenchDaemonRequest::PublishTerminalOps {
@@ -966,11 +1183,23 @@ mod unix {
             Self::ok_result(response).map(|_| ())
         }
 
-        fn subscribe(&mut self, since_seq: Option<u64>) -> Result<OpsSubscription, String> {
-            let response = self.send(&WorkbenchDaemonRequest::SubscribeOps { since_seq })?;
+        fn subscribe(&mut self, since_seq: Option<u64>) -> Result<VerifiedOpsSubscription, String> {
+            // The identity proof and subscription must share one connected
+            // socket. Reconnecting between them would permit a pathname swap
+            // to bind the proof to one listener and the snapshot to another.
+            let mut stream = self.connect_with_read_timeout(self.io_timeout)?;
+            let daemon_identity = self.verify_connected_stream_identity(&mut stream)?;
+            let response = self.send_on_stream(
+                &mut stream,
+                &WorkbenchDaemonRequest::SubscribeOps { since_seq },
+            )?;
             let result = Self::ok_result(response)?;
-            serde_json::from_value(result)
-                .map_err(|error| format!("parse ops subscription: {error}"))
+            let subscription = serde_json::from_value(result)
+                .map_err(|error| format!("parse ops subscription: {error}"))?;
+            Ok(VerifiedOpsSubscription {
+                subscription,
+                daemon_identity,
+            })
         }
 
         fn drain_governed_lifecycle_outbox(&mut self) -> Result<(), String> {
@@ -1101,19 +1330,23 @@ mod unix {
 
         fn accept(
             &mut self,
-            subscription: OpsSubscription,
+            verified: VerifiedOpsSubscription,
             downstream: &Arc<dyn DesktopEventSink>,
-        ) -> Result<(), String> {
+        ) -> Result<DaemonInstanceIdentity, String> {
+            let VerifiedOpsSubscription {
+                subscription,
+                daemon_identity,
+            } = verified;
             let next_seq = subscription.next_seq;
             self.next_seq = Some(next_seq);
             if self.last_emitted_seq == Some(next_seq) {
-                return Ok(());
+                return Ok(daemon_identity);
             }
             let payload = serde_json::to_value(subscription.snapshot)
                 .map_err(|error| format!("serialize subscribed ops snapshot: {error}"))?;
             downstream.emit(DesktopEvent::OpsUpdate { payload });
             self.last_emitted_seq = Some(next_seq);
-            Ok(())
+            Ok(daemon_identity)
         }
     }
 
@@ -1170,6 +1403,7 @@ mod unix {
         downstream: Arc<dyn DesktopEventSink>,
         config: DesktopDaemonOpsConfig,
     ) -> Result<DesktopDaemonOpsAttachment, DesktopDaemonOpsStartError> {
+        let expected_daemon_identity = config.expected_daemon_identity.clone();
         let lifecycle_outbox_path = config.project_root.as_ref().map(|root| {
             root.join(".impulse")
                 .join("DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.json")
@@ -1186,7 +1420,8 @@ mod unix {
         let worker_downstream = Arc::clone(&downstream);
         let heartbeat_interval = config.heartbeat_interval;
         let client = UnixDaemonOpsClient::new(config.socket_path)
-            .with_lifecycle_outbox(lifecycle_outbox_path);
+            .with_lifecycle_outbox(lifecycle_outbox_path)
+            .with_expected_daemon_identity(expected_daemon_identity);
         let command_client = Arc::new(client.clone());
         let mut client = client;
         let worker = thread::Builder::new()
@@ -1234,13 +1469,20 @@ mod unix {
             .map(|error| format!("governed lifecycle outbox: {error}"))
             .into_iter()
             .collect::<Vec<_>>();
-        initial_errors.extend(subscribe_and_emit(client, &mut cursor, &downstream));
+        let initial_identity = match subscribe_and_emit(client, &mut cursor, &downstream) {
+            Ok(identity) => Some(identity),
+            Err(error) => {
+                initial_errors.push(error);
+                None
+            }
+        };
         let initial_connected = initial_errors.is_empty();
         log_connection_transition(
             &mut last_error,
             &mut last_connected,
             initial_connected,
             initial_errors,
+            initial_connected.then_some(initial_identity).flatten(),
             &downstream,
         );
 
@@ -1268,14 +1510,23 @@ mod unix {
             if stop.load(Ordering::Acquire) {
                 continue;
             }
-            let subscribe_errors = subscribe_and_emit(client, &mut cursor, &downstream);
-            let connected = subscribe_errors.is_empty();
-            errors.extend(subscribe_errors);
+            let verified_identity = match subscribe_and_emit(client, &mut cursor, &downstream) {
+                Ok(identity) => Some(identity),
+                Err(error) => {
+                    errors.push(error);
+                    None
+                }
+            };
+            // Connection health is the result of the same-stream identity and
+            // subscription exchange. Publish/outbox errors remain visible in
+            // `error` without falsely reporting that the daemon is unreachable.
+            let connected = verified_identity.is_some();
             log_connection_transition(
                 &mut last_error,
                 &mut last_connected,
                 connected,
                 errors,
+                connected.then_some(verified_identity).flatten(),
                 &downstream,
             );
         }
@@ -1285,14 +1536,10 @@ mod unix {
         client: &mut T,
         cursor: &mut SubscriptionCursor,
         downstream: &Arc<dyn DesktopEventSink>,
-    ) -> Vec<String> {
+    ) -> Result<DaemonInstanceIdentity, String> {
         match client.subscribe(cursor.next_seq) {
-            Ok(subscription) => cursor
-                .accept(subscription, downstream)
-                .err()
-                .into_iter()
-                .collect(),
-            Err(error) => vec![format!("subscribe: {error}")],
+            Ok(subscription) => cursor.accept(subscription, downstream),
+            Err(error) => Err(format!("subscribe: {error}")),
         }
     }
 
@@ -1301,6 +1548,7 @@ mod unix {
         last_connected: &mut Option<bool>,
         connected: bool,
         errors: Vec<String>,
+        verified_identity: Option<DaemonInstanceIdentity>,
         downstream: &Arc<dyn DesktopEventSink>,
     ) {
         let error = (!errors.is_empty()).then(|| errors.join("; "));
@@ -1311,6 +1559,20 @@ mod unix {
                 eprintln!("desktop daemon-ops degraded: {error}");
             } else if last_error.is_some() {
                 eprintln!("desktop daemon-ops connection recovered");
+            }
+        }
+        if connected {
+            if let Some(identity) = verified_identity {
+                // This proof belongs to the subscription read from the same
+                // connected stream. Emit it before any connected transition;
+                // successful heartbeat loops refresh it even when health is
+                // otherwise unchanged.
+                downstream.emit(DesktopEvent::DaemonIdentityVerified { identity });
+            } else {
+                eprintln!(
+                    "desktop daemon-ops suppressed connected state without a verified identity"
+                );
+                return;
             }
         }
         if connection_changed || error_changed {
@@ -2383,7 +2645,7 @@ mod unix {
 
         struct ScriptedTransport {
             publish_results: VecDeque<Result<(), String>>,
-            subscribe_results: VecDeque<Result<OpsSubscription, String>>,
+            subscribe_results: VecDeque<Result<VerifiedOpsSubscription, String>>,
             report_tx: mpsc::Sender<TerminalOpsReport>,
             since_tx: mpsc::Sender<Option<u64>>,
         }
@@ -2396,7 +2658,10 @@ mod unix {
                 self.publish_results.pop_front().unwrap_or(Ok(()))
             }
 
-            fn subscribe(&mut self, since_seq: Option<u64>) -> Result<OpsSubscription, String> {
+            fn subscribe(
+                &mut self,
+                since_seq: Option<u64>,
+            ) -> Result<VerifiedOpsSubscription, String> {
                 self.since_tx
                     .send(since_seq)
                     .expect("record subscription cursor");
@@ -2406,15 +2671,85 @@ mod unix {
             }
         }
 
-        fn subscription(next_seq: u64, agents: Vec<AgentRuntime>) -> OpsSubscription {
-            OpsSubscription {
-                snapshot: ProjectOpsSnapshot {
-                    generated_at: format!("subscription-{next_seq}"),
-                    agents,
-                    ..Default::default()
+        fn daemon_identity() -> DaemonInstanceIdentity {
+            DaemonInstanceIdentity {
+                protocol_version: DAEMON_PROTOCOL_VERSION,
+                // Fake listeners run in this test process, so an intentionally
+                // valid expected-peer fixture must identify the real kernel
+                // peer rather than an arbitrary protocol-only PID.
+                pid: std::process::id(),
+                impulse_root: "/tmp/project".to_string(),
+                instance_nonce_sha256: Some("a".repeat(64)),
+            }
+        }
+
+        fn forged_identity_with_wrong_kernel_peer() -> DaemonInstanceIdentity {
+            let mut identity = daemon_identity();
+            identity.pid = if identity.pid == u32::MAX {
+                identity.pid - 1
+            } else {
+                identity.pid + 1
+            };
+            identity
+        }
+
+        #[test]
+        fn daemon_identity_validation_is_exact_when_expected_and_optional_otherwise() {
+            let expected = daemon_identity();
+            assert!(validate_daemon_identity(&expected, Some(&expected)).is_ok());
+
+            let mut unexpected_but_valid = expected.clone();
+            unexpected_but_valid.pid += 1;
+            assert!(validate_daemon_identity(&unexpected_but_valid, None).is_ok());
+
+            let mut mismatched = expected.clone();
+            mismatched.instance_nonce_sha256 = Some("b".repeat(64));
+            assert!(validate_daemon_identity(&mismatched, Some(&expected))
+                .expect_err("nonce mismatch")
+                .contains("nonce digest"));
+
+            let mut mismatched = expected.clone();
+            mismatched.pid += 1;
+            assert!(validate_daemon_identity(&mismatched, Some(&expected))
+                .expect_err("PID mismatch")
+                .contains("PID"));
+
+            let mut mismatched = expected.clone();
+            mismatched.impulse_root = "/tmp/other-project".to_string();
+            assert!(validate_daemon_identity(&mismatched, Some(&expected))
+                .expect_err("root mismatch")
+                .contains("Impulse root"));
+
+            let mut mismatched = expected.clone();
+            mismatched.protocol_version -= 1;
+            assert!(validate_daemon_identity(&mismatched, Some(&expected))
+                .expect_err("protocol mismatch")
+                .contains("protocol"));
+        }
+
+        fn ping_response(identity: &DaemonInstanceIdentity) -> WorkbenchDaemonResponse {
+            WorkbenchDaemonResponse::Ok {
+                result: serde_json::to_value(DaemonPingResponse {
+                    pong: true,
+                    protocol_version: identity.protocol_version,
+                    daemon_instance: identity.clone(),
+                })
+                .expect("serialize ping response"),
+            }
+        }
+
+        fn subscription(next_seq: u64, agents: Vec<AgentRuntime>) -> VerifiedOpsSubscription {
+            VerifiedOpsSubscription {
+                subscription: OpsSubscription {
+                    snapshot: ProjectOpsSnapshot {
+                        generated_at: format!("subscription-{next_seq}"),
+                        agents,
+                        ..Default::default()
+                    },
+                    events: Vec::new(),
+                    next_seq,
                 },
-                events: Vec::new(),
-                next_seq,
+                daemon_identity: daemon_identity(),
             }
         }
 
@@ -2476,6 +2811,15 @@ mod unix {
             stream.write_all(&encoded).expect("write response");
         }
 
+        fn read_request(
+            reader: &mut BufReader<std::os::unix::net::UnixStream>,
+        ) -> WorkbenchDaemonRequest {
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read request");
+            assert!(line.ends_with('\n'), "request must be JSONL framed");
+            serde_json::from_str(&line).expect("parse request")
+        }
+
         #[test]
         fn unix_transport_publish_subscribe_and_emit_snapshot() {
             let dir = tempfile::tempdir().expect("tempdir");
@@ -2487,13 +2831,9 @@ mod unix {
                 let mut subscription_count = 0_u64;
                 for _ in 0..3 {
                     let (mut stream, _) = listener.accept().expect("accept request");
-                    let mut line = String::new();
-                    BufReader::new(stream.try_clone().expect("clone stream"))
-                        .read_line(&mut line)
-                        .expect("read request");
-                    assert!(line.ends_with('\n'), "request must be JSONL framed");
-                    let request: WorkbenchDaemonRequest =
-                        serde_json::from_str(&line).expect("parse request");
+                    let mut reader =
+                        BufReader::new(stream.try_clone().expect("clone request stream"));
+                    let request = read_request(&mut reader);
                     requests_tx.send(request.clone()).expect("record request");
                     match request {
                         WorkbenchDaemonRequest::PublishTerminalOps { report } => {
@@ -2505,7 +2845,13 @@ mod unix {
                                 },
                             );
                         }
-                        WorkbenchDaemonRequest::SubscribeOps { .. } => {
+                        WorkbenchDaemonRequest::Ping => {
+                            write_response(&mut stream, &ping_response(&daemon_identity()));
+                            let request = read_request(&mut reader);
+                            requests_tx.send(request.clone()).expect("record request");
+                            let WorkbenchDaemonRequest::SubscribeOps { .. } = request else {
+                                panic!("expected subscribe after ping, got {request:?}");
+                            };
                             subscription_count += 1;
                             let subscription = OpsSubscription {
                                 snapshot: ProjectOpsSnapshot {
@@ -2545,23 +2891,49 @@ mod unix {
 
             assert!(downstream.wait_for_ops_agent("codex-live"));
             assert!(downstream.wait_for_connection(true));
-            let requests = (0..3)
+            let events = downstream.events();
+            let identity_index = events
+                .iter()
+                .position(|event| {
+                    matches!(
+                        event,
+                        DesktopEvent::DaemonIdentityVerified { identity }
+                            if identity == &daemon_identity()
+                    )
+                })
+                .expect("verified identity event");
+            let connected_index = events
+                .iter()
+                .position(|event| {
+                    matches!(
+                        event,
+                        DesktopEvent::OpsConnectionUpdate {
+                            connected: true,
+                            error: None,
+                        }
+                    )
+                })
+                .expect("connected event");
+            assert_eq!(connected_index, identity_index + 1);
+            let requests = (0..5)
                 .map(|_| {
                     requests_rx
                         .recv_timeout(Duration::from_secs(3))
                         .expect("request")
                 })
                 .collect::<Vec<_>>();
+            assert!(matches!(requests[0], WorkbenchDaemonRequest::Ping));
             assert!(matches!(
-                requests[0],
+                requests[1],
                 WorkbenchDaemonRequest::SubscribeOps { since_seq: None }
             ));
             assert!(matches!(
-                requests[1],
+                requests[2],
                 WorkbenchDaemonRequest::PublishTerminalOps { .. }
             ));
+            assert!(matches!(requests[3], WorkbenchDaemonRequest::Ping));
             assert!(matches!(
-                requests[2],
+                requests[4],
                 WorkbenchDaemonRequest::SubscribeOps {
                     since_seq: Some(11)
                 }
@@ -2580,12 +2952,14 @@ mod unix {
             let listener = UnixListener::bind(&socket).expect("bind fake daemon");
             let server = thread::spawn(move || {
                 let (mut stream, _) = listener.accept().expect("accept request");
-                let mut line = String::new();
-                BufReader::new(stream.try_clone().expect("clone stream"))
-                    .read_line(&mut line)
-                    .expect("read request");
+                let mut reader = BufReader::new(stream.try_clone().expect("clone request stream"));
                 assert!(matches!(
-                    serde_json::from_str::<WorkbenchDaemonRequest>(&line).expect("parse request"),
+                    read_request(&mut reader),
+                    WorkbenchDaemonRequest::Ping
+                ));
+                write_response(&mut stream, &ping_response(&daemon_identity()));
+                assert!(matches!(
+                    read_request(&mut reader),
                     WorkbenchDaemonRequest::SubscribeOps { since_seq: None }
                 ));
                 write_response(
@@ -2601,8 +2975,280 @@ mod unix {
                 );
             });
 
-            assert_eq!(client.subscribe(None).expect("recovered").next_seq, 7);
+            assert_eq!(
+                client
+                    .subscribe(None)
+                    .expect("recovered")
+                    .subscription
+                    .next_seq,
+                7
+            );
             server.join().expect("server thread");
+        }
+
+        #[test]
+        fn unix_transport_keeps_ping_and_subscribe_on_the_same_stream_after_socket_rebind() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket = dir.path().join("daemon.sock");
+            let moved_socket = dir.path().join("original-daemon.sock");
+            let listener = UnixListener::bind(&socket).expect("bind original daemon");
+            let observed_identity = daemon_identity();
+            let server_identity = observed_identity.clone();
+            let server_socket = socket.clone();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept original stream");
+                let mut reader = BufReader::new(stream.try_clone().expect("clone original stream"));
+                assert!(matches!(
+                    read_request(&mut reader),
+                    WorkbenchDaemonRequest::Ping
+                ));
+                write_response(&mut stream, &ping_response(&server_identity));
+
+                std::fs::rename(&server_socket, &moved_socket)
+                    .expect("move original socket pathname");
+                let replacement =
+                    UnixListener::bind(&server_socket).expect("bind replacement daemon");
+
+                assert!(matches!(
+                    read_request(&mut reader),
+                    WorkbenchDaemonRequest::SubscribeOps { since_seq: None }
+                ));
+                write_response(
+                    &mut stream,
+                    &WorkbenchDaemonResponse::Ok {
+                        result: serde_json::to_value(OpsSubscription {
+                            snapshot: ProjectOpsSnapshot::default(),
+                            events: Vec::new(),
+                            next_seq: 17,
+                        })
+                        .expect("subscription value"),
+                    },
+                );
+
+                replacement
+                    .set_nonblocking(true)
+                    .expect("make replacement listener nonblocking");
+                thread::sleep(Duration::from_millis(50));
+                assert!(matches!(
+                    replacement.accept(),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                ));
+            });
+
+            let mut client = UnixDaemonOpsClient::new(socket)
+                .with_expected_daemon_identity(Some(observed_identity.clone()));
+            let verified = client.subscribe(None).expect("same-stream subscription");
+            assert_eq!(verified.daemon_identity, observed_identity);
+            assert_eq!(verified.subscription.next_seq, 17);
+            server.join().expect("server thread");
+        }
+
+        #[test]
+        fn expected_identity_mismatch_fails_closed_without_identity_event() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket = dir.path().join("daemon.sock");
+            let listener = UnixListener::bind(&socket).expect("bind fake daemon");
+            let observed_identity = daemon_identity();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut reader = BufReader::new(stream.try_clone().expect("clone request stream"));
+                assert!(matches!(
+                    read_request(&mut reader),
+                    WorkbenchDaemonRequest::Ping
+                ));
+                write_response(&mut stream, &ping_response(&observed_identity));
+
+                let mut unexpected = String::new();
+                assert_eq!(
+                    reader
+                        .read_line(&mut unexpected)
+                        .expect("observe closed rejected stream"),
+                    0,
+                    "identity mismatch must fail before SubscribeOps"
+                );
+            });
+
+            let mut expected_identity = daemon_identity();
+            expected_identity.pid += 1;
+            let downstream = Arc::new(RecordingSink::default());
+            let downstream_trait: Arc<dyn DesktopEventSink> = downstream.clone();
+            let attachment = attach(
+                downstream_trait,
+                DesktopDaemonOpsConfig::new(socket, None)
+                    .with_expected_daemon_identity(expected_identity)
+                    .with_heartbeat_interval(Duration::from_secs(60)),
+            )
+            .expect("attach daemon ops");
+
+            assert!(downstream.wait_for_connection(false));
+            let events = downstream.events();
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, DesktopEvent::DaemonIdentityVerified { .. })));
+            assert!(!events.iter().any(|event| {
+                matches!(
+                    event,
+                    DesktopEvent::OpsConnectionUpdate {
+                        connected: true,
+                        ..
+                    }
+                )
+            }));
+            server.join().expect("server thread");
+            drop(attachment.event_sink);
+        }
+
+        #[test]
+        fn forged_expected_identity_with_wrong_kernel_peer_cannot_subscribe() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket = dir.path().join("daemon.sock");
+            let listener = UnixListener::bind(&socket).expect("bind forged daemon");
+            let forged_identity = forged_identity_with_wrong_kernel_peer();
+            let server_identity = forged_identity.clone();
+            let (operation_tx, operation_rx) = mpsc::channel();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept forged stream");
+                let mut reader = BufReader::new(stream.try_clone().expect("clone forged stream"));
+                assert!(matches!(
+                    read_request(&mut reader),
+                    WorkbenchDaemonRequest::Ping
+                ));
+                write_response(&mut stream, &ping_response(&server_identity));
+
+                let mut line = String::new();
+                let bytes = reader
+                    .read_line(&mut line)
+                    .expect("observe rejected forged stream");
+                let operation_sent = bytes != 0;
+                if operation_sent {
+                    write_response(
+                        &mut stream,
+                        &WorkbenchDaemonResponse::Error {
+                            message: "forged listener must not receive SubscribeOps".to_string(),
+                        },
+                    );
+                }
+                operation_tx.send(operation_sent).expect("record operation");
+            });
+
+            let mut client = UnixDaemonOpsClient::new(socket)
+                .with_expected_daemon_identity(Some(forged_identity));
+            let error = client
+                .subscribe(None)
+                .expect_err("protocol forgery must fail kernel peer validation");
+            assert!(error.contains("kernel peer PID"), "{error}");
+            assert!(!operation_rx.recv().expect("operation observation"));
+            server.join().expect("server thread");
+        }
+
+        #[test]
+        fn forged_expected_identity_with_wrong_kernel_peer_cannot_publish() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket = dir.path().join("daemon.sock");
+            let listener = UnixListener::bind(&socket).expect("bind forged daemon");
+            let forged_identity = forged_identity_with_wrong_kernel_peer();
+            let server_identity = forged_identity.clone();
+            let (requests_tx, requests_rx) = mpsc::channel();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept forged stream");
+                let mut reader = BufReader::new(stream.try_clone().expect("clone forged stream"));
+                let first = read_request(&mut reader);
+                requests_tx
+                    .send(first.clone())
+                    .expect("record first request");
+                if matches!(first, WorkbenchDaemonRequest::Ping) {
+                    write_response(&mut stream, &ping_response(&server_identity));
+                    let mut line = String::new();
+                    let bytes = reader
+                        .read_line(&mut line)
+                        .expect("observe rejected forged stream");
+                    if bytes != 0 {
+                        requests_tx
+                            .send(serde_json::from_str(&line).expect("decode leaked request"))
+                            .expect("record leaked request");
+                    }
+                } else {
+                    write_response(
+                        &mut stream,
+                        &WorkbenchDaemonResponse::Error {
+                            message: "expected identity Ping before operation".to_string(),
+                        },
+                    );
+                }
+            });
+
+            let mut client = UnixDaemonOpsClient::new(socket)
+                .with_expected_daemon_identity(Some(forged_identity));
+            let error = client
+                .publish(&TerminalOpsReport::default())
+                .expect_err("protocol forgery must fail before publish");
+            assert!(error.contains("kernel peer PID"), "{error}");
+            server.join().expect("server thread");
+            let requests = requests_rx.try_iter().collect::<Vec<_>>();
+            assert_eq!(requests.len(), 1, "forged peer received an operation");
+            assert!(matches!(requests[0], WorkbenchDaemonRequest::Ping));
+        }
+
+        #[test]
+        fn forged_expected_identity_with_wrong_kernel_peer_cannot_register_governed_task() {
+            use impulse_ops::governed_task::GovernedTaskRegistration;
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket = dir.path().join("daemon.sock");
+            let listener = UnixListener::bind(&socket).expect("bind forged daemon");
+            let forged_identity = forged_identity_with_wrong_kernel_peer();
+            let server_identity = forged_identity.clone();
+            let (operation_tx, operation_rx) = mpsc::channel();
+            let server = thread::spawn(move || {
+                for _ in 0..ACKNOWLEDGED_REQUEST_ATTEMPTS {
+                    let (mut stream, _) = listener.accept().expect("accept forged retry");
+                    let mut reader =
+                        BufReader::new(stream.try_clone().expect("clone forged retry stream"));
+                    assert!(matches!(
+                        read_request(&mut reader),
+                        WorkbenchDaemonRequest::Ping
+                    ));
+                    write_response(&mut stream, &ping_response(&server_identity));
+                    let mut line = String::new();
+                    let bytes = reader
+                        .read_line(&mut line)
+                        .expect("observe rejected forged retry");
+                    operation_tx
+                        .send(bytes != 0)
+                        .expect("record governed operation");
+                    if bytes != 0 {
+                        write_response(
+                            &mut stream,
+                            &WorkbenchDaemonResponse::Error {
+                                message: "forged listener must not receive registration"
+                                    .to_string(),
+                            },
+                        );
+                    }
+                }
+            });
+
+            let registration = GovernedTaskRegistration::builder(
+                "peer-bound-register",
+                "peer-bound-task",
+                "project",
+                "/tmp/project",
+                "prove peer-bound governed IPC",
+                "worker-1",
+                "codex",
+            )
+            .build()
+            .expect("governed registration fixture");
+            let client = UnixDaemonOpsClient::new(socket)
+                .with_expected_daemon_identity(Some(forged_identity));
+            let error = client
+                .register(registration)
+                .expect_err("protocol forgery must fail before governed registration");
+            assert!(error.contains("kernel peer PID"), "{error}");
+            server.join().expect("server thread");
+            let operations = operation_rx.try_iter().collect::<Vec<_>>();
+            assert_eq!(operations.len(), ACKNOWLEDGED_REQUEST_ATTEMPTS);
+            assert!(operations.iter().all(|sent| !sent));
         }
 
         #[test]
@@ -2614,15 +3260,14 @@ mod unix {
             let server = thread::spawn(move || {
                 for index in 0..2 {
                     let (mut stream, _) = listener.accept().expect("accept request");
-                    let mut line = String::new();
-                    BufReader::new(stream.try_clone().expect("clone stream"))
-                        .read_line(&mut line)
-                        .expect("read request");
-                    let request: WorkbenchDaemonRequest =
-                        serde_json::from_str(&line).expect("parse request");
+                    let mut reader =
+                        BufReader::new(stream.try_clone().expect("clone request stream"));
+                    let request = read_request(&mut reader);
                     if index == 0 {
+                        assert!(matches!(request, WorkbenchDaemonRequest::Ping));
+                        write_response(&mut stream, &ping_response(&daemon_identity()));
                         assert!(matches!(
-                            request,
+                            read_request(&mut reader),
                             WorkbenchDaemonRequest::SubscribeOps { since_seq: None }
                         ));
                         write_response(
@@ -2807,6 +3452,15 @@ mod unix {
                 (false, true),
                 (true, false),
             ]));
+            assert_eq!(
+                downstream
+                    .events()
+                    .iter()
+                    .filter(|event| matches!(event, DesktopEvent::DaemonIdentityVerified { .. }))
+                    .count(),
+                2,
+                "successful initial and recovery loops must each emit a fresh proof"
+            );
 
             stop.store(true, Ordering::Release);
             let _ = wake_tx.try_send(());
@@ -2870,6 +3524,15 @@ mod unix {
                 (true, true),
                 (true, false),
             ]));
+            assert_eq!(
+                downstream
+                    .events()
+                    .iter()
+                    .filter(|event| matches!(event, DesktopEvent::DaemonIdentityVerified { .. }))
+                    .count(),
+                3,
+                "every successful subscribe loop must refresh the identity proof"
+            );
 
             stop.store(true, Ordering::Release);
             let _ = wake_tx.try_send(());

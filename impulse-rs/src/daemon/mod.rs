@@ -131,6 +131,7 @@ pub struct DaemonConfig {
 
 pub struct Daemon {
     config: DaemonConfig,
+    instance_identity: Arc<impulse_ops::DaemonInstanceIdentity>,
     shutdown_flag: Arc<AtomicBool>,
     shutdown_notify: Arc<Notify>,
     tool_registry: Arc<crate::tooling::ToolRegistry>,
@@ -151,6 +152,13 @@ pub struct Daemon {
 
 impl Daemon {
     pub fn new(state: SharedState) -> Self {
+        let instance_nonce = std::env::var(impulse_ops::DAEMON_INSTANCE_NONCE_ENV)
+            .ok()
+            .filter(|value| !value.is_empty());
+        Self::new_with_instance_nonce(state, instance_nonce.as_deref())
+    }
+
+    fn new_with_instance_nonce(state: SharedState, instance_nonce: Option<&str>) -> Self {
         let socket_path = state
             .storage()
             .base_path()
@@ -179,11 +187,25 @@ impl Daemon {
         // Initialize the global plugin registry so ListPlugins/InvokePlugin work.
         crate::plugin::registry::init_global_registry();
 
+        let impulse_root = state
+            .storage()
+            .base_path()
+            .canonicalize()
+            .unwrap_or_else(|_| state.storage().base_path().to_path_buf());
+        let instance_nonce_sha256 = instance_nonce.map(impulse_ops::daemon_instance_nonce_sha256);
+        let instance_identity = Arc::new(impulse_ops::DaemonInstanceIdentity {
+            protocol_version: protocol::PROTOCOL_VERSION,
+            pid: std::process::id(),
+            impulse_root: impulse_root.to_string_lossy().into_owned(),
+            instance_nonce_sha256,
+        });
+
         Self {
             config: DaemonConfig {
                 socket_path: socket_path.clone(),
                 state,
             },
+            instance_identity,
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
             tool_registry: Arc::new(tool_registry),
@@ -203,6 +225,19 @@ impl Daemon {
     #[cfg(test)]
     pub fn socket_path(&self) -> &PathBuf {
         &self.config.socket_path
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_test_instance_nonce(
+        state: SharedState,
+        instance_nonce: Option<&str>,
+    ) -> Self {
+        Self::new_with_instance_nonce(state, instance_nonce)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn instance_identity(&self) -> &impulse_ops::DaemonInstanceIdentity {
+        &self.instance_identity
     }
 
     pub async fn start(&self) -> Result<()> {
@@ -282,6 +317,7 @@ impl Daemon {
                             let conflict_resolver = self.conflict_resolver.clone();
                             let delegation_tracker = self.delegation_tracker.clone();
                             let cached_agent = self.cached_agent.clone();
+                            let daemon_identity = self.instance_identity.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = handle_connection(
                                     stream,
@@ -295,6 +331,7 @@ impl Daemon {
                                         conflict_resolver,
                                         delegation_tracker,
                                         cached_agent,
+                                        daemon_identity,
                                     },
                                 )
                                 .await
@@ -329,6 +366,7 @@ struct ConnectionContext {
     conflict_resolver: Arc<RwLock<crate::agent::coordinator::ConflictResolver>>,
     delegation_tracker: Arc<RwLock<crate::delegation::DelegationTracker>>,
     cached_agent: Arc<tokio::sync::Mutex<Option<crate::agent::ImpulseAgent>>>,
+    daemon_identity: Arc<impulse_ops::DaemonInstanceIdentity>,
 }
 
 async fn handle_connection(
@@ -345,6 +383,7 @@ async fn handle_connection(
         conflict_resolver,
         delegation_tracker,
         cached_agent,
+        daemon_identity,
     } = context;
 
     let (reader, mut writer) = stream.split();
@@ -402,6 +441,7 @@ async fn handle_connection(
                 conflict_resolver: &conflict_resolver,
                 delegation_tracker: &delegation_tracker,
                 cached_agent: &cached_agent,
+                daemon_identity: &daemon_identity,
             },
         )
         .await;

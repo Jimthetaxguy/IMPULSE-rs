@@ -95,7 +95,7 @@ jobs:
       - run: cargo test -p impulse-desktop --test macos_packaging_contract --locked
       - name: Build and inspect universal developer-preview DMG
         env:
-          CARGO_TARGET_DIR: target/release-candidate
+          CARGO_TARGET_DIR: ${{ runner.temp }}/impulse-release-candidate
         run: |
           bash scripts/build-macos-app.sh --universal --dmg
-          shasum -a 256 target/release-candidate/package/*non-distributable-developer-preview.dmg
+          shasum -a 256 "$CARGO_TARGET_DIR"/package/*non-distributable-developer-preview.dmg
