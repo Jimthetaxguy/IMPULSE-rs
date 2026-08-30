@@ -58,14 +58,25 @@ pub struct HostInvokeRequest {
 /// The reply to a [`HostInvokeRequest`]. `ok` mirrors the underlying
 /// `Result`; `result` carries the serialized success value and `error` the
 /// failure message (never both).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct HostInvokeResponse {
     pub id: String,
     pub ok: bool,
-    #[serde(default)]
     pub result: Value,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// The only serializable Rust → JavaScript representation of an invoke
+/// response. Keeping the internal response non-serializable prevents a send
+/// site from bypassing the discriminator required by the strict JS router.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct HostInvokeResponseEnvelope {
+    kind: &'static str,
+    id: String,
+    ok: bool,
+    result: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 impl HostInvokeResponse {
@@ -263,6 +274,16 @@ pub fn host_event_envelope(event: &DesktopEvent) -> Value {
         "event": event.name(),
         "payload": payload,
     })
+}
+
+fn host_invoke_response_envelope(response: HostInvokeResponse) -> HostInvokeResponseEnvelope {
+    HostInvokeResponseEnvelope {
+        kind: "host_invoke_result",
+        id: response.id,
+        ok: response.ok,
+        result: response.result,
+        error: response.error,
+    }
 }
 
 /// A [`DesktopEventSink`] that forwards every runtime event onto an unbounded
@@ -491,9 +512,7 @@ pub fn use_live_host_bridge() {
                 }
                 response = invoke_result_rx.recv() => {
                     if let Some(response) = response {
-                        if let Ok(value) = serde_json::to_value(&response) {
-                            let _ = eval.send(value);
-                        }
+                        let _ = eval.send(host_invoke_response_envelope(response));
                         }
                 }
                 request = eval.recv::<HostInvokeRequest>() => {
@@ -511,9 +530,7 @@ pub fn use_live_host_bridge() {
                                 )),
                             };
                             if let Some(response) = rejected {
-                                if let Ok(value) = serde_json::to_value(&response) {
-                                    let _ = eval.send(value);
-                                }
+                                let _ = eval.send(host_invoke_response_envelope(response));
                             }
                         }
                         Err(_) => break,
@@ -645,14 +662,145 @@ mod tests {
     }
 
     #[test]
-    fn host_invoke_response_round_trips_both_arms() {
+    fn host_invoke_response_constructors_preserve_both_arms() {
         let ok = HostInvokeResponse::ok("a".to_string(), json!([1, 2, 3]));
         let err = HostInvokeResponse::err("b".to_string(), "boom".to_string());
-        for response in [ok, err] {
-            let text = serde_json::to_string(&response).unwrap();
-            let back: HostInvokeResponse = serde_json::from_str(&text).unwrap();
-            assert_eq!(response, back);
+        assert_eq!(ok.id, "a");
+        assert!(ok.ok);
+        assert_eq!(ok.result, json!([1, 2, 3]));
+        assert_eq!(ok.error, None);
+        assert_eq!(err.id, "b");
+        assert!(!err.ok);
+        assert_eq!(err.result, Value::Null);
+        assert_eq!(err.error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn host_invoke_response_envelope_marks_both_arms_for_the_js_router() {
+        let ok = serde_json::to_value(host_invoke_response_envelope(HostInvokeResponse::ok(
+            "host-ok".to_string(),
+            json!([1, 2, 3]),
+        )))
+        .expect("serialize success response envelope");
+        assert_eq!(ok["kind"], "host_invoke_result");
+        assert_eq!(ok["id"], "host-ok");
+        assert_eq!(ok["ok"], true);
+        assert_eq!(ok["result"], json!([1, 2, 3]));
+        assert!(ok.get("error").is_none());
+
+        let error = serde_json::to_value(host_invoke_response_envelope(HostInvokeResponse::err(
+            "host-error".to_string(),
+            "boom".to_string(),
+        )))
+        .expect("serialize error response envelope");
+        assert_eq!(error["kind"], "host_invoke_result");
+        assert_eq!(error["id"], "host-error");
+        assert_eq!(error["ok"], false);
+        assert_eq!(error["result"], Value::Null);
+        assert_eq!(error["error"], "boom");
+    }
+
+    #[test]
+    fn live_host_bridge_invoke_promise_settles_from_the_rust_response_envelope() {
+        let Ok(node_version) = std::process::Command::new("node").arg("--version").output() else {
+            eprintln!("node is unavailable; skipping live host response-envelope smoke");
+            return;
+        };
+        if !node_version.status.success() {
+            eprintln!("node is unavailable; skipping live host response-envelope smoke");
+            return;
         }
+
+        let envelope = host_invoke_response_envelope(HostInvokeResponse::ok(
+            "host-1".to_string(),
+            json!(["settled"]),
+        ));
+        let error_envelope = host_invoke_response_envelope(HostInvokeResponse::err(
+            "host-2".to_string(),
+            "typed rejection".to_string(),
+        ));
+        let script = format!(
+            r#"
+global.window = {{}};
+global.document = {{ documentElement: {{ setAttribute() {{}} }} }};
+const pendingMessages = [];
+let receiveResolver = null;
+const responseEnvelopes = {{
+  "host-1": {envelope},
+  "host-2": {error_envelope},
+}};
+const deliver = (message) => {{
+  if (receiveResolver) {{
+    const resolve = receiveResolver;
+    receiveResolver = null;
+    resolve(message);
+  }} else {{
+    pendingMessages.push(message);
+  }}
+}};
+global.dioxus = {{
+  send(message) {{
+    if (message?.kind === "host_invoke") {{
+      queueMicrotask(() => deliver(responseEnvelopes[message.id]));
+    }}
+  }},
+  recv() {{
+    if (pendingMessages.length > 0) return Promise.resolve(pendingMessages.shift());
+    return new Promise((resolve) => {{ receiveResolver = resolve; }});
+  }},
+}};
+{bridge}
+setImmediate(async () => {{
+  try {{
+    const timeout = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("host invoke promise did not settle")), 500)
+    );
+    const result = await Promise.race([
+      window.__IMPULSE_DESKTOP_HOST.invoke("agent_snapshot", {{}}),
+      timeout,
+    ]);
+    if (JSON.stringify(result) !== JSON.stringify(["settled"])) {{
+      throw new Error(`unexpected result: ${{JSON.stringify(result)}}`);
+    }}
+    let rejection = "";
+    try {{
+      await Promise.race([
+        window.__IMPULSE_DESKTOP_HOST.invoke("unknown", {{}}),
+        timeout,
+      ]);
+    }} catch (error) {{
+      rejection = String(error?.message || error);
+    }}
+    if (rejection !== "typed rejection") {{
+      throw new Error(`unexpected rejection: ${{rejection}}`);
+    }}
+    process.stdout.write("resolved-and-rejected");
+    process.exit(0);
+  }} catch (error) {{
+    console.error(error?.stack || String(error));
+    process.exit(1);
+  }}
+}});
+"#,
+            envelope = serde_json::to_string(&envelope).expect("serialize response envelope"),
+            error_envelope =
+                serde_json::to_string(&error_envelope).expect("serialize error response envelope"),
+            bridge = live_host_bridge_script(),
+        );
+        let output = std::process::Command::new("node")
+            .arg("-e")
+            .arg(script)
+            .output()
+            .expect("run live host response-envelope smoke");
+        assert!(
+            output.status.success(),
+            "node smoke failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "resolved-and-rejected"
+        );
     }
 
     #[test]

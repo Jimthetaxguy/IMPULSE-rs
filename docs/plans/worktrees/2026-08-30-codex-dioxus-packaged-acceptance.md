@@ -43,12 +43,19 @@ tags: [worktree, lane, release, dioxus, acceptance, provenance]
 - Verification: TDD-focused Rust/script contracts; real arm64 app/DMG rebuild from a clean commit;
   source-bound structural/provenance verification; GUI-capable mounted-DMG acceptance; complete
   locked workspace gate; docs validation; diff/leak/commit review.
-- Latest status: implementation, focused contracts, the complete locked workspace test/check/
-  strict-Clippy gates, and the final independent whole-diff review are green. Independent reviews
-  found and the implementation closed release-evidence blockers across provenance, output
-  containment, workflow targets, DMG finalization, process cleanup, xterm readiness, and daemon
-  peer identity. The exact reviewed file set must still be staged and checked before commit.
-  Exact-commit rebuild and mounted-DMG acceptance remain.
+- Latest status: the reviewed packaging implementation is committed locally on this unpushed
+  branch at `7e25412682900ca67170032d9ed632d9aab3c5b9`,
+  with bounded external and Rust-transcript diagnostics committed at `ecd9ce54cfe9b5685e3949848fd2d0eb7918ca86`
+  and `11b105c0834481454046d2b7d5e195412ff569b0`. Two exact-commit DMGs passed provenance,
+  structural, image, and read-only mount verification before the real mounted host timed out.
+  The improved transcript evidence exposed a confirmed blocker consistent with that timeout: Rust
+  responses omitted the JavaScript router's required `kind: host_invoke_result` discriminator.
+  Both response paths and focused resolve/reject regressions are now fixed locally; only a fresh
+  mounted run can show whether another packaged blocker remains. A third diagnostic candidate
+  correctly failed closed when this source edit occurred during verification; it is source-drift
+  evidence, not a product result. The post-fix desktop, external-harness, packaging, complete locked
+  workspace, all-target check, strict-Clippy, formatting, shell-syntax, and diff-hygiene gates are
+  green. Exact staging/commit review and a fresh exact-commit mounted acceptance remain.
 
 ## User-Visible Outcome
 
@@ -102,6 +109,10 @@ candidate is described as packaged-host accepted.
 - 2026-08-30: Treat the DMG as immutable evidence across verification: require exactly one
   non-symlink `Impulse.app` at the mounted volume root, run final `hdiutil verify`, detach, and
   require the post-detach SHA-256 to equal the pre-mount digest before reporting the final digest.
+- 2026-08-30: Keep the live JavaScript router strict and make every Rust invoke response use the
+  exact discriminated envelope `kind: host_invoke_result`, including both normal worker results
+  and queue-rejection results. The request id remains the sole pending-promise correlation key.
+  Keep the internal response non-serializable so future send paths cannot bypass the envelope.
 
 ## Non-Goals
 
@@ -191,12 +202,17 @@ candidate is described as packaged-host accepted.
   failed on the missing bounded asset poll token.
 - RED — isolated target `desktop_contract::test_packaged_acceptance_observer_is_passive_product_bridge_evidence`:
   failed because `src/packaged_acceptance.rs` did not yet exist.
-- GREEN — `macos_packaging_contract`: 32 passed; desktop library: 164 passed;
-  `packaged_live_host_acceptance`: 13 passed, 0 failed, and the one real mounted-app test remains
+- GREEN — `macos_packaging_contract`: 32 passed; desktop library: 167 passed;
+  `packaged_live_host_acceptance`: 14 passed, 0 failed, and the one real mounted-app test remains
   explicitly ignored until the package recipe supplies a read-only mounted app. The external
   harness suite was rerun with real macOS process/socket permissions and includes the real
   parent-`SIGKILL`/PTY-shell cleanup regression plus copied-identity rejection against the wrong
-  kernel peer.
+  kernel peer. The added diagnostic contracts preserve bounded receipt failure reasons and partial
+  Rust transcript failures without weakening any passing predicate.
+- RED/GREEN — focused `response_envelope` tests first failed because no discriminated Rust response
+  helper existed, then passed after both live send paths adopted the helper. A Node-driven smoke
+  loads the real live-bridge script and proves a sequential success resolves while a typed error
+  rejects; either missing discriminator would instead hit its 500 ms deadline.
 - GREEN — focused protocol/runtime verification: `impulse-ops` tests, 106 daemon-focused library
   tests, desktop library tests, desktop integration compilation, desktop-app binary check, and
   strict clippy for `impulse-ops`, `impulse-desktop`, and `impulse-rs`. Rustfmt, shell syntax, and
@@ -207,13 +223,20 @@ candidate is described as packaged-host accepted.
   `cargo clippy --workspace --all-targets --locked -- -D warnings` all exited zero. Rustfmt, shell
   syntax, and working-tree diff checks also pass. The independent final review found no remaining
   packaging/provenance code blocker.
-- Pending: explicit staging of the reviewed file set, staged diff/leak/commit review, commit, real
-  source-bound app/DMG rebuild, and mounted live-host acceptance against that clean committed tree.
+- EXACT-ARTIFACT FAILURES — `7e25412` and `ecd9ce5` each produced a structurally valid,
+  provenance-bound DMG and reached the mounted host, then timed out at Rust transcript validation.
+  The second run reported `packaged observer timed out`, which led to the confirmed invoke-envelope
+  blocker; the fresh mounted rerun must determine whether any additional blocker remains. The
+  `11b105c` run was intentionally rejected by the source-state warden after the local fix changed
+  its source worktree during verification; that candidate is invalid and not reusable.
+- Pending: exact staging/diff/leak review, commit, a fresh source-bound app/DMG rebuild with no
+  concurrent source writes, and mounted live-host acceptance.
 
 ## Handoff Notes
 
-- The current DMG predates its source commit by about 150 seconds and has no embedded provenance;
-  it must be rebuilt and cannot be reused as exact-HEAD evidence.
+- The preserved diagnostic DMGs are not release candidates: two encode known failing commits and
+  one was rejected for source drift. No passing exact-HEAD DMG exists yet, and none may be reused
+  to claim acceptance.
 - Browser `host_readiness_smoke.mjs` remains useful injected contract coverage, but it must never be
   represented as packaged live-host proof.
 - Full R6 still requires role-aware agent launch and real review decision behavior after this lane.

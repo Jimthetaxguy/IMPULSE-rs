@@ -6,7 +6,7 @@ type: doc
 category: roadmap
 phase: all
 status: active
-updated: 2026-08-17
+updated: 2026-08-30
 audience: builders
 tags: [roadmap, decommission, egui, eframe, dioxus, tauri, desktop, cleanup]
 authors:
@@ -222,13 +222,21 @@ lifecycle. The external runner owns process-group cleanup and precise Git-visibl
 proves the real PTY shell exits when its harness parent is killed without an opportunity to run
 Rust cleanup code.
 
-Focused post-fix contracts are green (`macos_packaging_contract` 32/32, desktop library 164/164,
-and external packaged-host harness 13 passed with only the real mounted-app case intentionally
-ignored). The complete locked workspace test/check/strict-Clippy gates and independent whole-diff
-review also pass, but this checkpoint records the implemented gate, not a passing candidate. The
-R1 and R6 boxes remain open until the exact reviewed snapshot is committed, rebuilt, and its
-read-only mounted app passes the gate. Even a pass would leave role-aware agent launch, review
-mutation, signing, notarization, installation, and deployment unproven.
+Focused post-fix contracts are green (`macos_packaging_contract` 32/32, desktop library 167/167,
+and external packaged-host harness 14 passed with only the real mounted-app case intentionally
+ignored). Two committed diagnostic candidates passed exact-source provenance, package structure,
+image verification, and read-only mounting before the live host timed out. Bounded transcript
+diagnostics exposed a confirmed blocker consistent with that result: Rust invoke responses were
+missing the strict JavaScript router's `kind: host_invoke_result` discriminator. Both Rust response
+paths and a real-script resolve/reject regression are fixed locally, and the internal response is
+no longer directly serializable; only a fresh mounted run can show whether another packaged
+blocker remains. A later candidate correctly failed the source-state warden because the fix was
+written while verification was running, so it supplies no runtime result. The repaired tree's
+complete locked workspace test/check/strict-Clippy gates, formatting, shell syntax, and diff checks
+pass. Commit review and a fresh exact-commit mounted run remain. The branch is local and unpushed.
+The R1 and R6 boxes stay open until that read-only mounted app passes. Even a pass would leave
+role-aware agent launch, review mutation, signing, notarization, installation, and deployment
+unproven.
 
 ### R2 — Remove resurrection vectors and dead affordances
 
