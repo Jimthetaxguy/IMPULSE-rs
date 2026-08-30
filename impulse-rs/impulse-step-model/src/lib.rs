@@ -158,6 +158,19 @@ mod tests {
         assert_eq!(decision.reason, StepModelReason::Configured);
     }
 
+
+    #[test]
+    fn test_decide_step_model_worker_stays_on_current_when_verifier_has_not_failed() {
+        // Ion/API fill sites use Worker with no verification yet. Escalate must
+        // stay unused until verifier/attestation actually failed.
+        let mut ctx = StepModelContext::worker("sonnet");
+        ctx.escalate_model = Some("opus".to_string());
+        let decision = decide_step_model(&ctx, "haiku");
+        assert_eq!(decision.model, "sonnet");
+        assert_eq!(decision.reason, StepModelReason::Configured);
+    }
+
+
     #[test]
     fn test_decide_step_model_current_model_wins_over_configured_fallback() {
         let decision = decide_step_model(&configured_ctx("already-selected"), "default");

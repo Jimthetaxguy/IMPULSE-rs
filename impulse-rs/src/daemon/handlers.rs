@@ -1461,7 +1461,10 @@ pub(crate) async fn handle_chat_request(
     }
 
     let provider = AnthropicProvider::new(api_key);
-    let model = std::env::var("IMPULSE_MODEL").unwrap_or_else(|_| "claude-sonnet-4-6".to_string());
+    let configured =
+        std::env::var("IMPULSE_MODEL").unwrap_or_else(|_| "claude-sonnet-4-6".to_string());
+    let step_ctx = crate::agent::step_model::HarnessStepContext::ion_api(configured.clone());
+    let model = crate::agent::step_model::resolve_step_model(&step_ctx, &configured, None);
     let request = ChatRequest {
         model,
         messages: vec![Message::text(Role::User, context_prompt)],
