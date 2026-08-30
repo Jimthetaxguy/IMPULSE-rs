@@ -662,6 +662,19 @@ fn validate_host_transcript(config: &PackagedAcceptanceConfig) -> Vec<String> {
     }
 }
 
+fn observer_timeout_failure_reasons_from_transcript(
+    transcript_failures: Vec<String>,
+) -> Vec<String> {
+    let mut failures = Vec::with_capacity(1 + transcript_failures.len());
+    failures.push("packaged observer timed out".to_string());
+    failures.extend(transcript_failures);
+    failures
+}
+
+fn observer_timeout_failure_reasons(config: &PackagedAcceptanceConfig) -> Vec<String> {
+    observer_timeout_failure_reasons_from_transcript(validate_host_transcript(config))
+}
+
 fn transcript_terminal_requiring_cleanup() -> Option<String> {
     let guard = transcript_slot()
         .lock()
@@ -1221,7 +1234,7 @@ pub fn use_packaged_acceptance() {
                 );
             }
             Err(_) => {
-                let mut failures = vec!["packaged observer timed out".to_string()];
+                let mut failures = observer_timeout_failure_reasons(&config);
                 failures.extend(contain_failed_acceptance().await);
                 let failures = bound_failures(failures);
                 emit_receipt(
@@ -1638,6 +1651,28 @@ mod tests {
         assert!(failures
             .iter()
             .any(|failure| failure.contains("terminal close")));
+    }
+
+    #[test]
+    fn observer_timeout_reports_partial_rust_transcript_failures() {
+        let config = test_config();
+        let mut transcript = passing_transcript(&config);
+        transcript.read_only_arrays.remove("review_queue");
+        transcript.terminal_closed = false;
+
+        let failures = observer_timeout_failure_reasons_from_transcript(
+            validate_host_transcript_snapshot(&transcript, &config),
+        );
+        assert_eq!(failures[0], "packaged observer timed out");
+        assert!(failures
+            .iter()
+            .any(|failure| failure.contains("review_queue array result")));
+        assert!(failures
+            .iter()
+            .any(|failure| failure.contains("terminal close")));
+        assert!(!failures
+            .iter()
+            .any(|failure| failure.contains("agent_snapshot array result")));
     }
 
     #[test]
