@@ -36,8 +36,8 @@ tags: [worktree, lane, ion, document-analysis, tools, primitives]
 - Latest status: implementation complete and gated on this lane: `cargo build --workspace`
   clean, `cargo test --workspace` 2282 passed / 0 failed / 9 ignored (21 new tests over the
   loop-contract lane), strict Clippy clean, rustfmt clean. `docs/validate_docs.py --all` reports
-  only failures that pre-exist on `main`; all lane docs validate. Pushed as a stacked draft PR
-  on top of PR #39.
+  only failures that pre-exist on `main`; all lane docs validate. Pushed; stacked draft PR
+  [#40](https://github.com/Jimthetaxguy/IMPULSE-rs/pull/40) open on top of PR #39.
 
 ## Decisions
 
