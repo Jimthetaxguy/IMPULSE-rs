@@ -255,9 +255,9 @@ mod tests {
                     ),
                 }
             }
-            Err(err) => panic!(
-                "could not create blocking-file fixture for unwritable-parent test: {err}"
-            ),
+            Err(err) => {
+                panic!("could not create blocking-file fixture for unwritable-parent test: {err}")
+            }
         };
 
         let mut editor = DefaultEditor::new().expect("editor");
