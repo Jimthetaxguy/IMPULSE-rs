@@ -41,7 +41,8 @@ tags: [worktree, lane, loop-contract, adr-0017, ion, primitives]
   `cargo test --workspace` 2261 passed / 0 failed / 9 ignored (31 new tests over base),
   strict Clippy clean, rustfmt clean. `docs/validate_docs.py --all` reports only failures that
   pre-exist on `main` (ADR-0014's `proposed` status and three stale March guides); all lane
-  docs validate. Unpushed; awaiting owner review and push/PR decision.
+  docs validate. Pushed to `origin/claude/loop-contract-20260901`; draft PR
+  [#39](https://github.com/Jimthetaxguy/IMPULSE-rs/pull/39) open for owner review and Ubuntu CI.
 
 ## Decisions
 
