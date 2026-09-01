@@ -98,6 +98,7 @@ in `VISION.md` are resolved.
 | [0013](decisions/0013-deterministic-accepted-run-memory-candidates.md) | Deterministic accepted-run memory candidates | Accepted | Owner-only pending review projection, provenance/source assurance, and no `GENOME`/`HISTORY` mutation |
 | [0014](decisions/0014-work-item-and-comparative-settlement.md) | WorkItem identity and comparative settlement | Proposed | Proposed planning identity, fan-out effect bound, and four-part settlement record |
 | [0015](decisions/0015-harness-owned-step-model.md) | Harness-owned step model choice | Accepted | Pure Impulse-owned per-step policy; hosts retain inference, provider, and evidence authority |
+| [0017](decisions/0017-canonical-loop-contract.md) | Canonical loop contract | Proposed | Typed loop budgets, breaker-evaluated stop conditions, and termination evidence for Ion tool loops |
 
 See [decisions/README.md](decisions/README.md) for full decision log.
 

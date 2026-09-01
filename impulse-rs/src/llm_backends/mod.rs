@@ -22,6 +22,9 @@ use std::time::Duration;
 
 use crate::agent::step_model::{resolve_step_model, HarnessStepContext};
 use crate::error::AgentError;
+use crate::loop_contract::{
+    CallOutcome, LoopBreaker, LoopContract, LoopReport, LoopTermination, LoopTrip,
+};
 
 // Re-export all providers from consolidated anthropic.rs
 pub mod anthropic;
@@ -186,7 +189,9 @@ pub struct ToolExecutionResult {
 /// Default cap on tool-use round trips within one [`Agent::chat_with_tools`]
 /// call (TUI_SPEC.md T9) -- bounds a misbehaving model that keeps
 /// requesting tools instead of ever returning a plain-text stop reason.
-pub const DEFAULT_MAX_TOOL_ROUNDS: usize = 10;
+/// Sourced from the Ion loop contract (ADR-0017) so the constant and
+/// [`LoopContract::ion_tool_loop`] can never disagree.
+pub const DEFAULT_MAX_TOOL_ROUNDS: usize = crate::loop_contract::ION_DEFAULT_MAX_ROUNDS;
 
 /// Overall wall-clock budget for one [`Agent::chat_with_tools`]/
 /// [`Agent::chat_with_tools_capped`] call -- the *entire* multi-round
@@ -200,8 +205,8 @@ pub const DEFAULT_MAX_TOOL_ROUNDS: usize = 10;
 /// tokens threaded through the REPL's event loop). This timeout is a
 /// narrower, immediately-actionable mitigation: it guarantees the loop
 /// always returns control to the REPL, even if a provider or tool call
-/// hangs outright.
-pub const DEFAULT_TOOL_LOOP_TIMEOUT: Duration = Duration::from_secs(180);
+/// hangs outright. Sourced from the Ion loop contract (ADR-0017).
+pub const DEFAULT_TOOL_LOOP_TIMEOUT: Duration = crate::loop_contract::ION_DEFAULT_WALL_CLOCK;
 
 pub struct Agent {
     pub id: String,
@@ -213,6 +218,12 @@ pub struct Agent {
     /// Harness step facts for [`resolve_step_model`]. Defaults to an Ion/API
     /// Worker context with no review/verification state (v0 identity).
     pub step_context: HarnessStepContext,
+    /// The budget every [`Agent::chat_with_tools`] run is bounded by
+    /// (ADR-0017). Defaults to [`LoopContract::ion_tool_loop`].
+    pub loop_contract: LoopContract,
+    /// Typed evidence from the most recent [`Agent::chat_with_tools`] run,
+    /// whether it completed or tripped. `None` until the first run.
+    last_loop_report: Option<LoopReport>,
 }
 
 impl Agent {
@@ -233,7 +244,25 @@ impl Agent {
             system_prompt,
             history: Vec::new(),
             step_context,
+            loop_contract: LoopContract::ion_tool_loop(),
+            last_loop_report: None,
         }
+    }
+
+    /// Replaces the loop contract every subsequent [`Agent::chat_with_tools`]
+    /// run is bounded by. Rejects a contract that could never run.
+    pub fn with_loop_contract(
+        mut self,
+        contract: LoopContract,
+    ) -> Result<Self, crate::loop_contract::LoopContractError> {
+        contract.validate()?;
+        self.loop_contract = contract;
+        Ok(self)
+    }
+
+    /// Typed evidence from the most recent [`Agent::chat_with_tools`] run.
+    pub fn last_loop_report(&self) -> Option<&LoopReport> {
+        self.last_loop_report.as_ref()
     }
 
     fn request_model(&self, tool_round: usize) -> String {
@@ -270,26 +299,28 @@ impl Agent {
     /// Sends one user turn with `tools` available for the model to call
     /// (TUI_SPEC.md T9), looping on `tool_use` stop reasons -- executing
     /// each requested call via `executor` and sending the results back --
-    /// until the model returns a plain-text reply, [`DEFAULT_MAX_TOOL_ROUNDS`]
-    /// is hit, or [`DEFAULT_TOOL_LOOP_TIMEOUT`] elapses. Conversation history
-    /// is only committed on a successful (non-error) return, matching
-    /// [`Agent::chat`]'s error-path behavior.
+    /// until the model returns a plain-text reply or the agent's
+    /// [`LoopContract`] trips (round cap, wall clock, repeated identical
+    /// call, or same-error streak; ADR-0017). Conversation history is only
+    /// committed on a successful (non-error) return, matching
+    /// [`Agent::chat`]'s error-path behavior. [`Agent::last_loop_report`]
+    /// holds the typed termination evidence afterwards either way.
     pub async fn chat_with_tools(
         &mut self,
         user_message: &str,
         tools: &[ToolDefinition],
         executor: &dyn ToolExecutor,
     ) -> AgentResult<String> {
-        self.chat_with_tools_capped(user_message, tools, executor, DEFAULT_MAX_TOOL_ROUNDS)
+        let max_rounds = self.loop_contract.budget.max_rounds;
+        self.chat_with_tools_capped(user_message, tools, executor, max_rounds)
             .await
     }
 
     /// Same as [`Agent::chat_with_tools`] with an explicit round cap --
     /// split out so tests can exercise the cap-hit error path without
-    /// looping [`DEFAULT_MAX_TOOL_ROUNDS`] times. Uses the default
-    /// [`DEFAULT_TOOL_LOOP_TIMEOUT`] wall-clock budget; see
-    /// [`Agent::chat_with_tools_capped_timeout`] for the test-only seam that
-    /// overrides it.
+    /// looping [`DEFAULT_MAX_TOOL_ROUNDS`] times. Uses the contract's
+    /// wall-clock budget; see [`Agent::chat_with_tools_capped_timeout`] for
+    /// the test-only seam that overrides it.
     pub async fn chat_with_tools_capped(
         &mut self,
         user_message: &str,
@@ -297,14 +328,9 @@ impl Agent {
         executor: &dyn ToolExecutor,
         max_rounds: usize,
     ) -> AgentResult<String> {
-        self.chat_with_tools_capped_timeout(
-            user_message,
-            tools,
-            executor,
-            max_rounds,
-            DEFAULT_TOOL_LOOP_TIMEOUT,
-        )
-        .await
+        let wall_clock = self.loop_contract.budget.wall_clock;
+        self.chat_with_tools_capped_timeout(user_message, tools, executor, max_rounds, wall_clock)
+            .await
     }
 
     /// Same as [`Agent::chat_with_tools_capped`] with an explicit wall-clock
@@ -332,6 +358,10 @@ impl Agent {
 
         let mut step_context = self.step_context.clone();
         step_context.current_model = self.model.clone();
+        let mut contract = self.loop_contract.clone();
+        contract.budget.max_rounds = max_rounds;
+        contract.budget.wall_clock = timeout_duration;
+        let mut breaker = LoopBreaker::new(contract);
         let loop_future = run_tool_loop(
             self.provider.as_ref(),
             &step_context,
@@ -339,18 +369,38 @@ impl Agent {
             working,
             tools,
             executor,
-            max_rounds,
+            &mut breaker,
         );
 
-        match tokio::time::timeout(timeout_duration, loop_future).await {
+        let outcome = tokio::time::timeout(timeout_duration, loop_future).await;
+        // The loop future is consumed by the timeout above, so the breaker
+        // is free again here: it carries the run's counts either way.
+        match outcome {
             Ok(Ok((reply, working))) => {
+                self.last_loop_report = Some(breaker.report(LoopTermination::Completed));
                 self.history = working;
                 Ok(reply)
             }
-            Ok(Err(err)) => Err(err),
-            Err(_elapsed) => Err(AgentError::ToolLoopTimedOut {
-                seconds: timeout_duration.as_secs(),
-            }),
+            Ok(Err(LoopExit::Tripped(trip))) => {
+                self.last_loop_report =
+                    Some(breaker.report(LoopTermination::Tripped { trip: trip.clone() }));
+                Err(match trip {
+                    LoopTrip::RoundCap { rounds } => AgentError::ToolLoopLimitExceeded { rounds },
+                    LoopTrip::WallClock { seconds } => AgentError::ToolLoopTimedOut { seconds },
+                    other => AgentError::ToolLoopStalled { trip: other },
+                })
+            }
+            Ok(Err(LoopExit::Failed(err))) => Err(err),
+            Err(_elapsed) => {
+                let trip = LoopTrip::WallClock {
+                    seconds: timeout_duration.as_secs(),
+                };
+                self.last_loop_report =
+                    Some(breaker.report(LoopTermination::Tripped { trip: trip.clone() }));
+                Err(AgentError::ToolLoopTimedOut {
+                    seconds: timeout_duration.as_secs(),
+                })
+            }
         }
     }
 
@@ -366,6 +416,8 @@ impl Agent {
 /// `Agent` across the `.await`. Returns the final reply and the full
 /// `working` history (system prompt excluded, matching `Agent::history`'s
 /// existing shape) on success, so the caller can decide whether to commit it.
+/// Every round is admitted by `breaker` and every executed tool call is
+/// reported to it, so a trip stops the loop with typed evidence (ADR-0017).
 async fn run_tool_loop(
     provider: &dyn LlmProvider,
     step_context: &HarnessStepContext,
@@ -373,9 +425,10 @@ async fn run_tool_loop(
     mut working: Vec<Message>,
     tools: &[ToolDefinition],
     executor: &dyn ToolExecutor,
-    max_rounds: usize,
-) -> AgentResult<(String, Vec<Message>)> {
-    for tool_round in 0..max_rounds {
+    breaker: &mut LoopBreaker,
+) -> Result<(String, Vec<Message>), LoopExit> {
+    loop {
+        let tool_round = breaker.begin_round().map_err(LoopExit::Tripped)?;
         let mut messages = Vec::new();
         if let Some(system) = system_prompt {
             messages.push(Message::text(Role::System, system.clone()));
@@ -391,7 +444,7 @@ async fn run_tool_loop(
             max_tokens: Some(4096),
             tools: tools.to_vec(),
         };
-        let response = provider.chat(request).await?;
+        let response = provider.chat(request).await.map_err(LoopExit::Failed)?;
 
         if response.stop_reason == StopReason::ToolUse && !response.tool_calls.is_empty() {
             working.push(Message::assistant_tool_use(
@@ -400,8 +453,19 @@ async fn run_tool_loop(
             ));
 
             let mut results = Vec::with_capacity(response.tool_calls.len());
+            let mut tripped = None;
             for call in &response.tool_calls {
                 let outcome = executor.execute(&call.name, call.input.clone()).await;
+                if tripped.is_none() {
+                    tripped = breaker.observe_call(
+                        &call.name,
+                        &call.input,
+                        CallOutcome {
+                            is_error: outcome.is_error,
+                            content: &outcome.content,
+                        },
+                    );
+                }
                 results.push(ToolResult {
                     tool_use_id: call.id.clone(),
                     content: outcome.content,
@@ -409,14 +473,23 @@ async fn run_tool_loop(
                 });
             }
             working.push(Message::tool_results(results));
+            if let Some(trip) = tripped {
+                return Err(LoopExit::Tripped(trip));
+            }
             continue;
         }
 
         working.push(Message::text(Role::Assistant, response.content.clone()));
         return Ok((response.content, working));
     }
+}
 
-    Err(AgentError::ToolLoopLimitExceeded { rounds: max_rounds })
+/// Why [`run_tool_loop`] returned without a final reply: the contract
+/// tripped, or a provider call failed outright.
+#[derive(Debug)]
+enum LoopExit {
+    Tripped(LoopTrip),
+    Failed(AgentError),
 }
 
 #[cfg(test)]
@@ -881,6 +954,15 @@ mod tests {
         // History must be left untouched on the error path, matching
         // Agent::chat's existing error-path behavior.
         assert!(agent.history.is_empty());
+        let report = agent.last_loop_report().expect("cap trip leaves a report");
+        assert_eq!(
+            report.termination,
+            LoopTermination::Tripped {
+                trip: LoopTrip::RoundCap { rounds: 2 }
+            }
+        );
+        assert_eq!(report.rounds_used, 2);
+        assert_eq!(report.tool_calls, 2);
     }
 
     /// Always sleeps longer than any sane test timeout before returning a
@@ -942,6 +1024,15 @@ mod tests {
         // onto `self.history`, matching the round-cap-exceeded invariant
         // above.
         assert!(agent.history.is_empty());
+        let report = agent.last_loop_report().expect("timeout leaves a report");
+        assert_eq!(
+            report.termination,
+            LoopTermination::Tripped {
+                trip: LoopTrip::WallClock { seconds: 0 }
+            }
+        );
+        assert_eq!(report.rounds_used, 1, "the first round had begun");
+        assert_eq!(report.tool_calls, 0);
     }
 
     #[tokio::test]
@@ -986,5 +1077,207 @@ mod tests {
             recorded.lock().unwrap().as_slice(),
             ["escalate-model", "escalate-model"]
         );
+    }
+
+    /// Always requests `echo_tool`, but with a different input every call,
+    /// so the repeated-call detector never fires and only the same-error
+    /// detector can trip.
+    struct VaryingToolProvider {
+        calls: std::sync::Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for VaryingToolProvider {
+        fn name(&self) -> &str {
+            "varying-tool-fake"
+        }
+        fn default_model(&self) -> &str {
+            "varying-tool-fake-model"
+        }
+        async fn chat(&self, request: ChatRequest) -> AgentResult<ChatResponse> {
+            let mut calls = self.calls.lock().expect("lock is never poisoned in tests");
+            *calls += 1;
+            Ok(ChatResponse {
+                content: String::new(),
+                model: request.model,
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+                stop_reason: StopReason::ToolUse,
+                tool_calls: vec![ToolCall {
+                    id: format!("call_{}", *calls),
+                    name: "echo_tool".to_string(),
+                    input: serde_json::json!({"n": *calls}),
+                }],
+            })
+        }
+        fn supported_models(&self) -> Vec<&str> {
+            vec!["varying-tool-fake-model"]
+        }
+    }
+
+    /// Fails every call the same way, with trailing detail that differs so
+    /// the signature (first line) is what must match.
+    struct FailingExecutor {
+        calls: std::sync::Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for FailingExecutor {
+        async fn execute(&self, _name: &str, _input: serde_json::Value) -> ToolExecutionResult {
+            let mut calls = self.calls.lock().expect("lock is never poisoned in tests");
+            *calls += 1;
+            ToolExecutionResult {
+                content: format!("permission denied: /etc/shadow\nattempt {}", *calls),
+                is_error: true,
+            }
+        }
+    }
+
+    #[test]
+    fn test_default_loop_constants_match_ion_contract() {
+        let contract = LoopContract::ion_tool_loop();
+        assert_eq!(DEFAULT_MAX_TOOL_ROUNDS, contract.budget.max_rounds);
+        assert_eq!(DEFAULT_TOOL_LOOP_TIMEOUT, contract.budget.wall_clock);
+        assert_eq!(
+            test_agent(FixedReplyProvider { content: "x" }).loop_contract,
+            contract
+        );
+    }
+
+    #[tokio::test]
+    async fn test_chat_with_tools_trips_on_repeated_identical_calls() {
+        // AlwaysToolUseProvider re-issues the exact same call every round;
+        // the default Ion contract trips on the third identical call, well
+        // before the ten-round cap.
+        let mut agent = test_agent(AlwaysToolUseProvider);
+        let executor = EchoExecutor::new();
+
+        let result = agent.chat_with_tools("do the thing", &[], &executor).await;
+
+        match result {
+            Err(AgentError::ToolLoopStalled {
+                trip: LoopTrip::RepeatedCall { tool, streak },
+            }) => {
+                assert_eq!(tool, "echo_tool");
+                assert_eq!(streak, 3);
+            }
+            other => panic!("expected RepeatedCall stall, got: {other:?}"),
+        }
+        assert_eq!(executor.invocations.lock().unwrap().len(), 3);
+        assert!(agent.history.is_empty(), "history untouched on stall");
+        let report = agent.last_loop_report().expect("stall leaves a report");
+        assert_eq!(report.contract, "ion_tool_loop");
+        assert_eq!(report.rounds_used, 3);
+        assert_eq!(report.tool_calls, 3);
+        assert_eq!(report.tool_errors, 0);
+        assert!(matches!(
+            report.termination,
+            LoopTermination::Tripped {
+                trip: LoopTrip::RepeatedCall { .. }
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_chat_with_tools_trips_on_same_error_streak() {
+        let mut agent = test_agent(VaryingToolProvider {
+            calls: std::sync::Mutex::new(0),
+        });
+        let executor = FailingExecutor {
+            calls: std::sync::Mutex::new(0),
+        };
+
+        let result = agent.chat_with_tools("do the thing", &[], &executor).await;
+
+        match result {
+            Err(AgentError::ToolLoopStalled {
+                trip:
+                    LoopTrip::SameError {
+                        tool,
+                        streak,
+                        signature,
+                    },
+            }) => {
+                assert_eq!(tool, "echo_tool");
+                assert_eq!(streak, 3);
+                assert_eq!(signature, "permission denied: /etc/shadow");
+            }
+            other => panic!("expected SameError stall, got: {other:?}"),
+        }
+        assert_eq!(*executor.calls.lock().unwrap(), 3);
+        assert!(agent.history.is_empty());
+        let report = agent.last_loop_report().expect("stall leaves a report");
+        assert_eq!(report.tool_calls, 3);
+        assert_eq!(report.tool_errors, 3);
+    }
+
+    #[tokio::test]
+    async fn test_chat_with_tools_success_records_completed_report() {
+        let mut agent = test_agent(OneShotToolProvider::new());
+        let executor = EchoExecutor::new();
+
+        let reply = agent
+            .chat_with_tools("do the thing", &[], &executor)
+            .await
+            .expect("one tool round then a final reply");
+
+        assert_eq!(reply, "final answer");
+        let report = agent.last_loop_report().expect("success leaves a report");
+        assert_eq!(report.termination, LoopTermination::Completed);
+        assert_eq!(report.rounds_used, 2);
+        assert_eq!(report.tool_calls, 1);
+        assert_eq!(report.tool_errors, 0);
+    }
+
+    #[tokio::test]
+    async fn test_with_loop_contract_bounds_subsequent_runs() {
+        let mut contract = LoopContract::ion_tool_loop();
+        contract.name = "tight".to_string();
+        contract.budget.max_rounds = 1;
+        let mut agent = test_agent(OneShotToolProvider::new())
+            .with_loop_contract(contract)
+            .expect("a one-round contract is valid");
+        let executor = EchoExecutor::new();
+
+        let result = agent.chat_with_tools("do the thing", &[], &executor).await;
+
+        assert!(matches!(
+            result,
+            Err(AgentError::ToolLoopLimitExceeded { rounds: 1 })
+        ));
+        assert_eq!(agent.last_loop_report().unwrap().contract, "tight");
+    }
+
+    #[test]
+    fn test_with_loop_contract_rejects_invalid_budget() {
+        let mut contract = LoopContract::ion_tool_loop();
+        contract.budget.max_rounds = 0;
+        let result = test_agent(FixedReplyProvider { content: "x" }).with_loop_contract(contract);
+        assert!(matches!(
+            result,
+            Err(crate::loop_contract::LoopContractError::ZeroRounds { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_disabled_detectors_fall_through_to_round_cap() {
+        let mut contract = LoopContract::ion_tool_loop();
+        contract.budget.max_rounds = 4;
+        contract.budget.max_repeated_call_streak = None;
+        contract.budget.max_same_error_streak = None;
+        let mut agent = test_agent(AlwaysToolUseProvider)
+            .with_loop_contract(contract)
+            .expect("valid contract");
+        let executor = EchoExecutor::new();
+
+        let result = agent.chat_with_tools("do the thing", &[], &executor).await;
+
+        assert!(matches!(
+            result,
+            Err(AgentError::ToolLoopLimitExceeded { rounds: 4 })
+        ));
+        assert_eq!(executor.invocations.lock().unwrap().len(), 4);
     }
 }

@@ -232,6 +232,12 @@ impl ChatState {
         self.agent.clear_history();
     }
 
+    /// Typed termination evidence from the most recent [`ChatState::turn`]
+    /// (ADR-0017): rounds used, tool calls, errors, and how the loop ended.
+    pub fn last_loop_report(&self) -> Option<&crate::loop_contract::LoopReport> {
+        self.agent.last_loop_report()
+    }
+
     /// Number of messages (user + assistant) currently held in history.
     /// `#[cfg(test)]`-only accessor used to prove `/clear` actually empties
     /// history rather than merely printing a confirmation string.

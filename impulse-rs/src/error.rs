@@ -71,6 +71,16 @@ pub enum AgentError {
     /// before Busy callers can retry.
     #[error("Harness command '{command}' did not complete within {seconds}s")]
     HarnessTimedOut { command: String, seconds: u64 },
+
+    /// Surfaced by `llm_backends::Agent::chat_with_tools` when the loop
+    /// contract's no-progress detectors trip (ADR-0017): the model kept
+    /// issuing the same tool call, or the same tool kept failing the same
+    /// way. Round-cap and wall-clock trips keep their dedicated variants
+    /// above; history is left untouched on this path too.
+    #[error("Tool-use loop stalled: {trip}")]
+    ToolLoopStalled {
+        trip: crate::loop_contract::LoopTrip,
+    },
 }
 
 pub type AgentResult<T> = Result<T, AgentError>;
@@ -175,6 +185,20 @@ mod tests {
             msg.to_lowercase().contains("wall-clock"),
             "expected wall-clock wording in: {msg}"
         );
+    }
+
+    #[test]
+    fn test_agent_error_tool_loop_stalled_display_includes_trip() {
+        let err = AgentError::ToolLoopStalled {
+            trip: crate::loop_contract::LoopTrip::RepeatedCall {
+                tool: "bash_exec".to_string(),
+                streak: 3,
+            },
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("stalled"), "{msg}");
+        assert!(msg.contains("bash_exec"), "{msg}");
+        assert!(msg.contains('3'), "{msg}");
     }
 
     #[test]

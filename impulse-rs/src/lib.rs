@@ -31,6 +31,7 @@ pub mod injection;
 pub mod integration_tests;
 pub mod ion_repl;
 pub mod llm_backends;
+pub mod loop_contract;
 pub mod mcp;
 pub mod memory;
 pub mod monty;
