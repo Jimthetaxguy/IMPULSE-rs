@@ -19,6 +19,7 @@ pub mod registry;
 pub mod router;
 pub mod tool_bridge;
 pub mod tool_claim;
+pub mod tool_document;
 pub mod tool_verify;
 pub mod tools;
 
@@ -426,6 +427,7 @@ mod tests {
         assert!(text.contains("file_read"));
         assert!(text.contains("file_write"));
         assert!(text.contains("bash_exec"));
+        assert!(text.contains("document_read"));
     }
 
     #[tokio::test]
