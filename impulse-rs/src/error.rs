@@ -53,11 +53,13 @@ pub enum AgentError {
     /// `chat_with_tools_capped` (same-day Opus adversarial-review follow-up
     /// to TUI_SPEC.md T9, finding S2) when the *entire* multi-round
     /// tool-use exchange exceeds its wall-clock budget
-    /// (`llm_backends::DEFAULT_TOOL_LOOP_TIMEOUT`), regardless of how many
-    /// rounds it took. Bounds a hung provider request or slow tool
-    /// execution so the REPL always regains control instead of blocking
-    /// indefinitely with no way to abort; history is left untouched on this
-    /// path, same as `ToolLoopLimitExceeded`.
+    /// (the agent's loop contract `wall_clock`, `DEFAULT_TOOL_LOOP_TIMEOUT`
+    /// by default; ADR-0017), regardless of how many rounds it took. Bounds
+    /// a hung provider request or slow tool execution so the REPL always
+    /// regains control instead of blocking indefinitely with no way to
+    /// abort; history is left untouched on this path, same as
+    /// `ToolLoopLimitExceeded`. `seconds` is the budget in whole seconds;
+    /// the `LoopReport` carries it in milliseconds.
     #[error("Tool-use loop exceeded its {seconds}s wall-clock budget without a final reply")]
     ToolLoopTimedOut { seconds: u64 },
 
@@ -74,9 +76,10 @@ pub enum AgentError {
 
     /// Surfaced by `llm_backends::Agent::chat_with_tools` when the loop
     /// contract's no-progress detectors trip (ADR-0017): the model kept
-    /// issuing the same tool call, or the same tool kept failing the same
-    /// way. Round-cap and wall-clock trips keep their dedicated variants
-    /// above; history is left untouched on this path too.
+    /// issuing the same tool call, the same batch of calls round after
+    /// round, or the same tool kept failing the same way. Round-cap and
+    /// wall-clock trips keep their dedicated variants above; history is left
+    /// untouched on this path too.
     #[error("Tool-use loop stalled: {trip}")]
     ToolLoopStalled {
         trip: crate::loop_contract::LoopTrip,

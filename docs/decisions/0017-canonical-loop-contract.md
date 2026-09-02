@@ -49,17 +49,29 @@ primitive rather than as more constants.
    plus a `LoopBudget`: `max_rounds` and `wall_clock` (hard caps, always enforced) and two
    optional no-progress detectors, `max_repeated_call_streak` and `max_same_error_streak`. A
    contract that could never run (zero rounds, zero wall clock, a zero streak limit) fails
-   validation and is rejected before the loop starts.
+   validation and is rejected before the loop starts. The stored contract is only replaceable
+   through a validating setter, and the *effective* contract, after any per-call round or
+   wall-clock override, is validated again at the execution boundary.
 2. **A `LoopBreaker` evaluates every trip condition on every round.** The breaker admits each
    model round (`begin_round`) and observes each executed tool call (`observe_call`). A repeated
    call is the same tool name with structurally equal input, compared through key-order-independent
    canonical JSON. A same-error streak is consecutive error results from the same tool whose
    trimmed first line matches. A different call resets the first streak; a non-error result or a
-   different error resets the second. A trip stops the loop; the caller must not continue.
+   different error resets the second. An error signature is the first line of the result that
+   carries a letter or digit, so a pretty-printed JSON failure payload (whose first line is `{`)
+   is keyed by its first field rather than matching every other failure. The breaker also closes
+   each round: the same set of calls requested in `max_repeated_call_streak` consecutive rounds
+   trips `RepeatedRound`, which catches a batch such as `[read a, read b]` re-issued every round
+   that the per-call comparison cannot see. A trip stops the loop immediately, including the
+   remaining calls of a batched tool-use response; the caller must not continue.
 3. **Termination is typed evidence.** Every run leaves a `LoopReport`: contract name,
-   `LoopTermination` (`Completed` or `Tripped { trip }` with a `LoopTrip` of `RoundCap`,
-   `WallClock`, `RepeatedCall`, or `SameError`), rounds used, tool calls, tool errors, and elapsed
-   time. Reports are serde round-trippable and carry no verdict: a trip is an execution fact, not
+   `LoopTermination` (`Completed`, `Tripped { trip }` with a `LoopTrip` of `RoundCap`,
+   `WallClock` (milliseconds), `RepeatedCall`, `RepeatedRound`, or `SameError`, or
+   `Failed { error }` when a model round itself failed), rounds used, tool calls that completed,
+   tool calls that were dispatched but interrupted by the wall clock, tool errors, and elapsed
+   time. A run clears the previous report when it starts, so a reader never sees stale evidence
+   describing a later turn.
+   Reports are serde round-trippable and carry no verdict: a trip is an execution fact, not
    a rejection, not a failed claim, and not a verification outcome. This extends ADR-0011's
    "process exit is not acceptance" with "a trip is not review".
 4. **The contract owns the defaults.** `DEFAULT_MAX_TOOL_ROUNDS` and `DEFAULT_TOOL_LOOP_TIMEOUT`
@@ -74,8 +86,16 @@ primitive rather than as more constants.
 
 ## Consequences
 
-- Ion's REPL now stops a stalled model after three identical calls or three identical failures
-  instead of spending the full ten rounds, and `ChatState::last_loop_report` exposes why.
+- Ion's REPL now stops a stalled model after three identical calls, three identical batches, or
+  three identical failures instead of spending the full ten rounds, and
+  `ChatState::last_loop_report` exposes why.
+- A user who declines a gated tool three times in one turn ends that turn: declines are error
+  results with one fixed signature, so the same-error detector trips and the REPL prints the
+  reason. This is intended. A human saying no three times is a stronger stop signal than any
+  budget, and the next prompt starts clean.
+- A tool call cut off by the wall clock while running is reported as interrupted, not as never
+  having happened. Whether that call's side effects landed is unknowable to the loop; the report
+  says so instead of implying no tool ran.
 - Callers of `chat_with_tools` that matched on `ToolLoopLimitExceeded` or `ToolLoopTimedOut` are
   unchanged; callers that render errors generically already show the new trip's `Display`.
 - The report is the first typed loop-evidence record. Persisting it beside governed-task
@@ -97,7 +117,9 @@ This decision is represented when tests prove:
 3. the breaker trips on round cap, repeated identical calls (key order ignored), and same-error
    streaks, and resets exactly as rule 2 states;
 4. `Agent::chat_with_tools` surfaces each trip as the documented `AgentError`, leaves history
-   untouched, and records a `LoopReport` on completion, cap, timeout, and stall;
+   untouched, stops a batched tool-use response at the tripping call, records a `LoopReport` on
+   completion, cap, timeout, stall, and provider failure, and rejects an invalid effective
+   contract before any model round runs;
 5. `DEFAULT_MAX_TOOL_ROUNDS` and `DEFAULT_TOOL_LOOP_TIMEOUT` equal the Ion contract's budget.
 
 Source of truth: `impulse-rs/src/loop_contract.rs`, `impulse-rs/src/llm_backends/mod.rs`,

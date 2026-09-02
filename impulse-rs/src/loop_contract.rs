@@ -135,10 +135,15 @@ pub enum LoopTrip {
     /// The round cap was reached without a final reply.
     RoundCap { rounds: usize },
     /// The wall-clock budget elapsed. Recorded by the caller that enforces
-    /// the timeout.
-    WallClock { seconds: u64 },
+    /// the timeout. Milliseconds, so a sub-second budget is reported
+    /// faithfully.
+    WallClock { millis: u64 },
     /// The model issued the same tool call `streak` times in a row.
     RepeatedCall { tool: String, streak: usize },
+    /// The model issued the same set of `calls` tool calls in `streak`
+    /// consecutive rounds. Catches a batch such as `[read a, read b]`
+    /// re-issued every round, which the per-call detector cannot see.
+    RepeatedRound { calls: usize, streak: usize },
     /// The same tool failed with the same error signature `streak` times in
     /// a row.
     SameError {
@@ -154,12 +159,16 @@ impl fmt::Display for LoopTrip {
             LoopTrip::RoundCap { rounds } => {
                 write!(f, "round cap of {rounds} reached without a final reply")
             }
-            LoopTrip::WallClock { seconds } => {
-                write!(f, "wall-clock budget of {seconds}s elapsed")
+            LoopTrip::WallClock { millis } => {
+                write!(f, "wall-clock budget of {millis}ms elapsed")
             }
             LoopTrip::RepeatedCall { tool, streak } => write!(
                 f,
                 "tool '{tool}' was requested with identical input {streak} times in a row"
+            ),
+            LoopTrip::RepeatedRound { calls, streak } => write!(
+                f,
+                "the same batch of {calls} tool call(s) was requested in {streak} consecutive rounds"
             ),
             LoopTrip::SameError {
                 tool,
@@ -181,6 +190,10 @@ pub enum LoopTermination {
     Completed,
     /// A trip condition stopped the loop before a final result.
     Tripped { trip: LoopTrip },
+    /// The loop ended because a model round itself failed (provider error),
+    /// not because the contract tripped. `error` is the bounded first line
+    /// of the failure, see [`error_signature`].
+    Failed { error: String },
 }
 
 /// Typed evidence left behind by one loop run, whether it completed or
@@ -191,10 +204,14 @@ pub struct LoopReport {
     pub termination: LoopTermination,
     /// Rounds that actually began.
     pub rounds_used: usize,
-    /// Tool calls executed across all rounds.
+    /// Tool calls that executed to completion and were observed.
     pub tool_calls: usize,
     /// Tool calls whose result was an error.
     pub tool_errors: usize,
+    /// Tool calls that were dispatched but never observed, because the run
+    /// was cut off (wall clock) while they were in flight.
+    #[serde(default)]
+    pub tool_calls_interrupted: usize,
     pub elapsed_ms: u64,
 }
 
@@ -205,21 +222,26 @@ pub struct CallOutcome<'a> {
     pub content: &'a str,
 }
 
-/// Per-run breaker state. Create one per loop run, call
-/// [`LoopBreaker::begin_round`] before each model round and
-/// [`LoopBreaker::observe_call`] after each executed tool call, and read
-/// [`LoopBreaker::report`] when the run ends.
+/// Per-run breaker state. Create one per loop run. For each model round:
+/// [`LoopBreaker::begin_round`], then for each tool call the model requested
+/// [`LoopBreaker::dispatch_call`] before executing it and
+/// [`LoopBreaker::observe_call`] after, then [`LoopBreaker::end_round`].
+/// Read [`LoopBreaker::report`] when the run ends.
 #[derive(Debug)]
 pub struct LoopBreaker {
     contract: LoopContract,
     started: Instant,
     rounds_used: usize,
+    dispatched: usize,
     tool_calls: usize,
     tool_errors: usize,
     last_call_key: Option<String>,
     repeated_call_streak: usize,
     last_error_key: Option<(String, String)>,
     same_error_streak: usize,
+    round_keys: Vec<String>,
+    last_round_keys: Option<Vec<String>>,
+    repeated_round_streak: usize,
 }
 
 impl LoopBreaker {
@@ -228,12 +250,16 @@ impl LoopBreaker {
             contract,
             started: Instant::now(),
             rounds_used: 0,
+            dispatched: 0,
             tool_calls: 0,
             tool_errors: 0,
             last_call_key: None,
             repeated_call_streak: 0,
             last_error_key: None,
             same_error_streak: 0,
+            round_keys: Vec::new(),
+            last_round_keys: None,
+            repeated_round_streak: 0,
         }
     }
 
@@ -254,7 +280,42 @@ impl LoopBreaker {
         }
         let index = self.rounds_used;
         self.rounds_used += 1;
+        self.round_keys.clear();
         Ok(index)
+    }
+
+    /// Records that a tool call is about to execute. A call that is
+    /// dispatched but never observed (the run was cut off while it ran) is
+    /// reported as interrupted rather than silently missing.
+    pub fn dispatch_call(&mut self) {
+        self.dispatched += 1;
+    }
+
+    /// Closes the current round and trips when the model has requested the
+    /// same set of tool calls in `max_repeated_call_streak` consecutive
+    /// rounds. Rounds without tool calls reset the streak.
+    pub fn end_round(&mut self) -> Option<LoopTrip> {
+        if self.round_keys.is_empty() {
+            self.last_round_keys = None;
+            self.repeated_round_streak = 0;
+            return None;
+        }
+        let mut keys = std::mem::take(&mut self.round_keys);
+        keys.sort();
+        if self.last_round_keys.as_ref() == Some(&keys) {
+            self.repeated_round_streak += 1;
+        } else {
+            self.repeated_round_streak = 1;
+        }
+        let calls = keys.len();
+        self.last_round_keys = Some(keys);
+        match self.contract.budget.max_repeated_call_streak {
+            Some(limit) if self.repeated_round_streak >= limit => Some(LoopTrip::RepeatedRound {
+                calls,
+                streak: self.repeated_round_streak,
+            }),
+            _ => None,
+        }
     }
 
     /// Records one executed tool call and returns a trip if it pushed a
@@ -270,6 +331,7 @@ impl LoopBreaker {
         self.tool_calls += 1;
 
         let call_key = format!("{tool}\u{1f}{}", canonical_json(input));
+        self.round_keys.push(call_key.clone());
         if self.last_call_key.as_deref() == Some(call_key.as_str()) {
             self.repeated_call_streak += 1;
         } else {
@@ -321,16 +383,25 @@ impl LoopBreaker {
             rounds_used: self.rounds_used,
             tool_calls: self.tool_calls,
             tool_errors: self.tool_errors,
+            tool_calls_interrupted: self.dispatched.saturating_sub(self.tool_calls),
             elapsed_ms: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
         }
     }
 }
 
-/// First line of an error, trimmed and bounded, so two failures that differ
-/// only in trailing detail still count as the same failure.
+/// The first line of an error that carries any letter or digit, trimmed and
+/// bounded, so two failures that differ only in trailing detail still count
+/// as the same failure while a structural opener such as `{` (the first line
+/// of a pretty-printed JSON failure payload) never becomes a signature that
+/// matches every failure. Content with no letters or digits at all falls
+/// back to its trimmed, bounded whole.
 pub fn error_signature(content: &str) -> String {
-    let first_line = content.lines().next().unwrap_or("").trim();
-    first_line.chars().take(ERROR_SIGNATURE_MAX_CHARS).collect()
+    let line = content
+        .lines()
+        .map(str::trim)
+        .find(|line| line.chars().any(char::is_alphanumeric))
+        .unwrap_or_else(|| content.trim());
+    line.chars().take(ERROR_SIGNATURE_MAX_CHARS).collect()
 }
 
 /// Serializes `value` with object keys sorted at every level, so two inputs
@@ -440,9 +511,13 @@ mod tests {
     fn round_trip_loop_trip_every_variant() {
         let variants = [
             LoopTrip::RoundCap { rounds: 3 },
-            LoopTrip::WallClock { seconds: 9 },
+            LoopTrip::WallClock { millis: 9_500 },
             LoopTrip::RepeatedCall {
                 tool: "bash_exec".into(),
+                streak: 3,
+            },
+            LoopTrip::RepeatedRound {
+                calls: 2,
                 streak: 3,
             },
             LoopTrip::SameError {
@@ -468,20 +543,37 @@ mod tests {
             rounds_used: 10,
             tool_calls: 9,
             tool_errors: 2,
+            tool_calls_interrupted: 1,
             elapsed_ms: 1234,
         };
         let json = serde_json::to_string(&original).unwrap();
         let recovered: LoopReport = serde_json::from_str(&json).unwrap();
         assert_eq!(original, recovered);
+        // Older reports without the interrupted count still deserialize.
+        let legacy = json.replace(",\"tool_calls_interrupted\":1", "");
+        assert_ne!(legacy, json);
+        let recovered: LoopReport = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(recovered.tool_calls_interrupted, 0);
 
         let completed = LoopReport {
             termination: LoopTermination::Completed,
-            ..original
+            ..original.clone()
         };
         let json = serde_json::to_string(&completed).unwrap();
         assert!(json.contains("\"outcome\":\"completed\""), "{json}");
         let recovered: LoopReport = serde_json::from_str(&json).unwrap();
         assert_eq!(completed, recovered);
+
+        let failed = LoopReport {
+            termination: LoopTermination::Failed {
+                error: "API request failed: boom".into(),
+            },
+            ..original
+        };
+        let json = serde_json::to_string(&failed).unwrap();
+        assert!(json.contains("\"outcome\":\"failed\""), "{json}");
+        let recovered: LoopReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(failed, recovered);
     }
 
     #[test]
@@ -664,18 +756,107 @@ mod tests {
         breaker.observe_call("u", &json!(2), err("x"));
         breaker.begin_round().unwrap();
         let report = breaker.report(LoopTermination::Tripped {
-            trip: LoopTrip::WallClock { seconds: 5 },
+            trip: LoopTrip::WallClock { millis: 5_000 },
         });
         assert_eq!(report.contract, "test_loop");
         assert_eq!(report.rounds_used, 2);
         assert_eq!(report.tool_calls, 2);
         assert_eq!(report.tool_errors, 1);
+        assert_eq!(report.tool_calls_interrupted, 0);
         assert!(matches!(
             report.termination,
             LoopTermination::Tripped {
-                trip: LoopTrip::WallClock { seconds: 5 }
+                trip: LoopTrip::WallClock { millis: 5_000 }
             }
         ));
+    }
+
+    #[test]
+    fn test_dispatched_but_unobserved_calls_are_reported_as_interrupted() {
+        let mut breaker = LoopBreaker::new(contract(5, None, None));
+        breaker.begin_round().unwrap();
+        breaker.dispatch_call();
+        breaker.observe_call("t", &json!(1), OK);
+        breaker.dispatch_call();
+        // The second call never comes back: the run was cut off mid-flight.
+        let report = breaker.report(LoopTermination::Tripped {
+            trip: LoopTrip::WallClock { millis: 100 },
+        });
+        assert_eq!(report.tool_calls, 1);
+        assert_eq!(report.tool_calls_interrupted, 1);
+    }
+
+    #[test]
+    fn test_end_round_trips_when_the_same_batch_repeats() {
+        let mut breaker = LoopBreaker::new(contract(10, Some(3), None));
+        let a = json!({"path": "a"});
+        let b = json!({"path": "b"});
+        for round in 1..=3 {
+            breaker.begin_round().unwrap();
+            // Order within the batch must not matter.
+            let (first, second) = if round % 2 == 0 { (&b, &a) } else { (&a, &b) };
+            assert_eq!(breaker.observe_call("file_read", first, OK), None);
+            assert_eq!(breaker.observe_call("file_read", second, OK), None);
+            let trip = breaker.end_round();
+            if round < 3 {
+                assert_eq!(trip, None, "round {round}");
+            } else {
+                assert_eq!(
+                    trip,
+                    Some(LoopTrip::RepeatedRound {
+                        calls: 2,
+                        streak: 3
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_end_round_resets_on_a_different_batch_or_an_empty_round() {
+        let mut breaker = LoopBreaker::new(contract(10, Some(2), None));
+        let a = json!({"path": "a"});
+        let b = json!({"path": "b"});
+        breaker.begin_round().unwrap();
+        breaker.observe_call("t", &a, OK);
+        breaker.observe_call("t", &b, OK);
+        assert_eq!(breaker.end_round(), None);
+        // Different batch resets.
+        breaker.begin_round().unwrap();
+        breaker.observe_call("t", &a, OK);
+        assert_eq!(breaker.end_round(), None);
+        breaker.begin_round().unwrap();
+        breaker.observe_call("t", &a, OK);
+        breaker.observe_call("t", &b, OK);
+        assert_eq!(breaker.end_round(), None);
+        // A round with no tool calls resets too.
+        breaker.begin_round().unwrap();
+        assert_eq!(breaker.end_round(), None);
+        breaker.begin_round().unwrap();
+        breaker.observe_call("t", &a, OK);
+        breaker.observe_call("t", &b, OK);
+        assert_eq!(breaker.end_round(), None);
+        breaker.begin_round().unwrap();
+        breaker.observe_call("t", &a, OK);
+        breaker.observe_call("t", &b, OK);
+        assert!(matches!(
+            breaker.end_round(),
+            Some(LoopTrip::RepeatedRound {
+                calls: 2,
+                streak: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn test_end_round_never_trips_when_the_detector_is_disabled() {
+        let mut breaker = LoopBreaker::new(contract(50, None, None));
+        for _ in 0..20 {
+            breaker.begin_round().unwrap();
+            breaker.observe_call("t", &json!(1), OK);
+            breaker.observe_call("t", &json!(2), OK);
+            assert_eq!(breaker.end_round(), None);
+        }
     }
 
     #[test]
@@ -700,7 +881,51 @@ mod tests {
         );
 
         assert!(format!("{}", LoopTrip::RoundCap { rounds: 10 }).contains("10"));
-        assert!(format!("{}", LoopTrip::WallClock { seconds: 180 }).contains("180"));
+        assert!(format!("{}", LoopTrip::WallClock { millis: 180_000 }).contains("180000ms"));
+        let msg = format!(
+            "{}",
+            LoopTrip::RepeatedRound {
+                calls: 2,
+                streak: 3
+            }
+        );
+        assert!(msg.contains('2') && msg.contains('3'), "{msg}");
+    }
+
+    #[test]
+    fn test_error_signature_skips_structural_lines_of_json_payloads() {
+        // A bridged tool's failure payload is pretty-printed JSON whose
+        // first line is just `{`; two different failures must not share a
+        // signature, and the same failure must.
+        let cargo =
+            "{\n  \"command\": \"cargo build\",\n  \"exit_code\": 101,\n  \"success\": false\n}";
+        let grep =
+            "{\n  \"command\": \"grep -rn x src/\",\n  \"exit_code\": 1,\n  \"success\": false\n}";
+        assert_eq!(error_signature(cargo), "\"command\": \"cargo build\",");
+        assert_ne!(error_signature(cargo), error_signature(grep));
+        assert_eq!(
+            error_signature(cargo),
+            error_signature(&cargo.replace("101", "102"))
+        );
+        // Content with no letters or digits at all falls back to itself.
+        assert_eq!(error_signature("{}\n  \n"), "{}");
+    }
+
+    #[test]
+    fn test_same_error_streak_ignores_json_structural_first_lines() {
+        let mut breaker = LoopBreaker::new(contract(10, None, Some(3)));
+        let mut inputs = (0..).map(|i| json!({"n": i}));
+        let failures = [
+            "{\n  \"command\": \"a\",\n  \"success\": false\n}",
+            "{\n  \"command\": \"b\",\n  \"success\": false\n}",
+            "{\n  \"command\": \"c\",\n  \"success\": false\n}",
+        ];
+        for failure in failures {
+            assert_eq!(
+                breaker.observe_call("bash_exec", &inputs.next().unwrap(), err(failure)),
+                None
+            );
+        }
     }
 
     #[test]

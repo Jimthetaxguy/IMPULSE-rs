@@ -178,18 +178,21 @@ impl ChatState {
     /// Sends one chat turn through the underlying `Agent`, with `tools`
     /// exposed to the model as Anthropic tool-use schemas (T9). Requested
     /// tool calls are executed against `tools`/`ctx` and their results sent
-    /// back to the model automatically (`Agent::chat_with_tools`, capped at
-    /// `llm_backends::DEFAULT_MAX_TOOL_ROUNDS` round trips and, as of the
-    /// same-day Opus adversarial-review follow-up (finding S2),
-    /// `llm_backends::DEFAULT_TOOL_LOOP_TIMEOUT` wall-clock) -- mutating
-    /// calls (`bash_exec`/`file_write`) are gated behind `self.confirm`
-    /// first (see module doc comment). Returns the assistant's final reply
-    /// text, or the `AgentError` the provider or loop cap failed with
-    /// (including `AgentError::MissingApiKey` for an absent key,
-    /// `AgentError::ToolLoopLimitExceeded` if the round cap is hit, and
-    /// `AgentError::ToolLoopTimedOut` if the wall-clock budget elapses
-    /// first) — never panics, matching every other `Result`-returning path
-    /// in this crate.
+    /// back to the model automatically (`Agent::chat_with_tools`, bounded by
+    /// the agent's loop contract, ADR-0017: by default
+    /// `llm_backends::DEFAULT_MAX_TOOL_ROUNDS` round trips,
+    /// `llm_backends::DEFAULT_TOOL_LOOP_TIMEOUT` wall-clock, and the
+    /// repeated-call, repeated-batch, and same-error streak detectors) --
+    /// mutating calls (`bash_exec`/`file_write`) are gated behind
+    /// `self.confirm` first (see module doc comment). Returns the
+    /// assistant's final reply text, or the `AgentError` the provider or
+    /// loop contract failed with (including `AgentError::MissingApiKey` for
+    /// an absent key, `AgentError::ToolLoopLimitExceeded` if the round cap
+    /// is hit, `AgentError::ToolLoopTimedOut` if the wall-clock budget
+    /// elapses first, and `AgentError::ToolLoopStalled` when a streak
+    /// detector trips) — never panics, matching every other
+    /// `Result`-returning path in this crate. [`ChatState::last_loop_report`]
+    /// holds the typed evidence for the turn either way.
     ///
     /// **Timeout caveat (fresh Opus sweep, finding G1):** the wall-clock
     /// timeout bounds every `.await` point in the loop -- provider calls,
