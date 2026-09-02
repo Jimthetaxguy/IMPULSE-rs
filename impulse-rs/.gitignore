@@ -16,6 +16,7 @@ Impulse.app/
 .impulse/retrieval.db
 .impulse/retrieval.db-*
 .impulse/sockets/
+.impulse/PRODUCER_RESERVATIONS.json
 impulse-gui/.impulse/agent_history.jsonl
 
 # Scratch/generated local work areas

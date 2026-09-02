@@ -622,6 +622,18 @@ pub enum GovernedTaskMutation {
     RecordOperatorDecision {
         decision: OperatorDecisionInput,
     },
+    /// Records that a durable producer reservation for this task was found
+    /// open by a fresh process and closed as needs-rerun. `reason` is a
+    /// prepared, self-contained detail string (see
+    /// `state/producer_reservation.rs`'s `note_producer_reservation_interrupted`)
+    /// rather than structured fields, matching the existing
+    /// `MarkLaunchFailed`/`MarkRuntimeExited` pattern of reconstructing the
+    /// mutation directly from the recorded event's `actor`/`detail` on
+    /// reload.
+    NoteProducerReservationInterrupted {
+        actor: GovernedActor,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -748,6 +760,11 @@ pub enum GovernedTaskEventKind {
     VerificationRecorded,
     SupervisorVerdictRecorded,
     OperatorDecisionRecorded,
+    /// A durable producer reservation (see `state/producer_reservation.rs`)
+    /// was left open by a process that exited before persisting a receipt.
+    /// Purely observational: it does not change `execution_state` or
+    /// `review_state`.
+    ProducerReservationInterrupted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

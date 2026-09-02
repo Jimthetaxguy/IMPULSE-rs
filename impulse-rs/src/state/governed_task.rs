@@ -487,7 +487,7 @@ impl State {
         Ok(ledger.tasks.values().cloned().collect())
     }
 
-    fn governed_project_id(&self) -> String {
+    pub(crate) fn governed_project_id(&self) -> String {
         governed_project_id_for_storage(self.storage())
     }
 
@@ -814,6 +814,13 @@ fn validate_task_history(task: &GovernedTaskRun) -> Result<BTreeMap<u64, String>
                         decision: fingerprint_input,
                     },
                 )
+            }
+            GovernedTaskEventKind::ProducerReservationInterrupted => {
+                let mutation = GovernedTaskMutation::NoteProducerReservationInterrupted {
+                    actor: event.actor.clone(),
+                    reason: event.detail.clone(),
+                };
+                (mutation.clone(), mutation)
             }
         };
         let fingerprint =
@@ -1240,6 +1247,21 @@ fn apply_mutation(
                 GovernedTaskEventKind::OperatorDecisionRecorded,
                 decision.actor,
                 format!("operator decision {id} recorded as {decision_kind:?}"),
+                &now,
+            ));
+        }
+        GovernedTaskMutation::NoteProducerReservationInterrupted { actor, reason } => {
+            // A pure observability note: it does not transition
+            // execution_state or review_state, and is valid at any point in
+            // the lifecycle, since the crash it records can interrupt any
+            // daemon-owned producer regardless of current review state.
+            require_actor(&actor, GovernedActorKind::System)?;
+            require_text("producer reservation interruption reason", &reason)?;
+            task.events.push(new_event(
+                event_revision,
+                GovernedTaskEventKind::ProducerReservationInterrupted,
+                actor,
+                reason,
                 &now,
             ));
         }

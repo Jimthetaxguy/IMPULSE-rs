@@ -87,6 +87,17 @@ A deterministic pending-review projection of one accepted governed task, persist
 is not curated memory, never mutates `GENOME.md`/`HISTORY.jsonl`, and has no v1 mutation action.
 - **Source:** `impulse-ops/src/memory_candidate.rs`, `src/state/memory_candidate.rs`, ADR-0013.
 
+### producer reservation — `[code]`
+A durable record of intent to run a daemon-owned producer side effect (verification, Supervisor
+review, and — reserved for ADR-0019 — promote), persisted independently of `GOVERNED_TASKS.json` in
+owner-only, digest-verified `PRODUCER_RESERVATIONS.json`. Reserved before the side effect, released
+with a receipt reference once the effect and its governed-task mutation are both durable; a
+reservation still open on reload is reconciled to `NeedsRerun` and noted on the owning governed
+task's own event chain. Closes the state-layer half of ADR-0012's crash-between-side-effect-and-
+receipt gap; handler wiring (adopting `with_reservation` in `RunGovernedVerification`/
+`RunGovernedSupervisorReview`) is follow-up work.
+- **Source of truth:** `src/state/producer_reservation.rs`, ADR-0012 amendment (2026-09-02).
+
 ### task — `[vocabulary]`
 The broader product assignment concept. A governed task is today's durable carrier; delegations,
 `AgentRuntime.current_task`, and Ion `Task` contracts remain separate legacy/specialized carriers

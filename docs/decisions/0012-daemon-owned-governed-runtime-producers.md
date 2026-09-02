@@ -2,6 +2,7 @@
 title: "ADR-0012: Daemon-Owned Governed Runtime Producers"
 status: accepted
 created: 2026-07-13
+updated: 2026-09-02
 deciders: [Impulse Maintainers]
 ---
 
@@ -166,6 +167,44 @@ This decision is represented only when tests prove:
 10. the docs keep memory promotion, strong local actor authentication, generalized profiles, and
    external-runtime parity explicit as follow-ups.
 
+## Amendment (2026-09-02): durable producer reservations
+
+The Consequences section above names an open gap: persisted receipts and the per-task daemon lock
+deduplicate replay and concurrent requests, but a daemon exit between a producer side effect and
+its durable receipt could still repeat that side effect after restart.
+
+The state layer half of that gap is now closed. `impulse-rs/src/state/producer_reservation.rs`
+adds a durable, atomic, digest-verified journal (`.impulse/PRODUCER_RESERVATIONS.json`, distinct
+from `GOVERNED_TASKS.json`) that records the *intent* to run a producer side effect before it
+starts:
+
+- `State::reserve(task_id, revision, request_id, producer)` fails closed with a typed
+  `DuplicateOpenReservation` error if an open reservation already exists for the same task and
+  producer, so a request replayed while the original side effect is still in flight cannot start a
+  second, competing run.
+- `State::release(id, receipt_ref)` closes a reservation once its side effect and governed-task
+  mutation are both durably recorded.
+- A reservation still open when the process reloads was interrupted before a receipt existed.
+  `State::new` reconciles it to `NeedsRerun` and records a note on the owning governed task's own
+  event chain (a new, purely additive `GovernedTaskEventKind::ProducerReservationInterrupted` /
+  `GovernedTaskMutation::NoteProducerReservationInterrupted` pair in
+  `impulse-ops/src/governed_task.rs`), so the operator surface can show it without inventing a
+  second source of truth.
+- `producer_reservation::with_reservation` is a ready-to-adopt async wrapper: reserve, run a closure
+  that performs the side effect *and* persists its governed-task mutation, then release with the
+  resulting receipt reference. Releasing before the mutation is persisted would reopen the gap this
+  journal exists to close, so the helper's closure contract requires both steps together.
+
+**Not yet done — handler wiring remains follow-up work**, tracked as the next lane in
+`docs/plans/2026-09-02-impulse-next-stages.md`'s Stage 3: `RunGovernedVerification` and
+`RunGovernedSupervisorReview` in `src/daemon/handlers.rs` do not yet call `with_reservation` around
+`governed_producers::run_verification`/the Supervisor review turn. Until that wiring lands, the gap
+this amendment describes is observable (an interrupted reservation is now durably visible and
+annotated) but not yet load-bearing (a replayed request after a crash still reruns the side effect,
+exactly as before). See the design spec for the exact adoption shape.
+
+Design spec: [`../superpowers/specs/2026-09-02-producer-reservation-journal.md`](../superpowers/specs/2026-09-02-producer-reservation-journal.md).
+
 ## Related Documents
 
 - [`0010-product-role-launch-contract.md`](0010-product-role-launch-contract.md)
@@ -174,3 +213,4 @@ This decision is represented only when tests prove:
 - [`../spec/RUST-CANONICAL-CONTRACT.md`](../spec/RUST-CANONICAL-CONTRACT.md)
 - [`../spec/TEST-TRACEABILITY.md`](../spec/TEST-TRACEABILITY.md)
 - [`../superpowers/plans/2026-07-13-governed-runtime-producers.md`](../superpowers/plans/2026-07-13-governed-runtime-producers.md)
+- [`../superpowers/specs/2026-09-02-producer-reservation-journal.md`](../superpowers/specs/2026-09-02-producer-reservation-journal.md)
