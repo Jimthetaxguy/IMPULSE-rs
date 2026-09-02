@@ -60,7 +60,7 @@ Run on this lane's tree with
 | `cargo build --workspace` | clean, zero warnings |
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean, zero warnings |
 | `cargo fmt --all -- --check` | clean, zero diffs |
-| `cargo test --workspace` | **2399 passed, 0 failed, 9 ignored** (base `36bda00`: 2310 passed; +89) |
+| `cargo test --workspace` | **2408 passed, 0 failed, 9 ignored** (base `36bda00`: 2310 passed; +98) |
 | `python3 docs/validate_docs.py --all` | only the four failures that pre-exist on `main` |
 
 Package-level totals from the same run:
@@ -73,13 +73,13 @@ Package-level totals from the same run:
 | `impulse-desktop` `runtime` | 22 | 0 | 1 |
 | `impulse-desktop` `views_ssr` | 7 | 0 | 0 |
 | `impulse-ion` lib | 23 | 0 | 1 |
-| `impulse-ops` lib | 97 | 0 | 0 |
+| `impulse-ops` lib | 101 | 0 | 0 |
 | `impulse-ops` `governed_producer_contract` | 8 | 0 | 0 |
 | `impulse-ops` `governed_task_contract` | 5 | 0 | 0 |
 | `impulse-ops` `memory_candidate_contract` | 5 | 0 | 0 |
-| `impulse-rs` lib | 1830 | 0 | 5 |
+| `impulse-rs` lib | 1833 | 0 | 5 |
 | `impulse-rs` `governed_process_flow` | 2 | 0 | 0 |
-| `impulse-rs` `governed_staged_worktree` (new) | 19 | 0 | 0 |
+| `impulse-rs` `governed_staged_worktree` (new) | 21 | 0 | 0 |
 | `impulse-rs` hook-validation suites (3 files) | 15 | 0 | 0 |
 | `impulse-rs` `integration_enhancements` | 11 | 0 | 1 |
 | `impulse-rs` `ion_binary` | 4 | 0 | 0 |
@@ -304,6 +304,40 @@ Two things the fixes changed beyond the literal asks, both worth flagging:
   ADR-0019's Consequences rather than papered over, and the sync failure message names the branch
   that already advanced so an operator is never left guessing.
 
+## Review round 3
+
+One HIGH, on a field **round 2 itself introduced** — the review caught a backward-compat break I
+created while fixing a security hole, which is the failure mode worth naming: `shared_config_digest`
+was non-`Option`, non-defaulted, with no `Default` on its type, so a staged worktree recorded before
+the pin existed fails to deserialize with `missing field`, and `GovernedTaskLedger::load` propagates
+it — one stale record takes the **entire** ledger down. Round 2's legacy test only stripped
+`staged_worktree` wholesale, so it never covered this.
+
+| Fix | Detail |
+|---|---|
+| Typed pin, not an empty default | `SharedRepositoryConfigPin::{Recorded(..), Unknown}`, `#[serde(default)] = Unknown`. An empty digest would compare equal to nothing (silently unsafe) or to everything (blocked forever with no explanation); `Unknown` says the comparison cannot be made |
+| Unpinned has consequences, not silence | Promotion returns `PromotionBlockedReason::RepositoryConfigUnpinned`; `staged_worktree_is_discardable` always allows discard when the pin is `Unknown`, so the operator is not left with a worktree that can neither promote nor be reclaimed |
+
+Regressions: (a) `test_a_ledger_with_an_unpinned_staged_worktree_still_loads`, (b)
+`test_promotion_blocks_an_unpinned_staged_worktree_without_moving_anything`, (c)
+`test_an_unpinned_staged_worktree_is_always_discardable` plus
+`test_an_unpinned_staged_worktree_passes_record_validation`, (d)
+`test_shared_config_pin_round_trips_and_defaults_to_unknown`,
+`test_staged_worktree_loads_without_a_shared_config_pin`,
+`test_staged_worktree_input_loads_without_a_shared_config_pin`,
+`test_unpinned_blocked_reason_round_trips`. LOW, added:
+`test_a_shared_file_deleted_after_materialization_blocks_and_names_it` — the symmetric
+present-then-absent case, since absence is pinned too.
+
+Fixture note worth carrying forward: stripping the field from the stored record alone made the
+ledger fail on a **receipt fingerprint** mismatch instead, which would have passed as "the ledger
+rejects it" while proving nothing about the pin. A genuine pre-pin ledger has both a record without
+the field and a receipt fingerprint computed without it, so the test recomputes the fingerprint the
+old shape would have had. A legacy-compat fixture that only edits the record is not a legacy fixture.
+
+Housekeeping: the uncommitted doc-comment rewording the verifier saw is deliberate and is included
+in this commit — see the enumeration-versus-detection correction above.
+
 ## Review round 2
 
 Not from the reviewer: the ADR-0018 lane, reading round 1's `core.hooksPath` fix, asked whether
@@ -338,6 +372,15 @@ Both fixes were checked for vacuity rather than assumed:
 - The hook test was verified by **reverting** `run_git` to its raw form and re-running: it fails at
   materialization with `a planted hook executed during materialization: post-index-change`. It
   genuinely covers the gap round 1 left.
+
+Correction taken from the ADR-0018 lane after the fix landed: an early draft of rule 13 argued
+safety from an enumeration — "no Git switch suppresses repository config", "`-c` cannot mask an
+attacker-named key". That is the wrong load-bearing claim. The gate is safe because it compares
+bytes and refuses on any difference, so it never needs to know which keys are dangerous; the
+enumeration is supporting evidence that a reviewer could disprove without changing the result.
+ADR-0019 now says that explicitly and warns against rewriting the rule to lean on the enumeration.
+The claim was imprecise too: `-c` *can* override a key you are able to name — what no one can do
+is enumerate names the attacker chooses.
 
 Also recorded in ADR-0019 at the reviewer's request: after a **blocked** promotion the accepted
 commit exists only in the staged worktree, so discarding it drops the only ref and leaves the

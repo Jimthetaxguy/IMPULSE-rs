@@ -11,7 +11,8 @@ use impulse_ops::governed_task::{
     ApprovalPolicy, GovernedActor, GovernedActorKind, GovernedExecutionState,
     GovernedPromotionOutcome, GovernedRecordId, GovernedReviewState, GovernedTaskId,
     GovernedTaskRun, GovernedVerificationProfile, PromotionBlockedReason, SharedConfigComponent,
-    StagedWorktree, StagedWorktreeInput, StagedWorktreeStatus, WorkerCompletionClaim, WorldScope,
+    SharedRepositoryConfigPin, StagedWorktree, StagedWorktreeInput, StagedWorktreeStatus,
+    WorkerCompletionClaim, WorldScope,
 };
 use impulse_rs::governed_producers::{
     discard_staged_worktree, materialize_staged_worktree, promote_governed_outcome,
@@ -579,6 +580,53 @@ fn test_a_shared_info_attributes_change_blocks_and_names_that_file() {
 
     let task = accepted(&registered, &staged, &initial, &builder_commit);
     let promotion = promote_governed_outcome(&task).expect("attribute drift blocks");
+
+    assert_eq!(
+        promotion.outcome.blocked_reason(),
+        Some(PromotionBlockedReason::RepositoryConfigChanged {
+            component: SharedConfigComponent::InfoAttributes
+        })
+    );
+    assert_eq!(head(&repo), initial);
+}
+
+/// Review round 3. A worktree materialized before the pin existed cannot be
+/// compared against anything, so promotion must refuse rather than guess.
+#[test]
+fn test_promotion_blocks_an_unpinned_staged_worktree_without_moving_anything() {
+    let (_dir, repo) = init_repo();
+    let (mut task, initial, _builder_commit, _root) = staged_with_builder_commit(&repo);
+    if let Some(staged) = task.staged_worktree.as_mut() {
+        staged.shared_config_digest = SharedRepositoryConfigPin::Unknown;
+    }
+
+    let promotion = promote_governed_outcome(&task).expect("an unpinned worktree blocks, not errs");
+
+    assert_eq!(
+        promotion.outcome.blocked_reason(),
+        Some(PromotionBlockedReason::RepositoryConfigUnpinned)
+    );
+    assert_eq!(head(&repo), initial, "a blocked promotion moves nothing");
+    assert!(!repo.join("feature.txt").exists());
+}
+
+/// The symmetric case of the round-2 tests: a shared file that existed at
+/// materialization and is gone at promotion is a change too. Absence is pinned.
+#[test]
+fn test_a_shared_file_deleted_after_materialization_blocks_and_names_it() {
+    let (_dir, repo) = init_repo();
+    let info = repo.join(".git").join("info");
+    std::fs::create_dir_all(&info).expect("info dir");
+    std::fs::write(info.join("attributes"), "* text=auto\n").expect("seed shared attributes");
+
+    let initial = head(&repo);
+    let registered = task(&repo, &initial);
+    let staged = materialize_staged_worktree(&registered).expect("materialize staged worktree");
+    let builder_commit = commit_in(Path::new(&staged.root), "feature.txt", "builder work\n");
+    std::fs::remove_file(info.join("attributes")).expect("delete shared attributes");
+
+    let task = accepted(&registered, &staged, &initial, &builder_commit);
+    let promotion = promote_governed_outcome(&task).expect("deletion blocks, never errors");
 
     assert_eq!(
         promotion.outcome.blocked_reason(),

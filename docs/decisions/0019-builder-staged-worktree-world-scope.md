@@ -173,8 +173,13 @@ in the task record.
     `diff.<name>.textconv` defined there executes whenever Git materializes a file — including the
     working-tree sync promotion performs, in the canonical workspace, under operator authority,
     after review has already passed. Disabling hooks (rule 5's `core.hooksPath`) does not touch
-    that path, and Git offers no flag that disables filters. Materialization therefore records a
-    digest of that shared state on the `StagedWorktree` record, and promotion refuses to check
+    that path. Materialization therefore records a
+    digest of that shared state on the `StagedWorktree` record — as a
+    `SharedRepositoryConfigPin`, so a worktree recorded before the pin existed loads as `Unknown`
+    rather than failing the whole ledger on a missing field, and promotion refuses it with its own
+    `repository_config_unpinned` reason telling the operator to discard and re-materialize. An
+    empty digest would have been the wrong default: it would either compare equal to nothing
+    (silently unsafe) or to everything (blocked with no explanation). Promotion refuses to check
     anything out unless the same digests still hold, reporting
     `repository_config_changed { component }` instead — the component names which file changed,
     because benign churn (a new remote, a credential helper) hard-blocks promotion too and the
@@ -182,6 +187,15 @@ in the task record.
     operator's own and is honored, while configuration the Builder introduced blocks until a human
     looks at it. An in-tree `.gitattributes` the Builder commits stays legitimate work, because a
     driver it names cannot be *defined* without changing the pinned digest.
+
+    **The load-bearing argument is detection, not enumeration.** This gate is safe because it
+    compares bytes and refuses on any difference, so it never has to know which Git keys are
+    dangerous. That distinction matters for how this ADR should be read: an enumeration claim
+    ("no Git switch suppresses repository config", "`-c` cannot mask an attacker-named key") is a
+    statement about a large surface that is right until one version or one key makes it not, and
+    it appears here only as supporting evidence. If a reviewer disproves it, or a future Git adds
+    a suppression switch, rule 13 still holds — a filter driver cannot be *defined* without
+    changing the bytes being compared. Do not rewrite this rule to lean on the enumeration.
 
 ## Consequences
 
@@ -320,6 +334,25 @@ written as amended. What changed, and why each mattered:
 The digest is now composed over `loop_contract::canonical_json` rather than `serde_json::to_vec`,
 so key ordering can never affect it.
 
+## Review round 3
+
+One HIGH finding, on a field round 2 itself introduced: `shared_config_digest` was non-`Option`,
+non-defaulted, and its type had no `Default`, so a staged worktree recorded before the pin existed
+would fail to deserialize with `missing field` — and `GovernedTaskLedger::load` propagates that,
+taking **every** task in the ledger down with it. The round-2 legacy test only stripped
+`staged_worktree` wholesale, so the case was uncovered.
+
+The fix is a typed `SharedRepositoryConfigPin::{Recorded, Unknown}` defaulting to `Unknown`, not an
+empty digest. `Unknown` states what is true — the comparison cannot be made — and carries its own
+consequences: promotion blocks with `repository_config_unpinned`, and
+`staged_worktree_is_discardable` always allows discard in that state, so the operator has a way
+forward instead of a worktree that can neither promote nor be reclaimed.
+
+The regression fixture is worth noting: stripping the field from the stored record alone made the
+ledger fail on a *receipt fingerprint* mismatch instead, which would have proven nothing about the
+pin. A genuine pre-pin ledger has both a record without the field and a receipt fingerprint
+computed without it, so the test recomputes the fingerprint the old shape would have had.
+
 ## Review round 2
 
 The ADR-0018 lane, reading round 1's `core.hooksPath` fix, pointed out that hooks are only one
@@ -331,6 +364,13 @@ Builder can write that config from inside its own worktree, because `git config 
 to the shared file for every linked worktree. Rule 13 and its Consequences note are the fix. The
 regression test carries a negative control that fires the planted driver in the staged worktree
 first, so the assertion that promotion does not run it cannot pass vacuously.
+
+The ADR-0018 lane also pushed back on how rule 13 was argued, and was right to: an early draft
+leaned on "no Git switch suppresses repository config" as though the enumeration were the reason
+the gate is safe. It is not, and the paragraph above now says so explicitly. The gate detects
+change; the enumeration is supporting evidence that can be disproved without touching the result.
+The claim was also imprecise — `-c` *can* override a key you are able to name; what no one can do
+is enumerate names the attacker chooses.
 
 Round 2 verification also found round 1's hook fix **incomplete**: it covered the two obviously
 mutating commands but not `run_git`, which backs every observation the module makes, including the
