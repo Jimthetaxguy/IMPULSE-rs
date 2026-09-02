@@ -207,6 +207,49 @@ numbers are identical, so no stored candidate digest changes** — proven by the
 
 Flagged for the producer-reservation-journal lane, which may also be touching state helpers.
 
+**Confirmed compatible with ADR-0018** (`claude/socket-actor-provenance-20260902`, PR #48, also a
+draft off `36bda00`). That lane edits `memory_candidate.rs` in two places that do not overlap this
+hunk: the `source_assurance` / `proposed_summary` selection a few lines below the coherence check,
+and a `prune_superseded_derivations()` in `MemoryCandidateLedger::load` for the
+`ACCEPTED_RUN_MEMORY_DERIVATION_VERSION` 1 → 2 bump. `git merge-tree` auto-merges that file with no
+conflict. Keep both hunks.
+
+## Merging with ADR-0018
+
+Neither PR is merged and `origin/main` is still `36bda00`, so nothing is rebased yet. A dry-run
+`git merge-tree` against `origin/claude/socket-actor-provenance-20260902` reports six conflicts,
+all mechanical and all **both-keep**:
+
+| File | Conflict | Resolution |
+|---|---|---|
+| `docs/{INDEX,SUMMARY}.md`, `docs/SUMMARY.yaml`, `docs/decisions/README.md` | Both lanes added an ADR row directly after 0017 | Keep both rows, 0018 then 0019 |
+| `impulse-rs/impulse-ops/src/governed_task.rs` | Both added types and a new `mod tests` | Union the imports, the types, and the test modules |
+| `impulse-rs/src/state/governed_task.rs` | Both added a parameter to `apply_mutation`, and both appended tests | See below |
+
+`apply_mutation` takes **both** new parameters after the merge:
+
+```rust
+fn apply_mutation(
+    task: &mut GovernedTaskRun,
+    mutation: GovernedTaskMutation,
+    event_revision: u64,
+    now: &str,                                       // ADR-0019
+    operator_authentication: OperatorAuthentication, // ADR-0018
+) -> Result<()>
+```
+
+`mutate_governed_task` passes the freshly computed `now` and the connection's authentication;
+`validate_task_history` passes `&event.created_at` and `replay_operator_authentication`. The two
+additions are orthogonal — one supplies replay's clock, the other supplies replay's actor
+provenance — and both call sites need both. Import lists and the two `mod tests` blocks are a plain
+union.
+
+**After whichever lane rebases second:** re-run `cargo test --workspace`, and specifically the
+ADR-0018 superseded-derivation reload test, which asserts a re-derived candidate equals the
+pre-bump one field for field. This lane's change feeds `operator.based_on_revision + 1` into the
+source digest rather than `task.revision`, so a promotion cannot move the digested value — that is
+the property that test is checking, and it should hold, but it must be re-run rather than assumed.
+
 ## Handoff Notes
 
 ### For the daemon / socket-provenance lane (`src/daemon/**`)
@@ -223,9 +266,25 @@ Three endpoints are needed; all producer and state work behind them is done and 
    (`request_id`, `project_id`, `task_id`, `expected_revision`, `deny_unknown_fields`). Call
    `governed_producers::promote_governed_outcome_async(task)`, then submit
    `GovernedTaskMutation::RecordPromotion { promotion }`. **This must be operator-class**, not
-   Builder-reachable — it is the step that makes work canonical, so it belongs behind whatever
-   actor authorization ADR-0018 lands. A `PromotionBlocked` result is a successful response with a
-   blocked outcome, not an error response.
+   Builder-reachable — it is the step that makes work canonical. Per the ADR-0018 lane, the whole
+   enforcement is one match arm in
+   `src/daemon/actor_provenance.rs::authorize_governed_mutation`: add
+   `GovernedTaskMutation::RecordPromotion { .. } => "RecordPromotion"` to the gated set and
+   promotion becomes Builder-unreachable with no other file changes. If promote arrives as its own
+   `DaemonRequest` variant instead of through `MutateGovernedTask`, gate it the same way in
+   `handle_governed_producer_request` — `connection_class.is_operator()` checked **before** the side
+   effect, with `connection_class` threaded in from `ProcessRequestContext`. A `PromotionBlocked`
+   result is a successful response with a blocked outcome, not an error response.
+   Gate `DiscardStagedWorktree` too — it destroys work. `MaterializeStagedWorktree` can stay
+   ungated if it has to run inside pre-PTY registration.
+
+   Protocol arithmetic: ADR-0018 moves `PROTOCOL_VERSION` to 7, so the promote bump is **8**, and
+   `docs/validate_docs.py` carries three version-keyed required markers
+   (`**Protocol version: N**`, `"protocol_version": N`, `### vN — ...`) plus the matching headings
+   in `docs/IPC-PROTOCOL.md` that must move with it. Also note that after ADR-0018 a client sending
+   `MutateGovernedTask` presents the operator capability first on the same connection
+   (`DaemonClient` reads `<socket>.operator-cap` automatically); any raw-JSON socket test or CLI
+   path expecting an approval to succeed will get a typed refusal instead.
 3. **`DiscardStagedWorktree`** — call `governed_producers::discard_staged_worktree_async(task)`,
    then submit `GovernedTaskMutation::DiscardStagedWorktree { actor, reason }`. Reachable after a
    rejection or after a successful promotion; the state layer enforces both.
