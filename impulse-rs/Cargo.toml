@@ -114,6 +114,8 @@ datafusion = { version = "43", optional = true }
 calamine = { version = "0.26", optional = true }
 rust_xlsxwriter = { version = "0.7", optional = true }
 docx = { version = "0.4", optional = true, package = "docx-rs" }
+# Central-directory pre-scan of xlsx/docx containers before parsing (ion document_read)
+zip = { version = "0.6", optional = true, default-features = false, features = ["deflate"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -132,7 +134,7 @@ monty-support = ["dep:pyo3"]
 datafusion-support = ["dep:datafusion"]
 # Office support enables document parsing and generation
 # Supports: Excel (.xlsx), Word (.docx), CSV
-office-support = ["dep:calamine", "dep:rust_xlsxwriter", "dep:docx"]
+office-support = ["dep:calamine", "dep:rust_xlsxwriter", "dep:docx", "dep:zip"]
 
 [dev-dependencies]
 filetime = "0.2"

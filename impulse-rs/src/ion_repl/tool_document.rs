@@ -11,11 +11,30 @@
 //! never floods the context budget and the model can jump straight to the
 //! part it needs instead of paging exhaustively.
 //!
-//! Bounds: the source file is refused above [`MAX_DOCUMENT_BYTES`]; the
-//! content window is capped at [`MAX_CHARS_CAP`] characters; the rendered
-//! section table is capped at [`MAX_RENDERED_SECTIONS`] rows and shown only
-//! on the first page or in outline mode; parsing runs on the blocking pool
-//! so the loop contract's wall clock can still fire.
+//! Documents come from third parties, so a hostile file must never take
+//! the `ion` process down. Bounds, in the order they apply:
+//!
+//! - the source file is refused above [`MAX_DOCUMENT_BYTES`];
+//! - an `xlsx`/`docx` zip container is inflated once, entry by entry,
+//!   through [`MAX_DECOMPRESSED_BYTES`] before any parser runs, so a forged
+//!   central directory cannot hide a decompression bomb;
+//! - workbooks are not handed to the dense-grid parser at all: cells are
+//!   streamed one at a time through calamine's cell reader and written into
+//!   this module's own text under [`MAX_EXTRACTED_CHARS`] and [`MAX_CELLS`],
+//!   so two cells at opposite corners of a sheet or thousands of references
+//!   to one huge shared string cost only what they render;
+//! - `csv` and `docx` text is checked against [`MAX_EXTRACTED_CHARS`] after
+//!   parsing, where the parsers' own memory is already bounded by the file
+//!   and inflation caps;
+//! - legacy `xls` is refused because its binary format has no streaming
+//!   reader and cannot be bounded the same way;
+//! - the content window is capped at [`MAX_CHARS_CAP`] characters; the
+//!   rendered section table at [`MAX_RENDERED_SECTIONS`] rows, shown only on
+//!   the first page or in outline mode;
+//! - parsing runs on the blocking pool so the loop contract's wall clock can
+//!   still fire.
+//!
+//! These bound the parser's inputs; they are not an OS sandbox.
 //!
 //! This tool is read-only, so it stays outside `CONFIRMATION_REQUIRED_TOOLS`
 //! like `file_read`. Paths resolve against the REPL's launch directory but
@@ -38,15 +57,25 @@ use super::ReplContext;
 pub const DEFAULT_MAX_CHARS: usize = 12_000;
 /// Hard ceiling on characters returned per call, whatever the model asks.
 pub const MAX_CHARS_CAP: usize = 32_000;
-/// Largest source file the tool will parse. Spreadsheets and Word files are
-/// zip-compressed, so this bounds far more than 10 MiB of extracted text.
+/// Largest source file the tool will read.
 pub const MAX_DOCUMENT_BYTES: u64 = 10 * 1024 * 1024;
+/// Largest total size the entries of an `xlsx`/`docx` zip container may
+/// inflate to. Every entry is inflated once through this cap before a parser
+/// runs.
+pub const MAX_DECOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
+/// Largest text the tool will extract from one document, in characters.
+pub const MAX_EXTRACTED_CHARS: usize = 16_000_000;
+/// Largest number of non-empty cells the tool will stream from a workbook.
+pub const MAX_CELLS: u64 = 2_000_000;
 /// Most section rows rendered for the model; the payload keeps them all.
 pub const MAX_RENDERED_SECTIONS: usize = 32;
+/// Empty columns inside a row rendered as bare tabs; wider gaps become a
+/// marker so a cell far to the right cannot inflate the text.
+pub const EMPTY_COLUMNS_INLINE: u32 = 8;
 
 const SHEET_HEADER_PREFIX: &str = "=== Sheet: ";
 const SHEET_HEADER_SUFFIX: &str = " ===";
-const SUPPORTED_FORMATS: &str = "xlsx, xls, csv, docx";
+const SUPPORTED_FORMATS: &str = "xlsx, csv, docx";
 
 pub struct DocumentReadTool;
 
@@ -72,8 +101,8 @@ pub struct DocumentReadRequest {
 /// One addressable part of a document: a sheet, a CSV body, or a run of
 /// paragraphs. `offset` and `chars` are in the same character coordinates
 /// as the paged whole-document text, so `offset` can be passed back to jump
-/// to the section. `offset` is absent when the parser's layout could not be
-/// matched.
+/// to the section. `offset` is absent only when a parser's layout could not
+/// be matched.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DocumentSection {
     pub index: usize,
@@ -108,6 +137,44 @@ pub struct DocumentWindow {
     pub content: Option<String>,
 }
 
+/// One non-empty worksheet as this module rendered it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SheetBody {
+    pub name: String,
+    /// Position in the workbook, counting empty sheets.
+    pub index: usize,
+    pub body: String,
+}
+
+/// Everything `document_read` knows about one file, in the character
+/// coordinates of `text`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedDocument {
+    pub format: String,
+    pub document_type: String,
+    pub size_bytes: u64,
+    /// The whole-document text the model pages through.
+    pub text: String,
+    pub sections: Vec<DocumentSection>,
+    /// Worksheet bodies in workbook order (`xlsx` only; empty sheets are
+    /// omitted).
+    pub sheets: Vec<SheetBody>,
+}
+
+/// How much a single extraction may produce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtractBudget {
+    pub max_chars: usize,
+    pub max_cells: u64,
+}
+
+impl ExtractBudget {
+    pub const DEFAULT: Self = Self {
+        max_chars: MAX_EXTRACTED_CHARS,
+        max_cells: MAX_CELLS,
+    };
+}
+
 #[async_trait]
 impl ReplTool for DocumentReadTool {
     fn name(&self) -> &'static str {
@@ -117,14 +184,14 @@ impl ReplTool for DocumentReadTool {
     fn usage(&self) -> &'static str {
         "document_read {\"path\": \"...\", \"sheet\": \"...\", \"outline\": false, \
          \"offset\": 0, \"max_chars\": 12000} -- read a spreadsheet or Word document \
-         (xlsx/xls/csv/docx) as text, paged by character offset"
+         (xlsx/csv/docx) as text, paged by character offset"
     }
 
     fn json_schema(&self) -> Value {
         json!({
             "name": "document_read",
             "description": format!(
-                "Read a spreadsheet (xlsx, xls, csv) or Word document (docx) as plain text. \
+                "Read a spreadsheet (xlsx, csv) or Word document (docx) as plain text. \
                  Read-only; files up to {} MiB. The tool loop allows only a few calls per \
                  turn, so do not page through a large document exhaustively: start with \
                  outline=true to learn total_chars and the sections with their offsets, then \
@@ -170,16 +237,15 @@ impl ReplTool for DocumentReadTool {
     async fn run(&self, args: Value, ctx: &ReplContext) -> Result<ToolOutcome> {
         let request = parse_request(&args)?;
         let path = resolve_document_path(&request.path, &ctx.repo_root)?;
-        // Parsing inflates the whole document synchronously (calamine,
-        // docx-rs). Run it off the async runtime so the loop contract's
-        // wall-clock timeout can still fire while a large file parses.
+        preflight_container(&path, &request.path)?;
+        // Parsing is synchronous (calamine, docx-rs). Run it off the async
+        // runtime so the loop contract's wall-clock timeout can still fire
+        // while a large file parses.
         let window = {
             let request = request.clone();
             let path = path.clone();
             tokio::task::spawn_blocking(move || -> Result<DocumentWindow> {
-                let parsed = office::parse_document(&path).map_err(|e| {
-                    anyhow::anyhow!("document_read: '{}' could not be parsed: {e}", request.path)
-                })?;
+                let parsed = parse_document_bounded(&path, &request.path, ExtractBudget::DEFAULT)?;
                 build_window(&request, &path, &parsed)
             })
             .await
@@ -207,7 +273,12 @@ pub fn parse_request(args: &Value) -> Result<DocumentReadRequest> {
     let sheet = match args.get("sheet") {
         None | Some(Value::Null) => None,
         Some(Value::String(s)) if !s.trim().is_empty() => Some(s.trim().to_string()),
-        Some(Value::String(_)) => None,
+        // A supplied-but-blank selector is a mistake, not a request for the
+        // whole workbook: falling back silently would hand the model
+        // unrelated data at whole-document cost.
+        Some(Value::String(_)) => {
+            bail!("'sheet' must not be blank; omit it to read the whole document")
+        }
         Some(other) => bail!("'sheet' must be a string, got {other}"),
     };
     let outline = match args.get("outline") {
@@ -247,7 +318,7 @@ pub fn parse_request(args: &Value) -> Result<DocumentReadRequest> {
 }
 
 /// Resolves `raw` against `repo_root` when relative and checks it names an
-/// existing regular file in a readable format under [`MAX_DOCUMENT_BYTES`].
+/// existing regular file in an accepted format under [`MAX_DOCUMENT_BYTES`].
 /// Error messages lead with the path the caller supplied, so two different
 /// bad paths never share an error signature.
 pub fn resolve_document_path(raw: &str, repo_root: &Path) -> Result<PathBuf> {
@@ -271,6 +342,12 @@ pub fn resolve_document_path_with_cap(
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_string();
+    if ext.eq_ignore_ascii_case("xls") {
+        bail!(
+            "document_read: '{raw}' is a legacy .xls workbook, which this tool does not accept \
+             because its binary format cannot be bounded before parsing; convert it to .xlsx"
+        );
+    }
     if !OfficeFormat::from_extension(&ext).is_readable() {
         bail!(
             "document_read: '{raw}' has unsupported extension '{ext}' (supported: {SUPPORTED_FORMATS})"
@@ -294,68 +371,290 @@ pub fn resolve_document_path_with_cap(
     Ok(path)
 }
 
-/// The addressable sections of a parsed document, with offsets in the
-/// character coordinates of `parsed.content`.
-///
-/// Sheet names are recovered by walking the parser's fixed layout
-/// (`=== Sheet: name ===\n` + body + `\n\n` per non-empty sheet) in lockstep
-/// with the sheet chunks, so a cell whose text merely looks like a header
-/// can never add, rename, or shift a section. Word sections are groups of
-/// paragraphs the parser emitted one per line. When a layout cannot be
-/// matched, the affected sections keep their chunk sizes but carry no offset.
-pub fn sections_of(parsed: &ExtractionResult) -> Vec<DocumentSection> {
+/// Case folding for sheet-name matching: Unicode lowercasing plus the
+/// Latin multi-character folds that lowercasing alone misses, so `Straße`,
+/// `STRAẞE`, and `STRASSE` all compare equal. Dotless `ı` is left alone (it
+/// folds to itself in Unicode), so Turkish lowercase names are not conflated
+/// with their dotted counterparts; uppercase `I` still lowercases to `i` as
+/// in every non-Turkic locale. Folds outside Latin script that expand to
+/// several characters and normalization are not applied.
+pub fn fold_case(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.to_lowercase().chars() {
+        match ch {
+            'ß' => out.push_str("ss"),
+            'ſ' => out.push('s'),
+            'ﬀ' => out.push_str("ff"),
+            'ﬁ' => out.push_str("fi"),
+            'ﬂ' => out.push_str("fl"),
+            'ﬃ' => out.push_str("ffi"),
+            'ﬄ' => out.push_str("ffl"),
+            'ﬅ' | 'ﬆ' => out.push_str("st"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Inflates every entry of an `xlsx`/`docx` zip container once through
+/// [`MAX_DECOMPRESSED_BYTES`] before any parser sees it, so neither a
+/// forged central directory nor a highly compressible entry can balloon
+/// during parsing. Other formats (`csv`) are not containers and pass.
+pub fn preflight_container(path: &Path, raw: &str) -> Result<()> {
+    preflight_container_with_limit(path, raw, MAX_DECOMPRESSED_BYTES)
+}
+
+/// [`preflight_container`] with an explicit inflation cap; the test seam.
+pub fn preflight_container_with_limit(path: &Path, raw: &str, max_uncompressed: u64) -> Result<()> {
+    use std::io::Read as _;
+
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if !matches!(ext.as_str(), "xlsx" | "docx") {
+        return Ok(());
+    }
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("document_read: '{raw}' could not be opened"))?;
+    let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file)).map_err(|e| {
+        anyhow::anyhow!(
+            "document_read: '{raw}' could not be parsed: not a valid {ext} container ({e})"
+        )
+    })?;
+    let mut inflated_total: u64 = 0;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|e| {
+            anyhow::anyhow!(
+                "document_read: '{raw}' could not be parsed: unreadable {ext} entry ({e})"
+            )
+        })?;
+        let remaining = max_uncompressed.saturating_sub(inflated_total);
+        let name = entry.name().to_string();
+        let inflated = std::io::copy(
+            &mut (&mut entry).take(remaining.saturating_add(1)),
+            &mut std::io::sink(),
+        )
+        .with_context(|| format!("document_read: '{raw}' entry '{name}' failed to inflate"))?;
+        if inflated > remaining {
+            bail!(
+                "document_read: '{raw}' inflates to more than {max_uncompressed} bytes of \
+                 uncompressed content, over the limit"
+            );
+        }
+        inflated_total += inflated;
+    }
+    Ok(())
+}
+
+/// Refuses extracted text above `max_chars`.
+pub fn check_extracted_size(text: &str, raw: &str, max_chars: usize) -> Result<()> {
+    let chars = text.chars().count();
+    if chars > max_chars {
+        bail!(
+            "document_read: '{raw}' extracted to {chars} characters, over the {max_chars} \
+             character limit"
+        );
+    }
+    Ok(())
+}
+
+/// Parses one accepted document under `budget`: workbooks are streamed
+/// cell by cell by this module, `csv` and `docx` go through the `office`
+/// parsers and are size-checked afterwards.
+pub fn parse_document_bounded(
+    path: &Path,
+    raw: &str,
+    budget: ExtractBudget,
+) -> Result<ParsedDocument> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    match ext.as_str() {
+        "xlsx" => extract_workbook(path, raw, budget),
+        "csv" | "docx" => {
+            let parsed = office::parse_document(path)
+                .map_err(|e| anyhow::anyhow!("document_read: '{raw}' could not be parsed: {e}"))?;
+            check_extracted_size(&parsed.content, raw, budget.max_chars)?;
+            Ok(from_extraction(parsed))
+        }
+        other => bail!(
+            "document_read: '{raw}' has unsupported extension '{other}' (supported: {SUPPORTED_FORMATS})"
+        ),
+    }
+}
+
+/// Streams a workbook through calamine's cell reader into this module's own
+/// text: `=== Sheet: name ===`, the sheet body, and a blank line per
+/// non-empty sheet, with sections and offsets computed as the text is built.
+/// The dense-grid parser is never used, so a far-off cell costs only its
+/// gap marker and a shared string costs only the cells that render it.
+pub fn extract_workbook(path: &Path, raw: &str, budget: ExtractBudget) -> Result<ParsedDocument> {
+    use calamine::{open_workbook, DataRef, Reader, Xlsx};
+
+    let mut workbook: Xlsx<_> = open_workbook(path)
+        .map_err(|e| anyhow::anyhow!("document_read: '{raw}' could not be parsed: {e}"))?;
+    let names = workbook.sheet_names().to_vec();
+    let mut text = String::new();
+    let mut cursor = 0usize;
+    let mut sections = Vec::new();
+    let mut sheets = Vec::new();
+    let mut cells_total: u64 = 0;
+
+    for (index, name) in names.iter().enumerate() {
+        let mut reader = workbook.worksheet_cells_reader(name).map_err(|e| {
+            anyhow::anyhow!("document_read: '{raw}' could not be parsed: sheet '{name}': {e}")
+        })?;
+        let mut body = SheetBodyBuilder::default();
+        while let Some(cell) = reader.next_cell().map_err(|e| {
+            anyhow::anyhow!("document_read: '{raw}' could not be parsed: sheet '{name}': {e}")
+        })? {
+            let value = match cell.get_value() {
+                DataRef::Empty => continue,
+                DataRef::Int(i) => i.to_string(),
+                DataRef::Float(f) => f.to_string(),
+                DataRef::String(s) => s.clone(),
+                DataRef::SharedString(s) => (*s).to_string(),
+                DataRef::Bool(b) => b.to_string(),
+                DataRef::DateTime(dt) => dt.to_string(),
+                DataRef::DateTimeIso(s) | DataRef::DurationIso(s) => s.clone(),
+                DataRef::Error(e) => e.to_string(),
+            };
+            cells_total += 1;
+            if cells_total > budget.max_cells {
+                bail!(
+                    "document_read: '{raw}' has more than {} non-empty cells, over the limit",
+                    budget.max_cells
+                );
+            }
+            let (row, col) = cell.get_position();
+            body.push(row, col, &value);
+            if cursor + body.chars > budget.max_chars {
+                bail!(
+                    "document_read: '{raw}' extracted to more than {} characters, over the limit",
+                    budget.max_chars
+                );
+            }
+        }
+        let (body_text, body_chars) = body.finish();
+        if body_text.is_empty() {
+            continue;
+        }
+        let header = format!("{SHEET_HEADER_PREFIX}{name}{SHEET_HEADER_SUFFIX}\n");
+        cursor += header.chars().count();
+        sections.push(DocumentSection {
+            index,
+            kind: "sheet".to_string(),
+            name: Some(name.clone()),
+            offset: Some(cursor),
+            chars: body_chars,
+        });
+        text.push_str(&header);
+        text.push_str(&body_text);
+        text.push_str("\n\n");
+        cursor += body_chars + 2;
+        sheets.push(SheetBody {
+            name: name.clone(),
+            index,
+            body: body_text,
+        });
+    }
+
+    let size_bytes = std::fs::metadata(path)
+        .with_context(|| format!("document_read: '{raw}' could not be read"))?
+        .len();
+    Ok(ParsedDocument {
+        format: "xlsx".to_string(),
+        document_type: "excel".to_string(),
+        size_bytes,
+        text,
+        sections,
+        sheets,
+    })
+}
+
+/// Renders streamed cells as tab-separated rows. Gaps of up to
+/// [`EMPTY_COLUMNS_INLINE`] empty columns become bare tabs; wider column
+/// gaps and every skipped row become a bracketed marker, so a cell far from
+/// the rest of the sheet costs a marker instead of a sea of separators.
+#[derive(Debug, Default)]
+pub struct SheetBodyBuilder {
+    out: String,
+    chars: usize,
+    last_row: Option<u32>,
+    last_col: u32,
+}
+
+impl SheetBodyBuilder {
+    fn push_str(&mut self, s: &str) {
+        self.out.push_str(s);
+        self.chars += s.chars().count();
+    }
+
+    fn push_gap(&mut self, empty_columns: u32) {
+        if empty_columns == 0 {
+            return;
+        }
+        if empty_columns <= EMPTY_COLUMNS_INLINE {
+            for _ in 0..empty_columns {
+                self.push_str("\t");
+            }
+        } else {
+            self.push_str(&format!("[{empty_columns} empty columns]\t"));
+        }
+    }
+
+    /// Appends one cell at zero-based (`row`, `col`); cells must arrive in
+    /// row-major order, as the cell reader yields them.
+    pub fn push(&mut self, row: u32, col: u32, value: &str) {
+        match self.last_row {
+            None => self.push_gap(col),
+            Some(last) if last == row => {
+                self.push_str("\t");
+                self.push_gap(col.saturating_sub(self.last_col + 1));
+            }
+            Some(last) => {
+                self.push_str("\n");
+                let skipped = row.saturating_sub(last + 1);
+                if skipped > 0 {
+                    self.push_str(&format!("[{skipped} empty rows]\n"));
+                }
+                self.push_gap(col);
+            }
+        }
+        self.push_str(value);
+        self.last_row = Some(row);
+        self.last_col = col;
+    }
+
+    /// The body text and its character count.
+    pub fn finish(self) -> (String, usize) {
+        (self.out, self.chars)
+    }
+}
+
+/// Adapts an `office` parser result (`csv`, `docx`) into a
+/// [`ParsedDocument`], computing section offsets from the parsers' fixed
+/// layouts: one span for CSV, and for Word one paragraph per line grouped
+/// into chunks joined by a blank line. Offsets are dropped when a layout
+/// cannot be matched exactly.
+pub fn from_extraction(parsed: ExtractionResult) -> ParsedDocument {
+    let total_chars = parsed.content.chars().count();
     let mut sections = Vec::with_capacity(parsed.chunks.len());
     let mut cursor = 0usize;
-    let mut rest = parsed.content.as_str();
-    let mut layout_ok = true;
-
     for chunk in &parsed.chunks {
-        let chunk_chars = chunk.content.chars().count();
         match chunk.chunk_type.as_str() {
-            "sheet" => {
-                let matched = if layout_ok {
-                    match_sheet_header(rest, &chunk.content)
-                } else {
-                    None
-                };
-                match matched {
-                    Some((name, header_chars, tail)) => {
-                        let offset = cursor + header_chars;
-                        sections.push(DocumentSection {
-                            index: chunk.index,
-                            kind: chunk.chunk_type.clone(),
-                            name: Some(name),
-                            offset: Some(offset),
-                            chars: chunk_chars,
-                        });
-                        let consumed = rest.chars().count() - tail.chars().count();
-                        cursor += consumed;
-                        rest = tail;
-                    }
-                    None => {
-                        layout_ok = false;
-                        sections.push(DocumentSection {
-                            index: chunk.index,
-                            kind: chunk.chunk_type.clone(),
-                            name: None,
-                            offset: None,
-                            chars: chunk_chars,
-                        });
-                    }
-                }
-            }
-            "csv" => {
-                sections.push(DocumentSection {
-                    index: chunk.index,
-                    kind: chunk.chunk_type.clone(),
-                    name: None,
-                    offset: Some(0),
-                    chars: parsed.content.chars().count(),
-                });
-            }
+            "csv" => sections.push(DocumentSection {
+                index: chunk.index,
+                kind: chunk.chunk_type.clone(),
+                name: None,
+                offset: Some(0),
+                chars: total_chars,
+            }),
             "paragraph" => {
-                // The parser wrote every paragraph followed by one newline,
-                // and grouped them into chunks joined by a blank line.
                 let span: usize = chunk
                     .content
                     .split("\n\n")
@@ -375,15 +674,12 @@ pub fn sections_of(parsed: &ExtractionResult) -> Vec<DocumentSection> {
                 kind: chunk.chunk_type.clone(),
                 name: None,
                 offset: None,
-                chars: chunk_chars,
+                chars: chunk.content.chars().count(),
             }),
         }
     }
-
-    // Paragraph offsets are only trustworthy if the reconstruction spanned
-    // the whole text exactly.
     let paragraph_layout_holds =
-        sections.iter().all(|s| s.kind != "paragraph") || cursor == parsed.content.chars().count();
+        sections.iter().all(|s| s.kind != "paragraph") || cursor == total_chars;
     if !paragraph_layout_holds {
         for section in sections.iter_mut().filter(|s| s.kind == "paragraph") {
             section.offset = None;
@@ -395,85 +691,56 @@ pub fn sections_of(parsed: &ExtractionResult) -> Vec<DocumentSection> {
                 .unwrap_or(section.chars);
         }
     }
-    sections
-}
-
-/// Matches one sheet header at the start of `rest` followed by exactly
-/// `body`, returning the sheet name, the header's length in characters
-/// (including its newline), and the text after the body's trailing blank
-/// line.
-fn match_sheet_header<'a>(rest: &'a str, body: &str) -> Option<(String, usize, &'a str)> {
-    let after_prefix = rest.strip_prefix(SHEET_HEADER_PREFIX)?;
-    let (header_rest, after_header) = after_prefix.split_once('\n')?;
-    let name = header_rest.strip_suffix(SHEET_HEADER_SUFFIX)?;
-    let after_body = after_header.strip_prefix(body)?;
-    let tail = after_body.strip_prefix("\n\n").unwrap_or(after_body);
-    let header_chars = SHEET_HEADER_PREFIX.chars().count() + header_rest.chars().count() + 1;
-    Some((name.to_string(), header_chars, tail))
-}
-
-/// Sheet names in chunk order, from the same layout walk as
-/// [`sections_of`].
-pub fn sheet_names(parsed: &ExtractionResult) -> Vec<String> {
-    sections_of(parsed)
-        .into_iter()
-        .filter(|s| s.kind == "sheet")
-        .filter_map(|s| s.name)
-        .collect()
+    ParsedDocument {
+        format: parsed.metadata.format,
+        document_type: parsed.document_type,
+        size_bytes: parsed.metadata.size_bytes,
+        text: parsed.content,
+        sections,
+        sheets: Vec::new(),
+    }
 }
 
 /// The text a call reads from: the whole document, or one sheet when
-/// `sheet` is given. Sheet selection is only meaningful for spreadsheets,
-/// and only non-empty worksheets exist after parsing.
+/// `sheet` is given. Sheet selection is only meaningful for workbooks, and
+/// only non-empty worksheets exist after extraction.
 pub fn select_text(
-    parsed: &ExtractionResult,
+    parsed: &ParsedDocument,
     sheet: Option<&str>,
 ) -> Result<(String, Option<String>)> {
     let Some(wanted) = sheet else {
-        return Ok((parsed.content.clone(), None));
+        return Ok((parsed.text.clone(), None));
     };
-    let is_workbook = matches!(parsed.metadata.format.as_str(), "xlsx" | "xls");
-    let named: Vec<(usize, String)> = sections_of(parsed)
-        .into_iter()
-        .filter(|s| s.kind == "sheet")
-        .enumerate()
-        .filter_map(|(ordinal, s)| s.name.map(|name| (ordinal, name)))
-        .collect();
-    if named.is_empty() {
-        if is_workbook {
+    if parsed.sheets.is_empty() {
+        if parsed.format == "xlsx" {
             bail!(
-                "no readable worksheets in this {} document: every sheet is empty \
-                 (empty worksheets are omitted)",
-                parsed.metadata.format
+                "no readable worksheets in this xlsx document: every sheet is empty (empty \
+                 worksheets are omitted)"
             );
         }
         bail!(
-            "'sheet' only applies to spreadsheets (xlsx/xls); this {} document has no sheets",
-            parsed.metadata.format
+            "'sheet' only applies to spreadsheets (xlsx); this {} document has no sheets",
+            parsed.format
         );
     }
-    let wanted_folded = wanted.to_lowercase();
-    let (ordinal, name) = named
+    let wanted_folded = fold_case(wanted);
+    let found = parsed
+        .sheets
         .iter()
-        .find(|(_, name)| name.to_lowercase() == wanted_folded)
+        .find(|s| fold_case(&s.name) == wanted_folded)
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "sheet '{wanted}' not found among non-empty sheets (empty worksheets are \
                  omitted); available: {}",
-                named
+                parsed
+                    .sheets
                     .iter()
-                    .map(|(_, n)| n.as_str())
+                    .map(|s| s.name.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")
             )
         })?;
-    let chunk = parsed
-        .chunks
-        .iter()
-        .filter(|c| c.chunk_type == "sheet")
-        .nth(*ordinal)
-        .ok_or_else(|| anyhow::anyhow!("sheet '{name}' has no parsed content"))?;
-    Ok((chunk.content.clone(), Some(name.clone())))
+    Ok((found.body.clone(), Some(found.name.clone())))
 }
 
 /// A character window over `text`. When the window would be cut short of
@@ -502,7 +769,7 @@ pub fn window(text: &str, offset: usize, max_chars: usize) -> (String, usize, bo
 fn build_window(
     request: &DocumentReadRequest,
     path: &Path,
-    parsed: &ExtractionResult,
+    parsed: &ParsedDocument,
 ) -> Result<DocumentWindow> {
     let (text, section) = select_text(parsed, request.sheet.as_deref())?;
     let total_chars = text.chars().count();
@@ -513,10 +780,10 @@ fn build_window(
     };
     Ok(DocumentWindow {
         path: path.display().to_string(),
-        format: parsed.metadata.format.clone(),
+        format: parsed.format.clone(),
         document_type: parsed.document_type.clone(),
-        size_bytes: parsed.metadata.size_bytes,
-        sections: sections_of(parsed),
+        size_bytes: parsed.size_bytes,
+        sections: parsed.sections.clone(),
         section,
         total_chars,
         offset: if request.outline {
@@ -567,7 +834,7 @@ pub fn render(window: &DocumentWindow) -> String {
         if hidden > 0 {
             out.push_str(&format!("  ... and {hidden} more section(s) not listed\n"));
         }
-        if matches!(window.format.as_str(), "xlsx" | "xls") {
+        if window.format == "xlsx" {
             out.push_str(
                 "  (empty worksheets are omitted; section indexes are workbook positions; \
                  section offsets are whole-document offsets)\n",
@@ -624,7 +891,7 @@ mod tests {
     use super::*;
     use crate::office::{ContentChunk, ExtractionMetadata};
 
-    fn fake_parsed_with(
+    fn extraction(
         format: &str,
         document_type: &str,
         content: &str,
@@ -651,8 +918,39 @@ mod tests {
         }
     }
 
-    fn fake_parsed(content: &str, chunks: Vec<(&str, &str)>) -> ExtractionResult {
-        fake_parsed_with("xlsx", "excel", content, chunks)
+    fn workbook_doc(sheets: &[(&str, &str)]) -> ParsedDocument {
+        let mut text = String::new();
+        let mut cursor = 0;
+        let mut sections = Vec::new();
+        let mut bodies = Vec::new();
+        for (index, (name, body)) in sheets.iter().enumerate() {
+            let header = format!("=== Sheet: {name} ===\n");
+            cursor += header.chars().count();
+            sections.push(DocumentSection {
+                index,
+                kind: "sheet".into(),
+                name: Some((*name).to_string()),
+                offset: Some(cursor),
+                chars: body.chars().count(),
+            });
+            text.push_str(&header);
+            text.push_str(body);
+            text.push_str("\n\n");
+            cursor += body.chars().count() + 2;
+            bodies.push(SheetBody {
+                name: (*name).to_string(),
+                index,
+                body: (*body).to_string(),
+            });
+        }
+        ParsedDocument {
+            format: "xlsx".into(),
+            document_type: "excel".into(),
+            size_bytes: 42,
+            text,
+            sections,
+            sheets: bodies,
+        }
     }
 
     fn window_for(sections: Vec<DocumentSection>, content: Option<&str>) -> DocumentWindow {
@@ -690,6 +988,10 @@ mod tests {
             "{description}"
         );
         assert!(description.contains("10 MiB"), "{description}");
+        assert!(
+            !description.contains("xls,"),
+            "legacy xls is not advertised"
+        );
         assert_eq!(DocumentReadTool.name(), "document_read");
         assert!(DocumentReadTool.usage().contains("document_read"));
     }
@@ -707,7 +1009,6 @@ mod tests {
                 max_chars: DEFAULT_MAX_CHARS,
             }
         );
-        // The serde shape matches the schema: a bare path is a valid request.
         let from_json: DocumentReadRequest =
             serde_json::from_value(json!({"path": "a.csv"})).unwrap();
         assert_eq!(from_json, request);
@@ -735,6 +1036,35 @@ mod tests {
         assert!(parse_request(&json!({"path": "a.csv", "sheet": 3})).is_err());
         let err = parse_request(&json!({"path": "a.csv", "max_chars": "many"})).unwrap_err();
         assert!(err.to_string().contains("max_chars"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_request_rejects_blank_sheet_selector() {
+        for blank in ["", "   ", "\t"] {
+            let err = parse_request(&json!({"path": "a.xlsx", "sheet": blank})).unwrap_err();
+            assert!(
+                err.to_string().contains("must not be blank"),
+                "{blank:?}: {err}"
+            );
+        }
+        assert_eq!(
+            parse_request(&json!({"path": "a.xlsx", "sheet": null}))
+                .unwrap()
+                .sheet,
+            None
+        );
+    }
+
+    #[test]
+    fn test_fold_case_handles_sharp_s_ligatures_and_dotless_i() {
+        assert_eq!(fold_case("Straße"), fold_case("STRASSE"));
+        assert_eq!(fold_case("STRA\u{1E9E}E"), "strasse");
+        assert_eq!(fold_case("Übersicht"), fold_case("ÜBERSICHT"));
+        assert_eq!(fold_case("Budget"), "budget");
+        assert_ne!(fold_case("Budget"), fold_case("Budgets"));
+        assert_ne!(fold_case("\u{131}s\u{131}"), fold_case("isi"));
+        assert_eq!(fold_case("\u{FB01}le"), "file");
+        assert_eq!(fold_case("\u{17F}"), "s");
     }
 
     #[test]
@@ -793,70 +1123,52 @@ mod tests {
     }
 
     #[test]
-    fn test_sections_follow_parser_layout_with_offsets() {
-        let parsed = fake_parsed(
-            "=== Sheet: Budget ===\na\tb\n\n=== Sheet: Notes ===\nc\n\n",
-            vec![("sheet", "a\tb"), ("sheet", "c")],
+    fn test_sheet_body_builder_renders_rows_gaps_and_markers() {
+        let mut b = SheetBodyBuilder::default();
+        b.push(0, 0, "Item");
+        b.push(0, 1, "Amount");
+        b.push(1, 0, "Rent");
+        b.push(1, 3, "1800");
+        b.push(4, 2, "note");
+        b.push(4, 16_383, "far");
+        b.push(1_048_575, 0, "end");
+        let (text, chars) = b.finish();
+        assert_eq!(
+            text,
+            "Item\tAmount\nRent\t\t\t1800\n[2 empty rows]\n\t\tnote\t[16380 empty columns]\tfar\n\
+             [1048570 empty rows]\nend"
         );
-        assert_eq!(sheet_names(&parsed), vec!["Budget", "Notes"]);
-        let sections = sections_of(&parsed);
-        assert_eq!(sections.len(), 2);
-        assert_eq!(sections[0].name.as_deref(), Some("Budget"));
-        assert_eq!(sections[0].offset, Some(22));
-        assert_eq!(sections[0].chars, 3);
-        assert_eq!(sections[1].name.as_deref(), Some("Notes"));
-        assert_eq!(sections[1].offset, Some(48));
-        assert_eq!(sections[1].index, 1);
-        // The offsets point at each sheet's body inside the paged text.
-        let body: String = parsed.content.chars().skip(22).take(3).collect();
-        assert_eq!(body, "a\tb");
-        let body: String = parsed.content.chars().skip(48).take(1).collect();
-        assert_eq!(body, "c");
+        assert_eq!(chars, text.chars().count());
+        assert!(chars < 120, "two corner cells cost markers, not a grid");
     }
 
     #[test]
-    fn test_sections_ignore_header_shaped_cell_text() {
-        // A Budget cell contains a line that looks like a sheet header. The
-        // layout walk anchors each header to its chunk, so no phantom
-        // "Evil" sheet appears and Notes stays selectable.
-        let spoofed = "Note:\n=== Sheet: Evil ===\nend";
-        let content = format!("=== Sheet: Budget ===\n{spoofed}\n\n=== Sheet: Notes ===\nc\n\n");
-        let parsed = fake_parsed(&content, vec![("sheet", spoofed), ("sheet", "c")]);
-        assert_eq!(sheet_names(&parsed), vec!["Budget", "Notes"]);
-        let sections = sections_of(&parsed);
-        assert_eq!(sections[1].name.as_deref(), Some("Notes"));
-        let (text, section) = select_text(&parsed, Some("Notes")).unwrap();
-        assert_eq!(text, "c");
-        assert_eq!(section.as_deref(), Some("Notes"));
-        let err = select_text(&parsed, Some("Evil")).unwrap_err();
-        assert!(err.to_string().contains("not found"), "{err}");
-        assert!(err.to_string().contains("Budget, Notes"), "{err}");
+    fn test_sheet_body_builder_leading_gap_inline_or_marker() {
+        let mut b = SheetBodyBuilder::default();
+        b.push(0, EMPTY_COLUMNS_INLINE, "x");
+        let (text, _) = b.finish();
+        assert_eq!(text, "\t".repeat(EMPTY_COLUMNS_INLINE as usize) + "x");
+        let mut b = SheetBodyBuilder::default();
+        b.push(0, EMPTY_COLUMNS_INLINE + 1, "x");
+        let (text, _) = b.finish();
+        assert_eq!(text, "[9 empty columns]\tx");
     }
 
     #[test]
-    fn test_sections_without_offsets_when_layout_does_not_match() {
-        let parsed = fake_parsed("unexpected layout\n", vec![("sheet", "a"), ("sheet", "b")]);
-        let sections = sections_of(&parsed);
-        assert_eq!(sections.len(), 2);
-        assert!(sections
-            .iter()
-            .all(|s| s.name.is_none() && s.offset.is_none()));
-        assert_eq!(sections[0].chars, 1);
-        assert!(sheet_names(&parsed).is_empty());
-    }
+    fn test_from_extraction_csv_and_paragraph_sections_cover_the_whole_text() {
+        let csv = from_extraction(extraction(
+            "csv",
+            "excel",
+            "a,b\n1,2\n",
+            vec![("csv", "a,b\n1,2\n")],
+        ));
+        assert_eq!(csv.sections.len(), 1);
+        assert_eq!(csv.sections[0].offset, Some(0));
+        assert_eq!(csv.sections[0].chars, 8);
+        assert!(csv.sheets.is_empty());
 
-    #[test]
-    fn test_csv_and_paragraph_sections_cover_the_whole_text() {
-        let csv = fake_parsed_with("csv", "excel", "a,b\n1,2\n", vec![("csv", "a,b\n1,2\n")]);
-        let sections = sections_of(&csv);
-        assert_eq!(sections.len(), 1);
-        assert_eq!(sections[0].offset, Some(0));
-        assert_eq!(sections[0].chars, 8);
-
-        // Word: paragraphs one per line in content, grouped into chunks
-        // joined by a blank line.
         let content = "Dear tenant,\nYour lease renews.\n[Table]\nRegards\n";
-        let docx = fake_parsed_with(
+        let docx = from_extraction(extraction(
             "docx",
             "word",
             content,
@@ -864,14 +1176,13 @@ mod tests {
                 ("paragraph", "Dear tenant,\n\nYour lease renews.\n\n[Table]"),
                 ("paragraph", "Regards"),
             ],
-        );
-        let sections = sections_of(&docx);
-        assert_eq!(sections[0].offset, Some(0));
-        assert_eq!(sections[0].chars, 13 + 19 + 8);
-        assert_eq!(sections[1].offset, Some(40));
-        assert_eq!(sections[1].chars, 8);
+        ));
+        assert_eq!(docx.sections[0].offset, Some(0));
+        assert_eq!(docx.sections[0].chars, 13 + 19 + 8);
+        assert_eq!(docx.sections[1].offset, Some(40));
+        assert_eq!(docx.sections[1].chars, 8);
         assert_eq!(
-            sections.iter().map(|s| s.chars).sum::<usize>(),
+            docx.sections.iter().map(|s| s.chars).sum::<usize>(),
             content.chars().count()
         );
         let tail: String = content.chars().skip(40).collect();
@@ -879,54 +1190,68 @@ mod tests {
     }
 
     #[test]
-    fn test_paragraph_offsets_are_dropped_when_reconstruction_fails() {
-        let docx = fake_parsed_with(
+    fn test_from_extraction_drops_paragraph_offsets_when_reconstruction_fails() {
+        let docx = from_extraction(extraction(
             "docx",
             "word",
             "Something the parser would not have produced",
             vec![("paragraph", "Dear tenant,\n\nRegards")],
+        ));
+        assert_eq!(docx.sections[0].offset, None);
+        assert_eq!(
+            docx.sections[0].chars,
+            "Dear tenant,\n\nRegards".chars().count()
         );
-        let sections = sections_of(&docx);
-        assert_eq!(sections[0].offset, None);
-        assert_eq!(sections[0].chars, "Dear tenant,\n\nRegards".chars().count());
+        let other = from_extraction(extraction("csv", "excel", "x", vec![("blob", "x")]));
+        assert_eq!(other.sections[0].offset, None);
     }
 
     #[test]
     fn test_select_text_picks_sheet_case_insensitively_including_non_ascii() {
-        let parsed = fake_parsed(
-            "=== Sheet: Budget ===\na\tb\n\n=== Sheet: Übersicht ===\nc\n\n",
-            vec![("sheet", "a\tb"), ("sheet", "c")],
-        );
+        let parsed = workbook_doc(&[("Budget", "a\tb"), ("Übersicht", "c"), ("Straße", "z")]);
         let (text, section) = select_text(&parsed, Some("übersicht")).unwrap();
         assert_eq!(text, "c");
         assert_eq!(section.as_deref(), Some("Übersicht"));
         let (text, section) = select_text(&parsed, Some("BUDGET")).unwrap();
         assert_eq!(text, "a\tb");
         assert_eq!(section.as_deref(), Some("Budget"));
+        let (text, section) = select_text(&parsed, Some("STRASSE")).unwrap();
+        assert_eq!(text, "z");
+        assert_eq!(section.as_deref(), Some("Straße"));
         let (all, none) = select_text(&parsed, None).unwrap();
-        assert_eq!(all, parsed.content);
+        assert_eq!(all, parsed.text);
         assert_eq!(none, None);
+        // Section offsets point at each body inside the paged text.
+        for (section, sheet) in parsed.sections.iter().zip(&parsed.sheets) {
+            let body: String = parsed
+                .text
+                .chars()
+                .skip(section.offset.unwrap())
+                .take(section.chars)
+                .collect();
+            assert_eq!(body, sheet.body);
+        }
     }
 
     #[test]
     fn test_select_text_errors_are_truthful_about_empty_and_non_spreadsheet_documents() {
-        let empty_workbook = fake_parsed("", vec![]);
+        let empty_workbook = workbook_doc(&[]);
         let err = select_text(&empty_workbook, Some("Sheet1")).unwrap_err();
         assert!(err.to_string().contains("every sheet is empty"), "{err}");
 
-        let csv = fake_parsed_with(
+        let csv = from_extraction(extraction(
             "csv",
             "excel",
             "=== Sheet: X ===\n",
             vec![("csv", "=== Sheet: X ===\n")],
-        );
+        ));
         let err = select_text(&csv, Some("X")).unwrap_err();
         assert!(
             err.to_string().contains("only applies to spreadsheets"),
             "{err}"
         );
 
-        let parsed = fake_parsed("=== Sheet: Budget ===\na\n\n", vec![("sheet", "a")]);
+        let parsed = workbook_doc(&[("Budget", "a")]);
         let err = select_text(&parsed, Some("Missing")).unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -967,6 +1292,15 @@ mod tests {
         std::fs::create_dir(dir.path().join("folder.csv")).unwrap();
         let err = resolve_document_path("folder.csv", dir.path()).unwrap_err();
         assert!(err.to_string().contains("is a directory"), "{err}");
+
+        std::fs::write(dir.path().join("old.xls"), "binary").unwrap();
+        let err = resolve_document_path("old.xls", dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("document_read: 'old.xls' is a legacy .xls workbook"),
+            "{msg}"
+        );
+        assert!(msg.contains("convert it to .xlsx"), "{msg}");
     }
 
     #[test]
@@ -981,6 +1315,95 @@ mod tests {
         );
         assert!(msg.contains("1-byte limit"), "{msg}");
         assert!(resolve_document_path_with_cap("big.csv", dir.path(), 4).is_ok());
+    }
+
+    #[test]
+    fn test_check_extracted_size_refuses_oversized_text() {
+        assert!(check_extracted_size("abcdef", "a.csv", 1_000).is_ok());
+        let err = check_extracted_size("abcdef", "a.csv", 5).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("document_read: 'a.csv' extracted to"),
+            "{msg}"
+        );
+        assert!(msg.contains("over the 5 character limit"), "{msg}");
+    }
+
+    /// Writes a deflated zip with the given (name, bytes) entries.
+    fn write_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        use std::io::Write as _;
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for (name, bytes) in entries {
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    #[test]
+    fn test_preflight_container_passes_non_zip_formats_and_rejects_bad_zips() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let csv = dir.path().join("a.csv");
+        std::fs::write(&csv, "a,b\n").unwrap();
+        assert!(preflight_container(&csv, "a.csv").is_ok());
+
+        let bad = dir.path().join("bad.docx");
+        std::fs::write(&bad, "not a zip").unwrap();
+        let err = preflight_container(&bad, "bad.docx").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("document_read: 'bad.docx' could not be parsed"),
+            "{msg}"
+        );
+        assert!(msg.contains("docx container"), "{msg}");
+
+        let missing = dir.path().join("missing.xlsx");
+        let err = preflight_container(&missing, "missing.xlsx").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("could not be opened"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn test_preflight_measures_inflated_size_not_archive_size() {
+        // 200 KiB of zeros deflates to a few hundred bytes on disk; the
+        // guard must count what the entry inflates to.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("bomb.docx");
+        let zeros = vec![0u8; 200 * 1024];
+        write_zip(&path, &[("word/document.xml", &zeros)]);
+        assert!(std::fs::metadata(&path).unwrap().len() < 10 * 1024);
+
+        let err = preflight_container_with_limit(&path, "bomb.docx", 100 * 1024).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("document_read: 'bomb.docx' inflates to more than 102400 bytes"),
+            "{msg}"
+        );
+        assert!(preflight_container_with_limit(&path, "bomb.docx", 300 * 1024).is_ok());
+    }
+
+    #[test]
+    fn test_preflight_counts_entries_cumulatively() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("many.xlsx");
+        let chunk = vec![b'x'; 40 * 1024];
+        write_zip(
+            &path,
+            &[
+                ("xl/workbook.xml", &chunk),
+                ("xl/worksheets/sheet1.xml", &chunk),
+                ("xl/worksheets/sheet2.xml", &chunk),
+            ],
+        );
+        // Each entry fits under 100 KiB alone; together they do not.
+        let err = preflight_container_with_limit(&path, "many.xlsx", 100 * 1024).unwrap_err();
+        assert!(err.to_string().contains("inflates to more than"), "{err}");
+        assert!(preflight_container_with_limit(&path, "many.xlsx", 130 * 1024).is_ok());
     }
 
     #[test]
@@ -1000,7 +1423,7 @@ mod tests {
                 },
                 DocumentSection {
                     index: 1,
-                    kind: "sheet".into(),
+                    kind: "paragraph".into(),
                     name: None,
                     offset: None,
                     chars: 1,
@@ -1124,7 +1547,6 @@ mod tests {
         assert!(!text.contains("empty worksheets"));
     }
 
-    #[cfg(feature = "office-support")]
     mod fixtures {
         use super::*;
 
@@ -1144,8 +1566,7 @@ mod tests {
             budget.write_string_only(0, 1, "Amount").unwrap();
             budget.write_string_only(1, 0, "Rent").unwrap();
             budget.write_number_only(1, 1, 1800.0).unwrap();
-            // A multi-line cell that looks like a sheet header must not
-            // become a phantom sheet.
+            // A multi-line cell that looks like a sheet header is just text.
             budget
                 .write_string_only(2, 0, "Note:\n=== Sheet: Evil ===\nend")
                 .unwrap();
@@ -1256,7 +1677,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_run_reads_xlsx_sheets_selects_one_and_ignores_spoofed_headers() {
+        async fn test_run_reads_xlsx_sheets_selects_one_and_treats_header_text_as_text() {
             let dir = tempfile::TempDir::new().unwrap();
             let path = write_workbook(&dir);
             let ctx = ctx_in(&dir);
@@ -1270,13 +1691,22 @@ mod tests {
                 .iter()
                 .map(|s| s["name"].as_str().unwrap())
                 .collect();
-            // The empty "Scratch" sheet is omitted by the parser; the spoofed
-            // cell does not add an "Evil" sheet; indexes are workbook positions.
+            // The empty "Scratch" sheet is omitted; the header-shaped cell
+            // is ordinary text; indexes are workbook positions.
             assert_eq!(names, ["Budget", "Notes"]);
             assert_eq!(sections[1]["index"], 2);
-            assert!(sections.iter().all(|s| s["offset"].is_u64()));
             let content = all.payload["content"].as_str().unwrap();
-            assert!(content.contains("Rent") && content.contains("Paid on the first"));
+            assert!(content.contains("Rent\t1800"), "{content}");
+            assert!(content.contains("=== Sheet: Evil ==="), "{content}");
+            assert!(content.contains("Paid on the first"));
+            // Section offsets land on each sheet's body in the paged text.
+            for section in sections {
+                let offset = section["offset"].as_u64().unwrap() as usize;
+                let chars = section["chars"].as_u64().unwrap() as usize;
+                let body: String = content.chars().skip(offset).take(chars).collect();
+                assert!(!body.starts_with("=== Sheet"), "{body}");
+                assert!(!body.is_empty());
+            }
             assert!(all.rendered.contains("empty worksheets are omitted"));
 
             let notes = DocumentReadTool
@@ -1285,11 +1715,10 @@ mod tests {
                 .unwrap();
             assert_eq!(notes.payload["section"], "Notes");
             let content = notes.payload["content"].as_str().unwrap();
-            assert!(content.contains("Paid on the first"));
-            assert!(!content.contains("Rent"));
+            assert_eq!(content, "Paid on the first");
 
             let err = DocumentReadTool
-                .run(json!({"path": "ledger.xlsx", "sheet": "Scratch"}), &ctx)
+                .run(json!({"path": "ledger.xlsx", "sheet": "Evil"}), &ctx)
                 .await
                 .unwrap_err();
             let msg = err.to_string();
@@ -1297,6 +1726,84 @@ mod tests {
                 msg.contains("Budget, Notes") && msg.contains("empty worksheets are omitted"),
                 "{msg}"
             );
+        }
+
+        #[tokio::test]
+        async fn test_run_handles_corner_cells_without_densifying_the_grid() {
+            // The dense-grid parser would attempt a 16384 x 1048576 vector
+            // for this sheet and abort the process; streaming renders two
+            // cells and two gap markers.
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("corners.xlsx");
+            let path_str = path.to_str().unwrap().to_string();
+            let mut workbook = rust_xlsxwriter::Workbook::new(&path_str);
+            let sheet = workbook.add_worksheet();
+            sheet.set_name("Wide").unwrap();
+            sheet.write_string_only(0, 0, "start").unwrap();
+            sheet.write_string_only(1_048_575, 16_383, "end").unwrap();
+            workbook.close().unwrap();
+
+            let outcome = DocumentReadTool
+                .run(json!({"path": "corners.xlsx"}), &ctx_in(&dir))
+                .await
+                .unwrap();
+
+            let content = outcome.payload["content"].as_str().unwrap();
+            assert!(
+                content.contains("start\n[1048574 empty rows]\n[16383 empty columns]\tend"),
+                "{content}"
+            );
+            assert!(outcome.payload["total_chars"].as_u64().unwrap() < 200);
+        }
+
+        #[test]
+        fn test_extract_workbook_enforces_text_and_cell_budgets() {
+            // 200 cells referencing one 500-character shared string would
+            // materialize 100 KB under the dense parser; the streamed
+            // extractor stops at the budget instead.
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("amplify.xlsx");
+            let path_str = path.to_str().unwrap().to_string();
+            let mut workbook = rust_xlsxwriter::Workbook::new(&path_str);
+            let sheet = workbook.add_worksheet();
+            let long = "x".repeat(500);
+            for row in 0..200u32 {
+                sheet.write_string_only(row, 0, &long).unwrap();
+            }
+            workbook.close().unwrap();
+
+            let err = extract_workbook(
+                &path,
+                "amplify.xlsx",
+                ExtractBudget {
+                    max_chars: 10_000,
+                    max_cells: MAX_CELLS,
+                },
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("extracted to more than 10000 characters"),
+                "{err}"
+            );
+
+            let err = extract_workbook(
+                &path,
+                "amplify.xlsx",
+                ExtractBudget {
+                    max_chars: MAX_EXTRACTED_CHARS,
+                    max_cells: 50,
+                },
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("more than 50 non-empty cells"),
+                "{err}"
+            );
+
+            let parsed = extract_workbook(&path, "amplify.xlsx", ExtractBudget::DEFAULT).unwrap();
+            assert_eq!(parsed.sheets.len(), 1);
+            assert_eq!(parsed.sections[0].chars, 200 * 500 + 199);
         }
 
         #[tokio::test]
@@ -1348,6 +1855,35 @@ mod tests {
                 msg.starts_with("document_read: 'bad.xlsx' could not be parsed"),
                 "{msg}"
             );
+
+            std::fs::write(dir.path().join("bad.csv"), [0xff, 0xfe, b'a']).unwrap();
+            let err = DocumentReadTool
+                .run(json!({"path": "bad.csv"}), &ctx)
+                .await
+                .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.starts_with("document_read: 'bad.csv' could not be parsed"),
+                "{msg}"
+            );
+        }
+
+        #[test]
+        fn test_preflight_container_accepts_real_documents_and_measures_inflation() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let docx = write_docx(&dir);
+            let xlsx = write_workbook(&dir);
+            for (path, raw) in [(&docx, "letter.docx"), (&xlsx, "ledger.xlsx")] {
+                assert!(preflight_container(path, raw).is_ok(), "{raw}");
+                let err = preflight_container_with_limit(path, raw, 16).unwrap_err();
+                let msg = err.to_string();
+                assert!(
+                    msg.starts_with(&format!(
+                        "document_read: '{raw}' inflates to more than 16 bytes"
+                    )),
+                    "{msg}"
+                );
+            }
         }
     }
 }
