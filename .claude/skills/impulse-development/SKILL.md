@@ -2,6 +2,7 @@
 name: impulse-development
 description: "Use when adding features to the Impulse codebase — CLI commands, daemon IPC messages, GUI views, dynamic tools, context lifecycle, or guardrails. Routes to detailed step-by-step guides."
 version: 1.0.0
+updated: 2026-08-29
 domain: engineering
 category: languages
 maturity: silver
@@ -24,7 +25,6 @@ related_skills:
   - rust-programming
   - rust-daemon-ipc
   - pty-terminal-engineering
-  - egui-webgpu-visualization
   - plugin-hooks-guardrails
   - context-engineering
   - ai-sidecar-patterns
@@ -36,7 +36,9 @@ path: ".claude/skills/impulse-development/"
 codebase_source:
   - impulse-rs/src/main.rs
   - impulse-rs/src/daemon/mod.rs
-  - impulse-rs/impulse-gui/src/app.rs
+  - impulse-rs/impulse-desktop/src/lib.rs
+  - impulse-rs/impulse-desktop/src/ui.rs
+  - impulse-rs/impulse-desktop/src/views.rs
   - impulse-rs/src/tooling/mod.rs
   - impulse-rs/src/guardrail/engine.rs
   - impulse-rs/impulse-term/src/backend.rs
@@ -47,6 +49,10 @@ codebase_source:
 Project-level skill for adding features to the Impulse codebase. Routes to the
 right reference file and global skills based on what you're building.
 
+The active GUI is the Dioxus Desktop host in `impulse-desktop` (ADR-0008).
+`impulse-gui` is a frozen egui/eframe workbench excluded from the workspace.
+Do not add GUI views or product shell work there.
+
 ---
 
 ## Task Routing Table
@@ -55,12 +61,12 @@ right reference file and global skills based on what you're building.
 |---|---|---|---|
 | Add a CLI command | `references/adding-cli-commands.md` | `src/main.rs`, handler module | `rust-programming` |
 | Add a daemon IPC message | `references/adding-daemon-ipc.md` | `src/daemon/mod.rs` | `rust-daemon-ipc` |
-| Add a GUI view | `references/adding-gui-views.md` | `impulse-gui/src/app.rs`, `views/` | `egui-webgpu-visualization` |
+| Add a GUI view | `docs/decisions/0008-dioxus-desktop-host.md`, `impulse-desktop/README.md` | `impulse-desktop/src/ui.rs`, `views.rs` | `rust-programming` |
 | Add a dynamic tool | `references/adding-dynamic-tools.md` | `src/tooling/mod.rs`, `traits.rs` | `rust-trait-design` |
 | Add a guardrail rule | CLAUDE.md guardrail section | `src/guardrail/` | `plugin-hooks-guardrails` |
 | Add a context lifecycle stage | Context lifecycle docs | `src/context_lifecycle/` | `context-engineering` |
-| Add a terminal feature | impulse-term docs | `impulse-term/src/` | `pty-terminal-engineering` |
-| Add a signal bus signal | Signal bus section in MEMORY.md | `impulse-gui/src/widgets/signal_bus.rs` | `egui-webgpu-visualization` |
+| Add a terminal feature | impulse-term docs | `impulse-term/src/` (PTY); xterm.js in `impulse-desktop` | `pty-terminal-engineering` |
+| Add a host command or desktop event | `impulse-desktop/README.md` | `impulse-desktop/src/host_commands.rs`, `host_bridge.rs`, `ui.rs` | `rust-programming` |
 
 ### Module-to-Skill Map (Context-Adaptive Loading)
 
@@ -69,9 +75,9 @@ When working on files in these paths, auto-surface the corresponding skills:
 | Active Module / Path Pattern | Auto-surface Skills |
 |---|---|
 | `src/daemon/**` | `rust-daemon-ipc` + `rust-async-concurrency` |
-| `impulse-gui/src/views/**` | `egui-webgpu-visualization` |
-| `impulse-gui/src/widgets/**` | `egui-webgpu-visualization` |
-| `impulse-term/**` | `pty-terminal-engineering` + `egui-webgpu-visualization` |
+| `impulse-desktop/src/**` | `rust-programming` (Dioxus Desktop host; ADR-0008) |
+| `impulse-gui/**` | Frozen egui workbench. Do not add views. Use `impulse-desktop`. |
+| `impulse-term/**` | `pty-terminal-engineering` |
 | `src/context_lifecycle/**` | `context-engineering` + `ai-sidecar-patterns` |
 | `src/guardrail/**` | `plugin-hooks-guardrails` |
 | `src/tooling/**` | `rust-trait-design` |
@@ -109,30 +115,43 @@ When working on files in these paths, auto-surface the corresponding skills:
 
 ### Terminal Crate (`impulse-term/`) — 7 files, ~2.4K lines
 
+PTY and vt100 authority. Product terminal glyphs render in xterm.js inside
+`impulse-desktop`. The egui `renderer.rs` / `panel.rs` widgets exist only for
+the frozen `impulse-gui` compile path.
+
 | Module | Purpose |
 |---|---|
 | `backend.rs` | PTY spawn + vt100 parser + reader thread |
-| `renderer.rs` | Run-based rendering for egui |
-| `input.rs` | Key → escape sequence mapping |
+| `renderer.rs` | Frozen egui run-based renderer (impulse-gui only) |
+| `input.rs` | Key to escape sequence mapping |
 | `theme.rs` | ANSI color resolution + palette |
 | `context.rs` | Context bridge (token estimation, extraction) |
-| `panel.rs` | Assembled egui terminal widget |
+| `panel.rs` | Frozen egui terminal widget (impulse-gui only) |
 
-### GUI Crate (`impulse-gui/`) — multi-view workbench
+### Desktop Crate (`impulse-desktop/`) — active Dioxus cockpit
+
+Workspace member. ADR-0008. New GUI work belongs here.
 
 | Module | Purpose |
 |---|---|
-| `app.rs` | ImpulseApp coordinator, view dispatch |
-| `views/terminals.rs` | Terminal tab multiplexer |
-| `views/sessions.rs` | Daemon session viewer |
-| `views/genome.rs` | Decision viewer/editor |
-| `views/search.rs` | Memory search |
-| `views/settings.rs` | Configuration panel |
-| `views/overview.rs` | Project overview |
-| `widgets/sidebar.rs` | Navigation sidebar |
-| `widgets/signal_bus.rs` | Event routing + debounce |
-| `widgets/status_bar.rs` | Bottom status bar |
-| `agent_panel/` | Left-side agent chat panel |
+| `lib.rs` | Crate boundary and public host types |
+| `ui.rs` | Dioxus shell, left rail, terminal stage kept alive |
+| `views.rs` | Center-stage Memory / Review / Artifacts / Supervisor |
+| `runtime.rs` | `DesktopRuntime` PTY and agent snapshots |
+| `host_commands.rs` | Typed host invoke commands |
+| `host_bridge.rs` | Dioxus host adapter seam |
+| `desktop_host.rs` | `desktop-app` native host |
+| `daemon_ops.rs` | Daemon publish/subscribe; workbench reads `ProjectOpsSnapshot` |
+| `bridge.rs` | Terminal open/write/resize/close contracts |
+| `native.rs` | macOS island DTOs |
+| `mcp.rs` | Built-in MCP tool descriptors |
+| `theme.rs` | Status classes and labels |
+| `workspace.rs` | Workspace targeting |
+
+### Frozen GUI Crate (`impulse-gui/`) — excluded from workspace
+
+Legacy egui/eframe workbench. Compile maintenance only. Do not add views,
+signal-bus kinds, or product shell features here.
 
 ---
 
@@ -149,8 +168,8 @@ cd impulse-rs
 cargo test                              # All tests
 cargo test -- --skip integration_tests  # Unit only
 cargo test daemon::tests                # Specific module
-cd impulse-term && cargo test           # Terminal crate
-cd impulse-gui && cargo test            # GUI crate
+cargo test -p impulse-term              # Terminal crate
+cargo test -p impulse-desktop           # Dioxus desktop crate
 ```
 
 ### DaemonGuard RAII Pattern
@@ -172,15 +191,16 @@ All four must pass. Never skip with `--no-verify`.
 
 ## Cross-Crate Conventions
 
-### impulse-term → impulse-gui
-- `impulse-gui` depends on `impulse-term` as a workspace member
-- GUI creates `TerminalBackend` + `TerminalPanel` per tab
-- Context bridge data flows: `impulse-term` extracts → `impulse-gui` displays via signal bus
+### impulse-term → impulse-desktop
+- `impulse-desktop` depends on `impulse-term` as a workspace member
+- Dioxus owns layout and controls; `DesktopRuntime` plus `impulse-term` own PTY bytes
+- xterm.js renders terminal glyphs; Dioxus does not own PTY lifecycle
+- Frozen `impulse-gui` still links `impulse-term` for compile maintenance only
 
-### impulse-gui → main crate
-- GUI connects to daemon via Unix socket IPC (background poller thread)
-- Shares `DaemonRequest`/`DaemonResponse` types via `impulse-rs` dependency
-- `SharedState` in GUI mirrors daemon state; IPC is the sync mechanism
+### impulse-desktop → daemon
+- Desktop publishes terminal ops and reads `ProjectOpsSnapshot` over daemon IPC
+- Local runtime events never rewrite daemon-owned truth
+- Shares ops/request types through workspace crates, not a parallel GUI state store
 
 ### Feature Flags
 | Flag | Default | What It Enables |
@@ -188,6 +208,7 @@ All four must pass. Never skip with `--no-verify`.
 | `office-support` | Yes | Excel/Word generation (calamine, docx-rs) |
 | `monty-support` | No | Embedded Python scripts |
 | `datafusion-support` | No | SQL queries over data |
+| `desktop-app` (`impulse-desktop`) | No | Real Dioxus Desktop binary and host adapter |
 
 ---
 
@@ -208,11 +229,13 @@ All four must pass. Never skip with `--no-verify`.
 5. **Daemon request/response pairs**: Every new `DaemonRequest` variant needs a
    corresponding `DaemonResponse` variant and a match arm in the handler.
 
-6. **GUI view registration**: New views need: ViewId enum variant, sidebar entry,
-   keyboard shortcut (Ctrl+N), and the view struct implementing show().
+6. **GUI view registration**: New Dioxus views belong in `impulse-desktop/src/views.rs`
+   with a `DesktopView` variant and a left-rail entry in `ui.rs`. Do not add
+   `ViewId` / `show()` work in frozen `impulse-gui`.
 
-7. **Signal bus debounce**: New signal kinds need a debounce window in the
-   `debounce_window()` method. Missing this causes notification spam.
+7. **Host commands, not an egui signal bus**: New desktop actions go through
+   `host_commands.rs` / the Dioxus host adapter. Do not add `SignalKind` debounce
+   windows in `impulse-gui`.
 
 8. **Test isolation**: Integration tests MUST use `tempfile::TempDir` for the
    `.impulse/` directory. Never use the real project directory.

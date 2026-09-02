@@ -390,6 +390,19 @@ pass the repo gate: `cargo build && cargo test && cargo clippy -- -D warnings &&
   the new error through the existing generic `format!("Chat failed: {err}")`
   branch (same as `ToolLoopLimitExceeded`) rather than adding a dedicated
   notice — the `Display` message is already self-explanatory.
+- **T9 loop contract (ADR-0017, 2026-09-01). DONE.** The round cap and wall
+  clock above are no longer loose constants: `Agent` carries a
+  `loop_contract::LoopContract` (default `ion_tool_loop`, validated on every
+  run) and `run_tool_loop` reports every round and executed call to a
+  `LoopBreaker`. Besides the cap and wall clock, the breaker stops the loop on
+  three consecutive identical calls, three consecutive identical batches, or
+  three consecutive same-signature failures of one tool
+  (`AgentError::ToolLoopStalled`), stopping mid-batch so no further requested
+  call executes. Every run leaves a `LoopReport` (`Completed`, `Tripped`, or
+  `Failed`; rounds, executed/interrupted calls, errors, elapsed) readable via
+  `ChatState::last_loop_report`. `DEFAULT_MAX_TOOL_ROUNDS` and
+  `DEFAULT_TOOL_LOOP_TIMEOUT` are sourced from the contract. See
+  `docs/decisions/0017-canonical-loop-contract.md`.
 - **T10 (optional) — ratatui inline polish.** Spinner during gate runs, colored
   verdict table, status line. *(Depends T7. Do not start before T9 is stable.)*
 

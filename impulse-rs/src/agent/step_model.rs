@@ -170,6 +170,16 @@ mod tests {
     }
 
     #[test]
+    fn test_decide_step_model_ion_api_worker_stays_on_current_when_verifier_has_not_failed() {
+        let mut ctx = HarnessStepContext::ion_api("claude-sonnet-4-6");
+        ctx.escalate_model = Some("claude-opus-4-6".to_string());
+        let decision = decide_step_model(&ctx, "haiku");
+        assert_eq!(ctx.actor, GovernedActorKind::Worker);
+        assert_eq!(decision.model, "claude-sonnet-4-6");
+        assert_eq!(decision.reason, StepModelReason::Configured);
+    }
+
+    #[test]
     fn test_decide_step_model_stays_on_current_model_when_configured_differs() {
         let ctx = configured_ctx("already-escalated");
         let decision = decide_step_model(&ctx, "claude-sonnet-4-6");

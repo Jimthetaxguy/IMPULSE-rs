@@ -42,6 +42,7 @@ registry-backed runtime identity, daemon truth, or the current Now/Next/Later ro
 | [0013](0013-deterministic-accepted-run-memory-candidates.md) | Deterministic accepted-run memory candidates | **Accepted** | Owner-only pending review projection and explicit no-promotion boundary | 2026-07-15 | -- |
 | [0014](0014-work-item-and-comparative-settlement.md) | WorkItem identity and comparative settlement | **Proposed** | Proposed planning identity, fan-out effect bound, and four-part settlement record | 2026-08-10 | -- |
 | [0015](0015-harness-owned-step-model.md) | Harness-owned step model choice | **Accepted** | Pure Impulse-owned per-step policy; applications retain inference and semantic authority | 2026-08-17 | -- |
+| [0017](0017-canonical-loop-contract.md) | Canonical loop contract | **Proposed** | Typed loop budgets, breaker-evaluated stop conditions, and termination evidence for Ion tool loops; 0016 reserved by the drafted harness evolution plane | 2026-09-01 | -- |
 
 ## ADR Format
 

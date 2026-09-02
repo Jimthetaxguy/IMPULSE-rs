@@ -233,12 +233,37 @@ mod tests {
     fn test_save_returns_err_when_path_has_no_writable_parent() {
         // A path under a file (not a directory) can never have its parent
         // created, so save() must surface an Err rather than panicking.
+        // Setup must not panic if the filesystem refuses the blocking write:
+        // PermissionDenied is the same class of failure save() should return.
+        // Still invoke save() and require Err — a successful save must not pass.
         let dir = tempfile::TempDir::new().expect("tempdir");
         let blocking_file = dir.path().join("not-a-dir");
-        std::fs::write(&blocking_file, b"x").expect("write blocking file");
-        let bad_path = blocking_file.join("ion_history");
+        let bad_path = match std::fs::write(&blocking_file, b"x") {
+            Ok(()) => blocking_file.join("ion_history"),
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                // Could not plant a file-as-parent in the temp dir. Fall back
+                // to an existing file (this process executable) so the parent
+                // is still "not a writable directory" without another write.
+                match std::env::current_exe() {
+                    Ok(exe) if exe.is_file() => exe.join("ion_history"),
+                    Ok(exe) => panic!(
+                        "could not create unwritable-parent fixture: blocking write was PermissionDenied and current_exe is not a file ({})",
+                        exe.display()
+                    ),
+                    Err(exe_err) => panic!(
+                        "could not create unwritable-parent fixture: blocking write was PermissionDenied ({err}) and current_exe failed ({exe_err})"
+                    ),
+                }
+            }
+            Err(err) => {
+                panic!("could not create blocking-file fixture for unwritable-parent test: {err}")
+            }
+        };
 
         let mut editor = DefaultEditor::new().expect("editor");
-        assert!(save(&mut editor, &bad_path).is_err());
+        assert!(
+            save(&mut editor, &bad_path).is_err(),
+            "save() must return Err when the parent is not a writable directory"
+        );
     }
 }

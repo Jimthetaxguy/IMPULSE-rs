@@ -146,6 +146,15 @@ returned reason in its own evidence domain.
 - **Source of truth:** `impulse-step-model`, the adapter and arena record in
   `src/agent/step_model.rs`, and ADR-0015.
 
+### loop contract — `[code]`
+The declared budget an Impulse-owned loop runs under (`LoopContract`: round cap, wall clock,
+repeated-call and same-error streak limits), the per-run breaker that evaluates every trip
+condition, and the typed `LoopReport` every run leaves behind. A trip is an execution fact, never
+a review outcome. Today it bounds the Ion tool loop; governed Builder iterations are the intended
+next consumer.
+- **Source of truth:** `src/loop_contract.rs`, `Agent::chat_with_tools` in
+  `src/llm_backends/mod.rs`, and ADR-0017.
+
 ### agent registry — `[code]`
 The catalog of platform identity and launch metadata. It answers what can be named, detected, and
 launched; daemon/runtime telemetry separately answers what is currently running.
