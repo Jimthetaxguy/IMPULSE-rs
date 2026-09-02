@@ -21,9 +21,10 @@ use impulse_ops::governed_task::{
     GovernedPromotionInput, GovernedPromotionOutcome, GovernedSupervisorReviewEnvelope,
     GovernedTaskRun, GovernedVerificationInput, GovernedVerificationOutcome,
     GovernedVerificationProfile, PromotionBlockedReason, SharedRepositoryConfigDigest,
-    StagedWorktreeInput, SupervisorVerdictInput, WorkerCompletionClaimInput, WorldScope,
-    MAX_PROFILED_ACCEPTANCE_CRITERIA, MAX_PROFILED_ACCEPTANCE_CRITERION_BYTES,
-    MAX_PROFILED_CLAIM_SUMMARY_BYTES, MAX_PROFILED_TASK_BYTES,
+    SharedRepositoryConfigPin, StagedWorktreeInput, SupervisorVerdictInput,
+    WorkerCompletionClaimInput, WorldScope, MAX_PROFILED_ACCEPTANCE_CRITERIA,
+    MAX_PROFILED_ACCEPTANCE_CRITERION_BYTES, MAX_PROFILED_CLAIM_SUMMARY_BYTES,
+    MAX_PROFILED_TASK_BYTES,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -1398,9 +1399,15 @@ pub(crate) fn bind_supervisor_review(
 /// `diff.<name>.textconv` defined there runs whenever Git materializes a file,
 /// including the working-tree sync promotion performs, in the canonical
 /// workspace, under operator authority, after review has already passed.
-/// Disabling hooks does not touch that path, and no Git switch suppresses
-/// repository config or `info/attributes`: `-c` and the `GIT_CONFIG_*`
-/// variables cannot mask an attacker-named key.
+/// Disabling hooks does not touch that path.
+///
+/// **Why this gate is safe:** it detects *change*, so it never has to enumerate
+/// what could be abused. That is the whole argument, and it survives being
+/// wrong about Git. As supporting evidence only: no switch known to us
+/// suppresses this class wholesale — `-c` overrides a key you can already name,
+/// and the attacker picks the name — but if that is wrong today, or a future Git
+/// adds such a switch, the digest is unaffected, because a driver still cannot
+/// be *defined* without changing the bytes being compared.
 ///
 /// `.git/config.worktree` is included because worktree-scoped config *not*
 /// accepting filter keys is convention, not a Git guarantee — the file takes
@@ -1539,7 +1546,9 @@ pub fn materialize_staged_worktree(task: &GovernedTaskRun) -> Result<StagedWorkt
         actor: staged_system_actor(),
         root,
         initial_subject_revision: initial.to_string(),
-        shared_config_digest: shared_repository_config_digest(&workspace)?,
+        shared_config_digest: SharedRepositoryConfigPin::Recorded(shared_repository_config_digest(
+            &workspace,
+        )?),
     })
 }
 
@@ -1706,11 +1715,16 @@ pub fn promote_governed_outcome(task: &GovernedTaskRun) -> Result<GovernedPromot
     // Before anything is checked out: worktree-shared configuration must be
     // exactly what it was when this worktree was materialized, or a Git filter
     // the Builder defined would execute during the sync below.
+    let Some(pinned_config) = staged.shared_config_digest.recorded() else {
+        // Materialized before the pin existed: there is nothing to compare, and
+        // guessing is exactly what this gate must not do.
+        return Ok(blocked(
+            canonical_head,
+            PromotionBlockedReason::RepositoryConfigUnpinned,
+        ));
+    };
     let observed_config = shared_repository_config_digest(&workspace)?;
-    if let Some(component) = staged
-        .shared_config_digest
-        .first_difference(&observed_config)
-    {
+    if let Some(component) = pinned_config.first_difference(&observed_config) {
         return Ok(blocked(
             canonical_head,
             PromotionBlockedReason::RepositoryConfigChanged { component },

@@ -180,8 +180,11 @@ pub struct StagedWorktree {
     pub initial_subject_revision: String,
     /// Digests of the worktree-shared repository configuration observed when
     /// this worktree was materialized. Promotion refuses to check anything out
-    /// unless the same digests still hold.
-    pub shared_config_digest: SharedRepositoryConfigDigest,
+    /// unless the same digests still hold. Defaults to
+    /// [`SharedRepositoryConfigPin::Unknown`] so a record written before the pin
+    /// existed still loads instead of failing the whole ledger closed.
+    #[serde(default)]
+    pub shared_config_digest: SharedRepositoryConfigPin,
     pub status: StagedWorktreeStatus,
     pub materialized_at: String,
     pub based_on_revision: u64,
@@ -194,7 +197,8 @@ pub struct StagedWorktreeInput {
     pub actor: GovernedActor,
     pub root: String,
     pub initial_subject_revision: String,
-    pub shared_config_digest: SharedRepositoryConfigDigest,
+    #[serde(default)]
+    pub shared_config_digest: SharedRepositoryConfigPin,
 }
 
 /// Why a promotion could not move the canonical branch.
@@ -217,6 +221,10 @@ pub enum PromotionBlockedReason {
     /// benign churn (a new remote, a credential helper) hard-blocks promotion
     /// too, and the operator must not have to guess which file to inspect.
     RepositoryConfigChanged { component: SharedConfigComponent },
+    /// The staged worktree was materialized before shared configuration was
+    /// pinned, so there is nothing to compare against. Not a failure of the
+    /// run: the operator discards the worktree and re-materializes.
+    RepositoryConfigUnpinned,
 }
 
 /// Which piece of worktree-shared Git state changed under a staged run.
@@ -244,6 +252,35 @@ impl SharedConfigComponent {
 impl std::fmt::Display for SharedConfigComponent {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.as_str())
+    }
+}
+
+/// Whether a staged worktree carries a shared-configuration pin at all.
+///
+/// A worktree materialized before ADR-0019 round 2 has no pin, and there is no
+/// honest default for one: an empty digest would either compare equal to
+/// nothing (silently unsafe) or to everything (blocked forever with no
+/// explanation). `Unknown` says exactly what is true — the comparison cannot be
+/// made — and promotion refuses on it with its own reason so the operator is
+/// told to discard and re-materialize rather than left guessing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedRepositoryConfigPin {
+    Recorded(SharedRepositoryConfigDigest),
+    #[default]
+    Unknown,
+}
+
+impl SharedRepositoryConfigPin {
+    pub fn recorded(&self) -> Option<&SharedRepositoryConfigDigest> {
+        match self {
+            Self::Recorded(digest) => Some(digest),
+            Self::Unknown => None,
+        }
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown)
     }
 }
 
@@ -282,6 +319,7 @@ impl PromotionBlockedReason {
             Self::DetachedHead => "detached_head",
             Self::ConcurrentBranchUpdate => "concurrent_branch_update",
             Self::RepositoryConfigChanged { .. } => "repository_config_changed",
+            Self::RepositoryConfigUnpinned => "repository_config_unpinned",
         }
     }
 }
@@ -1336,12 +1374,12 @@ mod tests {
         character.to_string().repeat(40)
     }
 
-    fn test_shared_config_digest() -> SharedRepositoryConfigDigest {
-        SharedRepositoryConfigDigest {
+    fn test_shared_config_digest() -> SharedRepositoryConfigPin {
+        SharedRepositoryConfigPin::Recorded(SharedRepositoryConfigDigest {
             repository_config: format!("sha256:{}", "d".repeat(64)),
             worktree_config: None,
             info_attributes: Some(format!("sha256:{}", "e".repeat(64))),
-        }
+        })
     }
 
     fn staged_registration_builder() -> GovernedTaskRegistrationBuilder {
@@ -1855,5 +1893,71 @@ mod tests {
         let claim: WorkerCompletionClaim = serde_json::from_value(legacy).unwrap();
         assert!(claim.loop_report_digest.is_some());
         assert_eq!(claim.loop_report_version, None);
+    }
+
+    #[test]
+    fn test_shared_config_pin_round_trips_and_defaults_to_unknown() {
+        let recorded = test_shared_config_digest();
+        let json = serde_json::to_string(&recorded).unwrap();
+        assert_eq!(
+            serde_json::from_str::<SharedRepositoryConfigPin>(&json).unwrap(),
+            recorded
+        );
+        assert!(recorded.recorded().is_some());
+        assert!(!recorded.is_unknown());
+
+        let unknown = SharedRepositoryConfigPin::Unknown;
+        assert_eq!(serde_json::to_string(&unknown).unwrap(), "\"unknown\"");
+        assert_eq!(
+            serde_json::from_str::<SharedRepositoryConfigPin>("\"unknown\"").unwrap(),
+            unknown
+        );
+        assert_eq!(SharedRepositoryConfigPin::default(), unknown);
+        assert!(unknown.recorded().is_none());
+        assert!(unknown.is_unknown());
+    }
+
+    /// The whole point of the pin being an enum: a worktree recorded before it
+    /// existed must still deserialize, or one stale record fails the ledger.
+    #[test]
+    fn test_staged_worktree_loads_without_a_shared_config_pin() {
+        let legacy = serde_json::json!({
+            "id": "staged-1",
+            "actor": {"kind": "system", "id": "impulse-daemon"},
+            "root": "/tmp/impulse-rs/.impulse/worktrees/task-1",
+            "initial_subject_revision": oid('a'),
+            "status": "active",
+            "materialized_at": "2026-09-02T00:00:00Z",
+            "based_on_revision": 0
+        });
+        let staged: StagedWorktree = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            staged.shared_config_digest,
+            SharedRepositoryConfigPin::Unknown
+        );
+        assert_eq!(staged.status, StagedWorktreeStatus::Active);
+    }
+
+    #[test]
+    fn test_staged_worktree_input_loads_without_a_shared_config_pin() {
+        let legacy = serde_json::json!({
+            "actor": {"kind": "system", "id": "impulse-daemon"},
+            "root": "/tmp/impulse-rs/.impulse/worktrees/task-1",
+            "initial_subject_revision": oid('a')
+        });
+        let input: StagedWorktreeInput = serde_json::from_value(legacy).unwrap();
+        assert!(input.shared_config_digest.is_unknown());
+    }
+
+    #[test]
+    fn test_unpinned_blocked_reason_round_trips() {
+        let reason = PromotionBlockedReason::RepositoryConfigUnpinned;
+        let json = serde_json::to_string(&reason).unwrap();
+        assert_eq!(json, "\"repository_config_unpinned\"");
+        assert_eq!(
+            serde_json::from_str::<PromotionBlockedReason>(&json).unwrap(),
+            reason
+        );
+        assert_eq!(reason.to_string(), "repository_config_unpinned");
     }
 }

@@ -11,7 +11,7 @@ use impulse_ops::governed_task::{
     GovernedTaskId, GovernedTaskMutation, GovernedTaskMutationRequest, GovernedTaskRegistration,
     GovernedTaskRun, GovernedVerification, GovernedVerificationInput, GovernedVerificationOutcome,
     OperatorAuthentication, OperatorDecision, OperatorDecisionInput, OperatorDecisionKind, PromotionBlockedReason,
-    SharedRepositoryConfigDigest, StagedWorktree, StagedWorktreeInput, StagedWorktreeStatus,
+    SharedRepositoryConfigPin, StagedWorktree, StagedWorktreeInput, StagedWorktreeStatus,
     SupervisorVerdict, SupervisorVerdictInput, SupervisorVerdictKind, WorkerCompletionClaim,
     WorkerCompletionClaimInput, WorldScope, MAX_GOVERNED_COMMANDS, MAX_GOVERNED_COMMAND_ARGS,
     MAX_GOVERNED_COMMAND_ARG_BYTES, MAX_GOVERNED_EVENTS, MAX_GOVERNED_RECORDS_PER_KIND,
@@ -1891,6 +1891,15 @@ fn staged_worktree_is_discardable(task: &GovernedTaskRun) -> bool {
     if task.execution_state == GovernedExecutionState::LaunchFailed {
         return true;
     }
+    // A worktree with no shared-configuration pin can never be promoted, so
+    // discarding it is the only way forward and must always be available.
+    if task
+        .staged_worktree
+        .as_ref()
+        .is_some_and(|staged| staged.shared_config_digest.is_unknown())
+    {
+        return true;
+    }
     match task.review_state {
         // Terminal: the operator declined, or the loop contract tripped and the
         // task accepts no further claims.
@@ -1955,7 +1964,12 @@ fn validate_promotion_outcome(promotion: &GovernedPromotionInput) -> Result<()> 
 
 /// Every present component digest must be well formed. Absence is a legitimate
 /// value (the file does not exist) and is pinned as such.
-fn require_shared_config_digest(digest: &SharedRepositoryConfigDigest) -> Result<()> {
+fn require_shared_config_digest(pin: &SharedRepositoryConfigPin) -> Result<()> {
+    // `Unknown` is a legitimate stored value: a worktree materialized before the
+    // pin existed. Promotion refuses on it; the ledger must still load.
+    let Some(digest) = pin.recorded() else {
+        return Ok(());
+    };
     require_sha256_digest(
         "staged worktree repository config digest",
         &digest.repository_config,
@@ -2191,12 +2205,14 @@ mod tests {
         }
     }
 
-    fn test_shared_config_digest() -> SharedRepositoryConfigDigest {
-        SharedRepositoryConfigDigest {
-            repository_config: digest('d'),
-            worktree_config: None,
-            info_attributes: None,
-        }
+    fn test_shared_config_digest() -> SharedRepositoryConfigPin {
+        SharedRepositoryConfigPin::Recorded(
+            impulse_ops::governed_task::SharedRepositoryConfigDigest {
+                repository_config: digest('d'),
+                worktree_config: None,
+                info_attributes: None,
+            },
+        )
     }
 
     fn digest(character: char) -> String {
@@ -4739,5 +4755,112 @@ mod tests {
             "loop evidence without its version must fail the ledger closed",
         );
         assert!(format!("{error:#}").contains("missing digest or version"));
+    }
+
+    // ---------------------------------------------------------------------
+    // Review round 3
+    // ---------------------------------------------------------------------
+
+    /// The ledger-wide failure this guards against: one round-2-shaped record
+    /// with an active worktree and no pin key would otherwise fail
+    /// `GovernedTaskLedger::load` and take every other task down with it.
+    #[test]
+    fn test_a_ledger_with_an_unpinned_staged_worktree_still_loads() {
+        let (root, state) = state();
+        let task = state
+            .register_governed_task(staged_registration(&state, "round3-1"))
+            .unwrap();
+        let task = materialize(&state, &task, "round3-1-staged");
+
+        // A genuine pre-pin ledger has no digest on the record *and* a receipt
+        // fingerprint computed without one. Rewriting only the record would
+        // fail on the fingerprint instead, and prove nothing about the pin.
+        let staged = task.staged_worktree.as_ref().expect("staged worktree");
+        let legacy_fingerprint = fingerprint_mutation(
+            &task.project_id,
+            &task.id,
+            &GovernedTaskMutation::MaterializeStagedWorktree {
+                staged: StagedWorktreeInput {
+                    actor: staged.actor.clone(),
+                    root: staged.root.clone(),
+                    initial_subject_revision: staged.initial_subject_revision.clone(),
+                    shared_config_digest: SharedRepositoryConfigPin::Unknown,
+                },
+            },
+        )
+        .unwrap();
+        rewrite_persisted_ledger(&state, |ledger| {
+            let tasks = ledger
+                .get_mut("tasks")
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("tasks object");
+            for stored in tasks.values_mut() {
+                stored
+                    .get_mut("staged_worktree")
+                    .and_then(serde_json::Value::as_object_mut)
+                    .expect("staged worktree object")
+                    .remove("shared_config_digest");
+            }
+            let receipts = ledger
+                .get_mut("processed_requests")
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("receipts object");
+            for receipt in receipts.values_mut() {
+                let receipt = receipt.as_object_mut().expect("receipt object");
+                if receipt
+                    .get("resulting_revision")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(1)
+                {
+                    receipt.insert(
+                        "request_fingerprint".to_string(),
+                        serde_json::Value::String(legacy_fingerprint.clone()),
+                    );
+                }
+            }
+        });
+
+        let reloaded = State::new(root.path().join("impulse-test").join(".impulse"))
+            .expect("a record written before the pin existed must not fail the ledger");
+        let stored = reloaded
+            .get_governed_task("impulse-test", &task.id)
+            .unwrap()
+            .expect("the unpinned task survives reload");
+        let staged = stored.staged_worktree.as_ref().expect("staged worktree");
+        assert!(staged.shared_config_digest.is_unknown());
+        assert_eq!(staged.status, StagedWorktreeStatus::Active);
+    }
+
+    /// An unpinned worktree can never be promoted, so discard must always be
+    /// available or the operator has no way out.
+    #[test]
+    fn test_an_unpinned_staged_worktree_is_always_discardable() {
+        let (_root, state) = state();
+        let task = state
+            .register_governed_task(staged_registration(&state, "round3-2"))
+            .unwrap();
+        let mut task = materialize(&state, &task, "round3-2-staged");
+        // Simulate the reloaded shape: an active worktree with no pin, on a task
+        // that is otherwise mid-run and would normally refuse a discard.
+        if let Some(staged) = task.staged_worktree.as_mut() {
+            staged.shared_config_digest = SharedRepositoryConfigPin::Unknown;
+        }
+        assert!(staged_worktree_is_discardable(&task));
+
+        // A pinned worktree in the same state is still protected.
+        let pinned = materialize(
+            &state,
+            &state
+                .register_governed_task(staged_registration(&state, "round3-3"))
+                .unwrap(),
+            "round3-3-staged",
+        );
+        assert!(!staged_worktree_is_discardable(&pinned));
+    }
+
+    #[test]
+    fn test_an_unpinned_staged_worktree_passes_record_validation() {
+        require_shared_config_digest(&SharedRepositoryConfigPin::Unknown).unwrap();
+        require_shared_config_digest(&test_shared_config_digest()).unwrap();
     }
 }
