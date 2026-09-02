@@ -53,10 +53,28 @@ it starts, independent of whether that side effect's own receipt is ever durably
 ### API on `State`
 
 - `reserve(task_id, revision, request_id, producer) -> Result<ReservationId>` — fails with
-  `ProducerReservationError::DuplicateOpenReservation` if an open (unreleased) reservation already
-  exists for the same `(task_id, producer)` pair, so a request replayed while the original side
-  effect is still in flight cannot start a second, competing run.
+  `ProducerReservationError::DuplicateOpenReservation` if an open (unreleased) reservation *at or
+  after* `revision` already exists for the same `(task_id, producer)` pair, so a request replayed
+  while the original side effect is genuinely still in flight cannot start a second, competing run.
+  An open reservation strictly *behind* `revision` cannot be that live attempt — the task has moved
+  on since it was taken — so `reserve` closes it as `NeedsRerun` in the same persisted write rather
+  than leaving it to block every future call for that task/producer until a process restart. See
+  "Revision-scoped duplicate check" below for what this does and does not close.
 - `release(id, receipt_ref) -> Result<()>` — marks the reservation `Released { receipt_ref }`.
+
+  `reserve`, `release`, and the internal `close_reservation_needs_rerun` all follow a
+  clone-mutate-persist-swap discipline (matching `state/governed_task.rs`'s `mutate_governed_task`
+  and `state/memory_candidate.rs`'s candidate-write pattern): each clones the in-memory ledger,
+  applies the change to the clone, persists the clone, and only then swaps it into the live
+  `Mutex`-guarded state. An earlier version of this journal mutated the live ledger *before* the
+  fallible persist call with no rollback on failure — a transient I/O error (a momentarily
+  unwritable `.impulse/`, a full disk) would return `Err` while leaving a phantom reservation
+  behind that the caller has no id for and can never release, permanently blocking every later
+  `reserve()` for that task/producer until the daemon restarted. Fixed in adversarial review before
+  merge; proven by `reserve_leaves_no_phantom_reservation_when_persist_fails` and
+  `release_leaves_reservation_open_when_persist_fails`, both of which chmod `.impulse/` read-only
+  to force the persist to fail and then assert the live ledger is unchanged and a corrected retry
+  succeeds once the directory is writable again.
 - `open_reservations() -> Result<Vec<ProducerReservation>>`.
 - `pending_rerun_reason(task_id, producer, request_id) -> Result<Option<String>>` — the reason the
   most recent reservation for this exact triple needed a rerun, if any. Not named in the original
@@ -69,6 +87,34 @@ it starts, independent of whether that side effect's own receipt is ever durably
   call again: each note is written through the governed-task ledger's existing idempotent mutation
   path (`mutate_governed_task`), keyed by a request id derived deterministically from the
   reservation id, so a repeat reconcile cannot duplicate an event or re-bump the task revision.
+
+### Revision-scoped duplicate check
+
+Keying `DuplicateOpenReservation` purely on `(task_id, producer)` has a second failure mode besides
+the crash-and-restart one this journal was built for: an **in-process panic** (not a process exit)
+during a side effect leaves a reservation open with no `State::new` reconcile ever running to close
+it — the daemon process is still alive. Every subsequent `reserve()` for that task and producer
+would then fail forever, until an operator restarted the daemon.
+
+`reserve` now scopes the check by revision instead of by task/producer alone: an open reservation
+with `stored.revision < incoming revision` cannot represent a still-relevant in-flight attempt,
+because the caller's higher revision is proof the task has genuinely moved on since that
+reservation was taken (nothing legitimate can still be racing to complete against a revision that
+is no longer current). Such a reservation is closed as `NeedsRerun` in the same write that creates
+the new one, rather than left to block.
+
+**What this does not close**, stated explicitly per review: two attempts at the **exact same**
+revision still conflict — a caller retrying immediately after an in-process panic, with the task's
+revision unchanged (no other activity happened in between), hits `DuplicateOpenReservation` exactly
+as before. Two options were on the table: this revision-scoped check, or an explicit
+`clear_stale_reservation(id)` API for the operator surface. The revision-scoped check was chosen
+because it needs no new operator plumbing and closes the more common case (the task advances
+between the panicked attempt and the retry — including via an unrelated operator action or a
+different producer's run), while the same-revision case is left as a known, documented gap rather
+than quietly declared solved. Closing it fully needs either a real process restart (which still
+works today, via `State::new`'s reconcile) or future operator-facing tooling; test:
+`reserve_at_the_same_revision_still_conflicts_with_an_open_reservation` proves the gap is exactly
+this narrow, not broader.
 
 ### `with_reservation` — the integration contract
 
@@ -108,17 +154,36 @@ exactly the gap this journal exists to close — so `with_reservation` intention
 
 On failure, the reservation is released with the failure recorded (`Released { receipt_ref: "failed:
 <error>" }`) rather than left open, so a corrected retry is not blocked by
-`DuplicateOpenReservation`.
+`DuplicateOpenReservation`. On success, a `release()` persist failure is logged and swallowed rather
+than propagated as if the side effect itself had failed — `side_effect`'s own governed-task mutation
+is already durable by the time `with_reservation` calls `release`, so a failure releasing *this*
+journal's bookkeeping must not turn a durably-recorded success into a reported failure. (An earlier
+version of this function used `?` on the success-path `release()` call, which had exactly that bug;
+fixed before merge, proven by
+`with_reservation_reports_success_even_when_release_persist_fails`, which forces the release to
+fail from inside the closure itself, after `reserve()` has already succeeded.)
+
+**Not panic-safe.** `with_reservation` has no `catch_unwind`. If `side_effect` panics, the
+reservation is left open (matching the crash-before-receipt case) but `release()` never runs and
+the panic propagates through `with_reservation` itself — there is no special handling distinguishing
+a panic from any other way the calling task might stop running. The handler-wiring lane must treat
+an in-process panic the same way it treats a process crash: the reservation stays open until either
+a real process restart runs `State::new`'s reconcile, or (for the same-revision case reconcile
+cannot reach without a restart) the revision-scoped check above closes it once the task's revision
+next advances.
 
 ### Ledger validation
 
 `ProducerReservationLedger` carries a `digest: String` field — a SHA-256 over the canonical JSON
 serialization of its `reservations` map, recomputed and compared at every load (mirroring the
 whole-file SHA-256 approach `src/basis.rs`'s `BasisDeclaration::Ledger` uses for its own freshness
-check, adapted here to guard the reservation file itself rather than a basis source). A forged or
-truncated file fails closed with `ProducerReservationError::LedgerDigestMismatch`, propagated
-through `State::new`'s `?` rather than panicking — daemon startup fails rather than silently
-trusting a tampered journal.
+check, adapted here to guard the reservation file itself rather than a basis source). **This is
+corruption/truncation detection, not tamper resistance**: it is an unkeyed hash, so anyone with
+filesystem write access to the file could edit its content and recompute a matching digest — the
+same limitation the basis and memory-candidate ledgers accept. Its job is to catch an accidental
+partial write or bit rot, not a deliberate adversary. A corrupted or truncated file fails closed
+with `ProducerReservationError::LedgerDigestMismatch`, propagated through `State::new`'s `?` rather
+than panicking — daemon startup fails rather than silently trusting a damaged journal.
 
 ### Governed-task event chain integration
 
@@ -196,11 +261,18 @@ Proven at the state layer by `src/state/producer_reservation.rs`'s test module:
 5. a replayed request against a needs-rerun reservation is distinguishable from a fresh one via
    `pending_rerun_reason`, and the retry itself is not blocked (the prior reservation is closed, not
    open);
-6. a forged or truncated ledger digest fails `State::new` closed;
+6. a corrupted or truncated ledger digest fails `State::new` closed;
 7. the ledger file is `0600` on Unix;
 8. every `Serialize + Deserialize` type here has a round-trip test;
 9. `with_reservation` releases with the receipt on success and with the failure recorded (not left
-   open) when the closure errors.
+   open) when the closure errors, and reports success (not the release failure) when the side
+   effect succeeds but the release persist itself fails;
+10. `reserve`/`release`/`close_reservation_needs_rerun` leave the live ledger unchanged (no phantom
+    open reservation, no silent release) when the underlying persist fails — forced by chmod'ing
+    `.impulse/` read-only mid-test — and a corrected retry succeeds once it is writable again;
+11. an open reservation strictly behind an incoming `reserve()` call's revision is closed as
+    `NeedsRerun` rather than blocking, while two attempts at the exact same revision still conflict
+    (the documented residual gap).
 
 Full handler-level acceptance (a replayed request genuinely skipping a second `cargo` run, proven
 against the execution counter at `src/governed_producers.rs:1080-1081`) is out of scope for this

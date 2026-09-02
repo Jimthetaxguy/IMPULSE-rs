@@ -43,15 +43,16 @@ tags: [worktree, lane, governed-tasks, producers, crash-safety, state, adr-0012]
   `cargo build --workspace`, `cargo test --workspace`,
   `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`,
   `python3 ../docs/validate_docs.py --all` (from inside `impulse-rs/`).
-- Latest status: implementation complete and gated on this lane. `cargo build --workspace` clean
-  (includes `impulse-desktop`, confirming the new `GovernedTaskEventKind`/`GovernedTaskMutation`
-  variants are additive and do not break any exhaustive match outside this lane's owned files —
-  verified there are none). `cargo clippy --workspace --all-targets -- -D warnings` clean.
-  `cargo fmt --all -- --check` clean. `cargo test --workspace`: **2325 passed / 0 failed / 9
-  ignored**, including all 15 new `state::producer_reservation::tests`.
-  `python3 ../docs/validate_docs.py --all` reports only the 4 pre-existing failures (ADR-0014
-  `proposed` status, `LONG-RANGE-ENHANCEMENTS.md` and the two `RUST-MULTI-AGENT-*` guides stale) —
-  no new failures from this lane's docs.
+- Latest status: implementation complete, adversarial review round 1 addressed (see "Review round
+  1" below), gate re-run on this lane. `cargo build --workspace` clean (includes `impulse-desktop`,
+  confirming the new `GovernedTaskEventKind`/`GovernedTaskMutation` variants are additive and do
+  not break any exhaustive match outside this lane's owned files — verified there are none).
+  `cargo clippy --workspace --all-targets -- -D warnings` clean. `cargo fmt --all -- --check`
+  clean. `cargo test --workspace`: **2330 passed / 0 failed / 9 ignored**, 20 tests now in
+  `state::producer_reservation::tests` (up from 15). `python3 ../docs/validate_docs.py --all`
+  reports only the 4 pre-existing failures (ADR-0014 `proposed` status,
+  `LONG-RANGE-ENHANCEMENTS.md` and the two `RUST-MULTI-AGENT-*` guides stale) — no new failures
+  from this lane's docs.
 
 ## Decisions
 
@@ -121,12 +122,76 @@ tags: [worktree, lane, governed-tasks, producers, crash-safety, state, adr-0012]
   interrupting request id, and reason all present on the governed task's own event chain;
   reconcile is idempotent across repeated `State::new` calls (no duplicate event, no extra
   revision bump); a replayed request against a needs-rerun reservation is distinguishable via
-  `pending_rerun_reason`, and the retry itself is not blocked; a forged or truncated ledger digest
-  fails `State::new` closed (two separate tests); the ledger file is `0600` on Unix; serde
+  `pending_rerun_reason`, and the retry itself is not blocked; a corrupted or truncated ledger
+  digest fails `State::new` closed (two separate tests); the ledger file is `0600` on Unix; serde
   round-trip tests for `ProducerReservation`, `ProducerKind` (all three variants), and
   `ReservationOutcome`; `with_reservation` releases with the receipt on success and with the
   failure recorded (not left open) when the closure errors, proven by then successfully
-  re-reserving the same triple.
+  re-reserving the same triple. Five more added in review round 1 — see below.
+
+## Review round 1 (adversarial review on PR #45, 2026-09-02)
+
+Verdict "needs changes"; all four findings addressed on this branch before the next review pass.
+
+- **P1 (confirmed): no rollback on a failed persist.** `reserve`, `release`, and the internal
+  `close_reservation_needs_rerun` mutated the live `Mutex`-guarded ledger *before* calling the
+  fallible `persist()`, with no rollback on failure. A transient I/O error (a momentarily
+  unwritable `.impulse/`, a full disk) would return `Err` while leaving a phantom reservation in
+  the live ledger that the caller has no id for and can never release — every later `reserve()` for
+  that task/producer would then hit `DuplicateOpenReservation` until the daemon restarted;
+  `release`/the internal close had the mirror bug (a failed persist could silently leave the
+  in-memory copy released while the disk copy stayed open, or vice versa depending on exactly where
+  it failed). Rewritten to the clone-mutate-persist-swap pattern already used by
+  `governed_task.rs`'s `mutate_governed_task` (~line 330-347) and `memory_candidate.rs`'s
+  candidate-write (~line 167-172): each function now clones the ledger, mutates only the clone,
+  persists the clone, and swaps it into the live state only on success. A persist failure now
+  leaves the live ledger byte-for-byte as it was before the call.
+- **New tests forcing `persist()` to fail**, mirroring `ion_repl::history`'s existing
+  unwritable-parent test pattern (chmod the directory read-only rather than trying to block a
+  single file): `reserve_leaves_no_phantom_reservation_when_persist_fails` and
+  `release_leaves_reservation_open_when_persist_fails` both chmod `.impulse/` to `0o500`, call the
+  method, restore permissions before any assertion (so a failing assert can't leave the fixture
+  directory locked for cleanup), then assert the live ledger is unchanged and that a corrected
+  retry succeeds once the directory is writable again.
+- **P1: duplicate-open scoped by revision, with the residual gap documented rather than silently
+  left.** Keying `DuplicateOpenReservation` on `(task_id, producer)` alone meant a reservation
+  stuck open by an in-process panic (not a process crash — no `State::new` reconcile ever runs)
+  blocked every future run for that task/producer until an operator restarted the daemon. Chose
+  the revision-scoped check over an explicit `clear_stale_reservation` operator API (per the
+  review's stated preference: no new operator plumbing needed): `reserve` now only blocks on an
+  open reservation whose stored revision is at or after the incoming one; a strictly older open
+  reservation is closed as `NeedsRerun` in the same write rather than left to block. Documented,
+  as asked, that this does **not** fully close the gap: two attempts at the exact same revision
+  still conflict (a same-revision retry immediately after a panic, with nothing else advancing the
+  task in between) — that case still needs a real process restart or future operator tooling.
+  Written up in both the spec ("Revision-scoped duplicate check") and this ADR-0012 amendment.
+  Also added, as asked: an explicit "not panic-safe" note on `with_reservation` (no
+  `catch_unwind`; the handler-wiring lane must treat an in-process panic exactly like a process
+  crash) in both the amendment and the spec. New tests:
+  `reserve_at_a_newer_revision_closes_a_stale_older_open_reservation_instead_of_blocking` and
+  `reserve_at_the_same_revision_still_conflicts_with_an_open_reservation` (the latter documents the
+  accepted residual gap rather than hiding it).
+- **P2: `with_reservation`'s success path propagated a `release()` persist failure as if the side
+  effect itself had failed.** The success branch used `?` on `release()`; fixed to log-and-continue
+  exactly like the pre-existing error branch, since `side_effect`'s own governed-task mutation is
+  already durable by the time `release` runs — losing this journal's own bookkeeping write must not
+  turn a durably-recorded success into a reported failure. New test:
+  `with_reservation_reports_success_even_when_release_persist_fails`, which chmods `.impulse/`
+  read-only from *inside* the closure itself (after `reserve()` has already succeeded, before
+  `with_reservation`'s internal `release()` call runs) to force exactly this failure window.
+- **Nit: digest language softened.** The module doc comment, the `digest` field's own doc comment,
+  the `LedgerDigestMismatch` error message, the spec, and this ADR amendment all described the
+  SHA-256 check as detecting "forged" or "tampered" content. Reworded throughout to
+  "corruption/truncation detection, not tamper resistance" — it is an unkeyed hash, so anyone with
+  filesystem write access could edit the content and recompute a matching digest; its actual job
+  is catching an accidental partial write or bit rot, matching the guarantee the basis and
+  memory-candidate ledgers already accept rather than implying a stronger one.
+- Gate re-run on this checkout after all four fixes: `cargo build --workspace` clean, `cargo test
+  --workspace` **2330 passed / 0 failed / 9 ignored** (up from 2325 — 5 new tests: two
+  persist-failure-rollback tests, two revision-scoping tests, one
+  release-fails-after-success test), `cargo clippy --workspace --all-targets -- -D warnings`
+  clean, `cargo fmt --all -- --check` clean, `python3 ../docs/validate_docs.py --all` still only
+  the 4 pre-existing failures.
 
 ## Handoff Notes
 

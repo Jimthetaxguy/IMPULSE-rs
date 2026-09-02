@@ -20,9 +20,12 @@
 //! for the exact integration contract.
 //!
 //! The journal is deliberately independent of `GOVERNED_TASKS.json`: a
-//! forged or truncated journal fails closed at load without blocking
+//! corrupted or truncated journal fails closed at load without blocking
 //! unrelated governed-task state, matching the private-ledger pattern in
-//! `state/memory_candidate.rs`.
+//! `state/memory_candidate.rs`. The digest is an unkeyed SHA-256 — it
+//! detects accidental corruption and torn/partial writes, not a deliberate
+//! adversary with filesystem write access (who could simply recompute it);
+//! it is a data-integrity check, not a tamper-resistance boundary.
 
 use std::collections::BTreeMap;
 
@@ -50,7 +53,9 @@ pub type ReservationId = GovernedRecordId;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ProducerReservationError {
-    #[error("producer reservation ledger digest mismatch: the journal may be forged or truncated")]
+    #[error(
+        "producer reservation ledger digest mismatch: the journal may be corrupted or truncated"
+    )]
     LedgerDigestMismatch,
     #[error("unsupported producer reservation ledger schema version {0}")]
     UnsupportedSchemaVersion(u32),
@@ -122,10 +127,11 @@ pub(super) struct ProducerReservationLedger {
     #[serde(default)]
     reservations: BTreeMap<ReservationId, ProducerReservation>,
     /// SHA-256 over the canonical JSON serialization of `reservations`,
-    /// recomputed and checked at every load. A forged or truncated file
-    /// changes this without the attacker knowing the exact serialization
-    /// this journal uses, so tampering fails closed instead of silently
-    /// hiding or fabricating a reservation.
+    /// recomputed and checked at every load. This is corruption/truncation
+    /// detection, not tamper resistance: it is an unkeyed hash, so anyone
+    /// with filesystem write access to this file could edit the content and
+    /// recompute a matching digest. Its job is to catch an accidental
+    /// partial write or bit rot, not a deliberate adversary.
     #[serde(default)]
     digest: String,
 }
@@ -211,9 +217,21 @@ impl State {
     }
 
     /// Reserve a producer slot for `task_id`/`producer` before running its
-    /// side effect. Fails if an open reservation already exists for the same
-    /// task and producer, so a request replayed while the original side
-    /// effect is still in flight cannot start a second, competing run.
+    /// side effect. Fails if an open reservation *at or after* `revision`
+    /// already exists for the same task and producer, so a request replayed
+    /// while the original side effect is genuinely still in flight cannot
+    /// start a second, competing run. An open reservation strictly *behind*
+    /// `revision` cannot be that live attempt — the task has since moved
+    /// on — so it is closed as `NeedsRerun` in the same persisted write
+    /// rather than left to block forever. See the design spec for the
+    /// residual gap this does not close: two attempts at the exact same
+    /// revision still conflict by design.
+    ///
+    /// Mutates the live ledger only after a successful persist (clone,
+    /// mutate the clone, persist the clone, then swap it in) so a transient
+    /// I/O failure here leaves the durable and in-memory state identical to
+    /// before the call — never a phantom reservation the caller has no id
+    /// for and can never release.
     pub fn reserve(
         &self,
         task_id: &GovernedTaskId,
@@ -223,16 +241,38 @@ impl State {
     ) -> Result<ReservationId> {
         let mut ledger = self.producer_reservations.lock().map_err(lock_err)?;
 
-        if ledger
-            .reservations
-            .values()
-            .any(|r| &r.task_id == task_id && r.producer == producer && r.is_open())
-        {
-            return Err(ProducerReservationError::DuplicateOpenReservation {
-                task_id: task_id.clone(),
-                producer,
+        let mut stale_ids = Vec::new();
+        for reservation in ledger.reservations.values() {
+            if &reservation.task_id != task_id
+                || reservation.producer != producer
+                || !reservation.is_open()
+            {
+                continue;
             }
-            .into());
+            if reservation.revision < revision {
+                stale_ids.push(reservation.id.clone());
+            } else {
+                return Err(ProducerReservationError::DuplicateOpenReservation {
+                    task_id: task_id.clone(),
+                    producer,
+                }
+                .into());
+            }
+        }
+
+        let mut candidate = ledger.clone();
+        let now = impulse_ops::now_rfc3339();
+        for stale_id in &stale_ids {
+            if let Some(stale) = candidate.reservations.get_mut(stale_id) {
+                stale.released_at = Some(now.clone());
+                stale.outcome = Some(ReservationOutcome::NeedsRerun {
+                    reason: format!(
+                        "superseded by a new reservation at revision {revision} \
+                         (this one was reserved at revision {})",
+                        stale.revision
+                    ),
+                });
+            }
         }
 
         let id = new_reservation_id();
@@ -242,12 +282,13 @@ impl State {
             revision,
             request_id: request_id.clone(),
             producer,
-            reserved_at: impulse_ops::now_rfc3339(),
+            reserved_at: now,
             released_at: None,
             outcome: None,
         };
-        ledger.reservations.insert(id.clone(), reservation);
-        ledger.persist(self.storage())?;
+        candidate.reservations.insert(id.clone(), reservation);
+        candidate.persist(self.storage())?;
+        *ledger = candidate;
         Ok(id)
     }
 
@@ -255,20 +296,31 @@ impl State {
     /// mutation that records it are both durably persisted. `receipt_ref`
     /// should name that receipt (for example the governed request id that
     /// produced it) so the journal entry stays traceable.
+    ///
+    /// Same clone-mutate-persist-swap discipline as `reserve`: a persist
+    /// failure here leaves the reservation exactly as open as it was before
+    /// the call, never silently (or partially) released.
     pub fn release(&self, id: &ReservationId, receipt_ref: impl Into<String>) -> Result<()> {
         let mut ledger = self.producer_reservations.lock().map_err(lock_err)?;
-        let reservation = ledger
+        let existing = ledger
             .reservations
-            .get_mut(id)
+            .get(id)
             .ok_or_else(|| ProducerReservationError::NotFound(id.clone()))?;
-        if !reservation.is_open() {
+        if !existing.is_open() {
             return Err(ProducerReservationError::AlreadyReleased(id.clone()).into());
         }
+
+        let mut candidate = ledger.clone();
+        let reservation = candidate
+            .reservations
+            .get_mut(id)
+            .expect("presence just confirmed against the same ledger");
         reservation.released_at = Some(impulse_ops::now_rfc3339());
         reservation.outcome = Some(ReservationOutcome::Released {
             receipt_ref: receipt_ref.into(),
         });
-        ledger.persist(self.storage())?;
+        candidate.persist(self.storage())?;
+        *ledger = candidate;
         Ok(())
     }
 
@@ -338,13 +390,20 @@ impl State {
 
     fn close_reservation_needs_rerun(&self, id: &ReservationId, reason: String) -> Result<()> {
         let mut ledger = self.producer_reservations.lock().map_err(lock_err)?;
-        let reservation = ledger
+        if !ledger.reservations.contains_key(id) {
+            return Err(ProducerReservationError::NotFound(id.clone()).into());
+        }
+
+        let mut candidate = ledger.clone();
+        let reservation = candidate
             .reservations
             .get_mut(id)
-            .ok_or_else(|| ProducerReservationError::NotFound(id.clone()))?;
+            .expect("presence just confirmed against the same ledger");
         reservation.released_at = Some(impulse_ops::now_rfc3339());
         reservation.outcome = Some(ReservationOutcome::NeedsRerun { reason });
-        ledger.persist(self.storage())
+        candidate.persist(self.storage())?;
+        *ledger = candidate;
+        Ok(())
     }
 
     fn note_producer_reservation_interrupted(
@@ -431,7 +490,16 @@ where
     let reservation_id = state.reserve(task_id, revision, request_id, producer)?;
     match side_effect().await {
         Ok((value, receipt_ref)) => {
-            state.release(&reservation_id, receipt_ref)?;
+            // The side effect's own governed-task mutation is already
+            // durable at this point (that is `side_effect`'s contract).
+            // A failure releasing *this* journal entry must not turn a
+            // durably-recorded success into a reported failure — log and
+            // continue, exactly like the error branch below.
+            if let Err(release_error) = state.release(&reservation_id, receipt_ref) {
+                tracing::error!(
+                    "failed to release producer reservation {reservation_id} after a successful side effect: {release_error}"
+                );
+            }
             Ok(value)
         }
         Err(error) => {
@@ -532,6 +600,81 @@ mod tests {
             )
             .unwrap();
 
+        let error = state
+            .reserve(
+                &task.id,
+                task.revision,
+                &request_id("req-2"),
+                ProducerKind::Verification,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn reserve_at_a_newer_revision_closes_a_stale_older_open_reservation_instead_of_blocking() {
+        let (_root, state) = state();
+        let task = registered_task(&state, "stale-revision");
+
+        // Simulate a reservation opened at an old revision that never got
+        // released (e.g. an in-process panic, not a process restart, so
+        // State::new's reconcile pass never ran for it).
+        let stale_id = state
+            .reserve(
+                &task.id,
+                task.revision,
+                &request_id("req-stale"),
+                ProducerKind::Verification,
+            )
+            .unwrap();
+
+        // A caller with proof the task has moved on (a strictly higher
+        // revision) must not be blocked by that stale reservation forever.
+        let fresh_id = state
+            .reserve(
+                &task.id,
+                task.revision + 1,
+                &request_id("req-fresh"),
+                ProducerKind::Verification,
+            )
+            .unwrap();
+        assert_ne!(stale_id, fresh_id);
+
+        let open = state.open_reservations().unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].id, fresh_id);
+
+        // The stale one is durably recorded as needs-rerun, not silently
+        // dropped.
+        let reason = state
+            .pending_rerun_reason(
+                &task.id,
+                ProducerKind::Verification,
+                &request_id("req-stale"),
+            )
+            .unwrap()
+            .expect("the stale reservation must be recorded needs-rerun");
+        assert!(reason.contains("superseded"));
+    }
+
+    #[test]
+    fn reserve_at_the_same_revision_still_conflicts_with_an_open_reservation() {
+        // Documents the residual gap the revision-scoped check accepts: two
+        // attempts at the exact same revision (e.g. a same-revision retry
+        // after an in-process panic with no other intervening activity)
+        // still conflict. Only a real process restart (State::new's
+        // reconcile) or future operator tooling clears that case.
+        let (_root, state) = state();
+        let task = registered_task(&state, "same-revision");
+
+        state
+            .reserve(
+                &task.id,
+                task.revision,
+                &request_id("req-1"),
+                ProducerKind::Verification,
+            )
+            .unwrap();
         let error = state
             .reserve(
                 &task.id,
@@ -789,6 +932,91 @@ mod tests {
         drop(state);
     }
 
+    /// Mirrors `ion_repl::history`'s unwritable-parent test: force the
+    /// journal's own directory read-only so the atomic write inside
+    /// `persist()` fails, and prove `reserve()` leaves no phantom open
+    /// reservation behind — the exact regression this round of review
+    /// caught (the ledger mutated in-memory before the fallible persist,
+    /// with no rollback on failure).
+    #[cfg(unix)]
+    #[test]
+    fn reserve_leaves_no_phantom_reservation_when_persist_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, state) = state();
+        let task = registered_task(&state, "unwritable-reserve");
+        let base = root.path().join("impulse-test").join(".impulse");
+
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = state.reserve(
+            &task.id,
+            task.revision,
+            &request_id("req-1"),
+            ProducerKind::Verification,
+        );
+        // Restore before any assertion that could panic and skip cleanup.
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(result.is_err(), "reserve must surface the write failure");
+        assert!(
+            state.open_reservations().unwrap().is_empty(),
+            "a failed persist must not leave a phantom open reservation in the live ledger"
+        );
+
+        // The directory is writable again: the same call now succeeds,
+        // proving the failed attempt did not leave a duplicate-open
+        // reservation behind either.
+        let id = state
+            .reserve(
+                &task.id,
+                task.revision,
+                &request_id("req-1"),
+                ProducerKind::Verification,
+            )
+            .unwrap();
+        assert!(state
+            .open_reservations()
+            .unwrap()
+            .iter()
+            .any(|r| r.id == id));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn release_leaves_reservation_open_when_persist_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, state) = state();
+        let task = registered_task(&state, "unwritable-release");
+        let id = state
+            .reserve(
+                &task.id,
+                task.revision,
+                &request_id("req-1"),
+                ProducerKind::Verification,
+            )
+            .unwrap();
+        let base = root.path().join("impulse-test").join(".impulse");
+
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = state.release(&id, "receipt-1");
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(result.is_err(), "release must surface the write failure");
+        assert!(
+            state
+                .open_reservations()
+                .unwrap()
+                .iter()
+                .any(|r| r.id == id),
+            "a failed persist must leave the reservation open, not silently released"
+        );
+
+        // Writable again: release now succeeds for real.
+        state.release(&id, "receipt-1").unwrap();
+        assert!(state.open_reservations().unwrap().is_empty());
+    }
+
     #[test]
     fn serde_round_trip_producer_reservation() {
         let original = ProducerReservation {
@@ -875,5 +1103,51 @@ mod tests {
                 ProducerKind::Verification,
             )
             .is_ok());
+    }
+
+    /// The success path must not propagate a `release()` persist failure as
+    /// if the durably-recorded side effect itself had failed. The closure
+    /// chmods the ledger directory read-only from *inside* itself, after
+    /// `reserve()` (which needed to succeed to get here) but before
+    /// `with_reservation`'s own `release()` call runs — simulating a
+    /// transient I/O failure landing exactly between a successful,
+    /// durable side effect and this journal's own bookkeeping.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn with_reservation_reports_success_even_when_release_persist_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, state) = state();
+        let task = registered_task(&state, "with-reservation-release-fails");
+        let base = root.path().join("impulse-test").join(".impulse");
+        let base_for_closure = base.clone();
+
+        let result = with_reservation(
+            &state,
+            &task.id,
+            task.revision,
+            &request_id("req-1"),
+            ProducerKind::Verification,
+            move || async move {
+                std::fs::set_permissions(&base_for_closure, std::fs::Permissions::from_mode(0o500))
+                    .unwrap();
+                Ok((42, "receipt-42".to_string()))
+            },
+        )
+        .await;
+
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(
+            result.unwrap(),
+            42,
+            "a durably-recorded success must be reported as success even though \
+             this journal's own release() persist failed"
+        );
+        // The reservation is left open (release never durably completed);
+        // this is the accepted, documented residual — the governed-task
+        // mutation itself is still durable, which is what replay safety
+        // actually depends on.
+        assert!(!state.open_reservations().unwrap().is_empty());
     }
 }

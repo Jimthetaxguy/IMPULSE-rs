@@ -174,16 +174,34 @@ deduplicate replay and concurrent requests, but a daemon exit between a producer
 its durable receipt could still repeat that side effect after restart.
 
 The state layer half of that gap is now closed. `impulse-rs/src/state/producer_reservation.rs`
-adds a durable, atomic, digest-verified journal (`.impulse/PRODUCER_RESERVATIONS.json`, distinct
-from `GOVERNED_TASKS.json`) that records the *intent* to run a producer side effect before it
-starts:
+adds a durable, atomic journal (`.impulse/PRODUCER_RESERVATIONS.json`, distinct from
+`GOVERNED_TASKS.json`) that records the *intent* to run a producer side effect before it starts.
+It carries a whole-file SHA-256 digest checked at every load, which is corruption/truncation
+detection, not tamper resistance (an unkeyed hash cannot stop an adversary who can already write
+the file — it exists to catch an accidental partial write, not a deliberate one), matching the
+guarantee the basis and memory-candidate ledgers already accept:
 
 - `State::reserve(task_id, revision, request_id, producer)` fails closed with a typed
-  `DuplicateOpenReservation` error if an open reservation already exists for the same task and
-  producer, so a request replayed while the original side effect is still in flight cannot start a
-  second, competing run.
+  `DuplicateOpenReservation` error if an open reservation at or after `revision` already exists for
+  the same task and producer, so a request replayed while the original side effect is genuinely
+  still in flight cannot start a second, competing run. An open reservation strictly behind the
+  incoming revision is closed as `NeedsRerun` instead of blocking — it cannot be a live attempt, since
+  the caller's higher revision proves the task has moved on. This does not fully close a same-day
+  adversarial-review finding: an in-process panic (not a process exit) leaves a reservation open
+  with no `State::new` reconcile to clear it, and two attempts at the *exact same* revision still
+  conflict until either a real process restart or future operator tooling; the revision-scoped
+  check narrows this to that one residual case rather than eliminating it, chosen over an explicit
+  operator-facing `clear_stale_reservation` API because it needs no new plumbing. See the design
+  spec's "Revision-scoped duplicate check" section.
 - `State::release(id, receipt_ref)` closes a reservation once its side effect and governed-task
-  mutation are both durably recorded.
+  mutation are both durably recorded. `reserve`, `release`, and reconcile's internal close-as-
+  needs-rerun step all clone the in-memory ledger, mutate the clone, persist the clone, and only
+  then swap it into the live state — the same discipline `mutate_governed_task` and the
+  memory-candidate ledger already use — so a transient persist failure (a momentarily unwritable
+  `.impulse/`, a full disk) leaves the live ledger exactly as it was, never a phantom reservation
+  the caller can neither find nor release. An earlier version of this journal mutated the live
+  ledger before the fallible persist with no rollback; fixed in adversarial review before this PR
+  merged.
 - A reservation still open when the process reloads was interrupted before a receipt existed.
   `State::new` reconciles it to `NeedsRerun` and records a note on the owning governed task's own
   event chain (a new, purely additive `GovernedTaskEventKind::ProducerReservationInterrupted` /
@@ -193,7 +211,11 @@ starts:
 - `producer_reservation::with_reservation` is a ready-to-adopt async wrapper: reserve, run a closure
   that performs the side effect *and* persists its governed-task mutation, then release with the
   resulting receipt reference. Releasing before the mutation is persisted would reopen the gap this
-  journal exists to close, so the helper's closure contract requires both steps together.
+  journal exists to close, so the helper's closure contract requires both steps together. It has no
+  `catch_unwind` and is not panic-safe: a panic inside the closure leaves the reservation open
+  (same as a crash) but propagates through `with_reservation` rather than being caught and
+  released, so the handler-wiring lane must treat an in-process panic exactly like a process crash,
+  not as a normal `Err` return.
 
 **Not yet done — handler wiring remains follow-up work**, tracked as the next lane in
 `docs/plans/2026-09-02-impulse-next-stages.md`'s Stage 3: `RunGovernedVerification` and
