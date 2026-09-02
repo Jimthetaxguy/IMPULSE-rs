@@ -555,10 +555,23 @@ fn sandbox_escape_verdict(paths: &[PathBuf], tool_ctx: &ToolContext, write: bool
 
 /// Advisory-only heuristic scan of a `bash_exec` command's shell TEXT for
 /// tokens that look like they reach outside the sandbox (review round 1,
-/// P1): any absolute-path-shaped token (starts with `/`), any token
-/// containing `..`, `~`, or `$HOME`, and any `cd` target that itself
-/// resolves outside the sandbox (checked as a write path, the same way
-/// `bash_exec`'s own `cwd` argument is checked in `bash_exec.rs`).
+/// P1; tightened in review round 2 -- see below): any absolute-path-shaped
+/// token (starts with `/`), any token containing `..`, `~`, `$HOME`, or
+/// `${HOME}`, and any `cd` target that itself resolves outside the sandbox
+/// (checked as a write path, the same way `bash_exec`'s own `cwd` argument
+/// is checked in `bash_exec.rs`). Tokenized via [`split_shell_tokens`]
+/// (whitespace AND shell metacharacters), with a defensive second strip of
+/// any leading metacharacter on each token.
+///
+/// **Review round 2 near-misses closed:** `echo x >/tmp/f` (redirect glued
+/// directly to the path, no whitespace) and `cat ${HOME}/.ssh/id_rsa`
+/// (brace-expansion form of `$HOME`) were NOT escalated before this round
+/// -- a plain `split_whitespace` tokenizer left `>/tmp/f` as one token that
+/// never matched `starts_with('/')`, and the `$HOME` check didn't cover the
+/// `${HOME}` spelling. Both are covered now; regression tests:
+/// `test_bash_command_escape_candidates_flags_redirect_glued_to_absolute_path`,
+/// `test_bash_command_escape_candidates_flags_pipe_glued_to_absolute_path`,
+/// `test_bash_command_escape_candidates_flags_brace_expanded_home`.
 ///
 /// **This is deliberately NOT enforcement, unlike [`sandbox_escape_verdict`]
 /// for `path`/`cwd` arguments.** `command` is opaque shell syntax --
@@ -569,29 +582,35 @@ fn sandbox_escape_verdict(paths: &[PathBuf], tool_ctx: &ToolContext, write: bool
 /// only, no shell awareness) remains the actual enforcement boundary for
 /// `bash_exec`'s effects on the filesystem outside its own `cwd` -- this
 /// heuristic only widens what forces a human to see and literally type
-/// `CONFIRM` before the command runs. A hostile or careless command can
-/// still evade this heuristic (e.g. through a variable, a nested quote, or
-/// simply not matching any of these shapes) and would then run behind a
-/// plain `y`/`N` like an ordinary `bash_exec` call.
+/// `CONFIRM` before the command runs. **Known inherent misses, left as
+/// documented advisory limits rather than chased further** (review round
+/// 2): a path built at runtime and never appearing as a literal token, e.g.
+/// `python3 -c "open('/tmp/x')"` (the path is inside a nested language's
+/// own string, not shell syntax at all) or `H=/etc; cat $H/passwd` (an
+/// indirection through a shell variable this heuristic does not track).
+/// Closing those needs either real shell/interpreter parsing or an OS-level
+/// sandbox (see the spec's "Explicitly out of scope"), not a bigger regex.
 fn bash_command_escape_candidates(command: &str, tool_ctx: &ToolContext) -> Vec<String> {
     fn unquoted(token: &str) -> &str {
         token.trim_matches(|c| c == '"' || c == '\'')
     }
 
-    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let tokens = split_shell_tokens(command);
     let mut flagged: Vec<String> = Vec::new();
     for (index, token) in tokens.iter().enumerate() {
-        let bare = unquoted(token);
+        let bare = unquoted(token).trim_start_matches(SHELL_METACHARS);
         if bare.starts_with('/')
             || bare.contains("..")
             || bare.contains('~')
             || bare.contains("$HOME")
+            || bare.contains("${HOME}")
         {
-            flagged.push((*token).to_string());
+            flagged.push(token.clone());
         }
-        if *token == "cd" {
+        if token.as_str() == "cd" {
             if let Some(target) = tokens.get(index + 1) {
-                let resolved = tool_ctx.resolve_path(unquoted(target));
+                let target_bare = unquoted(target).trim_start_matches(SHELL_METACHARS);
+                let resolved = tool_ctx.resolve_path(target_bare);
                 if !tool_ctx.is_path_allowed(&resolved, true) {
                     flagged.push(format!("cd {target}"));
                 }
@@ -601,6 +620,41 @@ fn bash_command_escape_candidates(command: &str, tool_ctx: &ToolContext) -> Vec<
     flagged.sort();
     flagged.dedup();
     flagged
+}
+
+/// Shell metacharacters that can sit directly against a path with no
+/// whitespace between them (`echo x >/tmp/f`, `cat</etc/passwd`) --
+/// review round 2 near-miss fix: a plain `split_whitespace` tokenizer (the
+/// original design) left the redirect glued to the path as one token,
+/// which never matched the `starts_with('/')` check because the token
+/// started with `>` or `<` instead. [`split_shell_tokens`] splits on these
+/// characters too (not just whitespace), and [`bash_command_escape_candidates`]
+/// additionally strips any that remain at the front of a token as a second,
+/// defensive pass.
+const SHELL_METACHARS: &[char] = &['<', '>', '|', '&', ';', '(', ')'];
+
+/// Tokenizes `command` on whitespace AND [`SHELL_METACHARS`], so a
+/// redirection/pipe/list operator glued directly to a path (`>/tmp/f`,
+/// `</etc/passwd`, `cmd1&&cmd2`) can never hide that path from
+/// [`bash_command_escape_candidates`]'s scan. This is still just a
+/// heuristic tokenizer, not a shell parser -- see that function's doc
+/// comment for what it does and does not catch.
+fn split_shell_tokens(command: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for c in command.chars() {
+        if c.is_whitespace() || SHELL_METACHARS.contains(&c) {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(c);
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
 }
 
 /// Synthesizes a `Block`-tier [`GuardVerdict`] from
@@ -1835,6 +1889,54 @@ mod tests {
         let ctx = ToolContext::default();
         let flagged = bash_command_escape_candidates("echo pwned > /tmp/outside/pwned.txt", &ctx);
         assert!(flagged.iter().any(|t| t.contains("/tmp/outside/pwned.txt")));
+    }
+
+    // ------------------------------------------------------------------
+    // Review round 2: near-misses where the redirect/pipe operator sits
+    // glued directly against the path with no whitespace, and the
+    // ${HOME} brace-expansion spelling of $HOME.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_bash_command_escape_candidates_flags_redirect_glued_to_absolute_path() {
+        let ctx = ToolContext::default();
+        let flagged = bash_command_escape_candidates("echo x >/tmp/f", &ctx);
+        assert!(
+            flagged.iter().any(|t| t.contains("/tmp/f")),
+            "redirect glued directly to the path must still be flagged: {flagged:?}"
+        );
+    }
+
+    #[test]
+    fn test_bash_command_escape_candidates_flags_pipe_glued_to_absolute_path() {
+        let ctx = ToolContext::default();
+        let flagged = bash_command_escape_candidates("cat</etc/passwd", &ctx);
+        assert!(
+            flagged.iter().any(|t| t.contains("/etc/passwd")),
+            "a redirect glued to the front of a path must still be flagged: {flagged:?}"
+        );
+    }
+
+    #[test]
+    fn test_bash_command_escape_candidates_flags_brace_expanded_home() {
+        let ctx = ToolContext::default();
+        let flagged = bash_command_escape_candidates("cat ${HOME}/.ssh/id_rsa", &ctx);
+        assert!(
+            flagged.iter().any(|t| t.contains("${HOME}")),
+            "${{HOME}} must be treated the same as $HOME: {flagged:?}"
+        );
+    }
+
+    #[test]
+    fn test_split_shell_tokens_splits_on_metacharacters_with_no_whitespace() {
+        assert_eq!(
+            split_shell_tokens("echo x>/tmp/f"),
+            vec!["echo".to_string(), "x".to_string(), "/tmp/f".to_string()]
+        );
+        assert_eq!(
+            split_shell_tokens("cmd1&&cmd2"),
+            vec!["cmd1".to_string(), "cmd2".to_string()]
+        );
     }
 
     #[test]

@@ -56,8 +56,10 @@ instead of trust alone.
 `repo_root` is now the session's **fixed write root** -- never overridable, not by `/allow` and not
 by a `CONFIRM`. `allowed_read_roots` is a **read-only extension list**, grown one path at a time via
 the new `/allow <path>` slash command (`ion_repl::apply_allow` -- refuses an empty or nonexistent
-path, warns loudly on a grant of `/`, `$HOME`, or an ancestor of the repo root, and a bare `/allow`
-lists current grants). `ReplContext::sandbox_tool_context` builds the `ToolContext` every
+path; a bare `/allow` lists current grants; **a grant that resolves to `/`, the user's `$HOME`, or
+an ancestor directory of the repo root still succeeds** -- the human explicitly asked for it -- but
+prints a loud warning first, since any of those three effectively disable the read sandbox rather
+than narrowly extending it). `ReplContext::sandbox_tool_context` builds the `ToolContext` every
 path-checking tool actually checks against: all capabilities are still granted (`ion` is a
 CLI-launched coding agent, matching `ToolContext::with_all_capabilities`'s existing precedent), but
 `allowed_write_roots = [repo_root]` and `allowed_read_roots = [repo_root] + allowed_read_roots`.
@@ -225,6 +227,28 @@ is a separate integration-test crate compiled against a non-`--cfg test` build o
 cannot see `test_support` (a `#[cfg(test)]`-gated module) regardless of visibility -- it keeps its
 own copy of the exact same hardened fixture, documented in place as a deliberate, kept-in-sync copy.
 
+### 6. Review round 2: tightening the advisory bash-text heuristic
+
+A second adversarial pass (probe crate re-run against round 1's fixes) confirmed every round-1 fix
+held, then found two near-misses in the round-1 heuristic's tokenizer: `echo x >/tmp/f` (a redirect
+glued directly to the path, no whitespace) and `cat ${HOME}/.ssh/id_rsa` (the brace-expansion
+spelling of `$HOME`) were NOT escalated, because a plain `split_whitespace` tokenizer left `>/tmp/f`
+as one token that never matched `starts_with('/')`, and the flagged-substring check only looked for
+the literal `$HOME` spelling.
+
+Fixed: `split_shell_tokens` now splits on shell metacharacters (`<>|&;()`) as well as whitespace, so
+`cat</etc/passwd` and `cmd1&&cmd2` also tokenize correctly; `bash_command_escape_candidates` also
+strips any metacharacter still glued to the front of a token as a defensive second pass, and checks
+for `${HOME}` alongside `$HOME`. All three shapes (`>/tmp/f`, `cat</etc/passwd` as an additional
+pipe-glued case, `${HOME}/.ssh/id_rsa`) have regression tests.
+
+**Known inherent misses stay documented as advisory limits, not chased further:** a path built at
+runtime and never appearing as a literal shell token (`python3 -c "open('/tmp/x')"` -- the path is
+inside a nested language's own string, not shell syntax) and an indirection through a shell
+variable this heuristic does not track (`H=/etc; cat $H/passwd`). Closing either needs real
+shell/interpreter parsing or an OS-level sandbox, not a bigger regex -- consistent with this
+heuristic's advisory-only framing from round 1.
+
 ## Acceptance criteria
 
 - An out-of-root write is refused: the confirmation-layer escalation forces a literal `CONFIRM` and
@@ -235,8 +259,9 @@ own copy of the exact same hardened fixture, documented in place as a deliberate
   relative `../` traversal outside the sandbox, proven with both shapes.
 - An instruction-shaped tool result (success OR error text) forces `CONFIRM` on a following,
   otherwise-innocuous `bash_exec`, in the same turn or a later one, until `/clear`.
-- `bash_exec` command text containing an absolute path, `..`, `~`, `$HOME`, or an escaping `cd`
-  target forces `CONFIRM` even when `cwd` itself is inside the sandbox.
+- `bash_exec` command text containing an absolute path (including one glued directly to a
+  redirect/pipe with no whitespace, e.g. `>/tmp/f` or `</etc/passwd`), `..`, `~`, `$HOME`/`${HOME}`,
+  or an escaping `cd` target forces `CONFIRM` even when `cwd` itself is inside the sandbox.
 - The untrusted-output envelope's delimiters cannot be forged by content that includes the literal
   footer text.
 - One `test_support::init_git_repo` definition workspace-wide (plus the necessarily-separate

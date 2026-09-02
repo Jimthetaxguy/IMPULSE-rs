@@ -40,13 +40,14 @@ tags: [worktree, lane, ion, sandbox, guardrail, loop-contract, prompt-injection]
   `cargo build --workspace`, `cargo test --workspace`,
   `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`,
   `cargo build --no-default-features`, `python3 docs/validate_docs.py --all`.
-- Latest status (post review round 1): `cargo build --workspace` clean; `cargo test --workspace`
-  2375 passed / 0 failed / ~4 ignored across the full workspace (main lib crate 1855 passed / 0
+- Latest status (post review round 2): `cargo build --workspace` clean; `cargo test --workspace`
+  2379 passed / 0 failed / ~4 ignored across the full workspace (main lib crate 1859 passed / 0
   failed / 5 ignored); strict Clippy clean across the workspace; rustfmt clean; `cargo build
   --no-default-features` clean; `docs/validate_docs.py --all` reports only the 4 pre-existing
   failures (ADR-0014 `status: proposed`, three stale March docs) -- the updated spec file
-  validates cleanly. `cargo test --lib -- ion_repl` run three times in a row: 173 passed / 0
-  failed each time, no flake. See "Review round 1" below for what changed since the initial PR.
+  validates cleanly. `cargo test --lib -- ion_repl` run three times in a row: 177 passed / 0
+  failed each time, no flake. See "Review round 1" and "Review round 2" below for what changed
+  since the initial PR.
 
 ## Decisions
 
@@ -186,6 +187,27 @@ rather than changed, since computing paths for every tool call would be a larger
 than this round of fixes scoped for. The three `GuardTarget::ToolCall` rules' known false-positive
 rate (README prose, ordinary "you are now ready" phrasing, freshly generated placeholder secrets)
 is now documented directly in `src/guardrail/defaults.rs` and the spec.
+
+## Review round 2 (re-probe of the round-1 fixes, same day)
+
+Re-probing confirmed every round-1 fix holds (358 lib tests green under the re-probe's filter,
+symlinked dirs/files denied, two-turn sticky escalation proven, the nonce envelope inert against a
+replayed footer). Two tightening items:
+
+1. **Advisory bash heuristic near-misses.** `echo x >/tmp/f` (redirect glued to the path, no
+   whitespace) and `cat ${HOME}/.ssh/id_rsa` (brace-expansion form of `$HOME`) were not escalated.
+   `split_shell_tokens` now splits on shell metacharacters (`<>|&;()`) as well as whitespace, with a
+   defensive strip of any metacharacter still glued to a token's front, and `${HOME}` is checked
+   alongside `$HOME`. Three regression tests added; known inherent misses (`python3 -c
+   "open('/tmp/x')"`, `H=/etc; cat $H/passwd`) stay documented as advisory limits -- see the spec's
+   new "Review round 2" section.
+2. **PR body rewritten** to match post-fix behavior (session-sticky `untrusted_seen`, the full
+   round-1 fix list, `governed_submit_claim` named as a conscious carry-forward gap, the "warns but
+   still grants" `/allow` semantics, current gate totals) -- also folded into `CONTEXT.md` and the
+   spec's Decision 1.
+
+Latest status after round 2: gate re-run clean end to end (see the top-of-card status line, kept
+current). `cargo test --lib -- ion_repl` three-in-a-row: 177 passed / 0 failed each time.
 
 ## Handoff Notes
 
