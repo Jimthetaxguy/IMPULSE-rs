@@ -156,8 +156,10 @@ next consumer.
   `src/llm_backends/mod.rs`, and ADR-0017.
 
 ### document read tool — `[code]`
-Ion's read-only `document_read` tool: parses `xlsx`, `xls`, `csv`, and `docx` through the
-`office` module (files up to 10 MiB, on the blocking pool) and returns a section outline with
+Ion's read-only `document_read` tool: reads `xlsx` by streaming cells through calamine's cell
+reader under a character and cell budget (never the dense-grid parser), and `csv`/`docx` through
+the `office` parsers (files up to 10 MiB; containers inflated through a 64 MiB cap first; legacy
+`xls` refused; parsing on the blocking pool) and returns a section outline with
 whole-document offsets plus a bounded character window that ends on a line boundary and names
 the next offset, so a model inside a loop contract can jump to and page through an everyday
 document without flooding its context. Ungated like `file_read`; absolute paths are accepted;
