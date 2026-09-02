@@ -4,6 +4,7 @@
 //! legacy coordinator/worker pane topology represented by [`crate::AgentRole`].
 
 use crate::agent_registry::AgentPlatformId;
+use crate::governed_task::WorldScope;
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 
@@ -201,6 +202,40 @@ pub fn canonical_governed_builder_assignment() -> AgentRoleAssignment {
     }
 }
 
+/// Capability id whose enforcement a world scope can raise.
+pub const FILESYSTEM_SCOPED_CAPABILITY: &str = "filesystem.scoped";
+
+/// Enforcement that a world scope contributes to `filesystem.scoped`.
+///
+/// A staged worktree is a *Git-level* boundary: the Builder writes into a
+/// separate checkout and only a promotion makes those bytes canonical. Nothing
+/// stops the process from writing outside that checkout, so this is
+/// [`EnforcementStrength::Mediated`] and never
+/// [`EnforcementStrength::Structural`]. Reporting it as structural would
+/// promise OS-level containment that ADR-0019 explicitly does not deliver.
+pub fn world_scope_filesystem_enforcement(scope: WorldScope) -> EnforcementStrength {
+    match scope {
+        WorldScope::StagedAuthoritative => EnforcementStrength::Mediated,
+        WorldScope::ReadOnlySnapshot
+        | WorldScope::DisposableScratch
+        | WorldScope::Authoritative => EnforcementStrength::Unsupported,
+    }
+}
+
+/// Launch capabilities a world scope contributes on top of the runtime's own
+/// declared support. An unsupported contribution is omitted rather than
+/// declared, so it can never raise a runtime's reported enforcement.
+pub fn world_scope_capability_support(scope: WorldScope) -> Vec<RuntimeCapabilitySupport> {
+    let enforcement = world_scope_filesystem_enforcement(scope);
+    if enforcement == EnforcementStrength::Unsupported {
+        return Vec::new();
+    }
+    vec![RuntimeCapabilitySupport {
+        capability: RuntimeCapabilityId::builtin(FILESYSTEM_SCOPED_CAPABILITY),
+        enforcement,
+    }]
+}
+
 /// One role requirement compared with the runtime's declared enforcement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityCompatibility {
@@ -286,6 +321,32 @@ pub fn evaluate_role_compatibility(
         role: assignment.role.clone(),
         checks,
     })
+}
+
+/// Compare a role assignment against a runtime's declared capabilities *plus*
+/// the mediation a world scope adds. The strongest declaration wins per
+/// capability, exactly as when a runtime declares the same capability twice.
+pub fn evaluate_role_compatibility_in_world(
+    platform: &AgentPlatformId,
+    declared_support: &[RuntimeCapabilitySupport],
+    assignment: &AgentRoleAssignment,
+    scope: WorldScope,
+) -> Result<RoleCompatibility, RoleAssignmentError> {
+    let scoped = world_scope_capability_support(scope);
+    if scoped.is_empty() {
+        return evaluate_role_compatibility(platform, declared_support, assignment);
+    }
+    let mut merged = declared_support.to_vec();
+    for support in scoped {
+        match merged
+            .iter_mut()
+            .find(|declared| declared.capability == support.capability)
+        {
+            Some(declared) => declared.enforcement = declared.enforcement.max(support.enforcement),
+            None => merged.push(support),
+        }
+    }
+    evaluate_role_compatibility(platform, &merged, assignment)
 }
 
 #[cfg(test)]
@@ -562,5 +623,148 @@ mod tests {
         assert_eq!(decoded, runtime);
         assert!(json.contains(r#""role":"builder""#));
         assert!(json.contains(r#""capability":"process.lifecycle""#));
+    }
+
+    fn ion_platform() -> AgentPlatformId {
+        AgentPlatformId::try_new("ion").unwrap()
+    }
+
+    #[test]
+    fn test_world_scope_filesystem_enforcement_is_mediated_never_structural() {
+        assert_eq!(
+            world_scope_filesystem_enforcement(WorldScope::StagedAuthoritative),
+            EnforcementStrength::Mediated
+        );
+        assert!(
+            world_scope_filesystem_enforcement(WorldScope::StagedAuthoritative)
+                < EnforcementStrength::Structural,
+            "a Git-level staged worktree must never be reported as structural containment"
+        );
+        for scope in [
+            WorldScope::ReadOnlySnapshot,
+            WorldScope::DisposableScratch,
+            WorldScope::Authoritative,
+        ] {
+            assert_eq!(
+                world_scope_filesystem_enforcement(scope),
+                EnforcementStrength::Unsupported
+            );
+            assert!(world_scope_capability_support(scope).is_empty());
+        }
+    }
+
+    #[test]
+    fn test_world_scope_capability_support_declares_only_filesystem_scoped() {
+        let support = world_scope_capability_support(WorldScope::StagedAuthoritative);
+        assert_eq!(support.len(), 1);
+        assert_eq!(support[0].capability, FILESYSTEM_SCOPED_CAPABILITY);
+        assert_eq!(support[0].enforcement, EnforcementStrength::Mediated);
+    }
+
+    #[test]
+    fn test_staged_world_scope_raises_filesystem_scoped_to_mediated() {
+        let assignment = canonical_governed_builder_assignment();
+        let declared = vec![
+            RuntimeCapabilitySupport {
+                capability: RuntimeCapabilityId::builtin("workspace.target"),
+                enforcement: EnforcementStrength::Mediated,
+            },
+            RuntimeCapabilitySupport {
+                capability: RuntimeCapabilityId::builtin("process.lifecycle"),
+                enforcement: EnforcementStrength::Mediated,
+            },
+        ];
+
+        let plain = evaluate_role_compatibility(&ion_platform(), &declared, &assignment).unwrap();
+        let scoped = evaluate_role_compatibility_in_world(
+            &ion_platform(),
+            &declared,
+            &assignment,
+            WorldScope::StagedAuthoritative,
+        )
+        .unwrap();
+
+        let filesystem = |compatibility: &RoleCompatibility| {
+            compatibility
+                .checks
+                .iter()
+                .find(|check| check.capability == FILESYSTEM_SCOPED_CAPABILITY)
+                .expect("the canonical Builder role requires filesystem.scoped")
+                .available
+        };
+        assert_eq!(filesystem(&plain), EnforcementStrength::Unsupported);
+        assert_eq!(filesystem(&scoped), EnforcementStrength::Mediated);
+        assert!(scoped.launch_allowed());
+        // Still degraded: the role asks for structural, the staged worktree
+        // honestly supplies only Git-level mediation.
+        assert!(scoped.is_degraded());
+    }
+
+    #[test]
+    fn test_authoritative_world_scope_leaves_compatibility_untouched() {
+        let assignment = canonical_governed_builder_assignment();
+        let declared = vec![RuntimeCapabilitySupport {
+            capability: RuntimeCapabilityId::builtin("workspace.target"),
+            enforcement: EnforcementStrength::Mediated,
+        }];
+        assert_eq!(
+            evaluate_role_compatibility_in_world(
+                &ion_platform(),
+                &declared,
+                &assignment,
+                WorldScope::Authoritative,
+            )
+            .unwrap(),
+            evaluate_role_compatibility(&ion_platform(), &declared, &assignment).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_world_scope_never_lowers_a_stronger_declared_enforcement() {
+        let assignment = canonical_governed_builder_assignment();
+        let declared = vec![RuntimeCapabilitySupport {
+            capability: RuntimeCapabilityId::builtin("filesystem.scoped"),
+            enforcement: EnforcementStrength::Structural,
+        }];
+        let scoped = evaluate_role_compatibility_in_world(
+            &ion_platform(),
+            &declared,
+            &assignment,
+            WorldScope::StagedAuthoritative,
+        )
+        .unwrap();
+        assert_eq!(
+            scoped
+                .checks
+                .iter()
+                .find(|check| check.capability == FILESYSTEM_SCOPED_CAPABILITY)
+                .unwrap()
+                .available,
+            EnforcementStrength::Structural
+        );
+    }
+
+    #[test]
+    fn test_world_scope_evaluation_preserves_duplicate_capability_errors() {
+        let assignment = canonical_governed_builder_assignment();
+        let declared = vec![
+            RuntimeCapabilitySupport {
+                capability: RuntimeCapabilityId::builtin("workspace.target"),
+                enforcement: EnforcementStrength::Mediated,
+            },
+            RuntimeCapabilitySupport {
+                capability: RuntimeCapabilityId::builtin("workspace.target"),
+                enforcement: EnforcementStrength::Advisory,
+            },
+        ];
+        assert!(matches!(
+            evaluate_role_compatibility_in_world(
+                &ion_platform(),
+                &declared,
+                &assignment,
+                WorldScope::StagedAuthoritative,
+            ),
+            Err(RoleAssignmentError::DuplicateRuntimeCapability(_))
+        ));
     }
 }

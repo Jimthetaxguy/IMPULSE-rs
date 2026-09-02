@@ -163,8 +163,8 @@ returned reason in its own evidence domain.
 The declared budget an Impulse-owned loop runs under (`LoopContract`: round cap, wall clock,
 repeated-call and same-error streak limits), the per-run breaker that evaluates every trip
 condition, and the typed `LoopReport` every run leaves behind. A trip is an execution fact, never
-a review outcome. Today it bounds the Ion tool loop; governed Builder iterations are the intended
-next consumer.
+a review outcome. Today it bounds the Ion tool loop and, through
+`LoopContract::governed_builder()`, one governed Builder task's claim cycles.
 - **Source of truth:** `src/loop_contract.rs`, `Agent::chat_with_tools` in
   `src/llm_backends/mod.rs`, and ADR-0017.
 
@@ -199,6 +199,19 @@ because it never goes through `ReplToolExecutor`'s `CONFIRMATION_REQUIRED_TOOLS`
 - **Source of truth:** `src/ion_repl/{mod,chat,tool_bridge,tool_document,tool_verify}.rs`,
   `src/guardrail/defaults.rs`, and
   `docs/superpowers/specs/2026-09-02-ion-tool-sandbox-and-untrusted-output.md`.
+### world scope — `[code]`
+The filesystem authority a launched runtime works under, declared on the governed task record:
+`read_only_snapshot`, `disposable_scratch`, `staged_authoritative`, `authoritative` (the serde
+default, so every pre-ADR-0019 ledger loads unchanged). Only the last two are materializable
+today; the others fail registration closed. A `staged_authoritative` Builder works in a disposable
+Git worktree at `<workspace>/.impulse/worktrees/<task id>`, created from the daemon-attested
+initial OID, and only a separate `PromoteGovernedOutcome` step after operator acceptance
+fast-forwards the canonical branch — or reports `PromotionBlocked{canonical_head}` if that head
+moved. It is a Git-level boundary, so the compatibility preview reports `filesystem.scoped` as
+**mediated**, never structural: nothing stops the process from writing outside the checkout.
+- **Source of truth:** `WorldScope` and `StagedWorktree` in
+  `impulse-rs/impulse-ops/src/governed_task.rs`, the staged producers in
+  `impulse-rs/src/governed_producers.rs`, and ADR-0019.
 
 ### document read tool — `[code]`
 Ion's read-only `document_read` tool: reads `xlsx` by streaming cells through calamine's cell

@@ -35,6 +35,14 @@ pub const ION_DEFAULT_REPEATED_CALL_STREAK: usize = 3;
 /// Default consecutive identical tool errors that trip the Ion loop.
 pub const ION_DEFAULT_SAME_ERROR_STREAK: usize = 3;
 
+/// Claim cycles a governed Builder may spend on one task (ADR-0019 rule 6).
+pub const GOVERNED_BUILDER_MAX_CLAIM_CYCLES: usize = 5;
+/// Wall-clock budget for one governed Builder task, measured from registration.
+pub const GOVERNED_BUILDER_WALL_CLOCK: Duration = Duration::from_secs(4 * 60 * 60);
+/// Consecutive verification failures with the same signature that trip the
+/// governed Builder loop.
+pub const GOVERNED_BUILDER_SAME_FAILURE_STREAK: usize = 3;
+
 /// Longest error signature retained for same-error detection and reports.
 const ERROR_SIGNATURE_MAX_CHARS: usize = 120;
 
@@ -70,6 +78,69 @@ impl LoopBudget {
             max_same_error_streak: Some(ION_DEFAULT_SAME_ERROR_STREAK),
         }
     }
+
+    /// The budget one governed Builder task runs under.
+    ///
+    /// A round here is a worker completion claim, not a model round trip, and
+    /// the wall clock is measured from task registration rather than from a
+    /// single exchange. The repeated-call detector is disabled: the daemon
+    /// never sees the Builder's individual tool calls.
+    pub fn governed_builder() -> Self {
+        Self {
+            max_rounds: GOVERNED_BUILDER_MAX_CLAIM_CYCLES,
+            wall_clock: GOVERNED_BUILDER_WALL_CLOCK,
+            max_repeated_call_streak: None,
+            max_same_error_streak: Some(GOVERNED_BUILDER_SAME_FAILURE_STREAK),
+        }
+    }
+
+    /// Evaluate the budget against externally observed, already-persisted
+    /// counts and elapsed time.
+    ///
+    /// Deliberately pure: it reads no clock, so replaying a stored event
+    /// history with the timestamps that history carries produces the same
+    /// verdict it produced when the event was first written.
+    pub fn evaluate_observed(&self, observed: &LoopObservation<'_>) -> Option<LoopTrip> {
+        if observed.rounds_used >= self.max_rounds {
+            return Some(LoopTrip::RoundCap {
+                rounds: self.max_rounds,
+            });
+        }
+        if observed.elapsed >= self.wall_clock {
+            return Some(LoopTrip::WallClock {
+                millis: u64::try_from(observed.elapsed.as_millis()).unwrap_or(u64::MAX),
+            });
+        }
+        if let (Some(limit), Some(same_error)) = (self.max_same_error_streak, &observed.same_error)
+        {
+            if same_error.streak >= limit {
+                return Some(LoopTrip::SameError {
+                    tool: same_error.tool.to_string(),
+                    streak: same_error.streak,
+                    signature: error_signature(same_error.signature),
+                });
+            }
+        }
+        None
+    }
+}
+
+/// A run of consecutive identical failures observed outside the breaker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SameErrorObservation<'a> {
+    pub tool: &'a str,
+    pub streak: usize,
+    pub signature: &'a str,
+}
+
+/// Loop state observed from a durable record rather than from a live breaker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoopObservation<'a> {
+    /// Rounds already spent, counting the round being admitted.
+    pub rounds_used: usize,
+    /// Time elapsed since the loop started, derived from stored timestamps.
+    pub elapsed: Duration,
+    pub same_error: Option<SameErrorObservation<'a>>,
 }
 
 /// A named loop plus the budget it declares before running.
@@ -97,6 +168,14 @@ impl LoopContract {
         Self {
             name: "ion_tool_loop".to_string(),
             budget: LoopBudget::ion_default(),
+        }
+    }
+
+    /// The contract one governed Builder task runs under (ADR-0019 rule 6).
+    pub fn governed_builder() -> Self {
+        Self {
+            name: "governed_builder".to_string(),
+            budget: LoopBudget::governed_builder(),
         }
     }
 
@@ -989,5 +1068,145 @@ mod tests {
             serde_json::Value::Object(map)
         };
         assert_eq!(canonical_json(&same_a), canonical_json(&same_b));
+    }
+
+    fn observation(rounds: usize, elapsed: Duration) -> LoopObservation<'static> {
+        LoopObservation {
+            rounds_used: rounds,
+            elapsed,
+            same_error: None,
+        }
+    }
+
+    #[test]
+    fn test_governed_builder_contract_validates() {
+        let contract = LoopContract::governed_builder();
+        assert_eq!(contract.name, "governed_builder");
+        assert_eq!(
+            contract.budget.max_rounds,
+            GOVERNED_BUILDER_MAX_CLAIM_CYCLES
+        );
+        assert_eq!(contract.budget.wall_clock, GOVERNED_BUILDER_WALL_CLOCK);
+        assert_eq!(contract.budget.max_repeated_call_streak, None);
+        assert_eq!(
+            contract.budget.max_same_error_streak,
+            Some(GOVERNED_BUILDER_SAME_FAILURE_STREAK)
+        );
+        contract.validate().unwrap();
+    }
+
+    #[test]
+    fn test_governed_builder_budget_round_trips_through_serde() {
+        let budget = LoopBudget::governed_builder();
+        let recovered: LoopBudget =
+            serde_json::from_str(&serde_json::to_string(&budget).unwrap()).unwrap();
+        assert_eq!(recovered, budget);
+    }
+
+    #[test]
+    fn test_evaluate_observed_admits_a_round_inside_every_budget() {
+        let budget = LoopBudget::governed_builder();
+        assert_eq!(
+            budget.evaluate_observed(&observation(0, Duration::ZERO)),
+            None
+        );
+        assert_eq!(
+            budget.evaluate_observed(&observation(
+                GOVERNED_BUILDER_MAX_CLAIM_CYCLES - 1,
+                GOVERNED_BUILDER_WALL_CLOCK - Duration::from_secs(1)
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn test_evaluate_observed_trips_the_round_cap() {
+        let budget = LoopBudget::governed_builder();
+        assert_eq!(
+            budget.evaluate_observed(&observation(
+                GOVERNED_BUILDER_MAX_CLAIM_CYCLES,
+                Duration::ZERO
+            )),
+            Some(LoopTrip::RoundCap {
+                rounds: GOVERNED_BUILDER_MAX_CLAIM_CYCLES
+            })
+        );
+    }
+
+    #[test]
+    fn test_evaluate_observed_trips_the_wall_clock() {
+        let budget = LoopBudget::governed_builder();
+        assert_eq!(
+            budget.evaluate_observed(&observation(0, GOVERNED_BUILDER_WALL_CLOCK)),
+            Some(LoopTrip::WallClock {
+                millis: u64::try_from(GOVERNED_BUILDER_WALL_CLOCK.as_millis()).unwrap()
+            })
+        );
+    }
+
+    #[test]
+    fn test_evaluate_observed_trips_a_same_failure_streak() {
+        let budget = LoopBudget::governed_builder();
+        let observed = LoopObservation {
+            rounds_used: 1,
+            elapsed: Duration::from_secs(1),
+            same_error: Some(SameErrorObservation {
+                tool: "governed_verification",
+                streak: GOVERNED_BUILDER_SAME_FAILURE_STREAK,
+                signature: "cargo test\nsecond line",
+            }),
+        };
+        assert_eq!(
+            budget.evaluate_observed(&observed),
+            Some(LoopTrip::SameError {
+                tool: "governed_verification".to_string(),
+                streak: GOVERNED_BUILDER_SAME_FAILURE_STREAK,
+                signature: "cargo test".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_evaluate_observed_ignores_a_short_failure_streak() {
+        let budget = LoopBudget::governed_builder();
+        let observed = LoopObservation {
+            rounds_used: 1,
+            elapsed: Duration::from_secs(1),
+            same_error: Some(SameErrorObservation {
+                tool: "governed_verification",
+                streak: GOVERNED_BUILDER_SAME_FAILURE_STREAK - 1,
+                signature: "cargo test",
+            }),
+        };
+        assert_eq!(budget.evaluate_observed(&observed), None);
+    }
+
+    #[test]
+    fn test_evaluate_observed_ignores_streaks_when_the_detector_is_disabled() {
+        let budget = LoopBudget {
+            max_rounds: 5,
+            wall_clock: Duration::from_secs(60),
+            max_repeated_call_streak: None,
+            max_same_error_streak: None,
+        };
+        let observed = LoopObservation {
+            rounds_used: 1,
+            elapsed: Duration::ZERO,
+            same_error: Some(SameErrorObservation {
+                tool: "governed_verification",
+                streak: 99,
+                signature: "cargo test",
+            }),
+        };
+        assert_eq!(budget.evaluate_observed(&observed), None);
+    }
+
+    #[test]
+    fn test_evaluate_observed_is_pure_and_repeatable() {
+        let budget = LoopBudget::governed_builder();
+        let observed = observation(GOVERNED_BUILDER_MAX_CLAIM_CYCLES, Duration::from_secs(3));
+        let first = budget.evaluate_observed(&observed);
+        let second = budget.evaluate_observed(&observed);
+        assert_eq!(first, second);
     }
 }

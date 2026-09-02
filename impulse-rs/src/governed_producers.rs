@@ -18,9 +18,10 @@ use std::os::unix::process::CommandExt;
 use anyhow::{Context, Result};
 use impulse_ops::governed_task::{
     GovernedActor, GovernedActorKind, GovernedClaimRequest, GovernedCommandEvidence,
-    GovernedSupervisorReviewEnvelope, GovernedTaskRun, GovernedVerificationInput,
-    GovernedVerificationOutcome, GovernedVerificationProfile, SupervisorVerdictInput,
-    WorkerCompletionClaimInput, MAX_PROFILED_ACCEPTANCE_CRITERIA,
+    GovernedPromotionInput, GovernedPromotionOutcome, GovernedSupervisorReviewEnvelope,
+    GovernedTaskRun, GovernedVerificationInput, GovernedVerificationOutcome,
+    GovernedVerificationProfile, StagedWorktreeInput, SupervisorVerdictInput,
+    WorkerCompletionClaimInput, WorldScope, MAX_PROFILED_ACCEPTANCE_CRITERIA,
     MAX_PROFILED_ACCEPTANCE_CRITERION_BYTES, MAX_PROFILED_CLAIM_SUMMARY_BYTES,
     MAX_PROFILED_TASK_BYTES,
 };
@@ -471,6 +472,48 @@ fn run_git(workspace: &Path, args: &[&str]) -> Result<BoundedProcessOutput> {
     )
 }
 
+/// Create one detached Git worktree at `checkout`, pinned to `subject_revision`.
+///
+/// Shared by daemon-owned verification (a throwaway snapshot under a temporary
+/// directory) and by the ADR-0019 staged Builder worktree, so both paths use
+/// exactly the same bounded, env-scrubbed, closed-argv Git invocation and the
+/// same failure cleanup. A failed or timed-out add is unregistered before the
+/// error propagates, so a killed `git worktree add` cannot leave a locked
+/// administrative entry behind.
+fn add_detached_worktree(
+    source_workspace: &Path,
+    checkout: &Path,
+    subject_revision: &str,
+    timeout: Duration,
+    label: &str,
+) -> Result<()> {
+    validate_oid(subject_revision)?;
+    let mut command = std::process::Command::new("git");
+    command
+        .arg("-C")
+        .arg(source_workspace)
+        .args(["worktree", "add", "--detach"])
+        .arg(checkout)
+        .arg(subject_revision);
+    scrub_and_allowlist_std_env(&mut command, &[]);
+    let output =
+        match run_bounded_process(&mut command, &format!("{label} materialization"), timeout) {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = cleanup_detached_worktree(source_workspace, checkout);
+                return Err(error);
+            }
+        };
+    if output.timed_out || !output.status.is_some_and(|status| status.success()) {
+        let _ = cleanup_detached_worktree(source_workspace, checkout);
+        if output.timed_out {
+            anyhow::bail!("{label} materialization timed out");
+        }
+        anyhow::bail!("failed to materialize {label}");
+    }
+    Ok(())
+}
+
 struct DetachedVerificationWorkspace {
     source_workspace: PathBuf,
     checkout: PathBuf,
@@ -534,32 +577,13 @@ impl DetachedVerificationWorkspace {
             .context("failed to allocate detached verification directory")?;
         let checkout = temporary_root.path().join("subject");
         let target_dir = temporary_root.path().join("target");
-        let mut command = std::process::Command::new("git");
-        command
-            .arg("-C")
-            .arg(source_workspace)
-            .args(["worktree", "add", "--detach"])
-            .arg(&checkout)
-            .arg(subject_revision);
-        scrub_and_allowlist_std_env(&mut command, &[]);
-        let output = match run_bounded_process(
-            &mut command,
-            "detached governed subject materialization",
+        add_detached_worktree(
+            source_workspace,
+            &checkout,
+            subject_revision,
             timeout,
-        ) {
-            Ok(output) => output,
-            Err(error) => {
-                let _ = cleanup_detached_worktree(source_workspace, &checkout);
-                return Err(error);
-            }
-        };
-        if output.timed_out || !output.status.is_some_and(|status| status.success()) {
-            let _ = cleanup_detached_worktree(source_workspace, &checkout);
-            if output.timed_out {
-                anyhow::bail!("detached governed subject materialization timed out");
-            }
-            anyhow::bail!("failed to materialize detached governed subject");
-        }
+            "detached governed subject",
+        )?;
         Ok(Self {
             source_workspace: source_workspace.to_path_buf(),
             checkout,
@@ -710,8 +734,14 @@ fn is_untracked_impulse_runtime_artifact(path: &[u8]) -> bool {
             | b".impulse/DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.json"
             | b".impulse/DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.lock"
             | b".impulse/sockets/impulse.pid"
+            // ADR-0019: a staged Builder worktree lives inside the project's own
+            // `.impulse` namespace, so an ungitignored `.impulse` would otherwise
+            // report the canonical tree as dirty for the rest of the run.
+            | b".impulse/worktrees"
+            | b".impulse/worktrees/"
     ) || path.starts_with(b".impulse/GOVERNED_TASKS.tmp.")
         || path.starts_with(b".impulse/DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.tmp-")
+        || path.starts_with(b".impulse/worktrees/")
 }
 
 fn status_contains_subject_change(status: &[u8]) -> bool {
@@ -1334,6 +1364,207 @@ pub(crate) fn bind_supervisor_review(
     })
 }
 
+// ---------------------------------------------------------------------------
+// ADR-0019: staged Builder world scope
+// ---------------------------------------------------------------------------
+
+/// Actor recorded for daemon-owned staged-worktree and promotion side effects.
+fn staged_system_actor() -> GovernedActor {
+    GovernedActor {
+        kind: GovernedActorKind::System,
+        id: "impulse-daemon:staged_worktree".to_string(),
+    }
+}
+
+fn require_staged_scope(task: &GovernedTaskRun) -> Result<()> {
+    if task.world_scope != WorldScope::StagedAuthoritative {
+        anyhow::bail!("this producer requires a staged_authoritative world scope");
+    }
+    Ok(())
+}
+
+/// Materialize the disposable worktree a staged Builder works in.
+///
+/// The daemon observes a clean canonical tree still sitting on the attested
+/// initial OID, then creates `<workspace>/.impulse/worktrees/<task id>` through
+/// the same detached `git worktree add` path verification already uses. Nothing
+/// here is caller-authored: the path is derived from the task record and the
+/// revision is the one the registration attested.
+pub fn materialize_staged_worktree(task: &GovernedTaskRun) -> Result<StagedWorktreeInput> {
+    require_staged_scope(task)?;
+    let initial = task
+        .initial_subject_revision
+        .as_deref()
+        .context("staged governed task lost its initial Git OID")?;
+    validate_oid(initial)?;
+    let workspace = PathBuf::from(&task.workspace_root);
+    let head = observe_clean_git_subject(&workspace, None)?;
+    if head != initial {
+        anyhow::bail!(
+            "canonical workspace HEAD moved off the registered initial OID before staging"
+        );
+    }
+    let root = task
+        .expected_staged_worktree_root()
+        .context("staged governed task cannot derive its worktree root")?;
+    if root.symlink_metadata().is_ok() {
+        anyhow::bail!(
+            "staged worktree path {} already exists; refusing to reuse it",
+            root.display()
+        );
+    }
+    let parent = root
+        .parent()
+        .context("staged worktree root has no parent directory")?;
+    std::fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create staged worktree parent {}",
+            parent.display()
+        )
+    })?;
+    add_detached_worktree(
+        &workspace,
+        &root,
+        initial,
+        GIT_MATERIALIZE_TIMEOUT,
+        "governed staged Builder worktree",
+    )?;
+    let root = root
+        .to_str()
+        .context("staged worktree root is not valid UTF-8")?
+        .to_string();
+    Ok(StagedWorktreeInput {
+        actor: staged_system_actor(),
+        root,
+        initial_subject_revision: initial.to_string(),
+    })
+}
+
+pub async fn materialize_staged_worktree_async(
+    task: GovernedTaskRun,
+) -> Result<StagedWorktreeInput> {
+    tokio::task::spawn_blocking(move || materialize_staged_worktree(&task))
+        .await
+        .context("staged governed worktree materialization worker panicked")?
+}
+
+/// The whole canonical-branch side effect, isolated in one function.
+///
+/// A durable producer reservation (the sibling journal lane) wraps exactly this
+/// call: everything before it is observation, everything after it is recording.
+fn fast_forward_canonical_branch(workspace: &Path, accepted_revision: &str) -> Result<()> {
+    validate_oid(accepted_revision)?;
+    let mut command = std::process::Command::new("git");
+    command
+        .arg("-C")
+        .arg(workspace)
+        .args(["merge", "--ff-only"])
+        .arg(accepted_revision);
+    scrub_and_allowlist_std_env(&mut command, &[]);
+    let output = run_bounded_process(
+        &mut command,
+        "governed outcome promotion fast-forward",
+        GIT_MATERIALIZE_TIMEOUT,
+    )?;
+    if output.timed_out {
+        anyhow::bail!("governed outcome promotion fast-forward timed out");
+    }
+    if !output.status.is_some_and(|status| status.success()) {
+        anyhow::bail!("governed outcome promotion fast-forward failed");
+    }
+    Ok(())
+}
+
+/// Promote an accepted staged outcome onto the canonical branch.
+///
+/// Fast-forward only, and only while the canonical head is still exactly the
+/// OID the task was registered at. A canonical head that moved is reported as
+/// [`GovernedPromotionOutcome::PromotionBlocked`]: an execution fact recorded
+/// against an already-accepted run, never an error that rewrites review state.
+pub fn promote_governed_outcome(task: &GovernedTaskRun) -> Result<GovernedPromotionInput> {
+    require_staged_scope(task)?;
+    if !task.is_accepted() {
+        anyhow::bail!("promotion requires an accepted governed task");
+    }
+    let staged = task
+        .active_staged_worktree()
+        .context("promotion requires an active staged worktree")?;
+    let claim = task
+        .latest_claim()
+        .context("promotion requires an accepted worker claim")?;
+    let accepted_revision = claim.subject_revision.clone();
+    validate_oid(&accepted_revision)?;
+    let initial = staged.initial_subject_revision.clone();
+
+    let staged_head = observe_clean_git_subject(Path::new(&staged.root), Some(&initial))
+        .context("staged worktree is not a clean descendant of the initial OID")?;
+    if staged_head != accepted_revision {
+        anyhow::bail!("staged worktree HEAD does not match the accepted subject revision");
+    }
+
+    let workspace = PathBuf::from(&task.workspace_root);
+    let canonical_head = observe_clean_git_subject(&workspace, None)?;
+    if canonical_head != initial {
+        return Ok(GovernedPromotionInput {
+            actor: staged_system_actor(),
+            accepted_revision,
+            initial_subject_revision: initial,
+            outcome: GovernedPromotionOutcome::PromotionBlocked { canonical_head },
+        });
+    }
+
+    fast_forward_canonical_branch(&workspace, &accepted_revision)?;
+
+    let promoted = observe_clean_git_subject(&workspace, Some(&initial))?;
+    if promoted != accepted_revision {
+        anyhow::bail!("canonical head did not land the accepted revision after fast-forward");
+    }
+    Ok(GovernedPromotionInput {
+        actor: staged_system_actor(),
+        accepted_revision: accepted_revision.clone(),
+        initial_subject_revision: initial,
+        outcome: GovernedPromotionOutcome::Promoted {
+            promoted_revision: accepted_revision,
+        },
+    })
+}
+
+pub async fn promote_governed_outcome_async(
+    task: GovernedTaskRun,
+) -> Result<GovernedPromotionInput> {
+    tokio::task::spawn_blocking(move || promote_governed_outcome(&task))
+        .await
+        .context("governed outcome promotion worker panicked")?
+}
+
+/// Remove a staged worktree and its administrative entry. Called after a
+/// rejection, or after a completed promotion.
+pub fn discard_staged_worktree(task: &GovernedTaskRun) -> Result<()> {
+    require_staged_scope(task)?;
+    let staged = task
+        .active_staged_worktree()
+        .context("task has no active staged worktree to discard")?;
+    let workspace = PathBuf::from(&task.workspace_root);
+    let root = PathBuf::from(&staged.root);
+    if !cleanup_detached_worktree(&workspace, &root) {
+        tracing::warn!(
+            checkout = %root.display(),
+            "failed to unregister staged governed Builder worktree"
+        );
+    }
+    if root.symlink_metadata().is_ok() {
+        std::fs::remove_dir_all(&root)
+            .with_context(|| format!("failed to remove staged worktree {}", root.display()))?;
+    }
+    Ok(())
+}
+
+pub async fn discard_staged_worktree_async(task: GovernedTaskRun) -> Result<()> {
+    tokio::task::spawn_blocking(move || discard_staged_worktree(&task))
+        .await
+        .context("staged governed worktree discard worker panicked")?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1380,6 +1611,7 @@ mod tests {
             task: "implement the change".to_string(),
             acceptance_criteria: vec!["tests pass".to_string()],
             approval_policy: ApprovalPolicy::OperatorRequired,
+            world_scope: WorldScope::default(),
             verification_profile: Some(GovernedVerificationProfile::RustWorkspaceV1),
             role_assignment: None,
             role_compatibility: None,
@@ -1387,6 +1619,8 @@ mod tests {
             agent_id: "worker-1".to_string(),
             session_id: None,
             initial_subject_revision: Some(subject.clone()),
+            staged_worktree: None,
+            promotions: Vec::new(),
             execution_state: GovernedExecutionState::Running,
             review_state: GovernedReviewState::AwaitingSupervisor,
             claims: vec![WorkerCompletionClaim {
@@ -1399,6 +1633,7 @@ mod tests {
                 subject_revision: subject.clone(),
                 artifact_ids: Vec::new(),
                 diff_ref: None,
+                loop_report_digest: None,
                 submitted_at: "2026-07-13T00:00:00Z".to_string(),
                 based_on_revision: 1,
             }],
