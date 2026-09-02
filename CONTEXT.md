@@ -157,9 +157,11 @@ next consumer.
 
 ### document read tool — `[code]`
 Ion's read-only `document_read` tool: parses `xlsx`, `xls`, `csv`, and `docx` through the
-`office` module and returns a section outline plus a bounded character window with an explicit
-`next_offset`, so a model inside a loop contract can page through an everyday document without
-flooding its context. Ungated like `file_read`; absolute paths are accepted.
+`office` module (files up to 10 MiB, on the blocking pool) and returns a section outline with
+whole-document offsets plus a bounded character window that ends on a line boundary and names
+the next offset, so a model inside a loop contract can jump to and page through an everyday
+document without flooding its context. Ungated like `file_read`; absolute paths are accepted;
+registered only with the default `office-support` feature.
 - **Source of truth:** `src/ion_repl/tool_document.rs` and
   `docs/superpowers/specs/2026-09-01-ion-document-tool-design.md`.
 
