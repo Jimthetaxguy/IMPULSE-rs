@@ -83,8 +83,8 @@ Gate run on this checkout with `CARGO_TARGET_DIR` isolated from the shared globa
 `cargo fmt --all -- --check` clean; `python3 docs/validate_docs.py --all` shows only the four
 pre-existing failures (ADR-0014 `status: proposed`, three stale March docs).
 
-`cargo test --workspace`: **2363 passed, 0 failed, 9 ignored** (review round 2; round 1 was
-2361/0/9, the pre-review commit `c156ce3` was 2353/0/9).
+`cargo test --workspace`: **2364 passed, 0 failed, 9 ignored** (round 2 was 2363/0/9, round 1
+2361/0/9, the pre-review commit `c156ce3` 2353/0/9).
 
 | Package / target | passed | failed | ignored |
 |---|---|---|---|
@@ -106,7 +106,7 @@ pre-existing failures (ADR-0014 `status: proposed`, three stale March docs).
 | impulse-rs tests/integration_enhancements | 11 | 0 | 1 |
 | impulse-rs tests/ion_binary | 4 | 0 | 0 |
 | impulse-rs tests/ion_verify_cli | 2 | 0 | 0 |
-| impulse-rs tests/socket_actor_provenance (new) | 4 | 0 | 0 |
+| impulse-rs tests/socket_actor_provenance (new) | 5 | 0 | 0 |
 | impulse-step-model lib | 12 | 0 | 0 |
 | impulse-term lib | 94 | 0 | 0 |
 | impulse-term tests/backend_tests | 19 | 0 | 0 |
@@ -202,6 +202,29 @@ socket is connectable" implies "the capability is on disk". The trade, documente
 a failed bind leaves a file for a daemon that never listened, which authenticates nothing and is
 overwritten by the next run; the concurrent-double-start race it does not fix already exists for the
 PID file and is what the liveness check is there to catch.
+
+## Cross-lane correction (ADR-0019 lane, `0762e1d`)
+
+The staged-worktree lane confirmed the `.git/config` / `.git/info/attributes` hunch this lane
+raised, and it was worse than hooks: with `core.hooksPath` disabled exactly as its producers set
+it, a `filter.<name>.smudge` driver defined in the shared `.git/config` still executes on checkout,
+`git config --local` reaches that shared file from inside a linked worktree, and
+`.git/info/attributes` never appears in a work-tree diff. Its round-1 hooks fix was also incomplete
+(`run_git`, which backs every observation the module makes, was not covered). The fix is
+digest-pinning `.git/config`, `.git/info/attributes`, and `.git/config.worktree` at materialization
+and refusing checkout at promotion unless the digests hold.
+
+ADR-0018's boundary bullet described that lane's mechanism as "pinning `core.hooksPath`", which is
+now wrong. Corrected to the digest-pinning description, with `0019-*` added to Related Documents as
+the other half of one boundary: this decision authenticates the connection, that one establishes the
+integrity of the repository state an authenticated request then acts on.
+
+Applying the same question to this lane's own artifact: the capability file is same-uid *writable*,
+not just readable. Overwriting it cannot forge operator class, because a presentation is compared
+against the running daemon's in-memory capability and never against the file — the exposure is a
+denial of service on the approval path, self-correcting on restart. That was previously only
+inferable from the code; `overwriting_the_published_capability_cannot_forge_operator_class` now pins
+it, and the ADR states it.
 
 ## Handoff Notes
 

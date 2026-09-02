@@ -505,6 +505,82 @@ async fn the_published_capability_is_owner_only_and_raises_the_presenting_connec
     assert_ne!(token, published_capability(&other_socket));
 }
 
+/// ADR-0018: the published file is a *hand-off* channel, not the source of
+/// truth. Anything that can read it can also overwrite it — same uid — so what
+/// matters is that overwriting it cannot forge operator class. A presentation
+/// is compared against the running daemon's in-memory capability, so rewriting
+/// the file only denies the real operator, and only until the daemon restarts.
+#[tokio::test]
+async fn overwriting_the_published_capability_cannot_forge_operator_class() {
+    let (repo, project_id, _) = init_project(false);
+    let (_daemon, socket) = start_daemon(repo.path());
+    let client = DaemonClient::new(socket.clone());
+    let workspace_root = repo.path().display().to_string();
+
+    let judged = awaiting_operator(&client, &project_id, &workspace_root, "forged-file").await;
+    let genuine = published_capability(&socket);
+
+    // A same-uid process replaces the file with a well-formed token of its own.
+    let forged = "9".repeat(64);
+    assert_ne!(forged, genuine);
+    std::fs::write(capability_path(&socket), format!("{forged}\n")).unwrap();
+
+    // Presenting the forged token is refused: the daemon compares against its
+    // own in-memory capability, which the file rewrite never touched.
+    let responses = raw_exchange(
+        &socket,
+        vec![
+            DaemonRequest::PresentOperatorCapability(OperatorCapabilityPresentation {
+                token: forged,
+            }),
+            DaemonRequest::MutateGovernedTask {
+                request: approval(&judged, "forged-file-approve"),
+            },
+        ],
+    )
+    .await;
+    assert!(error_message(&responses[0]).contains("does not match this daemon run"));
+    assert!(error_message(&responses[1]).contains("operator-class connection"));
+    assert_eq!(
+        client
+            .get_governed_task(project_id.clone(), judged.id.clone())
+            .await
+            .unwrap()
+            .unwrap(),
+        judged,
+        "a forged capability file must leave the task untouched"
+    );
+
+    // The exposure is availability, not authentication: `DaemonClient` now reads
+    // the forged file and is refused, while the genuine token still works.
+    let refused = client
+        .send(DaemonRequest::MutateGovernedTask {
+            request: approval(&judged, "forged-file-client-approve"),
+        })
+        .await
+        .unwrap();
+    assert!(error_message(&refused).contains("operator-class connection"));
+
+    let accepted = raw_exchange(
+        &socket,
+        vec![
+            DaemonRequest::PresentOperatorCapability(OperatorCapabilityPresentation {
+                token: genuine,
+            }),
+            DaemonRequest::MutateGovernedTask {
+                request: approval(&judged, "genuine-approve"),
+            },
+        ],
+    )
+    .await;
+    let task: GovernedTaskRun = ok_from_response(accepted.into_iter().nth(1).unwrap());
+    assert_eq!(task.review_state, GovernedReviewState::Accepted);
+    assert_eq!(
+        task.operator_decisions.last().unwrap().authentication,
+        OperatorAuthentication::CapabilityAuthenticated
+    );
+}
+
 #[tokio::test]
 async fn a_profiled_tasks_lifecycle_marks_require_operator_class() {
     let (repo, project_id, oid) = init_project(true);

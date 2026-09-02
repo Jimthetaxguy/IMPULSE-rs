@@ -139,15 +139,26 @@ governed runtime.
   handing the operator surface its capability over a channel the pane has no access to. Those are
   follow-ups below, not variations on this decision.
 - **A connection class authenticates the caller, not what the caller's action then executes.** The
-  concurrent staged-worktree lane (ADR-0019) found a bypass that this decision does not touch: a
-  staged Builder can plant a Git hook in `.git/hooks`, which is shared across linked worktrees, and
-  that hook fires later during an operator-triggered promotion — after review has passed, under the
-  operator's authority, without the Builder ever needing to reach the socket. It is the same shape
-  of failure this ADR fixes (a Builder influencing an operator-authority outcome) reached through a
-  different door, and it is a useful check on how far "operator-class connection" should be read:
-  the capability proves who opened the connection, and nothing about the integrity of the work the
-  request then acts on. Any producer or promotion path must establish that separately; ADR-0019 does
-  so by pinning `core.hooksPath` to a non-directory for every producer Git invocation.
+  concurrent staged-worktree lane (ADR-0019) found a family of bypasses this decision does not
+  touch. A staged Builder can write repository state that every linked worktree shares — `.git/hooks`,
+  `.git/config` (where a `filter.<name>.smudge` driver still executes on checkout even with
+  `core.hooksPath` disabled, and which `git config --local` reaches from inside the Builder's own
+  worktree), and `.git/info/attributes` (shared, and never visible in a work-tree diff, so code
+  review cannot see it) — and that state executes later during an operator-triggered promotion,
+  after review has passed, under the operator's authority, without the Builder ever reaching the
+  socket. It is the same shape of failure this ADR fixes, a Builder influencing an operator-authority
+  outcome, reached through a different door, and it sets the limit on how far "operator-class
+  connection" should be read: the capability proves who opened the connection, and nothing about the
+  integrity of the work that connection's request then acts on. Any producer or promotion path must
+  establish that separately; ADR-0019 does so by digesting those components at materialization and
+  refusing to check anything out at promotion unless the digests still hold.
+- **The capability file is same-uid writable, and that is an availability exposure, not an
+  authentication one.** Anything that can read the file can also overwrite it. Doing so does not
+  forge operator class: a presentation is compared against the *running* daemon's in-memory
+  capability, never against the file, so a rewritten file authenticates nothing. What it does is
+  make the real operator's client present a token the daemon will refuse — a denial of service on
+  the approval path, self-correcting on daemon restart. Pinned by a regression test rather than left
+  as an inference from the code.
 - The assurance label is honest about a mixed chain. An authenticated operator approving
   caller-composed evidence still reads `caller_composed_evidence_declared_operator`, because the
   evidence is the weaker half. Only `daemon_profiled_evidence_authenticated_operator` claims both.
@@ -229,5 +240,8 @@ Source of truth: `impulse-rs/src/daemon/actor_provenance.rs`, `impulse-rs/src/da
 - [`0012-daemon-owned-governed-runtime-producers.md`](0012-daemon-owned-governed-runtime-producers.md)
 - [`0013-deterministic-accepted-run-memory-candidates.md`](0013-deterministic-accepted-run-memory-candidates.md)
 - [`0017-canonical-loop-contract.md`](0017-canonical-loop-contract.md)
+- `0019-*` (staged Builder worktree scope): the other half of the same boundary — this decision
+  authenticates the connection, that one establishes the integrity of the repository state an
+  authenticated request then acts on.
 - `docs/IPC-PROTOCOL.md` (protocol v7)
 - `docs/plans/worktrees/2026-09-02-claude-socket-actor-provenance.md`
