@@ -265,6 +265,32 @@ impl Daemon {
             let _ = tokio::fs::remove_file(&pid_path).await;
         }
 
+        // Publish the capability BEFORE binding, so that "the socket is
+        // connectable" implies "the capability is on disk". Publishing after
+        // bind leaves a window in which a client that uses socket readiness as
+        // its readiness signal -- which is what every client here does -- reads
+        // no capability, silently acts as a non-operator, and is refused.
+        //
+        // The trade: if bind then fails, a capability file is left for a daemon
+        // that never listened. That authenticates nothing (a presentation is
+        // compared against a *running* daemon's in-memory value) and the next
+        // successful run overwrites it. The one case this is worse than
+        // publishing later is two daemons starting concurrently, where the
+        // loser can clobber the winner's file; that race already exists for the
+        // PID file, is what the liveness check above is there to catch, and
+        // self-corrects on restart.
+        let capability_path = self.operator_capability_path();
+        let capability = OperatorCapability::generate()
+            .context("Failed to mint this daemon run's operator capability")?;
+        actor_provenance::write_capability_file(&capability_path, &capability)
+            .context("Failed to publish daemon operator capability")?;
+        // `set` returns Err if the cell is already filled, and that value is
+        // simply dropped -- this line prevents nothing on its own. What keeps a
+        // second `start` on the same Daemon from publishing a file the
+        // connection loop never compares against is the stale-socket liveness
+        // check above: a live socket makes `start` bail before it reaches here.
+        let _ = self.operator_capability.set(capability);
+
         let listener =
             UnixListener::bind(&self.config.socket_path).context("Failed to bind socket")?;
         tokio::fs::set_permissions(
@@ -281,18 +307,6 @@ impl Daemon {
         tokio::fs::set_permissions(&pid_path, std::fs::Permissions::from_mode(0o600))
             .await
             .context("Failed to restrict daemon PID file permissions")?;
-
-        // Publish the run's operator capability only once the socket is bound
-        // and locked down, so the file can never advertise a capability for a
-        // daemon that failed to start.
-        let capability_path = self.operator_capability_path();
-        let capability = OperatorCapability::generate()
-            .context("Failed to mint this daemon run's operator capability")?;
-        actor_provenance::write_capability_file(&capability_path, &capability)
-            .context("Failed to publish daemon operator capability")?;
-        // A second `start` on the same Daemon would otherwise publish a
-        // capability the connection loop never compares against.
-        let _ = self.operator_capability.set(capability);
 
         println!("Daemon listening on {}", self.config.socket_path.display());
 
@@ -348,9 +362,15 @@ impl Daemon {
             }
         }
 
-        // The capability is scoped to this run; leaving the file behind would
-        // hand the next process a token that authorizes nothing and invite a
-        // client to present a stale value.
+        // Best-effort cleanup on the graceful path only. Nothing signals
+        // `shutdown_notify` today and there is no signal handler, so in practice
+        // a daemon ends by SIGTERM/SIGKILL and this line does not run: the
+        // capability file and the socket both survive. That is safe rather than
+        // tidy -- a stale token authenticates nothing, because
+        // `present_capability` compares against the in-memory capability of the
+        // *running* daemon, and the next run overwrites the file with its own.
+        // A signal handler that reaches this path is follow-up work, not a
+        // correctness gap.
         actor_provenance::remove_capability_file(&capability_path);
 
         Ok(())
@@ -440,8 +460,10 @@ async fn handle_connection(
 
         // Capability presentation mutates connection state, so it is answered
         // here rather than in the stateless dispatcher.
-        if let DaemonRequest::PresentOperatorCapability { token } = &request {
-            let response = match provenance.present_capability(token, operator_capability.get()) {
+        if let DaemonRequest::PresentOperatorCapability(presentation) = &request {
+            let response = match provenance
+                .present_capability(&presentation.token, operator_capability.get())
+            {
                 Ok(class) => {
                     tracing::info!(
                         connection_class = class.as_str(),

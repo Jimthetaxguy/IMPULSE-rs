@@ -798,7 +798,7 @@ pub(crate) async fn process_request(
         // socket loop in `daemon::mod` handles it before dispatch so a
         // successful presentation can raise that connection's class. Reaching
         // the dispatcher means a caller invoked `process_request` directly.
-        DaemonRequest::PresentOperatorCapability { .. } => respond_err(
+        DaemonRequest::PresentOperatorCapability(_) => respond_err(
             "PresentOperatorCapability is handled at the connection boundary and cannot be \
              dispatched as a stateless request",
         ),

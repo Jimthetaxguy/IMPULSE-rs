@@ -37,9 +37,7 @@ pub enum WorkbenchDaemonRequest {
     /// Connection-scoped: an operator surface sends it once immediately after
     /// connecting, before any request that mints acceptance. Governed panes
     /// never receive the capability, so a launched runtime cannot send this.
-    PresentOperatorCapability {
-        token: String,
-    },
+    PresentOperatorCapability(crate::operator_capability::OperatorCapabilityPresentation),
     ListSessions,
     CreateSession {
         name: String,

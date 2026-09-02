@@ -25,6 +25,7 @@ use impulse_ops::governed_task::{
     WorkerCompletionClaimInput,
 };
 use impulse_ops::memory_candidate::AcceptedRunSourceAssurance;
+use impulse_ops::operator_capability::OperatorCapabilityPresentation;
 use impulse_ops::role_assignment::canonical_governed_builder_assignment;
 use impulse_ops::ProjectOpsSnapshot;
 use impulse_rs::client::DaemonClient;
@@ -442,12 +443,12 @@ async fn a_wrong_or_absent_capability_never_raises_a_connection() {
     let responses = raw_exchange(
         &socket,
         vec![
-            DaemonRequest::PresentOperatorCapability {
+            DaemonRequest::PresentOperatorCapability(OperatorCapabilityPresentation {
                 token: "f".repeat(64),
-            },
-            DaemonRequest::PresentOperatorCapability {
+            }),
+            DaemonRequest::PresentOperatorCapability(OperatorCapabilityPresentation {
                 token: "not-even-hex".to_string(),
-            },
+            }),
             DaemonRequest::MutateGovernedTask {
                 request: approval(&judged, "wrong-token-approve"),
             },
@@ -483,9 +484,11 @@ async fn the_published_capability_is_owner_only_and_raises_the_presenting_connec
 
     let responses = raw_exchange(
         &socket,
-        vec![DaemonRequest::PresentOperatorCapability {
-            token: token.clone(),
-        }],
+        vec![DaemonRequest::PresentOperatorCapability(
+            OperatorCapabilityPresentation {
+                token: token.clone(),
+            },
+        )],
     )
     .await;
     let result: serde_json::Value = ok_from_response(responses.into_iter().next().unwrap());

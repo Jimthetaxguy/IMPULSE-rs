@@ -160,9 +160,11 @@ impl DaemonClient {
                 let presentation = exchange_line(
                     &mut writer,
                     &mut reader,
-                    &DaemonRequest::PresentOperatorCapability {
-                        token: capability.expose().to_string(),
-                    },
+                    &DaemonRequest::PresentOperatorCapability(
+                        impulse_ops::operator_capability::OperatorCapabilityPresentation {
+                            token: capability.expose().to_string(),
+                        },
+                    ),
                     timeout,
                 )
                 .await?;
@@ -727,7 +729,7 @@ mod tests {
         let received = server.await.unwrap();
         assert!(matches!(
             received[0],
-            DaemonRequest::PresentOperatorCapability { .. }
+            DaemonRequest::PresentOperatorCapability(_)
         ));
         assert!(
             matches!(received[1], DaemonRequest::MutateGovernedTask { .. }),
@@ -823,7 +825,8 @@ mod tests {
         assert!(
             matches!(
                 &received[0],
-                DaemonRequest::PresentOperatorCapability { token } if token == &expected_token
+                DaemonRequest::PresentOperatorCapability(presentation)
+                    if presentation.token == expected_token
             ),
             "the capability must be presented first, on the same connection"
         );

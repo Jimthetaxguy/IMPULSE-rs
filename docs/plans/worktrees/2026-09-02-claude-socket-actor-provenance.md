@@ -83,18 +83,18 @@ Gate run on this checkout with `CARGO_TARGET_DIR` isolated from the shared globa
 `cargo fmt --all -- --check` clean; `python3 docs/validate_docs.py --all` shows only the four
 pre-existing failures (ADR-0014 `status: proposed`, three stale March docs).
 
-`cargo test --workspace`: **2361 passed, 0 failed, 9 ignored** (review round 1; the pre-review
-commit `c156ce3` was 2353/0/9).
+`cargo test --workspace`: **2363 passed, 0 failed, 9 ignored** (review round 2; round 1 was
+2361/0/9, the pre-review commit `c156ce3` was 2353/0/9).
 
 | Package / target | passed | failed | ignored |
 |---|---|---|---|
-| impulse-desktop lib | 150 | 0 | 0 |
+| impulse-desktop lib | 151 | 0 | 0 |
 | impulse-desktop tests/desktop_contract | 64 | 0 | 0 |
 | impulse-desktop tests/host_surface | 8 | 0 | 0 |
 | impulse-desktop tests/runtime | 22 | 0 | 1 |
 | impulse-desktop tests/views_ssr | 7 | 0 | 0 |
 | impulse-ion lib | 23 | 0 | 1 |
-| impulse-ops lib | 77 | 0 | 0 |
+| impulse-ops lib | 78 | 0 | 0 |
 | impulse-ops tests/governed_producer_contract | 8 | 0 | 0 |
 | impulse-ops tests/governed_task_contract | 5 | 0 | 0 |
 | impulse-ops tests/memory_candidate_contract | 5 | 0 | 0 |
@@ -113,7 +113,7 @@ commit `c156ce3` was 2353/0/9).
 | impulse-term tests/boundary_tests | 3 | 0 | 0 |
 | doc-tests impulse_rs | 3 | 0 | 1 |
 
-Re-run after review round 1 was clean end to end (exit 0, no failures).
+Re-runs after review rounds 1 and 2 were clean end to end (exit 0, no failures).
 
 Observed flake on the first gate run only, unrelated to this lane: `agent::tests::test_harness_query_kills_hung_child_instead_of_orphaning`
 failed once under full-workspace parallel load and passed in isolation and on the recorded run. It
@@ -164,6 +164,44 @@ Nits: `#[serde(deny_unknown_fields)]` added to `OperatorDecisionInput` (a payloa
 `authentication` is now rejected at the boundary rather than ignored — the two smuggling tests
 assert the rejection); the `prune_superseded_derivations` / `MemoryCandidateStatus` hazard and the
 untyped-refusal-on-the-wire gap are both recorded in the ADR's follow-up list, no code change.
+
+## Review round 2 (verification of PR #48)
+
+Round 2 confirmed all eight round-1 items and found no bypass under a fresh wrong-then-right and
+misspelled-field attack. Three Low findings, all folded in:
+
+1. **"A capability never outlives the run that issued it" was false.** Nothing notifies
+   `shutdown_notify` and there is no signal handler, so the accept loop's cleanup is unreachable in
+   practice: a killed daemon leaves both the capability file and the socket behind. The ADR and the
+   code comment now say so, and explain why it is safe rather than tidy (a presentation is compared
+   against the *running* daemon's in-memory value; the next run overwrites the file). A signal
+   handler is recorded as ADR follow-up 3, not added this round. The `OnceLock::set` comment was
+   also describing a hazard the line does not prevent — `set` drops the losing value — and now names
+   what actually holds, the stale-socket liveness check.
+2. **A refused capability was retried up to nine times.** `send_with_read_timeout` returned `Err`
+   for "refusal plus daemon error", which `send_acknowledged` retries 3x and `mutate_current_once`
+   multiplies by its own revision loop — contradicting that function's "retry only ambiguous
+   transport failures" contract. A completed exchange carrying a refusal is now a terminal
+   `Ok(WorkbenchDaemonResponse::Error { .. })`; `ok_result` still turns it into the caller's `Err`
+   with both the daemon's refusal and the capability reason intact.
+   `a_refused_capability_is_terminal_and_makes_exactly_one_connection` pins the connection count.
+3. **`deny_unknown_fields` on the presentation payload, and a discarded refusal.** Serde has no
+   variant-level `deny_unknown_fields`, so the payload became a named
+   `impulse_ops::operator_capability::OperatorCapabilityPresentation` carried as a newtype variant —
+   which serializes to the identical wire shape (`{"type": ..., "data": {"token": ...}}`), so this
+   is a Rust-API change only. Both `DaemonRequest` and `WorkbenchDaemonRequest` use it. Separately,
+   an `Ok` response after a refusal (an ungated request on a non-operator connection) no longer
+   discards the refusal: it goes to `eprintln!`, which is that file's existing warning channel
+   (`daemon_ops.rs:523`, `:1244`, `:1350`), rather than `tracing`, which the file does not use.
+
+**Found while fixing these — a real ordering bug, not a test flake.** The capability was published
+*after* `UnixListener::bind`, so a client that treats socket-connectable as readiness (which is what
+every client here does, including `start_daemon` in the integration tests) could find no capability
+file, silently act as a non-operator, and be refused. Publishing now happens before bind, so "the
+socket is connectable" implies "the capability is on disk". The trade, documented at the call site:
+a failed bind leaves a file for a daemon that never listened, which authenticates nothing and is
+overwritten by the next run; the concurrent-double-start race it does not fix already exists for the
+PID file and is what the liveness check is there to catch.
 
 ## Handoff Notes
 

@@ -13,6 +13,21 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
+/// Payload of the connection-scoped `PresentOperatorCapability` request.
+///
+/// A named struct rather than an inline enum-variant body so it can carry
+/// `deny_unknown_fields` like the governed request DTOs: serde has no
+/// variant-level form of that attribute. As a newtype variant this serializes
+/// to exactly the same wire shape a struct variant would
+/// (`{"type": "PresentOperatorCapability", "data": {"token": "..."}}`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorCapabilityPresentation {
+    pub token: String,
+}
+
 /// Environment variable a client may use to present the capability instead of
 /// reading the file. Governed panes never receive it: every inherited
 /// `IMPULSE_*` key is scrubbed before a runtime is spawned.
@@ -67,6 +82,33 @@ pub fn resolve_for_socket(socket_path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presentation_round_trips_and_rejects_unknown_fields() {
+        let presentation = OperatorCapabilityPresentation {
+            token: "a".repeat(OPERATOR_CAPABILITY_HEX_LEN),
+        };
+        let json = serde_json::to_string(&presentation).unwrap();
+        assert_eq!(
+            serde_json::from_str::<OperatorCapabilityPresentation>(&json).unwrap(),
+            presentation
+        );
+
+        let error = serde_json::from_value::<OperatorCapabilityPresentation>(serde_json::json!({
+            "token": "a".repeat(OPERATOR_CAPABILITY_HEX_LEN),
+            "class": "operator",
+        }))
+        .unwrap_err();
+        assert!(format!("{error}").contains("class"));
+
+        // A misspelled `token` is already fatal: the field has no default.
+        assert!(
+            serde_json::from_value::<OperatorCapabilityPresentation>(serde_json::json!({
+                "tokenn": "a".repeat(OPERATOR_CAPABILITY_HEX_LEN),
+            }))
+            .is_err()
+        );
+    }
 
     #[test]
     fn path_for_socket_sits_beside_the_socket() {

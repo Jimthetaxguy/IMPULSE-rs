@@ -24,9 +24,7 @@ pub enum DaemonRequest {
     /// operator class and has no effect on any other connection. Requests that
     /// mint acceptance (`MutateGovernedTask` with `RecordOperatorDecision`, and
     /// the lifecycle marks of a profiled task) are rejected without it.
-    PresentOperatorCapability {
-        token: String,
-    },
+    PresentOperatorCapability(impulse_ops::operator_capability::OperatorCapabilityPresentation),
     CreateSession {
         name: String,
         platform: Option<String>,
@@ -277,7 +275,7 @@ pub(crate) fn request_type_name(req: &DaemonRequest) -> &'static str {
     match req {
         DaemonRequest::Ping => "Ping",
         DaemonRequest::Status => "Status",
-        DaemonRequest::PresentOperatorCapability { .. } => "PresentOperatorCapability",
+        DaemonRequest::PresentOperatorCapability(_) => "PresentOperatorCapability",
         DaemonRequest::CreateSession { .. } => "CreateSession",
         DaemonRequest::EndSession { .. } => "EndSession",
         DaemonRequest::TrackFile { .. } => "TrackFile",
@@ -342,14 +340,19 @@ mod tests {
 
     #[test]
     fn test_present_operator_capability_round_trips_and_never_leaks_into_the_type_name() {
-        let request = DaemonRequest::PresentOperatorCapability {
-            token: "a".repeat(64),
-        };
+        let request = DaemonRequest::PresentOperatorCapability(
+            impulse_ops::operator_capability::OperatorCapabilityPresentation {
+                token: "a".repeat(64),
+            },
+        );
         let json = serde_json::to_string(&request).unwrap();
+        // The newtype variant keeps the struct-variant wire shape exactly.
+        assert!(json.contains(r#""data":{"token":"#));
         let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
         assert!(matches!(
             parsed,
-            DaemonRequest::PresentOperatorCapability { ref token } if token == &"a".repeat(64)
+            DaemonRequest::PresentOperatorCapability(ref presentation)
+                if presentation.token == "a".repeat(64)
         ));
         assert_eq!(
             request_type_name(&request),
@@ -815,7 +818,7 @@ mod tests {
         match request {
             impulse_ops::WorkbenchDaemonRequest::Ping => "Ping",
             impulse_ops::WorkbenchDaemonRequest::Status => "Status",
-            impulse_ops::WorkbenchDaemonRequest::PresentOperatorCapability { .. } => {
+            impulse_ops::WorkbenchDaemonRequest::PresentOperatorCapability(_) => {
                 "PresentOperatorCapability"
             }
             impulse_ops::WorkbenchDaemonRequest::ListSessions => "ListSessions",

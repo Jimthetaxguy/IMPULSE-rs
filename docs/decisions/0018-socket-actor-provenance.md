@@ -62,11 +62,17 @@ governed runtime.
 2. **The daemon mints one operator capability per run.** 32 bytes read from the operating system's
    CSPRNG (`/dev/urandom`; `rand` and `getrandom` are only transitive dependencies of this
    workspace), hex encoded, written atomically at mode 0600 beside the socket (`impulse.sock` ->
-   `impulse.operator-cap`, matching how the PID file is placed) once the socket is bound and locked
-   down, and removed when the accept loop exits. The temp file is opened `create_new` and its mode
-   asserted on the descriptor rather than the path, so the secret is only ever written into a file
-   this process just created at 0600. Minting failure is returned, never absorbed into a weaker
-   fallback. A capability never outlives the run that issued it.
+   `impulse.operator-cap`, matching how the PID file is placed) **before** the listener binds, so
+   that "the socket is connectable" implies "the capability is on disk" — publishing after bind
+   leaves a window in which a client that treats socket readiness as readiness reads no capability,
+   silently acts as a non-operator, and is refused. The temp file is opened `create_new` and its mode asserted on the descriptor rather than
+   the path, so the secret is only ever written into a file this process just created at 0600.
+   Minting failure is returned, never absorbed into a weaker fallback. The file is removed when the
+   accept loop exits; **a signal-killed daemon leaves it behind**, and nothing signals the shutdown
+   path today, so in practice the file usually survives the process. This is safe rather than tidy:
+   a stale token authenticates nothing, because a presentation is compared against the *running*
+   daemon's in-memory capability, and the next run overwrites the file with its own. A signal
+   handler that reaches the cleanup path is follow-up work, not a correctness gap.
 3. **Presentation is a connection-scoped request.** `PresentOperatorCapability { token }` (protocol
    v7) raises *that* connection if, and only if, the peer uid equals the daemon's own uid **and**
    the token matches, compared in length-independent constant time. A rejected presentation leaves
@@ -175,7 +181,11 @@ governed runtime.
    When ADR-0020 (or ADR-0019's promotion work) adds `Promoted`/`Dismissed`, a prune would silently
    revert an operator's review decision to `PendingReview`; the load path must migrate the status
    forward instead of discarding the record.
-3. **Refusals are untyped on the wire.** A rejection is `DaemonResponse::Error { message }` with no
+3. **No signal handler reaches the capability cleanup path.** Nothing notifies `shutdown_notify`,
+   so the accept loop's cleanup is unreachable in practice and a killed daemon leaves its
+   capability file (and socket) behind. Harmless today for the reason in decision 2, but a daemon
+   that tidies up on SIGTERM is the honest end state.
+4. **Refusals are untyped on the wire.** A rejection is `DaemonResponse::Error { message }` with no
    machine-readable code, so clients match on prose. The protocol already has a precedent for a
    typed variant (`Busy { resource, retry_after_ms }`); an `Unauthorized { request, reason }` would
    follow it, and is deliberately deferred to avoid widening this lane's overlap with the concurrent

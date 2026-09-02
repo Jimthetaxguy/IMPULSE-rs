@@ -655,9 +655,32 @@ mod unix {
             // rather than only in a log the operator never reads.
             match (capability_refusal, response) {
                 (Some(refusal), WorkbenchDaemonResponse::Error { message }) => {
-                    Err(Self::capability_refusal_message(&refusal, &message))
+                    // Deliberately `Ok` carrying an `Error`, not `Err`. A
+                    // completed exchange that carried a refusal is a terminal
+                    // daemon verdict, not the ambiguous transport failure
+                    // `send_acknowledged` exists to retry -- and
+                    // `mutate_current_once` wraps that in its own revision loop,
+                    // so an `Err` here would reconnect up to nine times to be
+                    // refused identically each time. `ok_result` converts this
+                    // into the caller's `Err` with the refusal text intact.
+                    Ok(WorkbenchDaemonResponse::Error {
+                        message: Self::capability_refusal_message(&refusal, &message),
+                    })
                 }
-                (_, response) => Ok(response),
+                (Some(refusal), response) => {
+                    // The daemon answered successfully despite refusing the
+                    // capability, which means the request was not one it gates.
+                    // The refusal still matters -- this connection was not
+                    // operator class -- so it must not vanish silently.
+                    eprintln!(
+                        "desktop daemon-ops: the daemon refused this operator capability \
+                         ({refusal}); the request succeeded on a non-operator connection, so any \
+                         governed decision recorded through it carries declared, not \
+                         authenticated, provenance"
+                    );
+                    Ok(response)
+                }
+                (None, response) => Ok(response),
             }
         }
 
@@ -703,9 +726,10 @@ mod unix {
             else {
                 return Ok(None);
             };
-            let encoded =
-                serde_json::to_vec(&WorkbenchDaemonRequest::PresentOperatorCapability { token })
-                    .map_err(|error| format!("serialize operator capability: {error}"))?;
+            let encoded = serde_json::to_vec(&WorkbenchDaemonRequest::PresentOperatorCapability(
+                impulse_ops::operator_capability::OperatorCapabilityPresentation { token },
+            ))
+            .map_err(|error| format!("serialize operator capability: {error}"))?;
             let mut handle = stream;
             handle
                 .write_all(&encoded)
@@ -2676,12 +2700,10 @@ mod unix {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("capability request");
             match presented {
-                WorkbenchDaemonRequest::PresentOperatorCapability { token: presented } => {
-                    assert_eq!(
-                        presented, token,
-                        "the published capability is presented verbatim"
-                    )
-                }
+                WorkbenchDaemonRequest::PresentOperatorCapability(presentation) => assert_eq!(
+                    presentation.token, token,
+                    "the published capability is presented verbatim"
+                ),
                 other => panic!("expected the capability first, received {other:?}"),
             }
             assert!(matches!(
@@ -2806,8 +2828,8 @@ mod unix {
                 "the ungated read must not pay for a handshake"
             );
             match &observed[1] {
-                WorkbenchDaemonRequest::PresentOperatorCapability { token: presented } => {
-                    assert_eq!(presented, &token)
+                WorkbenchDaemonRequest::PresentOperatorCapability(presentation) => {
+                    assert_eq!(presentation.token, token)
                 }
                 other => panic!("expected the capability before the mutation, got {other:?}"),
             }
@@ -2816,6 +2838,91 @@ mod unix {
                 WorkbenchDaemonRequest::MutateGovernedTask { .. }
             ));
             server.join().unwrap();
+        }
+
+        /// ADR-0018 review round 2: a refused capability plus a daemon error is
+        /// a completed exchange, not an ambiguous transport failure. Returning
+        /// `Err` from `send_with_read_timeout` would feed it back through
+        /// `send_acknowledged`'s retry loop -- and `mutate_current_once`'s
+        /// revision loop on top of that -- reconnecting up to nine times to be
+        /// refused identically each time.
+        #[test]
+        fn a_refused_capability_is_terminal_and_makes_exactly_one_connection() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket = dir.path().join("refused-capability.sock");
+            std::fs::write(
+                impulse_ops::operator_capability::path_for_socket(&socket),
+                "e".repeat(64),
+            )
+            .expect("publish capability");
+            let listener = UnixListener::bind(&socket).expect("bind fake daemon");
+
+            let mutation_request = impulse_ops::governed_task::GovernedTaskMutationRequest {
+                request_id: impulse_ops::governed_task::GovernedRequestId::try_new("refused-1")
+                    .expect("request id"),
+                project_id: "project".to_string(),
+                task_id: impulse_ops::governed_task::GovernedTaskId::try_new("refused-task")
+                    .expect("task id"),
+                expected_revision: 4,
+                mutation:
+                    impulse_ops::governed_task::GovernedTaskMutation::RecordOperatorDecision {
+                        decision: impulse_ops::governed_task::OperatorDecisionInput {
+                            actor: impulse_ops::governed_task::GovernedActor {
+                                kind: impulse_ops::governed_task::GovernedActorKind::Operator,
+                                id: "cockpit-operator".to_string(),
+                            },
+                            supervisor_verdict_id:
+                                impulse_ops::governed_task::GovernedRecordId::try_new("verdict-a")
+                                    .expect("verdict id"),
+                            decision: impulse_ops::governed_task::OperatorDecisionKind::Approve,
+                            rationale: "approved from the cockpit".to_string(),
+                        },
+                    },
+            };
+
+            let (connections_tx, connections_rx) = mpsc::channel();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept connection");
+                connections_tx.send(()).expect("record connection");
+                let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+                // Refuse the capability, then refuse the mutation.
+                for message in [
+                    "operator capability rejected: the presented token does not match this daemon run",
+                    "request `RecordOperatorDecision` requires an operator-class connection",
+                ] {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).expect("read request");
+                    write_response(
+                        &mut stream,
+                        &WorkbenchDaemonResponse::Error {
+                            message: message.to_string(),
+                        },
+                    );
+                }
+                listener.set_nonblocking(true).expect("nonblocking");
+                while listener.accept().is_ok() {
+                    connections_tx.send(()).expect("record retry connection");
+                }
+            });
+
+            let client = UnixDaemonOpsClient::new(socket);
+            let error = client.mutate_governed_task(mutation_request).unwrap_err();
+            assert!(
+                error.contains("operator-class"),
+                "the daemon's own refusal must survive: {error}"
+            );
+            assert!(
+                error.contains("does not match this daemon run"),
+                "and so must the capability refusal that explains it: {error}"
+            );
+
+            server.join().unwrap();
+            drop(client);
+            let connections = connections_rx.iter().count();
+            assert_eq!(
+                connections, 1,
+                "a terminal refusal must not be retried; saw {connections} connections"
+            );
         }
 
         /// Without a published capability the cockpit still connects and sends
