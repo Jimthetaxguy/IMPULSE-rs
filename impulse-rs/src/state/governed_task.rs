@@ -11,8 +11,8 @@ use impulse_ops::governed_task::{
     GovernedTaskId, GovernedTaskMutation, GovernedTaskMutationRequest, GovernedTaskRegistration,
     GovernedTaskRun, GovernedVerification, GovernedVerificationInput, GovernedVerificationOutcome,
     OperatorAuthentication, OperatorDecision, OperatorDecisionInput, OperatorDecisionKind, PromotionBlockedReason,
-    StagedWorktree, StagedWorktreeInput, StagedWorktreeStatus, SupervisorVerdict,
-    SupervisorVerdictInput, SupervisorVerdictKind, WorkerCompletionClaim,
+    SharedRepositoryConfigDigest, StagedWorktree, StagedWorktreeInput, StagedWorktreeStatus,
+    SupervisorVerdict, SupervisorVerdictInput, SupervisorVerdictKind, WorkerCompletionClaim,
     WorkerCompletionClaimInput, WorldScope, MAX_GOVERNED_COMMANDS, MAX_GOVERNED_COMMAND_ARGS,
     MAX_GOVERNED_COMMAND_ARG_BYTES, MAX_GOVERNED_EVENTS, MAX_GOVERNED_RECORDS_PER_KIND,
     MAX_GOVERNED_REFERENCES, MAX_GOVERNED_REFERENCE_BYTES,
@@ -688,6 +688,7 @@ fn validate_task_history(task: &GovernedTaskRun) -> Result<BTreeMap<u64, String>
                         actor: staged.actor.clone(),
                         root: staged.root.clone(),
                         initial_subject_revision: staged.initial_subject_revision.clone(),
+                        shared_config_digest: staged.shared_config_digest.clone(),
                     },
                 };
                 (mutation.clone(), mutation)
@@ -1056,6 +1057,7 @@ fn staged_worktrees_match(
         (Some(replayed), Some(stored)) => {
             replayed.root == stored.root
                 && replayed.initial_subject_revision == stored.initial_subject_revision
+                && replayed.shared_config_digest == stored.shared_config_digest
                 && replayed.status == stored.status
                 && replayed.materialized_at == stored.materialized_at
                 && replayed.based_on_revision == stored.based_on_revision
@@ -1269,11 +1271,13 @@ fn apply_mutation(
             }
             require_expected_staged_root(task, &staged.root)?;
             let id = new_record_id("staged-worktree");
+            require_shared_config_digest(&staged.shared_config_digest)?;
             task.staged_worktree = Some(StagedWorktree {
                 id: id.clone(),
                 actor: staged.actor.clone(),
                 root: staged.root,
                 initial_subject_revision: staged.initial_subject_revision,
+                shared_config_digest: staged.shared_config_digest,
                 status: StagedWorktreeStatus::Active,
                 materialized_at: now.to_string(),
                 based_on_revision: task.revision,
@@ -1949,6 +1953,30 @@ fn validate_promotion_outcome(promotion: &GovernedPromotionInput) -> Result<()> 
     Ok(())
 }
 
+/// Every present component digest must be well formed. Absence is a legitimate
+/// value (the file does not exist) and is pinned as such.
+fn require_shared_config_digest(digest: &SharedRepositoryConfigDigest) -> Result<()> {
+    require_sha256_digest(
+        "staged worktree repository config digest",
+        &digest.repository_config,
+    )?;
+    for (label, component) in [
+        (
+            "staged worktree worktree-config digest",
+            &digest.worktree_config,
+        ),
+        (
+            "staged worktree info-attributes digest",
+            &digest.info_attributes,
+        ),
+    ] {
+        if let Some(component) = component {
+            require_sha256_digest(label, component)?;
+        }
+    }
+    Ok(())
+}
+
 fn require_commit_oid(label: &str, value: &str) -> Result<()> {
     if !matches!(value.len(), 40 | 64)
         || !value
@@ -2160,6 +2188,14 @@ mod tests {
         GovernedActor {
             kind,
             id: id.to_string(),
+        }
+    }
+
+    fn test_shared_config_digest() -> SharedRepositoryConfigDigest {
+        SharedRepositoryConfigDigest {
+            repository_config: digest('d'),
+            worktree_config: None,
+            info_attributes: None,
         }
     }
 
@@ -3708,6 +3744,7 @@ mod tests {
                         actor: actor(GovernedActorKind::System, "impulse-daemon"),
                         root: staged_root_for(task),
                         initial_subject_revision: staged_oid('a'),
+                        shared_config_digest: test_shared_config_digest(),
                     },
                 },
             ))
@@ -3829,6 +3866,7 @@ mod tests {
                         actor: actor(GovernedActorKind::System, "impulse-daemon"),
                         root: staged_root_for(&task),
                         initial_subject_revision: staged_oid('a'),
+                        shared_config_digest: test_shared_config_digest(),
                     },
                 },
             ))
@@ -3851,6 +3889,7 @@ mod tests {
                         actor: actor(GovernedActorKind::System, "impulse-daemon"),
                         root: "/tmp/somewhere-else".to_string(),
                         initial_subject_revision: staged_oid('a'),
+                        shared_config_digest: test_shared_config_digest(),
                     },
                 },
             ))
@@ -3873,6 +3912,7 @@ mod tests {
                         actor: actor(GovernedActorKind::System, "impulse-daemon"),
                         root: staged_root_for(&task),
                         initial_subject_revision: staged_oid('b'),
+                        shared_config_digest: test_shared_config_digest(),
                     },
                 },
             ))
@@ -3896,6 +3936,7 @@ mod tests {
                         actor: actor(GovernedActorKind::System, "impulse-daemon"),
                         root: staged_root_for(&task),
                         initial_subject_revision: staged_oid('a'),
+                        shared_config_digest: test_shared_config_digest(),
                     },
                 },
             ))
@@ -3919,6 +3960,7 @@ mod tests {
                         actor: actor(GovernedActorKind::System, "impulse-daemon"),
                         root: staged_root_for(&launched),
                         initial_subject_revision: staged_oid('a'),
+                        shared_config_digest: test_shared_config_digest(),
                     },
                 },
             ))

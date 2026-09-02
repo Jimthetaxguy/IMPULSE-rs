@@ -10,8 +10,8 @@ use std::process::Command;
 use impulse_ops::governed_task::{
     ApprovalPolicy, GovernedActor, GovernedActorKind, GovernedExecutionState,
     GovernedPromotionOutcome, GovernedRecordId, GovernedReviewState, GovernedTaskId,
-    GovernedTaskRun, GovernedVerificationProfile, PromotionBlockedReason, StagedWorktree,
-    StagedWorktreeStatus, WorkerCompletionClaim, WorldScope,
+    GovernedTaskRun, GovernedVerificationProfile, PromotionBlockedReason, SharedConfigComponent,
+    StagedWorktree, StagedWorktreeInput, StagedWorktreeStatus, WorkerCompletionClaim, WorldScope,
 };
 use impulse_rs::governed_producers::{
     discard_staged_worktree, materialize_staged_worktree, promote_governed_outcome,
@@ -107,13 +107,25 @@ fn system_actor() -> GovernedActor {
 
 /// Attach a materialized staged worktree and an accepted claim, as the ledger
 /// would hold them by the time promotion runs.
-fn accepted(task: &GovernedTaskRun, root: &str, initial: &str, accepted: &str) -> GovernedTaskRun {
+/// Attach a materialized staged worktree and an accepted claim, as the ledger
+/// would hold them by the time promotion runs. `shared_config_digest` is the
+/// digest the producer actually recorded at materialization, so promotion sees
+/// no configuration drift unless a test deliberately introduces some.
+fn accepted(
+    task: &GovernedTaskRun,
+    staged: &StagedWorktreeInput,
+    initial: &str,
+    accepted: &str,
+) -> GovernedTaskRun {
+    let root = staged.root.as_str();
+    let shared_config_digest = staged.shared_config_digest.clone();
     let mut task = task.clone();
     task.staged_worktree = Some(StagedWorktree {
         id: GovernedRecordId::try_new("staged-1").unwrap(),
         actor: system_actor(),
         root: root.to_string(),
         initial_subject_revision: initial.to_string(),
+        shared_config_digest,
         status: StagedWorktreeStatus::Active,
         materialized_at: "2026-09-02T00:00:00Z".to_string(),
         based_on_revision: 1,
@@ -145,7 +157,7 @@ fn staged_with_builder_commit(repo: &Path) -> (GovernedTaskRun, String, String, 
     let staged = materialize_staged_worktree(&registered).expect("materialize staged worktree");
     let root = staged.root.clone();
     let builder_commit = commit_in(Path::new(&root), "feature.txt", "builder work\n");
-    let task = accepted(&registered, &root, &initial, &builder_commit);
+    let task = accepted(&registered, &staged, &initial, &builder_commit);
     (task, initial, builder_commit, root)
 }
 
@@ -409,7 +421,17 @@ fn test_planted_git_hooks_never_execute_during_staging_or_promotion() {
     let hooks = repo.join(".git").join("hooks");
     std::fs::create_dir_all(&hooks).expect("hooks dir");
     let marker = repo.join("hook-ran.txt");
-    for hook in ["post-checkout", "post-merge", "reference-transaction"] {
+    // `post-index-change` and `fsmonitor-watchman` fire on a bare `git status`,
+    // which the promotion path runs twice; `pre-auto-gc` fires on ordinary
+    // plumbing. Hooks are not only about the obviously mutating commands.
+    for hook in [
+        "post-checkout",
+        "post-merge",
+        "reference-transaction",
+        "post-index-change",
+        "pre-auto-gc",
+        "fsmonitor-watchman",
+    ] {
         let path = hooks.join(hook);
         std::fs::write(
             &path,
@@ -434,7 +456,7 @@ fn test_planted_git_hooks_never_execute_during_staging_or_promotion() {
     );
 
     let builder_commit = commit_in(Path::new(&staged.root), "feature.txt", "builder work\n");
-    let task = accepted(&registered, &staged.root, &initial, &builder_commit);
+    let task = accepted(&registered, &staged, &initial, &builder_commit);
     promote_governed_outcome(&task).expect("promote accepted outcome");
 
     assert_eq!(head(&repo), builder_commit);
@@ -457,4 +479,112 @@ fn test_occupied_staged_path_error_names_the_recovery() {
     let message = error.to_string();
     assert!(message.contains("already exists"), "{message}");
     assert!(message.contains("worktree prune"), "{message}");
+}
+
+/// Review round 2, from the ADR-0018 lane's tip: `.git/hooks` is not the only
+/// worktree-shared state. `.git/config` is shared too, and a `filter` driver
+/// defined there executes during any checkout — including the working-tree sync
+/// that promotion performs, in the canonical workspace, after review passed.
+#[test]
+fn test_a_filter_driver_planted_by_the_builder_never_executes_during_promotion() {
+    let (_dir, repo) = init_repo();
+    let initial = head(&repo);
+    let registered = task(&repo, &initial);
+    let staged = materialize_staged_worktree(&registered).expect("materialize staged worktree");
+    let staged_root = PathBuf::from(&staged.root);
+    let marker = repo.join("filter-ran.txt");
+
+    // The Builder, working only inside its own staged worktree, writes to the
+    // shared repository config and assigns the driver to every path.
+    git(
+        &staged_root,
+        &[
+            "config",
+            "filter.evil.smudge",
+            &format!("sh -c 'echo FILTER_FIRED >> {}; cat'", marker.display()),
+        ],
+    );
+    git(&staged_root, &["config", "filter.evil.clean", "cat"]);
+    std::fs::write(staged_root.join(".gitattributes"), "* filter=evil\n").expect("write attrs");
+    git(&staged_root, &["add", ".gitattributes"]);
+    let builder_commit = commit_in(&staged_root, "feature.txt", "builder work\n");
+
+    // Negative control: prove the planted driver is actually armed, so the
+    // assertion below is about the fix and not about a filter that never would
+    // have run. Materializing a file in the staged worktree fires it.
+    std::fs::remove_file(staged_root.join("feature.txt")).expect("remove for re-checkout");
+    git(&staged_root, &["checkout", "--", "feature.txt"]);
+    assert!(
+        marker.exists(),
+        "the planted filter driver is not armed; this test would pass vacuously"
+    );
+    std::fs::remove_file(&marker).expect("reset the marker");
+
+    let task = accepted(&registered, &staged, &initial, &builder_commit);
+    let promotion = promote_governed_outcome(&task).expect("promotion reports, never executes");
+
+    assert!(
+        !marker.exists(),
+        "a Builder-planted filter driver executed during promotion: {}",
+        std::fs::read_to_string(&marker).unwrap_or_default()
+    );
+    assert_eq!(
+        promotion.outcome.blocked_reason(),
+        Some(PromotionBlockedReason::RepositoryConfigChanged {
+            component: SharedConfigComponent::RepositoryConfig
+        }),
+        "a Builder that rewrote shared repository config must block promotion, naming the file"
+    );
+    assert_eq!(head(&repo), initial, "a blocked promotion moves nothing");
+}
+
+/// Benign churn blocks too, and must say which file changed — an operator who
+/// ran `git remote add` mid-run should not have to guess.
+#[test]
+fn test_a_benign_shared_config_change_blocks_and_names_the_file() {
+    let (_dir, repo) = init_repo();
+    let initial = head(&repo);
+    let registered = task(&repo, &initial);
+    let staged = materialize_staged_worktree(&registered).expect("materialize staged worktree");
+    let builder_commit = commit_in(Path::new(&staged.root), "feature.txt", "builder work\n");
+    git(
+        &repo,
+        &["remote", "add", "origin", "https://example.invalid/x.git"],
+    );
+
+    let task = accepted(&registered, &staged, &initial, &builder_commit);
+    let promotion = promote_governed_outcome(&task).expect("benign drift blocks, never errors");
+
+    assert_eq!(
+        promotion.outcome.blocked_reason(),
+        Some(PromotionBlockedReason::RepositoryConfigChanged {
+            component: SharedConfigComponent::RepositoryConfig
+        })
+    );
+    assert_eq!(head(&repo), initial);
+}
+
+/// `.git/info/attributes` is shared and never shows up in a diff of the work
+/// tree, so it is the quietest door of the three.
+#[test]
+fn test_a_shared_info_attributes_change_blocks_and_names_that_file() {
+    let (_dir, repo) = init_repo();
+    let initial = head(&repo);
+    let registered = task(&repo, &initial);
+    let staged = materialize_staged_worktree(&registered).expect("materialize staged worktree");
+    let builder_commit = commit_in(Path::new(&staged.root), "feature.txt", "builder work\n");
+    let info = repo.join(".git").join("info");
+    std::fs::create_dir_all(&info).expect("info dir");
+    std::fs::write(info.join("attributes"), "* filter=evil\n").expect("write shared attributes");
+
+    let task = accepted(&registered, &staged, &initial, &builder_commit);
+    let promotion = promote_governed_outcome(&task).expect("attribute drift blocks");
+
+    assert_eq!(
+        promotion.outcome.blocked_reason(),
+        Some(PromotionBlockedReason::RepositoryConfigChanged {
+            component: SharedConfigComponent::InfoAttributes
+        })
+    );
+    assert_eq!(head(&repo), initial);
 }

@@ -178,6 +178,10 @@ pub struct StagedWorktree {
     pub actor: GovernedActor,
     pub root: String,
     pub initial_subject_revision: String,
+    /// Digests of the worktree-shared repository configuration observed when
+    /// this worktree was materialized. Promotion refuses to check anything out
+    /// unless the same digests still hold.
+    pub shared_config_digest: SharedRepositoryConfigDigest,
     pub status: StagedWorktreeStatus,
     pub materialized_at: String,
     pub based_on_revision: u64,
@@ -190,6 +194,7 @@ pub struct StagedWorktreeInput {
     pub actor: GovernedActor,
     pub root: String,
     pub initial_subject_revision: String,
+    pub shared_config_digest: SharedRepositoryConfigDigest,
 }
 
 /// Why a promotion could not move the canonical branch.
@@ -205,6 +210,69 @@ pub enum PromotionBlockedReason {
     /// The compare-and-swap on the canonical branch lost to a concurrent
     /// writer between observation and the ref update.
     ConcurrentBranchUpdate,
+    /// Shared repository configuration changed while the Builder was working.
+    /// A `filter` or `diff` driver defined there executes during the checkout
+    /// promotion performs, so a run that rewrote it is not promotable without a
+    /// human looking at what changed. The component names *what* changed:
+    /// benign churn (a new remote, a credential helper) hard-blocks promotion
+    /// too, and the operator must not have to guess which file to inspect.
+    RepositoryConfigChanged { component: SharedConfigComponent },
+}
+
+/// Which piece of worktree-shared Git state changed under a staged run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedConfigComponent {
+    /// `.git/config`, shared by the main worktree and every linked worktree.
+    RepositoryConfig,
+    /// `.git/config.worktree`, read only when `extensions.worktreeConfig` is on.
+    WorktreeConfig,
+    /// `.git/info/attributes`, shared and invisible to a diff of the work tree.
+    InfoAttributes,
+}
+
+impl SharedConfigComponent {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::RepositoryConfig => ".git/config",
+            Self::WorktreeConfig => ".git/config.worktree",
+            Self::InfoAttributes => ".git/info/attributes",
+        }
+    }
+}
+
+impl std::fmt::Display for SharedConfigComponent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Digests of every piece of worktree-shared Git state that can turn a later
+/// checkout into command execution. `None` means the component was absent,
+/// which is itself pinned: creating it is a change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedRepositoryConfigDigest {
+    pub repository_config: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_config: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub info_attributes: Option<String>,
+}
+
+impl SharedRepositoryConfigDigest {
+    /// The first component that differs, which is what the operator is told.
+    pub fn first_difference(&self, other: &Self) -> Option<SharedConfigComponent> {
+        if self.repository_config != other.repository_config {
+            return Some(SharedConfigComponent::RepositoryConfig);
+        }
+        if self.worktree_config != other.worktree_config {
+            return Some(SharedConfigComponent::WorktreeConfig);
+        }
+        if self.info_attributes != other.info_attributes {
+            return Some(SharedConfigComponent::InfoAttributes);
+        }
+        None
+    }
 }
 
 impl PromotionBlockedReason {
@@ -213,13 +281,20 @@ impl PromotionBlockedReason {
             Self::CanonicalHeadMoved => "canonical_head_moved",
             Self::DetachedHead => "detached_head",
             Self::ConcurrentBranchUpdate => "concurrent_branch_update",
+            Self::RepositoryConfigChanged { .. } => "repository_config_changed",
         }
     }
 }
 
 impl std::fmt::Display for PromotionBlockedReason {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.as_str())
+        match self {
+            // Name the file, so an operator facing a hard block is not guessing.
+            Self::RepositoryConfigChanged { component } => {
+                write!(formatter, "{} changed ({component})", self.as_str())
+            }
+            other => formatter.write_str(other.as_str()),
+        }
     }
 }
 
@@ -1261,6 +1336,14 @@ mod tests {
         character.to_string().repeat(40)
     }
 
+    fn test_shared_config_digest() -> SharedRepositoryConfigDigest {
+        SharedRepositoryConfigDigest {
+            repository_config: format!("sha256:{}", "d".repeat(64)),
+            worktree_config: None,
+            info_attributes: Some(format!("sha256:{}", "e".repeat(64))),
+        }
+    }
+
     fn staged_registration_builder() -> GovernedTaskRegistrationBuilder {
         GovernedTaskRegistration::builder(
             "request-1",
@@ -1357,6 +1440,7 @@ mod tests {
             },
             root: "/tmp/impulse-rs/.impulse/worktrees/task-1".to_string(),
             initial_subject_revision: oid('a'),
+            shared_config_digest: test_shared_config_digest(),
             status: StagedWorktreeStatus::Active,
             materialized_at: "2026-09-02T00:00:00Z".to_string(),
             based_on_revision: 0,
@@ -1375,6 +1459,7 @@ mod tests {
             },
             root: "/tmp/impulse-rs/.impulse/worktrees/task-1".to_string(),
             initial_subject_revision: oid('a'),
+            shared_config_digest: test_shared_config_digest(),
         };
         let recovered: StagedWorktreeInput =
             serde_json::from_str(&serde_json::to_string(&input).unwrap()).unwrap();
@@ -1540,6 +1625,7 @@ mod tests {
             },
             root: "/tmp/impulse-rs/.impulse/worktrees/task-1".to_string(),
             initial_subject_revision: oid('a'),
+            shared_config_digest: test_shared_config_digest(),
             status,
             materialized_at: "2026-09-02T00:00:00Z".to_string(),
             based_on_revision: 0,
@@ -1657,6 +1743,7 @@ mod tests {
                     },
                     root: "/tmp/impulse-rs/.impulse/worktrees/task-1".to_string(),
                     initial_subject_revision: oid('a'),
+                    shared_config_digest: test_shared_config_digest(),
                 },
             },
             GovernedTaskMutation::DiscardStagedWorktree {
