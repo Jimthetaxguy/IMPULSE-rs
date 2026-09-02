@@ -5,7 +5,8 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
 use impulse_ops::governed_task::{
-    GovernedActor, GovernedActorKind, GovernedExecutionState, GovernedRecordId, GovernedRequestId,
+    GovernedActor, GovernedActorKind, GovernedExecutionState, GovernedPromotion,
+    GovernedPromotionInput, GovernedPromotionOutcome, GovernedRecordId, GovernedRequestId,
     GovernedReviewState, GovernedTaskContractError, GovernedTaskEvent, GovernedTaskEventKind,
     GovernedTaskId, GovernedTaskMutation, GovernedTaskMutationRequest, GovernedTaskRegistration,
     GovernedTaskRun, GovernedVerification, GovernedVerificationInput, GovernedVerificationOutcome,
@@ -14,12 +15,21 @@ use impulse_ops::governed_task::{
     WorkerCompletionClaimInput, MAX_GOVERNED_COMMANDS, MAX_GOVERNED_COMMAND_ARGS,
     MAX_GOVERNED_COMMAND_ARG_BYTES, MAX_GOVERNED_EVENTS, MAX_GOVERNED_RECORDS_PER_KIND,
     MAX_GOVERNED_REFERENCES, MAX_GOVERNED_REFERENCE_BYTES,
+    OperatorDecision, OperatorDecisionInput, OperatorDecisionKind, StagedWorktree,
+    StagedWorktreeInput, StagedWorktreeStatus, SupervisorVerdict, SupervisorVerdictInput,
+    SupervisorVerdictKind, WorkerCompletionClaim, WorkerCompletionClaimInput, WorldScope,
+    MAX_GOVERNED_COMMANDS, MAX_GOVERNED_COMMAND_ARGS, MAX_GOVERNED_COMMAND_ARG_BYTES,
+    MAX_GOVERNED_EVENTS, MAX_GOVERNED_RECORDS_PER_KIND, MAX_GOVERNED_REFERENCES,
+    MAX_GOVERNED_REFERENCE_BYTES,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::State;
+use crate::loop_contract::{
+    LoopContract, LoopObservation, LoopReport, LoopTermination, LoopTrip, SameErrorObservation,
+};
 use crate::storage::Storage;
 
 const GOVERNED_TASKS_FILE: &str = "GOVERNED_TASKS.json";
@@ -239,6 +249,7 @@ fn stored_registration(
         task: task.task.clone(),
         acceptance_criteria: task.acceptance_criteria.clone(),
         approval_policy: task.approval_policy,
+        world_scope: task.world_scope,
         verification_profile: task.verification_profile,
         role_assignment: task.role_assignment.clone(),
         role_compatibility: task.role_compatibility.clone(),
@@ -313,6 +324,7 @@ impl State {
             task: registration.task,
             acceptance_criteria: registration.acceptance_criteria,
             approval_policy: registration.approval_policy,
+            world_scope: registration.world_scope,
             verification_profile: registration.verification_profile,
             role_assignment: registration.role_assignment,
             role_compatibility: registration.role_compatibility,
@@ -320,6 +332,8 @@ impl State {
             agent_id: registration.agent_id,
             session_id: registration.session_id,
             initial_subject_revision: registration.initial_subject_revision,
+            staged_worktree: None,
+            promotions: Vec::new(),
             execution_state: GovernedExecutionState::Registered,
             review_state: GovernedReviewState::AwaitingClaim,
             claims: Vec::new(),
@@ -432,8 +446,10 @@ impl State {
             next_revision,
             operator_authentication,
         )?;
+        let now = impulse_ops::now_rfc3339();
+        apply_mutation(&mut updated, request.mutation, next_revision, &now)?;
         updated.revision = next_revision;
-        updated.updated_at = impulse_ops::now_rfc3339();
+        updated.updated_at = now;
         if let Some(event) = updated.events.last_mut() {
             event.revision = updated.revision;
         }
@@ -577,6 +593,7 @@ fn validate_task_history(task: &GovernedTaskRun) -> Result<BTreeMap<u64, String>
         ("verification records", task.verifications.len()),
         ("supervisor verdicts", task.supervisor_verdicts.len()),
         ("operator decisions", task.operator_decisions.len()),
+        ("governed promotions", task.promotions.len()),
     ] {
         if len > MAX_GOVERNED_RECORDS_PER_KIND {
             anyhow::bail!("{label} exceeds its limit of {MAX_GOVERNED_RECORDS_PER_KIND}");
@@ -615,6 +632,8 @@ fn validate_task_history(task: &GovernedTaskRun) -> Result<BTreeMap<u64, String>
     let mut verification_index = 0usize;
     let mut supervisor_index = 0usize;
     let mut operator_index = 0usize;
+    let mut promotion_index = 0usize;
+    let mut staged_events = 0usize;
     let mut mutation_fingerprints = BTreeMap::new();
     let mut projection = task.clone();
     projection.revision = 0;
@@ -624,6 +643,8 @@ fn validate_task_history(task: &GovernedTaskRun) -> Result<BTreeMap<u64, String>
     projection.verifications.clear();
     projection.supervisor_verdicts.clear();
     projection.operator_decisions.clear();
+    projection.promotions.clear();
+    projection.staged_worktree = None;
     projection.events.clear();
 
     for (index, event) in task.events.iter().enumerate().skip(1) {
@@ -654,6 +675,62 @@ fn validate_task_history(task: &GovernedTaskRun) -> Result<BTreeMap<u64, String>
             GovernedTaskEventKind::Registered => {
                 anyhow::bail!("registration event may appear only at revision zero")
             }
+            GovernedTaskEventKind::StagedWorktreeMaterialized => {
+                let staged = task.staged_worktree.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("staged worktree event has no corresponding staged record")
+                })?;
+                validate_record_link(
+                    &staged.id,
+                    &staged.actor,
+                    staged.based_on_revision,
+                    &staged.materialized_at,
+                    event,
+                    &mut seen_ids,
+                )?;
+                staged_events += 1;
+                let mutation = GovernedTaskMutation::MaterializeStagedWorktree {
+                    staged: StagedWorktreeInput {
+                        actor: staged.actor.clone(),
+                        root: staged.root.clone(),
+                        initial_subject_revision: staged.initial_subject_revision.clone(),
+                    },
+                };
+                (mutation.clone(), mutation)
+            }
+            GovernedTaskEventKind::StagedWorktreeDiscarded => {
+                if task.staged_worktree.is_none() {
+                    anyhow::bail!("staged worktree discard event has no staged record");
+                }
+                staged_events += 1;
+                let mutation = GovernedTaskMutation::DiscardStagedWorktree {
+                    actor: event.actor.clone(),
+                    reason: event.detail.clone(),
+                };
+                (mutation.clone(), mutation)
+            }
+            GovernedTaskEventKind::PromotionRecorded => {
+                let promotion = task.promotions.get(promotion_index).ok_or_else(|| {
+                    anyhow::anyhow!("promotion event has no corresponding promotion record")
+                })?;
+                validate_record_link(
+                    &promotion.id,
+                    &promotion.actor,
+                    promotion.based_on_revision,
+                    &promotion.recorded_at,
+                    event,
+                    &mut seen_ids,
+                )?;
+                promotion_index += 1;
+                let mutation = GovernedTaskMutation::RecordPromotion {
+                    promotion: GovernedPromotionInput {
+                        actor: promotion.actor.clone(),
+                        accepted_revision: promotion.accepted_revision.clone(),
+                        initial_subject_revision: promotion.initial_subject_revision.clone(),
+                        outcome: promotion.outcome.clone(),
+                    },
+                };
+                (mutation.clone(), mutation)
+            }
             GovernedTaskEventKind::Running => {
                 let mutation = GovernedTaskMutation::MarkRunning {
                     actor: event.actor.clone(),
@@ -674,7 +751,7 @@ fn validate_task_history(task: &GovernedTaskRun) -> Result<BTreeMap<u64, String>
                 };
                 (mutation.clone(), mutation)
             }
-            GovernedTaskEventKind::ClaimSubmitted => {
+            GovernedTaskEventKind::ClaimSubmitted | GovernedTaskEventKind::LoopTripped => {
                 let claim = task.claims.get(claim_index).ok_or_else(|| {
                     anyhow::anyhow!("claim event has no corresponding worker claim")
                 })?;
@@ -883,6 +960,47 @@ fn validate_task_history(task: &GovernedTaskRun) -> Result<BTreeMap<u64, String>
                 event.kind, event.revision
             )
         })?;
+        // Replay uses the event's own recorded timestamp as its clock, so every
+        // clock-derived decision (the ADR-0019 loop contract) and every stored
+        // timestamp reproduce exactly instead of drifting with wall time.
+        apply_mutation(&mut projection, mutation, event.revision, &event.created_at).with_context(
+            || {
+                format!(
+                    "governed task event {:?} at revision {} cannot be replayed",
+                    event.kind, event.revision
+                )
+            },
+        )?;
+        let replayed_kind = projection
+            .events
+            .last()
+            .map(|replayed| replayed.kind)
+            .ok_or_else(|| anyhow::anyhow!("replayed governed task mutation emitted no event"))?;
+        if replayed_kind != event.kind {
+            anyhow::bail!(
+                "governed task event at revision {} replays as {replayed_kind:?}, not {:?}",
+                event.revision,
+                event.kind
+            );
+        }
+        if matches!(
+            event.kind,
+            GovernedTaskEventKind::ClaimSubmitted | GovernedTaskEventKind::LoopTripped
+        ) {
+            let stored = task
+                .claims
+                .get(claim_index.saturating_sub(1))
+                .ok_or_else(|| anyhow::anyhow!("claim event lost its stored claim"))?;
+            let replayed = projection
+                .latest_claim()
+                .ok_or_else(|| anyhow::anyhow!("replayed claim event produced no claim"))?;
+            if replayed.loop_report_digest != stored.loop_report_digest {
+                anyhow::bail!(
+                    "governed task claim at revision {} does not replay to its stored loop report digest",
+                    event.revision
+                );
+            }
+        }
         projection.revision = event.revision;
     }
 
@@ -890,6 +1008,8 @@ fn validate_task_history(task: &GovernedTaskRun) -> Result<BTreeMap<u64, String>
         || verification_index != task.verifications.len()
         || supervisor_index != task.supervisor_verdicts.len()
         || operator_index != task.operator_decisions.len()
+        || promotion_index != task.promotions.len()
+        || (task.staged_worktree.is_some() && staged_events == 0)
     {
         anyhow::bail!("governed task contains records without matching lifecycle events");
     }
@@ -900,7 +1020,48 @@ fn validate_task_history(task: &GovernedTaskRun) -> Result<BTreeMap<u64, String>
             "governed task materialized state does not match its replayed lifecycle history"
         );
     }
+    if !staged_worktrees_match(
+        projection.staged_worktree.as_ref(),
+        task.staged_worktree.as_ref(),
+    ) {
+        anyhow::bail!(
+            "governed task staged worktree does not match its replayed lifecycle history"
+        );
+    }
+    if projection.promotions.len() != task.promotions.len()
+        || projection
+            .promotions
+            .iter()
+            .zip(task.promotions.iter())
+            .any(|(replayed, stored)| {
+                replayed.accepted_revision != stored.accepted_revision
+                    || replayed.initial_subject_revision != stored.initial_subject_revision
+                    || replayed.outcome != stored.outcome
+            })
+    {
+        anyhow::bail!("governed task promotions do not match their replayed lifecycle history");
+    }
     Ok(mutation_fingerprints)
+}
+
+/// Structural comparison that ignores the freshly generated record id but holds
+/// every daemon-observed field, including the timestamp, which replay
+/// reproduces exactly because it replays on the event's own clock.
+fn staged_worktrees_match(
+    replayed: Option<&StagedWorktree>,
+    stored: Option<&StagedWorktree>,
+) -> bool {
+    match (replayed, stored) {
+        (None, None) => true,
+        (Some(replayed), Some(stored)) => {
+            replayed.root == stored.root
+                && replayed.initial_subject_revision == stored.initial_subject_revision
+                && replayed.status == stored.status
+                && replayed.materialized_at == stored.materialized_at
+                && replayed.based_on_revision == stored.based_on_revision
+        }
+        _ => false,
+    }
 }
 
 fn validate_record_link(
@@ -1031,14 +1192,153 @@ fn apply_mutation(
     mutation: GovernedTaskMutation,
     event_revision: u64,
     operator_authentication: OperatorAuthentication,
+    now: &str,
 ) -> Result<()> {
-    let now = impulse_ops::now_rfc3339();
     require_capacity(
         "governed task events",
         task.events.len(),
         MAX_GOVERNED_EVENTS,
     )?;
     match mutation {
+        GovernedTaskMutation::MaterializeStagedWorktree { staged } => {
+            require_actor(&staged.actor, GovernedActorKind::System)?;
+            if task.world_scope != WorldScope::StagedAuthoritative {
+                return invalid_transition(
+                    "only a staged_authoritative world scope materializes a staged worktree",
+                );
+            }
+            if task.staged_worktree.is_some() {
+                return invalid_transition("staged worktree was already materialized");
+            }
+            if task.execution_state != GovernedExecutionState::Registered {
+                return invalid_transition(
+                    "staged worktree must be materialized before the runtime launches",
+                );
+            }
+            let initial = task
+                .initial_subject_revision
+                .as_deref()
+                .ok_or_else(|| {
+                    GovernedTaskStateError::InvalidTransition(
+                        "staged world scope lost its registered initial Git OID".to_string(),
+                    )
+                })?
+                .to_string();
+            if staged.initial_subject_revision != initial {
+                return invalid_transition(
+                    "staged worktree must be materialized at the registered initial Git OID",
+                );
+            }
+            require_expected_staged_root(task, &staged.root)?;
+            let id = new_record_id("staged-worktree");
+            task.staged_worktree = Some(StagedWorktree {
+                id: id.clone(),
+                actor: staged.actor.clone(),
+                root: staged.root,
+                initial_subject_revision: staged.initial_subject_revision,
+                status: StagedWorktreeStatus::Active,
+                materialized_at: now.to_string(),
+                based_on_revision: task.revision,
+            });
+            task.events.push(new_event(
+                event_revision,
+                GovernedTaskEventKind::StagedWorktreeMaterialized,
+                staged.actor,
+                format!("staged worktree {id} materialized"),
+                now,
+            ));
+        }
+        GovernedTaskMutation::DiscardStagedWorktree { actor, reason } => {
+            require_actor(&actor, GovernedActorKind::System)?;
+            require_text("staged worktree discard reason", &reason)?;
+            let discardable = match task.staged_worktree.as_ref() {
+                Some(staged) if staged.status == StagedWorktreeStatus::Active => true,
+                Some(_) => return invalid_transition("staged worktree was already discarded"),
+                None => false,
+            };
+            if !discardable {
+                return invalid_transition("task has no staged worktree to discard");
+            }
+            if !staged_worktree_is_discardable(task) {
+                return invalid_transition(
+                    "a staged worktree is discarded only after rejection or a completed promotion",
+                );
+            }
+            if let Some(staged) = task.staged_worktree.as_mut() {
+                staged.status = StagedWorktreeStatus::Discarded;
+            }
+            task.events.push(new_event(
+                event_revision,
+                GovernedTaskEventKind::StagedWorktreeDiscarded,
+                actor,
+                reason,
+                now,
+            ));
+        }
+        GovernedTaskMutation::RecordPromotion { promotion } => {
+            require_capacity(
+                "governed promotions",
+                task.promotions.len(),
+                MAX_GOVERNED_RECORDS_PER_KIND,
+            )?;
+            require_actor(&promotion.actor, GovernedActorKind::System)?;
+            if task.world_scope != WorldScope::StagedAuthoritative {
+                return invalid_transition(
+                    "only a staged_authoritative world scope promotes an outcome",
+                );
+            }
+            if task.review_state != GovernedReviewState::Accepted {
+                return invalid_transition("promotion requires an accepted governed task");
+            }
+            let staged = task
+                .active_staged_worktree()
+                .ok_or_else(|| {
+                    GovernedTaskStateError::InvalidTransition(
+                        "promotion requires an active staged worktree".to_string(),
+                    )
+                })?
+                .clone();
+            if promotion.initial_subject_revision != staged.initial_subject_revision {
+                return invalid_transition(
+                    "promotion must reference the staged worktree's initial Git OID",
+                );
+            }
+            let claim = task.latest_claim().ok_or_else(|| {
+                GovernedTaskStateError::InvalidTransition(
+                    "promotion requires an accepted worker claim".to_string(),
+                )
+            })?;
+            if promotion.accepted_revision != claim.subject_revision {
+                return invalid_transition(
+                    "promotion must reference the accepted claim's subject revision",
+                );
+            }
+            if task
+                .latest_promotion()
+                .is_some_and(|previous| previous.outcome.is_promoted())
+            {
+                return invalid_transition("this governed outcome was already promoted");
+            }
+            validate_promotion_outcome(&promotion)?;
+            let id = new_record_id("promotion");
+            let summary = promotion_summary(&promotion.outcome);
+            task.promotions.push(GovernedPromotion {
+                id: id.clone(),
+                actor: promotion.actor.clone(),
+                accepted_revision: promotion.accepted_revision,
+                initial_subject_revision: promotion.initial_subject_revision,
+                outcome: promotion.outcome,
+                recorded_at: now.to_string(),
+                based_on_revision: task.revision,
+            });
+            task.events.push(new_event(
+                event_revision,
+                GovernedTaskEventKind::PromotionRecorded,
+                promotion.actor,
+                format!("promotion {id} recorded as {summary}"),
+                now,
+            ));
+        }
         GovernedTaskMutation::MarkRunning { actor } => {
             require_actor(&actor, GovernedActorKind::System)?;
             if task.execution_state != GovernedExecutionState::Registered {
@@ -1050,7 +1350,7 @@ fn apply_mutation(
                 GovernedTaskEventKind::Running,
                 actor,
                 "runtime launch acknowledged".to_string(),
-                &now,
+                now,
             ));
         }
         GovernedTaskMutation::MarkLaunchFailed { actor, reason } => {
@@ -1065,7 +1365,7 @@ fn apply_mutation(
                 GovernedTaskEventKind::LaunchFailed,
                 actor,
                 reason,
-                &now,
+                now,
             ));
         }
         GovernedTaskMutation::MarkRuntimeExited { actor, reason } => {
@@ -1082,7 +1382,7 @@ fn apply_mutation(
                 GovernedTaskEventKind::RuntimeExited,
                 actor,
                 reason.unwrap_or_else(|| "runtime exited".to_string()),
-                &now,
+                now,
             ));
         }
         GovernedTaskMutation::SubmitClaim { claim } => {
@@ -1119,6 +1419,11 @@ fn apply_mutation(
             if let Some(diff_ref) = claim.diff_ref.as_deref() {
                 require_project_relative_ref("claim diff ref", diff_ref)?;
             }
+            // ADR-0019 rule 6: a staged Builder claim is admitted under the
+            // governed loop contract. The verdict is derived only from stored
+            // counts and stored timestamps, so replaying this history produces
+            // the same verdict it produced when the event was first written.
+            let loop_state = governed_builder_loop_state(task, now)?;
             let id = new_record_id("claim");
             task.claims.push(WorkerCompletionClaim {
                 id: id.clone(),
@@ -1127,17 +1432,32 @@ fn apply_mutation(
                 subject_revision: claim.subject_revision,
                 artifact_ids: claim.artifact_ids,
                 diff_ref: claim.diff_ref,
-                submitted_at: now.clone(),
+                loop_report_digest: loop_state.as_ref().map(|state| state.report_digest.clone()),
+                submitted_at: now.to_string(),
                 based_on_revision: task.revision,
             });
-            task.review_state = GovernedReviewState::AwaitingVerification;
-            task.events.push(new_event(
-                event_revision,
-                GovernedTaskEventKind::ClaimSubmitted,
-                claim.actor,
-                format!("worker completion claim {id} submitted"),
-                &now,
-            ));
+            match loop_state.as_ref().and_then(|state| state.trip.as_ref()) {
+                Some(trip) => {
+                    task.review_state = GovernedReviewState::Escalated;
+                    task.events.push(new_event(
+                        event_revision,
+                        GovernedTaskEventKind::LoopTripped,
+                        claim.actor,
+                        format!("worker completion claim {id} tripped the governed Builder loop contract: {trip}"),
+                        now,
+                    ));
+                }
+                None => {
+                    task.review_state = GovernedReviewState::AwaitingVerification;
+                    task.events.push(new_event(
+                        event_revision,
+                        GovernedTaskEventKind::ClaimSubmitted,
+                        claim.actor,
+                        format!("worker completion claim {id} submitted"),
+                        now,
+                    ));
+                }
+            }
         }
         GovernedTaskMutation::RecordVerification { verification } => {
             require_capacity(
@@ -1175,7 +1495,7 @@ fn apply_mutation(
                 commands: verification.commands,
                 artifact_ids: verification.artifact_ids,
                 notes: verification.notes,
-                recorded_at: now.clone(),
+                recorded_at: now.to_string(),
                 based_on_revision: task.revision,
             });
             task.review_state = if outcome == GovernedVerificationOutcome::Passed {
@@ -1188,7 +1508,7 @@ fn apply_mutation(
                 GovernedTaskEventKind::VerificationRecorded,
                 verification.actor,
                 format!("verification {id} recorded as {outcome:?}"),
-                &now,
+                now,
             ));
         }
         GovernedTaskMutation::RecordSupervisorVerdict { verdict } => {
@@ -1226,7 +1546,7 @@ fn apply_mutation(
                 verification_id: verdict.verification_id,
                 verdict: verdict_kind,
                 rationale: verdict.rationale,
-                decided_at: now.clone(),
+                decided_at: now.to_string(),
                 based_on_revision: task.revision,
             });
             task.review_state = match verdict_kind {
@@ -1239,7 +1559,7 @@ fn apply_mutation(
                 GovernedTaskEventKind::SupervisorVerdictRecorded,
                 verdict.actor,
                 format!("supervisor verdict {id} recorded as {verdict_kind:?}"),
-                &now,
+                now,
             ));
         }
         GovernedTaskMutation::RecordOperatorDecision { decision } => {
@@ -1273,7 +1593,7 @@ fn apply_mutation(
                 supervisor_verdict_id: decision.supervisor_verdict_id,
                 decision: decision_kind,
                 rationale: decision.rationale,
-                decided_at: now.clone(),
+                decided_at: now.to_string(),
                 based_on_revision: task.revision,
                 authentication: operator_authentication,
             });
@@ -1286,7 +1606,7 @@ fn apply_mutation(
                 GovernedTaskEventKind::OperatorDecisionRecorded,
                 decision.actor,
                 format!("operator decision {id} recorded as {decision_kind:?}"),
-                &now,
+                now,
             ));
         }
         GovernedTaskMutation::NoteProducerReservationInterrupted { actor, reason } => {
@@ -1304,6 +1624,190 @@ fn apply_mutation(
                 &now,
             ));
         }
+    }
+    Ok(())
+}
+
+/// Deterministic loop verdict plus the digest of the evidence it was derived
+/// from. `None` for any task that is not under the staged Builder scope, which
+/// is what keeps every pre-ADR-0019 ledger replaying byte-for-byte.
+struct GovernedLoopState {
+    trip: Option<LoopTrip>,
+    report_digest: String,
+}
+
+fn governed_builder_loop_state(
+    task: &GovernedTaskRun,
+    now: &str,
+) -> Result<Option<GovernedLoopState>> {
+    if task.world_scope != WorldScope::StagedAuthoritative {
+        return Ok(None);
+    }
+    let contract = LoopContract::governed_builder();
+    contract
+        .validate()
+        .context("governed Builder loop contract is unusable")?;
+    let elapsed = elapsed_between(&task.created_at, now)?;
+    let failure = trailing_verification_failure_streak(task);
+    let observed = LoopObservation {
+        rounds_used: task.claims.len(),
+        elapsed,
+        same_error: failure
+            .as_ref()
+            .map(|(signature, streak)| SameErrorObservation {
+                tool: GOVERNED_VERIFICATION_TOOL,
+                streak: *streak,
+                signature: signature.as_str(),
+            }),
+    };
+    let trip = contract.budget.evaluate_observed(&observed);
+    let report = LoopReport {
+        contract: contract.name.clone(),
+        termination: match trip.clone() {
+            Some(trip) => LoopTermination::Tripped { trip },
+            None => LoopTermination::Completed,
+        },
+        rounds_used: task.claims.len().saturating_add(1),
+        tool_calls: task.verifications.len(),
+        tool_errors: task
+            .verifications
+            .iter()
+            .filter(|verification| verification.outcome != GovernedVerificationOutcome::Passed)
+            .count(),
+        tool_calls_interrupted: 0,
+        elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+    };
+    let payload = serde_json::to_vec(&report)
+        .context("Failed to serialize the governed Builder loop report")?;
+    Ok(Some(GovernedLoopState {
+        trip,
+        report_digest: format!("sha256:{:x}", Sha256::digest(payload)),
+    }))
+}
+
+/// Loop "tool" identity for governed Builder failures. The daemon never sees
+/// the Builder's own tool calls; the repeated failure it can observe is a
+/// verification that keeps failing the same way.
+const GOVERNED_VERIFICATION_TOOL: &str = "governed_verification";
+
+fn verification_failure_signature(verification: &GovernedVerification) -> Option<String> {
+    if verification.outcome != GovernedVerificationOutcome::Failed {
+        return None;
+    }
+    verification
+        .commands
+        .iter()
+        .find(|command| !command.success)
+        .map(|command| command.name.clone())
+        .or_else(|| verification.notes.clone())
+        .or_else(|| Some(verification.policy.clone()))
+}
+
+/// Length of the trailing run of verifications that failed the same way. A
+/// passing or inconclusive verification, or a different failure, resets it.
+fn trailing_verification_failure_streak(task: &GovernedTaskRun) -> Option<(String, usize)> {
+    let mut signature: Option<String> = None;
+    let mut streak = 0usize;
+    for verification in task.verifications.iter().rev() {
+        let Some(current) = verification_failure_signature(verification) else {
+            break;
+        };
+        match signature.as_deref() {
+            None => {
+                signature = Some(current);
+                streak = 1;
+            }
+            Some(previous) if previous == current => streak += 1,
+            Some(_) => break,
+        }
+    }
+    signature.map(|signature| (signature, streak))
+}
+
+fn elapsed_between(start: &str, end: &str) -> Result<std::time::Duration> {
+    let start = chrono::DateTime::parse_from_rfc3339(start)
+        .context("governed task creation timestamp must be a valid RFC 3339 timestamp")?;
+    let end = chrono::DateTime::parse_from_rfc3339(end)
+        .context("governed task event timestamp must be a valid RFC 3339 timestamp")?;
+    let millis = end
+        .signed_duration_since(start)
+        .num_milliseconds()
+        .max(0)
+        .unsigned_abs();
+    Ok(std::time::Duration::from_millis(millis))
+}
+
+fn require_expected_staged_root(task: &GovernedTaskRun, root: &str) -> Result<()> {
+    let expected = task
+        .expected_staged_worktree_root()
+        .map_err(GovernedTaskStateError::Contract)?;
+    let received = Path::new(root);
+    if !received.is_absolute() || received != expected {
+        return invalid_transition(&format!(
+            "staged worktree root must be the daemon-derived path {}",
+            expected.display()
+        ));
+    }
+    Ok(())
+}
+
+fn staged_worktree_is_discardable(task: &GovernedTaskRun) -> bool {
+    match task.review_state {
+        GovernedReviewState::Rejected => true,
+        GovernedReviewState::Accepted => task
+            .latest_promotion()
+            .is_some_and(|promotion| promotion.outcome.is_promoted()),
+        _ => false,
+    }
+}
+
+fn promotion_summary(outcome: &GovernedPromotionOutcome) -> String {
+    match outcome {
+        GovernedPromotionOutcome::Promoted { promoted_revision } => {
+            format!("promoted to {promoted_revision}")
+        }
+        GovernedPromotionOutcome::PromotionBlocked { canonical_head } => {
+            format!("blocked; canonical head is {canonical_head}")
+        }
+    }
+}
+
+fn validate_promotion_outcome(promotion: &GovernedPromotionInput) -> Result<()> {
+    require_commit_oid("promotion accepted revision", &promotion.accepted_revision)?;
+    require_commit_oid(
+        "promotion initial subject revision",
+        &promotion.initial_subject_revision,
+    )?;
+    match &promotion.outcome {
+        GovernedPromotionOutcome::Promoted { promoted_revision } => {
+            require_commit_oid("promoted revision", promoted_revision)?;
+            if promoted_revision != &promotion.accepted_revision {
+                return invalid_transition(
+                    "a promoted outcome must land exactly the accepted subject revision",
+                );
+            }
+        }
+        GovernedPromotionOutcome::PromotionBlocked { canonical_head } => {
+            require_commit_oid("blocked canonical head", canonical_head)?;
+            if canonical_head == &promotion.initial_subject_revision {
+                return invalid_transition(
+                    "a promotion is blocked only when the canonical head has moved off the initial OID",
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn require_commit_oid(label: &str, value: &str) -> Result<()> {
+    if !matches!(value.len(), 40 | 64)
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return invalid_transition(&format!(
+            "{label} must be a 40- or 64-character lowercase hexadecimal Git commit OID"
+        ));
     }
     Ok(())
 }
@@ -2997,5 +3501,799 @@ mod tests {
             accepted,
             "governed-task truth is untouched by the projection repair"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // ADR-0019: staged Builder world scope
+    // ---------------------------------------------------------------------
+
+    fn staged_oid(character: char) -> String {
+        character.to_string().repeat(40)
+    }
+
+    fn staged_registration(state: &State, request_id: &str) -> GovernedTaskRegistration {
+        let root = state.storage().base_path().parent().unwrap();
+        let assignment = impulse_ops::role_assignment::canonical_governed_builder_assignment();
+        let compatibility = impulse_ops::agent_registry::AgentRegistry::builtin()
+            .evaluate_role_compatibility(
+                &impulse_ops::agent_registry::AgentPlatformId::try_new("ion").unwrap(),
+                &assignment,
+            )
+            .unwrap();
+        GovernedTaskRegistration::builder(
+            request_id,
+            format!("task-{request_id}"),
+            "impulse-test",
+            root.display().to_string(),
+            "Ship the staged scope",
+            "worker-1",
+            "ion",
+        )
+        .world_scope(WorldScope::StagedAuthoritative)
+        .verification_profile(
+            impulse_ops::governed_task::GovernedVerificationProfile::RustWorkspaceV1,
+        )
+        .acceptance_criteria(vec!["the gate is green".to_string()])
+        .initial_subject_revision(staged_oid('a'))
+        .role_assignment(assignment)
+        .role_compatibility(compatibility)
+        .build()
+        .unwrap()
+    }
+
+    fn staged_root_for(task: &GovernedTaskRun) -> String {
+        task.expected_staged_worktree_root()
+            .unwrap()
+            .display()
+            .to_string()
+    }
+
+    fn materialize(state: &State, task: &GovernedTaskRun, request_id: &str) -> GovernedTaskRun {
+        state
+            .mutate_governed_task(mutation(
+                task,
+                request_id,
+                GovernedTaskMutation::MaterializeStagedWorktree {
+                    staged: StagedWorktreeInput {
+                        actor: actor(GovernedActorKind::System, "impulse-daemon"),
+                        root: staged_root_for(task),
+                        initial_subject_revision: staged_oid('a'),
+                    },
+                },
+            ))
+            .unwrap()
+    }
+
+    fn staged_claim(
+        state: &State,
+        task: &GovernedTaskRun,
+        request_id: &str,
+        subject: &str,
+    ) -> GovernedTaskRun {
+        state
+            .mutate_governed_task(mutation(
+                task,
+                request_id,
+                GovernedTaskMutation::SubmitClaim {
+                    claim: WorkerCompletionClaimInput {
+                        actor: actor(GovernedActorKind::Worker, "worker-1"),
+                        summary: "implementation complete".into(),
+                        subject_revision: subject.to_string(),
+                        artifact_ids: vec![],
+                        diff_ref: None,
+                    },
+                },
+            ))
+            .unwrap()
+    }
+
+    fn launch(state: &State, task: &GovernedTaskRun, request_id: &str) -> GovernedTaskRun {
+        state
+            .mutate_governed_task(mutation(
+                task,
+                request_id,
+                GovernedTaskMutation::MarkRunning {
+                    actor: actor(GovernedActorKind::System, "impulse-daemon"),
+                },
+            ))
+            .unwrap()
+    }
+
+    /// Drive one staged task all the way to `accepted` on the given subject OID.
+    fn staged_accepted(state: &State, request_id: &str, subject: &str) -> GovernedTaskRun {
+        let task = state
+            .register_governed_task(staged_registration(state, request_id))
+            .unwrap();
+        let task = materialize(state, &task, &format!("{request_id}-staged"));
+        let task = launch(state, &task, &format!("{request_id}-run"));
+        let task = staged_claim(state, &task, &format!("{request_id}-claim"), subject);
+        let task = verify(
+            state,
+            &task,
+            &format!("{request_id}-verify"),
+            GovernedVerificationOutcome::Passed,
+        );
+        let task = recommend_accept(state, &task, &format!("{request_id}-supervisor"));
+        operator_decide(
+            state,
+            &task,
+            &format!("{request_id}-operator"),
+            OperatorDecisionKind::Approve,
+        )
+    }
+
+    fn promotion_request(
+        task: &GovernedTaskRun,
+        request_id: &str,
+        outcome: GovernedPromotionOutcome,
+    ) -> GovernedTaskMutationRequest {
+        mutation(
+            task,
+            request_id,
+            GovernedTaskMutation::RecordPromotion {
+                promotion: GovernedPromotionInput {
+                    actor: actor(GovernedActorKind::System, "impulse-daemon"),
+                    accepted_revision: task.latest_claim().unwrap().subject_revision.clone(),
+                    initial_subject_revision: staged_oid('a'),
+                    outcome,
+                },
+            },
+        )
+    }
+
+    #[test]
+    fn test_materialize_staged_worktree_records_the_derived_root_and_event() {
+        let (_root, state) = state();
+        let task = state
+            .register_governed_task(staged_registration(&state, "staged-1"))
+            .unwrap();
+        assert_eq!(task.world_scope, WorldScope::StagedAuthoritative);
+        assert!(task.staged_worktree.is_none());
+        assert_eq!(task.launch_working_directory(), task.workspace_root);
+
+        let task = materialize(&state, &task, "staged-1-worktree");
+
+        let staged = task.staged_worktree.as_ref().expect("staged worktree");
+        assert_eq!(staged.status, StagedWorktreeStatus::Active);
+        assert_eq!(staged.root, staged_root_for(&task));
+        assert_eq!(staged.initial_subject_revision, staged_oid('a'));
+        assert_eq!(task.launch_working_directory(), staged.root);
+        assert_eq!(
+            task.events.last().unwrap().kind,
+            GovernedTaskEventKind::StagedWorktreeMaterialized
+        );
+    }
+
+    #[test]
+    fn test_materialize_rejects_an_authoritative_task() {
+        let (_root, state) = state();
+        let task = state
+            .register_governed_task(registration(&state, "plain-1"))
+            .unwrap();
+        let error = state
+            .mutate_governed_task(mutation(
+                &task,
+                "plain-1-worktree",
+                GovernedTaskMutation::MaterializeStagedWorktree {
+                    staged: StagedWorktreeInput {
+                        actor: actor(GovernedActorKind::System, "impulse-daemon"),
+                        root: staged_root_for(&task),
+                        initial_subject_revision: staged_oid('a'),
+                    },
+                },
+            ))
+            .expect_err("only a staged scope materializes a worktree");
+        assert!(error.to_string().contains("staged_authoritative"));
+    }
+
+    #[test]
+    fn test_materialize_rejects_a_root_outside_the_derived_path() {
+        let (_root, state) = state();
+        let task = state
+            .register_governed_task(staged_registration(&state, "staged-2"))
+            .unwrap();
+        let error = state
+            .mutate_governed_task(mutation(
+                &task,
+                "staged-2-worktree",
+                GovernedTaskMutation::MaterializeStagedWorktree {
+                    staged: StagedWorktreeInput {
+                        actor: actor(GovernedActorKind::System, "impulse-daemon"),
+                        root: "/tmp/somewhere-else".to_string(),
+                        initial_subject_revision: staged_oid('a'),
+                    },
+                },
+            ))
+            .expect_err("a staged worktree root is daemon-derived, never caller-chosen");
+        assert!(error.to_string().contains("daemon-derived path"));
+    }
+
+    #[test]
+    fn test_materialize_rejects_a_revision_other_than_the_registered_initial_oid() {
+        let (_root, state) = state();
+        let task = state
+            .register_governed_task(staged_registration(&state, "staged-3"))
+            .unwrap();
+        let error = state
+            .mutate_governed_task(mutation(
+                &task,
+                "staged-3-worktree",
+                GovernedTaskMutation::MaterializeStagedWorktree {
+                    staged: StagedWorktreeInput {
+                        actor: actor(GovernedActorKind::System, "impulse-daemon"),
+                        root: staged_root_for(&task),
+                        initial_subject_revision: staged_oid('b'),
+                    },
+                },
+            ))
+            .expect_err("a staged worktree must start at the attested OID");
+        assert!(error.to_string().contains("registered initial Git OID"));
+    }
+
+    #[test]
+    fn test_materialize_rejects_a_second_worktree() {
+        let (_root, state) = state();
+        let task = state
+            .register_governed_task(staged_registration(&state, "staged-4"))
+            .unwrap();
+        let task = materialize(&state, &task, "staged-4-worktree");
+        let error = state
+            .mutate_governed_task(mutation(
+                &task,
+                "staged-4-again",
+                GovernedTaskMutation::MaterializeStagedWorktree {
+                    staged: StagedWorktreeInput {
+                        actor: actor(GovernedActorKind::System, "impulse-daemon"),
+                        root: staged_root_for(&task),
+                        initial_subject_revision: staged_oid('a'),
+                    },
+                },
+            ))
+            .expect_err("a staged worktree is materialized exactly once");
+        assert!(error.to_string().contains("already materialized"));
+    }
+
+    #[test]
+    fn test_materialize_rejects_a_launched_runtime() {
+        let (_root, state) = state();
+        let launched = state
+            .register_governed_task(staged_registration(&state, "staged-5"))
+            .unwrap();
+        let launched = launch(&state, &launched, "staged-5-run");
+        let error = state
+            .mutate_governed_task(mutation(
+                &launched,
+                "staged-5-worktree",
+                GovernedTaskMutation::MaterializeStagedWorktree {
+                    staged: StagedWorktreeInput {
+                        actor: actor(GovernedActorKind::System, "impulse-daemon"),
+                        root: staged_root_for(&launched),
+                        initial_subject_revision: staged_oid('a'),
+                    },
+                },
+            ))
+            .expect_err("a staged worktree exists before the runtime launches");
+        assert!(error.to_string().contains("before the runtime launches"));
+    }
+
+    #[test]
+    fn test_discard_requires_rejection_or_a_completed_promotion() {
+        let (_root, state) = state();
+        let task = state
+            .register_governed_task(staged_registration(&state, "staged-6"))
+            .unwrap();
+        let task = materialize(&state, &task, "staged-6-worktree");
+        let error = state
+            .mutate_governed_task(mutation(
+                &task,
+                "staged-6-discard",
+                GovernedTaskMutation::DiscardStagedWorktree {
+                    actor: actor(GovernedActorKind::System, "impulse-daemon"),
+                    reason: "cleaning up early".into(),
+                },
+            ))
+            .expect_err("a live staged worktree is not discardable");
+        assert!(error
+            .to_string()
+            .contains("after rejection or a completed promotion"));
+    }
+
+    #[test]
+    fn test_rejection_discards_the_staged_worktree() {
+        let (_root, state) = state();
+        let task = state
+            .register_governed_task(staged_registration(&state, "staged-7"))
+            .unwrap();
+        let task = materialize(&state, &task, "staged-7-worktree");
+        let task = launch(&state, &task, "staged-7-run");
+        let task = staged_claim(&state, &task, "staged-7-claim", &staged_oid('b'));
+        let task = verify(
+            &state,
+            &task,
+            "staged-7-verify",
+            GovernedVerificationOutcome::Passed,
+        );
+        let task = recommend_accept(&state, &task, "staged-7-supervisor");
+        let task = operator_decide(
+            &state,
+            &task,
+            "staged-7-operator",
+            OperatorDecisionKind::Reject,
+        );
+        assert_eq!(task.review_state, GovernedReviewState::Rejected);
+
+        let task = state
+            .mutate_governed_task(mutation(
+                &task,
+                "staged-7-discard",
+                GovernedTaskMutation::DiscardStagedWorktree {
+                    actor: actor(GovernedActorKind::System, "impulse-daemon"),
+                    reason: "rejected outcome".into(),
+                },
+            ))
+            .unwrap();
+        assert_eq!(
+            task.staged_worktree.as_ref().unwrap().status,
+            StagedWorktreeStatus::Discarded
+        );
+        assert!(task.active_staged_worktree().is_none());
+        assert_eq!(task.launch_working_directory(), task.workspace_root);
+        assert_eq!(
+            task.events.last().unwrap().kind,
+            GovernedTaskEventKind::StagedWorktreeDiscarded
+        );
+
+        let error = state
+            .mutate_governed_task(mutation(
+                &task,
+                "staged-7-discard-again",
+                GovernedTaskMutation::DiscardStagedWorktree {
+                    actor: actor(GovernedActorKind::System, "impulse-daemon"),
+                    reason: "again".into(),
+                },
+            ))
+            .expect_err("a discarded worktree cannot be discarded twice");
+        assert!(error.to_string().contains("already discarded"));
+    }
+
+    #[test]
+    fn test_promotion_requires_an_accepted_task() {
+        let (_root, state) = state();
+        let task = state
+            .register_governed_task(staged_registration(&state, "staged-8"))
+            .unwrap();
+        let task = materialize(&state, &task, "staged-8-worktree");
+        let task = launch(&state, &task, "staged-8-run");
+        let task = staged_claim(&state, &task, "staged-8-claim", &staged_oid('b'));
+        let error = state
+            .mutate_governed_task(promotion_request(
+                &task,
+                "staged-8-promote",
+                GovernedPromotionOutcome::Promoted {
+                    promoted_revision: staged_oid('b'),
+                },
+            ))
+            .expect_err("promotion requires operator acceptance");
+        assert!(error.to_string().contains("accepted governed task"));
+    }
+
+    #[test]
+    fn test_promotion_records_a_promoted_outcome_and_leaves_review_state_accepted() {
+        let (_root, state) = state();
+        let task = staged_accepted(&state, "staged-9", &staged_oid('b'));
+        let task = state
+            .mutate_governed_task(promotion_request(
+                &task,
+                "staged-9-promote",
+                GovernedPromotionOutcome::Promoted {
+                    promoted_revision: staged_oid('b'),
+                },
+            ))
+            .unwrap();
+
+        assert_eq!(task.review_state, GovernedReviewState::Accepted);
+        assert_eq!(task.promotions.len(), 1);
+        assert!(task.latest_promotion().unwrap().outcome.is_promoted());
+        assert_eq!(
+            task.events.last().unwrap().kind,
+            GovernedTaskEventKind::PromotionRecorded
+        );
+
+        let error = state
+            .mutate_governed_task(promotion_request(
+                &task,
+                "staged-9-promote-again",
+                GovernedPromotionOutcome::Promoted {
+                    promoted_revision: staged_oid('b'),
+                },
+            ))
+            .expect_err("an outcome is promoted exactly once");
+        assert!(error.to_string().contains("already promoted"));
+    }
+
+    #[test]
+    fn test_blocked_promotion_is_an_execution_fact_that_allows_a_retry() {
+        let (_root, state) = state();
+        let task = staged_accepted(&state, "staged-10", &staged_oid('b'));
+        let task = state
+            .mutate_governed_task(promotion_request(
+                &task,
+                "staged-10-blocked",
+                GovernedPromotionOutcome::PromotionBlocked {
+                    canonical_head: staged_oid('c'),
+                },
+            ))
+            .unwrap();
+        assert_eq!(task.review_state, GovernedReviewState::Accepted);
+        assert!(!task.latest_promotion().unwrap().outcome.is_promoted());
+        assert!(task.active_staged_worktree().is_some());
+
+        let task = state
+            .mutate_governed_task(promotion_request(
+                &task,
+                "staged-10-retry",
+                GovernedPromotionOutcome::Promoted {
+                    promoted_revision: staged_oid('b'),
+                },
+            ))
+            .unwrap();
+        assert_eq!(task.promotions.len(), 2);
+        assert!(task.latest_promotion().unwrap().outcome.is_promoted());
+    }
+
+    #[test]
+    fn test_promotion_rejects_incoherent_outcomes() {
+        let (_root, state) = state();
+        let task = staged_accepted(&state, "staged-11", &staged_oid('b'));
+
+        let error = state
+            .mutate_governed_task(promotion_request(
+                &task,
+                "staged-11-wrong-commit",
+                GovernedPromotionOutcome::Promoted {
+                    promoted_revision: staged_oid('d'),
+                },
+            ))
+            .expect_err("a promotion must land exactly the accepted revision");
+        assert!(error.to_string().contains("exactly the accepted"));
+
+        let error = state
+            .mutate_governed_task(promotion_request(
+                &task,
+                "staged-11-unmoved-head",
+                GovernedPromotionOutcome::PromotionBlocked {
+                    canonical_head: staged_oid('a'),
+                },
+            ))
+            .expect_err("an unmoved canonical head cannot block a promotion");
+        assert!(error.to_string().contains("moved off the initial OID"));
+
+        let error = state
+            .mutate_governed_task(mutation(
+                &task,
+                "staged-11-wrong-claim",
+                GovernedTaskMutation::RecordPromotion {
+                    promotion: GovernedPromotionInput {
+                        actor: actor(GovernedActorKind::System, "impulse-daemon"),
+                        accepted_revision: staged_oid('e'),
+                        initial_subject_revision: staged_oid('a'),
+                        outcome: GovernedPromotionOutcome::Promoted {
+                            promoted_revision: staged_oid('e'),
+                        },
+                    },
+                },
+            ))
+            .expect_err("a promotion must reference the accepted claim");
+        assert!(error.to_string().contains("accepted claim's subject"));
+    }
+
+    #[test]
+    fn test_promotion_then_discard_completes_the_staged_lifecycle_and_reloads() {
+        let (root, state) = state();
+        let task = staged_accepted(&state, "staged-12", &staged_oid('b'));
+        let task = state
+            .mutate_governed_task(promotion_request(
+                &task,
+                "staged-12-promote",
+                GovernedPromotionOutcome::Promoted {
+                    promoted_revision: staged_oid('b'),
+                },
+            ))
+            .unwrap();
+        let task = state
+            .mutate_governed_task(mutation(
+                &task,
+                "staged-12-discard",
+                GovernedTaskMutation::DiscardStagedWorktree {
+                    actor: actor(GovernedActorKind::System, "impulse-daemon"),
+                    reason: "promoted outcome".into(),
+                },
+            ))
+            .unwrap();
+
+        let base = root.path().join("impulse-test").join(".impulse");
+        let reloaded = State::new(base).unwrap();
+        let stored = reloaded
+            .get_governed_task("impulse-test", &task.id)
+            .unwrap()
+            .expect("staged task survives reload");
+        assert_eq!(stored, task);
+    }
+
+    #[test]
+    fn test_staged_claims_carry_a_deterministic_loop_report_digest() {
+        let (_root, state) = state();
+        let task = state
+            .register_governed_task(staged_registration(&state, "staged-13"))
+            .unwrap();
+        let task = materialize(&state, &task, "staged-13-worktree");
+        let task = launch(&state, &task, "staged-13-run");
+        let task = staged_claim(&state, &task, "staged-13-claim", &staged_oid('b'));
+
+        let digest = task
+            .latest_claim()
+            .unwrap()
+            .loop_report_digest
+            .as_deref()
+            .expect("a staged claim carries loop evidence");
+        assert!(digest.starts_with("sha256:"));
+        assert_eq!(digest.len(), "sha256:".len() + 64);
+        assert_eq!(task.review_state, GovernedReviewState::AwaitingVerification);
+        assert_eq!(
+            task.events.last().unwrap().kind,
+            GovernedTaskEventKind::ClaimSubmitted
+        );
+    }
+
+    #[test]
+    fn test_authoritative_claims_carry_no_loop_evidence() {
+        let (_root, state) = state();
+        let task = state
+            .register_governed_task(registration(&state, "plain-2"))
+            .unwrap();
+        let task = launch(&state, &task, "plain-2-run");
+        let task = claim(&state, &task, "plain-2-claim");
+        assert!(task.latest_claim().unwrap().loop_report_digest.is_none());
+    }
+
+    /// Drive the staged task to the claim-cycle cap and prove the next claim
+    /// trips the contract instead of advancing review.
+    #[test]
+    fn test_governed_builder_loop_trips_at_the_claim_cycle_cap() {
+        let (root, state) = state();
+        let mut task = state
+            .register_governed_task(staged_registration(&state, "staged-14"))
+            .unwrap();
+        task = materialize(&state, &task, "staged-14-worktree");
+        task = launch(&state, &task, "staged-14-run");
+
+        for cycle in 0..crate::loop_contract::GOVERNED_BUILDER_MAX_CLAIM_CYCLES {
+            task = staged_claim(
+                &state,
+                &task,
+                &format!("staged-14-claim-{cycle}"),
+                &staged_oid('b'),
+            );
+            assert_eq!(task.review_state, GovernedReviewState::AwaitingVerification);
+            // A distinct failing command each cycle keeps the same-failure
+            // detector from firing before the cycle cap does.
+            task = state
+                .mutate_governed_task(mutation(
+                    &task,
+                    &format!("staged-14-verify-{cycle}"),
+                    GovernedTaskMutation::RecordVerification {
+                        verification: GovernedVerificationInput {
+                            actor: actor(GovernedActorKind::Verifier, "cargo-gate"),
+                            claim_id: task.latest_claim().unwrap().id.clone(),
+                            subject_revision: task.latest_claim().unwrap().subject_revision.clone(),
+                            policy: "rust_workspace_v1".into(),
+                            outcome: GovernedVerificationOutcome::Failed,
+                            commands: vec![GovernedCommandEvidence {
+                                name: format!("cargo step {cycle}"),
+                                executable: "cargo".into(),
+                                redacted_args: vec!["test".into()],
+                                command_digest: digest('a'),
+                                exit_code: Some(1),
+                                success: false,
+                                output_digest: digest('b'),
+                                output_ref: None,
+                                output_bytes: 4,
+                                output_truncated: false,
+                            }],
+                            artifact_ids: vec![],
+                            notes: None,
+                        },
+                    },
+                ))
+                .unwrap();
+            assert_eq!(task.review_state, GovernedReviewState::VerificationFailed);
+        }
+
+        let tripped = staged_claim(&state, &task, "staged-14-claim-final", &staged_oid('b'));
+        assert_eq!(tripped.review_state, GovernedReviewState::Escalated);
+        assert_eq!(
+            tripped.events.last().unwrap().kind,
+            GovernedTaskEventKind::LoopTripped
+        );
+        assert!(tripped.events.last().unwrap().detail.contains("round cap"));
+        assert!(tripped.latest_claim().unwrap().loop_report_digest.is_some());
+
+        // Escalated is terminal for claims: the Builder cannot spend another cycle.
+        let error = state
+            .mutate_governed_task(mutation(
+                &tripped,
+                "staged-14-claim-after-trip",
+                GovernedTaskMutation::SubmitClaim {
+                    claim: WorkerCompletionClaimInput {
+                        actor: actor(GovernedActorKind::Worker, "worker-1"),
+                        summary: "one more".into(),
+                        subject_revision: staged_oid('b'),
+                        artifact_ids: vec![],
+                        diff_ref: None,
+                    },
+                },
+            ))
+            .expect_err("an escalated task accepts no further claims");
+        assert!(error.to_string().contains("does not accept a worker claim"));
+
+        // The whole tripped history replays byte-for-byte on reload.
+        let base = root.path().join("impulse-test").join(".impulse");
+        let reloaded = State::new(base).unwrap();
+        assert_eq!(
+            reloaded
+                .get_governed_task("impulse-test", &tripped.id)
+                .unwrap()
+                .expect("tripped task survives reload"),
+            tripped
+        );
+    }
+
+    #[test]
+    fn test_governed_builder_loop_trips_on_a_repeated_verification_failure() {
+        let (_root, state) = state();
+        let mut task = state
+            .register_governed_task(staged_registration(&state, "staged-15"))
+            .unwrap();
+        task = materialize(&state, &task, "staged-15-worktree");
+        task = launch(&state, &task, "staged-15-run");
+
+        for cycle in 0..crate::loop_contract::GOVERNED_BUILDER_SAME_FAILURE_STREAK {
+            task = staged_claim(
+                &state,
+                &task,
+                &format!("staged-15-claim-{cycle}"),
+                &staged_oid('b'),
+            );
+            assert_eq!(task.review_state, GovernedReviewState::AwaitingVerification);
+            task = verify(
+                &state,
+                &task,
+                &format!("staged-15-verify-{cycle}"),
+                GovernedVerificationOutcome::Failed,
+            );
+        }
+
+        let tripped = staged_claim(&state, &task, "staged-15-claim-final", &staged_oid('b'));
+        assert_eq!(tripped.review_state, GovernedReviewState::Escalated);
+        assert!(tripped
+            .events
+            .last()
+            .unwrap()
+            .detail
+            .contains("failed 3 times in a row"));
+    }
+
+    #[test]
+    fn test_reloading_a_ledger_written_before_adr_0019_still_validates() {
+        let (root, state) = state();
+        let task = state
+            .register_governed_task(registration(&state, "legacy-1"))
+            .unwrap();
+        let task = launch(&state, &task, "legacy-1-run");
+        let task = claim(&state, &task, "legacy-1-claim");
+
+        // Strip every field ADR-0019 introduced, exactly as a ledger written by
+        // an older build would have persisted it.
+        rewrite_persisted_ledger(&state, |ledger| {
+            let tasks = ledger
+                .get_mut("tasks")
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("tasks object");
+            for stored in tasks.values_mut() {
+                let stored = stored.as_object_mut().expect("task object");
+                stored.remove("world_scope");
+                stored.remove("staged_worktree");
+                stored.remove("promotions");
+                for claim in stored
+                    .get_mut("claims")
+                    .and_then(serde_json::Value::as_array_mut)
+                    .expect("claims array")
+                {
+                    claim
+                        .as_object_mut()
+                        .expect("claim object")
+                        .remove("loop_report_digest");
+                }
+            }
+        });
+
+        let base = root.path().join("impulse-test").join(".impulse");
+        let reloaded = State::new(base).unwrap();
+        let stored = reloaded
+            .get_governed_task("impulse-test", &task.id)
+            .unwrap()
+            .expect("a pre-ADR-0019 ledger still loads");
+        assert_eq!(stored.world_scope, WorldScope::Authoritative);
+        assert!(stored.staged_worktree.is_none());
+        assert!(stored.promotions.is_empty());
+        assert!(stored.latest_claim().unwrap().loop_report_digest.is_none());
+    }
+
+    #[test]
+    fn test_a_tampered_loop_report_digest_fails_the_ledger_closed() {
+        let (root, state) = state();
+        let task = state
+            .register_governed_task(staged_registration(&state, "staged-16"))
+            .unwrap();
+        let task = materialize(&state, &task, "staged-16-worktree");
+        let task = launch(&state, &task, "staged-16-run");
+        let _ = staged_claim(&state, &task, "staged-16-claim", &staged_oid('b'));
+
+        rewrite_persisted_ledger(&state, |ledger| {
+            let tasks = ledger
+                .get_mut("tasks")
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("tasks object");
+            for stored in tasks.values_mut() {
+                for claim in stored
+                    .get_mut("claims")
+                    .and_then(serde_json::Value::as_array_mut)
+                    .expect("claims array")
+                {
+                    claim.as_object_mut().expect("claim object").insert(
+                        "loop_report_digest".to_string(),
+                        serde_json::Value::String(format!("sha256:{}", "0".repeat(64))),
+                    );
+                }
+            }
+        });
+
+        let error = reload_error(
+            root.path().join("impulse-test").join(".impulse"),
+            "a rewritten loop report digest must fail the ledger closed",
+        );
+        assert!(format!("{error:#}").contains("stored loop report digest"));
+    }
+
+    #[test]
+    fn test_a_tampered_staged_worktree_root_fails_the_ledger_closed() {
+        let (root, state) = state();
+        let task = state
+            .register_governed_task(staged_registration(&state, "staged-17"))
+            .unwrap();
+        let _ = materialize(&state, &task, "staged-17-worktree");
+
+        rewrite_persisted_ledger(&state, |ledger| {
+            let tasks = ledger
+                .get_mut("tasks")
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("tasks object");
+            for stored in tasks.values_mut() {
+                stored
+                    .get_mut("staged_worktree")
+                    .and_then(serde_json::Value::as_object_mut)
+                    .expect("staged worktree object")
+                    .insert(
+                        "root".to_string(),
+                        serde_json::Value::String("/tmp/attacker".to_string()),
+                    );
+            }
+        });
+
+        let error = reload_error(
+            root.path().join("impulse-test").join(".impulse"),
+            "a rewritten staged worktree root must fail the ledger closed",
+        );
+        assert!(format!("{error:#}").contains("daemon-derived path"));
     }
 }
