@@ -1,49 +1,66 @@
 # IMPULSE — Feed the impulse to build.
 
-**One governed cockpit for many coding agents.**
+**Local control plane for terminal-native coding agents.**
 
-Impulse names both the creative urge to make something and the force that sets work in motion. The product exists to protect that first spark, then help it compound across agents, tools, projects, and sessions instead of dissolving into terminal sprawl and repeated context setup.
+Impulse names both the creative urge to make something and the force that sets work in motion.
+The product protects that urge from dissolving into terminal sprawl, repeated context setup,
+silent conflicts, and unverified "done" — while keeping you in command of launches, policy, and
+acceptance.
 
-Everyone has felt it: the itch to open Claude Code or Codex and disappear into a build. Impulse is built for that moment.
+Impulse is a Rust-first **local control plane and harness manager** for AI software-engineering
+agents. It places Claude Code, Codex, Ion, and other runtimes in explicit workspaces, supervises
+their processes, and surrounds them with shared tools, telemetry, artifacts, policy, and
+verification. External CLIs keep their internal coding loops; Ion is the Impulse-native runtime.
+Impulse governs the operating conditions around those loops; it does not replace or fully control
+proprietary runtime internals. Memory is a governed platform service, not the whole product.
 
-Impulse is a terminal-native **local control plane and harness manager** for AI software-engineering agents. It launches and manages heterogeneous coding runtimes, places them in explicit workspaces, supervises their processes, and augments them with shared memory, tools, telemetry, artifacts, policy, and verification.
-
-Claude Code, Codex, and similar CLIs keep their own internal coding loops. Ion is the Impulse-native coding runtime. Impulse governs the operating conditions around those loops; it does not claim to replace or fully control proprietary runtime internals.
-
-> **Live foundation:** the Rust workspace provides PTY lifecycle, daemon workbench contracts and
-> telemetry, registry-backed desktop platform identity, supervisor-specific permissions,
-> explicit product-role/task launch preflight, capability-checked tools, memory/retrieval,
-> artifacts, credentials, verification, Ion's native REPL/tool loop, and daemon-owned governed
-> runtime producers. The profiled path keeps runtime exit, worker claim, verifier evidence,
-> Supervisor judgment, and operator approval separate while deriving producer provenance inside
-> the daemon. Accepted runs now stage deterministic, read-only memory candidates with source
-> assurance and evidence references; they do not write curated project memory.
+> **North star:** [`VISION.md`](VISION.md) · **Live contract:**
+> [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
 >
-> **Target:** runtime-independent role contracts, adapter capability negotiation, typed agent
-> messaging, and stronger structural enforcement across supported runtimes. See
-> [`VISION.md`](VISION.md) for the north star and explicit live-versus-target boundary.
+> **Live today:** PTY lifecycle, daemon workbench truth, registry-backed platform identity,
+> capability-checked tools, governed-task producers (`rust_workspace_v1`), accepted-run memory
+> candidates (review queue — not auto-written to `GENOME.md`), Ion's native REPL/tool loop under
+> the ADR-0017 loop contract, and Ion's read-only `document_read` tool for spreadsheets and Word
+> files. Worker claim, verifier evidence, supervisor judgment, and operator approval stay separate.
+>
+> **Still forming:** generalized role contracts, adapter capability negotiation, explicit memory
+> promotion/dismissal, and stronger structural enforcement across runtimes. See
+> [`VISION.md`](VISION.md) for the live-versus-target boundary.
 
 ## Why
 
-Using several coding agents today usually means several unrelated terminals, permission models, context stores, and completion claims. Impulse brings those runtimes into one observable environment while preserving their terminal-native workflows. Persistent memory preserves continuity; the wider control plane handles managed launch, project scoping, coordination, intervention, and evidence-backed completion. Structural filesystem isolation depends on the selected runtime or sandbox rather than on the cockpit alone.
+Using several coding agents today usually means several unrelated terminals, permission models,
+context stores, and completion claims. Impulse brings those runtimes into one observable,
+governed environment while preserving their terminal-native workflows. The control plane owns
+managed launch, project scoping, coordination, intervention, and evidence-backed completion;
+memory preserves continuity as one service among many. Structural filesystem isolation depends on
+the selected runtime or sandbox rather than on Impulse alone.
 
 ## What It Does
+
+**Control plane and governed completion**
 
 - **Managed agent terminals** — Spawns, monitors, writes to, resizes, focuses, and closes PTY-backed agent processes inside explicit workspace roots
 - **Daemon workbench truth** — Serves the authoritative agent, context, artifact, and intervention snapshot over versioned IPC
 - **Role and policy foundations** — Preflights an explicit Builder role/task against conservative launch capabilities and enforces a concrete supervisor permission policy; generalized role composition remains a later boundary
 - **Governed task truth** — Registers a durable task before PTY launch, optionally binds it to exact acceptance criteria plus a daemon-attested clean Git `HEAD`, applies revisioned/idempotent lifecycle mutations, and reserves `accepted` for an explicit operator decision against current passing evidence
-- **Accepted-run review queue** — Derives one versioned, provenance-bearing pending memory candidate from each accepted governed run while keeping `GENOME.md` and `HISTORY.jsonl` unchanged
+- **Artifacts and verification** — Runs the closed `rust_workspace_v1` profile in a detached Git worktree, persists daemon-derived command digests and outcomes without raw output, and keeps worker claims, verifier results, Supervisor verdicts, and operator decisions as distinct records
+- **External + native runtimes** — Wraps terminal CLIs and provides Ion's direct model/tool loop in the same product
+
+**Platform services**
+
 - **Typed platform tools** — Exposes capability-checked Rust tools through native registries, MCP, and runtime-specific bridges
-- **Session tracking** — Records files touched, tools used, and decisions made
-- **Persistent memory** — Project genome (decisions/preferences) and session history survive across sessions
-- **Context injection** — Relevant past context is surfaced in new sessions via review-first injection
+- **Credential services** — Selects configured credential providers without treating secret values as agent memory
 - **Multi-agent observability** — Tracks active agents, tasks, terminal telemetry, delegations, and intervention recommendations
+- **Session tracking** — Records files touched, tools used, and decisions made
+
+**Memory and context** (one governed service among many)
+
+- **Persistent memory** — Project genome (decisions/preferences) and session history survive across sessions
+- **Accepted-run review queue** — Derives one versioned, provenance-bearing pending memory candidate from each accepted governed run while keeping `GENOME.md` and `HISTORY.jsonl` unchanged
+- **Context injection** — Relevant past context is surfaced in new sessions via review-first injection
 - **Retrieval search** — FTS5 keyword search plus feature-gated, fallback-safe semantic search across session history and genome
 - **Context stewardship** — Monitors context window usage and proposes cleanup strategies
-- **Artifacts and verification** — Runs the closed `rust_workspace_v1` profile in a detached Git worktree, persists daemon-derived command digests and outcomes without raw output, and keeps worker claims, verifier results, Supervisor verdicts, and operator decisions as distinct records
-- **Credential services** — Selects configured credential providers without treating secret values as agent memory
-- **External + native runtimes** — Wraps terminal CLIs and provides Ion's direct model/tool loop in the same product
 
 ## Quick Start
 
@@ -78,6 +95,8 @@ adds a blanket `.impulse/` rule.
 Durable project inputs such as `.impulse/GENOME.md`, `.impulse/config.json`, and
 `.impulse/impulse-capabilities.json` therefore remain available to commit unless an existing
 operator-owned blanket rule already hides them. Init preserves but warns about that broader rule.
+
+### Governed Builder workflow
 
 In the Dioxus cockpit, use the governed Builder launch path:
 
