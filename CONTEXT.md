@@ -156,17 +156,29 @@ next consumer.
   `src/llm_backends/mod.rs`, and ADR-0017.
 
 ### tool sandbox roots — `[code]`
-The filesystem boundary bridged ion REPL tools (`file_read`, `file_write`, `bash_exec`) execute
-under: a session's `ReplContext.repo_root` is its fixed write root (never widened, not even by a
-literal `CONFIRM`), and `ReplContext.allowed_read_roots` is a read-only extension list grown one
-path at a time via `/allow <path>`. `ReplContext::sandbox_tool_context` builds the `ToolContext`
-`tool_bridge::DynamicToolBridge::run` actually executes under; `ion_repl::chat::ReplToolExecutor`
-independently checks the same roots against a pending call's resolved path(s) before confirmation,
-escalating an out-of-sandbox target to a literal-`CONFIRM` gate. Every tool result sent back to the
-model is wrapped in an "untrusted tool output" envelope and scanned against
-`GuardTarget::ToolCall` built-in rules; a match escalates every later gated call in that turn to
-the same `CONFIRM` gate for the rest of the turn.
-- **Source of truth:** `src/ion_repl/{mod,chat,tool_bridge}.rs`, `src/guardrail/defaults.rs`, and
+The filesystem boundary every path-checking ion REPL tool (`file_read`, `file_write`, `bash_exec`'s
+`cwd`, `document_read`, `ion_verify`'s `repo`) resolves against: a session's `ReplContext.repo_root`
+is its fixed write root (never widened, not even by a literal `CONFIRM`), and
+`ReplContext.allowed_read_roots` is a read-only extension list grown one path at a time via
+`/allow <path>` (which refuses an empty or nonexistent path and warns loudly on a grant of `/`,
+`$HOME`, or a repo-root ancestor; a bare `/allow` lists current grants).
+`ReplContext::sandbox_tool_context` builds the `ToolContext` every one of those tools actually
+checks paths against -- `tool_bridge::DynamicToolBridge::run` for the bridged tools,
+`resolve_document_path`/`IonVerifyTool::run` directly for the other two, all against the same roots.
+`ion_repl::chat::ReplToolExecutor` independently checks a *pending* `file_write`/`bash_exec cwd`
+call's resolved path(s) before confirmation, escalating an out-of-sandbox target to a literal
+`CONFIRM` gate; a heuristic scan of `bash_exec`'s shell TEXT (absolute-path tokens, `..`, `~`,
+`$HOME`, an escaping `cd` target) escalates the same way but is explicitly advisory, not
+enforcement -- the sandbox does not confine what a shell command's own text can touch beyond its
+`cwd`. Every tool result (success or error) sent back to the model is wrapped in a
+nonce-delimited "untrusted tool output" envelope (so content cannot forge the closing delimiter)
+and scanned against `GuardTarget::ToolCall` built-in rules (documented false-positive-prone); a
+match sets a flag sticky for the rest of the SESSION (not just the turn, to survive both
+out-of-order batch confirmation and content persisting in history) that escalates every later
+gated call to the same `CONFIRM` gate, reset only by `/clear`. `governed_submit_claim` is a
+separate, non-bridged `ReplTool` that mutates daemon state and is not covered by any of this.
+- **Source of truth:** `src/ion_repl/{mod,chat,tool_bridge,tool_document,tool_verify}.rs`,
+  `src/guardrail/defaults.rs`, and
   `docs/superpowers/specs/2026-09-02-ion-tool-sandbox-and-untrusted-output.md`.
 
 ### document read tool — `[code]`

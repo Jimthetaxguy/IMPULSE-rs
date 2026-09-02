@@ -20,9 +20,9 @@ tags: [worktree, lane, ion, sandbox, guardrail, loop-contract, prompt-injection]
 - Worktree: `.worktrees/ion-tool-floor-20260902` (repository-relative).
 - Base: `origin/main` at `36bda00`.
 - Owned paths:
-  - `impulse-rs/src/ion_repl/**` (`mod.rs`, `chat.rs`, `tool_bridge.rs`, `router.rs`; read-only
-    touches to `tool_document.rs`/`tool_verify.rs` for the `ReplContext` field addition and the
-    fixture swap)
+  - `impulse-rs/src/ion_repl/**` (`mod.rs`, `chat.rs`, `tool_bridge.rs`, `router.rs`,
+    `tool_document.rs`, `tool_verify.rs` -- the latter two grew real sandbox-enforcement logic in
+    review round 1, not just the `ReplContext` field addition and fixture swap noted originally)
   - `impulse-rs/src/guardrail/defaults.rs`
   - `impulse-rs/src/test_support.rs`
   - `impulse-rs/src/handlers/ion.rs` (fixture replacement only)
@@ -40,13 +40,13 @@ tags: [worktree, lane, ion, sandbox, guardrail, loop-contract, prompt-injection]
   `cargo build --workspace`, `cargo test --workspace`,
   `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`,
   `cargo build --no-default-features`, `python3 docs/validate_docs.py --all`.
-- Latest status: implementation complete and gated on this lane. `cargo build --workspace` clean;
-  `cargo test --workspace` 2347 passed / 0 failed / ~4 ignored across the full workspace (main lib
-  crate 1827 passed / 0 failed / 5 ignored); strict Clippy clean across the workspace; rustfmt
-  clean; `cargo build --no-default-features` clean; `docs/validate_docs.py --all` reports only the
-  4 pre-existing failures (ADR-0014 `status: proposed`, three stale March docs) -- the new spec
-  file validates cleanly. `cargo test --lib -- ion_repl` run three times in a row: 145 passed / 0
-  failed each time, no flake.
+- Latest status (post review round 1): `cargo build --workspace` clean; `cargo test --workspace`
+  2375 passed / 0 failed / ~4 ignored across the full workspace (main lib crate 1855 passed / 0
+  failed / 5 ignored); strict Clippy clean across the workspace; rustfmt clean; `cargo build
+  --no-default-features` clean; `docs/validate_docs.py --all` reports only the 4 pre-existing
+  failures (ADR-0014 `status: proposed`, three stale March docs) -- the updated spec file
+  validates cleanly. `cargo test --lib -- ion_repl` run three times in a row: 173 passed / 0
+  failed each time, no flake. See "Review round 1" below for what changed since the initial PR.
 
 ## Decisions
 
@@ -127,16 +127,78 @@ tags: [worktree, lane, ion, sandbox, guardrail, loop-contract, prompt-injection]
   independent directories.
 - `router`: `/allow` and `/loop` routing (with-args, no-args, `KNOWN_COMMANDS` updated).
 
+## Review round 1 (adversarial probe crate, same day)
+
+An adversarial review with a probe crate of live reproductions (`tests/attacks.rs`, A1-A11)
+returned "needs changes" against the PR as originally opened. All findings addressed on this same
+branch, gated, and re-pushed (no force-push -- new commit(s) on top).
+
+**P1 -- `document_read` bypassed the sandbox entirely.** `tool_document::resolve_document_path[_with_cap]`
+accepted any absolute path and any relative `../` traversal unconditionally -- it never consulted
+`ReplContext::sandbox_tool_context` at all, unlike every bridged tool. Fixed: the function now
+takes `&ReplContext` (signature change, all call sites updated) and refuses via
+`tool_ctx.is_path_allowed(&path, false)` before checking the file even exists. Same treatment for
+`tool_verify::IonVerifyTool::run`'s model-supplied `repo` argument (it ships the resolved repo's
+diff to an external API) -- refused before `run_ion_verify` is ever called if it resolves outside
+the sandbox. Tests: `..` traversal and absolute-outside cases for both, plus positive
+`/allow`-granted-path cases.
+
+**P1 -- `bash_exec` shell text was fully unconstrained.** `resolved_paths_for` only ever extracted
+`cwd`; the command's own TEXT (`echo x > <outside>/f`, `cat <outside>/id_rsa`,
+`cd <outside> && ...`) ran behind a plain y/N with no path check at all. Fixed with an explicitly
+**advisory** heuristic (`bash_command_escape_candidates`/`bash_command_verdict`): tokenizes the
+command, flags absolute-path tokens, `..`, `~`, `$HOME`, and an escaping `cd` target, and
+escalates to literal `CONFIRM` listing the offending tokens -- documented in the function doc
+comment, the verdict's own `reason` text, `CONTEXT.md`, and the spec as advisory, not enforcement.
+`CONTEXT.md`, the spec (Decisions 1/2/2b), and this card's earlier "Handoff Notes"/PR-body wording
+corrected to state the enforced boundary is `file_read`/`file_write`/`document_read`/`ion_verify`
+paths and `bash_exec`'s `cwd` only, and that `governed_submit_claim` is a separate, non-bridged,
+ungated tool this sandbox does not cover at all.
+
+**P2 -- tool errors were not enveloped or scanned.** `ReplToolExecutor::execute`'s `Err` arm
+bypassed both the untrusted-output envelope and the `GuardTarget::ToolCall` scan, even though
+error text (`ToolError::PathNotAllowed` and similar) echoes caller-supplied paths verbatim. Fixed
+by extracting the shared `observe_and_wrap` method, called from both the `Ok` and `Err` arms.
+
+**P2 -- envelope delimiters were fixed literals.** Content could include the literal footer text
+and close the envelope early in the model's eyes. Fixed with a per-call random 8-hex-char nonce
+(`uuid::Uuid::new_v4`, already a workspace dependency) embedded in both header and footer.
+
+**P2 -- batch order dependence / per-turn reset was too narrow.** A batch
+`[bash_exec, file_read(poisoned)]` would confirm `bash_exec` before the poisoned `file_read`
+result was scanned, and poisoned content persists in history across turns regardless of a
+per-turn flag. Fixed: `untrusted_seen` moved from a fresh-per-`turn()` `ReplToolExecutor` field to
+`ChatState` itself (`AtomicBool`, borrowed by reference into each turn's executor), sticky for the
+whole session, reset only by `ChatState::clear` (paired with clearing history).
+
+**P2/nit -- `/allow` hardening.** A grant resolving to `/`, `$HOME`, or an ancestor of the repo
+root now prints a loud warning (still grants it -- explicit human request); a bare `/allow` lists
+current grants instead of only a usage message; an empty or nonexistent path is refused outright.
+
+**Nits -- wording.** `chat.rs`'s module doc and the spec no longer claim denial happens "before
+`ToolRegistry::execute`" as if that were the general rule -- the confirmation-layer escalation
+(gated tools only) forces a human decision, and the sandboxed `ToolContext` (checked inside
+`ToolRegistry::execute` via `validate_paths`, before any I/O) is the actual authority either way,
+including after a `CONFIRM`. The "resolved paths ... gated call or not" doc claim was corrected:
+`resolved_paths_for` only runs inside the `CONFIRMATION_REQUIRED_TOOLS` branch, so an ungated
+`file_read` denial surfaces only as that tool's own error text, not a dedicated notice -- documented
+rather than changed, since computing paths for every tool call would be a larger behavior change
+than this round of fixes scoped for. The three `GuardTarget::ToolCall` rules' known false-positive
+rate (README prose, ordinary "you are now ready" phrasing, freshly generated placeholder secrets)
+is now documented directly in `src/guardrail/defaults.rs` and the spec.
+
 ## Handoff Notes
 
 - Deliberately not built this lane (out of scope per the assignment): GENOME Markdown rendering,
   the three real-file workflow tests named in the plan's Stage 1 bullet list, provider-neutral
   tool calls, context budgets.
-- `resolved_paths_for`/`sandbox_escape_verdict` only cover the path-bearing arguments each bridged
-  tool already declares (`path`, `cwd`) -- a `bash_exec` command that reaches outside the sandbox
-  through its shell text (e.g. `cat /etc/passwd`) is not caught by this layer; that is explicitly
-  the "OS-level sandboxing and egress allowlists" scope deferred to a later stage in the
-  next-stages plan.
+- `bash_exec`'s shell command text is only advisorily flagged, never confined (see "Review round
+  1" above) -- full confinement needs either shell-syntax parsing/rewriting (fragile for a security
+  boundary) or a real OS-level sandbox, both explicitly Stage 4 in the next-stages plan.
 - The `/allow`-granted read roots are session-scoped and in-memory only (`ReplContext`, not
   persisted to `.impulse/`); they do not survive a REPL restart.
-- No new dependencies were added; the workspace `Cargo.toml`/`Cargo.lock` are untouched.
+- No new dependencies were added; the workspace `Cargo.toml`/`Cargo.lock` are untouched (`uuid` for
+  the envelope nonce was already a workspace dependency).
+- `governed_submit_claim` is a separate, non-bridged `ReplTool` that mutates daemon-owned governed
+  task state, ungated, and out of scope for every fix in this lane -- flagged for a future lane's
+  attention if that tool ever needs the same treatment.

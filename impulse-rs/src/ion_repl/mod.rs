@@ -99,14 +99,31 @@ impl ReplContext {
 /// this session (never a write root -- see [`ReplContext`]'s doc comment).
 /// A relative path resolves against the process's current working
 /// directory, matching how `ToolContext::resolve_path` treats relative tool
-/// arguments elsewhere. Returns the text to print; an empty argument list
-/// is a usage error, not a panic or a silent no-op.
+/// arguments elsewhere.
+///
+/// **Review round 1, P2/nit:**
+/// - No argument lists the session's current grants (`list_allow_grants`)
+///   instead of a bare usage message -- a human checking "what have I
+///   already allowed" is at least as common as granting a new one.
+/// - An empty/whitespace-only argument or a path that does not exist is
+///   refused outright: a typo'd or nonexistent grant would otherwise sit
+///   silently in `allowed_read_roots` doing nothing (or worse, later
+///   resolving to something unintended once the path comes to exist).
+/// - A grant that resolves to `/`, the user's `$HOME`, or an ancestor
+///   directory of the repo root still succeeds (the human explicitly asked
+///   for it) but prints a loud warning first
+///   ([`overly_broad_grant_warning`]) -- these effectively disable the read
+///   sandbox, and a human should see that stated plainly rather than
+///   discover it later.
 fn apply_allow(ctx: &mut ReplContext, args: &[String]) -> String {
     let Some(path_arg) = args.first() else {
-        return "Usage: /allow <path> -- grant read access to an additional directory \
-                or file for this session."
-            .to_string();
+        return list_allow_grants(ctx);
     };
+    if path_arg.trim().is_empty() {
+        return "Usage: /allow <path> -- grant read access to an additional directory \
+                or file for this session. The path must not be empty."
+            .to_string();
+    }
     let path = std::path::PathBuf::from(path_arg);
     let resolved = if path.is_absolute() {
         path
@@ -115,11 +132,68 @@ fn apply_allow(ctx: &mut ReplContext, args: &[String]) -> String {
             .unwrap_or_else(|_| std::path::PathBuf::from("."))
             .join(path)
     };
+    if !resolved.exists() {
+        return format!(
+            "Refusing to grant read access to a path that does not exist: {}",
+            resolved.display()
+        );
+    }
+
+    let mut lines = Vec::new();
+    if let Some(warning) = overly_broad_grant_warning(&resolved, ctx) {
+        lines.push(warning);
+    }
     ctx.allowed_read_roots.push(resolved.clone());
-    format!(
+    lines.push(format!(
         "Granted read access to {} for this session.",
         resolved.display()
-    )
+    ));
+    lines.join("\n")
+}
+
+/// `/allow` with no argument: lists the session's current `/allow` grants,
+/// or says there are none yet.
+fn list_allow_grants(ctx: &ReplContext) -> String {
+    if ctx.allowed_read_roots.is_empty() {
+        "No /allow grants for this session yet. Usage: /allow <path> -- grant read access \
+         to an additional directory or file."
+            .to_string()
+    } else {
+        let mut lines = vec!["Current /allow grants for this session:".to_string()];
+        for root in &ctx.allowed_read_roots {
+            lines.push(format!("  {}", root.display()));
+        }
+        lines.join("\n")
+    }
+}
+
+/// Returns a warning line when `resolved` grants unusually broad read
+/// access: the filesystem root, the user's home directory, or any
+/// directory that is an ancestor of the session's repo root (which would
+/// make the "extension" strictly wider than just adding one more path --
+/// it would cover everything the repo root sandbox already allows, plus
+/// everything else under it). `None` for an ordinary, narrower grant.
+fn overly_broad_grant_warning(resolved: &std::path::Path, ctx: &ReplContext) -> Option<String> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let repo_root = ctx.effective_repo_root();
+
+    let reason = if resolved == std::path::Path::new("/") {
+        Some("the entire filesystem")
+    } else if home.as_deref() == Some(resolved) {
+        Some("your entire home directory")
+    } else if resolved != repo_root && repo_root.starts_with(resolved) {
+        Some("an ancestor of the repo root (wider than the repo root sandbox itself)")
+    } else {
+        None
+    };
+
+    reason.map(|reason| {
+        format!(
+            "\u{26a0} WARNING: {} grants unusually broad read access -- {reason}. \
+             Consider a narrower path if you don't need this much access.",
+            resolved.display()
+        )
+    })
 }
 
 /// Owns the readline editor, history path, tool registry, chat state, and
@@ -737,58 +811,146 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_allow_with_no_args_returns_usage_and_does_not_mutate_context() {
+    fn test_apply_allow_with_no_args_lists_grants_and_does_not_mutate_context() {
+        // Review round 1, P2/nit: no argument now LISTS current grants
+        // (rather than always printing a bare usage message) -- with no
+        // grants yet, it still says so and does not mutate the context.
         let mut ctx = ReplContext::default();
         let text = apply_allow(&mut ctx, &[]);
+        assert!(text.to_lowercase().contains("no /allow grants"));
+        assert!(ctx.allowed_read_roots.is_empty());
+    }
+
+    #[test]
+    fn test_apply_allow_with_no_args_lists_existing_grants() {
+        let granted = tempfile::tempdir().expect("tempdir");
+        let mut ctx = ReplContext::default();
+        apply_allow(&mut ctx, &[granted.path().display().to_string()]);
+
+        let text = apply_allow(&mut ctx, &[]);
+        assert!(text.contains("Current /allow grants"));
+        assert!(text.contains(&granted.path().display().to_string()));
+        // Listing must not itself mutate the grant list.
+        assert_eq!(ctx.allowed_read_roots.len(), 1);
+    }
+
+    #[test]
+    fn test_apply_allow_empty_argument_is_refused() {
+        let mut ctx = ReplContext::default();
+        let text = apply_allow(&mut ctx, &["   ".to_string()]);
         assert!(text.to_lowercase().contains("usage"));
         assert!(ctx.allowed_read_roots.is_empty());
     }
 
     #[test]
-    fn test_apply_allow_absolute_path_grants_it_verbatim() {
+    fn test_apply_allow_nonexistent_path_is_refused() {
         let mut ctx = ReplContext::default();
-        let text = apply_allow(&mut ctx, &["/tmp/some/dir".to_string()]);
-        assert!(text.contains("/tmp/some/dir"));
-        assert_eq!(
-            ctx.allowed_read_roots,
-            vec![std::path::PathBuf::from("/tmp/some/dir")]
+        let text = apply_allow(
+            &mut ctx,
+            &["/definitely/does/not/exist/ion-allow-test".to_string()],
         );
+        assert!(text.to_lowercase().contains("does not exist"), "{text}");
+        assert!(ctx.allowed_read_roots.is_empty());
+    }
+
+    #[test]
+    fn test_apply_allow_absolute_path_grants_it_verbatim() {
+        let granted = tempfile::tempdir().expect("tempdir");
+        let mut ctx = ReplContext::default();
+        let text = apply_allow(&mut ctx, &[granted.path().display().to_string()]);
+        assert!(text.contains(&granted.path().display().to_string()));
+        assert_eq!(ctx.allowed_read_roots, vec![granted.path().to_path_buf()]);
     }
 
     #[test]
     fn test_apply_allow_can_be_called_more_than_once_and_accumulates_grants() {
+        let a = tempfile::tempdir().expect("tempdir");
+        let b = tempfile::tempdir().expect("tempdir");
         let mut ctx = ReplContext::default();
-        apply_allow(&mut ctx, &["/tmp/a".to_string()]);
-        apply_allow(&mut ctx, &["/tmp/b".to_string()]);
+        apply_allow(&mut ctx, &[a.path().display().to_string()]);
+        apply_allow(&mut ctx, &[b.path().display().to_string()]);
         assert_eq!(
             ctx.allowed_read_roots,
-            vec![
-                std::path::PathBuf::from("/tmp/a"),
-                std::path::PathBuf::from("/tmp/b"),
-            ]
+            vec![a.path().to_path_buf(), b.path().to_path_buf()]
         );
+    }
+
+    #[test]
+    fn test_apply_allow_root_slash_grants_but_warns_loudly() {
+        let mut ctx = ReplContext::default();
+        let text = apply_allow(&mut ctx, &["/".to_string()]);
+        assert!(text.contains("WARNING"), "{text}");
+        assert!(text.to_lowercase().contains("entire filesystem"), "{text}");
+        // Still grants it -- the human explicitly asked.
+        assert_eq!(ctx.allowed_read_roots, vec![std::path::PathBuf::from("/")]);
+    }
+
+    #[test]
+    fn test_apply_allow_home_directory_warns_loudly() {
+        let home = std::env::var("HOME").expect("HOME must be set to run this test");
+        let mut ctx = ReplContext::default();
+        let text = apply_allow(&mut ctx, std::slice::from_ref(&home));
+        assert!(text.contains("WARNING"), "{text}");
+        assert!(text.to_lowercase().contains("home directory"), "{text}");
+        assert_eq!(ctx.allowed_read_roots, vec![std::path::PathBuf::from(home)]);
+    }
+
+    #[test]
+    fn test_apply_allow_ancestor_of_repo_root_warns_loudly() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let repo = base.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let mut ctx = ReplContext {
+            repo_root: repo.clone(),
+            ..ReplContext::default()
+        };
+
+        let text = apply_allow(&mut ctx, &[base.path().display().to_string()]);
+        assert!(text.contains("WARNING"), "{text}");
+        assert!(text.to_lowercase().contains("ancestor"), "{text}");
+    }
+
+    #[test]
+    fn test_apply_allow_ordinary_narrow_grant_does_not_warn() {
+        let granted = tempfile::tempdir().expect("tempdir");
+        let mut ctx = ReplContext::default();
+        let text = apply_allow(&mut ctx, &[granted.path().display().to_string()]);
+        assert!(!text.contains("WARNING"), "{text}");
     }
 
     #[tokio::test]
     async fn test_respond_allow_grants_a_read_root_via_the_router() {
+        let granted = tempfile::tempdir().expect("tempdir");
+        let granted_str = granted.path().display().to_string();
         let tools = ReplToolRegistry::with_defaults();
         let mut ctx = ReplContext::default();
         let mut chat = test_chat();
         let (text, should_exit) = respond(
-            RouterOutcome::Command(SlashCommand::Allow(vec![
-                "/tmp/granted-via-router".to_string()
-            ])),
+            RouterOutcome::Command(SlashCommand::Allow(vec![granted_str.clone()])),
             &tools,
             &mut ctx,
             &mut chat,
         )
         .await;
         assert!(!should_exit);
-        assert!(text.contains("/tmp/granted-via-router"));
-        assert_eq!(
-            ctx.allowed_read_roots,
-            vec![std::path::PathBuf::from("/tmp/granted-via-router")]
-        );
+        assert!(text.contains(&granted_str));
+        assert_eq!(ctx.allowed_read_roots, vec![granted.path().to_path_buf()]);
+    }
+
+    #[tokio::test]
+    async fn test_respond_allow_with_no_args_lists_grants_via_the_router() {
+        let tools = ReplToolRegistry::with_defaults();
+        let mut ctx = ReplContext::default();
+        let mut chat = test_chat();
+        let (text, should_exit) = respond(
+            RouterOutcome::Command(SlashCommand::Allow(Vec::new())),
+            &tools,
+            &mut ctx,
+            &mut chat,
+        )
+        .await;
+        assert!(!should_exit);
+        assert!(text.to_lowercase().contains("no /allow grants"));
     }
 
     #[tokio::test]

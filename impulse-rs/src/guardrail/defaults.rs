@@ -176,6 +176,20 @@ pub fn builtin_rules() -> Vec<GuardRule> {
         // ==================================================================
         // Warn rules targeting tool OUTPUT, not a pending call
         // (GuardTarget::ToolCall -- see the function doc comment)
+        //
+        // Known false-positive rate (review round 1, nit -- documented so a
+        // human doesn't learn to reflexively type CONFIRM without reading
+        // the flagged text): these are plain substring/phrase patterns with
+        // no semantic understanding of context. `warn-tool-output-injection-
+        // phrase` fires on a README explaining prompt injection, a security
+        // blog post, or this very source file's own comments about it.
+        // `warn-tool-output-role-override` fires on ordinary prose like "you
+        // are now ready to deploy" or a tutorial's "you are now a
+        // contributor". `warn-tool-output-credential-shaped` fires on a
+        // config-file EXAMPLE such as `SECRET_KEY = "django-insecure-..."`
+        // in a freshly generated Django settings file, or any placeholder
+        // 16+ characters long. None of these rules understand intent; they
+        // only widen what forces a slower, deliberate approval.
         // ==================================================================
         GuardRule {
             id: "warn-tool-output-injection-phrase".to_string(),
