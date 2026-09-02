@@ -135,25 +135,8 @@ mod tests {
     /// env var, shared with `handlers::ion` and `ion_repl` via
     /// `crate::test_support` (see that module's doc comment for why a
     /// per-file lock is insufficient).
+    use crate::test_support::init_git_repo;
     use crate::test_support::ion_gate_launcher_env_lock as env_lock;
-
-    fn init_git_repo() -> tempfile::TempDir {
-        let dir = tempfile::TempDir::new().expect("failed to create tempdir");
-        let run = |args: &[&str]| {
-            let status = std::process::Command::new("git")
-                .arg("-C")
-                .arg(dir.path())
-                .args(args)
-                .status()
-                .expect("failed to run git");
-            assert!(status.success(), "git {args:?} failed");
-        };
-        run(&["init", "--quiet"]);
-        run(&["config", "user.email", "test@example.com"]);
-        run(&["config", "user.name", "Test"]);
-        run(&["commit", "--allow-empty", "--quiet", "-m", "init"]);
-        dir
-    }
 
     #[test]
     fn test_name_and_usage() {
@@ -181,6 +164,7 @@ mod tests {
 
         let ctx = ReplContext {
             repo_root: repo.path().to_path_buf(),
+            ..ReplContext::default()
         };
         let outcome = IonVerifyTool
             .run(serde_json::json!({"diff_ref": "HEAD"}), &ctx)
@@ -204,6 +188,7 @@ mod tests {
 
         let ctx = ReplContext {
             repo_root: repo.path().to_path_buf(),
+            ..ReplContext::default()
         };
         let outcome = IonVerifyTool
             .run(serde_json::json!({"diff_ref": "HEAD"}), &ctx)
@@ -264,6 +249,7 @@ mod tests {
 
         let ctx = ReplContext {
             repo_root: repo.path().to_path_buf(),
+            ..ReplContext::default()
         };
         let outcome = IonVerifyTool
             .run(serde_json::json!({"diff_ref": "HEAD"}), &ctx)

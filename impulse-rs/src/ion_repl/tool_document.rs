@@ -1553,6 +1553,7 @@ mod tests {
         fn ctx_in(dir: &tempfile::TempDir) -> ReplContext {
             ReplContext {
                 repo_root: dir.path().to_path_buf(),
+                ..ReplContext::default()
             }
         }
 

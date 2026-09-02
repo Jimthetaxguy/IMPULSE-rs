@@ -155,6 +155,20 @@ next consumer.
 - **Source of truth:** `src/loop_contract.rs`, `Agent::chat_with_tools` in
   `src/llm_backends/mod.rs`, and ADR-0017.
 
+### tool sandbox roots — `[code]`
+The filesystem boundary bridged ion REPL tools (`file_read`, `file_write`, `bash_exec`) execute
+under: a session's `ReplContext.repo_root` is its fixed write root (never widened, not even by a
+literal `CONFIRM`), and `ReplContext.allowed_read_roots` is a read-only extension list grown one
+path at a time via `/allow <path>`. `ReplContext::sandbox_tool_context` builds the `ToolContext`
+`tool_bridge::DynamicToolBridge::run` actually executes under; `ion_repl::chat::ReplToolExecutor`
+independently checks the same roots against a pending call's resolved path(s) before confirmation,
+escalating an out-of-sandbox target to a literal-`CONFIRM` gate. Every tool result sent back to the
+model is wrapped in an "untrusted tool output" envelope and scanned against
+`GuardTarget::ToolCall` built-in rules; a match escalates every later gated call in that turn to
+the same `CONFIRM` gate for the rest of the turn.
+- **Source of truth:** `src/ion_repl/{mod,chat,tool_bridge}.rs`, `src/guardrail/defaults.rs`, and
+  `docs/superpowers/specs/2026-09-02-ion-tool-sandbox-and-untrusted-output.md`.
+
 ### document read tool — `[code]`
 Ion's read-only `document_read` tool: reads `xlsx` by streaming cells through calamine's cell
 reader under a character and cell budget (never the dense-grid parser), and `csv`/`docx` through
