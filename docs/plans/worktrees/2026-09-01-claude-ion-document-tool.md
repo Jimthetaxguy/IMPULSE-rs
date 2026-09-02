@@ -167,7 +167,8 @@ Owned paths for this stage add `impulse-rs/Cargo.toml` and
   nor the docx builder in the tree can emit a chart sheet, a revision mark, a field code, or
   malformed XML. The spec's Testing section carries the fixture table.
 
-Gate on this branch (isolated `CARGO_TARGET_DIR`, current checkout):
+Gate at the first push of this stage (isolated `CARGO_TARGET_DIR`); superseded by the review
+round 1 gate below:
 
 - `cargo build --workspace`: clean.
 - `cargo test --workspace`: **2324 passed, 0 failed, 9 ignored** across 30 test binaries —
@@ -181,6 +182,73 @@ Gate on this branch (isolated `CARGO_TARGET_DIR`, current checkout):
   without `office-support`.
 - `python3 docs/validate_docs.py --all`: the four failures that pre-exist on `main` only
   (ADR-0014's `proposed` status and three March documents past the staleness threshold).
+
+## Review round 1 (adversarial review of PR #49 at `fc61cf1`, 2026-09-02)
+
+The review measured the claims rather than reading them: 64 MiB of `<w:p/>` extracted in 296 ms
+and 6.5 MB RSS, billion-laughs and DOCTYPE internal subsets were refused, and the skip-subtree,
+namespace, outline-cap, and chart-sheet claims all held. Two P2s contradicted what the PR body and
+spec said, and both are now closed.
+
+- **P2, cell text could still forge a column or a row break.** `w:tab` and `w:br` elements were
+  neutralized inside a table, but a literal U+0009/U+000A, a numeric reference (`&#9;`, `&#10;`),
+  or a CDATA section passed straight through, so a two-cell row could render as three columns or
+  two lines; outside a table, `x&#10;y` became two lines. Fixed at the point document text enters
+  (`push_word_text`): `\n` and `\r` always become spaces, and `\t` as well inside a row, one
+  character for one so counts stay exact. `WordTextBuilder::push_line` repeats the newline
+  normalization as a backstop. Because the mapping is now absolute — one output line is exactly
+  one paragraph or one table row — `w:br`/`w:cr` became spaces everywhere rather than newlines
+  outside a table, which is a deliberate behavior change from the first push: it is what makes
+  `window`'s line snapping and the section spans exact instead of approximately right.
+- **P2, a nested table silently erased the containing cell's own text.** `Start tc` cleared the
+  cell unconditionally, so `<w:tc><w:p>OUTER</w:p><w:tbl>…INNER…</w:tbl></w:tc><w:tc>RIGHT</w:tc>`
+  rendered `INNER\t\tRIGHT` — OUTER gone, and a column that did not exist. A `cell_depth` counter
+  now clears and flushes only at the outermost `w:tc`, so an inner table merges into the text of
+  the cell holding it and the row keeps its real column count. An unmatched `</w:tc>` closes
+  nothing.
+- **P2, the "peak memory is the budget plus a single XML event" claim was false.** The text was
+  pushed into the paragraph buffer *before* `check_pending` ran, so a 50 MiB single `w:t` peaked
+  at 114 MB even with `max_chars=1000`; separately quick-xml's open-element stack scales with
+  nesting depth (9.6 M levels measured at 126 MB). Both stay bounded by the 64 MiB part cap
+  (worst measured ≈145 MB). The budget is now checked *before* every push, so no long-lived
+  buffer overshoots, and the module doc and spec now say the real bound: roughly twice the part
+  cap, from quick-xml's event buffer plus its open-element stack — the part cap is what does the
+  work, not the character budget.
+- **Fail-closed part read.** The 64 MiB `take` failed *open*: a 66 MiB part parsed whatever prefix
+  fit and returned `Ok`. It now takes one byte past the cap and refuses with a typed too-large
+  error when that headroom is consumed. A read error is held until after that check, so a part cut
+  off at the cap is reported as too large — which it is — rather than as malformed.
+- **Case-insensitive part lookup.** OPC part names compare case-insensitively and calamine
+  resolves workbook parts that way, so `word/document.xml` is now found however it is cased. Where
+  a container declares the part twice, the last entry wins (noted in the spec, not fixed).
+- **CDATA UTF-8.** `from_utf8_lossy` silently produced replacement characters; invalid UTF-8 in a
+  CDATA section is now a typed error, matching how `Event::Text` already behaved.
+- **Message and spec wording.** Skipped chart, dialog, and macro sheets are described as
+  non-worksheet parts rather than folded into "empty worksheets" in the sheet-not-found and
+  empty-workbook errors, the rendered note, and the schema. The spec now names `w:fldSimple`
+  (cached result kept, `w:instr` attribute never read) and records that DrawingML `<a:t>` and OMML
+  `<m:t>` text is extracted by local-name matching, because a reader sees it too.
+- **Left with a note, as the review allowed.** A duplicate `word/document.xml` entry resolves to
+  the last one; a self-closing `<w:tc/>`, which the schema does not permit, drops that column.
+  Both are recorded in the spec.
+
+Eight regression tests were added for these: control characters and CDATA smuggled into cells,
+breaks inside a plain paragraph, the nested-table case, `w:fldSimple`, a case-varied part name,
+non-UTF-8 CDATA, the oversized part read directly without the preflight, and two unit tests for
+the normalization itself.
+
+Gate after round 1 (isolated `CARGO_TARGET_DIR`, current checkout):
+
+- `cargo build --workspace`: clean.
+- `cargo test --workspace`: **2332 passed, 0 failed, 9 ignored** across 30 test binaries —
+  impulse-desktop 248/0/1, impulse-ion 23/0/1, impulse-ops 85/0/0, impulse-rs 1849/0/7,
+  impulse-step-model 12/0/0, impulse-term 115/0/0. `tool_document` itself: 58 tests (50 at the
+  first push, 36 before this stage).
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo fmt --all -- --check`: clean.
+- `cargo build --no-default-features` and
+  `cargo test --no-default-features --lib -- ion_repl::registry`: 4 passed, tool still absent.
+- `python3 docs/validate_docs.py --all`: only the four failures that pre-exist on `main`.
 
 ## Handoff Notes
 

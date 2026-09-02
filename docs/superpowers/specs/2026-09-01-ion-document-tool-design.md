@@ -57,8 +57,8 @@ the `ion` process down: every input is bounded before the parser sees it.
 
 | Field | Meaning |
 |---|---|
-| `path` | Required. Relative paths resolve against the REPL's launch directory. Formats: `xlsx`, `csv`, `docx`. Legacy `xls` is refused because its binary format has no streaming reader and cannot be bounded. Files over 10 MiB are refused. An `xlsx`/`docx` container is inflated once, entry by entry, through a 64 MiB cap before parsing, so a forged central directory cannot hide a decompression bomb. Workbooks never reach the dense-grid parser: cells are streamed one at a time through calamine's cell reader into the tool's own text under a 16 million character and 2 million cell budget, so two cells at opposite corners of a sheet cost two gap markers and a shared string costs only the cells that render it; a chart or dialog sheet holds no cells and is skipped rather than failing the workbook. Word documents are streamed the same way, through quick-xml (see "Word streaming"). `csv` text is checked against the character budget after parsing, where the parser's memory is already bounded by the 10 MiB file cap. These bound the parser's inputs; they are not an OS sandbox. |
-| `sheet` | Worksheet name, case-insensitive: Unicode lowercasing plus the Latin multi-character folds, so `Straße`, `STRAẞE`, and `STRASSE` match; dotless `ı` stays distinct from `i`; no normalization. Spreadsheets only; empty worksheets are omitted by the parser. A supplied blank value is rejected rather than treated as "whole document". When set, `offset` is relative to that sheet's text. |
+| `path` | Required. Relative paths resolve against the REPL's launch directory. Formats: `xlsx`, `csv`, `docx`. Legacy `xls` is refused because its binary format has no streaming reader and cannot be bounded. Files over 10 MiB are refused. An `xlsx`/`docx` container is inflated once, entry by entry, through a 64 MiB cap before parsing, so a forged central directory cannot hide a decompression bomb. Workbooks never reach the dense-grid parser: cells are streamed one at a time through calamine's cell reader into the tool's own text under a 16 million character and 2 million cell budget, so two cells at opposite corners of a sheet cost two gap markers and a shared string costs only the cells that render it; a chart, dialog, or macro sheet is not a worksheet, holds no cells, and is skipped rather than failing the workbook. Word documents are streamed the same way, through quick-xml (see "Word streaming"). `csv` text is checked against the character budget after parsing, where the parser's memory is already bounded by the 10 MiB file cap. These bound the parser's inputs; they are not an OS sandbox. |
+| `sheet` | Worksheet name, case-insensitive: Unicode lowercasing plus the Latin multi-character folds, so `Straße`, `STRAẞE`, and `STRASSE` match; dotless `ı` stays distinct from `i`; no normalization. Spreadsheets only; empty worksheets are omitted by the parser, as are chart, dialog, and macro sheets, which hold no cells. A supplied blank value is rejected rather than treated as "whole document". When set, `offset` is relative to that sheet's text. |
 | `outline` | Section table and sizes only, no content. |
 | `offset` | Character offset to start from: a section's offset from the outline, or the offset named by the previous continuation hint. |
 | `max_chars` | Characters to return. Default 12000, capped at 32000, zero rejected. Windows end on a line boundary when one exists inside the window. |
@@ -90,28 +90,45 @@ empty paragraphs — within every earlier cap — could still exhaust memory. Wo
 therefore streamed the way workbooks are: `word/document.xml` is read event by event through
 `quick-xml` (already in the tree under `calamine`) and written into the tool's own text.
 
-- **Layout.** One line per non-empty paragraph. A table row is one line with its cells
-  tab-separated, matching how workbook rows are rendered, and the paragraphs inside one cell are
-  joined with spaces. Outside a table `w:tab` stays a tab and `w:br`/`w:cr` a newline; inside one
-  they become spaces, so cell text cannot forge a column or row break. Nested tables are flattened
-  into the row that contains them. Blank paragraphs produce no line, no section, and no growth.
+- **Layout.** One line per non-empty paragraph, and one line per table row with its cells
+  tab-separated, matching how workbook rows are rendered; the paragraphs inside one cell are
+  joined with spaces. That mapping is absolute — an output line is always exactly one paragraph or
+  one table row — and everything else follows from it. `w:br`/`w:cr` become spaces rather than
+  newlines. Document text can never contribute a `\n` or `\r`, or, inside a row, a `\t`: a literal
+  control character, a numeric reference such as `&#9;`/`&#10;`, and a CDATA section are all
+  normalized one character for one as the text is read, so cell text cannot forge a column or a
+  row. Outside a table `w:tab` stays a tab, which cannot break a line. A nested table flattens
+  into the row that contains it, and the containing cell keeps its own text. Blank paragraphs
+  produce no line, no section, and no growth. `window`'s line snapping and the section spans are
+  exact because of this invariant.
 - **Excluded content.** `w:del` and `w:moveFrom` subtrees (a tracked deletion, and the source half
   of a tracked move, which would otherwise duplicate its `w:moveTo` counterpart),
   `w:instrText`/`w:delInstrText` field instruction codes such as `MERGEFIELD` (the field *result*
   a reader sees is a sibling `w:t` and is kept), and the `mc:Fallback` half of an
   `mc:AlternateContent` pair, whose text repeats the `mc:Choice` used instead. Matching is on the
-  local name, so a writer's namespace prefix does not matter.
+  local name, so a writer's namespace prefix does not matter — with two deliberate consequences:
+  a simple field (`w:fldSimple`) keeps its cached result because its instruction lives in a
+  `w:instr` *attribute* and attributes are never read; and text a writer put in a shape or text box
+  (DrawingML `<a:t>`) or an equation (OMML `<m:t>`) is extracted like any other `t`, because a
+  reader sees it too.
 - **Bounds.** Every buffer that holds text on its way to the output — the paragraph, the table
-  cell, the table row — is counted against the character budget as it grows, so neither one
-  enormous paragraph nor one enormous row can balloon between checks; peak memory is the budget
-  plus a single XML event. `word/document.xml` is itself read through the 64 MiB container cap
-  even when the container preflight has not run, and `quick-xml` resolves only the five predefined
-  XML entities, so no declared or nested entity expands here. The outline is capped at 4096
-  sections: past the cap no new section starts and the last one absorbs the remaining text, so
-  every offset reported stays truthful while the section table, which travels in the payload,
-  stays bounded.
+  cell, the table row — is checked against the character budget *before* it grows, so no
+  long-lived buffer overshoots on a single event. Peak memory is **not** the budget: `quick-xml`
+  holds one event in its own buffer and keeps an open-element stack that scales with nesting
+  depth, and both are bounded by the part rather than by the budget, so working memory for this
+  path is roughly twice the 64 MiB part cap. That cap is what does the work, and
+  `word/document.xml` is held to it here even when the container preflight has not run — a part
+  that exceeds it is refused with a typed error rather than answered from the prefix that fit.
+  `quick-xml` resolves only the five predefined XML entities, so no declared or nested entity
+  expands here. The outline is capped at 4096 sections: past the cap no new section starts and the
+  last one absorbs the remaining text, so every offset reported stays truthful while the section
+  table, which travels in the payload, stays bounded.
+- **Part lookup.** The part is found by comparing names ASCII-case-insensitively, the way
+  calamine resolves workbook parts, because OPC part names are not case-sensitive. Where a
+  container declares the part twice, the last entry wins.
 - **Out of scope.** Only `word/document.xml` is read. Headers, footers, footnotes, endnotes, and
-  comments live in sibling parts and are deliberately not extracted.
+  comments live in sibling parts and are deliberately not extracted. A self-closing `<w:tc/>`,
+  which the schema does not allow, drops that column.
 
 ## Error handling
 
@@ -119,8 +136,8 @@ Missing or malformed arguments (including a blank `sheet`), unsupported extensio
 lists supported ones), legacy `xls`, missing files, directories, files over the size cap,
 containers over the inflation cap, workbooks over the cell or character budget, extracted text
 over the character cap, unparseable files (the message carries the parser's reason), unknown
-sheets (the message lists available non-empty sheets, which excludes chart and dialog sheets
-because they hold no cells), sheet selection
+sheets (the message lists the readable worksheets, which excludes empty ones and chart, dialog,
+and macro sheets alike), sheet selection
 on a workbook whose sheets are all empty, sheet selection on non-spreadsheets, a docx with no
 `word/document.xml`, and malformed XML inside it all return
 typed errors. Each message leads with the path or name the model supplied, so two different bad
@@ -153,6 +170,13 @@ section grouping, the section cap) are unit-tested directly, without a document:
 | Docx whose `word/document.xml` alone inflates past the 64 MiB container cap, from a file far under the source cap | the typed inflation refusal, without OOM |
 | Docx with one paragraph split across 500 runs, read under a 64-character budget | the budget refusal, and the same document reading cleanly under the real budget |
 | Docx with a mismatched end tag, and a container with no `word/document.xml` | typed errors rather than a panic |
+| Table cells carrying a literal tab and newline, `&#9;`/`&#10;`, and a CDATA section | one row and three columns: text cannot forge a column or row break |
+| Paragraphs with a literal newline, `&#10;`, a `w:br`, and a `w:tab` | four paragraphs in, four lines out; a tab outside a table survives |
+| Table nested inside a cell that has its own text | the outer text survives and the row still has two columns |
+| `w:fldSimple` with a `MERGEFIELD` instruction attribute | the cached result is kept, the instruction is not |
+| Docx whose part is named `Word/Document.XML` | the part is found case-insensitively |
+| CDATA section that is not valid UTF-8 | a typed error rather than replacement characters |
+| The oversized part read directly, without the container preflight | the typed too-large refusal, not a silently truncated answer |
 
 ## Out of scope
 
