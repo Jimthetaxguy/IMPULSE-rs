@@ -577,7 +577,14 @@ pub enum OperatorDecisionKind {
     Reject,
 }
 
+/// The client-supplied half of an operator decision.
+///
+/// `deny_unknown_fields` matches [`GovernedClaimRequest`] and does real work
+/// here: the daemon-owned provenance field lives on [`OperatorDecision`], not on
+/// this type, so a payload that tries to assert its own `authentication` is
+/// rejected at the boundary rather than silently ignored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OperatorDecisionInput {
     pub actor: GovernedActor,
     pub supervisor_verdict_id: GovernedRecordId,
@@ -927,16 +934,26 @@ mod operator_authentication_tests {
     }
 
     #[test]
-    fn test_operator_decision_input_cannot_carry_authentication() {
+    fn test_operator_decision_input_rejects_a_payload_asserting_its_own_provenance() {
         // The daemon stamps provenance; a client payload must not be able to
-        // assert it. `OperatorDecisionInput` therefore has no such field, and
-        // an unknown key is dropped rather than honored.
-        let input: OperatorDecisionInput = serde_json::from_value(serde_json::json!({
+        // assert it. `OperatorDecisionInput` has no such field and denies
+        // unknown ones, so the attempt fails at the boundary.
+        let error = serde_json::from_value::<OperatorDecisionInput>(serde_json::json!({
             "actor": {"kind": "operator", "id": "operator-a"},
             "supervisor_verdict_id": "verdict-a",
             "decision": "approve",
             "rationale": "accepted",
             "authentication": "capability_authenticated",
+        }))
+        .unwrap_err();
+        assert!(format!("{error}").contains("authentication"));
+
+        // The legitimate shape still round-trips and carries no provenance.
+        let input: OperatorDecisionInput = serde_json::from_value(serde_json::json!({
+            "actor": {"kind": "operator", "id": "operator-a"},
+            "supervisor_verdict_id": "verdict-a",
+            "decision": "approve",
+            "rationale": "accepted",
         }))
         .unwrap();
         let encoded = serde_json::to_value(&input).unwrap();

@@ -59,10 +59,14 @@ governed runtime.
    `NonOperator` by default — including a launched governed runtime holding `IMPULSE_SOCKET_PATH` —
    and becomes `Operator` only by presenting this daemon run's capability. The class is connection
    state, never derived from request payload, and a request cannot assert it.
-2. **The daemon mints one operator capability per run.** 32 bytes from the platform CSPRNG, hex
-   encoded, written atomically at mode 0600 beside the socket (`impulse.sock` ->
+2. **The daemon mints one operator capability per run.** 32 bytes read from the operating system's
+   CSPRNG (`/dev/urandom`; `rand` and `getrandom` are only transitive dependencies of this
+   workspace), hex encoded, written atomically at mode 0600 beside the socket (`impulse.sock` ->
    `impulse.operator-cap`, matching how the PID file is placed) once the socket is bound and locked
-   down, and removed when the accept loop exits. A capability never outlives the run that issued it.
+   down, and removed when the accept loop exits. The temp file is opened `create_new` and its mode
+   asserted on the descriptor rather than the path, so the secret is only ever written into a file
+   this process just created at 0600. Minting failure is returned, never absorbed into a weaker
+   fallback. A capability never outlives the run that issued it.
 3. **Presentation is a connection-scoped request.** `PresentOperatorCapability { token }` (protocol
    v7) raises *that* connection if, and only if, the peer uid equals the daemon's own uid **and**
    the token matches, compared in length-independent constant time. A rejected presentation leaves
@@ -76,7 +80,10 @@ governed runtime.
    `MarkLaunchFailed`, and `MarkRuntimeExited` are also operator-only: a Builder submits claims
    through the daemon-owned producer requests, it does not narrate its own lifecycle.
    Caller-composed (non-profiled) tasks keep their existing lifecycle behavior, since no daemon-owned
-   producer chain governs them.
+   producer chain governs them. **The classification is an exhaustive match over
+   `GovernedTaskMutation`, deliberately with no catch-all arm**: a mutation variant added later must
+   break `authorize_governed_mutation`'s compilation and be classified on purpose, rather than
+   defaulting open and becoming silently reachable from a launched Builder.
 5. **Provenance is recorded on the decision, by the daemon.** `OperatorDecision` gains a
    serde-defaulted `authentication: OperatorAuthentication` of `Declared` or
    `CapabilityAuthenticated`. `OperatorDecisionInput` deliberately has **no** such field: the value
@@ -93,24 +100,38 @@ governed runtime.
    derivation version are pruned when `MEMORY_CANDIDATES.json` loads, and re-derived from
    authoritative governed-task truth by the existing reconcile pass. Governed tasks remain the
    source of truth; the projection stays independently replaceable, per ADR-0013.
-8. **Clients present, panes never receive.** `DaemonClient` resolves a capability from
-   `IMPULSE_OPERATOR_CAPABILITY` or the published file and presents it before a governed mutation,
-   on the same connection. `remove_inherited_impulse_env` strips every inherited `IMPULSE_*` key
-   before a pane spawns, so a governed runtime is never handed the capability; the explicit governed
-   env overlay must never add it back.
+8. **Clients present, panes never receive.** Both socket clients — the CLI/TUI `DaemonClient` and
+   the cockpit's own client in `impulse-desktop` — resolve a capability through one shared helper
+   (`impulse_ops::operator_capability`) from `IMPULSE_OPERATOR_CAPABILITY` or the published file, and
+   present it before a governed mutation on the same connection.
+   `remove_inherited_impulse_env` strips every inherited `IMPULSE_*` key before a pane spawns, so a
+   governed runtime is never handed the capability; the explicit governed env overlay must never add
+   it back. A capability that is found and *refused* is surfaced, not logged and forgotten: the CLI
+   prints a warning naming the provenance downgrade, and the cockpit folds the daemon's reason into
+   the error its existing surface already shows. Silence there would let an operator watch an
+   approval land as `declared` while believing it was authenticated.
 
 ## Consequences
 
 - A launched Builder that opens the daemon socket and sends `RecordOperatorDecision` now receives a
   typed refusal naming the request and how to present a capability, and the governed task is
   byte-identical afterwards. Operator-required acceptance is enforced rather than documented.
-- **This is a structural boundary, not a cryptographic one against a same-uid adversary.** The
-  capability file is mode 0600 in a mode 0700 directory owned by the daemon's uid; a same-uid
-  process that deliberately goes looking for it can read it. What the design guarantees is that a
-  launched runtime is never *given* the capability and its environment is scrubbed of every
-  `IMPULSE_*` key. Defeating it requires a runtime that deliberately hunts for a file it was never
-  told about — a different and far more visible act than sending one request to a socket path it was
-  handed. Real isolation needs a separate socket per class or an OS sandbox; neither is in this ADR.
+- **This is a structural boundary, not a cryptographic one against a same-uid adversary, and the
+  file is one `cat` away.** The capability path is a pure function of the socket path
+  (`with_extension("operator-cap")`), and every governed pane is handed `IMPULSE_SOCKET_PATH` by
+  design. A launched runtime that wants the capability does not have to search for it: it can derive
+  the path and read the file, because 0600 in a 0700 directory stops other users, not the daemon's
+  own uid. What the design guarantees is narrower and should be stated as such — a runtime is never
+  *given* the capability, and its environment is scrubbed of every `IMPULSE_*` key, so minting
+  `accepted` stops being an accident of holding a socket path and becomes a deliberate act of
+  reading a file the runtime was never told about. That is a real change in what an honest,
+  non-adversarial runtime can do by mistake, and no barrier at all to one that means to.
+  Relocating the file to a path not derivable from the socket was considered and rejected this
+  round: any location under the daemon's own `.impulse` home is still listable by the same uid, so
+  it would buy obscurity while reading as if it bought security. Closing this needs a mechanism, not
+  a new path — a separate socket per connection class, an OS sandbox for launched runtimes, or
+  handing the operator surface its capability over a channel the pane has no access to. Those are
+  follow-ups below, not variations on this decision.
 - The assurance label is honest about a mixed chain. An authenticated operator approving
   caller-composed evidence still reads `caller_composed_evidence_declared_operator`, because the
   evidence is the weaker half. Only `daemon_profiled_evidence_authenticated_operator` claims both.
@@ -119,14 +140,36 @@ governed runtime.
   the accepted runs changes, and no `GENOME.md` or `HISTORY.jsonl` write is involved.
 - Protocol v7 is additive. An old client that never presents a capability keeps working for every
   request except the two families above, where it now gets a typed error instead of a silent
-  success. The Dioxus cockpit's own socket client
-  (`impulse-desktop/src/daemon_ops.rs`) must present the capability before its Approve/Reject
-  buttons work again; that one-step change is recorded as a handoff in the lane card, since
-  `impulse-desktop` belongs to another lane.
+  success. Anything with a hand-rolled socket client — including test harnesses that write JSON
+  lines directly — must present the capability before an approval, or it will now be refused.
+  The concurrent packaged-acceptance lane also bumps the protocol to 7; the proposal on the table is
+  that this decision keeps v7 and that lane rebases to v8, with the exact conflict list recorded on
+  this lane's work card.
+- The Dioxus cockpit's own socket client (`impulse-desktop/src/daemon_ops.rs`) presents the
+  capability on the connection it is about to use. This covers both operator surfaces there: the
+  Approve/Reject buttons, and the lifecycle reconciler that marks a profiled task's runtime exit —
+  which is operator-only under rule 4, so without it a profiled Builder's exit would be refused and
+  the task would stay stuck in `Running`.
 - Not adopted here: a second socket for the operator surface, an OS-level sandbox for launched
   runtimes, capability rotation within a run, per-request signatures, and multi-user daemons. Event
   intake from outside the machine — deferred by ADR-0017 pending exactly this authorization — is
   now unblocked but not implemented.
+
+### Follow-ups this decision does not close
+
+1. **A mechanism that survives a same-uid adversary.** A per-class socket, an OS sandbox, or an
+   out-of-band hand-off of the capability to the operator surface. Until one of those lands, the
+   boundary is the structural one described above and must be described that way.
+2. **`prune_superseded_derivations` must become a status-preserving migration.** Dropping and
+   re-deriving a candidate is lossless only while `MemoryCandidateStatus` has exactly one variant.
+   When ADR-0020 (or ADR-0019's promotion work) adds `Promoted`/`Dismissed`, a prune would silently
+   revert an operator's review decision to `PendingReview`; the load path must migrate the status
+   forward instead of discarding the record.
+3. **Refusals are untyped on the wire.** A rejection is `DaemonResponse::Error { message }` with no
+   machine-readable code, so clients match on prose. The protocol already has a precedent for a
+   typed variant (`Busy { resource, retry_after_ms }`); an `Unauthorized { request, reason }` would
+   follow it, and is deliberately deferred to avoid widening this lane's overlap with the concurrent
+   packaged-acceptance lane, which edits the same protocol file.
 
 ## Verification
 
@@ -149,11 +192,15 @@ This decision is represented when tests prove:
    `DaemonProfiledEvidenceAuthenticatedOperator`, caller-composed evidence never does, and a
    client-supplied `authentication` key in the mutation payload is ignored;
 8. a `MEMORY_CANDIDATES.json` written at the previous derivation version reconciles on reload
-   instead of failing startup, leaving governed-task truth untouched.
+   instead of failing startup, leaving governed-task truth untouched;
+9. the cockpit client presents the capability on the same connection as the mutation and only for
+   gated requests, a profiled `MarkRuntimeExited` from the cockpit still reconciles, and a refused
+   or absent capability still sends the request so the daemon's own error surfaces.
 
 Source of truth: `impulse-rs/src/daemon/actor_provenance.rs`, `impulse-rs/src/daemon/mod.rs`,
 `impulse-rs/src/daemon/handlers.rs`, `impulse-rs/src/state/{governed_task,memory_candidate}.rs`,
-`impulse-rs/impulse-ops/src/{governed_task,memory_candidate}.rs`,
+`impulse-rs/impulse-ops/src/{governed_task,memory_candidate,operator_capability}.rs`,
+`impulse-rs/src/client/mod.rs`, `impulse-rs/impulse-desktop/src/daemon_ops.rs`,
 `impulse-rs/tests/socket_actor_provenance.rs`.
 
 ## Related Documents

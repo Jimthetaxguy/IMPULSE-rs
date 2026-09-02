@@ -83,21 +83,22 @@ Gate run on this checkout with `CARGO_TARGET_DIR` isolated from the shared globa
 `cargo fmt --all -- --check` clean; `python3 docs/validate_docs.py --all` shows only the four
 pre-existing failures (ADR-0014 `status: proposed`, three stale March docs).
 
-`cargo test --workspace`: **2353 passed, 0 failed, 9 ignored.**
+`cargo test --workspace`: **2361 passed, 0 failed, 9 ignored** (review round 1; the pre-review
+commit `c156ce3` was 2353/0/9).
 
 | Package / target | passed | failed | ignored |
 |---|---|---|---|
-| impulse-desktop lib | 147 | 0 | 0 |
+| impulse-desktop lib | 150 | 0 | 0 |
 | impulse-desktop tests/desktop_contract | 64 | 0 | 0 |
 | impulse-desktop tests/host_surface | 8 | 0 | 0 |
 | impulse-desktop tests/runtime | 22 | 0 | 1 |
 | impulse-desktop tests/views_ssr | 7 | 0 | 0 |
 | impulse-ion lib | 23 | 0 | 1 |
-| impulse-ops lib | 74 | 0 | 0 |
+| impulse-ops lib | 77 | 0 | 0 |
 | impulse-ops tests/governed_producer_contract | 8 | 0 | 0 |
 | impulse-ops tests/governed_task_contract | 5 | 0 | 0 |
 | impulse-ops tests/memory_candidate_contract | 5 | 0 | 0 |
-| impulse-rs lib | 1821 | 0 | 5 |
+| impulse-rs lib | 1823 | 0 | 5 |
 | impulse-rs tests/governed_process_flow | 2 | 0 | 0 |
 | impulse-rs tests/hook_validation_extraction_benchmark | 5 | 0 | 0 |
 | impulse-rs tests/hook_validation_precompact | 5 | 0 | 0 |
@@ -112,9 +113,57 @@ pre-existing failures (ADR-0014 `status: proposed`, three stale March docs).
 | impulse-term tests/boundary_tests | 3 | 0 | 0 |
 | doc-tests impulse_rs | 3 | 0 | 1 |
 
-Observed flake, unrelated to this lane: `agent::tests::test_harness_query_kills_hung_child_instead_of_orphaning`
+Re-run after review round 1 was clean end to end (exit 0, no failures).
+
+Observed flake on the first gate run only, unrelated to this lane: `agent::tests::test_harness_query_kills_hung_child_instead_of_orphaning`
 failed once under full-workspace parallel load and passed in isolation and on the recorded run. It
 is a process-kill timing test in `src/agent/mod.rs`, untouched here.
+
+## Review round 1 (adversarial review of PR #48 at `c156ce3`)
+
+Verdict was "needs changes"; design claims (a)-(d) and (f) held. Everything below is folded into
+the branch.
+
+1. **Cockpit lifecycle reconciler was still broken.** The review found that `daemon_ops.rs`'s
+   lifecycle reconciler and its `MarkLaunchFailed`/`MarkRuntimeExited` call sites also send
+   operator-only mutations for profiled tasks, so at `c156ce3` a profiled Builder exit would have
+   left the task stuck in `Running`. The coarse `requires_operator_class` over every
+   `MutateGovernedTask` already covers it; added
+   `a_profiled_runtime_exit_from_the_cockpit_presents_the_capability_and_reconciles`, which also
+   pins that the preceding `GetGovernedTask` does *not* pay for a handshake.
+2. **`authorize_governed_mutation` failed open.** It ended in `_ => Ok(())`, so a future variant
+   (ADR-0019's promotion) would have become silently reachable from a Builder. Now an exhaustive
+   match naming every `GovernedTaskMutation` variant, with a doc line saying a new variant must
+   break compilation and be classified deliberately.
+3. **Refused capabilities were silent.** Both clients logged at `debug` and continued, so an
+   approval could land as `declared` while the operator believed otherwise. The CLI now prints a
+   warning naming the downgrade (`capability_refusal_warning`, unit-tested); the cockpit returns
+   the daemon's reason from `present_operator_capability` and folds it into the error its existing
+   surface already shows — no UI restructuring.
+4. **The entropy claim was false.** `generate()` concatenated two `Uuid::new_v4` values: 244 bits
+   with six fixed nibbles, not the "32 CSPRNG bytes" the ADR claimed. `rand` and `getrandom` are
+   only transitive dependencies and `Cargo.toml` is not this lane's to change, so it now reads 32
+   bytes from `/dev/urandom` — the same kernel CSPRNG — and returns an error rather than falling
+   back. `generate()` became fallible, so the capability moved behind a `OnceLock` set in `start`
+   (`Daemon::new` stays infallible).
+5. **Desktop had a silent data-loss shape.** A `BufReader` was built for the handshake, read one
+   line, then dropped, and a second was built on the same socket. One reader is now hoisted across
+   both exchanges, matching `client/mod.rs::exchange_line`.
+6. **Capability location — kept, documented honestly.** The path is
+   `socket_path.with_extension("operator-cap")` and every pane is handed `IMPULSE_SOCKET_PATH`, so
+   the bypass is one `cat`. Relocation under `IMPULSE_HOME` with a per-run id was considered and
+   rejected: any location under the daemon's own home is still listable by the same uid, so it
+   buys obscurity while reading as if it bought security. ADR Consequences now say plainly that the
+   file is derivable from the socket path, and the follow-up list names the mechanisms that would
+   actually close it (per-class socket, OS sandbox, out-of-band hand-off).
+7. **`write_capability_file` hardened.** Stale temp removed, then `create_new(true)`, with the mode
+   asserted on the descriptor via `File::set_permissions` rather than on the path.
+8. **Protocol collision proposal recorded** — see the handoff notes below and the PR body.
+
+Nits: `#[serde(deny_unknown_fields)]` added to `OperatorDecisionInput` (a payload asserting its own
+`authentication` is now rejected at the boundary rather than ignored — the two smuggling tests
+assert the rejection); the `prune_superseded_derivations` / `MemoryCandidateStatus` hazard and the
+untyped-refusal-on-the-wire gap are both recorded in the ADR's follow-up list, no code change.
 
 ## Handoff Notes
 
@@ -154,7 +203,24 @@ operator-class — `actor_provenance::authorize_governed_mutation` is where that
 adding a `RecordPromotion`/`MaterializeStagedWorktree`/`DiscardStagedWorktree` arm there is the
 whole change.
 
-### Desktop client change still needed (blocked path, `impulse-desktop/**`)
+### Protocol version proposal (owner decision)
+Both this lane and the Codex packaged-acceptance lane bump `DAEMON_PROTOCOL_VERSION` to 7. Since
+#48 is an open PR and the Codex lane is five unpushed local commits, the proposal is: **#48 keeps
+v7 and the Codex lane rebases to v8.** Whichever lane takes v8 also updates the three
+version-keyed markers in `docs/validate_docs.py` (`**Protocol version: N**`,
+`"protocol_version": N`, `### vN — <heading>`) and the matching headings in
+`docs/IPC-PROTOCOL.md`. Exact conflict list is immediately below.
+
+### Desktop client change: DONE, ownership block lifted for it
+The ownership block on `impulse-desktop/src/daemon_ops.rs` was lifted for exactly this one-step
+change, delivered as its own commit (`feat(desktop): present operator capability on daemon
+connection (ADR-0018 handoff)`) so it can be dropped independently. Scope: capability presentation
+on the connection about to carry a governed mutation, discovery through the shared
+`impulse_ops::operator_capability` helper, one hoisted reader, refusal folded into the existing
+error surface, three tests. No other desktop file was touched for it, and nothing around the
+insertion was restructured — the Codex lane rewrites roughly 700 lines of that file.
+
+### Original handoff description (superseded by the commit above, kept for the record)
 `impulse-desktop/src/daemon_ops.rs` has its own socket client
 (`WorkbenchDaemonRequest`/`send_acknowledged`). It sends `MutateGovernedTask` with
 `RecordOperatorDecision` from the cockpit's Approve/Reject buttons (`ui.rs:1854`). After this lane

@@ -35,21 +35,20 @@ use std::path::{Path, PathBuf};
 
 use impulse_ops::governed_task::{GovernedTaskMutation, OperatorAuthentication};
 
-/// Environment variable a client may use to present the capability instead of
-/// reading the file. Governed panes never receive it: `remove_inherited_impulse_env`
-/// strips every inherited `IMPULSE_*` key before a runtime is spawned.
-pub const OPERATOR_CAPABILITY_ENV: &str = "IMPULSE_OPERATOR_CAPABILITY";
-
-/// Extension applied to the socket path to locate the capability file, matching
-/// how the daemon's PID file is placed (`impulse.sock` -> `impulse.operator-cap`).
-pub const OPERATOR_CAPABILITY_EXTENSION: &str = "operator-cap";
+// Where the capability lives, what a well-formed token looks like, and how a
+// client discovers one are shared with `impulse-desktop`'s own socket client
+// through `impulse_ops::operator_capability`. Minting, publishing, connection
+// classification, and the constant-time comparison stay here, with the daemon.
+pub use impulse_ops::operator_capability::{
+    OPERATOR_CAPABILITY_ENV, OPERATOR_CAPABILITY_EXTENSION,
+};
 
 /// Random bytes behind one capability token. 32 bytes is the same width as the
 /// SHA-256 digests used elsewhere in the governed record chain.
 const CAPABILITY_BYTES: usize = 32;
 
 /// Hex characters in a well-formed capability token.
-const CAPABILITY_HEX_LEN: usize = CAPABILITY_BYTES * 2;
+const CAPABILITY_HEX_LEN: usize = impulse_ops::operator_capability::OPERATOR_CAPABILITY_HEX_LEN;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ActorProvenanceError {
@@ -130,14 +129,26 @@ impl std::fmt::Debug for OperatorCapability {
 }
 
 impl OperatorCapability {
-    /// Mint a fresh capability for one daemon run.
+    /// Mint a fresh capability for one daemon run: 32 bytes straight from the
+    /// operating system's CSPRNG.
     ///
-    /// `Uuid::new_v4` is backed by the platform CSPRNG (`getrandom`); two of
-    /// them supply the 32 bytes without adding a dependency to the workspace.
-    pub fn generate() -> Self {
+    /// `/dev/urandom` rather than a crate: `rand` and `getrandom` are only
+    /// transitive dependencies here, and this workspace's manifest is not this
+    /// lane's to change. Reading the device is the same kernel CSPRNG those
+    /// crates draw from on this platform. An earlier draft concatenated two
+    /// `Uuid::new_v4` values, which is 244 bits with six fixed nibbles, not 256
+    /// — a real difference from what the ADR claims, so the claim now matches
+    /// the code. Failure is returned rather than absorbed: a daemon that cannot
+    /// read randomness must not fall back to something weaker.
+    pub fn generate() -> anyhow::Result<Self> {
+        use anyhow::Context as _;
+        use std::io::Read as _;
+
         let mut bytes = [0u8; CAPABILITY_BYTES];
-        bytes[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-        bytes[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        std::fs::File::open("/dev/urandom")
+            .context("Failed to open the system CSPRNG for the operator capability")?
+            .read_exact(&mut bytes)
+            .context("Failed to read operator capability entropy")?;
         let mut token = String::with_capacity(CAPABILITY_HEX_LEN);
         for byte in bytes {
             use std::fmt::Write as _;
@@ -145,22 +156,14 @@ impl OperatorCapability {
             // satisfy the fmt::Write signature.
             let _ = write!(token, "{byte:02x}");
         }
-        Self { token }
+        Ok(Self { token })
     }
 
     /// Parse a token read from a file or the environment.
     pub fn parse(token: &str) -> Result<Self, ActorProvenanceError> {
-        let token = token.trim();
-        if token.len() != CAPABILITY_HEX_LEN
-            || !token
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err(ActorProvenanceError::MalformedCapability);
-        }
-        Ok(Self {
-            token: token.to_string(),
-        })
+        impulse_ops::operator_capability::parse_token(token)
+            .map(|token| Self { token })
+            .ok_or(ActorProvenanceError::MalformedCapability)
     }
 
     /// The raw token. Only the capability file writer and the comparison below
@@ -186,7 +189,14 @@ impl OperatorCapability {
 
     /// Where the capability for `socket_path` lives.
     pub fn path_for_socket(socket_path: &Path) -> PathBuf {
-        socket_path.with_extension(OPERATOR_CAPABILITY_EXTENSION)
+        impulse_ops::operator_capability::path_for_socket(socket_path)
+    }
+
+    /// Resolve a capability the way a client does: an explicit environment
+    /// override, else the file the daemon published beside `socket_path`.
+    pub fn resolve_for_socket(socket_path: &Path) -> Option<Self> {
+        impulse_ops::operator_capability::resolve_for_socket(socket_path)
+            .map(|token| Self { token })
     }
 }
 
@@ -276,7 +286,17 @@ pub fn peer_uid(stream: &tokio::net::UnixStream) -> Option<u32> {
 /// operator-only: a Builder submits claims through the daemon-owned producer
 /// requests, it does not narrate its own lifecycle. Caller-composed
 /// (non-profiled) tasks keep their existing lifecycle behavior, since no
-/// daemon-owned producer chain governs them.
+/// daemon-owned producer chain governs them. The claim, verification, and
+/// Supervisor mutations are not classified here because a profiled task already
+/// refuses them outright in favour of the daemon-owned producer requests, and an
+/// unprofiled task's evidence is caller-composed by contract.
+///
+/// **The match below is deliberately exhaustive and must stay that way.** An
+/// earlier draft ended in `_ => Ok(())`, which fails *open*: a mutation variant
+/// added later — ADR-0019's promotion is the obvious one — would silently become
+/// reachable from a launched Builder. Adding a variant to
+/// [`GovernedTaskMutation`] must break this function's compilation so the new
+/// transition is classified on purpose rather than by omission.
 pub fn authorize_governed_mutation(
     mutation: &GovernedTaskMutation,
     task_is_profiled: bool,
@@ -285,14 +305,23 @@ pub fn authorize_governed_mutation(
     if class.is_operator() {
         return Ok(());
     }
-    let request = match mutation {
-        GovernedTaskMutation::RecordOperatorDecision { .. } => "RecordOperatorDecision",
-        GovernedTaskMutation::MarkRunning { .. } if task_is_profiled => "MarkRunning",
-        GovernedTaskMutation::MarkLaunchFailed { .. } if task_is_profiled => "MarkLaunchFailed",
-        GovernedTaskMutation::MarkRuntimeExited { .. } if task_is_profiled => "MarkRuntimeExited",
-        _ => return Ok(()),
+    let gated: Option<&'static str> = match mutation {
+        GovernedTaskMutation::RecordOperatorDecision { .. } => Some("RecordOperatorDecision"),
+        GovernedTaskMutation::MarkRunning { .. } => task_is_profiled.then_some("MarkRunning"),
+        GovernedTaskMutation::MarkLaunchFailed { .. } => {
+            task_is_profiled.then_some("MarkLaunchFailed")
+        }
+        GovernedTaskMutation::MarkRuntimeExited { .. } => {
+            task_is_profiled.then_some("MarkRuntimeExited")
+        }
+        GovernedTaskMutation::SubmitClaim { .. }
+        | GovernedTaskMutation::RecordVerification { .. }
+        | GovernedTaskMutation::RecordSupervisorVerdict { .. } => None,
     };
-    Err(ActorProvenanceError::OperatorClassRequired { request })
+    match gated {
+        Some(request) => Err(ActorProvenanceError::OperatorClassRequired { request }),
+        None => Ok(()),
+    }
 }
 
 /// True when authorizing `mutation` needs the task's verification profile, and
@@ -336,11 +365,24 @@ pub fn write_capability_file(path: &Path, capability: &OperatorCapability) -> an
         std::process::id(),
         nanos
     ));
+    // A leftover temp file from a crashed run could have any owner-visible
+    // mode, and `OpenOptions::mode` only applies to a file this call creates.
+    // `create_new` refuses to open an existing path at all, so the secret is
+    // only ever written into a file this process just created at 0600.
+    match std::fs::remove_file(&temp) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(anyhow::Error::new(error).context(format!(
+                "Failed to clear stale operator capability temp file {}",
+                temp.display()
+            )))
+        }
+    }
     {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .open(&temp)
             .with_context(|| {
@@ -349,6 +391,10 @@ pub fn write_capability_file(path: &Path, capability: &OperatorCapability) -> an
                     temp.display()
                 )
             })?;
+        // Assert the mode on the open descriptor, not the path: a path-based
+        // chmod races against anything that could swap the path in between.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .context("Failed to restrict operator capability permissions")?;
         file.write_all(capability.expose().as_bytes())
             .context("Failed to write operator capability")?;
         file.write_all(b"\n")
@@ -356,10 +402,6 @@ pub fn write_capability_file(path: &Path, capability: &OperatorCapability) -> an
         file.sync_all()
             .context("Failed to flush operator capability file")?;
     }
-    // Re-assert the mode: `mode()` only applies when the file is created, and
-    // a pre-existing temp file would have kept its old permissions.
-    std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))
-        .context("Failed to restrict operator capability permissions")?;
     std::fs::rename(&temp, path).with_context(|| {
         format!(
             "Failed to install operator capability at {}",
@@ -424,8 +466,8 @@ mod tests {
 
     #[test]
     fn test_generate_produces_distinct_full_width_lowercase_hex_tokens() {
-        let first = OperatorCapability::generate();
-        let second = OperatorCapability::generate();
+        let first = OperatorCapability::generate().unwrap();
+        let second = OperatorCapability::generate().unwrap();
         assert_eq!(first.expose().len(), CAPABILITY_HEX_LEN);
         assert!(first
             .expose()
@@ -440,7 +482,7 @@ mod tests {
 
     #[test]
     fn test_debug_never_renders_the_token() {
-        let capability = OperatorCapability::generate();
+        let capability = OperatorCapability::generate().unwrap();
         let rendered = format!("{capability:?}");
         assert!(rendered.contains("redacted"));
         assert!(!rendered.contains(capability.expose()));
@@ -464,14 +506,14 @@ mod tests {
 
     #[test]
     fn test_parse_accepts_a_generated_token_with_surrounding_whitespace() {
-        let capability = OperatorCapability::generate();
+        let capability = OperatorCapability::generate().unwrap();
         let parsed = OperatorCapability::parse(&format!("  {}\n", capability.expose())).unwrap();
         assert_eq!(parsed, capability);
     }
 
     #[test]
     fn test_matches_rejects_wrong_length_and_wrong_value() {
-        let capability = OperatorCapability::generate();
+        let capability = OperatorCapability::generate().unwrap();
         assert!(capability.matches(capability.expose()));
         assert!(!capability.matches(""));
         assert!(!capability.matches(&capability.expose()[..CAPABILITY_HEX_LEN - 1]));
@@ -482,7 +524,7 @@ mod tests {
 
     #[test]
     fn test_present_capability_raises_only_a_same_uid_peer_with_the_right_token() {
-        let capability = OperatorCapability::generate();
+        let capability = OperatorCapability::generate().unwrap();
         let mut provenance = ConnectionProvenance::new(Some(501), 501);
         assert_eq!(provenance.class(), ConnectionClass::NonOperator);
         assert_eq!(
@@ -496,7 +538,7 @@ mod tests {
 
     #[test]
     fn test_present_capability_rejects_a_different_peer_uid() {
-        let capability = OperatorCapability::generate();
+        let capability = OperatorCapability::generate().unwrap();
         let mut provenance = ConnectionProvenance::new(Some(502), 501);
         assert_eq!(
             provenance
@@ -512,7 +554,7 @@ mod tests {
 
     #[test]
     fn test_present_capability_rejects_missing_peer_credentials_and_wrong_tokens() {
-        let capability = OperatorCapability::generate();
+        let capability = OperatorCapability::generate().unwrap();
 
         let mut unknown_peer = ConnectionProvenance::new(None, 501);
         assert_eq!(
@@ -533,7 +575,10 @@ mod tests {
         let mut wrong_token = ConnectionProvenance::new(Some(501), 501);
         assert_eq!(
             wrong_token
-                .present_capability(OperatorCapability::generate().expose(), Some(&capability))
+                .present_capability(
+                    OperatorCapability::generate().unwrap().expose(),
+                    Some(&capability)
+                )
                 .unwrap_err(),
             ActorProvenanceError::CapabilityRejected
         );
@@ -542,7 +587,7 @@ mod tests {
 
     #[test]
     fn test_a_rejected_presentation_cannot_downgrade_an_operator_connection() {
-        let capability = OperatorCapability::generate();
+        let capability = OperatorCapability::generate().unwrap();
         let mut provenance = ConnectionProvenance::new(Some(501), 501);
         provenance
             .present_capability(capability.expose(), Some(&capability))
@@ -648,14 +693,14 @@ mod tests {
         let path = OperatorCapability::path_for_socket(&socket);
         assert_eq!(path.file_name().unwrap(), "impulse.operator-cap");
 
-        let capability = OperatorCapability::generate();
+        let capability = OperatorCapability::generate().unwrap();
         write_capability_file(&path, &capability).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "capability must be owner-read-write only");
         assert_eq!(read_capability_file(&path).unwrap(), capability);
 
         // Rewriting over an existing capability keeps the mode and the value.
-        let replacement = OperatorCapability::generate();
+        let replacement = OperatorCapability::generate().unwrap();
         write_capability_file(&path, &replacement).unwrap();
         assert_eq!(read_capability_file(&path).unwrap(), replacement);
 
@@ -683,7 +728,7 @@ mod tests {
         let blocker = directory.path().join("not-a-directory");
         std::fs::write(&blocker, "file").unwrap();
         let path = blocker.join("nested").join("impulse.operator-cap");
-        assert!(write_capability_file(&path, &OperatorCapability::generate()).is_err());
+        assert!(write_capability_file(&path, &OperatorCapability::generate().unwrap()).is_err());
     }
 
     #[test]

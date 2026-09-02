@@ -2768,9 +2768,10 @@ mod tests {
         let (_root, state) = state();
         let judged = awaiting_operator(&state, "smuggle");
 
-        // A client crafting the wire payload can add whatever keys it likes to
-        // the operator decision; none of them are the provenance field, which
-        // lives on the record and is written by the daemon.
+        // A client crafting the wire payload cannot assert its own provenance:
+        // the field lives on the persisted record, is written by the daemon,
+        // and `OperatorDecisionInput` denies unknown keys, so the attempt fails
+        // before it reaches the state layer at all.
         let mut wire = serde_json::to_value(mutation(
             &judged,
             "approve-smuggle",
@@ -2784,15 +2785,22 @@ mod tests {
             },
         ))
         .unwrap();
+        let legitimate = wire.clone();
         wire["mutation"]["data"]["decision"]["authentication"] =
             serde_json::json!("capability_authenticated");
-        let request: GovernedTaskMutationRequest = serde_json::from_value(wire).unwrap();
+        let error = serde_json::from_value::<GovernedTaskMutationRequest>(wire).unwrap_err();
+        assert!(
+            format!("{error}").contains("authentication"),
+            "a payload asserting its own provenance must be rejected at the boundary"
+        );
 
+        // The same request without that key is accepted, and the decision it
+        // records is `Declared` because this caller passed no connection class.
+        let request: GovernedTaskMutationRequest = serde_json::from_value(legitimate).unwrap();
         let accepted = state.mutate_governed_task(request).unwrap();
         assert_eq!(
             accepted.operator_decisions.last().unwrap().authentication,
-            OperatorAuthentication::Declared,
-            "payload-declared provenance must be ignored"
+            OperatorAuthentication::Declared
         );
     }
 

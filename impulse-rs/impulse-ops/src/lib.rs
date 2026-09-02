@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 pub mod agent_registry;
 pub mod governed_task;
 pub mod memory_candidate;
+pub mod operator_capability;
 pub mod role_assignment;
 
 /// Shared daemon protocol version for GUI/operator workbench compatibility.

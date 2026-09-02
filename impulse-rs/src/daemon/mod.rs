@@ -149,10 +149,13 @@ pub struct Daemon {
     /// Concurrent agent requests receive typed Busy; unrelated daemon request
     /// groups never acquire it.
     cached_agent: Arc<tokio::sync::Mutex<Option<crate::agent::ImpulseAgent>>>,
-    /// Per-run operator capability (ADR-0018). Minted here, published as a
-    /// mode-0600 file beside the socket while the daemon listens, and removed
-    /// on shutdown so a capability never outlives the run that issued it.
-    operator_capability: Arc<OperatorCapability>,
+    /// Per-run operator capability (ADR-0018). Minted in `start` once the
+    /// socket is bound, published as a mode-0600 file beside it while the
+    /// daemon listens, and removed on shutdown so a capability never outlives
+    /// the run that issued it. It lives behind a `OnceLock` because minting
+    /// reads the system CSPRNG and can fail, while `Daemon::new` is infallible;
+    /// an empty cell simply means no connection can reach operator class.
+    operator_capability: Arc<std::sync::OnceLock<OperatorCapability>>,
     daemon_uid: u32,
 }
 
@@ -204,7 +207,7 @@ impl Daemon {
             )),
             delegation_tracker: Arc::new(RwLock::new(crate::delegation::DelegationTracker::new())),
             cached_agent: Arc::new(tokio::sync::Mutex::new(None)),
-            operator_capability: Arc::new(OperatorCapability::generate()),
+            operator_capability: Arc::new(std::sync::OnceLock::new()),
             daemon_uid: actor_provenance::daemon_uid(),
         }
     }
@@ -283,8 +286,13 @@ impl Daemon {
         // and locked down, so the file can never advertise a capability for a
         // daemon that failed to start.
         let capability_path = self.operator_capability_path();
-        actor_provenance::write_capability_file(&capability_path, &self.operator_capability)
+        let capability = OperatorCapability::generate()
+            .context("Failed to mint this daemon run's operator capability")?;
+        actor_provenance::write_capability_file(&capability_path, &capability)
             .context("Failed to publish daemon operator capability")?;
+        // A second `start` on the same Daemon would otherwise publish a
+        // capability the connection loop never compares against.
+        let _ = self.operator_capability.set(capability);
 
         println!("Daemon listening on {}", self.config.socket_path.display());
 
@@ -359,7 +367,7 @@ struct ConnectionContext {
     conflict_resolver: Arc<RwLock<crate::agent::coordinator::ConflictResolver>>,
     delegation_tracker: Arc<RwLock<crate::delegation::DelegationTracker>>,
     cached_agent: Arc<tokio::sync::Mutex<Option<crate::agent::ImpulseAgent>>>,
-    operator_capability: Arc<OperatorCapability>,
+    operator_capability: Arc<std::sync::OnceLock<OperatorCapability>>,
     daemon_uid: u32,
 }
 
@@ -433,9 +441,7 @@ async fn handle_connection(
         // Capability presentation mutates connection state, so it is answered
         // here rather than in the stateless dispatcher.
         if let DaemonRequest::PresentOperatorCapability { token } = &request {
-            let response = match provenance
-                .present_capability(token, Some(operator_capability.as_ref()))
-            {
+            let response = match provenance.present_capability(token, operator_capability.get()) {
                 Ok(class) => {
                     tracing::info!(
                         connection_class = class.as_str(),
