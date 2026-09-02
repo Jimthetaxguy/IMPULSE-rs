@@ -102,8 +102,9 @@ CONTRACT_REQUIRED_MARKERS = {
         DURABLE_ROADMAP_MARKER,
     ],
     DOCS_DIR / "IPC-PROTOCOL.md": [
-        "**Protocol version: 6**",
-        '"protocol_version": 6',
+        "**Protocol version: 7**",
+        '"protocol_version": 7',
+        "### v7 — Socket actor provenance",
         "### v6 — Deterministic accepted-run memory candidates",
         "### v5 — Daemon-owned governed producers",
         "### v4 — Daemon-owned governed tasks",

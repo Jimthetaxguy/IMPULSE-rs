@@ -165,6 +165,7 @@ categories:
     - decisions/0014-work-item-and-comparative-settlement.md
     - decisions/0015-harness-owned-step-model.md
     - decisions/0017-canonical-loop-contract.md
+    - decisions/0018-socket-actor-provenance.md
 
   session_logs:
     - session-logs/DEVELOPMENT-HISTORY.md

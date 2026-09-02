@@ -12,6 +12,7 @@ mod tests {
 
     // Re-import handler functions from the extracted handlers module.
     // super::super = daemon module (tests.rs is daemon::tests, inner mod is daemon::tests::tests)
+    use super::super::actor_provenance::ConnectionClass;
     use super::super::handlers::{
         handle_delegation_request, handle_governed_task_request, handle_guard_request,
         handle_ops_request, handle_plugin_request, handle_session_request, handle_status,
@@ -911,7 +912,8 @@ mod tests {
         let request: DaemonRequest =
             serde_json::from_str(&wire).expect("deserialize register request");
 
-        let registered = handle_governed_task_request(request, &state).await;
+        let registered =
+            handle_governed_task_request(request, &state, ConnectionClass::Operator).await;
         let DaemonResponse::Ok { result } = registered else {
             panic!("expected governed task registration success");
         };
@@ -934,6 +936,7 @@ mod tests {
                 },
             },
             &state,
+            ConnectionClass::Operator,
         )
         .await;
         let DaemonResponse::Ok { result } = running else {
@@ -949,6 +952,7 @@ mod tests {
                 task_id: running.id.clone(),
             },
             &state,
+            ConnectionClass::Operator,
         )
         .await;
         let DaemonResponse::Ok { result } = fetched else {
@@ -966,6 +970,7 @@ mod tests {
                 project_id: "daemon-project".to_string(),
             },
             &state,
+            ConnectionClass::Operator,
         )
         .await;
         let DaemonResponse::Ok { result } = listed else {

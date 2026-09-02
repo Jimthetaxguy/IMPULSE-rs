@@ -266,6 +266,10 @@ pub fn MemoryView(
                                 let assurance = match candidate.source_assurance {
                                     AcceptedRunSourceAssurance::DaemonProfiledEvidenceDeclaredOperator =>
                                         "daemon-profiled evidence · declared operator",
+                                    // ADR-0018: the approving connection presented this
+                                    // daemon run's operator capability.
+                                    AcceptedRunSourceAssurance::DaemonProfiledEvidenceAuthenticatedOperator =>
+                                        "daemon-profiled evidence · authenticated operator",
                                     AcceptedRunSourceAssurance::CallerComposedEvidenceDeclaredOperator =>
                                         "caller-composed evidence · declared operator",
                                 };

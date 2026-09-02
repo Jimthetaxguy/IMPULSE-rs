@@ -585,6 +585,33 @@ pub struct OperatorDecisionInput {
     pub rationale: String,
 }
 
+/// How much the daemon can honestly attest about the operator behind a
+/// decision (ADR-0018).
+///
+/// This is deliberately absent from [`OperatorDecisionInput`]: the value is
+/// stamped by the daemon from the *connection class* the mutation arrived on
+/// and is never read from client-supplied payload. A caller that reaches the
+/// state layer directly (direct CLI mode, in-process tests) gets the
+/// serde-default [`OperatorAuthentication::Declared`], which is also what an
+/// operator decision recorded before ADR-0018 deserializes as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorAuthentication {
+    /// Operator identity is asserted by the caller inside the same-user socket
+    /// trust boundary. No connection-level proof was presented.
+    #[default]
+    Declared,
+    /// The decision arrived on a connection that presented this daemon run's
+    /// operator capability and whose peer uid matched the daemon's own uid.
+    CapabilityAuthenticated,
+}
+
+impl OperatorAuthentication {
+    pub fn is_capability_authenticated(self) -> bool {
+        matches!(self, Self::CapabilityAuthenticated)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperatorDecision {
     pub id: GovernedRecordId,
@@ -594,6 +621,10 @@ pub struct OperatorDecision {
     pub rationale: String,
     pub decided_at: String,
     pub based_on_revision: u64,
+    /// Daemon-stamped connection provenance (ADR-0018). Serde-defaulted so
+    /// records written before ADR-0018 load as `Declared`.
+    #[serde(default)]
+    pub authentication: OperatorAuthentication,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -839,3 +870,76 @@ impl GovernedTaskRun {
 /// The snapshot intentionally carries the full typed record in the first
 /// protocol version. Raw command output remains out-of-line.
 pub type GovernedTaskSnapshot = GovernedTaskRun;
+
+#[cfg(test)]
+mod operator_authentication_tests {
+    use super::*;
+
+    fn decision() -> OperatorDecision {
+        OperatorDecision {
+            id: GovernedRecordId::try_new("operator-decision-a").unwrap(),
+            actor: GovernedActor {
+                kind: GovernedActorKind::Operator,
+                id: "operator-a".to_string(),
+            },
+            supervisor_verdict_id: GovernedRecordId::try_new("verdict-a").unwrap(),
+            decision: OperatorDecisionKind::Approve,
+            rationale: "accepted".to_string(),
+            decided_at: "2026-09-02T00:00:00Z".to_string(),
+            based_on_revision: 4,
+            authentication: OperatorAuthentication::CapabilityAuthenticated,
+        }
+    }
+
+    #[test]
+    fn test_operator_authentication_round_trips_through_serde() {
+        for value in [
+            OperatorAuthentication::Declared,
+            OperatorAuthentication::CapabilityAuthenticated,
+        ] {
+            let json = serde_json::to_string(&value).unwrap();
+            let decoded: OperatorAuthentication = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, value);
+        }
+        assert_eq!(
+            serde_json::to_string(&OperatorAuthentication::CapabilityAuthenticated).unwrap(),
+            "\"capability_authenticated\""
+        );
+    }
+
+    #[test]
+    fn test_operator_decision_round_trips_with_authentication() {
+        let original = decision();
+        let json = serde_json::to_string(&original).unwrap();
+        let decoded: OperatorDecision = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, original);
+        assert!(decoded.authentication.is_capability_authenticated());
+    }
+
+    #[test]
+    fn test_operator_decision_without_authentication_field_loads_as_declared() {
+        // A record persisted before ADR-0018 has no `authentication` key.
+        let mut value = serde_json::to_value(decision()).unwrap();
+        value.as_object_mut().unwrap().remove("authentication");
+        let decoded: OperatorDecision = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.authentication, OperatorAuthentication::Declared);
+        assert!(!decoded.authentication.is_capability_authenticated());
+    }
+
+    #[test]
+    fn test_operator_decision_input_cannot_carry_authentication() {
+        // The daemon stamps provenance; a client payload must not be able to
+        // assert it. `OperatorDecisionInput` therefore has no such field, and
+        // an unknown key is dropped rather than honored.
+        let input: OperatorDecisionInput = serde_json::from_value(serde_json::json!({
+            "actor": {"kind": "operator", "id": "operator-a"},
+            "supervisor_verdict_id": "verdict-a",
+            "decision": "approve",
+            "rationale": "accepted",
+            "authentication": "capability_authenticated",
+        }))
+        .unwrap();
+        let encoded = serde_json::to_value(&input).unwrap();
+        assert!(encoded.get("authentication").is_none());
+    }
+}
