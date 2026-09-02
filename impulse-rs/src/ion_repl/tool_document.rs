@@ -29,10 +29,16 @@
 //!   event by event through quick-xml into one line per non-empty
 //!   paragraph and one line per table row, so the docx object tree, which
 //!   is many times the size of the XML, is never built. Every buffer that
-//!   holds text on its way to the output is counted against
-//!   [`MAX_EXTRACTED_CHARS`] as it grows, so a single unbounded paragraph
-//!   or row cannot balloon between checks, and the outline it produces is
-//!   capped at [`MAX_WORD_SECTIONS`] rows;
+//!   holds text on its way to the output is checked against
+//!   [`MAX_EXTRACTED_CHARS`] *before* it grows, so no long-lived buffer
+//!   overshoots on one event; the outline is capped at
+//!   [`MAX_WORD_SECTIONS`] rows; and an output line is always exactly one
+//!   paragraph or one table row, so document text can never contribute a
+//!   line or column break of its own. quick-xml's own event buffer and
+//!   open-element stack scale with the part rather than the budget, so
+//!   working memory for this path is bounded by roughly twice
+//!   [`MAX_DECOMPRESSED_BYTES`], which the part cap enforces here even
+//!   when [`preflight_container`] has not run;
 //! - `csv` text is checked against [`MAX_EXTRACTED_CHARS`] after parsing,
 //!   where the parser's memory is bounded by the 10 MiB file cap;
 //! - legacy `xls` is refused because its binary format has no streaming
@@ -206,7 +212,8 @@ impl ReplTool for DocumentReadTool {
                  outline=true to learn total_chars and the sections with their offsets, then \
                  read only the windows you need (max_chars up to {}) and answer from what you \
                  read. Every result ends with either 'complete' or 'truncated, continue with \
-                 offset=N'. Use sheet to read one worksheet (empty worksheets are omitted), or \
+                 offset=N'. Use sheet to read one worksheet (empty worksheets are omitted, \
+                 as are chart, dialog, and macro sheets, which hold no cells), or \
                  pass a section's offset to jump to it.",
                 MAX_DOCUMENT_BYTES / (1024 * 1024),
                 MAX_CHARS_CAP
@@ -220,7 +227,7 @@ impl ReplTool for DocumentReadTool {
                     },
                     "sheet": {
                         "type": "string",
-                        "description": "Worksheet name to read (spreadsheets only, case-insensitive; empty worksheets are omitted). When set, offset is relative to that sheet's text."
+                        "description": "Worksheet name to read (spreadsheets only, case-insensitive; empty worksheets are omitted, as are chart, dialog, and macro sheets, which are not worksheets and hold no cells). When set, offset is relative to that sheet's text."
                     },
                     "outline": {
                         "type": "boolean",
@@ -631,7 +638,11 @@ pub const MAX_WORD_SECTIONS: usize = 4_096;
 ///   whose text repeats the `mc:Choice` that is used instead.
 ///
 /// Matching is on the local name, so the namespace prefix a writer chose
-/// does not matter.
+/// does not matter. Two consequences of that are deliberate: a simple field
+/// (`w:fldSimple`) keeps its cached result, because its instruction lives in
+/// a `w:instr` **attribute** and attributes are never read; and text a writer
+/// put in a shape or text box (DrawingML `<a:t>`) or an equation (OMML
+/// `<m:t>`) is extracted like any other `t`, because a reader sees it too.
 fn is_skipped_word_subtree(local_name: &[u8]) -> bool {
     matches!(
         local_name,
@@ -685,10 +696,24 @@ impl WordTextBuilder {
     /// Commits one non-empty line (a paragraph, or a whole table row) and
     /// its trailing newline. Empty lines are dropped, so a document of
     /// blank paragraphs produces no text, no sections, and no growth.
+    ///
+    /// Any `\n` or `\r` still inside `line` becomes a space, one character
+    /// for one, so the invariant every consumer relies on holds absolutely:
+    /// one output line is exactly one paragraph or one table row, and the
+    /// only newlines in the text are the ones this method writes. `window`
+    /// snapping and section spans are exact because of it. The caller
+    /// already normalizes document text, so this is the backstop, not the
+    /// only guard.
     pub fn push_line(&mut self, line: &str, raw: &str) -> Result<()> {
         if line.trim().is_empty() {
             return Ok(());
         }
+        let line = if line.contains(['\n', '\r']) {
+            std::borrow::Cow::Owned(line.replace(['\n', '\r'], " "))
+        } else {
+            std::borrow::Cow::Borrowed(line)
+        };
+        let line = line.as_ref();
         let chars = line.chars().count() + 1;
         self.check_pending(chars, raw)?;
         if self.paragraphs_in_section == 0 && self.sections.len() < MAX_WORD_SECTIONS {
@@ -716,6 +741,23 @@ impl WordTextBuilder {
     }
 }
 
+/// Copies document text into the paragraph buffer, replacing the control
+/// characters that would otherwise let text forge structure: `\n` and `\r`
+/// always, because one output line is one paragraph or one row, and `\t`
+/// as well inside a table row, where a tab is the column separator. Every
+/// replacement is one character for one, so the caller's character count
+/// stays exact. Structural breaks are written only by the walk itself, from
+/// `w:tab` outside a table and from a row or paragraph ending.
+fn push_word_text(paragraph: &mut String, text: &str, in_row: bool) {
+    for ch in text.chars() {
+        paragraph.push(match ch {
+            '\n' | '\r' => ' ',
+            '\t' if in_row => ' ',
+            other => other,
+        });
+    }
+}
+
 /// Streams a Word document's `word/document.xml` through quick-xml into
 /// this module's own text under the character budget. The docx object
 /// tree, which is many times the size of the XML it is built from, is never
@@ -724,19 +766,29 @@ impl WordTextBuilder {
 ///
 /// Layout: one line per non-empty paragraph, and one line per table row
 /// with its cells tab-separated, matching how workbook rows are rendered;
-/// paragraphs inside one cell are joined with spaces. Inside a table `w:tab`
-/// and `w:br` become spaces, so cell text cannot forge a column or row
-/// break; outside one they stay `\t` and `\n`. Nested tables are flattened
-/// into the row that contains them.
+/// paragraphs inside one cell are joined with spaces. That mapping is
+/// absolute -- an output line is always exactly one paragraph or one row --
+/// so `w:br`/`w:cr` become spaces and document text can never contribute a
+/// `\n`, `\r`, or (inside a row) a `\t` of its own. Outside a table `w:tab`
+/// stays a tab, which cannot break a line. Nested tables flatten into the
+/// row that contains them, and a cell's own text survives a table nested
+/// inside it.
 ///
-/// Every buffer that holds text on its way to the output is counted against
-/// the budget as it grows, so neither one enormous paragraph nor one
-/// enormous row can balloon between budget checks: peak memory is the
-/// budget plus a single XML event. `word/document.xml` is itself read
-/// through [`MAX_DECOMPRESSED_BYTES`] even when [`preflight_container`] has
-/// not run, and quick-xml resolves only the five predefined XML entities,
-/// so neither a bomb in one part nor a nested-entity declaration expands
-/// here.
+/// Every buffer that holds text on its way to the output -- the paragraph,
+/// the table cell, the table row -- is checked against the budget *before*
+/// it grows, so no long-lived buffer can overshoot on one event. Peak
+/// memory is not the budget alone: quick-xml's event buffer holds one event
+/// and its open-element stack scales with nesting depth, both bounded by
+/// the part rather than by the budget, so the working bound is roughly
+/// twice [`MAX_DECOMPRESSED_BYTES`]. `word/document.xml` is held to that cap
+/// here even when [`preflight_container`] has not run, and a part that
+/// exceeds it is refused rather than silently truncated. quick-xml resolves
+/// only the five predefined XML entities, so no declared or nested entity
+/// expands here.
+///
+/// The part is located the way calamine locates workbook parts, comparing
+/// names ASCII-case-insensitively, because OPC part names are not
+/// case-sensitive.
 ///
 /// Only `word/document.xml` is read. Headers, footers, footnotes, endnotes,
 /// and comments live in sibling parts and are deliberately out of scope.
@@ -745,6 +797,8 @@ pub fn extract_word(path: &Path, raw: &str, budget: ExtractBudget) -> Result<Par
     use quick_xml::Reader;
     use std::io::Read as _;
 
+    const DOCUMENT_PART: &str = "word/document.xml";
+
     let file = std::fs::File::open(path)
         .with_context(|| format!("document_read: '{raw}' could not be opened"))?;
     let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file)).map_err(|e| {
@@ -752,11 +806,25 @@ pub fn extract_word(path: &Path, raw: &str, budget: ExtractBudget) -> Result<Par
             "document_read: '{raw}' could not be parsed: not a valid docx container ({e})"
         )
     })?;
-    let entry = archive.by_name("word/document.xml").map_err(|e| {
-        anyhow::anyhow!("document_read: '{raw}' could not be parsed: no word/document.xml ({e})")
+    // OPC part names compare case-insensitively, and calamine resolves
+    // workbook parts the same way; a writer that emits `word/Document.xml`
+    // produces a file every reader opens, so this one opens it too.
+    let part = archive
+        .file_names()
+        .find(|name| name.eq_ignore_ascii_case(DOCUMENT_PART))
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            anyhow::anyhow!("document_read: '{raw}' could not be parsed: no {DOCUMENT_PART}")
+        })?;
+    let entry = archive.by_name(&part).map_err(|e| {
+        anyhow::anyhow!("document_read: '{raw}' could not be parsed: no {DOCUMENT_PART} ({e})")
     })?;
-    let mut reader =
-        Reader::from_reader(std::io::BufReader::new(entry.take(MAX_DECOMPRESSED_BYTES)));
+    // One byte past the cap, so that running the limit to zero proves the
+    // part is over it: this path fails closed rather than parsing whatever
+    // prefix fits when `preflight_container` has not already run.
+    let mut reader = Reader::from_reader(std::io::BufReader::new(
+        entry.take(MAX_DECOMPRESSED_BYTES + 1),
+    ));
     let mut buf = Vec::new();
     let mut out = WordTextBuilder::new(budget.max_chars);
 
@@ -776,14 +844,27 @@ pub fn extract_word(path: &Path, raw: &str, budget: ExtractBudget) -> Result<Par
     let mut skip_depth = 0usize;
     // Depth of nested `w:tr`; 0 means not inside a table row.
     let mut row_depth = 0usize;
+    // Depth of nested `w:tc`. Only the outermost cell of a row becomes a
+    // column, so a table nested inside a cell merges into that cell instead
+    // of erasing the text beside it and adding a column of its own.
+    let mut cell_depth = 0usize;
     let mut cells_in_row = 0usize;
 
+    // A read error is held rather than returned, so that a part cut off at
+    // the cap is reported as too large -- which it is -- and not as a
+    // malformed document, which it may well not be.
+    let mut malformed: Option<anyhow::Error> = None;
     loop {
-        let event = reader.read_event_into(&mut buf).map_err(|e| {
-            anyhow::anyhow!(
-                "document_read: '{raw}' could not be parsed: word/document.xml is malformed ({e})"
-            )
-        })?;
+        let event = match reader.read_event_into(&mut buf) {
+            Ok(event) => event,
+            Err(e) => {
+                malformed = Some(anyhow::anyhow!(
+                    "document_read: '{raw}' could not be parsed: {DOCUMENT_PART} is malformed \
+                     ({e})"
+                ));
+                break;
+            }
+        };
         match event {
             Event::Start(ref e) => {
                 if skip_depth > 0 {
@@ -804,27 +885,35 @@ pub fn extract_word(path: &Path, raw: &str, budget: ExtractBudget) -> Result<Par
                                 row_chars = 0;
                                 cell_chars = 0;
                                 cells_in_row = 0;
+                                cell_depth = 0;
                             }
                             row_depth += 1;
                         }
                         b"tc" => {
-                            cell.clear();
-                            cell_chars = 0;
+                            if cell_depth == 0 {
+                                cell.clear();
+                                cell_chars = 0;
+                            }
+                            cell_depth += 1;
                         }
                         _ => {}
                     }
                 }
             }
             Event::Empty(ref e) if skip_depth == 0 => match e.local_name().as_ref() {
+                // A tab outside a table is ordinary text; inside one the tab
+                // is the column separator, so it becomes a space.
                 b"tab" => {
+                    out.check_pending(paragraph_chars + 1 + cell_chars + row_chars + 1, raw)?;
                     paragraph.push(if row_depth > 0 { ' ' } else { '\t' });
                     paragraph_chars += 1;
-                    out.check_pending(paragraph_chars + cell_chars + row_chars + 1, raw)?;
                 }
+                // A line break inside a paragraph becomes a space: one
+                // output line is one paragraph or one row, always.
                 b"br" | b"cr" => {
-                    paragraph.push(if row_depth > 0 { ' ' } else { '\n' });
+                    out.check_pending(paragraph_chars + 1 + cell_chars + row_chars + 1, raw)?;
+                    paragraph.push(' ');
                     paragraph_chars += 1;
-                    out.check_pending(paragraph_chars + cell_chars + row_chars + 1, raw)?;
                 }
                 b"p" => {
                     paragraph.clear();
@@ -838,15 +927,22 @@ pub fn extract_word(path: &Path, raw: &str, budget: ExtractBudget) -> Result<Par
                         "document_read: '{raw}' could not be parsed: bad text escape ({e})"
                     )
                 })?;
-                paragraph.push_str(&unescaped);
-                paragraph_chars += unescaped.chars().count();
-                out.check_pending(paragraph_chars + cell_chars + row_chars + 1, raw)?;
+                let chars = unescaped.chars().count();
+                out.check_pending(paragraph_chars + chars + cell_chars + row_chars + 1, raw)?;
+                push_word_text(&mut paragraph, &unescaped, row_depth > 0);
+                paragraph_chars += chars;
             }
             Event::CData(ref c) if skip_depth == 0 && in_text_run => {
-                let decoded = String::from_utf8_lossy(c);
-                paragraph.push_str(&decoded);
-                paragraph_chars += decoded.chars().count();
-                out.check_pending(paragraph_chars + cell_chars + row_chars + 1, raw)?;
+                let decoded = std::str::from_utf8(&c[..]).map_err(|e| {
+                    anyhow::anyhow!(
+                        "document_read: '{raw}' could not be parsed: a CDATA section is not \
+                         valid UTF-8 ({e})"
+                    )
+                })?;
+                let chars = decoded.chars().count();
+                out.check_pending(paragraph_chars + chars + cell_chars + row_chars + 1, raw)?;
+                push_word_text(&mut paragraph, decoded, row_depth > 0);
+                paragraph_chars += chars;
             }
             Event::End(ref e) => {
                 if skip_depth > 0 {
@@ -858,13 +954,14 @@ pub fn extract_word(path: &Path, raw: &str, budget: ExtractBudget) -> Result<Par
                             let trimmed = paragraph.trim();
                             if !trimmed.is_empty() {
                                 if row_depth > 0 {
-                                    if !cell.is_empty() {
+                                    let separator = usize::from(!cell.is_empty());
+                                    let chars = trimmed.chars().count() + separator;
+                                    out.check_pending(cell_chars + chars + row_chars + 1, raw)?;
+                                    if separator == 1 {
                                         cell.push(' ');
-                                        cell_chars += 1;
                                     }
                                     cell.push_str(trimmed);
-                                    cell_chars += trimmed.chars().count();
-                                    out.check_pending(cell_chars + row_chars + 1, raw)?;
+                                    cell_chars += chars;
                                 } else {
                                     out.push_line(trimmed, raw)?;
                                 }
@@ -872,18 +969,27 @@ pub fn extract_word(path: &Path, raw: &str, budget: ExtractBudget) -> Result<Par
                             paragraph.clear();
                             paragraph_chars = 0;
                         }
-                        b"tc" => {
-                            if cells_in_row > 0 {
-                                row.push('\t');
-                                row_chars += 1;
+                        // An unmatched `</w:tc>` closes nothing, and only the
+                        // outermost cell closes a column, so an inner table's
+                        // cells stay part of the text of the cell that
+                        // contains them rather than adding columns of their
+                        // own or erasing the text beside them.
+                        b"tc" if cell_depth > 0 => {
+                            cell_depth -= 1;
+                            if cell_depth == 0 {
+                                let trimmed = cell.trim();
+                                let separator = usize::from(cells_in_row > 0);
+                                let chars = trimmed.chars().count() + separator;
+                                out.check_pending(row_chars + chars + 1, raw)?;
+                                if separator == 1 {
+                                    row.push('\t');
+                                }
+                                row.push_str(trimmed);
+                                row_chars += chars;
+                                cells_in_row += 1;
+                                cell.clear();
+                                cell_chars = 0;
                             }
-                            let trimmed = cell.trim();
-                            row.push_str(trimmed);
-                            row_chars += trimmed.chars().count();
-                            cells_in_row += 1;
-                            cell.clear();
-                            cell_chars = 0;
-                            out.check_pending(row_chars + 1, raw)?;
                         }
                         b"tr" => {
                             row_depth = row_depth.saturating_sub(1);
@@ -892,6 +998,7 @@ pub fn extract_word(path: &Path, raw: &str, budget: ExtractBudget) -> Result<Par
                                 row.clear();
                                 row_chars = 0;
                                 cells_in_row = 0;
+                                cell_depth = 0;
                             }
                         }
                         _ => {}
@@ -902,6 +1009,19 @@ pub fn extract_word(path: &Path, raw: &str, budget: ExtractBudget) -> Result<Par
             _ => {}
         }
         buf.clear();
+    }
+
+    // The reader was given one byte of headroom past the cap; if it used
+    // every byte, the part is larger than the cap and the text above is a
+    // prefix of an unknown whole. Refuse instead of answering from it.
+    if reader.into_inner().into_inner().limit() == 0 {
+        bail!(
+            "document_read: '{raw}' has a {DOCUMENT_PART} that inflates to more than \
+             {MAX_DECOMPRESSED_BYTES} bytes of uncompressed content, over the limit"
+        );
+    }
+    if let Some(err) = malformed {
+        return Err(err);
     }
 
     let (text, sections) = out.finish();
@@ -1060,8 +1180,9 @@ pub fn select_text(
     if parsed.sheets.is_empty() {
         if parsed.format == "xlsx" {
             bail!(
-                "no readable worksheets in this xlsx document: every sheet is empty (empty \
-                 worksheets are omitted)"
+                "no readable worksheets in this xlsx document: every sheet is empty or is \
+                 not a worksheet (empty worksheets are omitted, as are chart, dialog, and \
+                 macro sheets, which hold no cells)"
             );
         }
         bail!(
@@ -1076,8 +1197,9 @@ pub fn select_text(
         .find(|s| fold_case(&s.name) == wanted_folded)
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "sheet '{wanted}' not found among non-empty sheets (empty worksheets are \
-                 omitted); available: {}",
+                "sheet '{wanted}' not found among readable worksheets (empty worksheets are \
+                 omitted, as are chart, dialog, and macro sheets, which are not worksheets and \
+                 hold no cells); available: {}",
                 parsed
                     .sheets
                     .iter()
@@ -1182,8 +1304,9 @@ pub fn render(window: &DocumentWindow) -> String {
         }
         if window.format == "xlsx" {
             out.push_str(
-                "  (empty worksheets are omitted; section indexes are workbook positions; \
-                 section offsets are whole-document offsets)\n",
+                "  (empty worksheets are omitted, as are chart, dialog, and macro sheets, \
+                 which are not worksheets; section indexes are workbook positions; section \
+                 offsets are whole-document offsets)\n",
             );
         }
     }
@@ -2073,6 +2196,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_push_word_text_replaces_the_breaks_text_could_forge() {
+        // Outside a row a tab is ordinary text; a newline never is.
+        let mut out = String::new();
+        push_word_text(&mut out, "a\tb\nc\rd", false);
+        assert_eq!(out, "a\tb c d");
+
+        // Inside a row the tab is the column separator, so it goes too.
+        let mut out = String::new();
+        push_word_text(&mut out, "a\tb\nc\rd", true);
+        assert_eq!(out, "a b c d");
+
+        // Every replacement is one character for one, so counts stay exact.
+        let source = "x\t\n\r\u{2603}";
+        let mut out = String::new();
+        push_word_text(&mut out, source, true);
+        assert_eq!(out.chars().count(), source.chars().count());
+    }
+
+    #[test]
+    fn test_word_text_builder_push_line_normalizes_embedded_newlines() {
+        let mut builder = WordTextBuilder::new(MAX_EXTRACTED_CHARS);
+        builder.push_line("one\ntwo\rthree", "b.docx").unwrap();
+        builder.push_line("plain", "b.docx").unwrap();
+        let (text, sections) = builder.finish();
+        assert_eq!(text, "one two three\nplain\n");
+        // Exactly two lines, so the section span still tiles the text.
+        assert_eq!(text.matches('\n').count(), 2);
+        assert_eq!(sections[0].chars, text.chars().count());
+    }
+
     mod fixtures {
         use super::*;
 
@@ -2510,7 +2664,7 @@ mod tests {
                 .await
                 .unwrap_err();
             let msg = err.to_string();
-            assert!(msg.contains("not found among non-empty sheets"), "{msg}");
+            assert!(msg.contains("not found among readable worksheets"), "{msg}");
             assert!(msg.contains("available: Data"), "{msg}");
         }
 
@@ -2696,7 +2850,7 @@ mod tests {
             // Highly compressible, so the file on disk stays far under the
             // source cap while `word/document.xml` alone inflates past the
             // 64 MiB container cap.
-            let filler = "<w:p><w:r><w:t>aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</w:t></w:r></w:p>";
+            let filler = "<w:p><w:pPr><w:spacing w:before=\"120\" w:after=\"120\"/></w:pPr></w:p>";
             let repeats = (MAX_DECOMPRESSED_BYTES as usize / filler.len()) + 4096;
             let path = write_docx_body(&dir, "bomb.docx", &filler.repeat(repeats));
             let on_disk = std::fs::metadata(&path).unwrap().len();
@@ -2711,6 +2865,145 @@ mod tests {
                 msg.starts_with(&format!(
                     "document_read: 'bomb.docx' inflates to more than {MAX_DECOMPRESSED_BYTES} bytes"
                 )),
+                "{msg}"
+            );
+
+            // Reached directly, without the container preflight, the part is
+            // refused rather than answered from whatever prefix fits under
+            // the cap.
+            let err = extract_word(&path, "bomb.docx", ExtractBudget::DEFAULT).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.starts_with(&format!(
+                    "document_read: 'bomb.docx' has a word/document.xml that inflates to more \
+                     than {MAX_DECOMPRESSED_BYTES} bytes"
+                )),
+                "{msg}"
+            );
+        }
+
+        #[test]
+        fn test_extract_word_cell_text_cannot_forge_a_column_or_row_break() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let body = concat!(
+                "<w:tbl><w:tr>",
+                // A literal tab and a literal newline carried in the text.
+                "<w:tc><w:p><w:r><w:t>a\tb\nc</w:t></w:r></w:p></w:tc>",
+                // The same two characters written as numeric references.
+                "<w:tc><w:p><w:r><w:t>d&#9;e&#10;f</w:t></w:r></w:p></w:tc>",
+                // And again inside a CDATA section.
+                "<w:tc><w:p><w:r><w:t><![CDATA[g\th\ni]]></w:t></w:r></w:p></w:tc>",
+                "</w:tr></w:tbl>",
+            );
+            let path = write_docx_body(&dir, "forge.docx", body);
+
+            let parsed = extract_word(&path, "forge.docx", ExtractBudget::DEFAULT).unwrap();
+
+            // One row, three columns: every smuggled break became a space.
+            assert_eq!(parsed.text, "a b c\td e f\tg h i\n");
+            assert_eq!(parsed.text.matches('\n').count(), 1);
+            assert_eq!(parsed.text.trim_end().matches('\t').count(), 2);
+        }
+
+        #[test]
+        fn test_extract_word_paragraph_text_and_breaks_stay_on_one_line() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let body = concat!(
+                "<w:p><w:r><w:t>x&#10;y</w:t></w:r></w:p>",
+                "<w:p><w:r><w:t>literal\nnewline</w:t></w:r></w:p>",
+                // A structural break is a space too: one line is one paragraph.
+                "<w:p><w:r><w:t>line one</w:t><w:br/><w:t>line two</w:t></w:r></w:p>",
+                // A tab outside a table is ordinary text and cannot break a line.
+                "<w:p><w:r><w:t>left</w:t><w:tab/><w:t>right</w:t></w:r></w:p>",
+            );
+            let path = write_docx_body(&dir, "breaks.docx", body);
+
+            let parsed = extract_word(&path, "breaks.docx", ExtractBudget::DEFAULT).unwrap();
+
+            assert_eq!(
+                parsed.text,
+                "x y\nliteral newline\nline one line two\nleft\tright\n",
+            );
+            // Four paragraphs in, four lines out.
+            assert_eq!(parsed.text.matches('\n').count(), 4);
+        }
+
+        #[test]
+        fn test_extract_word_keeps_outer_cell_text_around_a_nested_table() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let body = concat!(
+                "<w:tbl><w:tr>",
+                "<w:tc><w:p><w:r><w:t>OUTER</w:t></w:r></w:p>",
+                "<w:tbl><w:tr><w:tc><w:p><w:r><w:t>INNER</w:t></w:r></w:p></w:tc></w:tr></w:tbl>",
+                "</w:tc>",
+                "<w:tc><w:p><w:r><w:t>RIGHT</w:t></w:r></w:p></w:tc>",
+                "</w:tr></w:tbl>",
+            );
+            let path = write_docx_body(&dir, "nested.docx", body);
+
+            let parsed = extract_word(&path, "nested.docx", ExtractBudget::DEFAULT).unwrap();
+
+            // The containing cell keeps its own text, the nested table merges
+            // into it, and the row still has exactly two columns.
+            assert_eq!(parsed.text, "OUTER INNER\tRIGHT\n");
+            assert_eq!(parsed.text.trim_end().matches('\t').count(), 1);
+            assert!(parsed.text.contains("OUTER"), "{:?}", parsed.text);
+        }
+
+        #[test]
+        fn test_extract_word_keeps_a_simple_field_result_but_not_its_instruction() {
+            let dir = tempfile::TempDir::new().unwrap();
+            // `w:fldSimple` carries its instruction in an attribute, and
+            // attributes are never read, so only the cached result survives.
+            let body = concat!(
+                "<w:p><w:fldSimple w:instr=\" MERGEFIELD SECRETCODE \\* MERGEFORMAT \">",
+                "<w:r><w:t>Cached result.</w:t></w:r></w:fldSimple></w:p>",
+            );
+            let path = write_docx_body(&dir, "field.docx", body);
+
+            let parsed = extract_word(&path, "field.docx", ExtractBudget::DEFAULT).unwrap();
+
+            assert_eq!(parsed.text, "Cached result.\n");
+            assert!(!parsed.text.contains("SECRETCODE"), "{:?}", parsed.text);
+        }
+
+        #[test]
+        fn test_extract_word_finds_the_part_whatever_its_case() {
+            let dir = tempfile::TempDir::new().unwrap();
+            // OPC part names compare case-insensitively; calamine resolves
+            // workbook parts the same way, so this must open too.
+            let path = dir.path().join("cased.docx");
+            write_zip(
+                &path,
+                &[(
+                    "Word/Document.XML",
+                    br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Found it.</w:t></w:r></w:p></w:body></w:document>"#,
+                )],
+            );
+
+            let parsed = extract_word(&path, "cased.docx", ExtractBudget::DEFAULT).unwrap();
+
+            assert_eq!(parsed.text, "Found it.\n");
+        }
+
+        #[test]
+        fn test_extract_word_rejects_a_cdata_section_that_is_not_utf8() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut document_xml = Vec::new();
+            document_xml.extend_from_slice(
+                br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t><![CDATA["#,
+            );
+            document_xml.extend_from_slice(&[0xff, 0xfe, 0x00]);
+            document_xml.extend_from_slice(br#"]]></w:t></w:r></w:p></w:body></w:document>"#);
+            let path = write_docx_raw(&dir, "cdata.docx", &document_xml);
+
+            let err = extract_word(&path, "cdata.docx", ExtractBudget::DEFAULT).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.starts_with(
+                    "document_read: 'cdata.docx' could not be parsed: a CDATA section is not \
+                     valid UTF-8"
+                ),
                 "{msg}"
             );
         }
