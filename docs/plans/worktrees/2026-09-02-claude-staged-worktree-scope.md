@@ -60,7 +60,7 @@ Run on this lane's tree with
 | `cargo build --workspace` | clean, zero warnings |
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean, zero warnings |
 | `cargo fmt --all -- --check` | clean, zero diffs |
-| `cargo test --workspace` | **2396 passed, 0 failed, 9 ignored** (base `36bda00`: 2310 passed; +86) |
+| `cargo test --workspace` | **2399 passed, 0 failed, 9 ignored** (base `36bda00`: 2310 passed; +89) |
 | `python3 docs/validate_docs.py --all` | only the four failures that pre-exist on `main` |
 
 Package-level totals from the same run:
@@ -79,7 +79,7 @@ Package-level totals from the same run:
 | `impulse-ops` `memory_candidate_contract` | 5 | 0 | 0 |
 | `impulse-rs` lib | 1830 | 0 | 5 |
 | `impulse-rs` `governed_process_flow` | 2 | 0 | 0 |
-| `impulse-rs` `governed_staged_worktree` (new) | 16 | 0 | 0 |
+| `impulse-rs` `governed_staged_worktree` (new) | 19 | 0 | 0 |
 | `impulse-rs` hook-validation suites (3 files) | 15 | 0 | 0 |
 | `impulse-rs` `integration_enhancements` | 11 | 0 | 1 |
 | `impulse-rs` `ion_binary` | 4 | 0 | 0 |
@@ -303,6 +303,60 @@ Two things the fixes changed beyond the literal asks, both worth flagging:
   checkout between the cleanliness observation and that sync would be replaced. Documented in
   ADR-0019's Consequences rather than papered over, and the sync failure message names the branch
   that already advanced so an operator is never left guessing.
+
+## Review round 2
+
+Not from the reviewer: the ADR-0018 lane, reading round 1's `core.hooksPath` fix, asked whether
+`.git/config` and `.git/info/attributes` — also worktree-shared — were reachable the same way, and
+said plainly it was not going to guess at code it does not own. They are reachable. I confirmed it
+against a real repository before writing any code: with `core.hooksPath` disabled exactly as the
+producers set it, a `filter.<name>.smudge` in the shared `.git/config`, assigned by an in-tree
+`.gitattributes`, still executes on checkout. And a staged Builder can write that config from
+inside its own worktree, because `git config --local` resolves to the shared file for every linked
+worktree.
+
+That made ADR-0019's "the promotion path is sound" false as written, so it is fixed here rather
+than deferred:
+
+| # | Finding | Fix | Regression |
+|---|---|---|---|
+| R2-1 | **Round 1's hook fix was incomplete.** It covered the two obviously mutating commands but not `run_git`, which backs every observation the module makes — including the `git status` promotion runs twice. A `post-index-change` hook executed there | Every Git invocation in the module is built by one hook-free constructor; there is no "read-only enough to skip it" category | `test_planted_git_hooks_never_execute_during_staging_or_promotion`, now planting `post-index-change`, `pre-auto-gc`, and `fsmonitor-watchman` alongside the original three |
+| R2-2 | A `filter`/`diff` driver written to shared `.git/config`, `.git/info/attributes`, or `.git/config.worktree` by the Builder executes during promotion's working-tree sync, in the canonical workspace, under operator authority, after review passed. Hooks were only one door, and `info/attributes` never appears in a work-tree diff | `StagedWorktree` records a per-component digest of that shared state at materialization; promotion refuses to check anything out unless the digests still hold, returning `PromotionBlocked { reason: repository_config_changed { component } }`. Config predating the run is the operator's and is honored; config the Builder introduced blocks | `test_a_filter_driver_planted_by_the_builder_never_executes_during_promotion`, `test_a_benign_shared_config_change_blocks_and_names_the_file`, `test_a_shared_info_attributes_change_blocks_and_names_that_file` |
+
+Two corrections taken from the reviewer on the digest gate, both applied: `.git/config.worktree` is
+pinned as well (worktree-scoped config *not* accepting filter keys is convention, not a Git
+guarantee — the file takes arbitrary keys, and while reaching it needs `extensions.worktreeConfig`,
+which flipping would itself be caught, pinning removes the argument); and the refusal names **which**
+component changed, because benign churn hard-blocks promotion too and an operator must not be left
+guessing which file to open.
+
+Both fixes were checked for vacuity rather than assumed:
+
+- The filter test carries a **negative control** — it fires the planted driver inside the staged
+  worktree and asserts the marker appears, then clears it, then promotes. Without that, a passing
+  assertion would not distinguish "the fix works" from "the filter was never armed".
+- The hook test was verified by **reverting** `run_git` to its raw form and re-running: it fails at
+  materialization with `a planted hook executed during materialization: post-index-change`. It
+  genuinely covers the gap round 1 left.
+
+Also recorded in ADR-0019 at the reviewer's request: after a **blocked** promotion the accepted
+commit exists only in the staged worktree, so discarding it drops the only ref and leaves the
+commit reflog-only until expiry — the discard surface must say what it costs and show the OID
+(desktop track owns the wording). And none of these vectors is reachable in a running system today:
+these producers still have no IPC endpoint and no CLI handler, which bounds live exploitability to
+zero and is exactly why they were worth fixing before something calls them.
+
+Honest limits, both stated in ADR-0019: the pin is a change detector, not a sandbox — it does not
+stop a Builder committing a `.gitattributes` that routes new paths through a filter the operator
+had *already* configured, which would need the OS-level isolation this ADR defers. And it fails
+closed on benign drift: an operator who legitimately edits `.git/config` mid-run gets a blocked
+promotion. That bias is intended.
+
+Two of the repository's own guard rules fired during this investigation, and I complied rather
+than working around them: the recursive-delete guard on a scratch probe (switched to `mktemp -d`),
+and the hard-reset guard on a probe script. The second is why the promotion half of the vector is
+proven through the product's own code in a regression test rather than by hand-running the
+command — the better outcome anyway, since the test now ships.
 
 ## Handoff Notes
 

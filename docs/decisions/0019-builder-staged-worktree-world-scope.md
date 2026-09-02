@@ -88,7 +88,8 @@ in the task record.
    on an `accepted` task with an active staged worktree. It requires the staged worktree to be
    clean and sitting exactly on the accepted claim's subject revision, and it requires the
    canonical checkout to be **on a branch**: `git symbolic-ref --quiet HEAD` must resolve to a
-   `refs/heads/` reference. The move itself is a compare-and-swap —
+   `refs/heads/` reference. It also requires the worktree-shared repository configuration to be
+   byte-identical to what was observed at materialization (rule 13). The move itself is a compare-and-swap —
    `git update-ref <branch> <accepted> <initial>` — which writes only if the ref is still exactly
    the registered initial OID at the instant it writes. `git merge --ff-only` cannot promise that:
    it re-reads HEAD and then writes, leaving a window a concurrent commit can win. The working
@@ -100,8 +101,8 @@ in the task record.
 6. **A canonical branch that cannot be advanced is an execution fact, not an error.** Promotion
    returns `PromotionBlocked { canonical_head, reason }`, recorded against the already-accepted
    run. The reason is one of `canonical_head_moved` (the head no longer equals the registered
-   initial OID), `detached_head` (there is no branch to advance), or `concurrent_branch_update`
-   (the compare-and-swap lost). Review state stays `Accepted`; the staged worktree stays active;
+   initial OID), `detached_head` (there is no branch to advance), `concurrent_branch_update`
+   (the compare-and-swap lost), or `repository_config_changed` (rule 13). Review state stays `Accepted`; the staged worktree stays active;
    an operator who reconciles the canonical branch can retry. A run is promoted at most once: a
    second promotion after a successful one is refused, and a promoted outcome must land exactly
    the accepted revision.
@@ -161,6 +162,27 @@ in the task record.
     every record written before this ADR the two numbers are identical, so no stored candidate
     digest changes.
 
+13. **Worktree-shared repository configuration is pinned across the run.** `.git/config`,
+    `.git/info/attributes`, and `.git/config.worktree` are shared by the main worktree and every
+    linked one, so a staged Builder can write them from inside its own checkout —
+    `info/attributes` never appears in a diff of the work tree, so it is invisible to code review.
+    `config.worktree` is pinned too: worktree-scoped config *not* accepting filter keys is
+    convention, not a Git guarantee (the file takes arbitrary keys, and is read only when
+    `extensions.worktreeConfig` is on — turning that on would itself rewrite `.git/config` and be
+    caught, but pinning the file directly removes the argument). A `filter.<name>.smudge` or
+    `diff.<name>.textconv` defined there executes whenever Git materializes a file — including the
+    working-tree sync promotion performs, in the canonical workspace, under operator authority,
+    after review has already passed. Disabling hooks (rule 5's `core.hooksPath`) does not touch
+    that path, and Git offers no flag that disables filters. Materialization therefore records a
+    digest of that shared state on the `StagedWorktree` record, and promotion refuses to check
+    anything out unless the same digests still hold, reporting
+    `repository_config_changed { component }` instead — the component names which file changed,
+    because benign churn (a new remote, a credential helper) hard-blocks promotion too and the
+    operator must not be left guessing which file to inspect. The trust boundary is deliberate: configuration that predates the run is the
+    operator's own and is honored, while configuration the Builder introduced blocks until a human
+    looks at it. An in-tree `.gitattributes` the Builder commits stays legitimate work, because a
+    driver it names cannot be *defined* without changing the pinned digest.
+
 ## Consequences
 
 **What this buys.** A failed verification or a declined review is now recoverable by deleting a
@@ -185,16 +207,38 @@ replaced. The window is small and the tree was verified clean immediately before
 and is not closed by this ADR. If the sync fails, the error names the branch that already advanced
 so the operator can finish it by hand rather than guessing what state the repository is in.
 
+**After a blocked promotion, discarding the worktree drops the only ref to the accepted commit.**
+A blocked run's accepted commit exists only in the staged worktree; the canonical branch never
+advanced. Discarding removes the checkout and its administrative entry, leaving that commit
+reachable only through the reflog until it expires. Discard is still the right escape hatch, but
+the surface offering it must say what it costs, and should show the commit OID so an operator can
+recover it deliberately. The desktop track owns that wording.
+
+**None of this is reachable in a running system yet.** These producers have no IPC endpoint and no
+CLI handler; the daemon lane owns both. Live exploitability of the vectors above is zero today,
+which is exactly why they were worth fixing now rather than after something calls them.
+
 **A surviving staged directory fails closed, and names its own recovery.** If a run is interrupted
 between `git worktree add` and the recording mutation, the directory outlives the task and blocks
 re-materialization. Reusing it is not safe — it could be someone else's half-finished tree — so the
 producer refuses, and the error tells the operator exactly how to recover: delete the leftover
 directory, then run `git -C <workspace> worktree prune` to drop its administrative entry.
 
+**The configuration pin is a change detector, not a sandbox.** It catches a driver the Builder
+*introduced*, which is the reachable attack. It does not stop a Builder from committing a
+`.gitattributes` that routes new paths through a filter the operator had already configured — a
+pre-existing `git-lfs` or `crypt` driver, say. That is inherent to honoring the operator's own
+configuration, and closing it would need the OS-level isolation this ADR explicitly defers. The
+pin also fails closed on benign drift: an operator who legitimately edits `.git/config` mid-run
+gets a blocked promotion and has to look at it, which is the intended bias.
+
 **Git hooks never run inside a producer.** `.git/hooks` is shared across every linked worktree, so
-a staged Builder could otherwise plant a `post-checkout` or `post-merge` hook that executes inside
-a daemon-owned producer — at materialization, or at promotion, *after* review has already passed.
-Every producer Git invocation runs with `core.hooksPath` pointed at a non-directory.
+a staged Builder could otherwise plant a hook that executes inside a daemon-owned producer — at
+materialization, at promotion *after* review has already passed, or during plain observation:
+`post-index-change` and `fsmonitor-watchman` fire on a bare `git status`, which the promotion path
+runs twice. **Every** Git invocation in the producer module is therefore built by one constructor
+that sets `core.hooksPath` to a non-directory; there is no "read-only enough to skip it" category,
+and the first version of this fix was wrong precisely because it assumed one.
 
 **A crash between the Git side effect and its receipt is still not covered.** Promotion inherits
 the same window every other producer has. The side effect is isolated in one function so the
@@ -275,3 +319,27 @@ written as amended. What changed, and why each mattered:
 
 The digest is now composed over `loop_contract::canonical_json` rather than `serde_json::to_vec`,
 so key ordering can never affect it.
+
+## Review round 2
+
+The ADR-0018 lane, reading round 1's `core.hooksPath` fix, pointed out that hooks are only one
+instance of worktree-shared state and asked whether `.git/config` and `.git/info/attributes` were
+reachable the same way. They are. Verified against a real repository: with `core.hooksPath`
+disabled exactly as the producers set it, a `filter.<name>.smudge` defined in the shared
+`.git/config` and assigned by an in-tree `.gitattributes` still executes on checkout — and a staged
+Builder can write that config from inside its own worktree, because `git config --local` resolves
+to the shared file for every linked worktree. Rule 13 and its Consequences note are the fix. The
+regression test carries a negative control that fires the planted driver in the staged worktree
+first, so the assertion that promotion does not run it cannot pass vacuously.
+
+Round 2 verification also found round 1's hook fix **incomplete**: it covered the two obviously
+mutating commands but not `run_git`, which backs every observation the module makes, including the
+`git status` that promotion runs twice. A `post-index-change` hook executed there. Every Git
+invocation in the module now goes through one hook-free constructor, and the regression plants
+`post-index-change`, `pre-auto-gc`, and `fsmonitor-watchman` alongside the original three. Reverting
+the constructor makes that test fail at materialization, so it genuinely covers the gap.
+
+The two findings are one boundary seen through two doors, and ADR-0018 states the other half: a
+capability proves who opened a connection and nothing about the integrity of the work that
+connection's request then acts on. ADR-0018's promotion gate establishes the first half; this rule
+establishes the second.

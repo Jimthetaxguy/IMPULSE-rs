@@ -20,8 +20,8 @@ use impulse_ops::governed_task::{
     GovernedActor, GovernedActorKind, GovernedClaimRequest, GovernedCommandEvidence,
     GovernedPromotionInput, GovernedPromotionOutcome, GovernedSupervisorReviewEnvelope,
     GovernedTaskRun, GovernedVerificationInput, GovernedVerificationOutcome,
-    GovernedVerificationProfile, PromotionBlockedReason, StagedWorktreeInput,
-    SupervisorVerdictInput, WorkerCompletionClaimInput, WorldScope,
+    GovernedVerificationProfile, PromotionBlockedReason, SharedRepositoryConfigDigest,
+    StagedWorktreeInput, SupervisorVerdictInput, WorkerCompletionClaimInput, WorldScope,
     MAX_PROFILED_ACCEPTANCE_CRITERIA, MAX_PROFILED_ACCEPTANCE_CRITERION_BYTES,
     MAX_PROFILED_CLAIM_SUMMARY_BYTES, MAX_PROFILED_TASK_BYTES,
 };
@@ -461,10 +461,30 @@ fn run_bounded_process(
     })
 }
 
-fn run_git(workspace: &Path, args: &[&str]) -> Result<BoundedProcessOutput> {
+/// A `git` invocation with the repository's own hooks disabled.
+///
+/// `.git/hooks` is shared across every linked worktree, so a staged Builder can
+/// write a hook there that would otherwise execute inside a daemon-owned
+/// producer — at materialization, at promotion, or during any ordinary
+/// observation. `post-index-change` and `fsmonitor-watchman` fire on a bare
+/// `git status`, which the promotion path runs twice, so this is not only about
+/// the obviously mutating commands.
+///
+/// **Every** Git invocation in this module must be built here. There is no
+/// "read-only enough to skip it" category.
+fn hook_free_git(workspace: &Path) -> std::process::Command {
     let mut command = std::process::Command::new("git");
-    command.arg("-C").arg(workspace).args(args);
+    command
+        .arg("-C")
+        .arg(workspace)
+        .args(["-c", "core.hooksPath=/dev/null"]);
     scrub_and_allowlist_std_env(&mut command, &[]);
+    command
+}
+
+fn run_git(workspace: &Path, args: &[&str]) -> Result<BoundedProcessOutput> {
+    let mut command = hook_free_git(workspace);
+    command.args(args);
     run_bounded_process(
         &mut command,
         &format!("git {}", args.join(" ")),
@@ -480,23 +500,6 @@ fn run_git(workspace: &Path, args: &[&str]) -> Result<BoundedProcessOutput> {
 /// same failure cleanup. A failed or timed-out add is unregistered before the
 /// error propagates, so a killed `git worktree add` cannot leave a locked
 /// administrative entry behind.
-/// A `git` invocation with the repository's own hooks disabled.
-///
-/// `.git/hooks` is shared across every linked worktree, so a staged Builder can
-/// write a `post-checkout` or `post-merge` hook that would otherwise execute
-/// inside a daemon-owned producer — at materialization time, or at promotion
-/// time, after review has already passed. `core.hooksPath` pointed at a
-/// non-directory makes Git find no hooks at all.
-fn hook_free_git(workspace: &Path) -> std::process::Command {
-    let mut command = std::process::Command::new("git");
-    command
-        .arg("-C")
-        .arg(workspace)
-        .args(["-c", "core.hooksPath=/dev/null"]);
-    scrub_and_allowlist_std_env(&mut command, &[]);
-    command
-}
-
 fn add_detached_worktree(
     source_workspace: &Path,
     checkout: &Path,
@@ -536,16 +539,13 @@ struct DetachedVerificationWorkspace {
 }
 
 fn cleanup_detached_worktree(source_workspace: &Path, checkout: &Path) -> bool {
-    let mut command = std::process::Command::new("git");
+    let mut command = hook_free_git(source_workspace);
     command
-        .arg("-C")
-        .arg(source_workspace)
         // A killed `git worktree add` can leave its administrative entry
         // locked in the "initializing" state. Git requires force twice to
         // remove a locked worktree; one force only covers ordinary dirtiness.
         .args(["worktree", "remove", "--force", "--force"])
         .arg(checkout);
-    scrub_and_allowlist_std_env(&mut command, &[]);
     run_bounded_process(
         &mut command,
         "detached governed subject cleanup",
@@ -1388,6 +1388,82 @@ pub(crate) fn bind_supervisor_review(
 // ADR-0019: staged Builder world scope
 // ---------------------------------------------------------------------------
 
+/// Digest every piece of worktree-shared state that can turn a later Git
+/// checkout into command execution.
+///
+/// `.git/config` and `.git/info/attributes` are shared by the main worktree and
+/// every linked one, so a staged Builder can write them from inside its own
+/// checkout — and `info/attributes` never appears in a diff of the work tree,
+/// so it is invisible to code review. A `filter.<name>.smudge` or
+/// `diff.<name>.textconv` defined there runs whenever Git materializes a file,
+/// including the working-tree sync promotion performs, in the canonical
+/// workspace, under operator authority, after review has already passed.
+/// Disabling hooks does not touch that path, and no Git switch suppresses
+/// repository config or `info/attributes`: `-c` and the `GIT_CONFIG_*`
+/// variables cannot mask an attacker-named key.
+///
+/// `.git/config.worktree` is included because worktree-scoped config *not*
+/// accepting filter keys is convention, not a Git guarantee — the file takes
+/// arbitrary keys, and it is only read when `extensions.worktreeConfig` is on.
+/// Turning that extension on would itself rewrite `.git/config` and be caught,
+/// but pinning the file directly costs nothing and removes the argument.
+///
+/// Pinning across the run is the trust boundary: configuration that predates
+/// the run is the operator's own and is honored; configuration the Builder
+/// introduced blocks promotion until a human looks at it.
+fn shared_repository_config_digest(workspace: &Path) -> Result<SharedRepositoryConfigDigest> {
+    let common_dir = successful_git_text(
+        workspace,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        "shared Git directory discovery",
+    )?;
+    let common_dir = Path::new(&common_dir);
+
+    let mut entries = String::from_utf8(successful_git_bytes(
+        workspace,
+        &["config", "--local", "--list", "-z"],
+        "shared repository configuration listing",
+    )?)
+    .context("shared repository configuration is not valid UTF-8")?
+    .split('\0')
+    .filter(|entry| !entry.is_empty())
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    // Sorted so a rewrite that only reorders keys is not reported as a change.
+    entries.sort();
+    let mut hasher = Sha256::new();
+    hasher.update(b"impulse-shared-repo-config-v1\0");
+    hasher.update((entries.len() as u64).to_be_bytes());
+    for entry in entries {
+        hasher.update((entry.len() as u64).to_be_bytes());
+        hasher.update(entry.as_bytes());
+    }
+
+    Ok(SharedRepositoryConfigDigest {
+        repository_config: format!("sha256:{:x}", hasher.finalize()),
+        worktree_config: digest_shared_file(&common_dir.join("config.worktree"))?,
+        info_attributes: digest_shared_file(&common_dir.join("info").join("attributes"))?,
+    })
+}
+
+/// Digest one shared file, or `None` when it does not exist. Absence is pinned
+/// too: creating the file during a run is a change.
+fn digest_shared_file(path: &Path) -> Result<Option<String>> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let mut hasher = Sha256::new();
+            hasher.update(b"impulse-shared-file-v1\0");
+            hasher.update((bytes.len() as u64).to_be_bytes());
+            hasher.update(&bytes);
+            Ok(Some(format!("sha256:{:x}", hasher.finalize())))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to read shared Git file {}", path.display()))
+        }
+    }
+}
+
 /// Actor recorded for daemon-owned staged-worktree and promotion side effects.
 fn staged_system_actor() -> GovernedActor {
     GovernedActor {
@@ -1463,6 +1539,7 @@ pub fn materialize_staged_worktree(task: &GovernedTaskRun) -> Result<StagedWorkt
         actor: staged_system_actor(),
         root,
         initial_subject_revision: initial.to_string(),
+        shared_config_digest: shared_repository_config_digest(&workspace)?,
     })
 }
 
@@ -1626,6 +1703,20 @@ pub fn promote_governed_outcome(task: &GovernedTaskRun) -> Result<GovernedPromot
         },
     };
 
+    // Before anything is checked out: worktree-shared configuration must be
+    // exactly what it was when this worktree was materialized, or a Git filter
+    // the Builder defined would execute during the sync below.
+    let observed_config = shared_repository_config_digest(&workspace)?;
+    if let Some(component) = staged
+        .shared_config_digest
+        .first_difference(&observed_config)
+    {
+        return Ok(blocked(
+            canonical_head,
+            PromotionBlockedReason::RepositoryConfigChanged { component },
+        ));
+    }
+
     // A detached canonical HEAD has no branch to advance. Moving HEAD alone
     // would look like a successful promotion right up until the next
     // `git switch`, which would orphan the accepted commit entirely.
@@ -1714,6 +1805,9 @@ mod tests {
         let status = std::process::Command::new("git")
             .arg("-C")
             .arg(repo)
+            // The harness's own Git must not run project hooks either, or a
+            // planted hook would fire on the test's own commits.
+            .args(["-c", "core.hooksPath=/dev/null"])
             .args(args)
             .status()
             .unwrap();
@@ -2490,6 +2584,7 @@ mod tests {
             actor: staged_system_actor(),
             root: staged.root.clone(),
             initial_subject_revision: initial.clone(),
+            shared_config_digest: staged.shared_config_digest.clone(),
             status: impulse_ops::governed_task::StagedWorktreeStatus::Active,
             materialized_at: "2026-09-02T00:00:00Z".to_string(),
             based_on_revision: 1,
