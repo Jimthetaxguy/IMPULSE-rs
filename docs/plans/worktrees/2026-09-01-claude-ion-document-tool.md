@@ -40,8 +40,12 @@ tags: [worktree, lane, ion, document-analysis, tools, primitives]
   lane (rebased on `main` at `5286597`): `cargo build --workspace` clean, `cargo test --workspace`
   2310 passed / 0 failed / 9 ignored, strict Clippy clean, rustfmt clean, `--no-default-features`
   build and registry/help tests pass without the tool. `docs/validate_docs.py --all` reports only
-  failures that pre-exist on `main`; all lane docs validate. PR
-  [#40](https://github.com/Jimthetaxguy/IMPULSE-rs/pull/40) is ready for review.
+  failures that pre-exist on `main`; all lane docs validate.
+  [#40](https://github.com/Jimthetaxguy/IMPULSE-rs/pull/40) merged at `7bfcb74` in the same
+  minute the review-fix commit was pushed, so the fix did not land with it; it is carried
+  unchanged on branch `claude/document-read-hardening-20260902` (worktree
+  `.worktrees/document-read-hardening-20260902`) as
+  [#41](https://github.com/Jimthetaxguy/IMPULSE-rs/pull/41), the same tree re-gated there.
 
 ## Decisions
 
