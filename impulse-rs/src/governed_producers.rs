@@ -20,10 +20,10 @@ use impulse_ops::governed_task::{
     GovernedActor, GovernedActorKind, GovernedClaimRequest, GovernedCommandEvidence,
     GovernedPromotionInput, GovernedPromotionOutcome, GovernedSupervisorReviewEnvelope,
     GovernedTaskRun, GovernedVerificationInput, GovernedVerificationOutcome,
-    GovernedVerificationProfile, StagedWorktreeInput, SupervisorVerdictInput,
-    WorkerCompletionClaimInput, WorldScope, MAX_PROFILED_ACCEPTANCE_CRITERIA,
-    MAX_PROFILED_ACCEPTANCE_CRITERION_BYTES, MAX_PROFILED_CLAIM_SUMMARY_BYTES,
-    MAX_PROFILED_TASK_BYTES,
+    GovernedVerificationProfile, PromotionBlockedReason, StagedWorktreeInput,
+    SupervisorVerdictInput, WorkerCompletionClaimInput, WorldScope,
+    MAX_PROFILED_ACCEPTANCE_CRITERIA, MAX_PROFILED_ACCEPTANCE_CRITERION_BYTES,
+    MAX_PROFILED_CLAIM_SUMMARY_BYTES, MAX_PROFILED_TASK_BYTES,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -480,6 +480,23 @@ fn run_git(workspace: &Path, args: &[&str]) -> Result<BoundedProcessOutput> {
 /// same failure cleanup. A failed or timed-out add is unregistered before the
 /// error propagates, so a killed `git worktree add` cannot leave a locked
 /// administrative entry behind.
+/// A `git` invocation with the repository's own hooks disabled.
+///
+/// `.git/hooks` is shared across every linked worktree, so a staged Builder can
+/// write a `post-checkout` or `post-merge` hook that would otherwise execute
+/// inside a daemon-owned producer — at materialization time, or at promotion
+/// time, after review has already passed. `core.hooksPath` pointed at a
+/// non-directory makes Git find no hooks at all.
+fn hook_free_git(workspace: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    command
+        .arg("-C")
+        .arg(workspace)
+        .args(["-c", "core.hooksPath=/dev/null"]);
+    scrub_and_allowlist_std_env(&mut command, &[]);
+    command
+}
+
 fn add_detached_worktree(
     source_workspace: &Path,
     checkout: &Path,
@@ -488,14 +505,11 @@ fn add_detached_worktree(
     label: &str,
 ) -> Result<()> {
     validate_oid(subject_revision)?;
-    let mut command = std::process::Command::new("git");
+    let mut command = hook_free_git(source_workspace);
     command
-        .arg("-C")
-        .arg(source_workspace)
         .args(["worktree", "add", "--detach"])
         .arg(checkout)
         .arg(subject_revision);
-    scrub_and_allowlist_std_env(&mut command, &[]);
     let output =
         match run_bounded_process(&mut command, &format!("{label} materialization"), timeout) {
             Ok(output) => output,
@@ -849,8 +863,14 @@ pub(crate) fn derive_claim(
         .initial_subject_revision
         .as_deref()
         .context("profiled governed task lost its initial Git OID")?;
-    let subject_revision =
-        observe_clean_git_subject(Path::new(&task.workspace_root), Some(initial_oid))?;
+    // ADR-0019: a staged Builder commits inside its own worktree, so the claim's
+    // subject must be observed there. `launch_working_directory` returns the
+    // canonical workspace root for every non-staged task, so this is the same
+    // path it always was for them.
+    let subject_revision = observe_clean_git_subject(
+        Path::new(task.launch_working_directory()),
+        Some(initial_oid),
+    )?;
 
     // Keep profile read explicit so adding another subject type cannot silently
     // reuse Git semantics.
@@ -1408,9 +1428,15 @@ pub fn materialize_staged_worktree(task: &GovernedTaskRun) -> Result<StagedWorkt
         .expected_staged_worktree_root()
         .context("staged governed task cannot derive its worktree root")?;
     if root.symlink_metadata().is_ok() {
+        // Fail closed: reusing a surviving directory could hand the Builder
+        // someone else's half-finished tree. Name the recovery rather than
+        // leaving the operator to guess it.
         anyhow::bail!(
-            "staged worktree path {} already exists; refusing to reuse it",
-            root.display()
+            "staged worktree path {} already exists; refusing to reuse it. \
+             If it survived an interrupted run, delete that directory and then \
+             run `git -C {} worktree prune` to drop its administrative entry.",
+            root.display(),
+            workspace.display()
         );
     }
     let parent = root
@@ -1448,29 +1474,114 @@ pub async fn materialize_staged_worktree_async(
         .context("staged governed worktree materialization worker panicked")?
 }
 
+/// The branch HEAD currently points at, or `None` on a detached HEAD.
+///
+/// `git symbolic-ref --quiet HEAD` exits non-zero without output when HEAD is
+/// detached, which is a legitimate observation rather than a failure.
+fn canonical_branch_ref(workspace: &Path) -> Result<Option<String>> {
+    let mut command = hook_free_git(workspace);
+    command.args(["symbolic-ref", "--quiet", "HEAD"]);
+    let output = run_bounded_process(
+        &mut command,
+        "canonical branch resolution",
+        GIT_PROBE_TIMEOUT,
+    )?;
+    if output.timed_out {
+        anyhow::bail!("canonical branch resolution timed out");
+    }
+    if !output.status.is_some_and(|status| status.success()) {
+        return Ok(None);
+    }
+    if output.stdout_truncated {
+        anyhow::bail!("canonical branch resolution exceeded the bounded Git output limit");
+    }
+    let reference = String::from_utf8(output.stdout)
+        .context("canonical branch reference is not valid UTF-8")?
+        .trim()
+        .to_string();
+    if !reference.starts_with("refs/heads/") {
+        anyhow::bail!("canonical HEAD resolved to `{reference}`, which is not a local branch");
+    }
+    Ok(Some(reference))
+}
+
+/// Read HEAD without asserting cleanliness. Used only to report what a lost
+/// compare-and-swap actually found.
+fn observe_head_oid(workspace: &Path) -> Result<String> {
+    let oid = successful_git_text(
+        workspace,
+        &["rev-parse", "--verify", "HEAD^{commit}"],
+        "canonical head observation",
+    )?;
+    validate_oid(&oid)?;
+    Ok(oid)
+}
+
 /// The whole canonical-branch side effect, isolated in one function.
 ///
 /// A durable producer reservation (the sibling journal lane) wraps exactly this
 /// call: everything before it is observation, everything after it is recording.
-fn fast_forward_canonical_branch(workspace: &Path, accepted_revision: &str) -> Result<()> {
+///
+/// The move is a real compare-and-swap. `git update-ref <ref> <new> <old>`
+/// fails unless the ref is still exactly `expected_revision` at the instant it
+/// writes, which `git merge --ff-only` cannot promise — it re-reads HEAD and
+/// then writes, leaving a window for a concurrent commit. Returns `false` when
+/// the swap lost, which the caller reports as a blocked promotion rather than
+/// an error.
+fn compare_and_swap_canonical_branch(
+    workspace: &Path,
+    branch_ref: &str,
+    expected_revision: &str,
+    accepted_revision: &str,
+) -> Result<bool> {
+    validate_oid(expected_revision)?;
     validate_oid(accepted_revision)?;
-    let mut command = std::process::Command::new("git");
+    let mut command = hook_free_git(workspace);
     command
-        .arg("-C")
-        .arg(workspace)
-        .args(["merge", "--ff-only"])
-        .arg(accepted_revision);
-    scrub_and_allowlist_std_env(&mut command, &[]);
+        .arg("update-ref")
+        .arg(branch_ref)
+        .arg(accepted_revision)
+        .arg(expected_revision);
     let output = run_bounded_process(
         &mut command,
-        "governed outcome promotion fast-forward",
+        "governed outcome promotion compare-and-swap",
         GIT_MATERIALIZE_TIMEOUT,
     )?;
     if output.timed_out {
-        anyhow::bail!("governed outcome promotion fast-forward timed out");
+        anyhow::bail!("governed outcome promotion compare-and-swap timed out");
+    }
+    Ok(output.status.is_some_and(|status| status.success()))
+}
+
+/// Bring the canonical working tree in line with the branch the swap just moved.
+///
+/// `update-ref` writes the ref and nothing else, so without this the working
+/// tree and index would still hold the pre-promotion revision. The tree was
+/// observed clean immediately before the swap, so this replaces nothing a human
+/// authored; the residual window between that observation and this call is
+/// documented in ADR-0019.
+fn sync_canonical_worktree(workspace: &Path, accepted_revision: &str) -> Result<()> {
+    validate_oid(accepted_revision)?;
+    let mut command = hook_free_git(workspace);
+    command
+        .args(["reset", "--hard", "--quiet"])
+        .arg(accepted_revision);
+    let output = run_bounded_process(
+        &mut command,
+        "governed outcome promotion worktree sync",
+        GIT_MATERIALIZE_TIMEOUT,
+    )?;
+    if output.timed_out {
+        anyhow::bail!(
+            "governed outcome promotion advanced the canonical branch to {accepted_revision}, \
+             but syncing the working tree timed out; sync it manually before further work"
+        );
     }
     if !output.status.is_some_and(|status| status.success()) {
-        anyhow::bail!("governed outcome promotion fast-forward failed");
+        anyhow::bail!(
+            "governed outcome promotion advanced the canonical branch to {accepted_revision}, \
+             but the working tree could not be synced to it; sync it manually before further work"
+        );
     }
     Ok(())
 }
@@ -1504,20 +1615,45 @@ pub fn promote_governed_outcome(task: &GovernedTaskRun) -> Result<GovernedPromot
 
     let workspace = PathBuf::from(&task.workspace_root);
     let canonical_head = observe_clean_git_subject(&workspace, None)?;
+
+    let blocked = |canonical_head: String, reason: PromotionBlockedReason| GovernedPromotionInput {
+        actor: staged_system_actor(),
+        accepted_revision: accepted_revision.clone(),
+        initial_subject_revision: initial.clone(),
+        outcome: GovernedPromotionOutcome::PromotionBlocked {
+            canonical_head,
+            reason,
+        },
+    };
+
+    // A detached canonical HEAD has no branch to advance. Moving HEAD alone
+    // would look like a successful promotion right up until the next
+    // `git switch`, which would orphan the accepted commit entirely.
+    let Some(branch_ref) = canonical_branch_ref(&workspace)? else {
+        return Ok(blocked(
+            canonical_head,
+            PromotionBlockedReason::DetachedHead,
+        ));
+    };
     if canonical_head != initial {
-        return Ok(GovernedPromotionInput {
-            actor: staged_system_actor(),
-            accepted_revision,
-            initial_subject_revision: initial,
-            outcome: GovernedPromotionOutcome::PromotionBlocked { canonical_head },
-        });
+        return Ok(blocked(
+            canonical_head,
+            PromotionBlockedReason::CanonicalHeadMoved,
+        ));
     }
 
-    fast_forward_canonical_branch(&workspace, &accepted_revision)?;
+    if !compare_and_swap_canonical_branch(&workspace, &branch_ref, &initial, &accepted_revision)? {
+        let observed = observe_head_oid(&workspace).unwrap_or(canonical_head);
+        return Ok(blocked(
+            observed,
+            PromotionBlockedReason::ConcurrentBranchUpdate,
+        ));
+    }
+    sync_canonical_worktree(&workspace, &accepted_revision)?;
 
     let promoted = observe_clean_git_subject(&workspace, Some(&initial))?;
     if promoted != accepted_revision {
-        anyhow::bail!("canonical head did not land the accepted revision after fast-forward");
+        anyhow::bail!("canonical head did not land the accepted revision after promotion");
     }
     Ok(GovernedPromotionInput {
         actor: staged_system_actor(),
@@ -1634,6 +1770,7 @@ mod tests {
                 artifact_ids: Vec::new(),
                 diff_ref: None,
                 loop_report_digest: None,
+                loop_report_version: None,
                 submitted_at: "2026-07-13T00:00:00Z".to_string(),
                 based_on_revision: 1,
             }],
@@ -2264,5 +2401,112 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("exact profiled bounds"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Review round 1
+    // -----------------------------------------------------------------------
+
+    /// P1-1: the ref move is a real compare-and-swap, so a concurrent commit
+    /// that lands between observation and the write loses instead of being
+    /// silently overwritten.
+    #[test]
+    fn test_compare_and_swap_refuses_a_stale_expected_revision() {
+        let dir = init_repo();
+        let repo = dir.path().canonicalize().unwrap();
+        let stale = oid(&repo);
+        std::fs::write(repo.join("concurrent.txt"), "someone else\n").unwrap();
+        run(&repo, &["add", "concurrent.txt"]);
+        run(&repo, &["commit", "--quiet", "-m", "concurrent"]);
+        let current = oid(&repo);
+        assert_ne!(stale, current);
+        let branch_ref = canonical_branch_ref(&repo).unwrap().expect("a branch");
+
+        // Swapping against the revision we observed before the concurrent
+        // commit must fail and must not move the branch.
+        let target = "0".repeat(40);
+        let swapped =
+            compare_and_swap_canonical_branch(&repo, &branch_ref, &stale, &target).unwrap();
+
+        assert!(!swapped, "a stale compare-and-swap must not win");
+        assert_eq!(oid(&repo), current);
+    }
+
+    #[test]
+    fn test_compare_and_swap_succeeds_against_the_current_revision() {
+        let dir = init_repo();
+        let repo = dir.path().canonicalize().unwrap();
+        let initial = oid(&repo);
+        std::fs::write(repo.join("next.txt"), "next\n").unwrap();
+        run(&repo, &["add", "next.txt"]);
+        run(&repo, &["commit", "--quiet", "-m", "next"]);
+        let next = oid(&repo);
+        let branch_ref = canonical_branch_ref(&repo).unwrap().expect("a branch");
+        run(&repo, &["reset", "--hard", "--quiet", &initial]);
+
+        assert!(
+            compare_and_swap_canonical_branch(&repo, &branch_ref, &initial, &next).unwrap(),
+            "a matching compare-and-swap must win"
+        );
+        assert_eq!(oid(&repo), next);
+    }
+
+    #[test]
+    fn test_canonical_branch_ref_reports_none_on_a_detached_head() {
+        let dir = init_repo();
+        let repo = dir.path().canonicalize().unwrap();
+        assert!(canonical_branch_ref(&repo).unwrap().is_some());
+
+        run(&repo, &["checkout", "--detach", "--quiet", "HEAD"]);
+
+        assert_eq!(canonical_branch_ref(&repo).unwrap(), None);
+    }
+
+    /// P2-1: a staged Builder commits inside its own worktree, so the claim's
+    /// subject must be observed there, not in the canonical workspace root.
+    #[test]
+    fn test_derive_claim_observes_the_staged_worktree_for_a_staged_task() {
+        let dir = init_repo();
+        let repo = dir.path().canonicalize().unwrap();
+        let initial = oid(&repo);
+        let mut registered = task(&repo);
+        registered.world_scope = WorldScope::StagedAuthoritative;
+        registered.initial_subject_revision = Some(initial.clone());
+        registered.claims.clear();
+        registered.verifications.clear();
+        registered.supervisor_verdicts.clear();
+        registered.review_state = GovernedReviewState::AwaitingClaim;
+
+        let staged = materialize_staged_worktree(&registered).unwrap();
+        let staged_root = PathBuf::from(&staged.root);
+        std::fs::write(staged_root.join("feature.txt"), "builder work\n").unwrap();
+        run(&staged_root, &["add", "feature.txt"]);
+        run(&staged_root, &["commit", "--quiet", "-m", "builder work"]);
+        let builder_commit = oid(&staged_root);
+        assert_ne!(builder_commit, initial);
+
+        registered.staged_worktree = Some(impulse_ops::governed_task::StagedWorktree {
+            id: GovernedRecordId::try_new("staged-1").unwrap(),
+            actor: staged_system_actor(),
+            root: staged.root.clone(),
+            initial_subject_revision: initial.clone(),
+            status: impulse_ops::governed_task::StagedWorktreeStatus::Active,
+            materialized_at: "2026-09-02T00:00:00Z".to_string(),
+            based_on_revision: 1,
+        });
+
+        let request = GovernedClaimRequest {
+            request_id: impulse_ops::governed_task::GovernedRequestId::try_new("req-1").unwrap(),
+            project_id: registered.project_id.clone(),
+            task_id: registered.id.clone(),
+            expected_revision: registered.revision,
+            summary: "done".to_string(),
+            artifact_ids: Vec::new(),
+        };
+        let claim = derive_claim(&registered, &request).unwrap();
+
+        // The Builder's commit, not the untouched canonical head.
+        assert_eq!(claim.subject_revision, builder_commit);
+        assert_eq!(oid(&repo), initial);
     }
 }

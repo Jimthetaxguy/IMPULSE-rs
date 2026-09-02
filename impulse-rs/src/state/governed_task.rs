@@ -10,17 +10,12 @@ use impulse_ops::governed_task::{
     GovernedReviewState, GovernedTaskContractError, GovernedTaskEvent, GovernedTaskEventKind,
     GovernedTaskId, GovernedTaskMutation, GovernedTaskMutationRequest, GovernedTaskRegistration,
     GovernedTaskRun, GovernedVerification, GovernedVerificationInput, GovernedVerificationOutcome,
-    OperatorAuthentication, OperatorDecision, OperatorDecisionInput, OperatorDecisionKind,
-    SupervisorVerdict, SupervisorVerdictInput, SupervisorVerdictKind, WorkerCompletionClaim,
-    WorkerCompletionClaimInput, MAX_GOVERNED_COMMANDS, MAX_GOVERNED_COMMAND_ARGS,
+    OperatorAuthentication, OperatorDecision, OperatorDecisionInput, OperatorDecisionKind, PromotionBlockedReason,
+    StagedWorktree, StagedWorktreeInput, StagedWorktreeStatus, SupervisorVerdict,
+    SupervisorVerdictInput, SupervisorVerdictKind, WorkerCompletionClaim,
+    WorkerCompletionClaimInput, WorldScope, MAX_GOVERNED_COMMANDS, MAX_GOVERNED_COMMAND_ARGS,
     MAX_GOVERNED_COMMAND_ARG_BYTES, MAX_GOVERNED_EVENTS, MAX_GOVERNED_RECORDS_PER_KIND,
     MAX_GOVERNED_REFERENCES, MAX_GOVERNED_REFERENCE_BYTES,
-    OperatorDecision, OperatorDecisionInput, OperatorDecisionKind, StagedWorktree,
-    StagedWorktreeInput, StagedWorktreeStatus, SupervisorVerdict, SupervisorVerdictInput,
-    SupervisorVerdictKind, WorkerCompletionClaim, WorkerCompletionClaimInput, WorldScope,
-    MAX_GOVERNED_COMMANDS, MAX_GOVERNED_COMMAND_ARGS, MAX_GOVERNED_COMMAND_ARG_BYTES,
-    MAX_GOVERNED_EVENTS, MAX_GOVERNED_RECORDS_PER_KIND, MAX_GOVERNED_REFERENCES,
-    MAX_GOVERNED_REFERENCE_BYTES,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -28,7 +23,8 @@ use uuid::Uuid;
 
 use super::State;
 use crate::loop_contract::{
-    LoopContract, LoopObservation, LoopReport, LoopTermination, LoopTrip, SameErrorObservation,
+    canonical_json, LoopContract, LoopObservation, LoopReport, LoopTermination, LoopTrip,
+    SameErrorObservation, GOVERNED_BUILDER_LOOP_VERSION,
 };
 use crate::storage::Storage;
 
@@ -440,14 +436,13 @@ impl State {
             )
         })?;
         let mut updated = current;
+        let now = impulse_ops::now_rfc3339();
         apply_mutation(
             &mut updated,
             request.mutation,
             next_revision,
-            operator_authentication,
+            MutationContext::live(&now, operator_authentication),
         )?;
-        let now = impulse_ops::now_rfc3339();
-        apply_mutation(&mut updated, request.mutation, next_revision, &now)?;
         updated.revision = next_revision;
         updated.updated_at = now;
         if let Some(event) = updated.events.last_mut() {
@@ -948,11 +943,32 @@ fn validate_task_history(task: &GovernedTaskRun) -> Result<BTreeMap<u64, String>
                 event.revision
             );
         }
+        // Replay uses the event's own recorded timestamp as its clock, so every
+        // clock-derived decision (the ADR-0019 loop contract) and every stored
+        // timestamp reproduce exactly instead of drifting with wall time.
+        let replay_claim = matches!(
+            event.kind,
+            GovernedTaskEventKind::ClaimSubmitted | GovernedTaskEventKind::LoopTripped
+        )
+        .then(|| {
+            task.claims
+                .get(claim_index.saturating_sub(1))
+                .map(|stored| ReplayedClaimEvidence {
+                    digest: stored.loop_report_digest.as_deref(),
+                    version: stored.loop_report_version,
+                    tripped: event.kind == GovernedTaskEventKind::LoopTripped,
+                })
+        })
+        .flatten();
         apply_mutation(
             &mut projection,
             mutation,
             event.revision,
-            replay_operator_authentication,
+            MutationContext {
+                now: &event.created_at,
+                operator_authentication: replay_operator_authentication,
+                replay_claim,
+            },
         )
         .with_context(|| {
             format!(
@@ -960,17 +976,6 @@ fn validate_task_history(task: &GovernedTaskRun) -> Result<BTreeMap<u64, String>
                 event.kind, event.revision
             )
         })?;
-        // Replay uses the event's own recorded timestamp as its clock, so every
-        // clock-derived decision (the ADR-0019 loop contract) and every stored
-        // timestamp reproduce exactly instead of drifting with wall time.
-        apply_mutation(&mut projection, mutation, event.revision, &event.created_at).with_context(
-            || {
-                format!(
-                    "governed task event {:?} at revision {} cannot be replayed",
-                    event.kind, event.revision
-                )
-            },
-        )?;
         let replayed_kind = projection
             .events
             .last()
@@ -994,12 +999,7 @@ fn validate_task_history(task: &GovernedTaskRun) -> Result<BTreeMap<u64, String>
             let replayed = projection
                 .latest_claim()
                 .ok_or_else(|| anyhow::anyhow!("replayed claim event produced no claim"))?;
-            if replayed.loop_report_digest != stored.loop_report_digest {
-                anyhow::bail!(
-                    "governed task claim at revision {} does not replay to its stored loop report digest",
-                    event.revision
-                );
-            }
+            require_replayed_loop_evidence(event.revision, stored, replayed)?;
         }
         projection.revision = event.revision;
     }
@@ -1187,13 +1187,51 @@ fn require_receipt_revision(
     Ok(())
 }
 
+/// Loop evidence carried by a claim that is being replayed out of the ledger.
+#[derive(Debug, Clone, Copy)]
+struct ReplayedClaimEvidence<'a> {
+    digest: Option<&'a str>,
+    version: Option<u32>,
+    /// Whether the stored event for this claim was `LoopTripped`.
+    tripped: bool,
+}
+
+/// Everything a mutation needs that is not the mutation itself.
+///
+/// Bundled rather than passed as loose parameters so the replay path and the
+/// live path cannot drift, and so a future lane adding another ambient input
+/// (actor provenance, for instance) extends one struct instead of every call
+/// site.
+#[derive(Debug, Clone, Copy)]
+struct MutationContext<'a> {
+    /// The clock. Live mutations pass the current time; replay passes the
+    /// event's own recorded timestamp so clock-derived verdicts reproduce.
+    now: &'a str,
+    /// Daemon-derived provenance for any operator decision this mutation
+    /// records (ADR-0018). Never read from the request payload.
+    operator_authentication: OperatorAuthentication,
+    /// Set only while replaying a claim event out of the ledger.
+    replay_claim: Option<ReplayedClaimEvidence<'a>>,
+}
+
+impl<'a> MutationContext<'a> {
+    fn live(now: &'a str, operator_authentication: OperatorAuthentication) -> Self {
+        Self {
+            now,
+            operator_authentication,
+            replay_claim: None,
+        }
+    }
+}
+
 fn apply_mutation(
     task: &mut GovernedTaskRun,
     mutation: GovernedTaskMutation,
     event_revision: u64,
-    operator_authentication: OperatorAuthentication,
-    now: &str,
+    context: MutationContext<'_>,
 ) -> Result<()> {
+    let now = context.now;
+    let operator_authentication = context.operator_authentication;
     require_capacity(
         "governed task events",
         task.events.len(),
@@ -1423,7 +1461,7 @@ fn apply_mutation(
             // governed loop contract. The verdict is derived only from stored
             // counts and stored timestamps, so replaying this history produces
             // the same verdict it produced when the event was first written.
-            let loop_state = governed_builder_loop_state(task, now)?;
+            let loop_state = governed_builder_loop_state(task, now, context.replay_claim)?;
             let id = new_record_id("claim");
             task.claims.push(WorkerCompletionClaim {
                 id: id.clone(),
@@ -1433,6 +1471,7 @@ fn apply_mutation(
                 artifact_ids: claim.artifact_ids,
                 diff_ref: claim.diff_ref,
                 loop_report_digest: loop_state.as_ref().map(|state| state.report_digest.clone()),
+                loop_report_version: loop_state.as_ref().map(|state| state.report_version),
                 submitted_at: now.to_string(),
                 based_on_revision: task.revision,
             });
@@ -1634,14 +1673,34 @@ fn apply_mutation(
 struct GovernedLoopState {
     trip: Option<LoopTrip>,
     report_digest: String,
+    report_version: u32,
 }
 
 fn governed_builder_loop_state(
     task: &GovernedTaskRun,
     now: &str,
+    replay: Option<ReplayedClaimEvidence<'_>>,
 ) -> Result<Option<GovernedLoopState>> {
     if task.world_scope != WorldScope::StagedAuthoritative {
         return Ok(None);
+    }
+    // A claim written under a different evidence version cannot be recomputed:
+    // the budget constants or the report shape it was digested under are gone.
+    // Replay it verbatim instead, so revising a constant can never make an
+    // existing ledger unloadable.
+    if let Some(replay) = replay {
+        if replay.version != Some(current_governed_loop_version()) {
+            let (Some(digest), Some(version)) = (replay.digest, replay.version) else {
+                return Ok(None);
+            };
+            return Ok(Some(GovernedLoopState {
+                trip: replay.tripped.then_some(LoopTrip::RoundCap {
+                    rounds: task.claims.len(),
+                }),
+                report_digest: digest.to_string(),
+                report_version: version,
+            }));
+        }
     }
     let contract = LoopContract::governed_builder();
     contract
@@ -1677,12 +1736,78 @@ fn governed_builder_loop_state(
         tool_calls_interrupted: 0,
         elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
     };
-    let payload = serde_json::to_vec(&report)
-        .context("Failed to serialize the governed Builder loop report")?;
+    let version = current_governed_loop_version();
     Ok(Some(GovernedLoopState {
         trip,
-        report_digest: format!("sha256:{:x}", Sha256::digest(payload)),
+        report_digest: governed_loop_report_digest(&report, version)?,
+        report_version: version,
     }))
+}
+
+/// Digest input is the key-order-independent canonical JSON of the report,
+/// prefixed by the evidence version, so a digest is only ever compared against
+/// one computed the same way under the same version.
+fn governed_loop_report_digest(report: &LoopReport, version: u32) -> Result<String> {
+    let value = serde_json::to_value(report)
+        .context("Failed to serialize the governed Builder loop report")?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"impulse-governed-loop-report-v");
+    hasher.update(version.to_string().as_bytes());
+    hasher.update([0]);
+    hasher.update(canonical_json(&value).as_bytes());
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+/// Compare a replayed claim's loop evidence with what the ledger stored.
+///
+/// A claim written under a different evidence version is checked only for
+/// structural coherence: its digest cannot be recomputed, because the constants
+/// and report shape it was digested under no longer exist in this build. A
+/// claim written under the running version must reproduce its digest exactly.
+fn require_replayed_loop_evidence(
+    revision: u64,
+    stored: &WorkerCompletionClaim,
+    replayed: &WorkerCompletionClaim,
+) -> Result<()> {
+    match (&stored.loop_report_digest, stored.loop_report_version) {
+        // A pre-ADR-0019 claim, or any claim outside the staged world scope.
+        (None, None) => return Ok(()),
+        (Some(digest), Some(_)) => {
+            require_sha256_digest("claim loop report digest", digest)?;
+        }
+        _ => anyhow::bail!(
+            "governed task claim at revision {revision} carries loop evidence with a missing digest or version"
+        ),
+    }
+    if stored.loop_report_version != Some(current_governed_loop_version()) {
+        return Ok(());
+    }
+    if replayed.loop_report_digest != stored.loop_report_digest
+        || replayed.loop_report_version != stored.loop_report_version
+    {
+        anyhow::bail!(
+            "governed task claim at revision {revision} does not replay to its stored loop report digest"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam for P1-3: pretend the running build is on a later evidence
+    /// version so a ledger written under the current one can be reloaded.
+    static GOVERNED_LOOP_VERSION_OVERRIDE: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn current_governed_loop_version() -> u32 {
+    #[cfg(test)]
+    {
+        if let Some(version) = GOVERNED_LOOP_VERSION_OVERRIDE.with(std::cell::Cell::get) {
+            return version;
+        }
+    }
+    GOVERNED_BUILDER_LOOP_VERSION
 }
 
 /// Loop "tool" identity for governed Builder failures. The daemon never sees
@@ -1751,12 +1876,24 @@ fn require_expected_staged_root(task: &GovernedTaskRun, root: &str) -> Result<()
     Ok(())
 }
 
+/// Every state a staged worktree can legitimately be reclaimed from.
+///
+/// The first version of this allowed only `Rejected` and a promoted `Accepted`,
+/// which leaked the worktree for exactly the terminal state this ADR's own loop
+/// contract produces (`Escalated`) and for a runtime that never came up.
 fn staged_worktree_is_discardable(task: &GovernedTaskRun) -> bool {
+    // A runtime that failed to launch leaves a worktree nothing will ever use,
+    // whatever the review state says.
+    if task.execution_state == GovernedExecutionState::LaunchFailed {
+        return true;
+    }
     match task.review_state {
-        GovernedReviewState::Rejected => true,
-        GovernedReviewState::Accepted => task
-            .latest_promotion()
-            .is_some_and(|promotion| promotion.outcome.is_promoted()),
+        // Terminal: the operator declined, or the loop contract tripped and the
+        // task accepts no further claims.
+        GovernedReviewState::Rejected | GovernedReviewState::Escalated => true,
+        // Promoted (work is canonical, the checkout is spent) or blocked (the
+        // operator may reclaim the space instead of retrying).
+        GovernedReviewState::Accepted => task.latest_promotion().is_some(),
         _ => false,
     }
 }
@@ -1766,8 +1903,11 @@ fn promotion_summary(outcome: &GovernedPromotionOutcome) -> String {
         GovernedPromotionOutcome::Promoted { promoted_revision } => {
             format!("promoted to {promoted_revision}")
         }
-        GovernedPromotionOutcome::PromotionBlocked { canonical_head } => {
-            format!("blocked; canonical head is {canonical_head}")
+        GovernedPromotionOutcome::PromotionBlocked {
+            canonical_head,
+            reason,
+        } => {
+            format!("blocked ({reason}); canonical head is {canonical_head}")
         }
     }
 }
@@ -1787,11 +1927,21 @@ fn validate_promotion_outcome(promotion: &GovernedPromotionInput) -> Result<()> 
                 );
             }
         }
-        GovernedPromotionOutcome::PromotionBlocked { canonical_head } => {
+        GovernedPromotionOutcome::PromotionBlocked {
+            canonical_head,
+            reason,
+        } => {
             require_commit_oid("blocked canonical head", canonical_head)?;
-            if canonical_head == &promotion.initial_subject_revision {
+            // A detached canonical HEAD can legitimately still be sitting on the
+            // initial OID; a "head moved" block cannot.
+            if matches!(
+                reason,
+                PromotionBlockedReason::CanonicalHeadMoved
+                    | PromotionBlockedReason::ConcurrentBranchUpdate
+            ) && canonical_head == &promotion.initial_subject_revision
+            {
                 return invalid_transition(
-                    "a promotion is blocked only when the canonical head has moved off the initial OID",
+                    "a promotion is blocked on a moved head only when that head differs from the initial OID",
                 );
             }
         }
@@ -3921,6 +4071,7 @@ mod tests {
                 "staged-10-blocked",
                 GovernedPromotionOutcome::PromotionBlocked {
                     canonical_head: staged_oid('c'),
+                    reason: PromotionBlockedReason::CanonicalHeadMoved,
                 },
             ))
             .unwrap();
@@ -3963,10 +4114,13 @@ mod tests {
                 "staged-11-unmoved-head",
                 GovernedPromotionOutcome::PromotionBlocked {
                     canonical_head: staged_oid('a'),
+                    reason: PromotionBlockedReason::CanonicalHeadMoved,
                 },
             ))
             .expect_err("an unmoved canonical head cannot block a promotion");
-        assert!(error.to_string().contains("moved off the initial OID"));
+        assert!(error
+            .to_string()
+            .contains("blocked on a moved head only when that head differs"));
 
         let error = state
             .mutate_governed_task(mutation(
@@ -4295,5 +4449,253 @@ mod tests {
             "a rewritten staged worktree root must fail the ledger closed",
         );
         assert!(format!("{error:#}").contains("daemon-derived path"));
+    }
+
+    // ---------------------------------------------------------------------
+    // Review round 1
+    // ---------------------------------------------------------------------
+
+    /// Drive a staged task to `Escalated` through the loop contract's own
+    /// same-failure trip.
+    fn staged_escalated(state: &State, request_id: &str) -> GovernedTaskRun {
+        let mut task = state
+            .register_governed_task(staged_registration(state, request_id))
+            .unwrap();
+        task = materialize(state, &task, &format!("{request_id}-staged"));
+        task = launch(state, &task, &format!("{request_id}-run"));
+        for cycle in 0..crate::loop_contract::GOVERNED_BUILDER_SAME_FAILURE_STREAK {
+            task = staged_claim(
+                state,
+                &task,
+                &format!("{request_id}-claim-{cycle}"),
+                &staged_oid('b'),
+            );
+            task = verify(
+                state,
+                &task,
+                &format!("{request_id}-verify-{cycle}"),
+                GovernedVerificationOutcome::Failed,
+            );
+        }
+        staged_claim(
+            state,
+            &task,
+            &format!("{request_id}-claim-final"),
+            &staged_oid('b'),
+        )
+    }
+
+    fn discard(state: &State, task: &GovernedTaskRun, request_id: &str) -> Result<GovernedTaskRun> {
+        state.mutate_governed_task(mutation(
+            task,
+            request_id,
+            GovernedTaskMutation::DiscardStagedWorktree {
+                actor: actor(GovernedActorKind::System, "impulse-daemon"),
+                reason: "reclaiming the staged worktree".into(),
+            },
+        ))
+    }
+
+    /// P1-2: `Escalated` is terminal and accepts no further claims, so without
+    /// this the loop-trip path leaks its worktree forever.
+    #[test]
+    fn test_escalated_task_can_discard_its_staged_worktree() {
+        let (_root, state) = state();
+        let task = staged_escalated(&state, "review-1");
+        assert_eq!(task.review_state, GovernedReviewState::Escalated);
+
+        let task = discard(&state, &task, "review-1-discard").expect("an escalated run reclaims");
+
+        assert_eq!(
+            task.staged_worktree.as_ref().unwrap().status,
+            StagedWorktreeStatus::Discarded
+        );
+        assert!(task.active_staged_worktree().is_none());
+    }
+
+    /// P1-2: a runtime that never came up leaves a worktree nothing will use.
+    #[test]
+    fn test_launch_failed_task_can_discard_its_staged_worktree() {
+        let (_root, state) = state();
+        let task = state
+            .register_governed_task(staged_registration(&state, "review-2"))
+            .unwrap();
+        let task = materialize(&state, &task, "review-2-staged");
+        let task = state
+            .mutate_governed_task(mutation(
+                &task,
+                "review-2-failed",
+                GovernedTaskMutation::MarkLaunchFailed {
+                    actor: actor(GovernedActorKind::System, "impulse-daemon"),
+                    reason: "runtime binary was not found".into(),
+                },
+            ))
+            .unwrap();
+        assert_eq!(task.execution_state, GovernedExecutionState::LaunchFailed);
+        assert_eq!(task.review_state, GovernedReviewState::AwaitingClaim);
+
+        let task = discard(&state, &task, "review-2-discard").expect("a failed launch reclaims");
+
+        assert!(task.active_staged_worktree().is_none());
+    }
+
+    /// P1-2: after a blocked promotion the operator may reclaim the space
+    /// instead of retrying.
+    #[test]
+    fn test_blocked_promotion_allows_discarding_the_staged_worktree() {
+        let (_root, state) = state();
+        let task = staged_accepted(&state, "review-3", &staged_oid('b'));
+        let task = state
+            .mutate_governed_task(promotion_request(
+                &task,
+                "review-3-blocked",
+                GovernedPromotionOutcome::PromotionBlocked {
+                    canonical_head: staged_oid('c'),
+                    reason: PromotionBlockedReason::CanonicalHeadMoved,
+                },
+            ))
+            .unwrap();
+
+        let task = discard(&state, &task, "review-3-discard").expect("a blocked run reclaims");
+
+        assert!(task.active_staged_worktree().is_none());
+    }
+
+    /// A live run still cannot have its worktree pulled out from under it.
+    #[test]
+    fn test_a_running_task_still_cannot_discard_its_staged_worktree() {
+        let (_root, state) = state();
+        let task = state
+            .register_governed_task(staged_registration(&state, "review-4"))
+            .unwrap();
+        let task = materialize(&state, &task, "review-4-staged");
+        let task = launch(&state, &task, "review-4-run");
+
+        let error = discard(&state, &task, "review-4-discard")
+            .expect_err("a live Builder keeps its worktree");
+        assert!(error.to_string().contains("after rejection"));
+    }
+
+    /// P1-3: revising the budget constants, or adding a `LoopReport` field,
+    /// must never make an existing ledger unloadable.
+    #[test]
+    fn test_a_ledger_written_under_an_older_loop_version_still_loads() {
+        let (root, state) = state();
+        let task = state
+            .register_governed_task(staged_registration(&state, "review-5"))
+            .unwrap();
+        let task = materialize(&state, &task, "review-5-staged");
+        let task = launch(&state, &task, "review-5-run");
+        let task = staged_claim(&state, &task, "review-5-claim", &staged_oid('b'));
+        let stored_digest = task
+            .latest_claim()
+            .unwrap()
+            .loop_report_digest
+            .clone()
+            .expect("a staged claim carries loop evidence");
+        assert_eq!(
+            task.latest_claim().unwrap().loop_report_version,
+            Some(crate::loop_contract::GOVERNED_BUILDER_LOOP_VERSION)
+        );
+
+        // Pretend this build ships a later evidence version: every stored digest
+        // was computed under constants this build no longer has.
+        let base = root.path().join("impulse-test").join(".impulse");
+        let reloaded = GOVERNED_LOOP_VERSION_OVERRIDE
+            .with(|override_version| {
+                override_version.set(Some(
+                    crate::loop_contract::GOVERNED_BUILDER_LOOP_VERSION + 1,
+                ));
+                let reloaded = State::new(base);
+                override_version.set(None);
+                reloaded
+            })
+            .expect("a ledger written under an older loop version must still load");
+
+        let stored = reloaded
+            .get_governed_task("impulse-test", &task.id)
+            .unwrap()
+            .expect("the task survives the version bump");
+        // Replayed verbatim: the digest and version are preserved, not recomputed.
+        assert_eq!(
+            stored.latest_claim().unwrap().loop_report_digest,
+            Some(stored_digest)
+        );
+        assert_eq!(
+            stored.latest_claim().unwrap().loop_report_version,
+            Some(crate::loop_contract::GOVERNED_BUILDER_LOOP_VERSION)
+        );
+        assert_eq!(
+            stored.review_state,
+            GovernedReviewState::AwaitingVerification
+        );
+    }
+
+    /// A loop trip written under an older version replays as a trip, even
+    /// though this build's constants would not have tripped it.
+    #[test]
+    fn test_an_older_version_loop_trip_replays_as_a_trip() {
+        let (root, state) = state();
+        let tripped = staged_escalated(&state, "review-6");
+        assert_eq!(tripped.review_state, GovernedReviewState::Escalated);
+
+        let base = root.path().join("impulse-test").join(".impulse");
+        let reloaded = GOVERNED_LOOP_VERSION_OVERRIDE
+            .with(|override_version| {
+                override_version.set(Some(
+                    crate::loop_contract::GOVERNED_BUILDER_LOOP_VERSION + 1,
+                ));
+                let reloaded = State::new(base);
+                override_version.set(None);
+                reloaded
+            })
+            .expect("a tripped ledger written under an older loop version must still load");
+
+        let stored = reloaded
+            .get_governed_task("impulse-test", &tripped.id)
+            .unwrap()
+            .expect("the tripped task survives the version bump");
+        assert_eq!(stored.review_state, GovernedReviewState::Escalated);
+        assert_eq!(
+            stored.events.last().unwrap().kind,
+            GovernedTaskEventKind::LoopTripped
+        );
+    }
+
+    /// Loop evidence must be structurally coherent whatever version wrote it.
+    #[test]
+    fn test_a_claim_with_a_digest_but_no_version_fails_the_ledger_closed() {
+        let (root, state) = state();
+        let task = state
+            .register_governed_task(staged_registration(&state, "review-7"))
+            .unwrap();
+        let task = materialize(&state, &task, "review-7-staged");
+        let task = launch(&state, &task, "review-7-run");
+        let _ = staged_claim(&state, &task, "review-7-claim", &staged_oid('b'));
+
+        rewrite_persisted_ledger(&state, |ledger| {
+            let tasks = ledger
+                .get_mut("tasks")
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("tasks object");
+            for stored in tasks.values_mut() {
+                for claim in stored
+                    .get_mut("claims")
+                    .and_then(serde_json::Value::as_array_mut)
+                    .expect("claims array")
+                {
+                    claim
+                        .as_object_mut()
+                        .expect("claim object")
+                        .remove("loop_report_version");
+                }
+            }
+        });
+
+        let error = reload_error(
+            root.path().join("impulse-test").join(".impulse"),
+            "loop evidence without its version must fail the ledger closed",
+        );
+        assert!(format!("{error:#}").contains("missing digest or version"));
     }
 }

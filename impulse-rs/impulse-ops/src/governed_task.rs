@@ -192,20 +192,64 @@ pub struct StagedWorktreeInput {
     pub initial_subject_revision: String,
 }
 
+/// Why a promotion could not move the canonical branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromotionBlockedReason {
+    /// The canonical head no longer equals the OID the task was registered at.
+    CanonicalHeadMoved,
+    /// The canonical checkout is on a detached HEAD, so there is no branch to
+    /// advance. Promoting here would move HEAD only, and the next `git switch`
+    /// would orphan the accepted commit.
+    DetachedHead,
+    /// The compare-and-swap on the canonical branch lost to a concurrent
+    /// writer between observation and the ref update.
+    ConcurrentBranchUpdate,
+}
+
+impl PromotionBlockedReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::CanonicalHeadMoved => "canonical_head_moved",
+            Self::DetachedHead => "detached_head",
+            Self::ConcurrentBranchUpdate => "concurrent_branch_update",
+        }
+    }
+}
+
+impl std::fmt::Display for PromotionBlockedReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// What a promotion attempt actually did to the canonical branch.
 ///
 /// A blocked promotion is an execution fact, not an error: the run stays
-/// `accepted` and the operator decides what to do with a moved canonical head.
+/// `accepted` and the operator decides what to do with a canonical branch that
+/// moved, is detached, or lost a compare-and-swap.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum GovernedPromotionOutcome {
-    Promoted { promoted_revision: String },
-    PromotionBlocked { canonical_head: String },
+    Promoted {
+        promoted_revision: String,
+    },
+    PromotionBlocked {
+        canonical_head: String,
+        reason: PromotionBlockedReason,
+    },
 }
 
 impl GovernedPromotionOutcome {
     pub fn is_promoted(&self) -> bool {
         matches!(self, Self::Promoted { .. })
+    }
+
+    pub fn blocked_reason(&self) -> Option<PromotionBlockedReason> {
+        match self {
+            Self::Promoted { .. } => None,
+            Self::PromotionBlocked { reason, .. } => Some(*reason),
+        }
     }
 }
 
@@ -662,6 +706,12 @@ pub struct WorkerCompletionClaim {
     /// staged world scope (ADR-0019 rule 6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loop_report_digest: Option<String>,
+    /// Governed-loop evidence version the digest was computed under. Stored
+    /// beside the digest so revising the budget constants, or adding a field to
+    /// `LoopReport`, cannot make an existing ledger unloadable: replay only
+    /// recomputes digests written under the version it is running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_report_version: Option<u32>,
     pub submitted_at: String,
     pub based_on_revision: u64,
 }
@@ -1339,6 +1389,7 @@ mod tests {
             },
             GovernedPromotionOutcome::PromotionBlocked {
                 canonical_head: oid('c'),
+                reason: PromotionBlockedReason::CanonicalHeadMoved,
             },
         ] {
             let promotion = GovernedPromotion {
@@ -1625,6 +1676,7 @@ mod tests {
                     initial_subject_revision: oid('a'),
                     outcome: GovernedPromotionOutcome::PromotionBlocked {
                         canonical_head: oid('c'),
+                        reason: PromotionBlockedReason::DetachedHead,
                     },
                 },
             },
@@ -1658,5 +1710,63 @@ mod tests {
             let recovered: GovernedTaskEventKind = serde_json::from_str(&json).unwrap();
             assert_eq!(recovered, kind);
         }
+    }
+
+    #[test]
+    fn test_promotion_blocked_reason_round_trips_and_displays() {
+        for (reason, wire) in [
+            (
+                PromotionBlockedReason::CanonicalHeadMoved,
+                "canonical_head_moved",
+            ),
+            (PromotionBlockedReason::DetachedHead, "detached_head"),
+            (
+                PromotionBlockedReason::ConcurrentBranchUpdate,
+                "concurrent_branch_update",
+            ),
+        ] {
+            let json = serde_json::to_string(&reason).unwrap();
+            assert_eq!(json, format!("\"{wire}\""));
+            assert_eq!(
+                serde_json::from_str::<PromotionBlockedReason>(&json).unwrap(),
+                reason
+            );
+            assert_eq!(reason.to_string(), wire);
+        }
+    }
+
+    #[test]
+    fn test_blocked_reason_is_reachable_from_the_outcome() {
+        let blocked = GovernedPromotionOutcome::PromotionBlocked {
+            canonical_head: oid('c'),
+            reason: PromotionBlockedReason::DetachedHead,
+        };
+        assert_eq!(
+            blocked.blocked_reason(),
+            Some(PromotionBlockedReason::DetachedHead)
+        );
+        assert!(!blocked.is_promoted());
+
+        let promoted = GovernedPromotionOutcome::Promoted {
+            promoted_revision: oid('b'),
+        };
+        assert_eq!(promoted.blocked_reason(), None);
+        assert!(promoted.is_promoted());
+    }
+
+    #[test]
+    fn test_claim_loads_without_loop_evidence_version() {
+        let legacy = serde_json::json!({
+            "id": "claim-legacy",
+            "actor": {"kind": "worker", "id": "worker-1"},
+            "summary": "done",
+            "subject_revision": oid('a'),
+            "loop_report_digest": format!("sha256:{}", "a".repeat(64)),
+            "submitted_at": "2026-07-13T00:00:00Z",
+            "based_on_revision": 1
+        });
+        let claim: WorkerCompletionClaim = serde_json::from_value(legacy).unwrap();
+        assert!(claim.loop_report_digest.is_some());
+        assert_eq!(claim.loop_report_version, None);
     }
 }

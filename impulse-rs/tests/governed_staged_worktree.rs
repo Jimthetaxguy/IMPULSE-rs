@@ -10,8 +10,8 @@ use std::process::Command;
 use impulse_ops::governed_task::{
     ApprovalPolicy, GovernedActor, GovernedActorKind, GovernedExecutionState,
     GovernedPromotionOutcome, GovernedRecordId, GovernedReviewState, GovernedTaskId,
-    GovernedTaskRun, GovernedVerificationProfile, StagedWorktree, StagedWorktreeStatus,
-    WorkerCompletionClaim, WorldScope,
+    GovernedTaskRun, GovernedVerificationProfile, PromotionBlockedReason, StagedWorktree,
+    StagedWorktreeStatus, WorkerCompletionClaim, WorldScope,
 };
 use impulse_rs::governed_producers::{
     discard_staged_worktree, materialize_staged_worktree, promote_governed_outcome,
@@ -24,6 +24,10 @@ fn git(repo: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
+        // The harness's own Git must not run the project's hooks either, or a
+        // hook planted by a test would fire on the test's own commits and mask
+        // what the producers actually did.
+        .args(["-c", "core.hooksPath=/dev/null"])
         .args(args)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
@@ -125,6 +129,7 @@ fn accepted(task: &GovernedTaskRun, root: &str, initial: &str, accepted: &str) -
         artifact_ids: Vec::new(),
         diff_ref: None,
         loop_report_digest: None,
+        loop_report_version: None,
         submitted_at: "2026-09-02T00:00:01Z".to_string(),
         based_on_revision: 2,
     });
@@ -254,7 +259,8 @@ fn test_promotion_blocks_without_touching_the_canonical_branch_when_head_moved()
     assert_eq!(
         promotion.outcome,
         GovernedPromotionOutcome::PromotionBlocked {
-            canonical_head: moved.clone()
+            canonical_head: moved.clone(),
+            reason: PromotionBlockedReason::CanonicalHeadMoved,
         }
     );
     assert_eq!(head(&repo), moved);
@@ -341,4 +347,114 @@ fn test_rejected_run_leaves_the_canonical_tree_byte_identical() {
     );
     assert!(!Path::new(&root).exists());
     assert_eq!(git(&repo, &["status", "--porcelain"]).as_str(), "");
+}
+
+// ---------------------------------------------------------------------------
+// Review round 1
+// ---------------------------------------------------------------------------
+
+/// P1-1: a detached canonical HEAD has no branch to advance. Promoting there
+/// would move HEAD only, and the next `git switch` would orphan the work.
+#[test]
+fn test_promotion_blocks_on_a_detached_canonical_head_without_moving_anything() {
+    let (_dir, repo) = init_repo();
+    let (task, initial, _builder_commit, _root) = staged_with_builder_commit(&repo);
+    let branch_before = git(&repo, &["rev-parse", "refs/heads/main"]);
+    git(&repo, &["checkout", "--detach", "--quiet", "HEAD"]);
+    assert_eq!(
+        git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]).as_str(),
+        "HEAD"
+    );
+
+    let promotion = promote_governed_outcome(&task).expect("a detached HEAD blocks, not errors");
+
+    assert_eq!(
+        promotion.outcome,
+        GovernedPromotionOutcome::PromotionBlocked {
+            canonical_head: initial.clone(),
+            reason: PromotionBlockedReason::DetachedHead,
+        }
+    );
+    // Neither HEAD nor the branch moved, and the Builder's file never landed.
+    assert_eq!(head(&repo), initial);
+    assert_eq!(git(&repo, &["rev-parse", "refs/heads/main"]), branch_before);
+    assert!(!repo.join("feature.txt").exists());
+}
+
+/// P1-1: promotion moves a real branch ref, not just HEAD, so the accepted
+/// commit survives a later `git switch`.
+#[test]
+fn test_promotion_advances_the_branch_ref_not_only_head() {
+    let (_dir, repo) = init_repo();
+    let (task, _initial, builder_commit, _root) = staged_with_builder_commit(&repo);
+
+    promote_governed_outcome(&task).expect("promote accepted outcome");
+
+    assert_eq!(
+        git(&repo, &["rev-parse", "refs/heads/main"]),
+        builder_commit
+    );
+    // Leaving and returning to the branch keeps the promoted commit.
+    git(&repo, &["checkout", "--detach", "--quiet", "HEAD"]);
+    git(&repo, &["checkout", "--quiet", "main"]);
+    assert_eq!(head(&repo), builder_commit);
+    assert!(repo.join("feature.txt").is_file());
+}
+
+/// P2-2: `.git/hooks` is shared across linked worktrees, so a Builder could
+/// plant a hook that runs inside a daemon-owned producer.
+#[test]
+fn test_planted_git_hooks_never_execute_during_staging_or_promotion() {
+    let (_dir, repo) = init_repo();
+    let hooks = repo.join(".git").join("hooks");
+    std::fs::create_dir_all(&hooks).expect("hooks dir");
+    let marker = repo.join("hook-ran.txt");
+    for hook in ["post-checkout", "post-merge", "reference-transaction"] {
+        let path = hooks.join(hook);
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\necho {hook} >> {}\n", marker.display()),
+        )
+        .expect("write hook");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod hook");
+        }
+    }
+
+    let initial = head(&repo);
+    let registered = task(&repo, &initial);
+    let staged = materialize_staged_worktree(&registered).expect("materialize staged worktree");
+    assert!(
+        !marker.exists(),
+        "a planted hook executed during materialization: {}",
+        std::fs::read_to_string(&marker).unwrap_or_default()
+    );
+
+    let builder_commit = commit_in(Path::new(&staged.root), "feature.txt", "builder work\n");
+    let task = accepted(&registered, &staged.root, &initial, &builder_commit);
+    promote_governed_outcome(&task).expect("promote accepted outcome");
+
+    assert_eq!(head(&repo), builder_commit);
+    assert!(
+        !marker.exists(),
+        "a planted hook executed during promotion: {}",
+        std::fs::read_to_string(&marker).unwrap_or_default()
+    );
+}
+
+/// P2-3: the fail-closed message must name the recovery.
+#[test]
+fn test_occupied_staged_path_error_names_the_recovery() {
+    let (_dir, repo) = init_repo();
+    let registered = task(&repo, &head(&repo));
+    std::fs::create_dir_all(registered.expected_staged_worktree_root().unwrap())
+        .expect("pre-create staged path");
+
+    let error = materialize_staged_worktree(&registered).expect_err("occupied path fails closed");
+    let message = error.to_string();
+    assert!(message.contains("already exists"), "{message}");
+    assert!(message.contains("worktree prune"), "{message}");
 }

@@ -42,6 +42,15 @@ pub const GOVERNED_BUILDER_WALL_CLOCK: Duration = Duration::from_secs(4 * 60 * 6
 /// Consecutive verification failures with the same signature that trip the
 /// governed Builder loop.
 pub const GOVERNED_BUILDER_SAME_FAILURE_STREAK: usize = 3;
+/// Version of the governed Builder loop evidence contract.
+///
+/// Bump this whenever anything that feeds a persisted `loop_report_digest`
+/// changes: the budget constants above, the shape of [`LoopReport`], or the
+/// way the digest is composed. A stored claim records the version its digest
+/// was computed under, and ledger replay only recomputes digests written under
+/// the version it is running — so revising a constant can never make an
+/// existing `GOVERNED_TASKS.json` unloadable.
+pub const GOVERNED_BUILDER_LOOP_VERSION: u32 = 1;
 
 /// Longest error signature retained for same-error detection and reports.
 const ERROR_SIGNATURE_MAX_CHARS: usize = 120;
