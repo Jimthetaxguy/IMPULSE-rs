@@ -155,6 +155,16 @@ next consumer.
 - **Source of truth:** `src/loop_contract.rs`, `Agent::chat_with_tools` in
   `src/llm_backends/mod.rs`, and ADR-0017.
 
+### document read tool — `[code]`
+Ion's read-only `document_read` tool: parses `xlsx`, `xls`, `csv`, and `docx` through the
+`office` module (files up to 10 MiB, on the blocking pool) and returns a section outline with
+whole-document offsets plus a bounded character window that ends on a line boundary and names
+the next offset, so a model inside a loop contract can jump to and page through an everyday
+document without flooding its context. Ungated like `file_read`; absolute paths are accepted;
+registered only with the default `office-support` feature.
+- **Source of truth:** `src/ion_repl/tool_document.rs` and
+  `docs/superpowers/specs/2026-09-01-ion-document-tool-design.md`.
+
 ### agent registry — `[code]`
 The catalog of platform identity and launch metadata. It answers what can be named, detected, and
 launched; daemon/runtime telemetry separately answers what is currently running.

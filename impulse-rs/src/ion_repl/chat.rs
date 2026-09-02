@@ -284,9 +284,9 @@ fn tool_definitions(registry: &ReplToolRegistry) -> Vec<ToolDefinition> {
 /// Tool names whose execution mutates state (filesystem writes, shell
 /// commands) and therefore require an interactive confirmation before
 /// running when triggered by model-generated `tool_use` output. `ion_verify`
-/// (read-only, spec-a gate) and `file_read` are deliberately not gated:
-/// `ion_verify` is already ungated when hand-typed via `/verify`, and
-/// `file_read` cannot mutate anything.
+/// (read-only, spec-a gate), `file_read`, and `document_read` are
+/// deliberately not gated: `ion_verify` is already ungated when hand-typed
+/// via `/verify`, and the two readers cannot mutate anything.
 const CONFIRMATION_REQUIRED_TOOLS: &[&str] = &["bash_exec", "file_write"];
 
 /// An unforgeable proof that a mutating tool call was approved -- adapted
@@ -844,6 +844,46 @@ mod tests {
             .await;
         assert!(result.is_error);
         assert!(!result.content.contains("declined"));
+        assert!(asked.lock().unwrap().is_empty());
+    }
+
+    #[cfg(feature = "office-support")]
+    #[tokio::test]
+    async fn test_document_read_is_read_only_and_reaches_the_model_ungated() {
+        // The beyond-software tool must behave like file_read: never
+        // consult the confirmation hook, and hand the model a bounded,
+        // rendered window rather than the raw parser payload.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(
+            dir.path().join("invoice.csv"),
+            "item,amount\nconsulting,1200\n",
+        )
+        .expect("write fixture");
+        let tools = ReplToolRegistry::with_defaults();
+        let ctx = ReplContext {
+            repo_root: dir.path().to_path_buf(),
+        };
+        let asked: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        let confirm = |name: &str, _input: &Value, _verdict: &GuardVerdict| {
+            asked.lock().unwrap().push(name.to_string());
+            false
+        };
+        let executor = ReplToolExecutor {
+            tools: &tools,
+            ctx: &ctx,
+            confirm: &confirm,
+        };
+
+        let result = executor
+            .execute(
+                "document_read",
+                serde_json::json!({"path": "invoice.csv", "max_chars": 11}),
+            )
+            .await;
+
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("consulting") || result.content.contains("item,amount"));
+        assert!(result.content.contains("truncated"), "{}", result.content);
         assert!(asked.lock().unwrap().is_empty());
     }
 

@@ -20,6 +20,8 @@ use crate::tooling::ToolRegistry;
 
 use super::tool_bridge::DynamicToolBridge;
 use super::tool_claim::GovernedSubmitClaimTool;
+#[cfg(feature = "office-support")]
+use super::tool_document::DocumentReadTool;
 use super::tool_verify::IonVerifyTool;
 use super::tools::ReplTool;
 
@@ -65,13 +67,17 @@ impl ReplToolRegistry {
         self.tools.is_empty()
     }
 
-    /// Builds the default ion REPL tool set: `ion_verify` plus `file_read`,
-    /// `file_write`, and `bash_exec` bridged from
+    /// Builds the default ion REPL tool set: `ion_verify`,
+    /// `governed_submit_claim`, the read-only `document_read` (only with the
+    /// default `office-support` feature, matching `src/tooling::document`),
+    /// plus `file_read`, `file_write`, and `bash_exec` bridged from
     /// `src/tooling::ToolRegistry::with_defaults()`.
     pub fn with_defaults() -> Self {
         let mut registry = Self::new();
         registry.register(Box::new(IonVerifyTool));
         registry.register(Box::new(GovernedSubmitClaimTool));
+        #[cfg(feature = "office-support")]
+        registry.register(Box::new(DocumentReadTool));
 
         let dynamic = Arc::new(ToolRegistry::with_defaults());
         registry.register(Box::new(DynamicToolBridge::new(
@@ -115,7 +121,16 @@ mod tests {
         assert!(registry.get("file_write").is_some());
         assert!(registry.get("bash_exec").is_some());
         assert!(registry.get("governed_submit_claim").is_some());
-        assert_eq!(registry.len(), 5);
+        #[cfg(feature = "office-support")]
+        {
+            assert!(registry.get("document_read").is_some());
+            assert_eq!(registry.len(), 6);
+        }
+        #[cfg(not(feature = "office-support"))]
+        {
+            assert!(registry.get("document_read").is_none());
+            assert_eq!(registry.len(), 5);
+        }
     }
 
     #[test]
