@@ -60,7 +60,7 @@ Run on this lane's tree with
 | `cargo build --workspace` | clean, zero warnings |
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean, zero warnings |
 | `cargo fmt --all -- --check` | clean, zero diffs |
-| `cargo test --workspace` | **2378 passed, 0 failed, 9 ignored** (base `36bda00`: 2310 passed; +68) |
+| `cargo test --workspace` | **2396 passed, 0 failed, 9 ignored** (base `36bda00`: 2310 passed; +86) |
 | `python3 docs/validate_docs.py --all` | only the four failures that pre-exist on `main` |
 
 Package-level totals from the same run:
@@ -73,13 +73,13 @@ Package-level totals from the same run:
 | `impulse-desktop` `runtime` | 22 | 0 | 1 |
 | `impulse-desktop` `views_ssr` | 7 | 0 | 0 |
 | `impulse-ion` lib | 23 | 0 | 1 |
-| `impulse-ops` lib | 94 | 0 | 0 |
+| `impulse-ops` lib | 97 | 0 | 0 |
 | `impulse-ops` `governed_producer_contract` | 8 | 0 | 0 |
 | `impulse-ops` `governed_task_contract` | 5 | 0 | 0 |
 | `impulse-ops` `memory_candidate_contract` | 5 | 0 | 0 |
-| `impulse-rs` lib | 1819 | 0 | 5 |
+| `impulse-rs` lib | 1830 | 0 | 5 |
 | `impulse-rs` `governed_process_flow` | 2 | 0 | 0 |
-| `impulse-rs` `governed_staged_worktree` (new) | 12 | 0 | 0 |
+| `impulse-rs` `governed_staged_worktree` (new) | 16 | 0 | 0 |
 | `impulse-rs` hook-validation suites (3 files) | 15 | 0 | 0 |
 | `impulse-rs` `integration_enhancements` | 11 | 0 | 1 |
 | `impulse-rs` `ion_binary` | 4 | 0 | 0 |
@@ -226,29 +226,83 @@ all mechanical and all **both-keep**:
 | `impulse-rs/impulse-ops/src/governed_task.rs` | Both added types and a new `mod tests` | Union the imports, the types, and the test modules |
 | `impulse-rs/src/state/governed_task.rs` | Both added a parameter to `apply_mutation`, and both appended tests | See below |
 
-`apply_mutation` takes **both** new parameters after the merge:
+`apply_mutation`'s extra inputs are now bundled, which makes this merge smaller than it first
+looked. Review round 1 replaced the loose `now: &str` parameter with a context struct:
 
 ```rust
-fn apply_mutation(
-    task: &mut GovernedTaskRun,
-    mutation: GovernedTaskMutation,
-    event_revision: u64,
-    now: &str,                                       // ADR-0019
-    operator_authentication: OperatorAuthentication, // ADR-0018
-) -> Result<()>
+struct MutationContext<'a> {
+    now: &'a str,                            // ADR-0019: replay's clock
+    replay_claim: Option<ReplayedClaimEvidence<'a>>, // ADR-0019: foreign-version loop evidence
+    // ADR-0018 folds in here rather than becoming a fifth parameter:
+    // operator_authentication: OperatorAuthentication,
+}
+
+fn apply_mutation(task, mutation, event_revision, context: MutationContext<'_>) -> Result<()>
 ```
 
-`mutate_governed_task` passes the freshly computed `now` and the connection's authentication;
-`validate_task_history` passes `&event.created_at` and `replay_operator_authentication`. The two
-additions are orthogonal — one supplies replay's clock, the other supplies replay's actor
-provenance — and both call sites need both. Import lists and the two `mod tests` blocks are a plain
-union.
+`mutate_governed_task` builds it with `MutationContext::live(&now)` plus the connection's
+authentication; `validate_task_history` builds it with `&event.created_at`, the replayed claim
+evidence, and `replay_operator_authentication` — which the ADR-0018 lane already sets before the
+match, so it is in scope exactly where `&event.created_at` goes. The additions are orthogonal: one
+supplies replay's clock, one supplies replay's loop evidence, one supplies replay's actor
+provenance. Import lists and the two `mod tests` blocks are a plain union.
+
+Three further facts from ADR-0018's own review round, confirmed by that lane:
+
+- `authorize_governed_mutation` no longer has a `_ => Ok(())` catch-all; it is an exhaustive match.
+  Adding `RecordPromotion` is therefore **compiler-enforced** rather than something the daemon lane
+  has to remember — the function will not build until the new variant is classified. That is the
+  better outcome for this ADR's threat model.
+- `OperatorDecisionInput` gained `#[serde(deny_unknown_fields)]`. This lane's fixtures build that
+  payload as a struct literal, never as JSON with extra keys, so nothing here is affected.
+- `OperatorCapability::generate()` is fallible and now lives in a `OnceLock` set in `start()`, and
+  `impulse-ops` gains an `operator_capability.rs`. This lane touches neither `Daemon`'s fields nor
+  the accept loop, so there is no overlap.
+
+**PR #45 (producer reservation journal):** the reviewer confirmed no serde tag collision between
+this lane's new event kinds and #45's `producer_reservation_interrupted` /
+`note_producer_reservation_interrupted`. The piece #45 must satisfy after rebase is this lane's
+whole-enum replay assertion — `replayed_kind != event.kind` bails, so #45's new event arm has to
+replay to its own kind, not fall through to a neighbouring one.
 
 **After whichever lane rebases second:** re-run `cargo test --workspace`, and specifically the
 ADR-0018 superseded-derivation reload test, which asserts a re-derived candidate equals the
 pre-bump one field for field. This lane's change feeds `operator.based_on_revision + 1` into the
 source digest rather than `task.revision`, so a promotion cannot move the digested value — that is
 the property that test is checking, and it should hold, but it must be re-run rather than assumed.
+
+## Review round 1
+
+Adversarial review returned "needs changes": claims a, b, e-determinism, f and g held; three P1s
+and three P2s were each reproduced in a real repository. All six are fixed on this branch, with a
+regression test per finding. ADR-0019's rules are rewritten as amended and carry their own
+"Review round 1" section.
+
+| # | Finding | Fix | Regression |
+|---|---|---|---|
+| P1-1 | Promotion "succeeded" on a detached canonical HEAD: `git merge --ff-only` moves whatever HEAD is, the post-check passed, the ledger recorded `Promoted`, the worktree was discarded, and the next `git switch` orphaned the work | Require `git symbolic-ref --quiet HEAD` to resolve to `refs/heads/*`; a detached checkout returns a blocked outcome, not an `Err`. Move the branch with `git update-ref <ref> <accepted> <initial>` — a real compare-and-swap — and sync the working tree afterwards. Descendant check kept | `test_promotion_blocks_on_a_detached_canonical_head_without_moving_anything`, `test_promotion_advances_the_branch_ref_not_only_head`, `test_canonical_branch_ref_reports_none_on_a_detached_head`, `test_compare_and_swap_refuses_a_stale_expected_revision`, `test_compare_and_swap_succeeds_against_the_current_revision` |
+| P1-2 | `Escalated` is terminal with no transition out, so the loop-trip path this ADR's own contract produces leaked `.impulse/worktrees/<task_id>` forever | `staged_worktree_is_discardable` now allows `Escalated`, `execution_state: LaunchFailed`, and an `Accepted` run with any recorded promotion (promoted **or** blocked) | `test_escalated_task_can_discard_its_staged_worktree`, `test_launch_failed_task_can_discard_its_staged_worktree`, `test_blocked_promotion_allows_discarding_the_staged_worktree`, `test_a_running_task_still_cannot_discard_its_staged_worktree` |
+| P1-3 | `loop_report_digest` had no version pin and replay recomputed it with the running build's constants, so revising the budget — which the ADR says will happen — made `GOVERNED_TASKS.json` unloadable | `GOVERNED_BUILDER_LOOP_VERSION` stored on the claim beside the digest; digest is over `canonical_json` plus the version; replay reuses stored evidence **and the stored outcome** for any other version, checking only structural coherence | `test_a_ledger_written_under_an_older_loop_version_still_loads`, `test_an_older_version_loop_trip_replays_as_a_trip`, `test_a_claim_with_a_digest_but_no_version_fails_the_ledger_closed` |
+| P2-1 | `derive_claim` read `workspace_root`, so a real staged Builder's claim would carry `subject_revision == initial_oid` and every promotion would bail | Observe `task.launch_working_directory()` — unchanged for every non-staged task | `test_derive_claim_observes_the_staged_worktree_for_a_staged_task` |
+| P2-2 | `.git/hooks` is shared across linked worktrees, so a staged Builder could plant a hook that runs inside a producer at materialization or promotion time | Every producer Git invocation goes through `hook_free_git`, which sets `core.hooksPath=/dev/null` | `test_planted_git_hooks_never_execute_during_staging_or_promotion` (plants `post-checkout`, `post-merge`, `reference-transaction`) |
+| P2-3 | A staged directory surviving a crash blocked re-materialization with no stated recovery | Still fails closed; the error now names the recovery (delete the directory, then `git worktree prune`), and ADR-0019's Consequences documents it | `test_occupied_staged_path_error_names_the_recovery` |
+
+Nits, all applied: the digest uses `loop_contract::canonical_json` rather than `serde_json::to_vec`;
+ADR-0019 rule 8 now states that "never structural" bounds *the scope's own contribution* and that a
+runtime declaring `structural` still reports `structural` through the `max`; the lane card says why
+`pub mod governed_producers` is kept.
+
+Two things the fixes changed beyond the literal asks, both worth flagging:
+
+- **P1-3 needed the trip outcome replayed, not just the digest skipped.** Skipping only the digest
+  comparison would still have re-run the verdict under the new constants, so an old claim could
+  replay as `LoopTripped` when it was stored as `ClaimSubmitted` and fail the whole-enum event-kind
+  assertion. Foreign-version claims now replay their stored outcome verbatim.
+- **The compare-and-swap does not close the working-tree window.** `update-ref` writes the ref
+  atomically; syncing the working tree is a second step, and a file written into the canonical
+  checkout between the cleanliness observation and that sync would be replaced. Documented in
+  ADR-0019's Consequences rather than papered over, and the sync failure message names the branch
+  that already advanced so an operator is never left guessing.
 
 ## Handoff Notes
 

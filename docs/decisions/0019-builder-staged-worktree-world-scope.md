@@ -86,42 +86,67 @@ in the task record.
 
 5. **Promotion is a separate step after acceptance.** `promote_governed_outcome` is allowed only
    on an `accepted` task with an active staged worktree. It requires the staged worktree to be
-   clean and sitting exactly on the accepted claim's subject revision, then fast-forwards the
-   canonical branch — `git merge --ff-only` — but only while the canonical head still equals the
-   registered initial OID. The entire canonical-branch side effect is isolated in one function
-   (`fast_forward_canonical_branch`) so a durable producer reservation can wrap it without
-   re-reading this ADR.
+   clean and sitting exactly on the accepted claim's subject revision, and it requires the
+   canonical checkout to be **on a branch**: `git symbolic-ref --quiet HEAD` must resolve to a
+   `refs/heads/` reference. The move itself is a compare-and-swap —
+   `git update-ref <branch> <accepted> <initial>` — which writes only if the ref is still exactly
+   the registered initial OID at the instant it writes. `git merge --ff-only` cannot promise that:
+   it re-reads HEAD and then writes, leaving a window a concurrent commit can win. The working
+   tree is then synced to the moved ref, since `update-ref` writes the ref and nothing else. The
+   entire canonical-branch side effect is isolated in `compare_and_swap_canonical_branch` and
+   `sync_canonical_worktree` so a durable producer reservation can wrap it without re-reading this
+   ADR.
 
-6. **A moved canonical head is an execution fact, not an error.** Promotion returns
-   `PromotionBlocked { canonical_head }`, recorded against the already-accepted run. Review state
-   stays `Accepted`; the staged worktree stays active; an operator who reconciles the canonical
-   branch can retry. A run is promoted at most once: a second promotion after a successful one is
-   refused, and a promoted outcome must land exactly the accepted revision.
+6. **A canonical branch that cannot be advanced is an execution fact, not an error.** Promotion
+   returns `PromotionBlocked { canonical_head, reason }`, recorded against the already-accepted
+   run. The reason is one of `canonical_head_moved` (the head no longer equals the registered
+   initial OID), `detached_head` (there is no branch to advance), or `concurrent_branch_update`
+   (the compare-and-swap lost). Review state stays `Accepted`; the staged worktree stays active;
+   an operator who reconciles the canonical branch can retry. A run is promoted at most once: a
+   second promotion after a successful one is refused, and a promoted outcome must land exactly
+   the accepted revision.
 
 7. **A finished staged worktree is discarded.** `discard_staged_worktree` removes the checkout and
    its administrative entry, and the matching mutation marks the record `discarded`. It is allowed
-   only after a rejection or after a completed promotion, so a live Builder's work cannot be
-   deleted out from under it.
+   from every state a staged worktree can legitimately be reclaimed from — `rejected`,
+   `escalated` (the terminal state this ADR's own loop contract produces), an `accepted` run that
+   has recorded any promotion outcome (promoted, so the checkout is spent; or blocked, so the
+   operator may reclaim the space instead of retrying), and any task whose execution state is
+   `launch_failed` — and from nowhere else, so a live Builder's work cannot be deleted out from
+   under it.
 
-8. **The compatibility preview reports `filesystem.scoped` as `mediated`, never `structural`.**
-   `world_scope_filesystem_enforcement` returns `Mediated` for `StagedAuthoritative` and
-   `Unsupported` for every other scope, and `evaluate_role_compatibility_in_world` merges that
-   into the runtime's own declared support, taking the stronger of the two per capability. A
-   staged Builder launch therefore reads as *allowed but degraded*: the canonical Builder role
-   asks for structural containment, and a Git worktree honestly supplies only Git-level mediation.
-   Nothing stops the Builder's process from writing outside the checkout.
+8. **The world scope's own contribution to `filesystem.scoped` is `mediated`, never
+   `structural`.** `world_scope_filesystem_enforcement` returns `Mediated` for
+   `StagedAuthoritative` and `Unsupported` for every other scope, and
+   `evaluate_role_compatibility_in_world` merges that into the runtime's own declared support,
+   taking the stronger of the two per capability. Two consequences worth stating precisely: a
+   staged launch on a runtime that declares nothing reads as *allowed but degraded*, because the
+   canonical Builder role asks for structural containment and a Git worktree honestly supplies
+   only Git-level mediation; and a runtime that itself declares `structural` still reports
+   `structural`, because the `max` takes the runtime's stronger claim. The "never structural" rule
+   bounds what **the scope** may claim, not what a genuinely sandboxed runtime may. Nothing about
+   the staged worktree stops the Builder's process from writing outside the checkout.
 
 9. **A staged claim is admitted under `LoopContract::governed_builder()`.** Five claim cycles, a
    four-hour wall clock measured from registration, and three consecutive verification failures
    with the same signature. The verdict is computed by a new pure
    `LoopBudget::evaluate_observed`, which reads no clock: every input comes from stored counts and
    stored timestamps. A trip records the claim as evidence, emits a `loop_tripped` event, and moves
-   review state to `escalated`, which accepts no further claims. Every staged claim also carries a
-   `loop_report_digest`, the SHA-256 of the canonical ADR-0017 `LoopReport` the verdict came from.
-   Tasks outside the staged scope are not evaluated at all, which is what keeps every pre-ADR-0019
-   ledger replaying identically.
+   review state to `escalated`, which accepts no further claims. Tasks outside the staged scope
+   are not evaluated at all, which is what keeps every pre-ADR-0019 ledger replaying identically.
 
-10. **Replay is verified, not assumed.** `apply_mutation` now takes the clock as a parameter.
+10. **Loop evidence is versioned.** Every staged claim carries a `loop_report_digest` — the
+    SHA-256 of the version tag plus the key-order-independent canonical JSON of the ADR-0017
+    `LoopReport` the verdict came from — *and* the `loop_report_version` it was computed under
+    (`GOVERNED_BUILDER_LOOP_VERSION`). Replay only recomputes digests written under the version it
+    is running; a claim from any other version is replayed verbatim, reusing its stored digest and
+    its stored outcome, and is checked only for structural coherence (a digest and a version are
+    present together, and the digest is well formed). This is what makes rule 9's budget constants
+    genuinely revisable: bumping them, or adding a field to `LoopReport`, changes future digests
+    without making a single existing `GOVERNED_TASKS.json` unloadable. The version must be bumped
+    whenever anything feeding a persisted digest changes.
+
+11. **Replay is verified, not assumed.** `apply_mutation` now takes the clock as a parameter.
     Normal operation passes the current time; ledger validation passes each event's own recorded
     timestamp. Reload therefore reproduces every clock-derived decision exactly, and validation was
     tightened to prove it: the replayed event *kind* must match the stored kind, the replayed
@@ -129,7 +154,7 @@ in the task record.
     promotion records must match theirs. A ledger whose loop evidence or staged root was rewritten
     fails closed on load.
 
-11. **The accepted-run memory candidate is pinned to the accepting revision.** ADR-0013's
+12. **The accepted-run memory candidate is pinned to the accepting revision.** ADR-0013's
     projection previously digested `task.revision`, which was equivalent to the accepting revision
     only because nothing could mutate a task after acceptance. Promotion can. The projection now
     derives its `accepted_task_revision` from the operator decision's `based_on_revision + 1`. For
@@ -152,13 +177,33 @@ promising more would be false. OS-level sandboxing and egress control remain exp
 blocks, and a human decides. This is deliberate: an automated merge is a semantic decision, and the
 governed pipeline's whole premise is that semantic decisions need an operator.
 
+**The compare-and-swap closes the ref race, not the working-tree race.** `update-ref` guarantees
+the branch only moves from exactly the initial OID, so a concurrent commit loses and is reported as
+`concurrent_branch_update`. Syncing the working tree afterwards is a second step, and a file
+written into the canonical checkout between the cleanliness observation and that sync would be
+replaced. The window is small and the tree was verified clean immediately before, but it is real
+and is not closed by this ADR. If the sync fails, the error names the branch that already advanced
+so the operator can finish it by hand rather than guessing what state the repository is in.
+
+**A surviving staged directory fails closed, and names its own recovery.** If a run is interrupted
+between `git worktree add` and the recording mutation, the directory outlives the task and blocks
+re-materialization. Reusing it is not safe — it could be someone else's half-finished tree — so the
+producer refuses, and the error tells the operator exactly how to recover: delete the leftover
+directory, then run `git -C <workspace> worktree prune` to drop its administrative entry.
+
+**Git hooks never run inside a producer.** `.git/hooks` is shared across every linked worktree, so
+a staged Builder could otherwise plant a `post-checkout` or `post-merge` hook that executes inside
+a daemon-owned producer — at materialization, or at promotion, *after* review has already passed.
+Every producer Git invocation runs with `core.hooksPath` pointed at a non-directory.
+
 **A crash between the Git side effect and its receipt is still not covered.** Promotion inherits
 the same window every other producer has. The side effect is isolated in one function so the
 sibling reservation lane can wrap it; this lane does not implement reservations.
 
 **The loop budget is a guess informed by nothing yet.** Five cycles and four hours are starting
 values with no production data behind them. They are constants in `loop_contract.rs` and are meant
-to be revised once real governed Builder runs exist.
+to be revised once real governed Builder runs exist — which is exactly why rule 10 versions the
+evidence: revising them must not strand existing ledgers, and without the version pin it would.
 
 **Untracked `.impulse/worktrees/` no longer marks the canonical tree dirty.** The staged worktree
 lives inside the project's own runtime namespace, so the producers' cleanliness check ignores
@@ -169,6 +214,15 @@ mutations under that path are still subject changes.
 integration test can drive them against real repositories before any daemon endpoint exists. Every
 other item in the module stays `pub(crate)`.
 
+**A derivation-version bump must migrate candidate status, not drop it.** ADR-0018 adds
+`prune_superseded_derivations()` to the memory-candidate load path so a derivation-version bump
+cannot fail an existing ledger closed. That is lossless only while `MemoryCandidateStatus` has a
+single variant. The moment ADR-0020 adds `Promoted` or `Dismissed`, pruning a superseded record
+would silently revert an operator's review decision to `PendingReview` — a governance regression,
+not a cache miss. Whoever adds the second status variant must migrate status forward on load
+instead of dropping the record. Recorded here because this ADR is what put a post-acceptance
+mutation into the picture, and it lands before ADR-0020.
+
 ## Not delivered by this ADR's lane
 
 | Deferred | Owner |
@@ -177,6 +231,7 @@ other item in the module stays `pub(crate)`.
 | Desktop launch wiring: registering with a staged scope, materializing before the PTY starts, and using `launch_working_directory` as the pane cwd | the desktop track (`impulse-desktop/**`) |
 | Durable producer reservation around `fast_forward_canonical_branch` | the producer-reservation-journal lane |
 | Materializing `ReadOnlySnapshot` and `DisposableScratch` | future work; registration refuses them today |
+| A promotion reservation covering the crash window between the compare-and-swap and its receipt | producer-reservation-journal lane |
 | OS-level sandboxing, egress allowlists, container runtimes | explicitly deferred by the staging plan |
 
 ## Research
@@ -189,3 +244,34 @@ other item in the module stays `pub(crate)`.
   for staging mutation away from the authoritative tree.
 - ADR-0011's revisioned ledger and ADR-0012's detached verification worktree, whose `git worktree
   add --detach` path this ADR shares rather than duplicates.
+
+## Review round 1
+
+An adversarial review of the implementing PR confirmed the ADR's claims about world scope,
+determinism, honest capability reporting, and the canonical tree staying byte-identical through
+`awaiting_operator`, and found six defects. All six are fixed in the same PR; the rules above are
+written as amended. What changed, and why each mattered:
+
+- **Promotion could "succeed" on a detached canonical HEAD.** `git merge --ff-only` moves whatever
+  HEAD is, so on a detached checkout the post-check passed, the ledger recorded `Promoted`, the
+  staged worktree was then discarded, and the next `git switch` orphaned the work — a silent loss
+  of an accepted outcome. Rule 5 now requires HEAD to resolve to a branch, and rule 6 reports
+  `detached_head` as a blocked outcome rather than an error.
+- **The move was not a compare-and-swap.** `--ff-only` re-reads HEAD and then writes. Rule 5 now
+  uses `git update-ref <branch> <accepted> <initial>`, which writes only against the expected old
+  value, and reports a lost swap as `concurrent_branch_update`.
+- **The loop-trip path leaked its own worktree.** `escalated` is terminal and was not a discardable
+  state, so the one terminal state this ADR's loop contract produces could never reclaim its
+  checkout. Rule 7 now enumerates every legitimate reclaim state, including `launch_failed` and a
+  blocked promotion.
+- **The loop digest had no version pin.** Replay recomputed it with the running build's constants
+  and failed the ledger closed on mismatch, so revising the budget — which this ADR says will
+  happen — would have made existing ledgers unloadable. Rule 10 versions the evidence and replays
+  foreign versions verbatim.
+- **`derive_claim` read the canonical workspace, not the staged root**, so a real staged Builder's
+  claim would have carried the initial OID and every promotion would have bailed. It now observes
+  `launch_working_directory()`, which is unchanged for every non-staged task.
+- **Producer Git invocations ran the project's hooks.** See the Consequences note above.
+
+The digest is now composed over `loop_contract::canonical_json` rather than `serde_json::to_vec`,
+so key ordering can never affect it.
