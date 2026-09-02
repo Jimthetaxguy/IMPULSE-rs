@@ -132,6 +132,16 @@ governed runtime.
   a new path — a separate socket per connection class, an OS sandbox for launched runtimes, or
   handing the operator surface its capability over a channel the pane has no access to. Those are
   follow-ups below, not variations on this decision.
+- **A connection class authenticates the caller, not what the caller's action then executes.** The
+  concurrent staged-worktree lane (ADR-0019) found a bypass that this decision does not touch: a
+  staged Builder can plant a Git hook in `.git/hooks`, which is shared across linked worktrees, and
+  that hook fires later during an operator-triggered promotion — after review has passed, under the
+  operator's authority, without the Builder ever needing to reach the socket. It is the same shape
+  of failure this ADR fixes (a Builder influencing an operator-authority outcome) reached through a
+  different door, and it is a useful check on how far "operator-class connection" should be read:
+  the capability proves who opened the connection, and nothing about the integrity of the work the
+  request then acts on. Any producer or promotion path must establish that separately; ADR-0019 does
+  so by pinning `core.hooksPath` to a non-directory for every producer Git invocation.
 - The assurance label is honest about a mixed chain. An authenticated operator approving
   caller-composed evidence still reads `caller_composed_evidence_declared_operator`, because the
   evidence is the weaker half. Only `daemon_profiled_evidence_authenticated_operator` claims both.
