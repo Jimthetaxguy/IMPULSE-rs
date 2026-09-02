@@ -1,7 +1,7 @@
 ---
 title: Ion Document Read Tool Design
 description: Design spec for document_read, a bounded and pageable document-analysis tool inside Ion's tool loop
-updated: 2026-09-01
+updated: 2026-09-02
 type: specification
 category: architecture
 phase: all
@@ -57,7 +57,7 @@ the `ion` process down: every input is bounded before the parser sees it.
 
 | Field | Meaning |
 |---|---|
-| `path` | Required. Relative paths resolve against the REPL's launch directory. Formats: `xlsx`, `csv`, `docx`. Legacy `xls` is refused because its binary format has no streaming reader and cannot be bounded. Files over 10 MiB are refused. An `xlsx`/`docx` container is inflated once, entry by entry, through a 64 MiB cap before parsing, so a forged central directory cannot hide a decompression bomb. Workbooks never reach the dense-grid parser: cells are streamed one at a time through calamine's cell reader into the tool's own text under a 16 million character and 2 million cell budget, so two cells at opposite corners of a sheet cost two gap markers and a shared string costs only the cells that render it. `csv` and `docx` text is checked against the character budget after parsing, where the parsers' memory is already bounded by the file and inflation caps. These bound the parser's inputs; they are not an OS sandbox. |
+| `path` | Required. Relative paths resolve against the REPL's launch directory. Formats: `xlsx`, `csv`, `docx`. Legacy `xls` is refused because its binary format has no streaming reader and cannot be bounded. Files over 10 MiB are refused. An `xlsx`/`docx` container is inflated once, entry by entry, through a 64 MiB cap before parsing, so a forged central directory cannot hide a decompression bomb. Workbooks never reach the dense-grid parser: cells are streamed one at a time through calamine's cell reader into the tool's own text under a 16 million character and 2 million cell budget, so two cells at opposite corners of a sheet cost two gap markers and a shared string costs only the cells that render it; a chart or dialog sheet holds no cells and is skipped rather than failing the workbook. Word documents are streamed the same way, through quick-xml (see "Word streaming"). `csv` text is checked against the character budget after parsing, where the parser's memory is already bounded by the 10 MiB file cap. These bound the parser's inputs; they are not an OS sandbox. |
 | `sheet` | Worksheet name, case-insensitive: Unicode lowercasing plus the Latin multi-character folds, so `Straße`, `STRAẞE`, and `STRASSE` match; dotless `ı` stays distinct from `i`; no normalization. Spreadsheets only; empty worksheets are omitted by the parser. A supplied blank value is rejected rather than treated as "whole document". When set, `offset` is relative to that sheet's text. |
 | `outline` | Section table and sizes only, no content. |
 | `offset` | Character offset to start from: a section's offset from the outline, or the offset named by the previous continuation hint. |
@@ -82,14 +82,47 @@ a single long line says so.
 Parsing runs on the blocking pool so the loop contract's wall clock can still fire while a large
 file parses.
 
+## Word streaming
+
+Building the docx object tree was the last unbounded step in the pipeline. `docx-rs` materializes
+a document many times the size of the XML it parses, so a small file that inflates to 64 MiB of
+empty paragraphs — within every earlier cap — could still exhaust memory. Word documents are
+therefore streamed the way workbooks are: `word/document.xml` is read event by event through
+`quick-xml` (already in the tree under `calamine`) and written into the tool's own text.
+
+- **Layout.** One line per non-empty paragraph. A table row is one line with its cells
+  tab-separated, matching how workbook rows are rendered, and the paragraphs inside one cell are
+  joined with spaces. Outside a table `w:tab` stays a tab and `w:br`/`w:cr` a newline; inside one
+  they become spaces, so cell text cannot forge a column or row break. Nested tables are flattened
+  into the row that contains them. Blank paragraphs produce no line, no section, and no growth.
+- **Excluded content.** `w:del` and `w:moveFrom` subtrees (a tracked deletion, and the source half
+  of a tracked move, which would otherwise duplicate its `w:moveTo` counterpart),
+  `w:instrText`/`w:delInstrText` field instruction codes such as `MERGEFIELD` (the field *result*
+  a reader sees is a sibling `w:t` and is kept), and the `mc:Fallback` half of an
+  `mc:AlternateContent` pair, whose text repeats the `mc:Choice` used instead. Matching is on the
+  local name, so a writer's namespace prefix does not matter.
+- **Bounds.** Every buffer that holds text on its way to the output — the paragraph, the table
+  cell, the table row — is counted against the character budget as it grows, so neither one
+  enormous paragraph nor one enormous row can balloon between checks; peak memory is the budget
+  plus a single XML event. `word/document.xml` is itself read through the 64 MiB container cap
+  even when the container preflight has not run, and `quick-xml` resolves only the five predefined
+  XML entities, so no declared or nested entity expands here. The outline is capped at 4096
+  sections: past the cap no new section starts and the last one absorbs the remaining text, so
+  every offset reported stays truthful while the section table, which travels in the payload,
+  stays bounded.
+- **Out of scope.** Only `word/document.xml` is read. Headers, footers, footnotes, endnotes, and
+  comments live in sibling parts and are deliberately not extracted.
+
 ## Error handling
 
 Missing or malformed arguments (including a blank `sheet`), unsupported extensions (the message
 lists supported ones), legacy `xls`, missing files, directories, files over the size cap,
 containers over the inflation cap, workbooks over the cell or character budget, extracted text
 over the character cap, unparseable files (the message carries the parser's reason), unknown
-sheets (the message lists available non-empty sheets), sheet selection
-on a workbook whose sheets are all empty, and sheet selection on non-spreadsheets all return
+sheets (the message lists available non-empty sheets, which excludes chart and dialog sheets
+because they hold no cells), sheet selection
+on a workbook whose sheets are all empty, sheet selection on non-spreadsheets, a docx with no
+`word/document.xml`, and malformed XML inside it all return
 typed errors. Each message leads with the path or name the model supplied, so two different bad
 calls never share an error signature while a repeated identical bad call still trips the loop
 contract's same-error detector.
@@ -106,6 +139,20 @@ workbook that exceeds the text and cell budgets, and DOCX (via the docx builder)
 directory and drive the tool end to end, including a corrupt workbook. One executor test proves
 the tool is ungated and bounded. The registry and help tests assert the tool is absent without
 `office-support`.
+
+Word streaming and chart-sheet skipping add their own fixtures, all built in a temp directory the
+way the earlier ones are — the accumulator's boundaries (an empty document, a budget hit exactly,
+section grouping, the section cap) are unit-tested directly, without a document:
+
+| Fixture | Proves |
+|---|---|
+| Workbook with one worksheet and one chart sheet, hand-built because the workbook writer in the tree cannot emit a chart sheet | the worksheet reads; the chart sheet is skipped without failing the workbook, and asking for it by name still says truthfully that it is not among the non-empty sheets |
+| Docx of 50,000 blank paragraphs (self-closing and whitespace-only) plus a short real tail | the text, section table, and window are all the size of the tail, and the reported size is the file on disk |
+| Docx with a tracked deletion written both ways (`w:delText` and a `w:t` inside `w:del`), a `MERGEFIELD` field, and a tracked move | deleted, moved-from, and instruction text are absent while the field result and the visible tail are kept |
+| Docx with a table whose cell holds two paragraphs and a tab | rows render tab-separated, cell paragraphs join with spaces, and a tab inside a cell cannot forge a column |
+| Docx whose `word/document.xml` alone inflates past the 64 MiB container cap, from a file far under the source cap | the typed inflation refusal, without OOM |
+| Docx with one paragraph split across 500 runs, read under a 64-character budget | the budget refusal, and the same document reading cleanly under the real budget |
+| Docx with a mismatched end tag, and a container with no `word/document.xml` | typed errors rather than a panic |
 
 ## Out of scope
 
