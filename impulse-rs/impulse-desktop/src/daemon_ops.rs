@@ -611,6 +611,27 @@ mod unix {
                 .set_write_timeout(Some(self.io_timeout))
                 .map_err(|error| format!("set daemon write timeout: {error}"))?;
 
+            // One reader for the whole connection. A second `BufReader` over
+            // the same socket would silently discard whatever the first had
+            // buffered past its line, so the handshake and the request share
+            // this one.
+            let mut reader = BufReader::new(
+                stream
+                    .try_clone()
+                    .map_err(|error| format!("clone daemon connection for reading: {error}"))?,
+            );
+
+            // ADR-0018: the daemon classifies each connection, and this client
+            // opens a fresh one per request, so the capability is presented on
+            // this connection before a request the daemon gates on operator
+            // class. With no capability reachable the request still goes out and
+            // the daemon's own typed authorization error surfaces below.
+            let capability_refusal = if Self::requires_operator_class(request) {
+                self.present_operator_capability(&stream, &mut reader)?
+            } else {
+                None
+            };
+
             let encoded = serde_json::to_vec(request)
                 .map_err(|error| format!("serialize daemon request: {error}"))?;
             stream
@@ -620,13 +641,91 @@ mod unix {
                 .map_err(|error| format!("write daemon request: {error}"))?;
 
             let mut line = String::new();
-            let bytes = BufReader::new(stream)
+            let bytes = reader
                 .read_line(&mut line)
                 .map_err(|error| format!("read daemon response: {error}"))?;
             if bytes == 0 {
                 return Err("daemon closed connection before responding".to_string());
             }
-            serde_json::from_str(&line).map_err(|error| format!("parse daemon response: {error}"))
+            let response: WorkbenchDaemonResponse = serde_json::from_str(&line)
+                .map_err(|error| format!("parse daemon response: {error}"))?;
+
+            // A refused capability is why an operator mutation is about to be
+            // rejected, so it belongs in the message the cockpit already shows
+            // rather than only in a log the operator never reads.
+            match (capability_refusal, response) {
+                (Some(refusal), WorkbenchDaemonResponse::Error { message }) => {
+                    Err(Self::capability_refusal_message(&refusal, &message))
+                }
+                (_, response) => Ok(response),
+            }
+        }
+
+        /// Whether the daemon refuses `request` on a non-operator connection.
+        ///
+        /// Deliberately coarse: every governed mutation presents, rather than
+        /// this client re-deriving which mutations need it (that answer depends
+        /// on the task's verification profile, which only the daemon holds).
+        fn requires_operator_class(request: &WorkbenchDaemonRequest) -> bool {
+            matches!(request, WorkbenchDaemonRequest::MutateGovernedTask { .. })
+        }
+
+        /// Explain that an operator mutation failed behind a refused capability.
+        ///
+        /// Named as a provenance downgrade, not just a refusal: the connection
+        /// acted as a non-operator, which is why the daemon rejected the
+        /// mutation.
+        fn capability_refusal_message(refusal: &str, daemon_error: &str) -> String {
+            format!(
+                "{daemon_error} (this connection presented an operator capability and the daemon \
+                 refused it: {refusal}; it therefore acted as a non-operator connection)"
+            )
+        }
+
+        /// Present this daemon run's operator capability on an open connection.
+        ///
+        /// The capability is discovered through the shared
+        /// `impulse_ops::operator_capability` helper, the same one the CLI/TUI
+        /// client uses, and `reader` is the connection's single reader so no
+        /// buffered bytes are dropped between the handshake and the request.
+        ///
+        /// Returns the daemon's reason when a capability was presented and
+        /// refused, so the caller can fold it into the error the cockpit already
+        /// surfaces. `None` means either nothing to present or a clean
+        /// acceptance. Only transport failures propagate as `Err`.
+        fn present_operator_capability(
+            &self,
+            stream: &UnixStream,
+            reader: &mut BufReader<UnixStream>,
+        ) -> Result<Option<String>, String> {
+            let Some(token) =
+                impulse_ops::operator_capability::resolve_for_socket(&self.socket_path)
+            else {
+                return Ok(None);
+            };
+            let encoded =
+                serde_json::to_vec(&WorkbenchDaemonRequest::PresentOperatorCapability { token })
+                    .map_err(|error| format!("serialize operator capability: {error}"))?;
+            let mut handle = stream;
+            handle
+                .write_all(&encoded)
+                .and_then(|_| handle.write_all(b"\n"))
+                .and_then(|_| handle.flush())
+                .map_err(|error| format!("present operator capability: {error}"))?;
+            let mut line = String::new();
+            let bytes = reader
+                .read_line(&mut line)
+                .map_err(|error| format!("read operator capability response: {error}"))?;
+            if bytes == 0 {
+                return Err(
+                    "daemon closed connection before answering the operator capability".to_string(),
+                );
+            }
+            match serde_json::from_str::<WorkbenchDaemonResponse>(&line) {
+                Ok(WorkbenchDaemonResponse::Error { message }) => Ok(Some(message)),
+                Ok(_) => Ok(None),
+                Err(error) => Err(format!("parse operator capability response: {error}")),
+            }
         }
 
         fn send(
@@ -2465,6 +2564,338 @@ mod unix {
                     ..Default::default()
                 },
             }
+        }
+
+        /// ADR-0018: the cockpit's Approve/Reject path is a governed mutation,
+        /// so the capability must reach the daemon first, on the same
+        /// connection the mutation uses.
+        #[test]
+        fn governed_mutation_presents_the_operator_capability_first_on_a_fresh_connection() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket = dir.path().join("operator-capability.sock");
+            let token = "c".repeat(64);
+            std::fs::write(
+                impulse_ops::operator_capability::path_for_socket(&socket),
+                format!("{token}\n"),
+            )
+            .expect("publish capability");
+            let listener = UnixListener::bind(&socket).expect("bind fake daemon");
+
+            let task_id =
+                impulse_ops::governed_task::GovernedTaskId::try_new("cap-task").expect("task id");
+            let mutation_request = impulse_ops::governed_task::GovernedTaskMutationRequest {
+                request_id: impulse_ops::governed_task::GovernedRequestId::try_new("cap-approve")
+                    .expect("request id"),
+                project_id: "project".to_string(),
+                task_id: task_id.clone(),
+                expected_revision: 4,
+                mutation:
+                    impulse_ops::governed_task::GovernedTaskMutation::RecordOperatorDecision {
+                        decision: impulse_ops::governed_task::OperatorDecisionInput {
+                            actor: impulse_ops::governed_task::GovernedActor {
+                                kind: impulse_ops::governed_task::GovernedActorKind::Operator,
+                                id: "cockpit-operator".to_string(),
+                            },
+                            supervisor_verdict_id:
+                                impulse_ops::governed_task::GovernedRecordId::try_new("verdict-a")
+                                    .expect("verdict id"),
+                            decision: impulse_ops::governed_task::OperatorDecisionKind::Approve,
+                            rationale: "approved from the cockpit".to_string(),
+                        },
+                    },
+            };
+            let accepted = impulse_ops::governed_task::GovernedTaskRun {
+                id: task_id,
+                revision: 5,
+                project_id: "project".to_string(),
+                workspace_root: "/tmp/project".to_string(),
+                task: "prove the cockpit presents its capability".to_string(),
+                acceptance_criteria: vec!["approval reaches the daemon".to_string()],
+                approval_policy: impulse_ops::governed_task::ApprovalPolicy::OperatorRequired,
+                verification_profile: None,
+                role_assignment: None,
+                role_compatibility: None,
+                runtime_id: "codex".to_string(),
+                agent_id: "worker-1".to_string(),
+                session_id: None,
+                initial_subject_revision: None,
+                execution_state: impulse_ops::governed_task::GovernedExecutionState::Registered,
+                review_state: impulse_ops::governed_task::GovernedReviewState::Accepted,
+                claims: vec![],
+                verifications: vec![],
+                supervisor_verdicts: vec![],
+                operator_decisions: vec![],
+                events: vec![],
+                created_at: "2026-09-02T00:00:00Z".to_string(),
+                updated_at: "2026-09-02T00:00:00Z".to_string(),
+            };
+
+            let accepted_for_server = accepted.clone();
+            let (requests_tx, requests_rx) = mpsc::channel();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept mutation connection");
+                let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+                for index in 0..2 {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).expect("read request");
+                    let request: WorkbenchDaemonRequest =
+                        serde_json::from_str(&line).expect("parse request");
+                    requests_tx.send(request).expect("record request");
+                    if index == 0 {
+                        write_response(
+                            &mut stream,
+                            &WorkbenchDaemonResponse::Ok {
+                                result: serde_json::json!({"connection_class": "operator"}),
+                            },
+                        );
+                    } else {
+                        write_response(
+                            &mut stream,
+                            &WorkbenchDaemonResponse::Ok {
+                                result: serde_json::to_value(&accepted_for_server).unwrap(),
+                            },
+                        );
+                    }
+                }
+                // A second connection would mean the capability and the
+                // mutation did not share one classification.
+                listener.set_nonblocking(true).expect("nonblocking");
+                assert!(
+                    listener.accept().is_err(),
+                    "the mutation must reuse the connection the capability was presented on"
+                );
+            });
+
+            let client = UnixDaemonOpsClient::new(socket);
+            assert_eq!(
+                client.mutate_governed_task(mutation_request).unwrap(),
+                accepted
+            );
+
+            let presented = requests_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("capability request");
+            match presented {
+                WorkbenchDaemonRequest::PresentOperatorCapability { token: presented } => {
+                    assert_eq!(
+                        presented, token,
+                        "the published capability is presented verbatim"
+                    )
+                }
+                other => panic!("expected the capability first, received {other:?}"),
+            }
+            assert!(matches!(
+                requests_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("mutation request"),
+                WorkbenchDaemonRequest::MutateGovernedTask { .. }
+            ));
+            server.join().unwrap();
+        }
+
+        /// ADR-0018 review round 1: the cockpit's lifecycle reconciler marks a
+        /// profiled task's runtime exit, which is an operator-only mutation. If
+        /// only the approval path presented the capability, a profiled Builder
+        /// exit would be refused and the task would stay stuck in Running. The
+        /// read that precedes it is not gated and must not pay for a handshake.
+        #[test]
+        fn a_profiled_runtime_exit_from_the_cockpit_presents_the_capability_and_reconciles() {
+            use impulse_ops::governed_task as gt;
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket = dir.path().join("profiled-exit.sock");
+            let token = "d".repeat(64);
+            std::fs::write(
+                impulse_ops::operator_capability::path_for_socket(&socket),
+                format!("{token}\n"),
+            )
+            .expect("publish capability");
+            let listener = UnixListener::bind(&socket).expect("bind fake daemon");
+
+            let task_id = gt::GovernedTaskId::try_new("profiled-exit-task").expect("task id");
+            let running = gt::GovernedTaskRun {
+                id: task_id.clone(),
+                revision: 2,
+                project_id: "project".to_string(),
+                workspace_root: "/tmp/project".to_string(),
+                task: "prove a profiled exit still reconciles".to_string(),
+                acceptance_criteria: vec!["the committed workspace passes".to_string()],
+                approval_policy: gt::ApprovalPolicy::OperatorRequired,
+                verification_profile: Some(gt::GovernedVerificationProfile::RustWorkspaceV1),
+                role_assignment: None,
+                role_compatibility: None,
+                runtime_id: "ion".to_string(),
+                agent_id: "profiled-builder".to_string(),
+                session_id: None,
+                initial_subject_revision: Some("a".repeat(40)),
+                execution_state: gt::GovernedExecutionState::Running,
+                review_state: gt::GovernedReviewState::AwaitingClaim,
+                claims: vec![],
+                verifications: vec![],
+                supervisor_verdicts: vec![],
+                operator_decisions: vec![],
+                events: vec![],
+                created_at: "2026-09-02T00:00:00Z".to_string(),
+                updated_at: "2026-09-02T00:00:00Z".to_string(),
+            };
+            let mut exited = running.clone();
+            exited.revision = 3;
+            exited.execution_state = gt::GovernedExecutionState::RuntimeExited;
+
+            let running_for_server = running.clone();
+            let exited_for_server = exited.clone();
+            let (requests_tx, requests_rx) = mpsc::channel();
+            let server = thread::spawn(move || {
+                // Connection 1: the ungated read that resolves the current
+                // revision. Connection 2: capability, then the gated mutation.
+                for connection in 0..2 {
+                    let (mut stream, _) = listener.accept().expect("accept connection");
+                    let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+                    let exchanges = if connection == 0 { 1 } else { 2 };
+                    for exchange in 0..exchanges {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).expect("read request");
+                        let request: WorkbenchDaemonRequest =
+                            serde_json::from_str(&line).expect("parse request");
+                        requests_tx.send(request).expect("record request");
+                        let result = match (connection, exchange) {
+                            (0, _) => serde_json::to_value(Some(&running_for_server)).unwrap(),
+                            (_, 0) => serde_json::json!({"connection_class": "operator"}),
+                            _ => serde_json::to_value(&exited_for_server).unwrap(),
+                        };
+                        write_response(&mut stream, &WorkbenchDaemonResponse::Ok { result });
+                    }
+                }
+            });
+
+            // `mutate_current` is the durable lifecycle path: it queues the
+            // mutation, applies it, then clears the entry, so it needs the same
+            // outbox the cockpit configures.
+            let client = UnixDaemonOpsClient::new(socket)
+                .with_lifecycle_outbox(Some(dir.path().join("lifecycle-outbox.json")));
+            let reconciled = client
+                .mutate_current(
+                    "project",
+                    &task_id,
+                    gt::GovernedRequestId::try_new("profiled-exit-1").expect("request id"),
+                    gt::GovernedTaskMutation::MarkRuntimeExited {
+                        actor: gt::GovernedActor {
+                            kind: gt::GovernedActorKind::System,
+                            id: "cockpit-runtime".to_string(),
+                        },
+                        reason: Some("builder exited".to_string()),
+                    },
+                )
+                .expect("a profiled runtime exit must reconcile from the cockpit");
+            assert_eq!(reconciled, exited);
+            assert_eq!(
+                reconciled.execution_state,
+                gt::GovernedExecutionState::RuntimeExited,
+                "the task must not stay stuck in Running"
+            );
+
+            let observed: Vec<WorkbenchDaemonRequest> = (0..3)
+                .map(|_| {
+                    requests_rx
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("recorded request")
+                })
+                .collect();
+            assert!(
+                matches!(observed[0], WorkbenchDaemonRequest::GetGovernedTask { .. }),
+                "the ungated read must not pay for a handshake"
+            );
+            match &observed[1] {
+                WorkbenchDaemonRequest::PresentOperatorCapability { token: presented } => {
+                    assert_eq!(presented, &token)
+                }
+                other => panic!("expected the capability before the mutation, got {other:?}"),
+            }
+            assert!(matches!(
+                observed[2],
+                WorkbenchDaemonRequest::MutateGovernedTask { .. }
+            ));
+            server.join().unwrap();
+        }
+
+        /// Without a published capability the cockpit still connects and sends
+        /// the mutation, so the daemon's typed refusal is what the existing
+        /// error path surfaces.
+        #[test]
+        fn a_missing_capability_still_sends_the_mutation_and_surfaces_the_daemon_error() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket = dir.path().join("no-capability.sock");
+            let listener = UnixListener::bind(&socket).expect("bind fake daemon");
+
+            let mutation_request = impulse_ops::governed_task::GovernedTaskMutationRequest {
+                request_id: impulse_ops::governed_task::GovernedRequestId::try_new(
+                    "no-cap-approve",
+                )
+                .expect("request id"),
+                project_id: "project".to_string(),
+                task_id: impulse_ops::governed_task::GovernedTaskId::try_new("no-cap-task")
+                    .expect("task id"),
+                expected_revision: 4,
+                mutation:
+                    impulse_ops::governed_task::GovernedTaskMutation::RecordOperatorDecision {
+                        decision: impulse_ops::governed_task::OperatorDecisionInput {
+                            actor: impulse_ops::governed_task::GovernedActor {
+                                kind: impulse_ops::governed_task::GovernedActorKind::Operator,
+                                id: "cockpit-operator".to_string(),
+                            },
+                            supervisor_verdict_id:
+                                impulse_ops::governed_task::GovernedRecordId::try_new("verdict-a")
+                                    .expect("verdict id"),
+                            decision: impulse_ops::governed_task::OperatorDecisionKind::Approve,
+                            rationale: "approved from the cockpit".to_string(),
+                        },
+                    },
+            };
+
+            let (requests_tx, requests_rx) = mpsc::channel();
+            let server = thread::spawn(move || {
+                // One connection only: a typed refusal is a completed exchange,
+                // so `send_acknowledged` (which retries transport failures, not
+                // daemon errors) must not reconnect.
+                let (mut stream, _) = listener.accept().expect("accept mutation connection");
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().expect("clone stream"))
+                    .read_line(&mut line)
+                    .expect("read request");
+                requests_tx
+                    .send(serde_json::from_str::<WorkbenchDaemonRequest>(&line).unwrap())
+                    .expect("record request");
+                write_response(
+                    &mut stream,
+                    &WorkbenchDaemonResponse::Error {
+                        message: "request `RecordOperatorDecision` requires an operator-class \
+                                  connection"
+                            .to_string(),
+                    },
+                );
+                listener.set_nonblocking(true).expect("nonblocking");
+                assert!(
+                    listener.accept().is_err(),
+                    "a typed daemon refusal must not be retried as a transport failure"
+                );
+            });
+
+            let client = UnixDaemonOpsClient::new(socket);
+            let error = client.mutate_governed_task(mutation_request).unwrap_err();
+            assert!(
+                error.contains("operator-class"),
+                "the daemon's typed refusal must reach the existing error path, got: {error}"
+            );
+            assert!(
+                matches!(
+                    requests_rx
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("mutation request"),
+                    WorkbenchDaemonRequest::MutateGovernedTask { .. }
+                ),
+                "with no capability reachable the mutation is still sent"
+            );
+            server.join().unwrap();
         }
 
         fn write_response(
