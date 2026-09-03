@@ -4614,6 +4614,7 @@ dependencies = [
  "libc",
  "portable-pty",
  "pyo3",
+ "quick-xml 0.31.0",
  "ratatui",
  "regex",
  "reqwest 0.12.28",
