@@ -1664,7 +1664,7 @@ fn apply_mutation(
                 GovernedTaskEventKind::ProducerReservationInterrupted,
                 actor,
                 reason,
-                &now,
+                now,
             ));
         }
     }
