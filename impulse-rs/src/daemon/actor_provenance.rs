@@ -314,6 +314,14 @@ pub fn authorize_governed_mutation(
         GovernedTaskMutation::MarkRuntimeExited { .. } => {
             task_is_profiled.then_some("MarkRuntimeExited")
         }
+        // ADR-0012's reservation journal (PR #45) is reconciled in-process at
+        // ledger load; nothing legitimately submits it over the socket. Gating
+        // it operator-only therefore costs nothing and fails closed: a launched
+        // Builder cannot forge an "your reservation was interrupted" note to
+        // move its own task out of a stuck reservation.
+        GovernedTaskMutation::NoteProducerReservationInterrupted { .. } => {
+            Some("NoteProducerReservationInterrupted")
+        }
         GovernedTaskMutation::SubmitClaim { .. }
         | GovernedTaskMutation::RecordVerification { .. }
         | GovernedTaskMutation::RecordSupervisorVerdict { .. } => None,
@@ -669,6 +677,30 @@ mod tests {
         assert!(!mutation_authorization_needs_profile(
             &operator_decision_mutation()
         ));
+    }
+
+    #[test]
+    fn test_authorize_gates_the_reservation_interrupted_note_operator_only() {
+        let note = GovernedTaskMutation::NoteProducerReservationInterrupted {
+            actor: system_actor(),
+            reason: "a producer reservation was left open by a dead process".to_string(),
+        };
+        for profiled in [true, false] {
+            let error = authorize_governed_mutation(&note, profiled, ConnectionClass::NonOperator)
+                .unwrap_err();
+            assert_eq!(
+                error,
+                ActorProvenanceError::OperatorClassRequired {
+                    request: "NoteProducerReservationInterrupted"
+                },
+                "the reconcile-only note is never submittable from a non-operator connection"
+            );
+        }
+        assert!(authorize_governed_mutation(&note, true, ConnectionClass::Operator).is_ok());
+        assert!(
+            !mutation_authorization_needs_profile(&note),
+            "the note is gated regardless of profile, so no ledger lookup is needed"
+        );
     }
 
     #[test]

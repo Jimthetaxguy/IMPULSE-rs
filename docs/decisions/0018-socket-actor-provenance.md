@@ -89,7 +89,12 @@ governed runtime.
    producer chain governs them. **The classification is an exhaustive match over
    `GovernedTaskMutation`, deliberately with no catch-all arm**: a mutation variant added later must
    break `authorize_governed_mutation`'s compilation and be classified on purpose, rather than
-   defaulting open and becoming silently reachable from a launched Builder.
+   defaulting open and becoming silently reachable from a launched Builder. That guard has already
+   paid for itself once: rebasing this lane onto a `main` carrying ADR-0012's reservation journal
+   broke the build on the new `NoteProducerReservationInterrupted` variant, which is now classified
+   operator-only. It is reconciled in-process at ledger load and nothing legitimately submits it
+   over the socket, so gating it costs nothing and stops a launched Builder forging an
+   "your reservation was interrupted" note to move its own task out of a stuck reservation.
 5. **Provenance is recorded on the decision, by the daemon.** `OperatorDecision` gains a
    serde-defaulted `authentication: OperatorAuthentication` of `Declared` or
    `CapabilityAuthenticated`. `OperatorDecisionInput` deliberately has **no** such field: the value
