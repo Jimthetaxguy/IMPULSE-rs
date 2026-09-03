@@ -236,7 +236,7 @@ impl ReplTool for DocumentReadTool {
 
     async fn run(&self, args: Value, ctx: &ReplContext) -> Result<ToolOutcome> {
         let request = parse_request(&args)?;
-        let path = resolve_document_path(&request.path, &ctx.repo_root)?;
+        let path = resolve_document_path(&request.path, ctx)?;
         preflight_container(&path, &request.path)?;
         // Parsing is synchronous (calamine, docx-rs). Run it off the async
         // runtime so the loop contract's wall-clock timeout can still fire
@@ -317,26 +317,42 @@ pub fn parse_request(args: &Value) -> Result<DocumentReadRequest> {
     })
 }
 
-/// Resolves `raw` against `repo_root` when relative and checks it names an
-/// existing regular file in an accepted format under [`MAX_DOCUMENT_BYTES`].
-/// Error messages lead with the path the caller supplied, so two different
-/// bad paths never share an error signature.
-pub fn resolve_document_path(raw: &str, repo_root: &Path) -> Result<PathBuf> {
-    resolve_document_path_with_cap(raw, repo_root, MAX_DOCUMENT_BYTES)
+/// Resolves `raw` against `ctx.repo_root` when relative and checks it names
+/// an existing regular file in an accepted format under
+/// [`MAX_DOCUMENT_BYTES`] AND inside `ctx`'s read sandbox (Stage 1 review
+/// round 1, P1: `document_read` previously never consulted
+/// `ReplContext::sandbox_tool_context` at all -- an absolute path, or a
+/// relative `../` traversal, escaped the sandbox with no confirmation gate
+/// and no path check, unlike every bridged tool. This tool is ungated by
+/// design (read-only, like `file_read`), so the sandbox check here is the
+/// *only* enforcement point -- it must run before any file is opened, not
+/// just before it's parsed). Error messages lead with the path the caller
+/// supplied, so two different bad paths never share an error signature.
+pub fn resolve_document_path(raw: &str, ctx: &ReplContext) -> Result<PathBuf> {
+    resolve_document_path_with_cap(raw, ctx, MAX_DOCUMENT_BYTES)
 }
 
 /// [`resolve_document_path`] with an explicit size cap; the test seam.
 pub fn resolve_document_path_with_cap(
     raw: &str,
-    repo_root: &Path,
+    ctx: &ReplContext,
     max_bytes: u64,
 ) -> Result<PathBuf> {
+    let repo_root = ctx.effective_repo_root();
     let candidate = PathBuf::from(raw);
-    let path = if candidate.is_absolute() || repo_root.as_os_str().is_empty() {
+    let path = if candidate.is_absolute() {
         candidate
     } else {
         repo_root.join(candidate)
     };
+    let tool_ctx = ctx.sandbox_tool_context();
+    if !tool_ctx.is_path_allowed(&path, false) {
+        bail!(
+            "document_read: '{raw}' resolves outside the session's read sandbox \
+             (repo root plus any /allow grants); use /allow to grant access first \
+             if you trust this path"
+        );
+    }
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -1260,19 +1276,28 @@ mod tests {
         );
     }
 
+    fn doc_ctx(repo_root: &Path) -> ReplContext {
+        ReplContext {
+            repo_root: repo_root.to_path_buf(),
+            ..ReplContext::default()
+        }
+    }
+
     #[test]
     fn test_resolve_document_path_joins_relative_paths_and_validates() {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join("a.csv"), "x,y\n").unwrap();
-        let resolved = resolve_document_path("a.csv", dir.path()).unwrap();
+        let ctx = doc_ctx(dir.path());
+        let resolved = resolve_document_path("a.csv", &ctx).unwrap();
         assert_eq!(resolved, dir.path().join("a.csv"));
         let absolute = dir.path().join("a.csv");
+        // An absolute path INSIDE the sandbox (repo_root) is still accepted.
         assert_eq!(
-            resolve_document_path(absolute.to_str().unwrap(), Path::new("/elsewhere")).unwrap(),
+            resolve_document_path(absolute.to_str().unwrap(), &ctx).unwrap(),
             absolute
         );
 
-        let err = resolve_document_path("missing.csv", dir.path()).unwrap_err();
+        let err = resolve_document_path("missing.csv", &ctx).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.starts_with("document_read: 'missing.csv' not found"),
@@ -1280,7 +1305,7 @@ mod tests {
         );
 
         std::fs::write(dir.path().join("notes.pdf"), "%PDF").unwrap();
-        let err = resolve_document_path("notes.pdf", dir.path()).unwrap_err();
+        let err = resolve_document_path("notes.pdf", &ctx).unwrap_err();
         let msg = err.to_string();
         assert!(msg.starts_with("document_read: 'notes.pdf'"), "{msg}");
         assert!(msg.contains("unsupported extension 'pdf'"), "{msg}");
@@ -1290,11 +1315,11 @@ mod tests {
         );
 
         std::fs::create_dir(dir.path().join("folder.csv")).unwrap();
-        let err = resolve_document_path("folder.csv", dir.path()).unwrap_err();
+        let err = resolve_document_path("folder.csv", &ctx).unwrap_err();
         assert!(err.to_string().contains("is a directory"), "{err}");
 
         std::fs::write(dir.path().join("old.xls"), "binary").unwrap();
-        let err = resolve_document_path("old.xls", dir.path()).unwrap_err();
+        let err = resolve_document_path("old.xls", &ctx).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.starts_with("document_read: 'old.xls' is a legacy .xls workbook"),
@@ -1303,18 +1328,89 @@ mod tests {
         assert!(msg.contains("convert it to .xlsx"), "{msg}");
     }
 
+    // ------------------------------------------------------------------
+    // Review round 1, P1: document_read must enforce the same sandbox as
+    // the bridged tools (repo root + /allow grants), not accept any
+    // absolute path or relative traversal unconditionally.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_document_path_denies_an_absolute_path_outside_the_sandbox() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let secret = outside.path().join("private-finances.csv");
+        std::fs::write(
+            &secret,
+            "acct,balance
+123,999
+",
+        )
+        .unwrap();
+        let ctx = doc_ctx(repo.path());
+
+        let err = resolve_document_path(&secret.display().to_string(), &ctx).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("outside the session's read sandbox"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_document_path_denies_a_relative_traversal_outside_the_sandbox() {
+        let base = tempfile::TempDir::new().unwrap();
+        let repo = base.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let secret = base.path().join("secret.csv");
+        std::fs::write(
+            &secret, "a,b
+1,2
+",
+        )
+        .unwrap();
+        let ctx = doc_ctx(&repo);
+
+        let err = resolve_document_path("../secret.csv", &ctx).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("outside the session's read sandbox"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_document_path_allows_a_path_granted_via_allow() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let granted = tempfile::TempDir::new().unwrap();
+        let doc = granted.path().join("granted.csv");
+        std::fs::write(
+            &doc, "a,b
+1,2
+",
+        )
+        .unwrap();
+        let ctx = ReplContext {
+            repo_root: repo.path().to_path_buf(),
+            allowed_read_roots: vec![granted.path().to_path_buf()],
+        };
+
+        let resolved = resolve_document_path(&doc.display().to_string(), &ctx).unwrap();
+        assert_eq!(resolved, doc);
+    }
+
     #[test]
     fn test_resolve_document_path_refuses_files_over_the_size_cap() {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join("big.csv"), "a,b\n").unwrap();
-        let err = resolve_document_path_with_cap("big.csv", dir.path(), 1).unwrap_err();
+        let ctx = doc_ctx(dir.path());
+        let err = resolve_document_path_with_cap("big.csv", &ctx, 1).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.starts_with("document_read: 'big.csv' is 4 bytes"),
             "{msg}"
         );
         assert!(msg.contains("1-byte limit"), "{msg}");
-        assert!(resolve_document_path_with_cap("big.csv", dir.path(), 4).is_ok());
+        assert!(resolve_document_path_with_cap("big.csv", &ctx, 4).is_ok());
     }
 
     #[test]
@@ -1553,6 +1649,7 @@ mod tests {
         fn ctx_in(dir: &tempfile::TempDir) -> ReplContext {
             ReplContext {
                 repo_root: dir.path().to_path_buf(),
+                ..ReplContext::default()
             }
         }
 

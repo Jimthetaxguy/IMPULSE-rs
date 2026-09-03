@@ -182,27 +182,8 @@ mod tests {
     /// `static ENV_LOCK`s do NOT serialize across files in the same test
     /// binary, which silently reintroduced the exact race this lock exists
     /// to prevent.
+    use crate::test_support::init_git_repo;
     use crate::test_support::ion_gate_launcher_env_lock as env_lock;
-
-    /// Creates a throwaway git repo with one empty commit, so `diff_ref`
-    /// values like `HEAD` resolve via `git rev-parse`.
-    fn init_git_repo() -> tempfile::TempDir {
-        let dir = tempfile::TempDir::new().expect("failed to create tempdir");
-        let run = |args: &[&str]| {
-            let status = std::process::Command::new("git")
-                .arg("-C")
-                .arg(dir.path())
-                .args(args)
-                .status()
-                .expect("failed to run git");
-            assert!(status.success(), "git {args:?} failed");
-        };
-        run(&["init", "--quiet"]);
-        run(&["config", "user.email", "test@example.com"]);
-        run(&["config", "user.name", "Test"]);
-        run(&["commit", "--allow-empty", "--quiet", "-m", "init"]);
-        dir
-    }
 
     /// T3 item 4: proves `run_ion_verify` returns a `HarnessResponse` without
     /// going through the CLI print/exit path, by driving `PiAdapter` against
