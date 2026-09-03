@@ -10,9 +10,11 @@ mod config_keys;
 mod governed_task;
 mod memory_candidate;
 pub mod persistence;
+mod producer_reservation;
 pub mod session;
 
 pub use config::*;
 pub use governed_task::*;
 pub use persistence::*;
+pub use producer_reservation::*;
 pub use session::*;

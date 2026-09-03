@@ -43,6 +43,8 @@ pub struct State {
     storage: Storage,
     pub(super) governed_tasks: std::sync::Mutex<super::governed_task::GovernedTaskLedger>,
     pub(super) memory_candidates: std::sync::Mutex<super::memory_candidate::MemoryCandidateLedger>,
+    pub(super) producer_reservations:
+        std::sync::Mutex<super::producer_reservation::ProducerReservationLedger>,
     governed_producer_locks: tokio::sync::Mutex<
         HashMap<impulse_ops::governed_task::GovernedTaskId, Arc<tokio::sync::Mutex<()>>>,
     >,
@@ -91,17 +93,20 @@ impl State {
             .context("Failed to read config from disk")?;
         let governed_tasks = Self::load_governed_task_ledger(&storage)?;
         let memory_candidates = Self::load_memory_candidate_ledger(&storage)?;
+        let producer_reservations = Self::load_producer_reservation_ledger(&storage)?;
 
         let state = Self {
             storage,
             governed_tasks,
             memory_candidates,
+            producer_reservations,
             governed_producer_locks: tokio::sync::Mutex::new(HashMap::new()),
             live_state: RwLock::new(live_state),
             dirty: AtomicBool::new(false),
             config: RwLock::new(config),
         };
         state.reconcile_accepted_run_memory_candidates()?;
+        state.reconcile_producer_reservations()?;
         Ok(state)
     }
 
