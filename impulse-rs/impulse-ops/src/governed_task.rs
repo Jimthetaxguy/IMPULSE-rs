@@ -3,6 +3,8 @@
 //! A governed task is deliberately not a terminal session. Its execution can
 //! stop while review continues, so execution and review state are independent.
 
+use std::path::PathBuf;
+
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 
@@ -105,6 +107,284 @@ pub enum GovernedVerificationProfile {
     RustWorkspaceV1,
 }
 
+/// What an agent instance may see and touch in the project filesystem while it
+/// works (ROSA's world-scope vocabulary, adapted to Git-level mediation).
+///
+/// The variants are ordered from least to most authority. Only
+/// [`WorldScope::Authoritative`] (the serde default, so every pre-ADR-0019
+/// record loads unchanged) and [`WorldScope::StagedAuthoritative`] are
+/// materializable today; the two weaker scopes are declared so the contract is
+/// stable, and registration refuses them rather than pretending.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum WorldScope {
+    /// Observe a frozen copy; never write. What daemon-owned verification
+    /// already does in its detached worktree.
+    ReadOnlySnapshot,
+    /// Write freely into a copy that is thrown away; nothing is ever promoted.
+    DisposableScratch,
+    /// Write into a disposable staged worktree; an operator acceptance plus a
+    /// separate promotion step is what makes the result canonical.
+    StagedAuthoritative,
+    /// Write directly into the canonical project tree.
+    #[default]
+    Authoritative,
+}
+
+impl WorldScope {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ReadOnlySnapshot => "read_only_snapshot",
+            Self::DisposableScratch => "disposable_scratch",
+            Self::StagedAuthoritative => "staged_authoritative",
+            Self::Authoritative => "authoritative",
+        }
+    }
+
+    /// Whether the scope requires a staged worktree before the runtime launches.
+    pub fn requires_staged_worktree(&self) -> bool {
+        matches!(self, Self::StagedAuthoritative)
+    }
+
+    /// Whether the daemon can materialize the scope today. A declared but
+    /// unmaterializable scope must fail registration closed.
+    pub fn is_materializable(&self) -> bool {
+        matches!(self, Self::StagedAuthoritative | Self::Authoritative)
+    }
+}
+
+impl std::fmt::Display for WorldScope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Lifecycle of the disposable worktree a staged Builder works in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StagedWorktreeStatus {
+    Active,
+    Discarded,
+}
+
+/// Daemon-observed record of the staged worktree materialized for one task.
+/// `root` is an absolute canonical path inside the project's `.impulse`
+/// namespace; it is never caller-authored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagedWorktree {
+    pub id: GovernedRecordId,
+    pub actor: GovernedActor,
+    pub root: String,
+    pub initial_subject_revision: String,
+    /// Digests of the worktree-shared repository configuration observed when
+    /// this worktree was materialized. Promotion refuses to check anything out
+    /// unless the same digests still hold. Defaults to
+    /// [`SharedRepositoryConfigPin::Unknown`] so a record written before the pin
+    /// existed still loads instead of failing the whole ledger closed.
+    #[serde(default)]
+    pub shared_config_digest: SharedRepositoryConfigPin,
+    pub status: StagedWorktreeStatus,
+    pub materialized_at: String,
+    pub based_on_revision: u64,
+}
+
+/// Caller-free input for the staged-worktree materialization mutation. The
+/// daemon producer observes both fields; no client supplies them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagedWorktreeInput {
+    pub actor: GovernedActor,
+    pub root: String,
+    pub initial_subject_revision: String,
+    #[serde(default)]
+    pub shared_config_digest: SharedRepositoryConfigPin,
+}
+
+/// Why a promotion could not move the canonical branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromotionBlockedReason {
+    /// The canonical head no longer equals the OID the task was registered at.
+    CanonicalHeadMoved,
+    /// The canonical checkout is on a detached HEAD, so there is no branch to
+    /// advance. Promoting here would move HEAD only, and the next `git switch`
+    /// would orphan the accepted commit.
+    DetachedHead,
+    /// The compare-and-swap on the canonical branch lost to a concurrent
+    /// writer between observation and the ref update.
+    ConcurrentBranchUpdate,
+    /// Shared repository configuration changed while the Builder was working.
+    /// A `filter` or `diff` driver defined there executes during the checkout
+    /// promotion performs, so a run that rewrote it is not promotable without a
+    /// human looking at what changed. The component names *what* changed:
+    /// benign churn (a new remote, a credential helper) hard-blocks promotion
+    /// too, and the operator must not have to guess which file to inspect.
+    RepositoryConfigChanged { component: SharedConfigComponent },
+    /// The staged worktree was materialized before shared configuration was
+    /// pinned, so there is nothing to compare against. Not a failure of the
+    /// run: the operator discards the worktree and re-materializes.
+    RepositoryConfigUnpinned,
+}
+
+/// Which piece of worktree-shared Git state changed under a staged run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedConfigComponent {
+    /// `.git/config`, shared by the main worktree and every linked worktree.
+    RepositoryConfig,
+    /// `.git/config.worktree`, read only when `extensions.worktreeConfig` is on.
+    WorktreeConfig,
+    /// `.git/info/attributes`, shared and invisible to a diff of the work tree.
+    InfoAttributes,
+}
+
+impl SharedConfigComponent {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::RepositoryConfig => ".git/config",
+            Self::WorktreeConfig => ".git/config.worktree",
+            Self::InfoAttributes => ".git/info/attributes",
+        }
+    }
+}
+
+impl std::fmt::Display for SharedConfigComponent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Whether a staged worktree carries a shared-configuration pin at all.
+///
+/// A worktree materialized before ADR-0019 round 2 has no pin, and there is no
+/// honest default for one: an empty digest would either compare equal to
+/// nothing (silently unsafe) or to everything (blocked forever with no
+/// explanation). `Unknown` says exactly what is true — the comparison cannot be
+/// made — and promotion refuses on it with its own reason so the operator is
+/// told to discard and re-materialize rather than left guessing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedRepositoryConfigPin {
+    Recorded(SharedRepositoryConfigDigest),
+    #[default]
+    Unknown,
+}
+
+impl SharedRepositoryConfigPin {
+    pub fn recorded(&self) -> Option<&SharedRepositoryConfigDigest> {
+        match self {
+            Self::Recorded(digest) => Some(digest),
+            Self::Unknown => None,
+        }
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+}
+
+/// Digests of every piece of worktree-shared Git state that can turn a later
+/// checkout into command execution. `None` means the component was absent,
+/// which is itself pinned: creating it is a change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedRepositoryConfigDigest {
+    pub repository_config: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_config: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub info_attributes: Option<String>,
+}
+
+impl SharedRepositoryConfigDigest {
+    /// The first component that differs, which is what the operator is told.
+    pub fn first_difference(&self, other: &Self) -> Option<SharedConfigComponent> {
+        if self.repository_config != other.repository_config {
+            return Some(SharedConfigComponent::RepositoryConfig);
+        }
+        if self.worktree_config != other.worktree_config {
+            return Some(SharedConfigComponent::WorktreeConfig);
+        }
+        if self.info_attributes != other.info_attributes {
+            return Some(SharedConfigComponent::InfoAttributes);
+        }
+        None
+    }
+}
+
+impl PromotionBlockedReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::CanonicalHeadMoved => "canonical_head_moved",
+            Self::DetachedHead => "detached_head",
+            Self::ConcurrentBranchUpdate => "concurrent_branch_update",
+            Self::RepositoryConfigChanged { .. } => "repository_config_changed",
+            Self::RepositoryConfigUnpinned => "repository_config_unpinned",
+        }
+    }
+}
+
+impl std::fmt::Display for PromotionBlockedReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Name the file, so an operator facing a hard block is not guessing.
+            Self::RepositoryConfigChanged { component } => {
+                write!(formatter, "{} changed ({component})", self.as_str())
+            }
+            other => formatter.write_str(other.as_str()),
+        }
+    }
+}
+
+/// What a promotion attempt actually did to the canonical branch.
+///
+/// A blocked promotion is an execution fact, not an error: the run stays
+/// `accepted` and the operator decides what to do with a canonical branch that
+/// moved, is detached, or lost a compare-and-swap.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GovernedPromotionOutcome {
+    Promoted {
+        promoted_revision: String,
+    },
+    PromotionBlocked {
+        canonical_head: String,
+        reason: PromotionBlockedReason,
+    },
+}
+
+impl GovernedPromotionOutcome {
+    pub fn is_promoted(&self) -> bool {
+        matches!(self, Self::Promoted { .. })
+    }
+
+    pub fn blocked_reason(&self) -> Option<PromotionBlockedReason> {
+        match self {
+            Self::Promoted { .. } => None,
+            Self::PromotionBlocked { reason, .. } => Some(*reason),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernedPromotionInput {
+    pub actor: GovernedActor,
+    pub accepted_revision: String,
+    pub initial_subject_revision: String,
+    pub outcome: GovernedPromotionOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernedPromotion {
+    pub id: GovernedRecordId,
+    pub actor: GovernedActor,
+    pub accepted_revision: String,
+    pub initial_subject_revision: String,
+    pub outcome: GovernedPromotionOutcome,
+    pub recorded_at: String,
+    pub based_on_revision: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum GovernedExecutionState {
@@ -159,6 +439,10 @@ pub struct GovernedTaskRegistration {
     pub acceptance_criteria: Vec<String>,
     #[serde(default)]
     pub approval_policy: ApprovalPolicy,
+    /// Filesystem authority the launched runtime works under. Defaults to
+    /// `authoritative` so every record written before ADR-0019 loads unchanged.
+    #[serde(default)]
+    pub world_scope: WorldScope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification_profile: Option<GovernedVerificationProfile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -191,6 +475,7 @@ impl GovernedTaskRegistration {
             task: task.into(),
             acceptance_criteria: Vec::new(),
             approval_policy: ApprovalPolicy::OperatorRequired,
+            world_scope: WorldScope::default(),
             verification_profile: None,
             role_assignment: None,
             role_compatibility: None,
@@ -229,6 +514,26 @@ impl GovernedTaskRegistration {
         }
         if let Some(subject) = &self.initial_subject_revision {
             validate_nonblank("initial_subject_revision", subject, 1024)?;
+        }
+        if !self.world_scope.is_materializable() {
+            return Err(GovernedTaskContractError::InvalidField {
+                field: "world_scope",
+                message: format!(
+                    "world scope `{}` is declared but not materializable by this daemon",
+                    self.world_scope
+                ),
+            });
+        }
+        if self.world_scope.requires_staged_worktree() {
+            if self.verification_profile.is_none() {
+                return Err(GovernedTaskContractError::InvalidField {
+                    field: "world_scope",
+                    message:
+                        "a staged world scope requires a closed-loop verification profile so the initial Git OID is daemon-attested"
+                            .to_string(),
+                });
+            }
+            validate_path_segment("task_id", self.task_id.as_str())?;
         }
         if self.verification_profile.is_some() {
             if self.acceptance_criteria.is_empty() {
@@ -357,6 +662,7 @@ pub struct GovernedTaskRegistrationBuilder {
     task: String,
     acceptance_criteria: Vec<String>,
     approval_policy: ApprovalPolicy,
+    world_scope: WorldScope,
     verification_profile: Option<GovernedVerificationProfile>,
     role_assignment: Option<AgentRoleAssignment>,
     role_compatibility: Option<RoleCompatibility>,
@@ -374,6 +680,11 @@ impl GovernedTaskRegistrationBuilder {
 
     pub fn approval_policy(mut self, policy: ApprovalPolicy) -> Self {
         self.approval_policy = policy;
+        self
+    }
+
+    pub fn world_scope(mut self, scope: WorldScope) -> Self {
+        self.world_scope = scope;
         self
     }
 
@@ -411,6 +722,7 @@ impl GovernedTaskRegistrationBuilder {
             task: self.task,
             acceptance_criteria: self.acceptance_criteria,
             approval_policy: self.approval_policy,
+            world_scope: self.world_scope,
             verification_profile: self.verification_profile,
             role_assignment: self.role_assignment,
             role_compatibility: self.role_compatibility,
@@ -433,6 +745,31 @@ fn validate_nonblank(
         return Err(GovernedTaskContractError::InvalidField {
             field,
             message: format!("must be nonblank, NUL-free, and at most {max_bytes} UTF-8 bytes"),
+        });
+    }
+    Ok(())
+}
+
+/// A staged worktree is materialized at `.impulse/worktrees/<task_id>`, so the
+/// task id must be usable as exactly one filesystem path segment.
+pub fn validate_path_segment(
+    field: &'static str,
+    value: &str,
+) -> Result<(), GovernedTaskContractError> {
+    let rejected = value.is_empty()
+        || value.len() > 128
+        || value == "."
+        || value == ".."
+        || value.starts_with('.')
+        || value
+            .chars()
+            .any(|character| !matches!(character, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_'));
+    if rejected {
+        return Err(GovernedTaskContractError::InvalidField {
+            field,
+            message:
+                "must be one filesystem path segment of at most 128 ASCII letters, digits, `-`, or `_`"
+                    .to_string(),
         });
     }
     Ok(())
@@ -477,6 +814,17 @@ pub struct WorkerCompletionClaim {
     pub artifact_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_ref: Option<String>,
+    /// Digest of the deterministic loop report evaluated when this claim was
+    /// accepted. Daemon-derived, never caller-supplied, and present only for a
+    /// staged world scope (ADR-0019 rule 6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_report_digest: Option<String>,
+    /// Governed-loop evidence version the digest was computed under. Stored
+    /// beside the digest so revising the budget constants, or adding a field to
+    /// `LoopReport`, cannot make an existing ledger unloadable: replay only
+    /// recomputes digests written under the version it is running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_report_version: Option<u32>,
     pub submitted_at: String,
     pub based_on_revision: u64,
 }
@@ -648,6 +996,13 @@ pub enum GovernedTaskMutation {
         actor: GovernedActor,
         reason: Option<String>,
     },
+    MaterializeStagedWorktree {
+        staged: StagedWorktreeInput,
+    },
+    DiscardStagedWorktree {
+        actor: GovernedActor,
+        reason: String,
+    },
     SubmitClaim {
         claim: WorkerCompletionClaimInput,
     },
@@ -671,6 +1026,9 @@ pub enum GovernedTaskMutation {
     NoteProducerReservationInterrupted {
         actor: GovernedActor,
         reason: String,
+    },
+    RecordPromotion {
+        promotion: GovernedPromotionInput,
     },
 }
 
@@ -791,10 +1149,15 @@ fn validate_sha256_digest(
 #[serde(rename_all = "snake_case")]
 pub enum GovernedTaskEventKind {
     Registered,
+    StagedWorktreeMaterialized,
+    StagedWorktreeDiscarded,
     Running,
     LaunchFailed,
     RuntimeExited,
     ClaimSubmitted,
+    /// A claim that the governed Builder loop contract refused. The claim is
+    /// still recorded as evidence; review state escalates instead of advancing.
+    LoopTripped,
     VerificationRecorded,
     SupervisorVerdictRecorded,
     OperatorDecisionRecorded,
@@ -803,6 +1166,7 @@ pub enum GovernedTaskEventKind {
     /// Purely observational: it does not change `execution_state` or
     /// `review_state`.
     ProducerReservationInterrupted,
+    PromotionRecorded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -826,6 +1190,8 @@ pub struct GovernedTaskRun {
     pub acceptance_criteria: Vec<String>,
     #[serde(default)]
     pub approval_policy: ApprovalPolicy,
+    #[serde(default)]
+    pub world_scope: WorldScope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification_profile: Option<GovernedVerificationProfile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -838,6 +1204,12 @@ pub struct GovernedTaskRun {
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_subject_revision: Option<String>,
+    /// Present only for a staged world scope, once the daemon has materialized
+    /// the worktree. `None` on every pre-ADR-0019 record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged_worktree: Option<StagedWorktree>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub promotions: Vec<GovernedPromotion>,
     #[serde(default)]
     pub execution_state: GovernedExecutionState,
     #[serde(default)]
@@ -871,6 +1243,40 @@ impl GovernedTaskRun {
 
     pub fn is_accepted(&self) -> bool {
         self.review_state == GovernedReviewState::Accepted
+    }
+
+    /// The one path a staged worktree may occupy for this task:
+    /// `<workspace root>/.impulse/worktrees/<task id>`. Defined once here so
+    /// the daemon producer that creates it and the ledger that validates it
+    /// can never disagree.
+    pub fn expected_staged_worktree_root(&self) -> Result<PathBuf, GovernedTaskContractError> {
+        validate_path_segment("task_id", self.id.as_str())?;
+        Ok(PathBuf::from(&self.workspace_root)
+            .join(".impulse")
+            .join("worktrees")
+            .join(self.id.as_str()))
+    }
+
+    pub fn latest_promotion(&self) -> Option<&GovernedPromotion> {
+        self.promotions.last()
+    }
+
+    /// The staged worktree while it is still usable, or `None` once it has been
+    /// discarded or was never materialized.
+    pub fn active_staged_worktree(&self) -> Option<&StagedWorktree> {
+        self.staged_worktree
+            .as_ref()
+            .filter(|staged| staged.status == StagedWorktreeStatus::Active)
+    }
+
+    /// Working directory a launched runtime must be given. A staged Builder
+    /// works inside its disposable worktree; every other scope works in the
+    /// canonical workspace root.
+    pub fn launch_working_directory(&self) -> &str {
+        match self.active_staged_worktree() {
+            Some(staged) => staged.root.as_str(),
+            None => self.workspace_root.as_str(),
+        }
     }
 }
 
@@ -958,5 +1364,601 @@ mod operator_authentication_tests {
         .unwrap();
         let encoded = serde_json::to_value(&input).unwrap();
         assert!(encoded.get("authentication").is_none());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn oid(character: char) -> String {
+        character.to_string().repeat(40)
+    }
+
+    fn test_shared_config_digest() -> SharedRepositoryConfigPin {
+        SharedRepositoryConfigPin::Recorded(SharedRepositoryConfigDigest {
+            repository_config: format!("sha256:{}", "d".repeat(64)),
+            worktree_config: None,
+            info_attributes: Some(format!("sha256:{}", "e".repeat(64))),
+        })
+    }
+
+    fn staged_registration_builder() -> GovernedTaskRegistrationBuilder {
+        GovernedTaskRegistration::builder(
+            "request-1",
+            "task-1",
+            "impulse-rs",
+            "/tmp/impulse-rs",
+            "Ship the staged scope",
+            "worker-1",
+            "ion",
+        )
+        .world_scope(WorldScope::StagedAuthoritative)
+        .verification_profile(GovernedVerificationProfile::RustWorkspaceV1)
+        .acceptance_criteria(vec!["the gate is green".to_string()])
+        .initial_subject_revision(oid('a'))
+        .role_assignment(canonical_governed_builder_assignment())
+        .role_compatibility(RoleCompatibility {
+            platform: crate::agent_registry::AgentPlatformId::try_new("ion").unwrap(),
+            role: canonical_governed_builder_assignment().role.clone(),
+            checks: canonical_governed_builder_assignment()
+                .requirements
+                .iter()
+                .map(
+                    |requirement| crate::role_assignment::CapabilityCompatibility {
+                        capability: requirement.capability.clone(),
+                        required: requirement.minimum_enforcement,
+                        available: requirement.minimum_enforcement,
+                        mandatory: requirement.mandatory,
+                    },
+                )
+                .collect(),
+        })
+    }
+
+    #[test]
+    fn test_world_scope_round_trips_through_serde() {
+        for scope in [
+            WorldScope::ReadOnlySnapshot,
+            WorldScope::DisposableScratch,
+            WorldScope::StagedAuthoritative,
+            WorldScope::Authoritative,
+        ] {
+            let json = serde_json::to_string(&scope).unwrap();
+            let recovered: WorldScope = serde_json::from_str(&json).unwrap();
+            assert_eq!(recovered, scope);
+            assert_eq!(json, format!("\"{}\"", scope.as_str()));
+        }
+    }
+
+    #[test]
+    fn test_world_scope_display_matches_wire_names() {
+        assert_eq!(
+            WorldScope::StagedAuthoritative.to_string(),
+            "staged_authoritative"
+        );
+        assert_eq!(WorldScope::Authoritative.to_string(), "authoritative");
+        assert_eq!(
+            WorldScope::ReadOnlySnapshot.to_string(),
+            "read_only_snapshot"
+        );
+        assert_eq!(
+            WorldScope::DisposableScratch.to_string(),
+            "disposable_scratch"
+        );
+    }
+
+    #[test]
+    fn test_world_scope_default_is_authoritative_so_old_records_load() {
+        #[derive(Deserialize)]
+        struct Legacy {
+            #[serde(default)]
+            world_scope: WorldScope,
+        }
+
+        let legacy: Legacy = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.world_scope, WorldScope::Authoritative);
+        assert!(!legacy.world_scope.requires_staged_worktree());
+    }
+
+    #[test]
+    fn test_world_scope_materializability_is_explicit() {
+        assert!(WorldScope::StagedAuthoritative.is_materializable());
+        assert!(WorldScope::Authoritative.is_materializable());
+        assert!(!WorldScope::ReadOnlySnapshot.is_materializable());
+        assert!(!WorldScope::DisposableScratch.is_materializable());
+    }
+
+    #[test]
+    fn test_staged_worktree_round_trips_through_serde() {
+        let staged = StagedWorktree {
+            id: GovernedRecordId::try_new("staged-1").unwrap(),
+            actor: GovernedActor {
+                kind: GovernedActorKind::System,
+                id: "impulse-daemon".to_string(),
+            },
+            root: "/tmp/impulse-rs/.impulse/worktrees/task-1".to_string(),
+            initial_subject_revision: oid('a'),
+            shared_config_digest: test_shared_config_digest(),
+            status: StagedWorktreeStatus::Active,
+            materialized_at: "2026-09-02T00:00:00Z".to_string(),
+            based_on_revision: 0,
+        };
+        let recovered: StagedWorktree =
+            serde_json::from_str(&serde_json::to_string(&staged).unwrap()).unwrap();
+        assert_eq!(recovered, staged);
+    }
+
+    #[test]
+    fn test_staged_worktree_input_round_trips_through_serde() {
+        let input = StagedWorktreeInput {
+            actor: GovernedActor {
+                kind: GovernedActorKind::System,
+                id: "impulse-daemon".to_string(),
+            },
+            root: "/tmp/impulse-rs/.impulse/worktrees/task-1".to_string(),
+            initial_subject_revision: oid('a'),
+            shared_config_digest: test_shared_config_digest(),
+        };
+        let recovered: StagedWorktreeInput =
+            serde_json::from_str(&serde_json::to_string(&input).unwrap()).unwrap();
+        assert_eq!(recovered, input);
+    }
+
+    #[test]
+    fn test_promotion_records_round_trip_through_serde() {
+        for outcome in [
+            GovernedPromotionOutcome::Promoted {
+                promoted_revision: oid('b'),
+            },
+            GovernedPromotionOutcome::PromotionBlocked {
+                canonical_head: oid('c'),
+                reason: PromotionBlockedReason::CanonicalHeadMoved,
+            },
+        ] {
+            let promotion = GovernedPromotion {
+                id: GovernedRecordId::try_new("promotion-1").unwrap(),
+                actor: GovernedActor {
+                    kind: GovernedActorKind::System,
+                    id: "impulse-daemon".to_string(),
+                },
+                accepted_revision: oid('b'),
+                initial_subject_revision: oid('a'),
+                outcome: outcome.clone(),
+                recorded_at: "2026-09-02T00:00:00Z".to_string(),
+                based_on_revision: 6,
+            };
+            let recovered: GovernedPromotion =
+                serde_json::from_str(&serde_json::to_string(&promotion).unwrap()).unwrap();
+            assert_eq!(recovered, promotion);
+            assert_eq!(outcome.is_promoted(), recovered.outcome.is_promoted());
+        }
+    }
+
+    #[test]
+    fn test_staged_registration_requires_a_verification_profile() {
+        let error = GovernedTaskRegistration::builder(
+            "request-1",
+            "task-1",
+            "impulse-rs",
+            "/tmp/impulse-rs",
+            "Ship the staged scope",
+            "worker-1",
+            "ion",
+        )
+        .world_scope(WorldScope::StagedAuthoritative)
+        .build()
+        .expect_err("a staged scope without an attested OID must not register");
+        assert!(matches!(
+            error,
+            GovernedTaskContractError::InvalidField {
+                field: "world_scope",
+                ..
+            }
+        ));
+        assert!(error.to_string().contains("verification profile"));
+    }
+
+    #[test]
+    fn test_unmaterializable_world_scopes_fail_registration_closed() {
+        for scope in [WorldScope::ReadOnlySnapshot, WorldScope::DisposableScratch] {
+            let error = staged_registration_builder()
+                .world_scope(scope)
+                .build()
+                .expect_err("an unimplemented world scope must not register");
+            assert!(error.to_string().contains("not materializable"), "{error}");
+        }
+    }
+
+    #[test]
+    fn test_staged_registration_rejects_a_task_id_that_is_not_a_path_segment() {
+        let error = GovernedTaskRegistration::builder(
+            "request-1",
+            "../escape",
+            "impulse-rs",
+            "/tmp/impulse-rs",
+            "Ship the staged scope",
+            "worker-1",
+            "ion",
+        )
+        .world_scope(WorldScope::StagedAuthoritative)
+        .verification_profile(GovernedVerificationProfile::RustWorkspaceV1)
+        .acceptance_criteria(vec!["the gate is green".to_string()])
+        .initial_subject_revision(oid('a'))
+        .role_assignment(canonical_governed_builder_assignment())
+        .build()
+        .expect_err("a traversal task id must not become a worktree path");
+        assert!(matches!(
+            error,
+            GovernedTaskContractError::InvalidField {
+                field: "task_id",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_staged_registration_accepts_the_canonical_builder_shape() {
+        let registration = staged_registration_builder().build().unwrap();
+        assert_eq!(registration.world_scope, WorldScope::StagedAuthoritative);
+        assert!(registration.world_scope.requires_staged_worktree());
+    }
+
+    #[test]
+    fn test_validate_path_segment_rejects_traversal_and_separators() {
+        for value in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            ".hidden",
+            "a b",
+            &"x".repeat(129),
+        ] {
+            assert!(
+                validate_path_segment("task_id", value).is_err(),
+                "expected `{value}` to be rejected"
+            );
+        }
+        assert!(validate_path_segment("task_id", "task-1_A9").is_ok());
+    }
+
+    fn run_with(world_scope: WorldScope, staged: Option<StagedWorktree>) -> GovernedTaskRun {
+        GovernedTaskRun {
+            id: GovernedTaskId::try_new("task-1").unwrap(),
+            revision: 0,
+            project_id: "impulse-rs".to_string(),
+            workspace_root: "/tmp/impulse-rs".to_string(),
+            task: "Ship the staged scope".to_string(),
+            acceptance_criteria: Vec::new(),
+            approval_policy: ApprovalPolicy::OperatorRequired,
+            world_scope,
+            verification_profile: None,
+            role_assignment: None,
+            role_compatibility: None,
+            runtime_id: "ion".to_string(),
+            agent_id: "worker-1".to_string(),
+            session_id: None,
+            initial_subject_revision: None,
+            staged_worktree: staged,
+            promotions: Vec::new(),
+            execution_state: GovernedExecutionState::Registered,
+            review_state: GovernedReviewState::AwaitingClaim,
+            claims: Vec::new(),
+            verifications: Vec::new(),
+            supervisor_verdicts: Vec::new(),
+            operator_decisions: Vec::new(),
+            events: Vec::new(),
+            created_at: "2026-09-02T00:00:00Z".to_string(),
+            updated_at: "2026-09-02T00:00:00Z".to_string(),
+        }
+    }
+
+    fn staged_record(status: StagedWorktreeStatus) -> StagedWorktree {
+        StagedWorktree {
+            id: GovernedRecordId::try_new("staged-1").unwrap(),
+            actor: GovernedActor {
+                kind: GovernedActorKind::System,
+                id: "impulse-daemon".to_string(),
+            },
+            root: "/tmp/impulse-rs/.impulse/worktrees/task-1".to_string(),
+            initial_subject_revision: oid('a'),
+            shared_config_digest: test_shared_config_digest(),
+            status,
+            materialized_at: "2026-09-02T00:00:00Z".to_string(),
+            based_on_revision: 0,
+        }
+    }
+
+    #[test]
+    fn test_launch_working_directory_prefers_an_active_staged_worktree() {
+        let staged = run_with(
+            WorldScope::StagedAuthoritative,
+            Some(staged_record(StagedWorktreeStatus::Active)),
+        );
+        assert_eq!(
+            staged.launch_working_directory(),
+            "/tmp/impulse-rs/.impulse/worktrees/task-1"
+        );
+    }
+
+    #[test]
+    fn test_launch_working_directory_falls_back_once_the_worktree_is_discarded() {
+        let discarded = run_with(
+            WorldScope::StagedAuthoritative,
+            Some(staged_record(StagedWorktreeStatus::Discarded)),
+        );
+        assert!(discarded.active_staged_worktree().is_none());
+        assert_eq!(discarded.launch_working_directory(), "/tmp/impulse-rs");
+
+        let authoritative = run_with(WorldScope::Authoritative, None);
+        assert_eq!(authoritative.launch_working_directory(), "/tmp/impulse-rs");
+    }
+
+    #[test]
+    fn test_expected_staged_worktree_root_is_derived_from_the_record() {
+        let task = run_with(WorldScope::StagedAuthoritative, None);
+        assert_eq!(
+            task.expected_staged_worktree_root().unwrap(),
+            PathBuf::from("/tmp/impulse-rs/.impulse/worktrees/task-1")
+        );
+    }
+
+    #[test]
+    fn test_expected_staged_worktree_root_rejects_an_unsafe_task_id() {
+        let mut task = run_with(WorldScope::StagedAuthoritative, None);
+        task.id = GovernedTaskId::try_new("../escape").unwrap();
+        assert!(task.expected_staged_worktree_root().is_err());
+    }
+
+    #[test]
+    fn test_governed_task_run_round_trips_with_staged_fields() {
+        let mut task = run_with(
+            WorldScope::StagedAuthoritative,
+            Some(staged_record(StagedWorktreeStatus::Active)),
+        );
+        task.promotions.push(GovernedPromotion {
+            id: GovernedRecordId::try_new("promotion-1").unwrap(),
+            actor: GovernedActor {
+                kind: GovernedActorKind::System,
+                id: "impulse-daemon".to_string(),
+            },
+            accepted_revision: oid('b'),
+            initial_subject_revision: oid('a'),
+            outcome: GovernedPromotionOutcome::Promoted {
+                promoted_revision: oid('b'),
+            },
+            recorded_at: "2026-09-02T00:01:00Z".to_string(),
+            based_on_revision: 0,
+        });
+        let recovered: GovernedTaskRun =
+            serde_json::from_str(&serde_json::to_string(&task).unwrap()).unwrap();
+        assert_eq!(recovered, task);
+    }
+
+    #[test]
+    fn test_governed_task_run_loads_a_record_written_before_adr_0019() {
+        let legacy = serde_json::json!({
+            "id": "task-legacy",
+            "revision": 0,
+            "project_id": "impulse-rs",
+            "workspace_root": "/tmp/impulse-rs",
+            "task": "legacy run",
+            "runtime_id": "codex",
+            "agent_id": "worker-1",
+            "created_at": "2026-07-13T00:00:00Z",
+            "updated_at": "2026-07-13T00:00:00Z"
+        });
+        let task: GovernedTaskRun = serde_json::from_value(legacy).unwrap();
+        assert_eq!(task.world_scope, WorldScope::Authoritative);
+        assert!(task.staged_worktree.is_none());
+        assert!(task.promotions.is_empty());
+        assert_eq!(task.launch_working_directory(), "/tmp/impulse-rs");
+    }
+
+    #[test]
+    fn test_claim_loads_without_a_loop_report_digest() {
+        let legacy = serde_json::json!({
+            "id": "claim-legacy",
+            "actor": {"kind": "worker", "id": "worker-1"},
+            "summary": "done",
+            "subject_revision": oid('a'),
+            "submitted_at": "2026-07-13T00:00:00Z",
+            "based_on_revision": 1
+        });
+        let claim: WorkerCompletionClaim = serde_json::from_value(legacy).unwrap();
+        assert!(claim.loop_report_digest.is_none());
+    }
+
+    #[test]
+    fn test_new_mutations_round_trip_through_serde() {
+        let mutations = vec![
+            GovernedTaskMutation::MaterializeStagedWorktree {
+                staged: StagedWorktreeInput {
+                    actor: GovernedActor {
+                        kind: GovernedActorKind::System,
+                        id: "impulse-daemon".to_string(),
+                    },
+                    root: "/tmp/impulse-rs/.impulse/worktrees/task-1".to_string(),
+                    initial_subject_revision: oid('a'),
+                    shared_config_digest: test_shared_config_digest(),
+                },
+            },
+            GovernedTaskMutation::DiscardStagedWorktree {
+                actor: GovernedActor {
+                    kind: GovernedActorKind::System,
+                    id: "impulse-daemon".to_string(),
+                },
+                reason: "rejected".to_string(),
+            },
+            GovernedTaskMutation::RecordPromotion {
+                promotion: GovernedPromotionInput {
+                    actor: GovernedActor {
+                        kind: GovernedActorKind::System,
+                        id: "impulse-daemon".to_string(),
+                    },
+                    accepted_revision: oid('b'),
+                    initial_subject_revision: oid('a'),
+                    outcome: GovernedPromotionOutcome::PromotionBlocked {
+                        canonical_head: oid('c'),
+                        reason: PromotionBlockedReason::DetachedHead,
+                    },
+                },
+            },
+        ];
+        for mutation in mutations {
+            let recovered: GovernedTaskMutation =
+                serde_json::from_str(&serde_json::to_string(&mutation).unwrap()).unwrap();
+            assert_eq!(recovered, mutation);
+        }
+    }
+
+    #[test]
+    fn test_new_event_kinds_round_trip_through_serde() {
+        for (kind, wire) in [
+            (
+                GovernedTaskEventKind::StagedWorktreeMaterialized,
+                "\"staged_worktree_materialized\"",
+            ),
+            (
+                GovernedTaskEventKind::StagedWorktreeDiscarded,
+                "\"staged_worktree_discarded\"",
+            ),
+            (GovernedTaskEventKind::LoopTripped, "\"loop_tripped\""),
+            (
+                GovernedTaskEventKind::PromotionRecorded,
+                "\"promotion_recorded\"",
+            ),
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            assert_eq!(json, wire);
+            let recovered: GovernedTaskEventKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(recovered, kind);
+        }
+    }
+
+    #[test]
+    fn test_promotion_blocked_reason_round_trips_and_displays() {
+        for (reason, wire) in [
+            (
+                PromotionBlockedReason::CanonicalHeadMoved,
+                "canonical_head_moved",
+            ),
+            (PromotionBlockedReason::DetachedHead, "detached_head"),
+            (
+                PromotionBlockedReason::ConcurrentBranchUpdate,
+                "concurrent_branch_update",
+            ),
+        ] {
+            let json = serde_json::to_string(&reason).unwrap();
+            assert_eq!(json, format!("\"{wire}\""));
+            assert_eq!(
+                serde_json::from_str::<PromotionBlockedReason>(&json).unwrap(),
+                reason
+            );
+            assert_eq!(reason.to_string(), wire);
+        }
+    }
+
+    #[test]
+    fn test_blocked_reason_is_reachable_from_the_outcome() {
+        let blocked = GovernedPromotionOutcome::PromotionBlocked {
+            canonical_head: oid('c'),
+            reason: PromotionBlockedReason::DetachedHead,
+        };
+        assert_eq!(
+            blocked.blocked_reason(),
+            Some(PromotionBlockedReason::DetachedHead)
+        );
+        assert!(!blocked.is_promoted());
+
+        let promoted = GovernedPromotionOutcome::Promoted {
+            promoted_revision: oid('b'),
+        };
+        assert_eq!(promoted.blocked_reason(), None);
+        assert!(promoted.is_promoted());
+    }
+
+    #[test]
+    fn test_claim_loads_without_loop_evidence_version() {
+        let legacy = serde_json::json!({
+            "id": "claim-legacy",
+            "actor": {"kind": "worker", "id": "worker-1"},
+            "summary": "done",
+            "subject_revision": oid('a'),
+            "loop_report_digest": format!("sha256:{}", "a".repeat(64)),
+            "submitted_at": "2026-07-13T00:00:00Z",
+            "based_on_revision": 1
+        });
+        let claim: WorkerCompletionClaim = serde_json::from_value(legacy).unwrap();
+        assert!(claim.loop_report_digest.is_some());
+        assert_eq!(claim.loop_report_version, None);
+    }
+
+    #[test]
+    fn test_shared_config_pin_round_trips_and_defaults_to_unknown() {
+        let recorded = test_shared_config_digest();
+        let json = serde_json::to_string(&recorded).unwrap();
+        assert_eq!(
+            serde_json::from_str::<SharedRepositoryConfigPin>(&json).unwrap(),
+            recorded
+        );
+        assert!(recorded.recorded().is_some());
+        assert!(!recorded.is_unknown());
+
+        let unknown = SharedRepositoryConfigPin::Unknown;
+        assert_eq!(serde_json::to_string(&unknown).unwrap(), "\"unknown\"");
+        assert_eq!(
+            serde_json::from_str::<SharedRepositoryConfigPin>("\"unknown\"").unwrap(),
+            unknown
+        );
+        assert_eq!(SharedRepositoryConfigPin::default(), unknown);
+        assert!(unknown.recorded().is_none());
+        assert!(unknown.is_unknown());
+    }
+
+    /// The whole point of the pin being an enum: a worktree recorded before it
+    /// existed must still deserialize, or one stale record fails the ledger.
+    #[test]
+    fn test_staged_worktree_loads_without_a_shared_config_pin() {
+        let legacy = serde_json::json!({
+            "id": "staged-1",
+            "actor": {"kind": "system", "id": "impulse-daemon"},
+            "root": "/tmp/impulse-rs/.impulse/worktrees/task-1",
+            "initial_subject_revision": oid('a'),
+            "status": "active",
+            "materialized_at": "2026-09-02T00:00:00Z",
+            "based_on_revision": 0
+        });
+        let staged: StagedWorktree = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            staged.shared_config_digest,
+            SharedRepositoryConfigPin::Unknown
+        );
+        assert_eq!(staged.status, StagedWorktreeStatus::Active);
+    }
+
+    #[test]
+    fn test_staged_worktree_input_loads_without_a_shared_config_pin() {
+        let legacy = serde_json::json!({
+            "actor": {"kind": "system", "id": "impulse-daemon"},
+            "root": "/tmp/impulse-rs/.impulse/worktrees/task-1",
+            "initial_subject_revision": oid('a')
+        });
+        let input: StagedWorktreeInput = serde_json::from_value(legacy).unwrap();
+        assert!(input.shared_config_digest.is_unknown());
+    }
+
+    #[test]
+    fn test_unpinned_blocked_reason_round_trips() {
+        let reason = PromotionBlockedReason::RepositoryConfigUnpinned;
+        let json = serde_json::to_string(&reason).unwrap();
+        assert_eq!(json, "\"repository_config_unpinned\"");
+        assert_eq!(
+            serde_json::from_str::<PromotionBlockedReason>(&json).unwrap(),
+            reason
+        );
+        assert_eq!(reason.to_string(), "repository_config_unpinned");
     }
 }
