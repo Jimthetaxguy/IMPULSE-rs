@@ -1026,6 +1026,7 @@ pub enum GovernedTaskMutation {
     NoteProducerReservationInterrupted {
         actor: GovernedActor,
         reason: String,
+    },
     RecordPromotion {
         promotion: GovernedPromotionInput,
     },

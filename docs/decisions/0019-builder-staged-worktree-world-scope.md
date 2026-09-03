@@ -286,6 +286,31 @@ mutation into the picture, and it lands before ADR-0020.
 | Deferred | Owner |
 |---|---|
 | `PromoteGovernedOutcome` daemon endpoint, protocol bump, and CLI subcommand | the daemon / socket-provenance lane (`src/daemon/**`) |
+
+## Stacking on ADR-0018 (recorded 2026-09-03 during the merge train)
+
+This lane is stacked on ADR-0018's socket actor provenance, so:
+
+- **`DAEMON_PROTOCOL_VERSION` is 8 here.** `main` is 6; ADR-0018 takes 7 (it adds
+  `PresentOperatorCapability` and the operator-class requirement on `RecordOperatorDecision`);
+  this ADR takes 8 (the staged-worktree mutations and the promotion outcome they carry). Any
+  further lane claiming 7 -- the Codex packaged-acceptance branch does -- must rebase and take 9.
+- **`apply_mutation` takes a single `MutationContext`.** ADR-0018 added an
+  `operator_authentication: OperatorAuthentication` parameter; this lane replaced the loose `now:
+  &str` with a `MutationContext { now, replay_claim }` so replay reproduces clock-derived decisions
+  exactly. The merged shape keeps `MutationContext` and carries `operator_authentication` as a
+  field on it: the live path builds `MutationContext::live(&now, operator_authentication)`, the
+  replay path builds one carrying the provenance read back off the stored decision. The struct is
+  private to `state/governed_task.rs`, so a request handler still cannot assert its own provenance.
+- **All three of this ADR's mutations are operator-only.** `MaterializeStagedWorktree`,
+  `DiscardStagedWorktree`, and `RecordPromotion` are classified as requiring an operator-class
+  connection in `authorize_governed_mutation`, regardless of verification profile. The staged
+  worktree is daemon-owned end to end; a launched Builder that could drive these would be able to
+  materialize a scope it was never registered for, discard the evidence of its own run, or
+  fast-forward the canonical branch without acceptance. ADR-0018's deliberately exhaustive,
+  no-catch-all match is what forced this classification at compile time -- `RecordPromotion` is the
+  exact variant that rule was written to catch.
+
 | Desktop launch wiring: registering with a staged scope, materializing before the PTY starts, and using `launch_working_directory` as the pane cwd | the desktop track (`impulse-desktop/**`) |
 | Durable producer reservation around `fast_forward_canonical_branch` | the producer-reservation-journal lane |
 | Materializing `ReadOnlySnapshot` and `DisposableScratch` | future work; registration refuses them today |
