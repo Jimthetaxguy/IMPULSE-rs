@@ -322,6 +322,18 @@ pub fn authorize_governed_mutation(
         GovernedTaskMutation::NoteProducerReservationInterrupted { .. } => {
             Some("NoteProducerReservationInterrupted")
         }
+        // ADR-0019 (this lane). The staged worktree is daemon-owned: it is
+        // materialized from the daemon-attested initial OID, discarded by the
+        // daemon, and promoted only after an operator decision. A launched
+        // Builder that could drive any of the three would be able to
+        // materialize a scope it was never registered for, throw away the
+        // evidence of its own run, or fast-forward the canonical branch
+        // without acceptance -- so all three are operator-only regardless of
+        // profile. `RecordPromotion` is the exact variant ADR-0018's
+        // no-catch-all rule was written to catch.
+        GovernedTaskMutation::MaterializeStagedWorktree { .. } => Some("MaterializeStagedWorktree"),
+        GovernedTaskMutation::DiscardStagedWorktree { .. } => Some("DiscardStagedWorktree"),
+        GovernedTaskMutation::RecordPromotion { .. } => Some("RecordPromotion"),
         GovernedTaskMutation::SubmitClaim { .. }
         | GovernedTaskMutation::RecordVerification { .. }
         | GovernedTaskMutation::RecordSupervisorVerdict { .. } => None,
@@ -463,6 +475,37 @@ mod tests {
                 rationale: "looks right".to_string(),
             },
         }
+    }
+
+    /// ADR-0019's three daemon-owned staged-worktree mutations.
+    fn staged_scope_mutations() -> Vec<GovernedTaskMutation> {
+        use impulse_ops::governed_task::{
+            GovernedPromotionInput, GovernedPromotionOutcome, StagedWorktreeInput,
+        };
+        vec![
+            GovernedTaskMutation::MaterializeStagedWorktree {
+                staged: StagedWorktreeInput {
+                    actor: system_actor(),
+                    root: "/tmp/project/.impulse/worktrees/task-1".to_string(),
+                    initial_subject_revision: "a".repeat(40),
+                    shared_config_digest: Default::default(),
+                },
+            },
+            GovernedTaskMutation::DiscardStagedWorktree {
+                actor: system_actor(),
+                reason: "the run was discarded".to_string(),
+            },
+            GovernedTaskMutation::RecordPromotion {
+                promotion: GovernedPromotionInput {
+                    actor: system_actor(),
+                    accepted_revision: "b".repeat(40),
+                    initial_subject_revision: "a".repeat(40),
+                    outcome: GovernedPromotionOutcome::Promoted {
+                        promoted_revision: "b".repeat(40),
+                    },
+                },
+            },
+        ]
     }
 
     fn system_actor() -> GovernedActor {
@@ -701,6 +744,28 @@ mod tests {
             !mutation_authorization_needs_profile(&note),
             "the note is gated regardless of profile, so no ledger lookup is needed"
         );
+    }
+
+    #[test]
+    fn test_authorize_gates_every_staged_worktree_mutation_operator_only() {
+        // ADR-0019's three mutations are daemon-owned. A launched Builder on a
+        // non-operator connection must not reach any of them, profiled or not.
+        for mutation in staged_scope_mutations() {
+            for profiled in [true, false] {
+                assert!(
+                    authorize_governed_mutation(&mutation, profiled, ConnectionClass::NonOperator)
+                        .is_err(),
+                    "the staged-worktree mutations are operator-only regardless of profile"
+                );
+            }
+            assert!(
+                authorize_governed_mutation(&mutation, true, ConnectionClass::Operator).is_ok()
+            );
+            assert!(
+                !mutation_authorization_needs_profile(&mutation),
+                "gating does not depend on the profile, so no ledger lookup is needed"
+            );
+        }
     }
 
     #[test]

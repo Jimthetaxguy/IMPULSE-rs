@@ -100,6 +100,7 @@ in `VISION.md` are resolved.
 | [0015](decisions/0015-harness-owned-step-model.md) | Harness-owned step model choice | Accepted | Pure Impulse-owned per-step policy; hosts retain inference, provider, and evidence authority |
 | [0017](decisions/0017-canonical-loop-contract.md) | Canonical loop contract | Proposed | Typed loop budgets, breaker-evaluated stop conditions, and termination evidence for Ion tool loops |
 | [0018](decisions/0018-socket-actor-provenance.md) | Socket actor provenance | Proposed | Connection classes from peer credentials plus a per-run operator capability; only an operator surface can mint `accepted` |
+| [0019](decisions/0019-builder-staged-worktree-world-scope.md) | Builder staged-worktree world scope | Proposed | Declared world scope, a disposable staged Builder worktree, fast-forward-only promotion after acceptance, and the governed Builder loop binding |
 
 See [decisions/README.md](decisions/README.md) for full decision log.
 

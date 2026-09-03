@@ -332,10 +332,13 @@ mod tests {
     // ── PROTOCOL_VERSION ───────────────────────────────────────────────
 
     #[test]
-    fn test_protocol_version_is_seven() {
+    fn test_protocol_version_is_eight() {
         // v7 (ADR-0018) adds PresentOperatorCapability and the operator-class
-        // requirement on RecordOperatorDecision.
-        assert_eq!(PROTOCOL_VERSION, 7);
+        // requirement on RecordOperatorDecision. v8 (ADR-0019, this lane,
+        // stacked on top of it) adds the staged-worktree world scope: the
+        // MaterializeStagedWorktree / DiscardStagedWorktree / RecordPromotion
+        // mutations and the promotion outcome they carry.
+        assert_eq!(PROTOCOL_VERSION, 8);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use impulse_ops::agent_registry::AgentPlatformId;
 use impulse_ops::governed_task::{
     ApprovalPolicy, GovernedExecutionState, GovernedReviewState, GovernedTaskId,
-    GovernedTaskRegistration, GovernedTaskRun, GovernedTaskSnapshot,
+    GovernedTaskRegistration, GovernedTaskRun, GovernedTaskSnapshot, WorldScope,
 };
 use impulse_ops::role_assignment::{
     AgentRoleAssignment, AgentRoleId, EnforcementStrength, RoleCapabilityRequirement,
@@ -66,6 +66,7 @@ fn task_snapshot_keeps_execution_and_review_state_independent() {
         task: "Prove the lifecycle".into(),
         acceptance_criteria: vec![],
         approval_policy: ApprovalPolicy::OperatorRequired,
+        world_scope: WorldScope::default(),
         verification_profile: None,
         role_assignment: None,
         role_compatibility: None,
@@ -73,6 +74,8 @@ fn task_snapshot_keeps_execution_and_review_state_independent() {
         agent_id: "agent-01".into(),
         session_id: None,
         initial_subject_revision: None,
+        staged_worktree: None,
+        promotions: vec![],
         execution_state: GovernedExecutionState::RuntimeExited,
         review_state: GovernedReviewState::AwaitingOperator,
         claims: vec![],
