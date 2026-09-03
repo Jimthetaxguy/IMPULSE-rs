@@ -577,12 +577,46 @@ pub enum OperatorDecisionKind {
     Reject,
 }
 
+/// The client-supplied half of an operator decision.
+///
+/// `deny_unknown_fields` matches [`GovernedClaimRequest`] and does real work
+/// here: the daemon-owned provenance field lives on [`OperatorDecision`], not on
+/// this type, so a payload that tries to assert its own `authentication` is
+/// rejected at the boundary rather than silently ignored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OperatorDecisionInput {
     pub actor: GovernedActor,
     pub supervisor_verdict_id: GovernedRecordId,
     pub decision: OperatorDecisionKind,
     pub rationale: String,
+}
+
+/// How much the daemon can honestly attest about the operator behind a
+/// decision (ADR-0018).
+///
+/// This is deliberately absent from [`OperatorDecisionInput`]: the value is
+/// stamped by the daemon from the *connection class* the mutation arrived on
+/// and is never read from client-supplied payload. A caller that reaches the
+/// state layer directly (direct CLI mode, in-process tests) gets the
+/// serde-default [`OperatorAuthentication::Declared`], which is also what an
+/// operator decision recorded before ADR-0018 deserializes as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorAuthentication {
+    /// Operator identity is asserted by the caller inside the same-user socket
+    /// trust boundary. No connection-level proof was presented.
+    #[default]
+    Declared,
+    /// The decision arrived on a connection that presented this daemon run's
+    /// operator capability and whose peer uid matched the daemon's own uid.
+    CapabilityAuthenticated,
+}
+
+impl OperatorAuthentication {
+    pub fn is_capability_authenticated(self) -> bool {
+        matches!(self, Self::CapabilityAuthenticated)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -594,6 +628,10 @@ pub struct OperatorDecision {
     pub rationale: String,
     pub decided_at: String,
     pub based_on_revision: u64,
+    /// Daemon-stamped connection provenance (ADR-0018). Serde-defaulted so
+    /// records written before ADR-0018 load as `Declared`.
+    #[serde(default)]
+    pub authentication: OperatorAuthentication,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -839,3 +877,86 @@ impl GovernedTaskRun {
 /// The snapshot intentionally carries the full typed record in the first
 /// protocol version. Raw command output remains out-of-line.
 pub type GovernedTaskSnapshot = GovernedTaskRun;
+
+#[cfg(test)]
+mod operator_authentication_tests {
+    use super::*;
+
+    fn decision() -> OperatorDecision {
+        OperatorDecision {
+            id: GovernedRecordId::try_new("operator-decision-a").unwrap(),
+            actor: GovernedActor {
+                kind: GovernedActorKind::Operator,
+                id: "operator-a".to_string(),
+            },
+            supervisor_verdict_id: GovernedRecordId::try_new("verdict-a").unwrap(),
+            decision: OperatorDecisionKind::Approve,
+            rationale: "accepted".to_string(),
+            decided_at: "2026-09-02T00:00:00Z".to_string(),
+            based_on_revision: 4,
+            authentication: OperatorAuthentication::CapabilityAuthenticated,
+        }
+    }
+
+    #[test]
+    fn test_operator_authentication_round_trips_through_serde() {
+        for value in [
+            OperatorAuthentication::Declared,
+            OperatorAuthentication::CapabilityAuthenticated,
+        ] {
+            let json = serde_json::to_string(&value).unwrap();
+            let decoded: OperatorAuthentication = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, value);
+        }
+        assert_eq!(
+            serde_json::to_string(&OperatorAuthentication::CapabilityAuthenticated).unwrap(),
+            "\"capability_authenticated\""
+        );
+    }
+
+    #[test]
+    fn test_operator_decision_round_trips_with_authentication() {
+        let original = decision();
+        let json = serde_json::to_string(&original).unwrap();
+        let decoded: OperatorDecision = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, original);
+        assert!(decoded.authentication.is_capability_authenticated());
+    }
+
+    #[test]
+    fn test_operator_decision_without_authentication_field_loads_as_declared() {
+        // A record persisted before ADR-0018 has no `authentication` key.
+        let mut value = serde_json::to_value(decision()).unwrap();
+        value.as_object_mut().unwrap().remove("authentication");
+        let decoded: OperatorDecision = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.authentication, OperatorAuthentication::Declared);
+        assert!(!decoded.authentication.is_capability_authenticated());
+    }
+
+    #[test]
+    fn test_operator_decision_input_rejects_a_payload_asserting_its_own_provenance() {
+        // The daemon stamps provenance; a client payload must not be able to
+        // assert it. `OperatorDecisionInput` has no such field and denies
+        // unknown ones, so the attempt fails at the boundary.
+        let error = serde_json::from_value::<OperatorDecisionInput>(serde_json::json!({
+            "actor": {"kind": "operator", "id": "operator-a"},
+            "supervisor_verdict_id": "verdict-a",
+            "decision": "approve",
+            "rationale": "accepted",
+            "authentication": "capability_authenticated",
+        }))
+        .unwrap_err();
+        assert!(format!("{error}").contains("authentication"));
+
+        // The legitimate shape still round-trips and carries no provenance.
+        let input: OperatorDecisionInput = serde_json::from_value(serde_json::json!({
+            "actor": {"kind": "operator", "id": "operator-a"},
+            "supervisor_verdict_id": "verdict-a",
+            "decision": "approve",
+            "rationale": "accepted",
+        }))
+        .unwrap();
+        let encoded = serde_json::to_value(&input).unwrap();
+        assert!(encoded.get("authentication").is_none());
+    }
+}

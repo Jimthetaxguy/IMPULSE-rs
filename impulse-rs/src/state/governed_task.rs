@@ -9,8 +9,8 @@ use impulse_ops::governed_task::{
     GovernedReviewState, GovernedTaskContractError, GovernedTaskEvent, GovernedTaskEventKind,
     GovernedTaskId, GovernedTaskMutation, GovernedTaskMutationRequest, GovernedTaskRegistration,
     GovernedTaskRun, GovernedVerification, GovernedVerificationInput, GovernedVerificationOutcome,
-    OperatorDecision, OperatorDecisionInput, OperatorDecisionKind, SupervisorVerdict,
-    SupervisorVerdictInput, SupervisorVerdictKind, WorkerCompletionClaim,
+    OperatorAuthentication, OperatorDecision, OperatorDecisionInput, OperatorDecisionKind,
+    SupervisorVerdict, SupervisorVerdictInput, SupervisorVerdictKind, WorkerCompletionClaim,
     WorkerCompletionClaimInput, MAX_GOVERNED_COMMANDS, MAX_GOVERNED_COMMAND_ARGS,
     MAX_GOVERNED_COMMAND_ARG_BYTES, MAX_GOVERNED_EVENTS, MAX_GOVERNED_RECORDS_PER_KIND,
     MAX_GOVERNED_REFERENCES, MAX_GOVERNED_REFERENCE_BYTES,
@@ -348,9 +348,30 @@ impl State {
         Ok(task)
     }
 
+    /// Apply a mutation whose operator provenance is only *declared*.
+    ///
+    /// Every caller that is not the daemon's socket boundary uses this: direct
+    /// CLI mode, in-process callers, and tests. The socket boundary uses
+    /// [`State::mutate_governed_task_authenticated`] so an approval that
+    /// arrived on an operator-class connection is recorded as such (ADR-0018).
     pub fn mutate_governed_task(
         &self,
         request: GovernedTaskMutationRequest,
+    ) -> Result<GovernedTaskRun> {
+        self.mutate_governed_task_authenticated(request, OperatorAuthentication::Declared)
+    }
+
+    /// Apply a mutation, stamping `operator_authentication` onto any operator
+    /// decision it records.
+    ///
+    /// `operator_authentication` is derived by the daemon from the connection
+    /// the request arrived on. It is never read from the request payload:
+    /// [`OperatorDecisionInput`] has no such field precisely so a client cannot
+    /// assert its own provenance.
+    pub fn mutate_governed_task_authenticated(
+        &self,
+        request: GovernedTaskMutationRequest,
+        operator_authentication: OperatorAuthentication,
     ) -> Result<GovernedTaskRun> {
         let request_fingerprint = fingerprint_mutation_operation(&request)
             .context("Failed to fingerprint governed task mutation")?;
@@ -405,7 +426,12 @@ impl State {
             )
         })?;
         let mut updated = current;
-        apply_mutation(&mut updated, request.mutation, next_revision)?;
+        apply_mutation(
+            &mut updated,
+            request.mutation,
+            next_revision,
+            operator_authentication,
+        )?;
         updated.revision = next_revision;
         updated.updated_at = impulse_ops::now_rfc3339();
         if let Some(event) = updated.events.last_mut() {
@@ -620,6 +646,10 @@ fn validate_task_history(task: &GovernedTaskRun) -> Result<BTreeMap<u64, String>
             .ok_or_else(|| anyhow::anyhow!("non-registration event has revision zero"))?;
         projection.revision = based_on_revision;
 
+        // Replaying an operator decision must reproduce the provenance the
+        // daemon originally stamped, not re-derive it: the replayed projection
+        // is compared against stored truth.
+        let mut replay_operator_authentication = OperatorAuthentication::Declared;
         let (mutation, fingerprint_input_mutation) = match event.kind {
             GovernedTaskEventKind::Registered => {
                 anyhow::bail!("registration event may appear only at revision zero")
@@ -798,6 +828,7 @@ fn validate_task_history(task: &GovernedTaskRun) -> Result<BTreeMap<u64, String>
                     .id
                     .clone();
                 operator_index += 1;
+                replay_operator_authentication = decision.authentication;
                 let fingerprint_input = OperatorDecisionInput {
                     actor: decision.actor.clone(),
                     supervisor_verdict_id: stored_verdict.id.clone(),
@@ -840,7 +871,13 @@ fn validate_task_history(task: &GovernedTaskRun) -> Result<BTreeMap<u64, String>
                 event.revision
             );
         }
-        apply_mutation(&mut projection, mutation, event.revision).with_context(|| {
+        apply_mutation(
+            &mut projection,
+            mutation,
+            event.revision,
+            replay_operator_authentication,
+        )
+        .with_context(|| {
             format!(
                 "governed task event {:?} at revision {} cannot be replayed",
                 event.kind, event.revision
@@ -993,6 +1030,7 @@ fn apply_mutation(
     task: &mut GovernedTaskRun,
     mutation: GovernedTaskMutation,
     event_revision: u64,
+    operator_authentication: OperatorAuthentication,
 ) -> Result<()> {
     let now = impulse_ops::now_rfc3339();
     require_capacity(
@@ -1237,6 +1275,7 @@ fn apply_mutation(
                 rationale: decision.rationale,
                 decided_at: now.clone(),
                 based_on_revision: task.revision,
+                authentication: operator_authentication,
             });
             task.review_state = match decision_kind {
                 OperatorDecisionKind::Approve => GovernedReviewState::Accepted,
@@ -2618,6 +2657,345 @@ mod tests {
                 .list_accepted_run_memory_candidates("impulse-test")
                 .unwrap(),
             candidates
+        );
+    }
+
+    // ── ADR-0018: operator authentication provenance ────────────────────
+
+    fn operator_decide_authenticated(
+        state: &State,
+        task: &GovernedTaskRun,
+        request_id: &str,
+        authentication: OperatorAuthentication,
+    ) -> GovernedTaskRun {
+        state
+            .mutate_governed_task_authenticated(
+                mutation(
+                    task,
+                    request_id,
+                    GovernedTaskMutation::RecordOperatorDecision {
+                        decision: OperatorDecisionInput {
+                            actor: actor(GovernedActorKind::Operator, "james"),
+                            supervisor_verdict_id: task
+                                .latest_supervisor_verdict()
+                                .unwrap()
+                                .id
+                                .clone(),
+                            decision: OperatorDecisionKind::Approve,
+                            rationale: "decided from operator surface".into(),
+                        },
+                    },
+                ),
+                authentication,
+            )
+            .unwrap()
+    }
+
+    fn awaiting_operator(state: &State, suffix: &str) -> GovernedTaskRun {
+        let registered = state
+            .register_governed_task(registration(state, &format!("register-{suffix}")))
+            .unwrap();
+        let running = state
+            .mutate_governed_task(mutation(
+                &registered,
+                &format!("running-{suffix}"),
+                GovernedTaskMutation::MarkRunning {
+                    actor: actor(GovernedActorKind::System, "desktop"),
+                },
+            ))
+            .unwrap();
+        let claimed = claim(state, &running, &format!("claim-{suffix}"));
+        let verified = verify(
+            state,
+            &claimed,
+            &format!("verify-{suffix}"),
+            GovernedVerificationOutcome::Passed,
+        );
+        recommend_accept(state, &verified, &format!("review-{suffix}"))
+    }
+
+    #[test]
+    fn mutate_governed_task_defaults_operator_decisions_to_declared_provenance() {
+        let (_root, state) = state();
+        let judged = awaiting_operator(&state, "declared");
+        let accepted = operator_decide(
+            &state,
+            &judged,
+            "approve-declared",
+            OperatorDecisionKind::Approve,
+        );
+
+        assert_eq!(
+            accepted.operator_decisions.last().unwrap().authentication,
+            OperatorAuthentication::Declared,
+            "a caller that does not pass connection provenance never claims authentication"
+        );
+    }
+
+    #[test]
+    fn authenticated_mutation_stamps_capability_provenance_on_the_decision() {
+        let (_root, state) = state();
+        let judged = awaiting_operator(&state, "authenticated");
+        let accepted = operator_decide_authenticated(
+            &state,
+            &judged,
+            "approve-authenticated",
+            OperatorAuthentication::CapabilityAuthenticated,
+        );
+
+        let decision = accepted.operator_decisions.last().unwrap();
+        assert!(decision.authentication.is_capability_authenticated());
+        assert_eq!(accepted.review_state, GovernedReviewState::Accepted);
+
+        // The stamp survives a reload, and the replayed history still
+        // validates against stored truth.
+        let reloaded = State::new(state.storage().base_path().to_path_buf()).unwrap();
+        let stored = reloaded
+            .get_governed_task("impulse-test", &accepted.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored, accepted);
+        assert!(stored
+            .operator_decisions
+            .last()
+            .unwrap()
+            .authentication
+            .is_capability_authenticated());
+    }
+
+    #[test]
+    fn client_supplied_authentication_cannot_be_smuggled_through_the_mutation_payload() {
+        let (_root, state) = state();
+        let judged = awaiting_operator(&state, "smuggle");
+
+        // A client crafting the wire payload cannot assert its own provenance:
+        // the field lives on the persisted record, is written by the daemon,
+        // and `OperatorDecisionInput` denies unknown keys, so the attempt fails
+        // before it reaches the state layer at all.
+        let mut wire = serde_json::to_value(mutation(
+            &judged,
+            "approve-smuggle",
+            GovernedTaskMutation::RecordOperatorDecision {
+                decision: OperatorDecisionInput {
+                    actor: actor(GovernedActorKind::Operator, "james"),
+                    supervisor_verdict_id: judged.latest_supervisor_verdict().unwrap().id.clone(),
+                    decision: OperatorDecisionKind::Approve,
+                    rationale: "decided from operator surface".into(),
+                },
+            },
+        ))
+        .unwrap();
+        let legitimate = wire.clone();
+        wire["mutation"]["data"]["decision"]["authentication"] =
+            serde_json::json!("capability_authenticated");
+        let error = serde_json::from_value::<GovernedTaskMutationRequest>(wire).unwrap_err();
+        assert!(
+            format!("{error}").contains("authentication"),
+            "a payload asserting its own provenance must be rejected at the boundary"
+        );
+
+        // The same request without that key is accepted, and the decision it
+        // records is `Declared` because this caller passed no connection class.
+        let request: GovernedTaskMutationRequest = serde_json::from_value(legitimate).unwrap();
+        let accepted = state.mutate_governed_task(request).unwrap();
+        assert_eq!(
+            accepted.operator_decisions.last().unwrap().authentication,
+            OperatorAuthentication::Declared
+        );
+    }
+
+    #[test]
+    fn caller_composed_evidence_never_claims_an_authenticated_operator() {
+        use impulse_ops::memory_candidate::AcceptedRunSourceAssurance;
+
+        let (_root, state) = state();
+        let judged = awaiting_operator(&state, "composed");
+        operator_decide_authenticated(
+            &state,
+            &judged,
+            "approve-composed",
+            OperatorAuthentication::CapabilityAuthenticated,
+        );
+
+        let candidates = state
+            .list_accepted_run_memory_candidates("impulse-test")
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].source_assurance,
+            AcceptedRunSourceAssurance::CallerComposedEvidenceDeclaredOperator,
+            "these fixtures carry no verification profile, so the evidence half is the weaker one"
+        );
+        assert!(!candidates[0].source_assurance.is_authenticated_operator());
+    }
+
+    /// A profiled registration, materialized directly in the ledger.
+    ///
+    /// The daemon's own profiled-registration path additionally proves a clean
+    /// canonical Git worktree at a committed HEAD (`handle_governed_task_request`),
+    /// which is out of scope here: this fixture exists to prove the *assurance
+    /// mapping*, and the accepted-run chain is driven through the ordinary
+    /// state API afterwards.
+    fn profiled_awaiting_operator(state: &State, suffix: &str) -> GovernedTaskRun {
+        let oid = "b".repeat(40);
+        let root = state.storage().base_path().parent().unwrap();
+        let assignment = impulse_ops::role_assignment::canonical_governed_builder_assignment();
+        let registration = GovernedTaskRegistration::builder(
+            format!("register-{suffix}"),
+            format!("task-{suffix}"),
+            "impulse-test",
+            root.display().to_string(),
+            "Ship governed task truth",
+            "worker-1",
+            "ion",
+        )
+        .acceptance_criteria(vec!["the committed Rust workspace passes".to_string()])
+        .verification_profile(
+            impulse_ops::governed_task::GovernedVerificationProfile::RustWorkspaceV1,
+        )
+        .initial_subject_revision(oid.clone())
+        .role_assignment(assignment.clone())
+        .role_compatibility(
+            impulse_ops::agent_registry::AgentRegistry::builtin()
+                .evaluate_role_compatibility(
+                    &impulse_ops::agent_registry::AgentPlatformId::try_new("ion").unwrap(),
+                    &assignment,
+                )
+                .unwrap(),
+        )
+        .build()
+        .unwrap();
+        let registered = state.register_governed_task(registration).unwrap();
+        let running = state
+            .mutate_governed_task(mutation(
+                &registered,
+                &format!("running-{suffix}"),
+                GovernedTaskMutation::MarkRunning {
+                    actor: actor(GovernedActorKind::System, "desktop"),
+                },
+            ))
+            .unwrap();
+        let claimed = state
+            .mutate_governed_task(mutation(
+                &running,
+                &format!("claim-{suffix}"),
+                GovernedTaskMutation::SubmitClaim {
+                    claim: WorkerCompletionClaimInput {
+                        actor: actor(GovernedActorKind::Worker, "worker-1"),
+                        summary: "implementation complete".into(),
+                        subject_revision: oid.clone(),
+                        artifact_ids: vec!["artifact-1".into()],
+                        diff_ref: Some(format!("git:{oid}")),
+                    },
+                },
+            ))
+            .unwrap();
+        let verified = verify(
+            state,
+            &claimed,
+            &format!("verify-{suffix}"),
+            GovernedVerificationOutcome::Passed,
+        );
+        recommend_accept(state, &verified, &format!("review-{suffix}"))
+    }
+
+    #[test]
+    fn profiled_evidence_plus_an_authenticated_operator_yields_the_authenticated_assurance() {
+        use impulse_ops::memory_candidate::AcceptedRunSourceAssurance;
+
+        let (_root, state) = state();
+        let judged = profiled_awaiting_operator(&state, "profiled-auth");
+        operator_decide_authenticated(
+            &state,
+            &judged,
+            "approve-profiled-auth",
+            OperatorAuthentication::CapabilityAuthenticated,
+        );
+
+        let candidates = state
+            .list_accepted_run_memory_candidates("impulse-test")
+            .unwrap();
+        assert_eq!(
+            candidates.len(),
+            1,
+            "exactly one candidate per accepted run"
+        );
+        assert_eq!(
+            candidates[0].source_assurance,
+            AcceptedRunSourceAssurance::DaemonProfiledEvidenceAuthenticatedOperator
+        );
+        assert!(candidates[0]
+            .proposed_summary
+            .contains("authenticated operator"));
+        candidates[0].validate_shape().unwrap();
+    }
+
+    #[test]
+    fn profiled_evidence_with_a_declared_operator_keeps_the_declared_assurance() {
+        use impulse_ops::memory_candidate::AcceptedRunSourceAssurance;
+
+        let (_root, state) = state();
+        let judged = profiled_awaiting_operator(&state, "profiled-declared");
+        operator_decide(
+            &state,
+            &judged,
+            "approve-profiled-declared",
+            OperatorDecisionKind::Approve,
+        );
+
+        let candidates = state
+            .list_accepted_run_memory_candidates("impulse-test")
+            .unwrap();
+        assert_eq!(
+            candidates[0].source_assurance,
+            AcceptedRunSourceAssurance::DaemonProfiledEvidenceDeclaredOperator
+        );
+        assert!(!candidates[0].source_assurance.is_authenticated_operator());
+    }
+
+    #[test]
+    fn a_ledger_at_a_superseded_derivation_version_reconciles_instead_of_failing_startup() {
+        let (_root, state) = state();
+        let accepted = accept_run(&state, "supersede");
+        let before = state
+            .list_accepted_run_memory_candidates("impulse-test")
+            .unwrap();
+        assert_eq!(before.len(), 1);
+
+        // Simulate a ledger written before the ADR-0018 derivation bump: the
+        // stored candidate carries the previous derivation version (and, with
+        // it, a different id than today's derivation produces).
+        rewrite_persisted_candidate_ledger(&state, |ledger| {
+            let candidates = ledger["candidates"].as_object_mut().unwrap();
+            let (id, mut candidate) = candidates
+                .iter()
+                .next()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .unwrap();
+            candidates.remove(&id);
+            candidate["derivation_version"] = serde_json::json!(
+                impulse_ops::memory_candidate::ACCEPTED_RUN_MEMORY_DERIVATION_VERSION - 1
+            );
+            let legacy_id = format!("memory-candidate-{}", "f".repeat(64));
+            candidate["id"] = serde_json::json!(legacy_id);
+            candidates.insert(legacy_id, candidate);
+        });
+
+        let reloaded = State::new(state.storage().base_path().to_path_buf()).unwrap();
+        let after = reloaded
+            .list_accepted_run_memory_candidates("impulse-test")
+            .unwrap();
+        assert_eq!(
+            after, before,
+            "the superseded entry is dropped and re-derived from governed-task truth"
+        );
+        assert_eq!(
+            reloaded
+                .get_governed_task("impulse-test", &accepted.id)
+                .unwrap()
+                .unwrap(),
+            accepted,
+            "governed-task truth is untouched by the projection repair"
         );
     }
 }

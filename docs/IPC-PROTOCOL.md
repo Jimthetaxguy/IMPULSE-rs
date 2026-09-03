@@ -1,7 +1,7 @@
 # Impulse IPC Protocol
 
 > Unix domain socket protocol between Impulse daemon and clients (GUI, CLI `--daemon` mode).
-> **Protocol version: 6** — see [Version section](#protocol-version) for upgrade notes.
+> **Protocol version: 7** — see [Version section](#protocol-version) for upgrade notes.
 
 ---
 
@@ -52,12 +52,22 @@ The daemon reports `protocol_version` in `Ping`/`Status` results.
 
 | Constant | Value | Location |
 |----------|-------|----------|
-| `DAEMON_PROTOCOL_VERSION` / `PROTOCOL_VERSION` | **6** | Shared ops contract / daemon protocol |
+| `DAEMON_PROTOCOL_VERSION` / `PROTOCOL_VERSION` | **7** | Shared ops contract / daemon protocol |
 
 Current clients do **not** perform a version handshake or preflight-reject a mismatched daemon, and
 the protocol does not negotiate a downgrade. Known variants continue through normal JSON-line
 request/response decoding; an unknown request or response variant fails through the ordinary Serde
 or client error path. The reported number is observability, not negotiated compatibility.
+
+**Upgrading from v6:** v7 adds the connection-scoped `PresentOperatorCapability` request and makes
+`accepted` provenance-enforced (ADR-0018). Every accepted connection starts non-operator; presenting
+this daemon run's capability from a peer uid matching the daemon's raises that one connection to
+operator class. `MutateGovernedTask` with `RecordOperatorDecision` — and, for a task with a
+verification profile, `MarkRunning`/`MarkLaunchFailed`/`MarkRuntimeExited` — is rejected from a
+non-operator connection with a typed error, before the idempotency receipt is read, leaving the task
+revision unchanged. An old client keeps working for every other request. The accepted-run candidate
+derivation version moves to 2 and gains the `daemon_profiled_evidence_authenticated_operator`
+assurance; a `MEMORY_CANDIDATES.json` written at version 1 is pruned and re-derived on load.
 
 **Upgrading from v5:** v6 additively exposes the serde-defaulted
 `ProjectOpsSnapshot.memory_candidates` collection. Each entry is a deterministic, pending-review
@@ -148,6 +158,23 @@ and idempotency request ID; process exit and review/acceptance remain independen
 | `SubscribeOps` | `{since_seq?}` | v1 | Get ops updates since sequence number |
 | `PublishTerminalOps` | `{report}` | v1 | Push live terminal telemetry from the desktop shell |
 
+### Connection Provenance
+
+| Request | Data | Since | Description |
+|---------|------|-------|-------------|
+| `PresentOperatorCapability` | `{token}` | v7 | Raise this connection to operator class by presenting the daemon run's capability |
+
+Classification is per connection and is never derived from request payload. A connection begins as
+`non_operator` — which is what a launched governed runtime holding `IMPULSE_SOCKET_PATH` is — and a
+successful presentation returns `{"connection_class": "operator"}`. The presentation succeeds only
+when the peer uid, read from `SO_PEERCRED`/`LOCAL_PEERCRED`, equals the daemon's own uid **and** the
+token matches; a rejection leaves the class unchanged and never echoes the token. The daemon writes
+its capability at mode 0600 beside the socket (`impulse.sock` -> `impulse.operator-cap`) while it is
+listening, and removes it on shutdown. `IMPULSE_OPERATOR_CAPABILITY` is an accepted client override;
+governed panes never receive it, because every inherited `IMPULSE_*` key is scrubbed before a pane
+spawns. This is a structural boundary, not protection against a same-uid process that deliberately
+reads the file — see ADR-0018.
+
 ### Governed Tasks
 
 | Request | Data | Since | Description |
@@ -161,7 +188,10 @@ and idempotency request ID; process exit and review/acceptance remain independen
 | `RunGovernedSupervisorReview` | `{request: {request_id, project_id, task_id, expected_revision}}` | v5 | Run one strict API-only Supervisor review and derive its verdict |
 
 Governed task actor kinds are typed provenance and transition claims, not cryptographic same-user
-authentication. The daemon socket directory/socket/PID permissions protect the local OS-user
+authentication. Since v7 the *connection* behind an operator decision is authorized: the mutation
+requires operator class, and the daemon stamps `OperatorDecision.authentication`
+(`declared` or `capability_authenticated`) from the connection rather than from the payload, which
+carries no such field. The daemon socket directory/socket/PID permissions protect the local OS-user
 boundary. For unprofiled tasks, the generic mutation endpoint still accepts caller-composed records
 and validates their shape/lifecycle consistency. For `rust_workspace_v1`, automatic producer
 records can only enter through the three v5 requests: the daemon attests the clean Git subject,
@@ -393,7 +423,7 @@ All responses use the `DaemonResponse` enum.
 Contains the result as a JSON value. The structure depends on the request.
 
 ```json
-{"type": "Ok", "data": {"result": {"sessions": 3, "active": 1, "protocol_version": 6}}}
+{"type": "Ok", "data": {"result": {"sessions": 3, "active": 1, "protocol_version": 7}}}
 ```
 
 ### Error
@@ -488,6 +518,19 @@ the supplied role compatibility from the daemon-owned runtime registry and rejec
 ---
 
 ## Changelog
+
+### v7 — Socket actor provenance
+
+Added 2026-09-02 (ADR-0018):
+
+- `PresentOperatorCapability` request; per-connection `operator`/`non_operator` classes decided from
+  peer credentials plus a per-daemon-run 0600 capability published beside the socket.
+- `RecordOperatorDecision`, and a profiled task's `MarkRunning`/`MarkLaunchFailed`/
+  `MarkRuntimeExited`, rejected from non-operator connections with a typed error and no revision
+  change.
+- `OperatorDecision.authentication` (serde-defaulted `declared`), stamped by the daemon.
+- `AcceptedRunSourceAssurance::daemon_profiled_evidence_authenticated_operator` and
+  accepted-run memory derivation version 2, with superseded ledger entries re-derived on load.
 
 ### v6 — Deterministic accepted-run memory candidates
 

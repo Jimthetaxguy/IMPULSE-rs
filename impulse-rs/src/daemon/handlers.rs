@@ -9,6 +9,9 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use tokio::sync::RwLock;
 
+use super::actor_provenance::{
+    authorize_governed_mutation, mutation_authorization_needs_profile, ConnectionClass,
+};
 use super::protocol::{
     request_type_name, respond_err, respond_ok, DaemonRequest, DaemonResponse, PROTOCOL_VERSION,
 };
@@ -706,6 +709,10 @@ pub(crate) struct ProcessRequestContext<'a> {
     pub conflict_resolver: &'a Arc<RwLock<crate::agent::coordinator::ConflictResolver>>,
     pub delegation_tracker: &'a Arc<RwLock<crate::delegation::DelegationTracker>>,
     pub cached_agent: &'a Arc<tokio::sync::Mutex<Option<crate::agent::ImpulseAgent>>>,
+    /// Provenance class of the connection this request arrived on (ADR-0018).
+    /// Decided at the socket boundary from peer credentials plus a presented
+    /// operator capability; never derived from request payload.
+    pub connection_class: ConnectionClass,
 }
 
 #[tracing::instrument(skip_all, fields(request_type = request_type_name(&request)))]
@@ -722,6 +729,7 @@ pub(crate) async fn process_request(
         conflict_resolver,
         delegation_tracker,
         cached_agent,
+        connection_class,
     } = context;
 
     // ── Boundary validation ─��───────────────────────────────────────────────
@@ -786,6 +794,15 @@ pub(crate) async fn process_request(
         },
         DaemonRequest::Status => handle_status(&state).await,
 
+        // Capability presentation is connection state, not request state: the
+        // socket loop in `daemon::mod` handles it before dispatch so a
+        // successful presentation can raise that connection's class. Reaching
+        // the dispatcher means a caller invoked `process_request` directly.
+        DaemonRequest::PresentOperatorCapability(_) => respond_err(
+            "PresentOperatorCapability is handled at the connection boundary and cannot be \
+             dispatched as a stateless request",
+        ),
+
         // Session group
         DaemonRequest::CreateSession { .. }
         | DaemonRequest::EndSession { .. }
@@ -825,7 +842,7 @@ pub(crate) async fn process_request(
         | DaemonRequest::GetGovernedTask { .. }
         | DaemonRequest::ListGovernedTasks { .. }
         | DaemonRequest::MutateGovernedTask { .. } => {
-            handle_governed_task_request(request, &state).await
+            handle_governed_task_request(request, &state, connection_class).await
         }
 
         // Closed-loop callers trigger work but never supply derived actor,
@@ -921,6 +938,7 @@ pub(crate) async fn process_request(
 pub(crate) async fn handle_governed_task_request(
     request: DaemonRequest,
     state: &SharedState,
+    connection_class: ConnectionClass,
 ) -> DaemonResponse {
     // Generic lifecycle mutations and daemon-owned producer mutations share
     // one per-task serialization boundary. Without this guard, a runtime-exit
@@ -980,23 +998,31 @@ pub(crate) async fn handle_governed_task_request(
                     .context("Failed to serialize governed task list")
             }
             DaemonRequest::MutateGovernedTask { request } => {
+                // ADR-0018: acceptance is provenance-enforced. An operator
+                // decision, and a profiled task's launch-lifecycle marks, are
+                // rejected unless this connection proved operator class by
+                // presenting the daemon run's capability from a matching peer
+                // uid. This runs before the idempotency receipt is consulted,
+                // so a non-operator connection cannot replay someone else's
+                // approval either. The task revision is left untouched: the
+                // rejection happens before `mutate_governed_task*` is called.
+                let needs_profile = mutation_authorization_needs_profile(&request.mutation);
+                let profiled = if needs_profile {
+                    state
+                        .get_governed_task(&request.project_id, &request.task_id)?
+                        .map(|task| task.verification_profile.is_some())
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+                authorize_governed_mutation(&request.mutation, profiled, connection_class)?;
+
                 // Profiled tasks force claim / verification / Supervisor
                 // transitions through the daemon-owned producer requests
                 // (SubmitGovernedClaim / RunGovernedVerification /
                 // RunGovernedSupervisorReview), where the daemon derives actor
                 // identity and *computes* the result — those transitions are
-                // unforgeable by a client. `RecordOperatorDecision` is
-                // deliberately NOT rejected here: the Desktop operator surface
-                // and a profiled Builder both connect as unauthenticated
-                // same-user clients on this single socket, so no request-level
-                // property distinguishes them. Blocking the mutation would break
-                // legitimate approvals without stopping a determined same-user
-                // Builder, so operator decisions inherit the documented
-                // same-user provenance boundary (see CLAUDE.md "profiled
-                // governed-producer invariant" and RUST-CANONICAL-CONTRACT.md).
-                // Enforcing it needs socket peer-credential authorization,
-                // tracked as follow-up in
-                // docs/superpowers/plans/2026-07-13-governed-runtime-producers.md.
+                // unforgeable by a client.
                 if matches!(
                     request.mutation,
                     impulse_ops::governed_task::GovernedTaskMutation::SubmitClaim { .. }
@@ -1014,8 +1040,11 @@ pub(crate) async fn handle_governed_task_request(
                         );
                     }
                 }
-                serde_json::to_value(state.mutate_governed_task(request)?)
-                    .context("Failed to serialize governed task mutation")
+                serde_json::to_value(state.mutate_governed_task_authenticated(
+                    request,
+                    connection_class.operator_authentication(),
+                )?)
+                .context("Failed to serialize governed task mutation")
             }
             _ => anyhow::bail!("Internal routing error: not a governed task request"),
         }
@@ -2693,10 +2722,12 @@ mod agent_cache_lifecycle_tests {
 #[cfg(test)]
 mod governed_producer_handler_tests {
     use std::process::Command;
+
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    use super::ConnectionClass;
     use impulse_ops::agent_registry::{AgentPlatformId, AgentRegistry};
     use impulse_ops::governed_task::{
         GovernedActor, GovernedActorKind, GovernedClaimRequest, GovernedCommandEvidence,
@@ -2902,6 +2933,7 @@ mod governed_producer_handler_tests {
             handle_governed_task_request(
                 DaemonRequest::RegisterGovernedTask { registration },
                 &state,
+                ConnectionClass::Operator,
             )
             .await,
         );
@@ -2932,6 +2964,7 @@ mod governed_producer_handler_tests {
             handle_governed_task_request(
                 DaemonRequest::RegisterGovernedTask { registration },
                 &state,
+                ConnectionClass::Operator,
             )
             .await,
         );
@@ -2952,6 +2985,7 @@ mod governed_producer_handler_tests {
                     },
                 },
                 &state,
+                ConnectionClass::Operator,
             )
             .await,
         );
@@ -2976,6 +3010,7 @@ mod governed_producer_handler_tests {
                     },
                 },
                 &mutation_state,
+                ConnectionClass::Operator,
             )
             .await
         });
@@ -3017,6 +3052,7 @@ mod governed_producer_handler_tests {
                 registration: registration.clone(),
             },
             &state,
+            ConnectionClass::Operator,
         )
         .await;
         assert!(error_from_response(dirty_registration).contains("dirty"));
@@ -3025,6 +3061,7 @@ mod governed_producer_handler_tests {
             handle_governed_task_request(
                 DaemonRequest::RegisterGovernedTask { registration },
                 &state,
+                ConnectionClass::Operator,
             )
             .await,
         );
@@ -3050,6 +3087,7 @@ mod governed_producer_handler_tests {
                     },
                 },
                 &state,
+                ConnectionClass::Operator,
             )
             .await,
         );
@@ -3077,6 +3115,7 @@ mod governed_producer_handler_tests {
                 },
             },
             &state,
+            ConnectionClass::Operator,
         )
         .await;
         assert!(error_from_response(fabricated).contains("daemon-owned"));
@@ -3162,6 +3201,7 @@ mod governed_producer_handler_tests {
                 },
             },
             &state,
+            ConnectionClass::Operator,
         )
         .await;
         assert!(error_from_response(fabricated_verification).contains("daemon-owned"));
@@ -3280,6 +3320,7 @@ mod governed_producer_handler_tests {
                 },
             },
             &state,
+            ConnectionClass::Operator,
         )
         .await;
         assert!(error_from_response(fabricated_verdict).contains("daemon-owned"));
@@ -3377,6 +3418,7 @@ mod governed_producer_handler_tests {
                     },
                 },
                 &state,
+                ConnectionClass::Operator,
             )
             .await,
         );

@@ -43,11 +43,38 @@ impl Default for MemoryCandidateLedger {
 
 impl MemoryCandidateLedger {
     fn load(storage: &Storage) -> Result<Self> {
-        let ledger: Self = storage
+        let mut ledger: Self = storage
             .read_json(MEMORY_CANDIDATES_FILE)
             .context("Failed to read accepted-run memory candidate ledger")?;
+        let superseded = ledger.prune_superseded_derivations();
+        if superseded > 0 {
+            tracing::info!(
+                superseded_candidates = superseded,
+                derivation_version = ACCEPTED_RUN_MEMORY_DERIVATION_VERSION,
+                "dropping memory candidates derived under a superseded derivation version; \
+                 they are re-derived from accepted governed-task truth"
+            );
+        }
         ledger.validate_shape()?;
         Ok(ledger)
+    }
+
+    /// Drop candidates whose `derivation_version` is not the current one and
+    /// report how many were dropped.
+    ///
+    /// Governed tasks remain the source of truth and this ledger is
+    /// independently replaceable, so a derivation-version bump must reconcile
+    /// deterministically rather than fail an otherwise healthy daemon at
+    /// startup: `validate_shape` rejects a stale `derivation_version`, and
+    /// reconcile would then see a stale candidate as orphaned (its id is a
+    /// digest over the derivation version). Pruning first lets reconcile
+    /// re-derive the same accepted runs under the new version.
+    fn prune_superseded_derivations(&mut self) -> usize {
+        let before = self.candidates.len();
+        self.candidates.retain(|_, candidate| {
+            candidate.derivation_version == ACCEPTED_RUN_MEMORY_DERIVATION_VERSION
+        });
+        before - self.candidates.len()
     }
 
     fn validate_shape(&self) -> Result<()> {
@@ -271,10 +298,15 @@ pub(super) fn derive_accepted_run_memory_candidate(
             output_truncated: command.output_truncated,
         })
         .collect::<Vec<_>>();
-    let source_assurance = if task.verification_profile.is_some() {
-        AcceptedRunSourceAssurance::DaemonProfiledEvidenceDeclaredOperator
-    } else {
-        AcceptedRunSourceAssurance::CallerComposedEvidenceDeclaredOperator
+    // Assurance is the weaker half of the chain: caller-composed evidence
+    // never claims an authenticated operator, however the approval arrived.
+    let source_assurance = match (
+        task.verification_profile.is_some(),
+        operator.authentication.is_capability_authenticated(),
+    ) {
+        (true, true) => AcceptedRunSourceAssurance::DaemonProfiledEvidenceAuthenticatedOperator,
+        (true, false) => AcceptedRunSourceAssurance::DaemonProfiledEvidenceDeclaredOperator,
+        (false, _) => AcceptedRunSourceAssurance::CallerComposedEvidenceDeclaredOperator,
     };
     let source = CandidateSourceV1 {
         derivation_version: ACCEPTED_RUN_MEMORY_DERIVATION_VERSION,
@@ -306,6 +338,10 @@ pub(super) fn derive_accepted_run_memory_candidate(
     let source_digest = format!("sha256-v1:{source_hex}");
     let candidate_id = MemoryCandidateId::try_new(format!("memory-candidate-{source_hex}"))?;
     let proposed_summary = match source_assurance {
+        AcceptedRunSourceAssurance::DaemonProfiledEvidenceAuthenticatedOperator => format!(
+            "Accepted governed outcome for task: {}. Daemon-profiled evidence passed and an authenticated operator approved it; pending semantic-memory review.",
+            task.task
+        ),
         AcceptedRunSourceAssurance::DaemonProfiledEvidenceDeclaredOperator => format!(
             "Accepted governed outcome for task: {}. Daemon-profiled evidence passed; pending semantic-memory review.",
             task.task

@@ -10,6 +10,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
+use crate::daemon::actor_provenance::OperatorCapability;
 use crate::daemon::{DaemonRequest, DaemonResponse};
 
 /// How long to wait for a daemon response before giving up. Generous enough for
@@ -18,6 +19,63 @@ use crate::daemon::{DaemonRequest, DaemonResponse};
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(180);
 const GOVERNED_VERIFICATION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(21 * 60);
 const ACKNOWLEDGED_REQUEST_ATTEMPTS: usize = 2;
+
+/// Write one JSON-line request and read exactly one JSON-line response.
+///
+/// Shared by the capability handshake and the request itself so both use the
+/// same framing and the same hung-daemon timeout.
+async fn exchange_line<W, R>(
+    writer: &mut W,
+    reader: &mut R,
+    request: &DaemonRequest,
+    timeout: Duration,
+) -> Result<DaemonResponse>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let request_json =
+        serde_json::to_string(request).context("Failed to serialize daemon request")?;
+    writer
+        .write_all(request_json.as_bytes())
+        .await
+        .context("Failed to write request to daemon socket")?;
+    writer
+        .write_all(b"\n")
+        .await
+        .context("Failed to write newline delimiter to daemon socket")?;
+    writer
+        .flush()
+        .await
+        .context("Failed to flush daemon socket")?;
+
+    let mut response_line = String::new();
+    tokio::time::timeout(timeout, reader.read_line(&mut response_line))
+        .await
+        .with_context(|| {
+            format!(
+                "Daemon did not respond within {}s (it may be hung)",
+                timeout.as_secs()
+            )
+        })?
+        .context("Failed to read response from daemon socket")?;
+
+    serde_json::from_str(&response_line).context("Failed to parse daemon response")
+}
+
+/// Message shown when a capability was found but the daemon refused it.
+///
+/// Named as a downgrade rather than a bare failure: the caller keeps working,
+/// but at a lower provenance than it asked for, and any operator decision it
+/// records will read `declared`.
+fn capability_refusal_warning(reason: &str) -> String {
+    format!(
+        "warning: the daemon refused this operator capability ({reason}); \
+         continuing as a non-operator connection, so governed operator \
+         mutations will be rejected and any decision recorded through another \
+         path carries declared, not authenticated, provenance"
+    )
+}
 
 fn daemon_busy_error(
     resource: impulse_ops::DaemonBusyResource,
@@ -51,52 +109,80 @@ impl DaemonClient {
             ))
     }
 
+    /// Where this client looks for the daemon run's operator capability
+    /// (ADR-0018): beside the socket, as the daemon publishes it.
+    pub fn operator_capability_path(&self) -> PathBuf {
+        OperatorCapability::path_for_socket(&self.socket_path)
+    }
+
+    /// Resolve a capability token for this client, preferring an explicit
+    /// environment override over the file the daemon publishes.
+    ///
+    /// Returns `None` when no capability is reachable — a launched governed
+    /// pane, whose environment is scrubbed of every `IMPULSE_*` key, is exactly
+    /// that case. The request is still sent, so the caller sees the daemon's
+    /// typed unauthorized error rather than a client-side guess.
+    fn operator_capability(&self) -> Option<OperatorCapability> {
+        OperatorCapability::resolve_for_socket(&self.socket_path)
+    }
+
+    /// Whether the daemon will refuse `request` from a non-operator connection.
+    ///
+    /// Deliberately coarse: every governed mutation presents the capability
+    /// rather than the client re-deriving which mutations need it (that answer
+    /// depends on the task's verification profile, which only the daemon
+    /// holds). Other request groups skip the extra round trip entirely.
+    fn requires_operator_class(request: &DaemonRequest) -> bool {
+        matches!(request, DaemonRequest::MutateGovernedTask { .. })
+    }
+
     pub async fn send(&self, request: DaemonRequest) -> Result<DaemonResponse> {
         self.send_with_timeout(request, RESPONSE_TIMEOUT).await
     }
 
     /// Send a request and await the response, failing if the daemon does not
     /// reply within `timeout` (so a hung daemon can't hang the caller forever).
+    ///
+    /// When the request needs operator class and a capability is reachable, it
+    /// is presented first on the same connection: the daemon's classification
+    /// is per connection, and this client opens one connection per request.
     async fn send_with_timeout(
         &self,
         request: DaemonRequest,
         timeout: Duration,
     ) -> Result<DaemonResponse> {
         let mut stream = self.connect().await?;
-
-        let request_json =
-            serde_json::to_string(&request).context("Failed to serialize daemon request")?;
-        stream
-            .write_all(request_json.as_bytes())
-            .await
-            .context("Failed to write request to daemon socket")?;
-        stream
-            .write_all(b"\n")
-            .await
-            .context("Failed to write newline delimiter to daemon socket")?;
-        stream
-            .flush()
-            .await
-            .context("Failed to flush daemon socket")?;
-
-        let (reader, _) = stream.split();
+        let (reader, mut writer) = stream.split();
         let mut reader = BufReader::new(reader);
 
-        let mut response_line = String::new();
-        tokio::time::timeout(timeout, reader.read_line(&mut response_line))
-            .await
-            .with_context(|| {
-                format!(
-                    "Daemon did not respond within {}s (it may be hung)",
-                    timeout.as_secs()
+        if Self::requires_operator_class(&request) {
+            if let Some(capability) = self.operator_capability() {
+                let presentation = exchange_line(
+                    &mut writer,
+                    &mut reader,
+                    &DaemonRequest::PresentOperatorCapability(
+                        impulse_ops::operator_capability::OperatorCapabilityPresentation {
+                            token: capability.expose().to_string(),
+                        },
+                    ),
+                    timeout,
                 )
-            })?
-            .context("Failed to read response from daemon socket")?;
+                .await?;
+                if let DaemonResponse::Error { message } = &presentation {
+                    // Not fatal — the request below still goes out and fails
+                    // with the daemon's own typed authorization error — but it
+                    // must not be silent. A capability that exists and is
+                    // refused means this connection is about to act as a
+                    // non-operator, and an approval recorded that way is
+                    // stamped `declared`, not `capability_authenticated`.
+                    let warning = capability_refusal_warning(message);
+                    tracing::warn!("{warning}");
+                    eprintln!("{warning}");
+                }
+            }
+        }
 
-        let response: DaemonResponse =
-            serde_json::from_str(&response_line).context("Failed to parse daemon response")?;
-
-        Ok(response)
+        exchange_line(&mut writer, &mut reader, &request, timeout).await
     }
 
     pub async fn ping(&self) -> Result<bool> {
@@ -558,6 +644,230 @@ mod tests {
     fn test_daemon_client_new_stores_path() {
         let client = DaemonClient::new(PathBuf::from("/tmp/test.sock"));
         assert_eq!(client.socket_path, PathBuf::from("/tmp/test.sock"));
+    }
+
+    fn approval_request() -> DaemonRequest {
+        use impulse_ops::governed_task::{
+            GovernedActor, GovernedActorKind, GovernedRecordId, GovernedRequestId, GovernedTaskId,
+            GovernedTaskMutation, GovernedTaskMutationRequest, OperatorDecisionInput,
+            OperatorDecisionKind,
+        };
+        DaemonRequest::MutateGovernedTask {
+            request: GovernedTaskMutationRequest {
+                request_id: GovernedRequestId::try_new("approve-1").unwrap(),
+                project_id: "project-a".to_string(),
+                task_id: GovernedTaskId::try_new("task-a").unwrap(),
+                expected_revision: 4,
+                mutation: GovernedTaskMutation::RecordOperatorDecision {
+                    decision: OperatorDecisionInput {
+                        actor: GovernedActor {
+                            kind: GovernedActorKind::Operator,
+                            id: "operator-a".to_string(),
+                        },
+                        supervisor_verdict_id: GovernedRecordId::try_new("verdict-a").unwrap(),
+                        decision: OperatorDecisionKind::Approve,
+                        rationale: "approved".to_string(),
+                    },
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn test_capability_refusal_warning_names_the_downgrade_and_the_reason() {
+        let warning = capability_refusal_warning("token does not match this daemon run");
+        assert!(warning.starts_with("warning:"));
+        assert!(warning.contains("token does not match this daemon run"));
+        assert!(warning.contains("non-operator connection"));
+        assert!(
+            warning.contains("declared"),
+            "the message must name the provenance downgrade, not just the refusal"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_refused_capability_still_sends_the_request_and_surfaces_the_daemon_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("impulse.sock");
+        let capability = OperatorCapability::generate().unwrap();
+        std::fs::write(
+            OperatorCapability::path_for_socket(&socket),
+            capability.expose(),
+        )
+        .unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = tokio::io::split(stream);
+            let mut reader = BufReader::new(reader);
+            let mut received = Vec::new();
+            for response in [
+                serde_json::json!({"type": "Error", "data": {"message": "operator capability rejected"}}),
+                serde_json::json!({"type": "Error", "data": {"message": "requires an operator-class connection"}}),
+            ] {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                received.push(serde_json::from_str::<DaemonRequest>(&line).unwrap());
+                writer
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+                writer.flush().await.unwrap();
+            }
+            received
+        });
+
+        let client = DaemonClient::new(socket);
+        let response = client.send(approval_request()).await.unwrap();
+        match response {
+            DaemonResponse::Error { message } => {
+                assert!(message.contains("operator-class"))
+            }
+            other => panic!("expected the daemon's typed refusal, received {other:?}"),
+        }
+        let received = server.await.unwrap();
+        assert!(matches!(
+            received[0],
+            DaemonRequest::PresentOperatorCapability(_)
+        ));
+        assert!(
+            matches!(received[1], DaemonRequest::MutateGovernedTask { .. }),
+            "a refused presentation must not swallow the request"
+        );
+    }
+
+    #[test]
+    fn test_only_governed_mutations_trigger_a_capability_handshake() {
+        assert!(DaemonClient::requires_operator_class(&approval_request()));
+        for request in [
+            DaemonRequest::Ping,
+            DaemonRequest::Status,
+            DaemonRequest::ListGovernedTasks {
+                project_id: "project-a".to_string(),
+            },
+        ] {
+            assert!(
+                !DaemonClient::requires_operator_class(&request),
+                "reads must not pay for a handshake"
+            );
+        }
+    }
+
+    #[test]
+    fn test_operator_capability_path_sits_beside_the_socket() {
+        let client = DaemonClient::new(PathBuf::from("/tmp/sockets/impulse.sock"));
+        assert_eq!(
+            client.operator_capability_path(),
+            PathBuf::from("/tmp/sockets/impulse.operator-cap")
+        );
+    }
+
+    #[test]
+    fn test_operator_capability_reads_the_published_file_and_rejects_junk() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = DaemonClient::new(dir.path().join("impulse.sock"));
+        assert!(
+            client.operator_capability().is_none(),
+            "an unpublished capability must resolve to None, not a panic"
+        );
+
+        let capability = OperatorCapability::generate().unwrap();
+        std::fs::write(
+            client.operator_capability_path(),
+            format!("{}\n", capability.expose()),
+        )
+        .unwrap();
+        assert_eq!(client.operator_capability().unwrap(), capability);
+
+        std::fs::write(client.operator_capability_path(), "not-a-capability").unwrap();
+        assert!(client.operator_capability().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_governed_mutation_presents_the_capability_before_the_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("impulse.sock");
+        let capability = OperatorCapability::generate().unwrap();
+        std::fs::write(
+            OperatorCapability::path_for_socket(&socket),
+            capability.expose(),
+        )
+        .unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+
+        let expected_token = capability.expose().to_string();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = tokio::io::split(stream);
+            let mut reader = BufReader::new(reader);
+            let mut received = Vec::new();
+            for response in [
+                serde_json::json!({"type": "Ok", "data": {"result": {"connection_class": "operator"}}}),
+                serde_json::json!({"type": "Ok", "data": {"result": {"accepted": true}}}),
+            ] {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                received.push(serde_json::from_str::<DaemonRequest>(&line).unwrap());
+                writer
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+                writer.flush().await.unwrap();
+            }
+            received
+        });
+
+        let client = DaemonClient::new(socket);
+        client.send(approval_request()).await.unwrap();
+        let received = server.await.unwrap();
+
+        assert!(
+            matches!(
+                &received[0],
+                DaemonRequest::PresentOperatorCapability(presentation)
+                    if presentation.token == expected_token
+            ),
+            "the capability must be presented first, on the same connection"
+        );
+        assert!(matches!(
+            received[1],
+            DaemonRequest::MutateGovernedTask { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_governed_mutation_without_a_capability_sends_only_the_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("impulse.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = tokio::io::split(stream);
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            writer
+                .write_all(
+                    b"{\"type\": \"Error\", \"data\": {\"message\": \"operator capability required\"}}\n",
+                )
+                .await
+                .unwrap();
+            writer.flush().await.unwrap();
+            serde_json::from_str::<DaemonRequest>(&line).unwrap()
+        });
+
+        let client = DaemonClient::new(socket);
+        let response = client.send(approval_request()).await.unwrap();
+        assert!(matches!(response, DaemonResponse::Error { .. }));
+        assert!(
+            matches!(
+                server.await.unwrap(),
+                DaemonRequest::MutateGovernedTask { .. }
+            ),
+            "a scrubbed caller sends the request and surfaces the daemon's typed refusal"
+        );
     }
 
     #[test]

@@ -18,6 +18,13 @@ pub(crate) const SOCKET_NAME: &str = "impulse.sock";
 pub enum DaemonRequest {
     Ping,
     Status,
+    /// Present this daemon run's operator capability (ADR-0018).
+    ///
+    /// Connection-scoped: a successful presentation raises *this* connection to
+    /// operator class and has no effect on any other connection. Requests that
+    /// mint acceptance (`MutateGovernedTask` with `RecordOperatorDecision`, and
+    /// the lifecycle marks of a profiled task) are rejected without it.
+    PresentOperatorCapability(impulse_ops::operator_capability::OperatorCapabilityPresentation),
     CreateSession {
         name: String,
         platform: Option<String>,
@@ -268,6 +275,7 @@ pub(crate) fn request_type_name(req: &DaemonRequest) -> &'static str {
     match req {
         DaemonRequest::Ping => "Ping",
         DaemonRequest::Status => "Status",
+        DaemonRequest::PresentOperatorCapability(_) => "PresentOperatorCapability",
         DaemonRequest::CreateSession { .. } => "CreateSession",
         DaemonRequest::EndSession { .. } => "EndSession",
         DaemonRequest::TrackFile { .. } => "TrackFile",
@@ -324,8 +332,33 @@ mod tests {
     // ── PROTOCOL_VERSION ───────────────────────────────────────────────
 
     #[test]
-    fn test_protocol_version_is_six() {
-        assert_eq!(PROTOCOL_VERSION, 6);
+    fn test_protocol_version_is_seven() {
+        // v7 (ADR-0018) adds PresentOperatorCapability and the operator-class
+        // requirement on RecordOperatorDecision.
+        assert_eq!(PROTOCOL_VERSION, 7);
+    }
+
+    #[test]
+    fn test_present_operator_capability_round_trips_and_never_leaks_into_the_type_name() {
+        let request = DaemonRequest::PresentOperatorCapability(
+            impulse_ops::operator_capability::OperatorCapabilityPresentation {
+                token: "a".repeat(64),
+            },
+        );
+        let json = serde_json::to_string(&request).unwrap();
+        // The newtype variant keeps the struct-variant wire shape exactly.
+        assert!(json.contains(r#""data":{"token":"#));
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            DaemonRequest::PresentOperatorCapability(ref presentation)
+                if presentation.token == "a".repeat(64)
+        ));
+        assert_eq!(
+            request_type_name(&request),
+            "PresentOperatorCapability",
+            "the traced request name must never carry the token"
+        );
     }
 
     // ── request_type_name ───────────────────────────────────────────────
@@ -785,6 +818,9 @@ mod tests {
         match request {
             impulse_ops::WorkbenchDaemonRequest::Ping => "Ping",
             impulse_ops::WorkbenchDaemonRequest::Status => "Status",
+            impulse_ops::WorkbenchDaemonRequest::PresentOperatorCapability(_) => {
+                "PresentOperatorCapability"
+            }
             impulse_ops::WorkbenchDaemonRequest::ListSessions => "ListSessions",
             impulse_ops::WorkbenchDaemonRequest::CreateSession { .. } => "CreateSession",
             impulse_ops::WorkbenchDaemonRequest::EndSession { .. } => "EndSession",

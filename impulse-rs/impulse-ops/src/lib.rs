@@ -8,10 +8,14 @@ use serde::{Deserialize, Serialize};
 pub mod agent_registry;
 pub mod governed_task;
 pub mod memory_candidate;
+pub mod operator_capability;
 pub mod role_assignment;
 
 /// Shared daemon protocol version for GUI/operator workbench compatibility.
-pub const DAEMON_PROTOCOL_VERSION: u32 = 6;
+///
+/// v7 (ADR-0018) adds the connection-scoped `PresentOperatorCapability`
+/// request and the operator-class requirement on `RecordOperatorDecision`.
+pub const DAEMON_PROTOCOL_VERSION: u32 = 7;
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpsError {
@@ -28,6 +32,12 @@ pub enum OpsError {
 pub enum WorkbenchDaemonRequest {
     Ping,
     Status,
+    /// Present this daemon run's operator capability (ADR-0018).
+    ///
+    /// Connection-scoped: an operator surface sends it once immediately after
+    /// connecting, before any request that mints acceptance. Governed panes
+    /// never receive the capability, so a launched runtime cannot send this.
+    PresentOperatorCapability(crate::operator_capability::OperatorCapabilityPresentation),
     ListSessions,
     CreateSession {
         name: String,

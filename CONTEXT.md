@@ -257,6 +257,16 @@ policy, not a generalized role system.
 criteria-bound, history/tool-free API Supervisor review. It runs host-trusted code, not a sandbox;
 receipts/task locks do not close crash-before-receipt. External harness review fails closed.
 
+### operator capability — `[code]`
+A per-daemon-run secret (32 random bytes, hex) written mode 0600 beside the socket while the daemon
+listens and removed on shutdown. A connection is `non_operator` until it presents the capability
+from a peer uid matching the daemon's own; only an operator-class connection may record an operator
+decision, or mark a profiled task's launch lifecycle. Governed panes never receive it — every
+inherited `IMPULSE_*` key is scrubbed before a pane spawns — which is what separates the operator
+surface from a launched runtime holding `IMPULSE_SOCKET_PATH`. It is a structural boundary, not
+protection against a same-uid process that deliberately reads the file.
+- **Source of truth:** `src/daemon/actor_provenance.rs`, `src/daemon/mod.rs`, ADR-0018.
+
 ### memory / genome — `[code]`
 Scoped durable continuity: session history plus verified decisions/preferences, retrieval indexes,
 and review-first context injection. Memory records must carry project/session provenance.

@@ -10,6 +10,7 @@
 //! - [`handlers`] — Request dispatch and grouped sub-handlers
 //! - This file — `Daemon` struct, startup, socket accept loop, shutdown
 
+pub mod actor_provenance;
 pub mod handlers;
 pub mod protocol;
 
@@ -26,6 +27,7 @@ use tokio::net::UnixListener;
 use tokio::sync::{Notify, RwLock};
 
 use crate::state::SharedState;
+use actor_provenance::{ConnectionProvenance, OperatorCapability};
 
 /// Per-request line size cap, shared by the daemon's own read loop and (via
 /// [`read_bounded_line`]) reusable by other JSON-line protocol readers in
@@ -147,6 +149,14 @@ pub struct Daemon {
     /// Concurrent agent requests receive typed Busy; unrelated daemon request
     /// groups never acquire it.
     cached_agent: Arc<tokio::sync::Mutex<Option<crate::agent::ImpulseAgent>>>,
+    /// Per-run operator capability (ADR-0018). Minted in `start` once the
+    /// socket is bound, published as a mode-0600 file beside it while the
+    /// daemon listens, and removed on shutdown so a capability never outlives
+    /// the run that issued it. It lives behind a `OnceLock` because minting
+    /// reads the system CSPRNG and can fail, while `Daemon::new` is infallible;
+    /// an empty cell simply means no connection can reach operator class.
+    operator_capability: Arc<std::sync::OnceLock<OperatorCapability>>,
+    daemon_uid: u32,
 }
 
 impl Daemon {
@@ -197,7 +207,14 @@ impl Daemon {
             )),
             delegation_tracker: Arc::new(RwLock::new(crate::delegation::DelegationTracker::new())),
             cached_agent: Arc::new(tokio::sync::Mutex::new(None)),
+            operator_capability: Arc::new(std::sync::OnceLock::new()),
+            daemon_uid: actor_provenance::daemon_uid(),
         }
+    }
+
+    /// Where this daemon publishes its operator capability.
+    pub fn operator_capability_path(&self) -> PathBuf {
+        OperatorCapability::path_for_socket(&self.config.socket_path)
     }
 
     #[cfg(test)]
@@ -248,6 +265,32 @@ impl Daemon {
             let _ = tokio::fs::remove_file(&pid_path).await;
         }
 
+        // Publish the capability BEFORE binding, so that "the socket is
+        // connectable" implies "the capability is on disk". Publishing after
+        // bind leaves a window in which a client that uses socket readiness as
+        // its readiness signal -- which is what every client here does -- reads
+        // no capability, silently acts as a non-operator, and is refused.
+        //
+        // The trade: if bind then fails, a capability file is left for a daemon
+        // that never listened. That authenticates nothing (a presentation is
+        // compared against a *running* daemon's in-memory value) and the next
+        // successful run overwrites it. The one case this is worse than
+        // publishing later is two daemons starting concurrently, where the
+        // loser can clobber the winner's file; that race already exists for the
+        // PID file, is what the liveness check above is there to catch, and
+        // self-corrects on restart.
+        let capability_path = self.operator_capability_path();
+        let capability = OperatorCapability::generate()
+            .context("Failed to mint this daemon run's operator capability")?;
+        actor_provenance::write_capability_file(&capability_path, &capability)
+            .context("Failed to publish daemon operator capability")?;
+        // `set` returns Err if the cell is already filled, and that value is
+        // simply dropped -- this line prevents nothing on its own. What keeps a
+        // second `start` on the same Daemon from publishing a file the
+        // connection loop never compares against is the stale-socket liveness
+        // check above: a live socket makes `start` bail before it reaches here.
+        let _ = self.operator_capability.set(capability);
+
         let listener =
             UnixListener::bind(&self.config.socket_path).context("Failed to bind socket")?;
         tokio::fs::set_permissions(
@@ -282,6 +325,8 @@ impl Daemon {
                             let conflict_resolver = self.conflict_resolver.clone();
                             let delegation_tracker = self.delegation_tracker.clone();
                             let cached_agent = self.cached_agent.clone();
+                            let operator_capability = self.operator_capability.clone();
+                            let daemon_uid = self.daemon_uid;
                             tokio::spawn(async move {
                                 if let Err(e) = handle_connection(
                                     stream,
@@ -295,6 +340,8 @@ impl Daemon {
                                         conflict_resolver,
                                         delegation_tracker,
                                         cached_agent,
+                                        operator_capability,
+                                        daemon_uid,
                                     },
                                 )
                                 .await
@@ -315,6 +362,17 @@ impl Daemon {
             }
         }
 
+        // Best-effort cleanup on the graceful path only. Nothing signals
+        // `shutdown_notify` today and there is no signal handler, so in practice
+        // a daemon ends by SIGTERM/SIGKILL and this line does not run: the
+        // capability file and the socket both survive. That is safe rather than
+        // tidy -- a stale token authenticates nothing, because
+        // `present_capability` compares against the in-memory capability of the
+        // *running* daemon, and the next run overwrites the file with its own.
+        // A signal handler that reaches this path is follow-up work, not a
+        // correctness gap.
+        actor_provenance::remove_capability_file(&capability_path);
+
         Ok(())
     }
 }
@@ -329,6 +387,8 @@ struct ConnectionContext {
     conflict_resolver: Arc<RwLock<crate::agent::coordinator::ConflictResolver>>,
     delegation_tracker: Arc<RwLock<crate::delegation::DelegationTracker>>,
     cached_agent: Arc<tokio::sync::Mutex<Option<crate::agent::ImpulseAgent>>>,
+    operator_capability: Arc<std::sync::OnceLock<OperatorCapability>>,
+    daemon_uid: u32,
 }
 
 async fn handle_connection(
@@ -345,7 +405,13 @@ async fn handle_connection(
         conflict_resolver,
         delegation_tracker,
         cached_agent,
+        operator_capability,
+        daemon_uid,
     } = context;
+
+    // Peer credentials are a property of the connection, read once before the
+    // stream is split (splitting borrows it mutably for the rest of the loop).
+    let mut provenance = ConnectionProvenance::new(actor_provenance::peer_uid(&stream), daemon_uid);
 
     let (reader, mut writer) = stream.split();
     let mut reader = BufReader::new(reader);
@@ -391,6 +457,38 @@ async fn handle_connection(
 
         let req_type = protocol::request_type_name(&request);
         let start = std::time::Instant::now();
+
+        // Capability presentation mutates connection state, so it is answered
+        // here rather than in the stateless dispatcher.
+        if let DaemonRequest::PresentOperatorCapability(presentation) = &request {
+            let response = match provenance
+                .present_capability(&presentation.token, operator_capability.get())
+            {
+                Ok(class) => {
+                    tracing::info!(
+                        connection_class = class.as_str(),
+                        "connection raised to operator class"
+                    );
+                    DaemonResponse::Ok {
+                        result: serde_json::json!({"connection_class": class.as_str()}),
+                    }
+                }
+                Err(error) => {
+                    // The presented token is never logged, only the reason.
+                    tracing::warn!(reason = %error, "operator capability presentation rejected");
+                    DaemonResponse::Error {
+                        message: error.to_string(),
+                    }
+                }
+            };
+            writer
+                .write_all(serde_json::to_string(&response)?.as_bytes())
+                .await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+            continue;
+        }
+
         let response = handlers::process_request(
             request,
             handlers::ProcessRequestContext {
@@ -402,6 +500,7 @@ async fn handle_connection(
                 conflict_resolver: &conflict_resolver,
                 delegation_tracker: &delegation_tracker,
                 cached_agent: &cached_agent,
+                connection_class: provenance.class(),
             },
         )
         .await;

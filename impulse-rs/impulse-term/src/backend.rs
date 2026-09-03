@@ -37,6 +37,16 @@ const PTY_READ_BUFFER_SIZE: usize = 4096;
 /// ordinary pane could otherwise inherit a daemon socket, producer CLI, task,
 /// or role identity that belongs to the Desktop process. Explicit launch
 /// metadata is overlaid again after this scrub.
+/// Strip every inherited `IMPULSE_*` key from a command before the caller
+/// overlays the variables a governed pane is *meant* to receive.
+///
+/// The prefix rule is deliberately an allowlist-by-omission: a launched runtime
+/// gets exactly the keys the harness sets afterwards and nothing the harness
+/// process happens to be carrying. That is what keeps `IMPULSE_OPERATOR_CAPABILITY`
+/// (ADR-0018) out of governed panes — a runtime is never handed the capability
+/// that raises a socket connection to operator class, so it cannot approve its
+/// own governed task even though it holds `IMPULSE_SOCKET_PATH`. Callers that
+/// build the explicit overlay must never add that key back.
 fn remove_inherited_impulse_env<I>(command: &mut CommandBuilder, inherited_keys: I)
 where
     I: IntoIterator<Item = OsString>,
@@ -710,5 +720,37 @@ mod tests {
             command.get_env("IMPULSE_SOCKET_PATH"),
             Some(std::ffi::OsStr::new("/tmp/profiled.sock"))
         );
+    }
+
+    #[test]
+    fn operator_capability_never_reaches_a_spawned_pane() {
+        // ADR-0018: a governed pane holds IMPULSE_SOCKET_PATH but must never
+        // hold the capability that would let it approve its own task.
+        let mut command = CommandBuilder::new("true");
+        command.env("IMPULSE_OPERATOR_CAPABILITY", "a".repeat(64));
+        command.env("impulse_operator_capability", "b".repeat(64));
+        command.env("IMPULSE_SOCKET_PATH", "/tmp/parent.sock");
+
+        remove_inherited_impulse_env(
+            &mut command,
+            [
+                OsString::from("IMPULSE_OPERATOR_CAPABILITY"),
+                OsString::from("impulse_operator_capability"),
+                OsString::from("IMPULSE_SOCKET_PATH"),
+            ],
+        );
+
+        assert!(
+            command.get_env("IMPULSE_OPERATOR_CAPABILITY").is_none(),
+            "the operator capability must not survive into a governed pane"
+        );
+
+        // The explicit governed overlay re-adds the socket path and nothing else.
+        command.env("IMPULSE_SOCKET_PATH", "/tmp/profiled.sock");
+        assert_eq!(
+            command.get_env("IMPULSE_SOCKET_PATH"),
+            Some(std::ffi::OsStr::new("/tmp/profiled.sock"))
+        );
+        assert!(command.get_env("IMPULSE_OPERATOR_CAPABILITY").is_none());
     }
 }

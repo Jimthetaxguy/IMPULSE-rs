@@ -11,7 +11,12 @@ use serde::{Deserialize, Serialize};
 use crate::governed_task::{GovernedRecordId, GovernedTaskId, GovernedVerificationProfile};
 
 pub const ACCEPTED_RUN_MEMORY_CANDIDATE_SCHEMA_VERSION: u32 = 1;
-pub const ACCEPTED_RUN_MEMORY_DERIVATION_VERSION: u32 = 1;
+/// Bumped to 2 by ADR-0018: the derivation now reads the operator decision's
+/// connection provenance, so the same governed task can derive a different
+/// `source_assurance` — and therefore a different `source_digest` and id —
+/// than it did under version 1. Candidates persisted at an older derivation
+/// version are pruned and re-derived from governed-task truth on load.
+pub const ACCEPTED_RUN_MEMORY_DERIVATION_VERSION: u32 = 2;
 
 const MAX_OPEN_ID_BYTES: usize = 256;
 const MAX_PROJECT_TEXT_BYTES: usize = 16 * 1024;
@@ -81,13 +86,40 @@ pub enum MemoryCandidateStatus {
 
 /// Describes what Impulse can honestly attest about the source chain.
 ///
-/// Operator identity is declared inside the current same-user socket trust
-/// boundary; neither variant implies cryptographic human authentication.
+/// `Declared` variants mean operator identity was asserted inside the same-user
+/// socket trust boundary with no connection-level proof. The `Authenticated`
+/// variant (ADR-0018) additionally means the approving connection presented
+/// this daemon run's operator capability and its peer uid matched the daemon's
+/// own; it still does not imply cryptographic *human* authentication, and it
+/// does not defend against a same-uid process that deliberately reads the
+/// capability file.
+///
+/// There is deliberately no authenticated variant for caller-composed
+/// evidence: when the evidence chain itself was composed by a client, the
+/// weaker half of the chain sets the assurance label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AcceptedRunSourceAssurance {
     DaemonProfiledEvidenceDeclaredOperator,
+    DaemonProfiledEvidenceAuthenticatedOperator,
     CallerComposedEvidenceDeclaredOperator,
+}
+
+impl AcceptedRunSourceAssurance {
+    /// True when the evidence chain was produced by daemon-owned profiled
+    /// producers rather than composed by the caller.
+    pub fn is_daemon_profiled(self) -> bool {
+        matches!(
+            self,
+            Self::DaemonProfiledEvidenceDeclaredOperator
+                | Self::DaemonProfiledEvidenceAuthenticatedOperator
+        )
+    }
+
+    /// True when the approving connection proved operator class (ADR-0018).
+    pub fn is_authenticated_operator(self) -> bool {
+        matches!(self, Self::DaemonProfiledEvidenceAuthenticatedOperator)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,9 +199,7 @@ impl AcceptedRunMemoryCandidate {
         )?;
         validate_text("task", &self.task, MAX_TASK_BYTES)?;
         if self.acceptance_criteria.len() > MAX_CRITERIA
-            || (self.acceptance_criteria.is_empty()
-                && self.source_assurance
-                    == AcceptedRunSourceAssurance::DaemonProfiledEvidenceDeclaredOperator)
+            || (self.acceptance_criteria.is_empty() && self.source_assurance.is_daemon_profiled())
         {
             return invalid(
                 "acceptance_criteria",
@@ -196,17 +226,14 @@ impl AcceptedRunMemoryCandidate {
             &self.verification_policy,
             MAX_ARTIFACT_REFERENCE_BYTES,
         )?;
-        match self.source_assurance {
-            AcceptedRunSourceAssurance::DaemonProfiledEvidenceDeclaredOperator => {
-                validate_git_oid("subject_revision", &self.subject_revision)?;
-            }
-            AcceptedRunSourceAssurance::CallerComposedEvidenceDeclaredOperator => {
-                validate_text(
-                    "subject_revision",
-                    &self.subject_revision,
-                    MAX_ARTIFACT_REFERENCE_BYTES,
-                )?;
-            }
+        if self.source_assurance.is_daemon_profiled() {
+            validate_git_oid("subject_revision", &self.subject_revision)?;
+        } else {
+            validate_text(
+                "subject_revision",
+                &self.subject_revision,
+                MAX_ARTIFACT_REFERENCE_BYTES,
+            )?;
         }
         validate_references("claimed_artifact_ids", &self.claimed_artifact_ids)?;
         validate_references("verification_artifact_ids", &self.verification_artifact_ids)?;
@@ -406,6 +433,52 @@ mod tests {
         let mut candidate = candidate();
         candidate.commands[0].success = false;
         assert!(candidate.validate_shape().is_err());
+    }
+
+    #[test]
+    fn authenticated_operator_assurance_round_trips_and_keeps_profiled_rules() {
+        let mut candidate = candidate();
+        candidate.source_assurance =
+            AcceptedRunSourceAssurance::DaemonProfiledEvidenceAuthenticatedOperator;
+        candidate.validate_shape().unwrap();
+
+        let json = serde_json::to_string(&candidate).unwrap();
+        assert!(json.contains("daemon_profiled_evidence_authenticated_operator"));
+        let decoded: AcceptedRunMemoryCandidate = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, candidate);
+        assert!(decoded.source_assurance.is_daemon_profiled());
+        assert!(decoded.source_assurance.is_authenticated_operator());
+
+        // Daemon-profiled rules still apply to the authenticated variant.
+        let mut without_criteria = candidate.clone();
+        without_criteria.acceptance_criteria.clear();
+        assert!(without_criteria.validate_shape().is_err());
+
+        let mut without_git_oid = candidate;
+        without_git_oid.subject_revision = "not-a-git-oid".to_string();
+        assert!(without_git_oid.validate_shape().is_err());
+    }
+
+    #[test]
+    fn declared_assurances_are_not_reported_as_authenticated() {
+        for assurance in [
+            AcceptedRunSourceAssurance::DaemonProfiledEvidenceDeclaredOperator,
+            AcceptedRunSourceAssurance::CallerComposedEvidenceDeclaredOperator,
+        ] {
+            assert!(!assurance.is_authenticated_operator());
+        }
+        assert!(
+            !AcceptedRunSourceAssurance::CallerComposedEvidenceDeclaredOperator
+                .is_daemon_profiled()
+        );
+    }
+
+    #[test]
+    fn candidate_at_a_superseded_derivation_version_is_rejected() {
+        let mut candidate = candidate();
+        candidate.derivation_version = ACCEPTED_RUN_MEMORY_DERIVATION_VERSION - 1;
+        let error = candidate.validate_shape().unwrap_err();
+        assert!(format!("{error}").contains("derivation_version"));
     }
 
     #[test]
