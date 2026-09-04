@@ -61,7 +61,7 @@ Do not add GUI views or product shell work there.
 |---|---|---|---|
 | Add a CLI command | `references/adding-cli-commands.md` | `src/main.rs`, handler module | `rust-programming` |
 | Add a daemon IPC message | `references/adding-daemon-ipc.md` | `src/daemon/mod.rs` | `rust-daemon-ipc` |
-| Add a GUI view | `docs/decisions/0008-dioxus-desktop-host.md`, `impulse-desktop/README.md` | `impulse-desktop/src/ui.rs`, `views.rs` | `rust-programming` |
+| Add a GUI view | `references/adding-gui-views.md` | `impulse-desktop/src/ui.rs`, `views.rs` | `rust-programming` |
 | Add a dynamic tool | `references/adding-dynamic-tools.md` | `src/tooling/mod.rs`, `traits.rs` | `rust-trait-design` |
 | Add a guardrail rule | CLAUDE.md guardrail section | `src/guardrail/` | `plugin-hooks-guardrails` |
 | Add a context lifecycle stage | Context lifecycle docs | `src/context_lifecycle/` | `context-engineering` |

@@ -2,7 +2,7 @@
 title: "ADR-0015: Harness-Owned Step Model Choice"
 status: accepted
 created: 2026-08-17
-updated: 2026-08-23
+updated: 2026-09-02
 deciders: [Impulse Maintainers]
 ---
 
@@ -21,10 +21,10 @@ invent a per-step model policy. Final per-step selection stays in the
 Impulse-owned deterministic policy, not in an external proxy such as LiteLLM,
 OpenRouter, ROSA, or quirewiki.
 
-Today there is no step-level router. The model is resolved once at construction
-(`impulse_agent_model` / `IMPULSE_MODEL` / compiled default) and copied into
-every `ChatRequest`. The seam already exists: `ChatRequest.model` is per-request;
-fill sites copy a session-fixed string.
+Construction-time resolution (`impulse_agent_model` / `IMPULSE_MODEL` /
+compiled default) remains the configured default. The seam is `ChatRequest.model`
+per request. Fill sites must call harness-owned `decide_step_model` through
+`resolve_step_model` instead of stuffing an env string straight into the request.
 
 ADR-0011 already records four-party attestation (worker claim, verifier
 evidence, supervisor judgment, operator approval). Model choice for a harness
@@ -43,11 +43,14 @@ ledger and it does not rewrite ADR-0014.
    configuration, token/cost tracking, tracing, persistence, TUI, PTY, SQLite,
    office, or credential authority. Hosts adapt native facts and record the
    returned evidence in their own audit domains.
-3. **Fill the existing seam.** Call `decide_step_model` at the three API
-   `ChatRequest` fill sites: `Agent::chat`, `run_tool_loop`, and
-   `ImpulseAgent::query_stateless`. Start on Supervisor + Ion/API. Worker CLI
-   harness model stays opaque. Do not add a picker in `handle_chat` or daemon
-   chat.
+3. **Fill the existing seam.** Call `decide_step_model` through
+   `resolve_step_model` at the API `ChatRequest` fill sites (`Agent::chat`,
+   `run_tool_loop`, `ImpulseAgent::query_stateless`) and at the Ion/API chat
+   surfaces (`handlers::system::handle_chat`,
+   `daemon::handlers::handle_chat_request`). Start on Supervisor + Ion/API.
+   Worker CLI harness model stays opaque. Those chat surfaces use the same
+   harness policy. They must not invent a second picker, an env-only model
+   string, or a gateway router.
 4. **Policy order is host admissibility, then harness capability.**
    - Host admissibility: the application or provider layer chooses whether
      inference may occur, selects the provider, and supplies only non-empty,
@@ -94,7 +97,7 @@ ledger and it does not rewrite ADR-0014.
 
 This decision is represented when tests prove:
 
-1. `decide_step_model` is called at the three API fill sites;
+1. `decide_step_model` is called (via `resolve_step_model`) at the three API fill sites and at system/daemon `handle_chat`;
 2. v0 is identity unless verifier/attestation failed and an escalate model is
    set;
 3. token count / tool-round volume does not escalate;
@@ -123,6 +126,20 @@ James locked the single-picker boundary on 2026-08-19. The 2026-08-23 crate
 extraction makes that decision portable instead of requiring ROSA to import the
 Impulse product.
 
+
+## Addendum: chat surfaces on origin/main (2026-09-02)
+
+`origin/main` at `36bda00` routes system and daemon `handle_chat` through
+`resolve_step_model` with `HarnessStepContext::ion_api`. That is the same
+harness policy as the three API fill sites. It is not a second picker.
+Decision #3 above is updated to match that tree. The prior wording that said
+not to add a picker in those paths meant do not invent a separate chat-local
+model policy. Calling `resolve_step_model` there is required seam fill.
+
+Earlier local-only tip `9c586ba` held an equivalent chat-surface write before
+main advanced; that commit is no longer on the branch tip after a reset to
+`origin/main`. The live seam on HEAD is what this addendum records.
+
 ## Related Documents
 
 - [`0011-governed-task-run-lifecycle.md`](0011-governed-task-run-lifecycle.md)
@@ -141,7 +158,7 @@ Codee mapped rosa-renew-build @ `0f1d4e2` against Impulse main `76ab525`:
 | Who | File / fn | What it sets | Step policy? |
 |---|---|---|---|
 | Impulse | `step_model.rs` `decide_step_model` | `ChatRequest.model` | Yes. Admissibility, then verifier-failure escalate, then stay on `current_model`. |
-| Impulse | `Agent::chat`, `run_tool_loop`, `ImpulseAgent::query_stateless` | Calls the hook | Yes. |
+| Impulse | `Agent::chat`, `run_tool_loop`, `ImpulseAgent::query_stateless`, `handlers::system::handle_chat`, `daemon::handlers::handle_chat_request` | Calls `resolve_step_model` / the hook | Yes. |
 | ROSA | `selector.rs` `select()` | `BackendId` from `ROSA_BACKEND` / catalog score | No. Exported. No production caller. Same class as `monty/routing.rs`. |
 | ROSA | `team.rs` `AgentRole::to_request` | `RunRequest.model` from role model or `Team.default_model` | No. Construction-time string. |
 | ROSA | anthropic/gemini `start_run` | empty → compiled `DEFAULT_MODEL`; same string for the tool loop | No. |
