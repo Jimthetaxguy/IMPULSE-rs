@@ -170,6 +170,50 @@ mod tests {
     }
 
     #[test]
+    fn test_decide_step_model_worker_after_failure_uses_admitted_escalation_model() {
+        // Worker is the Ion/API actor. After verification Failed it may take an
+        // admitted escalate_model; Operator/Verifier stay blocked elsewhere.
+        let mut ctx = StepModelContext::worker("sonnet");
+        ctx.verification = Some(StepVerificationSignal::Failed);
+        ctx.escalate_model = Some("opus".to_string());
+        let decision = decide_step_model(&ctx, "haiku");
+        assert_eq!(ctx.actor, StepActor::Worker);
+        assert_eq!(decision.model, "opus");
+        assert_eq!(decision.reason, StepModelReason::AfterVerifierFailure);
+    }
+
+    #[test]
+    fn test_decide_step_model_system_after_failure_uses_admitted_escalation_model() {
+        // System is on the crate enum and is not blocked the way Operator and
+        // Verifier are. After verification Failed it may take an admitted
+        // escalate_model. The Impulse wrapper already locks GovernedActorKind::System;
+        // this locks the portable StepActor::System path.
+        let mut ctx = StepModelContext::worker("sonnet");
+        ctx.actor = StepActor::System;
+        ctx.verification = Some(StepVerificationSignal::Failed);
+        ctx.escalate_model = Some("opus".to_string());
+        let decision = decide_step_model(&ctx, "haiku");
+        assert_eq!(ctx.actor, StepActor::System);
+        assert_eq!(decision.model, "opus");
+        assert_eq!(decision.reason, StepModelReason::AfterVerifierFailure);
+    }
+
+    #[test]
+    fn test_decide_step_model_supervisor_after_failure_uses_admitted_escalation_model() {
+        // Supervisor is the default API actor via StepModelContext::supervisor.
+        // Failure tests that call configured_ctx already exercise this path
+        // without naming the actor. Lock Supervisor explicitly next to Worker
+        // and System so all three escalate-capable actors are named.
+        let mut ctx = StepModelContext::supervisor("sonnet");
+        ctx.verification = Some(StepVerificationSignal::Failed);
+        ctx.escalate_model = Some("opus".to_string());
+        let decision = decide_step_model(&ctx, "haiku");
+        assert_eq!(ctx.actor, StepActor::Supervisor);
+        assert_eq!(decision.model, "opus");
+        assert_eq!(decision.reason, StepModelReason::AfterVerifierFailure);
+    }
+
+    #[test]
     fn test_decide_step_model_current_model_wins_over_configured_fallback() {
         let decision = decide_step_model(&configured_ctx("already-selected"), "default");
         assert_eq!(decision.model, "already-selected");
