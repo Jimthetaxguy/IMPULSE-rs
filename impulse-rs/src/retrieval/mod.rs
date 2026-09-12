@@ -65,6 +65,23 @@ pub fn index_from_storage(
     index_memory_from_storage(storage, config, scope, rebuild)
 }
 
+/// Index the promoted memory records behind the GENOME projection (ADR-0020).
+pub fn index_promoted_memory(
+    base_path: &Path,
+    records: &[impulse_ops::memory_candidate::MemoryRecord],
+) -> Result<usize> {
+    indexer::index_promoted_memory_records(base_path, records)
+}
+
+/// Keyword search restricted to promoted memory records.
+pub fn search_promoted_memory(
+    base_path: &Path,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<types::SearchResult>> {
+    indexer::search_promoted_memory(base_path, query, limit)
+}
+
 pub fn search_history(
     base_path: &Path,
     config: &Config,

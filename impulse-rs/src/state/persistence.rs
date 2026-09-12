@@ -43,6 +43,9 @@ pub struct State {
     storage: Storage,
     pub(super) governed_tasks: std::sync::Mutex<super::governed_task::GovernedTaskLedger>,
     pub(super) memory_candidates: std::sync::Mutex<super::memory_candidate::MemoryCandidateLedger>,
+    /// Verified view of the append-only promoted-memory log (ADR-0020).
+    /// Always locked *after* `memory_candidates`, never before.
+    pub(super) memory_log: std::sync::Mutex<super::memory_record::MemoryLog>,
     pub(super) producer_reservations:
         std::sync::Mutex<super::producer_reservation::ProducerReservationLedger>,
     governed_producer_locks: tokio::sync::Mutex<
@@ -99,6 +102,7 @@ impl State {
             storage,
             governed_tasks,
             memory_candidates,
+            memory_log: std::sync::Mutex::new(Default::default()),
             producer_reservations,
             governed_producer_locks: tokio::sync::Mutex::new(HashMap::new()),
             live_state: RwLock::new(live_state),
@@ -106,6 +110,9 @@ impl State {
             config: RwLock::new(config),
         };
         state.reconcile_accepted_run_memory_candidates()?;
+        // Must follow candidate reconciliation: the log is cross-checked against
+        // the reconciled review statuses, not the pre-migration ones.
+        state.reconcile_promoted_memory_log()?;
         state.reconcile_producer_reservations()?;
         Ok(state)
     }

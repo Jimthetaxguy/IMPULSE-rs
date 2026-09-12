@@ -86,8 +86,38 @@ work.
 ### accepted-run memory candidate — `[code]`
 A deterministic pending-review projection of one accepted governed task, persisted in owner-only
 `MEMORY_CANDIDATES.json` with versioned source assurance/evidence and repairable from task truth. It
-is not curated memory, never mutates `GENOME.md`/`HISTORY.jsonl`, and has no v1 mutation action.
-- **Source:** `impulse-ops/src/memory_candidate.rs`, `src/state/memory_candidate.rs`, ADR-0013.
+is not curated memory and never mutates `GENOME.md`/`HISTORY.jsonl`. Since ADR-0020 it carries a
+review status (`pending_review`, `promoted`, `dismissed`) and a re-derivation carries that status
+forward rather than resetting it.
+- **Source:** `impulse-ops/src/memory_candidate.rs`, `src/state/memory_candidate.rs`, ADR-0013,
+  ADR-0020.
+
+### memory record — `[code]`
+One durable curated memory fact: `{id, kind, scope, project_id, source, valid_from, superseded_by,
+digest}`, where `source` is the candidate it was promoted from or an operator's own note. Its id and
+digest are both built from one SHA-256 over its content, deliberately excluding `valid_from`, so a
+replayed decision re-derives the same identity after a crash. Records live only in append-only,
+hash-chained `.impulse/MEMORY.jsonl`; only the `project` scope is writable today.
+- **Boundary:** a record is never edited in place. Supersession is a later log entry, not a rewrite.
+- **Source:** `impulse-ops/src/memory_candidate.rs`, `src/state/memory_record.rs`, ADR-0020.
+
+### promotion — `[code]`
+The operator-class decision that turns one pending candidate into a memory record: append to
+`MEMORY.jsonl`, then commit the candidate ledger (status, CAS revision, committed log head, receipt),
+then regenerate the projection and mark the retrieval index dirty. Its sibling is dismissal, which
+requires a nonblank reason and produces no record. Both are terminal, idempotent by request id, and
+refused on a candidate that no longer matches its accepted governed-task derivation.
+- **Boundary:** the decision input carries no authentication field; the daemon stamps provenance
+  from the connection class, as it does for an operator decision (ADR-0018).
+- **Source:** `impulse-ops/src/memory_wiring.rs`, `src/state/memory_candidate.rs`, ADR-0020.
+
+### projection — `[code]`
+`.impulse/GENOME_PROJECTION.md`: the deterministic, byte-stable markdown rendering of the currently
+valid memory records, regenerated wholesale and never hand-edited or merged into. It is what a
+runtime memory tool reads; the raw candidate ledger is never exposed to one.
+- **Boundary:** distinct from `GENOME.md`, which stays hand-curated by `impulse memory add` and is
+  never regenerated — raw candidates, promoted records, and the projection are separate artifacts.
+- **Source:** `src/state/memory_record.rs`, ADR-0020.
 
 ### producer reservation — `[code]`
 A durable record of intent to run a daemon-owned producer side effect (verification, Supervisor
@@ -283,7 +313,9 @@ protection against a same-uid process that deliberately reads the file.
 ### memory / genome — `[code]`
 Scoped durable continuity: session history plus verified decisions/preferences, retrieval indexes,
 and review-first context injection. Memory records must carry project/session provenance.
-- **Boundary:** pending accepted-run candidates are review state, not curated memory.
+- **Boundary:** pending accepted-run candidates are review state, not curated memory. Curated
+  memory now has two independent artifacts: hand-written `GENOME.md` and the promoted-record log
+  `MEMORY.jsonl` behind its projection.
 - **Source of truth:** `src/{state,memory,retrieval,injection,stewardship}/`.
 
 ### artifact — `[code]`
