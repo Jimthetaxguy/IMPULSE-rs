@@ -1,10 +1,10 @@
 //! Harness-owned per-step model choice (ADR-0015).
 //!
 //! Impulse is the harness. A gateway may do keys, rate limits, audit, or
-//! provider failover. It must not pick the model. There is no step-level
-//! router today: construction resolves one session model and fill sites copy
-//! it into every [`crate::llm_backends::ChatRequest`]. This module is the
-//! hook those fill sites call.
+//! provider failover. It must not pick the model. Construction resolves the
+//! configured default, then each API and Ion chat fill site calls
+//! [`resolve_step_model`] before setting [`crate::llm_backends::ChatRequest::model`].
+//! This module owns that single deterministic policy.
 //!
 //! Policy v0 is identity (`Configured`) unless attestation/verification
 //! failed and an optional escalate model is present. Escalation is
@@ -50,6 +50,18 @@ impl HarnessStepContext {
     pub fn ion_api(current_model: impl Into<String>) -> Self {
         Self {
             actor: GovernedActorKind::Worker,
+            review_state: None,
+            latest_verification: None,
+            tool_round: 0,
+            current_model: current_model.into(),
+            escalate_model: None,
+        }
+    }
+
+    /// System actor default with no review/verification yet.
+    pub fn system(current_model: impl Into<String>) -> Self {
+        Self {
+            actor: GovernedActorKind::System,
             review_state: None,
             latest_verification: None,
             tool_round: 0,
@@ -180,6 +192,18 @@ mod tests {
     }
 
     #[test]
+    fn test_decide_step_model_passed_verification_does_not_escalate() {
+        // Passed is not Failed/Inconclusive. An admitted escalate_model must
+        // stay unused when verification succeeded.
+        let mut ctx = HarnessStepContext::ion_api("haiku");
+        ctx.latest_verification = Some(GovernedVerificationOutcome::Passed);
+        ctx.escalate_model = Some("sonnet".to_string());
+        let decision = decide_step_model(&ctx, "haiku");
+        assert_eq!(decision.model, "haiku");
+        assert_eq!(decision.reason, StepModelReason::Configured);
+    }
+
+    #[test]
     fn test_decide_step_model_stays_on_current_model_when_configured_differs() {
         let ctx = configured_ctx("already-escalated");
         let decision = decide_step_model(&ctx, "claude-sonnet-4-6");
@@ -253,6 +277,60 @@ mod tests {
         ctx.actor = GovernedActorKind::Verifier;
         ctx.latest_verification = Some(GovernedVerificationOutcome::Failed);
         ctx.escalate_model = Some("sonnet".to_string());
+        let decision = decide_step_model(&ctx, "haiku");
+        assert_eq!(decision.model, "haiku");
+        assert_eq!(decision.reason, StepModelReason::Configured);
+    }
+
+    #[test]
+    fn test_decide_step_model_worker_after_failure_uses_escalate_model() {
+        // Ion/API fill sites use Worker via HarnessStepContext::ion_api. The
+        // portable crate already locks Worker after Failed; this locks the
+        // Impulse wrapper path the same way System is locked below.
+        let mut ctx = HarnessStepContext::ion_api("haiku");
+        ctx.latest_verification = Some(GovernedVerificationOutcome::Failed);
+        ctx.escalate_model = Some("sonnet".to_string());
+        let decision = decide_step_model(&ctx, "haiku");
+        assert_eq!(ctx.actor, GovernedActorKind::Worker);
+        assert_eq!(decision.model, "sonnet");
+        assert_eq!(decision.reason, StepModelReason::AfterVerifierFailure);
+    }
+
+    #[test]
+    fn test_decide_step_model_system_actor_can_escalate_after_verifier_failure() {
+        // ADR-0015 blocks only Operator and Verifier. Use
+        // HarnessStepContext::system next to ion_api and supervisor for the
+        // three escalate-capable actors.
+        let mut ctx = HarnessStepContext::system("haiku");
+        ctx.latest_verification = Some(GovernedVerificationOutcome::Failed);
+        ctx.escalate_model = Some("sonnet".to_string());
+        let decision = decide_step_model(&ctx, "haiku");
+        assert_eq!(ctx.actor, GovernedActorKind::System);
+        assert_eq!(decision.model, "sonnet");
+        assert_eq!(decision.reason, StepModelReason::AfterVerifierFailure);
+    }
+
+    #[test]
+    fn test_decide_step_model_supervisor_after_failure_uses_escalate_model() {
+        // Supervisor is the default API actor via HarnessStepContext::supervisor
+        // (configured_ctx). Failure tests that call configured_ctx already
+        // exercise this path without naming the actor. Lock Supervisor
+        // explicitly next to Worker and System so all three escalate-capable
+        // actors are named on the Impulse wrapper, matching the portable crate.
+        let mut ctx = HarnessStepContext::supervisor("haiku");
+        ctx.latest_verification = Some(GovernedVerificationOutcome::Failed);
+        ctx.escalate_model = Some("sonnet".to_string());
+        let decision = decide_step_model(&ctx, "haiku");
+        assert_eq!(ctx.actor, GovernedActorKind::Supervisor);
+        assert_eq!(decision.model, "sonnet");
+        assert_eq!(decision.reason, StepModelReason::AfterVerifierFailure);
+    }
+
+    #[test]
+    fn test_decide_step_model_blank_escalate_stays_configured() {
+        let mut ctx = configured_ctx("haiku");
+        ctx.latest_verification = Some(GovernedVerificationOutcome::Failed);
+        ctx.escalate_model = Some("   ".to_string());
         let decision = decide_step_model(&ctx, "haiku");
         assert_eq!(decision.model, "haiku");
         assert_eq!(decision.reason, StepModelReason::Configured);
