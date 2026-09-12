@@ -110,6 +110,8 @@ fn test_workspace_launcher_renders_required_builder_compatibility_preflight() {
             review_queue: Vec::new(),
             bridge_status: None,
             daemon_ops_status: None,
+            governed_acks: Default::default(),
+            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Terminal,
         },
     );
@@ -1010,6 +1012,8 @@ fn test_retro_shell_binds_project_ops_snapshot() {
             review_queue: Vec::new(),
             bridge_status: None,
             daemon_ops_status: None,
+            governed_acks: Default::default(),
+            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Terminal,
         },
     );
@@ -1047,6 +1051,8 @@ fn test_workspace_launcher_renders_registry_platforms_including_ion_and_custom()
             review_queue: Vec::new(),
             bridge_status: None,
             daemon_ops_status: None,
+            governed_acks: Default::default(),
+            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Terminal,
         },
     );
@@ -2370,6 +2376,8 @@ fn test_shell_render_accepts_live_agents_workspaces_and_tools() {
             }],
             bridge_status: None,
             daemon_ops_status: None,
+            governed_acks: Default::default(),
+            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Terminal,
         },
     );
@@ -2417,6 +2425,8 @@ fn test_shell_review_route_gates_review_console() {
             }],
             bridge_status: None,
             daemon_ops_status: None,
+            governed_acks: Default::default(),
+            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Review,
         },
     );
@@ -2456,6 +2466,8 @@ fn test_shell_supervisor_route_gates_operator_board() {
             review_queue: Vec::new(),
             bridge_status: None,
             daemon_ops_status: None,
+            governed_acks: Default::default(),
+            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Supervisor,
         },
     );
@@ -2544,6 +2556,8 @@ fn test_shell_supervisor_route_renders_authoritative_governed_evidence_and_contr
             review_queue: Vec::new(),
             bridge_status: None,
             daemon_ops_status: None,
+            governed_acks: Default::default(),
+            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Supervisor,
         },
     );
@@ -2612,6 +2626,8 @@ fn test_profiled_governed_tasks_label_rust_only_and_route_all_producers_via_daem
             review_queue: Vec::new(),
             bridge_status: None,
             daemon_ops_status: None,
+            governed_acks: Default::default(),
+            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Supervisor,
         },
     );
@@ -2992,6 +3008,8 @@ fn test_shell_renders_bridge_status_banner_when_degraded() {
                 reason: Some("host event API unavailable".to_string()),
             }),
             daemon_ops_status: None,
+            governed_acks: Default::default(),
+            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Terminal,
         },
     );
@@ -3020,6 +3038,8 @@ fn test_shell_hides_bridge_status_banner_when_healthy() {
             review_queue: Vec::new(),
             bridge_status: None,
             daemon_ops_status: None,
+            governed_acks: Default::default(),
+            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Terminal,
         },
     );
@@ -3048,6 +3068,8 @@ fn test_footer_stream_health_reflects_live_agent() {
                 connected: true,
                 error: None,
             }),
+            governed_acks: Default::default(),
+            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Terminal,
         },
     );
@@ -3089,6 +3111,8 @@ fn test_publish_only_degradation_keeps_subscribed_snapshot_current() {
                 connected: true,
                 error: Some("publish: temporary failure".to_string()),
             }),
+            governed_acks: Default::default(),
+            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Terminal,
         },
     );
@@ -3124,6 +3148,8 @@ fn test_footer_stream_health_reads_down_when_transport_degraded() {
                 connected: false,
                 error: Some("daemon unavailable".to_string()),
             }),
+            governed_acks: Default::default(),
+            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Terminal,
         },
     );
@@ -3141,4 +3167,923 @@ fn test_footer_stream_health_reads_down_when_transport_degraded() {
     assert!(html.contains("0 cached artifacts"));
     assert!(html.contains("0 cached interventions"));
     assert!(html.contains("supervisor_local_action · down"));
+}
+
+// ─────────────── ADR-0019 staged-worktree controls (protocol v9) ───────────────
+
+/// An accepted, staged governed task with an active checkout.
+fn staged_governed_task() -> impulse_ops::governed_task::GovernedTaskRun {
+    use impulse_ops::governed_task as gt;
+    with_accepted_claim(gt::GovernedTaskRun {
+        id: gt::GovernedTaskId::try_new("staged-task").expect("task id"),
+        revision: 7,
+        project_id: "impulse-rs".to_string(),
+        workspace_root: "/tmp/impulse-rs".to_string(),
+        task: "Wire the cockpit's staged controls".to_string(),
+        acceptance_criteria: vec!["the workspace gate is green".to_string()],
+        approval_policy: gt::ApprovalPolicy::OperatorRequired,
+        verification_profile: Some(gt::GovernedVerificationProfile::RustWorkspaceV1),
+        role_assignment: None,
+        role_compatibility: None,
+        runtime_id: "ion".to_string(),
+        agent_id: "builder-01".to_string(),
+        session_id: None,
+        initial_subject_revision: Some("a".repeat(40)),
+        world_scope: gt::WorldScope::StagedAuthoritative,
+        staged_worktree: Some(gt::StagedWorktree {
+            id: gt::GovernedRecordId::try_new("staged-1").expect("staged id"),
+            actor: gt::GovernedActor {
+                kind: gt::GovernedActorKind::System,
+                id: "impulse-daemon:staged_worktree".to_string(),
+            },
+            root: "/tmp/impulse-rs/.impulse/worktrees/staged-task".to_string(),
+            initial_subject_revision: "a".repeat(40),
+            // Pinned on purpose: an *unpinned* worktree can never be promoted,
+            // so ADR-0019 rule 7 makes it discardable from any state, which
+            // would mask the accepted-run rule these tests exercise.
+            // #52 added a pin scheme version; `current()` is its constructor,
+            // so the fixture tracks the live scheme instead of pinning a
+            // literal that will drift the next time the scheme moves.
+            shared_config_digest: gt::SharedRepositoryConfigPin::Recorded(
+                gt::SharedRepositoryConfigDigest::current(
+                    format!("sha256:{}", "d".repeat(64)),
+                    None,
+                    None,
+                ),
+            ),
+            status: gt::StagedWorktreeStatus::Active,
+            materialized_at: "2026-09-12T00:00:00Z".to_string(),
+            based_on_revision: 1,
+        }),
+        promotions: vec![],
+        execution_state: gt::GovernedExecutionState::RuntimeExited,
+        review_state: gt::GovernedReviewState::Accepted,
+        claims: vec![],
+        verifications: vec![],
+        supervisor_verdicts: vec![],
+        operator_decisions: vec![],
+        events: vec![],
+        created_at: "2026-09-12T00:00:00Z".to_string(),
+        updated_at: "2026-09-12T00:00:00Z".to_string(),
+    })
+}
+
+fn with_promotion(
+    mut task: impulse_ops::governed_task::GovernedTaskRun,
+    outcome: impulse_ops::governed_task::GovernedPromotionOutcome,
+) -> impulse_ops::governed_task::GovernedTaskRun {
+    use impulse_ops::governed_task as gt;
+    task.promotions.push(gt::GovernedPromotion {
+        id: gt::GovernedRecordId::try_new("promotion-1").expect("promotion id"),
+        actor: gt::GovernedActor {
+            kind: gt::GovernedActorKind::Operator,
+            id: "local-operator-ui".to_string(),
+        },
+        accepted_revision: "b".repeat(40),
+        initial_subject_revision: "a".repeat(40),
+        outcome,
+        recorded_at: "2026-09-12T00:01:00Z".to_string(),
+        based_on_revision: task.revision,
+    });
+    task.revision += 1;
+    task
+}
+
+/// Attach the accepted worker claim.
+///
+/// Folded into the base fixture rather than opt-in: an accepted run cannot
+/// exist without the claim its acceptance was granted against, and #52's
+/// `governed_outcome_is_promotable` requires one because the promotion producer
+/// reads the accepted revision off it. A claimless fixture modelled a state the
+/// ledger does not produce.
+fn with_accepted_claim(
+    mut task: impulse_ops::governed_task::GovernedTaskRun,
+) -> impulse_ops::governed_task::GovernedTaskRun {
+    use impulse_ops::governed_task as gt;
+    task.claims.push(gt::WorkerCompletionClaim {
+        id: gt::GovernedRecordId::try_new("claim-1").expect("claim id"),
+        actor: gt::GovernedActor {
+            kind: gt::GovernedActorKind::Worker,
+            id: "builder-01".to_string(),
+        },
+        summary: "the gate is green".to_string(),
+        subject_revision: "b".repeat(40),
+        artifact_ids: Vec::new(),
+        diff_ref: None,
+        loop_report_digest: None,
+        loop_report_version: None,
+        submitted_at: "2026-09-12T00:00:30Z".to_string(),
+        based_on_revision: task.revision,
+    });
+    task
+}
+
+fn operator_board_html(tasks: Vec<impulse_ops::governed_task::GovernedTaskRun>) -> String {
+    let snapshot = ProjectOpsSnapshot {
+        governed_tasks: tasks,
+        ..ProjectOpsSnapshot::default()
+    };
+    let mut vdom = VirtualDom::new_with_props(
+        DesktopShellWithSnapshot,
+        DesktopShellWithSnapshotProps {
+            snapshot,
+            runtime_agents: Vec::new(),
+            agent_platforms: Vec::new(),
+            workspaces: Vec::new(),
+            mcp_tools: Vec::new(),
+            last_invocations: Vec::new(),
+            review_queue: Vec::new(),
+            bridge_status: None,
+            daemon_ops_status: None,
+            governed_acks: Default::default(),
+            on_dismiss_governed_ack: None,
+            initial_view: DesktopView::Supervisor,
+        },
+    );
+    vdom.rebuild_in_place();
+    dioxus_ssr::render(&vdom)
+}
+
+/// The two controls exist, are labelled, and name the staged checkout they act
+/// on. Promote is live on an accepted staged run; Discard is not, because
+/// ADR-0019 rule 7 keeps an accepted run's checkout until a promotion has been
+/// attempted — and the surface must say which rule stopped it.
+#[test]
+fn test_staged_controls_render_with_a_named_reason_when_a_control_is_unavailable() {
+    let html = operator_board_html(vec![staged_governed_task()]);
+
+    assert!(html.contains("data-world-scope=\"staged_authoritative\""));
+    assert!(html.contains("/tmp/impulse-rs/.impulse/worktrees/staged-task"));
+    assert!(html.contains("data-governed-control=\"promote\""));
+    assert!(html.contains("data-governed-control=\"discard\""));
+    assert!(html.contains("Promote onto the canonical branch"));
+    assert!(html.contains("Discard staged worktree"));
+    assert!(
+        html.contains("data-governed-control-disabled=\"discard\""),
+        "a disabled control must render its reason, not just grey out"
+    );
+    assert!(html.contains("promote it first, then discard"));
+    assert!(
+        !html.contains("data-governed-control-disabled=\"promote\""),
+        "an accepted staged run with an active worktree is promotable"
+    );
+    assert!(
+        !html.contains("data-governed-control=\"discard-confirmation\""),
+        "the discard confirmation is armed by a click, never rendered up front"
+    );
+}
+
+/// A non-staged run has nothing to promote or reclaim, so the section is absent
+/// rather than a wall of disabled buttons.
+#[test]
+fn test_an_authoritative_run_renders_no_staged_controls() {
+    let mut authoritative = staged_governed_task();
+    authoritative.world_scope = impulse_ops::governed_task::WorldScope::Authoritative;
+    authoritative.staged_worktree = None;
+    let html = operator_board_html(vec![authoritative]);
+
+    assert!(!html.contains("data-governed-control=\"promote\""));
+    assert!(!html.contains("data-governed-control=\"discard\""));
+    assert!(!html.contains("data-world-scope=\"staged_authoritative\""));
+}
+
+/// ADR-0019 rule 6. A blocked promotion is rendered as a typed execution fact
+/// carrying the canonical head and a per-reason remedy, and the run stays
+/// actionable — Promote is still live for the retry the remedy describes.
+#[test]
+fn test_a_blocked_promotion_renders_as_an_execution_fact_with_its_remedy() {
+    use impulse_ops::governed_task as gt;
+
+    for (reason, slug, expected_remedy_fragment) in [
+        (
+            gt::PromotionBlockedReason::CanonicalHeadMoved,
+            "canonical_head_moved",
+            "retry the promotion",
+        ),
+        (
+            gt::PromotionBlockedReason::DetachedHead,
+            "detached_head",
+            "Check out the branch this work belongs on",
+        ),
+        (
+            gt::PromotionBlockedReason::ConcurrentBranchUpdate,
+            "concurrent_branch_update",
+            "Nothing was written.",
+        ),
+        (
+            gt::PromotionBlockedReason::RepositoryConfigChanged {
+                component: gt::SharedConfigComponent::InfoAttributes,
+            },
+            "repository_config_changed",
+            ".git/info/attributes",
+        ),
+        (
+            gt::PromotionBlockedReason::RepositoryConfigUnpinned,
+            "repository_config_unpinned",
+            "re-materialize it",
+        ),
+    ] {
+        let blocked = with_promotion(
+            staged_governed_task(),
+            gt::GovernedPromotionOutcome::PromotionBlocked {
+                canonical_head: "c".repeat(40),
+                reason,
+            },
+        );
+        let html = operator_board_html(vec![blocked]);
+
+        assert!(
+            html.contains(&format!("data-promotion-blocked-reason=\"{slug}\"")),
+            "{slug} must be rendered as a typed banner"
+        );
+        assert!(
+            html.contains(&"c".repeat(40)),
+            "{slug} must show the canonical head the operator has to reconcile"
+        );
+        assert!(
+            html.contains(expected_remedy_fragment),
+            "{slug} must carry its own remedy line"
+        );
+        assert!(
+            html.contains("The run stays accepted and the staged worktree stays active."),
+            "{slug} must not read as a failed run"
+        );
+        assert!(
+            !html.contains("data-governed-control-disabled=\"promote\""),
+            "{slug} leaves the run retryable"
+        );
+        assert!(
+            html.contains("data-review-state=\"accepted\""),
+            "{slug} must not change the review state the card reports"
+        );
+    }
+}
+
+/// A successful promotion is final: the run is promoted at most once, and the
+/// checkout it used becomes reclaimable.
+#[test]
+fn test_a_promoted_run_offers_discard_and_no_longer_offers_promote() {
+    let promoted = with_promotion(
+        staged_governed_task(),
+        impulse_ops::governed_task::GovernedPromotionOutcome::Promoted {
+            promoted_revision: "b".repeat(40),
+        },
+    );
+    let html = operator_board_html(vec![promoted.clone()]);
+
+    assert!(html.contains("data-governed-control-disabled=\"promote\""));
+    assert!(html.contains("promoted at most once"));
+    assert!(!html.contains("data-governed-control-disabled=\"discard\""));
+    assert!(!html.contains("data-promotion-blocked-reason"));
+    assert_eq!(
+        impulse_desktop::ui::blocked_promotion_notice(&promoted),
+        None,
+        "a successful promotion is not something to warn about"
+    );
+}
+
+/// The enable decision is the shared `impulse_ops` predicate and nothing else,
+/// so the cockpit cannot offer a control the daemon would refuse — or withhold
+/// one it would accept.
+#[test]
+fn test_control_states_track_the_shared_impulse_ops_predicates() {
+    use impulse_desktop::ui::{discard_control_state, promote_control_state};
+    use impulse_ops::governed_task as gt;
+    use impulse_ops::governed_wiring::{
+        governed_outcome_is_promotable, staged_worktree_is_discardable,
+    };
+
+    let mut candidates = vec![staged_governed_task()];
+    for review_state in [
+        gt::GovernedReviewState::AwaitingClaim,
+        gt::GovernedReviewState::AwaitingOperator,
+        gt::GovernedReviewState::Rejected,
+        gt::GovernedReviewState::Escalated,
+        gt::GovernedReviewState::Accepted,
+    ] {
+        let mut task = staged_governed_task();
+        task.review_state = review_state;
+        candidates.push(task);
+    }
+    candidates.push(with_promotion(
+        staged_governed_task(),
+        gt::GovernedPromotionOutcome::Promoted {
+            promoted_revision: "b".repeat(40),
+        },
+    ));
+    candidates.push(with_promotion(
+        staged_governed_task(),
+        gt::GovernedPromotionOutcome::PromotionBlocked {
+            canonical_head: "c".repeat(40),
+            reason: gt::PromotionBlockedReason::DetachedHead,
+        },
+    ));
+    let mut launch_failed = staged_governed_task();
+    launch_failed.execution_state = gt::GovernedExecutionState::LaunchFailed;
+    launch_failed.review_state = gt::GovernedReviewState::AwaitingClaim;
+    candidates.push(launch_failed);
+
+    for task in candidates {
+        let promote = promote_control_state(&task);
+        assert_eq!(
+            promote.is_enabled(),
+            governed_outcome_is_promotable(&task),
+            "promote control disagreed with the daemon predicate for {:?}/{:?}",
+            task.review_state,
+            task.execution_state
+        );
+        if !promote.is_enabled() {
+            assert!(
+                promote.reason().is_some_and(|reason| !reason.is_empty()),
+                "a disabled promote control must name its reason"
+            );
+        }
+
+        let discard = discard_control_state(&task);
+        let daemon_would_discard =
+            staged_worktree_is_discardable(&task) && task.active_staged_worktree().is_some();
+        assert_eq!(
+            discard.is_enabled(),
+            daemon_would_discard,
+            "discard control disagreed with the daemon predicate for {:?}/{:?}",
+            task.review_state,
+            task.execution_state
+        );
+        if !discard.is_enabled() {
+            assert!(
+                discard.reason().is_some_and(|reason| !reason.is_empty()),
+                "a disabled discard control must name its reason"
+            );
+        }
+    }
+}
+
+/// ADR-0019's Consequences: the surface offering a discard must say what it
+/// costs and show the OID, and it must do so *before* the request is sent. The
+/// notice is computed from the task through the same predicate that fills the
+/// acknowledgement's `unreferenced_accepted_commit`.
+#[test]
+fn test_the_discard_cost_notice_names_the_unreferenced_accepted_commit() {
+    use impulse_desktop::ui::discard_cost_notice;
+    use impulse_ops::governed_task as gt;
+
+    let blocked = with_promotion(
+        staged_governed_task(),
+        gt::GovernedPromotionOutcome::PromotionBlocked {
+            canonical_head: "c".repeat(40),
+            reason: gt::PromotionBlockedReason::CanonicalHeadMoved,
+        },
+    );
+    let notice = discard_cost_notice(&blocked).expect("a blocked run's commit has only one ref");
+    assert!(notice.contains(&"b".repeat(40)), "the OID must be shown");
+    assert!(
+        notice.contains("drops its only ref"),
+        "the cost must be stated, got: {notice}"
+    );
+    assert!(
+        notice.contains("git cat-file -p"),
+        "recovery must be actionable, not just described"
+    );
+    assert_eq!(
+        impulse_ops::governed_wiring::unreferenced_accepted_commit_on_discard(&blocked),
+        Some("b".repeat(40).as_str()),
+        "the notice must be derived from the same predicate that fills the acknowledgement"
+    );
+
+    let promoted = with_promotion(
+        staged_governed_task(),
+        gt::GovernedPromotionOutcome::Promoted {
+            promoted_revision: "b".repeat(40),
+        },
+    );
+    assert_eq!(
+        discard_cost_notice(&promoted),
+        None,
+        "a promoted commit is on the canonical branch and costs nothing to discard"
+    );
+
+    let mut rejected = staged_governed_task();
+    rejected.review_state = gt::GovernedReviewState::Rejected;
+    assert_eq!(discard_cost_notice(&rejected), None);
+}
+
+/// Both controls reach the host through the same named bridge entry points the
+/// JS bootstrap installs; a rename on either side is a silent dead button.
+#[test]
+fn test_staged_control_bridge_scripts_target_the_installed_bridge_entry_points() {
+    use impulse_desktop::ui::{governed_discard_bridge_script, governed_promotion_bridge_script};
+    use impulse_ops::governed_task as gt;
+
+    let promote =
+        governed_promotion_bridge_script(&impulse_ops::governed_wiring::GovernedPromotionRequest {
+            request_id: gt::GovernedRequestId::try_new("ui-promote-1").expect("request id"),
+            project_id: "impulse-rs".to_string(),
+            task_id: gt::GovernedTaskId::try_new("staged-task").expect("task id"),
+            expected_revision: 7,
+        });
+    assert!(promote.contains("bridge.promoteGovernedOutcome"));
+    assert!(promote.contains("\"expected_revision\":7"));
+    assert!(promote.contains("degraded"));
+
+    let discard = governed_discard_bridge_script(
+        &impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardRequest {
+            request_id: gt::GovernedRequestId::try_new("ui-discard-1").expect("request id"),
+            project_id: "impulse-rs".to_string(),
+            task_id: gt::GovernedTaskId::try_new("staged-task").expect("task id"),
+            expected_revision: 7,
+            reason: "the checkout is finished with".to_string(),
+        },
+    );
+    assert!(discard.contains("bridge.discardGovernedStagedWorktree"));
+    assert!(discard.contains("the checkout is finished with"));
+
+    let bootstrap = desktop_event_bridge_script();
+    assert!(bootstrap.contains("promoteGovernedOutcome"));
+    assert!(bootstrap.contains("discardGovernedStagedWorktree"));
+    assert!(bootstrap.contains("governed_outcome_promote"));
+    assert!(bootstrap.contains("governed_staged_worktree_discard"));
+    assert!(bootstrap.contains("governed_promotion_failed"));
+    assert!(bootstrap.contains("governed_discard_failed"));
+}
+
+// ───────────────────────── review round 1 regressions ─────────────────────────
+
+/// **P1.** An accepted staged run whose pin is `Unknown` — the pre-pin
+/// population `RepositoryConfigUnpinned` exists for — is discardable through the
+/// unknown-pin short-circuit with *zero* promotion attempts. The confirmation
+/// used to tell the operator "nothing here was accepted and left unpromoted"
+/// right before an irreversible action that stranded a commit.
+#[test]
+fn test_an_unpinned_accepted_run_names_the_commit_a_discard_would_strand() {
+    use impulse_desktop::ui::{
+        discard_control_state, discard_cost_notice, discard_reassurance_notice,
+    };
+    use impulse_ops::governed_task as gt;
+
+    let mut unpinned = staged_governed_task();
+    if let Some(staged) = unpinned.staged_worktree.as_mut() {
+        staged.shared_config_digest = gt::SharedRepositoryConfigPin::Unknown;
+    }
+    assert_eq!(unpinned.review_state, gt::GovernedReviewState::Accepted);
+    assert!(
+        unpinned.promotions.is_empty(),
+        "this reaches discard with no promotion attempt at all"
+    );
+    assert!(
+        discard_control_state(&unpinned).is_enabled(),
+        "an unpinned worktree can never be promoted, so discard is the only way forward"
+    );
+
+    let cost = discard_cost_notice(&unpinned)
+        .expect("an accepted, unpromoted run always costs its commit");
+    assert!(
+        cost.contains(&"b".repeat(40)),
+        "the OID must be shown: {cost}"
+    );
+    assert!(cost.contains("git cat-file -p"));
+    assert_eq!(
+        discard_reassurance_notice(&unpinned),
+        None,
+        "a run with a real cost must never also carry a reassurance"
+    );
+}
+
+/// The reassurance sentence must never claim "nothing was accepted" about an
+/// accepted run, in any shape — including the claimless record the state layer
+/// should not produce.
+#[test]
+fn test_no_accepted_run_is_ever_told_that_nothing_was_accepted() {
+    use impulse_desktop::ui::discard_reassurance_notice;
+    use impulse_ops::governed_task as gt;
+
+    let accepted = staged_governed_task();
+
+    let mut claimless = accepted.clone();
+    claimless.claims.clear();
+    let claimless_notice =
+        discard_reassurance_notice(&claimless).expect("a claimless accepted run still needs words");
+    assert!(
+        !claimless_notice.contains("never accepted")
+            && !claimless_notice.contains("nothing here was accepted"),
+        "an accepted run must not be told nothing was accepted, got: {claimless_notice}"
+    );
+    assert!(
+        claimless_notice.contains("Check the staged checkout's HEAD"),
+        "with no OID to show, the surface must admit it rather than reassure: {claimless_notice}"
+    );
+
+    let promoted = with_promotion(
+        accepted.clone(),
+        gt::GovernedPromotionOutcome::Promoted {
+            promoted_revision: "b".repeat(40),
+        },
+    );
+    let promoted_notice =
+        discard_reassurance_notice(&promoted).expect("a promoted run genuinely costs nothing");
+    assert!(promoted_notice.contains("already on the canonical branch"));
+
+    let mut rejected = accepted;
+    rejected.review_state = gt::GovernedReviewState::Rejected;
+    rejected.claims.clear();
+    assert!(discard_reassurance_notice(&rejected)
+        .expect("a rejected run costs nothing")
+        .contains("never accepted"));
+}
+
+/// **P2.** `pending_rerun_reason` and `unreferenced_accepted_commit` exist only
+/// on the acknowledgement — the `ops_update` the card waits for carries neither
+/// — so the bridge forwards them into the banner channel or they are lost.
+#[test]
+fn test_ack_only_facts_reach_the_banner_channel() {
+    use impulse_desktop::ui::{GOVERNED_RERUN_PENDING_STATUS, GOVERNED_UNREFERENCED_COMMIT_STATUS};
+
+    let bootstrap = desktop_event_bridge_script();
+    assert!(
+        bootstrap.contains("ack?.pending_rerun_reason"),
+        "the promotion bridge must read the ack-only rerun reason"
+    );
+    assert!(
+        bootstrap.contains(GOVERNED_RERUN_PENDING_STATUS),
+        "and forward it under the status the banner knows"
+    );
+    assert!(
+        bootstrap.contains("ack?.unreferenced_accepted_commit"),
+        "the discard bridge must read the ack-only stranded commit"
+    );
+    assert!(bootstrap.contains(GOVERNED_UNREFERENCED_COMMIT_STATUS));
+
+    // Neither reads as a failed host call.
+    let rerun = BridgeStatusUpdate {
+        status: GOVERNED_RERUN_PENDING_STATUS.to_string(),
+        reason: Some("a previous promotion producer was interrupted".to_string()),
+    };
+    assert!(rerun.headline().contains("redoing an interrupted producer"));
+    assert!(!rerun.headline().contains("Host call failed"));
+
+    let stranded = BridgeStatusUpdate {
+        status: GOVERNED_UNREFERENCED_COMMIT_STATUS.to_string(),
+        reason: Some(format!(
+            "Accepted commit {} was never promoted",
+            "b".repeat(40)
+        )),
+    };
+    assert!(stranded
+        .headline()
+        .contains("only ref to an accepted commit"));
+}
+
+/// Nit: a stale revision means the board is looking at a task the daemon has
+/// already moved past. "Host call failed: governed promotion" sends the operator
+/// hunting for a transport problem that does not exist.
+#[test]
+fn test_a_revision_conflict_reads_as_a_stale_board_not_a_transport_failure() {
+    let conflict = BridgeStatusUpdate {
+        status: "governed_promotion_failed".to_string(),
+        reason: Some("governed task revision conflict: expected 7, current 9".to_string()),
+    };
+    let headline = conflict.headline();
+    assert!(headline.contains("Board is out of date"), "got: {headline}");
+    assert!(headline.contains("refresh and retry"));
+    assert!(!headline.contains("Host call failed"));
+}
+
+/// Nit: the desktop launch path never declares a world scope, so every
+/// registration it builds is `Authoritative`. That is precisely why
+/// `RegisterGovernedTask` is absent from the desktop's operator-class list —
+/// the daemon gates registration only for a staged scope.
+#[test]
+fn test_every_desktop_registration_is_authoritative_scoped() {
+    use impulse_ops::governed_task as gt;
+
+    // Structural: the launch path never calls the builder's scope setter, so
+    // the registration cannot be anything but the default. Checked against the
+    // source so that adding a staged launch trips this test rather than
+    // silently shipping an unauthenticated staged registration.
+    let runtime_source = include_str!("../src/runtime.rs");
+    assert!(
+        !runtime_source.contains(".world_scope("),
+        "the desktop declares a world scope now; RegisterGovernedTask must join \
+         UnixDaemonOpsClient::requires_operator_class at the same time, because the daemon \
+         gates staged-scope registration as operator-class"
+    );
+
+    // And the default that therefore applies is `Authoritative`.
+    let registration = gt::GovernedTaskRegistration::builder(
+        "request-1".to_string(),
+        "task-1".to_string(),
+        "impulse-rs".to_string(),
+        "/tmp/impulse-rs".to_string(),
+        "Launch a governed agent".to_string(),
+        "builder-01".to_string(),
+        "codex",
+    )
+    .build()
+    .expect("a minimal registration builds");
+    assert_eq!(registration.world_scope, gt::WorldScope::Authoritative);
+}
+
+// ───────────────────── review round 3: durable ack notices ─────────────────────
+
+fn discard_ack_message(task_id: &str, commit: &str) -> DesktopBridgeMessage {
+    DesktopBridgeMessage {
+        kind: "governed_ack".to_string(),
+        payload: json!({
+            "task_id": task_id,
+            "kind": "discard_stranded_commit",
+            "commit": commit,
+            "discarded_root": "/tmp/impulse-rs/.impulse/worktrees/staged-task",
+            "detail": format!(
+                "Accepted commit {commit} was never promoted, so removing the staged worktree \
+                 dropped its only ref. `git cat-file -p {commit}` recovers it from the reflog \
+                 until that expires."
+            ),
+        }),
+    }
+}
+
+fn board_html_with_acks(
+    tasks: Vec<impulse_ops::governed_task::GovernedTaskRun>,
+    acks: std::collections::BTreeMap<String, impulse_desktop::ui::GovernedAckNotice>,
+) -> String {
+    let snapshot = ProjectOpsSnapshot {
+        governed_tasks: tasks,
+        ..ProjectOpsSnapshot::default()
+    };
+    let mut vdom = VirtualDom::new_with_props(
+        DesktopShellWithSnapshot,
+        DesktopShellWithSnapshotProps {
+            snapshot,
+            runtime_agents: Vec::new(),
+            agent_platforms: Vec::new(),
+            workspaces: Vec::new(),
+            mcp_tools: Vec::new(),
+            last_invocations: Vec::new(),
+            review_queue: Vec::new(),
+            bridge_status: None,
+            daemon_ops_status: None,
+            governed_acks: acks,
+            on_dismiss_governed_ack: None,
+            initial_view: DesktopView::Supervisor,
+        },
+    );
+    vdom.rebuild_in_place();
+    dioxus_ssr::render(&vdom)
+}
+
+/// **P2.** The reducer files an acknowledgement notice per task, and an
+/// `ops_update` — which lands immediately after every discard — must not remove
+/// it. The transient `bridge_status` slot is reset by every successfully
+/// reduced message, which is exactly why the OID cannot live only there.
+#[test]
+fn test_an_ops_update_after_a_discard_does_not_remove_the_stranded_commit_notice() {
+    use impulse_desktop::ui::GovernedAckNotice;
+
+    let commit = "b".repeat(40);
+    let notice = GovernedAckNotice::parse(&discard_ack_message("staged-task", &commit))
+        .expect("a well-formed governed_ack parses");
+    assert_eq!(notice.commit.as_deref(), Some(commit.as_str()));
+
+    let mut acks = std::collections::BTreeMap::new();
+    acks.insert(notice.task_id.clone(), notice);
+
+    // The reducer that handles `ops_update` cannot touch this map: it takes a
+    // `DesktopBridgeStateMut` that does not contain it, and the shell files
+    // governed acks on a separate branch that `continue`s before reduction.
+    let mut snapshot = ProjectOpsSnapshot::default();
+    let (mut agents, mut platforms, mut spaces, mut tools, mut queue, mut invocations) = (
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    apply_desktop_bridge_message(
+        DesktopBridgeStateMut::new(
+            &mut snapshot,
+            &mut agents,
+            &mut platforms,
+            &mut spaces,
+            &mut tools,
+            &mut queue,
+            &mut invocations,
+        ),
+        DesktopBridgeMessage {
+            kind: "ops_update".to_string(),
+            payload: serde_json::to_value(ProjectOpsSnapshot::default()).unwrap(),
+        },
+    )
+    .expect("an ops_update reduces");
+    assert_eq!(acks.len(), 1, "reducing an ops_update files no ack changes");
+
+    // And it is still rendered on the card afterwards.
+    let html = board_html_with_acks(vec![staged_governed_task()], acks);
+    assert!(html.contains("data-governed-ack=\"discard_stranded_commit\""));
+    assert!(
+        html.contains(&commit),
+        "the OID must still be on the card after an ops_update"
+    );
+    assert!(html.contains("git cat-file -p"));
+    assert!(
+        html.contains("data-governed-control=\"dismiss-ack\""),
+        "the only way to clear it is the operator's own Dismiss"
+    );
+}
+
+/// **P2.** A card remount — which every revision bump causes, because the card
+/// is keyed `id:revision` — must not take the notice with it. The notice lives
+/// on the board, above that key.
+#[test]
+fn test_the_stranded_commit_notice_survives_a_card_remount() {
+    use impulse_desktop::ui::GovernedAckNotice;
+
+    let commit = "b".repeat(40);
+    let notice = GovernedAckNotice::parse(&discard_ack_message("staged-task", &commit)).unwrap();
+    let mut acks = std::collections::BTreeMap::new();
+    acks.insert(notice.task_id.clone(), notice);
+
+    let before = board_html_with_acks(vec![staged_governed_task()], acks.clone());
+    assert!(before.contains("data-review-state=\"accepted\""));
+    assert!(before.contains(&commit));
+
+    // Same task, new daemon revision: the card is a different keyed element.
+    let mut bumped = staged_governed_task();
+    bumped.revision += 1;
+    let after = board_html_with_acks(vec![bumped], acks);
+    assert!(
+        after.contains(&commit),
+        "a revision bump remounts the card; the notice is board-owned and must survive"
+    );
+    assert!(after.contains("data-governed-ack-task=\"staged-task\""));
+}
+
+/// **P2.** Dismissal is the one thing that clears it, and it clears only the
+/// task it was filed against.
+#[test]
+fn test_dismissal_clears_only_the_dismissed_task_s_notice() {
+    use impulse_desktop::ui::GovernedAckNotice;
+
+    // Deliberately NOT the fixture's claim revision. That OID legitimately
+    // appears in the discard *cost* notice for an accepted, unpromoted run, so
+    // reusing it here would make "the OID is gone" unprovable -- the assertion
+    // would fail for a reason that is the P1 fix working correctly.
+    let commit = "e".repeat(40);
+    let other = "c".repeat(40);
+    let mut acks = std::collections::BTreeMap::new();
+    for (task_id, oid) in [("staged-task", &commit), ("other-task", &other)] {
+        let notice = GovernedAckNotice::parse(&discard_ack_message(task_id, oid)).unwrap();
+        acks.insert(notice.task_id.clone(), notice);
+    }
+
+    let both = board_html_with_acks(vec![staged_governed_task()], acks.clone());
+    assert!(both.contains(&commit));
+
+    // The dismissal the shell performs is a removal keyed by task id.
+    acks.remove("staged-task");
+    let dismissed = board_html_with_acks(vec![staged_governed_task()], acks.clone());
+    assert!(
+        !dismissed.contains("data-governed-ack=\"discard_stranded_commit\""),
+        "dismissing removes the notice"
+    );
+    assert!(
+        !dismissed.contains(&commit),
+        "and the OID with it: the operator said they were done with it"
+    );
+    assert_eq!(
+        acks.len(),
+        1,
+        "the other task's notice is untouched by this dismissal"
+    );
+}
+
+/// The notice crosses the eval channel as JSON, and a payload that cannot be
+/// filed against a card is dropped rather than keyed under an empty string.
+#[test]
+fn test_governed_ack_notice_round_trips_and_rejects_unfilable_payloads() {
+    use impulse_desktop::ui::{GovernedAckKind, GovernedAckNotice};
+
+    let notice = GovernedAckNotice::parse(&discard_ack_message("staged-task", &"b".repeat(40)))
+        .expect("parses");
+    let json = serde_json::to_string(&notice).expect("serialize");
+    let recovered: GovernedAckNotice = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(recovered, notice);
+    assert_eq!(recovered.kind, GovernedAckKind::DiscardStrandedCommit);
+    assert_eq!(recovered.kind.as_str(), "discard_stranded_commit");
+
+    // A promotion rerun notice carries no commit.
+    let rerun = GovernedAckNotice::parse(&DesktopBridgeMessage {
+        kind: "governed_ack".to_string(),
+        payload: json!({
+            "task_id": "staged-task",
+            "kind": "promotion_rerun_pending",
+            "detail": "a previous promotion producer was interrupted",
+        }),
+    })
+    .expect("a rerun notice parses without a commit");
+    assert_eq!(rerun.commit, None);
+    assert!(rerun.headline().contains("redoing an interrupted producer"));
+
+    for unfilable in [
+        json!({"task_id": "", "kind": "discard_stranded_commit", "detail": "x"}),
+        json!({"task_id": "  ", "kind": "discard_stranded_commit", "detail": "x"}),
+        json!({"task_id": "staged-task", "kind": "discard_stranded_commit", "detail": "   "}),
+        json!({"task_id": "staged-task", "kind": "not_a_kind", "detail": "x"}),
+    ] {
+        assert_eq!(
+            GovernedAckNotice::parse(&DesktopBridgeMessage {
+                kind: "governed_ack".to_string(),
+                payload: unfilable.clone(),
+            }),
+            None,
+            "an unfilable payload must be dropped, not keyed under an empty task: {unfilable}"
+        );
+    }
+
+    assert_eq!(
+        GovernedAckNotice::parse(&DesktopBridgeMessage {
+            kind: "ops_update".to_string(),
+            payload: json!({"task_id": "staged-task", "kind": "discard_stranded_commit", "detail": "x"}),
+        }),
+        None,
+        "only a governed_ack message files a notice"
+    );
+}
+
+/// The bridge emits the durable record *and* keeps the transient echo.
+#[test]
+fn test_the_bridge_emits_a_durable_ack_alongside_the_transient_banner() {
+    let bootstrap = desktop_event_bridge_script();
+    assert!(bootstrap.contains("forward(\"governed_ack\""));
+    assert!(bootstrap.contains("\"discard_stranded_commit\""));
+    assert!(bootstrap.contains("\"promotion_rerun_pending\""));
+    // The banner echo is still there; it is the transient half of the pair.
+    assert!(bootstrap.contains("governed_discard_unreferenced_commit"));
+    assert!(bootstrap.contains("governed_promotion_rerun_pending"));
+    // The notice is filed against the task the request named.
+    assert!(bootstrap.contains("request?.task_id"));
+}
+
+/// The staged-configuration refusal is typed now (#52), so the surface builds
+/// its notice from `StagedConfigRefusalReason` and renders the daemon's own
+/// `remedy` verbatim. That is the point of the ack carrying `reason.remedy()`:
+/// there is exactly one copy of the mapping, and it is not this one.
+#[test]
+fn test_the_refusal_notice_is_built_from_the_typed_reason_and_quotes_the_daemon_remedy() {
+    use impulse_desktop::ui::staged_config_refusal_notice;
+    use impulse_ops::governed_task::SharedConfigComponent;
+    use impulse_ops::governed_wiring::{GovernedStagedConfigRefusalAck, StagedConfigRefusalReason};
+
+    for reason in [
+        StagedConfigRefusalReason::Unpinned,
+        StagedConfigRefusalReason::Changed {
+            component: SharedConfigComponent::RepositoryConfig,
+        },
+        StagedConfigRefusalReason::UnsupportedSubmodules {
+            path: "/tmp/impulse-rs/.gitmodules".to_string(),
+        },
+    ] {
+        // Build the ack the way the daemon does, so the remedy under test is
+        // the one that actually crosses the wire.
+        let ack = GovernedStagedConfigRefusalAck::new(staged_governed_task(), reason.clone());
+        assert!(ack.refused, "the ack discriminates on one field");
+        let notice = staged_config_refusal_notice(&ack.reason, &ack.remedy);
+
+        assert_eq!(
+            notice.remedy, ack.remedy,
+            "the remedy is rendered verbatim, never re-derived locally"
+        );
+        assert!(
+            notice.headline.contains("Nothing was touched."),
+            "a refusal never reads as a run failure: {}",
+            notice.headline
+        );
+        assert!(
+            !notice.remedy.contains("  "),
+            "the wire remedy must not carry a run of interior spaces: {:?}",
+            notice.remedy
+        );
+    }
+
+    // Each reason names the specific thing the operator has to look at.
+    let changed = StagedConfigRefusalReason::Changed {
+        component: SharedConfigComponent::InfoAttributes,
+    };
+    let ack = GovernedStagedConfigRefusalAck::new(staged_governed_task(), changed);
+    let notice = staged_config_refusal_notice(&ack.reason, &ack.remedy);
+    assert!(
+        notice.headline.contains(".git/info/attributes"),
+        "a changed pin must name the component, got: {}",
+        notice.headline
+    );
+
+    let submodules = StagedConfigRefusalReason::UnsupportedSubmodules {
+        path: "/tmp/impulse-rs/.gitmodules".to_string(),
+    };
+    let ack = GovernedStagedConfigRefusalAck::new(staged_governed_task(), submodules);
+    let notice = staged_config_refusal_notice(&ack.reason, &ack.remedy);
+    assert!(
+        notice.headline.contains("/tmp/impulse-rs/.gitmodules"),
+        "an unsupported-submodule refusal must name the path, got: {}",
+        notice.headline
+    );
 }

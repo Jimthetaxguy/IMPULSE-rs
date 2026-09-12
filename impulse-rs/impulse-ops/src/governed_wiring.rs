@@ -859,4 +859,161 @@ mod tests {
         rejected.review_state = GovernedReviewState::Rejected;
         assert_eq!(unreferenced_accepted_commit_on_discard(&rejected), None);
     }
+
+    /// Every clause the daemon endpoint checks before it runs Git, one at a
+    /// time. A surface that disables Promote on a different rule than the
+    /// daemon enforces is the drift this predicate exists to prevent.
+    ///
+    /// The fixture carries a claim because `governed_outcome_is_promotable`
+    /// requires one: `governed_producers::promote_governed_outcome` takes the
+    /// accepted revision from `latest_claim()`, so a claimless accepted run is
+    /// not a promotable state — and is not one the ledger produces either.
+    #[test]
+    fn test_promotable_requires_a_staged_scope_acceptance_and_an_active_worktree() {
+        let mut accepted = with_claim(with_staged(task(), pinned()));
+        accepted.review_state = GovernedReviewState::Accepted;
+        assert!(governed_outcome_is_promotable(&accepted));
+
+        let mut claimless = accepted.clone();
+        claimless.claims.clear();
+        assert!(
+            !governed_outcome_is_promotable(&claimless),
+            "promotion reads its accepted revision off the claim, so there must be one"
+        );
+
+        let mut authoritative = accepted.clone();
+        authoritative.world_scope = WorldScope::Authoritative;
+        assert!(
+            !governed_outcome_is_promotable(&authoritative),
+            "promotion is a staged-scope operation"
+        );
+
+        let mut awaiting_operator = accepted.clone();
+        awaiting_operator.review_state = GovernedReviewState::AwaitingOperator;
+        assert!(
+            !governed_outcome_is_promotable(&awaiting_operator),
+            "nothing is promoted before an operator accepts it"
+        );
+
+        let mut discarded = accepted.clone();
+        if let Some(staged) = discarded.staged_worktree.as_mut() {
+            staged.status = StagedWorktreeStatus::Discarded;
+        }
+        assert!(
+            !governed_outcome_is_promotable(&discarded),
+            "a reclaimed checkout has nothing left to promote"
+        );
+
+        let mut unstaged = accepted;
+        unstaged.staged_worktree = None;
+        assert!(!governed_outcome_is_promotable(&unstaged));
+    }
+
+    /// Review round 1, P1. An accepted run whose staged worktree carries no
+    /// configuration pin is discardable through
+    /// [`staged_worktree_is_discardable`]'s unknown-pin short-circuit **with
+    /// zero promotion attempts** — the population
+    /// `PromotionBlockedReason::RepositoryConfigUnpinned` exists for. This
+    /// function used to answer `None` there, so the surface offering the
+    /// discard told the operator it cost nothing moments before it cost them a
+    /// commit.
+    #[test]
+    fn test_an_accepted_run_names_its_commit_even_with_no_promotion_attempt() {
+        let mut unpinned = with_claim(with_staged(task(), SharedRepositoryConfigPin::Unknown));
+        unpinned.review_state = GovernedReviewState::Accepted;
+
+        assert!(
+            staged_worktree_is_discardable(&unpinned),
+            "an unpinned worktree can never be promoted, so it is always reclaimable"
+        );
+        assert!(
+            unpinned.latest_promotion().is_none(),
+            "the discard is reachable without any promotion attempt"
+        );
+        assert_eq!(
+            unreferenced_accepted_commit_on_discard(&unpinned),
+            Some(oid('b').as_str()),
+            "the OID must come from the accepted claim, the same place the daemon's promotion \
+             producer takes it"
+        );
+
+        // Same shape, a recorded pin: still accepted, still unpromoted, still
+        // costs a commit. The pin is not what makes the cost real.
+        let mut pinned_accepted = with_claim(with_staged(task(), pinned()));
+        pinned_accepted.review_state = GovernedReviewState::Accepted;
+        assert_eq!(
+            unreferenced_accepted_commit_on_discard(&pinned_accepted),
+            Some(oid('b').as_str())
+        );
+    }
+
+    /// The three populations, kept apart. Only a promoted run costs nothing.
+    #[test]
+    fn test_only_a_promoted_run_costs_nothing_to_discard() {
+        let mut accepted = with_claim(with_staged(task(), pinned()));
+        accepted.review_state = GovernedReviewState::Accepted;
+
+        let promoted = with_promotion(
+            accepted.clone(),
+            GovernedPromotionOutcome::Promoted {
+                promoted_revision: oid('b'),
+            },
+        );
+        assert_eq!(unreferenced_accepted_commit_on_discard(&promoted), None);
+
+        let blocked = with_promotion(
+            accepted.clone(),
+            GovernedPromotionOutcome::PromotionBlocked {
+                canonical_head: oid('c'),
+                reason: PromotionBlockedReason::RepositoryConfigUnpinned,
+            },
+        );
+        assert_eq!(
+            unreferenced_accepted_commit_on_discard(&blocked),
+            Some(oid('b').as_str()),
+            "a blocked promotion answers with the OID the daemon already recorded"
+        );
+
+        // Accepted but claimless: the state layer should not produce this, but
+        // the function must not invent an OID for it.
+        let mut claimless = accepted.clone();
+        claimless.claims.clear();
+        assert_eq!(unreferenced_accepted_commit_on_discard(&claimless), None);
+
+        // Not accepted: nothing was ever accepted to lose.
+        let mut rejected = accepted;
+        rejected.review_state = GovernedReviewState::Rejected;
+        assert_eq!(unreferenced_accepted_commit_on_discard(&rejected), None);
+    }
+
+    /// ADR-0019 rule 6: a blocked promotion is an execution fact and the
+    /// operator may retry it; a successful one is final.
+    #[test]
+    fn test_a_blocked_promotion_stays_promotable_and_a_promoted_one_does_not() {
+        let mut accepted = with_claim(with_staged(task(), pinned()));
+        accepted.review_state = GovernedReviewState::Accepted;
+
+        let blocked = with_promotion(
+            accepted.clone(),
+            GovernedPromotionOutcome::PromotionBlocked {
+                canonical_head: oid('c'),
+                reason: PromotionBlockedReason::ConcurrentBranchUpdate,
+            },
+        );
+        assert!(
+            governed_outcome_is_promotable(&blocked),
+            "reconciling the canonical branch and retrying is the documented remedy"
+        );
+
+        let promoted = with_promotion(
+            accepted,
+            GovernedPromotionOutcome::Promoted {
+                promoted_revision: oid('b'),
+            },
+        );
+        assert!(
+            !governed_outcome_is_promotable(&promoted),
+            "a run is promoted at most once"
+        );
+    }
 }
