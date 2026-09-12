@@ -3240,7 +3240,9 @@ mod unix {
             assert_eq!(
                 acknowledged.pending_rerun_reason.as_deref(),
                 Some("a previous promotion producer was interrupted"),
-                "a reconciled reservation's reason must survive the desktop client"
+                "a reconciled reservation's reason must survive the desktop client -- it exists \
+                 only on this acknowledgement, and the JS bridge forwards it into the banner \
+                 channel (see test_ack_only_facts_reach_the_banner_channel)"
             );
 
             match requests_rx
