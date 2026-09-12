@@ -333,8 +333,9 @@ fixed on this branch; each regression was reverted once to watch its test fail.
 
 ### Blocked-path hunks after review round 1
 
-The count is now four. The two clippy one-liners and the `PRODUCER_RESERVATIONS.json` exemption are
-unchanged from the first round; two are new:
+The count is now **five**. Three are unchanged from the first round — the two clippy one-liners
+(`impulse-term/src/renderer.rs`, `impulse-desktop/tests/desktop_contract.rs`) and the
+`PRODUCER_RESERVATIONS.json` exemption in `src/governed_producers.rs`. Two are new:
 
 4. **`impulse-rs/src/governed_producers.rs`, second hunk** — `git cherry-pick af2f737` from
    `claude/adr0019-p1-fixes-20260912`, taken verbatim rather than hand-written so both PRs carry
@@ -385,7 +386,7 @@ both sides. When it lands:
      registration-time materialization already satisfies — no change needed, and
      `staged_registration_materializes_the_worktree_before_any_launch` already asserts the record
      is present at `Registered`.
-4. **Add the prepared staged end-to-end test.** Written, reviewed, and deliberately *not* run
+4. **Add the prepared staged end-to-end test**, including its negative branch. Written, reviewed, and deliberately *not* run
    before the merge because step 5 cannot pass on `8dfd2ab`. It lives at
    `<scratchpad>/prepared/staged_end_to_end.rs` and drops into the `mod tests` block of
    `src/daemon/governed_wiring.rs`. It drives one staged run through every endpoint this lane
@@ -397,7 +398,46 @@ both sides. When it lands:
    promotion, that promotion syncs the working tree, that a promoted run orphans no commit, and
    that every producer released its reservation. It needs two small `*_from_response` helpers and
    five extra imports, both listed in the file's header comment.
-5. Re-run the full gate, push, and report the new totals. Do not merge.
+
+   It also carries a **negative branch** added for #53's typed refusal: after materialization, plant
+   a `filter.*.smudge` driver in the staged worktree's shared repository configuration, then assert
+   the claim is refused with `StagedConfigRefusal::Changed { component }` naming the file that
+   changed, that no claim record was written, and that the Builder's marker file is untouched --
+   the refusal must not have run Git against that tree at all.
+5. **Adopt #53's typed staged-config refusal.** Its round-1 fix (`9d9a8c6`) adds a `pub`,
+   downcastable `StagedConfigRefusal::{Changed { component }, Unpinned}`, returned by `derive_claim`
+   and `run_verification` **before any Git runs** when a staged task's pinned shared configuration
+   drifted. It is a refusal to touch the tree, not a run failure, and the operator remedy is
+   discard-and-re-materialize. Four things follow for this lane:
+
+   - **Downcast it into a typed response** in `SubmitGovernedClaim` (which this lane left in
+     `handlers::handle_governed_producer_request`) and in
+     `governed_wiring::run_governed_verification`, plus the `governed-claim` CLI handler. A new
+     response variant — `StagedConfigRefused { component }` — carrying the remedy text, not a
+     generic error string. This is the same argument as the blocked promotion: a refusal that names
+     what happened and what to do is not an error the operator has to decode. Model it on
+     `blocked_promotion_line`, which already exists for exactly this purpose.
+   - **The verification reservation must close on the refusal, and it already does.** Verified by
+     reading `state/producer_reservation.rs` rather than assuming: `with_reservation`'s `Err` arm
+     calls `release(&reservation_id, format!("failed: {error}"))`, so the refusal is recorded as a
+     closed reservation, not left open. That matters here specifically because the remedy is
+     discard-and-re-materialize followed by a **retry**, and an open reservation at the same
+     revision would meet `DuplicateOpenReservation` and block it. Worth noting the refusal happens
+     *inside* the closure (it is raised by `run_verification`, which the closure calls), so a
+     reservation is taken and immediately released — harmless, but it means the journal will carry
+     a `failed: staged repository configuration ...` entry per refusal, which is the desired audit
+     trail rather than noise. **Add a test asserting `state.open_reservations()` is empty after a
+     refused verification and that an immediate retry is not blocked.**
+   - **`LaunchWorkingDirectoryError` gained a `task_id` field and lost `Copy`.** Both of this lane's
+     call sites are `.expect(...)` on the `Ok` path, so neither moves or copies the error — no
+     change beyond the `.expect(...)` already listed in step 3. Re-check after the merge rather
+     than assuming, since a `Copy` removal can surface in unrelated places.
+   - **Document it** in `docs/IPC-PROTOCOL.md` beside the blocked-promotion semantics, under the
+     same principle: a typed refusal carried on a successful-shape response is part of the contract,
+     not an error-string convention. Bump nothing — it is additive within v9 if it lands before
+     this PR merges; if v9 has already shipped, it takes v10.
+
+6. Re-run the full gate, push, and report the new totals. Do not merge.
 
 ### Residual gaps this lane knowingly leaves
 
