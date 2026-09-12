@@ -184,7 +184,7 @@ impl TerminalRenderer {
                             egui::pos2(x_start, underline_y),
                             egui::pos2(x_end, underline_y),
                         ],
-                        egui::Stroke::new(1.0, run.fg),
+                        egui::Stroke::new(1.0_f32, run.fg),
                     );
                 }
             }
