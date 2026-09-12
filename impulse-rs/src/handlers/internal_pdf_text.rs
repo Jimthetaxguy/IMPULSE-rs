@@ -66,15 +66,46 @@
 //!   list): an outer `ASCII85Decode`/`ASCIIHexDecode` layer is fully
 //!   decoded (cheap, bounded expansion), then the resulting bytes are fed
 //!   to a bounded counting decoder for a terminal `FlateDecode` or
-//!   `LZWDecode`. Deny-by-default: any filter this preflight cannot
-//!   bound-count (`RunLengthDecode`, `DCTDecode`, `JPXDecode`,
-//!   `CCITTFaxDecode`, `Crypt`, or a filter chain with anything after a
-//!   terminal Flate/LZW stage) is refused by name rather than silently
-//!   skipped.
+//!   `LZWDecode`.
 //! - **F4:** the old 64 MiB TOTAL cap refused ordinary documents (a
 //!   900-page, 2.87 MB Flate-compressed text PDF inflates to 73.6 MB).
 //!   [`MAX_PDF_TOTAL_DECOMPRESSED_BYTES`] is now 512 MiB; the per-stream
 //!   cap [`MAX_PDF_STREAM_DECOMPRESSED_BYTES`] stays 64 MiB.
+//!
+//! **Review round 4 (NEW-1/NEW-2), refining round 3's deny-by-default into
+//! deny-by-default-only-where-it-matters:** round 3's blanket refusal of
+//! any filter this preflight cannot bound-count was itself measurably too
+//! strict against real documents. On a 221-real-PDF sample: 23 (10.4%)
+//! were refused solely for `DCTDecode` (an embedded JPEG image alongside
+//! ordinary text), every scanned PDF (`CCITTFaxDecode`/`JBIG2Decode`) was
+//! refused outright, and 2 were refused with "corrupt deflate stream" that
+//! `lopdf`'s own real decoder tolerates.
+//!
+//! - **NEW-1 (HIGH):** a filter `lopdf` itself cannot decode
+//!   (`DCTDecode`/`JPXDecode`/`CCITTFaxDecode`/`JBIG2Decode`/
+//!   `RunLengthDecode`/`Crypt`/unrecognized) is, by construction, also one
+//!   `pdf-extract` never reads through (`PlainTextOutput` has no
+//!   image-handling code path, and `Stream::decompressed_content` itself
+//!   returns `Unimplemented` for anything outside `Flate`/`LZW`/
+//!   `ASCII85`) -- so it cannot inflate the way a real decompressor can.
+//!   [`stream_filter_chain_inflated_bytes`] now counts such a filter's
+//!   still-compressed on-disk size (`stream.content.len()`, already
+//!   bounded by [`crate::ion_repl::tool_document::MAX_DOCUMENT_BYTES`])
+//!   and continues, refusing by name ONLY when it precedes a terminal
+//!   `FlateDecode`/`LZWDecode` stage this preflight would otherwise have
+//!   to trust blindly.
+//! - **NEW-2 (MEDIUM):** the preflight was stricter than the decoder it
+//!   bounds: [`inflate_bounded_zlib_to_vec`] now mirrors `lopdf::Stream::
+//!   decompress_zlib`'s own tolerance (retry as raw deflate on a decode
+//!   failure with zero bytes decoded; otherwise keep whatever partial
+//!   output DID decode before an error) rather than failing the whole
+//!   document over one stream `lopdf`'s own real decoder would also have
+//!   recovered from, or one that (like the deny-by-default case above)
+//!   cannot inflate to anything at all. `[/FlateDecode /FlateDecode]` is
+//!   also now a recognized non-terminal case, since double-Flate
+//!   compression is a real, if uncommon, legal PDF construction: the
+//!   first stage is bound-materialized (not just counted) and fed to a
+//!   second bounded decode pass.
 
 use std::path::Path;
 
@@ -244,30 +275,76 @@ pub(crate) const MAX_PDF_TOTAL_DECOMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
 #[cfg(feature = "office-support")]
 pub(crate) const MAX_PDF_STREAM_DECOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Inflates `compressed` through a streaming zlib decoder, discarding each
-/// chunk immediately after counting it rather than accumulating output, so
-/// peak memory for this call is the decoder's own internal window plus one
-/// small read buffer -- never proportional to how much the stream would
-/// actually inflate to. Refuses once the running total exceeds `cap`.
+/// Reads `reader` to EOF (or its first read error), materializing bytes
+/// into a `Vec` bounded by `cap`. Returns `(bytes, errored)`: `errored`
+/// marks that the read loop ended via an `Err` from the underlying reader
+/// rather than a clean EOF, so a caller can decide whether that is
+/// tolerable (see [`inflate_bounded_zlib_to_vec`]'s raw-deflate fallback) --
+/// this function itself only ever returns `Err` for a genuine, intentional
+/// cap-exceeded refusal, never for a decode error.
 #[cfg(feature = "office-support")]
-fn inflate_bounded_zlib(compressed: &[u8], cap: u64) -> Result<u64> {
-    use std::io::Read as _;
-    let mut decoder = flate2::read::ZlibDecoder::new(compressed);
+fn read_bounded<R: std::io::Read>(mut reader: R, cap: u64) -> Result<(Vec<u8>, bool)> {
+    let mut out = Vec::new();
     let mut buf = [0u8; 64 * 1024];
-    let mut total = 0u64;
     loop {
-        let n = decoder
-            .read(&mut buf)
-            .map_err(|e| anyhow::anyhow!("could not inflate PDF stream (FlateDecode): {e}"))?;
-        if n == 0 {
-            break;
-        }
-        total += n as u64;
-        if total > cap {
-            bail!("PDF stream inflates to more than {cap} bytes via FlateDecode, over the limit");
+        match reader.read(&mut buf) {
+            Ok(0) => return Ok((out, false)),
+            Ok(n) => {
+                out.extend_from_slice(&buf[..n]);
+                if out.len() as u64 > cap {
+                    bail!("PDF stream inflates to more than {cap} bytes, over the limit");
+                }
+            }
+            Err(_) => return Ok((out, true)),
         }
     }
-    Ok(total)
+}
+
+/// Bounded, MATERIALIZING zlib decode, mirroring `lopdf::Stream::
+/// decompress_zlib`'s own fallback behavior (review round 4, NEW-2): a
+/// real-world sample of 221 PDFs refused 2 with "corrupt deflate stream"
+/// that `lopdf`'s own decoder recovers from. `Read::read_to_end` (which
+/// `decompress_zlib` uses) keeps whatever decoded successfully before a
+/// read error rather than discarding it, and only when NOTHING decoded at
+/// all does `lopdf` retry as raw deflate (skipping the 2-byte zlib
+/// header) before giving up and returning empty output -- it never fails
+/// the whole document over one stream its own real decoder would also
+/// have partially or fully recovered from, or over one it could not
+/// decode at all (a stream that decodes to nothing cannot inflate to
+/// anything, so it is correct, not merely lenient, to count it as 0).
+/// Bounded by `cap` throughout: a cap-exceeded refusal is real and
+/// distinct from a decode-error tolerance -- [`read_bounded`] only ever
+/// errors for the former.
+///
+/// Materializes up to `cap` bytes (64 MiB by default) rather than
+/// discarding chunks after counting them, unlike round 3's original
+/// version of this function: needed so a `[/FlateDecode /FlateDecode]`
+/// chain (review round 4, NEW-2) can feed the first stage's real output
+/// into a second bounded decode pass. A per-stream cap of 64 MiB is an
+/// acceptable, still-bounded materialization cost -- never proportional to
+/// how much the stream would inflate to if unbounded.
+#[cfg(feature = "office-support")]
+fn inflate_bounded_zlib_to_vec(compressed: &[u8], cap: u64) -> Result<Vec<u8>> {
+    if compressed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (out, errored) = read_bounded(flate2::read::ZlibDecoder::new(compressed), cap)?;
+    if !out.is_empty() || !errored {
+        return Ok(out);
+    }
+    if compressed.len() > 2 {
+        let (raw_out, _) = read_bounded(flate2::read::DeflateDecoder::new(&compressed[2..]), cap)?;
+        return Ok(raw_out);
+    }
+    Ok(Vec::new())
+}
+
+/// [`inflate_bounded_zlib_to_vec`], reporting only the final byte count --
+/// the common case (a terminal `FlateDecode` stage with nothing after it)
+/// never needs the actual bytes, only how many there are.
+#[cfg(feature = "office-support")]
+fn inflate_bounded_zlib(compressed: &[u8], cap: u64) -> Result<u64> {
+    Ok(inflate_bounded_zlib_to_vec(compressed, cap)?.len() as u64)
 }
 
 /// Inflates `compressed` through `weezl`'s streaming LZW decoder (review
@@ -426,10 +503,11 @@ fn decode_asciihex_bounded(input: &[u8], cap: u64) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Walks one stream's full filter chain (review round 3, F1/F3) in decoding
-/// order (`Stream::filters()`, `lopdf`'s public accessor -- the same order
-/// `Stream::decompressed_content()` itself decodes in) and returns the
-/// final decoded byte count, bounded throughout by `per_stream_cap`.
+/// Walks one stream's full filter chain (review round 3, F1/F3; extended
+/// review round 4, NEW-1/NEW-2) in decoding order (`Stream::filters()`,
+/// `lopdf`'s public accessor -- the same order `Stream::
+/// decompressed_content()` itself decodes in) and returns the final
+/// decoded byte count, bounded throughout by `per_stream_cap`.
 ///
 /// - No `/Filter` key at all (or a malformed one `lopdf` itself could not
 ///   parse either): treated as uncompressed content, `Ok(0)` -- there is
@@ -438,19 +516,36 @@ fn decode_asciihex_bounded(input: &[u8], cap: u64) -> Result<Vec<u8>> {
 ///   content" behavior.
 /// - `ASCII85Decode`/`ASCIIHexDecode`: fully decoded (bounded, cheap
 ///   expansion) and fed to the next filter in the chain.
-/// - `FlateDecode`/`LZWDecode`: bounded-counted via a streaming decoder.
-///   Treated as TERMINAL -- a filter chain with anything after either of
-///   these is refused (deny-by-default) rather than silently accepted,
-///   since no real-world PDF chain places another filter after the
-///   decompression stage and this preflight has no way to bound-count a
-///   third stage cheaply.
-/// - Anything else (`RunLengthDecode`, `DCTDecode`, `JPXDecode`,
-///   `CCITTFaxDecode`, `Crypt`, or an unrecognized name): refused by name.
-///   `lopdf` can fail to decode some of these too (`decompressed_content`
-///   returns `Unimplemented` for anything outside
-///   `Flate`/`LZW`/`ASCII85`), but this preflight refuses them regardless
-///   of whether `lopdf` could -- deny-by-default, not "deny only what we
-///   know is dangerous."
+/// - `FlateDecode`/`LZWDecode` as the LAST filter in the chain:
+///   bound-counted via a streaming decoder.
+/// - `[..., FlateDecode, FlateDecode]` (review round 4, NEW-2): the one
+///   recognized exception to "Flate/LZW must be terminal" -- the first
+///   `FlateDecode` stage is bound-materialized (not just counted) and fed
+///   to a second bounded decode pass, since double-Flate-compression is a
+///   real, if uncommon, legal PDF construction. Any OTHER filter after a
+///   `FlateDecode`/`LZWDecode` stage is still refused (deny-by-default):
+///   no real-world PDF chain places a third stage there, and this
+///   preflight has no way to bound-count one cheaply.
+/// - A filter `lopdf` itself cannot decode (`DCTDecode`, `JPXDecode`,
+///   `CCITTFaxDecode`, `JBIG2Decode`, `RunLengthDecode`, `Crypt`, or an
+///   unrecognized name; review round 4, NEW-1): counted as `stream.
+///   content.len()` (the still-compressed, on-disk size, already bounded
+///   by [`crate::ion_repl::tool_document::MAX_DOCUMENT_BYTES`]) and
+///   treated as this stream's final contribution, UNLESS a
+///   `FlateDecode`/`LZWDecode` stage appears later in the same chain (in
+///   which case it is refused by name, deny-by-default, the same as
+///   before this round). A filter `lopdf` cannot decode is, by
+///   definition, also one `pdf-extract` never actually reads through:
+///   `PlainTextOutput` has no image-handling code path at all, and
+///   `Stream::decompressed_content` itself returns `Unimplemented` for
+///   anything outside `Flate`/`LZW`/`ASCII85` -- so none of these can
+///   ever be materialized as inflated bytes by the REAL renderer either,
+///   and refusing them outright was a real cost with no matching safety
+///   benefit: on a real-world sample of 221 PDFs, 23 (10.4%) were refused
+///   solely for `DCTDecode` (a JPEG-compressed image alongside ordinary
+///   text), and every scanned PDF (`CCITTFaxDecode`/`JBIG2Decode`) was
+///   refused outright, previously with no way to read even the pages that
+///   DID have a text layer.
 #[cfg(feature = "office-support")]
 fn stream_filter_chain_inflated_bytes(
     stream: &pdf_extract::Stream,
@@ -465,6 +560,8 @@ fn stream_filter_chain_inflated_bytes(
     }
     let mut current: std::borrow::Cow<'_, [u8]> = std::borrow::Cow::Borrowed(&stream.content);
     for (idx, filter) in filters.iter().enumerate() {
+        let is_last = idx + 1 == filters.len();
+        let remaining = &filters[idx + 1..];
         match *filter {
             b"ASCII85Decode" => {
                 current =
@@ -475,31 +572,49 @@ fn stream_filter_chain_inflated_bytes(
                     std::borrow::Cow::Owned(decode_asciihex_bounded(&current, per_stream_cap)?);
             }
             b"FlateDecode" => {
-                let total = inflate_bounded_zlib(&current, per_stream_cap)?;
-                if idx + 1 != filters.len() {
-                    bail!(
-                        "PDF stream has a filter after FlateDecode, which this preflight does \
-                         not support counting; refusing by default"
-                    );
+                if is_last {
+                    return inflate_bounded_zlib(&current, per_stream_cap);
                 }
-                return Ok(total);
+                // Review round 4, NEW-2: the one recognized non-terminal
+                // case -- a second FlateDecode stage right after this one,
+                // and nothing else in the chain.
+                if remaining == [b"FlateDecode".as_slice()] {
+                    current = std::borrow::Cow::Owned(inflate_bounded_zlib_to_vec(
+                        &current,
+                        per_stream_cap,
+                    )?);
+                    continue;
+                }
+                bail!(
+                    "PDF stream has a filter after FlateDecode, which this preflight does \
+                     not support counting; refusing by default"
+                );
             }
             b"LZWDecode" => {
-                let total = inflate_bounded_lzw(&current, per_stream_cap)?;
-                if idx + 1 != filters.len() {
-                    bail!(
-                        "PDF stream has a filter after LZWDecode, which this preflight does not \
-                         support counting; refusing by default"
-                    );
+                if is_last {
+                    return inflate_bounded_lzw(&current, per_stream_cap);
                 }
-                return Ok(total);
+                bail!(
+                    "PDF stream has a filter after LZWDecode, which this preflight does not \
+                     support counting; refusing by default"
+                );
             }
             other => {
-                bail!(
-                    "PDF stream uses filter '{}', which this preflight cannot bound-count and \
-                     therefore refuses by default",
-                    String::from_utf8_lossy(other)
-                );
+                if remaining
+                    .iter()
+                    .any(|f| matches!(*f, b"FlateDecode" | b"LZWDecode"))
+                {
+                    bail!(
+                        "PDF stream uses filter '{}' before a FlateDecode/LZWDecode stage, \
+                         which this preflight cannot safely bound-count; refusing by default",
+                        String::from_utf8_lossy(other)
+                    );
+                }
+                // Review round 4, NEW-1: a filter neither this preflight
+                // nor the real renderer can decode contributes its
+                // still-compressed on-disk size and ends the chain walk
+                // here (there is no real decoded content to feed onward).
+                return Ok(stream.content.len() as u64);
             }
         }
     }
@@ -998,6 +1113,47 @@ mod tests {
     }
 
     #[test]
+    fn test_preflight_pdf_streams_with_caps_accepts_a_real_multi_stream_document_over_64mib_review_round_4_new3(
+    ) {
+        // Review round 4, NEW-3: proves the actual F4 claim (the real 512
+        // MiB total cap admits a document whose combined decompressed size
+        // clears the OLD 64 MiB cap) directly against `preflight_pdf_
+        // streams_with_caps` at the REAL production caps, without needing
+        // to actually render pages through `pdf_extract` -- a `Document`
+        // needs no page tree at all for this function, which only ever
+        // walks `doc.objects.values()`. Much faster than the equivalent
+        // end-to-end integration test in `tests/pdf_extraction_isolation.rs`
+        // (which additionally proves the real child process and real
+        // `Document::load` round-trip), and a second, independent
+        // confirmation that the cap change actually works as intended.
+        use pdf_extract::{Document, Object, Stream};
+
+        let mut doc = Document::with_version("1.5");
+        // 5 streams x 15 MiB each = 75 MiB combined: each stays under the
+        // 64 MiB PER-STREAM cap individually, but the TOTAL clears the OLD
+        // 64 MiB total cap while staying under the new 512 MiB one --
+        // exercising exactly the cap this test exists to prove, the same
+        // way the round-3 original version of this fixture (7.76 MiB
+        // combined) never did.
+        const PER_STREAM_DECOMPRESSED: usize = 15 * 1024 * 1024;
+        const STREAMS: usize = 5;
+        let combined = (PER_STREAM_DECOMPRESSED * STREAMS) as u64;
+        assert!(combined > 64 * 1024 * 1024, "must exceed the old cap");
+        assert!(
+            combined < MAX_PDF_TOTAL_DECOMPRESSED_BYTES,
+            "must clear the new cap"
+        );
+        for _ in 0..STREAMS {
+            let compressed = compress_zlib(&vec![b'A'; PER_STREAM_DECOMPRESSED]);
+            let mut dict = pdf_extract::Dictionary::new();
+            dict.set("Filter", Object::from("FlateDecode"));
+            doc.add_object(Stream::new(dict, compressed));
+        }
+
+        preflight_pdf_streams(&doc, "doc.pdf").unwrap();
+    }
+
+    #[test]
     fn test_preflight_pdf_streams_accepts_an_ascii85_plus_flate_legitimate_chain_review_round_3_f3()
     {
         // F3: before this fix, [/ASCII85Decode /FlateDecode] was refused
@@ -1027,9 +1183,27 @@ mod tests {
     }
 
     #[test]
-    fn test_preflight_pdf_streams_refuses_an_unrecognized_filter_by_name_deny_by_default() {
+    fn test_preflight_pdf_streams_accepts_a_standalone_undecodable_filter_review_round_4_new1() {
+        // Review round 4, NEW-1: an opaque-to-us filter as the SOLE filter
+        // (the overwhelmingly common real-world shape -- a DCTDecode image
+        // stream, a CCITTFax/JBIG2 scanned page) is neither decodable by
+        // this preflight NOR by `pdf-extract`'s own renderer, so it cannot
+        // inflate and must not be refused outright.
         let dir = tempfile::TempDir::new().unwrap();
-        let path = write_pdf_with_stream(&dir, &["RunLengthDecode"], b"whatever");
+        let path = write_pdf_with_stream(&dir, &["RunLengthDecode"], b"whatever content");
+        let doc = pdf_extract::Document::load(&path).unwrap();
+
+        preflight_pdf_streams(&doc, "doc.pdf").unwrap();
+    }
+
+    #[test]
+    fn test_preflight_pdf_streams_refuses_an_undecodable_filter_preceding_flate_deny_by_default() {
+        // The one case NEW-1 keeps refusing: an opaque filter followed by a
+        // real decompression stage this preflight would otherwise have to
+        // trust blindly.
+        let dir = tempfile::TempDir::new().unwrap();
+        let bomb = compress_zlib(&vec![b'A'; 1_000_000]);
+        let path = write_pdf_with_stream(&dir, &["RunLengthDecode", "FlateDecode"], &bomb);
         let doc = pdf_extract::Document::load(&path).unwrap();
 
         let err = preflight_pdf_streams(&doc, "doc.pdf").unwrap_err();
@@ -1071,6 +1245,66 @@ mod tests {
         );
 
         let err = inflate_bounded_zlib(&compressed, 1000).unwrap_err();
+
+        assert!(err.to_string().contains("over the limit"), "{err}");
+    }
+
+    #[test]
+    fn test_inflate_bounded_zlib_tolerates_a_truncated_stream_review_round_4_new2() {
+        // Review round 4, NEW-2: lopdf's own decompress_zlib keeps whatever
+        // read_to_end decoded before a read error, rather than failing.
+        // Truncating a real zlib stream mid-way reproduces that: some
+        // prefix decodes successfully before the corrupted/incomplete tail
+        // triggers a decode error.
+        let payload = vec![b'A'; 10_000];
+        let compressed = compress_zlib(&payload);
+        let truncated = &compressed[..compressed.len() - 4];
+
+        // Must not error -- a decode failure is tolerated, not propagated.
+        let total = inflate_bounded_zlib(truncated, 1_000_000).unwrap();
+
+        // Some non-trivial prefix decoded before the truncation-induced
+        // error (zlib's window means a few bytes right at the cut point
+        // may be lost, but the vast majority of a 10,000-byte run of 'A'
+        // should still come through).
+        assert!(total > 1000, "expected a real partial decode, got {total}");
+    }
+
+    #[test]
+    fn test_inflate_bounded_zlib_returns_zero_for_completely_undecodable_bytes() {
+        // Review round 4, NEW-2: a stream that decodes to nothing (not
+        // valid zlib, not valid raw deflate either) contributes 0 rather
+        // than failing the whole document -- it cannot inflate to
+        // anything if neither this preflight nor lopdf's own decoder can
+        // get a single byte out of it.
+        let garbage = vec![0xFFu8; 100];
+
+        let total = inflate_bounded_zlib(&garbage, 1_000_000).unwrap();
+
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn test_preflight_pdf_streams_allows_a_legitimate_double_flate_chain_review_round_4_new2() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let payload = b"BT /F1 12 Tf 10 700 Td (double-flate content) Tj ET";
+        let once = compress_zlib(payload);
+        let twice = compress_zlib(&once);
+        let path = write_pdf_with_stream(&dir, &["FlateDecode", "FlateDecode"], &twice);
+        let doc = pdf_extract::Document::load(&path).unwrap();
+
+        preflight_pdf_streams(&doc, "doc.pdf").unwrap();
+    }
+
+    #[test]
+    fn test_preflight_pdf_streams_refuses_a_double_flate_bomb_review_round_4_new2() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let bomb_once = compress_zlib(&vec![b'A'; 1_000_000]);
+        let bomb_twice = compress_zlib(&bomb_once);
+        let path = write_pdf_with_stream(&dir, &["FlateDecode", "FlateDecode"], &bomb_twice);
+        let doc = pdf_extract::Document::load(&path).unwrap();
+
+        let err = preflight_pdf_streams_with_caps(&doc, "bomb.pdf", 10_000, 10_000).unwrap_err();
 
         assert!(err.to_string().contains("over the limit"), "{err}");
     }

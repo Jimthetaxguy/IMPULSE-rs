@@ -721,16 +721,143 @@ fn write_pdf_with_stream(dir: &tempfile::TempDir, filters: &[&str], content: &[u
     path
 }
 
+/// A one-page PDF with a real text content stream AND a separate
+/// `/Type /XObject /Subtype /Image /Filter /DCTDecode` stream object
+/// present in the document (review round 4, NEW-1) -- the common
+/// real-world shape a photo-illustrated or scanned-with-OCR-text PDF
+/// takes. The image is listed in the page's `/Resources /XObject` dict
+/// (so it is a genuine, reachable part of the document, not dead weight)
+/// but deliberately never drawn via a `Do` operator in the content stream:
+/// `pdf_extract::PlainTextOutput` has no image-handling code path at all,
+/// so exercising that operator would prove nothing about the preflight
+/// fix under test here, and risks depending on pdf-extract's specific
+/// (untested-by-us) behavior for an image `Do` it cannot render.
+fn write_pdf_with_dct_image_and_text(dir: &tempfile::TempDir, text: &str) -> PathBuf {
+    use pdf_extract::content::{Content, Operation};
+    use pdf_extract::{Document, Object, Stream};
+
+    let mut doc = Document::with_version("1.5");
+    let font_id = doc.add_object(pdf_dict(&[
+        ("Type", Object::from("Font")),
+        ("Subtype", Object::from("Type1")),
+        ("BaseFont", Object::from("Helvetica")),
+    ]));
+    // Not a real JPEG -- pdf-extract's PlainTextOutput never decodes image
+    // pixel data, so the preflight (which only counts/refuses based on the
+    // declared /Filter, never attempts to actually decode a DCTDecode
+    // stream) is the only thing that could ever look at these bytes.
+    let mut image_dict = pdf_dict(&[
+        ("Type", Object::from("XObject")),
+        ("Subtype", Object::from("Image")),
+        ("Filter", Object::from("DCTDecode")),
+        ("Width", Object::Integer(1)),
+        ("Height", Object::Integer(1)),
+        ("BitsPerComponent", Object::Integer(8)),
+        ("ColorSpace", Object::from("DeviceGray")),
+    ]);
+    image_dict.set("Length", Object::Integer(4));
+    let image_id = doc.add_object(Stream::new(image_dict, b"\xFF\xD8\xFF\xD9".to_vec()));
+    let resources_id = doc.add_object(pdf_dict(&[
+        (
+            "Font",
+            Object::Dictionary(pdf_dict(&[("F1", Object::Reference(font_id))])),
+        ),
+        (
+            "XObject",
+            Object::Dictionary(pdf_dict(&[("Im0", Object::Reference(image_id))])),
+        ),
+    ]));
+    let pages_id = doc.new_object_id();
+    let content = Content {
+        operations: vec![
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec!["F1".into(), 12.into()]),
+            Operation::new("Td", vec![72.into(), 700.into()]),
+            Operation::new("Tj", vec![Object::string_literal(text)]),
+            Operation::new("ET", vec![]),
+        ],
+    };
+    let content_id = doc.add_object(Stream::new(pdf_dict(&[]), content.encode().unwrap()));
+    let page_id = doc.add_object(pdf_dict(&[
+        ("Type", Object::from("Page")),
+        ("Parent", Object::Reference(pages_id)),
+        ("Resources", Object::Reference(resources_id)),
+        ("Contents", Object::Reference(content_id)),
+    ]));
+    let pages_dict = pdf_dict(&[
+        ("Type", Object::from("Pages")),
+        ("Kids", Object::Array(vec![Object::Reference(page_id)])),
+        ("Count", Object::Integer(1)),
+        (
+            "MediaBox",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(612),
+                Object::Integer(792),
+            ]),
+        ),
+    ]);
+    doc.objects.insert(pages_id, Object::Dictionary(pages_dict));
+    let catalog_id = doc.add_object(pdf_dict(&[
+        ("Type", Object::from("Catalog")),
+        ("Pages", Object::Reference(pages_id)),
+    ]));
+    doc.trailer.set("Root", catalog_id);
+    let path = dir.path().join("dct_image_and_text.pdf");
+    doc.save(&path).unwrap();
+    path
+}
+
+/// **Review round 4, NEW-1 (CONFIRMED, HIGH).** Deny-by-default previously
+/// refused a whole document over a single `DCTDecode`-filtered image
+/// stream, even though `pdf-extract` never decodes image pixel data at
+/// all -- on a 221-real-PDF sample, 23 (10.4%) were refused solely for
+/// this. The fixture's TEXT must now extract successfully despite the
+/// DCTDecode image stream sitting right alongside it in the document.
+#[tokio::test]
+async fn test_extract_pdf_with_dct_image_still_extracts_its_text() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = write_pdf_with_dct_image_and_text(&dir, "text beside a DCT-encoded image");
+
+    let parsed = extract_pdf_with_exe_and_timeout(
+        &path,
+        "dct_image_and_text.pdf",
+        ExtractBudget::DEFAULT,
+        4096,
+        &impulse_rs_exe(),
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("a document with a DCTDecode image stream must still extract its text");
+
+    assert!(
+        parsed.text.contains("text beside a DCT-encoded image"),
+        "{}",
+        parsed.text
+    );
+}
+
 /// A multi-page, genuinely Flate-compressed, legitimate document (review
-/// round 3, F4): `pages` pages of `lines_per_page` lines each, real text
-/// content, inflating well past the OLD 64 MiB total cap while staying
-/// under the new 512 MiB one -- proving the raised cap actually admits
-/// ordinary large documents (the old `legit10m.pdf`-style fixture had NO
-/// compressed streams at all, so it never exercised this cap either way).
+/// round 3, F4; resized in review round 4, NEW-3): `pages` pages, each
+/// with one short line of REAL text plus a `pad_bytes_per_page`-sized PDF
+/// content-stream COMMENT (`% PPP...`, ignored by every conformant
+/// content-stream tokenizer, `pdf-extract` included) padding the
+/// DECOMPRESSED byte count without padding the EXTRACTED TEXT. This
+/// separation matters: review round 3's original version of this fixture
+/// (25 pages x 4000 lines of real text) inflated to only 7.76 MiB --
+/// 8x UNDER the OLD 64 MiB cap it was meant to prove now passes, so it
+/// would have passed against the PRE-F4 code too and proved nothing.
+/// Padding with real TEXT instead of a comment can't fix that either: `pad
+/// past 64 MiB decompressed` and `stay comfortably under the independent
+/// 16-million-character extraction budget` are incompatible if the padding
+/// itself becomes extracted text. A comment sidesteps this entirely: the
+/// content-stream bytes genuinely inflate past the cap, while the
+/// characters `BoundedSink` actually sees stay tiny.
 fn write_legit_multi_page_flate_pdf(
     dir: &tempfile::TempDir,
     pages: usize,
-    lines_per_page: usize,
+    pad_bytes_per_page: usize,
 ) -> PathBuf {
     use pdf_extract::{Document, Object, Stream};
 
@@ -747,14 +874,10 @@ fn write_legit_multi_page_flate_pdf(
     let pages_id = doc.new_object_id();
     let mut kids = Vec::new();
     for page in 0..pages {
-        let mut body = String::from("BT /F1 12 Tf 10 780 Td 14 TL\n");
-        for line in 0..lines_per_page {
-            body.push_str(&format!(
-                "(Page {page} line {line}: the quick brown fox jumps over the lazy dog \
-                 0123456789) Tj T*\n"
-            ));
-        }
-        body.push_str("ET\n");
+        let mut body = format!("% {}\n", "P".repeat(pad_bytes_per_page));
+        body.push_str(&format!(
+            "BT /F1 12 Tf 10 780 Td (Page {page} text) Tj ET\n"
+        ));
         let compressed = compress_zlib(body.as_bytes());
         let mut content_dict = pdf_dict(&[]);
         content_dict.set("Filter", Object::from("FlateDecode"));
@@ -1024,11 +1147,28 @@ async fn test_extract_pdf_ascii85_plus_flate_legitimate_chain_extracts_successfu
 #[tokio::test]
 async fn test_extract_pdf_large_legitimate_flate_document_clears_the_new_512mib_cap() {
     let dir = tempfile::TempDir::new().unwrap();
-    // ~80 bytes/line * 4000 lines/page * 25 pages ~= 8 MB of raw text per
-    // page-equivalent block, well over the OLD 64 MiB total cap when summed
-    // across enough pages, while completing in well under a second thanks
-    // to zlib's speed on this kind of repetitive text.
-    let path = write_legit_multi_page_flate_pdf(&dir, 25, 4000);
+    // Review round 4, NEW-3: 5 pages x 15 MiB of comment padding each =
+    // ~75 MiB combined decompressed -- ABOVE the OLD 64 MiB total cap
+    // (each page's own 15 MiB also stays comfortably under the 64 MiB
+    // PER-STREAM cap, so this specifically exercises the TOTAL cap this
+    // fixture exists to prove), while comfortably under the new 512 MiB
+    // one. The comment padding contributes 0 to extracted text, so the
+    // independent 16-million-character extraction budget is never at risk
+    // of cutting this fixture short before the decompression cap is what
+    // actually gets exercised.
+    const PAD_BYTES_PER_PAGE: usize = 15 * 1024 * 1024;
+    const PAGES: usize = 5;
+    let combined_decompressed = (PAD_BYTES_PER_PAGE * PAGES) as u64;
+    assert!(
+        combined_decompressed > 64 * 1024 * 1024,
+        "fixture must exceed the OLD 64 MiB total cap to prove anything: {combined_decompressed}"
+    );
+    assert!(
+        combined_decompressed < 512 * 1024 * 1024,
+        "fixture must stay under the new 512 MiB total cap to prove it PASSES: \
+         {combined_decompressed}"
+    );
+    let path = write_legit_multi_page_flate_pdf(&dir, PAGES, PAD_BYTES_PER_PAGE);
     let on_disk = std::fs::metadata(&path).unwrap().len();
     assert!(
         on_disk < 5 * 1024 * 1024,
@@ -1049,6 +1189,6 @@ async fn test_extract_pdf_large_legitimate_flate_document_clears_the_new_512mib_
     .await
     .expect("a large legitimate multi-page Flate document must clear the new 512 MiB cap");
 
-    assert_eq!(parsed.sections.len(), 25);
-    assert!(parsed.text.contains("Page 0 line 0"), "{}", parsed.text);
+    assert_eq!(parsed.sections.len(), PAGES);
+    assert!(parsed.text.contains("Page 0 text"), "{}", parsed.text);
 }

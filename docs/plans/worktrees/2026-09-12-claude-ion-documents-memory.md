@@ -723,3 +723,170 @@ moved-and-extended preflight/decoder/watchdog tests; `tool_document.rs` lost 10 
 `precheck_pdf`/`preflight_pdf_streams`/`inflate_bounded`/`stream_uses_flate_decode`, which no longer
 exist in that module (moved to `internal_pdf_text.rs` above), and gained 3 new
 `pdf_encryption_prescan` tests in their place -- -7 net. +17 and -7 nets to +10).
+
+## Review round 4 (2026-09-12)
+
+Coordinator relayed round-4 verification of PR #54 at `3a3679e`: F0 (parent peak 4.7 MB on the
+ObjStm bomb, never parses PDF structure), F2 (watchdog fires at 1 GiB + 4.4% slack, its exit code
+137 distinguishable from a `SIGKILL`, watchdog started before `Document::load`), F3, F5, encryption,
+caps, a 100-page/206 MB Flate control document, and a zero-conflict merge with `main` all
+CONFIRMED, against 197 lib tests plus 16 isolation tests. Three new findings, all usability/evidence
+rather than security holes in the fix itself, plus a required merge with `main` (which had landed
+#53 and #55 since this branch was cut) before the final gate.
+
+**Merge with `main`:** `git merge origin/main --no-edit` -- clean, auto-merged (`ort` strategy), one
+conflict-shaped hunk in `CONTEXT.md` (both branches added unrelated sections) resolved
+automatically by git with no manual intervention needed. Post-merge `cargo build --workspace`
+verified clean before continuing.
+
+### NEW-1 HIGH (CONFIRMED): deny-by-default refused 10.4% of a real-PDF sample over filters that cannot inflate at all
+
+Round 3's `stream_filter_chain_inflated_bytes` refused ANY filter it could not bound-count, by
+design (deny-by-default). The review ran this against 221 real PDFs from the reviewing machine: 23
+(10.4%) were refused SOLELY for `DCTDecode` (a JPEG-compressed image embedded alongside ordinary
+text), and every scanned PDF (`CCITTFaxDecode`/`JBIG2Decode`) was refused outright, with no way to
+read even the pages that DID carry a text layer.
+
+The key insight the fix relies on: a filter `lopdf` itself cannot decode is, by construction, also
+one `pdf-extract` never reads through at all -- `PlainTextOutput` has no image-handling code path,
+and `Stream::decompressed_content` itself returns `Unimplemented` for anything outside
+`Flate`/`LZW`/`ASCII85`. Such a filter therefore cannot inflate the way a real decompressor can; it
+was being refused for a danger it structurally cannot pose.
+
+**Fix (`stream_filter_chain_inflated_bytes`, `internal_pdf_text.rs`):** a filter this preflight
+cannot decode now counts `stream.content.len()` (the still-compressed, on-disk size, already
+bounded by `MAX_DOCUMENT_BYTES`) and the chain walk ends there -- UNLESS a `FlateDecode`/`LZWDecode`
+stage appears LATER in the same chain, in which case it is still refused by name, deny-by-default:
+an opaque filter feeding a real decompression stage is exactly the case this preflight cannot
+safely trust blindly. New tests: `test_preflight_pdf_streams_accepts_a_standalone_undecodable_
+filter_review_round_4_new1` (unit, `internal_pdf_text.rs`) and
+`test_preflight_pdf_streams_refuses_an_undecodable_filter_preceding_flate_deny_by_default` (the
+kept refusal case) plus, per the review's explicit ask, an end-to-end integration test
+(`test_extract_pdf_with_dct_image_still_extracts_its_text`,
+`tests/pdf_extraction_isolation.rs`) building a real fixture with BOTH a `DCTDecode`-filtered image
+XObject stream AND a genuine text content stream, proving the text extracts successfully despite
+the image stream sitting alongside it in the document. Reproduced against the review's own
+`rlbomb.pdf` (`RunLengthDecode` as the sole filter): previously refused, now succeeds (exit 0).
+
+### NEW-2 MEDIUM (CONFIRMED): the preflight was stricter than the decoder it bounds
+
+`inflate_bounded_zlib` errored on the FIRST zlib read failure and propagated that as a document-level
+refusal. `lopdf::Stream::decompress_zlib` (the real decoder `pdf-extract` actually uses) is more
+lenient: `read_to_end` keeps whatever decoded successfully before a read error, and only when
+NOTHING decoded at all does it retry as raw deflate (skipping the 2-byte zlib header) before giving
+up and returning empty output -- it never fails the whole document over one stream its own real
+decoder would also have partially or fully recovered from. The review found 2/221 real PDFs refused
+with "corrupt deflate stream" that `lopdf` tolerates. Separately, `[/FlateDecode /FlateDecode]`
+(double-Flate compression, a real if uncommon legal PDF construction) was refused outright as "a
+filter after FlateDecode", with no way to count it even though it is exactly as bound-countable as a
+single stage, just twice.
+
+**Fix:** `inflate_bounded_zlib` is now backed by a new bound-MATERIALIZING
+`inflate_bounded_zlib_to_vec` (via a shared `read_bounded` helper) that mirrors `lopdf`'s own
+zlib-then-raw-deflate-fallback tolerance exactly, and treats a stream that still fails as
+contributing 0 bytes (it cannot inflate to anything if neither this preflight nor `lopdf`'s own
+decoder can get a single byte out of it) rather than failing the document. `stream_filter_chain_
+inflated_bytes` now recognizes `[..., FlateDecode, FlateDecode]` as the one non-terminal exception:
+the first stage is bound-materialized (not merely counted) and fed into a second bounded decode
+pass. New unit tests: `test_inflate_bounded_zlib_tolerates_a_truncated_stream_review_round_4_new2`,
+`test_inflate_bounded_zlib_returns_zero_for_completely_undecodable_bytes`,
+`test_preflight_pdf_streams_allows_a_legitimate_double_flate_chain_review_round_4_new2`, and
+`test_preflight_pdf_streams_refuses_a_double_flate_bomb_review_round_4_new2` (the double-Flate BOMB
+variant still refuses correctly).
+
+**Tradeoff, disclosed rather than hidden:** switching `inflate_bounded_zlib` from discard-while-
+counting to bound-materialize-then-measure (needed to make the double-Flate chain's first stage's
+real bytes available to the second decode pass) raises peak RSS for a REFUSED bomb from ~22-32 MB
+(round 3) to ~90-97 MB (round 4, re-measured against the review's own `textbomb500.pdf`/
+`textbomb2g.pdf`/`chain_a85_flate.pdf`/`chain_ahx_flate.pdf` fixtures below) -- still trivially
+bounded by the 64 MiB per-stream cap plus baseline process overhead, and nowhere near the 1 GiB
+watchdog ceiling or the 512 MiB total-decompression cap, but a real, non-zero cost worth stating
+plainly rather than letting the round-3 numbers stand uncorrected.
+
+### NEW-3 MEDIUM (CONFIRMED, evidence gap): the F4 regression fixture was 8x under the cap it was meant to prove
+
+`test_extract_pdf_large_legitimate_flate_document_clears_the_new_512mib_cap` (25 pages x 4000 lines
+of real text) inflates to only 7.76 MiB combined -- 8x UNDER the OLD 64 MiB cap. It would have
+PASSED against the pre-F4 code just as well as the post-F4 code, so it proved nothing about the cap
+change it exists to regression-test; its doc comment's "well over the OLD 64 MiB total cap" claim
+was simply wrong arithmetic (25 x 4000 x ~80 bytes/line = 8,000,000 bytes = 7.63 MiB, not
+"well over 64 MiB").
+
+**Fix, both halves of the review's suggestion:** (1) `write_legit_multi_page_flate_pdf` was
+redesigned to pad each page's content stream with a PDF COMMENT (`% PPP...`, ignored by every
+conformant content-stream tokenizer, `pdf-extract` included) rather than real text -- this decouples
+"decompressed byte count" from "extracted character count," which real text padding cannot do
+(padding far enough past 64 MiB in real TEXT would also blow well past the independent 16-million-
+character extraction budget, refusing the fixture for an unrelated reason and proving nothing about
+the cap under test). The resized fixture (5 pages x 15 MiB padding = 75 MiB combined, each page's
+own 15 MiB safely under the 64 MiB PER-STREAM cap so the fixture specifically exercises the TOTAL
+cap) now genuinely clears the OLD 64 MiB cap while staying under the new 512 MiB one, and the test
+itself asserts both bounds explicitly rather than trusting a comment's arithmetic again. (2) A new,
+faster, independent unit test (`test_preflight_pdf_streams_with_caps_accepts_a_real_multi_stream_
+document_over_64mib_review_round_4_new3`, `internal_pdf_text.rs`) proves the identical claim
+directly against `preflight_pdf_streams_with_caps` at the REAL production caps, without needing to
+render any pages through `pdf_extract` at all (a `Document` needs no page tree for this function,
+which only ever walks `doc.objects.values()`) -- a second, structurally independent confirmation
+that the 512 MiB cap change works as intended.
+
+### RSS/behavior table (review round 4, re-measured, this checkout, debug build, `/usr/bin/time -l`, macOS)
+
+Same reviewer fixtures as round 3 (`review54-r3/fix/`), re-run at PRODUCTION defaults after the
+NEW-1/NEW-2 fixes:
+
+| Fixture | Result | Peak RSS (round 3) | Peak RSS (round 4) | Notes |
+|---|---|---|---|---|
+| `objstm_bomb2g.pdf` | refused, exit 137 | ~1.08 GB | ~1.12 GB | unchanged mechanism (watchdog); within normal run-to-run variance |
+| `lzwmulti300.pdf` | refused (512 MiB total cap) | ~25 MB | ~25 MB | unaffected by NEW-1/NEW-2 (terminal LZWDecode, no chain) |
+| `legit64.pdf` | panics (pre-existing fixture-generator bug) | ~34 MB | ~34 MB | unchanged, unrelated to this lane |
+| `textbomb500.pdf` | refused | ~22 MB | ~92 MB | NEW-2 tradeoff: materializing to the 64 MiB per-stream cap before measuring, vs. discard-while-counting |
+| `textbomb2g.pdf` | refused | ~32 MB | ~97 MB | same NEW-2 tradeoff |
+| `legit10m.pdf` | succeeds | ~63 MB | ~63 MB | no compressed streams, unaffected |
+| `chain_a85_flate.pdf` (bomb) | refused | ~25 MB | ~94 MB | same NEW-2 tradeoff (ASCII85+Flate chain materializes the Flate stage) |
+| `chain_a85_flate_legit.pdf` | succeeds | ~20 MB | ~20 MB | unaffected |
+| `chain_ahx_flate.pdf` (bomb) | refused | ~27 MB | ~96 MB | same NEW-2 tradeoff |
+| `chain_ahx_flate_legit.pdf` | succeeds | ~20 MB | ~20 MB | unaffected |
+| `lzwbomb.pdf` | refused (LZW decode error) | ~24 MB | ~24 MB | unaffected -- NEW-2 only changed zlib's error tolerance, not LZW's |
+| `rlbomb.pdf` (`RunLengthDecode`) | **now succeeds** (was refused) | n/a (refused) | ~21 MB | **NEW-1 in effect**: a standalone opaque filter is no longer refused |
+| `predictor.pdf` | succeeds | ~31 MB | ~35 MB | unaffected, normal run-to-run variance |
+
+All numbers stay far under every relevant ceiling (64 MiB per-stream, 512 MiB total, 1 GiB
+watchdog) -- the round-3-to-4 RSS increases are a disclosed, bounded tradeoff (see NEW-2 above), not
+a regression toward unbounded behavior.
+
+### Gate evidence (review round 4, this checkout)
+
+```
+cd impulse-rs
+git merge origin/main --no-edit                            # clean, auto-merged, no conflicts
+cargo build --workspace                                    # clean
+cargo test --workspace                                     # 2794 passed / 0 failed / 9 ignored
+                                                             # across every crate; impulse-rs lib
+                                                             # alone: 2161 passed / 0 failed / 5
+                                                             # ignored; tests/pdf_extraction_
+                                                             # isolation.rs: 17/17 passed
+cargo clippy --workspace --all-targets -- -D warnings       # clean
+cargo fmt --all -- --check                                  # clean
+cargo build --no-default-features                           # clean, zero warnings
+cargo test --no-default-features --lib                      # 2023 passed / 1 failed / 5 ignored --
+                                                             # the 1 failure
+                                                             # (daemon::tests::tests::
+                                                             # test_plugin_registry_initialized_
+                                                             # after_init) is the same pre-existing,
+                                                             # unrelated failure confirmed in round 3
+                                                             # (reproduces identically on the
+                                                             # pre-round-3 baseline ea9c7ea)
+cargo audit                                                 # unchanged: 11 pre-existing
+                                                             # vulnerabilities / 18 warnings, same as
+                                                             # before this round's changes and the
+                                                             # pre-round-3 baseline
+```
+
+Isolated re-run of `tests/pdf_extraction_isolation.rs` (17 tests, 1 new this round --
+`test_extract_pdf_with_dct_image_still_extracts_its_text`): 17/17 passed in 4.33-4.52s.
+
+Full lib total for this round: 2161 passed, 0 failed, 5 ignored on this checkout (post-merge with
+`main`, which itself added tests independent of this lane's PDF work -- not a like-for-like
+comparison against round 3's 2046, since `main`'s #53/#55 merge landed its own new tests in between;
+`internal_pdf_text.rs`'s own module alone went from 21 tests (round 3) to 27 (round 4, +6: two
+zlib-tolerance tests, two double-Flate tests, and two NEW-1 standalone/precedes-Flate tests).
