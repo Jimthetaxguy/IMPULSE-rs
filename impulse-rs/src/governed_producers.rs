@@ -4403,3 +4403,674 @@ mod tests {
         assert!(format!("{error:#}").contains("refs/heads/missing"));
     }
 }
+
+/// Property-based / fuzz-style tests over the parsers in this module that
+/// adversarial review kept re-finding bugs in during 2026-09: the shared Git
+/// config include-chain parser, the porcelain `-z` status classifier, and
+/// the no-Git HEAD reader. See
+/// `docs/superpowers/specs/2026-09-12-governed-parser-property-tests.md` for
+/// the invariant table, oracle, and known-miss list this module implements.
+///
+/// Case count follows proptest's own `PROPTEST_CASES` env override (default
+/// 256 per test). For a deeper local run:
+/// `PROPTEST_CASES=2000 cargo test --lib -- proptests`.
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::collections::BTreeSet;
+
+    // ---------------------------------------------------------------
+    // 1. Config parser: panic safety on arbitrary bytes.
+    // ---------------------------------------------------------------
+
+    proptest! {
+        #[test]
+        fn config_include_paths_never_panics_on_arbitrary_bytes(
+            bytes in proptest::collection::vec(any::<u8>(), 0..4096),
+        ) {
+            let base = Path::new("/base/.git");
+            let _ = config_include_paths(&bytes, base);
+        }
+
+        #[test]
+        fn join_continued_lines_never_panics(
+            bytes in proptest::collection::vec(any::<u8>(), 0..4096),
+        ) {
+            let _ = join_continued_lines(&bytes);
+        }
+
+        #[test]
+        fn config_value_never_panics(
+            bytes in proptest::collection::vec(any::<u8>(), 0..1024),
+        ) {
+            let _ = config_value(&bytes);
+        }
+
+        #[test]
+        fn expand_config_path_never_panics(
+            value in proptest::collection::vec(any::<u8>(), 0..512),
+            base in "[a-zA-Z0-9/._-]{0,64}",
+        ) {
+            let _ = expand_config_path(&value, Path::new(&base));
+        }
+
+        /// `config_include_paths` is `Result`-typed for portability (a
+        /// non-UTF-8 include path cannot become a `PathBuf` without
+        /// guessing on a platform where paths are not bytes -- see
+        /// `path_from_config_bytes`'s `#[cfg(not(unix))]` arm), but on this
+        /// platform (unix: an `OsStr` *is* bytes, so `path_from_config_bytes`
+        /// never fails) that error path is unreachable. So here,
+        /// unconditionally, arbitrary bytes never produce `Err` -- the only
+        /// documented failure case is compiled out entirely on unix, not
+        /// merely untriggered by this generator.
+        #[test]
+        #[cfg(unix)]
+        fn config_include_paths_is_infallible_on_unix_for_arbitrary_bytes(
+            bytes in proptest::collection::vec(any::<u8>(), 0..4096),
+        ) {
+            let base = Path::new("/base/.git");
+            prop_assert!(
+                config_include_paths(&bytes, base).is_ok(),
+                "config_include_paths returned Err on unix, where path_from_config_bytes cannot fail"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 1b. `join_continued_lines`: comments never continue, and an escaped
+    // trailing backslash (`c:\\`, an EVEN count) is preserved rather than
+    // treated as a continuation. Generated over an alternating mix of
+    // "plain", "continuing" (odd trailing backslashes), "escaped" (even
+    // trailing backslashes), and "comment" lines so the interaction between
+    // them -- not just each case alone -- is exercised.
+    // ---------------------------------------------------------------
+
+    #[derive(Clone, Debug)]
+    enum LineKind {
+        Plain(String),
+        Continuing(String),
+        EscapedBackslash(String),
+        Comment(String),
+    }
+
+    fn line_kind_strategy() -> impl Strategy<Value = LineKind> {
+        let body = "[a-zA-Z0-9 ]{0,12}";
+        prop_oneof![
+            body.prop_map(LineKind::Plain),
+            body.prop_map(LineKind::Continuing),
+            body.prop_map(LineKind::EscapedBackslash),
+            body.prop_map(LineKind::Comment),
+        ]
+    }
+
+    fn render_line(kind: &LineKind) -> String {
+        match kind {
+            LineKind::Plain(body) => body.clone(),
+            // Odd trailing backslash count: a real continuation.
+            LineKind::Continuing(body) => format!("{body}\\"),
+            // Even trailing backslash count: an escaped backslash, not a
+            // continuation -- covers the `path = c:\\` case from the spec.
+            LineKind::EscapedBackslash(body) => format!("{body}\\\\"),
+            LineKind::Comment(body) => format!("# {body}"),
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn join_continued_lines_never_continues_past_a_comment(
+            lines in proptest::collection::vec(line_kind_strategy(), 0..12),
+        ) {
+            let text = lines.iter().map(render_line).collect::<Vec<_>>().join("\n");
+            let joined = join_continued_lines(text.as_bytes());
+
+            // Invariant 1: every comment line in the input survives as its
+            // own joined line, verbatim -- it is never swallowed into a
+            // preceding continuation, and it never absorbs what follows.
+            for kind in &lines {
+                if let LineKind::Comment(_) = kind {
+                    let rendered = render_line(kind);
+                    let rendered_bytes = rendered.as_bytes();
+                    prop_assert!(
+                        joined.iter().any(|line| line.as_slice() == rendered_bytes),
+                        "comment line {rendered:?} did not survive verbatim in {joined:?}"
+                    );
+                }
+            }
+
+            // Invariant 2: an even-backslash-count line is never merged with
+            // its neighbor -- it always ends a joined line (or is a joined
+            // line unto itself), the same as a `Plain` line.
+            for kind in &lines {
+                if let LineKind::EscapedBackslash(body) = kind {
+                    let rendered = render_line(kind);
+                    let rendered_bytes = rendered.as_bytes();
+                    let contains_whole = joined
+                        .iter()
+                        .any(|line| line.ends_with(rendered_bytes) || line.as_slice() == rendered_bytes);
+                    prop_assert!(
+                        contains_whole,
+                        "escaped-backslash line {rendered:?} lost its trailing `\\\\` in {joined:?} (body {body:?})"
+                    );
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 2. Config include closure: differential against real `git config
+    // --list --show-origin` for one level of `[include]` entries spanning
+    // relative, nested-relative, and absolute paths, with quoting and
+    // backslash continuation.
+    // ---------------------------------------------------------------
+
+    #[derive(Clone, Debug)]
+    enum IncludeStyle {
+        Relative,
+        NestedRelative,
+        Absolute,
+        QuotedRelative,
+        ContinuedRelative,
+    }
+
+    fn include_style_strategy() -> impl Strategy<Value = IncludeStyle> {
+        prop_oneof![
+            Just(IncludeStyle::Relative),
+            Just(IncludeStyle::NestedRelative),
+            Just(IncludeStyle::Absolute),
+            Just(IncludeStyle::QuotedRelative),
+            Just(IncludeStyle::ContinuedRelative),
+        ]
+    }
+
+    /// Every leaf file gets exactly one key so it always contributes a line
+    /// to `git config --list --show-origin` -- an empty included file would
+    /// vanish from that oracle even though it was genuinely read, which
+    /// would make an equal-closure assertion meaningless.
+    fn write_leaf(dir: &Path, stem: &str, index: usize) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(format!("{stem}.include"));
+        std::fs::write(&path, format!("[leaf]\n\tk{index} = v{index}\n")).unwrap();
+        path
+    }
+
+    fn git_show_origin_files(root: &Path, home: &Path) -> BTreeSet<PathBuf> {
+        let output = std::process::Command::new("git")
+            .arg("config")
+            .arg("--file")
+            .arg(root)
+            .args(["--list", "--show-origin", "--includes"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", home)
+            .output()
+            .expect("failed to run git config --show-origin");
+        assert!(
+            output.status.success(),
+            "git config --show-origin failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .filter_map(|line| {
+                let field = line.split('\t').next()?;
+                let path = field.strip_prefix("file:")?;
+                Path::new(path).canonicalize().ok()
+            })
+            .collect()
+    }
+
+    fn our_include_closure(root: &Path) -> BTreeSet<PathBuf> {
+        let mut visited: BTreeSet<PathBuf> = BTreeSet::new();
+        let mut queue = vec![root.to_path_buf()];
+        while let Some(path) = queue.pop() {
+            let Ok(canon) = path.canonicalize() else {
+                continue;
+            };
+            if !visited.insert(canon) {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            let includes = config_include_paths(&bytes, parent).expect(
+                "generated config bytes are well-formed and unix path conversion cannot fail",
+            );
+            for include in includes {
+                queue.push(include);
+            }
+        }
+        visited
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+        #[test]
+        fn config_include_closure_matches_git_show_origin(
+            styles in proptest::collection::vec(include_style_strategy(), 1..4),
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("gitconfig");
+            let mut body = String::from("[core]\n\tbare = false\n");
+            for (index, style) in styles.iter().enumerate() {
+                let stem = format!("inc{index}");
+                let (value_line, _leaf_path) = match style {
+                    IncludeStyle::Relative => {
+                        let leaf = write_leaf(dir.path(), &stem, index);
+                        (format!("\tpath = {}.include\n", stem), leaf)
+                    }
+                    IncludeStyle::NestedRelative => {
+                        let nested_dir = dir.path().join("nested").join(&stem);
+                        let leaf = write_leaf(&nested_dir, "leaf", index);
+                        (format!("\tpath = nested/{stem}/leaf.include\n"), leaf)
+                    }
+                    IncludeStyle::Absolute => {
+                        let abs_dir = dir.path().join("abs");
+                        let leaf = write_leaf(&abs_dir, &stem, index);
+                        (format!("\tpath = {}\n", leaf.display()), leaf)
+                    }
+                    IncludeStyle::QuotedRelative => {
+                        let leaf = write_leaf(dir.path(), &stem, index);
+                        (format!("\tpath = \"{}.include\"\n", stem), leaf)
+                    }
+                    IncludeStyle::ContinuedRelative => {
+                        let leaf = write_leaf(dir.path(), &stem, index);
+                        // Split the value across a backslash-continued line;
+                        // this is a real Git continuation, not an escape,
+                        // because the trailing backslash count is odd (one).
+                        (format!("\tpath = {stem}\\\n.include\n"), leaf)
+                    }
+                };
+                body.push_str("[include]\n");
+                body.push_str(&value_line);
+            }
+            std::fs::write(&root, &body).unwrap();
+
+            let ours = our_include_closure(&root);
+            let git = git_show_origin_files(&root, dir.path());
+
+            prop_assert_eq!(
+                ours, git,
+                "include closure diverged from `git config --list --show-origin` for:\n{}",
+                body
+            );
+        }
+    }
+
+    // `includeIf` conditions are deliberately never evaluated by
+    // `config_include_paths` (documented on the function itself): the gate
+    // is about detecting *change*, not about replicating Git's condition
+    // evaluation, so a currently-false `includeIf` still pins its target.
+    // This is therefore a documented divergence from Git's own behavior
+    // (Git only reads a conditional include when its condition holds), not
+    // covered by the differential oracle above -- recorded here as an
+    // explicit invariant instead of a silent gap.
+    proptest! {
+        #[test]
+        fn config_include_treats_includeif_like_include_regardless_of_condition(
+            condition in "[a-zA-Z0-9_*/:. -]{0,40}",
+        ) {
+            let bytes = format!(
+                "[includeIf \"{condition}\"]\n\tpath = always-pinned.include\n"
+            );
+            let base = Path::new("/repo/.git");
+            let includes = config_include_paths(bytes.as_bytes(), base)
+                .expect("generated config bytes are well-formed and unix path conversion cannot fail");
+            prop_assert_eq!(includes, vec![base.join("always-pinned.include")]);
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 3. Porcelain `-z` status classification.
+    // ---------------------------------------------------------------
+
+    fn xy_strategy() -> impl Strategy<Value = [u8; 2]> {
+        // The real alphabet porcelain v1 uses for the XY pair, plus a few
+        // bytes that are not valid XY codes at all -- the classifier must
+        // not panic or crash on either.
+        let alphabet: &[u8] = b" MADRCU?!";
+        (
+            proptest::sample::select(alphabet),
+            proptest::sample::select(alphabet),
+        )
+            .prop_map(|(x, y)| [x, y])
+    }
+
+    fn path_bytes_strategy() -> impl Strategy<Value = Vec<u8>> {
+        // Unicode-ish path text plus a NUL-free slice of arbitrary bytes, so
+        // both "normal" and adversarial path bytes are covered. `-z` records
+        // are NUL-delimited, so a well-formed record body never itself
+        // contains a NUL -- generated separately from arbitrary bytes with
+        // NULs filtered out below.
+        prop_oneof![
+            "[a-zA-Z0-9/_.\\-]{0,40}".prop_map(|s| s.into_bytes()),
+            proptest::collection::vec(any::<u8>(), 0..40)
+                .prop_map(|bytes| bytes.into_iter().filter(|b| *b != 0).collect()),
+        ]
+    }
+
+    #[derive(Clone, Debug)]
+    enum RecordSpec {
+        Untracked(Vec<u8>),
+        Ordinary {
+            xy: [u8; 2],
+            path: Vec<u8>,
+        },
+        Rename {
+            xy: [u8; 2],
+            path: Vec<u8>,
+            orig: Vec<u8>,
+        },
+    }
+
+    fn record_strategy() -> impl Strategy<Value = RecordSpec> {
+        prop_oneof![
+            path_bytes_strategy().prop_map(RecordSpec::Untracked),
+            (xy_strategy(), path_bytes_strategy())
+                .prop_map(|(xy, path)| RecordSpec::Ordinary { xy, path }),
+            (xy_strategy(), path_bytes_strategy(), path_bytes_strategy())
+                .prop_map(|(xy, path, orig)| RecordSpec::Rename { xy, path, orig }),
+        ]
+    }
+
+    /// Renders one `-z` record's raw bytes: `"?? "` + path for an untracked
+    /// entry, `XY ` + path for an ordinary entry, and `XY ` + path + NUL +
+    /// origPath for a rename/copy, matching porcelain v1's two-NUL-separated
+    /// rename shape. Returns every record produced (renames render as two).
+    fn render_record(spec: &RecordSpec) -> Vec<Vec<u8>> {
+        match spec {
+            RecordSpec::Untracked(path) => {
+                let mut record = b"?? ".to_vec();
+                record.extend_from_slice(path);
+                vec![record]
+            }
+            RecordSpec::Ordinary { xy, path } => {
+                let mut record = xy.to_vec();
+                record.push(b' ');
+                record.extend_from_slice(path);
+                vec![record]
+            }
+            RecordSpec::Rename { xy, path, orig } => {
+                let mut first = xy.to_vec();
+                first.push(b' ');
+                first.extend_from_slice(path);
+                vec![first, orig.clone()]
+            }
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn status_contains_subject_change_never_panics(
+            bytes in proptest::collection::vec(any::<u8>(), 0..2048),
+        ) {
+            let _ = status_contains_subject_change(&bytes);
+        }
+
+        /// Invariant: every record that is not an untracked (`?? `) record
+        /// is always treated as a subject change, whatever its XY code or
+        /// path bytes -- tracked/staged mutations are never exempt.
+        #[test]
+        fn status_contains_subject_change_true_for_any_tracked_record(
+            xy in xy_strategy(),
+            path in path_bytes_strategy(),
+        ) {
+            prop_assume!(xy != *b"??");
+            let mut status = xy.to_vec();
+            status.push(b' ');
+            status.extend_from_slice(&path);
+            status.push(0);
+            prop_assert!(status_contains_subject_change(&status));
+        }
+
+        /// Invariant: an untracked record for a path outside the exact
+        /// `.impulse/...` exemption list is always a subject change. Covers
+        /// the two named attack shapes directly: a suffix appended to an
+        /// exempt name (`.impulse/MEMORY_CANDIDATES.json.evil`) and the
+        /// exemption spelling nested under an unrelated directory
+        /// (`x/.impulse/...`) -- exemptions are root-anchored.
+        #[test]
+        fn status_contains_subject_change_untracked_exemption_is_root_anchored(
+            suffix in "[a-zA-Z0-9._-]{1,20}",
+            prefix in "[a-zA-Z0-9_-]{1,10}",
+        ) {
+            let exempt_names: &[&str] = &[
+                ".impulse/GOVERNED_TASKS.json",
+                ".impulse/DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.json",
+                ".impulse/DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.lock",
+                ".impulse/sockets/impulse.pid",
+                ".impulse/PRODUCER_RESERVATIONS.json",
+                ".impulse/MEMORY_CANDIDATES.json",
+            ];
+            for exempt in exempt_names {
+                // Appending a suffix to an exempt name must never still be
+                // exempt (it is not an exact match and not a recognized
+                // `.tmp.`/`worktrees/` prefix family).
+                let evil = format!("{exempt}{suffix}");
+                let mut status = format!("?? {evil}").into_bytes();
+                status.push(0);
+                prop_assert!(
+                    status_contains_subject_change(&status),
+                    "suffix-appended exempt path {evil:?} was wrongly exempted"
+                );
+
+                // Nesting the exact exempt spelling under an unrelated
+                // directory must never be exempt either -- exemptions are
+                // root-anchored, not a bare filename match.
+                let nested = format!("{prefix}/{exempt}");
+                let mut status = format!("?? {nested}").into_bytes();
+                status.push(0);
+                prop_assert!(
+                    status_contains_subject_change(&status),
+                    "non-root-anchored exempt path {nested:?} was wrongly exempted"
+                );
+            }
+        }
+
+        /// Cross-check against [`render_record`]/[`record_strategy`]: an
+        /// untracked record is exempt if and only if
+        /// `is_untracked_impulse_runtime_artifact` says so directly, and any
+        /// non-`??` record (ordinary or the first half of a rename) is
+        /// always a change -- proving the two functions agree on every
+        /// generated record shape, including renames with two NUL-separated
+        /// paths.
+        #[test]
+        fn status_contains_subject_change_agrees_with_the_untracked_predicate(
+            specs in proptest::collection::vec(record_strategy(), 0..8),
+        ) {
+            let mut status = Vec::new();
+            let mut expect_change = false;
+            for spec in &specs {
+                for record in render_record(spec) {
+                    status.extend_from_slice(&record);
+                    status.push(0);
+                }
+                match spec {
+                    RecordSpec::Untracked(path) => {
+                        expect_change |= !is_untracked_impulse_runtime_artifact(path);
+                    }
+                    // Ordinary and rename records are always a change: the
+                    // rename's second (orig-path) record carries no XY
+                    // prefix at all, so it too falls into the `None` arm of
+                    // `status_contains_subject_change`'s match and is always
+                    // treated as a change.
+                    RecordSpec::Ordinary { .. } | RecordSpec::Rename { .. } => {
+                        expect_change = true;
+                    }
+                }
+            }
+            prop_assert_eq!(status_contains_subject_change(&status), expect_change);
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 4. `read_head_oid_without_git`: differential against
+    // `git rev-parse HEAD` across generated repository ref shapes.
+    // ---------------------------------------------------------------
+
+    fn git_rev_parse_head(repo: &Path) -> Result<String, ()> {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", "--verify", "HEAD"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", repo)
+            .output()
+            .expect("failed to run git rev-parse");
+        if output.status.success() {
+            Ok(String::from_utf8(output.stdout).unwrap().trim().to_string())
+        } else {
+            Err(())
+        }
+    }
+
+    fn git_run(repo: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", repo)
+            .output()
+            .expect("failed to run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn fresh_repo(branch: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        git_run(dir.path(), &["init", "--quiet", "-b", branch]);
+        git_run(dir.path(), &["config", "user.email", "test@example.com"]);
+        git_run(dir.path(), &["config", "user.name", "Test"]);
+        dir
+    }
+
+    #[derive(Clone, Debug)]
+    enum RefShape {
+        Loose,
+        PackedOnly,
+        LooseAndPacked,
+        Detached,
+        SymbolicToMissing,
+    }
+
+    fn ref_shape_strategy() -> impl Strategy<Value = RefShape> {
+        prop_oneof![
+            Just(RefShape::Loose),
+            Just(RefShape::PackedOnly),
+            Just(RefShape::LooseAndPacked),
+            Just(RefShape::Detached),
+            Just(RefShape::SymbolicToMissing),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(40))]
+        #[test]
+        fn read_head_oid_without_git_matches_git_rev_parse_for_generated_shapes(
+            branch in "[a-z][a-z0-9_-]{0,10}",
+            commits in 1..4usize,
+            shape in ref_shape_strategy(),
+        ) {
+            let dir = fresh_repo(&branch);
+            for index in 0..commits {
+                std::fs::write(dir.path().join("f.txt"), format!("{index}\n")).unwrap();
+                git_run(dir.path(), &["add", "f.txt"]);
+                git_run(dir.path(), &["commit", "--quiet", "-m", &format!("commit {index}")]);
+            }
+
+            match shape {
+                RefShape::Loose => {}
+                RefShape::PackedOnly => {
+                    git_run(dir.path(), &["pack-refs", "--all"]);
+                    let loose = dir.path().join(".git/refs/heads").join(&branch);
+                    let _ = std::fs::remove_file(loose);
+                }
+                RefShape::LooseAndPacked => {
+                    git_run(dir.path(), &["pack-refs", "--all"]);
+                    // Loose ref is regenerated by `pack-refs` leaving the
+                    // loose file in place only if HEAD moves again; force
+                    // both to exist by re-writing the branch ref.
+                    let oid = git_rev_parse_head(dir.path()).unwrap();
+                    git_run(dir.path(), &["update-ref", &format!("refs/heads/{branch}"), &oid]);
+                }
+                RefShape::Detached => {
+                    let oid = git_rev_parse_head(dir.path()).unwrap();
+                    git_run(dir.path(), &["checkout", "--quiet", &oid]);
+                }
+                RefShape::SymbolicToMissing => {
+                    std::fs::write(
+                        dir.path().join(".git/HEAD"),
+                        "ref: refs/heads/does-not-exist\n",
+                    )
+                    .unwrap();
+                }
+            }
+
+            let repo = dir.path().canonicalize().unwrap();
+            let ours = read_head_oid_without_git(&repo);
+            let git = git_rev_parse_head(&repo);
+
+            match (ours, git) {
+                (Ok(ours), Ok(git)) => prop_assert_eq!(ours, git),
+                (Err(_), Err(_)) => {}
+                (ours, git) => prop_assert!(
+                    false,
+                    "read_head_oid_without_git and `git rev-parse HEAD` disagreed on success: \
+                     ours={ours:?} git={git:?} shape={shape:?}"
+                ),
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 5. `validate_oid` / `validate_path_segment`: regex-oracle equivalence.
+    // ---------------------------------------------------------------
+
+    fn oid_oracle(s: &str) -> bool {
+        matches!(s.len(), 40 | 64)
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
+
+    fn path_segment_oracle(s: &str) -> bool {
+        if s.is_empty() || s.len() > 128 || s == "." || s == ".." || s.starts_with('.') {
+            return false;
+        }
+        s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    }
+
+    proptest! {
+        #[test]
+        fn validate_oid_matches_regex_oracle(
+            s in prop_oneof![
+                // Realistic near-misses: right alphabet, wrong length.
+                "[0-9a-f]{0,80}",
+                // Wrong alphabet (uppercase hex, arbitrary ASCII/Unicode).
+                ".{0,80}",
+            ],
+        ) {
+            prop_assert_eq!(validate_oid(&s).is_ok(), oid_oracle(&s));
+        }
+
+        #[test]
+        fn validate_path_segment_matches_regex_oracle(
+            s in prop_oneof![
+                "[a-zA-Z0-9_-]{0,140}",
+                "\\.[a-zA-Z0-9_-]{0,20}",
+                ".{0,140}",
+            ],
+        ) {
+            let result = impulse_ops::governed_task::validate_path_segment("field", &s);
+            prop_assert_eq!(result.is_ok(), path_segment_oracle(&s));
+        }
+    }
+}
