@@ -142,6 +142,7 @@ roadmap or whole-product risk authority.
 - [decisions/0017-canonical-loop-contract.md](decisions/0017-canonical-loop-contract.md)
 - [decisions/0018-socket-actor-provenance.md](decisions/0018-socket-actor-provenance.md)
 - [decisions/0019-builder-staged-worktree-world-scope.md](decisions/0019-builder-staged-worktree-world-scope.md)
+- [decisions/0020-scoped-memory-promotion-and-dismissal.md](decisions/0020-scoped-memory-promotion-and-dismissal.md)
 
 ### Session Logs
 

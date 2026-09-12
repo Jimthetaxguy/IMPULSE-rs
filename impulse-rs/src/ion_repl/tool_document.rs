@@ -4654,3 +4654,663 @@ mod tests {
         }
     }
 }
+
+/// Property-based / fuzz-style tests over this module's parsers -- see
+/// `docs/superpowers/specs/2026-09-12-governed-parser-property-tests.md` for
+/// the invariant table, the docx grammar this module generates from, and
+/// documented scope decisions (single-level tables in the generator, with
+/// one pinned nested-table regression case for the flattening behavior).
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::io::Write as _;
+
+    // ---------------------------------------------------------------
+    // fold_case: panic safety and ASCII/idempotence invariants.
+    // ---------------------------------------------------------------
+
+    proptest! {
+        #[test]
+        fn fold_case_never_panics(s in ".{0,256}") {
+            let _ = fold_case(&s);
+        }
+
+        /// Folding is idempotent: folding an already-folded string changes
+        /// nothing further.
+        #[test]
+        fn fold_case_is_idempotent(s in ".{0,256}") {
+            let once = fold_case(&s);
+            let twice = fold_case(&once);
+            prop_assert_eq!(once, twice);
+        }
+
+        /// For plain ASCII letters (no multi-character folds involved),
+        /// `fold_case` matches `str::to_lowercase`.
+        #[test]
+        fn fold_case_matches_ascii_lowercase_for_ascii_letters(s in "[a-zA-Z ]{0,64}") {
+            prop_assert_eq!(fold_case(&s), s.to_lowercase());
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // window(): panic safety, bound, and line-boundary invariants.
+    // ---------------------------------------------------------------
+
+    proptest! {
+        #[test]
+        fn window_never_panics(
+            text in "(?s).{0,2048}",
+            offset in 0..4096usize,
+            max_chars in 0..512usize,
+        ) {
+            let _ = window(&text, offset, max_chars);
+        }
+
+        /// Returned content is never longer than `max_chars`, and the
+        /// reported `returned_chars` always matches the content's own
+        /// length.
+        #[test]
+        fn window_respects_the_char_budget(
+            text in "(?s).{0,2048}",
+            offset in 0..2048usize,
+            max_chars in 1..512usize,
+        ) {
+            let (content, returned, _truncated, _next) = window(&text, offset, max_chars);
+            prop_assert!(content.chars().count() <= max_chars);
+            prop_assert_eq!(content.chars().count(), returned);
+        }
+
+        /// `next_offset` is `Some` exactly when `truncated`, and when
+        /// present it is strictly greater than the clamped start and
+        /// strictly less than the text's total length (there is always
+        /// more to read on a truncated page).
+        #[test]
+        fn window_next_offset_matches_truncated(
+            text in "(?s).{0,2048}",
+            offset in 0..2048usize,
+            max_chars in 1..512usize,
+        ) {
+            let total = text.chars().count();
+            let start = offset.min(total);
+            let (_content, returned, truncated, next_offset) = window(&text, offset, max_chars);
+            prop_assert_eq!(next_offset.is_some(), truncated);
+            if let Some(next) = next_offset {
+                prop_assert_eq!(next, start + returned);
+                prop_assert!(next < total);
+            }
+        }
+
+        /// When truncated and the window did not already end on a newline,
+        /// it always backs up to the last complete line -- content either
+        /// ends with `\n`, or contains no `\n` at all (the documented
+        /// single-long-line hard-cut case).
+        #[test]
+        fn window_truncation_ends_on_a_line_boundary_or_is_a_hard_cut(
+            text in "(?s).{0,2048}",
+            offset in 0..2048usize,
+            max_chars in 1..512usize,
+        ) {
+            let (content, _returned, truncated, _next) = window(&text, offset, max_chars);
+            if truncated {
+                prop_assert!(
+                    content.ends_with('\n') || !content.contains('\n'),
+                    "truncated window neither ends on a newline nor is a hard-cut single line: {content:?}"
+                );
+            }
+        }
+
+        /// An offset past the end of the text yields an empty, complete
+        /// (non-truncated) window -- the documented "model learns it is
+        /// done" case.
+        #[test]
+        fn window_offset_past_end_yields_an_empty_complete_window(
+            text in "(?s).{0,512}",
+            overshoot in 0..64usize,
+            max_chars in 1..256usize,
+        ) {
+            let total = text.chars().count();
+            let (content, returned, truncated, next_offset) = window(&text, total + overshoot, max_chars);
+            prop_assert!(content.is_empty());
+            prop_assert_eq!(returned, 0);
+            prop_assert!(!truncated);
+            prop_assert!(next_offset.is_none());
+        }
+    }
+
+    /// `max_chars == 0` is outside `window`'s useful domain (the
+    /// `document_read` request layer rejects a zero `max_chars` before ever
+    /// calling `window` -- see the module's request-validation code) and is
+    /// deliberately NOT exercised by the budget-respecting property tests
+    /// above (which start `max_chars` at 1). Recorded here as a pinned
+    /// characteristic rather than silently skipped: with `max_chars == 0`,
+    /// `next_offset` reports the SAME offset the call was given whenever
+    /// `offset < total`, so a caller that ignored the request-layer's
+    /// rejection and looped directly on `window` with `max_chars == 0`
+    /// would never advance. This is a boundary of the raw function, not a
+    /// reachable bug through the `document_read` tool.
+    #[test]
+    fn window_max_chars_zero_never_advances_the_offset_below_total() {
+        let text = "hello\nworld\n";
+        let (content, returned, truncated, next_offset) = window(text, 2, 0);
+        assert_eq!(content, "");
+        assert_eq!(returned, 0);
+        assert!(truncated);
+        assert_eq!(
+            next_offset,
+            Some(2),
+            "max_chars=0 reports the same offset back, unadvanced"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // SheetBodyBuilder: panic safety plus the tab/gap-marker rendering
+    // invariants for well-formed (row-major, in-order) cell streams.
+    // ---------------------------------------------------------------
+
+    proptest! {
+        /// Never panics for an arbitrary stream of (row, col, value) pushes,
+        /// including out-of-order and repeated positions.
+        #[test]
+        fn sheet_body_builder_never_panics(
+            cells in proptest::collection::vec(
+                (0u32..20, 0u32..20, "[a-zA-Z0-9]{0,8}"),
+                0..30,
+            ),
+        ) {
+            let mut builder = SheetBodyBuilder::default();
+            for (row, col, value) in cells {
+                builder.push(row, col, &value);
+            }
+            let _ = builder.finish();
+        }
+
+        /// For a row-major, strictly increasing, gap-free stream of single
+        /// non-empty values, the body renders as exactly one line per row
+        /// with values tab-separated in column order, and the reported
+        /// character count matches the rendered text's own length.
+        #[test]
+        fn sheet_body_builder_renders_dense_grid_as_tab_separated_rows(
+            rows in 1..6u32,
+            cols in 1..6u32,
+        ) {
+            let mut builder = SheetBodyBuilder::default();
+            let mut expected_lines = Vec::new();
+            for row in 0..rows {
+                let mut line_cells = Vec::new();
+                for col in 0..cols {
+                    let value = format!("r{row}c{col}");
+                    builder.push(row, col, &value);
+                    line_cells.push(value);
+                }
+                expected_lines.push(line_cells.join("\t"));
+            }
+            let (text, chars) = builder.finish();
+            prop_assert_eq!(text.clone(), expected_lines.join("\n"));
+            prop_assert_eq!(text.chars().count(), chars);
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // extract_word: grammar-based fuzzing over a bounded docx XML shape
+    // (w:p / w:r / w:t / w:tab / w:br / w:tbl / w:tr / w:tc / w:del / w:ins /
+    // w:instrText / mc:AlternateContent), nested to depth 8 via
+    // w:tbl>w:tr>w:tc>mc:AlternateContent>mc:Choice>w:p>w:r>w:t. Table
+    // nesting itself is deliberately single-level in the generator (see the
+    // spec doc for why: nested tables flatten every paragraph into the
+    // OUTERMOST cell's buffer rather than producing their own lines, which
+    // needs a materially different oracle); one hand-built nested-table
+    // regression test below pins that flattening behavior directly.
+    // ---------------------------------------------------------------
+
+    /// Guaranteed non-empty-after-trim, single-line-safe content: no
+    /// control characters, and at least one non-space character in the
+    /// middle, so it can never be silently dropped by `WordTextBuilder`.
+    fn safe_text_strategy() -> impl Strategy<Value = String> {
+        ("[a-zA-Z]{0,3}", "[a-zA-Z0-9]{1,8}", "[a-zA-Z]{0,3}")
+            .prop_map(|(a, b, c)| format!("{a}{b}{c}"))
+    }
+
+    /// Content used only where the assertion is "this text must NEVER
+    /// appear anywhere in the output" (a deleted run, a field instruction,
+    /// or an `mc:Fallback`). Prefixed with `HIDDEN_` -- a character
+    /// (`_`) that [`safe_text_strategy`]'s alphabet can never produce -- so
+    /// a hidden marker can never coincidentally equal, or be a substring
+    /// of, unrelated VISIBLE text generated elsewhere in the same document
+    /// (which would otherwise make a "must not appear" assertion fail for
+    /// a reason that has nothing to do with the code under test).
+    fn hidden_marker_strategy() -> impl Strategy<Value = String> {
+        "[a-zA-Z0-9]{1,8}".prop_map(|s| format!("HIDDEN_{s}"))
+    }
+
+    #[derive(Clone, Debug)]
+    enum RunPiece {
+        Text(String),
+        CData(String),
+        Tab,
+        Break,
+    }
+
+    fn run_piece_strategy() -> impl Strategy<Value = RunPiece> {
+        prop_oneof![
+            safe_text_strategy().prop_map(RunPiece::Text),
+            safe_text_strategy().prop_map(RunPiece::CData),
+            Just(RunPiece::Tab),
+            Just(RunPiece::Break),
+        ]
+    }
+
+    fn render_run_piece(piece: &RunPiece) -> String {
+        match piece {
+            RunPiece::Text(s) => format!("<w:r><w:t>{s}</w:t></w:r>"),
+            RunPiece::CData(s) => format!("<w:r><w:t><![CDATA[{s}]]></w:t></w:r>"),
+            RunPiece::Tab => "<w:r><w:tab/></w:r>".to_string(),
+            RunPiece::Break => "<w:r><w:br/></w:r>".to_string(),
+        }
+    }
+
+    fn render_paragraph(runs: &[RunPiece]) -> String {
+        let body: String = runs.iter().map(render_run_piece).collect();
+        format!("<w:p>{body}</w:p>")
+    }
+
+    #[derive(Clone, Debug)]
+    struct CellSpec {
+        text: String,
+        /// When set, the cell's paragraph is wrapped in
+        /// `mc:AlternateContent`/`mc:Choice`, with a `mc:Fallback` sibling
+        /// carrying this marker -- reaches the required depth-8 nesting
+        /// (`w:tbl>w:tr>w:tc>mc:AlternateContent>mc:Choice>w:p>w:r>w:t`) and
+        /// the fallback marker must never appear in the output.
+        fallback_marker: Option<String>,
+    }
+
+    fn cell_strategy() -> impl Strategy<Value = CellSpec> {
+        (
+            safe_text_strategy(),
+            proptest::option::of(hidden_marker_strategy()),
+        )
+            .prop_map(|(text, fallback_marker)| CellSpec {
+                text,
+                fallback_marker,
+            })
+    }
+
+    fn render_cell(cell: &CellSpec) -> String {
+        let paragraph = render_paragraph(&[RunPiece::Text(cell.text.clone())]);
+        let body = match &cell.fallback_marker {
+            None => paragraph,
+            Some(fallback) => format!(
+                "<mc:AlternateContent><mc:Choice Requires=\"wps\">{paragraph}</mc:Choice>\
+                 <mc:Fallback>{}</mc:Fallback></mc:AlternateContent>",
+                render_paragraph(&[RunPiece::Text(fallback.clone())])
+            ),
+        };
+        format!("<w:tc>{body}</w:tc>")
+    }
+
+    #[derive(Clone, Debug)]
+    struct RowSpec {
+        cells: Vec<CellSpec>,
+    }
+
+    fn row_strategy() -> impl Strategy<Value = RowSpec> {
+        proptest::collection::vec(cell_strategy(), 1..4).prop_map(|cells| RowSpec { cells })
+    }
+
+    fn render_row(row: &RowSpec) -> String {
+        let cells: String = row.cells.iter().map(render_cell).collect();
+        format!("<w:tr>{cells}</w:tr>")
+    }
+
+    #[derive(Clone, Debug)]
+    enum Block {
+        Paragraph(Vec<RunPiece>),
+        Deleted(String),
+        Instr(String),
+        AlternateContent { choice: String, fallback: String },
+        Inserted(String),
+        Table(Vec<RowSpec>),
+    }
+
+    fn block_strategy() -> impl Strategy<Value = Block> {
+        prop_oneof![
+            3 => proptest::collection::vec(run_piece_strategy(), 1..4).prop_map(Block::Paragraph),
+            1 => hidden_marker_strategy().prop_map(Block::Deleted),
+            1 => hidden_marker_strategy().prop_map(Block::Instr),
+            1 => (safe_text_strategy(), hidden_marker_strategy())
+                .prop_map(|(choice, fallback)| Block::AlternateContent { choice, fallback }),
+            1 => safe_text_strategy().prop_map(Block::Inserted),
+            1 => proptest::collection::vec(row_strategy(), 1..3).prop_map(Block::Table),
+        ]
+    }
+
+    fn render_block(block: &Block) -> String {
+        match block {
+            Block::Paragraph(runs) => render_paragraph(runs),
+            Block::Deleted(marker) => {
+                format!("<w:p><w:del><w:r><w:delText>{marker}</w:delText></w:r></w:del></w:p>")
+            }
+            Block::Instr(marker) => {
+                format!("<w:p><w:r><w:instrText>{marker}</w:instrText></w:r></w:p>")
+            }
+            Block::AlternateContent { choice, fallback } => format!(
+                "<mc:AlternateContent><mc:Choice Requires=\"wps\">{}</mc:Choice>\
+                 <mc:Fallback>{}</mc:Fallback></mc:AlternateContent>",
+                render_paragraph(&[RunPiece::Text(choice.clone())]),
+                render_paragraph(&[RunPiece::Text(fallback.clone())]),
+            ),
+            Block::Inserted(marker) => {
+                format!("<w:p><w:ins><w:r><w:t>{marker}</w:t></w:r></w:ins></w:p>")
+            }
+            Block::Table(rows) => {
+                let body: String = rows.iter().map(render_row).collect();
+                format!("<w:tbl>{body}</w:tbl>")
+            }
+        }
+    }
+
+    fn render_document_xml(blocks: &[Block]) -> Vec<u8> {
+        let body: String = blocks.iter().map(render_block).collect();
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+             <w:document \
+               xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" \
+               xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\">\
+               <w:body>{body}</w:body>\
+             </w:document>"
+        )
+        .into_bytes()
+    }
+
+    /// Writes a deflated zip with the given (name, bytes) entries -- a
+    /// local copy of the existing `write_zip` test helper in `mod tests`
+    /// (private to that module and not reachable from here), matching this
+    /// module's own precedent of keeping small fixture helpers local to
+    /// each test module.
+    fn write_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for (name, bytes) in entries {
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    fn budget() -> ExtractBudget {
+        ExtractBudget::DEFAULT
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+        #[test]
+        fn extract_word_never_panics_and_preserves_documented_invariants(
+            blocks in proptest::collection::vec(block_strategy(), 0..8),
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("doc.docx");
+            let xml = render_document_xml(&blocks);
+            write_zip(&path, &[("word/document.xml", &xml)]);
+
+            let result = extract_word(&path, "doc.docx", budget());
+            let parsed = match result {
+                Ok(parsed) => parsed,
+                // A generated document is always well-formed XML under this
+                // grammar and always under every size budget, so an error
+                // here is itself a property violation.
+                Err(e) => {
+                    prop_assert!(false, "well-formed generated docx failed to parse: {e:#}");
+                    unreachable!()
+                }
+            };
+
+            // sum(section.chars) == total_chars, exactly.
+            let total_chars = parsed.text.chars().count();
+            let section_sum: usize = parsed.sections.iter().map(|s| s.chars).sum();
+            prop_assert_eq!(section_sum, total_chars);
+
+            for block in &blocks {
+                match block {
+                    Block::Deleted(marker) => prop_assert!(
+                        !parsed.text.contains(marker.as_str()),
+                        "deleted text {marker:?} leaked into output"
+                    ),
+                    Block::Instr(marker) => prop_assert!(
+                        !parsed.text.contains(marker.as_str()),
+                        "field instruction text {marker:?} leaked into output"
+                    ),
+                    Block::AlternateContent { choice, fallback } => {
+                        prop_assert!(
+                            parsed.text.contains(choice.as_str()),
+                            "mc:Choice text {choice:?} is missing from output"
+                        );
+                        prop_assert!(
+                            !parsed.text.contains(fallback.as_str()),
+                            "mc:Fallback text {fallback:?} leaked into output"
+                        );
+                    }
+                    Block::Inserted(marker) => prop_assert!(
+                        parsed.text.contains(marker.as_str()),
+                        "w:ins text {marker:?} (a visible tracked insertion) is missing from output"
+                    ),
+                    Block::Table(rows) => {
+                        for row in rows {
+                            for cell in &row.cells {
+                                prop_assert!(
+                                    parsed.text.contains(cell.text.as_str()),
+                                    "cell text {:?} is missing from output",
+                                    cell.text
+                                );
+                                if let Some(fallback) = &cell.fallback_marker {
+                                    prop_assert!(
+                                        !parsed.text.contains(fallback.as_str()),
+                                        "cell's mc:Fallback text {fallback:?} leaked into output"
+                                    );
+                                }
+                            }
+                            // Tabs-only-between-cells: the row's cells,
+                            // tab-joined in column order, must appear as
+                            // exactly that WHOLE LINE somewhere in the
+                            // output -- not merely as a substring match on
+                            // the last cell's text, which a coincidentally
+                            // identical string from an unrelated block
+                            // (e.g. a `w:ins` paragraph elsewhere in the
+                            // same generated document) could satisfy for
+                            // the wrong line entirely, silently checking
+                            // zero tabs against a one-cell "row" that was
+                            // never actually this row. Matching the FULL
+                            // expected line (cell texts tab-joined) proves
+                            // both the content AND the separator placement
+                            // in one assertion, and is only satisfiable by
+                            // the real row line: every generated cell text
+                            // is alnum-only, so any tab found there is a
+                            // structural separator, never leaked content.
+                            let expected_line: String = row
+                                .cells
+                                .iter()
+                                .map(|cell| cell.text.as_str())
+                                .collect::<Vec<_>>()
+                                .join("\t");
+                            prop_assert!(
+                                parsed.text.lines().any(|line| line == expected_line),
+                                "expected row line {:?} not found verbatim in output:\n{}",
+                                expected_line,
+                                parsed.text
+                            );
+                        }
+                    }
+                    Block::Paragraph(_) => {}
+                }
+            }
+        }
+    }
+
+    /// Pinned regression for nested-table flattening (deliberately NOT
+    /// covered by the generator above -- see this module's top-of-file
+    /// doc comment): a `w:tbl` nested inside a `w:tc` does not produce its
+    /// own line. Every paragraph inside the nested table's own cells is
+    /// appended into the SAME outer `cell`/`row` buffer as the containing
+    /// cell (the code's own `cell_depth`/`row_depth` counters are shared
+    /// across nesting, incremented on every `w:tr`/`w:tc` regardless of
+    /// depth, and only flush at the outermost close) -- matching this
+    /// module's documented "nested tables flatten into the containing row"
+    /// design.
+    #[test]
+    fn extract_word_nested_table_flattens_into_the_containing_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested.docx");
+        let xml = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+            <w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
+              <w:body>\
+                <w:tbl>\
+                  <w:tr>\
+                    <w:tc><w:p><w:r><w:t>OUTER</w:t></w:r></w:p>\
+                      <w:tbl><w:tr><w:tc><w:p><w:r><w:t>INNER</w:t></w:r></w:p></w:tc></w:tr></w:tbl>\
+                    </w:tc>\
+                    <w:tc><w:p><w:r><w:t>RIGHT</w:t></w:r></w:p></w:tc>\
+                  </w:tr>\
+                </w:tbl>\
+              </w:body>\
+            </w:document>";
+        write_zip(&path, &[("word/document.xml", xml)]);
+
+        let parsed = extract_word(&path, "nested.docx", budget()).expect("well-formed docx");
+        // One line total: OUTER and INNER both land in the containing
+        // cell's buffer (joined by a space, the same "already non-empty
+        // buffer" separator paragraphs within one cell use), then RIGHT is
+        // the second column -- exactly one tab, not two, and no line of its
+        // own for the nested table.
+        assert_eq!(parsed.text.trim_end_matches('\n'), "OUTER INNER\tRIGHT");
+    }
+
+    // ---------------------------------------------------------------
+    // extract_word: arbitrary bytes as the `word/document.xml` entry never
+    // panic -- typed `Result::Err` or `Ok`, nothing else.
+    // ---------------------------------------------------------------
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+        #[test]
+        fn extract_word_never_panics_on_arbitrary_document_xml_bytes(
+            bytes in proptest::collection::vec(any::<u8>(), 0..2048),
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("fuzz.docx");
+            write_zip(&path, &[("word/document.xml", &bytes)]);
+            let _ = extract_word(&path, "fuzz.docx", budget());
+        }
+
+        /// Arbitrary bytes as the whole file (not even a valid zip) never
+        /// panic either.
+        #[test]
+        fn extract_word_never_panics_on_arbitrary_whole_file_bytes(
+            bytes in proptest::collection::vec(any::<u8>(), 0..2048),
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("fuzz2.docx");
+            std::fs::write(&path, &bytes).unwrap();
+            let _ = extract_word(&path, "fuzz2.docx", budget());
+        }
+    }
+
+    #[test]
+    fn extract_word_missing_document_part_is_a_typed_error_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.docx");
+        write_zip(&path, &[("word/other.xml", b"<x/>")]);
+        let err = extract_word(&path, "empty.docx", budget()).unwrap_err();
+        assert!(format!("{err:#}").contains("word/document.xml"));
+    }
+
+    // ---------------------------------------------------------------
+    // WordTextBuilder: direct property tests (exercised indirectly through
+    // extract_word above; these drive the builder's own public API, as
+    // named explicitly in the lane's target list).
+    // ---------------------------------------------------------------
+
+    proptest! {
+        /// Never panics for an arbitrary sequence of `push_line` calls.
+        #[test]
+        fn word_text_builder_push_line_never_panics(
+            lines in proptest::collection::vec("(?s).{0,64}", 0..20),
+            max_chars in 16..4096usize,
+        ) {
+            let mut builder = WordTextBuilder::new(max_chars);
+            for line in &lines {
+                let _ = builder.push_line(line, "doc.docx");
+            }
+        }
+
+        /// A whitespace-only (or empty) line is always dropped -- it grows
+        /// neither the text nor the section table nor the char count.
+        #[test]
+        fn word_text_builder_drops_whitespace_only_lines(
+            whitespace in prop_oneof![Just(""), Just("   "), Just("\t"), Just("  \t ")],
+            max_chars in 16..4096usize,
+        ) {
+            let mut builder = WordTextBuilder::new(max_chars);
+            let before = builder.chars();
+            builder.push_line(whitespace, "doc.docx").unwrap();
+            prop_assert_eq!(builder.chars(), before);
+            let (text, sections) = builder.finish();
+            prop_assert!(text.is_empty());
+            prop_assert!(sections.is_empty());
+        }
+
+        /// A non-empty (post-trim) line is always accepted whole when it
+        /// fits the budget: it becomes exactly one line of `finish().0`,
+        /// with no embedded `\n`/`\r` surviving from the input (both are
+        /// normalized to spaces, per `push_line`'s own documented
+        /// invariant), and `chars()` grows by exactly the line's length
+        /// plus its trailing newline.
+        #[test]
+        fn word_text_builder_accepts_a_fitting_non_blank_line_as_exactly_one_output_line(
+            line in "[a-zA-Z0-9 ]{1,40}",
+        ) {
+            prop_assume!(!line.trim().is_empty());
+            let mut builder = WordTextBuilder::new(4096);
+            builder.push_line(&line, "doc.docx").unwrap();
+            let expected_chars = line.chars().count() + 1;
+            prop_assert_eq!(builder.chars(), expected_chars);
+            let (text, sections) = builder.finish();
+            prop_assert_eq!(text, format!("{line}\n"));
+            prop_assert_eq!(sections.len(), 1);
+            prop_assert_eq!(sections[0].chars, expected_chars);
+        }
+
+        /// The section table never exceeds `MAX_WORD_SECTIONS`, however
+        /// many lines are pushed.
+        #[test]
+        fn word_text_builder_section_table_never_exceeds_the_cap(
+            count in 0..64usize,
+        ) {
+            let mut builder = WordTextBuilder::new(usize::MAX / 2);
+            for i in 0..count {
+                builder.push_line(&format!("line {i}"), "doc.docx").unwrap();
+            }
+            let (_text, sections) = builder.finish();
+            prop_assert!(sections.len() <= MAX_WORD_SECTIONS);
+        }
+
+        /// `check_pending` refuses before a buffer grows past the budget,
+        /// and once it refuses, `push_line` with content that would exceed
+        /// the same budget also refuses -- the two must agree, since
+        /// `push_line` calls `check_pending` internally before writing.
+        #[test]
+        fn word_text_builder_check_pending_and_push_line_agree(
+            max_chars in 1..64usize,
+            line in "[a-zA-Z0-9 ]{1,80}",
+        ) {
+            let builder = WordTextBuilder::new(max_chars);
+            let pending = line.chars().count() + 1;
+            let precheck = builder.check_pending(pending, "doc.docx").is_ok();
+
+            let mut builder = WordTextBuilder::new(max_chars);
+            let pushed = builder.push_line(&line, "doc.docx").is_ok();
+            prop_assert_eq!(precheck, pushed);
+        }
+    }
+}

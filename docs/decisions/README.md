@@ -45,6 +45,7 @@ registry-backed runtime identity, daemon truth, or the current Now/Next/Later ro
 | [0017](0017-canonical-loop-contract.md) | Canonical loop contract | **Proposed** | Typed loop budgets, breaker-evaluated stop conditions, and termination evidence for Ion tool loops; 0016 reserved by the drafted harness evolution plane | 2026-09-01 | -- |
 | [0018](0018-socket-actor-provenance.md) | Socket actor provenance | **Proposed** | Peer credentials plus a per-run operator capability classify every daemon connection, so only an operator surface can mint `accepted` | 2026-09-02 | -- |
 | [0019](0019-builder-staged-worktree-world-scope.md) | Builder staged-worktree world scope | **Proposed** | Declared `WorldScope`, a disposable staged Builder worktree, fast-forward-only promotion after operator acceptance, mediated (never structural) `filesystem.scoped` reporting, and the governed Builder loop binding; 0018 reserved by the socket actor-provenance lane | 2026-09-02 | -- |
+| [0020](0020-scoped-memory-promotion-and-dismissal.md) | Scoped memory promotion and dismissal | **Proposed** | Operator-class promote/dismiss with receipts, an append-only hash-chained `MEMORY.jsonl`, a separate regenerated `GENOME_PROJECTION.md` that never rewrites the hand-curated `GENOME.md`, a status-preserving derivation migration, and promoted-only retrieval indexing | 2026-09-12 | -- |
 
 ## ADR Format
 

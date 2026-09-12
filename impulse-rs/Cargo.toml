@@ -170,6 +170,10 @@ office-support = [
 
 [dev-dependencies]
 filetime = "0.2"
+# Property-based / fuzz-style testing over the parsers adversarial review keeps
+# breaking (CLAUDE.md "Property-Based Testing"); first used by the governed
+# fuzz harness lane, docs/superpowers/specs/2026-09-12-governed-parser-property-tests.md.
+proptest = "1"
 
 [profile.release]
 opt-level = 3
