@@ -32,6 +32,7 @@ use tokio::sync::mpsc::{
 use crate::host_commands::{
     self, DesktopShellState, AGENT_CLOSE_COMMAND, AGENT_FOCUS_COMMAND, AGENT_PLATFORMS_COMMAND,
     AGENT_RESIZE_COMMAND, AGENT_SNAPSHOT_COMMAND, AGENT_SPAWN_COMMAND, AGENT_WRITE_COMMAND,
+    GOVERNED_OUTCOME_PROMOTE_COMMAND, GOVERNED_STAGED_WORKTREE_DISCARD_COMMAND,
     GOVERNED_TASK_MUTATE_COMMAND, LIST_WORKSPACES_COMMAND, MCP_DESCRIPTORS_COMMAND,
     MCP_INVOKE_COMMAND, NATIVE_ISLAND_REQUEST_COMMAND, REGISTER_WORKSPACE_COMMAND,
     REVIEW_DECISION_COMMAND, REVIEW_QUEUE_COMMAND, SUPERVISOR_LOCAL_ACTION_COMMAND,
@@ -130,6 +131,12 @@ async fn dispatch_command(
         AGENT_WRITE_COMMAND => json(host_commands::agent_write(runtime, body(payload)?).await?),
         GOVERNED_TASK_MUTATE_COMMAND => {
             json(host_commands::governed_task_mutate(state, body(payload)?).await?)
+        }
+        GOVERNED_OUTCOME_PROMOTE_COMMAND => {
+            json(host_commands::governed_outcome_promote(state, body(payload)?).await?)
+        }
+        GOVERNED_STAGED_WORKTREE_DISCARD_COMMAND => {
+            json(host_commands::governed_staged_worktree_discard(state, body(payload)?).await?)
         }
         AGENT_RESIZE_COMMAND => json(host_commands::agent_resize(runtime, body(payload)?).await?),
         AGENT_FOCUS_COMMAND => json(host_commands::agent_focus(runtime, body(payload)?).await?),

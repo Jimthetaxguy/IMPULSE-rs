@@ -30,6 +30,8 @@ pub const AGENT_RESIZE_COMMAND: &str = "agent_resize";
 pub const AGENT_SNAPSHOT_COMMAND: &str = "agent_snapshot";
 pub const AGENT_SPAWN_COMMAND: &str = "agent_spawn";
 pub const AGENT_WRITE_COMMAND: &str = "agent_write";
+pub const GOVERNED_OUTCOME_PROMOTE_COMMAND: &str = "governed_outcome_promote";
+pub const GOVERNED_STAGED_WORKTREE_DISCARD_COMMAND: &str = "governed_staged_worktree_discard";
 pub const GOVERNED_TASK_MUTATE_COMMAND: &str = "governed_task_mutate";
 pub const LIST_WORKSPACES_COMMAND: &str = "list_workspaces";
 pub const MCP_DESCRIPTORS_COMMAND: &str = "mcp_descriptors";
@@ -53,6 +55,8 @@ pub const HOST_INVOKE_COMMANDS: &[&str] = &[
     AGENT_SNAPSHOT_COMMAND,
     AGENT_SPAWN_COMMAND,
     AGENT_WRITE_COMMAND,
+    GOVERNED_OUTCOME_PROMOTE_COMMAND,
+    GOVERNED_STAGED_WORKTREE_DISCARD_COMMAND,
     GOVERNED_TASK_MUTATE_COMMAND,
     LIST_WORKSPACES_COMMAND,
     MCP_DESCRIPTORS_COMMAND,
@@ -170,6 +174,73 @@ async fn governed_task_mutate_runtime(
     })
     .await
     .map_err(|error| format!("governed task command worker failed: {error}"))?
+}
+
+/// Fast-forward the canonical branch onto an accepted staged outcome
+/// (ADR-0019, protocol v9).
+///
+/// A blocked promotion is an `Ok` whose task carries the blocked outcome; only
+/// a request that never reached a verdict is an `Err`.
+#[cfg(feature = "legacy-tauri-runtime")]
+#[tauri::command]
+pub async fn governed_outcome_promote(
+    state: tauri::State<'_, DesktopShellState>,
+    request: impulse_ops::governed_wiring::GovernedPromotionRequest,
+) -> Result<impulse_ops::governed_wiring::GovernedProducerAck, String> {
+    governed_outcome_promote_runtime(std::sync::Arc::clone(&state.inner().runtime), request).await
+}
+
+#[cfg(not(feature = "legacy-tauri-runtime"))]
+pub async fn governed_outcome_promote(
+    state: &DesktopShellState,
+    request: impulse_ops::governed_wiring::GovernedPromotionRequest,
+) -> Result<impulse_ops::governed_wiring::GovernedProducerAck, String> {
+    governed_outcome_promote_runtime(std::sync::Arc::clone(&state.runtime), request).await
+}
+
+async fn governed_outcome_promote_runtime(
+    runtime: std::sync::Arc<DesktopRuntime>,
+    request: impulse_ops::governed_wiring::GovernedPromotionRequest,
+) -> Result<impulse_ops::governed_wiring::GovernedProducerAck, String> {
+    tokio::task::spawn_blocking(move || {
+        runtime
+            .promote_governed_outcome(request)
+            .map_err(err_to_string)
+    })
+    .await
+    .map_err(|error| format!("governed promotion command worker failed: {error}"))?
+}
+
+/// Reclaim a finished staged worktree (ADR-0019, protocol v9).
+#[cfg(feature = "legacy-tauri-runtime")]
+#[tauri::command]
+pub async fn governed_staged_worktree_discard(
+    state: tauri::State<'_, DesktopShellState>,
+    request: impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardRequest,
+) -> Result<impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardAck, String> {
+    governed_staged_worktree_discard_runtime(std::sync::Arc::clone(&state.inner().runtime), request)
+        .await
+}
+
+#[cfg(not(feature = "legacy-tauri-runtime"))]
+pub async fn governed_staged_worktree_discard(
+    state: &DesktopShellState,
+    request: impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardRequest,
+) -> Result<impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardAck, String> {
+    governed_staged_worktree_discard_runtime(std::sync::Arc::clone(&state.runtime), request).await
+}
+
+async fn governed_staged_worktree_discard_runtime(
+    runtime: std::sync::Arc<DesktopRuntime>,
+    request: impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardRequest,
+) -> Result<impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardAck, String> {
+    tokio::task::spawn_blocking(move || {
+        runtime
+            .discard_governed_staged_worktree(request)
+            .map_err(err_to_string)
+    })
+    .await
+    .map_err(|error| format!("governed discard command worker failed: {error}"))?
 }
 
 #[cfg(feature = "legacy-tauri-runtime")]

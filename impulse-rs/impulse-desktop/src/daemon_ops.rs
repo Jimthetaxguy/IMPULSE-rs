@@ -393,7 +393,13 @@ mod unix {
     // permits 15 seconds of execution plus two sequential five-second pipe
     // drains, for a 75-second theoretical aggregate. Leave cleanup/persistence
     // headroom without weakening the two-second bound on ordinary IPC.
-    const GOVERNED_REGISTRATION_READ_TIMEOUT: Duration = Duration::from_secs(90);
+    //
+    // ADR-0019's promotion and discard producers run Git in the canonical
+    // checkout and the staged worktree under the same daemon-side bounds, so
+    // they share this budget rather than inheriting the ordinary IPC timeout,
+    // under which every real promotion would read as a transport failure and be
+    // retried three times.
+    const GOVERNED_PRODUCER_READ_TIMEOUT: Duration = Duration::from_secs(90);
     const ACKNOWLEDGED_REQUEST_ATTEMPTS: usize = 3;
     const GOVERNED_LIFECYCLE_OUTBOX_SCHEMA: u32 = 1;
     const MAX_GOVERNED_LIFECYCLE_OUTBOX_ENTRIES: usize = 1_024;
@@ -563,7 +569,7 @@ mod unix {
         lifecycle_outbox_path: Option<PathBuf>,
         lifecycle_outbox_lock: Arc<Mutex<()>>,
         io_timeout: Duration,
-        governed_registration_read_timeout: Duration,
+        governed_producer_read_timeout: Duration,
     }
 
     impl UnixDaemonOpsClient {
@@ -573,7 +579,7 @@ mod unix {
                 lifecycle_outbox_path: None,
                 lifecycle_outbox_lock: Arc::new(Mutex::new(())),
                 io_timeout: IO_TIMEOUT,
-                governed_registration_read_timeout: GOVERNED_REGISTRATION_READ_TIMEOUT,
+                governed_producer_read_timeout: GOVERNED_PRODUCER_READ_TIMEOUT,
             }
         }
 
@@ -581,10 +587,10 @@ mod unix {
         fn with_io_timeouts(
             mut self,
             io_timeout: Duration,
-            governed_registration_read_timeout: Duration,
+            governed_producer_read_timeout: Duration,
         ) -> Self {
             self.io_timeout = io_timeout;
-            self.governed_registration_read_timeout = governed_registration_read_timeout;
+            self.governed_producer_read_timeout = governed_producer_read_timeout;
             self
         }
 
@@ -689,8 +695,18 @@ mod unix {
         /// Deliberately coarse: every governed mutation presents, rather than
         /// this client re-deriving which mutations need it (that answer depends
         /// on the task's verification profile, which only the daemon holds).
+        ///
+        /// The two ADR-0019 staged-worktree endpoints are not coarse at all —
+        /// `daemon::governed_wiring` calls `require_operator_class` on both
+        /// unconditionally, before any state read — so they are named here for
+        /// the same reason `DaemonClient::requires_operator_class` names them.
         fn requires_operator_class(request: &WorkbenchDaemonRequest) -> bool {
-            matches!(request, WorkbenchDaemonRequest::MutateGovernedTask { .. })
+            matches!(
+                request,
+                WorkbenchDaemonRequest::MutateGovernedTask { .. }
+                    | WorkbenchDaemonRequest::PromoteGovernedOutcome { .. }
+                    | WorkbenchDaemonRequest::DiscardGovernedStagedWorktree { .. }
+            )
         }
 
         /// Explain that an operator mutation failed behind a refused capability.
@@ -1107,7 +1123,7 @@ mod unix {
             registration: impulse_ops::governed_task::GovernedTaskRegistration,
         ) -> Result<impulse_ops::governed_task::GovernedTaskRun, String> {
             let read_timeout = if registration.verification_profile.is_some() {
-                self.governed_registration_read_timeout
+                self.governed_producer_read_timeout
             } else {
                 self.io_timeout
             };
@@ -1161,6 +1177,43 @@ mod unix {
                     "{error}; lifecycle mutation retained for durable daemon retry"
                 )),
             }
+        }
+
+        fn promote_outcome(
+            &self,
+            request: impulse_ops::governed_wiring::GovernedPromotionRequest,
+        ) -> Result<impulse_ops::governed_wiring::GovernedProducerAck, String> {
+            // Acknowledged, not fire-and-forget: the request carries its own
+            // idempotency key and expected revision, so a daemon commit followed
+            // by a lost response is replayed off the stored receipt rather than
+            // fast-forwarding the canonical branch twice.
+            let response = self.send_acknowledged_with_read_timeout(
+                &WorkbenchDaemonRequest::PromoteGovernedOutcome { request },
+                self.governed_producer_read_timeout,
+            )?;
+            let value = Self::ok_result(response)?;
+            serde_json::from_value(value)
+                .map_err(|error| format!("parse governed promotion acknowledgement: {error}"))
+        }
+
+        fn discard_staged_worktree(
+            &self,
+            request: impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardRequest,
+        ) -> Result<impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardAck, String>
+        {
+            // Validate the one caller-authored field here rather than paying a
+            // round trip to be told the reason was blank.
+            request
+                .validate()
+                .map_err(|error| format!("invalid governed discard request: {error}"))?;
+            let response = self.send_acknowledged_with_read_timeout(
+                &WorkbenchDaemonRequest::DiscardGovernedStagedWorktree { request },
+                self.governed_producer_read_timeout,
+            )?;
+            let value = Self::ok_result(response)?;
+            serde_json::from_value(value).map_err(|error| {
+                format!("parse governed staged-worktree discard acknowledgement: {error}")
+            })
         }
 
         fn routing_metadata(&self) -> Option<GovernedRoutingMetadata> {
@@ -1663,7 +1716,7 @@ mod unix {
 
             assert_eq!(IO_TIMEOUT, Duration::from_secs(2));
             assert!(
-                GOVERNED_REGISTRATION_READ_TIMEOUT > Duration::from_secs(75),
+                GOVERNED_PRODUCER_READ_TIMEOUT > Duration::from_secs(75),
                 "profiled registration must exceed all three probe and drain bounds"
             );
 
@@ -3024,6 +3077,399 @@ mod unix {
                 "with no capability reachable the mutation is still sent"
             );
             server.join().unwrap();
+        }
+
+        // ── ADR-0019 staged-worktree controls (protocol v9) ─────────────────
+
+        /// An accepted, staged governed task: the only shape from which the
+        /// cockpit offers Promote.
+        fn staged_accepted_task() -> impulse_ops::governed_task::GovernedTaskRun {
+            use impulse_ops::governed_task as gt;
+            gt::GovernedTaskRun {
+                id: gt::GovernedTaskId::try_new("staged-task").expect("task id"),
+                revision: 7,
+                project_id: "project".to_string(),
+                workspace_root: "/tmp/project".to_string(),
+                task: "Prove the cockpit drives the staged controls".to_string(),
+                acceptance_criteria: vec!["the gate is green".to_string()],
+                approval_policy: gt::ApprovalPolicy::OperatorRequired,
+                verification_profile: Some(gt::GovernedVerificationProfile::RustWorkspaceV1),
+                role_assignment: None,
+                role_compatibility: None,
+                runtime_id: "ion".to_string(),
+                agent_id: "worker-1".to_string(),
+                session_id: None,
+                initial_subject_revision: Some("a".repeat(40)),
+                world_scope: gt::WorldScope::StagedAuthoritative,
+                staged_worktree: Some(gt::StagedWorktree {
+                    id: gt::GovernedRecordId::try_new("staged-1").expect("staged id"),
+                    actor: gt::GovernedActor {
+                        kind: gt::GovernedActorKind::System,
+                        id: "impulse-daemon:staged_worktree".to_string(),
+                    },
+                    root: "/tmp/project/.impulse/worktrees/staged-task".to_string(),
+                    initial_subject_revision: "a".repeat(40),
+                    shared_config_digest: gt::SharedRepositoryConfigPin::Unknown,
+                    status: gt::StagedWorktreeStatus::Active,
+                    materialized_at: "2026-09-12T00:00:00Z".to_string(),
+                    based_on_revision: 1,
+                }),
+                promotions: vec![],
+                execution_state: gt::GovernedExecutionState::RuntimeExited,
+                review_state: gt::GovernedReviewState::Accepted,
+                claims: vec![],
+                verifications: vec![],
+                supervisor_verdicts: vec![],
+                operator_decisions: vec![],
+                events: vec![],
+                created_at: "2026-09-12T00:00:00Z".to_string(),
+                updated_at: "2026-09-12T00:00:00Z".to_string(),
+            }
+        }
+
+        /// Serve a capability handshake and then one request, recording both.
+        ///
+        /// The listener is asserted to see exactly one connection, which is what
+        /// proves the capability and the gated request shared a classification.
+        fn serve_capability_then_one_request(
+            listener: UnixListener,
+            response: WorkbenchDaemonResponse,
+        ) -> (
+            thread::JoinHandle<()>,
+            mpsc::Receiver<WorkbenchDaemonRequest>,
+        ) {
+            let (requests_tx, requests_rx) = mpsc::channel();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept connection");
+                let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+                for index in 0..2 {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).expect("read request");
+                    let request: WorkbenchDaemonRequest =
+                        serde_json::from_str(&line).expect("parse request");
+                    requests_tx.send(request).expect("record request");
+                    if index == 0 {
+                        write_response(
+                            &mut stream,
+                            &WorkbenchDaemonResponse::Ok {
+                                result: serde_json::json!({"connection_class": "operator"}),
+                            },
+                        );
+                    } else {
+                        write_response(&mut stream, &response);
+                    }
+                }
+                listener.set_nonblocking(true).expect("nonblocking");
+                assert!(
+                    listener.accept().is_err(),
+                    "the gated request must reuse the connection the capability was presented on"
+                );
+            });
+            (server, requests_rx)
+        }
+
+        fn publish_capability(socket: &Path, token: &str) {
+            std::fs::write(
+                impulse_ops::operator_capability::path_for_socket(socket),
+                format!("{token}\n"),
+            )
+            .expect("publish capability");
+        }
+
+        /// ADR-0019 rule 6: a canonical branch that cannot be advanced is an
+        /// execution fact, so the daemon answers `Ok` with a blocked outcome and
+        /// the client must return it as success. Reading it as an error is the
+        /// exact mistake the desktop handoff note warns about.
+        #[test]
+        fn a_blocked_promotion_is_an_operator_class_success_not_a_client_error() {
+            use impulse_ops::governed_task as gt;
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket = dir.path().join("promote.sock");
+            let token = "e".repeat(64);
+            publish_capability(&socket, &token);
+            let listener = UnixListener::bind(&socket).expect("bind fake daemon");
+
+            let mut blocked = staged_accepted_task();
+            blocked.revision = 8;
+            blocked.promotions.push(gt::GovernedPromotion {
+                id: gt::GovernedRecordId::try_new("promotion-1").expect("promotion id"),
+                actor: gt::GovernedActor {
+                    kind: gt::GovernedActorKind::Operator,
+                    id: "local-operator-ui".to_string(),
+                },
+                accepted_revision: "b".repeat(40),
+                initial_subject_revision: "a".repeat(40),
+                outcome: gt::GovernedPromotionOutcome::PromotionBlocked {
+                    canonical_head: "c".repeat(40),
+                    reason: gt::PromotionBlockedReason::CanonicalHeadMoved,
+                },
+                recorded_at: "2026-09-12T00:01:00Z".to_string(),
+                based_on_revision: 7,
+            });
+            let ack = impulse_ops::governed_wiring::GovernedProducerAck::new(
+                blocked.clone(),
+                false,
+                Some("a previous promotion producer was interrupted".to_string()),
+            );
+            let (server, requests_rx) = serve_capability_then_one_request(
+                listener,
+                WorkbenchDaemonResponse::Ok {
+                    result: serde_json::to_value(&ack).expect("serialize ack"),
+                },
+            );
+
+            let client = UnixDaemonOpsClient::new(socket);
+            let acknowledged = client
+                .promote_outcome(impulse_ops::governed_wiring::GovernedPromotionRequest {
+                    request_id: gt::GovernedRequestId::try_new("ui-promote-1").expect("request id"),
+                    project_id: "project".to_string(),
+                    task_id: blocked.id.clone(),
+                    expected_revision: 7,
+                })
+                .expect("a blocked promotion is a successful response");
+            assert_eq!(acknowledged.task, blocked);
+            assert_eq!(
+                acknowledged
+                    .task
+                    .latest_promotion()
+                    .and_then(|promotion| promotion.outcome.blocked_reason()),
+                Some(gt::PromotionBlockedReason::CanonicalHeadMoved)
+            );
+            assert!(!acknowledged.replayed);
+            assert_eq!(
+                acknowledged.pending_rerun_reason.as_deref(),
+                Some("a previous promotion producer was interrupted"),
+                "a reconciled reservation's reason must survive the desktop client"
+            );
+
+            match requests_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("capability request")
+            {
+                WorkbenchDaemonRequest::PresentOperatorCapability(presentation) => {
+                    assert_eq!(presentation.token, token)
+                }
+                other => panic!("promotion must present the capability first, received {other:?}"),
+            }
+            assert!(matches!(
+                requests_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("promotion request"),
+                WorkbenchDaemonRequest::PromoteGovernedOutcome { .. }
+            ));
+            server.join().unwrap();
+        }
+
+        /// The discard acknowledgement is what tells the cockpit an accepted
+        /// commit just lost its only ref, so the client must carry that field
+        /// through rather than collapsing the response to a bare task.
+        #[test]
+        fn a_discard_presents_the_capability_and_carries_the_unreferenced_commit() {
+            use impulse_ops::governed_task as gt;
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket = dir.path().join("discard.sock");
+            let token = "f".repeat(64);
+            publish_capability(&socket, &token);
+            let listener = UnixListener::bind(&socket).expect("bind fake daemon");
+
+            let mut discarded = staged_accepted_task();
+            discarded.revision = 9;
+            if let Some(staged) = discarded.staged_worktree.as_mut() {
+                staged.status = gt::StagedWorktreeStatus::Discarded;
+            }
+            let ack = impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardAck {
+                task: discarded.clone(),
+                discarded_root: "/tmp/project/.impulse/worktrees/staged-task".to_string(),
+                unreferenced_accepted_commit: Some("b".repeat(40)),
+            };
+            let (server, requests_rx) = serve_capability_then_one_request(
+                listener,
+                WorkbenchDaemonResponse::Ok {
+                    result: serde_json::to_value(&ack).expect("serialize ack"),
+                },
+            );
+
+            let client = UnixDaemonOpsClient::new(socket);
+            let acknowledged = client
+                .discard_staged_worktree(
+                    impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardRequest {
+                        request_id: gt::GovernedRequestId::try_new("ui-discard-1")
+                            .expect("request id"),
+                        project_id: "project".to_string(),
+                        task_id: discarded.id.clone(),
+                        expected_revision: 7,
+                        reason: "the run was rejected and the checkout is finished with"
+                            .to_string(),
+                    },
+                )
+                .expect("discard acknowledgement");
+            assert_eq!(
+                acknowledged.discarded_root,
+                "/tmp/project/.impulse/worktrees/staged-task"
+            );
+            assert_eq!(
+                acknowledged.unreferenced_accepted_commit.as_deref(),
+                Some("b".repeat(40).as_str())
+            );
+
+            match requests_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("capability request")
+            {
+                WorkbenchDaemonRequest::PresentOperatorCapability(presentation) => {
+                    assert_eq!(presentation.token, token)
+                }
+                other => panic!("discard must present the capability first, received {other:?}"),
+            }
+            assert!(matches!(
+                requests_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("discard request"),
+                WorkbenchDaemonRequest::DiscardGovernedStagedWorktree { .. }
+            ));
+            server.join().unwrap();
+        }
+
+        /// A blank reason is the one caller-authored field that can be wrong, and
+        /// a destructive request should not reach a socket to be told so.
+        #[test]
+        fn a_blank_discard_reason_is_refused_before_any_daemon_connection() {
+            use impulse_ops::governed_task as gt;
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            // Deliberately never bound: a request that reaches the transport
+            // fails with a connect error instead of the validation message.
+            let socket = dir.path().join("never-bound.sock");
+            let client = UnixDaemonOpsClient::new(socket);
+            let error = client
+                .discard_staged_worktree(
+                    impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardRequest {
+                        request_id: gt::GovernedRequestId::try_new("ui-discard-blank")
+                            .expect("request id"),
+                        project_id: "project".to_string(),
+                        task_id: gt::GovernedTaskId::try_new("staged-task").expect("task id"),
+                        expected_revision: 7,
+                        reason: "   ".to_string(),
+                    },
+                )
+                .expect_err("a blank discard reason is refused");
+            assert!(
+                error.contains("invalid governed discard request"),
+                "the refusal must name the request, got: {error}"
+            );
+            assert!(
+                !error.contains("connect to daemon"),
+                "validation must happen before the transport, got: {error}"
+            );
+        }
+
+        /// The two staged endpoints are operator-class in the daemon before any
+        /// state read, so the client has to present on both.
+        #[test]
+        fn both_staged_worktree_endpoints_require_the_operator_capability() {
+            use impulse_ops::governed_task as gt;
+
+            let promote = WorkbenchDaemonRequest::PromoteGovernedOutcome {
+                request: impulse_ops::governed_wiring::GovernedPromotionRequest {
+                    request_id: gt::GovernedRequestId::try_new("promote").expect("request id"),
+                    project_id: "project".to_string(),
+                    task_id: gt::GovernedTaskId::try_new("staged-task").expect("task id"),
+                    expected_revision: 1,
+                },
+            };
+            let discard = WorkbenchDaemonRequest::DiscardGovernedStagedWorktree {
+                request: impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardRequest {
+                    request_id: gt::GovernedRequestId::try_new("discard").expect("request id"),
+                    project_id: "project".to_string(),
+                    task_id: gt::GovernedTaskId::try_new("staged-task").expect("task id"),
+                    expected_revision: 1,
+                    reason: "finished with".to_string(),
+                },
+            };
+            assert!(UnixDaemonOpsClient::requires_operator_class(&promote));
+            assert!(UnixDaemonOpsClient::requires_operator_class(&discard));
+            assert!(
+                !UnixDaemonOpsClient::requires_operator_class(
+                    &WorkbenchDaemonRequest::GetGovernedTask {
+                        project_id: "project".to_string(),
+                        task_id: gt::GovernedTaskId::try_new("staged-task").expect("task id"),
+                    }
+                ),
+                "a read must not pay for a handshake"
+            );
+        }
+
+        /// Every protocol-v9 acknowledgement shape, parsed the way the client
+        /// parses it. `GovernedProducerAck` flattens the task, so a field
+        /// rename or a lost `#[serde(flatten)]` shows up here rather than as a
+        /// silent parse failure against a live daemon.
+        #[test]
+        fn the_desktop_parses_every_protocol_v9_acknowledgement() {
+            use impulse_ops::governed_task as gt;
+            use impulse_ops::governed_wiring::{
+                GovernedProducerAck, GovernedStagedWorktreeDiscardAck,
+            };
+
+            let task = staged_accepted_task();
+            let mut promoted = task.clone();
+            promoted.promotions.push(gt::GovernedPromotion {
+                id: gt::GovernedRecordId::try_new("promotion-ok").expect("promotion id"),
+                actor: gt::GovernedActor {
+                    kind: gt::GovernedActorKind::Operator,
+                    id: "local-operator-ui".to_string(),
+                },
+                accepted_revision: "b".repeat(40),
+                initial_subject_revision: "a".repeat(40),
+                outcome: gt::GovernedPromotionOutcome::Promoted {
+                    promoted_revision: "b".repeat(40),
+                },
+                recorded_at: "2026-09-12T00:01:00Z".to_string(),
+                based_on_revision: 7,
+            });
+
+            for ack in [
+                GovernedProducerAck::new(task.clone(), false, None),
+                GovernedProducerAck::new(promoted, true, Some("needs rerun".to_string())),
+            ] {
+                let value = serde_json::to_value(&ack).expect("serialize producer ack");
+                assert_eq!(
+                    value.get("id").and_then(serde_json::Value::as_str),
+                    Some("staged-task"),
+                    "the task must stay flattened so an older client still reads one"
+                );
+                let recovered: GovernedProducerAck =
+                    serde_json::from_value(value).expect("parse producer ack");
+                assert_eq!(recovered, ack);
+            }
+
+            for discard in [
+                GovernedStagedWorktreeDiscardAck {
+                    task: task.clone(),
+                    discarded_root: "/tmp/project/.impulse/worktrees/staged-task".to_string(),
+                    unreferenced_accepted_commit: None,
+                },
+                GovernedStagedWorktreeDiscardAck {
+                    task: task.clone(),
+                    discarded_root: "/tmp/project/.impulse/worktrees/staged-task".to_string(),
+                    unreferenced_accepted_commit: Some("b".repeat(40)),
+                },
+            ] {
+                let value = serde_json::to_value(&discard).expect("serialize discard ack");
+                let recovered: GovernedStagedWorktreeDiscardAck =
+                    serde_json::from_value(value).expect("parse discard ack");
+                assert_eq!(recovered, discard);
+            }
+
+            // An acknowledgement written by a daemon that predates the
+            // `replayed`/`pending_rerun_reason` fields still parses.
+            let bare = serde_json::to_value(&task).expect("serialize bare task");
+            let recovered: GovernedProducerAck =
+                serde_json::from_value(bare).expect("parse a bare governed task as an ack");
+            assert_eq!(recovered.task, task);
+            assert!(!recovered.replayed);
+            assert_eq!(recovered.pending_rerun_reason, None);
         }
 
         fn write_response(
