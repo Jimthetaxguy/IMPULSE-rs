@@ -35,7 +35,7 @@ tags: [worktree, lane, handoff, memory]
 - Verification: isolated `CARGO_TARGET_DIR`; `cargo build --workspace`, `cargo test --workspace`,
   `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`,
   `python3 docs/validate_docs.py --all`.
-- Latest status: review round 1 addressed; draft PR open.
+- Latest status: review round 2 addressed; branch FROZEN at the round-2 push; draft PR open.
 
 ## Decisions
 
@@ -198,6 +198,64 @@ a fence — preserved verbatim, neutralized rather than censored. ADR clause 12b
   temp file.
 - The reconcile doc comment now states the fresh-clone branch.
 
+## Review round 2 (2026-09-12)
+
+Round-2 verification confirmed every round-1 fix (crash-window replay including the forged-tail leg,
+fresh-clone adoption, the tracked-path exemption with every bypass attempt failing — verdict KEEP,
+so the gitignore alternative in open question 4 is settled — projection fencing, parked-migration
+surfacing, ADR 9a, the Display/round-trip tests, and the index-marker fix). One new P1 and two
+wording items, fixed here. The branch is frozen after this push.
+
+### P1 — `LedgerOrigin::Absent` was unreachable
+
+Round 1's fresh-clone fix probed for `MEMORY_CANDIDATES.json` inside
+`reconcile_promoted_memory_log`. But `reconcile_accepted_run_memory_candidates` runs first and
+**re-creates that file** from governed-task truth, so the probe reported `Local` on every machine
+that has ever run a governed task — which is every machine that could hold a memory log at all. The
+branch I added was dead code, and the bug it was meant to fix was still live: two promoted records
+plus a deleted ledger refused start-up with a remedy that changed nothing, and one record loaded with
+the record silently invisible.
+
+The origin is now captured in `load_memory_candidate_ledger`, before anything writes the file, and
+threaded to the log reconcile as a `State` field. Two regression tests cover tasks-present /
+ledger-absent at one and at two records; both must adopt.
+
+Fixing that exposed the half of the problem the probe had been hiding: recording the head is not
+enough, because the **review statuses lived only in the deleted ledger**. The first boot adopted and
+the second boot orphaned. Adoption now rebuilds each status from the record itself — every record
+names its candidate and governed task — marking the candidate promoted, or parking the rebuilt
+decision where the candidate was re-derived under a different id, exactly as a derivation migration
+parks one. Without this an adopted record orphans on the next start-up *and* its candidate sits
+pending, promotable a second time into a duplicate record. `decided_by` is the system actor
+`adopted-from-checkout`: the log is authoritative for what was promoted, never for who approved it,
+and borrowing an id to fill that field would imply an approval this machine never saw. Asserted by
+test.
+
+### P2 — the truncation error prescribed the wrong remedy
+
+`UncommittedTailTooLong` named only "remove the local candidate ledger". That is ADR 12a's *last*
+resort described as its first, and as a general remedy it is actively wrong: removing the ledger
+makes the log adopt wholesale under rule 3b, turning "refuse a log written outside Impulse" into
+"accept it" while discarding every review decision. The message now leads with keeping the first
+`memory_log_head.entry_count` lines, and 12a says plainly that ledger removal is not offered as a
+recovery.
+
+### P2 — ADR 3b's inverse boundary
+
+New clause 3c: a machine that loses the gitignored ledger adopts whatever log it finds, so deleting
+the ledger is also how a truncated or record-appended log is made to load clean. Truncation and
+orphan detection therefore depend on an artifact that is not in review. Stated as the same
+unkeyed-chain boundary as 9a seen from the other side, with the signed-head option named and not
+taken.
+
+### Low — rule 3's premise does not hold in this repository
+
+IMPULSE-rs's own `.gitignore` blanket-ignores `.impulse/` (line 7), so `MEMORY.jsonl` and
+`GENOME_PROJECTION.md` are *not* tracked here without force-adding them. Noted as an exception next
+to clause 3; force-adding is the owner's call and this lane did not do it. Rule 3a's exemption is
+still required regardless, because `impulse init` does not add a blanket rule to a project that
+lacks one.
+
 ## Handoffs
 
 1. **Daemon endpoint (`DecideMemoryCandidate`).** Types are ready in
@@ -242,12 +300,17 @@ a fence — preserved verbatim, neutralized rather than censored. ADR clause 12b
    CLAUDE.md already names for governed producers) would close it.
 3. **Supersession, deduplication, and embeddings for promoted records are out of scope.**
    `superseded_by` is reserved and always `None`; the projection already filters on it.
-4. **The subject-change exemption widened `governed_producers.rs` beyond the untracked arm.** It is
-   the first tracked-path exemption that function has ever had. It is justified for those two
-   daemon-owned digest-chained paths (ADR clause 3a) and pinned by tests, but any future addition to
-   that arm deserves the same scrutiny — say so if you would rather gitignore both files and give up
-   having promoted memory in review.
-5. **Pre-existing docs-validator failures on this base** (`7c2086c`), untouched by this lane:
+4. **The subject-change exemption widened `governed_producers.rs` beyond the untracked arm.**
+   Settled in round 2: verification tried every bypass and returned KEEP, so the gitignore
+   alternative is off the table. It remains the first tracked-path exemption that function has ever
+   had, so any future addition to that arm deserves the same scrutiny.
+5. **Whether to force-add `MEMORY.jsonl` and `GENOME_PROJECTION.md` in IMPULSE-rs itself.** This
+   repository blanket-ignores `.impulse/`, so rule 3's "promoted memory is in review" does not hold
+   here until someone force-adds them. Your call; the lane did not make it.
+6. **A signed committed head** would close the rule 3c boundary (losing the private ledger makes a
+   truncated log load clean). Needs a key a same-uid process cannot read, which is the same
+   unsolved problem as ADR-0018 follow-up 1.
+7. **Pre-existing docs-validator failures on this base** (`7c2086c`), untouched by this lane:
    `decisions/0014`'s `status: proposed` is not in the validator's allowed list, and three March
    documents are past the staleness threshold. Both are already open decisions 3 and 4 in
    `docs/plans/2026-09-02-impulse-next-stages.md`.

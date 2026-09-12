@@ -80,7 +80,7 @@ pub enum MemoryLogError {
         found: String,
     },
     #[error(
-        "memory log holds {found} uncommitted trailing entries (at most {MAX_UNCOMMITTED_TAIL_ENTRIES} is explainable by an interrupted decision). If this is a checkout whose .impulse/MEMORY_CANDIDATES.json was created locally before the tracked .impulse/MEMORY.jsonl arrived, the local ledger simply does not know about these entries: remove the local candidate ledger so the log is adopted wholesale. Otherwise .impulse/MEMORY.jsonl was modified outside Impulse and is refused"
+        "memory log holds {found} uncommitted trailing entries (at most {MAX_UNCOMMITTED_TAIL_ENTRIES} is explainable by an interrupted decision), so .impulse/MEMORY.jsonl was written outside Impulse and is refused. To recover, keep the first `memory_log_head.entry_count` lines of .impulse/MEMORY.jsonl (the count is in .impulse/MEMORY_CANDIDATES.json) and discard the rest: an uncommitted entry is referenced by nothing, so nothing committed is lost"
     )]
     UncommittedTailTooLong { found: usize },
     #[error("memory log record `{record_id}` is not referenced by any promoted candidate")]
@@ -139,7 +139,7 @@ pub(super) struct MemoryLog {
 }
 
 impl MemoryLog {
-    #[cfg(test)]
+    /// Entries the ledger commits.
     pub(super) fn committed(&self) -> &[MemoryLogEntry] {
         &self.committed
     }
@@ -1174,8 +1174,8 @@ mod tests {
         let error = MemoryLog::load(&storage, None, LedgerOrigin::Local).unwrap_err();
         assert!(format!("{error:#}").contains("uncommitted trailing entries"));
         assert!(
-            format!("{error:#}").contains("MEMORY_CANDIDATES.json"),
-            "the error must name the fresh-clone recovery: {error:#}"
+            format!("{error:#}").contains("memory_log_head.entry_count"),
+            "the error must name ADR 12a's primary recovery step: {error:#}"
         );
 
         let adopted = MemoryLog::load(&storage, None, LedgerOrigin::Absent).unwrap();

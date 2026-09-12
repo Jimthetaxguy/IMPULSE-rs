@@ -14,7 +14,7 @@ use impulse_ops::governed_task::{
 };
 use impulse_ops::memory_candidate::{
     AcceptedRunCommandEvidence, AcceptedRunMemoryCandidate, AcceptedRunSourceAssurance,
-    MemoryCandidateId, MemoryCandidateStatus, MemoryRecord,
+    MemoryCandidateId, MemoryCandidateStatus, MemoryRecord, MemorySource,
     ACCEPTED_RUN_MEMORY_CANDIDATE_SCHEMA_VERSION, ACCEPTED_RUN_MEMORY_DERIVATION_VERSION,
 };
 use impulse_ops::memory_wiring::{
@@ -212,10 +212,26 @@ impl MemoryCandidateLedger {
 }
 
 impl State {
+    /// Load the review ledger, reporting whether its file existed *before*
+    /// anything in this start-up wrote it.
+    ///
+    /// The existence probe has to happen here and nowhere later:
+    /// `reconcile_accepted_run_memory_candidates` re-creates
+    /// `MEMORY_CANDIDATES.json` from governed-task truth, so by the time the log
+    /// reconcile runs the file always exists and a fresh clone would be
+    /// misread as a local ledger that commits nothing.
     pub(super) fn load_memory_candidate_ledger(
         storage: &Storage,
-    ) -> Result<std::sync::Mutex<MemoryCandidateLedger>> {
-        Ok(std::sync::Mutex::new(MemoryCandidateLedger::load(storage)?))
+    ) -> Result<(std::sync::Mutex<MemoryCandidateLedger>, LedgerOrigin)> {
+        let origin = if storage.path(MEMORY_CANDIDATES_FILE).exists() {
+            LedgerOrigin::Local
+        } else {
+            LedgerOrigin::Absent
+        };
+        Ok((
+            std::sync::Mutex::new(MemoryCandidateLedger::load(storage)?),
+            origin,
+        ))
     }
 
     /// Reconcile the independently persisted review queue from authoritative
@@ -317,11 +333,13 @@ impl State {
         // `MEMORY.jsonl` is tracked, so a fresh clone legitimately has a full
         // log and no ledger. That is not the same as a ledger that commits
         // nothing, and must not be read as an interrupted decision.
-        let origin = if self.storage().path(MEMORY_CANDIDATES_FILE).exists() {
-            LedgerOrigin::Local
-        } else {
-            LedgerOrigin::Absent
-        };
+        //
+        // The origin is captured at load time, before
+        // `reconcile_accepted_run_memory_candidates` re-creates the ledger file
+        // from governed-task truth. Probing the path here instead would always
+        // see `Local` on any machine that has `GOVERNED_TASKS.json`, which is
+        // every machine that has ever run a governed task.
+        let origin = self.memory_ledger_origin;
         let log = MemoryLog::load(self.storage(), ledger.memory_log_head.as_ref(), origin)
             .context("Failed to load the promoted memory log")?;
         log.cross_check_statuses(
@@ -339,6 +357,48 @@ impl State {
                 );
                 let mut repaired = ledger.clone();
                 repaired.memory_log_head = Some(adopted);
+                // Recording the head is not enough. The review statuses lived
+                // only in the ledger that is missing, so without reattachment
+                // every adopted record would be an orphan on the *next*
+                // start-up, and its candidate would sit pending and be
+                // promotable a second time into a duplicate record.
+                //
+                // The record carries its own provenance, so the status is
+                // rebuilt from it. `decided_by` says plainly that this machine
+                // did not witness the decision: the log is the authority for
+                // what was promoted, not for who approved it.
+                for entry in log.committed() {
+                    let record = &entry.record;
+                    let MemorySource::CandidateRef {
+                        candidate_id,
+                        governed_task_id,
+                        ..
+                    } = &record.source
+                    else {
+                        continue;
+                    };
+                    let status = MemoryCandidateStatus::Promoted {
+                        record_id: record.id.clone(),
+                        decided_at: record.valid_from.clone(),
+                        decided_by: adopted_decision_actor(),
+                    };
+                    match repaired.candidates.get_mut(candidate_id) {
+                        Some(candidate) if candidate.status.is_pending() => {
+                            candidate.status = status;
+                        }
+                        Some(_) => {}
+                        // The candidate was re-derived under a different id, or
+                        // its accepted task is not present here. Park the
+                        // rebuilt decision the same way a derivation migration
+                        // would, so a later start-up reattaches it — or names
+                        // the lost task instead of reporting a bare orphan.
+                        None => {
+                            repaired
+                                .pending_status_migrations
+                                .insert(governed_task_id.clone(), status);
+                        }
+                    }
+                }
                 self.storage()
                     .write_private_json(MEMORY_CANDIDATES_FILE, &repaired)
                     .context("Failed to record the adopted promoted-memory log head")?;
@@ -752,6 +812,19 @@ impl State {
             .into_iter()
             .cloned()
             .collect::<Vec<_>>())
+    }
+}
+
+/// The actor recorded for a review decision rebuilt from an adopted log.
+///
+/// A checked-out `MEMORY.jsonl` says which records were promoted; it does not
+/// say who approved them, because the approving actor lives in the gitignored
+/// ledger. Naming that gap is more honest than borrowing the record's agent id
+/// and implying an approval this machine never saw.
+fn adopted_decision_actor() -> impulse_ops::governed_task::GovernedActor {
+    impulse_ops::governed_task::GovernedActor {
+        kind: impulse_ops::governed_task::GovernedActorKind::System,
+        id: "adopted-from-checkout".to_string(),
     }
 }
 
@@ -1669,6 +1742,110 @@ pub(in crate::state) mod tests {
         assert!(
             rendered.contains("no longer an accepted task"),
             "the orphan error must point at the lost task, not nowhere: {rendered}"
+        );
+    }
+
+    /// The reviewer's round-2 P1: candidate reconciliation re-creates
+    /// `MEMORY_CANDIDATES.json`, so probing the path after it runs reports
+    /// `Local` on every machine that has ever run a governed task — which is
+    /// every machine that could have a memory log in the first place. A fresh
+    /// clone's tracked log then became a pile of "interrupted decisions": two
+    /// records refused startup with a remedy that changed nothing, and one
+    /// record loaded with the record silently invisible.
+    fn promote_n_then_delete_the_local_ledger(count: usize) -> std::path::PathBuf {
+        let (root, state) = state();
+        let base = state.storage().base_path().to_path_buf();
+        for index in 0..count {
+            accept_run(&state, &format!("run-{index}"));
+            let pending = state
+                .list_accepted_run_memory_candidates(&state.governed_project_id())
+                .unwrap()
+                .into_iter()
+                .find(|candidate| candidate.status.is_pending())
+                .expect("a freshly accepted run leaves a pending candidate");
+            state
+                .decide_memory_candidate(
+                    with_project(
+                        promote(&pending.id, &format!("decide-{index}"), index as u64),
+                        &state,
+                    ),
+                    OperatorAuthentication::Declared,
+                    "2026-09-12T10:00:00Z",
+                )
+                .unwrap();
+        }
+        assert_eq!(state.list_promoted_memory_records().unwrap().len(), count);
+        drop(state);
+
+        // The candidate ledger is gitignored; the log and its projection are
+        // tracked. A fresh clone has the second pair and not the first, while
+        // GOVERNED_TASKS.json is present because it is local runtime state a
+        // running daemon rebuilds.
+        std::fs::remove_file(base.join(MEMORY_CANDIDATES_FILE)).unwrap();
+        assert!(base.join("GOVERNED_TASKS.json").exists());
+        std::mem::forget(root);
+        base
+    }
+
+    #[test]
+    fn test_absent_ledger_adopts_a_single_record_log_even_with_governed_tasks_present() {
+        let base = promote_n_then_delete_the_local_ledger(1);
+        let reloaded = State::new(base).expect("an absent ledger must adopt, never refuse");
+        assert_eq!(
+            reloaded.list_promoted_memory_records().unwrap().len(),
+            1,
+            "the promoted record must not become silently invisible"
+        );
+        assert!(reloaded
+            .read_genome_projection()
+            .unwrap()
+            .expect("the projection is rebuilt from the adopted log")
+            .contains("## memory-record-"));
+    }
+
+    #[test]
+    fn test_absent_ledger_adopts_a_multi_record_log_even_with_governed_tasks_present() {
+        let base = promote_n_then_delete_the_local_ledger(2);
+        let reloaded = State::new(base.clone()).expect("an absent ledger must adopt, never refuse");
+        assert_eq!(reloaded.list_promoted_memory_records().unwrap().len(), 2);
+
+        // Adoption also rebuilds the review statuses from the records. Without
+        // that, every adopted record orphans on the next start-up and its
+        // candidate sits pending, promotable a second time into a duplicate.
+        let candidates = reloaded
+            .list_accepted_run_memory_candidates(&reloaded.governed_project_id())
+            .unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.status.is_promoted()),
+            "adopted records must reattach to their candidates"
+        );
+        for candidate in &candidates {
+            let MemoryCandidateStatus::Promoted { decided_by, .. } = &candidate.status else {
+                unreachable!("asserted promoted above");
+            };
+            assert_eq!(
+                decided_by.id, "adopted-from-checkout",
+                "an adopted decision must not claim an approver this machine never saw"
+            );
+        }
+
+        // Adoption is recorded, so the next start-up sees a local ledger with a
+        // head and does not have to adopt again.
+        drop(reloaded);
+        let ledger: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(base.join(MEMORY_CANDIDATES_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(ledger["memory_log_head"]["entry_count"], 2);
+        assert_eq!(
+            State::new(base)
+                .unwrap()
+                .list_promoted_memory_records()
+                .unwrap()
+                .len(),
+            2
         );
     }
 }

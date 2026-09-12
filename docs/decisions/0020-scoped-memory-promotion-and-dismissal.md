@@ -95,6 +95,13 @@ acceptance. This decision reuses it verbatim rather than inventing a second auth
    so it belongs in review. The raw candidate ledger and the retrieval-index marker
    (`.impulse/MEMORY_INDEX.json`) stay in the runtime gitignore list.
 
+   **Exception, in this repository.** IMPULSE-rs's own `.gitignore` blanket-ignores `.impulse/`
+   (line 7), so rule 3 does not hold here without force-adding both files. That is the repository
+   owner's call and this decision does not make it: in IMPULSE-rs itself, promoted memory behaves
+   like an untracked project — which is exactly the configuration rule 3b covers. Rule 3a's
+   exemption is still required, because `impulse init` does *not* add a blanket rule to a project
+   that lacks one.
+
 3a. **Neither file is a governed subject change.** Because they are tracked and *not* gitignored,
    a promotion would otherwise make the next governed registration refuse the workspace as dirty —
    first as an untracked `??`, and after the first commit as a tracked ` M` forever. Both paths are
@@ -115,7 +122,28 @@ acceptance. This decision reuses it verbatim rather than inventing a second auth
    candidate ledger file is **absent**, the verified log is adopted wholesale as committed, its head
    is recorded, and the orphan direction of the cross-check is skipped — a machine with no ledger
    has no basis on which to call a committed record orphaned. When the ledger file is **present**,
-   its head (or its absence of one) is authoritative, exactly as before.
+   its head (or its absence of one) is authoritative, exactly as before. The ledger's existence is
+   captured when it is *loaded*, before reconciliation re-creates the file from governed-task truth;
+   probing the path afterwards reports "present" on every machine that has ever run a governed task,
+   which is every machine that could hold a memory log at all.
+
+   Adoption also **rebuilds the review statuses from the records themselves**, because those
+   statuses lived only in the missing ledger. Each adopted record names the candidate and governed
+   task it came from, so its candidate is marked promoted — and where the candidate was re-derived
+   under a different id, the rebuilt decision is parked exactly as a derivation migration parks one.
+   Without this an adopted record would orphan on the *next* start-up and its candidate would sit
+   pending, promotable a second time into a duplicate record. `decided_by` is recorded as the system
+   actor `adopted-from-checkout`: the log is authoritative for *what* was promoted, never for *who*
+   approved it, and borrowing an id to fill the field would imply an approval this machine never saw.
+
+3c. **The inverse of 3b is the cost of a gitignored ledger.** A machine that loses
+   `MEMORY_CANDIDATES.json` adopts whatever `MEMORY.jsonl` it finds as authoritative — so deleting
+   the ledger is also the way to make a truncated or record-appended log load clean, and truncation
+   and orphan detection both depend on an artifact that is not in review. This is the same boundary
+   as rule 9a stated from the other side: the chain is self-consistent, not authenticated, and
+   nothing here defends against an actor with write access to both files. It is the price of keeping
+   the review ledger private; a signed head the daemon alone can mint would remove it, and is not
+   taken here.
 
 ### The record
 
@@ -205,8 +233,10 @@ acceptance. This decision reuses it verbatim rather than inventing a second auth
     exists to avoid handing out. The manual step is stated by the error and is safe by construction,
     because an uncommitted entry is by definition referenced by nothing: keep the first
     `memory_log_head.entry_count` lines of `.impulse/MEMORY.jsonl` (the count is in
-    `.impulse/MEMORY_CANDIDATES.json`) and discard the rest; with no head recorded and no ledger,
-    remove the local candidate ledger instead and let rule 3b adopt the log.
+    `.impulse/MEMORY_CANDIDATES.json`) and discard the rest. That is the whole remedy, and it is what
+    the error says. Removing the candidate ledger is deliberately **not** offered as a general
+    recovery: it would make the log adopt wholesale under rule 3b, which turns "refuse a log written
+    outside Impulse" into "accept it", and discards every review decision in the process.
 
 ### The projection
 
@@ -393,11 +423,18 @@ This decision is represented when tests prove:
 17. every `MemoryLogError` variant's `Display` names what went wrong, and `MemoryLogHead` round-trips
     through serde; and
 18. a promotion followed by a governed registration succeeds in a repository that does not gitignore
-    `.impulse`, both before and after the memory log is committed.
+    `.impulse`, both before and after the memory log is committed; a deleted memory log and an edit
+    to the hand-curated `GENOME.md` are both still subject changes; and the exemption is pinned to
+    the state layer's own filename constants; and
+19. with governed tasks present and the candidate ledger deleted, a one-record and a two-record log
+    both adopt rather than refusing or silently disappearing, the adopted records reattach to their
+    candidates as promoted with the `adopted-from-checkout` actor, and the next start-up reloads
+    them from the recorded head without adopting again.
 
 Source of truth: `impulse-rs/impulse-ops/src/{memory_candidate,memory_wiring}.rs`,
 `impulse-rs/src/state/{memory_candidate,memory_record,persistence}.rs`,
-`impulse-rs/src/retrieval/{store,indexer,mod}.rs`, `impulse-rs/src/handlers/config.rs`,
+`impulse-rs/src/state/persistence.rs`, `impulse-rs/src/retrieval/{store,indexer,mod}.rs`,
+`impulse-rs/src/handlers/config.rs`,
 `impulse-rs/src/governed_producers.rs` (the subject-change exemption only).
 
 ## Related Documents
