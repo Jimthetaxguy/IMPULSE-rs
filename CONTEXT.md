@@ -378,38 +378,56 @@ into Ion's `ReplToolRegistry` (`registry.rs::with_defaults`) via `DynamicToolBri
 mechanism as `file_read`/`file_write`/`bash_exec`, rather than writing new `ReplTool` wrappers.
 They are ungated (read-only, `Capability::FileSystemRead` only).
 
-**`impulse_dir` default and validation (review round 1 P2-2/P2-3, corrected twice more in review
-round 5, P1 Codex items 2/3):** the default is `<repo_root>/.impulse` (the PROJECT's own state
-directory, where `GENOME.md`/`retrieval.db` actually live) — never `history::impulse_home()`'s
-`$HOME/.impulse` fallback, which a normal launch (no `IMPULSE_HOME` set) resolved to and which has
-no relationship to the project. `IMPULSE_HOME` is honored only when explicitly set and non-blank.
-An explicit `impulse_dir` override is no longer routed through the shared `ToolRegistry::execute` →
-`validate_paths` → `ctx.allowed_read_roots` check (declaring it `ParamType::FilePath`, round 1's
-approach, forced widening those SHARED roots to cover an out-of-repo `IMPULSE_HOME`, which would
-have also authorized `file_read`/`bash_exec` to reach it). Both tools now declare `impulse_dir` as
-`ParamType::String` and call a shared `tooling::builtin::resolve_and_validate_memory_dir` helper
-themselves, checking the resolved path against exactly `{ctx.impulse_dir, IMPULSE_HOME}` — an
-`/allow` grant does NOT extend this tool-scoped reach (a deliberate, disclosed behavior change from
-round 2). `history::impulse_home()` itself is untouched, still governing `.impulse/ion_history`
-only.
+**`impulse_dir` default and validation (review round 1 P2-2/P2-3, corrected in review round 5, P1
+Codex items 2/3, corrected again in review round 6, MEDIUM REFUTED):** the default is
+`<repo_root>/.impulse` (the PROJECT's own state directory, where `GENOME.md`/`retrieval.db`
+actually live) — never `history::impulse_home()`'s `$HOME/.impulse` fallback, which a normal launch
+(no `IMPULSE_HOME` set) resolved to and which has no relationship to the project. `IMPULSE_HOME` is
+honored only when explicitly set and non-blank (and trimmed before use, since round 6: a padded env
+value used to deny itself). An explicit `impulse_dir` override is no longer routed through the
+shared `ToolRegistry::execute` → `validate_paths` → `ctx.allowed_read_roots` check (declaring it
+`ParamType::FilePath`, round 1's approach, forced widening those SHARED roots to cover an
+out-of-repo `IMPULSE_HOME`, which would have also authorized `file_read`/`document_read` to reach
+it). Both tools declare `impulse_dir` as `ParamType::String` and call a shared
+`tooling::builtin::resolve_and_validate_memory_dir` helper themselves. **Round 6 fix:** round 5's
+check was `{ctx.impulse_dir, IMPULSE_HOME}` — but `sandbox_tool_context` also SETS `ctx.impulse_dir`
+to `IMPULSE_HOME` when it's configured, so with `IMPULSE_HOME` set the "closed set" collapsed onto
+one value and an explicit project `.impulse` override was wrongly denied. `ToolContext` gained a
+`project_impulse_dir: PathBuf` field, set independently of `impulse_dir` by `sandbox_tool_context`
+to `repo_root.join(".impulse")` (mirrors `impulse_dir`'s own default for every other constructor, so
+non-`ion_repl` callers see no change); the check is now `{ctx.impulse_dir, ctx.project_impulse_dir,
+trimmed(IMPULSE_HOME)}` — three independent members that never collapse. An `/allow` grant still
+does NOT extend this tool-scoped reach (unchanged from round 5). `history::impulse_home()` itself is
+untouched, still governing `.impulse/ion_history` only.
 
-**`memory_search` is read-only for real now (review round 5, MEDIUM/Cursor):** it used to call
-`retrieval::search_history`/`search_genome`, which open `RetrievalStore` write-capable
-(`create_dir_all` + `Connection::open`, which creates `retrieval.db`, plus WAL pragma writes that
-create `-wal`/`-shm` sidecars) — so pointing this ungated tool at any `/allow`-granted directory
-with no existing index could CREATE real files there. It now checks for `retrieval.db`'s existence
-itself (reporting a typed "No retrieval index found" when absent, no side effects) and, when
-present, opens via a new `RetrievalStore::open_read_only` (`SQLITE_OPEN_READ_ONLY`, no
-`create_dir_all`, no pragma writes, no schema init) — a disclosed, deliberate narrowing to
-keyword-only search for this tool specifically (semantic/vector mode needs the write-capable path's
-optional `sqlite-vec` extension loading).
+**`memory_search` is read-only for real now (review round 5, MEDIUM/Cursor; hardened in review round
+6, MEDIUM REFUTED):** it used to call `retrieval::search_history`/`search_genome`, which open
+`RetrievalStore` write-capable (`create_dir_all` + `Connection::open`, which creates `retrieval.db`,
+plus WAL pragma writes that create `-wal`/`-shm` sidecars) — so pointing this ungated tool at any
+`/allow`-granted directory with no existing index could CREATE real files there. It checks for
+`retrieval.db`'s existence itself (reporting a typed "No retrieval index found" when absent, no side
+effects) and, when present, opens via `RetrievalStore::open_read_only`. **Round 6 fix:** a plain
+`SQLITE_OPEN_READ_ONLY` open of the WAL-mode index still needed to create/touch `-shm`/`-wal`
+sidecars for reader coordination (persisting after `Drop`) and failed outright in a
+permission-restricted directory; `open_read_only` now opens via the SQLite URI form
+`file:<absolute-path>?immutable=1` (`SQLITE_OPEN_READ_ONLY | SQLITE_OPEN_URI`), which tells SQLite no
+connection will ever modify the file, skipping WAL reader-coordination and touching the directory
+not at all. `execute()` now separates `results` from `errors` (a scope's query failure — e.g. a
+corrupted index — lands in `errors`, rendered with the full `.context()` chain, and is never counted
+in `results`/`count`) and reports `mode_applied: "keyword"` so a `semantic` request can't look like
+it ran. Still a disclosed, deliberate narrowing to keyword-only search for this tool specifically
+(semantic/vector mode needs the write-capable path's optional `sqlite-vec` extension loading).
 
-**`genome_read` pages now (review round 5, P2/Codex):** it used to return the whole `GENOME.md` (or
-whole matched section) unbounded, risking `LoopTrip::ContextBudget` on a large genome. `max_chars`
-(default 12,000, capped at 32,000) and `offset` window the content exactly the way
-`document_read`'s own `window()` does (same field names: `content`/`returned_chars`/`truncated`/
-`next_offset`), reimplemented locally since `ion_repl::tool_document` is `office-support`-gated and
-`genome_read` is not.
+**`genome_read` pages now (review round 5, P2/Codex) and validates its paging params for real
+(review round 6, LOW):** it used to return the whole `GENOME.md` (or whole matched section)
+unbounded, risking `LoopTrip::ContextBudget` on a large genome. `max_chars` (default 12,000, capped
+at 32,000) and `offset` window the content exactly the way `document_read`'s own `window()` does
+(same field names: `content`/`returned_chars`/`truncated`/`next_offset`), reimplemented locally
+since `ion_repl::tool_document` is `office-support`-gated and `genome_read` is not. Round 6: the
+doc comment claims parity with `document_read`'s `parse_request`, but the original parsing silently
+clamped `max_chars: 0` up to 1 and silently fell back to defaults for a negative or non-integer
+`max_chars`/`offset`; it now mirrors `parse_request` exactly, bailing with `ToolError::InvalidParams`
+on all of those instead of guessing.
 
 Internals otherwise unchanged: `genome_read` reads `<impulse_dir>/GENOME.md`; `memory_search`
 queries `RetrievalStore`'s own `search_history_keyword`/`search_genome_keyword` directly.

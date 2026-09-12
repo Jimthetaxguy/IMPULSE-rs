@@ -42,34 +42,65 @@ use super::registry::ToolRegistry;
 
 /// Resolves and validates the `impulse_dir` parameter shared by the two
 /// read-only memory tools (`memory_search`, `genome_read`) -- review
-/// round 5, P1 Codex on PR #54, items 2/3.
+/// round 5, P1 Codex on PR #54, items 2/3; corrected review round 6,
+/// MEDIUM REFUTED.
 ///
 /// **Why not the shared `allowed_read_roots` check:** these tools used to
 /// declare `impulse_dir` as `ParamType::FilePath`, routing it through
 /// `ToolExecutor::validate_paths`'s generic check against `ctx.
-/// allowed_read_roots` -- the SAME roots `file_read`/`bash_exec` share.
-/// Making a normal launch's `.impulse` correctly resolve to the project's
-/// own state directory (not `$HOME/.impulse`) needed `ReplContext::
+/// allowed_read_roots` -- the SAME roots `file_read` shares (`bash_exec`
+/// is NOT constrained by `allowed_read_roots` at all: it only requires the
+/// `ShellExec` capability and checks its own `cwd` argument, gated instead
+/// by `ion_repl::chat`'s confirmation prompt -- an earlier version of this
+/// comment incorrectly also named `bash_exec` here). Making a normal
+/// launch's `.impulse` correctly resolve to the project's own state
+/// directory (not `$HOME/.impulse`) needed `ReplContext::
 /// sandbox_tool_context` to add whatever `impulse_dir` resolves to onto
 /// those shared roots -- but for an explicitly-configured `IMPULSE_HOME`
-/// OUTSIDE the project, that would have widened `file_read`'s/`bash_exec`'s
-/// own reach to include it too, authorizing every bridged tool to read
-/// (and, via the write roots, `bash_exec` to at least traverse) a
-/// directory the model was never granted access to for anything but these
-/// two memory tools specifically.
+/// OUTSIDE the project, that would have widened `file_read`'s own reach to
+/// include it too, authorizing that tool to read a directory the model was
+/// never granted access to for anything but these two memory tools
+/// specifically.
 ///
 /// Instead, `memory_search`/`genome_read` declare `impulse_dir` as a plain
 /// `ParamType::String` (invisible to the generic FilePath check) and each
 /// call this helper themselves: the resolved path must be either `ctx.
-/// impulse_dir` (the project's own default -- always allowed, and never
-/// itself widened) or, only when the `IMPULSE_HOME` environment variable
-/// is itself explicitly set and non-blank, that exact directory. Anything
-/// else is refused with the same `ToolError::PathNotAllowed` shape
-/// `validate_paths` already uses for the shared roots, so a caller sees a
-/// consistent refusal regardless of which mechanism produced it. Path
-/// containment reuses `secure_resolve` (canonicalize-or-lexically-collapse)
-/// so a `..`-traversal candidate can't be mistaken for a path under either
-/// allowed root, matching the shared sandbox's own guarantee exactly.
+/// project_impulse_dir` (the launching project's OWN directory -- always
+/// allowed, regardless of what `ctx.impulse_dir` currently resolves to) or,
+/// only when the `IMPULSE_HOME` environment variable is itself explicitly
+/// set and non-blank, that exact directory. `ctx.impulse_dir` itself is
+/// also accepted (covers the common case where it already equals one of
+/// the two above, and non-`ion_repl` callers that only ever set
+/// `impulse_dir`). Anything else is refused with the same
+/// `ToolError::PathNotAllowed` shape `validate_paths` already uses for the
+/// shared roots, so a caller sees a consistent refusal regardless of which
+/// mechanism produced it. Path containment reuses `secure_resolve`
+/// (canonicalize-or-lexically-collapse) so a `..`-traversal candidate
+/// can't be mistaken for a path under any allowed root, matching the
+/// shared sandbox's own guarantee exactly.
+///
+/// **Why `ctx.impulse_dir` alone was not enough (review round 6, MEDIUM
+/// REFUTED, CONFIRMED):** `ion_repl::ReplContext::sandbox_tool_context`
+/// sets `ctx.impulse_dir` to `IMPULSE_HOME` itself whenever that env var is
+/// set. An earlier version of this function checked an explicit override
+/// against `{ctx.impulse_dir, IMPULSE_HOME}` -- which, whenever
+/// `IMPULSE_HOME` was set, collapsed to `{IMPULSE_HOME, IMPULSE_HOME}`,
+/// losing the project's own directory as an allowed target entirely: with
+/// `IMPULSE_HOME` set, `genome_read {"impulse_dir": "<repo>/.impulse"}`
+/// was DENIED, while the OMITTED-parameter default silently read the home
+/// genome instead. `ctx.project_impulse_dir` (set independently by
+/// `sandbox_tool_context`, see that field's own doc comment) is what
+/// fixes this: the project's own directory is always in the allowed set,
+/// no matter what `ctx.impulse_dir` currently equals.
+///
+/// **`IMPULSE_HOME` is trusted verbatim, once trimmed:** this function (and
+/// `sandbox_tool_context`, which resolves the same env var for the
+/// DEFAULT) treats `IMPULSE_HOME` as an operator-set, trusted value, not
+/// untrusted input requiring its own sandboxing -- it is read directly from
+/// the process environment, never from model-supplied `params`. Both call
+/// sites trim it before use (not merely before the emptiness check): a
+/// padded value (e.g. a trailing newline from a sourced shell profile)
+/// must not silently deny the very directory it names.
 pub(super) fn resolve_and_validate_memory_dir(
     explicit: Option<&str>,
     ctx: &super::traits::ToolContext,
@@ -78,10 +109,11 @@ pub(super) fn resolve_and_validate_memory_dir(
         return Ok(ctx.impulse_dir.clone());
     };
     let candidate = ctx.resolve_path(explicit);
-    let mut allowed_roots = vec![ctx.impulse_dir.clone()];
+    let mut allowed_roots = vec![ctx.impulse_dir.clone(), ctx.project_impulse_dir.clone()];
     if let Ok(home) = std::env::var("IMPULSE_HOME") {
-        if !home.trim().is_empty() {
-            allowed_roots.push(std::path::PathBuf::from(home));
+        let trimmed = home.trim();
+        if !trimmed.is_empty() {
+            allowed_roots.push(std::path::PathBuf::from(trimmed));
         }
     }
     let resolved_candidate = super::traits::secure_resolve(&candidate);

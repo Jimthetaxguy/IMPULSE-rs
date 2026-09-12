@@ -123,11 +123,16 @@ impl ReplContext {
     ///   SHARED `allowed_read_roots` below -- reasoned as "safe" because
     ///   it was Impulse's own state directory, not arbitrary host
     ///   filesystem. But `allowed_read_roots` is shared by EVERY bridged
-    ///   read tool, not just the two memory tools: widening it to cover an
-    ///   explicitly-configured, out-of-repo `IMPULSE_HOME` would silently
-    ///   authorize `file_read` (and, via write roots, effectively
-    ///   `bash_exec`) to reach it too, with no `/allow` grant ever having
-    ///   been given for that specific purpose. Fixed: `impulse_dir` is
+    ///   read tool that actually consults it, not just the two memory
+    ///   tools: widening it to cover an explicitly-configured, out-of-repo
+    ///   `IMPULSE_HOME` would silently authorize `file_read`/`document_read`
+    ///   to reach it too, with no `/allow` grant ever having been given
+    ///   for that specific purpose. (Review round 6, LOW doc: an earlier
+    ///   version of this comment also named `bash_exec` here -- wrong.
+    ///   `bash_exec` never consults `allowed_read_roots` at all; it is
+    ///   gated only by the `ShellExec` capability and its own `cwd`
+    ///   argument check, with `ion_repl::chat`'s confirmation prompt as
+    ///   the actual backstop before it ever runs.) Fixed: `impulse_dir` is
     ///   NEVER added to `allowed_read_roots` now. The default case (inside
     ///   `repo_root`, per item 2) needs no separate grant, since
     ///   `repo_root` already is one. An explicitly-configured, out-of-repo
@@ -144,16 +149,32 @@ impl ReplContext {
     ///   never touches it) and into that tool-scoped helper.
     pub fn sandbox_tool_context(&self) -> crate::tooling::ToolContext {
         let repo_root = self.effective_repo_root();
+        // Review round 6, MEDIUM REFUTED: the project's own `.impulse` is
+        // computed independently of whatever `impulse_dir` below resolves
+        // to, and carried in its own field
+        // (`ToolContext::project_impulse_dir`) -- see that field's doc
+        // comment for exactly why `impulse_dir` alone is not enough (when
+        // `IMPULSE_HOME` is set, `impulse_dir` below becomes `IMPULSE_HOME`
+        // itself, so a memory tool comparing an explicit override against
+        // `ctx.impulse_dir` alone would have lost the ability to ever
+        // reach the project's own directory again).
+        let project_impulse_dir = repo_root.join(".impulse");
         // Review round 5, P1 Codex, item 2: the project's own state
         // directory by default; `IMPULSE_HOME` only when explicitly set
         // and non-blank. Deliberately NOT `history::impulse_home()`, whose
         // `$HOME/.impulse` fallback tier is correct for `.impulse/
         // ion_history` but wrong here -- see this struct's doc comment.
+        // Review round 6: the env value is TRIMMED before use, not just
+        // before the emptiness check -- a padded `IMPULSE_HOME` (e.g. a
+        // trailing newline from a sourced shell profile) previously
+        // produced a `PathBuf` that could never equal a caller's own
+        // trimmed comparison, denying the very directory it named.
         let impulse_dir = std::env::var("IMPULSE_HOME")
             .ok()
-            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| repo_root.join(".impulse"));
+            .unwrap_or_else(|| project_impulse_dir.clone());
         // Review round 5, P1 Codex, item 3: `impulse_dir` is deliberately
         // NEVER added to the shared read roots here (round 1's fix did
         // add it) -- see this struct's doc comment for why that widened
@@ -167,6 +188,7 @@ impl ReplContext {
         crate::tooling::ToolContext {
             execution_origin: crate::tooling::ExecutionOrigin::Cli,
             impulse_dir,
+            project_impulse_dir,
             allowed_read_roots: read_roots,
             allowed_write_roots: vec![repo_root],
             ..crate::tooling::ToolContext::with_all_capabilities()
@@ -987,7 +1009,10 @@ mod tests {
         // Review round 5, P1 Codex, items 2/3 together: when IMPULSE_HOME
         // IS explicitly set (and non-blank), it becomes `impulse_dir` --
         // but it must NOT be added to the shared `allowed_read_roots`,
-        // since that would authorize file_read/bash_exec to reach it too.
+        // since that would authorize file_read/document_read to reach it
+        // too (review round 6, LOW doc: bash_exec never consults
+        // allowed_read_roots at all -- see sandbox_tool_context's doc
+        // comment).
         let _guard = crate::test_support::impulse_home_env_lock();
         let prev = std::env::var("IMPULSE_HOME").ok();
         let home_dir = tempfile::TempDir::new().unwrap();
@@ -1006,11 +1031,50 @@ mod tests {
         }
 
         assert_eq!(tool_ctx.impulse_dir, home_dir.path());
+        // Review round 6, MEDIUM REFUTED: `project_impulse_dir` must stay
+        // the project's own directory, set INDEPENDENTLY of `impulse_dir`
+        // -- the whole point of the fix. Before it existed, `impulse_dir`
+        // collapsing onto `IMPULSE_HOME` here left nothing distinguishing
+        // "the project" from "the configured home" for a memory tool's
+        // explicit-override check to compare against.
+        assert_eq!(
+            tool_ctx.project_impulse_dir,
+            repo_root.path().join(".impulse")
+        );
+        assert_ne!(
+            tool_ctx.project_impulse_dir, tool_ctx.impulse_dir,
+            "project_impulse_dir must not collapse onto impulse_dir when IMPULSE_HOME is set"
+        );
         assert_eq!(
             tool_ctx.allowed_read_roots,
             vec![repo_root.path().to_path_buf()],
             "an explicitly-configured IMPULSE_HOME must never be added to the shared read roots"
         );
+    }
+
+    #[test]
+    fn test_sandbox_tool_context_trims_a_padded_impulse_home_before_use() {
+        // Review round 6: a padded IMPULSE_HOME (e.g. a trailing newline
+        // from a sourced shell profile) must not produce a PathBuf that
+        // can never equal a caller's own trimmed comparison.
+        let _guard = crate::test_support::impulse_home_env_lock();
+        let prev = std::env::var("IMPULSE_HOME").ok();
+        let home_dir = tempfile::TempDir::new().unwrap();
+        std::env::set_var("IMPULSE_HOME", format!("  {}\n", home_dir.path().display()));
+
+        let repo_root = tempfile::TempDir::new().unwrap();
+        let ctx = ReplContext {
+            repo_root: repo_root.path().to_path_buf(),
+            allowed_read_roots: Vec::new(),
+        };
+        let tool_ctx = ctx.sandbox_tool_context();
+
+        match prev {
+            Some(value) => std::env::set_var("IMPULSE_HOME", value),
+            None => std::env::remove_var("IMPULSE_HOME"),
+        }
+
+        assert_eq!(tool_ctx.impulse_dir, home_dir.path());
     }
 
     #[test]

@@ -6,6 +6,32 @@ use std::time::Duration;
 
 use crate::retrieval::types::SearchResult;
 
+/// Percent-encodes `path` for embedding in a SQLite `file:` URI (review
+/// round 6, MEDIUM REFUTED -- used by [`RetrievalStore::open_read_only`]'s
+/// `immutable=1` connection: `immutable` can only be requested via a URI,
+/// and SQLite's own URI parser treats `?`/`#`/`%` -- and, conservatively,
+/// anything else outside the unreserved/`/` set -- as syntactically
+/// significant, so a path containing any of them would otherwise corrupt
+/// the URI or be silently misinterpreted). Keeps `/` and RFC 3986
+/// "unreserved" characters (`A-Za-z0-9-._~`) literal; every other byte
+/// becomes `%XX`. Operates on UTF-8 bytes (`Path::to_string_lossy`),
+/// matching how the rest of this codebase already displays paths.
+fn percent_encode_uri_path(path: &Path) -> String {
+    let mut out = String::new();
+    for byte in path.to_string_lossy().as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                out.push(*byte as char);
+            }
+            other => {
+                out.push('%');
+                out.push_str(&format!("{other:02X}"));
+            }
+        }
+    }
+    out
+}
+
 pub struct RetrievalStore {
     conn: Connection,
     db_path: PathBuf,
@@ -98,14 +124,46 @@ impl RetrievalStore {
                 db_path.display()
             );
         }
-        let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .with_context(|| format!("failed to open {} read-only", db_path.display()))?;
-        // Read-only: no pragma writes (journal_mode/synchronous/foreign_keys
-        // all either write the database header or are irrelevant to a
-        // connection that only ever runs SELECTs). `busy_timeout` is a
-        // connection-local setting with no on-disk side effect, so it stays
-        // -- it only helps a read-only reader wait briefly instead of
-        // failing outright if a concurrent writer briefly holds a lock.
+        // Review round 6, MEDIUM REFUTED (CONFIRMED): a plain
+        // `SQLITE_OPEN_READ_ONLY` open of a WAL-mode database still
+        // materializes `-shm`/`-wal` sidecar files on the FIRST query
+        // (SQLite must still track the WAL read-mark for a consistent
+        // snapshot, which needs those files to exist even for a reader),
+        // and those sidecars persist after this connection is dropped --
+        // exactly the write side effect this method exists to prevent.
+        // `immutable=1` (SQLite's own documented flag for "this file will
+        // not change for the duration I have it open, and no other
+        // connection will change it either") tells SQLite it never needs
+        // WAL bookkeeping at all, so no sidecar is ever created. It can
+        // ONLY be passed via a `file:` URI (there is no `OpenFlags` bit for
+        // it), which requires `SQLITE_OPEN_URI` and an absolute,
+        // percent-encoded path (`std::path::absolute` -- no filesystem
+        // access, so it works even for a relative `base_path` that
+        // resolves to a directory the process cannot otherwise inspect --
+        // and `percent_encode_uri_path` for the reserved-character escaping
+        // SQLite's own URI parser requires).
+        let absolute_db_path = std::path::absolute(&db_path).with_context(|| {
+            format!(
+                "failed to resolve {} to an absolute path",
+                db_path.display()
+            )
+        })?;
+        let uri = format!(
+            "file:{}?immutable=1",
+            percent_encode_uri_path(&absolute_db_path)
+        );
+        let conn = Connection::open_with_flags(
+            &uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .with_context(|| format!("failed to open {} read-only (immutable)", db_path.display()))?;
+        // Read-only AND immutable: no pragma writes (journal_mode/
+        // synchronous/foreign_keys all either write the database header or
+        // are irrelevant to a connection that only ever runs SELECTs).
+        // `busy_timeout` is a connection-local setting with no on-disk side
+        // effect, so it stays -- though an immutable connection never
+        // actually contends with a writer for a lock the way a plain
+        // read-only one could.
         conn.busy_timeout(Duration::from_secs(5))
             .context("Failed to set busy_timeout on retrieval.db (read-only)")?;
         Ok(Self { conn, db_path })

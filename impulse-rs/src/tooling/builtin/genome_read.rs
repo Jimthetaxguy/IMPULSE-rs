@@ -155,19 +155,52 @@ impl DynamicTool for GenomeReadTool {
         let section_filter = params.get("section").and_then(|v| v.as_str());
         // Review round 5, P2/Codex: `max_chars` defaults to
         // `DEFAULT_MAX_CHARS` and is capped at `MAX_CHARS_CAP` regardless
-        // of what the caller asks -- mirrors `document_read`'s identical
-        // clamp (`ion_repl::tool_document::parse_request`).
-        let max_chars = params
-            .get("max_chars")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize)
-            .unwrap_or(DEFAULT_MAX_CHARS)
-            .clamp(1, MAX_CHARS_CAP);
-        let offset = params
-            .get("offset")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize)
-            .unwrap_or(0);
+        // of what the caller asks -- mirrors `document_read`'s clamp
+        // (`ion_repl::tool_document::parse_request`).
+        //
+        // Review round 6, LOW: the ORIGINAL version of this block used
+        // `.and_then(|v| v.as_u64())...unwrap_or(...)`, which silently
+        // treats `max_chars: 0`, a negative `max_chars`/`offset`, and a
+        // non-integer value (a JSON string or a non-whole float, since
+        // `Value::as_u64` returns `None` for all of those) the same way it
+        // treats "the caller omitted the field" -- clamping 0 up to 1 and
+        // falling every other rejected value back to the default/zero
+        // rather than reporting the mistake. `genome_read`'s own doc
+        // comment above claims parity with `document_read`, whose
+        // `parse_request` bails on exactly these cases instead of
+        // guessing what the caller meant -- mirrored here so the claimed
+        // parity is real, not just the windowing algorithm and field
+        // names.
+        let max_chars = match params.get("max_chars") {
+            None | Some(serde_json::Value::Null) => DEFAULT_MAX_CHARS,
+            Some(v) => {
+                let requested = v.as_u64().ok_or_else(|| {
+                    ToolError::InvalidParams(format!(
+                        "'max_chars' must be a positive integer, got {v}"
+                    ))
+                })?;
+                if requested == 0 {
+                    return Err(ToolError::InvalidParams(
+                        "'max_chars' must be at least 1".to_string(),
+                    ));
+                }
+                usize::try_from(requested)
+                    .unwrap_or(MAX_CHARS_CAP)
+                    .min(MAX_CHARS_CAP)
+            }
+        };
+        let offset = match params.get("offset") {
+            None | Some(serde_json::Value::Null) => 0,
+            Some(v) => {
+                let requested = v.as_u64().ok_or_else(|| {
+                    ToolError::InvalidParams(format!(
+                        "'offset' must be a non-negative integer, got {v}"
+                    ))
+                })?;
+                usize::try_from(requested)
+                    .map_err(|_| ToolError::InvalidParams("'offset' is too large".to_string()))?
+            }
+        };
 
         let genome_path = impulse_dir.join("GENOME.md");
 
@@ -371,14 +404,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_accepts_an_explicit_impulse_dir_matching_configured_impulse_home() {
-        // Review round 5, item 3's exact acceptance test (the genome_read
-        // half; `file_read` denying the same path is proven at the
-        // `ReplContext::sandbox_tool_context` level in `ion_repl::mod`'s
-        // own tests): an explicit `impulse_dir` equal to the process's own
-        // configured `IMPULSE_HOME` is accepted, even though it is outside
-        // `ctx.impulse_dir` (the project default) and never added to the
-        // shared `allowed_read_roots`.
+    async fn test_execute_when_impulse_home_is_set_both_project_and_home_impulse_dir_work() {
+        // Review round 5, item 3's original acceptance test, extended in
+        // review round 6 (MEDIUM REFUTED) to also prove the project's own
+        // directory STILL works once `IMPULSE_HOME` is set -- the exact
+        // regression the review found: with `ctx.impulse_dir` and
+        // `ctx.project_impulse_dir` constructed the way
+        // `ReplContext::sandbox_tool_context` REALLY produces them when
+        // `IMPULSE_HOME` is configured (`impulse_dir` becomes
+        // `IMPULSE_HOME` itself; `project_impulse_dir` stays the project's
+        // own directory, set independently), an earlier version of
+        // `resolve_and_validate_memory_dir` checked an explicit override
+        // against `{ctx.impulse_dir, IMPULSE_HOME}` -- which collapsed to
+        // `{IMPULSE_HOME, IMPULSE_HOME}` here, so `genome_read
+        // {"impulse_dir": "<project>/.impulse"}` was wrongly DENIED.
         let _guard = env_lock();
         let prev = std::env::var("IMPULSE_HOME").ok();
         let home_dir = tempfile::TempDir::new().unwrap();
@@ -386,15 +425,28 @@ mod tests {
         std::env::set_var("IMPULSE_HOME", home_dir.path());
 
         let project_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(project_dir.path().join("GENOME.md"), "# from project").unwrap();
+        // Mirrors what `sandbox_tool_context` actually produces once
+        // `IMPULSE_HOME` is set: `impulse_dir` == the home directory,
+        // `project_impulse_dir` == the project's own, independently.
         let ctx = ToolContext {
-            impulse_dir: project_dir.path().to_path_buf(),
+            impulse_dir: home_dir.path().to_path_buf(),
+            project_impulse_dir: project_dir.path().to_path_buf(),
             allowed_read_roots: vec![project_dir.path().to_path_buf()],
             ..ToolContext::with_all_capabilities()
         };
         let tool = GenomeReadTool;
-        let result = tool
+
+        let home_result = tool
             .execute(
                 serde_json::json!({"impulse_dir": home_dir.path().to_str().unwrap()}),
+                &ctx,
+            )
+            .await
+            .expect("the configured IMPULSE_HOME must remain reachable");
+        let project_result = tool
+            .execute(
+                serde_json::json!({"impulse_dir": project_dir.path().to_str().unwrap()}),
                 &ctx,
             )
             .await;
@@ -404,11 +456,16 @@ mod tests {
             None => std::env::remove_var("IMPULSE_HOME"),
         }
 
-        let result = result.unwrap();
-        assert!(result.output["content"]
+        assert!(home_result.output["content"]
             .as_str()
             .unwrap()
             .contains("from IMPULSE_HOME"));
+        let project_result =
+            project_result.expect("the project's own .impulse must stay reachable too");
+        assert!(project_result.output["content"]
+            .as_str()
+            .unwrap()
+            .contains("from project"));
     }
 
     // ----------------------------------------------------------------
@@ -499,6 +556,85 @@ mod tests {
             "returned {} chars, over MAX_CHARS_CAP",
             returned.chars().count()
         );
+    }
+
+    // Review round 6, LOW: `max_chars: 0` used to be silently clamped up
+    // to 1 and a negative/non-integer `max_chars`/`offset` used to fall
+    // back to the default/zero rather than reporting the mistake --
+    // `genome_read`'s own doc comment claims parity with `document_read`'s
+    // `parse_request`, which bails on all four of these instead. The four
+    // tests below prove the mirrored bail behavior.
+
+    #[tokio::test]
+    async fn test_execute_rejects_a_zero_max_chars() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("GENOME.md"), "content").unwrap();
+        let ctx = ToolContext {
+            impulse_dir: dir.path().to_path_buf(),
+            ..ToolContext::with_all_capabilities()
+        };
+
+        let tool = GenomeReadTool;
+        let result = tool
+            .execute(serde_json::json!({"max_chars": 0}), &ctx)
+            .await;
+
+        assert!(matches!(result, Err(ToolError::InvalidParams(_))));
+    }
+
+    #[tokio::test]
+    async fn test_execute_rejects_a_negative_max_chars() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("GENOME.md"), "content").unwrap();
+        let ctx = ToolContext {
+            impulse_dir: dir.path().to_path_buf(),
+            ..ToolContext::with_all_capabilities()
+        };
+
+        let tool = GenomeReadTool;
+        let result = tool
+            .execute(serde_json::json!({"max_chars": -5}), &ctx)
+            .await;
+
+        assert!(matches!(result, Err(ToolError::InvalidParams(_))));
+    }
+
+    #[tokio::test]
+    async fn test_execute_rejects_a_non_integer_max_chars() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("GENOME.md"), "content").unwrap();
+        let ctx = ToolContext {
+            impulse_dir: dir.path().to_path_buf(),
+            ..ToolContext::with_all_capabilities()
+        };
+
+        let tool = GenomeReadTool;
+        // A JSON string is rejected outright...
+        let result = tool
+            .execute(serde_json::json!({"max_chars": "100"}), &ctx)
+            .await;
+        assert!(matches!(result, Err(ToolError::InvalidParams(_))));
+        // ...and so is a non-whole float, which `Value::as_u64` also
+        // refuses (it is stored/parsed as an f64, not a u64).
+        let result = tool
+            .execute(serde_json::json!({"max_chars": 100.5}), &ctx)
+            .await;
+        assert!(matches!(result, Err(ToolError::InvalidParams(_))));
+    }
+
+    #[tokio::test]
+    async fn test_execute_rejects_a_negative_offset() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("GENOME.md"), "content").unwrap();
+        let ctx = ToolContext {
+            impulse_dir: dir.path().to_path_buf(),
+            ..ToolContext::with_all_capabilities()
+        };
+
+        let tool = GenomeReadTool;
+        let result = tool.execute(serde_json::json!({"offset": -1}), &ctx).await;
+
+        assert!(matches!(result, Err(ToolError::InvalidParams(_))));
     }
 
     #[tokio::test]

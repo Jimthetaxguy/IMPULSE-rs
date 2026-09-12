@@ -534,4 +534,52 @@ mod tests {
             .rendered
             .contains("from the configured IMPULSE_HOME"));
     }
+
+    #[tokio::test]
+    async fn run_genome_read_with_explicit_project_impulse_dir_still_works_when_impulse_home_is_set(
+    ) {
+        // Review round 6, MEDIUM REFUTED (CONFIRMED): the coordinator's
+        // exact reproduction, end to end through the REAL
+        // `ReplContext::sandbox_tool_context` (not a hand-built
+        // `ToolContext`) -- with `IMPULSE_HOME` set, `genome_read
+        // {"impulse_dir": "<repo>/.impulse"}` was wrongly DENIED, because
+        // the closed set the tool validated against had collapsed to
+        // `{IMPULSE_HOME, IMPULSE_HOME}`.
+        let _guard = crate::test_support::impulse_home_env_lock();
+        let prev = std::env::var("IMPULSE_HOME").ok();
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("IMPULSE_HOME", home_dir.path());
+
+        let repo_root = tempfile::tempdir().expect("tempdir");
+        let project_impulse_dir = repo_root.path().join(".impulse");
+        std::fs::create_dir_all(&project_impulse_dir).unwrap();
+        std::fs::write(
+            project_impulse_dir.join("GENOME.md"),
+            "# the project's own genome",
+        )
+        .unwrap();
+        let registry = Arc::new(ToolRegistry::with_defaults());
+        let bridge = DynamicToolBridge::new(registry, "genome_read", "n/a");
+        let ctx = ReplContext {
+            repo_root: repo_root.path().to_path_buf(),
+            ..ReplContext::default()
+        };
+
+        let outcome = bridge
+            .run(
+                serde_json::json!({"impulse_dir": project_impulse_dir.display().to_string()}),
+                &ctx,
+            )
+            .await;
+
+        match prev {
+            Some(value) => std::env::set_var("IMPULSE_HOME", value),
+            None => std::env::remove_var("IMPULSE_HOME"),
+        }
+
+        let outcome = outcome
+            .expect("an explicit project .impulse must stay reachable even with IMPULSE_HOME set");
+        assert!(outcome.ok);
+        assert!(outcome.rendered.contains("the project's own genome"));
+    }
 }

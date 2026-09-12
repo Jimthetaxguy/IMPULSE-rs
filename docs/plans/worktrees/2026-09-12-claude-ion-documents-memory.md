@@ -1125,3 +1125,150 @@ tests to 5 -- 1 updated in place, 4 new); `ion_repl/tool_bridge.rs` +2 net (1 re
 `tooling/builtin/genome_read.rs` +9 net (2 rewritten, 7 new). No files this lane does not own were
 touched beyond `AGENTS.md` (item 1's doc fix) and `impulse-rs/src/cli.rs` (the merge conflict
 resolution, additive only -- no existing content changed).
+
+## Review round 6 (2026-09-12)
+
+PR #54 at `c9f7706`: containment/paging/scoping all held up under adversarial probing, but four
+items (two MEDIUM REFUTED, two LOW) remained; the coordinator asked for a fix round then a freeze
+("I will resolve the five threads and merge"). All four addressed below; no reply to or resolution
+of the PR's own review threads was requested or performed here.
+
+### 1. MEDIUM REFUTED, `ion_repl/mod.rs:152-157` / `builtin/mod.rs:78-84` -- the "closed set" collapsed onto one value when `IMPULSE_HOME` was set
+
+Round 5's fix validated an explicit `genome_read`/`memory_search` `impulse_dir` override against
+`{ctx.impulse_dir, IMPULSE_HOME}` -- but `sandbox_tool_context` also SETS `ctx.impulse_dir` to
+`IMPULSE_HOME` whenever it is configured. With `IMPULSE_HOME` set, the "closed set" collapsed to a
+single value: `genome_read {"impulse_dir": "<repo>/.impulse"}` was DENIED, and the tool's own
+default (`ctx.impulse_dir`, unchanged) silently read the wrong (home) genome instead of the
+project's own -- exactly the round-1/round-5 failure mode reappearing under one more condition.
+Separately, an `IMPULSE_HOME` value with incidental leading/trailing whitespace was compared
+byte-for-byte against a `PathBuf::from` of the untrimmed env value, so a padded real value denied
+itself.
+
+**Fix:** a new `ToolContext::project_impulse_dir: PathBuf` field, set independently of
+`impulse_dir` by `sandbox_tool_context` to `repo_root.join(".impulse")` and mirroring `impulse_dir`'s
+own default in every OTHER constructor (`Default`, `with_all_capabilities`) -- so non-`ion_repl`
+callers (CLI/daemon/MCP, `handlers::common::build_tool_context`, the one non-spread call site that
+needed a manual update) see no behavior change. `resolve_and_validate_memory_dir` now checks an
+explicit override against `{ctx.impulse_dir, ctx.project_impulse_dir, trimmed(IMPULSE_HOME)}` --
+three independent members, never collapsing regardless of what `IMPULSE_HOME` resolves to.
+`sandbox_tool_context` now trims the env value (`.trim().to_string()`) before both the
+blank-check and the `PathBuf::from`, so a padded value is honored, not rejected. Doc comments on
+both the new field and `resolve_and_validate_memory_dir` spell out the collapse bug and the
+"`IMPULSE_HOME` is operator-controlled env, trusted verbatim once trimmed" caveat the coordinator
+asked for. New/changed tests: `test_sandbox_tool_context_trims_a_padded_impulse_home_before_use`
+(new, `ion_repl/mod.rs`); `test_sandbox_tool_context_honors_an_explicitly_set_impulse_home_without_
+widening_read_roots` extended with `project_impulse_dir != impulse_dir` assertions;
+`test_execute_when_impulse_home_is_set_both_project_and_home_impulse_dir_work` (rewritten in both
+`genome_read.rs` and `memory_search.rs`, asserting BOTH the project and the home override succeed
+with `IMPULSE_HOME` set); `run_genome_read_with_explicit_project_impulse_dir_still_works_when_
+impulse_home_is_set` (new, `ion_repl/tool_bridge.rs`, the coordinator's exact reproduction scenario
+driven through the real `sandbox_tool_context`, not a hand-built `ToolContext`).
+
+### 2. MEDIUM REFUTED, `retrieval/store.rs` -- `open_read_only` still materialized WAL sidecars and miscounted errors as results
+
+Plain `SQLITE_OPEN_READ_ONLY` against a WAL-mode index still needs to create/touch `retrieval.db-shm`
+(and, on first write-shaped access, `-wal`) for reader coordination -- which persisted after `Drop`,
+and which a permission-restricted (chmod-555) directory refuses outright, failing every query. Worse,
+`memory_search.rs`'s `execute()` pushed those per-scope failures into the SAME array as genuine
+hits, so `count` counted error objects as if they were real results (`ok: true, count: 2`, both
+entries actually errors) -- a caller checking `count > 0` would have been fooled.
+
+**Fix:** `open_read_only` now opens via the SQLite URI form `file:<absolute-path>?immutable=1` with
+`SQLITE_OPEN_READ_ONLY | SQLITE_OPEN_URI` -- `immutable=1` tells SQLite no connection, ever, will
+modify this file, so it skips WAL reader-coordination entirely and never touches the directory at
+all (proven empirically: the chmod-555 fixture now succeeds cleanly with zero sidecar files, where
+it previously failed on every query). `std::path::absolute()` (no filesystem access, unlike
+`canonicalize`) makes the path absolute first, since a SQLite URI path must be; a new
+`percent_encode_uri_path` escapes everything outside RFC 3986 unreserved characters plus `/`, since
+`?`/`#`/`%`/non-ASCII bytes are syntactically significant to SQLite's own URI parser.
+`memory_search.rs`'s `execute()` now builds separate `results`/`errors` arrays -- a scope's query
+failure goes into `errors` (rendered via `{e:#}` so the full `.context()` chain survives, not just
+the outermost message) and is never added to `results`; `count` reflects only genuine hits. Added
+`mode_applied: "keyword"` to the payload so a `semantic`-mode request can never be mistaken for
+having actually run in that mode. New/changed tests (`memory_search.rs`):
+`test_execute_finds_results_via_the_read_only_path_against_a_real_index` extended with a
+before/after directory-listing snapshot (asserts byte-for-byte no sidecar files appear) and an
+`errors`-is-empty assertion; `test_execute_succeeds_against_a_chmod_555_index_directory` (new --
+proves the `immutable=1` fix directly, chmod-555 now succeeds with a real result and no errors, in
+place of an earlier draft of this test that asserted the pre-fix failure mode and was corrected
+after actually running it and observing the fix works better than a graceful-failure framing would
+have implied); `test_execute_puts_a_query_failure_in_errors_not_results` (new -- a corrupted, non-SQLite
+`retrieval.db` file deterministically reproduces a real query-time failure independent of filesystem
+permissions, proving the results/errors separation on its own terms).
+
+### 3. LOW, `genome_read.rs` -- `max_chars`/`offset` silently guessed instead of bailing on invalid input
+
+`genome_read`'s own doc comment claims parity with `document_read`'s `parse_request`, but its
+`max_chars`/`offset` parsing used `.and_then(|v| v.as_u64())...unwrap_or(...)`: `max_chars: 0` was
+silently clamped up to 1, and a negative value, a non-integer value (a JSON string, or a non-whole
+float -- `Value::as_u64` returns `None` for both), or a negative `offset` all silently fell back to
+the default/zero rather than reporting the caller's mistake, unlike `tool_document::parse_request`,
+which `bail!`s on every one of these.
+
+**Fix:** mirrored `parse_request`'s exact validation: `max_chars`/`offset` now match on the raw
+`serde_json::Value`, returning `ToolError::InvalidParams` for a non-`u64`-representable value or a
+zero `max_chars`, and clamping only the upper bound (`MAX_CHARS_CAP`) as before -- never the lower
+one. New tests: `test_execute_rejects_a_zero_max_chars`, `test_execute_rejects_a_negative_max_chars`,
+`test_execute_rejects_a_non_integer_max_chars` (both a JSON string and a non-whole float),
+`test_execute_rejects_a_negative_offset`.
+
+### 4. LOW doc, `builtin/mod.rs:50-57` / `ion_repl/mod.rs:136-141` -- stale `bash_exec` claim and two other doc/skill drift items
+
+Three independent doc-accuracy fixes, no behavior change:
+
+- The rationale comments explaining why `impulse_dir` is never added to the shared
+  `allowed_read_roots` claimed widening it would let `bash_exec` "reach"/"traverse" the path too.
+  `bash_exec` never consults `allowed_read_roots` at all -- it is gated only by the `ShellExec`
+  capability and its own `cwd` argument check, with `ion_repl::chat`'s confirmation prompt as the
+  actual backstop before it ever runs. Corrected in both `builtin/mod.rs`'s doc comment (already
+  fixed as part of item 1's rewrite this round) and `ion_repl/mod.rs`'s `ReplContext` struct doc
+  comment (the reviewer's second citation, fixed here) plus one test comment repeating the same
+  claim.
+- `.claude/skills/impulse-development/references/adding-cli-commands.md` still said "Add the enum
+  variant in `src/main.rs`" -- stale since before round 5 found and fixed the same claim in
+  `AGENTS.md`. Updated to match: the `Commands` enum lives in `src/cli.rs`; `main.rs` is a thin
+  entrypoint; the handler is shared across `direct_dispatch.rs`/`daemon_dispatch.rs`, with a
+  matching `IonCommand` variant needed only when the command is also exposed from the `ion` binary.
+- `AGENTS.md`'s round-5 fix for item 1 above had grown into a 13-line, multi-paragraph hunk
+  narrating the "Phase 2 module extraction" history and round-5's own confirmation work --
+  provenance that belongs in git history, not a standing operating guide. Trimmed to one paragraph
+  stating just the current convention (cli.rs declaration, shared handler, `ion`'s own `IonCommand`
+  mirror).
+
+### Gate evidence (review round 6, this checkout)
+
+```
+cd impulse-rs
+cargo build --workspace                                     # clean
+cargo test --workspace                                      # 3018 passed / 0 failed / 9 ignored
+                                                              # across every crate; impulse-rs lib
+                                                              # alone: 2335 passed / 0 failed / 5
+                                                              # ignored; tests/pdf_extraction_
+                                                              # isolation.rs: 17/17 passed
+cargo clippy --workspace --all-targets -- -D warnings        # clean
+cargo fmt --all -- --check                                   # clean (four files needed
+                                                              # reformatting after this round's
+                                                              # edits; applied via cargo fmt --all)
+cargo build --no-default-features                            # clean, zero warnings
+cargo test --no-default-features --lib -- tooling::builtin::genome_read \
+  tooling::builtin::memory_search                            # 28 passed / 0 failed / 0 ignored
+cargo audit                                                  # unchanged: 11 pre-existing
+                                                              # vulnerabilities / 18 warnings
+python3 docs/validate_docs.py --all                          # only pre-existing failures on main
+                                                              # (0014's status field, three stale
+                                                              # docs unrelated to this lane)
+```
+
+`git fetch origin` confirmed `origin/main` at `6004194` (one commit ahead of this branch's merge
+base, `4dbb8b3`, via #58/#59-class work); no real conflict potential (the one shared file, AGENTS.md,
+was touched by `main` in a different section than this round's item-4 trim). Per the coordinator's
+"conflict-free with main 6004194" verification finding (not an instruction to merge) and the
+explicit "then freeze," `main` was not merged again this round.
+
+New/changed test totals this round: `ion_repl/mod.rs` +1 (35 -> 36); `ion_repl/tool_bridge.rs` +1
+(16 -> 17); `tooling/builtin/genome_read.rs` +4 (12 -> 16); `tooling/builtin/memory_search.rs` +2
+(10 -> 12); `retrieval/store.rs` unchanged (25, covered by `memory_search.rs`'s tests instead of new
+tests directly against the store). No files this lane does not own were touched beyond `AGENTS.md`
+(item 4's trim) and `.claude/skills/impulse-development/references/adding-cli-commands.md` (item 4's
+stale-doc fix, a skill reference file, not a lane-owned source path).
