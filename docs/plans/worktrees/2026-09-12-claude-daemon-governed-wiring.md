@@ -481,31 +481,45 @@ both sides. When it lands:
      state layer's `RecordPromotion` preconditions (nothing the predicate promises is promotable may
      be refused by the ledger).
 
-     **The subset half: option (a), decided by the owner.** Extract
-     `pub(crate) fn record_promotion_preconditions_hold(task: &GovernedTaskRun) -> bool` in
-     `src/state/governed_task.rs` and **call it from the `RecordPromotion` arm of `apply_mutation`**,
-     so the predicate and the mutation cannot drift — a predicate that merely restates the arm would
-     be the same failure mode this whole test exists to catch. A sixth blocked-path hunk of that
-     shape is accepted; the state file's other lanes (#53, #56) are frozen or nearly so and the
-     conflict is trivial. Option (b) — 432 real-ledger mutations — was rejected as certain to be
-     deleted the first time the suite feels slow.
+     **The subset half: decided.** Extract the task-state preconditions of the `RecordPromotion`
+     arm in `src/state/governed_task.rs` into
 
-     **Scope the extraction carefully: only the task-state half is extractable.** The `RecordPromotion`
-     arm mixes preconditions on the *task* with validation of the *promotion input*, and a predicate
-     taking `&GovernedTaskRun` can only carry the former. Into the predicate:
-     promotion-record capacity, `world_scope == StagedAuthoritative`,
-     `review_state == Accepted`, `active_staged_worktree().is_some()`, `latest_claim().is_some()`,
-     and "no previous promotion already succeeded". Staying in the arm, because they read
-     `promotion`: `require_actor`, `initial_subject_revision` matching the staged worktree's,
-     `accepted_revision` matching the accepted claim's, and `validate_promotion_outcome`. The arm
-     therefore becomes `if !record_promotion_preconditions_hold(task) { return invalid_transition(..) }`
-     followed by the input-bound checks — but note that collapsing six distinct refusals into one
-     boolean loses their individual messages, so either keep the per-check `invalid_transition`
-     calls and have the predicate be a pure `&&` of the same conditions (simplest, and the drift
-     risk is then caught by the matrix test rather than by construction), or return a typed reason
-     from the predicate and render it. **Prefer the second**: it keeps the operator-facing messages
-     and makes the predicate the single source. Decide when writing it; the matrix test only needs
-     the boolean.
+     ```rust
+     pub(crate) fn record_promotion_preconditions_hold(
+         task: &GovernedTaskRun,
+     ) -> Result<(), PromotionPreconditionFailure>
+     ```
+
+     where `PromotionPreconditionFailure` is a small enum with **one variant per check** and each
+     variant's `Display` is the existing operator-facing message verbatim. The `RecordPromotion` arm
+     calls it first and maps a failure straight back into `invalid_transition(&failure.to_string())`,
+     so **no operator-visible message changes**; the matrix test uses `.is_ok()`. This is what makes
+     the predicate the single source rather than a restatement of the arm — a predicate that merely
+     re-listed the same conditions would be the exact failure mode this test exists to catch. A
+     sixth blocked-path hunk of that shape is accepted; the state file's other lanes (#53, #56) are
+     frozen or nearly so and the conflict is trivial. Driving 432 real-ledger mutations instead was
+     rejected as certain to be deleted the first time the suite feels slow.
+
+     **Only the task-state half moves.** The arm mixes preconditions on the *task* with validation
+     of the promotion *input*, and a predicate taking `&GovernedTaskRun` can only carry the former.
+
+     | Check | Existing message | Goes |
+     |---|---|---|
+     | promotion-record capacity | `governed promotions reached its limit of 256` (via `require_capacity`) | predicate |
+     | `world_scope == StagedAuthoritative` | `only a staged_authoritative world scope promotes an outcome` | predicate |
+     | `review_state == Accepted` | `promotion requires an accepted governed task` | predicate |
+     | `active_staged_worktree().is_some()` | `promotion requires an active staged worktree` | predicate |
+     | `latest_claim().is_some()` | `promotion requires an accepted worker claim` | predicate |
+     | not already promoted | `this governed outcome was already promoted` | predicate |
+     | `require_actor(&promotion.actor, System)` | — | arm (reads `promotion`) |
+     | `initial_subject_revision` matches the staged worktree | `promotion must reference the staged worktree's initial Git OID` | arm (reads `promotion`) |
+     | `accepted_revision` matches the accepted claim | `promotion must reference the accepted claim's subject revision` | arm (reads `promotion`) |
+     | `validate_promotion_outcome` | — | arm (reads `promotion`) |
+
+     All six predicate checks already terminate in `InvalidTransition` today — `require_capacity`
+     routes through `invalid_transition` itself — so the mapping back is uniform and lossless. The
+     arm keeps its own ordering: the predicate runs first, then the input-bound checks, because the
+     input checks borrow `staged` and `claim` that the predicate has just proven exist.
 
    - **Record the desktop follow-up.** #58 text-matches `StagedConfigRefusal`'s strings at a single
      replacement point, `staged_config_refusal_notice` in `impulse-desktop/src/ui.rs`. When step 5's
