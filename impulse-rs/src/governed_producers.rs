@@ -761,9 +761,17 @@ fn is_untracked_impulse_runtime_artifact(path: &[u8]) -> bool {
             // verification reserved -- breaking every later claim and
             // registration in the same workspace.
             | b".impulse/PRODUCER_RESERVATIONS.json"
+            // ADR-0013's accepted-run memory candidates. `impulse init`
+            // gitignores this file but the cleanliness check never exempted it,
+            // so in a project whose `.impulse` is not gitignored, recording an
+            // operator approval dirtied the canonical tree -- and the very next
+            // promotion, which is only reachable *after* an approval, failed on
+            // a tree the daemon had dirtied itself.
+            | b".impulse/MEMORY_CANDIDATES.json"
     ) || path.starts_with(b".impulse/GOVERNED_TASKS.tmp.")
         || path.starts_with(b".impulse/DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.tmp-")
         || path.starts_with(b".impulse/PRODUCER_RESERVATIONS.tmp.")
+        || path.starts_with(b".impulse/MEMORY_CANDIDATES.tmp.")
         || path.starts_with(b".impulse/worktrees/")
 }
 
