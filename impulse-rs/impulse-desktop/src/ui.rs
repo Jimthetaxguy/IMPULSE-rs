@@ -331,7 +331,17 @@ const DESKTOP_EVENT_BRIDGE_SCRIPT: &str = concat!(
       // A blocked promotion resolves here, not in the catch: ADR-0019 makes it
       // an execution fact carried on the acknowledged task, and the card reads
       // it off the authoritative ops_update that follows.
-      return await invoke("governed_outcome_promote", { request });
+      const ack = await invoke("governed_outcome_promote", { request });
+      // `pending_rerun_reason` exists only on the acknowledgement -- the
+      // ops_update the card waits for does not carry it -- so it is forwarded
+      // here or it is lost.
+      if (ack?.pending_rerun_reason) {
+        forward("bridge_status", {
+          status: "governed_promotion_rerun_pending",
+          reason: String(ack.pending_rerun_reason),
+        });
+      }
+      return ack;
     } catch (error) {
       forward("bridge_status", {
         status: "governed_promotion_failed",
@@ -347,7 +357,24 @@ const DESKTOP_EVENT_BRIDGE_SCRIPT: &str = concat!(
       return null;
     }
     try {
-      return await invoke("governed_staged_worktree_discard", { request });
+      const ack = await invoke("governed_staged_worktree_discard", { request });
+      // The task in the ops_update that follows says nothing about what the
+      // discard cost. Only this acknowledgement names the commit that just lost
+      // its last reference, so it is forwarded here or it is lost.
+      if (ack?.unreferenced_accepted_commit) {
+        forward("bridge_status", {
+          status: "governed_discard_unreferenced_commit",
+          reason:
+            "Accepted commit " +
+            String(ack.unreferenced_accepted_commit) +
+            " was never promoted, so removing " +
+            String(ack.discarded_root ?? "the staged worktree") +
+            " dropped its only ref. `git cat-file -p " +
+            String(ack.unreferenced_accepted_commit) +
+            "` recovers it from the reflog until that expires.",
+        });
+      }
+      return ack;
     } catch (error) {
       forward("bridge_status", {
         status: "governed_discard_failed",
@@ -574,6 +601,14 @@ pub struct BridgeStatusUpdate {
     pub reason: Option<String>,
 }
 
+/// A promotion acknowledgement carried `pending_rerun_reason`: a crashed
+/// producer's reservation was reconciled and its work is being redone.
+pub const GOVERNED_RERUN_PENDING_STATUS: &str = "governed_promotion_rerun_pending";
+
+/// A discard acknowledgement carried `unreferenced_accepted_commit`: the
+/// checkout that just went away held the only ref to an accepted commit.
+pub const GOVERNED_UNREFERENCED_COMMIT_STATUS: &str = "governed_discard_unreferenced_commit";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonOpsStatusUpdate {
     pub connected: bool,
@@ -627,11 +662,31 @@ impl BridgeStatusUpdate {
     pub fn headline(&self) -> String {
         match self.status.as_str() {
             "degraded" => "Host bridge degraded".to_string(),
+            // Neither of these is a failure. One says a crashed producer's work
+            // is being redone; the other says a discard just cost a commit its
+            // only reference. Both are facts an operator has to see.
+            GOVERNED_RERUN_PENDING_STATUS => {
+                "Governed promotion is redoing an interrupted producer's work".to_string()
+            }
+            GOVERNED_UNREFERENCED_COMMIT_STATUS => {
+                "Discarded staged worktree held the only ref to an accepted commit".to_string()
+            }
             // A staged-configuration refusal is a daemon decision not to touch
             // the tree, not a failed host call, so it gets its own headline
             // rather than "Host call failed".
             _ if self.staged_config_refusal().is_some() => {
                 "Staged worktree refused: the daemon did not run Git in it".to_string()
+            }
+            // A revision conflict means this board is looking at a task the
+            // daemon has already moved past — the operator's next action is to
+            // refresh, not to debug a transport problem (review round 1 nit).
+            _ if self
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("revision conflict")) =>
+            {
+                "Board is out of date: this task changed on the daemon — refresh and retry"
+                    .to_string()
             }
             other => {
                 let action = other.trim_end_matches("_failed").replace('_', " ");
@@ -671,14 +726,16 @@ fn BridgeStatusBanner(status: BridgeStatusUpdate) -> Element {
             span { class: "bridge-status-mark", "!" }
             span { class: "bridge-status-headline", "{status.headline()}" }
             if let Some(refusal) = staged_refusal.as_ref() {
+                // Both, never the interpretation alone: the classifier reads a
+                // message it does not own, so an operator has to be able to see
+                // what the daemon actually said (review round 1, P2).
                 span {
                     class: "bridge-status-reason",
                     "data-staged-config-refusal": "true",
                     "{refusal.headline} {refusal.remedy}"
                 }
-            } else {
-                span { class: "bridge-status-reason", "{reason}" }
             }
+            span { class: "bridge-status-reason", "data-bridge-status-raw": "true", "{reason}" }
         }
     }
 }
@@ -1528,6 +1585,14 @@ fn OperatorBoard(
     on_governed_promotion: EventHandler<GovernedPromotionRequest>,
     on_governed_discard: EventHandler<GovernedStagedWorktreeDiscardRequest>,
 ) -> Element {
+    // Discard drafts live here, not on the card, and are keyed by task id
+    // alone. The card is keyed `id:revision` so a new daemon revision clears
+    // the decision rationale; a half-typed discard reason must not be collateral
+    // damage of an unrelated `ops_update` (review round 1 nit). The board is not
+    // remounted per task, so this survives.
+    let mut discard_drafts = use_signal(HashMap::<String, String>::new);
+    let mut armed_discard = use_signal(|| Option::<String>::None);
+
     let queued = governed_tasks
         .iter()
         .filter(|task| {
@@ -1579,15 +1644,39 @@ fn OperatorBoard(
             } else {
                 div { class: "governed-task-grid", "data-source": "governed_tasks",
                     for task in governed_tasks {
-                        GovernedTaskCard {
-                            // A daemon revision is the authoritative decision epoch.
-                            // Remounting clears rationale text so it cannot bleed into
-                            // a later supervisor/operator decision.
-                            key: "{task.id}:{task.revision}",
-                            task,
-                            on_mutation: on_governed_mutation,
-                            on_promote: on_governed_promotion,
-                            on_discard: on_governed_discard,
+                        {
+                            let task_key = task.id.as_str().to_string();
+                            let draft_key = task_key.clone();
+                            let arm_key = task_key.clone();
+                            let discard_draft = discard_drafts
+                                .read()
+                                .get(&task_key)
+                                .cloned()
+                                .unwrap_or_default();
+                            let discard_armed =
+                                armed_discard.read().as_deref() == Some(task_key.as_str());
+                            rsx! {
+                                GovernedTaskCard {
+                                    // A daemon revision is the authoritative decision epoch.
+                                    // Remounting clears rationale text so it cannot bleed into
+                                    // a later supervisor/operator decision. The discard draft is
+                                    // deliberately NOT part of that epoch — see the board's
+                                    // `discard_drafts` comment.
+                                    key: "{task.id}:{task.revision}",
+                                    task,
+                                    on_mutation: on_governed_mutation,
+                                    on_promote: on_governed_promotion,
+                                    on_discard: on_governed_discard,
+                                    discard_armed,
+                                    discard_draft,
+                                    on_discard_arm: move |armed: bool| {
+                                        armed_discard.set(armed.then(|| arm_key.clone()));
+                                    },
+                                    on_discard_draft: move |value: String| {
+                                        discard_drafts.write().insert(draft_key.clone(), value);
+                                    },
+                                }
+                            }
                         }
                     }
                 }
@@ -1629,6 +1718,16 @@ fn GovernedTaskCard(
     on_mutation: EventHandler<GovernedTaskMutationRequest>,
     on_promote: EventHandler<GovernedPromotionRequest>,
     on_discard: EventHandler<GovernedStagedWorktreeDiscardRequest>,
+    /// Discard draft state lives in `OperatorBoard`, keyed by task id, because
+    /// this card is keyed `id:revision` — deliberately, so a new daemon
+    /// revision clears the decision rationale rather than letting it bleed into
+    /// a later decision. A half-typed discard reason must survive that: an
+    /// unrelated `ops_update` bumping the revision would otherwise wipe it
+    /// mid-sentence (review round 1 nit).
+    discard_armed: bool,
+    discard_draft: String,
+    on_discard_arm: EventHandler<bool>,
+    on_discard_draft: EventHandler<String>,
 ) -> Element {
     let mut rationale = use_signal(String::new);
     let review_state = governed_review_state_label(task.review_state);
@@ -1651,8 +1750,6 @@ fn GovernedTaskCard(
     // ADR-0019 staged controls. They exist only for a staged_authoritative run;
     // every other world scope writes into the canonical tree directly and has
     // nothing to promote or reclaim.
-    let mut discard_armed = use_signal(|| false);
-    let mut discard_reason = use_signal(String::new);
     let is_staged = task.world_scope == impulse_ops::governed_task::WorldScope::StagedAuthoritative;
     let staged_root = task
         .active_staged_worktree()
@@ -1665,7 +1762,8 @@ fn GovernedTaskCard(
     let discard_reason_disabled = discard_state.reason().map(str::to_string);
     let blocked_promotion = blocked_promotion_notice(&task);
     let discard_cost = discard_cost_notice(&task);
-    let can_discard = discard_enabled && !discard_reason().trim().is_empty();
+    let discard_reassurance = discard_reassurance_notice(&task);
+    let can_discard = discard_enabled && !discard_draft.trim().is_empty();
     let promote_task = task.clone();
     let discard_task = task.clone();
 
@@ -1933,7 +2031,7 @@ fn GovernedTaskCard(
                             class: "invoke-button secondary",
                             "data-governed-control": "discard",
                             disabled: !discard_enabled,
-                            onclick: move |_| discard_armed.set(true),
+                            onclick: move |_| on_discard_arm.call(true),
                             "Discard staged worktree"
                         }
                     }
@@ -1951,7 +2049,7 @@ fn GovernedTaskCard(
                             "Discard unavailable: {reason}"
                         }
                     }
-                    if discard_armed() && discard_enabled {
+                    if discard_armed && discard_enabled {
                         div {
                             class: "governed-discard-confirmation",
                             "data-governed-control": "discard-confirmation",
@@ -1964,15 +2062,19 @@ fn GovernedTaskCard(
                                     "data-governed-discard-cost": "unreferenced-accepted-commit",
                                     "{cost}"
                                 }
-                            } else {
-                                p { class: "governed-evidence-copy", "No accepted commit loses its only reference: nothing here was accepted and left unpromoted." }
+                            } else if let Some(reassurance) = discard_reassurance.as_deref() {
+                                p {
+                                    class: "governed-evidence-copy",
+                                    "data-governed-discard-cost": "none",
+                                    "{reassurance}"
+                                }
                             }
                             label { class: "workspace-field wide governed-rationale",
                                 span { "Why this staged worktree is being reclaimed" }
                                 textarea {
                                     placeholder: "State why this checkout is finished with",
-                                    value: "{discard_reason}",
-                                    oninput: move |event| discard_reason.set(event.value()),
+                                    value: "{discard_draft}",
+                                    oninput: move |event| on_discard_draft.call(event.value()),
                                 }
                             }
                             div { class: "review-actions governed-task-actions",
@@ -1981,10 +2083,10 @@ fn GovernedTaskCard(
                                     "data-governed-control": "discard-confirm",
                                     disabled: !can_discard,
                                     onclick: move |_| {
-                                        if let Some(request) = discard_request(&discard_task, &discard_reason()) {
+                                        if let Some(request) = discard_request(&discard_task, &discard_draft) {
                                             on_discard.call(request);
-                                            discard_armed.set(false);
-                                            discard_reason.set(String::new());
+                                            on_discard_arm.call(false);
+                                            on_discard_draft.call(String::new());
                                         }
                                     },
                                     "Confirm discard"
@@ -1992,7 +2094,7 @@ fn GovernedTaskCard(
                                 button {
                                     class: "invoke-button secondary",
                                     "data-governed-control": "discard-cancel",
-                                    onclick: move |_| discard_armed.set(false),
+                                    onclick: move |_| on_discard_arm.call(false),
                                     "Cancel"
                                 }
                             }
@@ -2272,6 +2374,45 @@ pub fn discard_cost_notice(task: &GovernedTaskRun) -> Option<String> {
     ))
 }
 
+/// The reassurance shown when a discard genuinely costs nothing — and `None`
+/// whenever that claim cannot be made.
+///
+/// Review round 1, P1: the confirmation used to fall back to "nothing here was
+/// accepted and left unpromoted" for *every* task with no cost notice, which
+/// silently included accepted runs whose commit this surface simply failed to
+/// name. An accepted run therefore never gets a reassurance from here. It gets
+/// either the cost notice above (naming its OID) or, if even the claim is
+/// missing, the honest admission below — never "nothing was accepted".
+pub fn discard_reassurance_notice(task: &GovernedTaskRun) -> Option<String> {
+    if discard_cost_notice(task).is_some() {
+        return None;
+    }
+    if !task.is_accepted() {
+        return Some(
+            "No accepted commit loses its only reference: this run was never accepted.".to_string(),
+        );
+    }
+    if task
+        .latest_promotion()
+        .is_some_and(|promotion| promotion.outcome.is_promoted())
+    {
+        return Some(
+            "This run's accepted commit is already on the canonical branch, so discarding the \
+             staged checkout loses nothing."
+                .to_string(),
+        );
+    }
+    // Accepted, not promoted, and no claim to name a commit from. The state
+    // layer should not produce this, but a confirmation for an irreversible
+    // action is the wrong place to assume that.
+    Some(
+        "This run was accepted but its commit was never promoted, and this record carries no claim \
+         to name it from. Check the staged checkout's HEAD before discarding — the commit may exist \
+         only there."
+            .to_string(),
+    )
+}
+
 /// A daemon refusal to run Git inside a staged worktree whose pinned shared
 /// configuration no longer holds.
 ///
@@ -2290,18 +2431,28 @@ pub struct StagedConfigRefusalNotice {
 /// (`claude/adr0019-p1-fixes-20260912`, PR #53) introduces a downcastable
 /// `governed_producers::StagedConfigRefusal`, and #52's post-merge work turns it
 /// into a typed daemon response. Until that response variant exists, the only
-/// thing that crosses the socket is the `Display` string, so this reads it —
-/// and reads it off the *substrings that are the refusal's identity* rather
-/// than the whole sentence, so a wording tweak upstream does not silently
-/// reclassify a refusal as a generic error.
+/// thing that crosses the socket is the `Display` string, so this reads it.
+///
+/// **It matches nothing on this lane's base**, which is correct: the strings it
+/// targets are introduced by PR #53 and do not exist until that merges. The
+/// classifier is inert rather than wrong, and it starts working the moment the
+/// producer it targets is on the branch. Review round 1 confirmed this and
+/// asked that it be stated rather than implied.
+///
+/// Each arm keys off the *distinguishing* clause, never a clause another
+/// refusal could reuse. The changed-pin arm in particular requires "shared
+/// repository configuration changed since" and does **not** accept "refusing to
+/// run Git in that worktree" on its own — that trailing clause is a generic
+/// consequence any future refusal might also print, and matching it would let an
+/// unrelated refusal render a discard-and-re-materialize remedy that does not
+/// apply (review round 1, P2).
 ///
 /// When the typed variant lands, `StagedConfigRefusalNotice` is constructed
 /// from it directly and this function's body is the only thing that changes;
 /// its callers and its tests describe behavior, not the matching strategy.
 pub fn staged_config_refusal_notice(error: &str) -> Option<StagedConfigRefusalNotice> {
     let unpinned = error.contains("no comparable shared-repository-configuration pin");
-    let changed = error.contains("shared repository configuration changed since")
-        || error.contains("refusing to run Git in that worktree");
+    let changed = error.contains("shared repository configuration changed since");
     let submodules = error.contains("the staged world scope does not support submodules");
     if !(unpinned || changed || submodules) {
         return None;
