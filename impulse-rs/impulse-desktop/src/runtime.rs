@@ -1938,30 +1938,147 @@ const EXECUTABLE_GIT_CONFIG_SECTIONS: [&str; 2] = ["filter", "diff"];
 /// Files this refusal reads. Filesystem reads only — it must run *before* the
 /// first Git invocation, since running Git is the thing it is protecting
 /// against.
-fn shared_git_config_paths(workspace_root: &Path) -> Vec<PathBuf> {
-    let mut git_dir = workspace_root.join(".git");
-    // A linked worktree's `.git` is a file holding `gitdir: <path>`. Follow one
-    // level; a deeper chain is a residual recorded on the lane card.
-    if git_dir.is_file() {
-        if let Ok(contents) = std::fs::read_to_string(&git_dir) {
-            if let Some(target) = contents
-                .lines()
-                .find_map(|line| line.trim().strip_prefix("gitdir:"))
-            {
-                let target = Path::new(target.trim());
-                git_dir = if target.is_absolute() {
-                    target.to_path_buf()
-                } else {
-                    workspace_root.join(target)
-                };
+/// Which grammar a scanned file is written in.
+///
+/// Only a config file can define an executable driver or carry an `include`
+/// directive; `info/attributes` merely routes paths through a driver defined
+/// elsewhere. It is scanned for completeness with ADR-0019's pin set, not
+/// because a driver could hide in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitConfigFileKind {
+    Config,
+    Attributes,
+}
+
+/// Resolve a workspace's git directory and the *common* directory it shares.
+///
+/// For an ordinary checkout these are the same path. For a **linked worktree**
+/// they are not, and the difference is the whole point: `.git` is a file
+/// holding `gitdir: <common>/worktrees/<id>`, that directory holds a
+/// `commondir` file pointing back at the shared `.git`, and the repository
+/// configuration `git status` actually loads lives at `<common>/config` — not
+/// under the linked git dir, which usually has no `config` at all.
+///
+/// Scanning only the linked git dir therefore found nothing and returned `Ok`
+/// while a `filter.*.clean` sat in the common config, live for every worktree
+/// (review round 4, Cursor).
+///
+/// Both hops are resolved relative to their own parent, which is how Git
+/// records them, and `..` segments are folded lexically rather than through
+/// `canonicalize` so a missing directory reads as "nothing to scan" instead of
+/// aborting the resolution.
+fn resolve_git_dirs(workspace_root: &Path) -> (PathBuf, PathBuf) {
+    let dot_git = workspace_root.join(".git");
+    let git_dir = if dot_git.is_file() {
+        std::fs::read_to_string(&dot_git)
+            .ok()
+            .and_then(|contents| {
+                contents
+                    .lines()
+                    .find_map(|line| line.trim().strip_prefix("gitdir:"))
+                    .map(|target| resolve_against(workspace_root, target.trim()))
+            })
+            .unwrap_or(dot_git)
+    } else {
+        dot_git
+    };
+
+    // `commondir` is present only in a linked worktree's git dir.
+    let common_dir = std::fs::read_to_string(git_dir.join("commondir"))
+        .ok()
+        .and_then(|contents| {
+            let target = contents.trim();
+            (!target.is_empty()).then(|| resolve_against(&git_dir, target))
+        })
+        .unwrap_or_else(|| git_dir.clone());
+
+    (git_dir, common_dir)
+}
+
+fn resolve_against(base: &Path, target: &str) -> PathBuf {
+    let target = Path::new(target);
+    let joined = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        base.join(target)
+    };
+    normalize_lexically(&joined)
+}
+
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
             }
+            other => normalized.push(other.as_os_str()),
         }
     }
-    vec![
-        git_dir.join("config"),
-        git_dir.join("config.worktree"),
-        git_dir.join("info").join("attributes"),
-    ]
+    normalized
+}
+
+/// Every file the preflight reads before it will run Git.
+///
+/// The common directory supplies the repository config and shared attributes;
+/// the (possibly identical) worktree git dir supplies `config.worktree`, which
+/// is per-worktree and is read when `extensions.worktreeConfig` is on. Scanned
+/// unconditionally rather than gated on that extension: the check is
+/// fail-closed, and reading a file Git would ignore costs nothing.
+fn shared_git_config_paths(workspace_root: &Path) -> Vec<(PathBuf, GitConfigFileKind)> {
+    let (git_dir, common_dir) = resolve_git_dirs(workspace_root);
+    let mut paths = vec![
+        (common_dir.join("config"), GitConfigFileKind::Config),
+        (
+            common_dir.join("info").join("attributes"),
+            GitConfigFileKind::Attributes,
+        ),
+        (git_dir.join("config.worktree"), GitConfigFileKind::Config),
+    ];
+    if git_dir != common_dir {
+        // A linked worktree can still carry its own `config`/`info/attributes`.
+        // Git does not load them as repository config, but this check is
+        // fail-closed and they cost one `read_to_string` each.
+        paths.push((git_dir.join("config"), GitConfigFileKind::Config));
+        paths.push((
+            git_dir.join("info").join("attributes"),
+            GitConfigFileKind::Attributes,
+        ));
+    }
+    paths
+}
+
+/// Whether a config line opens an `[include]` or `[includeIf "..."]` section,
+/// or states an `include.path` / `includeIf.<cond>.path` key outright.
+///
+/// Git resolves includes transparently, so a driver can live in a file this
+/// check never opens. Following them means implementing Git's include
+/// resolution — conditional `gitdir:`/`onbranch:` matching, `~` expansion,
+/// relative-path rules — which is the producers' pin machinery by another name.
+/// The desktop refuses instead: the operator inlines or removes the include and
+/// the preflight proceeds (review round 4, Cursor).
+fn line_opens_a_git_include(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+        return false;
+    }
+    if let Some(header) = trimmed.strip_prefix('[').and_then(|s| s.split(']').next()) {
+        let header = header.trim().to_ascii_lowercase();
+        if header == "include" || header.starts_with("include ") || header.starts_with("includeif")
+        {
+            return true;
+        }
+    }
+    if let Some((key, _)) = trimmed.split_once('=') {
+        let key = key.trim().to_ascii_lowercase();
+        if key.starts_with("include.") || key.starts_with("includeif") {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether one line of Git configuration defines an executable filter or diff
@@ -2032,12 +2149,28 @@ fn key_is_executable(key: &str) -> bool {
 /// during `git status`. This is a filesystem-only check, so it happens before
 /// the first Git process is spawned.
 fn refuse_executable_git_drivers(workspace_root: &Path) -> Result<(), DesktopBridgeError> {
-    for path in shared_git_config_paths(workspace_root) {
+    for (path, kind) in shared_git_config_paths(workspace_root) {
         let Ok(contents) = std::fs::read_to_string(&path) else {
             continue;
         };
         let mut section = String::new();
         for line in contents.lines() {
+            // The include check comes first. A file carrying one is refused on
+            // that ground alone, because everything past it is unverifiable:
+            // the driver may be in a file this check never opens.
+            if kind == GitConfigFileKind::Config && line_opens_a_git_include(line) {
+                return Err(DesktopBridgeError::GovernedTaskFailed {
+                    message: format!(
+                        "closed-loop governed launch refuses this workspace: {} carries an \
+                         `include`/`includeIf` directive. Git resolves those transparently, so an \
+                         executable filter or diff driver could be defined in a file this \
+                         preflight does not read, and such a driver runs during its own `git \
+                         status` with no command-line override that disables it. Inline or remove \
+                         the include before launching a governed agent.",
+                        path.display()
+                    ),
+                });
+            }
             if line_defines_executable_git_driver(line, &mut section) {
                 return Err(DesktopBridgeError::GovernedTaskFailed {
                     message: format!(
@@ -3069,6 +3202,164 @@ mod tests {
             !filter_marker.exists(),
             "the refusal must happen before any Git process runs the filter"
         );
+    }
+
+    /// Review round 4 (Cursor, MEDIUM). In a **linked worktree** `.git` is a
+    /// file pointing at `<common>/worktrees/<id>`, that directory carries a
+    /// `commondir` file, and the repository configuration `git status` actually
+    /// loads is `<common>/config` — which the linked git dir does not contain.
+    /// Scanning only the linked git dir therefore returned `Ok` while a
+    /// `filter.*.clean` sat in the common config, live for every worktree.
+    #[cfg(unix)]
+    #[test]
+    fn test_governed_git_preflight_refuses_a_driver_hidden_in_a_linked_worktree_common_config() {
+        let temp = tempfile::tempdir().expect("temporary Git preflight fixture");
+        let filter_marker = temp.path().join("filter-ran");
+        let (main_workspace, filter, run_git) =
+            governed_git_fixture(temp.path(), "common-filter.sh", &filter_marker);
+
+        std::fs::write(main_workspace.join("tracked.txt"), "committed\n")
+            .expect("write tracked file");
+        std::fs::write(main_workspace.join(".gitattributes"), "* filter=probe\n")
+            .expect("write gitattributes");
+        run_git(&["add", "tracked.txt", ".gitattributes"]);
+        run_git(&["commit", "--quiet", "-m", "tracked"]);
+        // The driver lives ONLY in the shared repository config.
+        run_git(&[
+            "config",
+            "filter.probe.clean",
+            filter.to_str().expect("UTF-8 filter path"),
+        ]);
+
+        let linked = temp.path().join("linked");
+        run_git(&[
+            "worktree",
+            "add",
+            "--detach",
+            linked.to_str().expect("UTF-8 linked path"),
+        ]);
+        assert!(
+            linked.join(".git").is_file(),
+            "a linked worktree's .git is a file, which is what makes this case different"
+        );
+        assert!(
+            !linked.join("config").exists(),
+            "and it has no config of its own -- the old scan looked here and found nothing"
+        );
+
+        let error = observe_clean_git_head_with_timeout(
+            linked.to_str().expect("UTF-8 linked path"),
+            Duration::from_secs(10),
+        )
+        .expect_err("a driver in the common config must refuse the linked worktree's preflight");
+        assert!(
+            matches!(
+                error,
+                DesktopBridgeError::GovernedTaskFailed { ref message }
+                    if message.contains("executable Git filter or diff driver")
+            ),
+            "got: {error:?}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !filter_marker.exists(),
+            "the refusal must happen before any Git process runs the filter"
+        );
+    }
+
+    /// An `include.path` can point at a file this check never opens, so the
+    /// directive itself is the refusal. The desktop does not follow includes —
+    /// that is the producers' pin machinery — it declines to proceed.
+    #[cfg(unix)]
+    #[test]
+    fn test_governed_git_preflight_refuses_an_include_directive_rather_than_following_it() {
+        let temp = tempfile::tempdir().expect("temporary Git preflight fixture");
+        let filter_marker = temp.path().join("filter-ran");
+        let (workspace, filter, run_git) =
+            governed_git_fixture(temp.path(), "included-filter.sh", &filter_marker);
+
+        std::fs::write(workspace.join("tracked.txt"), "committed\n").expect("write tracked file");
+        std::fs::write(workspace.join(".gitattributes"), "* filter=probe\n")
+            .expect("write gitattributes");
+        run_git(&["add", "tracked.txt", ".gitattributes"]);
+        run_git(&["commit", "--quiet", "-m", "tracked"]);
+
+        // The driver is in a sibling file the preflight never opens; only the
+        // include directive in `.git/config` reveals that it exists.
+        let included = temp.path().join("extra-config");
+        std::fs::write(
+            &included,
+            format!(
+                "[filter \"probe\"]\n\tclean = {}\n",
+                filter.to_str().expect("UTF-8 filter path")
+            ),
+        )
+        .expect("write included config");
+        run_git(&[
+            "config",
+            "include.path",
+            included.to_str().expect("UTF-8 include path"),
+        ]);
+
+        let error = observe_clean_git_head_with_timeout(
+            workspace.to_str().expect("UTF-8 workspace path"),
+            Duration::from_secs(10),
+        )
+        .expect_err("an include directive must refuse the preflight");
+        assert!(
+            matches!(
+                error,
+                DesktopBridgeError::GovernedTaskFailed { ref message }
+                    if message.contains("`include`/`includeIf` directive")
+                        && message.contains("Inline or remove the include")
+            ),
+            "the refusal must name the directive and the remedy, got: {error:?}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !filter_marker.exists(),
+            "an included driver must not have run"
+        );
+    }
+
+    /// Include detection has to cover the spellings Git accepts without
+    /// refusing a repository that merely mentions the word.
+    #[test]
+    fn test_git_include_detection_covers_both_spellings_and_leaves_others_alone() {
+        for line in [
+            "[include]",
+            "[includeIf \"gitdir:~/work/\"]",
+            "\tpath = ../shared",
+            "include.path = ../shared",
+            "includeIf.gitdir:~/work/.path = ../shared",
+            "[INCLUDE]",
+        ] {
+            // The bare `path = ...` line only counts under an include section,
+            // which the section-scanning caller tracks; assert the directive
+            // spellings directly.
+            if line.trim().starts_with("path") {
+                continue;
+            }
+            assert!(
+                line_opens_a_git_include(line),
+                "must be recognized as an include directive: {line}"
+            );
+        }
+
+        for line in [
+            "[core]",
+            "# [includeIf \"gitdir:/tmp\"] commented out",
+            "; [include]",
+            "[filter \"probe\"]",
+            "\tclean = cat",
+            "includes = not-a-directive",
+            "",
+        ] {
+            assert!(
+                !line_opens_a_git_include(line),
+                "must not be mistaken for an include directive: {line}"
+            );
+        }
     }
 
     /// The refusal is a line-level parse, so it has to recognize both spellings

@@ -308,13 +308,13 @@ honest equivalent. Proven with the reviewer's reproduction — the filter's mark
 written — plus a negative control (removing the refusal makes the marker appear) and an
 acceptance case so it is not a blanket block.
 
-**Residuals, recorded rather than implied:**
+**Residuals, recorded rather than implied:** *(the first two were closed in review round 4 —
+see that section; the third stands)*
 
-- An `include.path` / `includeIf` directive in `.git/config` can pull a driver in from a file this
-  check does not read. Following includes means implementing Git's include resolution, which is the
-  producers' pin machinery by another name.
-- `.git`-as-a-file is followed one level (`gitdir:`); a deeper chain, and `commondir` indirection,
-  are not resolved.
+- ~~An `include.path` / `includeIf` directive in `.git/config` can pull a driver in from a file this
+  check does not read.~~ **Closed:** the directive is now itself a refusal.
+- ~~`.git`-as-a-file is followed one level (`gitdir:`); a deeper chain, and `commondir` indirection,
+  are not resolved.~~ **Closed:** `commondir` is resolved and the common config is scanned.
 - The parser is line-level and case-insensitive on keys. It accepts both the section-header and
   fully-qualified spellings and ignores comments; it does not implement Git's full config grammar
   (line continuations, quoted values containing `=`).
@@ -429,3 +429,68 @@ and a rejection sweep over unfilable payloads.
 undismissed notice, because nothing persists them. Making them durable across restarts means giving
 the desktop its own store, which is a larger decision than this thread; the daemon's ledger remains
 the authoritative record of what happened either way.
+
+## Review round 4
+
+One Cursor security thread on PR #58 at `f549d39` (`runtime.rs:1964`, MEDIUM). Valid, and the
+reproduction is unambiguous.
+
+### The hole
+
+`refuse_executable_git_drivers` resolved `.git` with a single `gitdir:` hop and scanned
+`<gitdir>/config`, `<gitdir>/config.worktree`, `<gitdir>/info/attributes`. For an ordinary checkout
+that is right. For a **linked worktree** it is not: `.git` is a file pointing at
+`<common>/worktrees/<id>`, and the repository configuration `git status` actually loads lives at
+`<common>/config` — a path the old scan never opened, because the linked git dir usually has no
+`config` at all. A `filter.*.clean` in the common config was therefore invisible to a check that
+returned `Ok`, and live for every worktree of that repository. Separately, an `include.path` in any
+scanned config could point at a file the check does not read.
+
+Both are the same failure mode: the scan reported "nothing here" about files it had not looked at.
+
+### The fix, fail-closed and self-contained
+
+`resolve_git_dirs` now returns the git dir **and** the common dir. `.git`-as-a-file is followed via
+`gitdir:`, then that directory's `commondir` file (present only in a linked worktree) is followed to
+the shared `.git`. Each hop resolves relative to its own parent, which is how Git records them, and
+`..` folds lexically rather than through `canonicalize`, so a missing directory reads as "nothing to
+scan" instead of aborting resolution. The scan set is now `<common>/config`,
+`<common>/info/attributes`, `<gitdir>/config.worktree`, plus — when the two differ — the linked git
+dir's own `config` and `info/attributes`, which Git does not load as repository config but which
+cost one `read_to_string` each and keep the check fail-closed.
+
+`config.worktree` is scanned unconditionally rather than gated on `extensions.worktreeConfig`, on
+the same fail-closed reasoning: reading a file Git would ignore costs nothing.
+
+**Includes are refused, not followed.** Any `[include]`, `[includeIf "..."]`, `include.path`, or
+`includeIf.<cond>.path` in a scanned config refuses the preflight naming that file, because
+everything past the directive is unverifiable from here. Following includes means implementing Git's
+resolution — conditional `gitdir:`/`onbranch:` matching, `~` expansion, relative-path rules — and
+that is the producers' pin machinery by another name. **This is the desktop's conservative
+counterpart to the include-following pin PR #53 gives the daemon-owned producers:** the producers
+resolve includes because they own a materialization-time digest of the result; the desktop owns no
+pin, so it declines to proceed and tells the operator to inline or remove the include. No dependency
+on the root crate either way.
+
+The include check runs before the driver check on each line, so a file carrying one is refused on
+that ground rather than on a driver that happens to also be present.
+
+### Proof
+
+Three new tests, and both new ones are non-vacuous — verified by neutralizing the `commondir` hop
+and the include branch and re-running:
+
+- a real linked worktree (`git worktree add --detach`) whose driver is **only** in the common config
+  → refused, marker never written;
+- an `include.path` pointing at a sibling file that holds the driver → refused **because of the
+  directive**, marker never written;
+- include-spelling coverage, including the negative cases (`[core]`, commented-out directives, a key
+  merely named `includes`).
+
+With the fix removed, both failure messages read *"closed-loop governed launch requires a clean
+committed workspace"* — which is itself the evidence: the clean filter ran and dirtied the tree. The
+driver executed. That is exactly what Cursor said would happen.
+
+A plain repository with no includes still passes
+(`test_governed_git_preflight_accepts_a_workspace_with_no_executable_driver`), so this is not a
+blanket block.
