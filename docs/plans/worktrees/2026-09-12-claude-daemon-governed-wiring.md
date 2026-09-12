@@ -340,7 +340,8 @@ fixed on this branch; each regression was reverted once to watch its test fail.
 
 ### Blocked-path hunks after review round 1
 
-The count is now **five**. Three are unchanged from the first round — the two clippy one-liners
+The count is now **five**, and the post-#53 merge adds a sixth (the
+`record_promotion_preconditions_hold` extraction, decided by the owner — see checklist step 6). Three are unchanged from the first round — the two clippy one-liners
 (`impulse-term/src/renderer.rs`, `impulse-desktop/tests/desktop_contract.rs`) and the
 `PRODUCER_RESERVATIONS.json` exemption in `src/governed_producers.rs`. Two are new:
 
@@ -480,16 +481,31 @@ both sides. When it lands:
      state layer's `RecordPromotion` preconditions (nothing the predicate promises is promotable may
      be refused by the ledger).
 
-     **The subset half needs a decision, and it is the same one P2-4 needed.** The
-     `RecordPromotion` preconditions live inside `apply_mutation` in `src/state/governed_task.rs`
-     and are not separately callable. Two options: (a) extract them into a
-     `pub(crate) fn record_promotion_preconditions_hold(task) -> bool` — a sixth blocked-path hunk,
-     but the same one-keyword shape as the `staged_worktree_is_discardable` change and the honest
-     fix; or (b) drive `state.mutate_governed_task` once per matrix case against a real ledger and
-     classify accept/refuse, which needs no blocked-file edit but is far slower and has to
-     construct 432 valid ledger states. **Recommendation: (a).** Option (b) tests the real path but
-     the setup cost buys nothing the predicate comparison does not already give, and a matrix test
-     that takes minutes will get deleted. Raise it with the owner before writing it.
+     **The subset half: option (a), decided by the owner.** Extract
+     `pub(crate) fn record_promotion_preconditions_hold(task: &GovernedTaskRun) -> bool` in
+     `src/state/governed_task.rs` and **call it from the `RecordPromotion` arm of `apply_mutation`**,
+     so the predicate and the mutation cannot drift — a predicate that merely restates the arm would
+     be the same failure mode this whole test exists to catch. A sixth blocked-path hunk of that
+     shape is accepted; the state file's other lanes (#53, #56) are frozen or nearly so and the
+     conflict is trivial. Option (b) — 432 real-ledger mutations — was rejected as certain to be
+     deleted the first time the suite feels slow.
+
+     **Scope the extraction carefully: only the task-state half is extractable.** The `RecordPromotion`
+     arm mixes preconditions on the *task* with validation of the *promotion input*, and a predicate
+     taking `&GovernedTaskRun` can only carry the former. Into the predicate:
+     promotion-record capacity, `world_scope == StagedAuthoritative`,
+     `review_state == Accepted`, `active_staged_worktree().is_some()`, `latest_claim().is_some()`,
+     and "no previous promotion already succeeded". Staying in the arm, because they read
+     `promotion`: `require_actor`, `initial_subject_revision` matching the staged worktree's,
+     `accepted_revision` matching the accepted claim's, and `validate_promotion_outcome`. The arm
+     therefore becomes `if !record_promotion_preconditions_hold(task) { return invalid_transition(..) }`
+     followed by the input-bound checks — but note that collapsing six distinct refusals into one
+     boolean loses their individual messages, so either keep the per-check `invalid_transition`
+     calls and have the predicate be a pure `&&` of the same conditions (simplest, and the drift
+     risk is then caught by the matrix test rather than by construction), or return a typed reason
+     from the predicate and render it. **Prefer the second**: it keeps the operator-facing messages
+     and makes the predicate the single source. Decide when writing it; the matrix test only needs
+     the boolean.
 
    - **Record the desktop follow-up.** #58 text-matches `StagedConfigRefusal`'s strings at a single
      replacement point, `staged_config_refusal_notice` in `impulse-desktop/src/ui.rs`. When step 5's
