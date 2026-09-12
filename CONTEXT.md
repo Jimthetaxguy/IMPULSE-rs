@@ -125,10 +125,15 @@ review, and — reserved for ADR-0019 — promote), persisted independently of `
 owner-only, digest-verified `PRODUCER_RESERVATIONS.json`. Reserved before the side effect, released
 with a receipt reference once the effect and its governed-task mutation are both durable; a
 reservation still open on reload is reconciled to `NeedsRerun` and noted on the owning governed
-task's own event chain. Closes the state-layer half of ADR-0012's crash-between-side-effect-and-
-receipt gap; handler wiring (adopting `with_reservation` in `RunGovernedVerification`/
-`RunGovernedSupervisorReview`) is follow-up work.
-- **Source of truth:** `src/state/producer_reservation.rs`, ADR-0012 amendment (2026-09-02).
+task's own event chain. Since the 2026-09-12 handler wiring it is load-bearing, not just
+observable: `RunGovernedVerification`, `RunGovernedSupervisorReview`, and `PromoteGovernedOutcome`
+each run their side effect *and* persist its governed-task receipt inside one `with_reservation`
+closure, the in-memory `acquire_governed_producer_lock` stays as the concurrency optimization it
+always was, a same-revision duplicate is refused with the journal's typed error, and a rerun after
+an interrupted attempt is distinguishable at the wire through `pending_rerun_reason`. It is not
+panic-safe: an in-process panic is treated exactly like a crash, never as an ordinary `Err`.
+- **Source of truth:** `src/state/producer_reservation.rs`, `src/daemon/governed_wiring.rs`,
+  ADR-0012 amendment (2026-09-02) and its handler-wiring note (2026-09-12).
 
 ### task — `[vocabulary]`
 The broader product assignment concept. A governed task is today's durable carrier; delegations,
@@ -173,6 +178,12 @@ Unix socket.
   generic producer mutations fail for profiled tasks.
 - **Candidate wire:** protocol v6 adds serde-defaulted `ProjectOpsSnapshot.memory_candidates` only;
   it defines no candidate mutation request.
+- **Staged wire:** protocol v9 adds `PromoteGovernedOutcome` and `DiscardGovernedStagedWorktree`
+  and folds staged materialization into `RegisterGovernedTask`. Every producer request answers with
+  a **producer acknowledgement** — the governed task flattened into the response object plus
+  `replayed` and an optional `pending_rerun_reason` — so a pre-v9 client reading a bare
+  `GovernedTaskRun` is unaffected; the discard acknowledgement adds `discarded_root` and, when the
+  discard drops the only ref to an accepted-but-blocked commit, `unreferenced_accepted_commit`.
 
 ### managed agent turn — `[code]`
 One exclusive, bounded use of the cached `ImpulseAgent`. Concurrent turns fail fast with typed
@@ -281,10 +292,19 @@ daemon-owned producer — claim *and* verification — observes that staged root
 canonical checkout; and the shared-repository-configuration pin is a digest of **raw file bytes**
 (including files reached through `include`/`includeIf`) that promotion compares before spawning any
 Git process, since asking Git a question inside a repository whose configuration is in question is
-not a neutral act.
+not a neutral act. Since protocol v9 the scope is reachable end to end: `RegisterGovernedTask`
+materializes the staged worktree as part of registration (so the checkout exists before any PTY
+launch), and `PromoteGovernedOutcome`/`DiscardGovernedStagedWorktree` are live endpoints — all
+three operator-class, checked before any state read, with a blocked promotion answered as a
+*successful* response carrying the typed outcome rather than an error, and a drifted configuration
+pin answered as a typed `StagedConfigRefusal` whose remedy is discard-and-re-materialize. Claim,
+verification and promotion each compare the pin before spawning Git; **discard deliberately does
+not** — it removes a checkout and materializes no files, so no driver can fire, and an unpinned or
+drifted worktree is exactly the one an operator most needs to be able to reclaim.
 - **Source of truth:** `WorldScope` and `StagedWorktree` in
   `impulse-rs/impulse-ops/src/governed_task.rs`, the staged producers in
-  `impulse-rs/src/governed_producers.rs`, and ADR-0019.
+  `impulse-rs/src/governed_producers.rs`, the endpoints in `impulse-rs/src/daemon/governed_wiring.rs`,
+  and ADR-0019.
 
 ### document read tool — `[code]`
 Ion's read-only `document_read` tool: reads `xlsx` by streaming cells through calamine's cell

@@ -600,7 +600,9 @@ where
         }
         Commands::GovernedClaim { .. }
         | Commands::GovernedVerify { .. }
-        | Commands::GovernedReview { .. } => {
+        | Commands::GovernedReview { .. }
+        | Commands::GovernedPromote { .. }
+        | Commands::GovernedDiscard { .. } => {
             anyhow::bail!(
                 "governed producer commands require --daemon so the project daemon remains authoritative"
             );
