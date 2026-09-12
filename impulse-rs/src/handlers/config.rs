@@ -82,7 +82,11 @@ pub fn handle_init(state: &Arc<state::State>, impulse_dir: &Path) -> Result<()> 
 /// must not make an otherwise clean governed Git subject appear dirty.
 ///
 /// Deliberately absent are durable project artifacts such as `GENOME.md`,
-/// `HISTORY.jsonl`, `config.json`, and `impulse-capabilities.json`.
+/// `HISTORY.jsonl`, `config.json`, and `impulse-capabilities.json` — and, since
+/// ADR-0020, `MEMORY.jsonl` and `GENOME_PROJECTION.md`. The promoted-memory log
+/// is curated project memory in the same class as `GENOME.md`, and its
+/// projection is the reviewable rendering of it; both belong in review, unlike
+/// the raw candidate ledger above, which is private review state.
 const REPO_RUNTIME_GITIGNORE_ENTRIES: &[&str] = &[
     ".impulse/LIVE_STATE.json",
     ".impulse/SESSIONS.json",
@@ -99,6 +103,11 @@ const REPO_RUNTIME_GITIGNORE_ENTRIES: &[&str] = &[
     ".impulse/MEMORY_CANDIDATES.tmp.*",
     ".impulse/PRODUCER_RESERVATIONS.json",
     ".impulse/PRODUCER_RESERVATIONS.tmp.*",
+    // Rebuildable retrieval bookkeeping for the ADR-0020 projection, in the
+    // same class as `retrieval.db` itself.
+    ".impulse/MEMORY_INDEX.json",
+    ".impulse/MEMORY_INDEX.tmp.*",
+    ".impulse/GENOME_PROJECTION.tmp.*",
     ".impulse/DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.json",
     ".impulse/DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.lock",
     ".impulse/DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.tmp-*",

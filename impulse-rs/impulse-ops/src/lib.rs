@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 pub mod agent_registry;
 pub mod governed_task;
 pub mod memory_candidate;
+/// ADR-0020 promotion/dismissal wire contract (request types only).
+pub mod memory_wiring;
 pub mod operator_capability;
 pub mod role_assignment;
 

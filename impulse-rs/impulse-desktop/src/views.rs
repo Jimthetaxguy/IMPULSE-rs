@@ -273,8 +273,13 @@ pub fn MemoryView(
                                     AcceptedRunSourceAssurance::CallerComposedEvidenceDeclaredOperator =>
                                         "caller-composed evidence · declared operator",
                                 };
+                                // ADR-0020 added the two decided variants. This
+                                // read-only view renders them; the operator
+                                // Promote/Dismiss controls are a separate lane.
                                 let status = match candidate.status {
                                     MemoryCandidateStatus::PendingReview => "Pending review — not stored in GENOME",
+                                    MemoryCandidateStatus::Promoted { .. } => "Promoted — in the GENOME projection",
+                                    MemoryCandidateStatus::Dismissed { .. } => "Dismissed — not stored in GENOME",
                                 };
                                 rsx! {
                                     article {
