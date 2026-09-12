@@ -141,6 +141,7 @@ roadmap or whole-product risk authority.
 - [decisions/0015-harness-owned-step-model.md](decisions/0015-harness-owned-step-model.md)
 - [decisions/0017-canonical-loop-contract.md](decisions/0017-canonical-loop-contract.md)
 - [decisions/0018-socket-actor-provenance.md](decisions/0018-socket-actor-provenance.md)
+- [decisions/0019-builder-staged-worktree-world-scope.md](decisions/0019-builder-staged-worktree-world-scope.md)
 
 ### Session Logs
 

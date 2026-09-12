@@ -52,7 +52,7 @@ The daemon reports `protocol_version` in `Ping`/`Status` results.
 
 | Constant | Value | Location |
 |----------|-------|----------|
-| `DAEMON_PROTOCOL_VERSION` / `PROTOCOL_VERSION` | **7** | Shared ops contract / daemon protocol |
+| `DAEMON_PROTOCOL_VERSION` / `PROTOCOL_VERSION` | **8** | Shared ops contract / daemon protocol |
 
 Current clients do **not** perform a version handshake or preflight-reject a mismatched daemon, and
 the protocol does not negotiate a downgrade. Known variants continue through normal JSON-line
