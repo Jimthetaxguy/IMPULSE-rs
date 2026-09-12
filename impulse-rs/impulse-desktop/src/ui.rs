@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use dioxus::prelude::*;
 use impulse_ops::{
@@ -336,9 +336,17 @@ const DESKTOP_EVENT_BRIDGE_SCRIPT: &str = concat!(
       // ops_update the card waits for does not carry it -- so it is forwarded
       // here or it is lost.
       if (ack?.pending_rerun_reason) {
+        const detail = String(ack.pending_rerun_reason);
+        // Durable, per task, dismissed by the operator. The banner below is
+        // only the transient echo -- the next reduced message clears it.
+        forward("governed_ack", {
+          task_id: String(request?.task_id ?? ack?.id ?? ""),
+          kind: "promotion_rerun_pending",
+          detail,
+        });
         forward("bridge_status", {
           status: "governed_promotion_rerun_pending",
-          reason: String(ack.pending_rerun_reason),
+          reason: detail,
         });
       }
       return ack;
@@ -362,16 +370,29 @@ const DESKTOP_EVENT_BRIDGE_SCRIPT: &str = concat!(
       // discard cost. Only this acknowledgement names the commit that just lost
       // its last reference, so it is forwarded here or it is lost.
       if (ack?.unreferenced_accepted_commit) {
+        const commit = String(ack.unreferenced_accepted_commit);
+        const root = String(ack.discarded_root ?? "the staged worktree");
+        const detail =
+          "Accepted commit " +
+          commit +
+          " was never promoted, so removing " +
+          root +
+          " dropped its only ref. `git cat-file -p " +
+          commit +
+          "` recovers it from the reflog until that expires.";
+        // Durable, per task, dismissed by the operator. An `ops_update` lands
+        // immediately after a discard and would clear the banner, taking the
+        // only copy of the OID with it.
+        forward("governed_ack", {
+          task_id: String(request?.task_id ?? ack?.id ?? ""),
+          kind: "discard_stranded_commit",
+          commit,
+          discarded_root: root,
+          detail,
+        });
         forward("bridge_status", {
           status: "governed_discard_unreferenced_commit",
-          reason:
-            "Accepted commit " +
-            String(ack.unreferenced_accepted_commit) +
-            " was never promoted, so removing " +
-            String(ack.discarded_root ?? "the staged worktree") +
-            " dropped its only ref. `git cat-file -p " +
-            String(ack.unreferenced_accepted_commit) +
-            "` recovers it from the reflog until that expires.",
+          reason: detail,
         });
       }
       return ack;
@@ -608,6 +629,83 @@ pub const GOVERNED_RERUN_PENDING_STATUS: &str = "governed_promotion_rerun_pendin
 /// A discard acknowledgement carried `unreferenced_accepted_commit`: the
 /// checkout that just went away held the only ref to an accepted commit.
 pub const GOVERNED_UNREFERENCED_COMMIT_STATUS: &str = "governed_discard_unreferenced_commit";
+
+/// Which acknowledgement fact a [`GovernedAckNotice`] carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernedAckKind {
+    /// A discard dropped the only ref to an accepted commit.
+    DiscardStrandedCommit,
+    /// A promotion is redoing an interrupted producer's work.
+    PromotionRerunPending,
+}
+
+impl GovernedAckKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::DiscardStrandedCommit => "discard_stranded_commit",
+            Self::PromotionRerunPending => "promotion_rerun_pending",
+        }
+    }
+}
+
+/// A fact that exists **only** on a governed acknowledgement, held per task
+/// until the operator dismisses it.
+///
+/// Review round 3, P2. These were forwarded through the transient
+/// `bridge_status` slot, which every successfully reduced bridge message
+/// clears. A discard is immediately followed by an `ops_update`, so the only
+/// post-action copy of a stranded commit's OID and its recovery command could
+/// vanish before the operator finished reading the banner — the exact failure
+/// the round-1 fix was meant to prevent, moved one layer out.
+///
+/// So the banner stays as the transient *echo* and this is the durable record:
+/// keyed by task id, rendered on that task's card, cleared only by an explicit
+/// Dismiss, and never touched by `ops_update`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernedAckNotice {
+    pub task_id: String,
+    pub kind: GovernedAckKind,
+    /// The stranded commit, when there is one. Kept as its own field rather
+    /// than only inside `detail` so a surface can render it as a selectable
+    /// token instead of prose an operator has to re-type.
+    #[serde(default)]
+    pub commit: Option<String>,
+    #[serde(default)]
+    pub discarded_root: Option<String>,
+    pub detail: String,
+}
+
+impl GovernedAckNotice {
+    /// Extract a governed acknowledgement notice from a bridge message, or
+    /// `None` for any other message kind or a payload missing its identity.
+    ///
+    /// A notice with no task id is dropped: it could not be filed against a
+    /// card, and silently keying it under an empty string would attach one
+    /// task's stranded commit to another's.
+    pub fn parse(message: &DesktopBridgeMessage) -> Option<Self> {
+        if message.kind != "governed_ack" {
+            return None;
+        }
+        let notice: Self = serde_json::from_value(message.payload.clone()).ok()?;
+        if notice.task_id.trim().is_empty() || notice.detail.trim().is_empty() {
+            return None;
+        }
+        Some(notice)
+    }
+
+    /// Human-facing one-liner for the card.
+    pub fn headline(&self) -> &'static str {
+        match self.kind {
+            GovernedAckKind::DiscardStrandedCommit => {
+                "This discard dropped the only ref to an accepted commit"
+            }
+            GovernedAckKind::PromotionRerunPending => {
+                "This promotion is redoing an interrupted producer's work"
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonOpsStatusUpdate {
@@ -1581,6 +1679,8 @@ fn OperatorBoard(
     runtime_agents: Vec<AgentRuntimeSnapshot>,
     last_invocations: Vec<McpInvocation>,
     governed_tasks: Vec<GovernedTaskRun>,
+    governed_acks: BTreeMap<String, GovernedAckNotice>,
+    on_dismiss_governed_ack: EventHandler<String>,
     on_governed_mutation: EventHandler<GovernedTaskMutationRequest>,
     on_governed_promotion: EventHandler<GovernedPromotionRequest>,
     on_governed_discard: EventHandler<GovernedStagedWorktreeDiscardRequest>,
@@ -1655,6 +1755,8 @@ fn OperatorBoard(
                                 .unwrap_or_default();
                             let discard_armed =
                                 armed_discard.read().as_deref() == Some(task_key.as_str());
+                            let ack_notice = governed_acks.get(&task_key).cloned();
+                            let dismiss_key = task_key.clone();
                             rsx! {
                                 GovernedTaskCard {
                                     // A daemon revision is the authoritative decision epoch.
@@ -1674,6 +1776,10 @@ fn OperatorBoard(
                                     },
                                     on_discard_draft: move |value: String| {
                                         discard_drafts.write().insert(draft_key.clone(), value);
+                                    },
+                                    ack_notice,
+                                    on_dismiss_ack: move |_| {
+                                        on_dismiss_governed_ack.call(dismiss_key.clone());
                                     },
                                 }
                             }
@@ -1728,6 +1834,12 @@ fn GovernedTaskCard(
     discard_draft: String,
     on_discard_arm: EventHandler<bool>,
     on_discard_draft: EventHandler<String>,
+    /// An acknowledgement fact for this task, held until dismissed. Lives on
+    /// the board, not here, for the same reason the discard draft does: this
+    /// card is remounted on every revision bump, and an `ops_update` lands
+    /// immediately after a discard (review round 3, P2).
+    ack_notice: Option<GovernedAckNotice>,
+    on_dismiss_ack: EventHandler<()>,
 ) -> Element {
     let mut rationale = use_signal(String::new);
     let review_state = governed_review_state_label(task.review_state);
@@ -1995,6 +2107,29 @@ fn GovernedTaskCard(
                     "aria-label": "Staged worktree controls",
                     "data-world-scope": "staged_authoritative",
                     h4 { "Staged worktree" }
+                    if let Some(notice) = ack_notice.as_ref() {
+                        // Durable: only the operator's Dismiss removes this. An
+                        // `ops_update` lands right after a discard and clears
+                        // the headline banner, which is why the OID cannot live
+                        // only there (review round 3, P2).
+                        div {
+                            class: "governed-ack-notice",
+                            "data-governed-ack": "{notice.kind.as_str()}",
+                            "data-governed-ack-task": "{notice.task_id}",
+                            role: "status",
+                            strong { "{notice.headline()}" }
+                            if let Some(commit) = notice.commit.as_deref() {
+                                code { "data-governed-ack-commit": "{commit}", "{commit}" }
+                            }
+                            p { class: "governed-evidence-copy", "{notice.detail}" }
+                            button {
+                                class: "invoke-button secondary",
+                                "data-governed-control": "dismiss-ack",
+                                onclick: move |_| on_dismiss_ack.call(()),
+                                "Dismiss"
+                            }
+                        }
+                    }
                     if let Some(root) = staged_root.as_deref() {
                         code { class: "governed-staged-root", "{root}" }
                     } else {
@@ -2912,6 +3047,12 @@ pub fn DesktopShellWithSnapshot(
     #[props(default)] review_queue: Vec<ReviewQueueItem>,
     #[props(default)] bridge_status: Option<BridgeStatusUpdate>,
     #[props(default)] daemon_ops_status: Option<DaemonOpsStatusUpdate>,
+    /// Acknowledgement facts held per task until the operator dismisses them
+    /// (review round 3, P2). Deliberately separate from `bridge_status`: that
+    /// slot is transient and every reduced bridge message clears it.
+    #[props(default)]
+    governed_acks: BTreeMap<String, GovernedAckNotice>,
+    #[props(default)] on_dismiss_governed_ack: Option<EventHandler<String>>,
     #[props(default = DesktopView::Terminal)] initial_view: DesktopView,
 ) -> Element {
     let context = &snapshot.context;
@@ -3254,6 +3395,12 @@ pub fn DesktopShellWithSnapshot(
                                 runtime_agents: runtime_agents.clone(),
                                 last_invocations: last_invocations.clone(),
                                 governed_tasks: snapshot.governed_tasks.clone(),
+                                governed_acks: governed_acks.clone(),
+                                on_dismiss_governed_ack: move |task_id: String| {
+                                    if let Some(handler) = on_dismiss_governed_ack.as_ref() {
+                                        handler.call(task_id);
+                                    }
+                                },
                                 on_governed_mutation: move |request| {
                                     let script = governed_task_mutation_bridge_script(&request);
                                     spawn(async move {
@@ -3367,6 +3514,10 @@ pub fn DesktopShell() -> Element {
     let mut last_invocations = use_signal(Vec::<McpInvocation>::new);
     let mut bridge_status = use_signal(|| None::<BridgeStatusUpdate>);
     let mut daemon_ops_status = use_signal(|| None::<DaemonOpsStatusUpdate>);
+    // Acknowledgement facts, per task, cleared only by an explicit Dismiss.
+    // Deliberately not folded into `bridge_status`, which every successfully
+    // reduced message resets (review round 3, P2).
+    let mut governed_acks = use_signal(BTreeMap::<String, GovernedAckNotice>::new);
 
     use_effect(move || {
         let _agent_mount_count = runtime_agents().len();
@@ -3381,6 +3532,12 @@ pub fn DesktopShell() -> Element {
             while let Ok(message) = eval.recv::<DesktopBridgeMessage>().await {
                 if let Some(update) = DaemonOpsStatusUpdate::parse(&message) {
                     daemon_ops_status.set(Some(update));
+                    continue;
+                }
+                // Durable per-task record. Taken before the status branch so a
+                // later banner reset cannot take the OID with it.
+                if let Some(notice) = GovernedAckNotice::parse(&message) {
+                    governed_acks.write().insert(notice.task_id.clone(), notice);
                     continue;
                 }
                 // Status messages update the operator banner. A platform
@@ -3438,6 +3595,10 @@ pub fn DesktopShell() -> Element {
             last_invocations: last_invocations(),
             bridge_status: bridge_status(),
             daemon_ops_status: daemon_ops_status(),
+            governed_acks: governed_acks(),
+            on_dismiss_governed_ack: move |task_id: String| {
+                governed_acks.write().remove(&task_id);
+            },
         }
     }
 }

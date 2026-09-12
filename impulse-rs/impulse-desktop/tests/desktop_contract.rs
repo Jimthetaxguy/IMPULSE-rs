@@ -110,6 +110,8 @@ fn test_workspace_launcher_renders_required_builder_compatibility_preflight() {
             review_queue: Vec::new(),
             bridge_status: None,
             daemon_ops_status: None,
+            governed_acks: Default::default(),
+            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Terminal,
         },
     );
@@ -1010,6 +1012,8 @@ fn test_retro_shell_binds_project_ops_snapshot() {
             review_queue: Vec::new(),
             bridge_status: None,
             daemon_ops_status: None,
+            governed_acks: Default::default(),
+            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Terminal,
         },
     );
@@ -1047,6 +1051,8 @@ fn test_workspace_launcher_renders_registry_platforms_including_ion_and_custom()
             review_queue: Vec::new(),
             bridge_status: None,
             daemon_ops_status: None,
+            governed_acks: Default::default(),
+            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Terminal,
         },
     );
@@ -2370,6 +2376,8 @@ fn test_shell_render_accepts_live_agents_workspaces_and_tools() {
             }],
             bridge_status: None,
             daemon_ops_status: None,
+            governed_acks: Default::default(),
+            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Terminal,
         },
     );
@@ -2417,6 +2425,8 @@ fn test_shell_review_route_gates_review_console() {
             }],
             bridge_status: None,
             daemon_ops_status: None,
+            governed_acks: Default::default(),
+            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Review,
         },
     );
@@ -2456,6 +2466,8 @@ fn test_shell_supervisor_route_gates_operator_board() {
             review_queue: Vec::new(),
             bridge_status: None,
             daemon_ops_status: None,
+            governed_acks: Default::default(),
+            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Supervisor,
         },
     );
@@ -2544,6 +2556,8 @@ fn test_shell_supervisor_route_renders_authoritative_governed_evidence_and_contr
             review_queue: Vec::new(),
             bridge_status: None,
             daemon_ops_status: None,
+            governed_acks: Default::default(),
+            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Supervisor,
         },
     );
@@ -2612,6 +2626,8 @@ fn test_profiled_governed_tasks_label_rust_only_and_route_all_producers_via_daem
             review_queue: Vec::new(),
             bridge_status: None,
             daemon_ops_status: None,
+            governed_acks: Default::default(),
+            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Supervisor,
         },
     );
@@ -2992,6 +3008,8 @@ fn test_shell_renders_bridge_status_banner_when_degraded() {
                 reason: Some("host event API unavailable".to_string()),
             }),
             daemon_ops_status: None,
+            governed_acks: Default::default(),
+            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Terminal,
         },
     );
@@ -3020,6 +3038,8 @@ fn test_shell_hides_bridge_status_banner_when_healthy() {
             review_queue: Vec::new(),
             bridge_status: None,
             daemon_ops_status: None,
+            governed_acks: Default::default(),
+            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Terminal,
         },
     );
@@ -3048,6 +3068,8 @@ fn test_footer_stream_health_reflects_live_agent() {
                 connected: true,
                 error: None,
             }),
+            governed_acks: Default::default(),
+            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Terminal,
         },
     );
@@ -3089,6 +3111,8 @@ fn test_publish_only_degradation_keeps_subscribed_snapshot_current() {
                 connected: true,
                 error: Some("publish: temporary failure".to_string()),
             }),
+            governed_acks: Default::default(),
+            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Terminal,
         },
     );
@@ -3124,6 +3148,8 @@ fn test_footer_stream_health_reads_down_when_transport_degraded() {
                 connected: false,
                 error: Some("daemon unavailable".to_string()),
             }),
+            governed_acks: Default::default(),
+            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Terminal,
         },
     );
@@ -3261,6 +3287,8 @@ fn operator_board_html(tasks: Vec<impulse_ops::governed_task::GovernedTaskRun>) 
             review_queue: Vec::new(),
             bridge_status: None,
             daemon_ops_status: None,
+            governed_acks: Default::default(),
+            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Supervisor,
         },
     );
@@ -3764,6 +3792,8 @@ fn test_the_bridge_banner_shows_the_raw_daemon_text_next_to_any_interpretation()
                 reason: Some(raw.to_string()),
             }),
             daemon_ops_status: None,
+            governed_acks: Default::default(),
+            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Supervisor,
         },
     );
@@ -3869,4 +3899,241 @@ fn test_every_desktop_registration_is_authoritative_scoped() {
     .build()
     .expect("a minimal registration builds");
     assert_eq!(registration.world_scope, gt::WorldScope::Authoritative);
+}
+
+// ───────────────────── review round 3: durable ack notices ─────────────────────
+
+fn discard_ack_message(task_id: &str, commit: &str) -> DesktopBridgeMessage {
+    DesktopBridgeMessage {
+        kind: "governed_ack".to_string(),
+        payload: json!({
+            "task_id": task_id,
+            "kind": "discard_stranded_commit",
+            "commit": commit,
+            "discarded_root": "/tmp/impulse-rs/.impulse/worktrees/staged-task",
+            "detail": format!(
+                "Accepted commit {commit} was never promoted, so removing the staged worktree \
+                 dropped its only ref. `git cat-file -p {commit}` recovers it from the reflog \
+                 until that expires."
+            ),
+        }),
+    }
+}
+
+fn board_html_with_acks(
+    tasks: Vec<impulse_ops::governed_task::GovernedTaskRun>,
+    acks: std::collections::BTreeMap<String, impulse_desktop::ui::GovernedAckNotice>,
+) -> String {
+    let snapshot = ProjectOpsSnapshot {
+        governed_tasks: tasks,
+        ..ProjectOpsSnapshot::default()
+    };
+    let mut vdom = VirtualDom::new_with_props(
+        DesktopShellWithSnapshot,
+        DesktopShellWithSnapshotProps {
+            snapshot,
+            runtime_agents: Vec::new(),
+            agent_platforms: Vec::new(),
+            workspaces: Vec::new(),
+            mcp_tools: Vec::new(),
+            last_invocations: Vec::new(),
+            review_queue: Vec::new(),
+            bridge_status: None,
+            daemon_ops_status: None,
+            governed_acks: acks,
+            on_dismiss_governed_ack: None,
+            initial_view: DesktopView::Supervisor,
+        },
+    );
+    vdom.rebuild_in_place();
+    dioxus_ssr::render(&vdom)
+}
+
+/// **P2.** The reducer files an acknowledgement notice per task, and an
+/// `ops_update` — which lands immediately after every discard — must not remove
+/// it. The transient `bridge_status` slot is reset by every successfully
+/// reduced message, which is exactly why the OID cannot live only there.
+#[test]
+fn test_an_ops_update_after_a_discard_does_not_remove_the_stranded_commit_notice() {
+    use impulse_desktop::ui::GovernedAckNotice;
+
+    let commit = "b".repeat(40);
+    let notice = GovernedAckNotice::parse(&discard_ack_message("staged-task", &commit))
+        .expect("a well-formed governed_ack parses");
+    assert_eq!(notice.commit.as_deref(), Some(commit.as_str()));
+
+    let mut acks = std::collections::BTreeMap::new();
+    acks.insert(notice.task_id.clone(), notice);
+
+    // The reducer that handles `ops_update` cannot touch this map: it takes a
+    // `DesktopBridgeStateMut` that does not contain it, and the shell files
+    // governed acks on a separate branch that `continue`s before reduction.
+    let mut snapshot = ProjectOpsSnapshot::default();
+    let (mut agents, mut platforms, mut spaces, mut tools, mut queue, mut invocations) = (
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    apply_desktop_bridge_message(
+        DesktopBridgeStateMut::new(
+            &mut snapshot,
+            &mut agents,
+            &mut platforms,
+            &mut spaces,
+            &mut tools,
+            &mut queue,
+            &mut invocations,
+        ),
+        DesktopBridgeMessage {
+            kind: "ops_update".to_string(),
+            payload: serde_json::to_value(ProjectOpsSnapshot::default()).unwrap(),
+        },
+    )
+    .expect("an ops_update reduces");
+    assert_eq!(acks.len(), 1, "reducing an ops_update files no ack changes");
+
+    // And it is still rendered on the card afterwards.
+    let html = board_html_with_acks(vec![staged_governed_task()], acks);
+    assert!(html.contains("data-governed-ack=\"discard_stranded_commit\""));
+    assert!(
+        html.contains(&commit),
+        "the OID must still be on the card after an ops_update"
+    );
+    assert!(html.contains("git cat-file -p"));
+    assert!(
+        html.contains("data-governed-control=\"dismiss-ack\""),
+        "the only way to clear it is the operator's own Dismiss"
+    );
+}
+
+/// **P2.** A card remount — which every revision bump causes, because the card
+/// is keyed `id:revision` — must not take the notice with it. The notice lives
+/// on the board, above that key.
+#[test]
+fn test_the_stranded_commit_notice_survives_a_card_remount() {
+    use impulse_desktop::ui::GovernedAckNotice;
+
+    let commit = "b".repeat(40);
+    let notice = GovernedAckNotice::parse(&discard_ack_message("staged-task", &commit)).unwrap();
+    let mut acks = std::collections::BTreeMap::new();
+    acks.insert(notice.task_id.clone(), notice);
+
+    let before = board_html_with_acks(vec![staged_governed_task()], acks.clone());
+    assert!(before.contains("data-review-state=\"accepted\""));
+    assert!(before.contains(&commit));
+
+    // Same task, new daemon revision: the card is a different keyed element.
+    let mut bumped = staged_governed_task();
+    bumped.revision += 1;
+    let after = board_html_with_acks(vec![bumped], acks);
+    assert!(
+        after.contains(&commit),
+        "a revision bump remounts the card; the notice is board-owned and must survive"
+    );
+    assert!(after.contains("data-governed-ack-task=\"staged-task\""));
+}
+
+/// **P2.** Dismissal is the one thing that clears it, and it clears only the
+/// task it was filed against.
+#[test]
+fn test_dismissal_clears_only_the_dismissed_task_s_notice() {
+    use impulse_desktop::ui::GovernedAckNotice;
+
+    let commit = "b".repeat(40);
+    let other = "c".repeat(40);
+    let mut acks = std::collections::BTreeMap::new();
+    for (task_id, oid) in [("staged-task", &commit), ("other-task", &other)] {
+        let notice = GovernedAckNotice::parse(&discard_ack_message(task_id, oid)).unwrap();
+        acks.insert(notice.task_id.clone(), notice);
+    }
+
+    let both = board_html_with_acks(vec![staged_governed_task()], acks.clone());
+    assert!(both.contains(&commit));
+
+    // The dismissal the shell performs is a removal keyed by task id.
+    acks.remove("staged-task");
+    let dismissed = board_html_with_acks(vec![staged_governed_task()], acks.clone());
+    assert!(
+        !dismissed.contains("data-governed-ack=\"discard_stranded_commit\""),
+        "dismissing removes the notice"
+    );
+    assert!(
+        !dismissed.contains(&commit),
+        "and the OID with it: the operator said they were done with it"
+    );
+    assert_eq!(
+        acks.len(),
+        1,
+        "the other task's notice is untouched by this dismissal"
+    );
+}
+
+/// The notice crosses the eval channel as JSON, and a payload that cannot be
+/// filed against a card is dropped rather than keyed under an empty string.
+#[test]
+fn test_governed_ack_notice_round_trips_and_rejects_unfilable_payloads() {
+    use impulse_desktop::ui::{GovernedAckKind, GovernedAckNotice};
+
+    let notice = GovernedAckNotice::parse(&discard_ack_message("staged-task", &"b".repeat(40)))
+        .expect("parses");
+    let json = serde_json::to_string(&notice).expect("serialize");
+    let recovered: GovernedAckNotice = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(recovered, notice);
+    assert_eq!(recovered.kind, GovernedAckKind::DiscardStrandedCommit);
+    assert_eq!(recovered.kind.as_str(), "discard_stranded_commit");
+
+    // A promotion rerun notice carries no commit.
+    let rerun = GovernedAckNotice::parse(&DesktopBridgeMessage {
+        kind: "governed_ack".to_string(),
+        payload: json!({
+            "task_id": "staged-task",
+            "kind": "promotion_rerun_pending",
+            "detail": "a previous promotion producer was interrupted",
+        }),
+    })
+    .expect("a rerun notice parses without a commit");
+    assert_eq!(rerun.commit, None);
+    assert!(rerun.headline().contains("redoing an interrupted producer"));
+
+    for unfilable in [
+        json!({"task_id": "", "kind": "discard_stranded_commit", "detail": "x"}),
+        json!({"task_id": "  ", "kind": "discard_stranded_commit", "detail": "x"}),
+        json!({"task_id": "staged-task", "kind": "discard_stranded_commit", "detail": "   "}),
+        json!({"task_id": "staged-task", "kind": "not_a_kind", "detail": "x"}),
+    ] {
+        assert_eq!(
+            GovernedAckNotice::parse(&DesktopBridgeMessage {
+                kind: "governed_ack".to_string(),
+                payload: unfilable.clone(),
+            }),
+            None,
+            "an unfilable payload must be dropped, not keyed under an empty task: {unfilable}"
+        );
+    }
+
+    assert_eq!(
+        GovernedAckNotice::parse(&DesktopBridgeMessage {
+            kind: "ops_update".to_string(),
+            payload: json!({"task_id": "staged-task", "kind": "discard_stranded_commit", "detail": "x"}),
+        }),
+        None,
+        "only a governed_ack message files a notice"
+    );
+}
+
+/// The bridge emits the durable record *and* keeps the transient echo.
+#[test]
+fn test_the_bridge_emits_a_durable_ack_alongside_the_transient_banner() {
+    let bootstrap = desktop_event_bridge_script();
+    assert!(bootstrap.contains("forward(\"governed_ack\""));
+    assert!(bootstrap.contains("\"discard_stranded_commit\""));
+    assert!(bootstrap.contains("\"promotion_rerun_pending\""));
+    // The banner echo is still there; it is the transient half of the pair.
+    assert!(bootstrap.contains("governed_discard_unreferenced_commit"));
+    assert!(bootstrap.contains("governed_promotion_rerun_pending"));
+    // The notice is filed against the task the request named.
+    assert!(bootstrap.contains("request?.task_id"));
 }
