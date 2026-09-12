@@ -1,6 +1,6 @@
 ---
 title: Adding Dioxus desktop views
-updated: 2026-08-30
+updated: 2026-09-12
 kind: living reference
 ---
 # Adding GUI Views to Impulse
@@ -58,7 +58,23 @@ Do not invent a second Review or Supervisor path in `views.rs` unless you are de
 
 Extend the `DesktopView::ALL` unit test in `views.rs`. Add an SSR assertion in `impulse-rs/impulse-desktop/tests/views_ssr.rs` for the new `data-view` slug when the component lives in `views.rs`. Add a route in `impulse-rs/impulse-desktop/scripts/visual_smoke.mjs` with `slug`, `active` selector, and `visibleText` from the hero band (Review uses `.review-console`; Supervisor uses `[data-source="operator_board"]`; Memory/Artifacts use `.view-<slug>.active`).
 
-Gate is the named local `impulse-desktop` crate test plus the visual smoke script in that crate. Do not run tests inside frozen `impulse-gui`.
+Run the focused desktop checks first:
+
+```bash
+cd impulse-rs
+cargo test -p impulse-desktop
+# visual smoke lives in the same crate; do not run tests inside frozen impulse-gui
+```
+
+Those do not replace the repository-wide gate. A new public `DesktopView` variant or `ui.rs` dispatch arm can break other workspace crates. Before commit, also run the AGENTS.md verification gate:
+
+```bash
+cd impulse-rs
+cargo build --workspace
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
+```
 
 ---
 
@@ -72,4 +88,6 @@ Gate is the named local `impulse-desktop` crate test plus the visual smoke scrip
 - Mutating action, if any, goes through host commands
 - views.rs unit test and views_ssr.rs assertion when applicable
 - visual_smoke.mjs route with the real active selector
-- named local impulse-desktop crate test clean
+- named local impulse-desktop crate test clean (`cargo test -p impulse-desktop`)
+- AGENTS.md workspace gate clean (`cargo build --workspace`, `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`)
+- no tests run inside frozen impulse-gui
