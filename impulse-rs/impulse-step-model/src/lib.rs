@@ -68,6 +68,18 @@ impl StepModelContext {
         }
     }
 
+    /// Default API system context with no review or verification signal.
+    pub fn system(current_model: impl Into<String>) -> Self {
+        Self {
+            actor: StepActor::System,
+            review: None,
+            verification: None,
+            tool_round: 0,
+            current_model: current_model.into(),
+            escalate_model: None,
+        }
+    }
+
     /// Default API supervisor context with no review or verification signal.
     pub fn supervisor(current_model: impl Into<String>) -> Self {
         Self {
@@ -170,6 +182,18 @@ mod tests {
     }
 
     #[test]
+    fn test_decide_step_model_passed_verification_does_not_escalate() {
+        // Passed is not Failed/Inconclusive. An admitted escalate_model must
+        // stay unused when verification succeeded.
+        let mut ctx = StepModelContext::worker("sonnet");
+        ctx.verification = Some(StepVerificationSignal::Passed);
+        ctx.escalate_model = Some("opus".to_string());
+        let decision = decide_step_model(&ctx, "haiku");
+        assert_eq!(decision.model, "sonnet");
+        assert_eq!(decision.reason, StepModelReason::Configured);
+    }
+
+    #[test]
     fn test_decide_step_model_worker_after_failure_uses_admitted_escalation_model() {
         // Worker is the Ion/API actor. After verification Failed it may take an
         // admitted escalate_model; Operator/Verifier stay blocked elsewhere.
@@ -184,12 +208,10 @@ mod tests {
 
     #[test]
     fn test_decide_step_model_system_after_failure_uses_admitted_escalation_model() {
-        // System is on the crate enum and is not blocked the way Operator and
-        // Verifier are. After verification Failed it may take an admitted
-        // escalate_model. The Impulse wrapper already locks GovernedActorKind::System;
-        // this locks the portable StepActor::System path.
-        let mut ctx = StepModelContext::worker("sonnet");
-        ctx.actor = StepActor::System;
+        // System is escalate-capable (Operator and Verifier stay blocked). Use
+        // StepModelContext::system next to worker and supervisor for the three
+        // escalate-capable actors.
+        let mut ctx = StepModelContext::system("sonnet");
         ctx.verification = Some(StepVerificationSignal::Failed);
         ctx.escalate_model = Some("opus".to_string());
         let decision = decide_step_model(&ctx, "haiku");
@@ -231,51 +253,72 @@ mod tests {
 
     #[test]
     fn test_decide_step_model_inconclusive_verification_uses_admitted_escalation_model() {
+        // Inconclusive is in the Failed|Inconclusive match arm. Lock the
+        // reason too so this path cannot silently slide back to Configured.
         let mut ctx = configured_ctx("sonnet");
         ctx.verification = Some(StepVerificationSignal::Inconclusive);
         ctx.escalate_model = Some("opus".to_string());
-        assert_eq!(decide_step_model(&ctx, "sonnet").model, "opus");
+        let decision = decide_step_model(&ctx, "sonnet");
+        assert_eq!(decision.model, "opus");
+        assert_eq!(decision.reason, StepModelReason::AfterVerifierFailure);
     }
 
     #[test]
     fn test_decide_step_model_review_failure_uses_admitted_escalation_model() {
+        // Review VerificationFailed is the attestation half of
+        // verifier_or_attestation_failed. Lock model and reason together.
         let mut ctx = configured_ctx("sonnet");
         ctx.review = Some(StepReviewSignal::VerificationFailed);
         ctx.escalate_model = Some("opus".to_string());
-        assert_eq!(decide_step_model(&ctx, "sonnet").model, "opus");
+        let decision = decide_step_model(&ctx, "sonnet");
+        assert_eq!(decision.model, "opus");
+        assert_eq!(decision.reason, StepModelReason::AfterVerifierFailure);
     }
 
     #[test]
     fn test_decide_step_model_failure_without_escalation_stays_current() {
+        // Failed without an admitted escalate_model must stay Configured.
+        // Lock the reason so this path cannot silently report AfterVerifierFailure.
         let mut ctx = configured_ctx("sonnet");
         ctx.verification = Some(StepVerificationSignal::Failed);
-        assert_eq!(decide_step_model(&ctx, "sonnet").model, "sonnet");
+        let decision = decide_step_model(&ctx, "sonnet");
+        assert_eq!(decision.model, "sonnet");
+        assert_eq!(decision.reason, StepModelReason::Configured);
     }
 
     #[test]
     fn test_decide_step_model_blank_escalation_stays_current() {
+        // Whitespace-only escalate_model is filtered the same as None.
         let mut ctx = configured_ctx("sonnet");
         ctx.verification = Some(StepVerificationSignal::Failed);
         ctx.escalate_model = Some("   ".to_string());
-        assert_eq!(decide_step_model(&ctx, "sonnet").model, "sonnet");
+        let decision = decide_step_model(&ctx, "sonnet");
+        assert_eq!(decision.model, "sonnet");
+        assert_eq!(decision.reason, StepModelReason::Configured);
     }
 
     #[test]
     fn test_decide_step_model_tool_round_does_not_escalate() {
+        // Policy v0 ignores tool-round volume even when escalate_model is set.
         let mut ctx = configured_ctx("sonnet");
         ctx.tool_round = 99;
         ctx.escalate_model = Some("opus".to_string());
-        assert_eq!(decide_step_model(&ctx, "sonnet").model, "sonnet");
+        let decision = decide_step_model(&ctx, "sonnet");
+        assert_eq!(decision.model, "sonnet");
+        assert_eq!(decision.reason, StepModelReason::Configured);
     }
 
     #[test]
     fn test_decide_step_model_operator_and_verifier_never_receive_escalation() {
+        // Operator and Verifier stay Configured even after Failed with escalate set.
         for actor in [StepActor::Operator, StepActor::Verifier] {
             let mut ctx = configured_ctx("sonnet");
             ctx.actor = actor;
             ctx.verification = Some(StepVerificationSignal::Failed);
             ctx.escalate_model = Some("opus".to_string());
-            assert_eq!(decide_step_model(&ctx, "sonnet").model, "sonnet");
+            let decision = decide_step_model(&ctx, "sonnet");
+            assert_eq!(decision.model, "sonnet");
+            assert_eq!(decision.reason, StepModelReason::Configured);
         }
     }
 
@@ -283,6 +326,7 @@ mod tests {
     fn test_decide_step_model_empty_current_uses_configured_fallback() {
         let decision = decide_step_model(&configured_ctx(""), "configured");
         assert_eq!(decision.model, "configured");
+        assert_eq!(decision.reason, StepModelReason::Configured);
     }
 
     #[test]

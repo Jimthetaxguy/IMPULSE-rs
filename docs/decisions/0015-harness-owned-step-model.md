@@ -2,7 +2,7 @@
 title: "ADR-0015: Harness-Owned Step Model Choice"
 status: accepted
 created: 2026-08-17
-updated: 2026-09-02
+updated: 2026-09-12
 deciders: [Impulse Maintainers]
 ---
 
@@ -129,9 +129,11 @@ Impulse product.
 
 ## Addendum: chat surfaces on origin/main (2026-09-02)
 
-`origin/main` at `36bda00` routes system and daemon `handle_chat` through
-`resolve_step_model` with `HarnessStepContext::ion_api`. That is the same
-harness policy as the three API fill sites. It is not a second picker.
+`origin/main` at `4e581f3` (was `36bda00` when this addendum first landed on
+2026-09-02; tip advanced through daemon provenance ADR-0018 and related
+merges without changing the chat seam) routes system and daemon `handle_chat`
+through `resolve_step_model` with `HarnessStepContext::ion_api`. That is the
+same harness policy as the three API fill sites. It is not a second picker.
 Decision #3 above is updated to match that tree. The prior wording that said
 not to add a picker in those paths meant do not invent a separate chat-local
 model policy. Calling `resolve_step_model` there is required seam fill.
@@ -140,14 +142,33 @@ Earlier local-only tip `9c586ba` held an equivalent chat-surface write before
 main advanced; that commit is no longer on the branch tip after a reset to
 `origin/main`. The live seam on HEAD is what this addendum records.
 
-## Related Documents
+Checked again on 2026-09-06: both chat fill sites (`handlers::system::handle_chat`
+and `daemon::handlers::handle_chat_request`) still call `resolve_step_model` with
+`HarnessStepContext::ion_api` on `origin/main` at `4e581f3`.
 
-- [`0011-governed-task-run-lifecycle.md`](0011-governed-task-run-lifecycle.md)
-- [`0012-daemon-owned-governed-runtime-producers.md`](0012-daemon-owned-governed-runtime-producers.md)
-- [`../../impulse-rs/impulse-step-model/README.md`](../../impulse-rs/impulse-step-model/README.md)
-- [`../../VISION.md`](../../VISION.md)
-- [`../spec/RUST-CANONICAL-CONTRACT.md`](../spec/RUST-CANONICAL-CONTRACT.md)
+Checked again on 2026-09-08: same two chat fill sites still call
+`resolve_step_model` with `HarnessStepContext::ion_api` on this checkout tip
+`4f9cb3d` (PR #51 branch; `origin/main` still `4e581f3`). Portable crate
+Inconclusive and review-failure tests now lock `AfterVerifierFailure` reason,
+not only the model string.
 
+Checked again on 2026-09-09: same two chat fill sites still call
+`resolve_step_model` with `HarnessStepContext::ion_api` on tip `4f9cb3d`
+(`origin/main` still `4e581f3`). Portable stay-configured paths
+(failure-without-escalate, blank escalate, tool-round, Operator/Verifier,
+empty current) now lock `Configured` reason to match the Impulse wrapper.
+
+Checked again on 2026-09-10: same two chat fill sites still call
+`resolve_step_model` with `HarnessStepContext::ion_api` on tip `4f9cb3d`
+(`origin/main` still `4e581f3`). Portable `StepModelContext::system` and
+Impulse `HarnessStepContext::system` constructors now sit next to
+worker/`ion_api` and supervisor for the three escalate-capable actors.
+
+Checked again on 2026-09-12: `origin/main` advanced to `8dfd2ab` (reservation
+journal #45, Ion tool floor #46, docx streaming #49, ADR-0019 reland #50).
+Both chat fill sites (`handlers::system::handle_chat`, line 255, and
+`daemon::handlers::handle_chat_request`, line 1495) still call
+`resolve_step_model` with `HarnessStepContext::ion_api`. No second picker.
 
 ## Addendum: ROSA imports `decide_step_model`
 
@@ -169,3 +190,11 @@ Codee mapped rosa-renew-build @ `0f1d4e2` against Impulse main `76ab525`:
 Jim locked 2026-08-19: Impulse stays the only picker. ROSA has no step picker and should call Impulse's `decide_step_model`.
 
 Do not add LiteLLM, OpenRouter, or a ROSA sibling of `decide_step_model`.
+
+## Related Documents
+
+- [`0011-governed-task-run-lifecycle.md`](0011-governed-task-run-lifecycle.md)
+- [`0012-daemon-owned-governed-runtime-producers.md`](0012-daemon-owned-governed-runtime-producers.md)
+- [`../../impulse-rs/impulse-step-model/README.md`](../../impulse-rs/impulse-step-model/README.md)
+- [`../../VISION.md`](../../VISION.md)
+- [`../spec/RUST-CANONICAL-CONTRACT.md`](../spec/RUST-CANONICAL-CONTRACT.md)
