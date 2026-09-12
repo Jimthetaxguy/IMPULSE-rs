@@ -364,3 +364,112 @@ async fn an_unknown_task_id_is_refused_before_any_side_effect() {
     assert!(error.to_string().contains("was not found"), "got: {error}");
     assert!(!repo.path().join(".impulse/worktrees").exists());
 }
+
+/// Review round 1, P1-2: staged materialization runs before the ledger write,
+/// so a retry of a registration that already succeeded must be recognized from
+/// the request id rather than reaching the producer and failing on a staged
+/// path occupied by its own earlier attempt.
+///
+/// Driven over the real socket because that is where the retry comes from:
+/// `DaemonClient` re-sends acknowledged requests, and `git worktree add` on a
+/// large repository can outlast the response timeout.
+#[tokio::test]
+async fn a_replayed_staged_registration_over_the_socket_returns_the_recorded_task() {
+    let (repo, project_id, oid) = init_project();
+    let (_daemon, socket) = start_daemon(repo.path());
+    let client = DaemonClient::new(socket.clone());
+    let registration = staged_registration(&project_id, repo.path(), &oid, "staged-replay");
+
+    let first: GovernedTaskRun = ok_from_response(
+        client
+            .send(DaemonRequest::RegisterGovernedTask {
+                registration: registration.clone(),
+            })
+            .await
+            .unwrap(),
+    );
+    let staged_root = first.active_staged_worktree().unwrap().root.clone();
+
+    // Stand in for a Builder that has already started working in the checkout.
+    let marker = Path::new(&staged_root).join("builder-scratch.txt");
+    std::fs::write(&marker, "a live Builder is working here\n").unwrap();
+
+    let replayed: GovernedTaskRun = ok_from_response(
+        client
+            .send(DaemonRequest::RegisterGovernedTask { registration })
+            .await
+            .unwrap(),
+    );
+
+    assert_eq!(replayed, first, "the replay returns the recorded task");
+    assert!(
+        marker.exists(),
+        "a replayed registration must not disturb a live Builder's checkout"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap(),
+        "a live Builder is working here\n"
+    );
+    assert_eq!(
+        run_git(Path::new(&staged_root), &["rev-parse", "HEAD"]),
+        oid,
+        "the staged worktree is untouched by the replay"
+    );
+    assert_eq!(
+        client
+            .get_governed_task(project_id.clone(), first.id.clone())
+            .await
+            .unwrap()
+            .unwrap(),
+        first,
+        "the replay records no second revision"
+    );
+}
+
+/// Review round 1, P1-2 (second half): a genuinely occupied staged path — a
+/// directory that outlived an interrupted run, not this task's own replay —
+/// still fails closed, and the producer's recovery instructions survive to the
+/// wire.
+///
+/// The daemon previously rendered these errors with `Display`, which collapses
+/// an `anyhow` context chain to its outermost message, so the operator saw
+/// "failed to materialize the staged worktree for this registration" and none
+/// of the text telling them what to do about it.
+#[tokio::test]
+async fn a_materialization_failure_reaches_the_operator_with_its_recovery_text() {
+    let (repo, project_id, oid) = init_project();
+    let (_daemon, socket) = start_daemon(repo.path());
+    let client = DaemonClient::new(socket.clone());
+    let registration = staged_registration(&project_id, repo.path(), &oid, "staged-occupied");
+    let task_id = registration.task_id.clone();
+
+    std::fs::create_dir_all(
+        repo.path()
+            .join(".impulse")
+            .join("worktrees")
+            .join(task_id.as_str()),
+    )
+    .unwrap();
+
+    let response = client
+        .send(DaemonRequest::RegisterGovernedTask { registration })
+        .await
+        .unwrap();
+    let message = error_message(&response);
+    assert!(
+        message.contains("already exists"),
+        "the operator must be told the symptom: {message}"
+    );
+    assert!(
+        message.contains("worktree prune"),
+        "the operator must be told the recovery, not just the symptom: {message}"
+    );
+    assert!(
+        client
+            .get_governed_task(project_id, task_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "a failed materialization still records no task"
+    );
+}

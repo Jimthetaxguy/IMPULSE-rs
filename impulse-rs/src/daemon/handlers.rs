@@ -976,6 +976,21 @@ pub(crate) async fn handle_governed_task_request(
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
         match request {
             DaemonRequest::RegisterGovernedTask { registration } => {
+                // Authorization first, before *anything* reads the request's
+                // caller-supplied paths. The profiled preflight below runs
+                // `AgentRegistry::registry_for_runtime` and then
+                // `observe_clean_git_subject`, which spawns `git` inside
+                // `registration.workspace_root` -- a path the caller chose. A
+                // staged registration is operator-only, so a non-operator
+                // connection must be refused before it can use this endpoint to
+                // probe the filesystem or start a subprocess. Review round 1
+                // caught this ordering: a non-operator staged registration
+                // against a non-Git path answered "git root discovery failed"
+                // rather than the class refusal.
+                super::governed_wiring::require_staged_registration_class(
+                    &registration,
+                    connection_class,
+                )?;
                 if registration.verification_profile.is_some() {
                     registration.validate()?;
                     let assignment = registration
@@ -1079,7 +1094,14 @@ pub(crate) async fn handle_governed_task_request(
 
     match result {
         Ok(Ok(result)) => DaemonResponse::Ok { result },
-        Ok(Err(error)) => respond_err(error),
+        // `{:#}` rather than `{}`: these errors are built with `.context()`
+        // chains whose outer layer names the operation and whose inner layers
+        // carry the operator's actual recovery instructions (the staged
+        // producer's "delete the leftover directory and run `git worktree
+        // prune`" text, for one). Rendering with `Display` collapses the chain
+        // to the outermost message and drops exactly the part the operator
+        // needs.
+        Ok(Err(error)) => respond_err(format!("{error:#}")),
         Err(error) => respond_err(format!("Governed task worker failed: {error}")),
     }
 }

@@ -9,7 +9,12 @@
 //!    declares `world_scope = staged_authoritative` materializes it as part of
 //!    registration. It is an operator-initiated launch, so a non-operator
 //!    connection is refused; a materialization that fails leaves no task
-//!    record behind.
+//!    record behind. Because the checkout is created *before* the ledger write,
+//!    a replay must be recognized before the producer runs: the request id is
+//!    checked against the governed ledger's own receipts first, so retrying a
+//!    registration that already succeeded (a client that timed out on a slow
+//!    `git worktree add`, say) returns the recorded task instead of failing on
+//!    a staged path that is "already occupied" by its own earlier attempt.
 //! 2. **The promote and discard endpoints.** Both are operator-class only:
 //!    promotion is the step that makes a Builder's work canonical, and discard
 //!    destroys work. A *blocked* promotion is an execution fact, not an error —
@@ -75,6 +80,25 @@ pub(crate) fn require_operator_class(
         return Ok(());
     }
     Err(ActorProvenanceError::OperatorClassRequired { request })
+}
+
+/// Authorize a registration by world scope, before any of its caller-supplied
+/// fields are used.
+///
+/// Split out of [`register_governed_task`] so the dispatcher can run it at the
+/// very top of the `RegisterGovernedTask` arm: the profiled preflight there
+/// spawns `git` inside a caller-chosen path, which a non-operator connection
+/// must not be able to reach for a scope it is not allowed to request.
+/// `register_governed_task` still performs the same check, so the function is
+/// safe on its own; this is ordering, not a relocation.
+pub(crate) fn require_staged_registration_class(
+    registration: &GovernedTaskRegistration,
+    class: ConnectionClass,
+) -> Result<(), ActorProvenanceError> {
+    if !registration.world_scope.requires_staged_worktree() {
+        return Ok(());
+    }
+    require_operator_class(class, "RegisterGovernedTask with a staged world scope")
 }
 
 fn require_staged_scope(task: &GovernedTaskRun, what: &str) -> Result<()> {
@@ -189,10 +213,24 @@ pub(crate) fn register_governed_task(
     if !registration.world_scope.requires_staged_worktree() {
         return state.register_governed_task(registration);
     }
-    require_operator_class(
-        connection_class,
-        "RegisterGovernedTask with a staged world scope",
-    )?;
+    require_staged_registration_class(&registration, connection_class)?;
+
+    // Replay before side effect. `materialize_staged_worktree` runs before the
+    // ledger write (that is what makes "a failed materialization leaves no task
+    // record" true), which means a retry of a registration that already
+    // succeeded would otherwise reach the producer and fail on a staged path
+    // occupied by its own earlier attempt -- with a recovery message telling the
+    // operator to delete a directory that is in fact a live Builder's checkout.
+    // A client retry is not hypothetical: `DaemonClient` re-sends acknowledged
+    // requests, and `git worktree add` on a large repository can outlast the
+    // response timeout. Consulting the governed ledger's own receipts first
+    // makes the replay idempotent, and `register_governed_task` then
+    // fingerprint-checks the replayed request against the recorded one.
+    if state.governed_producer_request_is_replay(&registration.request_id, &registration.task_id)? {
+        return state
+            .register_governed_task(registration)
+            .context("failed to replay a recorded staged governed registration");
+    }
 
     let provisional = provisional_staged_task(&registration)?;
     let staged = crate::governed_producers::materialize_staged_worktree(&provisional)
@@ -402,10 +440,16 @@ async fn discard_governed_staged_worktree(
         .map(|staged| staged.root.clone())
         .context("governed staged worktree discard requires a materialized worktree")?;
     if replay {
+        // Recomputed, not `None`. `DaemonClient` retries an acknowledged
+        // request, so the *first* response carrying this warning can be lost
+        // and the retry is then the only copy the operator ever sees. The
+        // recorded promotion outcome is still on the task, so the answer is
+        // derivable rather than needing to have been remembered.
+        let unreferenced = unreferenced_accepted_commit_on_discard(&task).map(str::to_string);
         return Ok(GovernedStagedWorktreeDiscardAck {
             task,
             discarded_root: staged_root,
-            unreferenced_accepted_commit: None,
+            unreferenced_accepted_commit: unreferenced,
         });
     }
 
@@ -712,6 +756,22 @@ mod tests {
     /// A real Rust workspace in a real Git repository plus its project state,
     /// matching the fixture the governed producer handler tests already use.
     fn repo_state() -> (tempfile::TempDir, SharedState, String, String) {
+        repo_state_with_runtime_ignores(true)
+    }
+
+    /// The same fixture without the ignore list `impulse init` writes.
+    ///
+    /// This is the configuration every `.impulse` cleanliness exemption exists
+    /// for, and the one the ignore-list fixture cannot reach: with the list
+    /// present, a missing exemption is invisible because Git never reports the
+    /// file at all.
+    fn repo_state_without_runtime_ignores() -> (tempfile::TempDir, SharedState, String, String) {
+        repo_state_with_runtime_ignores(false)
+    }
+
+    fn repo_state_with_runtime_ignores(
+        runtime_ignores: bool,
+    ) -> (tempfile::TempDir, SharedState, String, String) {
         let repo = tempfile::Builder::new()
             .prefix("impulse-governed-wiring-")
             .tempdir()
@@ -729,11 +789,14 @@ mod tests {
         .unwrap();
         // The ignore list `impulse init` writes. Without it an ungitignored
         // `.impulse` makes the canonical tree dirty the moment a runtime ledger
-        // is written, and every later governed observation fails.
+        // is written, and every later governed observation fails -- which is
+        // exactly what `repo_state_without_runtime_ignores` exists to exercise.
         let mut ignores = String::from("target/\n");
-        for entry in crate::handlers::config::repo_runtime_gitignore_entries() {
-            ignores.push_str(entry);
-            ignores.push('\n');
+        if runtime_ignores {
+            for entry in crate::handlers::config::repo_runtime_gitignore_entries() {
+                ignores.push_str(entry);
+                ignores.push('\n');
+            }
         }
         std::fs::write(repo.path().join(".gitignore"), ignores).unwrap();
         let lock_status = Command::new("cargo")
@@ -1562,6 +1625,413 @@ mod tests {
         assert!(error
             .to_string()
             .contains("staged_authoritative world scope"));
+    }
+
+    // ── Review round 1 regressions ──────────────────────────────────────────
+
+    /// P1-1. Recording an operator approval writes
+    /// `.impulse/MEMORY_CANDIDATES.json` (ADR-0013), and promotion — which is
+    /// only reachable *after* an approval — observes the canonical tree. In a
+    /// project whose `.impulse` is not gitignored, a missing cleanliness
+    /// exemption therefore makes the daemon fail on a tree it dirtied itself.
+    ///
+    /// Every other fixture here writes the `impulse init` ignore list, which
+    /// hides the bug completely. This one does not, and it carries a negative
+    /// control so it cannot pass vacuously.
+    #[tokio::test]
+    async fn an_approval_does_not_dirty_the_canonical_tree_for_promotion() {
+        let (repo, state, project_id, oid) = repo_state_without_runtime_ignores();
+        let registered = register_governed_task(
+            &state,
+            registration(
+                &project_id,
+                repo.path(),
+                &oid,
+                WorldScope::StagedAuthoritative,
+            ),
+            ConnectionClass::Operator,
+        )
+        .unwrap();
+        let (accepted, accepted_oid) = accepted_staged_task(&state, registered);
+
+        // Negative control: Git must actually see the candidate ledger here,
+        // or the assertion below proves nothing.
+        let candidates = repo.path().join(".impulse").join("MEMORY_CANDIDATES.json");
+        assert!(
+            candidates.exists(),
+            "the approval must have written the accepted-run candidate ledger"
+        );
+        let untracked = git(
+            repo.path(),
+            &["status", "--porcelain", "--untracked-files=all"],
+        );
+        assert!(
+            untracked.contains(".impulse/MEMORY_CANDIDATES.json"),
+            "this fixture must leave the candidate ledger untracked, or the \
+             exemption under test is never exercised; saw: {untracked}"
+        );
+
+        let ack = promote_governed_outcome(
+            &state,
+            promotion_request(&accepted, "promote-after-approval"),
+            ConnectionClass::Operator,
+        )
+        .await
+        .expect("promotion must not fail on a tree the daemon dirtied itself");
+        assert_eq!(
+            ack.task.latest_promotion().unwrap().outcome,
+            GovernedPromotionOutcome::Promoted {
+                promoted_revision: accepted_oid.clone(),
+            }
+        );
+        assert_eq!(git(repo.path(), &["rev-parse", "HEAD"]), accepted_oid);
+    }
+
+    /// P1-2. `materialize_staged_worktree` runs before the ledger write, so a
+    /// retry of a registration that already succeeded would reach the producer
+    /// and fail on a staged path occupied by its own earlier attempt. The
+    /// request id is checked against the ledger's receipts first.
+    #[test]
+    fn a_replayed_staged_registration_returns_the_recorded_task_and_touches_nothing() {
+        let (repo, state, project_id, oid) = repo_state();
+        let first = register_governed_task(
+            &state,
+            registration(
+                &project_id,
+                repo.path(),
+                &oid,
+                WorldScope::StagedAuthoritative,
+            ),
+            ConnectionClass::Operator,
+        )
+        .unwrap();
+        let staged_root = first.active_staged_worktree().unwrap().root.clone();
+        let marker = Path::new(&staged_root).join("builder-scratch.txt");
+        std::fs::write(&marker, "a live Builder is working here\n").unwrap();
+
+        // The same request id again, as a timed-out client would resend it.
+        let replayed = register_governed_task(
+            &state,
+            registration(
+                &project_id,
+                repo.path(),
+                &oid,
+                WorldScope::StagedAuthoritative,
+            ),
+            ConnectionClass::Operator,
+        )
+        .expect("a replayed registration must not fail on its own staged path");
+
+        assert_eq!(replayed, first, "the replay returns the recorded task");
+        assert!(
+            marker.exists(),
+            "the replay must not disturb a live Builder's checkout"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "a live Builder is working here\n"
+        );
+        assert_eq!(
+            git(Path::new(&staged_root), &["rev-parse", "HEAD"]),
+            oid,
+            "the staged worktree is untouched"
+        );
+    }
+
+    /// P1-2, second half. A genuinely occupied staged path (a directory that
+    /// outlived an interrupted run, not this task's own replay) still fails
+    /// closed, and the recovery instructions survive to the caller.
+    #[test]
+    fn an_occupied_staged_path_still_fails_closed_with_its_recovery_text() {
+        let (repo, state, project_id, oid) = repo_state();
+        let registration = registration(
+            &project_id,
+            repo.path(),
+            &oid,
+            WorldScope::StagedAuthoritative,
+        );
+        let squatter = repo
+            .path()
+            .join(".impulse")
+            .join("worktrees")
+            .join(registration.task_id.as_str());
+        std::fs::create_dir_all(&squatter).unwrap();
+
+        let error = register_governed_task(&state, registration, ConnectionClass::Operator)
+            .expect_err("a leftover directory is not adoptable");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("already exists"), "{rendered}");
+        assert!(
+            rendered.contains("worktree prune"),
+            "the operator needs the recovery command, not just the symptom: {rendered}"
+        );
+    }
+
+    /// P2-1. The profiled preflight in `handle_governed_task_request` spawns
+    /// `git` inside a caller-supplied path. A non-operator connection must be
+    /// refused before that happens, so this endpoint cannot be used to probe
+    /// the filesystem or start a subprocess pre-capability.
+    #[tokio::test]
+    async fn a_non_operator_staged_registration_is_refused_before_git_runs() {
+        let (repo, state, project_id, oid) = repo_state();
+        let elsewhere = tempfile::Builder::new()
+            .prefix("impulse-not-a-repo-")
+            .tempdir()
+            .unwrap();
+        assert!(
+            !elsewhere.path().join(".git").exists(),
+            "the probe target must not be a Git repository"
+        );
+
+        let mut probing = registration(
+            &project_id,
+            repo.path(),
+            &oid,
+            WorldScope::StagedAuthoritative,
+        );
+        probing.workspace_root = elsewhere.path().display().to_string();
+
+        let response = super::super::handlers::handle_governed_task_request(
+            DaemonRequest::RegisterGovernedTask {
+                registration: probing,
+            },
+            &state,
+            ConnectionClass::NonOperator,
+        )
+        .await;
+        let message = match response {
+            DaemonResponse::Error { message } => message,
+            other => panic!("expected a refusal, received {other:?}"),
+        };
+        assert!(
+            message.contains("operator-class connection"),
+            "expected the class refusal, got: {message}"
+        );
+        assert!(
+            !message.contains("git root discovery") && !message.contains("canonicalize"),
+            "the refusal must land before any filesystem or Git observation: {message}"
+        );
+    }
+
+    /// P2-3. `DaemonClient` retries acknowledged requests, so the first
+    /// response carrying the orphaned-commit warning can be lost. The replay
+    /// must recompute it rather than answering `None`.
+    #[tokio::test]
+    async fn a_replayed_discard_still_names_the_unreferenced_commit() {
+        let (repo, state, project_id, oid) = repo_state();
+        let registered = register_governed_task(
+            &state,
+            registration(
+                &project_id,
+                repo.path(),
+                &oid,
+                WorldScope::StagedAuthoritative,
+            ),
+            ConnectionClass::Operator,
+        )
+        .unwrap();
+        let (accepted, accepted_oid) = accepted_staged_task(&state, registered);
+
+        std::fs::write(repo.path().join("NOTES.md"), "canonical work\n").unwrap();
+        git(repo.path(), &["add", "NOTES.md"]);
+        git(repo.path(), &["commit", "--quiet", "-m", "canonical move"]);
+        let blocked = promote_governed_outcome(
+            &state,
+            promotion_request(&accepted, "replay-discard-promote"),
+            ConnectionClass::Operator,
+        )
+        .await
+        .unwrap()
+        .task;
+
+        let request = discard_request(&blocked, "replay-discard");
+        let first =
+            discard_governed_staged_worktree(&state, request.clone(), ConnectionClass::Operator)
+                .await
+                .unwrap();
+        assert_eq!(
+            first.unreferenced_accepted_commit.as_deref(),
+            Some(accepted_oid.as_str())
+        );
+
+        let replayed = discard_governed_staged_worktree(&state, request, ConnectionClass::Operator)
+            .await
+            .expect("the retry replays the recorded discard");
+        assert_eq!(
+            replayed.unreferenced_accepted_commit.as_deref(),
+            Some(accepted_oid.as_str()),
+            "a lost first response must not cost the operator the warning"
+        );
+        assert_eq!(replayed.discarded_root, first.discarded_root);
+    }
+
+    /// P2-4. The daemon preflights discardability against its own copy of the
+    /// rule because the destructive side effect runs before the mutation the
+    /// state layer enforces. Two copies can drift; this makes drift fail
+    /// loudly rather than silently letting the daemon delete a checkout the
+    /// ledger would then refuse to record.
+    #[test]
+    fn both_discardability_rules_agree_over_the_whole_state_matrix() {
+        use crate::state::staged_worktree_is_discardable as state_layer_rule;
+
+        let base = |review: GovernedReviewState,
+                    execution: GovernedExecutionState,
+                    pin: impulse_ops::governed_task::SharedRepositoryConfigPin,
+                    promotion: Option<GovernedPromotionOutcome>| {
+            let mut task = GovernedTaskRun {
+                id: impulse_ops::governed_task::GovernedTaskId::try_new("task-matrix").unwrap(),
+                revision: 5,
+                project_id: "demo".to_string(),
+                workspace_root: "/tmp/demo".to_string(),
+                task: "matrix".to_string(),
+                acceptance_criteria: vec!["c".to_string()],
+                approval_policy: impulse_ops::governed_task::ApprovalPolicy::OperatorRequired,
+                world_scope: WorldScope::StagedAuthoritative,
+                verification_profile: Some(GovernedVerificationProfile::RustWorkspaceV1),
+                role_assignment: None,
+                role_compatibility: None,
+                runtime_id: "ion".to_string(),
+                agent_id: "worker".to_string(),
+                session_id: None,
+                initial_subject_revision: Some("a".repeat(40)),
+                staged_worktree: Some(impulse_ops::governed_task::StagedWorktree {
+                    id: impulse_ops::governed_task::GovernedRecordId::try_new("staged-m").unwrap(),
+                    actor: staged_system_actor(),
+                    root: "/tmp/demo/.impulse/worktrees/task-matrix".to_string(),
+                    initial_subject_revision: "a".repeat(40),
+                    shared_config_digest: pin,
+                    status: StagedWorktreeStatus::Active,
+                    materialized_at: "2026-09-12T00:00:00Z".to_string(),
+                    based_on_revision: 1,
+                }),
+                promotions: Vec::new(),
+                execution_state: execution,
+                review_state: review,
+                claims: Vec::new(),
+                verifications: Vec::new(),
+                supervisor_verdicts: Vec::new(),
+                operator_decisions: Vec::new(),
+                events: Vec::new(),
+                created_at: "2026-09-12T00:00:00Z".to_string(),
+                updated_at: "2026-09-12T00:00:00Z".to_string(),
+            };
+            if let Some(outcome) = promotion {
+                task.promotions
+                    .push(impulse_ops::governed_task::GovernedPromotion {
+                        id: impulse_ops::governed_task::GovernedRecordId::try_new("promo-m")
+                            .unwrap(),
+                        actor: staged_system_actor(),
+                        accepted_revision: "b".repeat(40),
+                        initial_subject_revision: "a".repeat(40),
+                        outcome,
+                        recorded_at: "2026-09-12T00:00:00Z".to_string(),
+                        based_on_revision: 4,
+                    });
+            }
+            task
+        };
+
+        let pins = [
+            impulse_ops::governed_task::SharedRepositoryConfigPin::Unknown,
+            impulse_ops::governed_task::SharedRepositoryConfigPin::Recorded(
+                impulse_ops::governed_task::SharedRepositoryConfigDigest {
+                    repository_config: format!("sha256:{}", "c".repeat(64)),
+                    worktree_config: None,
+                    info_attributes: None,
+                },
+            ),
+        ];
+        let promotions = [
+            None,
+            Some(GovernedPromotionOutcome::Promoted {
+                promoted_revision: "b".repeat(40),
+            }),
+            Some(GovernedPromotionOutcome::PromotionBlocked {
+                canonical_head: "c".repeat(40),
+                reason: PromotionBlockedReason::CanonicalHeadMoved,
+            }),
+        ];
+        let reviews = [
+            GovernedReviewState::AwaitingClaim,
+            GovernedReviewState::AwaitingVerification,
+            GovernedReviewState::AwaitingSupervisor,
+            GovernedReviewState::AwaitingOperator,
+            GovernedReviewState::ChangesRequested,
+            GovernedReviewState::VerificationFailed,
+            GovernedReviewState::Accepted,
+            GovernedReviewState::Rejected,
+            GovernedReviewState::Escalated,
+        ];
+        let executions = [
+            GovernedExecutionState::Registered,
+            GovernedExecutionState::Running,
+            GovernedExecutionState::LaunchFailed,
+            GovernedExecutionState::RuntimeExited,
+        ];
+
+        let mut compared = 0usize;
+        for review in reviews {
+            for execution in executions {
+                for pin in &pins {
+                    for promotion in &promotions {
+                        let task = base(review, execution, pin.clone(), promotion.clone());
+                        assert_eq!(
+                            staged_worktree_is_discardable(&task),
+                            state_layer_rule(&task),
+                            "the daemon preflight and the state-layer rule disagree for \
+                             review={review:?} execution={execution:?} pin={pin:?} \
+                             promotion={promotion:?}"
+                        );
+                        compared += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            compared,
+            reviews.len() * executions.len() * pins.len() * promotions.len()
+        );
+        assert!(
+            compared >= 200,
+            "the matrix must be exhaustive, not a sample"
+        );
+    }
+
+    /// Nit from review round 1: `roll_back_staged_checkout` has five call sites
+    /// and had no direct coverage. Leaving the administrative entry behind
+    /// would make the operator's retry fail on a path Git still considers
+    /// registered, which is the whole reason it goes through the real discard
+    /// producer rather than `remove_dir_all`.
+    #[test]
+    fn rolling_back_a_checkout_removes_its_administrative_entry_too() {
+        let (repo, _state, project_id, oid) = repo_state();
+        let registration = registration(
+            &project_id,
+            repo.path(),
+            &oid,
+            WorldScope::StagedAuthoritative,
+        );
+        let provisional = provisional_staged_task(&registration).unwrap();
+        let staged = crate::governed_producers::materialize_staged_worktree(&provisional).unwrap();
+        let root = PathBuf::from(&staged.root);
+        assert!(root.exists());
+        assert!(
+            git(repo.path(), &["worktree", "list"]).contains(&staged.root),
+            "the checkout must be registered before the rollback is meaningful"
+        );
+
+        roll_back_staged_checkout(&provisional, &staged);
+
+        assert!(!root.exists(), "the checkout directory is removed");
+        assert!(
+            !git(repo.path(), &["worktree", "list"]).contains(&staged.root),
+            "the administrative entry must go with it, or a retry fails on a \
+             path Git still considers registered"
+        );
+        // Proof that the retry actually works: materializing again succeeds.
+        let again = crate::governed_producers::materialize_staged_worktree(&provisional)
+            .expect("a rolled-back path is reusable");
+        assert_eq!(again.root, staged.root);
     }
 
     #[test]

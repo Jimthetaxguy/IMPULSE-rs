@@ -379,9 +379,7 @@ async fn handle_governed_promote(
                 canonical_head,
                 reason,
             } => {
-                println!(
-                    "  blocked ({reason}): the canonical head is {canonical_head}. The run stays                      accepted and the staged worktree stays active; reconcile the canonical                      branch and retry."
-                );
+                println!("{}", blocked_promotion_line(reason, canonical_head));
             }
         },
         None => println!("  no promotion record was written"),
@@ -415,11 +413,97 @@ async fn handle_governed_discard(
     print_governed_ack(&acknowledged.task, json, "Staged worktree discarded")?;
     println!("  removed: {}", acknowledged.discarded_root);
     if let Some(commit) = &acknowledged.unreferenced_accepted_commit {
-        println!(
-            "  WARNING: the accepted commit {commit} was never promoted onto the canonical              branch, so this discard dropped its only ref. It is reachable through the reflog              until that expires; `git cat-file -p {commit}` recovers it deliberately."
-        );
+        println!("{}", unreferenced_commit_warning(commit));
     }
     Ok(())
+}
+
+/// What an operator is told when a promotion could not move the branch.
+///
+/// A free function rather than an inline `println!` so the wording is testable.
+/// It was previously a wrapped literal with no `\` continuations, which
+/// rustfmt joined into one string carrying a 22-space run in the middle of a
+/// sentence -- in the exact message ADR-0019 requires the surface to get right.
+fn blocked_promotion_line(
+    reason: &impulse_ops::governed_task::PromotionBlockedReason,
+    canonical_head: &str,
+) -> String {
+    format!(
+        "  blocked ({reason}): the canonical head is {canonical_head}. The run stays accepted and the staged worktree stays active; reconcile the canonical branch and retry."
+    )
+}
+
+/// What an operator is told when a discard drops an accepted commit's only ref.
+///
+/// Same reason as [`blocked_promotion_line`] for being a free function: this is
+/// the wording ADR-0019's Consequences require, and it had the same 14-space
+/// run from an unescaped line wrap.
+fn unreferenced_commit_warning(commit: &str) -> String {
+    format!(
+        "  WARNING: the accepted commit {commit} was never promoted onto the canonical branch, so this discard dropped its only ref. It is reachable through the reflog until that expires; `git cat-file -p {commit}` recovers it deliberately."
+    )
+}
+
+#[cfg(test)]
+mod governed_message_tests {
+    use super::{blocked_promotion_line, unreferenced_commit_warning};
+    use impulse_ops::governed_task::{PromotionBlockedReason, SharedConfigComponent};
+
+    /// Both messages were assembled from wrapped literals with no `\`
+    /// continuation, so rustfmt joined them into one string with a run of
+    /// interior spaces. A double space is the cheapest signal that the same
+    /// mistake has come back.
+    #[test]
+    fn test_operator_messages_contain_no_run_of_spaces() {
+        let messages = [
+            blocked_promotion_line(&PromotionBlockedReason::CanonicalHeadMoved, "abc123"),
+            blocked_promotion_line(&PromotionBlockedReason::DetachedHead, "abc123"),
+            blocked_promotion_line(
+                &PromotionBlockedReason::RepositoryConfigChanged {
+                    component: SharedConfigComponent::RepositoryConfig,
+                },
+                "abc123",
+            ),
+            unreferenced_commit_warning("abc123"),
+        ];
+        for message in messages {
+            // The two-space indent every line of this output uses is the only
+            // legitimate run, and it is a prefix.
+            let body = message
+                .strip_prefix("  ")
+                .expect("each operator line is indented by exactly two spaces");
+            assert!(
+                !body.contains("  "),
+                "operator message has a run of spaces: {message:?}"
+            );
+            assert!(!body.contains('\n'), "operator message must be one line");
+        }
+    }
+
+    #[test]
+    fn test_blocked_promotion_line_names_the_reason_and_the_head() {
+        let line = blocked_promotion_line(
+            &PromotionBlockedReason::RepositoryConfigChanged {
+                component: SharedConfigComponent::InfoAttributes,
+            },
+            "deadbeef",
+        );
+        assert!(line.contains("repository_config_changed"));
+        assert!(line.contains(".git/info/attributes"));
+        assert!(line.contains("deadbeef"));
+        assert!(
+            line.contains("stays accepted"),
+            "a blocked promotion must not read as a failed run: {line}"
+        );
+    }
+
+    #[test]
+    fn test_unreferenced_commit_warning_shows_the_oid_and_how_to_recover_it() {
+        let warning = unreferenced_commit_warning("deadbeef");
+        assert!(warning.contains("deadbeef"));
+        assert!(warning.contains("reflog"));
+        assert!(warning.contains("git cat-file -p deadbeef"));
+    }
 }
 
 // ============================================================================
