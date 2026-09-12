@@ -252,10 +252,32 @@ load-bearing". It is load-bearing now. What changed, and what is therefore true 
   request id, the recorded evidence is replayed verbatim and no side effect runs, so there is
   nothing to reserve. That is the case the spec's acceptance criterion names as "a replayed request
   does not re-run cargo".
+- **Replay must be checked before a side effect, not only before a receipt.** Staged materialization
+  is the case that makes this concrete: it creates its checkout *before* the ledger write, so a
+  retry that is not recognized first reaches the producer and fails on a staged path occupied by
+  its own earlier attempt — telling the operator to delete what is in fact a live Builder's
+  checkout. Every producer that mutates the world before it writes its receipt must consult the
+  ledger's receipts first. The three reserved producers get this from
+  `require_producer_request_state`; registration now does it explicitly.
 - **A panic is treated as a crash, not as an error.** `with_reservation` has no `catch_unwind`; the
   wiring adds none. A panic inside a producer closure leaves the reservation open and propagates,
   and is closed either by a real process restart's reconcile or by the revision-scoped duplicate
   check once the task's revision next advances.
+
+**Discard is deliberately *not* reserved, and that is a documented gap, not an omission.**
+`DiscardGovernedStagedWorktree` removes a checkout and then records
+`DiscardStagedWorktree`, which flips the staged record's `status` to `discarded` and appends an
+event. That is a governed-task mutation, so the crash window is real: a daemon that exits between
+the removal and the receipt leaves a record whose `status` is still `active` pointing at a path that
+no longer exists. Two things bound it. The side effect is idempotent on retry — `discard_staged_worktree`
+treats an already-removed checkout as a no-op and the endpoint's replay branch answers from the
+receipt — so an operator who re-issues the request reaches a correct terminal state. And the stale
+record is inert rather than dangerous: `active_staged_worktree()` would hand a launch a missing
+path, but nothing re-launches a task that has already reached a discardable state. It is still
+wrong, and the fix is the same shape as the other three producers: a fourth
+`ProducerKind::Discard` and a `with_reservation` wrap. That needs an added variant in
+`src/state/producer_reservation.rs`, which the daemon-wiring lane does not own, so it is recorded
+here and carried on that lane's handoff list rather than hand-rolled.
 
 **One consequence worth recording because it was not obvious.** Adopting the journal made the
 daemon write `.impulse/PRODUCER_RESERVATIONS.json` on a governed path for the first time. In a

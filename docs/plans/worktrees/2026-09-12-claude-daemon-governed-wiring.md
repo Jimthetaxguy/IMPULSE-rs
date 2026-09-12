@@ -69,10 +69,17 @@ tags: [worktree, lane, handoff, governed, adr-0012, adr-0019]
   record nothing. `impulse_ops::governed_wiring::staged_worktree_is_discardable` mirrors the rule so
   the daemon can refuse first. **Unifying them is a one-line change in a blocked file — see
   handoff.**
-- **2026-09-12: no reservation around discard.** ADR-0012's amendment names verification, Supervisor
-  review, and promotion. Discard's side effect is idempotent (removing a checkout that is already
-  gone is a no-op) and records no evidence, so a reservation would add bookkeeping without closing
-  a window.
+- **2026-09-12: no reservation around discard — corrected in review round 1.** The original
+  rationale here said discard "records no evidence", which is **wrong**: the mutation flips the
+  staged record's `status` to `discarded` and appends an event, so the crash window is real. A
+  daemon that exits between removing the checkout and persisting that receipt leaves a record whose
+  `status` is still `active` pointing at a path that no longer exists. What actually bounds it is
+  narrower and worth stating precisely: the side effect is **idempotent on retry** (removing an
+  already-removed checkout is a no-op, and the endpoint's replay branch answers from the receipt),
+  and the stale record is inert because nothing re-launches a task that has already reached a
+  discardable state. The correct fix is a fourth `ProducerKind::Discard` and a `with_reservation`
+  wrap, which needs a variant added to `src/state/producer_reservation.rs` — a file this lane does
+  not own. It is on the handoff list below and recorded in the ADR-0012 appendix.
 
 ## Changes
 
@@ -152,9 +159,13 @@ New, all passing:
   reservation refuses a second verification with the journal's typed error; an interrupted
   reservation is reconciled, visible on the task's event chain, and the rerun proceeds carrying
   `pending_rerun_reason`; a fresh verification reports none; plus routing and scope refusals.
-- `impulse-rs/tests/daemon_governed_wiring.rs` (3), real daemon over the socket: a raw
+- `impulse-rs/tests/daemon_governed_wiring.rs` (5), real daemon over the socket: a raw
   non-operator connection can neither stage its own world scope nor promote nor discard, and the
-  operator surface can; an unknown task id is refused before any side effect.
+  operator surface can; an unknown task id is refused before any side effect; a replayed staged
+  registration returns the recorded task without disturbing a live Builder's checkout; and a
+  materialization failure reaches the operator with its recovery text intact.
+- `impulse-rs::handlers::daemon_dispatch::governed_message_tests` (3): the two operator-facing
+  messages ADR-0019 requires are one line each with no run of spaces, and say what they must.
 
 ### Gate
 
@@ -164,7 +175,7 @@ Run on this checkout with `CARGO_TARGET_DIR` isolated to
 | Command | Result |
 |---|---|
 | `cargo build --workspace` | clean |
-| `cargo test --workspace` | **2612 passed / 0 failed / 9 ignored** (see per-target table) |
+| `cargo test --workspace` | **2624 passed / 0 failed / 9 ignored** (see per-target table; 2612 before review round 1, +12 regressions) |
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean |
 | `cargo fmt --all -- --check` | clean |
 | `python3 ../docs/validate_docs.py --all` | 4 pre-existing failures only (unchanged) |
@@ -173,8 +184,8 @@ Per-target totals for `cargo test --workspace`, exactly as the command reported 
 
 | Target | passed | failed | ignored |
 |---|---|---|---|
-| `impulse-rs` lib | 1994 | 0 | 5 |
-| `impulse-rs` tests/daemon_governed_wiring (**new**) | 3 | 0 | 0 |
+| `impulse-rs` lib | 2004 | 0 | 5 |
+| `impulse-rs` tests/daemon_governed_wiring (**new**) | 5 | 0 | 0 |
 | `impulse-rs` tests/governed_process_flow | 2 | 0 | 0 |
 | `impulse-rs` tests/governed_staged_worktree | 21 | 0 | 0 |
 | `impulse-rs` tests/socket_actor_provenance | 5 | 0 | 0 |
@@ -279,18 +290,72 @@ Three exact changes this lane needs but did not make, in priority order:
    `governed_producers::is_untracked_impulse_runtime_artifact`, so recording an operator approval
    dirtied the canonical worktree and the very next step for a staged run — promotion — failed on a
    tree the daemon had dirtied itself.
-2. **Unify the discardability rule.** `state/governed_task.rs`'s private
+2. **Add a fourth `ProducerKind::Discard` and wrap the discard endpoint** (`src/state/producer_reservation.rs`,
+   which this lane does not own). `DiscardGovernedStagedWorktree` removes a checkout and then
+   records `DiscardStagedWorktree`, which flips `staged.status` and appends an event — so a crash
+   between the two leaves an `active` record pointing at a missing path. It is bounded (the side
+   effect is idempotent on retry and the stale record is inert, since nothing re-launches an
+   already-discardable task) but it is the same window the other three producers now close. The
+   wrap itself is four lines in `governed_wiring::discard_governed_staged_worktree`, identical in
+   shape to the promote path; only the enum variant is out of reach.
+
+3. **Unify the discardability rule.** `state/governed_task.rs`'s private
    `staged_worktree_is_discardable(task: &GovernedTaskRun) -> bool` is now duplicated as
    `impulse_ops::governed_wiring::staged_worktree_is_discardable`, because the daemon must refuse a
    discard *before* deleting the checkout, not after. The fix is one line: delete the private copy
    and call the `impulse_ops` one. The two are byte-for-byte the same logic today, and both have
    tests; leaving them split risks drift where the daemon allows what the ledger refuses.
-3. **Staged verification end to end is still unproven on this branch.** Per the 2026-09-12
+4. **Staged verification end to end is still unproven on this branch.** Per the 2026-09-12
    coordination note, `run_verification` observes `task.workspace_root`, so a staged task cannot
    pass verification on `8dfd2ab`. This lane's reservation tests therefore run against
    **authoritative** profiled tasks, and its staged tests compose the accepted state through
    `state.mutate_governed_task` directly rather than through the producer chain. PR #53 fixes it;
    the end-to-end test is written and waiting — see "Post-#53 merge checklist" below.
+
+## Review round 1 (2026-09-12)
+
+Adversarial review returned "needs changes" with claims b, c, d, e, f and both clippy fixes
+CONFIRMED, and a live SIGKILL-and-restart proving the reservation path. Every finding below is
+fixed on this branch; each regression was reverted once to watch its test fail.
+
+| Finding | Fix | Proof |
+|---|---|---|
+| **P1-1** `.impulse/MEMORY_CANDIDATES.json` is written by every approval, so the very next promotion sees a dirty canonical tree when `.impulse` is not gitignored. Every `governed_wiring` fixture wrote the full ignore list, so the suite could not reach it. | `git cherry-pick af2f737` from the P1 lane, so both PRs carry byte-identical hunks in the same `matches!` arm. | New `repo_state_without_runtime_ignores()` fixture plus `an_approval_does_not_dirty_the_canonical_tree_for_promotion`, with a negative control asserting Git actually reports the candidate ledger as untracked. Reverting the two exemption lines fails it. |
+| **P1-2** Staged registration was not replay-idempotent: materialization ran before the ledger write, so a retry (a client that timed out on a slow `git worktree add`) hit "path already exists" and never reached the receipt — and the recovery text it produced was actively wrong advice, because the "leftover" directory was a live Builder's checkout. | The request id is checked against the governed ledger's receipts immediately after the class check and before the producer runs; a hit delegates to `register_governed_task`, which fingerprint-checks the replay and returns the recorded task. | `a_replayed_staged_registration_returns_the_recorded_task_and_touches_nothing` (in-process, asserts a Builder's scratch file survives) and `a_replayed_staged_registration_over_the_socket_returns_the_recorded_task` (real daemon, the path the retry actually comes from). Removing the probe fails both. |
+| **P1-2b** `respond_err` rendered `anyhow` with `Display`, collapsing the `.context()` chain, so the producer's recovery instructions never reached the operator. The existing test asserted `{error:#}`, not the wire form. | `handle_governed_task_request` now renders `format!("{error:#}")`. | `a_materialization_failure_reaches_the_operator_with_its_recovery_text` asserts **over the socket** that the message carries both "already exists" and "worktree prune". |
+| **P2-1** `handlers.rs` ran registry evaluation and `observe_clean_git_subject` — which spawns `git` inside a caller-supplied path — before the operator check, so a non-operator connection could probe arbitrary paths and start a subprocess pre-capability. | `require_staged_registration_class` is now the first statement in the `RegisterGovernedTask` arm. `register_governed_task` keeps its own check, so the function stays safe standalone; this is ordering, not relocation. | `a_non_operator_staged_registration_is_refused_before_git_runs` points the registration at a non-Git temp directory and asserts the class refusal, and asserts the message contains no "git root discovery"/"canonicalize" text. |
+| **P2-5** Two operator-facing messages were wrapped string literals with no `\` continuation, which rustfmt joined into single strings carrying 22- and 14-space runs — in exactly the wording ADR-0019 requires the surface to get right. | Extracted to `blocked_promotion_line` and `unreferenced_commit_warning` and joined. | `governed_message_tests`: no run of spaces after the two-space indent, no embedded newline, plus content assertions (the blocked line must say "stays accepted"; the warning must show the OID and `git cat-file -p`). |
+| **P2-3** The discard replay branch answered `unreferenced_accepted_commit: None`, and `DaemonClient` retries acknowledged requests, so a lost first response hid the orphaned-commit warning entirely. | The replay branch recomputes it from the recorded promotion. | `a_replayed_discard_still_names_the_unreferenced_commit`. |
+| **P2-2** Discard has no reservation and this card's rationale was inaccurate. | Documentation option taken this round, as directed: the Decisions entry above is corrected and ADR-0012's appendix now states the crash window, what bounds it (idempotent-on-retry side effect, inert stale record), and that the fix is a fourth `ProducerKind::Discard`. | Handoff item below. |
+| **P2-4** The two `staged_worktree_is_discardable` copies could drift silently. | `state/governed_task.rs`'s copy is now `pub(crate)` (one keyword, commented) and a cross-check test runs both over the same matrix. | `both_discardability_rules_agree_over_the_whole_state_matrix`: 9 review states x 4 execution states x 2 pin states x 3 promotion outcomes = 216 comparisons, with an assertion that the matrix is exhaustive rather than a sample. |
+| **Nit** `roll_back_staged_checkout` had five call sites and no coverage. | — | `rolling_back_a_checkout_removes_its_administrative_entry_too` asserts the directory *and* the Git administrative entry are gone, then proves the path is reusable by materializing again. |
+| **Nit** the dead `b".impulse/worktrees"` arm (no trailing slash). | Left in place. It is in `src/governed_producers.rs`, which the P1 lane owns, and the pair already carries an explanatory comment; touching it would add a hunk to their file for no behavior change. Named here so it is not re-discovered. | — |
+
+### Blocked-path hunks after review round 1
+
+The count is now four. The two clippy one-liners and the `PRODUCER_RESERVATIONS.json` exemption are
+unchanged from the first round; two are new:
+
+4. **`impulse-rs/src/governed_producers.rs`, second hunk** — `git cherry-pick af2f737` from
+   `claude/adr0019-p1-fixes-20260912`, taken verbatim rather than hand-written so both PRs carry
+   byte-identical changes and the eventual merge is a no-op. That commit's own regression test and
+   `staged_registration_at` fixture live in `src/state/governed_task.rs` and depend on its three
+   earlier commits, so they are **not** carried; equivalent coverage lands in this lane's own
+   fixture instead.
+5. **`impulse-rs/src/state/governed_task.rs`** — one keyword, `fn` -> `pub(crate) fn` on
+   `staged_worktree_is_discardable`, with a comment explaining why. Required by P2-4: the drift
+   test cannot compare against a private function. No behavior change.
+
+### Known narrow race, recorded rather than closed
+
+The replay probe added for P1-2 is check-then-act: it consults the ledger's receipts, then
+materializes, then registers. Two *concurrent* registrations carrying the same request id can both
+miss the probe, and one of them then loses — either on the staged path ("already exists") or on the
+ledger's own `AlreadyExists`. It is narrow (one daemon, one project, the same request id sent twice
+at once rather than sequentially), it fails closed rather than corrupting anything, and the loser's
+rollback removes only the checkout it created itself. Closing it properly means reserving the
+registration the same way the three producers reserve, which is the same `ProducerKind` addition
+P2-2 needs.
 
 ## Post-#53 merge checklist
 
