@@ -716,5 +716,15 @@ pub enum Commands {
         /// Refuse the PDF above this many pages.
         #[arg(long)]
         max_pages: usize,
+        /// Memory-watchdog ceiling in bytes (review round 3, F2). Defaults
+        /// to the production ceiling
+        /// (`ion_repl::tool_document::PDF_CHILD_MEMORY_LIMIT_BYTES`) when
+        /// omitted; overridable only so integration tests can prove the
+        /// watchdog actually fires using a small fixture against a small
+        /// ceiling, rather than needing a genuinely gigabyte-scale bomb in
+        /// the default test suite. `RLIMIT_AS` (set by the parent,
+        /// independent of this flag) is unaffected by this override.
+        #[arg(long)]
+        memory_limit_bytes: Option<u64>,
     },
 }

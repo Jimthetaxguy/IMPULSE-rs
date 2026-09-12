@@ -50,6 +50,10 @@ enum IonCommand {
         max_chars: usize,
         #[arg(long)]
         max_pages: usize,
+        /// Memory-watchdog ceiling override in bytes (review round 3, F2);
+        /// see `impulse_rs::cli::Commands::InternalPdfText`'s doc comment.
+        #[arg(long)]
+        memory_limit_bytes: Option<u64>,
     },
 }
 
@@ -75,6 +79,12 @@ async fn main() -> Result<()> {
             path,
             max_chars,
             max_pages,
-        }) => impulse_rs::handlers::internal_pdf_text::run(&path, max_chars, max_pages),
+            memory_limit_bytes,
+        }) => impulse_rs::handlers::internal_pdf_text::run(
+            &path,
+            max_chars,
+            max_pages,
+            memory_limit_bytes,
+        ),
     }
 }

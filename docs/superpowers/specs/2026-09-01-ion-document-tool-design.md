@@ -341,6 +341,100 @@ comment previously claimed "the primary bound is still the sink" -- false, per P
 and `internal_pdf_text.rs`'s module doc gained a note distinguishing what `BoundedSink` bounds
 (output volume, wall clock) from what `preflight_pdf_streams` bounds (memory).
 
+### Review round 3 (2026-09-12): the parent still parsed PDF structure, and the preflight missed LZW
+
+A third adversarial pass refuted round 2's memory bound twice more, found a related false refusal,
+and found the total cap refused ordinary documents. All five findings share one root cause: only
+the child may ever touch PDF structure, and everything the preflight cannot bound-count must be
+refused, not silently skipped.
+
+- **F0 (P0).** `precheck_pdf` (the parent's "cheap" page count) called `pdf_extract::Document::load`
+  IN THE PARENT before `preflight_pdf_streams` ran. `lopdf::Document::load` eagerly, unconditionally
+  decompresses every `/Type /ObjStm` object stream as part of loading, with no hook to intercept or
+  bound it -- so a crafted ObjStm blew up the PARENT itself before any preflight ever got a chance
+  to refuse it. The review's `objstm_bomb2g.pdf` (2.04 MB on disk) drove the PARENT to 2,078 MB RSS
+  and still reported "OK"; it scales to ~10 GB at the 10 MiB source-file cap. Fix, structural: the
+  parent's ENTIRE PDF-specific job before spawning the child is now `pdf_encryption_prescan` -- a
+  raw byte scan for `/Encrypt`, nothing else. `precheck_pdf` is deleted. Page count, the
+  trailer-based encryption re-check, `preflight_pdf_streams`, and rendering all moved into
+  `handlers::internal_pdf_text`, which is now sole and authoritative for all PDF structure parsing.
+- **F2.** Even confined to the child, `Document::load`'s eager ObjStm inflation cannot be
+  pre-counted -- there is no hook between "lopdf decides to inflate an object stream" and "lopdf has
+  already inflated it." `RLIMIT_AS` (the round-1 defense-in-depth layer) turned out to be accepted
+  but silently NOT kernel-enforced on macOS (`setrlimit` returns success; a 1 GiB limit let a child
+  reach 4.12 GiB RSS in testing) -- so on the primary development platform, the child had no memory
+  bound at all for this path. Fix: a memory-watchdog background thread
+  (`spawn_memory_watchdog`/`current_peak_rss_bytes`), started before any PDF parsing, polling this
+  process's own peak RSS (`getrusage`, normalized for the BYTES-on-macOS/KILOBYTES-on-Linux
+  `ru_maxrss` unit inconsistency) roughly every 10ms and self-terminating via
+  `std::process::exit(PDF_MEMORY_CEILING_EXIT_CODE = 137)` the instant it crosses
+  `PDF_CHILD_MEMORY_LIMIT_BYTES` (kept at 1 GiB). The parent checks this specific exit code BEFORE
+  its generic signal check, mapping it to a typed "exceeded its memory ceiling" error rather than a
+  generic parse failure. `RLIMIT_AS` stays as real, kernel-enforced defense-in-depth on Linux; on
+  macOS, isolation is honestly "crash containment plus the watchdog," not "RLIMIT_AS" -- documented
+  as such rather than implied otherwise. Reproduced on the review's own `objstm_bomb2g.pdf`: the
+  child now peaks at ~1.08 GB RSS (bounded near the ceiling, not the review's original unbounded
+  2+ GB) and exits 137; the parent's own RSS stays negligible throughout, since it never touches the
+  file's PDF structure at all.
+- **F1 (P1).** `preflight_pdf_streams` only ever counted `FlateDecode` streams. `lopdf` decodes
+  `/LZWDecode` exactly as readily; the review's `lzwmulti300.pdf` (1.65 MB) reached 4.12 GiB child
+  RSS while the preflight still reported "OK". Fix: the preflight now walks each stream's FULL
+  filter chain via `Stream::filters()` (lopdf's public, decode-ordered accessor) rather than just
+  checking for a bare `FlateDecode` name: a terminal `FlateDecode` or `LZWDecode` stage is
+  bound-counted through a streaming decoder (`inflate_bounded_zlib`/`inflate_bounded_lzw`, the
+  latter via `weezl::decode::Decoder::with_tiff_size_switch(BitOrder::Msb, 8)`, matching `lopdf`'s
+  own internal parameters exactly so it decodes the identical byte stream). Reproduced on the
+  review's own `lzwmulti300.pdf`: now refused via the TOTAL cap (`... inflates to more than
+  536870912 bytes combined, over the limit`) at ~25 MB peak RSS in ~1.85s, not 4+ GB.
+- **F3.** A direct consequence of F1's fix, and a real correctness gap it closed along the way: a
+  `[/ASCII85Decode /FlateDecode]` filter CHAIN was previously refused with "corrupt deflate stream"
+  on any legitimate document using it, because the still-ASCII85-encoded outer bytes were fed
+  straight to zlib. Fix: an outer `ASCII85Decode`/`ASCIIHexDecode` layer is now fully decoded first
+  (bounded, cheap -- roughly 5:4/2:1 expansion, and stream content is already bounded by the 10 MiB
+  source-file cap), and the RESULT fed to the terminal Flate/LZW bounded decoder. Reproduced on the
+  review's own `chain_a85_flate_legit.pdf`: previously refused, now extracts successfully; the
+  matching bomb variant `chain_a85_flate.pdf` is still correctly refused. Any filter this preflight
+  cannot bound-count at all (`RunLengthDecode`, `DCTDecode`, `JPXDecode`, `CCITTFaxDecode`, `Crypt`,
+  or anything chained after a terminal Flate/LZW stage) is now refused BY NAME -- deny-by-default,
+  not silently skipped the way every non-`FlateDecode` filter was in round 2. Reproduced on the
+  review's own `rlbomb.pdf` (`RunLengthDecode`): refused naming the filter, at ~20 MB peak RSS.
+- **F4.** The round-2 64 MiB TOTAL cap refused ordinary documents -- a 900-page, 2.87 MB
+  Flate-compressed text PDF inflates to 73.6 MB, over the old cap -- while the round-2 "legitimacy"
+  fixture (`legit10m.pdf`) has NO compressed streams at all, so it never actually exercised this cap
+  either way. Fix: the per-stream cap stays 64 MiB (`MAX_PDF_STREAM_DECOMPRESSED_BYTES`); the total
+  cap rises to 512 MiB (`MAX_PDF_TOTAL_DECOMPRESSED_BYTES`), justified against
+  [`MAX_DOCUMENT_BYTES`] (10 MiB source-file cap: 512 MiB is a ~51x expansion ceiling on the largest
+  input this tool ever reads) and the separate, independent `MAX_EXTRACTED_CHARS` budget (16 million
+  characters of FINAL output text is capped regardless of how much raw decompressed PDF-operator
+  bytes it took to render that much). A new fixture (`write_legit_multi_page_flate_pdf`, 25
+  genuinely Flate-compressed pages) proves the raised cap actually admits large real documents,
+  extracting successfully; the round-2 bombs (`textbomb500.pdf`/`textbomb2g.pdf`) still refuse
+  correctly. (The review's own `legit64.pdf` fixture was also reproduced, but its Python generator
+  has an unrelated pre-existing bug -- `/F1`'s font reference resolves to the Pages object, not a
+  Font -- which panics `pdf_extract::get_name_string` during rendering regardless of this fix;
+  isolation still contains it cleanly, exit 101, the parent surfaces a typed parse error, ~34 MB
+  peak RSS, no memory blowup. Not a security regression, and out of scope to patch a third-party
+  crate's font-resolution panic; the new purpose-built fixture proves F4's actual claim instead.)
+- **F5 (doc corrections, no code change).** Two round-2 doc numbers were re-measured and corrected.
+  The production stdout cap for the DEFAULT budget (16,000,000 chars / 4,096 pages) is exactly
+  128,266,240 bytes (`max_child_stdout_bytes`'s formula, derived from `MAX_EXTRACTED_CHARS`, not
+  from whatever `max_chars` a caller happens to pass) -- this was already correct, just previously
+  understated in prose. Parent RSS on a rogue child (`tests/fakes/rogue-stdout-shim.sh`) through the
+  DEFAULT budget (not an artificially small one) measures ~139 MB, not the ~9.3 MB an earlier,
+  smaller-budget-only measurement implied -- both numbers are real, they were just measuring
+  different budgets; the ~139 MB figure is the one a production caller actually experiences.
+
+Two structural additions from this pass, beyond the fixes themselves: a `weezl` direct dependency
+(already transitively present via `lopdf`/`gif`/`tiff` at the same 0.1.x line, so no new download or
+version conflict) for the bounded LZW decoder, and a `--memory-limit-bytes` hidden CLI flag on
+`internal-pdf-text` (`Option<u64>`, defaulting to the production ceiling when omitted) so integration
+tests can prove the watchdog mechanism fires end to end, through the real parent exit-code mapping,
+using a small fixture against a small injected ceiling rather than needing a genuinely gigabyte-scale
+bomb in the default test suite (`extract_pdf_with_exe_timeout_and_memory_limit` is the corresponding
+Rust-side seam, mirroring the existing exe/timeout injection pattern). `RLIMIT_AS` is deliberately
+NOT affected by this override, so a test using a low injected ceiling exercises the watchdog
+specifically, never `RLIMIT_AS`.
+
 ### Fixture table
 
 | Fixture | Proves |
@@ -369,6 +463,10 @@ and `internal_pdf_text.rs`'s module doc gained a note distinguishing what `Bound
 | A PDF whose trailer names `/Encr#79pt` (ISO 32000-1 §7.3.5 hex escape) instead of the literal `/Encrypt` | the same encrypted-PDF refusal as the literal form -- proves the scan decodes name escapes, not just literal bytes |
 | The identical literal text `/Encrypt`, once in an uncompressed content stream and once in a `FlateDecode`-compressed one | refused in the first case (false positive, documented and accepted), parses normally in the second -- the scan operates on raw file bytes only |
 | `memory_search`/`genome_read`, called through the real `DynamicToolBridge`/`ToolRegistry::execute` path with an explicit `impulse_dir` outside the sandbox | refused by `validate_paths` before either tool's own `execute` runs; the identical path granted via `/allow` succeeds |
+| A raw-bytes-constructed PDF whose Catalog/Pages/Page/Font all live inside one `/Type /ObjStm` object stream, padded with an ignored comment, run through the real tool with a small INJECTED memory-watchdog ceiling (`extract_pdf_with_exe_timeout_and_memory_limit`) | the typed "exceeded its memory ceiling" refusal; the same fixture succeeds under a generous injected ceiling, proving the refusal is specifically the watchdog, not an unrelated parse error |
+| An 80 MB (decoded) `LZWDecode`-filtered stream, run through the real tool at PRODUCTION caps | the typed "over the limit" refusal, end to end (not just at the unit-level `preflight_pdf_streams` seam) |
+| A `[/ASCII85Decode /FlateDecode]` chain over legitimate, small compressed text, run through the real tool | extracts successfully (previously refused with "corrupt deflate stream") |
+| A 25-page, genuinely Flate-compressed legitimate document whose combined inflated size clears the OLD 64 MiB total cap but stays under the new 512 MiB one | extracts successfully, all 25 page sections present |
 
 ## Out of scope
 

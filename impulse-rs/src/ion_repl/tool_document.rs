@@ -49,22 +49,33 @@
 //!   crashes `pdf-extract`'s content-stream interpreter via stack-overflow
 //!   abort, which `spawn_blocking`'s `JoinError` containment cannot catch
 //!   (an abort, not an unwinding panic) -- isolation is what keeps that
-//!   contained to the child. Page count is checked in-process first (cheap,
-//!   already hardened against page-tree cycles) and refused above
-//!   [`MAX_PDF_PAGES`] before any page is rendered; inside the child, each
-//!   page's text is checked against the character budget *per write*, not
-//!   once per page after the fact (true check-before-push, the same
-//!   discipline as the workbook and Word streamers, and the fix for a
-//!   second review finding: an unbounded per-page sink previously reached
-//!   multiple GB of RSS on a small crafted file); only the text layer is
-//!   ever read (`PlainTextOutput` has no image-handling code path at all,
-//!   so an image never reaches this tool's output, and neither does
-//!   annotation/`AcroForm` text, which lives outside a page's own
-//!   `/Contents` stream); an encrypted PDF is refused via a raw byte scan
-//!   for `/Encrypt` in the trailer, run before any parser touches the file
-//!   -- `lopdf::Document::load` silently authenticates a PDF whose *user*
-//!   password is empty, so `doc.is_encrypted()` after loading cannot be
-//!   trusted, and this tool makes no password attempt of any kind;
+//!   contained to the child. **Review round 3 (F0):** the parent no longer
+//!   parses PDF structure AT ALL, not even for a cheap page count -- a
+//!   prior version called `pdf_extract::Document::load` in-process for
+//!   exactly that, and `lopdf`'s eager, unconditional decompression of
+//!   `/Type /ObjStm` object streams during `load` blew up the PARENT itself
+//!   on a crafted file well before any downstream check could run. The
+//!   parent's ENTIRE PDF-specific job before spawning the child is now a
+//!   raw byte scan for `/Encrypt`; page count, the trailer-based encryption
+//!   re-check, the stream-inflation preflight (now covering `FlateDecode`
+//!   *and* `LZWDecode`, including an outer `ASCII85Decode`/`ASCIIHexDecode`
+//!   layer, deny-by-default for any other filter), and rendering are all
+//!   exclusively the child's job, backed by a memory-watchdog thread that
+//!   is the real ceiling on macOS (`RLIMIT_AS` is accepted but not
+//!   kernel-enforced there). Inside the child, each page's text is checked
+//!   against the character budget *per write*, not once per page after the
+//!   fact (true check-before-push, the same discipline as the workbook and
+//!   Word streamers, and the fix for a review round 1 finding: an unbounded
+//!   per-page sink previously reached multiple GB of RSS on a small crafted
+//!   file); only the text layer is ever read (`PlainTextOutput` has no
+//!   image-handling code path at all, so an image never reaches this
+//!   tool's output, and neither does annotation/`AcroForm` text, which
+//!   lives outside a page's own `/Contents` stream); an encrypted PDF is
+//!   refused via a raw byte scan for `/Encrypt` in the trailer, run before
+//!   any parser touches the file -- `lopdf::Document::load` silently
+//!   authenticates a PDF whose *user* password is empty, so
+//!   `doc.is_encrypted()` after loading cannot be trusted, and this tool
+//!   makes no password attempt of any kind;
 //! - `txt`/`md` are read whole (already bounded by [`MAX_DOCUMENT_BYTES`])
 //!   and require valid UTF-8, refused with a typed error otherwise (this
 //!   tool does not guess an encoding or lossily replace invalid bytes);
@@ -1136,27 +1147,80 @@ pub fn extract_word(path: &Path, raw: &str, budget: ExtractBudget) -> Result<Par
 /// streamer that can loop or recurse on attacker-controlled structure the
 /// way a PDF's Form XObjects can (review round 1, item 3).
 const PDF_CHILD_TIMEOUT_SECS: u64 = 30;
-/// Soft/hard `RLIMIT_AS` ceiling for the isolated PDF-extraction child, in
-/// bytes -- one more layer among several, not the memory bound.
+/// Memory ceiling for the isolated PDF-extraction child, in bytes -- checked
+/// two structurally different ways depending on platform, both enforced
+/// entirely inside the child (`handlers::internal_pdf_text`).
 ///
 /// **Correction (review round 2):** an earlier version of this comment
 /// claimed "the primary bound is still the sink" -- FALSIFIED.
-/// `internal_pdf_text::BoundedSink` bounds OUTPUT VOLUME and WALL CLOCK; it
-/// was never a memory bound, and measurably is not one: a `FlateDecode`
-/// content stream inflates before any sink write ever runs (`pdf-extract`'s
-/// own internal decompression is unbounded), so a small compressed stream
-/// reached multiple GB of RSS regardless of how small the character budget
-/// was set. [`preflight_pdf_streams`] -- which discards inflated bytes as
-/// it counts them, refusing before any page renders -- is what actually
-/// bounds memory. `RLIMIT_AS` here is a THIRD, best-effort layer on top of
-/// both (not fully kernel-enforced on macOS, where `setrlimit` accepts it
-/// but does not enforce it the way Linux does; real enforcement is Linux).
-/// Isolation (this whole child process) bounds blast radius on top of all
-/// three. Measured after the preflight fix: the review's own
-/// `textbomb500.pdf` (1.05 MB) peaks at ~13 MB RSS in ~0.56s;
-/// `textbomb2g.pdf` (4.2 MB) peaks at ~22 MB RSS in ~0.03s -- both refused
-/// by the preflight before any page rendering begins.
-const PDF_CHILD_MEMORY_LIMIT_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
+/// `internal_pdf_text::BoundedSink` bounds OUTPUT VOLUME and WALL CLOCK, not
+/// memory.
+///
+/// **Correction (review round 3, F0/F2 -- FALSIFIED AGAIN, more deeply):**
+/// round 2's fix (`preflight_pdf_streams`, run in the PARENT against an
+/// already-`Document::load`-ed doc) was itself refuted twice. First
+/// (F0/P0): `lopdf::Document::load` eagerly decompresses every `/Type
+/// /ObjStm` object stream DURING LOAD, storing the inflated bytes back into
+/// the object with `/Filter` stripped -- so by the time any preflight could
+/// run, the memory had already been spent, and the preflight counted zero
+/// for it (a 2.04 MB `objstm_bomb2g.pdf` drove the PARENT itself to 2,078 MB
+/// RSS before the preflight ever got a chance to refuse). Running
+/// `Document::load` in the parent at all was the bug: an attacker-controlled
+/// PDF's structure must never be parsed outside the isolated child. Second
+/// (F1/P1): the preflight only ever counted `FlateDecode` streams;
+/// `LZWDecode` streams (which `lopdf` decodes exactly as readily) were not
+/// counted at all (`lzwmulti300.pdf`, 1.65 MB, reached 4.12 GiB child RSS
+/// while still reporting "OK").
+///
+/// **The round-3 architecture, honestly split by which layer actually
+/// bounds which attack:**
+/// - `Document::load`'s OWN eager ObjStm inflation cannot be intercepted or
+///   pre-counted at all (there is no hook between "lopdf decides to inflate
+///   an object stream" and "lopdf has already inflated it") -- it is bounded
+///   **only** by [`crate::handlers::internal_pdf_text`]'s memory-watchdog
+///   thread, which polls this process's own peak RSS (`getrusage`) roughly
+///   every 10ms and self-terminates the instant it crosses this ceiling.
+/// - Every OTHER stream (a page/Form-XObject content stream, or any stream
+///   object not routed through an ObjStm) is bounded by the extended
+///   `preflight_pdf_streams` -- now living in the child, after `load`, walking
+///   each stream's filter chain (`FlateDecode`, `LZWDecode`, and an outer
+///   `ASCII85Decode`/`ASCIIHexDecode` layer feeding either) and refusing
+///   before any page renders. Any OTHER filter this preflight cannot count
+///   is refused by name (deny-by-default), rather than silently skipped.
+/// - `RLIMIT_AS`, set by the parent (`run_pdf_extraction_child`, below) via
+///   `pre_exec`, is real, kernel-enforced defense-in-depth on Linux -- but
+///   is accepted and silently NOT enforced by macOS's `setrlimit` (confirmed
+///   empirically: a 1 GiB `RLIMIT_AS` let a child reach 4.12 GiB RSS on
+///   macOS). **On macOS specifically, isolation is "crash containment plus
+///   the watchdog," not "RLIMIT_AS."**
+/// - Process isolation (this whole child) bounds blast radius on top of all
+///   three: whichever layer catches an attack, only the child dies.
+///
+/// 1 GiB (unchanged from round 2) is sized with headroom above the new 512
+/// MiB total-decompressed-bytes cap (`internal_pdf_text::
+/// MAX_PDF_TOTAL_DECOMPRESSED_BYTES`, review round 3 F4): decompressed text
+/// plus the raw source file (<= [`MAX_DOCUMENT_BYTES`]) plus this process's
+/// own JSON-serialized stdout buffer (up to ~128 MB for the default budget,
+/// see [`max_child_stdout_bytes`]) plus baseline process/allocator overhead
+/// comfortably fits under 1 GiB for any legitimate document the preflight
+/// accepts, while still being a real ceiling against anything that gets
+/// past it.
+pub(crate) const PDF_CHILD_MEMORY_LIMIT_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
+
+/// Exit code [`crate::handlers::internal_pdf_text`]'s memory watchdog uses
+/// via `std::process::exit` the instant it observes this process's own peak
+/// RSS cross [`PDF_CHILD_MEMORY_LIMIT_BYTES`] (review round 3, F2) --
+/// distinct from a normal error exit (`1`) or a crash signal, so
+/// [`run_pdf_extraction_child`] can tell "the watchdog fired" apart from
+/// every other failure mode and report a specific "exceeded memory ceiling"
+/// error rather than folding it into the generic parse-failure message.
+/// Defined once here (the parent) and referenced from the child so the two
+/// processes can never drift out of agreement on the value. `137` mirrors
+/// the shell convention for "killed by signal 9" (`128 + 9`); this is a
+/// deliberate, in-process self-exit, not an actual `SIGKILL`, but the same
+/// numeric convention makes it immediately legible to anyone used to POSIX
+/// exit codes.
+pub(crate) const PDF_MEMORY_CEILING_EXIT_CODE: i32 = 137;
 
 /// One page's text as reported by the `internal-pdf-text` child (review
 /// round 1, P0-1/P0-2). Shared with `handlers::internal_pdf_text` so parent
@@ -1208,9 +1272,9 @@ fn decode_pdf_name_token(bytes: &[u8]) -> Vec<u8> {
 /// Cheap, conservative refusal check for a PDF whose trailer declares
 /// `/Encrypt`, run against the RAW file bytes before any parser sees them.
 ///
-/// **Review round 1, P2-1:** `lopdf::Document::load` -- used both by
-/// [`precheck_pdf`] below and independently by the isolated extraction
-/// child -- unconditionally tries an EMPTY user password first
+/// **Review round 1, P2-1:** `lopdf::Document::load` -- called only inside
+/// the isolated extraction child (review round 3, F0: never in this
+/// process) -- unconditionally tries an EMPTY user password first
 /// (`authenticate_and_setup_encryption`'s first branch in lopdf's reader)
 /// and silently decrypts on success. An empty user password is a common
 /// real-world case (owner-password-only protection, e.g. "printable but
@@ -1255,138 +1319,28 @@ pub(crate) fn pdf_declares_encryption(bytes: &[u8]) -> bool {
         .any(|(i, _)| decode_pdf_name_token(&bytes[i + 1..]) == b"Encrypt")
 }
 
-/// Largest total inflated bytes every `FlateDecode` stream object in a PDF
-/// may produce combined, mirroring [`MAX_DECOMPRESSED_BYTES`] (the
-/// analogous zip-container cap `xlsx`/`docx` already enforce) for the PDF
-/// version of the same vulnerability class.
-pub const MAX_PDF_DECOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
-/// Per-stream inflation cap: generous for any legitimate single page/Form
-/// XObject content stream (review round 2's own 600-page, 9.9 MB
-/// legitimate fixture rendered fine well under this), far below what a
-/// pathological single stream can otherwise reach.
-pub const MAX_PDF_STREAM_DECOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
-
-/// Inflates `compressed` through a streaming zlib decoder, discarding each
-/// chunk immediately after counting it rather than accumulating output, so
-/// peak memory for this call is the decoder's own internal window plus one
-/// small read buffer -- never proportional to how much the stream would
-/// actually inflate to. Refuses once the running total exceeds `cap`.
-fn inflate_bounded(compressed: &[u8], cap: u64) -> Result<u64> {
-    use std::io::Read as _;
-    let mut decoder = flate2::read::ZlibDecoder::new(compressed);
-    let mut buf = [0u8; 64 * 1024];
-    let mut total = 0u64;
-    loop {
-        let n = decoder
-            .read(&mut buf)
-            .map_err(|e| anyhow::anyhow!("could not inflate PDF stream: {e}"))?;
-        if n == 0 {
-            break;
-        }
-        total += n as u64;
-        if total > cap {
-            bail!("PDF stream inflates to more than {cap} bytes, over the limit");
-        }
-    }
-    Ok(total)
-}
-
-/// `true` when `dict`'s `/Filter` entry names (or includes, in a filter
-/// chain array) `FlateDecode` -- the PDF ecosystem's dominant stream
-/// filter, and the one review round 2's actual compression-bomb attack
-/// uses.
-fn stream_uses_flate_decode(dict: &pdf_extract::Dictionary) -> bool {
-    match dict.get(b"Filter") {
-        Ok(pdf_extract::Object::Name(name)) => name == b"FlateDecode",
-        Ok(pdf_extract::Object::Array(names)) => names
-            .iter()
-            .any(|n| matches!(n, pdf_extract::Object::Name(name) if name == b"FlateDecode")),
-        _ => false,
-    }
-}
-
-/// Inflates every `FlateDecode`-filtered stream object in `doc` once,
-/// through [`inflate_bounded`], before any page is rendered -- the PDF
-/// analogue of `preflight_container`'s zip-container check.
+/// The parent-side pre-flight before spawning the extraction child (review
+/// round 3, F0): reads the raw file bytes and runs ONLY the byte-level
+/// `/Encrypt` scan above -- never `pdf_extract::Document::load` or anything
+/// else that parses attacker-controlled PDF structure. That parsing (page
+/// count, the trailer-based encryption re-check, the stream-inflation
+/// preflight, and rendering) now happens exclusively inside the isolated
+/// child process (`handlers::internal_pdf_text::extract`), which is
+/// authoritative for all of it -- this function exists only to reject an
+/// obviously-encrypted file cheaply, before paying the cost of a subprocess
+/// spawn, not as a security boundary the child may skip.
 ///
-/// **Review round 2, P2 (CONFIRMED):** `pdf-extract`'s own internal
-/// decompression of a stream's content -- which happens lazily, the moment
-/// a page or Form XObject's content stream is actually read for rendering,
-/// deep inside `output_doc_page`, well after `BoundedSink`'s first write
-/// could ever run -- is itself completely unbounded. A crafted PDF
-/// declaring one `FlateDecode` stream inflated to 476x its compressed size
-/// on the review's own fixture, reaching multiple GB of RSS regardless of
-/// how small `max_chars` was set, since the character budget was never the
-/// bound that mattered: **`BoundedSink` bounds output volume and wall
-/// clock, not memory. This preflight is what actually bounds memory.**
-/// Isolation (the child process) bounds blast radius on top of both.
-///
-/// Refuses with a typed error if a single stream or the combined total
-/// exceeds its cap. Streams under any OTHER declared filter (`LZWDecode`,
-/// `ASCII85Decode`, `RunLengthDecode`, `DCTDecode`, none) are not
-/// independently bounded here -- a documented limitation: `FlateDecode` is
-/// both the dominant real-world filter and the one this attack class
-/// actually uses, and the alternatives either cannot reach comparable
-/// inflation ratios (`ASCII85Decode`/`RunLengthDecode` are a few times
-/// larger at most) or are not text-content filters at all (`DCTDecode` is
-/// JPEG image data `PlainTextOutput` never reads).
-pub fn preflight_pdf_streams(doc: &pdf_extract::Document, raw: &str) -> Result<()> {
-    preflight_pdf_streams_with_caps(
-        doc,
-        raw,
-        MAX_PDF_STREAM_DECOMPRESSED_BYTES,
-        MAX_PDF_DECOMPRESSED_BYTES,
-    )
-}
-
-/// [`preflight_pdf_streams`] with explicit per-stream/total caps; the test
-/// seam (compressing a fixture large enough to exceed the real 64 MiB caps
-/// would be slow for no extra coverage).
-pub fn preflight_pdf_streams_with_caps(
-    doc: &pdf_extract::Document,
-    raw: &str,
-    per_stream_cap: u64,
-    total_cap: u64,
-) -> Result<()> {
-    let mut total: u64 = 0;
-    for object in doc.objects.values() {
-        let pdf_extract::Object::Stream(stream) = object else {
-            continue;
-        };
-        if !stream_uses_flate_decode(&stream.dict) {
-            continue;
-        }
-        let inflated = inflate_bounded(&stream.content, per_stream_cap)
-            .map_err(|e| anyhow::anyhow!("document_read: '{raw}' could not be parsed: {e}"))?;
-        total = total.saturating_add(inflated);
-        if total > total_cap {
-            bail!(
-                "document_read: '{raw}' PDF stream content inflates to more than {total_cap} \
-                 bytes combined, over the limit"
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Cheap, safe pre-checks run in-process: the raw encryption scan above,
-/// then the page count via `lopdf::Document::get_pages` -- walking the page
-/// tree once, no text extraction. Review round 1's adversarial pass
-/// confirmed this path is already hardened against reference cycles,
-/// 50k-deep `Kids` nesting, and 180k objects. The operation that is NOT
-/// safe here -- rendering one page's content stream into text -- never
-/// happens in this function; it happens only inside the isolated child
-/// process [`run_pdf_extraction_child`] spawns.
-///
-/// **Belt and braces (review round 2):** after `Document::load`, this also
-/// re-asserts directly against the PARSED trailer dictionary
-/// (`doc.trailer.get(b"Encrypt")`) that no `Encrypt` key exists, rather
-/// than relying solely on the raw byte scan or on `doc.is_encrypted()`
-/// (unreliable per P2-1 above). `lopdf`'s auto-decrypt-on-load transparently
-/// decrypts object CONTENTS but does not remove the trailer's `/Encrypt`
-/// reference itself, so this check catches the same case as the byte scan
-/// through a structurally independent path.
-fn precheck_pdf(path: &Path, raw: &str) -> Result<usize> {
+/// **Why this moved (review round 3, F0, P0, CONFIRMED):** the previous
+/// `precheck_pdf` called `pdf_extract::Document::load` in THIS process to
+/// get a cheap page count ahead of the child. But `lopdf::Document::load`
+/// eagerly decompresses every `/Type /ObjStm` object stream as part of
+/// loading -- unconditionally, with no hook to intercept or bound it -- so
+/// a small file whose ObjStm inflates to gigabytes blew up the PARENT
+/// itself before any preflight downstream ever ran (`objstm_bomb2g.pdf`,
+/// 2.04 MB on disk, drove the parent to 2,078 MB RSS and still reported
+/// "OK"). The parent must never be the process that parses PDF structure;
+/// only the isolated, watchdog-guarded, crash-contained child may.
+fn pdf_encryption_prescan(path: &Path, raw: &str) -> Result<()> {
     let bytes =
         std::fs::read(path).with_context(|| format!("document_read: '{raw}' could not be read"))?;
     if pdf_declares_encryption(&bytes) {
@@ -1396,17 +1350,7 @@ fn precheck_pdf(path: &Path, raw: &str) -> Result<usize> {
              protection and try again"
         );
     }
-    let doc = pdf_extract::Document::load(path)
-        .map_err(|e| anyhow::anyhow!("document_read: '{raw}' could not be parsed: {e}"))?;
-    if doc.trailer.get(b"Encrypt").is_ok() {
-        bail!(
-            "document_read: '{raw}' is an encrypted PDF, which this tool does not support \
-             (it never attempts a password, including an empty one); remove the password \
-             protection and try again"
-        );
-    }
-    preflight_pdf_streams(&doc, raw)?;
-    Ok(doc.get_pages().len())
+    Ok(())
 }
 
 /// Reads a PDF's text layer, isolating the actual page-rendering step in a
@@ -1441,14 +1385,18 @@ fn precheck_pdf(path: &Path, raw: &str) -> Result<usize> {
 /// writes as it goes), not once per page after the fact -- true
 /// check-before-push, the discipline `extract_workbook`/`extract_word`
 /// already apply. Process isolation on top is what makes an RSS ceiling
-/// (`PDF_CHILD_MEMORY_LIMIT_BYTES` via `RLIMIT_AS`) safe to add as a second
-/// layer: killing a child's memory-bloated process is harmless; doing the
-/// same to `ion` itself would not be.
+/// (`PDF_CHILD_MEMORY_LIMIT_BYTES`, enforced by the child's own memory
+/// watchdog thread plus `RLIMIT_AS` where the platform honors it) safe to
+/// add as a second layer: killing a child's memory-bloated process is
+/// harmless; doing the same to `ion` itself would not be.
 ///
 /// A PDF whose page count exceeds [`MAX_PDF_PAGES`] is refused before any
-/// page is rendered, in-process (see [`precheck_pdf`]), the same way
-/// `preflight_container` measures a zip container's inflated size before a
-/// parser runs.
+/// page is rendered -- **inside the child**, not here (review round 3, F0):
+/// the parent never parses PDF structure at all, so it cannot know the page
+/// count in advance; `handlers::internal_pdf_text::extract` enforces this
+/// cap itself, authoritatively, immediately after `Document::load` and
+/// before rendering any page, the same way `preflight_container` measures a
+/// zip container's inflated size before a parser runs.
 ///
 /// A page with no extractable text (common for a scanned/image-only PDF)
 /// contributes no line and no section, exactly like a blank Word paragraph;
@@ -1506,19 +1454,62 @@ pub async fn extract_pdf_with_exe_and_timeout(
     exe: &Path,
     timeout: std::time::Duration,
 ) -> Result<ParsedDocument> {
-    let page_count = {
+    extract_pdf_with_exe_timeout_and_memory_limit(
+        path,
+        raw,
+        budget,
+        max_pages,
+        exe,
+        timeout,
+        PDF_CHILD_MEMORY_LIMIT_BYTES,
+    )
+    .await
+}
+
+/// [`extract_pdf_with_exe_and_timeout`] with the child's memory-watchdog
+/// ceiling also injectable -- a second test seam (review round 3, F2),
+/// mirroring the existing exe/timeout injection pattern exactly. Lets a
+/// test prove the watchdog fires end to end, through the REAL parent
+/// exit-code mapping in [`run_pdf_extraction_child`], using a small
+/// fixture against a small ceiling rather than needing a genuinely
+/// gigabyte-scale bomb in the default test suite. `RLIMIT_AS` (set
+/// unconditionally to [`PDF_CHILD_MEMORY_LIMIT_BYTES`] in
+/// [`run_pdf_extraction_child`]'s `pre_exec`) is deliberately NOT affected
+/// by this override, so a test using a low `memory_limit_bytes` here
+/// exercises the watchdog specifically, not `RLIMIT_AS`.
+pub async fn extract_pdf_with_exe_timeout_and_memory_limit(
+    path: &Path,
+    raw: &str,
+    budget: ExtractBudget,
+    max_pages: usize,
+    exe: &Path,
+    timeout: std::time::Duration,
+    memory_limit_bytes: u64,
+) -> Result<ParsedDocument> {
+    // Review round 3, F0: the ONLY thing the parent does with the file's
+    // bytes before spawning the isolated child -- a raw byte scan, never a
+    // PDF parse. The page count, the trailer-based encryption re-check, the
+    // stream-inflation preflight, and rendering are all now exclusively the
+    // child's job (`handlers::internal_pdf_text::extract`), which enforces
+    // `max_pages` itself, authoritatively.
+    {
         let path = path.to_path_buf();
         let raw = raw.to_string();
-        tokio::task::spawn_blocking(move || precheck_pdf(&path, &raw))
+        tokio::task::spawn_blocking(move || pdf_encryption_prescan(&path, &raw))
             .await
-            .context("document_read PDF precheck task panicked")??
-    };
-    if page_count > max_pages {
-        bail!("document_read: '{raw}' has {page_count} pages, over the {max_pages}-page limit");
+            .context("document_read PDF encryption prescan task panicked")??;
     }
 
-    let pages =
-        run_pdf_extraction_child(exe, path, raw, budget.max_chars, max_pages, timeout).await?;
+    let pages = run_pdf_extraction_child(
+        exe,
+        path,
+        raw,
+        budget.max_chars,
+        max_pages,
+        timeout,
+        memory_limit_bytes,
+    )
+    .await?;
 
     let mut text = String::new();
     let mut cursor = 0usize;
@@ -1580,6 +1571,7 @@ async fn run_pdf_extraction_child(
     max_chars: usize,
     max_pages: usize,
     timeout: std::time::Duration,
+    memory_limit_bytes: u64,
 ) -> Result<Vec<PdfChildPage>> {
     let mut cmd = tokio::process::Command::new(exe);
     cmd.arg("internal-pdf-text")
@@ -1588,6 +1580,8 @@ async fn run_pdf_extraction_child(
         .arg(max_chars.to_string())
         .arg("--max-pages")
         .arg(max_pages.to_string())
+        .arg("--memory-limit-bytes")
+        .arg(memory_limit_bytes.to_string())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -1598,6 +1592,23 @@ async fn run_pdf_extraction_child(
         // tokio::process::Command exposes `process_group` natively, the
         // same call `agent::ImpulseAgent::harness_query_structured` uses.
         cmd.process_group(0);
+
+        // Review round 3, F2: `RLIMIT_AS` below is real, kernel-enforced
+        // defense-in-depth on Linux, but macOS's `setrlimit` accepts
+        // `RLIMIT_AS` and reports success while silently NOT enforcing it
+        // (confirmed empirically: a 1 GiB limit let a child reach 4.12 GiB
+        // RSS). This is logged here, in the PARENT, before spawning --
+        // never inside the `pre_exec` closure below, which runs after
+        // `fork` in a context where only async-signal-safe calls are sound
+        // and logging is not one of them. The real enforcement on macOS is
+        // the child's own memory-watchdog thread
+        // (`handlers::internal_pdf_text::spawn_memory_watchdog`).
+        #[cfg(target_os = "macos")]
+        tracing::debug!(
+            limit_bytes = PDF_CHILD_MEMORY_LIMIT_BYTES,
+            "RLIMIT_AS will be set on the PDF extraction child but is not kernel-enforced on \
+             macOS; the child's own memory watchdog thread is the real ceiling on this platform"
+        );
 
         // SAFETY: this closure runs in the child after `fork`, before
         // `exec`, on a single thread with no other threads from the parent
@@ -1669,6 +1680,20 @@ async fn run_pdf_extraction_child(
     };
 
     if !output.status.success() {
+        // Review round 3, F2: checked BEFORE the signal check below, since
+        // the watchdog's `std::process::exit(PDF_MEMORY_CEILING_EXIT_CODE)`
+        // is a normal (non-signaled) exit -- it would otherwise fall through
+        // to the generic stderr-based error and be indistinguishable from
+        // any other parse failure, losing the specific "this was the memory
+        // ceiling, not a malformed file" signal.
+        if output.status.code() == Some(PDF_MEMORY_CEILING_EXIT_CODE) {
+            bail!(
+                "document_read: '{raw}' PDF extraction subprocess exceeded its memory ceiling \
+                 ({} bytes) while parsing (possibly a maliciously constructed PDF, such as an \
+                 oversized compressed object stream); refusing to extract text from this file",
+                PDF_CHILD_MEMORY_LIMIT_BYTES
+            );
+        }
         #[cfg(unix)]
         {
             use std::os::unix::process::ExitStatusExt as _;
@@ -4240,9 +4265,12 @@ mod tests {
         /// Builds a PDF with one page per entry of `pages`, each page's text
         /// written via a single `Tj` operator. An empty `pages` slice is not
         /// meaningful (`Kids`/`Count` would be empty); callers needing a
-        /// page with no text use [`write_pdf_blank_page`] instead, which
-        /// still creates one real page, just with no text operators in its
-        /// content stream.
+        /// page with no text use `tests/pdf_extraction_isolation.rs`'s own
+        /// `write_pdf_blank_page` instead (this module's own copy was
+        /// removed in review round 3 once page-count/blank-page behavior
+        /// moved to being tested exclusively through the isolated child),
+        /// which still creates one real page, just with no text operators
+        /// in its content stream.
         fn write_pdf(dir: &tempfile::TempDir, pages: &[&str]) -> PathBuf {
             use pdf_extract::content::{Content, Operation};
             use pdf_extract::{Document, Object, Stream};
@@ -4305,48 +4333,6 @@ mod tests {
             path
         }
 
-        /// One real page with an empty content stream: a well-formed PDF
-        /// with a page tree but no text operators anywhere, matching a
-        /// scanned/image-only PDF's text layer (empty, not absent).
-        fn write_pdf_blank_page(dir: &tempfile::TempDir) -> PathBuf {
-            use pdf_extract::content::Content;
-            use pdf_extract::{Document, Object, Stream};
-
-            let mut doc = Document::with_version("1.5");
-            let pages_id = doc.new_object_id();
-            let content = Content::<Vec<_>> { operations: vec![] };
-            let content_id = doc.add_object(Stream::new(pdf_dict(&[]), content.encode().unwrap()));
-            let page_id = doc.add_object(pdf_dict(&[
-                ("Type", Object::from("Page")),
-                ("Parent", Object::Reference(pages_id)),
-                ("Contents", Object::Reference(content_id)),
-            ]));
-            let pages_dict = pdf_dict(&[
-                ("Type", Object::from("Pages")),
-                ("Kids", Object::Array(vec![Object::Reference(page_id)])),
-                ("Count", Object::Integer(1)),
-                ("Resources", Object::Dictionary(pdf_dict(&[]))),
-                (
-                    "MediaBox",
-                    Object::Array(vec![
-                        Object::Integer(0),
-                        Object::Integer(0),
-                        Object::Integer(612),
-                        Object::Integer(792),
-                    ]),
-                ),
-            ]);
-            doc.objects.insert(pages_id, Object::Dictionary(pages_dict));
-            let catalog_id = doc.add_object(pdf_dict(&[
-                ("Type", Object::from("Catalog")),
-                ("Pages", Object::Reference(pages_id)),
-            ]));
-            doc.trailer.set("Root", catalog_id);
-            let path = dir.path().join("blank.pdf");
-            doc.save(&path).unwrap();
-            path
-        }
-
         /// A one-page PDF (from [`write_pdf`]) re-saved with RC4 V1
         /// encryption (the simplest supported scheme, no extra crate
         /// needed), with a non-empty user password: `pdf_declares_encryption`
@@ -4395,11 +4381,15 @@ mod tests {
         // `tests/pdf_extraction_isolation.rs`, which has
         // `CARGO_BIN_EXE_impulse-rs` available and injects it via
         // `extract_pdf_with_exe_and_timeout`. What stays safe to test
-        // in-process here is everything that does NOT render a page:
-        // `pdf_declares_encryption` (pure byte scan) and `precheck_pdf`
-        // (page count via `lopdf::Document::get_pages`, no content-stream
-        // interpretation, already proven safe against the same adversarial
-        // pass that found the rendering-path crash).
+        // in-process here is everything that does NOT parse PDF structure
+        // at all: `pdf_declares_encryption` (pure byte scan) and
+        // `pdf_encryption_prescan` (the same scan plus file I/O, review
+        // round 3, F0 -- the parent's ENTIRE PDF-specific job before
+        // spawning the child). Page count, the trailer-based encryption
+        // re-check, and the stream-inflation preflight all moved into
+        // `handlers::internal_pdf_text` in review round 3 (F0) and are
+        // tested there instead, since they now require
+        // `pdf_extract::Document::load`, which only the child may call.
 
         #[test]
         fn test_pdf_declares_encryption_pure_byte_scan() {
@@ -4431,52 +4421,36 @@ mod tests {
         }
 
         #[test]
-        fn test_precheck_pdf_returns_the_page_count_for_a_plain_multi_page_pdf() {
+        fn test_pdf_encryption_prescan_accepts_a_plain_pdf() {
             let dir = tempfile::TempDir::new().unwrap();
             let path = write_pdf(&dir, &["one", "two", "three"]);
 
-            let count = precheck_pdf(&path, "doc.pdf").unwrap();
-
-            assert_eq!(count, 3);
+            pdf_encryption_prescan(&path, "doc.pdf").unwrap();
         }
 
         #[test]
-        fn test_precheck_pdf_counts_a_blank_page_too() {
-            // precheck_pdf counts pages, not non-empty pages -- the
-            // page-cap check happens before any page is known to be
-            // text-bearing or not, matching the previous (pre-isolation)
-            // behavior of checking page_count from get_pages() directly.
-            let dir = tempfile::TempDir::new().unwrap();
-            let path = write_pdf_blank_page(&dir);
-
-            let count = precheck_pdf(&path, "blank.pdf").unwrap();
-
-            assert_eq!(count, 1);
-        }
-
-        #[test]
-        fn test_precheck_pdf_refuses_an_encrypted_pdf_via_the_byte_scan_before_loading() {
+        fn test_pdf_encryption_prescan_refuses_an_encrypted_pdf_via_the_byte_scan() {
             let dir = tempfile::TempDir::new().unwrap();
             let path = write_encrypted_pdf(&dir);
 
-            let err = precheck_pdf(&path, "encrypted.pdf").unwrap_err();
+            let err = pdf_encryption_prescan(&path, "encrypted.pdf").unwrap_err();
 
             assert!(err.to_string().contains("encrypted PDF"), "{err}");
         }
 
         #[test]
-        fn test_precheck_pdf_rejects_a_non_pdf_file() {
+        fn test_pdf_encryption_prescan_does_not_parse_pdf_structure_at_all() {
+            // Review round 3, F0: unlike the removed `precheck_pdf`, this
+            // function never calls `pdf_extract::Document::load` -- so a
+            // file that is not even valid PDF structure, but does not
+            // declare `/Encrypt`, passes the prescan cleanly (the actual
+            // parse failure surfaces later, from the isolated child, not
+            // from this byte-only scan).
             let dir = tempfile::TempDir::new().unwrap();
             let path = dir.path().join("not-really.pdf");
-            std::fs::write(&path, b"this is not a pdf").unwrap();
+            std::fs::write(&path, b"this is not a pdf at all").unwrap();
 
-            let err = precheck_pdf(&path, "not-really.pdf").unwrap_err();
-
-            assert!(
-                err.to_string()
-                    .starts_with("document_read: 'not-really.pdf' could not be parsed"),
-                "{err}"
-            );
+            pdf_encryption_prescan(&path, "not-really.pdf").unwrap();
         }
 
         // --------------------------------------------------------------
@@ -4531,147 +4505,6 @@ mod tests {
             assert!(!pdf_declares_encryption(
                 b"<</Type/Font/BaseFont/Helvetica>>"
             ));
-        }
-
-        fn compress_zlib(data: &[u8]) -> Vec<u8> {
-            use flate2::write::ZlibEncoder;
-            use flate2::Compression;
-            use std::io::Write as _;
-            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
-            encoder.write_all(data).unwrap();
-            encoder.finish().unwrap()
-        }
-
-        #[test]
-        fn test_inflate_bounded_accepts_under_the_cap_and_reports_the_true_size() {
-            let payload = vec![b'A'; 1000];
-            let compressed = compress_zlib(&payload);
-
-            let size = inflate_bounded(&compressed, 2000).unwrap();
-
-            assert_eq!(size, 1000);
-        }
-
-        #[test]
-        fn test_inflate_bounded_refuses_once_the_running_total_exceeds_the_cap() {
-            // A highly compressible payload: real zlib bytes, large ratio,
-            // mirroring the review's own textbomb fixtures -- but sized for
-            // a fast, deterministic test rather than gigabytes.
-            let payload = vec![b'A'; 1_000_000];
-            let compressed = compress_zlib(&payload);
-            assert!(
-                compressed.len() < 10_000,
-                "fixture should compress far smaller than its inflated size: {}",
-                compressed.len()
-            );
-
-            let err = inflate_bounded(&compressed, 1000).unwrap_err();
-
-            assert!(err.to_string().contains("over the limit"), "{err}");
-        }
-
-        #[test]
-        fn test_stream_uses_flate_decode_recognizes_a_name_and_a_filter_chain_array() {
-            let mut named = pdf_extract::Dictionary::new();
-            named.set("Filter", pdf_extract::Object::from("FlateDecode"));
-            assert!(stream_uses_flate_decode(&named));
-
-            let mut chained = pdf_extract::Dictionary::new();
-            chained.set(
-                "Filter",
-                pdf_extract::Object::Array(vec![
-                    pdf_extract::Object::from("ASCII85Decode"),
-                    pdf_extract::Object::from("FlateDecode"),
-                ]),
-            );
-            assert!(stream_uses_flate_decode(&chained));
-
-            let mut other = pdf_extract::Dictionary::new();
-            other.set("Filter", pdf_extract::Object::from("DCTDecode"));
-            assert!(!stream_uses_flate_decode(&other));
-
-            assert!(!stream_uses_flate_decode(&pdf_extract::Dictionary::new()));
-        }
-
-        /// Builds a one-page PDF whose page content stream is itself a
-        /// highly compressible `FlateDecode` bomb: real zlib bytes (so
-        /// `stream_uses_flate_decode`/`inflate_bounded` see genuine
-        /// declared+compressed data, exactly like `write_pdf`'s legitimate
-        /// fixture), but `payload_len` bytes of a single repeated byte, so
-        /// a modest `payload_len` still inflates far past a small test cap
-        /// -- mirroring the review's `textbomb2g`/`textbomb500` fixtures at
-        /// test-appropriate scale rather than gigabytes.
-        fn write_pdf_with_bomb_stream(dir: &tempfile::TempDir, payload_len: usize) -> PathBuf {
-            use pdf_extract::{Document, Object, Stream};
-
-            let mut doc = Document::with_version("1.5");
-            let pages_id = doc.new_object_id();
-            let bomb = compress_zlib(&vec![b'A'; payload_len]);
-            let mut content_dict = pdf_dict(&[]);
-            content_dict.set("Filter", Object::from("FlateDecode"));
-            let content_id = doc.add_object(Stream::new(content_dict, bomb));
-            let page_id = doc.add_object(pdf_dict(&[
-                ("Type", Object::from("Page")),
-                ("Parent", Object::Reference(pages_id)),
-                ("Contents", Object::Reference(content_id)),
-            ]));
-            let pages_dict = pdf_dict(&[
-                ("Type", Object::from("Pages")),
-                ("Kids", Object::Array(vec![Object::Reference(page_id)])),
-                ("Count", Object::Integer(1)),
-                (
-                    "MediaBox",
-                    Object::Array(vec![
-                        Object::Integer(0),
-                        Object::Integer(0),
-                        Object::Integer(612),
-                        Object::Integer(792),
-                    ]),
-                ),
-            ]);
-            doc.objects.insert(pages_id, Object::Dictionary(pages_dict));
-            let catalog_id = doc.add_object(pdf_dict(&[
-                ("Type", Object::from("Catalog")),
-                ("Pages", Object::Reference(pages_id)),
-            ]));
-            doc.trailer.set("Root", catalog_id);
-            let path = dir.path().join("bomb.pdf");
-            doc.save(&path).unwrap();
-            path
-        }
-
-        #[test]
-        fn test_preflight_pdf_streams_refuses_a_compression_bomb_before_any_page_renders() {
-            let dir = tempfile::TempDir::new().unwrap();
-            let path = write_pdf_with_bomb_stream(&dir, 1_000_000);
-            let doc = pdf_extract::Document::load(&path).unwrap();
-
-            let err =
-                preflight_pdf_streams_with_caps(&doc, "bomb.pdf", 10_000, 10_000).unwrap_err();
-
-            assert!(err.to_string().contains("over the limit"), "{err}");
-        }
-
-        #[test]
-        fn test_preflight_pdf_streams_accepts_a_legitimate_document_under_the_cap() {
-            let dir = tempfile::TempDir::new().unwrap();
-            let path = write_pdf(&dir, &["ordinary page text, nothing pathological here"]);
-            let doc = pdf_extract::Document::load(&path).unwrap();
-
-            preflight_pdf_streams(&doc, "doc.pdf").unwrap();
-        }
-
-        #[test]
-        fn test_precheck_pdf_refuses_a_compression_bomb_via_the_default_caps() {
-            // End-to-end through precheck_pdf's own call to
-            // preflight_pdf_streams (the real 64 MiB caps): a bomb sized to
-            // clear 64 MiB inflated while staying fast to build/compress.
-            let dir = tempfile::TempDir::new().unwrap();
-            let path = write_pdf_with_bomb_stream(&dir, 80 * 1024 * 1024);
-
-            let err = precheck_pdf(&path, "bomb.pdf").unwrap_err();
-
-            assert!(err.to_string().contains("over the limit"), "{err}");
         }
 
         #[tokio::test]

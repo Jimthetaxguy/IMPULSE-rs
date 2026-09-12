@@ -504,3 +504,222 @@ from round 2's 2017, matching the 19 new tests added this round: 16 in `tool_doc
 covering `decode_pdf_name_token`/hex-escape detection/`inflate_bounded`/`stream_uses_flate_decode`/
 `preflight_pdf_streams`/`read_capped`/`read_capped_tail`/`max_child_stdout_bytes`, plus 3 P3
 sandbox-denial tests in `tool_bridge.rs`).
+
+## Review round 3 (2026-09-12)
+
+Coordinator relayed a third adversarial pass against PR #54 at `ea9c7ea`: round-2's five fixture
+measurements reproduced, `read_capped`/the deadlock fix held (5x rogue shim, no zombies), encryption
+failed closed on every variant, sandbox tests were real, `flate2` audit was unchanged -- **but the
+memory bound was refuted twice more**, plus a false-refusal and an over-tight cap. Fixtures supplied
+read-only at `review54-r3/fix/` in this session's scratchpad; reproduced against them directly below
+in addition to new tracked fixtures added to this repo (`tests/pdf_extraction_isolation.rs`,
+`src/handlers/internal_pdf_text.rs`'s own test module) so the regression coverage stays portable
+across fresh clones, linked worktrees, and CI, per this project's verification-gate requirement.
+
+### F0 P0 (CONFIRMED): the parent still parsed PDF structure — `precheck_pdf` called `Document::load` before the preflight ever ran
+
+`precheck_pdf` (`tool_document.rs`, now deleted) called `pdf_extract::Document::load` IN THE PARENT
+to get a cheap page count, ahead of `preflight_pdf_streams`. `lopdf::Document::load` eagerly,
+unconditionally decompresses every `/Type /ObjStm` object stream as part of loading — with no hook
+to intercept or bound it — and stores the inflated bytes back into the object with `/Filter`
+stripped. The preflight, which only ever runs AFTER `load` returns, therefore counted zero for this
+class of stream: the memory had already been spent in the PARENT by the time any check could run.
+
+Reproduced on the reviewer's `objstm_bomb2g.pdf` (2.04 MB on disk, a Catalog/Pages/Page/Font all
+packed into one ObjStm padded with a ~2000 MiB ignored comment): the review reported parent RSS
+2,078 MB, returning "OK".
+
+**Fix, structural, not a patch:** the parent's entire PDF-specific job before spawning the child is
+now `pdf_encryption_prescan` — a raw byte scan for `/Encrypt`, nothing else (`tool_document.rs`).
+`Document::load`, the trailer-based encryption re-check, `preflight_pdf_streams` (moved and
+extended, see F1 below), the page-count cap, and rendering are now exclusively the child's job
+(`handlers::internal_pdf_text::extract`), which is authoritative for all of it. The parent never
+parses attacker-controlled PDF structure again, full stop.
+
+### F2 MEDIUM (CONFIRMED): `RLIMIT_AS` is silently a no-op on macOS — the child had no real memory bound on the primary platform
+
+Even confined to the child, `Document::load`'s eager ObjStm inflation cannot be pre-counted by any
+preflight — there is no hook between "lopdf decides to inflate an object stream" and "lopdf has
+already inflated it." The existing defense-in-depth layer, `RLIMIT_AS` (set via `pre_exec` in
+`run_pdf_extraction_child`), turned out to be accepted by macOS's `setrlimit` but silently NOT
+kernel-enforced there — the review measured a child reaching 4.12 GiB RSS despite a 1 GiB limit.
+
+**Fix:** a memory-watchdog background thread (`handlers::internal_pdf_text::spawn_memory_watchdog`
+/`current_peak_rss_bytes`), started at the very top of `extract()` before any PDF parsing at all
+(including `Document::load`), polling this process's own peak RSS via `libc::getrusage` roughly
+every 10ms and self-terminating via `std::process::exit(PDF_MEMORY_CEILING_EXIT_CODE = 137)` the
+instant it crosses `PDF_CHILD_MEMORY_LIMIT_BYTES` (kept at 1 GiB, now justified in its doc comment
+against the new 512 MiB total-decompression cap plus JSON-stdout/baseline overhead). `getrusage`'s
+`ru_maxrss` unit inconsistency (BYTES on macOS/BSD, KILOBYTES on Linux) is normalized in
+`current_peak_rss_bytes`. `run_pdf_extraction_child` checks this specific exit code BEFORE its
+generic unix-signal check, mapping it to a typed "exceeded its memory ceiling" error rather than
+folding it into a generic parse failure. `RLIMIT_AS` stays as real, kernel-enforced defense-in-depth
+on Linux; a `tracing::debug!` (outside the `pre_exec` closure, which cannot safely log) now states
+the macOS limitation explicitly at spawn time. **Isolation on macOS is honestly "crash containment
+plus the watchdog," not "RLIMIT_AS" — documented as such, not implied otherwise.**
+
+Both `current_peak_rss_bytes` (the `unsafe` `libc::getrusage` call) and `spawn_memory_watchdog` have
+dedicated unit tests (`internal_pdf_text.rs`) exercising the real code path, not just precondition
+checks, per this project's unsafe-code policy.
+
+### F1 P1 (CONFIRMED): the preflight only ever counted `FlateDecode` — an LZW-filtered bomb reached 4+ GiB while reporting "OK"
+
+`preflight_pdf_streams` checked a stream's `/Filter` for the literal name `FlateDecode` and skipped
+everything else — but `lopdf` decodes `/LZWDecode` exactly as readily. Reproduced on the reviewer's
+`lzwmulti300.pdf` (1.65 MB on disk): the review measured 4.12 GiB child RSS while the preflight
+still reported "OK".
+
+**Fix:** the preflight (moved into `internal_pdf_text.rs`, see F0) now walks each stream's FULL
+filter chain via `Stream::filters()` — lopdf's public, decode-ordered accessor — rather than a
+bare-name check. A terminal `FlateDecode` or `LZWDecode` stage is bound-counted through a streaming
+decoder (`inflate_bounded_zlib`, and new `inflate_bounded_lzw` via
+`weezl::decode::Decoder::with_tiff_size_switch(BitOrder::Msb, 8)`, matching `lopdf`'s own internal
+LZW parameters exactly). Any filter chain with something AFTER a terminal Flate/LZW stage, or any
+filter this preflight cannot bound-count at all (`RunLengthDecode`, `DCTDecode`, `JPXDecode`,
+`CCITTFaxDecode`, `Crypt`, or an unrecognized name), is refused BY NAME — deny-by-default, not
+silently skipped the way every non-`FlateDecode` filter was before this round.
+
+### F3 (found and fixed alongside F1): `[/ASCII85Decode /FlateDecode]` chains were falsely refused
+
+A direct consequence of doing the chain-walk properly: before this fix, a legitimate document using
+an `[/ASCII85Decode /FlateDecode]` filter chain was refused with "corrupt deflate stream", because
+the still-ASCII85-ENCODED outer bytes were fed straight to zlib. Fixed by fully decoding an outer
+`ASCII85Decode`/`ASCIIHexDecode` layer first (new `decode_ascii85_bounded`/`decode_asciihex_bounded`
+— lopdf's own `decode_ascii85` is a private associated fn, so this is a from-scratch, bounded
+reimplementation of the same Adobe ASCII85 algorithm lopdf itself uses) and feeding the RESULT to
+the terminal Flate/LZW bounded decoder.
+
+### F4 (CONFIRMED): the 64 MiB TOTAL cap refused ordinary documents, and the round-2 "legitimacy" fixture proved nothing
+
+The round-2 fix set BOTH the per-stream and total decompression caps to 64 MiB. The review found a
+900-page, 2.87 MB Flate-compressed text PDF inflates to 73.6 MB, over the old TOTAL cap — while
+`legit10m.pdf` (round 2's own "this still works" fixture) has NO compressed streams at all, so it
+never actually exercised this cap either way.
+
+**Fix:** per-stream cap stays 64 MiB (`MAX_PDF_STREAM_DECOMPRESSED_BYTES`); total cap rises to 512
+MiB (`MAX_PDF_TOTAL_DECOMPRESSED_BYTES`), justified in its doc comment against `MAX_DOCUMENT_BYTES`
+(10 MiB source-file cap: 512 MiB is a ~51x expansion ceiling on the largest input this tool ever
+reads) and the separate, independent `MAX_EXTRACTED_CHARS` budget (16M characters of FINAL text,
+capped regardless of how much raw decompressed PDF-operator bytes it took to render that much). A
+new, purpose-built fixture (`write_legit_multi_page_flate_pdf`, 25 genuinely Flate-compressed pages)
+proves the raised cap actually admits large real documents.
+
+The reviewer's own `legit64.pdf` was also run against the real tool: it PANICS during rendering
+(`pdf_extract::get_name_string`, "deref") — a pre-existing bug in its own Python generator script
+(`/F1`'s font reference resolves to the Pages object, not a Font, from a duplicate-assignment typo
+in `gen_r3.py`), unrelated to this fix and outside this lane's scope to patch in a third-party
+crate. Isolation still contained it cleanly: child exit 101 (a plain Rust panic unwind, not a
+signal), the parent reported a typed "could not be parsed" error, ~34 MB peak RSS, no memory
+blowup, no parent impact whatsoever. Not a security regression — the new purpose-built fixture
+above proves F4's actual claim (the raised cap admits real documents) instead.
+
+### F5 (doc corrections, no code change)
+
+Two round-2 doc numbers were re-measured and corrected, not changed in behavior:
+- The production stdout cap for the DEFAULT budget (16,000,000 chars / 4,096 pages) is exactly
+  **128,266,240 bytes** (`max_child_stdout_bytes`'s formula, derived from `MAX_EXTRACTED_CHARS`, not
+  from whatever `max_chars` a caller happens to pass) — this was already correct in code, just
+  understated in prose.
+- Parent RSS on a rogue child (`tests/fakes/rogue-stdout-shim.sh`) through the DEFAULT budget (not
+  an artificially small one) measures **~139 MB** — re-measured directly this round (see RSS table
+  below), not the ~9.3 MB a smaller-budget-only measurement previously implied. Both numbers are
+  real; they were measuring different budgets. ~139 MB is what a production caller actually
+  experiences at the default budget, and is the expected, correct size of the stdout-cap buffer at
+  that budget (~128 MB) plus baseline process overhead — not a bug.
+- On macOS, isolation is crash containment plus the watchdog, not `RLIMIT_AS` (see F2).
+
+### New test seam: injectable memory-watchdog ceiling
+
+`internal-pdf-text` gained a hidden `--memory-limit-bytes` flag (`Option<u64>`, defaulting to the
+production `PDF_CHILD_MEMORY_LIMIT_BYTES` when omitted), and `tool_document.rs` gained
+`extract_pdf_with_exe_timeout_and_memory_limit` (mirroring the existing exe/timeout injection
+pattern `extract_pdf_with_exe_and_timeout` already used). This lets
+`tests/pdf_extraction_isolation.rs` prove the watchdog fires END TO END — through the real parent
+exit-code mapping, not just the unit-level `spawn_memory_watchdog` test — using a small (4 MB
+padded) ObjStm fixture against a small (1 MB) injected ceiling, rather than needing a genuinely
+gigabyte-scale bomb in the default test suite. `RLIMIT_AS` is deliberately NOT affected by this
+override (it stays hardcoded to the production constant in `pre_exec`), so a test using a low
+injected ceiling exercises the watchdog specifically, never `RLIMIT_AS`.
+
+### RSS/behavior table (review round 3, this checkout, debug build, `/usr/bin/time -l`, macOS)
+
+All reviewer fixtures read directly from `review54-r3/fix/` (read-only scratchpad), run through the
+real `internal-pdf-text` child at PRODUCTION defaults (`--max-chars 16000000 --max-pages 4096`,
+default 1 GiB memory ceiling) unless noted:
+
+| Fixture | On disk | Result | Peak RSS | Notes |
+|---|---|---|---|---|
+| `objstm_bomb2g.pdf` | 2.04 MB | refused, exit 137 | ~1.08 GB | watchdog fires (F0/F2); review's original unbounded parent RSS was 2,078 MB — now the PARENT never touches this file's structure at all |
+| `lzwmulti300.pdf` | 1.65 MB | refused ("inflates to more than 536870912 bytes combined") | ~25 MB | 512 MiB TOTAL cap catches it (F1); review's original was 4.12 GiB |
+| `legit64.pdf` | 2.87 MB | panics in `pdf_extract` (pre-existing fixture-generator bug, unrelated to this fix) | ~34 MB | isolation contains it cleanly: child exit 101, parent typed error, no blowup (F4) |
+| `textbomb500.pdf` | 1.05 MB | refused | ~22 MB | round-1/2 regression, still holds |
+| `textbomb2g.pdf` | 4.20 MB | refused | ~32 MB | round-1/2 regression, still holds |
+| `legit10m.pdf` | 9.91 MB | succeeds (8.93 MB text) | ~63 MB, 7.84s | no compressed streams; proves nothing about the decompression caps either way (unchanged from round 2) |
+| `chain_a85_flate.pdf` (bomb) | 1.38 MB | refused | ~25 MB | F1/F3 chain-walk catches an ASCII85+Flate bomb |
+| `chain_a85_flate_legit.pdf` | 695 B | succeeds | ~20 MB | F3 fix, reviewer's own legit chain fixture |
+| `chain_ahx_flate.pdf` (bomb) | 2.20 MB | refused | ~27 MB | ASCIIHexDecode+Flate chain, same fix |
+| `chain_ahx_flate_legit.pdf` | 757 B | succeeds | ~20 MB | ASCIIHexDecode+Flate chain, same fix |
+| `lzwbomb.pdf` (round-2 scale) | 1.51 MB | refused ("could not decode ... invalid code") | ~24 MB | still safely denied; the reviewer's own hand-rolled Python LZW encoder produces a stream even `lopdf`'s real (also `weezl`-based) decoder would not decode either — deny-by-default fails closed regardless of the specific reason |
+| `rlbomb.pdf` | 401 KB | refused ("uses filter 'RunLengthDecode'") | ~20 MB | deny-by-default names the filter (F3) |
+| `predictor.pdf` | 9.8 KB | succeeds | ~31 MB | Predictor-filtered legitimate stream unaffected |
+| rogue shim, DEFAULT budget | n/a | refused ("exceeded its output bound") | **~139 MB** | F5: the correct number at the default budget (~128 MB computed stdout cap + baseline), not ~9.3 MB |
+| rogue shim, small (1000-char) budget | n/a | refused | ~9 MB | the small-budget case round 2 measured; both are correct, for their own budgets |
+
+Tracked-fixture coverage (portable, CI-safe, no gigabyte-scale allocations) for the same findings:
+`tests/pdf_extraction_isolation.rs` gained
+`test_extract_pdf_refuses_an_objstm_bomb_via_the_memory_watchdog`,
+`test_extract_pdf_objstm_document_succeeds_under_a_generous_memory_limit`,
+`test_extract_pdf_refuses_an_lzw_bomb_end_to_end`,
+`test_extract_pdf_ascii85_plus_flate_legitimate_chain_extracts_successfully`, and
+`test_extract_pdf_large_legitimate_flate_document_clears_the_new_512mib_cap` (16 tests total in this
+file now, up from 11); `src/handlers/internal_pdf_text.rs`'s own test module gained the moved and
+extended `preflight_pdf_streams`/decoder unit tests plus the watchdog tests (21 tests total in that
+file now, previously untested at the unit level since the preflight lived in `tool_document.rs`).
+
+### Gate evidence (review round 3, this checkout)
+
+```
+cd impulse-rs
+cargo build --workspace                                    # clean
+cargo test --workspace                                     # 2664 passed / 0 failed / 9 ignored
+                                                             # across every crate; impulse-rs lib
+                                                             # alone: 2046 passed / 0 failed / 5
+                                                             # ignored; tests/pdf_extraction_
+                                                             # isolation.rs: 16/16 passed
+cargo clippy --workspace --all-targets -- -D warnings       # clean
+cargo fmt --all -- --check                                  # clean
+cargo build --no-default-features                           # clean, zero warnings
+cargo test --no-default-features --lib                      # 1914 passed / 1 failed / 5 ignored --
+                                                             # the 1 failure
+                                                             # (daemon::tests::tests::
+                                                             # test_plugin_registry_initialized_
+                                                             # after_init) reproduces IDENTICALLY
+                                                             # on the pre-round-3 baseline (ea9c7ea)
+                                                             # with this branch's changes stashed;
+                                                             # pre-existing, unrelated to this lane
+                                                             # (a --no-default-features feature-
+                                                             # gating gap in a daemon plugin-
+                                                             # registry test, outside src/ion_repl
+                                                             # and src/handlers/internal_pdf_text)
+cargo audit                                                 # unchanged: 11 pre-existing
+                                                             # vulnerabilities / 18 warnings on both
+                                                             # this branch and the pre-round-3
+                                                             # baseline; weezl (the one new direct
+                                                             # dependency this round) not flagged by
+                                                             # name; Cargo.lock diff is a single
+                                                             # added line, matching the flate2
+                                                             # precedent from round 2
+```
+
+Isolated re-run of `tests/pdf_extraction_isolation.rs` (16 tests, 5 new this round): 16/16 passed in
+7.06-7.66s across repeated runs (the two new ~80 MB-scale fixtures -- the real-cap LZW bomb and the
+25-page legitimate document -- account for most of the wall time; no fixture in this file needs
+gigabyte-scale allocation, per this project's portability requirement for tracked test fixtures).
+
+Full lib total across all four review rounds combined: 2046 passed, 0 failed, 5 ignored (net +10
+from round 2/3's 2036: `internal_pdf_text.rs`'s own module now has 21 tests total, up from its
+pre-round-3 baseline of 4 (the original `BoundedSink` tests, unchanged) -- +17 net, covering the
+moved-and-extended preflight/decoder/watchdog tests; `tool_document.rs` lost 10 tests exercising
+`precheck_pdf`/`preflight_pdf_streams`/`inflate_bounded`/`stream_uses_flate_decode`, which no longer
+exist in that module (moved to `internal_pdf_text.rs` above), and gained 3 new
+`pdf_encryption_prescan` tests in their place -- -7 net. +17 and -7 nets to +10).

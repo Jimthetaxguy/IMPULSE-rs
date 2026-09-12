@@ -248,26 +248,41 @@ spawned with `kill_on_drop`, a `ProcessGroupGuard`, a 30s wall-clock timeout, an
 running character total would exceed budget -- true check-before-push, since the earlier
 per-page-then-check design reached multi-GB RSS on a small crafted file. Encryption is refused via
 a raw `/Encrypt` byte scan run before any parser touches the file, not `doc.is_encrypted()` after
-loading: `lopdf::Document::load` silently authenticates a PDF whose *user* password is empty. Page
-count is still checked cheaply in-process (`precheck_pdf`, proven safe against page-tree cycles/
-deep nesting) before any page is rendered. Annotation/`AcroForm` text is never extracted (only a
-page's own `/Contents` stream is rendered).
+loading: `lopdf::Document::load` silently authenticates a PDF whose *user* password is empty.
+Annotation/`AcroForm` text is never extracted (only a page's own `/Contents` stream is rendered).
 
-**Review round 2 on PR #54 refuted three round-1 claims.** (1) `child.wait_with_output()` buffered
-the whole child stdout/stderr unboundedly -- a rogue child streaming ~1 GiB drove the PARENT to
-~3.2 GB RSS. Fixed with `read_capped`/`read_capped_tail`, read on independent `tokio::spawn`ed
-tasks (not `tokio::join!`, which would hang: a child blocked writing past the stdout cap never
-closes stderr either). (2) `BoundedSink` bounds output volume and wall clock, never memory --
-`pdf-extract`'s own stream decompression is unbounded and happens before `BoundedSink` ever runs;
-a `FlateDecode` stream inflated 476x on the review's own fixture. Fixed with
-`preflight_pdf_streams` (the PDF analogue of `preflight_container`), run before any page renders,
-bringing peak RSS on the review's text-bomb fixtures from multi-GB down to ~13-22 MB. (3) The raw
-`/Encrypt` scan missed a legal PDF name hex-escape (`/Encr#79pt`, ISO 32000-1 §7.3.5) with no
-literal `/Encrypt` bytes. Fixed with a name-escape decoder plus a second, independent check
-directly against the parsed trailer dictionary.
+**Review round 2 refuted three round-1 claims:** the unbounded parent-side `child.wait_with_output()`
+read (~3.2 GB RSS from a rogue child, fixed with `read_capped`/`read_capped_tail` on independent
+tasks), `BoundedSink` never having bounded memory in the first place (`pdf-extract`'s own stream
+decompression happens before `BoundedSink` ever runs; fixed with a `preflight_pdf_streams` counting
+pass), and a legal PDF name hex-escape (`/Encr#79pt`) bypassing the raw `/Encrypt` byte scan (fixed
+with a name-escape decoder plus a trailer-dictionary belt-and-braces check).
+
+**Review round 3 found the parent itself still parsed PDF structure, and the preflight missed
+LZW.** The "cheap" in-process page count (`precheck_pdf`, since deleted) called
+`pdf_extract::Document::load` in the PARENT -- but `lopdf::Document::load` eagerly decompresses
+every `/Type /ObjStm` object stream during loading with no hook to bound it, so a crafted ObjStm
+blew up the PARENT before any preflight could run (the review's `objstm_bomb2g.pdf`, 2.04 MB on
+disk, drove the parent to 2,078 MB RSS). Fixed structurally: the parent's entire PDF-specific job
+before spawning the child is now a raw `/Encrypt` byte scan (`pdf_encryption_prescan`) -- page
+count, the trailer re-check, the preflight, and rendering are now exclusively the child's job,
+authoritatively. The preflight also only ever counted `FlateDecode`; `LZWDecode` (`lzwmulti300.pdf`
+reached 4.12 GiB RSS) is now walked via each stream's full filter chain
+(`Stream::filters()`), with an outer `ASCII85Decode`/`ASCIIHexDecode` layer decoded first (fixing a
+real false-refusal on legitimate `[/ASCII85Decode /FlateDecode]` chains along the way) and
+deny-by-default for any filter this preflight cannot bound-count. Since `Document::load`'s own
+eager ObjStm inflation still cannot be pre-counted even confined to the child, a memory-watchdog
+thread (`spawn_memory_watchdog`, polling `getrusage`-derived peak RSS every ~10ms,
+self-terminating via a distinct exit code the parent maps to a typed error) is the real bound for
+that path -- and the ONLY enforced bound on macOS specifically, since `RLIMIT_AS` there is accepted
+by `setrlimit` but silently not kernel-enforced (confirmed empirically). The total decompression
+cap also rose from 64 MiB to 512 MiB (per-stream stays 64 MiB): the old total cap refused ordinary
+multi-hundred-page documents that were never actually proven to pass it, since the round-2
+"legitimacy" fixture had no compressed streams at all.
 - **Source of truth:** `src/ion_repl/tool_document.rs`, `src/handlers/internal_pdf_text.rs`,
   `tests/pdf_extraction_isolation.rs`, `tests/fakes/rogue-stdout-shim.sh`, and
-  `docs/superpowers/specs/2026-09-01-ion-document-tool-design.md`.
+  `docs/superpowers/specs/2026-09-01-ion-document-tool-design.md` (full review round 1/2/3 detail
+  and fixture table).
 
 ### bridged memory tools — `[code]`
 `memory_search` and `genome_read` (`src/tooling/builtin/{memory_search,genome_read}.rs`) are

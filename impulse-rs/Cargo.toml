@@ -130,6 +130,14 @@ pdf-extract = { version = "0.12", optional = true }
 # Already a transitive dependency (via lopdf, zip, image); pinned here as direct so this crate can
 # call its streaming decoder to count inflated bytes without ever materializing them.
 flate2 = { version = "1", optional = true }
+# Bounded LZWDecode stream-inflation preflight for PDFs (review round 3, F1):
+# lopdf can decode /LZWDecode streams but the round-2 preflight only counted
+# FlateDecode, so an LZW-filtered bomb reached multi-GB RSS despite the
+# preflight reporting "OK". Already a transitive dependency (via lopdf, gif,
+# tiff) at the same 0.1.x line; pinned here as direct so this crate can drive
+# its streaming decoder to count decoded bytes without ever materializing
+# them, mirroring the flate2 precedent immediately above.
+weezl = { version = "0.1", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -157,6 +165,7 @@ office-support = [
     "dep:quick-xml",
     "dep:pdf-extract",
     "dep:flate2",
+    "dep:weezl",
 ]
 
 [dev-dependencies]
