@@ -890,3 +890,47 @@ Full lib total for this round: 2161 passed, 0 failed, 5 ignored on this checkout
 comparison against round 3's 2046, since `main`'s #53/#55 merge landed its own new tests in between;
 `internal_pdf_text.rs`'s own module alone went from 21 tests (round 3) to 27 (round 4, +6: two
 zlib-tolerance tests, two double-Flate tests, and two NEW-1 standalone/precedes-Flate tests).
+
+**Second merge with `main` (post-fix, same round):** between pushing the round-4 fixes above and
+this final gate, `main` advanced twice more (#56 memory promotion/ADR-0020, #59 property-based/fuzz
+parser harnesses), which the GitHub PR view surfaced as `mergeable: CONFLICTING` after the first
+push -- not caused by anything in this lane, but by `main` moving again while the coordinator's
+round-4 message was in flight. `git merge origin/main --no-edit` reproduced exactly one real
+conflict, in `impulse-rs/Cargo.lock` (a mechanical lockfile conflict from #59's new `proptest`/
+fuzz-harness dependencies landing in the same region `weezl`'s round-3 addition touched) --
+`CONTEXT.md`, `Cargo.toml`, and `tool_document.rs` all auto-merged cleanly with no manual
+intervention. Resolved by taking `main`'s `Cargo.lock` (`git checkout --theirs`) and letting
+`cargo build` patch in the one entry this lane's `Cargo.toml` needs (`weezl`, already present as a
+transitive dependency via `lopdf` in both parents, so no new download) -- a 92-line net diff, not a
+disruptive full `cargo generate-lockfile` regeneration (which was tried first and produced an
+~1,095-line diff reordering unrelated entries; reverted in favor of the minimal patch). Full gate
+re-run clean after this second merge (see totals below); no files this lane owns were touched by
+either `main` merge beyond `Cargo.lock`/`Cargo.toml`.
+
+### Gate evidence (post-second-merge, this checkout, final)
+
+```
+cd impulse-rs
+git merge origin/main --no-edit                            # 1 real conflict (Cargo.lock, resolved
+                                                             # via checkout --theirs + cargo build);
+                                                             # CONTEXT.md/Cargo.toml/tool_document.rs
+                                                             # auto-merged clean
+cargo build --workspace                                    # clean
+cargo test --workspace                                     # 2928 passed / 0 failed / 9 ignored
+                                                             # across every crate; impulse-rs lib
+                                                             # alone: 2272 passed / 0 failed / 5
+                                                             # ignored; tests/pdf_extraction_
+                                                             # isolation.rs: 17/17 passed
+cargo clippy --workspace --all-targets -- -D warnings       # clean
+cargo fmt --all -- --check                                  # clean
+cargo build --no-default-features                           # clean, zero warnings
+cargo test --no-default-features --lib                      # 2113 passed / 1 failed / 5 ignored --
+                                                             # the same pre-existing, unrelated
+                                                             # daemon::tests::tests::
+                                                             # test_plugin_registry_initialized_
+                                                             # after_init failure confirmed in
+                                                             # rounds 3 and 4
+cargo audit                                                 # unchanged: 11 pre-existing
+                                                             # vulnerabilities / 18 warnings
+python3 docs/validate_docs.py --all                         # only pre-existing failures on main
+```
