@@ -12,7 +12,7 @@ use impulse_ops::governed_task::{
     GovernedPromotionOutcome, GovernedRecordId, GovernedReviewState, GovernedTaskId,
     GovernedTaskRun, GovernedVerificationProfile, PromotionBlockedReason, SharedConfigComponent,
     SharedRepositoryConfigPin, StagedWorktree, StagedWorktreeInput, StagedWorktreeStatus,
-    WorkerCompletionClaim, WorldScope,
+    WorkerCompletionClaim, WorldScope, LEGACY_SHARED_REPOSITORY_CONFIG_SCHEME_VERSION,
 };
 use impulse_rs::governed_producers::{
     discard_staged_worktree, materialize_staged_worktree, promote_governed_outcome,
@@ -635,4 +635,330 @@ fn test_a_shared_file_deleted_after_materialization_blocks_and_names_it() {
         })
     );
     assert_eq!(head(&repo), initial);
+}
+
+// ---------------------------------------------------------------------------
+// Post-merge fixes for the #50 P1 review (2026-09-12)
+// ---------------------------------------------------------------------------
+
+/// Write an executable `core.fsmonitor` hook and point the *shared* repository
+/// config at it. Git executes a pathname-valued `core.fsmonitor` to query
+/// changed files, and `core.hooksPath` does not disable it.
+fn plant_fsmonitor(repo: &Path, marker: &Path) -> PathBuf {
+    // Inside `.git/`, which is not part of the work tree: a script in the work
+    // tree would make the canonical checkout dirty and fail materialization for
+    // a reason that has nothing to do with what this test is about.
+    let script = repo.join(".git").join("fsmonitor-hook.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho FSMONITOR_FIRED >> {}\nprintf '/\\0'\n",
+            marker.display()
+        ),
+    )
+    .expect("write fsmonitor hook");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fsmonitor hook");
+    }
+    script
+}
+
+/// Second #50 P1 finding, the defense-in-depth half: every producer Git
+/// invocation disables `core.fsmonitor` as well as `core.hooksPath`.
+///
+/// Materialization legitimately runs `git status` against configuration that
+/// predates the run — the operator's own, which the trust boundary honors — so
+/// there is no pin to compare against yet and ordering cannot help. Only the
+/// `-c core.fsmonitor=false` in `hook_free_git` keeps this from executing.
+#[test]
+fn test_materialization_never_executes_a_pre_existing_fsmonitor_hook() {
+    let (_dir, repo) = init_repo();
+    let marker = repo.join(".git").join("fsmonitor-ran.txt");
+    let script = plant_fsmonitor(&repo, &marker);
+    git(
+        &repo,
+        &["config", "core.fsmonitor", &script.display().to_string()],
+    );
+
+    // Negative control: the hook really is armed for an ordinary `git status`.
+    let armed = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["-c", "core.hooksPath=/dev/null"])
+        .args(["status", "--porcelain"])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .expect("run git status");
+    assert!(armed.status.success());
+    assert!(
+        marker.exists(),
+        "the planted fsmonitor hook is not armed; this test would pass vacuously"
+    );
+    std::fs::remove_file(&marker).expect("reset the marker");
+
+    let initial = head(&repo);
+    let registered = task(&repo, &initial);
+    let staged = materialize_staged_worktree(&registered).expect("materialize staged worktree");
+
+    assert!(
+        !marker.exists(),
+        "a pathname-valued core.fsmonitor executed inside a producer: {}",
+        std::fs::read_to_string(&marker).unwrap_or_default()
+    );
+    assert_eq!(head(Path::new(&staged.root)), initial);
+}
+
+/// Second #50 P1 finding, the load-bearing half: promotion compares the pinned
+/// shared configuration **before** it spawns Git against the repository.
+///
+/// A Builder-planted `core.fsmonitor` runs on the `git status` that the old
+/// ordering performed first, under operator authority, before the comparison
+/// that was supposed to refuse the run could say anything.
+#[test]
+fn test_promotion_blocks_a_builder_planted_fsmonitor_without_executing_it() {
+    let (_dir, repo) = init_repo();
+    let initial = head(&repo);
+    let registered = task(&repo, &initial);
+    let staged = materialize_staged_worktree(&registered).expect("materialize staged worktree");
+    let staged_root = PathBuf::from(&staged.root);
+    let marker = repo.join(".git").join("fsmonitor-ran.txt");
+    let script = plant_fsmonitor(&repo, &marker);
+
+    // The Builder, working only inside its own staged worktree, writes the key
+    // into `.git/config`, which every linked worktree shares.
+    git(
+        &staged_root,
+        &["config", "core.fsmonitor", &script.display().to_string()],
+    );
+    let builder_commit = commit_in(&staged_root, "feature.txt", "builder work\n");
+    assert!(
+        marker.exists(),
+        "the planted fsmonitor hook is not armed; this test would pass vacuously"
+    );
+    std::fs::remove_file(&marker).expect("reset the marker");
+
+    let task = accepted(&registered, &staged, &initial, &builder_commit);
+    let promotion = promote_governed_outcome(&task).expect("promotion reports, never executes");
+
+    assert!(
+        !marker.exists(),
+        "a Builder-planted fsmonitor hook executed during promotion: {}",
+        std::fs::read_to_string(&marker).unwrap_or_default()
+    );
+    assert_eq!(
+        promotion.outcome.blocked_reason(),
+        Some(PromotionBlockedReason::RepositoryConfigChanged {
+            component: SharedConfigComponent::RepositoryConfig
+        })
+    );
+    assert_eq!(head(&repo), initial, "a blocked promotion moves nothing");
+}
+
+/// The ordering itself, proven independently of what any one Git key does: a
+/// shared config that no Git process can parse.
+///
+/// Every `git` invocation in such a repository fails with `bad config line`, so
+/// a promotion that still returns the typed blocked outcome cannot have run
+/// one. Reverting the ordering turns this into an `Err`.
+#[test]
+fn test_promotion_compares_shared_config_before_running_any_git_command() {
+    let (_dir, repo) = init_repo();
+    let initial = head(&repo);
+    let registered = task(&repo, &initial);
+    let staged = materialize_staged_worktree(&registered).expect("materialize staged worktree");
+    let builder_commit = commit_in(Path::new(&staged.root), "feature.txt", "builder work\n");
+
+    // After materialization, so the pin was recorded against a parseable file.
+    let config = repo.join(".git").join("config");
+    let mut bytes = std::fs::read(&config).expect("read shared config");
+    bytes.extend_from_slice(b"[unterminated\n");
+    std::fs::write(&config, &bytes).expect("write shared config");
+    // Negative control: Git really cannot run here any more.
+    let broken = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["-c", "core.hooksPath=/dev/null"])
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("run git rev-parse");
+    assert!(
+        !broken.status.success(),
+        "the config is still parseable; this test would pass vacuously"
+    );
+
+    let task = accepted(&registered, &staged, &initial, &builder_commit);
+    let promotion = promote_governed_outcome(&task)
+        .expect("the configuration comparison must not need a Git process");
+
+    assert_eq!(
+        promotion.outcome.blocked_reason(),
+        Some(PromotionBlockedReason::RepositoryConfigChanged {
+            component: SharedConfigComponent::RepositoryConfig
+        })
+    );
+    // The head was reported by reading the ref files directly.
+    match promotion.outcome {
+        GovernedPromotionOutcome::PromotionBlocked { canonical_head, .. } => {
+            assert_eq!(canonical_head, initial)
+        }
+        other => panic!("expected a blocked promotion, got {other:?}"),
+    }
+}
+
+/// Third #50 P1 finding: the digest sorted a rendered `git config --list`, so
+/// swapping two repeated scalar keys produced the same digest even though Git
+/// resolves the **last** one. Reproduced against Git 2.50.1: after the swap
+/// `git config --get filter.evil.smudge` returns the other value.
+#[test]
+fn test_promotion_blocks_a_reordered_repeated_config_key() {
+    let (_dir, repo) = init_repo();
+    let marker = repo.join("filter-ran.txt");
+    let inert = "[filter \"evil\"]\n\tsmudge = cat\n";
+    let armed = format!(
+        "[filter \"evil\"]\n\tsmudge = sh -c 'echo FILTER_FIRED >> {}; cat'\n",
+        marker.display()
+    );
+    // Both lines exist before the run: the operator's own configuration, which
+    // the trust boundary honors. Only their order changes during it.
+    let config = repo.join(".git").join("config");
+    let original = std::fs::read_to_string(&config).expect("read shared config");
+    std::fs::write(&config, format!("{original}{armed}{inert}")).expect("seed repeated keys");
+    assert_eq!(
+        git(&repo, &["config", "--get", "filter.evil.smudge"]).as_str(),
+        "cat",
+        "the last repeated value wins; the inert one must be effective at first"
+    );
+
+    let initial = head(&repo);
+    let registered = task(&repo, &initial);
+    let staged = materialize_staged_worktree(&registered).expect("materialize staged worktree");
+    let builder_commit = commit_in(Path::new(&staged.root), "feature.txt", "builder work\n");
+
+    // The Builder swaps the two existing lines. No key is added, no value is
+    // edited — and the armed driver is now the effective one.
+    std::fs::write(&config, format!("{original}{inert}{armed}")).expect("reorder repeated keys");
+    assert!(
+        git(&repo, &["config", "--get", "filter.evil.smudge"]).contains("FILTER_FIRED"),
+        "the reorder must actually change which driver Git resolves"
+    );
+
+    let task = accepted(&registered, &staged, &initial, &builder_commit);
+    let promotion = promote_governed_outcome(&task).expect("a reorder blocks, never errors");
+
+    assert_eq!(
+        promotion.outcome.blocked_reason(),
+        Some(PromotionBlockedReason::RepositoryConfigChanged {
+            component: SharedConfigComponent::RepositoryConfig
+        }),
+        "reordering repeated keys must not pass the pin"
+    );
+    assert!(!marker.exists(), "the reordered driver must not have run");
+    assert_eq!(head(&repo), initial);
+}
+
+/// The digest covers files the shared config reaches through `include.path`,
+/// because their contents are configuration too and can be edited without
+/// touching `.git/config` itself.
+#[test]
+fn test_promotion_blocks_a_change_to_an_included_config_file() {
+    let (_dir, repo) = init_repo();
+    let included = repo.join(".git").join("extra.config");
+    std::fs::write(&included, "[user]\n\temail = before@example.invalid\n")
+        .expect("seed included config");
+    let config = repo.join(".git").join("config");
+    let original = std::fs::read_to_string(&config).expect("read shared config");
+    std::fs::write(
+        &config,
+        format!("{original}[include]\n\tpath = extra.config\n"),
+    )
+    .expect("seed include directive");
+    assert_eq!(
+        git(&repo, &["config", "--get", "user.email"]).as_str(),
+        "before@example.invalid",
+        "the include must actually be in effect"
+    );
+
+    let initial = head(&repo);
+    let registered = task(&repo, &initial);
+    let staged = materialize_staged_worktree(&registered).expect("materialize staged worktree");
+    let builder_commit = commit_in(Path::new(&staged.root), "feature.txt", "builder work\n");
+
+    // `.git/config` itself is byte-identical; only the included file changed.
+    std::fs::write(&included, "[user]\n\temail = after@example.invalid\n")
+        .expect("rewrite included config");
+    assert_eq!(
+        std::fs::read_to_string(&config).unwrap(),
+        format!("{original}[include]\n\tpath = extra.config\n")
+    );
+
+    let task = accepted(&registered, &staged, &initial, &builder_commit);
+    let promotion = promote_governed_outcome(&task).expect("an include change blocks");
+
+    assert_eq!(
+        promotion.outcome.blocked_reason(),
+        Some(PromotionBlockedReason::RepositoryConfigChanged {
+            component: SharedConfigComponent::RepositoryConfig
+        })
+    );
+    assert_eq!(head(&repo), initial);
+}
+
+/// An unchanged repository still promotes: the raw-bytes digest is stable
+/// across the run when nothing writes to the pinned files.
+#[test]
+fn test_an_unchanged_shared_config_with_includes_still_promotes() {
+    let (_dir, repo) = init_repo();
+    let included = repo.join(".git").join("extra.config");
+    std::fs::write(&included, "[user]\n\temail = stable@example.invalid\n")
+        .expect("seed included config");
+    let config = repo.join(".git").join("config");
+    let original = std::fs::read_to_string(&config).expect("read shared config");
+    std::fs::write(
+        &config,
+        format!("{original}[include]\n\tpath = extra.config\n"),
+    )
+    .expect("seed include directive");
+
+    let (task, _initial, builder_commit, _root) = staged_with_builder_commit(&repo);
+    let promotion = promote_governed_outcome(&task).expect("promote accepted outcome");
+
+    assert_eq!(
+        promotion.outcome,
+        GovernedPromotionOutcome::Promoted {
+            promoted_revision: builder_commit.clone()
+        }
+    );
+    assert_eq!(head(&repo), builder_commit);
+}
+
+/// Third #50 P1 finding, the migration half: a pin recorded under the
+/// superseded sorted-listing scheme is not comparable with a raw-bytes one, so
+/// it must be refused like an absent pin rather than compared across schemes.
+#[test]
+fn test_promotion_blocks_a_pin_recorded_under_a_superseded_scheme() {
+    let (_dir, repo) = init_repo();
+    let (mut task, initial, _builder_commit, _root) = staged_with_builder_commit(&repo);
+    if let Some(staged) = task.staged_worktree.as_mut() {
+        let mut digest = staged
+            .shared_config_digest
+            .recorded()
+            .expect("a freshly materialized worktree is pinned")
+            .clone();
+        digest.scheme_version = LEGACY_SHARED_REPOSITORY_CONFIG_SCHEME_VERSION;
+        staged.shared_config_digest = SharedRepositoryConfigPin::Recorded(digest);
+    }
+
+    let promotion =
+        promote_governed_outcome(&task).expect("a superseded pin blocks, it does not error");
+
+    assert_eq!(
+        promotion.outcome.blocked_reason(),
+        Some(PromotionBlockedReason::RepositoryConfigUnpinned)
+    );
+    assert_eq!(head(&repo), initial);
+    assert!(!repo.join("feature.txt").exists());
 }
