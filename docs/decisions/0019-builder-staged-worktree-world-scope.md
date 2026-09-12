@@ -305,6 +305,16 @@ resolved by reading `.git` and `commondir` the way Git does — so promotion com
 *before* it spawns any Git process against that repository. Both properties were forced by the
 post-merge review; both are load-bearing.
 
+**Discard is the one producer that does not compare the pin.** Materialization records it, and
+claim, verification and promotion all compare it before spawning Git — but `discard_staged_worktree`
+runs `git worktree remove --force --force` under the hook-free constructor and nothing else. That is
+deliberate rather than an oversight: the comparison exists to stop a Builder-defined filter or
+textconv driver from executing while Git *materializes* files, and removing a checkout materializes
+nothing — there is no status walk, no checkout, and no index refresh for a driver to fire on. It is
+also load-bearing that it stays this way: an unpinned or drifted worktree is precisely the one an
+operator most needs to be able to reclaim, and gating discard behind the same comparison would leave
+it with no way out. Do not "fix" this by adding a pin check to discard.
+
 **The configuration pin is a change detector, not a sandbox.** It catches a driver the Builder
 *introduced*, which is the reachable attack. It does not stop a Builder from committing a
 `.gitattributes` that routes new paths through a filter the operator had already configured — a

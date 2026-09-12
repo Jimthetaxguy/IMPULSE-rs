@@ -1482,24 +1482,112 @@ mod tests {
             .any(|event| event.kind == GovernedTaskEventKind::StagedWorktreeDiscarded));
     }
 
-    /// The accepted/unpinned/zero-promotions case, and why its coverage sits
-    /// where it does.
+    /// An unpinned staged worktree cannot be launched, and can always be
+    /// reclaimed — the endpoint path, driven forward with no ledger surgery.
     ///
-    /// An accepted run whose staged worktree carries no configuration pin is
-    /// discardable with no promotion attempt — `staged_worktree_is_discardable`
-    /// short-circuits on an unpinned worktree — and discarding it drops the only
-    /// ref to the accepted commit. It is a real state, but **not one this build
-    /// can produce**: `materialize_staged_worktree` always records a pin, so an
-    /// unpinned worktree only arrives on a ledger written before the pin
-    /// existed. Synthesizing one by editing `GOVERNED_TASKS.json` fails closed
-    /// on ADR-0019 rule 11's replay validation, which is correct behavior and
-    /// not worth defeating for a test.
+    /// `require_shared_config_digest` accepts `Unknown` as a legitimate stored
+    /// value, so submitting the materialization mutation with an unpinned input
+    /// produces a genuine pre-pin record with a naturally computed receipt.
+    /// From there #53's `MarkRunning` precondition refuses the launch, which is
+    /// precisely why discard must be available: an unpinned worktree can never
+    /// be promoted *and* can never be worked in, so reclaiming it is the only
+    /// way forward.
+    #[tokio::test]
+    async fn an_unpinned_staged_worktree_cannot_be_launched_but_can_be_reclaimed() {
+        let (repo, state, project_id, oid) = repo_state();
+        let registration = registration(
+            &project_id,
+            repo.path(),
+            &oid,
+            WorldScope::StagedAuthoritative,
+        );
+
+        // Registered without this lane's auto-materializing wrapper, then the
+        // worktree recorded the way a build predating the pin would record it.
+        let registered = state.register_governed_task(registration).unwrap();
+        let staged_input =
+            crate::governed_producers::materialize_staged_worktree(&registered).unwrap();
+        let staged_root = staged_input.root.clone();
+        let unpinned = mutate(
+            &state,
+            &registered,
+            "unpinned-materialize",
+            GovernedTaskMutation::MaterializeStagedWorktree {
+                staged: StagedWorktreeInput {
+                    shared_config_digest:
+                        impulse_ops::governed_task::SharedRepositoryConfigPin::Unknown,
+                    ..staged_input
+                },
+            },
+        );
+        assert!(
+            unpinned
+                .staged_worktree
+                .as_ref()
+                .is_some_and(|staged| staged.shared_config_digest.is_unknown()),
+            "the fixture must actually be unpinned or it proves nothing"
+        );
+
+        // #53: no launch without a comparable pin.
+        let launch = state.mutate_governed_task(GovernedTaskMutationRequest {
+            request_id: request_id("unpinned-running"),
+            project_id: project_id.clone(),
+            task_id: unpinned.id.clone(),
+            expected_revision: unpinned.revision,
+            mutation: GovernedTaskMutation::MarkRunning {
+                actor: staged_system_actor(),
+            },
+        });
+        let launch_error = launch.expect_err("an unpinned worktree must not be launched into");
+        assert!(
+            format!("{launch_error:#}").contains("pin cannot be compared"),
+            "got: {launch_error:#}"
+        );
+
+        // So the checkout is reclaimable, with nothing else to do with it.
+        assert!(staged_worktree_is_discardable(&unpinned));
+        let ack = discard_governed_staged_worktree(
+            &state,
+            discard_request(&unpinned, "unpinned-discard"),
+            ConnectionClass::Operator,
+        )
+        .await
+        .expect("an unpinned worktree is always reclaimable");
+        assert_eq!(ack.discarded_root, staged_root);
+        assert_eq!(
+            ack.unreferenced_accepted_commit, None,
+            "nothing was accepted, so nothing is orphaned"
+        );
+        assert!(!Path::new(&staged_root).exists());
+        assert_eq!(git(repo.path(), &["rev-parse", "HEAD"]), oid);
+    }
+
+    /// The accepted/unpinned/zero-promotions case, and why its coverage sits at
+    /// the function rather than at the endpoint.
     ///
-    /// So the behavior is proven on the pure function (`impulse-ops`, which
-    /// covers the unpinned case directly), and what is proven *here* is the
-    /// wiring: both the fresh and the replay branch of the discard endpoint
-    /// fill the acknowledgement from that one function, so whatever it decides
-    /// for a legacy record is what the operator is told.
+    /// An earlier version of this comment claimed the state "cannot be
+    /// synthesized". That was wrong — `state/governed_task.rs` synthesizes one
+    /// by rewriting the record *and* its materialization receipt's fingerprint,
+    /// and a ledger so built loads fine. The accurate reason is narrower and
+    /// worth stating, because it changed under this lane:
+    ///
+    /// - An unpinned worktree can no longer be driven *forward* into an accepted
+    ///   state by this build at all. #53 made `MarkRunning` refuse an unpinned
+    ///   staged task, so the run can never start, never claim, and never be
+    ///   accepted — proven directly by the test above.
+    /// - So the only accepted-and-unpinned records that exist are ones a
+    ///   *pre-pin build* accepted, then this build loaded. Reproducing that
+    ///   means rewriting the receipt fingerprint for every mutation in the
+    ///   history, through `fingerprint_mutation`, which is private to
+    ///   `state/governed_task.rs` — a file this lane does not own and which two
+    ///   other lanes merged this week.
+    ///
+    /// The state is real (those ledgers exist in the wild, which is exactly why
+    /// `staged_worktree_is_discardable` short-circuits on an unpinned worktree),
+    /// so the behavior is covered on the pure function in `impulse-ops` and the
+    /// wiring that carries it to the operator is covered here. Making
+    /// `fingerprint_mutation` `pub(crate)` would allow the full endpoint test
+    /// and is on the handoff list rather than taken unilaterally.
     #[test]
     fn the_discard_ack_is_filled_from_the_shared_orphaned_commit_rule() {
         let mut unpinned = accepted_unpinned_task();
@@ -1784,6 +1872,181 @@ mod tests {
             }
             other => panic!("expected a governed task response, received {other:?}"),
         }
+    }
+
+    // ── Promote preconditions, observed at the endpoint ─────────────────────
+
+    /// An already-promoted run is refused by the endpoint, and the producer is
+    /// never called.
+    ///
+    /// "Never called" is proven rather than asserted: the staged checkout is
+    /// removed from disk first, so a producer that *did* run would fail loudly
+    /// on a missing worktree instead of returning the precondition message.
+    #[tokio::test]
+    async fn an_already_promoted_run_is_refused_before_the_producer_runs() {
+        let (repo, state, project_id, oid) = repo_state();
+        let registered = register_governed_task(
+            &state,
+            registration(
+                &project_id,
+                repo.path(),
+                &oid,
+                WorldScope::StagedAuthoritative,
+            ),
+            ConnectionClass::Operator,
+        )
+        .unwrap();
+        let (accepted, accepted_oid) = accepted_staged_task(&state, registered);
+        let promoted = promote_governed_outcome(
+            &state,
+            promotion_request(&accepted, "already-promote-1"),
+            ConnectionClass::Operator,
+        )
+        .await
+        .expect("the first promotion succeeds");
+        assert!(promoted
+            .task
+            .latest_promotion()
+            .unwrap()
+            .outcome
+            .is_promoted());
+        assert_eq!(git(repo.path(), &["rev-parse", "HEAD"]), accepted_oid);
+
+        // Sabotage: if the producer runs, it cannot possibly succeed quietly.
+        let staged_root = promoted.task.staged_worktree.as_ref().unwrap().root.clone();
+        std::fs::remove_dir_all(&staged_root).unwrap();
+
+        let error = promote_governed_outcome(
+            &state,
+            promotion_request(&promoted.task, "already-promote-2"),
+            ConnectionClass::Operator,
+        )
+        .await
+        .expect_err("a run is promoted at most once");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("this governed outcome was already promoted"),
+            "expected the ledger's own precondition message, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("worktree") || !rendered.contains("No such file"),
+            "the producer must not have run: {rendered}"
+        );
+        assert!(
+            state.open_reservations().unwrap().is_empty(),
+            "a precondition refusal takes no reservation"
+        );
+        let after = state
+            .get_governed_task(&project_id, &promoted.task.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after, promoted.task, "a refused promotion records nothing");
+        assert_eq!(after.promotions.len(), 1);
+    }
+
+    /// A discarded staged worktree is refused the same way, and the producer is
+    /// again never reached: the checkout it would observe is gone.
+    #[tokio::test]
+    async fn a_promotion_without_an_active_worktree_is_refused_before_the_producer_runs() {
+        let (repo, state, project_id, oid) = repo_state();
+        let registered = register_governed_task(
+            &state,
+            registration(
+                &project_id,
+                repo.path(),
+                &oid,
+                WorldScope::StagedAuthoritative,
+            ),
+            ConnectionClass::Operator,
+        )
+        .unwrap();
+        let (accepted, _) = accepted_staged_task(&state, registered);
+        std::fs::write(repo.path().join("NOTES.md"), "canonical work\n").unwrap();
+        git(repo.path(), &["add", "NOTES.md"]);
+        git(repo.path(), &["commit", "--quiet", "-m", "canonical move"]);
+        let blocked = promote_governed_outcome(
+            &state,
+            promotion_request(&accepted, "no-worktree-promote-1"),
+            ConnectionClass::Operator,
+        )
+        .await
+        .unwrap()
+        .task;
+        let reclaimed = discard_governed_staged_worktree(
+            &state,
+            discard_request(&blocked, "no-worktree-discard"),
+            ConnectionClass::Operator,
+        )
+        .await
+        .unwrap()
+        .task;
+
+        let error = promote_governed_outcome(
+            &state,
+            promotion_request(&reclaimed, "no-worktree-promote-2"),
+            ConnectionClass::Operator,
+        )
+        .await
+        .expect_err("there is no staged worktree left to promote from");
+        assert!(
+            format!("{error:#}").contains("promotion requires an active staged worktree"),
+            "got: {error:#}"
+        );
+        assert!(state.open_reservations().unwrap().is_empty());
+    }
+
+    /// An accepted staged task with no worker claim, checked at the endpoint's
+    /// own admission function.
+    ///
+    /// Deliberately not driven through the ledger: `Accepted` is only reachable
+    /// via an operator decision on a Supervisor verdict on a verification on a
+    /// claim, so a claimless accepted task cannot be constructed by any
+    /// sequence of real mutations. The check is defense in depth against a
+    /// future transition that relaxes that chain, which is exactly the kind of
+    /// thing an inline `is_accepted() && has_worktree()` preflight would have
+    /// missed — it did, until the matrix test found it.
+    #[test]
+    fn an_accepted_task_without_a_claim_is_refused_by_the_endpoint_admission() {
+        let mut claimless = matrix_task(
+            GovernedReviewState::Accepted,
+            GovernedExecutionState::RuntimeExited,
+            impulse_ops::governed_task::SharedRepositoryConfigPin::Recorded(
+                impulse_ops::governed_task::SharedRepositoryConfigDigest::current(
+                    format!("sha256:{}", "c".repeat(64)),
+                    None,
+                    None,
+                ),
+            ),
+            None,
+        );
+        assert!(claimless.latest_claim().is_none());
+        let error = promote_preflight(&claimless)
+            .expect_err("a promotion has nothing to reference without a claim");
+        assert!(
+            format!("{error:#}").contains("promotion requires an accepted worker claim"),
+            "got: {error:#}"
+        );
+
+        // With a claim the same task is admitted, so the refusal above is about
+        // the claim and not about some other precondition.
+        claimless
+            .claims
+            .push(impulse_ops::governed_task::WorkerCompletionClaim {
+                id: impulse_ops::governed_task::GovernedRecordId::try_new("claim-a").unwrap(),
+                actor: GovernedActor {
+                    kind: GovernedActorKind::Worker,
+                    id: "worker".to_string(),
+                },
+                summary: "done".to_string(),
+                subject_revision: "b".repeat(40),
+                artifact_ids: Vec::new(),
+                diff_ref: None,
+                loop_report_digest: None,
+                loop_report_version: None,
+                submitted_at: "2026-09-12T00:00:00Z".to_string(),
+                based_on_revision: 2,
+            });
+        assert!(promote_preflight(&claimless).is_ok());
     }
 
     // ── Durable producer reservations (ADR-0012 amendment) ──────────────────

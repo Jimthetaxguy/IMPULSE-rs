@@ -290,7 +290,10 @@ materializes the staged worktree as part of registration (so the checkout exists
 launch), and `PromoteGovernedOutcome`/`DiscardGovernedStagedWorktree` are live endpoints — all
 three operator-class, checked before any state read, with a blocked promotion answered as a
 *successful* response carrying the typed outcome rather than an error, and a drifted configuration
-pin answered as a typed `StagedConfigRefusal` whose remedy is discard-and-re-materialize.
+pin answered as a typed `StagedConfigRefusal` whose remedy is discard-and-re-materialize. Claim,
+verification and promotion each compare the pin before spawning Git; **discard deliberately does
+not** — it removes a checkout and materializes no files, so no driver can fire, and an unpinned or
+drifted worktree is exactly the one an operator most needs to be able to reclaim.
 - **Source of truth:** `WorldScope` and `StagedWorktree` in
   `impulse-rs/impulse-ops/src/governed_task.rs`, the staged producers in
   `impulse-rs/src/governed_producers.rs`, the endpoints in `impulse-rs/src/daemon/governed_wiring.rs`,

@@ -241,15 +241,16 @@ remedy ends in is not blocked.
 {"type": "Ok", "data": {"result": {
   "id": "task-1", "revision": 7, "...": "...",
   "refused": true,
-  "reason": {"kind": "changed", "component": "repository_config"},
+  "reason": {"kind": "repository_config_changed", "component": "repository_config"},
   "remedy": "discard the staged worktree and re-materialize it, then re-run the producer"
 }}}
 ```
 
-`reason.kind` is `unpinned` (the worktree predates the pin, so there is nothing to compare),
-`changed` (with the `component` that differs: `repository_config`, `worktree_config`, or
-`info_attributes`), or `unsupported_submodules` (with the `path`; the staged scope cannot pin a
-submodule's own configuration and refuses to run in such a repository). Clients discriminate on the
+`reason.kind` is `repository_config_unpinned` (the worktree predates the pin, so there is nothing
+to compare), `repository_config_changed` (with the `component` that differs: `repository_config`,
+`worktree_config`, or `info_attributes`), or `unsupported_submodules` (with the `path`; the staged
+scope cannot pin a submodule's own configuration and refuses to run in such a repository). The
+`kind` token is the same string the daemon logs and the CLI renders — one name per reason. Clients discriminate on the
 `refused` flag. An `Error` response from these endpoints still means what it always did: the
 producer genuinely failed.
 

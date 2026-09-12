@@ -145,13 +145,22 @@ pub struct GovernedStagedWorktreeDiscardAck {
 pub enum StagedConfigRefusalReason {
     /// The staged worktree predates the configuration pin, so there is nothing
     /// to compare against.
+    ///
+    /// The wire name is spelled out rather than taken from the variant, so it
+    /// matches [`StagedConfigRefusalReason::as_str`] exactly and shares
+    /// `PromotionBlockedReason`'s vocabulary for the same condition. Two names
+    /// for one reason — a terse `kind` on the wire and a descriptive one in
+    /// logs — is a trap for whoever has to correlate them.
+    #[serde(rename = "repository_config_unpinned")]
     Unpinned,
     /// Worktree-shared repository configuration changed since materialization.
     /// The component names which file, because benign drift blocks too and the
     /// operator must not have to guess.
+    #[serde(rename = "repository_config_changed")]
     Changed { component: SharedConfigComponent },
     /// The repository carries submodule configuration, which the staged scope
     /// cannot pin and therefore refuses to run in.
+    #[serde(rename = "unsupported_submodules")]
     UnsupportedSubmodules { path: String },
 }
 
@@ -606,6 +615,61 @@ mod tests {
         assert_eq!(recovered, expected);
     }
 
+    fn refusal_ack() -> GovernedStagedConfigRefusalAck {
+        GovernedStagedConfigRefusalAck::new(
+            with_staged(task(), pinned()),
+            StagedConfigRefusalReason::Changed {
+                component: SharedConfigComponent::InfoAttributes,
+            },
+        )
+    }
+
+    #[test]
+    fn test_refusal_ack_round_trips_through_serde() {
+        let original = refusal_ack();
+        let json = serde_json::to_string(&original).unwrap();
+        let recovered: GovernedStagedConfigRefusalAck = serde_json::from_str(&json).unwrap();
+        assert_eq!(recovered, original);
+        assert!(recovered.refused);
+        assert_eq!(recovered.remedy, recovered.reason.remedy());
+    }
+
+    #[test]
+    fn test_every_refusal_reason_round_trips_through_serde() {
+        for reason in every_refusal_reason() {
+            let json = serde_json::to_string(&reason).unwrap();
+            let recovered: StagedConfigRefusalReason = serde_json::from_str(&json).unwrap();
+            assert_eq!(recovered, reason, "round trip changed {json}");
+            // The wire discriminator is the snake_case `kind`, which is what a
+            // non-Rust client matches on.
+            // One name per reason: the wire discriminator and the string a log
+            // or a CLI renders must be the same token, or correlating them
+            // becomes a lookup table nobody maintains.
+            let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(value["kind"], reason.as_str());
+        }
+    }
+
+    /// Same guarantee the two sibling acks carry: the refusal flattens the
+    /// governed task, so a client written against the pre-v9 bare
+    /// `GovernedTaskRun` response still parses one out of it. Without this a
+    /// refusal would look like a malformed task to an older reader rather than
+    /// like a task plus fields it does not know.
+    #[test]
+    fn test_refusal_ack_is_wire_compatible_with_a_bare_governed_task() {
+        let expected = with_staged(task(), pinned());
+        let ack = GovernedStagedConfigRefusalAck::new(
+            expected.clone(),
+            StagedConfigRefusalReason::Unpinned,
+        );
+        let json = serde_json::to_value(&ack).unwrap();
+        let recovered: GovernedTaskRun = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(recovered, expected);
+        // And the discriminator an updated client keys on is present beside it.
+        assert_eq!(json["refused"], serde_json::Value::Bool(true));
+        assert_eq!(json["reason"]["kind"], "repository_config_unpinned");
+        assert!(json["remedy"].as_str().unwrap().contains("re-materialize"));
+    }
     #[test]
     fn test_discard_ack_is_wire_compatible_with_a_bare_governed_task() {
         let expected = with_staged(task(), pinned());

@@ -175,7 +175,7 @@ Run on this checkout with `CARGO_TARGET_DIR` isolated to
 | Command | Result |
 |---|---|
 | `cargo build --workspace` | clean |
-| `cargo test --workspace` | **2898 passed / 0 failed / 9 ignored** after review round 2, against `origin/main` `22f9630` (2612 initial, 2624 after review round 1, 2762 after the #53/#55 merge; the rest is #56's and #59's own tests arriving with main) |
+| `cargo test --workspace` | **2905 passed / 0 failed / 9 ignored** after the final verification round, against `origin/main` `22f9630` (2612 initial, 2624 after review round 1, 2762 after the #53/#55 merge; the rest is #56's and #59's own tests arriving with main) |
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean |
 | `cargo fmt --all -- --check` | clean |
 | `python3 ../docs/validate_docs.py --all` | 4 pre-existing failures only (unchanged) |
@@ -431,8 +431,9 @@ lane's `PRODUCER_RESERVATIONS.json`, the cherry-picked `MEMORY_CANDIDATES.json`,
 arm and three lanes have edited it. Verified by inspection after each merge rather than inferred
 from a clean auto-merge.
 
-Final gate against `22f9630`: `cargo build --workspace` clean; `cargo test --workspace` **2898
-passed / 0 failed / 9 ignored** (2896 before review round 2's two guard tests); `cargo clippy --workspace --all-targets -- -D warnings` clean;
+Final gate against `22f9630`: `cargo build --workspace` clean; `cargo test --workspace` **2905
+passed / 0 failed / 9 ignored** (2896 before review round 2, 2898 after its guard tests, 2905 after
+the final verification round's seven); `cargo clippy --workspace --all-targets -- -D warnings` clean;
 `cargo fmt --all -- --check` clean; `python3 ../docs/validate_docs.py --all` still the same four
 pre-existing failures.
 
@@ -486,6 +487,67 @@ the message.
 in review because the source looks correctly wrapped — the run only exists after the continuation
 is lost. Enumerating the strings at their definition is the best available substitute; the standing
 risk is a *new* operator-facing string defined somewhere neither guard enumerates.
+
+## Final verification round (2026-09-12)
+
+Five items from the pre-merge verification at `d8df6aa`. Four fixed, one recorded.
+
+- **F2 — the refusal ack had no serde or wire-compat test**, unlike both sibling acks. Added:
+  `test_refusal_ack_round_trips_through_serde`,
+  `test_every_refusal_reason_round_trips_through_serde`, and
+  `test_refusal_ack_is_wire_compatible_with_a_bare_governed_task`.
+
+  Writing them surfaced a defect worth naming: the serde `kind` and
+  `StagedConfigRefusalReason::as_str()` **disagreed** — `unpinned` on the wire, but
+  `repository_config_unpinned` in logs and the CLI. Two names for one reason is a lookup table
+  nobody maintains, so the variants now carry explicit `#[serde(rename = ...)]` matching `as_str()`,
+  the round-trip test asserts `kind == as_str()` for every variant so they cannot drift again, and
+  `docs/IPC-PROTOCOL.md` was corrected (it documented the short names).
+
+- **F3 — no endpoint-level observation of the new promote preconditions.** Added three tests.
+  `an_already_promoted_run_is_refused_before_the_producer_runs` and
+  `a_promotion_without_an_active_worktree_is_refused_before_the_producer_runs` drive the endpoint
+  and assert the ledger's own message, an empty `open_reservations()`, and no new promotion record.
+  "The producer never ran" is *proven* rather than asserted: the staged checkout is deleted first,
+  so a producer that did run would fail loudly on a missing worktree instead of returning the
+  precondition message. The `NoClaim` case is checked at `promote_preflight` rather than through the
+  ledger, because `Accepted` is only reachable via an operator decision on a verdict on a
+  verification on a claim — a claimless accepted task cannot be built by any sequence of real
+  mutations. That check is defense in depth against a future transition relaxing the chain, which is
+  exactly the kind of thing the old inline preflight missed.
+
+- **F4 — the "cannot be synthesized" comment was wrong.** It was, twice over:
+  `state/governed_task.rs` synthesizes an unpinned ledger by rewriting the record *and* its receipt
+  fingerprint, and more simply `require_shared_config_digest` accepts `Unknown`, so submitting the
+  materialization mutation with an unpinned input produces a genuine pre-pin record with a naturally
+  computed receipt and no ledger surgery at all.
+
+  That route produced a real new endpoint test —
+  `an_unpinned_staged_worktree_cannot_be_launched_but_can_be_reclaimed` — and, in writing it, a
+  fact that changes the answer: **#53 made `MarkRunning` refuse an unpinned staged task**, so an
+  unpinned worktree can no longer be driven forward into an accepted state by this build *at all*.
+  The accepted-and-unpinned records that exist are ones a pre-pin build accepted and this build
+  later loaded; reproducing that means rewriting the receipt fingerprint for every mutation in the
+  history through the private `fingerprint_mutation`. So the comment is now correct and specific,
+  the reachable half is covered end to end at the endpoint, and the unreachable half stays at the
+  function plus its wiring. Making `fingerprint_mutation` `pub(crate)` would allow the full test and
+  is on the handoff list rather than taken as a seventh blocked-path hunk.
+
+- **F6 — discard compares no pin**, unlike the other three producers. Stated in ADR-0019's
+  Consequences and in `CONTEXT.md`'s world-scope entry, with the reason: removing a checkout
+  materializes no files, so no filter or textconv driver can fire, and an unpinned or drifted
+  worktree is precisely the one an operator most needs to reclaim. Both notes say explicitly not to
+  "fix" it by adding a pin check.
+
+- **F5 — recorded, not changed.** Extracting `record_promotion_preconditions_hold` moved
+  `require_actor` from *first* in the `RecordPromotion` arm to *after* the task-state checks. Every
+  message is byte-identical, and a request violating exactly one precondition reports exactly what
+  it did before. A request violating **two** — a non-System actor on a task that is also, say, not
+  accepted — now reports the task-state failure where it previously reported the actor failure. No
+  test depended on the old order, and the new order is the better one: the task-state checks are
+  about whether the transition is possible at all, the actor check about whether this caller may
+  make it. Worth knowing if a downstream test matches on the first message of a doubly-invalid
+  request.
 
 ## Post-#53 merge checklist
 
