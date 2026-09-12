@@ -241,6 +241,25 @@ acceptance. This decision reuses it verbatim rather than inventing a second auth
     recovery: it would make the log adopt wholesale under rule 3b, which turns "refuse a log written
     outside Impulse" into "accept it", and discards every review decision in the process.
 
+    **A single foreign trailing entry gets the same recovery, not the replay one.** One well-formed,
+    correctly chained entry appended to the tracked `MEMORY.jsonl` is within the cap, so it loads and
+    stays invisible — but it is not an interrupted decision, and telling an operator to replay a
+    request id that was never issued here is an instruction nobody can follow. A trailing entry whose
+    request id has no local receipt *and* whose candidate is neither live nor parked on this machine
+    is classified as foreign and refused with the truncation recovery above, naming the exact number
+    of lines to keep. The genuine case — the candidate is local, because the decision was taken
+    against it moments earlier — keeps the replay instruction unchanged.
+
+12c. **Write access to the tracked log can deny promotions; it can never make one.** That is the
+    honest statement of the boundary rules 3a and 9a leave open. Anyone who can write or merge
+    `.impulse/MEMORY.jsonl` — a branch, a PR, a shared checkout — can append an entry that blocks
+    every future decision on every checkout until an operator truncates the tail. What they cannot do
+    through that door is promote anything or alter a record: an uncommitted entry never enters the
+    projection, never reaches the retrieval index, and never becomes a candidate's status, because
+    only the ledger commit does those things and the ledger is not in review. Availability is the
+    exposure; integrity is not. An operator recovers with one truncation that loses nothing
+    committed.
+
 ### The projection
 
 12b. **Record text is Builder-influenced, so the projection escapes it.** A candidate's task and
@@ -368,6 +387,9 @@ daemon restart
   loads clean and reaches the projection. Everything downstream of the projection — including any
   runtime memory tool — inherits that boundary and must not be described as reading authenticated
   memory.
+- Making the memory log tracked (rule 3) buys review at the cost of an availability surface: rule
+  12c's foreign trailing entry. The refusal is now actionable rather than a dead end, but the
+  exposure is inherent to a shared, writable evidence file and is not closed here.
 - `status_contains_subject_change` now has a tracked-path exemption where it previously had none
   (rule 3a). That is a real widening of what counts as a clean governed subject, justified only by
   those two daemon-owned digest-chained paths; any future addition to that arm deserves the same
@@ -448,7 +470,11 @@ This decision is represented when tests prove:
     adopted records across a fourth boot; and
 21. a committed record claimed only by a parked decision is not an orphan and is reported at warn,
     while a record claimed by nothing — including by a parked decision naming some other record —
-    still is.
+    still is; and
+22. a single foreign trailing entry appended to the tracked log still loads and stays invisible, the
+    next decision is refused with the truncation recovery and its exact line count rather than the
+    replay instruction, the refusal leaves the log byte-identical, truncating unblocks promotion, and
+    a genuine interrupted tail still gets the replay instruction naming its own request id.
 
 Source of truth: `impulse-rs/impulse-ops/src/{memory_candidate,memory_wiring}.rs`,
 `impulse-rs/src/state/{memory_candidate,memory_record,persistence}.rs`,

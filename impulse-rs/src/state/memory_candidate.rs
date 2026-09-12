@@ -66,6 +66,14 @@ pub enum MemoryCandidateDecisionError {
         "a previous memory decision (request `{request_id}`) was interrupted after appending to the memory log and before committing the ledger; replay that exact request id to finish it before deciding anything else"
     )]
     InterruptedDecision { request_id: GovernedRequestId },
+    #[error(
+        "the memory log's uncommitted trailing entry (request `{request_id}`, candidate `{candidate_id}`) belongs to no decision this checkout ever made, so it cannot be finished by replaying it. .impulse/MEMORY.jsonl was appended to outside this Impulse: keep the first {committed_entries} lines and discard the rest, which loses nothing committed, and the decision can proceed"
+    )]
+    ForeignUncommittedTail {
+        request_id: GovernedRequestId,
+        candidate_id: String,
+        committed_entries: u64,
+    },
     #[error("memory candidate decisions belong to project `{expected}`, not `{actual}`")]
     ProjectMismatch { expected: String, actual: String },
 }
@@ -652,10 +660,32 @@ impl State {
                 Some(entry.record.clone())
             }
             Some(entry) => {
+                // "Replay that request id" is only actionable advice when the
+                // request was ever real here. A well-formed, correctly chained
+                // entry appended to the *tracked* log by anyone with write or
+                // merge access names a request no checkout can replay — and
+                // without this branch it would refuse every future decision on
+                // every checkout, permanently, with instructions that cannot be
+                // followed. That is a denial of service, not an interruption,
+                // and its remedy is the truncation one.
+                if is_foreign_tail(entry, &ledger) {
+                    return Err(MemoryCandidateDecisionError::ForeignUncommittedTail {
+                        request_id: entry.record.request_id.clone(),
+                        candidate_id: tail_candidate_id(entry)
+                            .map(|id| id.to_string())
+                            .unwrap_or_else(|| "<none>".to_string()),
+                        committed_entries: ledger
+                            .memory_log_head
+                            .as_ref()
+                            .map(|head| head.entry_count)
+                            .unwrap_or(0),
+                    }
+                    .into());
+                }
                 return Err(MemoryCandidateDecisionError::InterruptedDecision {
                     request_id: entry.record.request_id.clone(),
                 }
-                .into())
+                .into());
             }
             None => None,
         };
@@ -823,6 +853,53 @@ impl State {
             .into_iter()
             .cloned()
             .collect::<Vec<_>>())
+    }
+}
+
+/// The candidate a log entry was promoted from, when it names one.
+fn tail_candidate_id(
+    entry: &impulse_ops::memory_candidate::MemoryLogEntry,
+) -> Option<&MemoryCandidateId> {
+    match &entry.record.source {
+        MemorySource::CandidateRef { candidate_id, .. } => Some(candidate_id),
+        MemorySource::OperatorManual { .. } => None,
+    }
+}
+
+/// Whether an uncommitted trailing entry belongs to a decision this checkout
+/// could ever have made.
+///
+/// Genuine interruption leaves a tail whose candidate is local — the decision
+/// was taken against it moments earlier — or whose request id already has a
+/// receipt. Anything else came from outside, and telling an operator to replay
+/// it is instructions they cannot follow.
+fn is_foreign_tail(
+    entry: &impulse_ops::memory_candidate::MemoryLogEntry,
+    ledger: &MemoryCandidateLedger,
+) -> bool {
+    if ledger
+        .processed_decisions
+        .contains_key(&entry.record.request_id)
+    {
+        return false;
+    }
+    let Some(candidate_id) = tail_candidate_id(entry) else {
+        // An operator-manual record has no candidate to be local, and no
+        // producer mints one in this stage.
+        return true;
+    };
+    if ledger.candidates.contains_key(candidate_id) {
+        return false;
+    }
+    // A candidate re-derived under a new id still leaves its decision parked
+    // under the governed task, which the record names.
+    match &entry.record.source {
+        MemorySource::CandidateRef {
+            governed_task_id, ..
+        } => !ledger
+            .pending_status_migrations
+            .contains_key(governed_task_id),
+        MemorySource::OperatorManual { .. } => true,
     }
 }
 
@@ -1493,7 +1570,16 @@ pub(in crate::state) mod tests {
                 candidate_id: candidate_id.clone(),
             }
             .to_string(),
-            MemoryCandidateDecisionError::InterruptedDecision { request_id }.to_string(),
+            MemoryCandidateDecisionError::InterruptedDecision {
+                request_id: request_id.clone(),
+            }
+            .to_string(),
+            MemoryCandidateDecisionError::ForeignUncommittedTail {
+                request_id,
+                candidate_id: candidate_id.to_string(),
+                committed_entries: 4,
+            }
+            .to_string(),
             MemoryCandidateDecisionError::ProjectMismatch {
                 expected: "a".to_string(),
                 actual: "b".to_string(),
@@ -1507,6 +1593,7 @@ pub(in crate::state) mod tests {
             "already promoted",
             "superseded",
             "interrupted",
+            "belongs to no decision this checkout ever made",
             "belong to project",
         ]) {
             assert!(
@@ -2026,5 +2113,105 @@ pub(in crate::state) mod tests {
             serde_json::from_slice(&std::fs::read(base.join(MEMORY_CANDIDATES_FILE)).unwrap())
                 .unwrap();
         ledger["revision"].as_u64().unwrap_or(0)
+    }
+
+    /// Reviewer's round-4 Case A. A well-formed, correctly chained entry
+    /// appended to the *tracked* `MEMORY.jsonl` by anyone with write or merge
+    /// access lands in the uncommitted tail, loads fine, and stays invisible —
+    /// but used to refuse every future decision on every checkout with
+    /// "replay that exact request id", an instruction no one could follow.
+    #[test]
+    fn test_a_foreign_uncommitted_tail_is_refused_with_a_truncation_recovery_not_a_replay() {
+        let (_root, state, candidate_id) = state_with_candidate();
+        let base = state.storage().base_path().to_path_buf();
+        drop(state);
+
+        // The foreign entry names a candidate from a different project, so this
+        // checkout has never seen it, live or parked.
+        let foreign_source = sample_candidate();
+        let foreign = derive_promoted_record(
+            &foreign_source,
+            &GovernedRequestId::try_new("never-issued-here").unwrap(),
+            0,
+            "2026-09-12T09:00:00Z",
+        )
+        .unwrap();
+        let storage = Storage::new(base.clone());
+        let mut log = MemoryLog::load(&storage, None, LedgerOrigin::Local).unwrap();
+        log.append(&storage, foreign.clone()).unwrap();
+        let planted = std::fs::read(base.join("MEMORY.jsonl")).unwrap();
+
+        // It loads: one trailing entry is within the cap, and it is invisible.
+        let reloaded = State::new(base.clone()).unwrap();
+        assert!(reloaded.list_promoted_memory_records().unwrap().is_empty());
+        assert!(reloaded
+            .read_genome_projection()
+            .unwrap()
+            .is_none_or(|projection| !projection.contains(foreign.id.as_str())));
+
+        // But every decision is refused — with the recovery an operator can
+        // actually perform, and without the replay instruction.
+        let error = reloaded
+            .decide_memory_candidate(
+                with_project(promote(&candidate_id, "decide-1", 0), &reloaded),
+                OperatorAuthentication::Declared,
+                "2026-09-12T10:00:00Z",
+            )
+            .unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("belongs to no decision this checkout ever made"),
+            "unexpected error: {rendered}"
+        );
+        assert!(
+            rendered.contains("keep the first 0 lines"),
+            "the message must name the exact truncation: {rendered}"
+        );
+        assert!(
+            !rendered.contains("replay that exact request id"),
+            "an unreplayable request must not be handed the replay instruction: {rendered}"
+        );
+        assert_eq!(
+            std::fs::read(base.join("MEMORY.jsonl")).unwrap(),
+            planted,
+            "a refusal must not touch the log"
+        );
+        drop(reloaded);
+
+        // Truncating to the committed head — nothing committed, so an empty
+        // file — unblocks promotion.
+        std::fs::write(base.join("MEMORY.jsonl"), "").unwrap();
+        let recovered = State::new(base).unwrap();
+        let outcome = recovered
+            .decide_memory_candidate(
+                with_project(promote(&candidate_id, "decide-1", 0), &recovered),
+                OperatorAuthentication::Declared,
+                "2026-09-12T10:00:00Z",
+            )
+            .unwrap();
+        assert!(outcome.record.is_some());
+        assert_eq!(recovered.list_promoted_memory_records().unwrap().len(), 1);
+    }
+
+    /// The genuine interrupted-decision path is untouched: its candidate is
+    /// local, so it is never classified as foreign.
+    #[test]
+    fn test_a_genuine_interrupted_tail_still_says_replay() {
+        let (_root, state, candidate_id) = state_with_candidate();
+        let base = crash_between_append_and_commit(&state, &candidate_id, "decide-1");
+        drop(state);
+        let reloaded = State::new(base).unwrap();
+
+        let error = reloaded
+            .decide_memory_candidate(
+                with_project(promote(&candidate_id, "decide-2", 0), &reloaded),
+                OperatorAuthentication::Declared,
+                "2026-09-12T12:00:00Z",
+            )
+            .unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("replay that exact request id"));
+        assert!(rendered.contains("decide-1"));
+        assert!(!rendered.contains("belongs to no decision"));
     }
 }

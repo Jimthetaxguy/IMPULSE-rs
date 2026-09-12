@@ -35,7 +35,7 @@ tags: [worktree, lane, handoff, memory]
 - Verification: isolated `CARGO_TARGET_DIR`; `cargo build --workspace`, `cargo test --workspace`,
   `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`,
   `python3 docs/validate_docs.py --all`.
-- Latest status: review round 3 addressed; branch FROZEN at the round-3 push; draft PR open.
+- Latest status: review round 4 addressed; branch FROZEN at the round-4 push; draft PR open.
 
 ## Decisions
 
@@ -302,6 +302,38 @@ the error it used to produce.
 
 ADR clause 14a rewritten, 3b extended with the true-fresh-clone case, Verification items 20 and 21
 added. Display coverage is now eight variants.
+
+## Review round 4 (2026-09-12)
+
+Round-4 verification confirmed the fresh-clone four-boot fix and that the orphan and truncation
+refusals still hold. One Medium availability finding, fixed here; branch frozen after this push.
+
+**A foreign trailing entry blocked promotions forever with unfollowable advice.** One well-formed,
+correctly chained entry appended to the *tracked* `MEMORY.jsonl` lands within the tail cap, loads,
+and stays invisible — correct so far. But `decide_memory_candidate` then refused every future
+decision on every checkout with `InterruptedDecision`'s "replay that exact request id", which nobody
+can do for an id that was never issued here. Anyone with write or merge access to the tracked log
+could therefore deny promotions permanently, and the documented recovery was wrong.
+
+A trailing entry is now classified. Foreign means: no local receipt for its request id **and** its
+candidate is neither live in the ledger nor parked under its governed task (and an operator-manual
+record, which has no candidate at all, is foreign by construction). Those get a new
+`ForeignUncommittedTail` carrying the truncation recovery and the exact number of lines to keep —
+the same remedy `UncommittedTailTooLong` gives, because it is the same situation. The genuine path is
+untouched: an interrupted decision's candidate is local, because the decision was taken against it
+moments earlier, so it still gets the replay instruction naming its own id.
+
+ADR 12a gained the foreign-entry paragraph and a new 12c states the boundary plainly: write access to
+the tracked log can **deny** promotions until an operator truncates, and can never **make** one — an
+uncommitted entry never enters the projection, the retrieval index, or a candidate's status, because
+only the ledger commit does those and the ledger is not in review. Availability is the exposure;
+integrity is not. A Consequences bullet records that this is the price of rule 3's tracked log.
+
+Tests: the reviewer's Case A end to end (append a foreign entry, load succeeds and records are
+unaffected, the next decision is refused with the foreign message and its line count and without the
+replay instruction, the refusal leaves the log byte-identical, truncation unblocks promotion), a
+companion asserting a genuine interrupted tail still says replay, and Display coverage for the new
+variant.
 
 ## Handoffs
 
