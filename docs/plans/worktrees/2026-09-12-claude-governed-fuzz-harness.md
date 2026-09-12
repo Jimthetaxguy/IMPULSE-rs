@@ -34,8 +34,12 @@ tags: [worktree, lane, proptest, fuzz, governed, ion, testing]
     (see Findings below -- test-only, no production code touched)
   - `impulse-rs/Cargo.toml` (`[dev-dependencies]` `proptest = "1"` line only)
     and `impulse-rs/Cargo.lock`
-  - `impulse-rs/.gitignore` (`proptest-regressions/` -- local failure-seed
-    corpus the new dev-dependency creates on a failing run)
+  - `impulse-rs/proptest-regressions/.gitkeep` (tracked placeholder so the
+    directory exists in a fresh clone/CI; proptest writes minimized
+    counterexamples here on a failing run, and per proptest's own
+    convention they are committed, not ignored -- a fresh clone or CI run
+    that can't see a previously discovered failing case would silently
+    lose it)
   - `docs/superpowers/specs/2026-09-12-governed-parser-property-tests.md`
   - This work card
 - Blocked/shared paths (not touched): any production code in
@@ -137,7 +141,8 @@ tags: [worktree, lane, proptest, fuzz, governed, ion, testing]
   first-alnum-line-or-whole-trim selection rule.
 - `Cargo.toml`/`Cargo.lock`: `proptest = "1"` added to `[dev-dependencies]`
   (first use in this workspace).
-- `.gitignore`: `proptest-regressions/` (local failure-seed corpus).
+- `.gitignore`: the `proptest-regressions/` ignore rule was **removed**, not
+  added -- see the 2026-09-12 PR-review correction below.
 
 ## Tests
 
@@ -177,6 +182,22 @@ here for anyone scanning lane cards:
    `max_chars` before calling `window`), so recorded as a pinned
    characteristic test rather than a bug -- flagged in case a future caller
    of the raw `window()` function skips that precondition.
+
+## PR review round 1 (2026-09-12, PR #57)
+
+Two corrections landed after the PR opened, both docs/config only -- no
+test or production code changed for either.
+
+| Finding | Fix | Verified |
+|---|---|---|
+| Lane card's "## Tests" said "80 new tests"; `14+13+21+8+3=59` | Corrected to 59 in the lane card and the PR description | `cargo test --lib -- proptests --list` reports 59 |
+| **P2 (Codex)** -- `.gitignore:10` ignored `proptest-regressions/`, so a fresh clone or CI would silently lose any minimized counterexample proptest discovers and writes there, contradicting proptest's own convention (commit the regression corpus, don't ignore it) | Removed the ignore rule entirely; `impulse-rs/proptest-regressions/.gitkeep` added so the (currently empty -- no discovered failing case is outstanding) directory is tracked and ready to receive real seed files as they're found | `cargo test --lib -- proptests` still 59 passed, 0 failed after the change (removing an ignore rule cannot itself change test behavior; re-run was to confirm nothing else shifted) |
+
+Codex's finding is correct and this card's original `.gitignore` rationale
+(treating the corpus as a disposable "local re-run aid") was the actual
+error -- proptest's own docs recommend committing `proptest-regressions/`
+precisely so a regression discovered once, anywhere, is never silently
+re-lost by someone else's clone or by CI.
 
 ## Handoff Notes
 
