@@ -165,7 +165,8 @@ in the task record.
     every record written before this ADR the two numbers are identical, so no stored candidate
     digest changes.
 
-13. **Every repository-level configuration file Git reads is pinned across the run.**
+13. **Every repository-level configuration file Git reads is pinned across the run — in a
+    repository without submodules, which is the only kind this scope runs in.**
     `.git/config` and `.git/info/attributes` are shared by the main worktree and every linked one,
     so a staged Builder can write them from inside its own checkout — `info/attributes` never
     appears in a diff of the work tree, so it is invisible to code review. `config.worktree` is
@@ -212,10 +213,29 @@ in the task record.
     driver it names cannot be *defined* without changing the pinned digest.
 
     Global and system configuration are outside the pin and cannot be brought inside it — they are
-    not repository state — so every producer Git invocation suppresses them with
-    `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_SYSTEM=/dev/null`. The env scrub keeps `HOME`, so
-    without that a `filter.<name>.clean` in the operator's own `~/.gitconfig` would execute inside
-    a daemon-owned producer.
+    not repository state — so every daemon-owned producer Git invocation in `governed_producers.rs`
+    suppresses them with `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_SYSTEM=/dev/null`. The env
+    scrub keeps `HOME`, so without that a `filter.<name>.clean` in the operator's own `~/.gitconfig`
+    would execute inside a daemon-owned producer.
+
+    **Submodules are refused, not pinned.** Each submodule is a repository with a configuration file
+    of its own — `<common>/modules/<name>/config` for the main worktree,
+    `<common>/worktrees/<id>/modules/<name>/config` for a linked one, each with its own
+    `info/attributes` — and a `filter.<name>.clean` defined there fires on the *enclosing*
+    worktree's `git status`, which is the first thing every producer runs. Verified against Git
+    2.50.1. Pinning that set means walking a directory tree whose shape is Git's to change, and this
+    rule's whole claim is that the file list is complete; a list that has to be re-derived from a
+    directory walk is not one this ADR can stand behind. So the staged scope refuses a repository
+    that carries submodule configuration — a `.gitmodules` in either tree, or a `modules/` directory
+    in either Git directory — at materialization, and again on every producer path so a
+    `.gitmodules` introduced mid-run cannot slip past. That is a real capability gap, stated as one
+    rather than papered over.
+
+    **The pin is recorded after the worktree exists**, so it covers that worktree's own per-worktree
+    files. The window between `git worktree add` and the recording mutation is synchronous, with no
+    `.await` and no launch path: launching requires the active staged record the caller has not
+    recorded yet, `MarkRunning` refuses a staged task without one, and materialization is
+    operator-only. Nothing runs in the staged worktree before its pin exists.
 
     **The load-bearing argument is detection, not enumeration — within the files it covers.** This
     gate is safe because it
@@ -479,6 +499,38 @@ offer; `~/` and backslash line continuation are both handled. And a repository u
 returns an error instead of the typed `PromotionBlocked` record; it still fails closed and still
 names the component that changed, but the operator does not get a recorded outcome. Both are
 narrow, both fail safe, and both are cheaper to fix once something needs them than to guess at now.
+
+### Review round 2 on the fixes (PR #53)
+
+Three P3s and two wording corrections; the branch freezes after them.
+
+- **Submodule configuration was outside the pinned set** while rule 13 asserted that every
+  repository-level configuration file Git reads is pinned. Verified reachable against Git 2.50.1.
+  Resolved by refusing submodule repositories outright rather than by extending the walk — see rule
+  13. Refusing is the smaller and the more honest of the two, because the alternative replaces a
+  fixed file list with a directory walk and quietly weakens what the rule can promise.
+
+- **The pin's scheme version was not bumped when the covered file set changed.** Round 1 added the
+  staged worktree's files and changed the attributes digest's domain separator but left the version
+  at 2, so a pin written by the immediately preceding commit was *compared* — producing a
+  `repository_config_changed` naming a component nothing had touched — instead of being refused as
+  uncomparable. Now 3, with the constant's own documentation saying to bump it whenever the covered
+  file set changes, not only when the algorithm does. A misleading difference is worse than an
+  honest refusal: it sends an operator looking for a change that never happened.
+
+- **A comment line ending in a backslash swallowed the line after it.** Git's continuation lives
+  inside value parsing, not at the line level, so `# hidden \` leaves a following `[include]`
+  header in force — and the line-level join hid that header from the include walk, leaving its
+  target unpinned. Comment lines now never continue, and never absorb a continuation in progress.
+
+- **Scope of the Git-invocation hardening, stated precisely.** "Every producer Git invocation"
+  means every daemon-owned producer in `governed_producers.rs`. The Dioxus governed-launch preflight
+  (`impulse-desktop/src/runtime.rs`, `run_bounded_governed_git`) is a separate code path and is
+  **not** hook-free: it sets no `core.hooksPath`, no `core.fsmonitor`, and no `GIT_CONFIG_*`
+  overrides, and its env scrub keeps `HOME`. It runs before a staged worktree exists, in the
+  operator's own checkout, so it is not this ADR's trust boundary — but it is a Git invocation on a
+  governed path with none of these protections, and it belongs to the desktop track. Recorded here
+  so it is not mistaken for covered.
 
 ## Review round 1
 

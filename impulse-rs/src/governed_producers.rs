@@ -909,6 +909,56 @@ pub enum StagedConfigRefusal {
         task_id: String,
         component: SharedConfigComponent,
     },
+    #[error(
+        "governed task `{task_id}` targets a repository with submodule configuration ({path}); the staged world scope does not support submodules"
+    )]
+    UnsupportedSubmodules { task_id: String, path: String },
+}
+
+/// Refuse a repository that carries submodule configuration.
+///
+/// Each submodule is a repository with a configuration file of its own —
+/// `<common>/modules/<name>/config` for the main worktree and
+/// `<common>/worktrees/<id>/modules/<name>/config` for a linked one — and a
+/// `filter.<name>.clean` defined there fires on the enclosing worktree's
+/// `git status`, which is the first thing every producer runs. Reproduced
+/// against Git 2.50.1.
+///
+/// Pinning that set would mean walking a directory tree whose shape is Git's to
+/// change, so the staged scope refuses submodule repositories outright instead.
+/// That is the honest position: rule 13 claims to pin *every* repository-level
+/// configuration file Git reads, and a scope that cannot make that true for a
+/// repository must not run in it. Filesystem reads only, so it is callable
+/// before the first Git invocation.
+fn ensure_no_submodule_configuration(
+    task_id: &str,
+    workspace: &Path,
+    staged_root: Option<&Path>,
+) -> Result<()> {
+    let mut candidates = vec![workspace.join(".gitmodules")];
+    candidates.push(
+        SharedGitPaths::resolve(workspace)?
+            .common_dir
+            .join("modules"),
+    );
+    if let Some(staged_root) = staged_root {
+        candidates.push(staged_root.join(".gitmodules"));
+        candidates.push(
+            SharedGitPaths::resolve(staged_root)?
+                .git_dir
+                .join("modules"),
+        );
+    }
+    for candidate in candidates {
+        if candidate.symlink_metadata().is_ok() {
+            return Err(StagedConfigRefusal::UnsupportedSubmodules {
+                task_id: task_id.to_string(),
+                path: candidate.display().to_string(),
+            }
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// Refuse to run Git in a staged worktree whose shared configuration no longer
@@ -930,13 +980,13 @@ fn ensure_staged_config_pin_holds(task: &GovernedTaskRun) -> Result<()> {
         return Ok(());
     };
     let task_id = task.id.as_str().to_string();
+    let workspace = Path::new(&task.workspace_root);
+    let staged_root = Path::new(staged.root.as_str());
+    ensure_no_submodule_configuration(&task_id, workspace, Some(staged_root))?;
     let Some(pinned) = staged.shared_config_digest.comparable() else {
         return Err(StagedConfigRefusal::Unpinned { task_id }.into());
     };
-    let observed = shared_repository_config_digest(
-        Path::new(&task.workspace_root),
-        Some(Path::new(staged.root.as_str())),
-    )?;
+    let observed = shared_repository_config_digest(workspace, Some(staged_root))?;
     match pinned.first_difference(&observed) {
         Some(component) => Err(StagedConfigRefusal::Changed { task_id, component }.into()),
         None => Ok(()),
@@ -1824,10 +1874,26 @@ fn config_include_paths(bytes: &[u8], base: &Path) -> Vec<PathBuf> {
 /// Counted rather than matched, so `path = c:\\` (an even number of trailing
 /// backslashes, meaning one escaped backslash) is not mistaken for a
 /// continuation.
+///
+/// Comment lines never continue. In Git the continuation lives inside *value*
+/// parsing, not at the line level, so `# hidden \` does not swallow the line
+/// after it — and treating it as a continuation would let a comment hide a real
+/// `[include]` header from this walk, leaving its target unpinned. A comment
+/// also ends any continuation in progress rather than being appended to it,
+/// which is the conservative direction: at worst the walk finds an include Git
+/// would not honor, never the reverse.
 fn join_continued_lines(text: &str) -> Vec<String> {
     let mut joined: Vec<String> = Vec::new();
     let mut pending: Option<String> = None;
     for line in text.lines() {
+        let comment = line.trim_start().starts_with(['#', ';']);
+        if comment {
+            if let Some(buffer) = pending.take() {
+                joined.push(buffer);
+            }
+            joined.push(line.to_string());
+            continue;
+        }
         let trailing = line.len() - line.trim_end_matches('\\').len();
         let continues = trailing % 2 == 1;
         let body = if continues {
@@ -1956,6 +2022,13 @@ fn require_staged_scope(task: &GovernedTaskRun) -> Result<()> {
 /// the same detached `git worktree add` path verification already uses. Nothing
 /// here is caller-authored: the path is derived from the task record and the
 /// revision is the one the registration attested.
+///
+/// The configuration pin is computed after the worktree exists, so it covers
+/// that worktree's own per-worktree files. The window between the two is
+/// synchronous with no `.await` and no launch path: launching requires the
+/// active staged record this function's caller has not recorded yet,
+/// `MarkRunning` refuses a staged task without one, and materialization is
+/// operator-only. Nothing runs in the staged worktree before its pin exists.
 pub fn materialize_staged_worktree(task: &GovernedTaskRun) -> Result<StagedWorktreeInput> {
     require_staged_scope(task)?;
     let initial = task
@@ -1964,6 +2037,9 @@ pub fn materialize_staged_worktree(task: &GovernedTaskRun) -> Result<StagedWorkt
         .context("staged governed task lost its initial Git OID")?;
     validate_oid(initial)?;
     let workspace = PathBuf::from(&task.workspace_root);
+    // Before anything is created, and before the first Git call: a repository
+    // with submodules carries configuration this scope cannot pin.
+    ensure_no_submodule_configuration(task.id.as_str(), &workspace, None)?;
     let head = observe_clean_git_subject(&workspace, None)?;
     if head != initial {
         anyhow::bail!(
@@ -2233,8 +2309,19 @@ pub fn promote_governed_outcome(task: &GovernedTaskRun) -> Result<GovernedPromot
     };
 
     // FIRST, before any Git process is spawned against this repository:
-    // worktree-shared configuration must be exactly what it was when this
-    // worktree was materialized.
+    // submodule configuration is unpinnable, and worktree-shared configuration
+    // must be exactly what it was when this worktree was materialized.
+    //
+    // Submodules are an *error* rather than a blocked outcome: a blocked
+    // promotion says "the canonical branch could not be advanced, retry after
+    // reconciling it", and that is not what happened here. A repository this
+    // scope cannot govern is a registration-time mistake, and materialization
+    // already refuses it — this catches only a `.gitmodules` introduced mid-run.
+    ensure_no_submodule_configuration(
+        task.id.as_str(),
+        &workspace,
+        Some(Path::new(staged.root.as_str())),
+    )?;
     //
     // The original code observed the staged worktree and the canonical tree
     // first, and compared configuration afterwards. Both observations run
@@ -3662,6 +3749,97 @@ mod tests {
                 "{key} must be suppressed for every producer Git invocation"
             );
         }
+    }
+
+    /// Review round 2 on PR #53: a comment line ending in a backslash must not
+    /// swallow the line after it. Git's continuation lives inside value parsing,
+    /// so `# hidden \` leaves the following `[include]` header in force — and a
+    /// line-level join would hide that header from this walk, leaving its target
+    /// unpinned while Git still honored it.
+    #[test]
+    fn test_config_include_paths_are_not_hidden_by_a_continued_comment() {
+        let base = Path::new("/repo/.git");
+        let bytes = b"# hidden \\\n[include]\n\tpath = evil.inc\n";
+        assert_eq!(
+            config_include_paths(bytes, base),
+            vec![PathBuf::from("/repo/.git/evil.inc")],
+            "a comment must not swallow an include header Git honors"
+        );
+        // A comment also ends a continuation in progress rather than joining it.
+        assert_eq!(
+            join_continued_lines("path = a\\\n; note\n[include]"),
+            vec![
+                "path = a".to_string(),
+                "; note".to_string(),
+                "[include]".to_string()
+            ]
+        );
+    }
+
+    /// Review round 2 on PR #53: each submodule is a repository with a
+    /// configuration file of its own, and a `filter.<name>.clean` defined there
+    /// fires on the enclosing worktree's `git status`. Pinning that set means
+    /// walking a tree whose shape is Git's to change, so the staged scope
+    /// refuses submodule repositories outright rather than claiming a coverage
+    /// it does not have.
+    #[test]
+    fn test_materialize_refuses_a_repository_with_submodule_configuration() {
+        let dir = init_repo();
+        let repo = dir.path().canonicalize().unwrap();
+        let mut registered = task(&repo);
+        registered.world_scope = WorldScope::StagedAuthoritative;
+        registered.initial_subject_revision = Some(oid(&repo));
+        std::fs::write(
+            repo.join(".gitmodules"),
+            "[submodule \"sub\"]\n\tpath = sub\n\turl = ../sub\n",
+        )
+        .unwrap();
+
+        let error = materialize_staged_worktree(&registered)
+            .expect_err("a submodule repository is not a staged world this scope can pin");
+        assert_eq!(
+            error.downcast_ref::<StagedConfigRefusal>().map(|refusal| {
+                matches!(refusal, StagedConfigRefusal::UnsupportedSubmodules { .. })
+            }),
+            Some(true)
+        );
+        assert!(error.to_string().contains("submodule"));
+        // Nothing was created: the refusal precedes every side effect.
+        assert!(!registered.expected_staged_worktree_root().unwrap().exists());
+    }
+
+    /// The same refusal reaches the producers that run Git in an already-staged
+    /// worktree, so a `.gitmodules` introduced mid-run cannot slip past.
+    #[test]
+    fn test_producers_refuse_a_submodule_repository_introduced_mid_run() {
+        let dir = init_repo();
+        let repo = dir.path().canonicalize().unwrap();
+        let initial = oid(&repo);
+        let mut registered = task(&repo);
+        registered.world_scope = WorldScope::StagedAuthoritative;
+        registered.initial_subject_revision = Some(initial.clone());
+        registered.claims.clear();
+        registered.verifications.clear();
+        registered.supervisor_verdicts.clear();
+        registered.review_state = GovernedReviewState::AwaitingClaim;
+        let staged = materialize_staged_worktree(&registered).unwrap();
+        with_staged_record(&mut registered, &staged, &initial);
+
+        // The Builder introduces one inside its own worktree.
+        std::fs::write(
+            PathBuf::from(&staged.root).join(".gitmodules"),
+            "[submodule \"sub\"]\n\tpath = sub\n\turl = ../sub\n",
+        )
+        .unwrap();
+
+        let error = derive_claim(&registered, &claim_request(&registered, "req-submodule"))
+            .expect_err("a submodule repository is refused on every producer path");
+        assert!(error
+            .downcast_ref::<StagedConfigRefusal>()
+            .is_some_and(|refusal| matches!(
+                refusal,
+                StagedConfigRefusal::UnsupportedSubmodules { .. }
+            )));
     }
 
     /// Git honors a backslash line continuation in a configuration value, so the

@@ -298,15 +298,21 @@ impl SharedRepositoryConfigPin {
 
 /// Scheme these digests are computed under.
 ///
-/// Bumped by the 2026-09-12 post-merge fix: the original scheme hashed a
-/// *sorted* `git config --local --list` rendering, which collapses a reordering
-/// of repeated scalar keys to the same digest even though Git resolves the last
-/// one. The current scheme hashes the raw bytes of the pinned files plus every
-/// file reachable through their `include`/`includeIf` paths, exactly as ADR-0019
-/// promises. A pin recorded under any other version cannot be compared by this
-/// build, so promotion refuses it with `repository_config_unpinned` rather than
-/// comparing two different things.
-pub const SHARED_REPOSITORY_CONFIG_SCHEME_VERSION: u32 = 2;
+/// Bumped by the 2026-09-12 post-merge fixes. Scheme 1 hashed a *sorted*
+/// `git config --local --list` rendering, which collapses a reordering of
+/// repeated scalar keys to the same digest even though Git resolves the last
+/// one. Scheme 2 hashed raw file bytes but covered only the canonical
+/// worktree's per-worktree files. Scheme 3 adds the staged worktree's own
+/// per-worktree configuration and attributes, and changes the domain separator
+/// of the attributes digest.
+///
+/// **Bump this whenever the covered file set or any hashing input changes**, not
+/// only when the algorithm does. Two pins computed over different file sets
+/// answer different questions, and comparing them produces a *misleading*
+/// difference — `RepositoryConfigChanged` naming a component nothing touched —
+/// rather than the honest `repository_config_unpinned` refusal. A pin recorded
+/// under any other version is refused as uncomparable.
+pub const SHARED_REPOSITORY_CONFIG_SCHEME_VERSION: u32 = 3;
 
 /// The version a record written before the field existed loads as. It is not
 /// comparable, and it is deliberately not `SHARED_REPOSITORY_CONFIG_SCHEME_VERSION`.
@@ -1915,6 +1921,23 @@ mod tests {
         let future = SharedRepositoryConfigPin::Recorded(future);
         assert!(!future.is_comparable());
         assert!(future.recorded().is_some());
+    }
+
+    /// Review round 2 on PR #53: a pin from this branch's own earlier commit was
+    /// still scheme 2, which covered a *different* file set, so comparing it
+    /// produced a misleading `RepositoryConfigChanged` instead of refusing.
+    #[test]
+    fn test_a_scheme_two_pin_is_refused_rather_than_compared() {
+        let mut superseded =
+            SharedRepositoryConfigDigest::current(format!("sha256:{}", "d".repeat(64)), None, None);
+        superseded.scheme_version = 2;
+        let pin = SharedRepositoryConfigPin::Recorded(superseded);
+        assert!(pin.recorded().is_some(), "it still loads");
+        assert!(
+            !pin.is_comparable(),
+            "a scheme-2 pin covers a different file set and must not be compared"
+        );
+        assert_eq!(SHARED_REPOSITORY_CONFIG_SCHEME_VERSION, 3);
     }
 
     #[test]

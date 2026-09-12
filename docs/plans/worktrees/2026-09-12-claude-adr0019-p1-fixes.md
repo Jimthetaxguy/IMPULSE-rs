@@ -140,6 +140,28 @@ One lesson worth keeping: the test harness had been setting `GIT_CONFIG_GLOBAL=/
 along while production did not. A harness safer than production hides the thing it is meant to
 test.
 
+## Review round 2 (2026-09-12, PR #53)
+
+Round-2 verification confirmed every round-1 fix and both P1 reverts. Three P3s and two wording
+corrections; the branch freezes after them.
+
+| Finding | Fix | Test | Revert-check |
+|---|---|---|---|
+| **P3** — submodule config (`<common>/modules/<name>/config`, `<common>/worktrees/<id>/modules/<name>/config`, and their `info/attributes`) is outside the pinned set, while rule 13 claims every repository-level config file is pinned. Verified reachable on Git 2.50.1. | **refusal, not coverage**: `ensure_no_submodule_configuration` refuses a repository carrying a `.gitmodules` in either tree or a `modules/` directory in either Git directory — at materialization and on every producer path | `test_materialize_refuses_a_repository_with_submodule_configuration`, `test_producers_refuse_a_submodule_repository_introduced_mid_run` | both fail when the check is dropped |
+| **P3** — the scheme version stayed 2 although round 1 changed the covered file set and the attributes domain separator, so a pin from the previous commit was *compared* (misleading `RepositoryConfigChanged`) instead of refused | bumped to 3; the constant's doc now says to bump on any change to the covered set, not only the algorithm | `test_a_scheme_two_pin_is_refused_rather_than_compared` | reverting to 2 fails it |
+| **P3** — `join_continued_lines` let a comment ending in `\` swallow a following `[include]` header Git honors | comment lines never continue and never absorb a continuation in progress; docstring corrected | `test_config_include_paths_are_not_hidden_by_a_continued_comment` | removing the comment branch fails it |
+| Nit — the materialization window was undocumented | one sentence in `materialize_staged_worktree` and rule 13: synchronous, no `.await`, no launch path (launch needs the active record, `MarkRunning` refuses without it, materialization is operator-only) | — | — |
+| Wording — "every producer Git invocation" | now "every daemon-owned producer in `governed_producers.rs`", in the commit, the code, and ADR-0019 | — | — |
+
+Why refusal over coverage for the submodule finding: extending the pin means replacing a fixed file
+list with a walk of a directory tree whose shape is Git's to change, which weakens exactly the
+property rule 13 rests on. A named capability gap is worth more than a coverage claim that has to be
+re-derived at runtime.
+
+Why the scheme bump matters more than it looks: comparing two pins computed over *different* file
+sets does not fail safe in the useful sense — it reports a change that never happened, and sends an
+operator looking for it. An uncomparable pin must say so.
+
 ## Follow-ups
 
 - `staged_worktree_is_discardable` is duplicated: the state layer holds the enforcing copy, and
@@ -149,6 +171,13 @@ test.
 
 ## Handoff Notes
 
+- **Desktop track — a governed-path Git invocation with none of this hardening.**
+  `impulse-desktop/src/runtime.rs`'s `run_bounded_governed_git` (the Dioxus governed-launch
+  preflight) sets no `core.hooksPath`, no `core.fsmonitor`, and no `GIT_CONFIG_GLOBAL`/
+  `GIT_CONFIG_SYSTEM`, and its env scrub keeps `HOME`. It runs in the operator's own checkout
+  before any staged worktree exists, so it is outside ADR-0019's trust boundary, but it is a Git
+  invocation on a governed path without the protections every producer has. **Not fixed here:
+  `impulse-desktop/**` is blocked for this lane.** Recorded in ADR-0019's residuals too.
 - **For `claude/daemon-governed-wiring-20260912`:** one breaking signature.
   `GovernedTaskRun::launch_working_directory()` now returns
   `Result<&str, LaunchWorkingDirectoryError>` instead of `&str`. Every other producer signature is
