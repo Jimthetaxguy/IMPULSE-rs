@@ -3,7 +3,7 @@ title: "ADR-0019: Builder Staged-Worktree World Scope"
 description: A declared world scope, a disposable staged worktree for the Builder, and promotion as a separate step after operator acceptance
 status: review
 created: 2026-09-02
-updated: 2026-09-02
+updated: 2026-09-12
 type: decision
 category: architecture
 phase: all
@@ -81,8 +81,11 @@ in the task record.
    its own `staged_worktree_materialized` event.
 
 4. **`launch_working_directory` is the Builder's cwd.** It returns the staged root while the
-   worktree is active and the canonical workspace root otherwise, so a runtime that has not been
-   taught about world scopes still lands somewhere correct.
+   worktree is active and the canonical workspace root for every non-staged scope, so a runtime
+   that has not been taught about world scopes still lands somewhere correct. A *staged* task with
+   no active staged worktree has no launch directory at all and returns a typed error rather than
+   the canonical workspace, and `MarkRunning` refuses such a task outright — see
+   [Post-merge fixes (2026-09-12)](#post-merge-fixes-2026-09-12).
 
 5. **Promotion is a separate step after acceptance.** `promote_governed_outcome` is allowed only
    on an `accepted` task with an active staged worktree. It requires the staged worktree to be
@@ -162,22 +165,43 @@ in the task record.
     every record written before this ADR the two numbers are identical, so no stored candidate
     digest changes.
 
-13. **Worktree-shared repository configuration is pinned across the run.** `.git/config`,
-    `.git/info/attributes`, and `.git/config.worktree` are shared by the main worktree and every
-    linked one, so a staged Builder can write them from inside its own checkout —
-    `info/attributes` never appears in a diff of the work tree, so it is invisible to code review.
-    `config.worktree` is pinned too: worktree-scoped config *not* accepting filter keys is
-    convention, not a Git guarantee (the file takes arbitrary keys, and is read only when
-    `extensions.worktreeConfig` is on — turning that on would itself rewrite `.git/config` and be
-    caught, but pinning the file directly removes the argument). A `filter.<name>.smudge` or
+13. **Every repository-level configuration file Git reads is pinned across the run — in a
+    repository without submodules, which is the only kind this scope runs in.**
+    `.git/config` and `.git/info/attributes` are shared by the main worktree and every linked one,
+    so a staged Builder can write them from inside its own checkout — `info/attributes` never
+    appears in a diff of the work tree, so it is invisible to code review. `config.worktree` is
+    pinned too, and **per worktree**: it is not shared, and the copy that matters most is the
+    *staged* worktree's own `<common>/worktrees/<task id>/config.worktree`, which Git reads for
+    every command a producer runs in that checkout. The original draft of this rule argued that
+    `config.worktree` was covered because enabling `extensions.worktreeConfig` rewrites
+    `.git/config` and would be caught. That argument is wrong whenever the extension is *already*
+    on — `git sparse-checkout` in a linked worktree turns it on for entirely ordinary reasons — and
+    the review of the post-merge fixes reproduced the consequence end to end: a `filter.<name>.clean`
+    plus a `core.attributesFile` written there leaves `.git/config` byte-identical and still
+    executes inside a daemon-owned producer. The pin covers the canonical worktree's copy, the
+    common-directory copy, and the staged worktree's own, and it is recorded at materialization
+    *after* the staged worktree exists so all three are in it. A `filter.<name>.smudge` or
     `diff.<name>.textconv` defined there executes whenever Git materializes a file — including the
     working-tree sync promotion performs, in the canonical workspace, under operator authority,
     after review has already passed. Disabling hooks (rule 5's `core.hooksPath`) does not touch
     that path. Materialization therefore records a
-    digest of that shared state on the `StagedWorktree` record — as a
-    `SharedRepositoryConfigPin`, so a worktree recorded before the pin existed loads as `Unknown`
+    digest of that shared state on the `StagedWorktree` record — the **raw bytes** of each pinned
+    file, plus the raw bytes of every file reachable through the `include`/`includeIf` paths those
+    files name — as a
+    `SharedRepositoryConfigPin` covering the canonical worktree, the common directory, and the
+    staged worktree, so a worktree recorded before the pin existed loads as `Unknown`
     rather than failing the whole ledger on a missing field, and promotion refuses it with its own
-    `repository_config_unpinned` reason telling the operator to discard and re-materialize. An
+    `repository_config_unpinned` reason telling the operator to discard and re-materialize. The pin
+    carries the `scheme_version` it was computed under, and a pin from any other scheme is refused
+    the same way rather than compared across schemes. The comparison, and the digest itself, read
+    files and run no Git process, so a producer can refuse **before** any Git invocation touches the
+    repository whose configuration is in question. **Every** producer that runs Git in the staged
+    worktree compares it first, not only promotion: the claim and verification producers run
+    `git status` there, which applies a `filter.<name>.clean` to any file the attributes route
+    through it, so a Builder that planted one executed its own script at claim time — before an
+    operator ever saw the run — until they were gated too. They refuse with a typed
+    `StagedConfigRefusal`, which is an error rather than a recorded outcome because, unlike
+    promotion, there is no accepted run to record it against. An
     empty digest would have been the wrong default: it would either compare equal to nothing
     (silently unsafe) or to everything (blocked with no explanation). Promotion refuses to check
     anything out unless the same digests still hold, reporting
@@ -188,9 +212,39 @@ in the task record.
     looks at it. An in-tree `.gitattributes` the Builder commits stays legitimate work, because a
     driver it names cannot be *defined* without changing the pinned digest.
 
-    **The load-bearing argument is detection, not enumeration.** This gate is safe because it
+    Global and system configuration are outside the pin and cannot be brought inside it — they are
+    not repository state — so every daemon-owned producer Git invocation in `governed_producers.rs`
+    suppresses them with `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_SYSTEM=/dev/null`. The env
+    scrub keeps `HOME`, so without that a `filter.<name>.clean` in the operator's own `~/.gitconfig`
+    would execute inside a daemon-owned producer.
+
+    **Submodules are refused, not pinned.** Each submodule is a repository with a configuration file
+    of its own — `<common>/modules/<name>/config` for the main worktree,
+    `<common>/worktrees/<id>/modules/<name>/config` for a linked one, each with its own
+    `info/attributes` — and a `filter.<name>.clean` defined there fires on the *enclosing*
+    worktree's `git status`, which is the first thing every producer runs. Verified against Git
+    2.50.1. Pinning that set means walking a directory tree whose shape is Git's to change, and this
+    rule's whole claim is that the file list is complete; a list that has to be re-derived from a
+    directory walk is not one this ADR can stand behind. So the staged scope refuses a repository
+    that carries submodule configuration — a `.gitmodules` in either tree, or a `modules/` directory
+    in either Git directory — at materialization, and again on every producer path so a
+    `.gitmodules` introduced mid-run cannot slip past. That is a real capability gap, stated as one
+    rather than papered over.
+
+    **The pin is recorded after the worktree exists**, so it covers that worktree's own per-worktree
+    files. The window between `git worktree add` and the recording mutation is synchronous, with no
+    `.await` and no launch path: launching requires the active staged record the caller has not
+    recorded yet, `MarkRunning` refuses a staged task without one, and materialization is
+    operator-only. Nothing runs in the staged worktree before its pin exists.
+
+    **The load-bearing argument is detection, not enumeration — within the files it covers.** This
+    gate is safe because it
     compares bytes and refuses on any difference, so it never has to know which Git keys are
-    dangerous. That distinction matters for how this ADR should be read: an enumeration claim
+    dangerous. What it is *not* immune to is being wrong about **which files Git reads**: a
+    configuration source outside the list is outside the gate, which is exactly how the staged
+    worktree's own `config.worktree` was missed in the first draft and how global configuration was
+    reachable until it was suppressed. The file list is the security-relevant surface and must be
+    re-derived whenever Git grows a new source. That distinction matters for how this ADR should be read: an enumeration claim
     ("no Git switch suppresses repository config", "`-c` cannot mask an attacker-named key") is a
     statement about a large surface that is right until one version or one key makes it not, and
     it appears here only as supporting evidence. If a reviewer disproves it, or a future Git adds
@@ -200,8 +254,9 @@ in the task record.
 ## Consequences
 
 **What this buys.** A failed verification or a declined review is now recoverable by deleting a
-directory. The canonical tree is byte-identical from registration through `awaiting_operator`, and
-the integration tests prove it against real repositories. A Builder that cannot make the gate green
+directory. The canonical tree is byte-identical from registration through `awaiting_operator` — the
+daemon-owned verifier observes and snapshots the *staged* tree, never the canonical one — and the
+integration tests prove it against real repositories. A Builder that cannot make the gate green
 escalates instead of churning. Operators see an honest scope claim rather than silence.
 
 **What it does not buy.** This is a Git-level boundary and nothing more. There is no OS sandbox, no
@@ -238,6 +293,15 @@ re-materialization. Reusing it is not safe — it could be someone else's half-f
 producer refuses, and the error tells the operator exactly how to recover: delete the leftover
 directory, then run `git -C <workspace> worktree prune` to drop its administrative entry.
 
+**The configuration pin compares raw bytes, and it compares them first.** The digest is the bytes
+of `.git/config`, `.git/config.worktree`, and `.git/info/attributes`, plus the bytes of every file
+their `include`/`includeIf` directives reach. It is not a rendering of `git config --list`: a
+rendering loses order, and order is semantic, because Git resolves a repeated scalar key to the
+last one. And it is computed without running Git — the Git directory and the common directory are
+resolved by reading `.git` and `commondir` the way Git does — so promotion compares the pin
+*before* it spawns any Git process against that repository. Both properties were forced by the
+post-merge review; both are load-bearing.
+
 **The configuration pin is a change detector, not a sandbox.** It catches a driver the Builder
 *introduced*, which is the reachable attack. It does not stop a Builder from committing a
 `.gitattributes` that routes new paths through a filter the operator had already configured — a
@@ -252,7 +316,10 @@ materialization, at promotion *after* review has already passed, or during plain
 `post-index-change` and `fsmonitor-watchman` fire on a bare `git status`, which the promotion path
 runs twice. **Every** Git invocation in the producer module is therefore built by one constructor
 that sets `core.hooksPath` to a non-directory; there is no "read-only enough to skip it" category,
-and the first version of this fix was wrong precisely because it assumed one.
+and the first version of this fix was wrong precisely because it assumed one. That constructor also
+disables `core.fsmonitor`, which is a second hook mechanism `core.hooksPath` does not cover — but
+that flag is supporting defense, not the guarantee. The guarantee for promotion is the ordering
+above: the configuration comparison happens before any Git process exists to be protected.
 
 **A crash between the Git side effect and its receipt is still not covered.** Promotion inherits
 the same window every other producer has. The side effect is isolated in one function so the
@@ -327,6 +394,154 @@ This lane is stacked on ADR-0018's socket actor provenance, so:
   for staging mutation away from the authoritative tree.
 - ADR-0011's revisioned ledger and ADR-0012's detached verification worktree, whose `git worktree
   add --detach` path this ADR shares rather than duplicates.
+
+## Post-merge fixes (2026-09-12)
+
+PR #50 merged with four unresolved P1 review threads, all four confirmed against a real repository
+before being fixed (Git 2.50.1 here; the review used 2.43, and both reproduce). The rules above are
+written as amended. What was wrong, and what closed it:
+
+- **Staged claims could never be verified.** Review round 1 moved `derive_claim` onto the staged
+  worktree but left `run_verification` observing `task.workspace_root` and requiring that canonical
+  HEAD to equal the claim. The canonical checkout deliberately stays on the initial OID until
+  promotion, so every staged run failed that check *before* its detached verifier was created, and
+  no staged run could reach Supervisor review or operator acceptance. Both producers now take the
+  source tree from `launch_working_directory`, and the detached verifier is created from the staged
+  worktree's own commit — still detached, still hook-free. The canonical tree is neither read nor
+  written by a staged verification, which the integration-grade test asserts by comparing the
+  canonical head and source bytes before and after a real `rust_workspace_v1` run.
+
+- **Promotion ran Git before it compared the pin.** `promote_governed_outcome` observed the staged
+  worktree and the canonical tree first and compared shared configuration afterwards. Both
+  observations run `git status`, and a `core.fsmonitor` set to a pathname is a hook Git executes
+  there — `core.hooksPath` does not disable it. A Builder writes that key from inside its own
+  checkout, because `.git/config` is shared with every linked worktree, so the Builder's program
+  ran under operator authority before the gate that was supposed to refuse the run said anything.
+  The comparison now happens first, and it is implementable as "first" only because it no longer
+  needs Git at all (below). `core.fsmonitor=false` was also added to the one hook-free Git
+  constructor, for the materialization path where pre-existing operator configuration is legitimately
+  in force and there is no pin to compare yet; it is belt and braces, and this ADR should not be
+  rewritten to lean on it.
+
+- **The digest erased ordering.** It hashed a *sorted* `git config --local --list` rendering. Git
+  resolves a repeated scalar key to the **last** value, so a Builder could swap two existing
+  `filter.<name>.smudge` lines — adding nothing, editing nothing — and arm a different driver while
+  producing an identical digest. The same was true of ordered includes. The digest is now the raw
+  bytes of each pinned file plus the raw bytes of every file reachable through its
+  `include`/`includeIf` paths, which is what rule 13 always claimed. Because nothing is rendered,
+  nothing runs: the pin is computed and compared with filesystem reads, which is also what makes
+  the ordering fix above possible. A pin recorded under the superseded scheme is not comparable
+  with a raw-bytes one, so `SharedRepositoryConfigDigest` carries a `scheme_version` and promotion
+  refuses a foreign one with `repository_config_unpinned` — discardable, per rule 7 — rather than
+  comparing two different questions. The version field defaults to the legacy value and is omitted
+  from serialization when legacy, so an existing record re-serializes to the same bytes and its
+  receipt fingerprint still matches: the round-3 lesson about failing a whole ledger closed applies
+  to this field too.
+
+- **`MarkRunning` did not require staging.** It checked only `execution_state`, so a
+  `staged_authoritative` task could be marked running with no staged worktree — and
+  `launch_working_directory` then returned the canonical workspace, handing the Builder
+  authoritative filesystem access under a record that says the opposite. The mutation now refuses
+  that transition, and `launch_working_directory` returns a typed error for a staged task with no
+  active worktree instead of falling back. Only the staged scope is affected: `authoritative`
+  tasks, which every pre-ADR-0019 ledger replays as, are untouched, and a regression test replays
+  one to prove it.
+
+Two things worth carrying forward. First, the third and second findings are the same mistake seen
+twice: asking Git a question is not a neutral act inside a repository whose configuration is the
+thing under suspicion. Reading bytes is. Second, every one of these was a gap between what the ADR
+*said* and what the code did — rule 13 promised raw bytes, rule 4 promised the Builder's cwd — which
+is an argument for reviewing prose against implementation, not only implementation against itself.
+
+### Review round 1 on the fixes (PR #53)
+
+An adversarial review of the fixes above confirmed all five claims and the non-vacuity of every
+test, and found four more defects plus two residuals. All four are fixed; the rules above are
+written as amended.
+
+- **The staged worktree's own `config.worktree` was unpinned.** The pin was computed against the
+  canonical workspace only, so it covered `<repo>/.git/config.worktree` and the common-directory
+  copy but never `<common>/worktrees/<task id>/config.worktree` — which is the file Git actually
+  reads for commands run in the staged checkout, and the first thing every producer does there is
+  `git status`. Reachable whenever `extensions.worktreeConfig` is already on, which
+  `git sparse-checkout` in a linked worktree does for ordinary reasons; `.git/config` then stays
+  byte-identical. Reproduced end to end. Rule 13 is rewritten: the pin is recorded after the staged
+  worktree exists and covers all three copies, and the old "enabling the extension would be caught"
+  argument is retracted in place.
+
+- **Only promotion compared the pin.** `derive_claim` and `run_verification` spawned Git against the
+  staged tree with no comparison at all, so a `filter.<name>.clean` in the shared `.git/config`
+  plus a committed `.gitattributes` executed during `governed-claim` — the earliest producer, before
+  an operator sees anything. Both now compare first and refuse with a typed `StagedConfigRefusal`.
+  Note the failure mode the regression had to be written around: without the gate the producer
+  *succeeds*, because a passthrough `clean` filter leaves the tree reading clean. The marker file,
+  not the error, is what proves nothing ran.
+
+- **Global and system configuration were in force.** The env scrub keeps `HOME` and nothing set
+  `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`, so a driver in the operator's own `~/.gitconfig` would
+  execute inside a producer — a file the repository pin does not and cannot cover. Both are now
+  suppressed for every producer invocation. The test harness had been setting them all along, which
+  is how the gap stayed invisible: a harness that is safer than production hides the thing it is
+  meant to test.
+
+- **The `MarkRunning` precondition was enforced during replay.** A #50-era ledger can legitimately
+  hold a staged task that reached `running` with no materialized worktree — that *is* the bug — and
+  re-judging it under the new rule made `GovernedTaskLedger::load` fail on that task, taking every
+  unrelated task in the file down with it. `MutationContext` now carries `is_replay`, and
+  transition *rejections* are live-only. This is the general rule, not a special case: replay
+  reproduces decisions, it does not re-authorize them. Clock-derived *computations* (rule 11) are
+  the opposite case and are still recomputed.
+
+**A Git probe that reports no exit status is not an observation.** The producers translate Git exit
+statuses into governance findings — `merge-base --is-ancestor` exiting non-zero *means* the subject
+is not descended from the registered OID — and a bounded child that hits its deadline is killed and
+reaped, so it comes back as simply "not success". Reading that as the finding accuses a run of a
+violation that did not happen, and under load it is the likelier of the two. Every producer call
+site that turns an exit status into a decision therefore goes through one classifier that separates
+*completed and failed* from *never reported*, and the second is a typed error. The same rule makes a
+killed `symbolic-ref` not a detached head and a killed `update-ref` not a lost compare-and-swap. The
+verification profile's own commands are the deliberate exception: there a non-zero or timed-out exit
+is the evidence being recorded, not a probe of Git state.
+
+**Residuals, accepted for now and named so they are not rediscovered as findings.** The include walk
+does not resolve `~user/` — Git does, but it needs a passwd lookup the standard library does not
+offer; `~/` and backslash line continuation are both handled. And a repository using Git's
+`reftable` backend cannot have its HEAD read without Git, so a promotion blocked on configuration
+returns an error instead of the typed `PromotionBlocked` record; it still fails closed and still
+names the component that changed, but the operator does not get a recorded outcome. Both are
+narrow, both fail safe, and both are cheaper to fix once something needs them than to guess at now.
+
+### Review round 2 on the fixes (PR #53)
+
+Three P3s and two wording corrections; the branch freezes after them.
+
+- **Submodule configuration was outside the pinned set** while rule 13 asserted that every
+  repository-level configuration file Git reads is pinned. Verified reachable against Git 2.50.1.
+  Resolved by refusing submodule repositories outright rather than by extending the walk — see rule
+  13. Refusing is the smaller and the more honest of the two, because the alternative replaces a
+  fixed file list with a directory walk and quietly weakens what the rule can promise.
+
+- **The pin's scheme version was not bumped when the covered file set changed.** Round 1 added the
+  staged worktree's files and changed the attributes digest's domain separator but left the version
+  at 2, so a pin written by the immediately preceding commit was *compared* — producing a
+  `repository_config_changed` naming a component nothing had touched — instead of being refused as
+  uncomparable. Now 3, with the constant's own documentation saying to bump it whenever the covered
+  file set changes, not only when the algorithm does. A misleading difference is worse than an
+  honest refusal: it sends an operator looking for a change that never happened.
+
+- **A comment line ending in a backslash swallowed the line after it.** Git's continuation lives
+  inside value parsing, not at the line level, so `# hidden \` leaves a following `[include]`
+  header in force — and the line-level join hid that header from the include walk, leaving its
+  target unpinned. Comment lines now never continue, and never absorb a continuation in progress.
+
+- **Scope of the Git-invocation hardening, stated precisely.** "Every producer Git invocation"
+  means every daemon-owned producer in `governed_producers.rs`. The Dioxus governed-launch preflight
+  (`impulse-desktop/src/runtime.rs`, `run_bounded_governed_git`) is a separate code path and is
+  **not** hook-free: it sets no `core.hooksPath`, no `core.fsmonitor`, and no `GIT_CONFIG_*`
+  overrides, and its env scrub keeps `HOME`. It runs before a staged worktree exists, in the
+  operator's own checkout, so it is not this ADR's trust boundary — but it is a Git invocation on a
+  governed path with none of these protections, and it belongs to the desktop track. Recorded here
+  so it is not mistaken for covered.
 
 ## Review round 1
 

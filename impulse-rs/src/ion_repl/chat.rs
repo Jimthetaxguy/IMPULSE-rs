@@ -12,15 +12,26 @@
 //!
 //! **Missing-key handling:** unlike `handlers::system::handle_chat` (which
 //! pre-checks `ANTHROPIC_API_KEY` with an `anyhow::bail!` before ever
-//! constructing a provider), `ChatState::from_env` always constructs an
-//! `AnthropicProvider` — even with an empty key string — matching the typed
+//! constructing a provider), `ChatState::from_env` always constructs a
+//! provider — even with an empty key string — matching the typed
 //! `AgentError::MissingApiKey` path used by `ImpulseAgent::new`
-//! (`src/agent/mod.rs`). `AnthropicProvider::chat` calls
+//! (`src/agent/mod.rs`). Every provider calls
 //! `BaseProvider::check_api_key()` first and returns
 //! `Err(AgentError::MissingApiKey { .. })` without ever opening a network
 //! connection, so `ChatState::turn` naturally surfaces that typed error for
 //! the REPL to render as a one-line notice (`ion_repl::mod::respond`) — no
 //! panic, no special-cased startup check needed.
+//!
+//! **Provider selection (Stage 1b-A):** `IMPULSE_PROVIDER` picks
+//! `anthropic` (the default when unset or blank), `openai`, or `minimax`;
+//! each reads its own API key and default model through
+//! `agent::ImpulseProvider`, with `IMPULSE_MODEL` overriding the model for
+//! any of them. An unknown value fails closed with a typed
+//! `ProviderSelectionError` — `ChatState::try_from_env` returns it, and the
+//! infallible `from_env` carries it to the first turn through
+//! `llm_backends::UnconfiguredProvider`, exactly like the missing-key path
+//! above. This selects a *transport*, never a model: `IMPULSE_MODEL` and the
+//! harness-owned step model (ADR-0015) remain the only model pickers.
 //!
 //! **Tool-calling (T9):** every `turn()` now runs through
 //! [`Agent::chat_with_tools`], with the REPL's own [`ReplToolRegistry`]
@@ -152,7 +163,10 @@ use serde_json::Value;
 
 use crate::error::AgentResult;
 use crate::guardrail::{self, GuardAction, GuardConfig, GuardResult, GuardTarget};
-use crate::llm_backends::{Agent, LlmProvider, ToolDefinition, ToolExecutionResult, ToolExecutor};
+use crate::llm_backends::{
+    build_provider, provider_from_env, Agent, LlmProvider, ProviderSelectionError, ToolDefinition,
+    ToolExecutionResult, ToolExecutor, UnconfiguredProvider,
+};
 use crate::tooling::ToolContext;
 
 use super::registry::ReplToolRegistry;
@@ -197,20 +211,42 @@ pub struct ChatState {
 }
 
 impl ChatState {
-    /// Builds chat state from `ANTHROPIC_API_KEY`/`CLAUDE_API_KEY` (same
-    /// fallback order as `handlers::system::handle_chat`) and `IMPULSE_MODEL`
-    /// (override, else `claude-sonnet-4-6`). Never fails and never requires
-    /// the key to be present — see the module doc comment for why a missing
-    /// key is handled lazily, on first `turn()`, instead of here.
+    /// Builds chat state for the provider named by `IMPULSE_PROVIDER`
+    /// (`anthropic`, `openai`, or `minimax`; unset or blank means
+    /// `anthropic`), reading that provider's own API key and default model
+    /// through `ImpulseProvider::{resolve_api_key, default_model}` —
+    /// `ANTHROPIC_API_KEY`/`CLAUDE_API_KEY`, `OPENAI_API_KEY`, or
+    /// `MINIMAX_API_KEY`, with `IMPULSE_MODEL` overriding the model for any
+    /// of them.
+    ///
+    /// Never fails and never requires the key to be present: a missing key is
+    /// handled lazily on the first `turn()` (see the module doc comment). An
+    /// *unknown* `IMPULSE_PROVIDER` is handled the same way rather than
+    /// silently running against Anthropic — [`ChatState::try_from_env`] is
+    /// the typed form, and this infallible wrapper carries its error to the
+    /// first turn through [`UnconfiguredProvider`], which refuses every
+    /// request with the typed reason. `ion_repl::mod::ReplSession::new`
+    /// builds one `ChatState` unconditionally at session start and renders
+    /// chat errors one line at a time, so deferring is both consistent with
+    /// the missing-key path and the only shape that fits that call site.
     pub fn from_env() -> Self {
-        let api_key = std::env::var("ANTHROPIC_API_KEY")
-            .or_else(|_| std::env::var("CLAUDE_API_KEY"))
-            .unwrap_or_default();
-        let model = std::env::var("IMPULSE_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
-        let provider: Box<dyn LlmProvider> = Box::new(
-            crate::llm_backends::anthropic::AnthropicProvider::new(api_key),
-        );
-        Self::with_provider(provider, model)
+        match Self::try_from_env() {
+            Ok(state) => state,
+            Err(err) => Self::with_provider(
+                Box::new(UnconfiguredProvider::new(err)),
+                DEFAULT_MODEL.to_string(),
+            ),
+        }
+    }
+
+    /// The fallible form of [`ChatState::from_env`]: resolves
+    /// `IMPULSE_PROVIDER` and fails closed with a typed
+    /// [`ProviderSelectionError`] when it names no known provider.
+    pub fn try_from_env() -> Result<Self, ProviderSelectionError> {
+        let selected = provider_from_env()?;
+        let model = selected.default_model();
+        let provider: Box<dyn LlmProvider> = build_provider(selected);
+        Ok(Self::with_provider(provider, model))
     }
 
     /// Test/DI seam: build chat state with an arbitrary provider (e.g. a
@@ -761,6 +797,17 @@ impl ReplToolExecutor<'_> {
 
 #[async_trait]
 impl ToolExecutor for ReplToolExecutor<'_> {
+    /// A context-budget compaction stub replaces a stored `tool_result`'s
+    /// entire content -- including the untrusted-output envelope that
+    /// [`ReplToolExecutor::observe_and_wrap`] put there. Re-wrap it, so a
+    /// compacted result stays inside exactly the framing the content it
+    /// replaced was inside and the model is never handed tool-derived text
+    /// as unframed prose (review round 1, P2). A fresh nonce per wrap is
+    /// correct here for the same reason it is on the original wrap.
+    fn wrap_compaction_stub(&self, stub: &str) -> String {
+        wrap_untrusted_tool_output(stub)
+    }
+
     async fn execute(&self, name: &str, input: Value) -> ToolExecutionResult {
         let _grant: Option<ApprovalGrant> = if CONFIRMATION_REQUIRED_TOOLS.contains(&name) {
             let tool_ctx = self.ctx.sandbox_tool_context();
@@ -1291,6 +1338,66 @@ mod tests {
         let _chat = ChatState::from_env();
     }
 
+    /// `IMPULSE_PROVIDER` is process-global; these two tests share a lock so
+    /// they cannot race each other under the harness's threads.
+    static PROVIDER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_provider_env<T>(value: Option<&str>, body: impl FnOnce() -> T) -> T {
+        let _guard = PROVIDER_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var("IMPULSE_PROVIDER").ok();
+        match value {
+            Some(value) => std::env::set_var("IMPULSE_PROVIDER", value),
+            None => std::env::remove_var("IMPULSE_PROVIDER"),
+        }
+        let outcome = body();
+        match previous {
+            Some(previous) => std::env::set_var("IMPULSE_PROVIDER", previous),
+            None => std::env::remove_var("IMPULSE_PROVIDER"),
+        }
+        outcome
+    }
+
+    #[test]
+    fn test_try_from_env_builds_each_supported_provider() {
+        for (value, expected) in [
+            (None, "anthropic"),
+            (Some("openai"), "openai"),
+            (Some("minimax"), "minimax"),
+        ] {
+            let state = with_provider_env(value, ChatState::try_from_env)
+                .expect("a known provider must build");
+            assert_eq!(state.agent.provider.name(), expected, "for {value:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_from_env_defers_an_unknown_provider_to_a_failing_turn() {
+        // Fail closed, not fall back: an unrecognized IMPULSE_PROVIDER must
+        // never quietly run the turn against Anthropic.
+        let typed = with_provider_env(Some("gemini"), ChatState::try_from_env);
+        assert!(
+            matches!(
+                typed,
+                Err(ProviderSelectionError::UnknownProvider { ref value }) if value == "gemini"
+            ),
+            "try_from_env must return the typed selection error"
+        );
+
+        let mut chat = with_provider_env(Some("gemini"), ChatState::from_env);
+        let tools = ReplToolRegistry::new();
+        let ctx = ReplContext::default();
+        let result = chat.turn("hello", &tools, &ctx).await;
+        match result {
+            Err(AgentError::InvalidRequest(message)) => {
+                assert!(message.contains("gemini"), "got: {message}");
+                assert!(message.contains("IMPULSE_PROVIDER"), "got: {message}");
+            }
+            other => panic!("expected a typed InvalidRequest, got: {other:?}"),
+        }
+    }
+
     #[test]
     fn test_tool_definitions_maps_replool_schema_to_tool_definition() {
         let registry = ReplToolRegistry::with_defaults();
@@ -1354,6 +1461,40 @@ mod tests {
             "declined bash_exec must never have run the shell command"
         );
         assert_eq!(asked.lock().unwrap().as_slice(), &["bash_exec".to_string()]);
+    }
+
+    #[test]
+    fn test_repl_executor_rewraps_a_compaction_stub_in_the_untrusted_envelope() {
+        // Review round 1, P2: a context-budget stub replaces a stored
+        // tool_result's whole content, envelope included. The executor that
+        // applied the envelope must put it back, or compacted tool-derived
+        // text re-enters the model's context as unframed prose.
+        let tools = ReplToolRegistry::with_defaults();
+        let ctx = ReplContext::default();
+        let confirm = |_n: &str, _i: &Value, _v: &GuardVerdict, _p: &[PathBuf]| false;
+        let untrusted_seen = std::sync::atomic::AtomicBool::new(false);
+        let executor = ReplToolExecutor {
+            tools: &tools,
+            ctx: &ctx,
+            confirm: &confirm,
+            untrusted_seen: &untrusted_seen,
+        };
+
+        let wrapped = executor.wrap_compaction_stub("[compacted 4000 chars]");
+        assert!(
+            wrapped.starts_with(UNTRUSTED_TOOL_OUTPUT_HEADER_PREFIX),
+            "got: {wrapped}"
+        );
+        assert!(wrapped.contains("[compacted 4000 chars]"), "got: {wrapped}");
+        assert!(
+            wrapped.contains(UNTRUSTED_TOOL_OUTPUT_FOOTER_PREFIX),
+            "got: {wrapped}"
+        );
+        // The nonce differs per wrap, so content can never forge the footer.
+        assert_ne!(
+            wrapped,
+            executor.wrap_compaction_stub("[compacted 4000 chars]")
+        );
     }
 
     #[tokio::test]

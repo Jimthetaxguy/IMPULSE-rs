@@ -35,7 +35,7 @@ tags: [worktree, lane, handoff, memory]
 - Verification: isolated `CARGO_TARGET_DIR`; `cargo build --workspace`, `cargo test --workspace`,
   `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`,
   `python3 docs/validate_docs.py --all`.
-- Latest status: review round 4 addressed; branch FROZEN at the round-4 push; draft PR open.
+- Latest status: merged `origin/main` (#53 `ceb29a8`, #55 `1f866d6`); branch FROZEN at the merge push; draft PR open.
 
 ## Decisions
 
@@ -334,6 +334,23 @@ unaffected, the next decision is refused with the foreign message and its line c
 replay instruction, the refusal leaves the log byte-identical, truncation unblocks promotion), a
 companion asserting a genuine interrupted tail still says replay, and Display coverage for the new
 variant.
+
+## Merge from main (2026-09-12)
+
+Merged `origin/main` after #53 and #55 landed; merge commit, no rebase, no force. One real conflict,
+in `handlers/config.rs`'s runtime gitignore list — both sides kept (#53's `PRODUCER_RESERVATIONS`
+entries and this lane's `MEMORY_INDEX`/`GENOME_PROJECTION.tmp` entries). The
+`is_untracked_impulse_runtime_artifact` region the both-keep note predicted auto-merged cleanly:
+#53's `PRODUCER_RESERVATIONS.json` and `MEMORY_CANDIDATES.json` entries sit alongside this lane's
+`|| is_impulse_memory_evidence_artifact(path)`, and the tracked arm of
+`status_contains_subject_change` is untouched by their changes. `state/governed_task.rs` also
+auto-merged with both sides intact — this lane's `pub(in crate::state)` test visibility and #55's
+`compactions: 0`.
+
+Worth noting for whoever reviews the exemption: #53 exempted `.impulse/MEMORY_CANDIDATES.json` for
+exactly the reason ADR-0020 rule 3a gives for the two memory-evidence paths — a daemon-owned runtime
+artifact dirtying the canonical tree and breaking the next governed step. The two changes are
+independent and complementary, and their comments now sit next to each other.
 
 ## Handoffs
 
