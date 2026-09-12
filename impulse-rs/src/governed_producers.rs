@@ -757,6 +757,48 @@ fn is_untracked_impulse_runtime_artifact(path: &[u8]) -> bool {
     ) || path.starts_with(b".impulse/GOVERNED_TASKS.tmp.")
         || path.starts_with(b".impulse/DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.tmp-")
         || path.starts_with(b".impulse/worktrees/")
+        || is_impulse_memory_evidence_artifact(path)
+}
+
+/// ADR-0020 rule 3a: the promoted-memory log and its projection are tracked and
+/// deliberately not gitignored, so without an exemption the first promotion
+/// makes the next governed registration refuse the workspace as dirty — as an
+/// untracked `??` before the first commit, and as a tracked ` M` forever after.
+///
+/// Sound for exactly these two paths and no others: they are written only by
+/// the daemon's own decision path, a launched Builder is never given a way to
+/// write them, and their content is digest-chained, so a Builder that did write
+/// them would fail the memory log's own load rather than smuggle a fact into an
+/// accepted run.
+fn is_impulse_memory_evidence_artifact(path: &[u8]) -> bool {
+    matches!(
+        path,
+        b".impulse/MEMORY.jsonl" | b".impulse/GENOME_PROJECTION.md"
+    ) || path.starts_with(b".impulse/GENOME_PROJECTION.tmp.")
+}
+
+/// Status codes whose tracked mutation a memory-evidence path may be exempt for.
+///
+/// Modification and addition only. A **deletion** of the promoted-memory log is
+/// still a subject change: destroying evidence is not a promotion side effect.
+const EXEMPT_TRACKED_STATUS_CODES: &[&[u8; 2]] = &[b" M", b"M ", b"MM", b"A ", b"AM"];
+
+/// Split a porcelain-v1 record into its status code and path, when it has one.
+///
+/// A `-z` rename emits the origin path as its own bare record with no status
+/// prefix; that record returns `None` and is treated as a subject change.
+fn tracked_status_and_path(record: &[u8]) -> Option<(&[u8], &[u8])> {
+    if record.len() < 4 || record[2] != b' ' {
+        return None;
+    }
+    let (code, rest) = record.split_at(2);
+    if !EXEMPT_TRACKED_STATUS_CODES
+        .iter()
+        .any(|exempt| exempt.as_slice() == code)
+    {
+        return None;
+    }
+    Some((code, &rest[1..]))
 }
 
 fn status_contains_subject_change(status: &[u8]) -> bool {
@@ -766,9 +808,14 @@ fn status_contains_subject_change(status: &[u8]) -> bool {
         }
         match record.strip_prefix(b"?? ") {
             Some(path) => !is_untracked_impulse_runtime_artifact(path),
-            // Tracked/staged mutations are always subject changes, even when
-            // their path is in Impulse's generated runtime namespace.
-            None => true,
+            // Tracked/staged mutations are subject changes, even when their path
+            // is in Impulse's generated runtime namespace — with the single
+            // ADR-0020 exemption above, which is why this arm is no longer a
+            // bare `true`.
+            None => match tracked_status_and_path(record) {
+                Some((_, path)) => !is_impulse_memory_evidence_artifact(path),
+                None => true,
+            },
         }
     })
 }
@@ -1985,6 +2032,122 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("dirty"));
+    }
+
+    /// ADR-0020 rule 3a. `.impulse/MEMORY.jsonl` and `.impulse/GENOME_PROJECTION.md`
+    /// are tracked and not gitignored, so without the exemption the first
+    /// promotion blocks registration as an untracked `??`, and every promotion
+    /// after the log is committed blocks it again as a tracked ` M`.
+    #[test]
+    fn clean_git_subject_exempts_promoted_memory_evidence_before_and_after_it_is_committed() {
+        let repo = init_repo();
+        let initial = observe_clean_git_subject(repo.path(), None).unwrap();
+        let impulse = repo.path().join(".impulse");
+        std::fs::create_dir(&impulse).unwrap();
+
+        // First promotion: both files are untracked in a repo that does not
+        // gitignore `.impulse`.
+        std::fs::write(impulse.join("MEMORY.jsonl"), "{\"seq\":0}\n").unwrap();
+        std::fs::write(impulse.join("GENOME_PROJECTION.md"), "# projection\n").unwrap();
+        std::fs::write(impulse.join("GENOME_PROJECTION.tmp.1.2"), "partial").unwrap();
+        assert_eq!(
+            observe_clean_git_subject(repo.path(), Some(&initial)).unwrap(),
+            initial
+        );
+
+        // Staging them for their first commit must not block registration either.
+        run(
+            repo.path(),
+            &[
+                "add",
+                ".impulse/MEMORY.jsonl",
+                ".impulse/GENOME_PROJECTION.md",
+            ],
+        );
+        assert_eq!(
+            observe_clean_git_subject(repo.path(), Some(&initial)).unwrap(),
+            initial
+        );
+        run(repo.path(), &["commit", "--quiet", "-m", "promote"]);
+        let committed = observe_clean_git_subject(repo.path(), None).unwrap();
+
+        // Every later promotion is a tracked modification of both files.
+        std::fs::write(impulse.join("MEMORY.jsonl"), "{\"seq\":0}\n{\"seq\":1}\n").unwrap();
+        std::fs::write(
+            impulse.join("GENOME_PROJECTION.md"),
+            "# projection\n\n## r\n",
+        )
+        .unwrap();
+        assert_eq!(
+            observe_clean_git_subject(repo.path(), Some(&committed)).unwrap(),
+            committed
+        );
+    }
+
+    /// The exemption is modification/addition only, and only for those paths.
+    #[test]
+    fn clean_git_subject_still_refuses_a_deleted_memory_log_or_a_neighbouring_file() {
+        let repo = init_repo();
+        let impulse = repo.path().join(".impulse");
+        std::fs::create_dir(&impulse).unwrap();
+        std::fs::write(impulse.join("MEMORY.jsonl"), "{\"seq\":0}\n").unwrap();
+        std::fs::write(impulse.join("GENOME.md"), "hand curated\n").unwrap();
+        run(
+            repo.path(),
+            &["add", ".impulse/MEMORY.jsonl", ".impulse/GENOME.md"],
+        );
+        run(repo.path(), &["commit", "--quiet", "-m", "memory"]);
+        let committed = observe_clean_git_subject(repo.path(), None).unwrap();
+
+        // Deleting the evidence log is a subject change, not a promotion.
+        std::fs::remove_file(impulse.join("MEMORY.jsonl")).unwrap();
+        assert!(observe_clean_git_subject(repo.path(), Some(&committed))
+            .unwrap_err()
+            .to_string()
+            .contains("dirty"));
+        run(repo.path(), &["checkout", "--", ".impulse/MEMORY.jsonl"]);
+
+        // The hand-curated GENOME.md is not exempt.
+        std::fs::write(impulse.join("GENOME.md"), "edited\n").unwrap();
+        assert!(observe_clean_git_subject(repo.path(), Some(&committed))
+            .unwrap_err()
+            .to_string()
+            .contains("dirty"));
+    }
+
+    /// Pin the exemption to the state layer's own constants: renaming either
+    /// artifact must break this test rather than silently un-exempt the path
+    /// and start blocking every governed registration after a promotion.
+    #[test]
+    fn memory_evidence_exemption_tracks_the_state_layer_file_names() {
+        for name in [
+            crate::state::memory_record::MEMORY_LOG_FILE,
+            crate::state::memory_record::GENOME_PROJECTION_FILE,
+        ] {
+            let path = format!(".impulse/{name}");
+            assert!(
+                is_impulse_memory_evidence_artifact(path.as_bytes()),
+                "`{path}` must be exempt from the governed clean-subject check"
+            );
+            assert!(is_untracked_impulse_runtime_artifact(path.as_bytes()));
+        }
+        // Neighbouring durable project memory is deliberately not exempt.
+        assert!(!is_impulse_memory_evidence_artifact(b".impulse/GENOME.md"));
+        assert!(!is_impulse_memory_evidence_artifact(
+            b".impulse/HISTORY.jsonl"
+        ));
+    }
+
+    #[test]
+    fn tracked_status_and_path_rejects_a_bare_rename_origin_record() {
+        // A `-z` rename emits the origin path as its own bare record.
+        assert!(tracked_status_and_path(b".impulse/MEMORY.jsonl").is_none());
+        // Deletion codes are not exempt-eligible at all.
+        assert!(tracked_status_and_path(b" D .impulse/MEMORY.jsonl").is_none());
+        assert_eq!(
+            tracked_status_and_path(b" M .impulse/MEMORY.jsonl"),
+            Some((b" M".as_slice(), b".impulse/MEMORY.jsonl".as_slice()))
+        );
     }
 
     #[cfg(unix)]
