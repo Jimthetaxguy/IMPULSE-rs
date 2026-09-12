@@ -172,7 +172,7 @@ impl StagedConfigRefusalReason {
                 "discard the staged worktree and re-materialize it, then re-run the producer"
             }
             Self::UnsupportedSubmodules { .. } => {
-                "register this task with the authoritative world scope; the staged scope does not                  support submodule repositories"
+                "register this task with the authoritative world scope; the staged scope does not support submodule repositories"
             }
         }
     }
@@ -440,6 +440,121 @@ mod tests {
         }
     }
 
+    /// Every operator-facing string this module and its neighbours produce, checked
+    /// for the one defect that has now hit this lane twice: a wrapped string
+    /// literal whose `\\` continuation is missing, which the formatter then joins
+    /// into one string carrying a run of interior spaces mid-sentence.
+    ///
+    /// Review round 1 caught it in two CLI messages; it came straight back in
+    /// `remedy()` for `UnsupportedSubmodules`, because the literal was authored
+    /// through a shell heredoc that ate the backslash. A lint would be better, but
+    /// a test that enumerates the strings is what is available, so these are
+    /// enumerated at their source rather than at each render site.
+    #[test]
+    fn test_operator_facing_strings_have_no_run_of_interior_spaces() {
+        let mut messages: Vec<String> = Vec::new();
+        for reason in every_refusal_reason() {
+            messages.push(reason.remedy().to_string());
+            messages.push(reason.to_string());
+            messages.push(reason.as_str().to_string());
+        }
+        for reason in every_blocked_reason() {
+            messages.push(reason.to_string());
+            messages.push(reason.as_str().to_string());
+        }
+        assert!(
+            messages.len() >= 15,
+            "the enumerations must not have gone empty"
+        );
+        for message in messages {
+            assert!(!message.trim().is_empty(), "empty operator string");
+            assert_eq!(
+                message.trim(),
+                message,
+                "operator strings carry no leading or trailing whitespace: {message:?}"
+            );
+            assert!(
+                !message.contains("  "),
+                "operator string has a run of interior spaces, which is what a wrapped \
+                 literal with no continuation looks like once it is joined: {message:?}"
+            );
+            assert!(
+                !message.contains('\n') && !message.contains('\t'),
+                "operator string must be one line: {message:?}"
+            );
+        }
+    }
+
+    /// One of each. The match below is what fails to compile if a variant is
+    /// added without extending this list.
+    fn every_refusal_reason() -> Vec<StagedConfigRefusalReason> {
+        let all = vec![
+            StagedConfigRefusalReason::Unpinned,
+            StagedConfigRefusalReason::Changed {
+                component: SharedConfigComponent::RepositoryConfig,
+            },
+            StagedConfigRefusalReason::Changed {
+                component: SharedConfigComponent::WorktreeConfig,
+            },
+            StagedConfigRefusalReason::Changed {
+                component: SharedConfigComponent::InfoAttributes,
+            },
+            StagedConfigRefusalReason::UnsupportedSubmodules {
+                path: ".git/modules/vendor".to_string(),
+            },
+        ];
+        for reason in &all {
+            match reason {
+                StagedConfigRefusalReason::Unpinned => {}
+                StagedConfigRefusalReason::Changed { .. } => {}
+                StagedConfigRefusalReason::UnsupportedSubmodules { .. } => {}
+            }
+        }
+        all
+    }
+
+    /// Same shape for ADR-0019's blocked-promotion reasons, which the promote
+    /// endpoint and the CLI both render.
+    fn every_blocked_reason() -> Vec<PromotionBlockedReason> {
+        let all = vec![
+            PromotionBlockedReason::CanonicalHeadMoved,
+            PromotionBlockedReason::DetachedHead,
+            PromotionBlockedReason::ConcurrentBranchUpdate,
+            PromotionBlockedReason::RepositoryConfigUnpinned,
+            PromotionBlockedReason::RepositoryConfigChanged {
+                component: SharedConfigComponent::RepositoryConfig,
+            },
+            PromotionBlockedReason::RepositoryConfigChanged {
+                component: SharedConfigComponent::WorktreeConfig,
+            },
+            PromotionBlockedReason::RepositoryConfigChanged {
+                component: SharedConfigComponent::InfoAttributes,
+            },
+        ];
+        for reason in &all {
+            match reason {
+                PromotionBlockedReason::CanonicalHeadMoved => {}
+                PromotionBlockedReason::DetachedHead => {}
+                PromotionBlockedReason::ConcurrentBranchUpdate => {}
+                PromotionBlockedReason::RepositoryConfigChanged { .. } => {}
+                PromotionBlockedReason::RepositoryConfigUnpinned => {}
+            }
+        }
+        all
+    }
+
+    /// The specific string that regressed, pinned by content as well as by shape.
+    #[test]
+    fn test_the_submodule_remedy_reads_as_one_sentence() {
+        let remedy = StagedConfigRefusalReason::UnsupportedSubmodules {
+            path: ".git/modules/vendor".to_string(),
+        }
+        .remedy();
+        assert_eq!(
+            remedy,
+            "register this task with the authoritative world scope; the staged scope does not support submodule repositories"
+        );
+    }
     #[test]
     fn test_promotion_request_round_trips_through_serde() {
         let original = promotion_request();

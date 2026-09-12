@@ -175,7 +175,7 @@ Run on this checkout with `CARGO_TARGET_DIR` isolated to
 | Command | Result |
 |---|---|
 | `cargo build --workspace` | clean |
-| `cargo test --workspace` | **2896 passed / 0 failed / 9 ignored** on the final merge-in against `origin/main` `22f9630` (2612 initial, 2624 after review round 1, 2762 after the #53/#55 merge; the rest is #56's and #59's own tests arriving with main) |
+| `cargo test --workspace` | **2898 passed / 0 failed / 9 ignored** after review round 2, against `origin/main` `22f9630` (2612 initial, 2624 after review round 1, 2762 after the #53/#55 merge; the rest is #56's and #59's own tests arriving with main) |
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean |
 | `cargo fmt --all -- --check` | clean |
 | `python3 ../docs/validate_docs.py --all` | 4 pre-existing failures only (unchanged) |
@@ -431,8 +431,8 @@ lane's `PRODUCER_RESERVATIONS.json`, the cherry-picked `MEMORY_CANDIDATES.json`,
 arm and three lanes have edited it. Verified by inspection after each merge rather than inferred
 from a clean auto-merge.
 
-Final gate against `22f9630`: `cargo build --workspace` clean; `cargo test --workspace` **2896
-passed / 0 failed / 9 ignored**; `cargo clippy --workspace --all-targets -- -D warnings` clean;
+Final gate against `22f9630`: `cargo build --workspace` clean; `cargo test --workspace` **2898
+passed / 0 failed / 9 ignored** (2896 before review round 2's two guard tests); `cargo clippy --workspace --all-targets -- -D warnings` clean;
 `cargo fmt --all -- --check` clean; `python3 ../docs/validate_docs.py --all` still the same four
 pre-existing failures.
 
@@ -458,6 +458,34 @@ path.
 - **The prepared e2e's negative branch became its own test.** `a_drifted_config_pin_refuses_the_claim_with_a_typed_reason`
   is separate from the happy path rather than a branch inside it: one test asserting a run completes
   and another asserting a run is refused read better than one test doing both.
+
+## Review round 2 (2026-09-12)
+
+One finding: `StagedConfigRefusalReason::remedy()` for `UnsupportedSubmodules` carried an 18-space
+run mid-sentence. **The same defect review round 1 fixed, reintroduced by the same mechanism** — a
+wrapped literal whose `\` continuation went missing — and it landed in the very message that exists
+to tell an operator what to do.
+
+The cause is worth recording, because it is not carelessness in the Rust: the literal was authored
+through a shell heredoc, and the `\<newline>` was consumed by the heredoc before `rustc` ever saw
+it. Round 1's guard could not catch it either, because that guard lives in
+`handlers::daemon_dispatch` and only knows about the two CLI strings it was written for.
+
+Fixed, and the guard moved to where the strings are defined rather than where they are rendered:
+`test_operator_facing_strings_have_no_run_of_interior_spaces` in `impulse-ops` now covers **every**
+`StagedConfigRefusalReason` variant's `remedy()`, `Display`, and `as_str()`, and **every**
+`PromotionBlockedReason`'s `Display` and `as_str()` — 22 strings, asserted to have no interior
+space run, no leading or trailing whitespace, and no newline or tab. Each enumeration ends in an
+exhaustive `match`, so adding a variant fails to compile until it is listed. A second test pins the
+regressed string by exact content, not only by shape.
+
+Proven non-vacuous: reintroducing a three-space run fails the guard with the offending string in
+the message.
+
+**A lint would be better than a test.** `clippy` has no rule for this, and the defect is invisible
+in review because the source looks correctly wrapped — the run only exists after the continuation
+is lost. Enumerating the strings at their definition is the best available substitute; the standing
+risk is a *new* operator-facing string defined somewhere neither guard enumerates.
 
 ## Post-#53 merge checklist
 
