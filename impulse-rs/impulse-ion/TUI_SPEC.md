@@ -444,7 +444,9 @@ pass the repo gate: `cargo build && cargo test && cargo clippy -- -D warnings &&
   contacting the provider — and made OpenAI-style refusals
   (`message.refusal`, `finish_reason: "content_filter"`) return
   `AgentError::ProviderRefusal` instead of committing an empty assistant reply
-  as success. See
+  as success; a same-day follow-up closed the Anthropic half
+  (`stop_reason: "refusal"`), leaving `StopReason::Other` to mean only an
+  unrecognized stop reason, which still completes. See
   `docs/decisions/0017-canonical-loop-contract.md` (2026-09-12 addendum).
 - **T10 (optional) — ratatui inline polish.** Spinner during gate runs, colored
   verdict table, status line. *(Depends T7. Do not start before T9 is stable.)*

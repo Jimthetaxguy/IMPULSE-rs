@@ -153,11 +153,14 @@ tool ever run — a truncation rendered as a successful answer. The loop fails w
 `AgentError::TruncatedToolCall { provider, tool_calls }` instead, history untouched. A truncated
 *plain* reply is unaffected: it is still the model's answer and is returned as before.
 
-The same principle covers a provider that declines: an OpenAI-style refusal
-(`message.refusal` with null content) or a blocked completion (`finish_reason: "content_filter"`)
-returns `AgentError::ProviderRefusal { provider, message }` rather than an empty assistant message
-committed as success. An empty reply is never an acceptable rendering of "the model would not
-answer".
+The same principle covers a provider that declines, on every provider: an OpenAI-style refusal
+(`message.refusal` with null content), a blocked completion
+(`finish_reason: "content_filter"`), and Anthropic's `stop_reason: "refusal"` all return
+`AgentError::ProviderRefusal { provider, message }` rather than an empty assistant message
+committed as success — with the response text when there is any, and a fixed reason when there is
+not. An empty reply is never an acceptable rendering of "the model would not answer".
+`StopReason::Other` keeps its literal meaning, a stop reason this code does not recognize, and such
+a response still completes normally.
 
 Measurement and compaction live with the caller (`llm_backends`), which owns the message types;
 this module declares the limit, counts the compactions, and names the trip. Rule 6 is therefore
@@ -213,9 +216,11 @@ report, and `rounds_used: 0` when nothing ever fit. a result carried in from an
 earlier completed turn is compactible on the next turn while one this run produced is not. Rule 8
 is represented when a provider stopping on `max_tokens` with tool calls returns
 `TruncatedToolCall`, runs no tool, leaves history untouched, and never returns `Ok("")`, while a
-truncated plain reply still completes; and when an OpenAI-style `refusal` or a `content_filter`
-finish returns `ProviderRefusal` rather than an empty success, while an empty or null `refusal`
-field on an ordinary reply does not.
+truncated plain reply still completes; and when an OpenAI-style `refusal`, a `content_filter`
+finish, or an Anthropic `stop_reason: "refusal"` returns `ProviderRefusal` rather than an empty
+success — carrying the response text when there is any and a fixed reason when there is not, and
+leaving history untouched — while an empty or null `refusal` field on an ordinary reply, and an
+unrecognized stop reason carrying real text, both still complete.
 
 Full design, including the algorithm's exact ordering and what was deliberately not adopted:
 `docs/superpowers/specs/2026-09-01-loop-contract-design.md` (addendum of the same date).

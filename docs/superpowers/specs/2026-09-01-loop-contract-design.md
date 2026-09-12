@@ -221,9 +221,17 @@ survived it: returning that text as an ordinary reply would present a blocked co
 finished answer, so the partial text travels in the error instead. `refusal: null` and an
 all-whitespace `refusal` are *not* refusals — many ordinary replies carry the field empty.
 
-**Known gap, not fixed here:** Anthropic's newer `stop_reason: "refusal"` maps to
-`StopReason::Other` and would take the same empty-reply path. The review scoped this thread to the
-OpenAI response type; the Anthropic arm is left for a follow-up rather than widened silently.
+Anthropic closes on the same terms (follow-up, same day): `stop_reason: "refusal"` used to fall
+into the catch-all `StopReason::Other` arm and return as an ordinary reply — typically with no text
+at all, so the loop committed an empty assistant message and reported success. The response mapping
+is now extracted into `anthropic_chat_response`, mirroring `openai_style_chat_response`, and a
+refusal returns `AgentError::ProviderRefusal { provider: "anthropic", message }` with the response
+text when there is any and `UNEXPLAINED_REFUSAL` when there is not.
+
+`StopReason::Other` consequently means only what its name says: a stop reason this code does not
+recognize. Such a response still completes and still returns the model's text — asserted at both
+the mapping level and through a fake provider driving `chat_with_tools`, so the two refusal arms
+cannot quietly widen into "anything unfamiliar is a refusal".
 
 ### Truncated tool-use turns (review round 1, P1)
 

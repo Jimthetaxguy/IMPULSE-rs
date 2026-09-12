@@ -250,10 +250,21 @@ the partial-text case, the negative case, and the `Display`.
 `src/error.rs` gained one variant (`ProviderRefusal`), consistent with the round-1 edit the
 coordinator authorized for that file.
 
-**Known gap, deliberately not widened:** Anthropic's newer `stop_reason: "refusal"` maps to
-`StopReason::Other` and takes the same empty-reply path this thread fixed for OpenAI. The thread
-scoped the fix to the OpenAI response type, so the Anthropic arm is recorded here and in the design
-spec as a follow-up rather than changed silently.
+**Follow-up, closed same day at the coordinator's direction — the Anthropic half.** The gap flagged
+above is now closed on the same terms. `AnthropicProvider::chat`'s response mapping is extracted
+into `anthropic_chat_response` (mirroring `openai_style_chat_response`, so it is assertable without
+a network call), and `stop_reason: "refusal"` returns
+`AgentError::ProviderRefusal { provider: "anthropic", message }` — the response text when there is
+any, `UNEXPLAINED_REFUSAL` ("the provider refused the request") when there is not — with history
+untouched. `StopReason::Other` now means only what its name says.
+
+Six tests: refusal with text, refusal with no text (the case that used to commit an empty assistant
+message and report success), an unknown stop reason with real text still completing, the four known
+stop reasons mapping as before, and two fake-provider tests through `chat_with_tools` — one proving
+a refusal leaves history empty, runs no tool, and reports `Failed`; the other proving an
+unrecognized stop reason with text still completes with a `Completed` report. The last of those
+exists specifically so the refusal arms cannot quietly widen into "anything unfamiliar is a
+refusal".
 
 **Branch re-frozen after this round.**
 

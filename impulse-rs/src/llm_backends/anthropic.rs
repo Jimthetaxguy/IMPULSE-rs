@@ -603,6 +603,76 @@ fn build_anthropic_body(
     Ok(body)
 }
 
+/// Message used when a provider refuses without saying anything.
+const UNEXPLAINED_REFUSAL: &str = "the provider refused the request";
+
+/// Converts an Anthropic Messages API response into the provider-neutral
+/// [`ChatResponse`].
+///
+/// Extracted from [`AnthropicProvider::chat`] so the mapping — in particular
+/// the refusal arm — is assertable without a network call, mirroring
+/// [`openai_style_chat_response`].
+///
+/// **Refusals are errors, not empty replies (review round 3 follow-up).**
+/// Anthropic reports a declined completion as `stop_reason: "refusal"`, which
+/// previously fell into the catch-all `StopReason::Other` arm and was returned
+/// as an ordinary reply — typically with no text at all, so the loop committed
+/// an empty assistant message and reported success. This is the same defect
+/// fixed on the OpenAI path in review round 3, and it closes here on the same
+/// terms: [`AgentError::ProviderRefusal`], history untouched. `StopReason::
+/// Other` now means only what its name says — a stop reason this code does not
+/// recognize — and such a response still completes normally.
+fn anthropic_chat_response(resp: AnthropicResponse, provider: &str) -> AgentResult<ChatResponse> {
+    let content = resp
+        .content
+        .iter()
+        .filter(|c| c.block_type == "text")
+        .filter_map(|c| c.text.clone())
+        .collect::<Vec<_>>()
+        .join("");
+
+    if resp.stop_reason.as_deref() == Some("refusal") {
+        let message = if content.trim().is_empty() {
+            UNEXPLAINED_REFUSAL.to_string()
+        } else {
+            content
+        };
+        return Err(AgentError::ProviderRefusal {
+            provider: provider.to_string(),
+            message,
+        });
+    }
+
+    let tool_calls: Vec<ToolCall> = resp
+        .content
+        .iter()
+        .filter(|c| c.block_type == "tool_use")
+        .map(|c| ToolCall {
+            id: c.id.clone().unwrap_or_default(),
+            name: c.name.clone().unwrap_or_default(),
+            input: c.input.clone().unwrap_or(serde_json::Value::Null),
+        })
+        .collect();
+
+    let stop_reason = match resp.stop_reason.as_deref() {
+        Some("tool_use") => StopReason::ToolUse,
+        Some("max_tokens") => StopReason::MaxTokens,
+        Some("end_turn") | Some("stop_sequence") => StopReason::EndTurn,
+        _ => StopReason::Other,
+    };
+
+    Ok(ChatResponse {
+        content,
+        model: resp.model,
+        usage: Usage {
+            input_tokens: resp.usage.input_tokens,
+            output_tokens: resp.usage.output_tokens,
+        },
+        stop_reason,
+        tool_calls,
+    })
+}
+
 #[async_trait]
 impl LlmProvider for AnthropicProvider {
     fn name(&self) -> &str {
@@ -643,42 +713,7 @@ impl LlmProvider for AnthropicProvider {
             .await
             .map_err(|e| AgentError::ApiResponse(e.to_string()))?;
 
-        let content = resp
-            .content
-            .iter()
-            .filter(|c| c.block_type == "text")
-            .filter_map(|c| c.text.clone())
-            .collect::<Vec<_>>()
-            .join("");
-
-        let tool_calls: Vec<ToolCall> = resp
-            .content
-            .iter()
-            .filter(|c| c.block_type == "tool_use")
-            .map(|c| ToolCall {
-                id: c.id.clone().unwrap_or_default(),
-                name: c.name.clone().unwrap_or_default(),
-                input: c.input.clone().unwrap_or(serde_json::Value::Null),
-            })
-            .collect();
-
-        let stop_reason = match resp.stop_reason.as_deref() {
-            Some("tool_use") => StopReason::ToolUse,
-            Some("max_tokens") => StopReason::MaxTokens,
-            Some("end_turn") | Some("stop_sequence") => StopReason::EndTurn,
-            _ => StopReason::Other,
-        };
-
-        Ok(ChatResponse {
-            content,
-            model: resp.model,
-            usage: Usage {
-                input_tokens: resp.usage.input_tokens,
-                output_tokens: resp.usage.output_tokens,
-            },
-            stop_reason,
-            tool_calls,
-        })
+        anthropic_chat_response(resp, self.name())
     }
 
     fn supported_models(&self) -> Vec<&str> {
@@ -835,6 +870,7 @@ fn openai_style_chat_response(
         } else {
             content
         };
+        debug_assert!(!message.is_empty(), "a refusal always carries a reason");
         return Err(AgentError::ProviderRefusal {
             provider: provider.to_string(),
             message,
@@ -1452,6 +1488,90 @@ mod tests {
         let parsed = openai_style_chat_response(resp, "openai", "m").unwrap();
         assert_eq!(parsed.content, "");
         assert!(parsed.tool_calls.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // Anthropic refusals (review round 3 follow-up)
+    // ---------------------------------------------------------------
+
+    fn anthropic_response(stop_reason: &str, text: &str) -> AnthropicResponse {
+        let content = if text.is_empty() {
+            serde_json::json!([])
+        } else {
+            serde_json::json!([{"type": "text", "text": text}])
+        };
+        serde_json::from_value(serde_json::json!({
+            "id": "msg_1",
+            "model": "claude-sonnet-4-6",
+            "stop_reason": stop_reason,
+            "content": content,
+            "usage": {"input_tokens": 3, "output_tokens": 0}
+        }))
+        .expect("the fixture is a valid Anthropic response")
+    }
+
+    #[test]
+    fn test_anthropic_refusal_with_text_surfaces_the_models_words() {
+        let resp = anthropic_response("refusal", "I won't help with that.");
+        let err = anthropic_chat_response(resp, "anthropic")
+            .expect_err("a refusal must not be a successful reply");
+        match err {
+            AgentError::ProviderRefusal {
+                ref provider,
+                ref message,
+            } => {
+                assert_eq!(provider, "anthropic");
+                assert_eq!(message, "I won't help with that.");
+            }
+            other => panic!("expected ProviderRefusal, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_anthropic_refusal_without_text_falls_back_to_a_fixed_reason() {
+        // The empty-content case is the one that used to commit an empty
+        // assistant message and report success.
+        let resp = anthropic_response("refusal", "");
+        let err = anthropic_chat_response(resp, "anthropic")
+            .expect_err("a refusal must not be a successful empty reply");
+        match err {
+            AgentError::ProviderRefusal {
+                ref provider,
+                ref message,
+            } => {
+                assert_eq!(provider, "anthropic");
+                assert_eq!(message, UNEXPLAINED_REFUSAL);
+                assert!(!message.is_empty());
+            }
+            other => panic!("expected ProviderRefusal, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_anthropic_unknown_stop_reason_with_text_still_completes() {
+        // `Other` now means only what its name says. A stop reason this code
+        // does not recognize is not a refusal and must still return the
+        // model's answer.
+        let resp = anthropic_response("some_future_reason", "still an answer");
+        let parsed = anthropic_chat_response(resp, "anthropic")
+            .expect("an unknown stop reason is not an error");
+        assert_eq!(parsed.stop_reason, StopReason::Other);
+        assert_eq!(parsed.content, "still an answer");
+        assert_eq!(parsed.model, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn test_anthropic_known_stop_reasons_map_as_before() {
+        for (raw, expected) in [
+            ("end_turn", StopReason::EndTurn),
+            ("stop_sequence", StopReason::EndTurn),
+            ("max_tokens", StopReason::MaxTokens),
+            ("tool_use", StopReason::ToolUse),
+        ] {
+            let parsed = anthropic_chat_response(anthropic_response(raw, "hi"), "anthropic")
+                .unwrap_or_else(|err| panic!("{raw} must not error: {err}"));
+            assert_eq!(parsed.stop_reason, expected, "for {raw}");
+        }
     }
 
     // ---------------------------------------------------------------

@@ -2950,6 +2950,113 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
+    // Refusals reach the loop as errors (review round 3 follow-up)
+    // ---------------------------------------------------------------
+
+    /// A provider that declines, the way `AnthropicProvider` and
+    /// `OpenAiProvider` now do once they see a refusal on the wire.
+    struct RefusingProvider;
+
+    #[async_trait]
+    impl LlmProvider for RefusingProvider {
+        fn name(&self) -> &str {
+            "refusing-fake"
+        }
+        fn default_model(&self) -> &str {
+            "refusing-fake-model"
+        }
+        async fn chat(&self, _request: ChatRequest) -> AgentResult<ChatResponse> {
+            Err(AgentError::ProviderRefusal {
+                provider: "anthropic".to_string(),
+                message: "I won't help with that.".to_string(),
+            })
+        }
+        fn supported_models(&self) -> Vec<&str> {
+            vec!["refusing-fake-model"]
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_refusal_leaves_history_untouched_and_never_completes() {
+        let mut agent = test_agent(RefusingProvider);
+        let executor = EchoExecutor::new();
+
+        let result = agent.chat_with_tools("go", &[], &executor).await;
+
+        assert!(
+            result.is_err(),
+            "a refusal must never surface as a completed reply, got: {result:?}"
+        );
+        match result {
+            Err(AgentError::ProviderRefusal {
+                ref provider,
+                ref message,
+            }) => {
+                assert_eq!(provider, "anthropic");
+                assert_eq!(message, "I won't help with that.");
+            }
+            other => panic!("expected ProviderRefusal, got: {other:?}"),
+        }
+        assert!(
+            agent.history.is_empty(),
+            "the refused turn must not be committed to history"
+        );
+        assert_eq!(executor.invocations.lock().unwrap().len(), 0);
+        let report = agent.last_loop_report().expect("a failure leaves a report");
+        assert!(
+            matches!(report.termination, LoopTermination::Failed { .. }),
+            "got: {:?}",
+            report.termination
+        );
+    }
+
+    /// Returns a stop reason this code does not recognize, with real text.
+    struct UnknownStopReasonProvider;
+
+    #[async_trait]
+    impl LlmProvider for UnknownStopReasonProvider {
+        fn name(&self) -> &str {
+            "unknown-stop-fake"
+        }
+        fn default_model(&self) -> &str {
+            "unknown-stop-fake-model"
+        }
+        async fn chat(&self, request: ChatRequest) -> AgentResult<ChatResponse> {
+            Ok(ChatResponse {
+                content: "still an answer".to_string(),
+                model: request.model,
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+                stop_reason: StopReason::Other,
+                tool_calls: Vec::new(),
+            })
+        }
+        fn supported_models(&self) -> Vec<&str> {
+            vec!["unknown-stop-fake-model"]
+        }
+    }
+
+    #[tokio::test]
+    async fn test_an_unknown_stop_reason_with_text_still_completes() {
+        // `Other` is not a refusal: a stop reason this code does not know
+        // still carries the model's answer and must be returned.
+        let mut agent = test_agent(UnknownStopReasonProvider);
+        let executor = EchoExecutor::new();
+
+        let reply = agent
+            .chat_with_tools("go", &[], &executor)
+            .await
+            .expect("an unknown stop reason must not fail the turn");
+
+        assert_eq!(reply, "still an answer");
+        assert_eq!(agent.history.len(), 2);
+        let report = agent.last_loop_report().expect("a run leaves a report");
+        assert_eq!(report.termination, LoopTermination::Completed);
+    }
+
+    // ---------------------------------------------------------------
     // Provider selection (Stage 1b-A)
     // ---------------------------------------------------------------
 
