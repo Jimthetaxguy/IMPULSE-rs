@@ -230,6 +230,23 @@ response carrying the typed outcome rather than an error.
   `impulse-rs/src/governed_producers.rs`, the endpoints in `impulse-rs/src/daemon/governed_wiring.rs`,
   and ADR-0019.
 
+### staged control — `[code]`
+A Dioxus cockpit affordance that drives one ADR-0019 staged-worktree endpoint: **Promote** and
+**Discard**, rendered beside Approve/Reject on the operator board and only for a
+`staged_authoritative` run. A control is offered exactly when the daemon would accept it —
+`governed_outcome_is_promotable` and `staged_worktree_is_discardable` in
+`impulse-ops/src/governed_wiring.rs` are the single predicates both sides read — and a control that
+is not offered always names the rule that withheld it rather than greying out silently. Two
+renderings carry ADR-0019's own wording requirements: a **blocked-promotion banner** (typed per
+`PromotionBlockedReason`, showing the canonical head plus a per-reason remedy, and saying the run
+stays accepted and the checkout stays active — it is an execution fact, never an error), and a
+**discard confirmation** that states what the discard costs and shows the unreferenced accepted
+commit's OID *before* anything is sent.
+- **Source of truth:** `promote_control_state`, `discard_control_state`,
+  `blocked_promotion_notice`, `discard_cost_notice`, and `staged_config_refusal_notice` in
+  `impulse-rs/impulse-desktop/src/ui.rs`; the gateway methods in
+  `impulse-rs/impulse-desktop/src/{runtime,daemon_ops}.rs`.
+
 ### document read tool — `[code]`
 Ion's read-only `document_read` tool: reads `xlsx` by streaming cells through calamine's cell
 reader under a character and cell budget (never the dense-grid parser; a chart or dialog sheet
