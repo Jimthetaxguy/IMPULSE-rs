@@ -3730,6 +3730,14 @@ mod tests {
     }
 
     fn staged_registration(state: &State, request_id: &str) -> GovernedTaskRegistration {
+        staged_registration_at(state, request_id, &staged_oid('a'))
+    }
+
+    fn staged_registration_at(
+        state: &State,
+        request_id: &str,
+        initial_subject_revision: &str,
+    ) -> GovernedTaskRegistration {
         let root = state.storage().base_path().parent().unwrap();
         let assignment = impulse_ops::role_assignment::canonical_governed_builder_assignment();
         let compatibility = impulse_ops::agent_registry::AgentRegistry::builtin()
@@ -3752,7 +3760,7 @@ mod tests {
             impulse_ops::governed_task::GovernedVerificationProfile::RustWorkspaceV1,
         )
         .acceptance_criteria(vec!["the gate is green".to_string()])
-        .initial_subject_revision(staged_oid('a'))
+        .initial_subject_revision(initial_subject_revision.to_string())
         .role_assignment(assignment)
         .role_compatibility(compatibility)
         .build()
@@ -4990,6 +4998,120 @@ mod tests {
             .expect("the replayed task");
         assert_eq!(stored.execution_state, GovernedExecutionState::Running);
         assert_eq!(stored.world_scope, WorldScope::Authoritative);
+    }
+
+    /// Run one Git command in a fixture repository, returning trimmed stdout.
+    fn run_git(repo: &std::path::Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["-c", "core.hooksPath=/dev/null"])
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run git {args:?}: {error}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("git output is UTF-8")
+            .trim()
+            .to_string()
+    }
+
+    /// Handed over by the daemon-wiring lane alongside its
+    /// `PRODUCER_RESERVATIONS.json` fix: `.impulse/MEMORY_CANDIDATES.json` has
+    /// the identical shape of gap. `impulse init` gitignores it, but the
+    /// producers' cleanliness check never exempted it, so in a project whose
+    /// `.impulse` namespace is *not* gitignored, recording an operator approval
+    /// dirties the canonical tree — and promotion, which is only reachable
+    /// after an approval, then fails on a tree the daemon dirtied itself.
+    ///
+    /// This drives the real chain against a real repository: register, stage
+    /// with the real producer, launch, Builder commit, claim, verify, recommend,
+    /// approve, promote.
+    #[test]
+    fn test_an_operator_approval_leaves_an_ungitignored_canonical_tree_promotable() {
+        let (root, state) = state();
+        let project = root.path().join("impulse-test");
+        // Deliberately no `.gitignore`: this is the project shape where the
+        // daemon's own runtime files are visible to Git.
+        run_git(&project, &["init", "--quiet", "--initial-branch=main"]);
+        run_git(&project, &["config", "user.email", "lane@example.invalid"]);
+        run_git(&project, &["config", "user.name", "Memory Lane"]);
+        std::fs::write(project.join("README.md"), "initial\n").unwrap();
+        run_git(&project, &["add", "README.md"]);
+        run_git(&project, &["commit", "--quiet", "-m", "initial"]);
+        let initial = run_git(&project, &["rev-parse", "--verify", "HEAD^{commit}"]);
+
+        let task = state
+            .register_governed_task(staged_registration_at(&state, "mem-1", &initial))
+            .unwrap();
+        // The real producer, so the recorded pin is the real one promotion
+        // compares against.
+        let staged_input = crate::governed_producers::materialize_staged_worktree(&task).unwrap();
+        let staged_root = std::path::PathBuf::from(&staged_input.root);
+        let task = state
+            .mutate_governed_task(mutation(
+                &task,
+                "mem-1-staged",
+                GovernedTaskMutation::MaterializeStagedWorktree {
+                    staged: staged_input,
+                },
+            ))
+            .unwrap();
+        let task = launch(&state, &task, "mem-1-run");
+
+        std::fs::write(staged_root.join("feature.txt"), "builder work\n").unwrap();
+        run_git(&staged_root, &["add", "feature.txt"]);
+        run_git(&staged_root, &["commit", "--quiet", "-m", "builder work"]);
+        let builder_commit = run_git(&staged_root, &["rev-parse", "--verify", "HEAD^{commit}"]);
+
+        let task = staged_claim(&state, &task, "mem-1-claim", &builder_commit);
+        let task = verify(
+            &state,
+            &task,
+            "mem-1-verify",
+            GovernedVerificationOutcome::Passed,
+        );
+        let task = recommend_accept(&state, &task, "mem-1-supervisor");
+        let task = operator_decide(
+            &state,
+            &task,
+            "mem-1-operator",
+            OperatorDecisionKind::Approve,
+        );
+        assert_eq!(task.review_state, GovernedReviewState::Accepted);
+
+        // Negative control: the approval really did write a file Git can see,
+        // so the assertion below is about the exemption and not about a file
+        // that never appeared.
+        let candidates = project.join(".impulse").join("MEMORY_CANDIDATES.json");
+        assert!(candidates.is_file(), "the approval records a candidate");
+        assert!(
+            run_git(
+                &project,
+                &["status", "--porcelain", "--untracked-files=all"]
+            )
+            .contains("MEMORY_CANDIDATES.json"),
+            "an ungitignored .impulse must expose the candidate ledger to Git"
+        );
+
+        let promotion = crate::governed_producers::promote_governed_outcome(&task)
+            .expect("the daemon's own runtime file must not block promotion");
+        assert_eq!(
+            promotion.outcome,
+            GovernedPromotionOutcome::Promoted {
+                promoted_revision: builder_commit.clone()
+            }
+        );
+        assert_eq!(
+            run_git(&project, &["rev-parse", "--verify", "HEAD^{commit}"]),
+            builder_commit
+        );
     }
 
     /// Third #50 P1 finding, the migration half: a ledger written before the

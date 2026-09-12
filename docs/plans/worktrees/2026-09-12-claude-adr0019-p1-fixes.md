@@ -92,6 +92,36 @@ Every fix was reverted once and its test watched to fail, including the two-part
 reproduces finding 2 exactly as reviewed (old ordering plus no `core.fsmonitor=false`: the
 Builder-planted hook executes during promotion).
 
+## Cross-lane pickups (2026-09-12)
+
+Handed over by the sibling `claude/daemon-governed-wiring-20260912` lane (PR #52) and carried here
+so the two PRs do not diverge:
+
+- **Cherry-picked `8dca0a1` verbatim** — `cargo clippy --workspace --all-targets -- -D warnings`
+  fails on `origin/main` with the installed toolchain (rustc 1.98.1) at two pre-existing one-line
+  sites outside both lanes: `impulse-term/src/renderer.rs` (`float_literal_f32_fallback`, now
+  hard-denied) and `impulse-desktop/tests/desktop_contract.rs` (`clippy::drain_collect`). Neither
+  is caused by this lane; without the pick the gate cannot run to completion.
+- **Cherry-picked `e533b09` verbatim** — exempts `.impulse/PRODUCER_RESERVATIONS.json` from the
+  producers' cleanliness check and adds it to what `impulse init` gitignores.
+- **Added on top, in this lane's own file:** `.impulse/MEMORY_CANDIDATES.json` (and its `.tmp.`
+  siblings) had the identical gap — gitignored by `init`, never exempted from the cleanliness
+  check — so in a project whose `.impulse` is not gitignored, recording an operator approval
+  dirtied the canonical tree and the very next promotion failed on a tree the daemon had dirtied
+  itself. Promotion is only reachable *after* an approval, so this was on the critical path.
+  Test: `state::governed_task::tests::test_an_operator_approval_leaves_an_ungitignored_canonical_tree_promotable`,
+  which drives the real chain (register → real `materialize_staged_worktree` → launch → Builder
+  commit → claim → verify → recommend → approve → promote) against a real repository with no
+  `.gitignore`, with a negative control asserting Git can actually see the candidate ledger.
+  Reverting the exemption fails it.
+
+## Follow-ups
+
+- `staged_worktree_is_discardable` is duplicated: the state layer holds the enforcing copy, and
+  `impulse_ops::governed_wiring` (PR #52) holds a preflight copy. Deliberately **not** unified in
+  either PR — whichever lands second should not be rebased around a refactor. Unify in a dedicated
+  follow-up once both are merged, keeping the state layer as the single enforcement point.
+
 ## Handoff Notes
 
 - **For `claude/daemon-governed-wiring-20260912`:** one breaking signature.
