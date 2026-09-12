@@ -724,9 +724,13 @@ struct OpenAiStyleChoice {
 
 #[derive(Debug, Deserialize)]
 struct OpenAiStyleMessage {
-    /// Null on a pure tool-call turn, hence `Option`.
+    /// Null on a pure tool-call turn, and on a refusal, hence `Option`.
     #[serde(default)]
     content: Option<String>,
+    /// The model's own refusal text. Present (with `content` null) when the
+    /// model declines to answer; see [`AgentError::ProviderRefusal`].
+    #[serde(default)]
+    refusal: Option<String>,
     #[serde(default)]
     tool_calls: Vec<OpenAiStyleToolCall>,
 }
@@ -790,14 +794,52 @@ fn build_openai_style_body(
 /// response, not an empty call: it fails with [`AgentError::ApiResponse`]
 /// rather than being silently turned into an empty input object that the
 /// tool would then execute with.
+///
+/// **Refusals are errors, not empty replies (review round 3).** A model that
+/// declines to answer sends `message.content: null` with the explanation in
+/// `message.refusal`; a filtered completion reports
+/// `finish_reason: "content_filter"`. Both used to fall through
+/// `unwrap_or_default()` into an empty-string reply that the loop committed as
+/// a successful turn, so the user saw a blank answer and nothing said the model
+/// had refused. Both now return [`AgentError::ProviderRefusal`], leaving
+/// history untouched like every other error path.
 fn openai_style_chat_response(
     resp: OpenAiStyleResponse,
+    provider: &str,
     fallback_model: &str,
 ) -> AgentResult<ChatResponse> {
     let choice = resp.choices.first();
     let content = choice
         .and_then(|c| c.message.content.clone())
         .unwrap_or_default();
+
+    // A structured refusal is unambiguous: the model said why it will not
+    // answer, and that text is the outcome.
+    if let Some(refusal) = choice
+        .and_then(|c| c.message.refusal.as_deref())
+        .map(str::trim)
+        .filter(|refusal| !refusal.is_empty())
+    {
+        return Err(AgentError::ProviderRefusal {
+            provider: provider.to_string(),
+            message: refusal.to_string(),
+        });
+    }
+
+    // A filtered completion is also a refusal, whether or not any partial text
+    // survived it: returning that text as an ordinary reply would present a
+    // blocked completion as a finished answer.
+    if choice.and_then(|c| c.finish_reason.as_deref()) == Some("content_filter") {
+        let message = if content.trim().is_empty() {
+            "the provider filtered this completion".to_string()
+        } else {
+            content
+        };
+        return Err(AgentError::ProviderRefusal {
+            provider: provider.to_string(),
+            message,
+        });
+    }
 
     let mut tool_calls = Vec::new();
     if let Some(choice) = choice {
@@ -899,7 +941,7 @@ impl LlmProvider for OpenAiProvider {
             .await
             .map_err(|e| AgentError::ApiResponse(e.to_string()))?;
 
-        openai_style_chat_response(resp, &request.model)
+        openai_style_chat_response(resp, self.name(), &request.model)
     }
 
     fn supported_models(&self) -> Vec<&str> {
@@ -978,7 +1020,7 @@ impl LlmProvider for MinimaxProvider {
             .await
             .map_err(|e| AgentError::ApiResponse(e.to_string()))?;
 
-        openai_style_chat_response(resp, &request.model)
+        openai_style_chat_response(resp, self.name(), &request.model)
     }
 
     fn supported_models(&self) -> Vec<&str> {
@@ -1225,7 +1267,7 @@ mod tests {
             "usage": {"prompt_tokens": 11, "completion_tokens": 3}
         });
         let resp: OpenAiStyleResponse = serde_json::from_value(raw).unwrap();
-        let parsed = openai_style_chat_response(resp, "fallback-model").unwrap();
+        let parsed = openai_style_chat_response(resp, "openai", "fallback-model").unwrap();
         assert_eq!(parsed.stop_reason, StopReason::ToolUse);
         assert_eq!(parsed.model, "gpt-4o");
         assert_eq!(parsed.content, "");
@@ -1248,7 +1290,7 @@ mod tests {
             "usage": {"prompt_tokens": 1, "completion_tokens": 1}
         });
         let resp: OpenAiStyleResponse = serde_json::from_value(raw).unwrap();
-        let parsed = openai_style_chat_response(resp, "abab6.5s-chat").unwrap();
+        let parsed = openai_style_chat_response(resp, "openai", "abab6.5s-chat").unwrap();
         assert_eq!(parsed.model, "abab6.5s-chat");
         assert_eq!(parsed.content, "hi");
         assert_eq!(parsed.stop_reason, StopReason::EndTurn);
@@ -1264,7 +1306,7 @@ mod tests {
             "usage": {}
         });
         let resp: OpenAiStyleResponse = serde_json::from_value(raw).unwrap();
-        let parsed = openai_style_chat_response(resp, "m").unwrap();
+        let parsed = openai_style_chat_response(resp, "openai", "m").unwrap();
         assert_eq!(parsed.stop_reason, StopReason::ToolUse);
         // Empty arguments mean "no input", not malformed input.
         assert_eq!(parsed.tool_calls[0].input, serde_json::json!({}));
@@ -1278,22 +1320,112 @@ mod tests {
         });
         let resp: OpenAiStyleResponse = serde_json::from_value(raw).unwrap();
         assert_eq!(
-            openai_style_chat_response(resp, "m").unwrap().stop_reason,
+            openai_style_chat_response(resp, "openai", "m")
+                .unwrap()
+                .stop_reason,
             StopReason::MaxTokens
         );
     }
 
     #[test]
     fn test_openai_style_response_maps_an_unknown_reason_to_other() {
+        // A reason this code does not know is `Other` -- not an error. Only
+        // the refusal shapes below are errors.
         let raw = serde_json::json!({
-            "choices": [{"finish_reason": "content_filter", "message": {"content": ""}}],
+            "choices": [{"finish_reason": "some_future_reason", "message": {"content": "partial"}}],
             "usage": {}
         });
         let resp: OpenAiStyleResponse = serde_json::from_value(raw).unwrap();
-        assert_eq!(
-            openai_style_chat_response(resp, "m").unwrap().stop_reason,
-            StopReason::Other
-        );
+        let parsed = openai_style_chat_response(resp, "openai", "m").unwrap();
+        assert_eq!(parsed.stop_reason, StopReason::Other);
+        assert_eq!(parsed.content, "partial");
+    }
+
+    #[test]
+    fn test_openai_style_response_surfaces_a_structured_refusal_as_an_error() {
+        // Review round 3: `content` is null and the explanation lives in
+        // `refusal`. This used to become an empty-string reply that the loop
+        // committed as a successful turn -- a blank answer with nothing
+        // saying the model had refused.
+        let raw = serde_json::json!({
+            "model": "gpt-4o",
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": null, "refusal": "I can't help with that request."}
+            }],
+            "usage": {"prompt_tokens": 9, "completion_tokens": 0}
+        });
+        let resp: OpenAiStyleResponse = serde_json::from_value(raw).unwrap();
+        let err = openai_style_chat_response(resp, "openai", "m")
+            .expect_err("a refusal must not be a successful empty reply");
+        match err {
+            AgentError::ProviderRefusal {
+                ref provider,
+                ref message,
+            } => {
+                assert_eq!(provider, "openai");
+                assert_eq!(message, "I can't help with that request.");
+            }
+            other => panic!("expected ProviderRefusal, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_openai_style_response_surfaces_a_content_filter_as_an_error() {
+        let raw = serde_json::json!({
+            "choices": [{"finish_reason": "content_filter", "message": {"content": null}}],
+            "usage": {}
+        });
+        let resp: OpenAiStyleResponse = serde_json::from_value(raw).unwrap();
+        let err = openai_style_chat_response(resp, "minimax", "m")
+            .expect_err("a filtered completion must not be a successful empty reply");
+        match err {
+            AgentError::ProviderRefusal {
+                ref provider,
+                ref message,
+            } => {
+                assert_eq!(provider, "minimax");
+                assert!(message.contains("filtered"), "got: {message}");
+            }
+            other => panic!("expected ProviderRefusal, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_openai_style_response_content_filter_keeps_any_partial_text_in_the_error() {
+        // A filtered completion is a refusal whether or not partial text
+        // survived it: returning that text as an ordinary reply would present
+        // a blocked completion as a finished answer.
+        let raw = serde_json::json!({
+            "choices": [{
+                "finish_reason": "content_filter",
+                "message": {"content": "here is how to"}
+            }],
+            "usage": {}
+        });
+        let resp: OpenAiStyleResponse = serde_json::from_value(raw).unwrap();
+        let err = openai_style_chat_response(resp, "openai", "m")
+            .expect_err("a filtered completion is never a success");
+        assert!(format!("{err}").contains("here is how to"), "got: {err}");
+    }
+
+    #[test]
+    fn test_openai_style_response_ignores_an_empty_refusal_field() {
+        // Many ordinary replies carry `refusal: null`, and some carry an
+        // empty string; neither is a refusal.
+        for refusal in [serde_json::Value::Null, serde_json::json!("   ")] {
+            let raw = serde_json::json!({
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": {"content": "a real answer", "refusal": refusal}
+                }],
+                "usage": {}
+            });
+            let resp: OpenAiStyleResponse = serde_json::from_value(raw).unwrap();
+            let parsed = openai_style_chat_response(resp, "openai", "m")
+                .expect("an ordinary reply must not be mistaken for a refusal");
+            assert_eq!(parsed.content, "a real answer");
+        }
     }
 
     #[test]
@@ -1305,7 +1437,7 @@ mod tests {
             "usage": {}
         });
         let resp: OpenAiStyleResponse = serde_json::from_value(raw).unwrap();
-        let err = openai_style_chat_response(resp, "m").unwrap_err();
+        let err = openai_style_chat_response(resp, "openai", "m").unwrap_err();
         assert!(
             matches!(err, AgentError::ApiResponse(_)),
             "expected ApiResponse, got: {err:?}"
@@ -1317,7 +1449,7 @@ mod tests {
     fn test_openai_style_response_with_no_choices_is_an_empty_reply() {
         let raw = serde_json::json!({"choices": [], "usage": {}});
         let resp: OpenAiStyleResponse = serde_json::from_value(raw).unwrap();
-        let parsed = openai_style_chat_response(resp, "m").unwrap();
+        let parsed = openai_style_chat_response(resp, "openai", "m").unwrap();
         assert_eq!(parsed.content, "");
         assert!(parsed.tool_calls.is_empty());
     }

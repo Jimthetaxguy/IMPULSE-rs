@@ -106,6 +106,20 @@ pub enum AgentError {
          the request was truncated mid-tool-use and was not executed"
     )]
     TruncatedToolCall { provider: String, tool_calls: usize },
+
+    /// Surfaced when a provider declines to answer (review round 3).
+    ///
+    /// OpenAI-style completions report this two ways: a structured
+    /// `message.refusal` string with `message.content` null, and
+    /// `finish_reason: "content_filter"`. Both used to reach the loop as an
+    /// ordinary reply whose content was `unwrap_or_default()`-ed to the empty
+    /// string, so the turn committed an empty assistant message and reported
+    /// success — the user saw a blank answer with no indication the model had
+    /// refused or the completion had been filtered. A refusal is a real,
+    /// nameable outcome and is surfaced as one; history is left untouched, as
+    /// on every other error path.
+    #[error("Provider '{provider}' declined to answer: {message}")]
+    ProviderRefusal { provider: String, message: String },
 }
 
 pub type AgentResult<T> = Result<T, AgentError>;
@@ -265,5 +279,20 @@ mod tests {
         assert!(msg.contains("stalled"), "{msg}");
         assert!(msg.contains("900"), "{msg}");
         assert!(msg.contains("100"), "{msg}");
+    }
+
+    #[test]
+    fn test_agent_error_provider_refusal_display() {
+        let err = AgentError::ProviderRefusal {
+            provider: "openai".to_string(),
+            message: "I can't help with that.".to_string(),
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("openai"), "expected provider name in: {msg}");
+        assert!(
+            msg.contains("I can't help with that."),
+            "expected the refusal text in: {msg}"
+        );
+        assert!(msg.contains("declined"), "expected the reason in: {msg}");
     }
 }

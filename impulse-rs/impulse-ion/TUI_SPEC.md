@@ -437,7 +437,14 @@ pass the repo gate: `cargo build && cargo test && cargo clippy -- -D warnings &&
   executed; it is now `AgentError::TruncatedToolCall`. Round 2 replaced the
   stub's text-matching "already compacted?" test with an exact
   `tool_use_id` set carried beside the working history, so a genuine tool
-  result that merely contains the marker is still compactable. See
+  result that merely contains the marker is still compactable. Round 3 (Codex
+  threads) scoped the newest-round exemption to results *this run* produced —
+  it had been "the last tool-result anywhere", so a completed turn's final
+  result stayed exempt on the next turn and a new turn could trip before
+  contacting the provider — and made OpenAI-style refusals
+  (`message.refusal`, `finish_reason: "content_filter"`) return
+  `AgentError::ProviderRefusal` instead of committing an empty assistant reply
+  as success. See
   `docs/decisions/0017-canonical-loop-contract.md` (2026-09-12 addendum).
 - **T10 (optional) — ratatui inline polish.** Spinner during gate runs, colored
   verdict table, status line. *(Depends T7. Do not start before T9 is stable.)*

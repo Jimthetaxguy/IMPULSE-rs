@@ -137,19 +137,27 @@ when `Some(0)`), `LoopTrip` gains `ContextBudget { chars, limit }`, and `LoopRep
 compacts tool-result content oldest-first into a bounded stub that preserves the `tool_use` id and
 names the originating tool, and only trips when compaction cannot get the history back under
 budget. Two classes of content are never compacted: prose — the user's turn and the model's own
-words — and **the most recent round's results**, which the model has not been shown even once. A
-loop that cannot fit without touching either trips instead of silently eliding it.
+words — and **the results this run produced**, which the model has not been shown even once. A
+loop that cannot fit without touching either trips instead of silently eliding it. That second
+exemption is scoped to the current run: a tool result carried in from an earlier, completed turn
+has already been seen and is ordinary compactible history.
 
 The budget is evaluated *before* the round is admitted, so a history that never fit reports
 `rounds_used: 0` rather than claiming a round it never spent.
 
-**Rule 8. A truncated tool-use turn is neither executed nor completed.** A provider that stops on
+**Rule 8. A truncated or refused turn is neither executed nor completed.** A provider that stops on
 `max_tokens` while emitting tool calls produced a partial batch: a call's input may be missing
 fields, or the batch may be missing calls. Running it executes the model's half-written intent;
 returning it as a final reply hands the caller an empty string with a `Completed` report and no
 tool ever run — a truncation rendered as a successful answer. The loop fails with
 `AgentError::TruncatedToolCall { provider, tool_calls }` instead, history untouched. A truncated
 *plain* reply is unaffected: it is still the model's answer and is returned as before.
+
+The same principle covers a provider that declines: an OpenAI-style refusal
+(`message.refusal` with null content) or a blocked completion (`finish_reason: "content_filter"`)
+returns `AgentError::ProviderRefusal { provider, message }` rather than an empty assistant message
+committed as success. An empty reply is never an acceptable rendering of "the model would not
+answer".
 
 Measurement and compaction live with the caller (`llm_backends`), which owns the message types;
 this module declares the limit, counts the compactions, and names the trip. Rule 6 is therefore
@@ -201,9 +209,13 @@ with it on failure, and cleared by `clear_history`; a history of prose alone ove
 escape-heavy input is the OpenAI rendering, not the Anthropic one; a hostile tool name survives only
 as an escaped, bounded JSON string; a stub is re-wrapped in the executor's framing; and
 `chat_with_tools` surfaces the trip as `ToolLoopStalled` with history untouched, a `Tripped`
-report, and `rounds_used: 0` when nothing ever fit. Rule 8 is represented when a provider stopping
-on `max_tokens` with tool calls returns `TruncatedToolCall`, runs no tool, leaves history
-untouched, and never returns `Ok("")`, while a truncated plain reply still completes.
+report, and `rounds_used: 0` when nothing ever fit. a result carried in from an
+earlier completed turn is compactible on the next turn while one this run produced is not. Rule 8
+is represented when a provider stopping on `max_tokens` with tool calls returns
+`TruncatedToolCall`, runs no tool, leaves history untouched, and never returns `Ok("")`, while a
+truncated plain reply still completes; and when an OpenAI-style `refusal` or a `content_filter`
+finish returns `ProviderRefusal` rather than an empty success, while an empty or null `refusal`
+field on an ordinary reply does not.
 
 Full design, including the algorithm's exact ordering and what was deliberately not adopted:
 `docs/superpowers/specs/2026-09-01-loop-contract-design.md` (addendum of the same date).

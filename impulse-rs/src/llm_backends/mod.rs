@@ -691,6 +691,15 @@ pub type CompactedResults = std::collections::BTreeSet<String>;
 ///    round N+1, so the model would see the stub and never the content its own
 ///    tool call asked for. A budget that cannot be met without touching them
 ///    trips instead.
+///
+///    The exemption is scoped to *this run* via `current_run_start`, the
+///    length `working` had when [`run_tool_loop`] was entered (review round 3).
+///    It used to be "the last tool-result message anywhere in the history",
+///    which on a fresh user turn pointed at the previous, already-completed
+///    turn's final result — content the model had long since seen. That
+///    exempted the one result a new turn most needed to compact, so a turn
+///    that opened over budget with nothing older to give tripped before the
+///    provider was ever contacted.
 /// 6. If every eligible result has been compacted and the history is still
 ///    over budget, return [`LoopTrip::ContextBudget`]. Only tool results are
 ///    compacted: the user's and the model's own words are the turn, and a
@@ -708,6 +717,7 @@ fn enforce_context_budget(
     breaker: &mut LoopBreaker,
     executor: &dyn ToolExecutor,
     compacted: &mut CompactedResults,
+    current_run_start: usize,
 ) -> Option<LoopTrip> {
     let limit = breaker.contract().budget.max_context_chars?;
     let mut total = history_chars(working);
@@ -715,10 +725,14 @@ fn enforce_context_budget(
         return None;
     }
 
-    // The newest round's results are off limits; see rule 5 above.
+    // The newest round's results are off limits -- but only when this run
+    // produced them. A tool-result message carried in from an earlier,
+    // completed turn has already been shown to the model and is ordinary
+    // compactible history; see rule 5 above.
     let newest_results = working
         .iter()
-        .rposition(|message| !message.tool_results.is_empty());
+        .rposition(|message| !message.tool_results.is_empty())
+        .filter(|index| *index >= current_run_start);
 
     // `tool_use` id -> tool name, so a stub can still say which tool the
     // elided text came from.
@@ -792,12 +806,23 @@ async fn run_tool_loop(
     breaker: &mut LoopBreaker,
     compacted: &mut CompactedResults,
 ) -> Result<(String, Vec<Message>), LoopExit> {
+    // Everything already in `working` arrived from a previous, completed turn
+    // (plus this turn's user message); anything appended past this index was
+    // produced by this run. The context budget's newest-round exemption is
+    // scoped with it -- see `enforce_context_budget` rule 5.
+    let current_run_start = working.len();
     loop {
         // Fit the working history to the contract's context budget before
         // admitting the round, so a history that cannot fit at all trips
         // with `rounds_used: 0` -- no round was ever spent on it, and the
         // report should not claim one was (review round 1).
-        if let Some(trip) = enforce_context_budget(&mut working, breaker, executor, compacted) {
+        if let Some(trip) = enforce_context_budget(
+            &mut working,
+            breaker,
+            executor,
+            compacted,
+            current_run_start,
+        ) {
             return Err(LoopExit::Tripped(trip));
         }
         let tool_round = breaker.begin_round().map_err(LoopExit::Tripped)?;
@@ -2101,6 +2126,7 @@ mod tests {
                 &mut breaker,
                 &EchoExecutor::new(),
                 &mut CompactedResults::new(),
+                0,
             ),
             None
         );
@@ -2121,6 +2147,7 @@ mod tests {
                 &mut breaker,
                 &EchoExecutor::new(),
                 &mut CompactedResults::new(),
+                0,
             ),
             None
         );
@@ -2138,6 +2165,7 @@ mod tests {
                 &mut breaker,
                 &EchoExecutor::new(),
                 &mut CompactedResults::new(),
+                0,
             ),
             None
         );
@@ -2179,6 +2207,7 @@ mod tests {
             &mut breaker,
             &EchoExecutor::new(),
             &mut CompactedResults::new(),
+            0,
         );
         assert!(
             matches!(trip, Some(LoopTrip::ContextBudget { .. })),
@@ -2189,6 +2218,76 @@ mod tests {
             5_000,
             "the newest result must survive untouched"
         );
+        assert_eq!(breaker.compactions(), 0);
+    }
+
+    #[test]
+    fn test_a_prior_turns_last_result_is_compactible_on_a_new_turn() {
+        // Review round 3: the exemption used to be "the last tool-result
+        // message anywhere in the history". On a fresh user turn that points
+        // at the PREVIOUS, completed turn's final result -- content the model
+        // was shown long ago -- so the one result a new turn most needed to
+        // compact was exempt, and a turn that opened over budget with nothing
+        // older to give tripped before the provider was ever contacted.
+        let mut working = vec![
+            Message::text(Role::User, "first turn"),
+            Message::assistant_tool_use(String::new(), vec![call("prior_call", "file_read")]),
+            Message::tool_results(vec![result("prior_call", "x".repeat(5_000))]),
+            Message::text(Role::Assistant, "here is what I found"),
+            // A new user turn begins here; everything above is completed
+            // history the model has already seen.
+            Message::text(Role::User, "second turn"),
+        ];
+        let current_run_start = working.len();
+        let mut breaker = breaker_with_context_budget(Some(300));
+        let mut compacted = CompactedResults::new();
+
+        let trip = enforce_context_budget(
+            &mut working,
+            &mut breaker,
+            &EchoExecutor::new(),
+            &mut compacted,
+            current_run_start,
+        );
+
+        assert_eq!(
+            trip, None,
+            "a completed turn's result is ordinary compactible history on the next turn"
+        );
+        assert!(working[2].tool_results[0]
+            .content
+            .contains("[compacted 5000 chars"));
+        assert!(compacted.contains("prior_call"));
+        assert!(history_chars(&working) <= 300);
+        assert_eq!(breaker.compactions(), 1);
+    }
+
+    #[test]
+    fn test_the_floor_still_protects_a_result_this_run_produced() {
+        // The same history, but with the tool round belonging to THIS run:
+        // the floor applies and the budget trips rather than eliding a result
+        // the model has not seen.
+        let mut working = vec![
+            Message::text(Role::User, "first turn"),
+            Message::assistant_tool_use(String::new(), vec![call("this_call", "file_read")]),
+            Message::tool_results(vec![result("this_call", "x".repeat(5_000))]),
+        ];
+        let mut breaker = breaker_with_context_budget(Some(300));
+        let mut compacted = CompactedResults::new();
+
+        let trip = enforce_context_budget(
+            &mut working,
+            &mut breaker,
+            &EchoExecutor::new(),
+            &mut compacted,
+            1,
+        );
+
+        assert!(
+            matches!(trip, Some(LoopTrip::ContextBudget { .. })),
+            "got: {trip:?}"
+        );
+        assert_eq!(working[2].tool_results[0].content.len(), 5_000);
         assert_eq!(breaker.compactions(), 0);
     }
 
@@ -2212,6 +2311,7 @@ mod tests {
                 &mut breaker,
                 &EchoExecutor::new(),
                 &mut CompactedResults::new(),
+                0,
             ),
             None
         );
@@ -2242,6 +2342,7 @@ mod tests {
             &mut breaker,
             &EchoExecutor::new(),
             &mut CompactedResults::new(),
+            0,
         );
         assert!(
             matches!(trip, Some(LoopTrip::ContextBudget { .. })),
@@ -2261,7 +2362,8 @@ mod tests {
                 &mut working,
                 &mut breaker,
                 &WrappingExecutor,
-                &mut compacted
+                &mut compacted,
+                0,
             ),
             None
         );
@@ -2274,7 +2376,8 @@ mod tests {
                 &mut working,
                 &mut breaker,
                 &WrappingExecutor,
-                &mut compacted
+                &mut compacted,
+                0,
             ),
             None
         );
@@ -2311,6 +2414,7 @@ mod tests {
             &mut breaker,
             &EchoExecutor::new(),
             &mut compacted,
+            0,
         );
 
         assert_eq!(
@@ -2336,6 +2440,7 @@ mod tests {
                 &mut breaker,
                 &WrappingExecutor,
                 &mut CompactedResults::new(),
+                0,
             ),
             None
         );
@@ -2356,6 +2461,7 @@ mod tests {
             &mut breaker,
             &EchoExecutor::new(),
             &mut CompactedResults::new(),
+            0,
         );
         match trip {
             Some(LoopTrip::ContextBudget { chars, limit }) => {
@@ -2667,6 +2773,48 @@ mod tests {
             agent.compacted_results().is_empty(),
             "the compaction record must be discarded with the working history"
         );
+    }
+
+    #[tokio::test]
+    async fn test_a_second_turn_compacts_the_first_turns_result_instead_of_tripping() {
+        // Review round 3, end to end. Turn 1 leaves a large tool result in
+        // history. Turn 2 opens over budget with nothing else to give: it must
+        // compact that now-seen result and reach the provider, not trip.
+        let mut agent = test_agent(OneShotToolProvider::new())
+            .with_loop_contract(contract_with_context_budget("two_turns", 5, 3_200))
+            .expect("contract is valid");
+        let executor = BigResultExecutor;
+
+        let first = agent
+            .chat_with_tools("turn one", &[], &executor)
+            .await
+            .expect("the first turn completes");
+        assert_eq!(first, "final answer");
+        assert_eq!(
+            agent.last_loop_report().unwrap().compactions,
+            0,
+            "turn one's own result is protected by the floor"
+        );
+        let carried = history_chars(&agent.history);
+        assert!(
+            carried > 3_000,
+            "turn one must leave a large result: {carried}"
+        );
+
+        // A long user turn pushes the carried history over the budget.
+        let second = agent
+            .chat_with_tools(&"q".repeat(500), &[], &executor)
+            .await
+            .expect("the second turn must compact rather than trip");
+
+        assert_eq!(second, "final answer");
+        assert_eq!(
+            agent.last_loop_report().unwrap().compactions,
+            1,
+            "turn two must compact turn one's result"
+        );
+        assert!(agent.compacted_results().contains("call_1"));
+        assert!(history_chars(&agent.history) <= 3_200);
     }
 
     #[tokio::test]

@@ -218,7 +218,44 @@ would leak a mutation past an error); and `clear_history` clears it.
 `#[allow(clippy::too_many_arguments)]`: bundling them into a struct would re-introduce the
 long-lived `&mut Agent` borrow that splitting the fn out of `Agent` exists to avoid.
 
-**Branch frozen after this round.**
+**Branch frozen after this round** (reopened for review round 3 below, then re-frozen).
+
+## Review round 3 (2026-09-12) — Codex threads on PR #55
+
+Two P2 threads at head `f93d16b`, both confirmed and fixed; the third thread (the missing-key
+notice) was already closed by PR #54 `d768eee` and needed nothing from this lane.
+
+**P2 — the newest-round floor exempted the wrong result across turns.** The exemption used
+`rposition` over the whole history, so on a fresh user turn it pointed at the *previous, completed*
+turn's final result — content the model had already been shown. That exempted the one result a new
+turn most needed to compact, so a turn opening over budget with nothing older to give tripped
+`ContextBudget` before the provider was ever contacted. Fixed by scoping the exemption to results
+produced during the current `run_tool_loop` invocation: `current_run_start` is `working.len()` at
+loop entry, and only a tool-result message at or past that index is exempt. Three tests, two of
+which were confirmed to fail against the pre-fix code: a prior turn's result is compactible on the
+next turn; a result this run produced is still protected; and an end-to-end two-turn run where turn
+two compacts turn one's result and reaches the provider instead of tripping.
+
+**P2 — an OpenAI refusal committed an empty assistant reply as success.** A refusal carries
+`message.content: null` with the text in `message.refusal`; a blocked completion reports
+`finish_reason: "content_filter"`. Both fell through `unwrap_or_default()` into an empty-string
+reply the loop committed as a successful turn, so the user saw a blank answer with nothing saying
+the model had refused. `OpenAiStyleMessage` now deserializes `refusal`, and
+`openai_style_chat_response` returns a new `AgentError::ProviderRefusal { provider, message }` for
+either shape, history untouched. A filtered completion is a refusal whether or not partial text
+survived it — that text travels in the error rather than being presented as a finished answer. An
+empty or null `refusal` on an ordinary reply is not a refusal. Five tests covering both shapes,
+the partial-text case, the negative case, and the `Display`.
+
+`src/error.rs` gained one variant (`ProviderRefusal`), consistent with the round-1 edit the
+coordinator authorized for that file.
+
+**Known gap, deliberately not widened:** Anthropic's newer `stop_reason: "refusal"` maps to
+`StopReason::Other` and takes the same empty-reply path this thread fixed for OpenAI. The thread
+scoped the fix to the OpenAI response type, so the Anthropic arm is recorded here and in the design
+spec as a follow-up rather than changed silently.
+
+**Branch re-frozen after this round.**
 
 ### Handoff to `claude/ion-documents-memory-20260912` (owner of `src/ion_repl/mod.rs`)
 
@@ -233,7 +270,9 @@ AgentError::MissingApiKey { provider } => format!(
 ),
 ```
 
-Not applied here: `ion_repl/mod.rs` is that lane's owned path this wave.
+Not applied here: `ion_repl/mod.rs` is that lane's owned path this wave. **Closed 2026-09-12** by
+that lane in `d768eee` (`missing_api_key_notice(provider)`, with openai/minimax tests); verified
+against the pushed commit.
 
 ## Verification
 

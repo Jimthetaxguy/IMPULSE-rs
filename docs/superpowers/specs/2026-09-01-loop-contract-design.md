@@ -134,9 +134,15 @@ before the provider call:
    Oldest-first because the newest results are what the model is reasoning about this round.
 4. Skip a result whose `tool_use_id` the run's compaction record already holds, or whose stub
    would not be shorter than the content it replaces — compaction may never grow the history.
-5. Skip **the most recent round's results** entirely (review round 1). They have not been shown to
-   the model even once: a large result produced in round N would otherwise be replaced before
-   round N+1, so the model would see the stub and never the content its own tool call asked for.
+5. Skip **the most recent round's results** entirely (review round 1) — but only when *this run*
+   produced them (review round 3). They have not been shown to the model even once: a large result
+   produced in round N would otherwise be replaced before round N+1, so the model would see the
+   stub and never the content its own tool call asked for. The exemption is scoped by
+   `current_run_start`, the length `working` had when `run_tool_loop` was entered. It was
+   originally "the last tool-result message anywhere in the history", which on a fresh user turn
+   pointed at the *previous, completed* turn's final result — content the model had long since
+   seen — so the one result a new turn most needed to compact was exempt, and a turn that opened
+   over budget with nothing older to give tripped before the provider was ever contacted.
 6. Still over budget with every eligible result compacted: return `LoopTrip::ContextBudget`.
 
 The pass runs *before* `begin_round`, so a history that never fit reports `rounds_used: 0`.
@@ -199,6 +205,25 @@ catch-all rather than a new variant, so callers that already render `LoopTrip::D
 need no change. The rendered message ("Tool-use loop stalled: conversation history is N characters
 after compaction, over the M-character context budget") is self-explanatory. That variant's doc
 comment was widened in review round 1 to name `ContextBudget` alongside the no-progress detectors.
+
+### Refusals are not empty replies (review round 3)
+
+Also separate from the budget. An OpenAI-style refusal carries `message.content: null` with the
+explanation in `message.refusal`; a blocked completion reports `finish_reason: "content_filter"`.
+Both fell through `unwrap_or_default()` into an empty-string reply, which the loop then committed
+as a successful turn — the user saw a blank answer and nothing said the model had refused or the
+completion had been filtered.
+
+`OpenAiStyleMessage` now deserializes `refusal`, and `openai_style_chat_response` returns
+`AgentError::ProviderRefusal { provider, message }` for either shape, leaving history untouched
+like every other error path. A filtered completion is a refusal whether or not partial text
+survived it: returning that text as an ordinary reply would present a blocked completion as a
+finished answer, so the partial text travels in the error instead. `refusal: null` and an
+all-whitespace `refusal` are *not* refusals — many ordinary replies carry the field empty.
+
+**Known gap, not fixed here:** Anthropic's newer `stop_reason: "refusal"` maps to
+`StopReason::Other` and would take the same empty-reply path. The review scoped this thread to the
+OpenAI response type; the Anthropic arm is left for a follow-up rather than widened silently.
 
 ### Truncated tool-use turns (review round 1, P1)
 

@@ -174,8 +174,9 @@ The characters of working conversation history a loop may carry into one model r
 It is the one budget the loop tries to *fit* before it stops: over budget, the loop compacts
 tool-result content oldest-first into a bounded stub that keeps the `tool_use` id and names the
 tool, and only trips `LoopTrip::ContextBudget` when compaction cannot recover enough room. Two
-things are never compacted: prose, and the most recent round's results (which the model has not
-been shown yet). A stub quotes the model-supplied tool name as an escaped, length-bounded JSON
+things are never compacted: prose, and the results the current run produced (which the model has
+not been shown yet) — a result carried in from an earlier completed turn is ordinary compactible
+history. A stub quotes the model-supplied tool name as an escaped, length-bounded JSON
 string and is re-wrapped in the executor's own untrusted-output framing via
 `ToolExecutor::wrap_compaction_stub`. Which results are already compacted is tracked by
 `tool_use_id` in a `CompactedResults` set that travels with the working history (committed on
