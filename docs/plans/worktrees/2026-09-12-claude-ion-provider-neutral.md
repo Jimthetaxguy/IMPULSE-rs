@@ -190,6 +190,36 @@ ignore `ChatRequest::tools`"). `enforce_context_budget` now runs *before* `begin
 history that never fit reports `rounds_used: 0` (asserted). The PR body's blocked-path count was
 corrected to 4 lines.
 
+## Review round 2 (2026-09-12)
+
+Round-2 verification at `8167145` confirmed all five round-1 fixes through the public API. One low
+finding remained.
+
+**Low — text classification skipped a genuine tool result.** `is_compaction_stub` asked whether the
+stored content *contained* `[compacted `, so a real tool result that merely mentioned the marker (a
+grep over a log that had recorded a compaction) was treated as already compacted, skipped, and the
+turn tripped `ContextBudget` where compaction would have succeeded. Reviewer's reproduction: 5,069
+chars against a 5,042 limit; the identical run without the substring compacted fine.
+
+Fixed by dropping text classification entirely. The run carries a `CompactedResults`
+(`BTreeSet<String>`) of `tool_use_id`s beside the working history; the compaction pass consults and
+updates it. An id cannot be forged by tool output and cannot be missed because of framing, so the
+marker text is now purely presentational. The set mirrors the working history exactly: cloned from
+`Agent` at the start of a run, committed with `self.history` on success, discarded on every error
+path, and cleared by `clear_history`. It lives on `Agent`, which is not a wire type, so no
+persisted format changes and no digest impact. `wrap_compaction_stub` is unchanged.
+
+Four new tests: the reviewer's reproduction (a genuine result containing the marker still
+compacts); the record is committed with history on a successful run; it is discarded on a run that
+compacts and *then* trips the round cap (the case where a record kept outside the working copy
+would leak a mutation past an error); and `clear_history` clears it.
+
+`run_tool_loop` now takes eight arguments and carries a justified
+`#[allow(clippy::too_many_arguments)]`: bundling them into a struct would re-introduce the
+long-lived `&mut Agent` borrow that splitting the fn out of `Agent` exists to avoid.
+
+**Branch frozen after this round.**
+
 ### Handoff to `claude/ion-documents-memory-20260912` (owner of `src/ion_repl/mod.rs`)
 
 `src/ion_repl/mod.rs` hard-codes `"No ANTHROPIC_API_KEY set"` for every `AgentError::MissingApiKey`,

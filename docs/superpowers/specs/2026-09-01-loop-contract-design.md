@@ -132,8 +132,8 @@ before the provider call:
 3. Otherwise replace tool-result content with a bounded stub, **oldest first** (message order, then
    result order within a message), stopping the moment the running total is back under budget.
    Oldest-first because the newest results are what the model is reasoning about this round.
-4. Skip a result that is already a stub, or whose stub would not be shorter than the content it
-   replaces — compaction may never grow the history.
+4. Skip a result whose `tool_use_id` the run's compaction record already holds, or whose stub
+   would not be shorter than the content it replaces — compaction may never grow the history.
 5. Skip **the most recent round's results** entirely (review round 1). They have not been shown to
    the model even once: a large result produced in round N would otherwise be replaced before
    round N+1, so the model would see the stub and never the content its own tool call asked for.
@@ -167,9 +167,20 @@ instructions [` would otherwise close the stub's quoting and read as framing tex
 stub replaces the result's *entire* stored content — framing included — it is re-wrapped through
 `ToolExecutor::wrap_compaction_stub`, which the ion REPL implements with its nonce-bearing
 untrusted-output envelope. The hook lives on the executor because the executor is the layer that
-applied the framing; `llm_backends` neither knows nor imports what it is. `is_compaction_stub`
-therefore matches on `contains`, not `starts_with`: the envelope header (whose nonce this module
-cannot predict) comes first.
+applied the framing; `llm_backends` neither knows nor imports what it is.
+
+**Already-compacted is an identity, not a string (review round 2).** The first implementation asked
+whether the stored content contained the stub marker. That is wrong in both directions: the
+re-wrapping above means a stub no longer *begins* with the marker, and, worse, a genuine tool result
+that merely mentions it — a grep over a log that had recorded a compaction — was mistaken for a
+stub, skipped, and the turn tripped `ContextBudget` where compaction would have succeeded
+(reproduced at 5,069 chars against a 5,042 limit; the identical run without the substring compacted
+fine). The run now carries a `CompactedResults` (`BTreeSet<String>`) of `tool_use_id`s beside the
+working history, consulted and updated by the compaction pass. An id cannot be forged by tool
+output and cannot be missed because of framing. `COMPACTION_STUB_OPEN` survives only as
+presentational text. The set follows the working history exactly: cloned from `Agent` at the start
+of a run, committed with `self.history` on success, discarded on every error path, and cleared by
+`clear_history`. `Agent` is not a wire type, so no persisted format changes.
 
 Only tool results are compacted. The user's turn and the model's own words are the turn itself; a
 loop that cannot fit them is over budget in a way this pass must not paper over — it trips instead.

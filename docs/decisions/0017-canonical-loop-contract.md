@@ -166,6 +166,12 @@ exactly how this under-measurement would return: a future provider that forgets 
 silently measures its own traffic short. The widest can never under-count for anyone; over-counting
 only spends the budget's deliberate headroom slightly sooner.
 
+**Already-compacted is tracked by identity.** The run carries a set of compacted `tool_use_id`s
+beside the working history, committed with it on success and discarded with it on every error path.
+Classifying by the stub's marker text was wrong in both directions: a re-wrapped stub no longer
+begins with the marker, and a genuine tool result that merely contains it was skipped as though it
+were a stub, tripping the budget where compaction would have succeeded.
+
 **A stub carries untrusted text and must stay framed.** The tool name a stub quotes comes from the
 model's own request, not from a registry, so it is rendered through `serde_json::Value::String`
 (escaping quotes, backslashes, and control characters) and bounded to 64 characters. Because a stub
@@ -188,8 +194,10 @@ it, and history is committed only on success. A `ContextBudget` trip surfaces th
 `LoopBudget`, `LoopTrip::ContextBudget`, and a `LoopReport` carrying `compactions` round-trip
 through serde, and JSON written before either field existed still loads; a zero compaction count
 never reaches the wire form; compaction preserves `tool_use_id`, runs oldest-first, stops as soon
-as it is under budget, refuses to grow the history, never re-compacts a stub, and never touches the
-newest round's results; a history of prose alone over budget trips; the measurement of an
+as it is under budget, refuses to grow the history, never re-compacts a result whose id the run already
+recorded, still compacts a genuine result that merely contains the stub marker, and never touches
+the newest round's results; the compaction record is committed with history on success, discarded
+with it on failure, and cleared by `clear_history`; a history of prose alone over budget trips; the measurement of an
 escape-heavy input is the OpenAI rendering, not the Anthropic one; a hostile tool name survives only
 as an escaped, bounded JSON string; a stub is re-wrapped in the executor's framing; and
 `chat_with_tools` surfaces the trip as `ToolLoopStalled` with history untouched, a `Tripped`

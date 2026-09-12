@@ -434,7 +434,10 @@ pass the repo gate: `cargo build && cargo test && cargo clippy -- -D warnings &&
   envelope via `ToolExecutor::wrap_compaction_stub`. The same review found a
   pre-existing loop bug: a response carrying `max_tokens` *plus* tool calls
   matched no branch and returned `Ok("")` with a `Completed` report and nothing
-  executed; it is now `AgentError::TruncatedToolCall`. See
+  executed; it is now `AgentError::TruncatedToolCall`. Round 2 replaced the
+  stub's text-matching "already compacted?" test with an exact
+  `tool_use_id` set carried beside the working history, so a genuine tool
+  result that merely contains the marker is still compactable. See
   `docs/decisions/0017-canonical-loop-contract.md` (2026-09-12 addendum).
 - **T10 (optional) — ratatui inline polish.** Spinner during gate runs, colored
   verdict table, status line. *(Depends T7. Do not start before T9 is stable.)*

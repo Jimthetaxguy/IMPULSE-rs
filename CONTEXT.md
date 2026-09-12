@@ -177,7 +177,9 @@ tool, and only trips `LoopTrip::ContextBudget` when compaction cannot recover en
 things are never compacted: prose, and the most recent round's results (which the model has not
 been shown yet). A stub quotes the model-supplied tool name as an escaped, length-bounded JSON
 string and is re-wrapped in the executor's own untrusted-output framing via
-`ToolExecutor::wrap_compaction_stub`. Measured in characters, not tokens, at the widest wire
+`ToolExecutor::wrap_compaction_stub`. Which results are already compacted is tracked by
+`tool_use_id` in a `CompactedResults` set that travels with the working history (committed on
+success, discarded on error), never by matching the stub's text against tool output. Measured in characters, not tokens, at the widest wire
 rendering of each input, so the number is exact, reproducible, and never below what any of
 Anthropic, OpenAI, or MiniMax actually sends. `LoopReport::compactions` records how many results a
 run compacted.

@@ -340,6 +340,10 @@ pub struct Agent {
     /// and while a run is in progress, so a stale report can never describe
     /// a later turn.
     last_loop_report: Option<LoopReport>,
+    /// The `tool_use_id`s whose results have already been compacted in
+    /// `history` (review round 2). Committed with `history` and only on the
+    /// success path, so an error leaves both exactly as they were.
+    compacted_results: CompactedResults,
 }
 
 impl Agent {
@@ -362,6 +366,7 @@ impl Agent {
             step_context,
             loop_contract: LoopContract::ion_tool_loop(),
             last_loop_report: None,
+            compacted_results: CompactedResults::new(),
         }
     }
 
@@ -384,6 +389,12 @@ impl Agent {
     /// Typed evidence from the most recent [`Agent::chat_with_tools`] run.
     pub fn last_loop_report(&self) -> Option<&LoopReport> {
         self.last_loop_report.as_ref()
+    }
+
+    /// The `tool_use_id`s whose results in [`Agent::history`] have been
+    /// replaced by a compaction stub.
+    pub fn compacted_results(&self) -> &CompactedResults {
+        &self.compacted_results
     }
 
     fn request_model(&self, tool_round: usize) -> String {
@@ -497,6 +508,10 @@ impl Agent {
         let mut step_context = self.step_context.clone();
         step_context.current_model = self.model.clone();
         let mut breaker = LoopBreaker::new(contract);
+        // A working copy of the compaction record, mirroring `working` for the
+        // history: both are committed together on success and both are
+        // discarded on every error path.
+        let mut compacted = self.compacted_results.clone();
         let loop_future = run_tool_loop(
             self.provider.as_ref(),
             &step_context,
@@ -505,6 +520,7 @@ impl Agent {
             tools,
             executor,
             &mut breaker,
+            &mut compacted,
         );
 
         let outcome = tokio::time::timeout(timeout_duration, loop_future).await;
@@ -514,6 +530,7 @@ impl Agent {
             Ok(Ok((reply, working))) => {
                 self.last_loop_report = Some(breaker.report(LoopTermination::Completed));
                 self.history = working;
+                self.compacted_results = compacted;
                 Ok(reply)
             }
             Ok(Err(LoopExit::Tripped(trip))) => {
@@ -548,6 +565,9 @@ impl Agent {
 
     pub fn clear_history(&mut self) {
         self.history.clear();
+        // The compaction record describes results that lived in that history;
+        // clearing one without the other would leave ids referring to nothing.
+        self.compacted_results.clear();
     }
 }
 
@@ -587,11 +607,14 @@ pub fn history_chars(messages: &[Message]) -> usize {
     messages.iter().map(message_chars).sum()
 }
 
-/// Opening marker of a compaction stub. Also the test used to recognize a
-/// result this loop already compacted, so a second pass does not re-measure
-/// (and re-count) text that is already a stub. A genuine tool output that
-/// happens to contain this marker is simply skipped, which costs a compaction
-/// opportunity but never corrupts a result.
+/// Opening marker of a compaction stub.
+///
+/// Presentational only. It is **not** how this module decides whether a result
+/// has already been compacted — that is tracked exactly, by `tool_use_id`, in
+/// [`CompactedResults`] (review round 2). Classifying by text meant a genuine
+/// tool result that merely *contained* this marker (a grep over a log that had
+/// recorded a compaction, say) was mistaken for a stub, skipped, and the turn
+/// tripped `ContextBudget` where compaction would have succeeded.
 const COMPACTION_STUB_OPEN: &str = "[compacted ";
 
 /// Longest tool name a stub will quote. A name is chosen by the model, so
@@ -629,15 +652,21 @@ fn compaction_stub(dropped_chars: usize, tool: Option<&str>) -> String {
     }
 }
 
-/// Whether `content` is a result this loop already compacted.
+/// The `tool_use_id`s whose results this session has already compacted.
 ///
-/// Uses `contains`, not `starts_with`: a stub is re-wrapped through
-/// [`ToolExecutor::wrap_compaction_stub`], so for a framing executor the
-/// stored content opens with that executor's envelope header (whose nonce
-/// this module cannot predict) and the marker sits inside it.
-fn is_compaction_stub(content: &str) -> bool {
-    content.contains(COMPACTION_STUB_OPEN)
-}
+/// Identity, not text (review round 2). A stub is re-wrapped in the
+/// executor's own framing, so the stored content does not reliably begin with
+/// any marker this module could look for — and any marker it *did* look for
+/// could appear inside a genuine tool result, which would then be skipped as
+/// though it were already compacted. An id is exact in both directions: it
+/// cannot be forged by tool output, and it cannot be missed because of framing.
+///
+/// Carried alongside the working history for the life of one
+/// [`run_tool_loop`] and committed with it on success, so a result compacted
+/// in one turn is still known to be compacted in the next. Nothing is
+/// serialized: this rides on [`Agent`], which is not a wire type, so no
+/// persisted format changes.
+pub type CompactedResults = std::collections::BTreeSet<String>;
 
 /// Brings `working` under the contract's context budget, or reports the trip
 /// that says it could not (ADR-0017 addendum, 2026-09-12).
@@ -653,9 +682,9 @@ fn is_compaction_stub(content: &str) -> bool {
 ///    order, then result order within a message), stopping the moment the
 ///    running total is back under the budget. Oldest-first because the newest
 ///    results are the ones the model is actually reasoning about this round.
-/// 4. A result is skipped when it is already a stub, or when its stub would
-///    not be shorter than the content it replaces — compaction may never make
-///    the history bigger.
+/// 4. A result is skipped when `compacted` already records its `tool_use_id`,
+///    or when its stub would not be shorter than the content it replaces —
+///    compaction may never make the history bigger.
 /// 5. **The most recent round's results are never eligible** (review round 1,
 ///    P2). Compacting them would elide a result the model has not been shown
 ///    even once: a large result produced in round N would be replaced before
@@ -678,6 +707,7 @@ fn enforce_context_budget(
     working: &mut [Message],
     breaker: &mut LoopBreaker,
     executor: &dyn ToolExecutor,
+    compacted: &mut CompactedResults,
 ) -> Option<LoopTrip> {
     let limit = breaker.contract().budget.max_context_chars?;
     let mut total = history_chars(working);
@@ -708,7 +738,7 @@ fn enforce_context_budget(
             if total <= limit {
                 break;
             }
-            if is_compaction_stub(&result.content) {
+            if compacted.contains(&result.tool_use_id) {
                 continue;
             }
             let original = result.content.chars().count();
@@ -721,6 +751,7 @@ fn enforce_context_budget(
                 continue;
             }
             result.content = stub;
+            compacted.insert(result.tool_use_id.clone());
             total -= original - stub_chars;
             breaker.observe_compaction();
         }
@@ -747,6 +778,10 @@ fn enforce_context_budget(
 /// existing shape) on success, so the caller can decide whether to commit it.
 /// Every round is admitted by `breaker` and every executed tool call is
 /// reported to it, so a trip stops the loop with typed evidence (ADR-0017).
+#[allow(clippy::too_many_arguments)] // clippy: a free fn deliberately borrowing
+                                     // only what it needs (never `&mut Agent`) so its future can be wrapped in
+                                     // `tokio::time::timeout`; bundling these into a struct would re-introduce the
+                                     // long-lived borrow that split-out exists to avoid.
 async fn run_tool_loop(
     provider: &dyn LlmProvider,
     step_context: &HarnessStepContext,
@@ -755,13 +790,14 @@ async fn run_tool_loop(
     tools: &[ToolDefinition],
     executor: &dyn ToolExecutor,
     breaker: &mut LoopBreaker,
+    compacted: &mut CompactedResults,
 ) -> Result<(String, Vec<Message>), LoopExit> {
     loop {
         // Fit the working history to the contract's context budget before
         // admitting the round, so a history that cannot fit at all trips
         // with `rounds_used: 0` -- no round was ever spent on it, and the
         // report should not claim one was (review round 1).
-        if let Some(trip) = enforce_context_budget(&mut working, breaker, executor) {
+        if let Some(trip) = enforce_context_budget(&mut working, breaker, executor, compacted) {
             return Err(LoopExit::Tripped(trip));
         }
         let tool_round = breaker.begin_round().map_err(LoopExit::Tripped)?;
@@ -2060,7 +2096,12 @@ mod tests {
         let before = working.clone();
         let mut breaker = breaker_with_context_budget(None);
         assert_eq!(
-            enforce_context_budget(&mut working, &mut breaker, &EchoExecutor::new()),
+            enforce_context_budget(
+                &mut working,
+                &mut breaker,
+                &EchoExecutor::new(),
+                &mut CompactedResults::new(),
+            ),
             None
         );
         assert_eq!(
@@ -2075,7 +2116,12 @@ mod tests {
         let mut working = history_with_older_tool_result(50);
         let mut breaker = breaker_with_context_budget(Some(100_000));
         assert_eq!(
-            enforce_context_budget(&mut working, &mut breaker, &EchoExecutor::new()),
+            enforce_context_budget(
+                &mut working,
+                &mut breaker,
+                &EchoExecutor::new(),
+                &mut CompactedResults::new(),
+            ),
             None
         );
         assert_eq!(working[2].tool_results[0].content.len(), 50);
@@ -2087,7 +2133,12 @@ mod tests {
         let mut working = history_with_older_tool_result(5_000);
         let mut breaker = breaker_with_context_budget(Some(200));
         assert_eq!(
-            enforce_context_budget(&mut working, &mut breaker, &EchoExecutor::new()),
+            enforce_context_budget(
+                &mut working,
+                &mut breaker,
+                &EchoExecutor::new(),
+                &mut CompactedResults::new(),
+            ),
             None
         );
 
@@ -2123,7 +2174,12 @@ mod tests {
             Message::tool_results(vec![result("only", "x".repeat(5_000))]),
         ];
         let mut breaker = breaker_with_context_budget(Some(200));
-        let trip = enforce_context_budget(&mut working, &mut breaker, &EchoExecutor::new());
+        let trip = enforce_context_budget(
+            &mut working,
+            &mut breaker,
+            &EchoExecutor::new(),
+            &mut CompactedResults::new(),
+        );
         assert!(
             matches!(trip, Some(LoopTrip::ContextBudget { .. })),
             "got: {trip:?}"
@@ -2151,7 +2207,12 @@ mod tests {
         ];
         let mut breaker = breaker_with_context_budget(Some(1_300));
         assert_eq!(
-            enforce_context_budget(&mut working, &mut breaker, &EchoExecutor::new()),
+            enforce_context_budget(
+                &mut working,
+                &mut breaker,
+                &EchoExecutor::new(),
+                &mut CompactedResults::new(),
+            ),
             None
         );
 
@@ -2176,7 +2237,12 @@ mod tests {
             Message::tool_results(vec![result("b", "newest".to_string())]),
         ];
         let mut breaker = breaker_with_context_budget(Some(1));
-        let trip = enforce_context_budget(&mut working, &mut breaker, &EchoExecutor::new());
+        let trip = enforce_context_budget(
+            &mut working,
+            &mut breaker,
+            &EchoExecutor::new(),
+            &mut CompactedResults::new(),
+        );
         assert!(
             matches!(trip, Some(LoopTrip::ContextBudget { .. })),
             "got: {trip:?}"
@@ -2189,13 +2255,27 @@ mod tests {
     fn test_enforce_context_budget_never_recompacts_a_stub() {
         let mut working = history_with_older_tool_result(5_000);
         let mut breaker = breaker_with_context_budget(Some(200));
+        let mut compacted = CompactedResults::new();
         assert_eq!(
-            enforce_context_budget(&mut working, &mut breaker, &WrappingExecutor),
+            enforce_context_budget(
+                &mut working,
+                &mut breaker,
+                &WrappingExecutor,
+                &mut compacted
+            ),
             None
         );
+        assert!(compacted.contains("old_call"), "the id must be recorded");
         let after_first = working.clone();
+        // A second pass carrying the same record recognizes the result by id,
+        // not by anything it can read out of the content.
         assert_eq!(
-            enforce_context_budget(&mut working, &mut breaker, &WrappingExecutor),
+            enforce_context_budget(
+                &mut working,
+                &mut breaker,
+                &WrappingExecutor,
+                &mut compacted
+            ),
             None
         );
         assert_eq!(
@@ -2210,6 +2290,40 @@ mod tests {
     }
 
     #[test]
+    fn test_a_genuine_result_containing_the_marker_is_still_compactable() {
+        // Review round 2: classification used to be `content.contains(
+        // "[compacted ")`, so a real tool result that merely mentioned the
+        // marker -- a grep over a log that had recorded a compaction, say --
+        // was mistaken for a stub, skipped, and the turn tripped
+        // `ContextBudget` where compaction would have succeeded.
+        let mut working = history_with_older_tool_result(0);
+        working[2].tool_results[0].content = format!(
+            "log.txt:41: {}4000 chars from tool \"file_read\"]\n{}",
+            COMPACTION_STUB_OPEN,
+            "y".repeat(5_000)
+        );
+        let over_budget = history_chars(&working);
+        let mut breaker = breaker_with_context_budget(Some(200));
+        let mut compacted = CompactedResults::new();
+
+        let trip = enforce_context_budget(
+            &mut working,
+            &mut breaker,
+            &EchoExecutor::new(),
+            &mut compacted,
+        );
+
+        assert_eq!(
+            trip, None,
+            "a genuine result that merely contains the marker must compact, not trip"
+        );
+        assert_eq!(breaker.compactions(), 1);
+        assert!(compacted.contains("old_call"));
+        assert!(history_chars(&working) < over_budget);
+        assert!(history_chars(&working) <= 200);
+    }
+
+    #[test]
     fn test_enforce_context_budget_rewraps_the_stub_in_the_executors_framing() {
         // Review round 1, P2: the stub replaces the whole stored content,
         // framing included, so it must go back inside the executor's own
@@ -2217,7 +2331,12 @@ mod tests {
         let mut working = history_with_older_tool_result(5_000);
         let mut breaker = breaker_with_context_budget(Some(300));
         assert_eq!(
-            enforce_context_budget(&mut working, &mut breaker, &WrappingExecutor),
+            enforce_context_budget(
+                &mut working,
+                &mut breaker,
+                &WrappingExecutor,
+                &mut CompactedResults::new(),
+            ),
             None
         );
         let content = &working[2].tool_results[0].content;
@@ -2232,7 +2351,12 @@ mod tests {
         // the turn, and this pass must not silently drop them.
         let mut working = vec![Message::text(Role::User, "p".repeat(5_000))];
         let mut breaker = breaker_with_context_budget(Some(100));
-        let trip = enforce_context_budget(&mut working, &mut breaker, &EchoExecutor::new());
+        let trip = enforce_context_budget(
+            &mut working,
+            &mut breaker,
+            &EchoExecutor::new(),
+            &mut CompactedResults::new(),
+        );
         match trip {
             Some(LoopTrip::ContextBudget { chars, limit }) => {
                 assert_eq!(chars, 5_000);
@@ -2250,12 +2374,6 @@ mod tests {
             "[compacted 12 chars from tool \"file_read\"]"
         );
         assert_eq!(compaction_stub(12, None), "[compacted 12 chars]");
-        assert!(is_compaction_stub(&compaction_stub(1, None)));
-        assert!(is_compaction_stub(&compaction_stub(1, Some("t"))));
-        assert!(is_compaction_stub(
-            "<<untrusted>>[compacted 1 chars]<</untrusted>>"
-        ));
-        assert!(!is_compaction_stub("ordinary output"));
     }
 
     #[test]
@@ -2351,6 +2469,224 @@ mod tests {
             .unwrap();
         assert_eq!(reply, "hi");
         assert_eq!(agent.last_loop_report().unwrap().compactions, 0);
+    }
+
+    // ---------------------------------------------------------------
+    // The compaction record travels with history (review round 2)
+    // ---------------------------------------------------------------
+
+    /// Requests a distinct tool call on each of the first two rounds, then
+    /// answers — so the third round has an *older* completed round whose
+    /// result is eligible for compaction.
+    struct TwoRoundToolProvider {
+        calls: std::sync::Mutex<usize>,
+    }
+
+    impl TwoRoundToolProvider {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::Mutex::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for TwoRoundToolProvider {
+        fn name(&self) -> &str {
+            "two-round-fake"
+        }
+        fn default_model(&self) -> &str {
+            "two-round-fake-model"
+        }
+        async fn chat(&self, request: ChatRequest) -> AgentResult<ChatResponse> {
+            let mut calls = self.calls.lock().expect("lock is never poisoned in tests");
+            *calls += 1;
+            let round = *calls;
+            if round <= 2 {
+                Ok(ChatResponse {
+                    content: String::new(),
+                    model: request.model,
+                    usage: Usage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                    },
+                    stop_reason: StopReason::ToolUse,
+                    tool_calls: vec![ToolCall {
+                        id: format!("call_{round}"),
+                        name: "echo_tool".to_string(),
+                        input: serde_json::json!({"round": round}),
+                    }],
+                })
+            } else {
+                Ok(ChatResponse {
+                    content: "done".to_string(),
+                    model: request.model,
+                    usage: Usage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                    },
+                    stop_reason: StopReason::EndTurn,
+                    tool_calls: Vec::new(),
+                })
+            }
+        }
+        fn supported_models(&self) -> Vec<&str> {
+            vec!["two-round-fake-model"]
+        }
+    }
+
+    /// Returns a payload large enough to push a small budget over.
+    struct BigResultExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for BigResultExecutor {
+        async fn execute(&self, _name: &str, _input: serde_json::Value) -> ToolExecutionResult {
+            ToolExecutionResult {
+                content: "z".repeat(3_000),
+                is_error: false,
+            }
+        }
+    }
+
+    fn contract_with_context_budget(name: &str, max_rounds: usize, chars: usize) -> LoopContract {
+        LoopContract {
+            name: name.to_string(),
+            budget: LoopBudget {
+                max_rounds,
+                wall_clock: Duration::from_secs(5),
+                max_repeated_call_streak: None,
+                max_same_error_streak: None,
+                max_context_chars: Some(chars),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_successful_run_commits_the_compaction_record_with_history() {
+        let mut agent = test_agent(TwoRoundToolProvider::new())
+            .with_loop_contract(contract_with_context_budget("committing", 5, 3_500))
+            .expect("contract is valid");
+        assert!(agent.compacted_results().is_empty());
+
+        let reply = agent
+            .chat_with_tools("go", &[], &BigResultExecutor)
+            .await
+            .expect("the run completes");
+
+        assert_eq!(reply, "done");
+        // Round 3's budget pass compacted round 1's result -- round 2's was
+        // the newest and is protected by the floor.
+        assert_eq!(agent.last_loop_report().unwrap().compactions, 1);
+        assert_eq!(
+            agent.compacted_results().iter().collect::<Vec<_>>(),
+            vec!["call_1"],
+            "the record must be committed alongside the history it describes"
+        );
+        let stubbed = agent
+            .history
+            .iter()
+            .flat_map(|m| m.tool_results.iter())
+            .find(|r| r.tool_use_id == "call_1")
+            .expect("the compacted result is in history");
+        assert!(
+            stubbed.content.contains(COMPACTION_STUB_OPEN),
+            "got: {}",
+            stubbed.content
+        );
+    }
+
+    /// Requests a fresh tool call every round and never answers, so the run
+    /// always ends at the round cap.
+    struct NeverAnsweringToolProvider {
+        calls: std::sync::Mutex<usize>,
+    }
+
+    impl NeverAnsweringToolProvider {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::Mutex::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for NeverAnsweringToolProvider {
+        fn name(&self) -> &str {
+            "never-answering-fake"
+        }
+        fn default_model(&self) -> &str {
+            "never-answering-fake-model"
+        }
+        async fn chat(&self, request: ChatRequest) -> AgentResult<ChatResponse> {
+            let mut calls = self.calls.lock().expect("lock is never poisoned in tests");
+            *calls += 1;
+            let round = *calls;
+            Ok(ChatResponse {
+                content: String::new(),
+                model: request.model,
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+                stop_reason: StopReason::ToolUse,
+                tool_calls: vec![ToolCall {
+                    id: format!("call_{round}"),
+                    name: "echo_tool".to_string(),
+                    input: serde_json::json!({"round": round}),
+                }],
+            })
+        }
+        fn supported_models(&self) -> Vec<&str> {
+            vec!["never-answering-fake-model"]
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_run_leaves_the_compaction_record_untouched() {
+        // The budget pass runs before `begin_round`, so the round that trips
+        // the cap has already compacted an older result in the working copy.
+        // That is exactly the case where a record kept outside the working
+        // copy would leak a mutation past an error.
+        let mut agent = test_agent(NeverAnsweringToolProvider::new())
+            .with_loop_contract(contract_with_context_budget("tripping", 3, 3_500))
+            .expect("contract is valid");
+
+        let result = agent.chat_with_tools("go", &[], &BigResultExecutor).await;
+
+        assert!(
+            matches!(result, Err(AgentError::ToolLoopLimitExceeded { rounds: 3 })),
+            "got: {result:?}"
+        );
+        let report = agent.last_loop_report().expect("a trip leaves a report");
+        assert!(
+            report.compactions > 0,
+            "the run must have compacted before it tripped, or this proves nothing"
+        );
+        assert!(agent.history.is_empty(), "history must be untouched");
+        assert!(
+            agent.compacted_results().is_empty(),
+            "the compaction record must be discarded with the working history"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_clear_history_also_clears_the_compaction_record() {
+        let mut agent = test_agent(TwoRoundToolProvider::new())
+            .with_loop_contract(contract_with_context_budget("clearing", 5, 3_500))
+            .expect("contract is valid");
+        agent
+            .chat_with_tools("go", &[], &BigResultExecutor)
+            .await
+            .expect("the run completes");
+        assert!(!agent.compacted_results().is_empty());
+
+        agent.clear_history();
+
+        assert!(agent.history.is_empty());
+        assert!(
+            agent.compacted_results().is_empty(),
+            "ids describing a cleared history would refer to nothing"
+        );
     }
 
     // ---------------------------------------------------------------
