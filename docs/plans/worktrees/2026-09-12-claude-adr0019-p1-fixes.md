@@ -162,6 +162,32 @@ Why the scheme bump matters more than it looks: comparing two pins computed over
 sets does not fail safe in the useful sense — it reports a change that never happened, and sends an
 operator looking for it. An uncomparable pin must say so.
 
+## Review round 3 (2026-09-12, PR #53)
+
+One finding from PR #56's verifier (running these tests under load) plus three Codex threads on
+head `637afaf`. Each fix reverted once to watch its test fail.
+
+| Finding | Fix | Test | Revert-check |
+|---|---|---|---|
+| **P1** — a Git probe that never reported an exit status was read as a decision it never made. `merge-base --is-ancestor` is the worst case: its non-zero exit *is* a governance finding, and a timed-out child is killed and reaped, so it comes back as simply "not success". `test_derive_claim_observes_the_staged_worktree_for_a_staged_task` failed 1/7 on a cold, loaded run with "not descended from the registered initial OID" — a violation that never happened. | typed `GitProbeFailure::{TimedOut,Killed}` + `git_completed_successfully`, routed through **every** producer call site that turns an exit status into a decision | `test_a_timed_out_ancestry_probe_is_not_reported_as_a_governance_finding` (zero deadline, deterministic), `test_git_completed_successfully_separates_unknown_from_failed` | reverting the ancestry check reproduces the reviewed message |
+| **P1** — one non-UTF-8 byte anywhere in `.git/config` made the include walk give up on the whole file, so every include went unpinned while Git honored them | the walk is byte-wise end to end; paths are the exact bytes Git opens (on Unix an `OsStr` *is* bytes, so nothing is decoded), and a platform where that is impossible fails closed | `test_a_non_utf8_byte_does_not_hide_include_directives`, `test_the_digest_covers_includes_of_a_non_utf8_config`, `test_an_include_path_with_non_utf8_bytes_is_carried_through_exactly` | restoring the early return fails all three |
+| **P2** — a pin that failed *after* `git worktree add` left the checkout and its admin entry behind, so every retry died at the "already exists" check on a leftover the first attempt created | `discard_materialized_worktree` on every post-add error path | `test_a_failed_pin_removes_the_worktree_it_had_already_created` (asserts the path, `git worktree list`, **and** that a retry then succeeds) | dropping the cleanup fails it |
+| **P2** — `MarkRunning` allowed a worktree with an uncomparable pin, launching a Builder that every producer would then refuse forever | the transition refuses it, live-only, naming discard-and-re-materialize as the way out | `test_mark_running_requires_a_comparable_shared_config_pin` (refused / allowed / replay-exempt) | disabling the branch fails it |
+
+Two notes:
+
+- **Audited, deliberately unchanged:** `run_observed_command` (the verification profile's own
+  commands) still records a timed-out command as failed *evidence* with the timeout in its notes.
+  That is the opposite case — there the command's exit status is the finding being recorded, not a
+  probe of Git state — so it stays. `cleanup_detached_worktree`'s boolean is likewise conservative:
+  a timed-out cleanup counts as "not cleaned" and warns.
+- **Deviation from the suggested fix, stated:** for non-UTF-8 include *paths* the thread offered
+  lossy decoding with a fail-closed fallback. On Unix a path is bytes, so the walk takes them
+  exactly — strictly stronger than either, because a lossily decoded path digests a *different*
+  file and reports it as pinned. Fail-closed remains the non-Unix branch. The byte-exactness is
+  asserted at the parser rather than end to end because APFS refuses to create a filename that is
+  not valid UTF-8.
+
 ## Follow-ups
 
 - `staged_worktree_is_discardable` is duplicated: the state layer holds the enforcing copy, and

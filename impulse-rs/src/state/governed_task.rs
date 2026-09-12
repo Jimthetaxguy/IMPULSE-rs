@@ -1411,13 +1411,25 @@ fn apply_mutation(
             // reached `running` without a worktree — that is the bug — and
             // enforcing this during replay would make such a ledger unloadable
             // in its entirety rather than merely unable to repeat the mistake.
-            if !context.is_replay
-                && task.world_scope == WorldScope::StagedAuthoritative
-                && task.active_staged_worktree().is_none()
-            {
-                return invalid_transition(
-                    "a staged_authoritative task starts running only after its staged worktree is materialized",
-                );
+            if !context.is_replay && task.world_scope == WorldScope::StagedAuthoritative {
+                match task.active_staged_worktree() {
+                    None => {
+                        return invalid_transition(
+                            "a staged_authoritative task starts running only after its staged worktree is materialized",
+                        );
+                    }
+                    // A worktree whose pin this build cannot compare is a dead
+                    // end, not a slow start: every producer refuses to run Git
+                    // in it, so launching a Builder there burns a run that can
+                    // never claim, verify, or promote. Refuse at the transition
+                    // and name the way out.
+                    Some(staged) if !staged.shared_config_digest.is_comparable() => {
+                        return invalid_transition(
+                            "the staged worktree's shared-repository-configuration pin cannot be compared by this build; discard the staged worktree and re-materialize it before starting the runtime",
+                        );
+                    }
+                    Some(_) => {}
+                }
             }
             task.execution_state = GovernedExecutionState::Running;
             task.events.push(new_event(
@@ -4979,6 +4991,63 @@ mod tests {
             running.launch_working_directory().unwrap(),
             running.workspace_root
         );
+    }
+
+    /// Review round 3 on PR #53: `MarkRunning` also has to refuse a worktree
+    /// whose pin this build cannot compare. Launching there burns a run — every
+    /// producer refuses to run Git in it, so the Builder can never claim, verify,
+    /// or promote — and the operator is left with a live agent and no path
+    /// forward. Replay-exempt, like the materialization precondition.
+    #[test]
+    fn test_mark_running_requires_a_comparable_shared_config_pin() {
+        let (_root, state) = state();
+        let task = state
+            .register_governed_task(staged_registration(&state, "p1-pin-1"))
+            .unwrap();
+        let materialized = materialize(&state, &task, "p1-pin-1-staged");
+
+        // A pin from a superseded scheme, exactly as an upgraded build reloads.
+        let mut superseded = materialized.clone();
+        if let Some(staged) = superseded.staged_worktree.as_mut() {
+            let mut digest = staged
+                .shared_config_digest
+                .recorded()
+                .expect("a freshly materialized worktree is pinned")
+                .clone();
+            digest.scheme_version =
+                impulse_ops::governed_task::LEGACY_SHARED_REPOSITORY_CONFIG_SCHEME_VERSION;
+            staged.shared_config_digest = SharedRepositoryConfigPin::Recorded(digest);
+        }
+        let error = apply_mutation(
+            &mut superseded.clone(),
+            GovernedTaskMutation::MarkRunning {
+                actor: actor(GovernedActorKind::System, "impulse-daemon"),
+            },
+            superseded.revision + 1,
+            MutationContext::live("2026-09-12T00:00:00Z", OperatorAuthentication::Declared),
+        )
+        .expect_err("an uncomparable pin is a dead end, not a slow start");
+        assert!(error.to_string().contains("re-materialize"), "{error}");
+
+        // The comparable pin the producer actually recorded is allowed.
+        let running = launch(&state, &materialized, "p1-pin-1-run");
+        assert_eq!(running.execution_state, GovernedExecutionState::Running);
+
+        // ...and replay of a ledger that recorded `Running` under an older pin
+        // scheme still validates, so an upgrade cannot make a ledger unloadable.
+        let mut legacy = running;
+        if let Some(staged) = legacy.staged_worktree.as_mut() {
+            let mut digest = staged
+                .shared_config_digest
+                .recorded()
+                .expect("pinned")
+                .clone();
+            digest.scheme_version =
+                impulse_ops::governed_task::LEGACY_SHARED_REPOSITORY_CONFIG_SCHEME_VERSION;
+            staged.shared_config_digest = SharedRepositoryConfigPin::Recorded(digest);
+        }
+        validate_task_history(&legacy)
+            .expect("an upgraded build must still replay a ledger written before the bump");
     }
 
     /// The same tightening must not touch any other world scope, including the

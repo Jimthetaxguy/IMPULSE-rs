@@ -492,6 +492,17 @@ written as amended.
   reproduces decisions, it does not re-authorize them. Clock-derived *computations* (rule 11) are
   the opposite case and are still recomputed.
 
+**A Git probe that reports no exit status is not an observation.** The producers translate Git exit
+statuses into governance findings — `merge-base --is-ancestor` exiting non-zero *means* the subject
+is not descended from the registered OID — and a bounded child that hits its deadline is killed and
+reaped, so it comes back as simply "not success". Reading that as the finding accuses a run of a
+violation that did not happen, and under load it is the likelier of the two. Every producer call
+site that turns an exit status into a decision therefore goes through one classifier that separates
+*completed and failed* from *never reported*, and the second is a typed error. The same rule makes a
+killed `symbolic-ref` not a detached head and a killed `update-ref` not a lost compare-and-swap. The
+verification profile's own commands are the deliberate exception: there a non-zero or timed-out exit
+is the evidence being recorded, not a probe of Git state.
+
 **Residuals, accepted for now and named so they are not rediscovered as findings.** The include walk
 does not resolve `~user/` — Git does, but it needs a passwd lookup the standard library does not
 offer; `~/` and backslash line continuation are both handled. And a repository using Git's

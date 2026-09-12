@@ -507,13 +507,60 @@ fn hook_free_git(workspace: &Path) -> std::process::Command {
 }
 
 fn run_git(workspace: &Path, args: &[&str]) -> Result<BoundedProcessOutput> {
+    run_git_with_timeout(workspace, args, GIT_PROBE_TIMEOUT)
+}
+
+fn run_git_with_timeout(
+    workspace: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<BoundedProcessOutput> {
     let mut command = hook_free_git(workspace);
     command.args(args);
-    run_bounded_process(
-        &mut command,
-        &format!("git {}", args.join(" ")),
-        GIT_PROBE_TIMEOUT,
-    )
+    run_bounded_process(&mut command, &format!("git {}", args.join(" ")), timeout)
+}
+
+/// A bounded Git invocation that never reported an exit status of its own.
+///
+/// This is a typed error rather than a `false`, because the two are not the
+/// same claim and the producers translate exit status into governance findings.
+/// A `git merge-base --is-ancestor` that exits non-zero means *the subject is
+/// not descended from the registered OID*; the same call killed at its timeout
+/// means *we do not know*. Reporting the second as the first accuses a run of a
+/// violation that did not happen — and under load it is the likelier of the two,
+/// because a timed-out child is killed and reaped, so it comes back with a
+/// signal status that is simply "not success".
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum GitProbeFailure {
+    #[error(
+        "`{command}` timed out in a governed producer; the observation is unknown, not a finding"
+    )]
+    TimedOut { command: String },
+    #[error(
+        "`{command}` was killed before reporting an exit status in a governed producer; the observation is unknown, not a finding"
+    )]
+    Killed { command: String },
+}
+
+/// Whether a bounded Git invocation *completed* and succeeded.
+///
+/// Every producer call site that turns an exit status into a decision must go
+/// through this, so a timed-out or killed probe can never be read as a decision
+/// the process never made.
+fn git_completed_successfully(output: &BoundedProcessOutput, command: &str) -> Result<bool> {
+    if output.timed_out {
+        return Err(GitProbeFailure::TimedOut {
+            command: command.to_string(),
+        }
+        .into());
+    }
+    match output.status {
+        Some(status) => Ok(status.success()),
+        None => Err(GitProbeFailure::Killed {
+            command: command.to_string(),
+        }
+        .into()),
+    }
 }
 
 /// Create one detached Git worktree at `checkout`, pinned to `subject_revision`.
@@ -545,11 +592,15 @@ fn add_detached_worktree(
                 return Err(error);
             }
         };
-    if output.timed_out || !output.status.is_some_and(|status| status.success()) {
-        let _ = cleanup_detached_worktree(source_workspace, checkout);
-        if output.timed_out {
-            anyhow::bail!("{label} materialization timed out");
+    let completed = match git_completed_successfully(&output, "git worktree add --detach") {
+        Ok(completed) => completed,
+        Err(error) => {
+            let _ = cleanup_detached_worktree(source_workspace, checkout);
+            return Err(error).with_context(|| format!("{label} materialization"));
         }
+    };
+    if !completed {
+        let _ = cleanup_detached_worktree(source_workspace, checkout);
         anyhow::bail!("failed to materialize {label}");
     }
     Ok(())
@@ -703,10 +754,9 @@ impl Drop for DetachedVerificationWorkspace {
 
 fn successful_git_bytes(workspace: &Path, args: &[&str], label: &str) -> Result<Vec<u8>> {
     let output = run_git(workspace, args)?;
-    if output.timed_out {
-        anyhow::bail!("{label} timed out for governed workspace");
-    }
-    if !output.status.is_some_and(|status| status.success()) {
+    if !git_completed_successfully(&output, &format!("git {}", args.join(" ")))
+        .with_context(|| format!("{label} could not be observed"))?
+    {
         anyhow::bail!("{label} failed for governed workspace");
     }
     if output.stdout_truncated {
@@ -828,6 +878,20 @@ pub(crate) fn observe_clean_git_subject(
     workspace: &Path,
     initial_oid: Option<&str>,
 ) -> Result<String> {
+    observe_clean_git_subject_with_ancestry_timeout(workspace, initial_oid, GIT_PROBE_TIMEOUT)
+}
+
+/// The ancestry probe's timeout is injectable for exactly one reason: its
+/// non-zero exit is the only Git exit status this function translates into a
+/// *governance finding*, so it is the one probe whose timeout handling has to be
+/// provable. Production always passes [`GIT_PROBE_TIMEOUT`]; the test passes a
+/// zero deadline. Same test-seam shape as `chat_with_tools_capped_timeout` and
+/// `harness_query_structured_with_timeout`.
+fn observe_clean_git_subject_with_ancestry_timeout(
+    workspace: &Path,
+    initial_oid: Option<&str>,
+    ancestry_timeout: Duration,
+) -> Result<String> {
     let canonical_workspace = workspace
         .canonicalize()
         .with_context(|| format!("failed to canonicalize workspace {}", workspace.display()))?;
@@ -867,11 +931,17 @@ pub(crate) fn observe_clean_git_subject(
 
     if let Some(initial_oid) = initial_oid {
         validate_oid(initial_oid)?;
-        let ancestry = run_git(
+        let ancestry = run_git_with_timeout(
             &canonical_workspace,
             &["merge-base", "--is-ancestor", initial_oid, &oid],
+            ancestry_timeout,
         )?;
-        if !ancestry.status.is_some_and(|status| status.success()) {
+        // A non-zero exit here is a finding; a probe that never reported one is
+        // not. Under load the second is the likelier failure — a timed-out child
+        // is killed and reaped, so it comes back as simply "not success" — and
+        // reporting it as the first accuses a run of a violation that did not
+        // happen.
+        if !git_completed_successfully(&ancestry, "git merge-base --is-ancestor")? {
             anyhow::bail!("governed Git subject is not descended from the registered initial OID");
         }
     }
@@ -1807,7 +1877,12 @@ fn digest_config_chain(roots: &[PathBuf]) -> Result<Option<String>> {
                 hasher.update((bytes.len() as u64).to_be_bytes());
                 hasher.update(&bytes);
                 let parent = path.parent().unwrap_or_else(|| Path::new("."));
-                for include in config_include_paths(&bytes, parent) {
+                for include in config_include_paths(&bytes, parent).with_context(|| {
+                    format!(
+                        "failed to resolve the include directives in shared Git configuration {}",
+                        path.display()
+                    )
+                })? {
                     queue.push(include);
                 }
             }
@@ -1823,49 +1898,75 @@ fn digest_config_chain(roots: &[PathBuf]) -> Result<Option<String>> {
 ///
 /// Conditions are deliberately ignored: an `includeIf` whose condition is false
 /// today can become true later, and the gate is about detecting change rather
-/// than predicting Git's evaluation. Non-UTF-8 bytes are skipped rather than
-/// failing the pin, since the file's own bytes are already hashed — a parser
-/// miss costs coverage of one *included* file, never coverage of the file being
-/// parsed.
+/// than predicting Git's evaluation.
+///
+/// **Parsed as bytes, never as UTF-8.** The first version decoded the file and
+/// gave up on the whole thing when the decode failed — so a single Latin-1 byte
+/// anywhere, in a comment or a user's name, skipped *every* include directive in
+/// that file while Git went on honoring them. An included file defining a filter
+/// could then change after materialization with the recorded and observed
+/// digests still equal, which is the one outcome this pin exists to prevent.
+/// Git's configuration syntax is ASCII; values are bytes. So is this.
+///
+/// Paths are taken as the exact bytes Git would open (on Unix an `OsStr` is
+/// bytes, so no decoding happens at all). On a platform where paths are not
+/// bytes, a non-UTF-8 path fails closed rather than being guessed at, because a
+/// guessed path digests the wrong file — or nothing — and reports it as pinned.
 ///
 /// Backslash line continuation is honored, because Git honors it. The one
 /// spelling deliberately left unresolved is `~user/`, which needs a passwd
 /// lookup the standard library does not offer; it is recorded as a residual in
 /// ADR-0019 rather than half-implemented.
-fn config_include_paths(bytes: &[u8], base: &Path) -> Vec<PathBuf> {
-    let Ok(text) = std::str::from_utf8(bytes) else {
-        return Vec::new();
-    };
+fn config_include_paths(bytes: &[u8], base: &Path) -> Result<Vec<PathBuf>> {
     let mut includes = Vec::new();
-    let mut section = String::new();
-    for raw_line in join_continued_lines(text) {
-        let raw_line = raw_line.as_str();
-        let mut line = raw_line.trim();
-        if let Some(rest) = line.strip_prefix('[') {
-            let Some(end) = rest.find(']') else {
+    let mut section: Vec<u8> = Vec::new();
+    for raw_line in join_continued_lines(bytes) {
+        let mut line = raw_line.trim_ascii();
+        if let Some(rest) = line.strip_prefix(b"[") {
+            let Some(end) = rest.iter().position(|byte| *byte == b']') else {
                 continue;
             };
-            section = rest[..end].trim().to_ascii_lowercase();
-            line = rest[end + 1..].trim();
+            section = rest[..end].trim_ascii().to_ascii_lowercase();
+            line = rest[end + 1..].trim_ascii();
             if line.is_empty() {
                 continue;
             }
         }
-        if !(section == "include" || section.starts_with("includeif")) {
+        if !(section == b"include" || section.starts_with(b"includeif")) {
             continue;
         }
-        let Some((key, value)) = line.split_once('=') else {
+        let Some(separator) = line.iter().position(|byte| *byte == b'=') else {
             continue;
         };
-        if !key.trim().eq_ignore_ascii_case("path") {
+        if !line[..separator].trim_ascii().eq_ignore_ascii_case(b"path") {
             continue;
         }
-        let Some(value) = config_value(value) else {
+        let Some(value) = config_value(&line[separator + 1..]) else {
             continue;
         };
-        includes.push(expand_config_path(&value, base));
+        includes.push(expand_config_path(&value, base)?);
     }
-    includes
+    Ok(includes)
+}
+
+/// One configuration value's bytes as the path Git would open.
+///
+/// On Unix a path *is* bytes, so this is exact. Elsewhere a non-UTF-8 value
+/// cannot be turned into a path without guessing, and this fails closed: the
+/// caller propagates the error, the pin cannot be computed, and materialization
+/// refuses rather than recording a digest that covers the wrong file.
+#[cfg(unix)]
+fn path_from_config_bytes(bytes: &[u8]) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    Ok(PathBuf::from(OsStr::from_bytes(bytes)))
+}
+
+#[cfg(not(unix))]
+fn path_from_config_bytes(bytes: &[u8]) -> Result<PathBuf> {
+    let text = std::str::from_utf8(bytes).context(
+        "a shared Git configuration include path is not valid UTF-8 and cannot be resolved on this platform",
+    )?;
+    Ok(PathBuf::from(text))
 }
 
 /// Join lines that Git treats as one: a value ending in a single backslash
@@ -1882,19 +1983,25 @@ fn config_include_paths(bytes: &[u8], base: &Path) -> Vec<PathBuf> {
 /// also ends any continuation in progress rather than being appended to it,
 /// which is the conservative direction: at worst the walk finds an include Git
 /// would not honor, never the reverse.
-fn join_continued_lines(text: &str) -> Vec<String> {
-    let mut joined: Vec<String> = Vec::new();
-    let mut pending: Option<String> = None;
-    for line in text.lines() {
-        let comment = line.trim_start().starts_with(['#', ';']);
+fn join_continued_lines(bytes: &[u8]) -> Vec<Vec<u8>> {
+    let mut joined: Vec<Vec<u8>> = Vec::new();
+    let mut pending: Option<Vec<u8>> = None;
+    for raw_line in bytes.split(|byte| *byte == b'\n') {
+        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        let comment = matches!(line.trim_ascii_start().first(), Some(b'#') | Some(b';'));
         if comment {
             if let Some(buffer) = pending.take() {
                 joined.push(buffer);
             }
-            joined.push(line.to_string());
+            joined.push(line.to_vec());
             continue;
         }
-        let trailing = line.len() - line.trim_end_matches('\\').len();
+        let trailing = line.len()
+            - line
+                .iter()
+                .rposition(|byte| *byte != b'\\')
+                .map(|index| index + 1)
+                .unwrap_or(0);
         let continues = trailing % 2 == 1;
         let body = if continues {
             &line[..line.len() - 1]
@@ -1902,8 +2009,8 @@ fn join_continued_lines(text: &str) -> Vec<String> {
             line
         };
         match pending.as_mut() {
-            Some(buffer) => buffer.push_str(body),
-            None => pending = Some(body.to_string()),
+            Some(buffer) => buffer.extend_from_slice(body),
+            None => pending = Some(body.to_vec()),
         }
         if !continues {
             if let Some(buffer) = pending.take() {
@@ -1918,25 +2025,26 @@ fn join_continued_lines(text: &str) -> Vec<String> {
 }
 
 /// Strip an inline comment, surrounding quotes, and backslash escapes from one
-/// configuration value.
-fn config_value(raw: &str) -> Option<String> {
-    let mut value = String::new();
+/// configuration value. Bytes in, bytes out: a value can name a path that is not
+/// valid UTF-8, and Git will open it.
+fn config_value(raw: &[u8]) -> Option<Vec<u8>> {
+    let mut value: Vec<u8> = Vec::new();
     let mut quoted = false;
     let mut escaped = false;
-    for character in raw.trim_start().chars() {
+    for byte in raw.trim_ascii_start() {
         if escaped {
-            value.push(character);
+            value.push(*byte);
             escaped = false;
             continue;
         }
-        match character {
-            '\\' => escaped = true,
-            '"' => quoted = !quoted,
-            '#' | ';' if !quoted => break,
+        match *byte {
+            b'\\' => escaped = true,
+            b'"' => quoted = !quoted,
+            b'#' | b';' if !quoted => break,
             other => value.push(other),
         }
     }
-    let value = value.trim().to_string();
+    let value = value.trim_ascii().to_vec();
     if value.is_empty() {
         None
     } else {
@@ -1946,13 +2054,13 @@ fn config_value(raw: &str) -> Option<String> {
 
 /// Resolve one include path the way Git does: `~/` against the home directory,
 /// anything else relative against the including file's own directory.
-fn expand_config_path(value: &str, base: &Path) -> PathBuf {
-    if let Some(rest) = value.strip_prefix("~/") {
+fn expand_config_path(value: &[u8], base: &Path) -> Result<PathBuf> {
+    if let Some(rest) = value.strip_prefix(b"~/") {
         if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest);
+            return Ok(PathBuf::from(home).join(path_from_config_bytes(rest)?));
         }
     }
-    resolve_against(base, Path::new(value))
+    Ok(resolve_against(base, &path_from_config_bytes(value)?))
 }
 
 /// Digest the raw bytes of a fixed list of shared files, or `None` when none of
@@ -2077,21 +2185,60 @@ pub fn materialize_staged_worktree(task: &GovernedTaskRun) -> Result<StagedWorkt
         GIT_MATERIALIZE_TIMEOUT,
         "governed staged Builder worktree",
     )?;
-    // Computed after the worktree exists, so the pin covers the staged
-    // worktree's own per-worktree configuration as well as the canonical
-    // worktree's and the shared files. Every later comparison passes the same
-    // staged root.
-    let shared_config_digest = shared_repository_config_digest(&workspace, Some(&root))?;
-    let root = root
-        .to_str()
-        .context("staged worktree root is not valid UTF-8")?
-        .to_string();
-    Ok(StagedWorktreeInput {
-        actor: staged_system_actor(),
-        root,
-        initial_subject_revision: initial.to_string(),
-        shared_config_digest: SharedRepositoryConfigPin::Recorded(shared_config_digest),
-    })
+    // Everything past the `git worktree add` must undo it on failure. Without
+    // that, a pin that cannot be computed — an include chain over the cap, an
+    // unreadable include target — leaves the checkout and its administrative
+    // entry behind, and every retry then dies at the "already exists" check with
+    // a message about a leftover the *first* attempt created. The recovery text
+    // that check prints is for a crash, not for an error this function returned.
+    let recorded = (|| -> Result<StagedWorktreeInput> {
+        // Computed after the worktree exists, so the pin covers the staged
+        // worktree's own per-worktree configuration as well as the canonical
+        // worktree's and the shared files. Every later comparison passes the
+        // same staged root.
+        let shared_config_digest = shared_repository_config_digest(&workspace, Some(&root))?;
+        let root = root
+            .to_str()
+            .context("staged worktree root is not valid UTF-8")?
+            .to_string();
+        Ok(StagedWorktreeInput {
+            actor: staged_system_actor(),
+            root,
+            initial_subject_revision: initial.to_string(),
+            shared_config_digest: SharedRepositoryConfigPin::Recorded(shared_config_digest),
+        })
+    })();
+
+    match recorded {
+        Ok(input) => Ok(input),
+        Err(error) => {
+            discard_materialized_worktree(&workspace, &root);
+            Err(error)
+        }
+    }
+}
+
+/// Remove a staged checkout and its administrative entry, best effort.
+///
+/// Shared by the failure path of [`materialize_staged_worktree`] and by
+/// [`discard_staged_worktree`]: a worktree this producer created and could not
+/// finish recording must not outlive the call, or it blocks every retry.
+fn discard_materialized_worktree(workspace: &Path, root: &Path) {
+    if !cleanup_detached_worktree(workspace, root) {
+        tracing::warn!(
+            checkout = %root.display(),
+            "failed to unregister staged governed Builder worktree"
+        );
+    }
+    if root.symlink_metadata().is_ok() {
+        if let Err(error) = std::fs::remove_dir_all(root) {
+            tracing::warn!(
+                checkout = %root.display(),
+                %error,
+                "failed to remove staged governed Builder worktree"
+            );
+        }
+    }
 }
 
 pub async fn materialize_staged_worktree_async(
@@ -2114,10 +2261,11 @@ fn canonical_branch_ref(workspace: &Path) -> Result<Option<String>> {
         "canonical branch resolution",
         GIT_PROBE_TIMEOUT,
     )?;
-    if output.timed_out {
-        anyhow::bail!("canonical branch resolution timed out");
-    }
-    if !output.status.is_some_and(|status| status.success()) {
+    // `symbolic-ref --quiet` exits non-zero on a detached HEAD, which is a real
+    // observation. A killed probe is not one, and must not be read as a detached
+    // head: promotion would block with `detached_head` for a head that is on a
+    // branch.
+    if !git_completed_successfully(&output, "git symbolic-ref --quiet HEAD")? {
         return Ok(None);
     }
     if output.stdout_truncated {
@@ -2237,10 +2385,10 @@ fn compare_and_swap_canonical_branch(
         "governed outcome promotion compare-and-swap",
         GIT_MATERIALIZE_TIMEOUT,
     )?;
-    if output.timed_out {
-        anyhow::bail!("governed outcome promotion compare-and-swap timed out");
-    }
-    Ok(output.status.is_some_and(|status| status.success()))
+    // `false` here is reported as `concurrent_branch_update` — a claim about what
+    // another writer did. A probe that never reported an exit status supports no
+    // such claim, so it errors instead.
+    git_completed_successfully(&output, "git update-ref")
 }
 
 /// Bring the canonical working tree in line with the branch the swap just moved.
@@ -2261,13 +2409,15 @@ fn sync_canonical_worktree(workspace: &Path, accepted_revision: &str) -> Result<
         "governed outcome promotion worktree sync",
         GIT_MATERIALIZE_TIMEOUT,
     )?;
-    if output.timed_out {
-        anyhow::bail!(
-            "governed outcome promotion advanced the canonical branch to {accepted_revision}, \
-             but syncing the working tree timed out; sync it manually before further work"
-        );
-    }
-    if !output.status.is_some_and(|status| status.success()) {
+    let completed =
+        git_completed_successfully(&output, "git worktree sync").with_context(|| {
+            format!(
+                "governed outcome promotion advanced the canonical branch to {accepted_revision}, \
+             but the working-tree sync never reported an exit status; sync it manually before \
+             further work"
+            )
+        })?;
+    if !completed {
         anyhow::bail!(
             "governed outcome promotion advanced the canonical branch to {accepted_revision}, \
              but the working tree could not be synced to it; sync it manually before further work"
@@ -2633,7 +2783,7 @@ mod tests {
         )
         .err()
         .expect("hanging smudge filter must time out");
-        assert!(error.to_string().contains("timed out"));
+        assert!(format!("{error:#}").contains("timed out"), "{error:#}");
         let worktrees = successful_git_text(
             repo.path(),
             &["worktree", "list", "--porcelain"],
@@ -2677,7 +2827,7 @@ mod tests {
             .expect("materialization task must not panic")
             .err()
             .expect("hanging smudge filter must time out");
-        assert!(error.to_string().contains("timed out"));
+        assert!(format!("{error:#}").contains("timed out"), "{error:#}");
         let worktrees = successful_git_text(
             repo.path(),
             &["worktree", "list", "--porcelain"],
@@ -3510,7 +3660,8 @@ mod tests {
         let parsed = config_include_paths(
             b"[core]\n\tpath = ignored\n[include]\n\tpath = one.config ; trailing\n[includeIf \"gitdir:/x/\"]\n\tpath = \"two.config\"\n",
             base,
-        );
+        )
+        .unwrap();
         assert_eq!(
             parsed,
             vec![
@@ -3518,13 +3669,14 @@ mod tests {
                 PathBuf::from("/repo/.git/two.config"),
             ]
         );
-        // An absolute include is taken as-is, and non-UTF-8 bytes are skipped
-        // rather than failing the pin.
+        // An absolute include is taken as-is.
         assert_eq!(
-            config_include_paths(b"[include]\n\tpath = /abs/other.config\n", base),
+            config_include_paths(b"[include]\n\tpath = /abs/other.config\n", base).unwrap(),
             vec![PathBuf::from("/abs/other.config")]
         );
-        assert!(config_include_paths(&[0xff, 0xfe], base).is_empty());
+        assert!(config_include_paths(&[0xff, 0xfe], base)
+            .unwrap()
+            .is_empty());
     }
 
     /// The head reader used when promotion refuses to spawn Git: it must agree
@@ -3751,6 +3903,224 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Review round 3 on PR #53 (2026-09-12)
+    // -----------------------------------------------------------------------
+
+    /// Round-3 P1: a probe that never reported an exit status was read as a
+    /// decision the process never made. `merge-base --is-ancestor` is the worst
+    /// case — its non-zero exit means *the subject is not descended from the
+    /// registered OID*, a governance finding — and a timed-out child is killed
+    /// and reaped, so it comes back as simply "not success". Under load that
+    /// reported a violation that never happened.
+    ///
+    /// A zero deadline makes this deterministic: the bounded runner checks
+    /// `try_wait` once and then the elapsed time, and no spawned process can
+    /// have exited in that window.
+    #[test]
+    fn test_a_timed_out_ancestry_probe_is_not_reported_as_a_governance_finding() {
+        let dir = init_repo();
+        let repo = dir.path().canonicalize().unwrap();
+        let initial = oid(&repo);
+        // Sanity: with the real timeout this observation succeeds, so the
+        // failure below is the deadline and nothing else.
+        assert_eq!(
+            observe_clean_git_subject(&repo, Some(&initial)).unwrap(),
+            initial
+        );
+
+        let error =
+            observe_clean_git_subject_with_ancestry_timeout(&repo, Some(&initial), Duration::ZERO)
+                .expect_err("a probe that never reported a status is not an observation");
+
+        let message = format!("{error:#}");
+        assert!(
+            !message.contains("not descended"),
+            "a timed-out probe must not be reported as a governance violation: {message}"
+        );
+        assert_eq!(
+            error.downcast_ref::<GitProbeFailure>(),
+            Some(&GitProbeFailure::TimedOut {
+                command: "git merge-base --is-ancestor".to_string()
+            }),
+            "and it must be typed, so a caller can tell 'unknown' from 'violated'"
+        );
+    }
+
+    /// Round-3 P1: a single non-UTF-8 byte anywhere in `.git/config` used to
+    /// make the include walk give up on the whole file, so every include
+    /// directive went unpinned while Git went on honoring them. An included file
+    /// defining a filter could then change after materialization with the
+    /// recorded and observed digests still equal.
+    #[test]
+    fn test_a_non_utf8_byte_does_not_hide_include_directives() {
+        let base = Path::new("/repo/.git");
+        // A Latin-1 byte in a comment, then a perfectly ordinary include.
+        let mut bytes = b"# caf".to_vec();
+        bytes.push(0xe9);
+        bytes.extend_from_slice(b"\n[include]\n\tpath = included.config\n");
+
+        assert_eq!(
+            config_include_paths(&bytes, base).unwrap(),
+            vec![PathBuf::from("/repo/.git/included.config")],
+            "a byte the decoder rejects must not hide an include Git honors"
+        );
+    }
+
+    /// The same, end to end: the digest must actually cover the included file's
+    /// contents when the including config is not valid UTF-8.
+    #[test]
+    fn test_the_digest_covers_includes_of_a_non_utf8_config() {
+        let dir = init_repo();
+        let repo = dir.path().canonicalize().unwrap();
+        let config = repo.join(".git").join("config");
+        let included = repo.join(".git").join("included.config");
+        std::fs::write(&included, "[user]\n\temail = before@example.invalid\n").unwrap();
+        let mut bytes = std::fs::read(&config).unwrap();
+        bytes.extend_from_slice(b"# caf");
+        bytes.push(0xe9);
+        bytes.extend_from_slice(b"\n[include]\n\tpath = included.config\n");
+        std::fs::write(&config, &bytes).unwrap();
+        assert!(std::str::from_utf8(&std::fs::read(&config).unwrap()).is_err());
+
+        let before = shared_repository_config_digest(&repo, None).unwrap();
+        std::fs::write(&included, "[user]\n\temail = after@example.invalid\n").unwrap();
+        let after = shared_repository_config_digest(&repo, None).unwrap();
+
+        assert_ne!(
+            before.repository_config, after.repository_config,
+            "the included file must be inside the pin even when the including config is not UTF-8"
+        );
+    }
+
+    /// A path whose bytes are not UTF-8 is carried through exactly, because that
+    /// is the file Git opens. Lossy decoding would digest a *different* file —
+    /// or nothing — and report it as pinned.
+    ///
+    /// Asserted at the parser rather than end to end: the filesystem this runs
+    /// on (APFS) refuses to create a filename that is not valid UTF-8, so the
+    /// byte-exactness has to be proven where it is decided.
+    #[cfg(unix)]
+    #[test]
+    fn test_an_include_path_with_non_utf8_bytes_is_carried_through_exactly() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let base = Path::new("/repo/.git");
+        let mut name = b"inc-".to_vec();
+        name.push(0xff);
+        name.extend_from_slice(b".config");
+        let mut config = b"[include]\n\tpath = ".to_vec();
+        config.extend_from_slice(&name);
+        config.push(b'\n');
+
+        let parsed = config_include_paths(&config, base).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed[0].file_name().map(OsStr::as_bytes),
+            Some(name.as_slice()),
+            "the include path must be the exact bytes Git would open"
+        );
+        assert_eq!(parsed[0].parent(), Some(base));
+    }
+
+    /// Round-3 P2: a pin that cannot be computed after `git worktree add` used
+    /// to leave the checkout and its administrative entry behind, so every retry
+    /// died at the "already exists" check — reporting a leftover the *first*
+    /// attempt had created.
+    #[test]
+    fn test_a_failed_pin_removes_the_worktree_it_had_already_created() {
+        let dir = init_repo();
+        let repo = dir.path().canonicalize().unwrap();
+        let mut registered = task(&repo);
+        registered.world_scope = WorldScope::StagedAuthoritative;
+        registered.initial_subject_revision = Some(oid(&repo));
+        let root = registered.expected_staged_worktree_root().unwrap();
+
+        // More include directives than this walk will follow. Git is perfectly
+        // happy with them -- they are one level deep and simply absent, which it
+        // ignores -- so every Git call still succeeds and the pin is what fails,
+        // *after* the worktree has been created. That ordering is the point.
+        let config = repo.join(".git").join("config");
+        let original = std::fs::read_to_string(&config).unwrap();
+        let mut oversized = original.clone();
+        for index in 0..=MAX_CONFIG_INCLUDE_FILES {
+            oversized.push_str(&format!("[include]\n\tpath = absent-{index}.config\n"));
+        }
+        std::fs::write(&config, &oversized).unwrap();
+        // Git still reads this repository without complaint.
+        assert_eq!(
+            oid(&repo),
+            registered.initial_subject_revision.clone().unwrap()
+        );
+
+        let error = materialize_staged_worktree(&registered)
+            .expect_err("an include chain over the cap must fail the pin");
+        assert!(format!("{error:#}").contains("included files"), "{error:#}");
+
+        assert!(
+            !root.exists(),
+            "the failed materialization must not leave its checkout behind"
+        );
+        let listed = successful_git_text(&repo, &["worktree", "list"], "worktree list").unwrap();
+        assert!(
+            !listed.contains(root.to_str().unwrap()),
+            "nor its administrative entry: {listed}"
+        );
+
+        // And a retry succeeds once the cause is removed.
+        std::fs::write(&config, &original).unwrap();
+        let staged = materialize_staged_worktree(&registered)
+            .expect("the retry must not trip over the first attempt's leftovers");
+        assert_eq!(PathBuf::from(&staged.root), root);
+    }
+
+    /// The classifier itself, over every shape `run_bounded_process` can return.
+    #[test]
+    fn test_git_completed_successfully_separates_unknown_from_failed() {
+        fn output(
+            status: Option<std::process::ExitStatus>,
+            timed_out: bool,
+        ) -> BoundedProcessOutput {
+            BoundedProcessOutput {
+                status,
+                stdout: Vec::new(),
+                stdout_truncated: false,
+                _stderr: Vec::new(),
+                _stderr_truncated: false,
+                timed_out,
+            }
+        }
+        let success = std::process::Command::new("true").status().unwrap();
+        let failure = std::process::Command::new("false").status().unwrap();
+        assert!(success.success());
+        assert!(!failure.success());
+
+        assert!(git_completed_successfully(&output(Some(success), false), "git probe").unwrap());
+        assert!(!git_completed_successfully(&output(Some(failure), false), "git probe").unwrap());
+
+        // Timed out, whatever status the reap produced.
+        for status in [None, Some(success), Some(failure)] {
+            let error = git_completed_successfully(&output(status, true), "git probe")
+                .expect_err("a timed-out probe is not an observation");
+            assert_eq!(
+                error.downcast_ref::<GitProbeFailure>(),
+                Some(&GitProbeFailure::TimedOut {
+                    command: "git probe".to_string()
+                })
+            );
+        }
+        // Killed without reporting a status, and without the timeout flag.
+        let error = git_completed_successfully(&output(None, false), "git probe")
+            .expect_err("a killed probe is not an observation");
+        assert_eq!(
+            error.downcast_ref::<GitProbeFailure>(),
+            Some(&GitProbeFailure::Killed {
+                command: "git probe".to_string()
+            })
+        );
+        assert!(format!("{error}").contains("not a finding"));
+    }
+
     /// Review round 2 on PR #53: a comment line ending in a backslash must not
     /// swallow the line after it. Git's continuation lives inside value parsing,
     /// so `# hidden \` leaves the following `[include]` header in force — and a
@@ -3761,17 +4131,17 @@ mod tests {
         let base = Path::new("/repo/.git");
         let bytes = b"# hidden \\\n[include]\n\tpath = evil.inc\n";
         assert_eq!(
-            config_include_paths(bytes, base),
+            config_include_paths(bytes, base).unwrap(),
             vec![PathBuf::from("/repo/.git/evil.inc")],
             "a comment must not swallow an include header Git honors"
         );
         // A comment also ends a continuation in progress rather than joining it.
         assert_eq!(
-            join_continued_lines("path = a\\\n; note\n[include]"),
+            join_continued_lines(b"path = a\\\n; note\n[include]"),
             vec![
-                "path = a".to_string(),
-                "; note".to_string(),
-                "[include]".to_string()
+                b"path = a".to_vec(),
+                b"; note".to_vec(),
+                b"[include]".to_vec()
             ]
         );
     }
@@ -3849,14 +4219,14 @@ mod tests {
     fn test_config_include_paths_honors_backslash_line_continuation() {
         let base = Path::new("/repo/.git");
         assert_eq!(
-            config_include_paths(b"[include]\n\tpath = one\\\n.config\n", base),
+            config_include_paths(b"[include]\n\tpath = one\\\n.config\n", base).unwrap(),
             vec![PathBuf::from("/repo/.git/one.config")]
         );
         // An even number of trailing backslashes is an escaped backslash, not a
         // continuation.
         assert_eq!(
-            join_continued_lines("a\\\\\nb"),
-            vec!["a\\\\".to_string(), "b".to_string()]
+            join_continued_lines(b"a\\\\\nb"),
+            vec![b"a\\\\".to_vec(), b"b".to_vec()]
         );
     }
 
