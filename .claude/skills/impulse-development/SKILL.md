@@ -2,7 +2,7 @@
 name: impulse-development
 description: "Use when adding features to the Impulse codebase — CLI commands, daemon IPC messages, GUI views, dynamic tools, context lifecycle, or guardrails. Routes to detailed step-by-step guides."
 version: 1.0.0
-updated: 2026-08-29
+updated: 2026-09-12
 domain: engineering
 category: languages
 maturity: silver
@@ -61,7 +61,7 @@ Do not add GUI views or product shell work there.
 |---|---|---|---|
 | Add a CLI command | `references/adding-cli-commands.md` | `src/main.rs`, handler module | `rust-programming` |
 | Add a daemon IPC message | `references/adding-daemon-ipc.md` | `src/daemon/mod.rs` | `rust-daemon-ipc` |
-| Add a GUI view | `docs/decisions/0008-dioxus-desktop-host.md`, `impulse-desktop/README.md` | `impulse-desktop/src/ui.rs`, `views.rs` | `rust-programming` |
+| Add a GUI view | `references/adding-gui-views.md` | `impulse-desktop/src/ui.rs`, `views.rs` | `rust-programming` |
 | Add a dynamic tool | `references/adding-dynamic-tools.md` | `src/tooling/mod.rs`, `traits.rs` | `rust-trait-design` |
 | Add a guardrail rule | CLAUDE.md guardrail section | `src/guardrail/` | `plugin-hooks-guardrails` |
 | Add a context lifecycle stage | Context lifecycle docs | `src/context_lifecycle/` | `context-engineering` |
@@ -183,9 +183,13 @@ Each test gets a unique socket path to support parallel execution.
 
 ### Verification Before Commit
 ```bash
-cargo build && cargo test && cargo clippy -- -D warnings && cargo fmt --check
+cd impulse-rs
+cargo build --workspace
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
 ```
-All four must pass. Never skip with `--no-verify`.
+All four must pass. Never skip with `--no-verify`. Crate-local checks (`cargo test -p impulse-desktop`) are extra, not a substitute.
 
 ---
 
