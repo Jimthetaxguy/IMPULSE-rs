@@ -1,7 +1,7 @@
 ---
 title: Ion Document Read Tool Design
 description: Design spec for document_read, a bounded and pageable document-analysis tool inside Ion's tool loop
-updated: 2026-09-02
+updated: 2026-09-12
 type: specification
 category: architecture
 phase: all
@@ -178,7 +178,76 @@ section grouping, the section cap) are unit-tested directly, without a document:
 | CDATA section that is not valid UTF-8 | a typed error rather than replacement characters |
 | The oversized part read directly, without the container preflight | the typed too-large refusal, not a silently truncated answer |
 
+## New kinds (Stage 1b-B, 2026-09-12): pdf, txt, md
+
+Iteration 3, `docs/plans/2026-09-02-impulse-next-stages.md` Stage 1b. Adds three more kinds
+under the same caps (`MAX_DOCUMENT_BYTES`, `ExtractBudget`, `MAX_CHARS_CAP`/`DEFAULT_MAX_CHARS`,
+the rendered section-table cap) and the same sandbox check
+(`ReplContext::sandbox_tool_context().is_path_allowed`, enforced in `resolve_document_path_with_cap`
+exactly like `xlsx`/`csv`/`docx`); `document_extract` (the stubbed CLI/daemon dynamic tool whose
+default path always errored) is deleted rather than extended, per the deferred decision this spec
+originally left open.
+
+- **PDF (text layer only).** New dependency: `pdf-extract` (crate `pdf-extract`, MIT, behind
+  `office-support`; re-exports `lopdf` at its crate root, so no separate `lopdf` dependency was
+  added). Pages are streamed one at a time through `pdf-extract`'s public
+  `output_doc_page`/`PlainTextOutput` API -- never the crate's own whole-document
+  `extract_text`/`extract_text_by_pages`, both of which build the full result before this tool
+  could check anything. The page count is read from `lopdf::Document::get_pages` (walking the
+  page tree once, no text extraction) and refused above `MAX_PDF_PAGES` (4096) before any page is
+  rendered; each page's text is checked against the character budget before it is appended
+  (check-before-push, the same discipline as the workbook and Word streamers). `PlainTextOutput`
+  implements only the text-output half of `pdf_extract::OutputDev` -- it has no image-handling
+  code at all, so an embedded image can never reach this tool's output regardless of what the PDF
+  contains. An encrypted PDF (`doc.is_encrypted()`) is refused unconditionally and immediately,
+  before any page is read: `pdf-extract`'s own whole-document helpers try an empty password first
+  and only fail if that does not work, which would make "encrypted" support depend on how the
+  file happened to be protected; this tool makes no such attempt. A page with no extractable text
+  (a scanned/image-only page) contributes no line and no section, exactly like a blank Word
+  paragraph, so a PDF with no text layer at all parses successfully to an empty document with zero
+  sections -- `render` says so explicitly (`(no extractable text layer: this PDF is likely scanned
+  or image-only ...)`) rather than leaving the model to wonder whether reading failed. One section
+  per non-empty page (`kind: "page"`, `name: "Page N"`), same shape as a workbook's one section per
+  sheet.
+- **txt.** Read whole (already bounded by `MAX_DOCUMENT_BYTES` at path-resolution time) and
+  requires valid UTF-8; invalid UTF-8 is a typed error naming the first invalid byte's offset
+  (`String::from_utf8`'s `valid_up_to()`) rather than a lossy replacement -- this tool does not
+  guess an encoding, and a lossy read would make an offset the tool reports not correspond to what
+  the model actually sees. One section spanning the whole document (`kind: "text"`), matching
+  `csv`'s single-section shape.
+- **md.** Same whole-file UTF-8 read as `txt`, plus an outline built from ATX headings (`#`
+  through `######`, requiring a following space/tab or end of line, per CommonMark's basic rule --
+  a run of more than 6 `#`s, or one glued directly to text like `#tag`, is not a heading).
+  Deliberately not full CommonMark: an optional closing run of `#`s (`## Title ##`) is left in the
+  heading text rather than stripped, a documented simplification for a tool that only needs stable
+  section boundaries, not a rendered heading. Content before the first heading belongs to no
+  section (mirrors Word's "no growth before the first non-empty paragraph"). Bounded at
+  `MAX_MD_SECTIONS` (4096) the same way Word's outline is bounded at `MAX_WORD_SECTIONS`: past the
+  cap no new section starts and the most recently opened one keeps absorbing text, so every offset
+  already reported stays truthful.
+
+### Fixture table
+
+| Fixture | Proves |
+|---|---|
+| PDF with two pages of real text, built with `lopdf` (re-exported by `pdf_extract::*`) the way `create.rs` in lopdf's own examples does | two `page` sections named `Page 1`/`Page 2`; both pages' text is in the window; render ends `complete` |
+| PDF with one page and an empty content stream (no text operators at all) | zero sections, `total_chars == 0`, and `render`'s explicit "no extractable text layer" note |
+| PDF re-saved with RC4 V1 encryption (`doc.encrypt`) | the typed encrypted-PDF refusal, before any page is read |
+| PDF with more pages than an injected page-cap test seam | the typed page-count refusal, without building a real multi-thousand-page fixture |
+| PDF whose single page's text exceeds an injected tiny character budget | the typed over-the-limit refusal |
+| Bytes that are not a PDF at all, saved with a `.pdf` extension | a typed parse error, not a panic |
+| Empty `.txt` file | empty text, zero sections |
+| `.txt` exactly at a budget, then one character over | accepted, then the typed over-the-limit refusal |
+| `.txt` with a byte that is not valid UTF-8 | the typed UTF-8 refusal naming the invalid byte's offset |
+| `.md` with a heading, read via `outline=true` then jumped to by the heading's own offset | the section table and offset-based jump agree |
+| `.md` with `MAX_MD_SECTIONS + 5` headings | exactly `MAX_MD_SECTIONS` sections, and the last one's offset+chars reaches the true end of the text |
+| A previously-`.pdf`-specific "unsupported extension" test, now retargeted at `.pptx` | `pdf`/`txt`/`md` are supported extensions; a still-unsupported one still names them all in its error |
+
 ## Out of scope
 
-PDF and plain-text formats, the stubbed `document_extract` tool, a `/doc` slash command,
-per-session path sandboxing, and caching parsed documents across calls.
+Caching parsed documents across calls, a `/doc` slash command, and OCR/rendering for a
+PDF with no text layer (scanned/image-only pages are reported empty, never rasterized or sent to
+an OCR model). Per-session path sandboxing is no longer out of scope -- see
+`docs/superpowers/specs/2026-09-02-ion-tool-sandbox-and-untrusted-output.md`, which this tool's
+`resolve_document_path_with_cap` already implements for every kind, including the three added
+here.

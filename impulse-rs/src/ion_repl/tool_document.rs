@@ -41,6 +41,23 @@
 //!   when [`preflight_container`] has not run;
 //! - `csv` text is checked against [`MAX_EXTRACTED_CHARS`] after parsing,
 //!   where the parser's memory is bounded by the 10 MiB file cap;
+//! - `pdf` text is streamed page by page through `pdf-extract`'s public
+//!   `output_doc_page`/`PlainTextOutput` API (never the whole-document
+//!   `extract_text`, so this module controls the loop): the page count is
+//!   read from the page tree first and refused above [`MAX_PDF_PAGES`]
+//!   before any page is rendered, each page's text is checked against
+//!   [`MAX_EXTRACTED_CHARS`] *before* it is appended (`check-before-push`,
+//!   the same discipline as the workbook and Word streamers), only the text
+//!   layer is ever read (`PlainTextOutput` has no image-handling code path
+//!   at all, so an image never reaches this tool's output), and an
+//!   encrypted PDF is refused outright rather than attempted with an empty
+//!   password -- this tool never supplies one;
+//! - `txt`/`md` are read whole (already bounded by [`MAX_DOCUMENT_BYTES`])
+//!   and require valid UTF-8, refused with a typed error otherwise (this
+//!   tool does not guess an encoding or lossily replace invalid bytes);
+//!   `md` additionally scans ATX headings (`#` through `######`) into an
+//!   outline capped at [`MAX_MD_SECTIONS`] rows, mirroring
+//!   [`MAX_WORD_SECTIONS`];
 //! - legacy `xls` is refused because its binary format has no streaming
 //!   reader and cannot be bounded the same way;
 //! - the content window is capped at [`MAX_CHARS_CAP`] characters; the
@@ -63,7 +80,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::office::{self, ExtractionResult, OfficeFormat};
+use crate::office::{self, ExtractionResult};
 
 use super::tools::{ReplTool, ToolOutcome};
 use super::ReplContext;
@@ -87,10 +104,27 @@ pub const MAX_RENDERED_SECTIONS: usize = 32;
 /// Empty columns inside a row rendered as bare tabs; wider gaps become a
 /// marker so a cell far to the right cannot inflate the text.
 pub const EMPTY_COLUMNS_INLINE: u32 = 8;
+/// Largest number of pages a PDF may have before this tool refuses it. The
+/// section table travels in the payload, one row per non-empty page, so an
+/// unbounded page count would otherwise grow it without bound; checked
+/// before any page is rendered, from the page tree's own count.
+pub const MAX_PDF_PAGES: usize = 4_096;
+/// Most outline sections a Markdown document may contribute, one per ATX
+/// heading line. Past the cap no new section starts and the last one
+/// absorbs the remaining text, mirroring [`MAX_WORD_SECTIONS`], so every
+/// offset reported stays truthful.
+pub const MAX_MD_SECTIONS: usize = 4_096;
 
 const SHEET_HEADER_PREFIX: &str = "=== Sheet: ";
 const SHEET_HEADER_SUFFIX: &str = " ===";
-const SUPPORTED_FORMATS: &str = "xlsx, csv, docx";
+const SUPPORTED_FORMATS: &str = "xlsx, csv, docx, pdf, txt, md";
+/// Extensions this tool accepts, independent of `office::OfficeFormat`
+/// (which backs the separate CLI/daemon `document_parse` dynamic tool and
+/// does not know about `pdf`/`txt`/`md`, nor need to): `csv` still goes
+/// through `office::parse_document`, and `xlsx`/`docx` through this
+/// module's own streamers, but the accepted-extension gate below is this
+/// tool's own, so adding a kind here never needs to touch `office::mod`.
+const READABLE_EXTENSIONS: [&str; 6] = ["xlsx", "csv", "docx", "pdf", "txt", "md"];
 
 pub struct DocumentReadTool;
 
@@ -198,24 +232,29 @@ impl ReplTool for DocumentReadTool {
 
     fn usage(&self) -> &'static str {
         "document_read {\"path\": \"...\", \"sheet\": \"...\", \"outline\": false, \
-         \"offset\": 0, \"max_chars\": 12000} -- read a spreadsheet or Word document \
-         (xlsx/csv/docx) as text, paged by character offset"
+         \"offset\": 0, \"max_chars\": 12000} -- read a spreadsheet, Word document, PDF \
+         (text layer only), plain text, or Markdown file (xlsx/csv/docx/pdf/txt/md) as \
+         text, paged by character offset"
     }
 
     fn json_schema(&self) -> Value {
         json!({
             "name": "document_read",
             "description": format!(
-                "Read a spreadsheet (xlsx, csv) or Word document (docx) as plain text. \
-                 Read-only; files up to {} MiB. The tool loop allows only a few calls per \
-                 turn, so do not page through a large document exhaustively: start with \
-                 outline=true to learn total_chars and the sections with their offsets, then \
-                 read only the windows you need (max_chars up to {}) and answer from what you \
-                 read. Every result ends with either 'complete' or 'truncated, continue with \
-                 offset=N'. Use sheet to read one worksheet (empty worksheets are omitted, \
-                 as are chart, dialog, and macro sheets, which hold no cells), or \
-                 pass a section's offset to jump to it.",
+                "Read a spreadsheet (xlsx, csv), Word document (docx), PDF (text layer only \
+                 -- scanned/image-only pages return no text), plain text (txt), or Markdown \
+                 (md) file as plain text. Read-only; files up to {} MiB, PDFs up to {} pages. \
+                 The tool loop allows only a few calls per turn, so do not page through a \
+                 large document exhaustively: start with outline=true to learn total_chars \
+                 and the sections with their offsets, then read only the windows you need \
+                 (max_chars up to {}) and answer from what you read. Every result ends with \
+                 either 'complete' or 'truncated, continue with offset=N'. Use sheet to read \
+                 one worksheet (empty worksheets are omitted, as are chart, dialog, and macro \
+                 sheets, which hold no cells), or pass a section's offset to jump to it -- for \
+                 PDF a section is one page, for Markdown a section is one ATX heading \
+                 (# through ######).",
                 MAX_DOCUMENT_BYTES / (1024 * 1024),
+                MAX_PDF_PAGES,
                 MAX_CHARS_CAP
             ),
             "input_schema": {
@@ -380,7 +419,10 @@ pub fn resolve_document_path_with_cap(
              because its binary format cannot be bounded before parsing; convert it to .xlsx"
         );
     }
-    if !OfficeFormat::from_extension(&ext).is_readable() {
+    if !READABLE_EXTENSIONS
+        .iter()
+        .any(|e| ext.eq_ignore_ascii_case(e))
+    {
         bail!(
             "document_read: '{raw}' has unsupported extension '{ext}' (supported: {SUPPORTED_FORMATS})"
         );
@@ -493,9 +535,11 @@ pub fn check_extracted_size(text: &str, raw: &str, max_chars: usize) -> Result<(
 }
 
 /// Parses one accepted document under `budget`: workbooks are streamed
-/// cell by cell and Word documents event by event by this module; `csv`
-/// goes through the `office` parser and is size-checked afterwards, its
-/// memory already bounded by the 10 MiB file cap.
+/// cell by cell, Word documents event by event, and PDFs page by page, all
+/// by this module; `csv` goes through the `office` parser and is
+/// size-checked afterwards, its memory already bounded by the 10 MiB file
+/// cap; `txt`/`md` are read whole (already bounded by the file cap) and
+/// size-checked the same way.
 pub fn parse_document_bounded(
     path: &Path,
     raw: &str,
@@ -509,6 +553,9 @@ pub fn parse_document_bounded(
     match ext.as_str() {
         "xlsx" => extract_workbook(path, raw, budget),
         "docx" => extract_word(path, raw, budget),
+        "pdf" => extract_pdf(path, raw, budget),
+        "txt" => extract_plain_text(path, raw, budget, "txt", "text"),
+        "md" => extract_plain_text(path, raw, budget, "md", "markdown"),
         "csv" => {
             let parsed = office::parse_document(path)
                 .map_err(|e| anyhow::anyhow!("document_read: '{raw}' could not be parsed: {e}"))?;
@@ -1038,6 +1085,221 @@ pub fn extract_word(path: &Path, raw: &str, budget: ExtractBudget) -> Result<Par
     })
 }
 
+/// Streams a PDF's text layer page by page through `pdf-extract`'s public
+/// `output_doc_page`/`PlainTextOutput` API -- never the crate's own
+/// whole-document `extract_text`/`extract_text_by_pages`, which build the
+/// entire result before this module could check anything -- so the page
+/// count and character budget can both be enforced before this module's own
+/// text grows unbounded. `PlainTextOutput` implements only the text-output
+/// half of `pdf_extract::OutputDev` (`begin_page`/`output_character`/
+/// `begin_word`/`end_word`/`end_line`): it has no image-handling code path
+/// at all, so an embedded image can never reach this tool's output.
+///
+/// Encrypted PDFs are refused unconditionally, before any page is read:
+/// `pdf-extract`'s own whole-document helpers try an empty password first
+/// and only fail if that does not work, which would make "encrypted"
+/// availability depend on how the file happened to be protected. This tool
+/// makes no such attempt -- `doc.is_encrypted()` is enough to refuse.
+///
+/// A PDF whose page count exceeds [`MAX_PDF_PAGES`] is refused before any
+/// page is rendered: the count comes from `lopdf::Document::get_pages`
+/// (walking the page tree once, no text extraction), the same way
+/// `preflight_container` measures a zip container's inflated size before a
+/// parser runs.
+///
+/// A page with no extractable text (common for a scanned/image-only PDF)
+/// contributes no line and no section, exactly like a blank Word paragraph;
+/// a PDF with no text layer at all therefore parses successfully to an
+/// empty document with zero sections, which [`render`] calls out explicitly
+/// rather than leaving the model to wonder whether reading failed.
+pub fn extract_pdf(path: &Path, raw: &str, budget: ExtractBudget) -> Result<ParsedDocument> {
+    extract_pdf_with_page_cap(path, raw, budget, MAX_PDF_PAGES)
+}
+
+/// [`extract_pdf`] with an explicit page-count cap; the test seam (building
+/// a many-thousand-page fixture PDF to exercise the real
+/// [`MAX_PDF_PAGES`] would be slow for no extra coverage).
+pub fn extract_pdf_with_page_cap(
+    path: &Path,
+    raw: &str,
+    budget: ExtractBudget,
+    max_pages: usize,
+) -> Result<ParsedDocument> {
+    let doc = pdf_extract::Document::load(path)
+        .map_err(|e| anyhow::anyhow!("document_read: '{raw}' could not be parsed: {e}"))?;
+    if doc.is_encrypted() {
+        bail!(
+            "document_read: '{raw}' is an encrypted PDF, which this tool does not support \
+             (it never attempts a password); remove the password protection and try again"
+        );
+    }
+    let pages = doc.get_pages();
+    let page_count = pages.len();
+    if page_count > max_pages {
+        bail!("document_read: '{raw}' has {page_count} pages, over the {max_pages}-page limit");
+    }
+
+    let mut text = String::new();
+    let mut cursor = 0usize;
+    let mut sections = Vec::new();
+    for page_num in 1..=(page_count as u32) {
+        let mut page_text = String::new();
+        {
+            let mut output = pdf_extract::PlainTextOutput::new(&mut page_text);
+            pdf_extract::output_doc_page(&doc, &mut output, page_num).map_err(|e| {
+                anyhow::anyhow!("document_read: '{raw}' could not be parsed: page {page_num}: {e}")
+            })?;
+        }
+        let page_text = page_text.trim_end_matches(['\n', '\r']);
+        if page_text.trim().is_empty() {
+            continue;
+        }
+        let chars = page_text.chars().count() + 1; // +1 for the trailing newline pushed below
+        if cursor + chars > budget.max_chars {
+            bail!(
+                "document_read: '{raw}' extracted to more than {} characters, over the limit",
+                budget.max_chars
+            );
+        }
+        sections.push(DocumentSection {
+            index: (page_num - 1) as usize,
+            kind: "page".to_string(),
+            name: Some(format!("Page {page_num}")),
+            offset: Some(cursor),
+            chars,
+        });
+        text.push_str(page_text);
+        text.push('\n');
+        cursor += chars;
+    }
+
+    let size_bytes = std::fs::metadata(path)
+        .with_context(|| format!("document_read: '{raw}' could not be read"))?
+        .len();
+    Ok(ParsedDocument {
+        format: "pdf".to_string(),
+        document_type: "pdf".to_string(),
+        size_bytes,
+        text,
+        sections,
+        sheets: Vec::new(),
+    })
+}
+
+/// Detects one ATX heading line: 1 to 6 leading `#` characters followed by a
+/// space/tab or end of line (CommonMark's basic rule; a run of more than 6
+/// `#`s, or one glued directly to following text like `#tag`, is not a
+/// heading). Returns the heading level and the trimmed heading text, or
+/// `None` for an ordinary line. Deliberately not full CommonMark: an
+/// optional closing run of `#`s (`## Title ##`) is left in the heading text
+/// rather than stripped, a documented simplification for a tool that only
+/// needs stable section boundaries, not a rendered heading.
+pub fn parse_atx_heading(line: &str) -> Option<(u8, String)> {
+    let hashes = line.chars().take_while(|c| *c == '#').count();
+    if hashes == 0 || hashes > 6 {
+        return None;
+    }
+    let rest = &line[hashes..];
+    if !rest.is_empty() && !rest.starts_with([' ', '\t']) {
+        return None;
+    }
+    let text = rest.trim_start_matches([' ', '\t']).trim_end();
+    Some((hashes as u8, text.to_string()))
+}
+
+/// Scans `text` for ATX headings and returns the section table this
+/// module's own text is built from directly (unlike Word/xlsx, Markdown
+/// text is not rewritten, so offsets are plain char offsets into `text`
+/// itself). Content before the first heading belongs to no section, mirror-
+/// ing Word's own "no growth before the first non-empty paragraph"
+/// behavior. Past [`MAX_MD_SECTIONS`] headings, no new section starts and
+/// the most recently opened one keeps absorbing text, so every offset
+/// already reported stays truthful.
+pub fn markdown_sections(text: &str) -> Vec<DocumentSection> {
+    let mut sections: Vec<DocumentSection> = Vec::new();
+    let mut cursor = 0usize;
+    let mut open: Option<usize> = None;
+    for line in text.split_inclusive('\n') {
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        let content = content.strip_suffix('\r').unwrap_or(content);
+        if let Some((_level, heading_text)) = parse_atx_heading(content) {
+            if sections.len() < MAX_MD_SECTIONS {
+                sections.push(DocumentSection {
+                    index: sections.len(),
+                    kind: "heading".to_string(),
+                    name: Some(heading_text),
+                    offset: Some(cursor),
+                    chars: 0,
+                });
+                open = Some(sections.len() - 1);
+            }
+        }
+        let line_chars = line.chars().count();
+        if let Some(idx) = open {
+            sections[idx].chars += line_chars;
+        }
+        cursor += line_chars;
+    }
+    sections
+}
+
+/// Reads a `txt`/`md` file whole (already bounded by [`MAX_DOCUMENT_BYTES`]
+/// at path-resolution time) and requires valid UTF-8, refusing with a typed
+/// error otherwise -- this tool does not guess an encoding or silently
+/// replace invalid bytes with the Unicode replacement character, which
+/// would make offsets returned to the model line up with a text the model
+/// never actually sees. `format`/`document_type` are supplied by the
+/// caller so this one reader backs both `txt` (no sections: the whole
+/// document is one span, matching `csv`'s single-section shape) and `md`
+/// (sections from [`markdown_sections`]).
+pub fn extract_plain_text(
+    path: &Path,
+    raw: &str,
+    budget: ExtractBudget,
+    format: &str,
+    document_type: &str,
+) -> Result<ParsedDocument> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("document_read: '{raw}' could not be read"))?;
+    let text = String::from_utf8(bytes).map_err(|e| {
+        anyhow::anyhow!(
+            "document_read: '{raw}' is not valid UTF-8 (first invalid byte at offset {}); \
+             this tool reads UTF-8 text only and does not guess an encoding",
+            e.utf8_error().valid_up_to()
+        )
+    })?;
+    check_extracted_size(&text, raw, budget.max_chars)?;
+
+    let sections = if format == "md" {
+        markdown_sections(&text)
+    } else {
+        let total_chars = text.chars().count();
+        if total_chars == 0 {
+            Vec::new()
+        } else {
+            vec![DocumentSection {
+                index: 0,
+                kind: "text".to_string(),
+                name: None,
+                offset: Some(0),
+                chars: total_chars,
+            }]
+        }
+    };
+
+    let size_bytes = std::fs::metadata(path)
+        .with_context(|| format!("document_read: '{raw}' could not be read"))?
+        .len();
+    Ok(ParsedDocument {
+        format: format.to_string(),
+        document_type: document_type.to_string(),
+        size_bytes,
+        text,
+        sections,
+        sheets: Vec::new(),
+    })
+}
+
 /// Renders streamed cells as tab-separated rows. Gaps of up to
 /// [`EMPTY_COLUMNS_INLINE`] empty columns become bare tabs; wider column
 /// gaps and every skipped row become a bracketed marker, so a cell far from
@@ -1307,6 +1569,12 @@ pub fn render(window: &DocumentWindow) -> String {
                 "  (empty worksheets are omitted, as are chart, dialog, and macro sheets, \
                  which are not worksheets; section indexes are workbook positions; section \
                  offsets are whole-document offsets)\n",
+            );
+        }
+        if window.format == "pdf" && window.total_chars == 0 {
+            out.push_str(
+                "  (no extractable text layer: this PDF is likely scanned or image-only; \
+                 this tool never renders images, so there is nothing more to read here)\n",
             );
         }
     }
@@ -1757,13 +2025,17 @@ mod tests {
             "{msg}"
         );
 
-        std::fs::write(dir.path().join("notes.pdf"), "%PDF").unwrap();
-        let err = resolve_document_path("notes.pdf", &ctx).unwrap_err();
+        std::fs::write(dir.path().join("slides.pptx"), "PK").unwrap();
+        let err = resolve_document_path("slides.pptx", &ctx).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.starts_with("document_read: 'notes.pdf'"), "{msg}");
-        assert!(msg.contains("unsupported extension 'pdf'"), "{msg}");
+        assert!(msg.starts_with("document_read: 'slides.pptx'"), "{msg}");
+        assert!(msg.contains("unsupported extension 'pptx'"), "{msg}");
         assert!(
             msg.contains("xlsx") && msg.contains("csv") && msg.contains("docx"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("pdf") && msg.contains("txt") && msg.contains("md"),
             "{msg}"
         );
 
@@ -1779,6 +2051,20 @@ mod tests {
             "{msg}"
         );
         assert!(msg.contains("convert it to .xlsx"), "{msg}");
+    }
+
+    #[test]
+    fn test_resolve_document_path_accepts_pdf_txt_and_md_extensions() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ctx = doc_ctx(dir.path());
+        for name in ["a.pdf", "b.txt", "c.md", "D.PDF", "E.TXT", "F.MD"] {
+            std::fs::write(dir.path().join(name), "content").unwrap();
+            assert_eq!(
+                resolve_document_path(name, &ctx).unwrap(),
+                dir.path().join(name),
+                "{name} should resolve as a supported extension"
+            );
+        }
     }
 
     // ------------------------------------------------------------------
@@ -2225,6 +2511,173 @@ mod tests {
         // Exactly two lines, so the section span still tiles the text.
         assert_eq!(text.matches('\n').count(), 2);
         assert_eq!(sections[0].chars, text.chars().count());
+    }
+
+    // ------------------------------------------------------------------
+    // Markdown ATX heading detection and section accumulation -- pure,
+    // unit-tested directly without a document, matching the WordTextBuilder
+    // tests above.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_atx_heading_recognizes_levels_one_through_six() {
+        assert_eq!(parse_atx_heading("# Title"), Some((1, "Title".to_string())));
+        assert_eq!(
+            parse_atx_heading("###### Deepest"),
+            Some((6, "Deepest".to_string()))
+        );
+        assert_eq!(
+            parse_atx_heading("###   Padded   "),
+            Some((3, "Padded".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_atx_heading_accepts_an_empty_heading() {
+        assert_eq!(parse_atx_heading("##"), Some((2, String::new())));
+        assert_eq!(parse_atx_heading("## "), Some((2, String::new())));
+    }
+
+    #[test]
+    fn test_parse_atx_heading_rejects_non_headings() {
+        assert_eq!(parse_atx_heading("plain text"), None);
+        assert_eq!(
+            parse_atx_heading("#tag-not-a-heading"),
+            None,
+            "no space after #"
+        );
+        assert_eq!(
+            parse_atx_heading("####### seven hashes"),
+            None,
+            "CommonMark caps ATX headings at level 6"
+        );
+        assert_eq!(parse_atx_heading(""), None);
+    }
+
+    #[test]
+    fn test_markdown_sections_empty_text_has_no_sections() {
+        assert!(markdown_sections("").is_empty());
+    }
+
+    #[test]
+    fn test_markdown_sections_content_before_first_heading_has_no_section() {
+        let sections = markdown_sections("intro line\n# First\nbody\n");
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].name.as_deref(), Some("First"));
+        // Offset is the char offset of the "# First" line, i.e. after "intro line\n".
+        assert_eq!(sections[0].offset, Some("intro line\n".chars().count()));
+    }
+
+    #[test]
+    fn test_markdown_sections_spans_run_up_to_the_next_heading() {
+        let text = "# One\nbody one\n## Two\nbody two\nmore\n";
+        let sections = markdown_sections(text);
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].name.as_deref(), Some("One"));
+        assert_eq!(sections[0].offset, Some(0));
+        assert_eq!(sections[0].chars, "# One\nbody one\n".chars().count());
+        assert_eq!(sections[1].name.as_deref(), Some("Two"));
+        assert_eq!(
+            sections[1].offset,
+            Some("# One\nbody one\n".chars().count())
+        );
+        assert_eq!(
+            sections[1].chars,
+            "## Two\nbody two\nmore\n".chars().count()
+        );
+        // Section spans tile the whole document exactly.
+        let total: usize = sections.iter().map(|s| s.chars).sum();
+        assert_eq!(total, text.chars().count());
+    }
+
+    #[test]
+    fn test_markdown_sections_caps_at_max_md_sections_and_last_absorbs_the_rest() {
+        let mut text = String::new();
+        for i in 0..(MAX_MD_SECTIONS + 5) {
+            text.push_str(&format!("# H{i}\nbody\n"));
+        }
+        let sections = markdown_sections(&text);
+        assert_eq!(sections.len(), MAX_MD_SECTIONS);
+        // Every offset reported stays truthful: the last section's offset
+        // plus its char count reaches exactly the end of the text, proving
+        // it really did absorb the 5 headings past the cap rather than
+        // silently dropping their text.
+        let last = sections.last().unwrap();
+        assert_eq!(
+            last.offset.unwrap() + last.chars,
+            text.chars().count(),
+            "last section must absorb every char past the cap"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // extract_plain_text (txt/md whole-file reader) -- pure I/O boundaries,
+    // no ReplTool involved.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_plain_text_empty_file_has_no_sections() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("empty.txt");
+        std::fs::write(&path, "").unwrap();
+
+        let parsed =
+            extract_plain_text(&path, "empty.txt", ExtractBudget::DEFAULT, "txt", "text").unwrap();
+
+        assert_eq!(parsed.text, "");
+        assert!(parsed.sections.is_empty());
+    }
+
+    #[test]
+    fn test_extract_plain_text_accepts_a_budget_hit_exactly_and_refuses_one_more() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("t.txt");
+        std::fs::write(&path, "abcde").unwrap();
+        let budget = ExtractBudget {
+            max_chars: 5,
+            max_cells: 0,
+        };
+        assert!(extract_plain_text(&path, "t.txt", budget, "txt", "text").is_ok());
+
+        std::fs::write(&path, "abcdef").unwrap();
+        let err = extract_plain_text(&path, "t.txt", budget, "txt", "text").unwrap_err();
+        assert!(err.to_string().contains("over the 5 character limit"));
+    }
+
+    #[test]
+    fn test_extract_plain_text_rejects_invalid_utf8() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("bad.txt");
+        std::fs::write(&path, [b'o', b'k', 0xff, 0xfe]).unwrap();
+
+        let err = extract_plain_text(&path, "bad.txt", ExtractBudget::DEFAULT, "txt", "text")
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not valid UTF-8"), "{msg}");
+        assert!(msg.contains("offset 2"), "{msg}");
+    }
+
+    #[test]
+    fn test_extract_plain_text_md_builds_sections_txt_does_not() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("t.md");
+        std::fs::write(&path, "# Heading\nbody\n").unwrap();
+        let parsed =
+            extract_plain_text(&path, "t.md", ExtractBudget::DEFAULT, "md", "markdown").unwrap();
+        assert_eq!(parsed.format, "md");
+        assert_eq!(parsed.document_type, "markdown");
+        assert_eq!(parsed.sections.len(), 1);
+
+        let path_txt = dir.path().join("t.txt");
+        std::fs::write(&path_txt, "# Heading\nbody\n").unwrap();
+        let parsed_txt =
+            extract_plain_text(&path_txt, "t.txt", ExtractBudget::DEFAULT, "txt", "text").unwrap();
+        assert_eq!(parsed_txt.sections.len(), 1);
+        assert_eq!(parsed_txt.sections[0].kind, "text");
+        assert_eq!(
+            parsed_txt.sections[0].chars,
+            parsed_txt.text.chars().count()
+        );
     }
 
     mod fixtures {
@@ -3006,6 +3459,343 @@ mod tests {
                 ),
                 "{msg}"
             );
+        }
+
+        // --------------------------------------------------------------
+        // PDF (text layer only). Fixtures are built with lopdf directly
+        // (re-exported by `pdf_extract::*`, so no extra dependency), the
+        // same low-level construction lopdf's own `create.rs` example
+        // uses: a Type1 Helvetica font (no embedded font file needed for
+        // pdf-extract's built-in core-font metrics), one content stream
+        // per page.
+        // --------------------------------------------------------------
+
+        fn pdf_dict(pairs: &[(&str, pdf_extract::Object)]) -> pdf_extract::Dictionary {
+            let mut dict = pdf_extract::Dictionary::new();
+            for (key, value) in pairs {
+                dict.set(*key, value.clone());
+            }
+            dict
+        }
+
+        /// Builds a PDF with one page per entry of `pages`, each page's text
+        /// written via a single `Tj` operator. An empty `pages` slice is not
+        /// meaningful (`Kids`/`Count` would be empty); callers needing a
+        /// page with no text use [`write_pdf_blank_page`] instead, which
+        /// still creates one real page, just with no text operators in its
+        /// content stream.
+        fn write_pdf(dir: &tempfile::TempDir, pages: &[&str]) -> PathBuf {
+            use pdf_extract::content::{Content, Operation};
+            use pdf_extract::{Document, Object, Stream};
+
+            let mut doc = Document::with_version("1.5");
+            let font_id = doc.add_object(pdf_dict(&[
+                ("Type", Object::from("Font")),
+                ("Subtype", Object::from("Type1")),
+                ("BaseFont", Object::from("Helvetica")),
+            ]));
+            let resources_id = doc.add_object(pdf_dict(&[(
+                "Font",
+                Object::Dictionary(pdf_dict(&[("F1", Object::Reference(font_id))])),
+            )]));
+            let pages_id = doc.new_object_id();
+            let mut kids = Vec::new();
+            for page_text in pages {
+                let content = Content {
+                    operations: vec![
+                        Operation::new("BT", vec![]),
+                        Operation::new("Tf", vec!["F1".into(), 12.into()]),
+                        Operation::new("Td", vec![72.into(), 700.into()]),
+                        Operation::new("Tj", vec![Object::string_literal(*page_text)]),
+                        Operation::new("ET", vec![]),
+                    ],
+                };
+                let content_id =
+                    doc.add_object(Stream::new(pdf_dict(&[]), content.encode().unwrap()));
+                let page_id = doc.add_object(pdf_dict(&[
+                    ("Type", Object::from("Page")),
+                    ("Parent", Object::Reference(pages_id)),
+                    ("Contents", Object::Reference(content_id)),
+                ]));
+                kids.push(Object::Reference(page_id));
+            }
+            let count = kids.len() as i64;
+            let pages_dict = pdf_dict(&[
+                ("Type", Object::from("Pages")),
+                ("Kids", Object::Array(kids)),
+                ("Count", Object::Integer(count)),
+                ("Resources", Object::Reference(resources_id)),
+                (
+                    "MediaBox",
+                    Object::Array(vec![
+                        Object::Integer(0),
+                        Object::Integer(0),
+                        Object::Integer(612),
+                        Object::Integer(792),
+                    ]),
+                ),
+            ]);
+            doc.objects.insert(pages_id, Object::Dictionary(pages_dict));
+            let catalog_id = doc.add_object(pdf_dict(&[
+                ("Type", Object::from("Catalog")),
+                ("Pages", Object::Reference(pages_id)),
+            ]));
+            doc.trailer.set("Root", catalog_id);
+            let path = dir.path().join("doc.pdf");
+            doc.save(&path).unwrap();
+            path
+        }
+
+        /// One real page with an empty content stream: a well-formed PDF
+        /// with a page tree but no text operators anywhere, matching a
+        /// scanned/image-only PDF's text layer (empty, not absent).
+        fn write_pdf_blank_page(dir: &tempfile::TempDir) -> PathBuf {
+            use pdf_extract::content::Content;
+            use pdf_extract::{Document, Object, Stream};
+
+            let mut doc = Document::with_version("1.5");
+            let pages_id = doc.new_object_id();
+            let content = Content::<Vec<_>> { operations: vec![] };
+            let content_id = doc.add_object(Stream::new(pdf_dict(&[]), content.encode().unwrap()));
+            let page_id = doc.add_object(pdf_dict(&[
+                ("Type", Object::from("Page")),
+                ("Parent", Object::Reference(pages_id)),
+                ("Contents", Object::Reference(content_id)),
+            ]));
+            let pages_dict = pdf_dict(&[
+                ("Type", Object::from("Pages")),
+                ("Kids", Object::Array(vec![Object::Reference(page_id)])),
+                ("Count", Object::Integer(1)),
+                ("Resources", Object::Dictionary(pdf_dict(&[]))),
+                (
+                    "MediaBox",
+                    Object::Array(vec![
+                        Object::Integer(0),
+                        Object::Integer(0),
+                        Object::Integer(612),
+                        Object::Integer(792),
+                    ]),
+                ),
+            ]);
+            doc.objects.insert(pages_id, Object::Dictionary(pages_dict));
+            let catalog_id = doc.add_object(pdf_dict(&[
+                ("Type", Object::from("Catalog")),
+                ("Pages", Object::Reference(pages_id)),
+            ]));
+            doc.trailer.set("Root", catalog_id);
+            let path = dir.path().join("blank.pdf");
+            doc.save(&path).unwrap();
+            path
+        }
+
+        /// A one-page PDF (from [`write_pdf`]) re-saved with RC4 V1
+        /// encryption (the simplest supported scheme, no extra crate
+        /// needed): `doc.is_encrypted()` is true on load, which
+        /// `extract_pdf` must refuse before attempting anything.
+        fn write_encrypted_pdf(dir: &tempfile::TempDir) -> PathBuf {
+            use pdf_extract::{Document, EncryptionState, EncryptionVersion, Object, Permissions};
+
+            let path = write_pdf(dir, &["secret contents"]);
+            let mut doc = Document::load(&path).unwrap();
+            // RC4 key derivation needs the trailer's /ID (first element);
+            // write_pdf's minimal trailer does not set one, so encrypt()
+            // would otherwise fail with DecryptionError::MissingFileID.
+            doc.trailer.set(
+                "ID",
+                Object::Array(vec![
+                    Object::string_literal(b"0123456789abcdef".to_vec()),
+                    Object::string_literal(b"0123456789abcdef".to_vec()),
+                ]),
+            );
+            let permissions = Permissions::PRINTABLE
+                | Permissions::COPYABLE
+                | Permissions::COPYABLE_FOR_ACCESSIBILITY
+                | Permissions::PRINTABLE_IN_HIGH_QUALITY;
+            let state = EncryptionState::try_from(EncryptionVersion::V1 {
+                document: &doc,
+                owner_password: "owner-pw",
+                user_password: "user-pw",
+                permissions,
+            })
+            .unwrap();
+            doc.encrypt(&state).unwrap();
+            let enc_path = dir.path().join("encrypted.pdf");
+            doc.save(&enc_path).unwrap();
+            enc_path
+        }
+
+        #[tokio::test]
+        async fn test_run_reads_pdf_pages_with_sections_and_complete_window() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = write_pdf(&dir, &["First page text", "Second page text"]);
+            let name = path.file_name().unwrap().to_str().unwrap().to_string();
+
+            let outcome = DocumentReadTool
+                .run(json!({"path": name}), &ctx_in(&dir))
+                .await
+                .unwrap();
+
+            assert!(outcome.ok);
+            assert_eq!(outcome.payload["format"], "pdf");
+            assert_eq!(outcome.payload["document_type"], "pdf");
+            let sections = outcome.payload["sections"].as_array().unwrap();
+            assert_eq!(sections.len(), 2);
+            assert_eq!(sections[0]["kind"], "page");
+            assert_eq!(sections[0]["name"], "Page 1");
+            assert_eq!(sections[1]["name"], "Page 2");
+            let content = outcome.payload["content"].as_str().unwrap();
+            assert!(content.contains("First page text"), "{content}");
+            assert!(content.contains("Second page text"), "{content}");
+            assert!(outcome.rendered.contains("complete"));
+        }
+
+        #[tokio::test]
+        async fn test_run_pdf_with_no_text_layer_is_empty_with_a_note() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = write_pdf_blank_page(&dir);
+            let name = path.file_name().unwrap().to_str().unwrap().to_string();
+
+            let outcome = DocumentReadTool
+                .run(json!({"path": name}), &ctx_in(&dir))
+                .await
+                .unwrap();
+
+            assert!(outcome.ok);
+            assert_eq!(outcome.payload["total_chars"], 0);
+            assert_eq!(outcome.payload["sections"].as_array().unwrap().len(), 0);
+            assert!(
+                outcome.rendered.contains("no extractable text layer"),
+                "{}",
+                outcome.rendered
+            );
+        }
+
+        #[tokio::test]
+        async fn test_run_refuses_an_encrypted_pdf() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = write_encrypted_pdf(&dir);
+            let name = path.file_name().unwrap().to_str().unwrap().to_string();
+
+            let err = DocumentReadTool
+                .run(json!({"path": name}), &ctx_in(&dir))
+                .await
+                .unwrap_err();
+
+            assert!(err.to_string().contains("encrypted PDF"), "{err}");
+        }
+
+        #[test]
+        fn test_extract_pdf_with_page_cap_refuses_over_the_limit() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = write_pdf(&dir, &["one", "two", "three"]);
+
+            let err =
+                extract_pdf_with_page_cap(&path, "doc.pdf", ExtractBudget::DEFAULT, 2).unwrap_err();
+
+            assert!(
+                err.to_string().contains("3 pages, over the 2-page limit"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn test_extract_pdf_enforces_the_character_budget() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = write_pdf(&dir, &["abcdefgh"]);
+            let budget = ExtractBudget {
+                max_chars: 5,
+                max_cells: 0,
+            };
+
+            let err = extract_pdf(&path, "doc.pdf", budget).unwrap_err();
+
+            assert!(err.to_string().contains("over the limit"), "{err}");
+        }
+
+        #[test]
+        fn test_extract_pdf_rejects_a_non_pdf_file() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("not-really.pdf");
+            std::fs::write(&path, b"this is not a pdf").unwrap();
+
+            let err = extract_pdf(&path, "not-really.pdf", ExtractBudget::DEFAULT).unwrap_err();
+
+            assert!(
+                err.to_string()
+                    .starts_with("document_read: 'not-really.pdf' could not be parsed"),
+                "{err}"
+            );
+        }
+
+        // --------------------------------------------------------------
+        // txt / md, through the ReplTool end to end.
+        // --------------------------------------------------------------
+
+        #[tokio::test]
+        async fn test_run_reads_txt_as_one_section() {
+            let dir = tempfile::TempDir::new().unwrap();
+            std::fs::write(dir.path().join("notes.txt"), "Plain notes, no structure.\n").unwrap();
+
+            let outcome = DocumentReadTool
+                .run(json!({"path": "notes.txt"}), &ctx_in(&dir))
+                .await
+                .unwrap();
+
+            assert!(outcome.ok);
+            assert_eq!(outcome.payload["format"], "txt");
+            let sections = outcome.payload["sections"].as_array().unwrap();
+            assert_eq!(sections.len(), 1);
+            assert_eq!(sections[0]["kind"], "text");
+            assert!(outcome.payload["content"]
+                .as_str()
+                .unwrap()
+                .contains("Plain notes"));
+        }
+
+        #[tokio::test]
+        async fn test_run_reads_md_headings_as_sections() {
+            let dir = tempfile::TempDir::new().unwrap();
+            std::fs::write(
+                dir.path().join("plan.md"),
+                "# Plan\nintro\n## Step one\ndo the thing\n",
+            )
+            .unwrap();
+
+            let outline = DocumentReadTool
+                .run(json!({"path": "plan.md", "outline": true}), &ctx_in(&dir))
+                .await
+                .unwrap();
+
+            let sections = outline.payload["sections"].as_array().unwrap();
+            assert_eq!(sections.len(), 2);
+            assert_eq!(sections[0]["name"], "Plan");
+            assert_eq!(sections[1]["name"], "Step one");
+            let jump_offset = sections[1]["offset"].as_u64().unwrap();
+
+            let jumped = DocumentReadTool
+                .run(
+                    json!({"path": "plan.md", "offset": jump_offset}),
+                    &ctx_in(&dir),
+                )
+                .await
+                .unwrap();
+            assert!(jumped.payload["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("## Step one"));
+        }
+
+        #[tokio::test]
+        async fn test_run_rejects_txt_that_is_not_valid_utf8() {
+            let dir = tempfile::TempDir::new().unwrap();
+            std::fs::write(dir.path().join("bad.txt"), [b'o', b'k', 0xff, 0xfe]).unwrap();
+
+            let err = DocumentReadTool
+                .run(json!({"path": "bad.txt"}), &ctx_in(&dir))
+                .await
+                .unwrap_err();
+
+            assert!(err.to_string().contains("not valid UTF-8"), "{err}");
         }
     }
 }

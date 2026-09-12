@@ -427,13 +427,14 @@ DynamicTool trait (async, Send+Sync)
     ├── ToolRegistry (register, get, list, execute)
     │       └── Capability enforcement (deny-by-default)
     │
-    ├── Built-in tools (19 wrappers, zero code duplication)
+    ├── Built-in tools (zero code duplication; document_extract, a stub whose
+    │       default path always errored, was deleted 2026-09-12 — read
+    │       Office documents via Ion's document_read instead)
     │       ├── Analysis: benchmark, genome_read, memory_search, session_query
     │       ├── System: build_health, clean_all, config_get, health_check,
     │       │           sccache_setup, sccache_status, steward_status, sweep,
     │       │           system_info, tool_availability, wipe
-    │       ├── Utility: calculator, file_read, python_exec
-    │       └── Document: document_extract
+    │       └── Utility: calculator, file_read, python_exec
     │
     └── CLI commands
             ├── tooling-list      — List available tools

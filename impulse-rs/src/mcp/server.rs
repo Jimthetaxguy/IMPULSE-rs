@@ -341,6 +341,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_mcp_tools_list_does_not_advertise_document_extract() {
+        // Stage 1b-B: document_extract was a stub whose default path always
+        // errored ("Python extraction not yet wired") and is superseded by
+        // document_read (xlsx/csv/docx/pdf/txt/md). It was deleted from
+        // src/tooling/builtin, so MCP's tools/list -- which enumerates
+        // whatever ToolRegistry has registered -- must no longer list it.
+        let response = test_server()
+            .process_request(r#"{"method":"tools/list"}"#)
+            .await;
+        let tools = response["tools"].as_array().expect("tools is an array");
+        assert!(
+            !tools.iter().any(|tool| tool["name"] == "document_extract"),
+            "document_extract must not be advertised: {tools:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_mcp_tool_response() {
         let response = test_server()
             .process_request(

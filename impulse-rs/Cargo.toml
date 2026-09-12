@@ -118,6 +118,12 @@ docx = { version = "0.4", optional = true, package = "docx-rs" }
 zip = { version = "0.6", optional = true, default-features = false, features = ["deflate"] }
 # Streaming docx text extraction for ion document_read (calamine already pulls quick-xml 0.31)
 quick-xml = { version = "0.31", optional = true }
+# PDF text-layer extraction for ion document_read (Stage 1b-B). Text layer only, page-by-page
+# via the public output_doc_page/PlainTextOutput API so page count and the extracted-character
+# budget can be enforced before/between pages; never renders images (PlainTextOutput has no
+# image handling). Re-exports lopdf at its crate root (`pdf_extract::Document` etc.), so no
+# separate lopdf dependency is needed for this crate's own PDF handling or its test fixtures.
+pdf-extract = { version = "0.12", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -135,8 +141,16 @@ monty-support = ["dep:pyo3"]
 # DataFusion support enables advanced analytics and aggregation
 datafusion-support = ["dep:datafusion"]
 # Office support enables document parsing and generation
-# Supports: Excel (.xlsx), Word (.docx), CSV
-office-support = ["dep:calamine", "dep:rust_xlsxwriter", "dep:docx", "dep:zip", "dep:quick-xml"]
+# Supports: Excel (.xlsx), Word (.docx), CSV; ion's document_read additionally reads
+# PDF (text layer), txt, and md under this same feature.
+office-support = [
+    "dep:calamine",
+    "dep:rust_xlsxwriter",
+    "dep:docx",
+    "dep:zip",
+    "dep:quick-xml",
+    "dep:pdf-extract",
+]
 
 [dev-dependencies]
 filetime = "0.2"

@@ -170,7 +170,9 @@ a review outcome. Today it bounds the Ion tool loop and, through
 
 ### tool sandbox roots — `[code]`
 The filesystem boundary every path-checking ion REPL tool (`file_read`, `file_write`, `bash_exec`'s
-`cwd`, `document_read`, `ion_verify`'s `repo`) resolves against: a session's `ReplContext.repo_root`
+`cwd`, `document_read`, `ion_verify`'s `repo`, and — Stage 1b-B, bridged the same way as
+`file_read`/`file_write` rather than through a bespoke path check — `memory_search`'s and
+`genome_read`'s `impulse_dir`) resolves against: a session's `ReplContext.repo_root`
 is its fixed write root (never widened, not even by a literal `CONFIRM`), and
 `ReplContext.allowed_read_roots` is a read-only extension list grown one path at a time via
 `/allow <path>` (which refuses an empty or nonexistent path; a bare `/allow` lists current grants;
@@ -218,15 +220,34 @@ Ion's read-only `document_read` tool: reads `xlsx` by streaming cells through ca
 reader under a character and cell budget (never the dense-grid parser; a chart or dialog sheet
 holds no cells and is skipped rather than failing the workbook), `docx` by streaming
 `word/document.xml` event by event through quick-xml so the object tree, many times the size of
-the XML, is never built, and `csv` through the `office` parser (files up to 10 MiB; containers
-inflated through a 64 MiB cap first; legacy
-`xls` refused; parsing on the blocking pool) and returns a section outline with
-whole-document offsets plus a bounded character window that ends on a line boundary and names
-the next offset, so a model inside a loop contract can jump to and page through an everyday
-document without flooding its context. Ungated like `file_read`; absolute paths are accepted;
-registered only with the default `office-support` feature.
+the XML, is never built, `csv` through the `office` parser, `pdf` (text layer only) by streaming
+pages one at a time through `pdf-extract`'s public page-render API (page count capped before any
+page renders; an encrypted PDF is refused outright; `PlainTextOutput` never renders images), and
+`txt`/`md` as whole-file UTF-8 reads (`md` additionally outlined by ATX heading) — files up to
+10 MiB; containers inflated through a 64 MiB cap first; legacy `xls` refused; parsing on the
+blocking pool — and returns a section outline with whole-document offsets plus a bounded
+character window that ends on a line boundary and names the next offset, so a model inside a
+loop contract can jump to and page through an everyday document without flooding its context.
+Ungated like `file_read`; absolute paths are accepted; registered only with the default
+`office-support` feature. `document_extract` (a separate, stubbed CLI/daemon dynamic tool whose
+default path always errored) was deleted rather than extended when `document_read` gained `pdf`.
 - **Source of truth:** `src/ion_repl/tool_document.rs` and
   `docs/superpowers/specs/2026-09-01-ion-document-tool-design.md`.
+
+### bridged memory tools — `[code]`
+`memory_search` and `genome_read` (`src/tooling/builtin/{memory_search,genome_read}.rs`) are
+ordinary `src/tooling::DynamicTool`s, registered in `ToolRegistry::with_defaults()` since before
+Stage 1b-B and already reachable from the CLI/daemon/MCP; that lane's addition was bridging them
+into Ion's `ReplToolRegistry` (`registry.rs::with_defaults`) via `DynamicToolBridge`, the same
+mechanism as `file_read`/`file_write`/`bash_exec`, rather than writing new `ReplTool` wrappers.
+They are ungated (read-only, `Capability::FileSystemRead` only) and get the tool sandbox for free:
+their `impulse_dir` parameter is declared `ParamType::FilePath`, so the shared
+`ToolRegistry::execute` → `validate_paths` step checks it against `ctx.sandbox_tool_context()`
+before either tool's own `execute` runs — no bespoke sandboxing code was needed. Internals
+(`genome_read` reads `.impulse/GENOME.md`; `memory_search` queries `retrieval::search_history`/
+`search_genome`) are unchanged by the bridging and out of this entry's scope.
+- **Source of truth:** `src/ion_repl/registry.rs`, `src/tooling/builtin/{memory_search,
+  genome_read}.rs`.
 
 ### agent registry — `[code]`
 The catalog of platform identity and launch metadata. It answers what can be named, detected, and

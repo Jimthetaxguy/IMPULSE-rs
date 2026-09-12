@@ -9,7 +9,6 @@ mod benchmarker;
 mod build_health;
 mod calculator;
 mod config_get;
-mod document_extract;
 mod file_read;
 mod file_write;
 mod genome_read;
@@ -28,7 +27,6 @@ pub use build_health::{
 };
 pub use calculator::CalculatorTool;
 pub use config_get::ConfigGetTool;
-pub use document_extract::DocumentExtractTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
 pub use genome_read::GenomeReadTool;
@@ -50,7 +48,6 @@ pub fn register_all(registry: &mut ToolRegistry) -> Result<(), ToolError> {
     registry.register(Box::new(CalculatorTool))?;
     registry.register(Box::new(CleanAllTool))?;
     registry.register(Box::new(ConfigGetTool))?;
-    registry.register(Box::new(DocumentExtractTool))?;
     registry.register(Box::new(FileReadTool))?;
     registry.register(Box::new(FileWriteTool))?;
     registry.register(Box::new(GenomeReadTool))?;
