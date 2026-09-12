@@ -934,3 +934,194 @@ cargo audit                                                 # unchanged: 11 pre-
                                                              # vulnerabilities / 18 warnings
 python3 docs/validate_docs.py --all                         # only pre-existing failures on main
 ```
+
+## Review round 5 (2026-09-12)
+
+PR #54 was marked ready-for-review, CI green at `59e770f`, but the coordinator relayed two problems:
+(a) `main` had advanced again (#52), producing a real `cli.rs` conflict; (b) Codex + Cursor left
+five findings on the PR. Fixed all five, merged `main`, and re-gated. The coordinator asked that the
+review threads themselves not be replied to or resolved here -- they will handle that separately.
+
+### 0. Merge `origin/main` (#52) -- `cli.rs` content conflict
+
+`git fetch origin && git merge origin/main` (main = `4dbb8b3`, adding v9 protocol endpoints, the
+`governed-promote`/`governed-discard` CLI subcommands, and `ion_repl/tool_claim.rs`'s typed
+refusal). One real conflict, in `impulse-rs/src/cli.rs`: both branches added a new `Commands`
+variant in the same location (this branch's `InternalPdfText`, main's `GovernedPromote`/
+`GovernedDiscard`). Resolved by keeping both variants, one after the other -- no semantic overlap,
+just two independent additions landing at the same enum position. `CONTEXT.md` and
+`handlers/direct_dispatch.rs` auto-merged cleanly, matching what the coordinator's message
+predicted. `cargo build --workspace` verified clean immediately after the merge, before touching
+anything else.
+
+### 1. P1 Codex, `cli.rs:710` -- AGENTS.md's CLI-command convention was stale, not violated
+
+AGENTS.md L170-174 said "New CLI commands go in `src/main.rs` with clap derive." Checked where
+`Commands` actually lives on `main`: `impulse-rs/src/main.rs` is a 32-line thin entrypoint (`cli::
+Cli::parse()` then dispatch) and has been since a much older "Phase 2 module extraction — main.rs
+1548→66" commit; the clap-derive `Commands` enum itself has lived in `impulse-rs/src/cli.rs` ever
+since, with `direct_dispatch.rs`/`daemon_dispatch.rs` sharing ONE handler match per variant (a
+daemon-only command like `GovernedClaim`/`GovernedVerify`/`GovernedReview` gets an explicit
+direct-mode refusal in `direct_dispatch.rs`, its real logic only in `daemon_dispatch.rs` -- never a
+second implementation). Confirmed: `InternalPdfText` (this lane) and `GovernedPromote`/
+`GovernedDiscard` (#52) BOTH already follow this real, current convention -- neither needed to move.
+The actual bug was AGENTS.md's own text, unmaintained since the Phase 2 refactor. Fixed
+`AGENTS.md`'s item 2 in place to describe the real convention (cli.rs declaration, shared handler
+across `direct_dispatch.rs`/`daemon_dispatch.rs`, plus the `ion` binary's own minimal `IonCommand`
+mirror for the subset it exposes) rather than the stale text. Per the coordinator's instruction, #52's
+placement is noted here as ALSO conforming (not moved, not flagged as a problem).
+
+### 2. P1 Codex, `ion_repl/mod.rs:111` -- `impulse_dir` defaulted to `$HOME/.impulse`, not the project's own state directory
+
+`ReplContext::sandbox_tool_context` set `impulse_dir` from `history::impulse_home()` (`IMPULSE_HOME`
+if set, else `$HOME/.impulse`). A normal `ion` launch has no `IMPULSE_HOME` set at all, so this
+resolved to `$HOME/.impulse` -- a directory with no relationship to the launching project. `genome_read`
+silently reported "no genome" and `memory_search` silently queried the wrong (usually nonexistent)
+index for the overwhelmingly common case: an ordinary launch inside a repo whose real `GENOME.md`/
+`retrieval.db` live at `<repo_root>/.impulse`.
+
+**Fix:** the default is now `<repo_root>/.impulse`; `IMPULSE_HOME` is honored ONLY when the env var
+is itself explicitly set and non-blank (mirroring `history::impulse_home()`'s "explicit env var" tier
+but deliberately NOT its `$HOME/.impulse` fallback tier, which is the specifically wrong default
+here). `history::impulse_home()` itself is untouched -- it keeps governing `.impulse/ion_history`
+exactly as before; these were always two independently-tuned resolutions of ".impulse", and round 1's
+doc comment claiming they were the "same ... convention" was itself part of what round 5 found wrong.
+New tests: `test_sandbox_tool_context_default_impulse_dir_is_the_project_state_directory`,
+`test_sandbox_tool_context_honors_an_explicitly_set_impulse_home_without_widening_read_roots`,
+`test_sandbox_tool_context_ignores_a_blank_impulse_home` (`ion_repl/mod.rs`).
+
+### 3. P1 Codex, `ion_repl/mod.rs:115` -- `impulse_dir` widened the SHARED read sandbox for every bridged tool
+
+Round 1 also added `impulse_dir` to the shared `allowed_read_roots` -- reasoned as safe because it
+was "Impulse's own state directory, not arbitrary host filesystem." But `allowed_read_roots` is
+shared by EVERY bridged read tool: widening it to cover an explicitly-configured, out-of-repo
+`IMPULSE_HOME` would silently authorize `file_read` (and, via the write roots, effectively
+`bash_exec`) to reach it too, with no `/allow` grant ever having been given for that purpose.
+
+**Fix:** `impulse_dir` is now NEVER added to `allowed_read_roots`. The default case (item 2, inside
+`repo_root`) needs no separate grant, since `repo_root` already is one. An explicitly-configured,
+out-of-repo `IMPULSE_HOME` is instead validated by `memory_search`/`genome_read` THEMSELVES,
+tool-scoped: both tools' `impulse_dir` param changed from `ParamType::FilePath` (which routed it
+through the generic, `allowed_read_roots`-based `ToolExecutor::validate_paths` check) to
+`ParamType::String` (invisible to that generic check), and each tool now calls a new shared helper,
+`tooling::builtin::resolve_and_validate_memory_dir` (in `builtin/mod.rs`, used by both sibling
+modules), which checks the resolved path against exactly `{ctx.impulse_dir, IMPULSE_HOME}` and
+refuses (`ToolError::PathNotAllowed`, the same variant/shape the generic check already used) anything
+else -- reusing `tooling::traits::secure_resolve` (now `pub(crate)`) for the same traversal-free
+containment guarantee the shared sandbox has, so a `..`-traversal candidate can't slip through either.
+
+**Behavior change, disclosed:** an `/allow` grant no longer extends what `memory_search`/`genome_read`
+can reach at all (round 2's `run_memory_search_with_an_impulse_dir_inside_the_allow_grant_succeeds`
+assumed the old model and was rewritten to `..._is_still_refused`) -- these two tools' `impulse_dir`
+reach is now governed by a completely independent, narrower mechanism than `/allow`.
+
+**The coordinator's exact acceptance test**, added to `ion_repl/tool_bridge.rs`:
+`run_file_read_on_an_explicitly_configured_impulse_home_is_denied` (file_read refused) paired with
+`run_genome_read_with_the_same_explicitly_configured_impulse_home_succeeds` (genome_read, same path,
+succeeds) -- proving the two authorization surfaces are genuinely independent, not "IMPULSE_HOME
+happens to work for everything because it's on some shared list."
+
+**Cross-file test-lock consolidation (found while adding these tests):** `ion_repl::history`,
+`tooling::builtin::{memory_search,genome_read}`, and now `ion_repl::mod` all mutate the
+process-global `IMPULSE_HOME` env var in tests; each had (or was about to gain) its OWN private
+`static ENV_LOCK`, which only serializes within one file, not across files -- the exact cross-file
+race `test_support.rs`'s own doc comment already warns about for `ION_GATE_LAUNCHER`. Added a shared
+`test_support::impulse_home_env_lock()` (mirroring `ion_gate_launcher_env_lock`/
+`retrieval_embedding_env_lock`'s existing pattern) and pointed every one of those files' `env_lock()`
+helpers at it.
+
+### 4. MEDIUM Cursor, `registry.rs:129` -- `memory_search` could create `retrieval.db`/WAL sidecars under any granted directory
+
+`memory_search` is registered ungated (read-only, `Capability::FileSystemRead` only), but it called
+`retrieval::search_history`/`search_genome`, which call `RetrievalStore::open` -- `create_dir_all`
+plus a plain `Connection::open` (creates `retrieval.db` if missing) plus WAL journal-mode pragma
+writes (creates `-wal`/`-shm` sidecars). After a `/allow` grant on any directory for an unrelated
+reason, the model could cause real SQLite files to be CREATED there -- a write side effect a
+read-only tool must never have.
+
+**Fix:** new `RetrievalStore::open_read_only` (`src/retrieval/store.rs`) -- no `create_dir_all`,
+`Connection::open_with_flags(..., OpenFlags::SQLITE_OPEN_READ_ONLY)` (no CREATE bit), no pragma
+writes, no `init_schema()` call, refuses outright if `retrieval.db` does not already exist.
+`memory_search.rs`'s `execute()` checks for `retrieval.db`'s existence explicitly before ever
+touching `RetrievalStore` (an early, side-effect-free "No retrieval index found" response when
+absent) and, when present, opens read-only and calls `search_history_keyword`/`search_genome_keyword`
+directly, bypassing `retrieval::search_history`/`search_genome`'s write-capable-`open`-based wrapper
+entirely. Disclosed, deliberate narrowing: this specifically drops semantic/vector-mode dispatch for
+`memory_search` (vector search needs the optional `sqlite-vec` extension loaded through the same
+write-capable path used by indexing; re-plumbing that through a strictly read-only connection is a
+larger, separate change) -- the tool's OWN default mode is already keyword, and the safety property
+(no side effects from a read-only tool) matters more here than semantic-mode parity for this one
+tool. New tests: `test_open_read_only_refuses_when_retrieval_db_does_not_exist`,
+`test_open_read_only_creates_no_files_when_retrieval_db_does_not_exist`,
+`test_open_read_only_succeeds_against_an_existing_index`,
+`test_open_read_only_connection_refuses_a_write` (`store.rs`);
+`test_execute_reports_no_retrieval_index_when_impulse_dir_exists_but_db_does_not`,
+`test_execute_creates_no_files_under_a_granted_directory_with_no_index` (asserts the granted
+directory is byte-for-byte empty afterward, not just that the response looks right),
+`test_execute_finds_results_via_the_read_only_path_against_a_real_index` (`memory_search.rs`).
+
+### 5. P2 Codex, `registry.rs:137` -- `genome_read` returned the whole `GENOME.md` unbounded
+
+With the loop contract's newest-result compaction floor (`ion_repl::chat`'s context-budget
+handling), a sufficiently large genome could trip `LoopTrip::ContextBudget` before the provider ever
+saw the result.
+
+**Fix:** `max_chars` (default `DEFAULT_MAX_CHARS` = 12,000, capped at `MAX_CHARS_CAP` = 32,000 --
+local constants in `genome_read.rs` matching `ion_repl::tool_document`'s identical values exactly,
+not imported: that module is `office-support`-gated, `genome_read` is not) and `offset` page through
+either the full file or a matched section's own text. A local `window()` function -- character-
+counted, snaps a truncated cut back to the last full line, never mid-line -- reimplements
+`ion_repl::tool_document::window`'s exact algorithm and field shape (`content`, `returned_chars`,
+`truncated`, `next_offset`) so a model already paging `document_read` recognizes this immediately;
+reimplemented locally rather than imported for the same feature-gating reason as the constants. New
+tests: `test_window_accepts_everything_when_it_fits`,
+`test_window_snaps_a_truncated_cut_to_the_last_full_line`,
+`test_window_past_end_is_empty_and_not_truncated`,
+`test_execute_paginates_a_large_genome_at_the_default_cap`,
+`test_execute_max_chars_is_capped_regardless_of_what_the_caller_asks`,
+`test_execute_offset_resumes_from_a_prior_next_offset`,
+`test_execute_paginates_a_matched_section_too` (`genome_read.rs`).
+
+### Gate evidence (review round 5, this checkout)
+
+```
+cd impulse-rs
+git fetch origin && git merge origin/main --no-edit         # 1 real conflict (cli.rs, resolved by
+                                                              # keeping both new variants);
+                                                              # CONTEXT.md/direct_dispatch.rs
+                                                              # auto-merged clean
+cargo build --workspace                                     # clean
+cargo test --workspace                                      # 3010 passed / 0 failed / 9 ignored
+                                                              # across every crate; impulse-rs lib
+                                                              # alone: 2327 passed / 0 failed / 5
+                                                              # ignored; tests/pdf_extraction_
+                                                              # isolation.rs: 17/17 passed
+cargo clippy --workspace --all-targets -- -D warnings        # clean (after adding a justified
+                                                              # #[allow(clippy::await_holding_lock)]
+                                                              # to the three test modules whose new
+                                                              # IMPULSE_HOME-mutating tests hold the
+                                                              # shared lock across an .await --
+                                                              # matching ion_repl::mod's existing,
+                                                              # identically-justified precedent)
+cargo fmt --all -- --check                                   # clean
+cargo build --no-default-features                            # clean, zero warnings
+cargo test --no-default-features --lib                       # 2168 passed / 1 failed / 5 ignored --
+                                                              # the same pre-existing, unrelated
+                                                              # daemon::tests::tests::
+                                                              # test_plugin_registry_initialized_
+                                                              # after_init failure confirmed in
+                                                              # rounds 3, 4, and now 5
+cargo audit                                                  # unchanged: 11 pre-existing
+                                                              # vulnerabilities / 18 warnings
+python3 docs/validate_docs.py --all                          # only pre-existing failures on main
+```
+
+Isolated re-run of `tests/pdf_extraction_isolation.rs`: 17/17 passed, unaffected by this round (no
+files under `src/ion_repl/tool_document.rs`/`src/handlers/internal_pdf_text.rs` touched).
+
+New/changed test totals this round: `ion_repl/mod.rs` +4 (`sandbox_tool_context` rewritten from 2
+tests to 5 -- 1 updated in place, 4 new); `ion_repl/tool_bridge.rs` +2 net (1 rewritten, 2 new);
+`retrieval/store.rs` +4; `tooling/builtin/memory_search.rs` +3 net (2 rewritten, 3 new);
+`tooling/builtin/genome_read.rs` +9 net (2 rewritten, 7 new). No files this lane does not own were
+touched beyond `AGENTS.md` (item 1's doc fix) and `impulse-rs/src/cli.rs` (the merge conflict
+resolution, additive only -- no existing content changed).

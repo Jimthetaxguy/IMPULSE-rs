@@ -376,19 +376,47 @@ ordinary `src/tooling::DynamicTool`s, registered in `ToolRegistry::with_defaults
 Stage 1b-B and already reachable from the CLI/daemon/MCP; that lane's addition was bridging them
 into Ion's `ReplToolRegistry` (`registry.rs::with_defaults`) via `DynamicToolBridge`, the same
 mechanism as `file_read`/`file_write`/`bash_exec`, rather than writing new `ReplTool` wrappers.
-They are ungated (read-only, `Capability::FileSystemRead` only). An EXPLICITLY-supplied
-`impulse_dir` gets the sandbox for free: it is declared `ParamType::FilePath`, so the shared
-`ToolRegistry::execute` → `validate_paths` step checks it against `ctx.sandbox_tool_context()`
-before either tool's own `execute` runs. An OMITTED `impulse_dir` needed one real fix (review
-round 1, P2-2/P2-3 on PR #54): `validate_paths` only checks parameters a caller supplied, so the
-default previously fell through to each tool's own bare `".impulse"` literal — unrelated to
-`IMPULSE_HOME`/the sandbox. Both tools now default from `ctx.impulse_dir`, and
-`ReplContext::sandbox_tool_context` sets that field from `history::impulse_home()` and adds it to
-the read roots explicitly (it is Impulse's own state directory, not arbitrary host filesystem).
-Internals (`genome_read` reads `<impulse_dir>/GENOME.md`; `memory_search` queries
-`retrieval::search_history`/`search_genome`) are otherwise unchanged by the bridging.
-- **Source of truth:** `src/ion_repl/registry.rs`, `src/tooling/builtin/{memory_search,
-  genome_read}.rs`.
+They are ungated (read-only, `Capability::FileSystemRead` only).
+
+**`impulse_dir` default and validation (review round 1 P2-2/P2-3, corrected twice more in review
+round 5, P1 Codex items 2/3):** the default is `<repo_root>/.impulse` (the PROJECT's own state
+directory, where `GENOME.md`/`retrieval.db` actually live) — never `history::impulse_home()`'s
+`$HOME/.impulse` fallback, which a normal launch (no `IMPULSE_HOME` set) resolved to and which has
+no relationship to the project. `IMPULSE_HOME` is honored only when explicitly set and non-blank.
+An explicit `impulse_dir` override is no longer routed through the shared `ToolRegistry::execute` →
+`validate_paths` → `ctx.allowed_read_roots` check (declaring it `ParamType::FilePath`, round 1's
+approach, forced widening those SHARED roots to cover an out-of-repo `IMPULSE_HOME`, which would
+have also authorized `file_read`/`bash_exec` to reach it). Both tools now declare `impulse_dir` as
+`ParamType::String` and call a shared `tooling::builtin::resolve_and_validate_memory_dir` helper
+themselves, checking the resolved path against exactly `{ctx.impulse_dir, IMPULSE_HOME}` — an
+`/allow` grant does NOT extend this tool-scoped reach (a deliberate, disclosed behavior change from
+round 2). `history::impulse_home()` itself is untouched, still governing `.impulse/ion_history`
+only.
+
+**`memory_search` is read-only for real now (review round 5, MEDIUM/Cursor):** it used to call
+`retrieval::search_history`/`search_genome`, which open `RetrievalStore` write-capable
+(`create_dir_all` + `Connection::open`, which creates `retrieval.db`, plus WAL pragma writes that
+create `-wal`/`-shm` sidecars) — so pointing this ungated tool at any `/allow`-granted directory
+with no existing index could CREATE real files there. It now checks for `retrieval.db`'s existence
+itself (reporting a typed "No retrieval index found" when absent, no side effects) and, when
+present, opens via a new `RetrievalStore::open_read_only` (`SQLITE_OPEN_READ_ONLY`, no
+`create_dir_all`, no pragma writes, no schema init) — a disclosed, deliberate narrowing to
+keyword-only search for this tool specifically (semantic/vector mode needs the write-capable path's
+optional `sqlite-vec` extension loading).
+
+**`genome_read` pages now (review round 5, P2/Codex):** it used to return the whole `GENOME.md` (or
+whole matched section) unbounded, risking `LoopTrip::ContextBudget` on a large genome. `max_chars`
+(default 12,000, capped at 32,000) and `offset` window the content exactly the way
+`document_read`'s own `window()` does (same field names: `content`/`returned_chars`/`truncated`/
+`next_offset`), reimplemented locally since `ion_repl::tool_document` is `office-support`-gated and
+`genome_read` is not.
+
+Internals otherwise unchanged: `genome_read` reads `<impulse_dir>/GENOME.md`; `memory_search`
+queries `RetrievalStore`'s own `search_history_keyword`/`search_genome_keyword` directly.
+- **Source of truth:** `src/ion_repl/registry.rs`, `src/ion_repl/mod.rs`
+  (`ReplContext::sandbox_tool_context`), `src/tooling/builtin/mod.rs`
+  (`resolve_and_validate_memory_dir`), `src/tooling/builtin/{memory_search,genome_read}.rs`,
+  `src/retrieval/store.rs` (`RetrievalStore::open_read_only`).
 
 ### agent registry — `[code]`
 The catalog of platform identity and launch metadata. It answers what can be named, detected, and

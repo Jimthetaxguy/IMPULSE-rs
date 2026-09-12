@@ -121,6 +121,11 @@ impl ReplTool for DynamicToolBridge {
 }
 
 #[cfg(test)]
+// clippy: some tests here hold `impulse_home_env_lock()`/`env_lock()`
+// across an `.await` (must span the whole IMPULSE_HOME-dependent async
+// call so a concurrent test can't mutate the env var mid-call); see
+// ion_repl::mod's identical justification for the same pattern.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
 
@@ -409,11 +414,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_memory_search_with_an_impulse_dir_inside_the_allow_grant_succeeds() {
-        // Positive control for the two refusal tests above: the SAME
-        // out-of-repo_root directory, but explicitly /allow-granted, must
-        // be reachable -- proving the refusal above is about the sandbox,
-        // not merely "any impulse_dir outside repo_root fails".
+    async fn run_memory_search_with_an_impulse_dir_inside_an_allow_grant_is_still_refused() {
+        // Review round 5, P1 Codex, item 3 (behavior change from round 2):
+        // an `/allow` grant no longer extends what `memory_search`'s/
+        // `genome_read`'s `impulse_dir` may reach at all -- these two tools
+        // validate `impulse_dir` against a CLOSED set (`ctx.impulse_dir`,
+        // or an explicitly-configured `IMPULSE_HOME`), never the shared
+        // `allowed_read_roots` `/allow` extends. This intentionally
+        // supersedes round 2's `run_memory_search_with_an_impulse_dir_
+        // inside_the_allow_grant_succeeds`, which assumed the OLD model
+        // where `impulse_dir` was a `ParamType::FilePath` checked against
+        // those shared roots.
         let repo_root = tempfile::tempdir().expect("tempdir");
         let granted = tempfile::tempdir().expect("tempdir");
         let registry = Arc::new(ToolRegistry::with_defaults());
@@ -423,7 +434,7 @@ mod tests {
             allowed_read_roots: vec![granted.path().to_path_buf()],
         };
 
-        let outcome = bridge
+        let result = bridge
             .run(
                 serde_json::json!({
                     "query": "auth",
@@ -431,9 +442,96 @@ mod tests {
                 }),
                 &ctx,
             )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "an /allow grant must not widen memory_search's impulse_dir reach"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Review round 5, P1 Codex, items 2/3's exact acceptance test: an
+    // explicitly-configured IMPULSE_HOME outside repo_root is reachable by
+    // the two memory tools (tool-scoped validation) but NOT by file_read
+    // (never added to the shared allowed_read_roots) -- proving the two
+    // authorization surfaces are genuinely independent, not "IMPULSE_HOME
+    // happens to work for everything because it's on some shared list".
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn run_file_read_on_an_explicitly_configured_impulse_home_is_denied() {
+        let _guard = crate::test_support::impulse_home_env_lock();
+        let prev = std::env::var("IMPULSE_HOME").ok();
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let history_path = home_dir.path().join("ion_history");
+        std::fs::write(&history_path, "/help\n").unwrap();
+        std::env::set_var("IMPULSE_HOME", home_dir.path());
+
+        let repo_root = tempfile::tempdir().expect("tempdir");
+        let registry = Arc::new(ToolRegistry::with_defaults());
+        let bridge = DynamicToolBridge::new(registry, "file_read", "n/a");
+        let ctx = ReplContext {
+            repo_root: repo_root.path().to_path_buf(),
+            ..ReplContext::default()
+        };
+
+        let result = bridge
+            .run(
+                serde_json::json!({"path": history_path.display().to_string()}),
+                &ctx,
+            )
+            .await;
+
+        match prev {
+            Some(value) => std::env::set_var("IMPULSE_HOME", value),
+            None => std::env::remove_var("IMPULSE_HOME"),
+        }
+
+        assert!(
+            result.is_err(),
+            "file_read must never gain access to IMPULSE_HOME just because the memory tools can \
+             read it -- the shared allowed_read_roots must stay untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_genome_read_with_the_same_explicitly_configured_impulse_home_succeeds() {
+        let _guard = crate::test_support::impulse_home_env_lock();
+        let prev = std::env::var("IMPULSE_HOME").ok();
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            home_dir.path().join("GENOME.md"),
+            "# from the configured IMPULSE_HOME",
+        )
+        .unwrap();
+        std::env::set_var("IMPULSE_HOME", home_dir.path());
+
+        let repo_root = tempfile::tempdir().expect("tempdir");
+        let registry = Arc::new(ToolRegistry::with_defaults());
+        let bridge = DynamicToolBridge::new(registry, "genome_read", "n/a");
+        let ctx = ReplContext {
+            repo_root: repo_root.path().to_path_buf(),
+            ..ReplContext::default()
+        };
+
+        // Omitting `impulse_dir` proves the DEFAULT (`ctx.impulse_dir`,
+        // which `sandbox_tool_context` set from IMPULSE_HOME here) already
+        // resolves correctly -- the same path `file_read` was just denied
+        // above, reached a completely different way.
+        let outcome = bridge
+            .run(serde_json::json!({}), &ctx)
             .await
-            .expect("an /allow-granted impulse_dir must be reachable");
+            .expect("genome_read must reach the same IMPULSE_HOME file_read was denied");
+
+        match prev {
+            Some(value) => std::env::set_var("IMPULSE_HOME", value),
+            None => std::env::remove_var("IMPULSE_HOME"),
+        }
 
         assert!(outcome.ok);
+        assert!(outcome
+            .rendered
+            .contains("from the configured IMPULSE_HOME"));
     }
 }

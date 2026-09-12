@@ -170,7 +170,19 @@ worktrees, and CI.
 ### Code Requirements
 
 1. New modules need unit tests in a `mod tests` block — not just one happy-path test
-2. New CLI commands go in `src/main.rs` with clap derive
+2. New CLI commands are declared as `clap::Subcommand` variants of `Commands` in `impulse-rs/src/cli.rs`
+   (`main.rs` has been a thin entrypoint since the "Phase 2 module extraction" refactor — it only
+   calls `cli::Cli::parse()` and dispatches; it has not held the clap derive struct/enum itself in a
+   long time). The handler is shared, not duplicated per execution mode: `direct_dispatch.rs` and
+   `daemon_dispatch.rs` both match on the same `cli::Commands` variant, routing daemon-only
+   commands (e.g. `GovernedClaim`/`GovernedVerify`/`GovernedReview`/`GovernedPromote`/
+   `GovernedDiscard`) to an explicit direct-mode refusal rather than a second implementation. A
+   command also exposed from the `ion` binary (`src/bin/ion.rs`) additionally needs a matching
+   variant on `ion`'s own minimal `IonCommand` enum (a deliberately small CLI surface, not the
+   full `Commands` set) whose handler still calls the ONE shared function in `handlers::` — never a
+   second implementation of the command's actual logic (review round 5, PR #54: confirmed
+   `InternalPdfText` and `GovernedPromote`/`GovernedDiscard` both already follow this real
+   convention; this line was simply stale, predating the extraction).
 3. New dynamic tools implement the `DynamicTool` trait in `src/tooling/`
 4. File operations must use atomic writes (temp + rename)
 5. Error handling must use `Result<T>` — never `unwrap()` on user-facing paths

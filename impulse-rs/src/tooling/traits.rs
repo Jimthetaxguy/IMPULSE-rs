@@ -32,7 +32,7 @@ fn normalize_lexical(path: &Path) -> PathBuf {
 /// canonicalizes the nearest existing ancestor and re-attaches the remainder,
 /// collapsing `..` lexically — so `<root>/../../etc/x` can never be mistaken for
 /// a path under `<root>`.
-fn secure_resolve(path: &Path) -> PathBuf {
+pub(crate) fn secure_resolve(path: &Path) -> PathBuf {
     if let Ok(canonical) = std::fs::canonicalize(path) {
         return canonical;
     }

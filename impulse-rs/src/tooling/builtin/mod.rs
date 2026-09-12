@@ -40,6 +40,61 @@ pub use system_info::SystemInfoTool;
 use super::error::ToolError;
 use super::registry::ToolRegistry;
 
+/// Resolves and validates the `impulse_dir` parameter shared by the two
+/// read-only memory tools (`memory_search`, `genome_read`) -- review
+/// round 5, P1 Codex on PR #54, items 2/3.
+///
+/// **Why not the shared `allowed_read_roots` check:** these tools used to
+/// declare `impulse_dir` as `ParamType::FilePath`, routing it through
+/// `ToolExecutor::validate_paths`'s generic check against `ctx.
+/// allowed_read_roots` -- the SAME roots `file_read`/`bash_exec` share.
+/// Making a normal launch's `.impulse` correctly resolve to the project's
+/// own state directory (not `$HOME/.impulse`) needed `ReplContext::
+/// sandbox_tool_context` to add whatever `impulse_dir` resolves to onto
+/// those shared roots -- but for an explicitly-configured `IMPULSE_HOME`
+/// OUTSIDE the project, that would have widened `file_read`'s/`bash_exec`'s
+/// own reach to include it too, authorizing every bridged tool to read
+/// (and, via the write roots, `bash_exec` to at least traverse) a
+/// directory the model was never granted access to for anything but these
+/// two memory tools specifically.
+///
+/// Instead, `memory_search`/`genome_read` declare `impulse_dir` as a plain
+/// `ParamType::String` (invisible to the generic FilePath check) and each
+/// call this helper themselves: the resolved path must be either `ctx.
+/// impulse_dir` (the project's own default -- always allowed, and never
+/// itself widened) or, only when the `IMPULSE_HOME` environment variable
+/// is itself explicitly set and non-blank, that exact directory. Anything
+/// else is refused with the same `ToolError::PathNotAllowed` shape
+/// `validate_paths` already uses for the shared roots, so a caller sees a
+/// consistent refusal regardless of which mechanism produced it. Path
+/// containment reuses `secure_resolve` (canonicalize-or-lexically-collapse)
+/// so a `..`-traversal candidate can't be mistaken for a path under either
+/// allowed root, matching the shared sandbox's own guarantee exactly.
+pub(super) fn resolve_and_validate_memory_dir(
+    explicit: Option<&str>,
+    ctx: &super::traits::ToolContext,
+) -> Result<std::path::PathBuf, ToolError> {
+    let Some(explicit) = explicit else {
+        return Ok(ctx.impulse_dir.clone());
+    };
+    let candidate = ctx.resolve_path(explicit);
+    let mut allowed_roots = vec![ctx.impulse_dir.clone()];
+    if let Ok(home) = std::env::var("IMPULSE_HOME") {
+        if !home.trim().is_empty() {
+            allowed_roots.push(std::path::PathBuf::from(home));
+        }
+    }
+    let resolved_candidate = super::traits::secure_resolve(&candidate);
+    let is_allowed = allowed_roots
+        .iter()
+        .any(|root| resolved_candidate.starts_with(super::traits::secure_resolve(root)));
+    if is_allowed {
+        Ok(candidate)
+    } else {
+        Err(ToolError::PathNotAllowed(candidate.display().to_string()))
+    }
+}
+
 /// Register all built-in tools into a registry
 pub fn register_all(registry: &mut ToolRegistry) -> Result<(), ToolError> {
     registry.register(Box::new(BashExecTool))?;
