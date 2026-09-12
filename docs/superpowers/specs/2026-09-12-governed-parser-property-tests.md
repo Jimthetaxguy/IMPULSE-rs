@@ -28,6 +28,18 @@ entry, `impulse-rs/Cargo.toml`) and a property-test module next to each
 target function, so the invariant itself is checked over a wide generated
 input space, with a differential oracle (real `git`) wherever one exists.
 
+**Update (2026-09-12, PR review round 2):** this branch was rebased onto
+`main` after `#53`'s round-3 commit made the config-include-chain parser
+byte-wise (`config_include_paths`/`join_continued_lines`/`config_value`/
+`expand_config_path` now take/return `&[u8]`/`Vec<u8>`, and
+`config_include_paths` returns `Result`, for a real correctness reason:
+the previous UTF-8 decode silently skipped every include directive in a
+file containing one non-UTF-8 byte anywhere). This lane's tests were
+adapted to the new signatures with no invariant weakened; full detail in
+the lane card's "PR review round 2" section. Invariant 1e below (the
+`Result`-is-`Err`-only-for-the-documented-case property) is new as of that
+adaptation.
+
 ## Scope: what was NOT built
 
 Per the assignment, this lane owns **only** new test modules, the
@@ -103,6 +115,7 @@ specific tests.
 | 1b | `join_continued_lines` | `governed_producers.rs` | A comment line never continues, and never absorbs a pending continuation; an even (escaped) trailing-backslash count never continues | direct (generated mixed `Plain`/`Continuing`/`EscapedBackslash`/`Comment` line sequences) |
 | 1c | `config_include_paths` (BFS closure) | `governed_producers.rs` | For generated `[include]` trees (relative / nested-relative / absolute / quoted / backslash-continued paths, each leaf non-empty), the include closure equals the set of `file:` origins `git config --file <root> --list --show-origin --includes` reports | **real `git`**, not skipped |
 | 1d | `config_include_paths` | `governed_producers.rs` | `includeIf` sections pin their target regardless of the condition text (documented divergence from Git, not a gap) | direct |
+| 1e | `config_include_paths` | `governed_producers.rs` | On unix, `Result` is never `Err` for arbitrary bytes -- the one documented failure case (a non-UTF-8 include path where paths are not bytes) is compiled out under `#[cfg(unix)]`, provably rather than merely unfalsified | direct, `#[cfg(unix)]`-gated |
 | 2a | `status_contains_subject_change`, `is_untracked_impulse_runtime_artifact` | `governed_producers.rs` | Never panic on arbitrary `-z` bytes | none |
 | 2b | `status_contains_subject_change` | `governed_producers.rs` | Any non-`??` record (including a rename's second, no-XY-prefix record) is always a change | direct |
 | 2c | `status_contains_subject_change` | `governed_producers.rs` | An untracked path is exempt iff it is one of the exact named `.impulse/...` spellings or a documented `.tmp.`/`worktrees/` prefix family -- root-anchored: `.impulse/MEMORY_CANDIDATES.json.evil` and `x/.impulse/...` are never exempt | direct + cross-check against `is_untracked_impulse_runtime_artifact` over generated mixed-record streams including two-record renames |

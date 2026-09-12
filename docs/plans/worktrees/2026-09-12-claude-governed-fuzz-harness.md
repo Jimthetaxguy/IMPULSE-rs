@@ -93,11 +93,14 @@ tags: [worktree, lane, proptest, fuzz, governed, ion, testing]
 
 ## Changes
 
-- `governed_producers.rs`: 14 property tests covering
+- `governed_producers.rs`: 15 property tests covering
   `config_include_paths`/`join_continued_lines`/`config_value`/`expand_config_path`
   (panic safety, the comment/escaped-backslash continuation invariant, a
   differential closure test against real `git config --show-origin`, the
-  `includeIf`-ignores-condition invariant), `status_contains_subject_change`/
+  `includeIf`-ignores-condition invariant, and -- since main's config parser
+  is now byte-wise (`&[u8]` in, `config_include_paths` `Result`-typed out;
+  see "PR review round 2" below) -- an explicit `Result`-is-`Err`-only-for-
+  the-documented-case property), `status_contains_subject_change`/
   `is_untracked_impulse_runtime_artifact` (panic safety, tracked-record
   always-change, root-anchored untracked exemption including the two named
   attack shapes, a full cross-check against generated mixed record streams
@@ -146,7 +149,7 @@ tags: [worktree, lane, proptest, fuzz, governed, ion, testing]
 
 ## Tests
 
-59 new tests total (14 + 13 + 21 + 8 + 3, per file below; confirmed by
+60 new tests total (15 + 13 + 21 + 8 + 3, per file below; confirmed by
 `cargo test --lib -- proptests --list`), all under `#[cfg(test)] mod
 proptests` blocks alongside each target's existing `mod tests`. Full
 per-file breakdown is in the "Invariant table" of the spec doc. Every
@@ -199,14 +202,89 @@ error -- proptest's own docs recommend committing `proptest-regressions/`
 precisely so a regression discovered once, anywhere, is never silently
 re-lost by someone else's clone or by CI.
 
+## PR review round 2 (2026-09-12, PR #59, rebase onto main)
+
+The coordinator rebased this branch onto `main` (now `1f866d6`, containing
+merged `#53` and `#55`) and reopened it as PR #59 (the original stacked PR
+#57 was closed by GitHub when #53's branch was deleted after merge -- a
+rebase side effect, not a review finding). CI on #59 failed to *compile*
+the lib tests: 9 errors (`E0308` mismatched types, `E0277` "can't compare
+`Vec<u8>` with `String`", `E0369` `prop_assert_eq` on
+`Result<Vec<PathBuf>, anyhow::Error>`).
+
+**Root cause:** `#53`'s round-3 commit (merged to `main`, landed under this
+branch after the rebase) made the shared Git config include-chain parser
+byte-wise, for a real correctness reason unrelated to this lane -- the
+first version decoded the file as UTF-8 and skipped every include directive
+in a file the moment one non-UTF-8 byte appeared anywhere in it (a Latin-1
+byte in a comment or a user's name, say), silently leaving Git-honored
+includes unpinned. The signatures this lane's tests called against changed
+underneath them:
+
+| Function | Before (what this lane's tests were written against) | After (`#53` round 3, on `main`) |
+|---|---|---|
+| `config_include_paths` | `fn(bytes: &[u8], base: &Path) -> Vec<PathBuf>` | `fn(bytes: &[u8], base: &Path) -> Result<Vec<PathBuf>>` |
+| `join_continued_lines` | `fn(text: &str) -> Vec<String>` | `fn(bytes: &[u8]) -> Vec<Vec<u8>>` |
+| `config_value` | `fn(raw: &str) -> Option<String>` | `fn(raw: &[u8]) -> Option<Vec<u8>>` |
+| `expand_config_path` | `fn(value: &str, base: &Path) -> PathBuf` | `fn(value: &[u8], base: &Path) -> Result<PathBuf>` |
+
+**Fix, in `governed_producers.rs`'s `mod proptests` only (no production
+code touched, matching this lane's ownership):**
+- Every string-strategy generator feeding these four functions switched to
+  a byte-vector strategy (`proptest::collection::vec(any::<u8>(), ..)`) or
+  `.as_bytes()` at the call site.
+- `join_continued_lines_never_continues_past_a_comment`'s two invariant
+  checks (comment lines survive verbatim; escaped-backslash lines never
+  merge) now compare `&[u8]` slices instead of `&str`s.
+- `our_include_closure` (the differential-oracle helper) and
+  `config_include_treats_includeif_like_include_regardless_of_condition`
+  both now `.expect(...)` the `Result` before using the `Vec<PathBuf>` --
+  appropriate here because every input they feed the parser is a generated,
+  well-formed config file, where the only documented failure mode (a
+  non-UTF-8 include path on a non-unix target -- see
+  `path_from_config_bytes`'s `#[cfg(not(unix))]` arm) cannot occur.
+- **New invariant added**, per the fix instructions ("add a property that
+  arbitrary bytes never panic and that the `Result` is `Err` only for the
+  documented cases"): `config_include_paths_is_infallible_on_unix_for_arbitrary_bytes`
+  (`#[cfg(unix)]`) asserts `config_include_paths(&bytes, base).is_ok()` for
+  4096-byte arbitrary input. This is provably true, not merely
+  unfalsified-by-this-generator: on unix, `path_from_config_bytes` (which
+  `expand_config_path` is the only fallible caller of) always returns `Ok`
+  because an `OsStr` *is* bytes there, so the one documented `Err` path is
+  compiled out entirely under `#[cfg(unix)]` -- there is no byte sequence
+  that can reach it on this platform. This lane's own arbitrary-bytes panic
+  test (`config_include_paths_never_panics_on_arbitrary_bytes`) is kept
+  unconditional and separate, since panic-safety must hold regardless of
+  platform or `Result` variant.
+
+No invariant from the original 59 tests was weakened, dropped, or had its
+assertion loosened to make the byte-wise types fit -- every fix was a type
+adaptation at the call site, confirmed by re-running the differential
+oracles (`config_include_closure_matches_git_show_origin` against real
+`git`, still passing) and the full property suite.
+
+**Gate on `main` at `1f866d6` + this branch's three commits (isolated
+`CARGO_TARGET_DIR=target-fuzz`):**
+- `cargo build --workspace`: clean
+- `cargo test --workspace`: **2769 passed, 0 failed, 9 ignored**
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean
+- `cargo fmt --all -- --check`: clean
+- `cargo test --lib -- proptests`: **60 passed, 0 failed**
+- `python3 docs/validate_docs.py --all`: only the same 4 pre-existing
+  failures (ADR-0014 `status: proposed`, three stale March docs)
+
 ## Handoff Notes
 
-- This branch is stacked on PR #53 (`claude/adr0019-p1-fixes-20260912` at
-  `637afaf`), not on `main` -- `gh pr create --base claude/adr0019-p1-fixes-20260912`,
-  and the PR will need retargeting to `main` after #53 merges (the config-
-  include-chain functions this lane's differential tests exercise
-  (`config_include_paths`, `join_continued_lines`, `digest_config_chain`)
-  only exist on that branch).
+- **Superseded by "PR review round 2" above.** This branch was originally
+  stacked on PR #53 (`claude/adr0019-p1-fixes-20260912` at `637afaf`), not
+  `main` -- the coordinator rebased it onto `main` (`1f866d6`, #53 and #55
+  now merged) and it now lives as PR #59; the original stacked PR #57 was
+  closed by GitHub as a rebase side effect when #53's source branch was
+  deleted. The config-include-chain functions this lane's differential
+  tests exercise (`config_include_paths`, `join_continued_lines`,
+  `digest_config_chain`) now live on `main` directly, in their `#53`
+  round-3 byte-wise form -- see "PR review round 2" for the signature
+  changes and how this lane's tests were adapted.
 - No production code changes anywhere in this diff. Every file this lane
   touches production-owned by another lane got test-module-only additions;
   the two findings above are reports for the owning lanes, not fixes.

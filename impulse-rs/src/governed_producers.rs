@@ -4271,21 +4271,46 @@ mod proptests {
         }
 
         #[test]
-        fn join_continued_lines_never_panics(text in ".{0,4096}") {
-            let _ = join_continued_lines(&text);
+        fn join_continued_lines_never_panics(
+            bytes in proptest::collection::vec(any::<u8>(), 0..4096),
+        ) {
+            let _ = join_continued_lines(&bytes);
         }
 
         #[test]
-        fn config_value_never_panics(text in ".{0,1024}") {
-            let _ = config_value(&text);
+        fn config_value_never_panics(
+            bytes in proptest::collection::vec(any::<u8>(), 0..1024),
+        ) {
+            let _ = config_value(&bytes);
         }
 
         #[test]
         fn expand_config_path_never_panics(
-            value in ".{0,512}",
+            value in proptest::collection::vec(any::<u8>(), 0..512),
             base in "[a-zA-Z0-9/._-]{0,64}",
         ) {
             let _ = expand_config_path(&value, Path::new(&base));
+        }
+
+        /// `config_include_paths` is `Result`-typed for portability (a
+        /// non-UTF-8 include path cannot become a `PathBuf` without
+        /// guessing on a platform where paths are not bytes -- see
+        /// `path_from_config_bytes`'s `#[cfg(not(unix))]` arm), but on this
+        /// platform (unix: an `OsStr` *is* bytes, so `path_from_config_bytes`
+        /// never fails) that error path is unreachable. So here,
+        /// unconditionally, arbitrary bytes never produce `Err` -- the only
+        /// documented failure case is compiled out entirely on unix, not
+        /// merely untriggered by this generator.
+        #[test]
+        #[cfg(unix)]
+        fn config_include_paths_is_infallible_on_unix_for_arbitrary_bytes(
+            bytes in proptest::collection::vec(any::<u8>(), 0..4096),
+        ) {
+            let base = Path::new("/base/.git");
+            prop_assert!(
+                config_include_paths(&bytes, base).is_ok(),
+                "config_include_paths returned Err on unix, where path_from_config_bytes cannot fail"
+            );
         }
     }
 
@@ -4334,7 +4359,7 @@ mod proptests {
             lines in proptest::collection::vec(line_kind_strategy(), 0..12),
         ) {
             let text = lines.iter().map(render_line).collect::<Vec<_>>().join("\n");
-            let joined = join_continued_lines(&text);
+            let joined = join_continued_lines(text.as_bytes());
 
             // Invariant 1: every comment line in the input survives as its
             // own joined line, verbatim -- it is never swallowed into a
@@ -4342,8 +4367,9 @@ mod proptests {
             for kind in &lines {
                 if let LineKind::Comment(_) = kind {
                     let rendered = render_line(kind);
+                    let rendered_bytes = rendered.as_bytes();
                     prop_assert!(
-                        joined.iter().any(|line| line == &rendered),
+                        joined.iter().any(|line| line.as_slice() == rendered_bytes),
                         "comment line {rendered:?} did not survive verbatim in {joined:?}"
                     );
                 }
@@ -4355,8 +4381,10 @@ mod proptests {
             for kind in &lines {
                 if let LineKind::EscapedBackslash(body) = kind {
                     let rendered = render_line(kind);
-                    let contains_whole =
-                        joined.iter().any(|line| line.ends_with(&rendered) || line == &rendered);
+                    let rendered_bytes = rendered.as_bytes();
+                    let contains_whole = joined
+                        .iter()
+                        .any(|line| line.ends_with(rendered_bytes) || line.as_slice() == rendered_bytes);
                     prop_assert!(
                         contains_whole,
                         "escaped-backslash line {rendered:?} lost its trailing `\\\\` in {joined:?} (body {body:?})"
@@ -4444,7 +4472,10 @@ mod proptests {
                 continue;
             };
             let parent = path.parent().unwrap_or_else(|| Path::new("."));
-            for include in config_include_paths(&bytes, parent) {
+            let includes = config_include_paths(&bytes, parent).expect(
+                "generated config bytes are well-formed and unix path conversion cannot fail",
+            );
+            for include in includes {
                 queue.push(include);
             }
         }
@@ -4522,7 +4553,8 @@ mod proptests {
                 "[includeIf \"{condition}\"]\n\tpath = always-pinned.include\n"
             );
             let base = Path::new("/repo/.git");
-            let includes = config_include_paths(bytes.as_bytes(), base);
+            let includes = config_include_paths(bytes.as_bytes(), base)
+                .expect("generated config bytes are well-formed and unix path conversion cannot fail");
             prop_assert_eq!(includes, vec![base.join("always-pinned.include")]);
         }
     }
