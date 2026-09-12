@@ -9,9 +9,13 @@ pub mod config;
 mod config_keys;
 mod governed_task;
 mod memory_candidate;
+pub mod memory_record;
 pub mod persistence;
 mod producer_reservation;
 pub mod session;
+
+pub use memory_candidate::MemoryCandidateDecisionError;
+pub use memory_record::{MemoryIndexMarker, MemoryLogError, MemoryLogHead};
 
 pub use config::*;
 pub use governed_task::*;

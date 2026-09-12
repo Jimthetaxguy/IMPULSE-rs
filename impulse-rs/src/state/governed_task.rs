@@ -2283,7 +2283,7 @@ fn new_event(
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::state) mod tests {
     use std::sync::{Arc, Barrier};
 
     #[cfg(unix)]
@@ -2319,7 +2319,10 @@ mod tests {
         format!("sha256:{}", character.to_string().repeat(64))
     }
 
-    fn state() -> (TempDir, Arc<State>) {
+    // Shared with `state::memory_candidate::tests` (ADR-0020): reaching an
+    // accepted governed run is the only way to obtain a real memory candidate,
+    // and CLAUDE.md forbids duplicating the factory.
+    pub(in crate::state) fn state() -> (TempDir, Arc<State>) {
         let root = TempDir::new().unwrap();
         let base = root.path().join("impulse-test");
         std::fs::create_dir_all(base.join(".impulse")).unwrap();
@@ -2523,7 +2526,7 @@ mod tests {
             .unwrap()
     }
 
-    fn accept_run(state: &State, suffix: &str) -> GovernedTaskRun {
+    pub(in crate::state) fn accept_run(state: &State, suffix: &str) -> GovernedTaskRun {
         let registered = state
             .register_governed_task(registration(state, &format!("register-{suffix}")))
             .unwrap();

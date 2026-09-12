@@ -24,6 +24,20 @@ pub struct HistoryUpsert<'a> {
     pub content_hash: &'a str,
 }
 
+/// One promoted memory record, as the retrieval index stores it.
+pub struct MemoryRecordUpsert<'a> {
+    pub record_id: &'a str,
+    pub project_id: &'a str,
+    pub scope: &'a str,
+    pub kind: &'a str,
+    pub valid_from: &'a str,
+    pub title: &'a str,
+    pub body: &'a str,
+    pub source_json: &'a str,
+    pub search_text: &'a str,
+    pub content_hash: &'a str,
+}
+
 pub struct GenomeUpsert<'a> {
     pub decision_id: &'a str,
     pub date: &'a str,
@@ -165,6 +179,23 @@ CREATE TABLE IF NOT EXISTS genome_decisions (
   content_hash TEXT NOT NULL DEFAULT ''
 );
 
+-- ADR-0020: promoted memory records. Deliberately its own table rather than
+-- extra rows in `genome_decisions`: the hand-curated GENOME and the promoted
+-- record log are different artifacts with different owners, and collapsing
+-- them into one table would make "where did this fact come from" unanswerable.
+CREATE TABLE IF NOT EXISTS memory_records (
+  record_id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  valid_from TEXT NOT NULL,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL,
+  source_json TEXT NOT NULL,
+  search_text TEXT NOT NULL,
+  content_hash TEXT NOT NULL DEFAULT ''
+);
+
 CREATE TABLE IF NOT EXISTS retrieval_meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -177,6 +208,11 @@ CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(
 
 CREATE VIRTUAL TABLE IF NOT EXISTS genome_fts USING fts5(
   decision_id,
+  search_text
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+  record_id,
   search_text
 );
 
@@ -206,7 +242,7 @@ CREATE TABLE IF NOT EXISTS genome_vec (
         )
         .context("Failed to ensure content_hash column on genome_decisions")?;
 
-        self.set_meta("schema_version", "2")
+        self.set_meta("schema_version", "3")
             .context("Failed to set schema_version in retrieval_meta")?;
         Ok(())
     }
@@ -384,6 +420,10 @@ CREATE TABLE IF NOT EXISTS genome_vec (
             .context("Failed to delete from history_vec")?;
         tx.execute("DELETE FROM genome_vec", [])
             .context("Failed to delete from genome_vec")?;
+        tx.execute("DELETE FROM memory_records", [])
+            .context("Failed to delete from memory_records")?;
+        tx.execute("DELETE FROM memory_fts", [])
+            .context("Failed to delete from memory_fts")?;
         let _ = tx.execute("DELETE FROM history_vec0", []);
         let _ = tx.execute("DELETE FROM genome_vec0", []);
         tx.commit()
@@ -543,6 +583,10 @@ ON CONFLICT(decision_id) DO UPDATE SET
                 .context("Failed to delete all from history_entries")?;
             tx.execute("DELETE FROM history_vec", [])
                 .context("Failed to delete all from history_vec")?;
+            tx.execute("DELETE FROM memory_records", [])
+                .context("Failed to delete from memory_records")?;
+            tx.execute("DELETE FROM memory_fts", [])
+                .context("Failed to delete from memory_fts")?;
             let _ = tx.execute("DELETE FROM history_vec0", []);
             tx.commit()
                 .context("Failed to commit delete_history_except transaction")?;
@@ -636,6 +680,12 @@ ON CONFLICT(decision_id) DO UPDATE SET
             "INSERT INTO genome_fts(decision_id, search_text) SELECT decision_id, search_text FROM genome_decisions",
             [],
         ).context("Failed to repopulate genome_fts from genome_decisions")?;
+        tx.execute("DELETE FROM memory_fts", [])
+            .context("Failed to delete from memory_fts")?;
+        tx.execute(
+            "INSERT INTO memory_fts(record_id, search_text) SELECT record_id, search_text FROM memory_records",
+            [],
+        ).context("Failed to repopulate memory_fts from memory_records")?;
         tx.commit()
             .context("Failed to commit refresh_fts transaction")?;
         Ok(())
@@ -881,6 +931,167 @@ LIMIT ?2
         Ok(out)
     }
 
+    /// Insert or replace one promoted memory record and its FTS row.
+    pub fn upsert_memory_record(&self, row: MemoryRecordUpsert<'_>) -> Result<()> {
+        self.conn
+            .execute(
+                r#"
+INSERT INTO memory_records(record_id, project_id, scope, kind, valid_from, title, body, source_json, search_text, content_hash)
+VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+ON CONFLICT(record_id) DO UPDATE SET
+  project_id=excluded.project_id,
+  scope=excluded.scope,
+  kind=excluded.kind,
+  valid_from=excluded.valid_from,
+  title=excluded.title,
+  body=excluded.body,
+  source_json=excluded.source_json,
+  search_text=excluded.search_text,
+  content_hash=excluded.content_hash
+"#,
+                params![
+                    row.record_id,
+                    row.project_id,
+                    row.scope,
+                    row.kind,
+                    row.valid_from,
+                    row.title,
+                    row.body,
+                    row.source_json,
+                    row.search_text,
+                    row.content_hash
+                ],
+            )
+            .context("Failed to upsert memory record into retrieval store")?;
+        self.conn
+            .execute(
+                "DELETE FROM memory_fts WHERE record_id = ?1",
+                params![row.record_id],
+            )
+            .context("Failed to clear stale memory_fts row")?;
+        self.conn
+            .execute(
+                "INSERT INTO memory_fts(record_id, search_text) VALUES(?1, ?2)",
+                params![row.record_id, row.search_text],
+            )
+            .context("Failed to insert memory_fts row")?;
+        Ok(())
+    }
+
+    /// Drop indexed records that are no longer in the projection, so a
+    /// superseded or removed record cannot keep answering searches.
+    pub fn delete_memory_records_except(&self, keep_ids: &HashSet<String>) -> Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT record_id FROM memory_records")
+            .context("Failed to prepare memory_records id scan")?;
+        let existing = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .context("Failed to scan memory_records ids")?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("Failed to read memory_records ids")?;
+        for record_id in existing {
+            if keep_ids.contains(&record_id) {
+                continue;
+            }
+            self.conn
+                .execute(
+                    "DELETE FROM memory_records WHERE record_id = ?1",
+                    params![record_id],
+                )
+                .context("Failed to delete stale memory record")?;
+            self.conn
+                .execute(
+                    "DELETE FROM memory_fts WHERE record_id = ?1",
+                    params![record_id],
+                )
+                .context("Failed to delete stale memory_fts row")?;
+        }
+        Ok(())
+    }
+
+    pub fn count_memory_records(&self) -> Result<usize> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM memory_records", [], |row| row.get(0))
+            .context("Failed to count memory records")?;
+        Ok(count.max(0) as usize)
+    }
+
+    /// Keyword search over promoted memory records only. A pending or dismissed
+    /// candidate is never in this table, so it can never be returned here
+    /// (ADR-0013 rule 9).
+    pub fn search_memory_keyword(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+        let fts_query = Self::sanitize_fts_query(query);
+        if fts_query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = match self.conn.prepare_cached(
+            r#"
+SELECT m.record_id, m.title, m.body, bm25(memory_fts) AS rank
+FROM memory_fts
+JOIN memory_records m ON m.record_id = memory_fts.record_id
+WHERE memory_fts MATCH ?1
+ORDER BY rank
+LIMIT ?2
+"#,
+        ) {
+            Ok(stmt) => stmt,
+            Err(_) => return self.search_memory_keyword_like(query, limit),
+        };
+        let rows = stmt.query_map(params![fts_query, limit as i64], |row| {
+            Ok(SearchResult {
+                source: "memory".to_string(),
+                id: row.get(0)?,
+                title: row.get(1)?,
+                snippet: row.get(2)?,
+                score: row.get::<_, f64>(3)?,
+            })
+        });
+        match rows {
+            Ok(rows) => {
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row.context("Failed to read FTS result row from memory_fts")?);
+                }
+                Ok(out)
+            }
+            Err(_) => self.search_memory_keyword_like(query, limit),
+        }
+    }
+
+    fn search_memory_keyword_like(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+        let like = format!("%{}%", query.to_lowercase());
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                r#"
+SELECT record_id, title, body
+FROM memory_records
+WHERE lower(search_text) LIKE ?1
+ORDER BY valid_from DESC
+LIMIT ?2
+"#,
+            )
+            .context("Failed to prepare LIKE search on memory_records")?;
+        let rows = stmt
+            .query_map(params![like, limit as i64], |row| {
+                Ok(SearchResult {
+                    source: "memory".to_string(),
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    snippet: row.get(2)?,
+                    score: 0.0,
+                })
+            })
+            .context("Failed to execute LIKE search on memory_records")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("Failed to read memory_records LIKE search result row")?);
+        }
+        Ok(out)
+    }
+
     pub fn read_history_vectors(&self) -> Result<Vec<(String, Vec<f32>)>> {
         let mut stmt = self
             .conn
@@ -1087,9 +1298,11 @@ mod tests {
         assert!(store.table_exists("genome_fts").unwrap());
         assert!(store.table_exists("history_vec").unwrap());
         assert!(store.table_exists("genome_vec").unwrap());
+        assert!(store.table_exists("memory_records").unwrap());
+        assert!(store.table_exists("memory_fts").unwrap());
         assert_eq!(
             store.get_meta("schema_version").unwrap(),
-            Some("2".to_string())
+            Some("3".to_string())
         );
     }
 
