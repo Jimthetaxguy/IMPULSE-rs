@@ -141,12 +141,13 @@ tags: [worktree, lane, proptest, fuzz, governed, ion, testing]
 
 ## Tests
 
-80 new tests total (14 + 13 + 21 + 8 + 3 + the chat.rs findings-related
-swap described below), all under `#[cfg(test)] mod proptests` blocks
-alongside each target's existing `mod tests`. Full per-file breakdown is in
-the "Invariant table" of the spec doc. Every property test failed against a
-deliberately broken/reverted version of its target invariant before this
-card was written (either by temporarily weakening the assertion or, for the
+59 new tests total (14 + 13 + 21 + 8 + 3, per file below; confirmed by
+`cargo test --lib -- proptests --list`), all under `#[cfg(test)] mod
+proptests` blocks alongside each target's existing `mod tests`. Full
+per-file breakdown is in the "Invariant table" of the spec doc. Every
+property test failed against a deliberately broken/reverted version of its
+target invariant before this card was written (either by temporarily
+weakening the assertion or, for the
 two real findings below, by directly probing the current code) -- see
 Findings for the two cases that surfaced something worth reporting.
 
