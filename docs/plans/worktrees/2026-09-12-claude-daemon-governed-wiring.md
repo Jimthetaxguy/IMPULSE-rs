@@ -270,28 +270,69 @@ promotion, digest sorting, `MarkRunning`'s staged fallback) is in that function.
 
 Three exact changes this lane needs but did not make, in priority order:
 
-1. **`MEMORY_CANDIDATES.json` has the same exemption gap `PRODUCER_RESERVATIONS.json` had.** It is
-   in `REPO_RUNTIME_GITIGNORE_ENTRIES` but not in
-   `governed_producers::is_untracked_impulse_runtime_artifact`. In a project whose `.impulse` is not
-   gitignored, recording an operator approval therefore makes the canonical worktree dirty, and the
-   very next thing that happens to a staged run — promotion — fails with "governed workspace is
-   dirty". Add `b".impulse/MEMORY_CANDIDATES.json"` to the `matches!` list and
-   `.impulse/MEMORY_CANDIDATES.tmp.` to the `starts_with` chain, beside the entry this lane added.
-   This lane worked around it in its own fixtures rather than taking a second hunk in your file.
+1. ~~**`MEMORY_CANDIDATES.json` has the same exemption gap `PRODUCER_RESERVATIONS.json` had.**~~
+   **Accepted and fixed by PR #53** (`af2f737`, "fix(governed): exempt the accepted-run memory
+   candidate ledger"), with a regression test driving the real chain against a repository that has
+   no `.gitignore` at all, plus a negative control proving Git actually sees the candidate ledger.
+   Nothing left to do here. Kept for the record: the gap was that `MEMORY_CANDIDATES.json` was in
+   `REPO_RUNTIME_GITIGNORE_ENTRIES` but not in
+   `governed_producers::is_untracked_impulse_runtime_artifact`, so recording an operator approval
+   dirtied the canonical worktree and the very next step for a staged run — promotion — failed on a
+   tree the daemon had dirtied itself.
 2. **Unify the discardability rule.** `state/governed_task.rs`'s private
    `staged_worktree_is_discardable(task: &GovernedTaskRun) -> bool` is now duplicated as
    `impulse_ops::governed_wiring::staged_worktree_is_discardable`, because the daemon must refuse a
    discard *before* deleting the checkout, not after. The fix is one line: delete the private copy
    and call the `impulse_ops` one. The two are byte-for-byte the same logic today, and both have
    tests; leaving them split risks drift where the daemon allows what the ledger refuses.
-3. **Staged verification end to end is still unproven.** Per the 2026-09-12 coordination note,
-   `run_verification` observes `task.workspace_root`, so a staged task cannot pass verification on
-   `8dfd2ab`. This lane's reservation tests therefore run against **authoritative** profiled tasks,
-   and its staged tests compose the accepted state through `state.mutate_governed_task` directly
-   rather than through the producer chain. Once your fix lands, a single end-to-end staged run
-   (register -> claim -> verify -> review -> approve -> promote -> discard) through the daemon is
-   worth adding; `tests/daemon_governed_wiring.rs` is the natural home and already has the daemon
-   harness.
+3. **Staged verification end to end is still unproven on this branch.** Per the 2026-09-12
+   coordination note, `run_verification` observes `task.workspace_root`, so a staged task cannot
+   pass verification on `8dfd2ab`. This lane's reservation tests therefore run against
+   **authoritative** profiled tasks, and its staged tests compose the accepted state through
+   `state.mutate_governed_task` directly rather than through the producer chain. PR #53 fixes it;
+   the end-to-end test is written and waiting — see "Post-#53 merge checklist" below.
+
+## Post-#53 merge checklist
+
+PR #53 (`claude/adr0019-p1-fixes-20260912`) merges **before** this one. It contains verbatim
+cherry-picks of this lane's `8dca0a1` (clippy unblock, as `ba25bac`) and `e533b09`
+(`PRODUCER_RESERVATIONS.json` exemption, as `6c5fd6b`), so those two commits arrive on `main` from
+both sides. When it lands:
+
+1. `git merge origin/main` on this branch. **No rebase, no force** — a merge commit is expected.
+2. **Expected resolutions.**
+   - The two cherry-picked commits carry identical content on both sides and should merge with no
+     conflict. If Git does flag the `impulse-term`/`impulse-desktop` one-liners, take either side;
+     they are byte-identical.
+   - `impulse-rs/src/governed_producers.rs`, the `is_untracked_impulse_runtime_artifact` region:
+     **keep both entries** — this lane's `.impulse/PRODUCER_RESERVATIONS.json` and #53's
+     `.impulse/MEMORY_CANDIDATES.json`, with both `starts_with` prefixes.
+3. **Adapt to the one breaking signature.** `GovernedTaskRun::launch_working_directory()` becomes
+   `Result<&str, LaunchWorkingDirectoryError>`, with no canonical fallback for a staged task. This
+   lane has exactly **two** call sites, both test assertions:
+   - `impulse-rs/src/daemon/governed_wiring.rs:1009`
+   - `impulse-rs/tests/daemon_governed_wiring.rs:278`
+
+     Both become
+     `.expect("a materialized staged task has a launch directory")`. The other call sites
+     (`src/governed_producers.rs`, `src/state/governed_task.rs`) belong to #53 and arrive adapted.
+     `MarkRunning` on a staged task is refused until materialization is recorded, which this lane's
+     registration-time materialization already satisfies — no change needed, and
+     `staged_registration_materializes_the_worktree_before_any_launch` already asserts the record
+     is present at `Registered`.
+4. **Add the prepared staged end-to-end test.** Written, reviewed, and deliberately *not* run
+   before the merge because step 5 cannot pass on `8dfd2ab`. It lives at
+   `<scratchpad>/prepared/staged_end_to_end.rs` and drops into the `mod tests` block of
+   `src/daemon/governed_wiring.rs`. It drives one staged run through every endpoint this lane
+   added — register (materializes) -> `MarkRunning` -> Builder commit in the staged checkout ->
+   `SubmitGovernedClaim` -> `RunGovernedVerification` (real Cargo, under a reservation) ->
+   `RunGovernedSupervisorReview` (a bound fake provider, the one non-real step, copied from the
+   existing `BoundSupervisorProvider` pattern) -> operator approval -> `PromoteGovernedOutcome` ->
+   `DiscardGovernedStagedWorktree` — and asserts the canonical branch does not move until
+   promotion, that promotion syncs the working tree, that a promoted run orphans no commit, and
+   that every producer released its reservation. It needs two small `*_from_response` helpers and
+   five extra imports, both listed in the file's header comment.
+5. Re-run the full gate, push, and report the new totals. Do not merge.
 
 ### Residual gaps this lane knowingly leaves
 
