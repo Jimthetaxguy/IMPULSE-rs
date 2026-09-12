@@ -859,4 +859,84 @@ mod tests {
         rejected.review_state = GovernedReviewState::Rejected;
         assert_eq!(unreferenced_accepted_commit_on_discard(&rejected), None);
     }
+
+    /// Every clause the daemon endpoint checks before it runs Git, one at a
+    /// time. A surface that disables Promote on a different rule than the
+    /// daemon enforces is the drift this predicate exists to prevent.
+    ///
+    /// The fixture carries a claim because `governed_outcome_is_promotable`
+    /// requires one: `governed_producers::promote_governed_outcome` takes the
+    /// accepted revision from `latest_claim()`, so a claimless accepted run is
+    /// not a promotable state — and is not one the ledger produces either.
+    #[test]
+    fn test_promotable_requires_a_staged_scope_acceptance_and_an_active_worktree() {
+        let mut accepted = with_claim(with_staged(task(), pinned()));
+        accepted.review_state = GovernedReviewState::Accepted;
+        assert!(governed_outcome_is_promotable(&accepted));
+
+        let mut claimless = accepted.clone();
+        claimless.claims.clear();
+        assert!(
+            !governed_outcome_is_promotable(&claimless),
+            "promotion reads its accepted revision off the claim, so there must be one"
+        );
+
+        let mut authoritative = accepted.clone();
+        authoritative.world_scope = WorldScope::Authoritative;
+        assert!(
+            !governed_outcome_is_promotable(&authoritative),
+            "promotion is a staged-scope operation"
+        );
+
+        let mut awaiting_operator = accepted.clone();
+        awaiting_operator.review_state = GovernedReviewState::AwaitingOperator;
+        assert!(
+            !governed_outcome_is_promotable(&awaiting_operator),
+            "nothing is promoted before an operator accepts it"
+        );
+
+        let mut discarded = accepted.clone();
+        if let Some(staged) = discarded.staged_worktree.as_mut() {
+            staged.status = StagedWorktreeStatus::Discarded;
+        }
+        assert!(
+            !governed_outcome_is_promotable(&discarded),
+            "a reclaimed checkout has nothing left to promote"
+        );
+
+        let mut unstaged = accepted;
+        unstaged.staged_worktree = None;
+        assert!(!governed_outcome_is_promotable(&unstaged));
+    }
+
+    /// ADR-0019 rule 6: a blocked promotion is an execution fact and the
+    /// operator may retry it; a successful one is final.
+    #[test]
+    fn test_a_blocked_promotion_stays_promotable_and_a_promoted_one_does_not() {
+        let mut accepted = with_claim(with_staged(task(), pinned()));
+        accepted.review_state = GovernedReviewState::Accepted;
+
+        let blocked = with_promotion(
+            accepted.clone(),
+            GovernedPromotionOutcome::PromotionBlocked {
+                canonical_head: oid('c'),
+                reason: PromotionBlockedReason::ConcurrentBranchUpdate,
+            },
+        );
+        assert!(
+            governed_outcome_is_promotable(&blocked),
+            "reconciling the canonical branch and retrying is the documented remedy"
+        );
+
+        let promoted = with_promotion(
+            accepted,
+            GovernedPromotionOutcome::Promoted {
+                promoted_revision: oid('b'),
+            },
+        );
+        assert!(
+            !governed_outcome_is_promotable(&promoted),
+            "a run is promoted at most once"
+        );
+    }
 }
