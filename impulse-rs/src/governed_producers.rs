@@ -764,8 +764,16 @@ fn is_untracked_impulse_runtime_artifact(path: &[u8]) -> bool {
             // report the canonical tree as dirty for the rest of the run.
             | b".impulse/worktrees"
             | b".impulse/worktrees/"
+            // ADR-0012's reservation journal (PR #45). Nothing wrote this file
+            // on a governed path until the producer handlers adopted
+            // `with_reservation`, at which point an ungitignored `.impulse`
+            // started reporting the canonical tree as dirty the moment a
+            // verification reserved -- breaking every later claim and
+            // registration in the same workspace.
+            | b".impulse/PRODUCER_RESERVATIONS.json"
     ) || path.starts_with(b".impulse/GOVERNED_TASKS.tmp.")
         || path.starts_with(b".impulse/DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.tmp-")
+        || path.starts_with(b".impulse/PRODUCER_RESERVATIONS.tmp.")
         || path.starts_with(b".impulse/worktrees/")
 }
 

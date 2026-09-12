@@ -97,10 +97,19 @@ const REPO_RUNTIME_GITIGNORE_ENTRIES: &[&str] = &[
     ".impulse/GOVERNED_TASKS.tmp.*",
     ".impulse/MEMORY_CANDIDATES.json",
     ".impulse/MEMORY_CANDIDATES.tmp.*",
+    ".impulse/PRODUCER_RESERVATIONS.json",
+    ".impulse/PRODUCER_RESERVATIONS.tmp.*",
     ".impulse/DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.json",
     ".impulse/DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.lock",
     ".impulse/DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.tmp-*",
 ];
+
+/// The runtime ignore entries `impulse init` writes, exposed so tests that
+/// build a governed fixture repository can reproduce a real project's
+/// `.gitignore` instead of hand-maintaining a second copy of this list.
+pub fn repo_runtime_gitignore_entries() -> &'static [&'static str] {
+    REPO_RUNTIME_GITIGNORE_ENTRIES
+}
 
 fn has_blanket_impulse_ignore(existing: &str) -> bool {
     existing.lines().any(|line| {
