@@ -95,6 +95,28 @@ acceptance. This decision reuses it verbatim rather than inventing a second auth
    so it belongs in review. The raw candidate ledger and the retrieval-index marker
    (`.impulse/MEMORY_INDEX.json`) stay in the runtime gitignore list.
 
+3a. **Neither file is a governed subject change.** Because they are tracked and *not* gitignored,
+   a promotion would otherwise make the next governed registration refuse the workspace as dirty —
+   first as an untracked `??`, and after the first commit as a tracked ` M` forever. Both paths are
+   therefore exempt in `governed_producers::status_contains_subject_change`, in the untracked arm
+   **and** in the tracked arm, which until now treated every tracked mutation as a subject change.
+   The exemption is sound for exactly these two paths and no others: they are written only by the
+   daemon's own decision path, a launched Builder is never given a way to write them (its
+   `IMPULSE_*` environment is scrubbed and it has no promotion request), and their content is
+   digest-chained, so a Builder that did somehow write them would fail the log's own load rather
+   than smuggle a fact into an accepted run. The exemption is narrowed to modification and addition
+   status codes — a **deletion** of the memory log is still a subject change, because destroying
+   evidence is not a promotion side effect.
+
+3b. **A fresh clone has the log but not the ledger.** `MEMORY_CANDIDATES.json` is gitignored and
+   `MEMORY.jsonl` is not, so a clone legitimately arrives with a full memory log and no ledger at
+   all. That is not the same state as a ledger that commits nothing, and reading it that way would
+   make every clone of a project with more than one promoted record fail to start. When the
+   candidate ledger file is **absent**, the verified log is adopted wholesale as committed, its head
+   is recorded, and the orphan direction of the cross-check is skipped — a machine with no ledger
+   has no basis on which to call a committed record orphaned. When the ledger file is **present**,
+   its head (or its absence of one) is authoritative, exactly as before.
+
 ### The record
 
 4. **`MemoryRecord { id, schema_version, kind, scope, project_id, source, request_id,
@@ -133,6 +155,16 @@ acceptance. This decision reuses it verbatim rather than inventing a second auth
    checks rather than a case it skips. Editing any byte of any record, reordering two lines, or
    cutting the file mid-line breaks the next link, and load refuses the file.
 
+9a. **The chain is unkeyed SHA-256, and detects corruption, not forgery.** "Tamper-evident" here
+    means self-consistency: no single edit to `MEMORY.jsonl` survives, because the next link, the
+    entry digest, the record's own identity digest, and the ledger's committed head all have to
+    agree. It does **not** mean authenticity against an actor who can write both artifacts — such an
+    actor can rewrite the last entry, reseal its digests, update the ledger head and the candidate's
+    `record_id`, and the result loads clean. That is the same boundary every other private ledger in
+    this system already has (ADR-0018: the capability proves who opened a connection, nothing about
+    the integrity of local state a same-uid process can rewrite), and closing it needs a key the
+    daemon holds and a same-uid process cannot read — which this decision does not attempt.
+
 10. **The committed head lives in the *other* artifact.** A hash chain is still a valid chain after
     its last lines are cut off, so the candidate ledger records
     `memory_log_head { entry_count, head_digest }`. Load compares the two. This is federation, not
@@ -149,10 +181,45 @@ acceptance. This decision reuses it verbatim rather than inventing a second auth
 
 12. **A decision appends first and commits the ledger second, and an interrupted decision blocks
     the next one.** A process killed between the two steps leaves exactly one *uncommitted* trailing
-    entry, which the projection and the retrieval index both ignore. Replaying that exact request id
-    adopts the entry instead of appending a duplicate; any other decision is refused with a typed
-    error naming the request id to replay. The reverse order would instead leave a promoted
-    candidate pointing at a record that does not exist, which the ledger alone cannot repair.
+    entry, which the projection and the retrieval index both ignore. The reverse order would instead
+    leave a promoted candidate pointing at a record that does not exist, which the ledger alone
+    cannot repair.
+
+    Recovery runs through the **decision path**, not the receipt path: the receipt is written by the
+    ledger commit, so after a crash no receipt exists and the replay branch cannot see the request at
+    all. Instead, the uncommitted tail entry is matched by the `request_id` carried on its record.
+    Replaying that exact request id re-derives the record and compares ids — and because the identity
+    digest covers the payload but excludes `valid_from`, a genuine replay derives exactly the tail's
+    id while any other payload under the same id does not, and is refused as an idempotency
+    conflict. On a match the entry is adopted: the ledger commits with the tail's head and a receipt,
+    and nothing is appended. The adopted record keeps the `valid_from` of its original append, and
+    the decision records that same instant, because that is when the decision happened. A dismissal
+    carrying an interrupted promotion's request id is likewise a payload conflict — only a promotion
+    ever appends. Any *different* request is refused with a typed error naming the request id to
+    replay.
+
+12a. **Two uncommitted entries is corruption, and its recovery is manual and named.** One is the
+    only count an interrupted decision can produce, so more means the file was written outside
+    Impulse and the load fails closed. There is deliberately **no API to discard a log tail**:
+    an endpoint that truncates an append-only evidence log is exactly the primitive this decision
+    exists to avoid handing out. The manual step is stated by the error and is safe by construction,
+    because an uncommitted entry is by definition referenced by nothing: keep the first
+    `memory_log_head.entry_count` lines of `.impulse/MEMORY.jsonl` (the count is in
+    `.impulse/MEMORY_CANDIDATES.json`) and discard the rest; with no head recorded and no ledger,
+    remove the local candidate ledger instead and let rule 3b adopt the log.
+
+### The projection
+
+12b. **Record text is Builder-influenced, so the projection escapes it.** A candidate's task and
+    acceptance criteria come from registration and flow into the record's title and body, and
+    `validate_text` permits newlines — so an unescaped body could emit a structurally valid second
+    record section and a reader (or a runtime memory tool) would parse a fabricated fact as
+    promoted. The title is collapsed to one line with a leading Markdown structural character
+    escaped, and the body is rendered inside a fence whose backtick run is one longer than the
+    longest run in the body itself. That is deterministic — the projection must stay byte-identical
+    across runs, so a random nonce is not available — and CommonMark closes a fence only on a run at
+    least as long as the one that opened it, so the body cannot close its own fence. The injected
+    text is preserved verbatim inside the fence: neutralized, not censored.
 
 ### The decision
 
@@ -170,6 +237,13 @@ acceptance. This decision reuses it verbatim rather than inventing a second auth
     the candidate it was actually promoted from — the log is append-only and is not rewritten — so
     the cross-check requires only that every promoted candidate finds its record, never that a
     record's `source.candidate_id` still exists.
+
+14a. **A parked decision whose task disappears is kept, not cleared.** If a migration parks a
+    decision and the accepted governed task is then gone, the decision cannot be reattached to any
+    candidate. Silently dropping it would leave its record in the log with nothing claiming it, and
+    the cross-check would then refuse start-up with an orphan error pointing nowhere. The parked
+    entry is kept and logged at warn, and the orphan error names both the record and the governed
+    task it was promoted from. A parked *pending* status carries no information and is dropped.
 
 15. **A review decision is terminal, and only covers a candidate that still matches its evidence.**
     A second, differing decision on a decided candidate is refused. A promotion is refused when the
@@ -220,10 +294,17 @@ operator promotes candidate C at ledger revision R
   -> replace MEMORY_CANDIDATES.json: status, revision R+1, new head, receipt   <- side effect 2
   -> regenerate GENOME_PROJECTION.md, mark MEMORY_INDEX.json dirty
 
+replay of an interrupted request id (no receipt exists: the ledger never committed)
+  -> the uncommitted tail entry's record carries the request id; re-derive and compare ids
+  -> ids match   -> adopt: commit the ledger with the tail's head + a receipt, append nothing
+  -> ids differ  -> idempotency payload conflict
+
 daemon restart
   -> reconcile candidates from governed-task truth (status carried across migrations)
-  -> load + verify MEMORY.jsonl against the committed head; fail closed on any mismatch
-  -> cross-check promoted statuses against committed records
+  -> load + verify MEMORY.jsonl; ledger absent -> adopt the log wholesale (fresh clone)
+                                 ledger present -> compare against its committed head
+  -> fail closed on any mismatch
+  -> cross-check promoted statuses against committed records (skipped when no ledger exists)
   -> regenerate the projection; never mark the index dirty
 ```
 
@@ -238,8 +319,18 @@ daemon restart
 - The crash window between the two side effects is narrowed, not closed. It leaves a recoverable
   uncommitted tail rather than an unrecoverable dangling reference, and it blocks further decisions
   until the interrupted request is replayed — which means a client that never retries wedges the
-  promotion path until someone replays it or edits the file. A durable two-phase reservation (the
-  same gap CLAUDE.md already names for governed producers) would close it, and is not taken here.
+  promotion path until someone replays it or applies rule 12a's manual step. A durable two-phase
+  reservation (the same gap CLAUDE.md already names for governed producers) would close it, and is
+  not taken here.
+- The chain detects corruption, not forgery (rule 9a). An actor with write access to both
+  `.impulse/MEMORY.jsonl` and `.impulse/MEMORY_CANDIDATES.json` can fabricate a promoted record that
+  loads clean and reaches the projection. Everything downstream of the projection — including any
+  runtime memory tool — inherits that boundary and must not be described as reading authenticated
+  memory.
+- `status_contains_subject_change` now has a tracked-path exemption where it previously had none
+  (rule 3a). That is a real widening of what counts as a clean governed subject, justified only by
+  those two daemon-owned digest-chained paths; any future addition to that arm deserves the same
+  scrutiny.
 - Keeping the projection out of `GENOME.md` means a reader now has two places to look for project
   memory. That is the honest state of the system: one artifact is hand-written, one is promoted
   from evidence, and pretending otherwise would erode provenance. Unifying them is future work with
@@ -286,11 +377,28 @@ This decision is represented when tests prove:
     candidate never reaches the index;
 12. a promoted record's identity digest is independent of `valid_from` and sensitive to content,
     request id, and ledger revision; and the record contract carries no worker, Supervisor, or
-    operator prose.
+    operator prose;
+13. an interrupted decision (append landed, ledger rolled back) reloads with the entry uncommitted
+    and the candidate still pending; replaying that exact request id adopts the entry, appends no
+    second line, keeps the original `valid_from`, and reloads clean; a *different* request id is
+    refused with an error naming the one to replay; and the same request id carrying a dismissal is
+    refused as a payload conflict;
+14. a record body carrying a forged `## memory-record-…` section and a fence-breaking backtick run
+    parses back to exactly one record, with the injected heading inside a fence and never at the top
+    level, and a multi-line title collapses to one escaped line;
+15. a tracked memory log with no local candidate ledger is adopted wholesale, while the same log
+    read as a local ledger's uncommitted tail fails closed with an error naming the recovery;
+16. a parked decision whose accepted task is gone survives reconciliation, and the resulting orphan
+    error names both the record and the governed task;
+17. every `MemoryLogError` variant's `Display` names what went wrong, and `MemoryLogHead` round-trips
+    through serde; and
+18. a promotion followed by a governed registration succeeds in a repository that does not gitignore
+    `.impulse`, both before and after the memory log is committed.
 
 Source of truth: `impulse-rs/impulse-ops/src/{memory_candidate,memory_wiring}.rs`,
 `impulse-rs/src/state/{memory_candidate,memory_record,persistence}.rs`,
-`impulse-rs/src/retrieval/{store,indexer,mod}.rs`, `impulse-rs/src/handlers/config.rs`.
+`impulse-rs/src/retrieval/{store,indexer,mod}.rs`, `impulse-rs/src/handlers/config.rs`,
+`impulse-rs/src/governed_producers.rs` (the subject-change exemption only).
 
 ## Related Documents
 
