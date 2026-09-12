@@ -35,7 +35,7 @@ tags: [worktree, lane, handoff, memory]
 - Verification: isolated `CARGO_TARGET_DIR`; `cargo build --workspace`, `cargo test --workspace`,
   `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`,
   `python3 docs/validate_docs.py --all`.
-- Latest status: review round 2 addressed; branch FROZEN at the round-2 push; draft PR open.
+- Latest status: review round 3 addressed; branch FROZEN at the round-3 push; draft PR open.
 
 ## Decisions
 
@@ -255,6 +255,53 @@ IMPULSE-rs's own `.gitignore` blanket-ignores `.impulse/` (line 7), so `MEMORY.j
 to clause 3; force-adding is the owner's call and this lane did not do it. Rule 3a's exemption is
 still required regardless, because `impulse init` does not add a blanket rule to a project that
 lacks one.
+
+## Review round 3 (2026-09-12)
+
+Round-3 verification confirmed the round-2 origin capture, the 1/2-record adoption with governed
+tasks present, re-promotion refusal, the message rewrite, and ADR 3c/clause 3. One HIGH finding
+remained, fixed here. Branch frozen after this push.
+
+### HIGH — a true fresh clone was permanently unbootable from boot 2
+
+Round 2's adoption was tested only with `GOVERNED_TASKS.json` present. On a **true** fresh clone —
+only `MEMORY.jsonl`, `GENOME_PROJECTION.md` and `config.json` — the adopted records have no local
+candidate, so their rebuilt decisions park under `governed_task_id`. Reattachment only ever fired in
+candidate reconciliation's newly-inserted-candidate branch, which never runs when there are no
+accepted tasks. Boot 1 adopted; boot 2 saw `origin == Local`, found the lingering park, and refused
+with `OrphanRecordFromLostTask` — whose "no longer an accepted task" wording was also false, since
+the task was never known here. Every subsequent boot refused identically.
+
+**Not fixed as the reviewer's preferred option (a).** Synthesizing a candidate from the record's
+provenance is not implementable honestly: an `AcceptedRunMemoryCandidate` carries the whole evidence
+chain (claim/verification/verdict/decision ids, command digests, source assurance, and a
+`source_digest` that its id is a SHA-256 over), and a record carries only the candidate id, the task
+id, and that digest. Building one would mean fabricating evidence fields and an id that does not hash
+to its own source — `validate_shape` would reject it, and bending validation to accept it would mint
+a daemon-profiled evidence chain this machine never observed, which is the exact thing ADR-0013
+exists to prevent.
+
+Fixed as (b), and taken further than the reviewer framed it. The distinction offered was "parked,
+awaiting a task never seen" (valid) versus "task known and gone" (orphan). But the second case is
+equally permanently unbootable and equally not corruption — it is review state waiting for a
+candidate that may never return, not a log that disagrees with itself. So the rule is now simply:
+**a parked decision naming a committed record claims that record**, exactly like a live candidate's
+promoted status, and only a record that *nothing* claims is an orphan. The waiting state is surfaced
+at warn with the record and task named, which is the alternative round 1 explicitly allowed.
+
+`MemoryLogError::OrphanRecordFromLostTask` is deleted rather than reworded — it can no longer fire,
+so there is no misleading message left to fix. A parked decision naming a record that is *not* in the
+log claims nothing and neither rescues an orphan nor is reported.
+
+Regression is the reviewer's exact recipe: fresh-clone the three tracked files, boot four times,
+accept and promote a local run on boot 3, assert both adopted records stay visible in the projection
+across every boot, that a clone with no governed tasks has no candidates to review at all (so nothing
+can be double-promoted), and that re-promoting the local candidate is refused. Round 1's
+lost-task test now asserts the start-up succeeds and survives a second boot, rather than asserting
+the error it used to produce.
+
+ADR clause 14a rewritten, 3b extended with the true-fresh-clone case, Verification items 20 and 21
+added. Display coverage is now eight variants.
 
 ## Handoffs
 

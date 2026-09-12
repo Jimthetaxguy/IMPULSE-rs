@@ -85,13 +85,6 @@ pub enum MemoryLogError {
     UncommittedTailTooLong { found: usize },
     #[error("memory log record `{record_id}` is not referenced by any promoted candidate")]
     OrphanRecord { record_id: MemoryRecordId },
-    #[error(
-        "memory log record `{record_id}` was promoted from governed task `{governed_task_id}`, which is no longer an accepted task in this project; the review decision was parked by a derivation migration and can no longer be reattached to a candidate"
-    )]
-    OrphanRecordFromLostTask {
-        record_id: MemoryRecordId,
-        governed_task_id: GovernedTaskId,
-    },
     #[error("promoted candidate `{candidate_id}` names record `{record_id}`, which is not in the memory log")]
     MissingPromotedRecord {
         candidate_id: String,
@@ -330,7 +323,7 @@ impl MemoryLog {
         parked: &std::collections::BTreeMap<GovernedTaskId, MemoryCandidateStatus>,
         check_orphans: bool,
     ) -> Result<()> {
-        let mut promoted = BTreeSet::new();
+        let mut claimed = BTreeSet::new();
         for candidate in candidates {
             if let Some(record_id) = candidate.status.promoted_record_id() {
                 if self.committed_record(record_id).is_none() {
@@ -340,7 +333,19 @@ impl MemoryLog {
                     }
                     .into());
                 }
-                promoted.insert(record_id.clone());
+                claimed.insert(record_id.clone());
+            }
+        }
+        // A decision parked by a derivation migration, or rebuilt when a log was
+        // adopted, claims its record just as a live candidate's status does. It
+        // is review state waiting for a candidate, not a missing claim — and on
+        // a machine that has never seen the governed task (a true fresh clone
+        // of a project whose memory log is tracked) it may wait forever without
+        // anything being wrong. Refusing to start on it would make such a
+        // checkout permanently unbootable from its second boot onward.
+        for status in parked.values() {
+            if let Some(record_id) = status.promoted_record_id() {
+                claimed.insert(record_id.clone());
             }
         }
         if !check_orphans {
@@ -349,28 +354,34 @@ impl MemoryLog {
             return Ok(());
         }
         for entry in &self.committed {
-            if promoted.contains(&entry.record.id) {
-                continue;
-            }
-            // A decision parked by a derivation migration whose accepted task
-            // has since disappeared is the one explainable orphan. Name the
-            // task so the error points somewhere instead of nowhere.
-            if let Some((governed_task_id, _)) = parked
-                .iter()
-                .find(|(_, status)| status.promoted_record_id() == Some(&entry.record.id))
-            {
-                return Err(MemoryLogError::OrphanRecordFromLostTask {
+            if !claimed.contains(&entry.record.id) {
+                return Err(MemoryLogError::OrphanRecord {
                     record_id: entry.record.id.clone(),
-                    governed_task_id: governed_task_id.clone(),
                 }
                 .into());
             }
-            return Err(MemoryLogError::OrphanRecord {
-                record_id: entry.record.id.clone(),
-            }
-            .into());
         }
         Ok(())
+    }
+
+    /// Parked decisions that still have no candidate to reattach to, paired
+    /// with the record each one claims.
+    ///
+    /// Not an error — see [`Self::cross_check_statuses`] — but worth saying out
+    /// loud at start-up, because it is review state that no operator surface
+    /// will show until the governed task appears on this machine.
+    pub(super) fn unreattached_parked_claims(
+        &self,
+        parked: &std::collections::BTreeMap<GovernedTaskId, MemoryCandidateStatus>,
+    ) -> Vec<(GovernedTaskId, MemoryRecordId)> {
+        parked
+            .iter()
+            .filter_map(|(governed_task_id, status)| {
+                let record_id = status.promoted_record_id()?;
+                self.committed_record(record_id)?;
+                Some((governed_task_id.clone(), record_id.clone()))
+            })
+            .collect()
     }
 
     /// Append one sealed entry to the log file and to this in-memory view.
@@ -1189,7 +1200,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cross_check_names_the_lost_task_behind_a_parked_decision() {
+    fn test_a_parked_decision_claims_its_record_instead_of_orphaning_it() {
         let (_dir, storage) = storage();
         let mut log = MemoryLog::load(&storage, None, LedgerOrigin::Local).unwrap();
         let source = candidate();
@@ -1198,6 +1209,15 @@ mod tests {
         log.append(&storage, record.clone()).unwrap();
         log.commit_tail();
 
+        // Claimed by nothing at all: a real orphan.
+        let error = log
+            .cross_check_statuses(std::iter::empty(), &Default::default(), true)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("not referenced by any promoted candidate"));
+
+        // Claimed by a parked decision: review state awaiting a candidate, not
+        // corruption. Refusing here made a fresh clone permanently unbootable
+        // from its second boot onward.
         let mut parked = std::collections::BTreeMap::new();
         parked.insert(
             source.governed_task_id.clone(),
@@ -1205,18 +1225,42 @@ mod tests {
                 record_id: record.id.clone(),
                 decided_at: "2026-09-12T10:00:00Z".to_string(),
                 decided_by: impulse_ops::governed_task::GovernedActor {
-                    kind: impulse_ops::governed_task::GovernedActorKind::Operator,
-                    id: "operator-a".to_string(),
+                    kind: impulse_ops::governed_task::GovernedActorKind::System,
+                    id: "adopted-from-checkout".to_string(),
                 },
             },
         );
-        let error = log
-            .cross_check_statuses(std::iter::empty(), &parked, true)
-            .unwrap_err();
-        let rendered = format!("{error:#}");
-        assert!(rendered.contains(source.governed_task_id.as_str()));
-        assert!(rendered.contains(record.id.as_str()));
-        assert!(rendered.contains("no longer an accepted task"));
+        log.cross_check_statuses(std::iter::empty(), &parked, true)
+            .unwrap();
+
+        // And it is reported, so the waiting state is visible rather than silent.
+        assert_eq!(
+            log.unreattached_parked_claims(&parked),
+            vec![(source.governed_task_id.clone(), record.id.clone())]
+        );
+
+        // A parked decision naming a record that is not in the log claims
+        // nothing, so it neither rescues an orphan nor is reported.
+        let mut stale = std::collections::BTreeMap::new();
+        stale.insert(
+            source.governed_task_id,
+            MemoryCandidateStatus::Promoted {
+                record_id: MemoryRecordId::try_new(format!(
+                    "{MEMORY_RECORD_ID_PREFIX}{}",
+                    "9".repeat(64)
+                ))
+                .unwrap(),
+                decided_at: "2026-09-12T10:00:00Z".to_string(),
+                decided_by: impulse_ops::governed_task::GovernedActor {
+                    kind: impulse_ops::governed_task::GovernedActorKind::System,
+                    id: "adopted-from-checkout".to_string(),
+                },
+            },
+        );
+        assert!(log.unreattached_parked_claims(&stale).is_empty());
+        assert!(log
+            .cross_check_statuses(std::iter::empty(), &stale, true)
+            .is_err());
     }
 
     #[test]
@@ -1277,13 +1321,6 @@ mod tests {
                 "not referenced by any promoted candidate",
             ),
             (
-                MemoryLogError::OrphanRecordFromLostTask {
-                    record_id: record_id.clone(),
-                    governed_task_id: GovernedTaskId::try_new("task-a").unwrap(),
-                },
-                "no longer an accepted task",
-            ),
-            (
                 MemoryLogError::MissingPromotedRecord {
                     candidate_id: "memory-candidate-x".to_string(),
                     record_id: record_id.clone(),
@@ -1297,7 +1334,7 @@ mod tests {
         ];
         assert_eq!(
             cases.len(),
-            9,
+            8,
             "every MemoryLogError variant must be covered"
         );
         for (error, expected) in cases {

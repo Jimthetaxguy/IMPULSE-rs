@@ -132,7 +132,10 @@ acceptance. This decision reuses it verbatim rather than inventing a second auth
    task it came from, so its candidate is marked promoted — and where the candidate was re-derived
    under a different id, the rebuilt decision is parked exactly as a derivation migration parks one.
    Without this an adopted record would orphan on the *next* start-up and its candidate would sit
-   pending, promotable a second time into a duplicate record. `decided_by` is recorded as the system
+   pending, promotable a second time into a duplicate record. On a **true** fresh clone — no
+   `GOVERNED_TASKS.json` either — there is no candidate to reattach to and no accepted task that
+   would ever create one, so every rebuilt decision parks; rule 14a is what keeps those boots
+   working, and there is nothing to double-promote because there are no candidates at all. `decided_by` is recorded as the system
    actor `adopted-from-checkout`: the log is authoritative for *what* was promoted, never for *who*
    approved it, and borrowing an id to fill the field would imply an approval this machine never saw.
 
@@ -268,12 +271,20 @@ acceptance. This decision reuses it verbatim rather than inventing a second auth
     the cross-check requires only that every promoted candidate finds its record, never that a
     record's `source.candidate_id` still exists.
 
-14a. **A parked decision whose task disappears is kept, not cleared.** If a migration parks a
-    decision and the accepted governed task is then gone, the decision cannot be reattached to any
-    candidate. Silently dropping it would leave its record in the log with nothing claiming it, and
-    the cross-check would then refuse start-up with an orphan error pointing nowhere. The parked
-    entry is kept and logged at warn, and the orphan error names both the record and the governed
-    task it was promoted from. A parked *pending* status carries no information and is dropped.
+14a. **A parked decision claims its record, and is never grounds for refusing start-up.** A
+    decision can end up parked two ways: a derivation migration re-derived its candidate under a new
+    id, or a log was adopted on a machine that does not have the candidate. Silently dropping it
+    would leave its record in the log with nothing claiming it. So it is kept — and the orphan check
+    treats a parked decision naming a committed record as a **claim**, exactly like a live
+    candidate's promoted status. Only a committed record that *nothing* claims is an orphan.
+
+    This is deliberately not a "known task versus never-seen task" distinction. On a true fresh
+    clone the governed task may never appear on this machine, and the park may wait forever without
+    anything being wrong; refusing to start would make such a checkout permanently unbootable from
+    its second boot onward, for review state that is waiting rather than incorrect. The waiting state
+    is surfaced at warn — naming the record and the governed task — instead of as an error, and the
+    record stays visible in the projection throughout. A parked *pending* status carries no
+    information and is dropped.
 
 15. **A review decision is terminal, and only covers a candidate that still matches its evidence.**
     A second, differing decision on a decided candidate is refused. A promotion is refused when the
@@ -429,7 +440,15 @@ This decision is represented when tests prove:
 19. with governed tasks present and the candidate ledger deleted, a one-record and a two-record log
     both adopt rather than refusing or silently disappearing, the adopted records reattach to their
     candidates as promoted with the `adopted-from-checkout` actor, and the next start-up reloads
-    them from the recorded head without adopting again.
+    them from the recorded head without adopting again;
+20. a **true** fresh clone — only the tracked artifacts, no `GOVERNED_TASKS.json` and no candidate
+    ledger — boots repeatedly: boot 1 adopts, boot 2 does not refuse and keeps both records visible
+    in the projection with no candidates to review, a record cannot be promoted twice because there
+    is no candidate to decide on, and a run accepted and promoted locally on boot 3 coexists with the
+    adopted records across a fourth boot; and
+21. a committed record claimed only by a parked decision is not an orphan and is reported at warn,
+    while a record claimed by nothing — including by a parked decision naming some other record —
+    still is.
 
 Source of truth: `impulse-rs/impulse-ops/src/{memory_candidate,memory_wiring}.rs`,
 `impulse-rs/src/state/{memory_candidate,memory_record,persistence}.rs`,

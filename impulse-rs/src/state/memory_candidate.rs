@@ -405,6 +405,17 @@ impl State {
                 *ledger = repaired;
             }
         }
+        for (governed_task_id, record_id) in
+            log.unreattached_parked_claims(&ledger.pending_status_migrations)
+        {
+            tracing::warn!(
+                governed_task_id = %governed_task_id,
+                record_id = %record_id,
+                "a promoted memory record is claimed by a parked review decision with no candidate \
+                 on this machine; it stays out of the review queue until that governed task is \
+                 present here"
+            );
+        }
         if let Some(entry) = log.uncommitted_tail().first() {
             tracing::warn!(
                 request_id = %entry.record.request_id,
@@ -1733,15 +1744,29 @@ pub(in crate::state) mod tests {
         std::fs::write(&path, serde_json::to_vec_pretty(&ledger).unwrap()).unwrap();
         std::fs::remove_file(base.join("GOVERNED_TASKS.json")).unwrap();
 
-        let error = State::new(base).unwrap_err();
-        let rendered = format!("{error:#}");
-        assert!(
-            rendered.contains(record_id.as_str()),
-            "the orphan error must name the record: {rendered}"
+        // The parked decision claims its record, so start-up succeeds and the
+        // record stays visible. Refusing here would have made this state — and
+        // a true fresh clone, which reaches it by a different road — permanently
+        // unbootable, for review state that is waiting rather than wrong.
+        let reloaded = State::new(base.clone()).expect("a parked claim is not corruption");
+        assert_eq!(
+            reloaded.list_promoted_memory_records().unwrap()[0].id,
+            record_id
         );
-        assert!(
-            rendered.contains("no longer an accepted task"),
-            "the orphan error must point at the lost task, not nowhere: {rendered}"
+        assert!(reloaded
+            .list_accepted_run_memory_candidates(&reloaded.governed_project_id())
+            .unwrap()
+            .is_empty());
+
+        // And it survives a second boot rather than degrading.
+        drop(reloaded);
+        assert_eq!(
+            State::new(base)
+                .unwrap()
+                .list_promoted_memory_records()
+                .unwrap()[0]
+                .id,
+            record_id
         );
     }
 
@@ -1847,5 +1872,159 @@ pub(in crate::state) mod tests {
                 .len(),
             2
         );
+    }
+
+    /// A **true** fresh clone: only the tracked artifacts, no
+    /// `GOVERNED_TASKS.json` and no candidate ledger.
+    ///
+    /// Round 2 shipped adoption but tested only the governed-tasks-present
+    /// variant. Here the adopted records have no local candidate, so their
+    /// rebuilt decisions are parked — and reattachment only ever fired when
+    /// candidate reconciliation *inserted* a candidate from an accepted task,
+    /// which never happens when there are no tasks. Boot 1 adopted and boot 2
+    /// refused, permanently.
+    fn fresh_clone_of_a_project_with_two_promoted_records(
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let (_root, state) = state();
+        let base = state.storage().base_path().to_path_buf();
+        for index in 0..2 {
+            accept_run(&state, &format!("run-{index}"));
+            let pending = state
+                .list_accepted_run_memory_candidates(&state.governed_project_id())
+                .unwrap()
+                .into_iter()
+                .find(|candidate| candidate.status.is_pending())
+                .expect("a freshly accepted run leaves a pending candidate");
+            state
+                .decide_memory_candidate(
+                    with_project(
+                        promote(&pending.id, &format!("decide-{index}"), index as u64),
+                        &state,
+                    ),
+                    OperatorAuthentication::Declared,
+                    "2026-09-12T10:00:00Z",
+                )
+                .unwrap();
+        }
+        assert_eq!(state.list_promoted_memory_records().unwrap().len(), 2);
+        drop(state);
+
+        let clone = tempfile::tempdir().unwrap();
+        // Mirror the original layout: the governed project id is derived from
+        // the directory holding `.impulse`, and boot 3 accepts a run here.
+        let clone_base = clone.path().join("impulse-test").join(".impulse");
+        std::fs::create_dir_all(&clone_base).unwrap();
+        for tracked in ["MEMORY.jsonl", "GENOME_PROJECTION.md", "config.json"] {
+            let from = base.join(tracked);
+            if from.exists() {
+                std::fs::copy(&from, clone_base.join(tracked)).unwrap();
+            }
+        }
+        assert!(!clone_base.join("GOVERNED_TASKS.json").exists());
+        assert!(!clone_base.join(MEMORY_CANDIDATES_FILE).exists());
+        (clone, clone_base)
+    }
+
+    #[test]
+    fn test_true_fresh_clone_boots_repeatedly_and_keeps_its_records_visible() {
+        let (_clone, base) = fresh_clone_of_a_project_with_two_promoted_records();
+
+        // Boot 1: adopt.
+        let first = State::new(base.clone()).expect("boot 1 must adopt");
+        assert_eq!(first.list_promoted_memory_records().unwrap().len(), 2);
+        drop(first);
+
+        // Boot 2: the ledger now exists, so the parked decisions are the only
+        // thing claiming those records. This is the boot that used to refuse.
+        let second = State::new(base.clone()).expect("boot 2 must not refuse");
+        assert_eq!(
+            second.list_promoted_memory_records().unwrap().len(),
+            2,
+            "adopted records must stay visible across boots"
+        );
+        assert!(
+            second
+                .list_accepted_run_memory_candidates(&second.governed_project_id())
+                .unwrap()
+                .is_empty(),
+            "a clone with no governed tasks has no candidates to review"
+        );
+        let projection = second.read_genome_projection().unwrap().unwrap();
+        assert_eq!(projection.matches("\n## memory-record-").count(), 2);
+
+        // Nothing here can be re-promoted into a duplicate: there is no
+        // candidate to decide on at all.
+        let error = second
+            .decide_memory_candidate(
+                with_project(
+                    promote(
+                        &MemoryCandidateId::try_new(format!("memory-candidate-{}", "a".repeat(64)))
+                            .unwrap(),
+                        "decide-clone",
+                        second_ledger_revision(&base),
+                    ),
+                    &second,
+                ),
+                OperatorAuthentication::Declared,
+                "2026-09-12T12:00:00Z",
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("was not found"));
+        drop(second);
+
+        // Boot 3, after this machine accepts a run of its own and promotes it:
+        // the new record and the adopted ones coexist.
+        let third = State::new(base.clone()).unwrap();
+        accept_run(&third, "local");
+        let pending = third
+            .list_accepted_run_memory_candidates(&third.governed_project_id())
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.status.is_pending())
+            .expect("the locally accepted run leaves a pending candidate");
+        let outcome = third
+            .decide_memory_candidate(
+                with_project(
+                    promote(&pending.id, "decide-local", second_ledger_revision(&base)),
+                    &third,
+                ),
+                OperatorAuthentication::Declared,
+                "2026-09-12T13:00:00Z",
+            )
+            .unwrap();
+        let local_record = outcome.record.unwrap().id;
+        assert_eq!(third.list_promoted_memory_records().unwrap().len(), 3);
+
+        // Promoting it again is refused, and a fourth boot still loads clean.
+        let error = third
+            .decide_memory_candidate(
+                with_project(
+                    promote(
+                        &pending.id,
+                        "decide-local-again",
+                        second_ledger_revision(&base),
+                    ),
+                    &third,
+                ),
+                OperatorAuthentication::Declared,
+                "2026-09-12T13:01:00Z",
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("already promoted"));
+        drop(third);
+
+        let fourth = State::new(base).expect("boot 4 must not refuse");
+        let records = fourth.list_promoted_memory_records().unwrap();
+        assert_eq!(records.len(), 3);
+        assert!(records.iter().any(|record| record.id == local_record));
+    }
+
+    /// The ledger revision on disk, so a test can CAS against it without
+    /// tracking every decision it has made.
+    fn second_ledger_revision(base: &std::path::Path) -> u64 {
+        let ledger: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(base.join(MEMORY_CANDIDATES_FILE)).unwrap())
+                .unwrap();
+        ledger["revision"].as_u64().unwrap_or(0)
     }
 }
