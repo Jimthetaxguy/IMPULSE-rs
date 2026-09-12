@@ -427,7 +427,14 @@ pass the repo gate: `cargo build && cargo test && cargo clippy -- -D warnings &&
   the Ion contract): before each provider call the loop compacts tool-result
   content oldest-first into a `[compacted N chars from tool 'x']` stub that keeps
   the `tool_use` id, and trips `LoopTrip::ContextBudget` only when compaction
-  cannot recover enough room. See
+  cannot recover enough room. Adversarial review round 1 added three floors to
+  that pass: the most recent round's results are never compacted (the model has
+  not seen them yet), the model-supplied tool name in a stub is escaped and
+  length-bounded, and a stub is re-wrapped in the executor's untrusted-output
+  envelope via `ToolExecutor::wrap_compaction_stub`. The same review found a
+  pre-existing loop bug: a response carrying `max_tokens` *plus* tool calls
+  matched no branch and returned `Ok("")` with a `Completed` report and nothing
+  executed; it is now `AgentError::TruncatedToolCall`. See
   `docs/decisions/0017-canonical-loop-contract.md` (2026-09-12 addendum).
 - **T10 (optional) — ratatui inline polish.** Spinner during gate runs, colored
   verdict table, status line. *(Depends T7. Do not start before T9 is stable.)*

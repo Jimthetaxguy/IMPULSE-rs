@@ -136,12 +136,43 @@ when `Some(0)`), `LoopTrip` gains `ContextBudget { chars, limit }`, and `LoopRep
 `compactions`. Unlike every trip in rule 2, this one is not reached on first breach: the loop first
 compacts tool-result content oldest-first into a bounded stub that preserves the `tool_use` id and
 names the originating tool, and only trips when compaction cannot get the history back under
-budget. Prose — the user's turn and the model's own words — is never compacted; a loop that cannot
-fit it trips instead of silently dropping it.
+budget. Two classes of content are never compacted: prose — the user's turn and the model's own
+words — and **the most recent round's results**, which the model has not been shown even once. A
+loop that cannot fit without touching either trips instead of silently eliding it.
+
+The budget is evaluated *before* the round is admitted, so a history that never fit reports
+`rounds_used: 0` rather than claiming a round it never spent.
+
+**Rule 8. A truncated tool-use turn is neither executed nor completed.** A provider that stops on
+`max_tokens` while emitting tool calls produced a partial batch: a call's input may be missing
+fields, or the batch may be missing calls. Running it executes the model's half-written intent;
+returning it as a final reply hands the caller an empty string with a `Completed` report and no
+tool ever run — a truncation rendered as a successful answer. The loop fails with
+`AgentError::TruncatedToolCall { provider, tool_calls }` instead, history untouched. A truncated
+*plain* reply is unaffected: it is still the model's answer and is returned as before.
 
 Measurement and compaction live with the caller (`llm_backends`), which owns the message types;
 this module declares the limit, counts the compactions, and names the trip. Rule 6 is therefore
 preserved: `loop_contract` still depends on no provider, tool, or daemon type.
+
+**Measurement is of what is sent, at its widest.** A call's input costs different amounts on
+different wires: Anthropic sends it as a JSON object, OpenAI as `function.arguments`, a JSON
+*string* holding that object's serialization, so quotes and backslashes are escaped twice.
+Measuring the un-escaped form under-counted the OpenAI wire by roughly 1.28x on escape-heavy
+inputs. The measurement therefore takes `WireFormat::widest_tool_input_chars` — the largest
+rendering across every wire shape — rather than reading the shape off the running provider. Reading
+it off the provider would mean a `LlmProvider` trait method, and a defaulted trait method is
+exactly how this under-measurement would return: a future provider that forgets to override it
+silently measures its own traffic short. The widest can never under-count for anyone; over-counting
+only spends the budget's deliberate headroom slightly sooner.
+
+**A stub carries untrusted text and must stay framed.** The tool name a stub quotes comes from the
+model's own request, not from a registry, so it is rendered through `serde_json::Value::String`
+(escaping quotes, backslashes, and control characters) and bounded to 64 characters. Because a stub
+replaces the result's *entire* stored content — including any framing the executor applied — it is
+re-wrapped through `ToolExecutor::wrap_compaction_stub`, a hook on the executor because the
+executor is the layer that framed the content in the first place. `llm_backends` neither knows nor
+imports what that framing is.
 
 The Ion contract defaults to 200,000 characters (`ION_DEFAULT_MAX_CONTEXT_CHARS`); the governed
 Builder contract leaves the budget unset, because the daemon holds claim records rather than a
@@ -157,9 +188,14 @@ it, and history is committed only on success. A `ContextBudget` trip surfaces th
 `LoopBudget`, `LoopTrip::ContextBudget`, and a `LoopReport` carrying `compactions` round-trip
 through serde, and JSON written before either field existed still loads; a zero compaction count
 never reaches the wire form; compaction preserves `tool_use_id`, runs oldest-first, stops as soon
-as it is under budget, refuses to grow the history, and never re-compacts a stub; a history of
-prose alone over budget trips; and `chat_with_tools` surfaces the trip as `ToolLoopStalled` with
-history untouched and a `Tripped` report.
+as it is under budget, refuses to grow the history, never re-compacts a stub, and never touches the
+newest round's results; a history of prose alone over budget trips; the measurement of an
+escape-heavy input is the OpenAI rendering, not the Anthropic one; a hostile tool name survives only
+as an escaped, bounded JSON string; a stub is re-wrapped in the executor's framing; and
+`chat_with_tools` surfaces the trip as `ToolLoopStalled` with history untouched, a `Tripped`
+report, and `rounds_used: 0` when nothing ever fit. Rule 8 is represented when a provider stopping
+on `max_tokens` with tool calls returns `TruncatedToolCall`, runs no tool, leaves history
+untouched, and never returns `Ok("")`, while a truncated plain reply still completes.
 
 Full design, including the algorithm's exact ordering and what was deliberately not adopted:
 `docs/superpowers/specs/2026-09-01-loop-contract-design.md` (addendum of the same date).

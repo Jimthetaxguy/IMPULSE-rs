@@ -268,6 +268,52 @@ pub enum WireFormat {
     OpenAi,
 }
 
+impl WireFormat {
+    /// Every wire shape, so a measurement that must not under-count can take
+    /// the widest. Adding a variant automatically joins this list.
+    pub const ALL: [WireFormat; 2] = [WireFormat::Anthropic, WireFormat::OpenAi];
+
+    /// Characters one tool call's `input` occupies in this wire shape.
+    ///
+    /// The two shapes differ by more than formatting. Anthropic sends the
+    /// input as a JSON **object**, so it costs its canonical serialization.
+    /// OpenAI sends it as `function.arguments`, a JSON **string** *holding*
+    /// that serialization — so every quote and backslash inside is escaped a
+    /// second time, and an escape-heavy input costs materially more on the
+    /// OpenAI wire than on Anthropic's.
+    ///
+    /// Canonical JSON is used as the inner form so the measurement never
+    /// drifts with map ordering.
+    pub fn tool_input_chars(self, input: &serde_json::Value) -> usize {
+        let canonical = crate::loop_contract::canonical_json(input);
+        match self {
+            WireFormat::Anthropic => canonical.chars().count(),
+            WireFormat::OpenAi => serde_json::Value::String(canonical)
+                .to_string()
+                .chars()
+                .count(),
+        }
+    }
+
+    /// The largest [`WireFormat::tool_input_chars`] across every wire shape.
+    ///
+    /// The context budget measures with this rather than with the running
+    /// provider's own shape (review round 1): reading the shape off the
+    /// provider would mean a `LlmProvider` trait method, and a trait method
+    /// with a default is exactly how the under-measurement it fixes would
+    /// come back — a future provider that forgets to override it silently
+    /// measures its own traffic short. Taking the widest can never
+    /// under-count for any provider, and over-counting only spends the
+    /// budget's deliberate headroom slightly sooner.
+    pub fn widest_tool_input_chars(input: &serde_json::Value) -> usize {
+        WireFormat::ALL
+            .into_iter()
+            .map(|format| format.tool_input_chars(input))
+            .max()
+            .unwrap_or(0)
+    }
+}
+
 /// Renders `messages` in the wire shape `format` expects, preserving every
 /// tool block. One [`Message`] may expand into more than one wire message
 /// (OpenAI wants one `role: "tool"` message per result), which is why this
@@ -382,12 +428,11 @@ fn openai_tools_value(tools: &[ToolDefinition]) -> serde_json::Value {
 }
 
 /// Renders messages for the Anthropic Messages API. Plain text messages use
-/// the simple `{"role", "content": "..."}` shape (matching
-/// `BaseProvider::format_messages`); messages carrying `tool_calls` or
-/// `tool_results` (TUI_SPEC.md T9) render `content` as a block array per
-/// Anthropic's tool-use protocol instead. Kept Anthropic-specific rather
-/// than folded into `BaseProvider::format_messages` because OpenAI/Minimax
-/// don't support tool-use blocks yet.
+/// the simple `{"role", "content": "..."}` shape; messages carrying
+/// `tool_calls` or `tool_results` (TUI_SPEC.md T9) render `content` as a
+/// block array per Anthropic's tool-use protocol instead. Reached through
+/// [`format_messages_for`] with [`WireFormat::Anthropic`]; the OpenAI and
+/// MiniMax shape is [`format_openai_messages`].
 fn format_anthropic_messages(messages: &[Message]) -> Vec<serde_json::Value> {
     messages
         .iter()

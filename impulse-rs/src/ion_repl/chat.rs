@@ -797,6 +797,17 @@ impl ReplToolExecutor<'_> {
 
 #[async_trait]
 impl ToolExecutor for ReplToolExecutor<'_> {
+    /// A context-budget compaction stub replaces a stored `tool_result`'s
+    /// entire content -- including the untrusted-output envelope that
+    /// [`ReplToolExecutor::observe_and_wrap`] put there. Re-wrap it, so a
+    /// compacted result stays inside exactly the framing the content it
+    /// replaced was inside and the model is never handed tool-derived text
+    /// as unframed prose (review round 1, P2). A fresh nonce per wrap is
+    /// correct here for the same reason it is on the original wrap.
+    fn wrap_compaction_stub(&self, stub: &str) -> String {
+        wrap_untrusted_tool_output(stub)
+    }
+
     async fn execute(&self, name: &str, input: Value) -> ToolExecutionResult {
         let _grant: Option<ApprovalGrant> = if CONFIRMATION_REQUIRED_TOOLS.contains(&name) {
             let tool_ctx = self.ctx.sandbox_tool_context();
@@ -1450,6 +1461,40 @@ mod tests {
             "declined bash_exec must never have run the shell command"
         );
         assert_eq!(asked.lock().unwrap().as_slice(), &["bash_exec".to_string()]);
+    }
+
+    #[test]
+    fn test_repl_executor_rewraps_a_compaction_stub_in_the_untrusted_envelope() {
+        // Review round 1, P2: a context-budget stub replaces a stored
+        // tool_result's whole content, envelope included. The executor that
+        // applied the envelope must put it back, or compacted tool-derived
+        // text re-enters the model's context as unframed prose.
+        let tools = ReplToolRegistry::with_defaults();
+        let ctx = ReplContext::default();
+        let confirm = |_n: &str, _i: &Value, _v: &GuardVerdict, _p: &[PathBuf]| false;
+        let untrusted_seen = std::sync::atomic::AtomicBool::new(false);
+        let executor = ReplToolExecutor {
+            tools: &tools,
+            ctx: &ctx,
+            confirm: &confirm,
+            untrusted_seen: &untrusted_seen,
+        };
+
+        let wrapped = executor.wrap_compaction_stub("[compacted 4000 chars]");
+        assert!(
+            wrapped.starts_with(UNTRUSTED_TOOL_OUTPUT_HEADER_PREFIX),
+            "got: {wrapped}"
+        );
+        assert!(wrapped.contains("[compacted 4000 chars]"), "got: {wrapped}");
+        assert!(
+            wrapped.contains(UNTRUSTED_TOOL_OUTPUT_FOOTER_PREFIX),
+            "got: {wrapped}"
+        );
+        // The nonce differs per wrap, so content can never forge the footer.
+        assert_ne!(
+            wrapped,
+            executor.wrap_compaction_stub("[compacted 4000 chars]")
+        );
     }
 
     #[tokio::test]

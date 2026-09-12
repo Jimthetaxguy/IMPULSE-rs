@@ -173,9 +173,14 @@ The characters of working conversation history a loop may carry into one model r
 (`LoopBudget::max_context_chars`; 200,000 for the Ion tool loop, unset for the governed Builder).
 It is the one budget the loop tries to *fit* before it stops: over budget, the loop compacts
 tool-result content oldest-first into a bounded stub that keeps the `tool_use` id and names the
-tool, and only trips `LoopTrip::ContextBudget` when compaction cannot recover enough room. Prose is
-never compacted. Measured in characters, not tokens, so one number is exact and reproducible across
-Anthropic, OpenAI, and MiniMax. `LoopReport::compactions` records how many results a run compacted.
+tool, and only trips `LoopTrip::ContextBudget` when compaction cannot recover enough room. Two
+things are never compacted: prose, and the most recent round's results (which the model has not
+been shown yet). A stub quotes the model-supplied tool name as an escaped, length-bounded JSON
+string and is re-wrapped in the executor's own untrusted-output framing via
+`ToolExecutor::wrap_compaction_stub`. Measured in characters, not tokens, at the widest wire
+rendering of each input, so the number is exact, reproducible, and never below what any of
+Anthropic, OpenAI, or MiniMax actually sends. `LoopReport::compactions` records how many results a
+run compacted.
 - **Source of truth:** `LoopBudget`/`LoopTrip`/`LoopReport` in `src/loop_contract.rs`,
   `enforce_context_budget` in `src/llm_backends/mod.rs`, and ADR-0017's 2026-09-12 addendum.
 
