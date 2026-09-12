@@ -175,12 +175,16 @@ Run on this checkout with `CARGO_TARGET_DIR` isolated to
 | Command | Result |
 |---|---|
 | `cargo build --workspace` | clean |
-| `cargo test --workspace` | **2624 passed / 0 failed / 9 ignored** (see per-target table; 2612 before review round 1, +12 regressions) |
+| `cargo test --workspace` | **2896 passed / 0 failed / 9 ignored** on the final merge-in against `origin/main` `22f9630` (2612 initial, 2624 after review round 1, 2762 after the #53/#55 merge; the rest is #56's and #59's own tests arriving with main) |
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean |
 | `cargo fmt --all -- --check` | clean |
 | `python3 ../docs/validate_docs.py --all` | 4 pre-existing failures only (unchanged) |
 
-Per-target totals for `cargo test --workspace`, exactly as the command reported them:
+Per-target totals below are from the **pre-merge** run and are kept as the record of what this
+lane's own work contributed; after three `origin/main` merges the workspace total is dominated by
+other lanes' tests. The final run's own figures: `impulse-ops` lib **157**, `impulse-rs`
+tests/daemon_governed_wiring **5**, tests/governed_staged_worktree **30**,
+tests/socket_actor_provenance **5**.
 
 | Target | passed | failed | ignored |
 |---|---|---|---|
@@ -414,6 +418,28 @@ predicate (`promote_preflight`), so all three now agree by construction rather t
 the test calls that function rather than restating it, so changing the endpoint changes the test.
 This is exactly the class of drift the P2-4 cross-check was raised about, found the first time the
 same technique was pointed at promotion.
+
+### Gate and merges taken during the checklist
+
+`origin/main` was merged three times, because main moved under this lane twice while the checklist
+was being executed: `1f866d6` (#53 + #51 + #55), `16ed8c1` (#56 scoped memory promotion), `22f9630`
+(#59 property-test harnesses). Only the first conflicted, in `CONTEXT.md`.
+
+Each merge was followed by a check that every `.impulse` cleanliness exemption survived — this
+lane's `PRODUCER_RESERVATIONS.json`, the cherry-picked `MEMORY_CANDIDATES.json`, and #56's
+`is_impulse_memory_evidence_artifact` — since they now sit in adjacent lines of the same `matches!`
+arm and three lanes have edited it. Verified by inspection after each merge rather than inferred
+from a clean auto-merge.
+
+Final gate against `22f9630`: `cargo build --workspace` clean; `cargo test --workspace` **2896
+passed / 0 failed / 9 ignored**; `cargo clippy --workspace --all-targets -- -D warnings` clean;
+`cargo fmt --all -- --check` clean; `python3 ../docs/validate_docs.py --all` still the same four
+pre-existing failures.
+
+Clippy caught one thing worth recording: `GovernedProducerOutcome::StagedConfigRefused` carries a
+whole flattened `GovernedTaskRun` (~824 bytes) while `Recorded` is often far smaller, so the
+refusal variant is boxed — the rare branch should not make every caller pay for it on the common
+path.
 
 ### Deliberate deviations from the plan
 
