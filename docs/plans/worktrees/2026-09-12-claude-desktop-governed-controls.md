@@ -373,3 +373,59 @@ that does not read as a failed host call.
   connection that never presents the operator capability.
 - **Stale revisions read as a stale board.** A `revision conflict` reason now headlines as "Board is
   out of date: this task changed on the daemon — refresh and retry" instead of "Host call failed".
+
+## Review round 3
+
+Codex's two threads on PR #58 at `f549d39`. Round-2 verification had already confirmed all seven
+round-1 items (430 desktop + ops tests green, with the filter-driver reproduction and the
+unpinned-accepted OID both re-proven independently).
+
+### P1 — the repository's declared live contract said the opposite of this PR
+
+`AGENTS.md:109` and the identical claim in `CLAUDE.md`'s "Current profiled governed-producer
+invariant" paragraph both stated that Dioxus shows terminal command guidance **rather than** producer
+buttons. Shipping Promote and Discard made that false, and a contract file that contradicts the code
+is worse than one that is merely out of date — it is the thing other lanes read to decide what is
+true.
+
+Corrected under explicit orchestrator authorization for this coordinated edit, **one sentence in each
+file and nothing else**:
+
+- `AGENTS.md` — "Dioxus exposes operator-only Promote and Discard controls (ADR-0019) and still
+  renders evidence plus terminal command guidance for claim, verify, and review — `governed-claim` /
+  `governed-verify` / `governed-review` — which remain CLI-driven."
+- `CLAUDE.md` — the same statement in that paragraph's own voice.
+
+Both files are otherwise untouched. `CLAUDE.md`'s `PROTOCOL_VERSION` line already reads 9 on this
+base and is PR #52's to own, so it was left alone. ADR-0019's "Not delivered" row now quotes the new
+sentence so the ADR, the two contract files, and this card cannot drift apart silently.
+
+### P2 — the durable half of an acknowledgement was living in a transient slot
+
+Round 1 moved `unreferenced_accepted_commit` and `pending_rerun_reason` out of "dropped entirely" and
+into the `bridge_status` banner. Codex found that this only moved the problem: every successfully
+reduced bridge message resets that slot, and an `ops_update` lands immediately after a discard — so
+the only post-action copy of a stranded commit's OID and its `git cat-file -p` recovery command could
+disappear before the operator finished reading it. The round-1 fix was correct about *what* to
+surface and wrong about *where*.
+
+Now a pair. The banner stays as the transient echo, and a new `GovernedAckNotice` is the durable
+record: emitted by the bridge as its own `governed_ack` message kind, filed by task id into a
+`BTreeMap` signal on the shell, rendered on that task's card, and cleared **only** by an explicit
+Dismiss control. The reducer branch that files it `continue`s before the message ever reaches
+`apply_desktop_bridge_message`, so no `ops_update` path can touch it. The map lives on the shell
+rather than the card for the same reason the discard draft lives on the board: the card is keyed
+`id:revision` and is remounted on every revision bump.
+
+A notice whose payload carries no task id or no detail is **dropped**, not filed under an empty
+string — keying one task's stranded commit under `""` would attach it to whatever card looked there
+next.
+
+Tests: an `ops_update` after a discard leaves the OID on the card; a revision bump (card remount)
+leaves it; explicit dismissal removes it and touches no other task's notice; plus a serde round trip
+and a rejection sweep over unfilable payloads.
+
+**Known limit, stated:** these notices are session-scoped. Restarting the cockpit loses any
+undismissed notice, because nothing persists them. Making them durable across restarts means giving
+the desktop its own store, which is a larger decision than this thread; the daemon's ledger remains
+the authoritative record of what happened either way.

@@ -46,6 +46,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 review_queue: review_queue.clone(),
                 bridge_status: None,
                 daemon_ops_status: None,
+                // Visual fixtures render the resting state of each view; an
+                // acknowledgement notice is a post-action artifact.
+                governed_acks: Default::default(),
+                on_dismiss_governed_ack: None,
                 initial_view: view,
             },
         );
