@@ -209,6 +209,14 @@ initial OID, and only a separate `PromoteGovernedOutcome` step after operator ac
 fast-forwards the canonical branch — or reports `PromotionBlocked{canonical_head}` if that head
 moved. It is a Git-level boundary, so the compatibility preview reports `filesystem.scoped` as
 **mediated**, never structural: nothing stops the process from writing outside the checkout.
+Three invariants the scope depends on, all hardened by the 2026-09-12 post-merge review: a staged
+task has **no** launch working directory until its worktree is materialized (`MarkRunning` refuses
+it, and `launch_working_directory` returns an error rather than the canonical workspace); every
+daemon-owned producer — claim *and* verification — observes that staged root rather than the
+canonical checkout; and the shared-repository-configuration pin is a digest of **raw file bytes**
+(including files reached through `include`/`includeIf`) that promotion compares before spawning any
+Git process, since asking Git a question inside a repository whose configuration is in question is
+not a neutral act.
 - **Source of truth:** `WorldScope` and `StagedWorktree` in
   `impulse-rs/impulse-ops/src/governed_task.rs`, the staged producers in
   `impulse-rs/src/governed_producers.rs`, and ADR-0019.

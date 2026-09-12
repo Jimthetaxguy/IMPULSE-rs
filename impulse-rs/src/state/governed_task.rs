@@ -969,6 +969,7 @@ fn validate_task_history(task: &GovernedTaskRun) -> Result<BTreeMap<u64, String>
                 now: &event.created_at,
                 operator_authentication: replay_operator_authentication,
                 replay_claim,
+                is_replay: true,
             },
         )
         .with_context(|| {
@@ -1214,6 +1215,17 @@ struct MutationContext<'a> {
     operator_authentication: OperatorAuthentication,
     /// Set only while replaying a claim event out of the ledger.
     replay_claim: Option<ReplayedClaimEvidence<'a>>,
+    /// True while replaying stored history rather than applying a new mutation.
+    ///
+    /// Preconditions that *reject* a transition must not be evaluated during
+    /// replay: a ledger written before the precondition existed recorded a
+    /// transition that was legal when it happened, and re-judging it under
+    /// today's rules fails the whole ledger closed — taking every unrelated task
+    /// in the file down with it. Replay reproduces decisions; it does not
+    /// re-authorize them. (Clock-derived *computations*, like the loop verdict,
+    /// are the opposite case and are deliberately recomputed — see ADR-0019
+    /// rule 11.)
+    is_replay: bool,
 }
 
 impl<'a> MutationContext<'a> {
@@ -1222,6 +1234,7 @@ impl<'a> MutationContext<'a> {
             now,
             operator_authentication,
             replay_claim: None,
+            is_replay: false,
         }
     }
 }
@@ -1385,6 +1398,38 @@ fn apply_mutation(
             require_actor(&actor, GovernedActorKind::System)?;
             if task.execution_state != GovernedExecutionState::Registered {
                 return invalid_transition("only a registered task can start running");
+            }
+            // ADR-0019, 2026-09-12 post-merge fix. Execution state alone is not
+            // enough: a staged task whose worktree has not been materialized has
+            // no directory to launch into, and the contract used to fall back to
+            // the canonical workspace, handing the Builder authoritative
+            // filesystem access under a record that says `staged_authoritative`.
+            // Refuse the transition instead, so the scope cannot be defeated by
+            // a launcher that simply skipped materialization.
+            //
+            // Live mutations only. A #50-era ledger can hold a staged task that
+            // reached `running` without a worktree — that is the bug — and
+            // enforcing this during replay would make such a ledger unloadable
+            // in its entirety rather than merely unable to repeat the mistake.
+            if !context.is_replay && task.world_scope == WorldScope::StagedAuthoritative {
+                match task.active_staged_worktree() {
+                    None => {
+                        return invalid_transition(
+                            "a staged_authoritative task starts running only after its staged worktree is materialized",
+                        );
+                    }
+                    // A worktree whose pin this build cannot compare is a dead
+                    // end, not a slow start: every producer refuses to run Git
+                    // in it, so launching a Builder there burns a run that can
+                    // never claim, verify, or promote. Refuse at the transition
+                    // and name the way out.
+                    Some(staged) if !staged.shared_config_digest.is_comparable() => {
+                        return invalid_transition(
+                            "the staged worktree's shared-repository-configuration pin cannot be compared by this build; discard the staged worktree and re-materialize it before starting the runtime",
+                        );
+                    }
+                    Some(_) => {}
+                }
             }
             task.execution_state = GovernedExecutionState::Running;
             task.events.push(new_event(
@@ -1891,12 +1936,14 @@ fn staged_worktree_is_discardable(task: &GovernedTaskRun) -> bool {
     if task.execution_state == GovernedExecutionState::LaunchFailed {
         return true;
     }
-    // A worktree with no shared-configuration pin can never be promoted, so
-    // discarding it is the only way forward and must always be available.
+    // A worktree whose shared-configuration pin this build cannot compare —
+    // absent, or recorded under a superseded digest scheme — can never be
+    // promoted, so discarding it is the only way forward and must always be
+    // available.
     if task
         .staged_worktree
         .as_ref()
-        .is_some_and(|staged| staged.shared_config_digest.is_unknown())
+        .is_some_and(|staged| !staged.shared_config_digest.is_comparable())
     {
         return true;
     }
@@ -2207,11 +2254,11 @@ mod tests {
 
     fn test_shared_config_digest() -> SharedRepositoryConfigPin {
         SharedRepositoryConfigPin::Recorded(
-            impulse_ops::governed_task::SharedRepositoryConfigDigest {
-                repository_config: digest('d'),
-                worktree_config: None,
-                info_attributes: None,
-            },
+            impulse_ops::governed_task::SharedRepositoryConfigDigest::current(
+                digest('d'),
+                None,
+                None,
+            ),
         )
     }
 
@@ -3714,6 +3761,14 @@ mod tests {
     }
 
     fn staged_registration(state: &State, request_id: &str) -> GovernedTaskRegistration {
+        staged_registration_at(state, request_id, &staged_oid('a'))
+    }
+
+    fn staged_registration_at(
+        state: &State,
+        request_id: &str,
+        initial_subject_revision: &str,
+    ) -> GovernedTaskRegistration {
         let root = state.storage().base_path().parent().unwrap();
         let assignment = impulse_ops::role_assignment::canonical_governed_builder_assignment();
         let compatibility = impulse_ops::agent_registry::AgentRegistry::builtin()
@@ -3736,7 +3791,7 @@ mod tests {
             impulse_ops::governed_task::GovernedVerificationProfile::RustWorkspaceV1,
         )
         .acceptance_criteria(vec!["the gate is green".to_string()])
-        .initial_subject_revision(staged_oid('a'))
+        .initial_subject_revision(initial_subject_revision.to_string())
         .role_assignment(assignment)
         .role_compatibility(compatibility)
         .build()
@@ -3852,7 +3907,8 @@ mod tests {
             .unwrap();
         assert_eq!(task.world_scope, WorldScope::StagedAuthoritative);
         assert!(task.staged_worktree.is_none());
-        assert_eq!(task.launch_working_directory(), task.workspace_root);
+        // A staged task has no launch directory until materialization.
+        assert!(task.launch_working_directory().is_err());
 
         let task = materialize(&state, &task, "staged-1-worktree");
 
@@ -3860,7 +3916,7 @@ mod tests {
         assert_eq!(staged.status, StagedWorktreeStatus::Active);
         assert_eq!(staged.root, staged_root_for(&task));
         assert_eq!(staged.initial_subject_revision, staged_oid('a'));
-        assert_eq!(task.launch_working_directory(), staged.root);
+        assert_eq!(task.launch_working_directory().unwrap(), staged.root);
         assert_eq!(
             task.events.last().unwrap().kind,
             GovernedTaskEventKind::StagedWorktreeMaterialized
@@ -3961,12 +4017,28 @@ mod tests {
     }
 
     #[test]
-    fn test_materialize_rejects_a_launched_runtime() {
+    fn test_materialize_rejects_a_task_that_left_the_registered_state() {
         let (_root, state) = state();
         let launched = state
             .register_governed_task(staged_registration(&state, "staged-5"))
             .unwrap();
-        let launched = launch(&state, &launched, "staged-5-run");
+        // A staged task can no longer reach `running` without a worktree (see
+        // `test_mark_running_requires_a_materialized_staged_worktree`), so the
+        // reachable way to leave `registered` without one is a failed launch.
+        let launched = state
+            .mutate_governed_task(mutation(
+                &launched,
+                "staged-5-launch-failed",
+                GovernedTaskMutation::MarkLaunchFailed {
+                    actor: actor(GovernedActorKind::System, "impulse-daemon"),
+                    reason: "runtime never started".into(),
+                },
+            ))
+            .unwrap();
+        assert_eq!(
+            launched.execution_state,
+            GovernedExecutionState::LaunchFailed
+        );
         let error = state
             .mutate_governed_task(mutation(
                 &launched,
@@ -4045,7 +4117,9 @@ mod tests {
             StagedWorktreeStatus::Discarded
         );
         assert!(task.active_staged_worktree().is_none());
-        assert_eq!(task.launch_working_directory(), task.workspace_root);
+        // Discarded: the staged task has no launch directory again, and must
+        // not silently fall back to the canonical workspace.
+        assert!(task.launch_working_directory().is_err());
         assert_eq!(
             task.events.last().unwrap().kind,
             GovernedTaskEventKind::StagedWorktreeDiscarded
@@ -4862,5 +4936,420 @@ mod tests {
     fn test_an_unpinned_staged_worktree_passes_record_validation() {
         require_shared_config_digest(&SharedRepositoryConfigPin::Unknown).unwrap();
         require_shared_config_digest(&test_shared_config_digest()).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Post-merge fixes for the #50 P1 review (2026-09-12)
+    // -----------------------------------------------------------------------
+
+    /// Fourth #50 P1 finding: `MarkRunning` checked only `execution_state`, so
+    /// an operator could launch a `staged_authoritative` task with no staged
+    /// worktree — and the contract then handed the launcher the canonical
+    /// workspace, defeating the declared scope in silence.
+    #[test]
+    fn test_mark_running_requires_a_materialized_staged_worktree() {
+        let (_root, state) = state();
+        let task = state
+            .register_governed_task(staged_registration(&state, "p1-running-1"))
+            .unwrap();
+        assert!(task.staged_worktree.is_none());
+
+        let error = state
+            .mutate_governed_task(mutation(
+                &task,
+                "p1-running-1-run",
+                GovernedTaskMutation::MarkRunning {
+                    actor: actor(GovernedActorKind::System, "impulse-daemon"),
+                },
+            ))
+            .expect_err("a staged task must not run before its worktree exists");
+        assert!(
+            error
+                .to_string()
+                .contains("staged worktree is materialized"),
+            "{error}"
+        );
+
+        // The refusal is a no-op: no event, no state change.
+        let stored = state
+            .get_governed_task("impulse-test", &task.id)
+            .unwrap()
+            .expect("the task still exists");
+        assert_eq!(stored.execution_state, GovernedExecutionState::Registered);
+        assert_eq!(stored.revision, task.revision);
+
+        // After materialization the same transition is allowed, and the launch
+        // directory is the staged root rather than the canonical workspace.
+        let materialized = materialize(&state, &task, "p1-running-1-staged");
+        let running = launch(&state, &materialized, "p1-running-1-run-again");
+        assert_eq!(running.execution_state, GovernedExecutionState::Running);
+        assert_eq!(
+            running.launch_working_directory().unwrap(),
+            staged_root_for(&running)
+        );
+        assert_ne!(
+            running.launch_working_directory().unwrap(),
+            running.workspace_root
+        );
+    }
+
+    /// Review round 3 on PR #53: `MarkRunning` also has to refuse a worktree
+    /// whose pin this build cannot compare. Launching there burns a run — every
+    /// producer refuses to run Git in it, so the Builder can never claim, verify,
+    /// or promote — and the operator is left with a live agent and no path
+    /// forward. Replay-exempt, like the materialization precondition.
+    #[test]
+    fn test_mark_running_requires_a_comparable_shared_config_pin() {
+        let (_root, state) = state();
+        let task = state
+            .register_governed_task(staged_registration(&state, "p1-pin-1"))
+            .unwrap();
+        let materialized = materialize(&state, &task, "p1-pin-1-staged");
+
+        // A pin from a superseded scheme, exactly as an upgraded build reloads.
+        let mut superseded = materialized.clone();
+        if let Some(staged) = superseded.staged_worktree.as_mut() {
+            let mut digest = staged
+                .shared_config_digest
+                .recorded()
+                .expect("a freshly materialized worktree is pinned")
+                .clone();
+            digest.scheme_version =
+                impulse_ops::governed_task::LEGACY_SHARED_REPOSITORY_CONFIG_SCHEME_VERSION;
+            staged.shared_config_digest = SharedRepositoryConfigPin::Recorded(digest);
+        }
+        let error = apply_mutation(
+            &mut superseded.clone(),
+            GovernedTaskMutation::MarkRunning {
+                actor: actor(GovernedActorKind::System, "impulse-daemon"),
+            },
+            superseded.revision + 1,
+            MutationContext::live("2026-09-12T00:00:00Z", OperatorAuthentication::Declared),
+        )
+        .expect_err("an uncomparable pin is a dead end, not a slow start");
+        assert!(error.to_string().contains("re-materialize"), "{error}");
+
+        // The comparable pin the producer actually recorded is allowed.
+        let running = launch(&state, &materialized, "p1-pin-1-run");
+        assert_eq!(running.execution_state, GovernedExecutionState::Running);
+
+        // ...and replay of a ledger that recorded `Running` under an older pin
+        // scheme still validates, so an upgrade cannot make a ledger unloadable.
+        let mut legacy = running;
+        if let Some(staged) = legacy.staged_worktree.as_mut() {
+            let mut digest = staged
+                .shared_config_digest
+                .recorded()
+                .expect("pinned")
+                .clone();
+            digest.scheme_version =
+                impulse_ops::governed_task::LEGACY_SHARED_REPOSITORY_CONFIG_SCHEME_VERSION;
+            staged.shared_config_digest = SharedRepositoryConfigPin::Recorded(digest);
+        }
+        validate_task_history(&legacy)
+            .expect("an upgraded build must still replay a ledger written before the bump");
+    }
+
+    /// The same tightening must not touch any other world scope, including the
+    /// `authoritative` default every pre-ADR-0019 ledger replays under.
+    #[test]
+    fn test_mark_running_is_unchanged_for_an_authoritative_task() {
+        let (_root, state) = state();
+        let task = state
+            .register_governed_task(registration(&state, "p1-running-2"))
+            .unwrap();
+        assert_eq!(task.world_scope, WorldScope::Authoritative);
+        let running = launch(&state, &task, "p1-running-2-run");
+        assert_eq!(running.execution_state, GovernedExecutionState::Running);
+        assert_eq!(
+            running.launch_working_directory().unwrap(),
+            running.workspace_root
+        );
+    }
+
+    /// An authoritative ledger that recorded `Running` replays unchanged under
+    /// the new precondition — the tightening is scoped to the staged world.
+    #[test]
+    fn test_an_authoritative_ledger_with_a_running_task_still_replays() {
+        let (root, state) = state();
+        let task = state
+            .register_governed_task(registration(&state, "p1-replay-1"))
+            .unwrap();
+        let task = launch(&state, &task, "p1-replay-1-run");
+        let task = claim(&state, &task, "p1-replay-1-claim");
+
+        let reloaded = State::new(root.path().join("impulse-test").join(".impulse"))
+            .expect("an authoritative ledger replays under the staged precondition");
+        let stored = reloaded
+            .get_governed_task("impulse-test", &task.id)
+            .unwrap()
+            .expect("the replayed task");
+        assert_eq!(stored.execution_state, GovernedExecutionState::Running);
+        assert_eq!(stored.world_scope, WorldScope::Authoritative);
+    }
+
+    /// Run one Git command in a fixture repository, returning trimmed stdout.
+    fn run_git(repo: &std::path::Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["-c", "core.hooksPath=/dev/null"])
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run git {args:?}: {error}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("git output is UTF-8")
+            .trim()
+            .to_string()
+    }
+
+    /// Handed over by the daemon-wiring lane alongside its
+    /// `PRODUCER_RESERVATIONS.json` fix: `.impulse/MEMORY_CANDIDATES.json` has
+    /// the identical shape of gap. `impulse init` gitignores it, but the
+    /// producers' cleanliness check never exempted it, so in a project whose
+    /// `.impulse` namespace is *not* gitignored, recording an operator approval
+    /// dirties the canonical tree — and promotion, which is only reachable
+    /// after an approval, then fails on a tree the daemon dirtied itself.
+    ///
+    /// This drives the real chain against a real repository: register, stage
+    /// with the real producer, launch, Builder commit, claim, verify, recommend,
+    /// approve, promote.
+    #[test]
+    fn test_an_operator_approval_leaves_an_ungitignored_canonical_tree_promotable() {
+        let (root, state) = state();
+        let project = root.path().join("impulse-test");
+        // Deliberately no `.gitignore`: this is the project shape where the
+        // daemon's own runtime files are visible to Git.
+        run_git(&project, &["init", "--quiet", "--initial-branch=main"]);
+        run_git(&project, &["config", "user.email", "lane@example.invalid"]);
+        run_git(&project, &["config", "user.name", "Memory Lane"]);
+        std::fs::write(project.join("README.md"), "initial\n").unwrap();
+        run_git(&project, &["add", "README.md"]);
+        run_git(&project, &["commit", "--quiet", "-m", "initial"]);
+        let initial = run_git(&project, &["rev-parse", "--verify", "HEAD^{commit}"]);
+
+        let task = state
+            .register_governed_task(staged_registration_at(&state, "mem-1", &initial))
+            .unwrap();
+        // The real producer, so the recorded pin is the real one promotion
+        // compares against.
+        let staged_input = crate::governed_producers::materialize_staged_worktree(&task).unwrap();
+        let staged_root = std::path::PathBuf::from(&staged_input.root);
+        let task = state
+            .mutate_governed_task(mutation(
+                &task,
+                "mem-1-staged",
+                GovernedTaskMutation::MaterializeStagedWorktree {
+                    staged: staged_input,
+                },
+            ))
+            .unwrap();
+        let task = launch(&state, &task, "mem-1-run");
+
+        std::fs::write(staged_root.join("feature.txt"), "builder work\n").unwrap();
+        run_git(&staged_root, &["add", "feature.txt"]);
+        run_git(&staged_root, &["commit", "--quiet", "-m", "builder work"]);
+        let builder_commit = run_git(&staged_root, &["rev-parse", "--verify", "HEAD^{commit}"]);
+
+        let task = staged_claim(&state, &task, "mem-1-claim", &builder_commit);
+        let task = verify(
+            &state,
+            &task,
+            "mem-1-verify",
+            GovernedVerificationOutcome::Passed,
+        );
+        let task = recommend_accept(&state, &task, "mem-1-supervisor");
+        let task = operator_decide(
+            &state,
+            &task,
+            "mem-1-operator",
+            OperatorDecisionKind::Approve,
+        );
+        assert_eq!(task.review_state, GovernedReviewState::Accepted);
+
+        // Negative control: the approval really did write a file Git can see,
+        // so the assertion below is about the exemption and not about a file
+        // that never appeared.
+        let candidates = project.join(".impulse").join("MEMORY_CANDIDATES.json");
+        assert!(candidates.is_file(), "the approval records a candidate");
+        assert!(
+            run_git(
+                &project,
+                &["status", "--porcelain", "--untracked-files=all"]
+            )
+            .contains("MEMORY_CANDIDATES.json"),
+            "an ungitignored .impulse must expose the candidate ledger to Git"
+        );
+
+        let promotion = crate::governed_producers::promote_governed_outcome(&task)
+            .expect("the daemon's own runtime file must not block promotion");
+        assert_eq!(
+            promotion.outcome,
+            GovernedPromotionOutcome::Promoted {
+                promoted_revision: builder_commit.clone()
+            }
+        );
+        assert_eq!(
+            run_git(&project, &["rev-parse", "--verify", "HEAD^{commit}"]),
+            builder_commit
+        );
+    }
+
+    /// Third #50 P1 finding, the migration half: a ledger written before the
+    /// digest scheme was versioned must still load, receipt fingerprints and
+    /// all. The version field is skipped on serialization when it holds the
+    /// legacy value precisely so the stored bytes — and therefore the
+    /// fingerprint computed over them — are unchanged for such a record.
+    #[test]
+    fn test_a_ledger_written_before_the_digest_scheme_was_versioned_still_loads() {
+        let (root, state) = state();
+        let task = state
+            .register_governed_task(staged_registration(&state, "p1-scheme-2"))
+            .unwrap();
+        let task = materialize(&state, &task, "p1-scheme-2-staged");
+        let staged = task.staged_worktree.as_ref().expect("staged worktree");
+        let mut legacy_digest = staged
+            .shared_config_digest
+            .recorded()
+            .expect("a freshly materialized worktree is pinned")
+            .clone();
+        legacy_digest.scheme_version =
+            impulse_ops::governed_task::LEGACY_SHARED_REPOSITORY_CONFIG_SCHEME_VERSION;
+        let legacy_fingerprint = fingerprint_mutation(
+            &task.project_id,
+            &task.id,
+            &GovernedTaskMutation::MaterializeStagedWorktree {
+                staged: StagedWorktreeInput {
+                    actor: staged.actor.clone(),
+                    root: staged.root.clone(),
+                    initial_subject_revision: staged.initial_subject_revision.clone(),
+                    shared_config_digest: SharedRepositoryConfigPin::Recorded(legacy_digest),
+                },
+            },
+        )
+        .unwrap();
+
+        rewrite_persisted_ledger(&state, |ledger| {
+            let tasks = ledger
+                .get_mut("tasks")
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("tasks object");
+            for stored in tasks.values_mut() {
+                let removed = stored
+                    .get_mut("staged_worktree")
+                    .and_then(|staged| staged.get_mut("shared_config_digest"))
+                    .and_then(|pin| pin.get_mut("recorded"))
+                    .and_then(serde_json::Value::as_object_mut)
+                    .expect("recorded pin object")
+                    .remove("scheme_version");
+                assert!(
+                    removed.is_some(),
+                    "the current scheme must serialize the version it used"
+                );
+            }
+            let receipts = ledger
+                .get_mut("processed_requests")
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("receipts object");
+            for receipt in receipts.values_mut() {
+                let receipt = receipt.as_object_mut().expect("receipt object");
+                if receipt
+                    .get("resulting_revision")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(1)
+                {
+                    receipt.insert(
+                        "request_fingerprint".to_string(),
+                        serde_json::Value::String(legacy_fingerprint.clone()),
+                    );
+                }
+            }
+        });
+
+        let reloaded = State::new(root.path().join("impulse-test").join(".impulse"))
+            .expect("a pre-versioning ledger must not fail closed");
+        let stored = reloaded
+            .get_governed_task("impulse-test", &task.id)
+            .unwrap()
+            .expect("the task survives reload");
+        let staged = stored.staged_worktree.as_ref().expect("staged worktree");
+        // It loads, it is refused for promotion, and it can be reclaimed.
+        assert!(staged.shared_config_digest.recorded().is_some());
+        assert!(!staged.shared_config_digest.is_comparable());
+        assert!(staged_worktree_is_discardable(&stored));
+    }
+
+    /// Review round 1 on PR #53: the staged `MarkRunning` precondition must be
+    /// live-only. A #50-era ledger can hold exactly the shape the precondition
+    /// now refuses — a staged task that reached `running` with no materialized
+    /// worktree — and enforcing it during replay made `GovernedTaskLedger::load`
+    /// fail on that task, taking every unrelated task in the file with it.
+    ///
+    /// The fixture is that ledger's shape: a real history whose `Running` event
+    /// was legal when it was recorded, replayed as a staged task.
+    #[test]
+    fn test_a_staged_ledger_that_ran_before_materialization_still_replays() {
+        let (_root, state) = state();
+        let task = state
+            .register_governed_task(registration(&state, "p1-replay-staged"))
+            .unwrap();
+        let task = launch(&state, &task, "p1-replay-staged-run");
+        let task = claim(&state, &task, "p1-replay-staged-claim");
+
+        let mut legacy = task.clone();
+        legacy.world_scope = WorldScope::StagedAuthoritative;
+        assert!(legacy.staged_worktree.is_none());
+        assert_eq!(legacy.execution_state, GovernedExecutionState::Running);
+
+        validate_task_history(&legacy)
+            .expect("a ledger written before the precondition existed must still replay");
+
+        // ...while the live path still refuses the same transition.
+        let fresh = state
+            .register_governed_task(staged_registration(&state, "p1-replay-staged-live"))
+            .unwrap();
+        assert!(state
+            .mutate_governed_task(mutation(
+                &fresh,
+                "p1-replay-staged-live-run",
+                GovernedTaskMutation::MarkRunning {
+                    actor: actor(GovernedActorKind::System, "impulse-daemon"),
+                },
+            ))
+            .is_err());
+    }
+
+    /// Third #50 P1 finding: a pin recorded under the superseded sorted-listing
+    /// scheme cannot be compared, so it must be as discardable as no pin at all
+    /// or the operator is left with a worktree that can neither promote nor be
+    /// reclaimed.
+    #[test]
+    fn test_a_legacy_scheme_pin_is_always_discardable() {
+        let (_root, state) = state();
+        let task = state
+            .register_governed_task(staged_registration(&state, "p1-scheme-1"))
+            .unwrap();
+        let mut task = materialize(&state, &task, "p1-scheme-1-staged");
+        assert!(!staged_worktree_is_discardable(&task));
+
+        if let Some(staged) = task.staged_worktree.as_mut() {
+            let mut digest = staged
+                .shared_config_digest
+                .recorded()
+                .expect("a freshly materialized worktree is pinned")
+                .clone();
+            digest.scheme_version =
+                impulse_ops::governed_task::LEGACY_SHARED_REPOSITORY_CONFIG_SCHEME_VERSION;
+            assert!(!digest.is_current_scheme());
+            staged.shared_config_digest = SharedRepositoryConfigPin::Recorded(digest);
+        }
+        assert!(staged_worktree_is_discardable(&task));
     }
 }

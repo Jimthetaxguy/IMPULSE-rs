@@ -282,6 +282,44 @@ impl SharedRepositoryConfigPin {
     pub fn is_unknown(&self) -> bool {
         matches!(self, Self::Unknown)
     }
+
+    /// The digest only when this build can actually compare against it: it was
+    /// recorded, *and* it was recorded under the current scheme. A pin from a
+    /// superseded scheme is as uncomparable as no pin at all, and promotion must
+    /// treat it the same way rather than comparing apples to oranges.
+    pub fn comparable(&self) -> Option<&SharedRepositoryConfigDigest> {
+        self.recorded().filter(|digest| digest.is_current_scheme())
+    }
+
+    pub fn is_comparable(&self) -> bool {
+        self.comparable().is_some()
+    }
+}
+
+/// Scheme these digests are computed under.
+///
+/// Bumped by the 2026-09-12 post-merge fixes. Scheme 1 hashed a *sorted*
+/// `git config --local --list` rendering, which collapses a reordering of
+/// repeated scalar keys to the same digest even though Git resolves the last
+/// one. Scheme 2 hashed raw file bytes but covered only the canonical
+/// worktree's per-worktree files. Scheme 3 adds the staged worktree's own
+/// per-worktree configuration and attributes, and changes the domain separator
+/// of the attributes digest.
+///
+/// **Bump this whenever the covered file set or any hashing input changes**, not
+/// only when the algorithm does. Two pins computed over different file sets
+/// answer different questions, and comparing them produces a *misleading*
+/// difference — `RepositoryConfigChanged` naming a component nothing touched —
+/// rather than the honest `repository_config_unpinned` refusal. A pin recorded
+/// under any other version is refused as uncomparable.
+pub const SHARED_REPOSITORY_CONFIG_SCHEME_VERSION: u32 = 3;
+
+/// The version a record written before the field existed loads as. It is not
+/// comparable, and it is deliberately not `SHARED_REPOSITORY_CONFIG_SCHEME_VERSION`.
+pub const LEGACY_SHARED_REPOSITORY_CONFIG_SCHEME_VERSION: u32 = 0;
+
+fn scheme_version_is_legacy(version: &u32) -> bool {
+    *version == LEGACY_SHARED_REPOSITORY_CONFIG_SCHEME_VERSION
 }
 
 /// Digests of every piece of worktree-shared Git state that can turn a later
@@ -289,6 +327,12 @@ impl SharedRepositoryConfigPin {
 /// which is itself pinned: creating it is a change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SharedRepositoryConfigDigest {
+    /// Scheme the digests below were computed under. Skipped when it is the
+    /// legacy value so a record written before this field existed serializes to
+    /// exactly the bytes it was fingerprinted from, which is what keeps an
+    /// existing ledger loading.
+    #[serde(default, skip_serializing_if = "scheme_version_is_legacy")]
+    pub scheme_version: u32,
     pub repository_config: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_config: Option<String>,
@@ -297,6 +341,26 @@ pub struct SharedRepositoryConfigDigest {
 }
 
 impl SharedRepositoryConfigDigest {
+    /// A digest recorded under the scheme this build compares with.
+    pub fn current(
+        repository_config: String,
+        worktree_config: Option<String>,
+        info_attributes: Option<String>,
+    ) -> Self {
+        Self {
+            scheme_version: SHARED_REPOSITORY_CONFIG_SCHEME_VERSION,
+            repository_config,
+            worktree_config,
+            info_attributes,
+        }
+    }
+
+    /// Whether this pin was computed the same way this build computes one.
+    /// Comparing across schemes would compare two different questions.
+    pub fn is_current_scheme(&self) -> bool {
+        self.scheme_version == SHARED_REPOSITORY_CONFIG_SCHEME_VERSION
+    }
+
     /// The first component that differs, which is what the operator is told.
     pub fn first_difference(&self, other: &Self) -> Option<SharedConfigComponent> {
         if self.repository_config != other.repository_config {
@@ -1272,12 +1336,34 @@ impl GovernedTaskRun {
     /// Working directory a launched runtime must be given. A staged Builder
     /// works inside its disposable worktree; every other scope works in the
     /// canonical workspace root.
-    pub fn launch_working_directory(&self) -> &str {
+    ///
+    /// A staged task with no active staged worktree has **no** launch working
+    /// directory. Falling back to the canonical workspace there would hand a
+    /// Builder authoritative filesystem access under a record that says it is
+    /// staged, which is the scope silently defeating itself; the 2026-09-12
+    /// post-merge fix makes that case a typed error instead. Every non-staged
+    /// scope is unchanged and still infallible in practice.
+    pub fn launch_working_directory(&self) -> Result<&str, LaunchWorkingDirectoryError> {
         match self.active_staged_worktree() {
-            Some(staged) => staged.root.as_str(),
-            None => self.workspace_root.as_str(),
+            Some(staged) => Ok(staged.root.as_str()),
+            None if self.world_scope == WorldScope::StagedAuthoritative => {
+                Err(LaunchWorkingDirectoryError::StagedWorktreeNotMaterialized {
+                    task_id: self.id.as_str().to_string(),
+                    scope: self.world_scope,
+                })
+            }
+            None => Ok(self.workspace_root.as_str()),
         }
     }
+}
+
+/// Why a governed task has no directory a runtime may be launched in.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LaunchWorkingDirectoryError {
+    #[error(
+        "{scope} governed task `{task_id}` has no launch working directory until its staged worktree is materialized"
+    )]
+    StagedWorktreeNotMaterialized { task_id: String, scope: WorldScope },
 }
 
 /// The snapshot intentionally carries the full typed record in the first
@@ -1376,11 +1462,11 @@ mod tests {
     }
 
     fn test_shared_config_digest() -> SharedRepositoryConfigPin {
-        SharedRepositoryConfigPin::Recorded(SharedRepositoryConfigDigest {
-            repository_config: format!("sha256:{}", "d".repeat(64)),
-            worktree_config: None,
-            info_attributes: Some(format!("sha256:{}", "e".repeat(64))),
-        })
+        SharedRepositoryConfigPin::Recorded(SharedRepositoryConfigDigest::current(
+            format!("sha256:{}", "d".repeat(64)),
+            None,
+            Some(format!("sha256:{}", "e".repeat(64))),
+        ))
     }
 
     fn staged_registration_builder() -> GovernedTaskRegistrationBuilder {
@@ -1678,22 +1764,48 @@ mod tests {
             Some(staged_record(StagedWorktreeStatus::Active)),
         );
         assert_eq!(
-            staged.launch_working_directory(),
+            staged.launch_working_directory().unwrap(),
             "/tmp/impulse-rs/.impulse/worktrees/task-1"
         );
     }
 
+    /// 2026-09-12 post-merge fix for the fourth #50 P1 finding: a staged task
+    /// without an active staged worktree has no launch directory at all. The
+    /// old silent fallback to the canonical workspace handed a Builder
+    /// authoritative access under a record that claims to be staged.
     #[test]
-    fn test_launch_working_directory_falls_back_once_the_worktree_is_discarded() {
-        let discarded = run_with(
-            WorldScope::StagedAuthoritative,
-            Some(staged_record(StagedWorktreeStatus::Discarded)),
-        );
-        assert!(discarded.active_staged_worktree().is_none());
-        assert_eq!(discarded.launch_working_directory(), "/tmp/impulse-rs");
+    fn test_launch_working_directory_refuses_a_staged_task_without_a_worktree() {
+        for staged in [None, Some(staged_record(StagedWorktreeStatus::Discarded))] {
+            let task = run_with(WorldScope::StagedAuthoritative, staged);
+            assert!(task.active_staged_worktree().is_none());
+            let error = task
+                .launch_working_directory()
+                .expect_err("a staged task must not fall back to the canonical workspace");
+            assert_eq!(
+                error,
+                LaunchWorkingDirectoryError::StagedWorktreeNotMaterialized {
+                    task_id: task.id.as_str().to_string(),
+                    scope: WorldScope::StagedAuthoritative,
+                }
+            );
+            assert!(error.to_string().contains("staged_authoritative"));
+            // The operator has to know *which* task refused.
+            assert!(error.to_string().contains(task.id.as_str()));
+        }
+    }
 
-        let authoritative = run_with(WorldScope::Authoritative, None);
-        assert_eq!(authoritative.launch_working_directory(), "/tmp/impulse-rs");
+    #[test]
+    fn test_launch_working_directory_is_the_canonical_root_for_every_other_scope() {
+        for scope in [
+            WorldScope::Authoritative,
+            WorldScope::ReadOnlySnapshot,
+            WorldScope::DisposableScratch,
+        ] {
+            assert_eq!(
+                run_with(scope, None).launch_working_directory().unwrap(),
+                "/tmp/impulse-rs"
+            );
+        }
     }
 
     #[test]
@@ -1754,7 +1866,86 @@ mod tests {
         assert_eq!(task.world_scope, WorldScope::Authoritative);
         assert!(task.staged_worktree.is_none());
         assert!(task.promotions.is_empty());
-        assert_eq!(task.launch_working_directory(), "/tmp/impulse-rs");
+        assert_eq!(task.launch_working_directory().unwrap(), "/tmp/impulse-rs");
+    }
+
+    /// A pin recorded by the superseded sorted-listing scheme still loads — the
+    /// ledger must not fail closed — but it is not comparable, so promotion
+    /// treats it exactly like a worktree that carries no pin at all.
+    #[test]
+    fn test_a_legacy_scheme_pin_loads_but_is_not_comparable() {
+        let legacy: SharedRepositoryConfigPin = serde_json::from_value(serde_json::json!({
+            "recorded": {
+                "repository_config": format!("sha256:{}", "d".repeat(64)),
+                "info_attributes": format!("sha256:{}", "e".repeat(64)),
+            }
+        }))
+        .unwrap();
+        let digest = legacy.recorded().expect("a legacy pin is still `Recorded`");
+        assert_eq!(
+            digest.scheme_version,
+            LEGACY_SHARED_REPOSITORY_CONFIG_SCHEME_VERSION
+        );
+        assert!(!digest.is_current_scheme());
+        assert!(!legacy.is_comparable());
+        assert!(legacy.comparable().is_none());
+        // ...and it re-serializes to exactly the bytes it was loaded from, so
+        // an existing receipt fingerprint over this record still matches.
+        assert_eq!(
+            serde_json::to_value(&legacy).unwrap(),
+            serde_json::json!({
+                "recorded": {
+                    "repository_config": format!("sha256:{}", "d".repeat(64)),
+                    "info_attributes": format!("sha256:{}", "e".repeat(64)),
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn test_a_current_scheme_pin_is_comparable_and_round_trips() {
+        let pin = test_shared_config_digest();
+        assert!(pin.is_comparable());
+        assert_eq!(
+            pin.comparable().unwrap().scheme_version,
+            SHARED_REPOSITORY_CONFIG_SCHEME_VERSION
+        );
+        let recovered: SharedRepositoryConfigPin =
+            serde_json::from_str(&serde_json::to_string(&pin).unwrap()).unwrap();
+        assert_eq!(recovered, pin);
+        assert!(recovered.is_comparable());
+
+        // An unknown future scheme loads and is refused rather than compared.
+        let mut future = pin.comparable().unwrap().clone();
+        future.scheme_version = SHARED_REPOSITORY_CONFIG_SCHEME_VERSION + 1;
+        let future = SharedRepositoryConfigPin::Recorded(future);
+        assert!(!future.is_comparable());
+        assert!(future.recorded().is_some());
+    }
+
+    /// Review round 2 on PR #53: a pin from this branch's own earlier commit was
+    /// still scheme 2, which covered a *different* file set, so comparing it
+    /// produced a misleading `RepositoryConfigChanged` instead of refusing.
+    #[test]
+    fn test_a_scheme_two_pin_is_refused_rather_than_compared() {
+        let mut superseded =
+            SharedRepositoryConfigDigest::current(format!("sha256:{}", "d".repeat(64)), None, None);
+        superseded.scheme_version = 2;
+        let pin = SharedRepositoryConfigPin::Recorded(superseded);
+        assert!(pin.recorded().is_some(), "it still loads");
+        assert!(
+            !pin.is_comparable(),
+            "a scheme-2 pin covers a different file set and must not be compared"
+        );
+        assert_eq!(SHARED_REPOSITORY_CONFIG_SCHEME_VERSION, 3);
+    }
+
+    #[test]
+    fn test_an_unknown_pin_is_neither_recorded_nor_comparable() {
+        let unknown = SharedRepositoryConfigPin::default();
+        assert!(unknown.is_unknown());
+        assert!(unknown.recorded().is_none());
+        assert!(!unknown.is_comparable());
     }
 
     #[test]
