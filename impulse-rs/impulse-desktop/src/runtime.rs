@@ -1919,6 +1919,141 @@ fn run_bounded_governed_git(
     })
 }
 
+/// Config keys that make Git execute a command during an ordinary `git status`.
+///
+/// `filter.<name>.clean`/`.smudge` run against any path a `.gitattributes` line
+/// routes through that filter; `diff.<name>.textconv`/`.command` run the same
+/// way for diffs. Unlike hooks and fsmonitor there is **no `-c` override that
+/// disables them** — setting `filter.x.clean=` to empty only breaks that one
+/// name, and the set of names is whatever the repository defines. Reproduced
+/// against Git 2.50.1 with a `.gitattributes` line of `* filter=probe`.
+///
+/// The daemon's producers handle this by pinning the shared configuration at
+/// materialization and refusing to run when the pin no longer holds. This
+/// preflight owns no pin — it runs in the operator's own checkout before any
+/// staged worktree exists — so it refuses outright instead.
+const EXECUTABLE_GIT_CONFIG_KEY_MARKERS: [&str; 4] = [".clean", ".smudge", ".textconv", ".command"];
+const EXECUTABLE_GIT_CONFIG_SECTIONS: [&str; 2] = ["filter", "diff"];
+
+/// Files this refusal reads. Filesystem reads only — it must run *before* the
+/// first Git invocation, since running Git is the thing it is protecting
+/// against.
+fn shared_git_config_paths(workspace_root: &Path) -> Vec<PathBuf> {
+    let mut git_dir = workspace_root.join(".git");
+    // A linked worktree's `.git` is a file holding `gitdir: <path>`. Follow one
+    // level; a deeper chain is a residual recorded on the lane card.
+    if git_dir.is_file() {
+        if let Ok(contents) = std::fs::read_to_string(&git_dir) {
+            if let Some(target) = contents
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("gitdir:"))
+            {
+                let target = Path::new(target.trim());
+                git_dir = if target.is_absolute() {
+                    target.to_path_buf()
+                } else {
+                    workspace_root.join(target)
+                };
+            }
+        }
+    }
+    vec![
+        git_dir.join("config"),
+        git_dir.join("config.worktree"),
+        git_dir.join("info").join("attributes"),
+    ]
+}
+
+/// Whether one line of Git configuration defines an executable filter or diff
+/// driver.
+///
+/// Deliberately lenient about form: a key can appear as a section header plus a
+/// bare key (`[filter "x"]` / `clean = ...`) or fully qualified on one line
+/// (`filter.x.clean=...`). `section` carries the most recent `[...]` header.
+fn line_defines_executable_git_driver(line: &str, section: &mut String) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+        return false;
+    }
+    if let Some(header) = trimmed.strip_prefix('[').and_then(|s| s.split(']').next()) {
+        *section = header.to_ascii_lowercase();
+        // `[filter "x"]` with the key on a later line, and also the one-line
+        // form `[filter "x"] clean = ...` Git accepts.
+        let rest = trimmed
+            .split_once(']')
+            .map(|(_, rest)| rest.trim())
+            .unwrap_or_default();
+        if rest.is_empty() {
+            return false;
+        }
+        return section_is_executable(section) && key_is_executable(rest);
+    }
+    if let Some((key, _)) = trimmed.split_once('=') {
+        let key = key.trim().to_ascii_lowercase();
+        // Fully qualified: `filter.x.clean = ...`
+        if EXECUTABLE_GIT_CONFIG_SECTIONS
+            .iter()
+            .any(|s| key.starts_with(&format!("{s}.")))
+            && EXECUTABLE_GIT_CONFIG_KEY_MARKERS
+                .iter()
+                .any(|marker| key.ends_with(marker))
+        {
+            return true;
+        }
+        return section_is_executable(section) && key_is_executable(&key);
+    }
+    false
+}
+
+fn section_is_executable(section: &str) -> bool {
+    EXECUTABLE_GIT_CONFIG_SECTIONS
+        .iter()
+        .any(|s| section == *s || section.starts_with(&format!("{s} ")))
+}
+
+fn key_is_executable(key: &str) -> bool {
+    let key = key
+        .split('=')
+        .next()
+        .unwrap_or(key)
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        key.as_str(),
+        "clean" | "smudge" | "textconv" | "command" | "process"
+    )
+}
+
+/// Refuse the governed preflight when repository configuration would execute a
+/// command during it.
+///
+/// Review round 1, P2: the preflight's `-c` overrides make it hook- and
+/// global-config-free, but a repository-level `filter.*.clean` still executes
+/// during `git status`. This is a filesystem-only check, so it happens before
+/// the first Git process is spawned.
+fn refuse_executable_git_drivers(workspace_root: &Path) -> Result<(), DesktopBridgeError> {
+    for path in shared_git_config_paths(workspace_root) {
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut section = String::new();
+        for line in contents.lines() {
+            if line_defines_executable_git_driver(line, &mut section) {
+                return Err(DesktopBridgeError::GovernedTaskFailed {
+                    message: format!(
+                        "closed-loop governed launch refuses this workspace: {} defines an \
+                         executable Git filter or diff driver, which runs during the preflight's \
+                         own `git status` and cannot be disabled by a command-line override. \
+                         Remove or relocate that driver before launching a governed agent.",
+                        path.display()
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 fn observe_clean_git_head_with_timeout(
     workspace_root: &str,
     timeout: Duration,
@@ -1953,6 +2088,11 @@ fn observe_clean_git_head_with_timeout(
                 message: "Git governed-launch preflight returned non-UTF-8 output".to_string(),
             })
     }
+
+    // Before the first Git process: repository configuration can still execute a
+    // filter or diff driver during `git status`, and no command-line override
+    // disables it.
+    refuse_executable_git_drivers(Path::new(workspace_root))?;
 
     let canonical = std::fs::canonicalize(workspace_root).map_err(|error| {
         DesktopBridgeError::GovernedTaskFailed {
@@ -2883,6 +3023,112 @@ mod tests {
     fn filetime_touch(path: &Path) {
         let contents = std::fs::read(path).expect("read tracked file");
         std::fs::write(path, contents).expect("rewrite tracked file");
+    }
+
+    /// Review round 1, P2: `-c core.hooksPath`/`core.fsmonitor` make the
+    /// preflight hook- and global-config-free, but a repository-level
+    /// `filter.*.clean` still executes during `git status` and no Git switch
+    /// disables it — the reviewer reproduced it with a `.gitattributes` line of
+    /// `* filter=probe`. The preflight now refuses such a workspace before
+    /// spawning Git at all, so the marker is never written.
+    #[cfg(unix)]
+    #[test]
+    fn test_governed_git_preflight_refuses_a_workspace_with_an_executable_filter_driver() {
+        let temp = tempfile::tempdir().expect("temporary Git preflight fixture");
+        let filter_marker = temp.path().join("filter-ran");
+        let (workspace, filter, run_git) =
+            governed_git_fixture(temp.path(), "probe-filter.sh", &filter_marker);
+
+        std::fs::write(workspace.join("tracked.txt"), "committed\n").expect("write tracked file");
+        std::fs::write(workspace.join(".gitattributes"), "* filter=probe\n")
+            .expect("write gitattributes");
+        run_git(&["add", "tracked.txt", ".gitattributes"]);
+        run_git(&["commit", "--quiet", "-m", "tracked"]);
+        run_git(&[
+            "config",
+            "filter.probe.clean",
+            filter.to_str().expect("UTF-8 filter path"),
+        ]);
+
+        let error = observe_clean_git_head_with_timeout(
+            workspace.to_str().expect("UTF-8 workspace path"),
+            Duration::from_secs(10),
+        )
+        .expect_err("an executable filter driver must refuse the preflight");
+        assert!(
+            matches!(
+                error,
+                DesktopBridgeError::GovernedTaskFailed { ref message }
+                    if message.contains("executable Git filter or diff driver")
+                        && message.contains(".git/config")
+            ),
+            "the refusal must name what it found and where, got: {error:?}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !filter_marker.exists(),
+            "the refusal must happen before any Git process runs the filter"
+        );
+    }
+
+    /// The refusal is a line-level parse, so it has to recognize both spellings
+    /// Git accepts and leave unrelated configuration alone.
+    #[test]
+    fn test_executable_git_driver_detection_covers_both_config_spellings() {
+        let mut section = String::new();
+        assert!(line_defines_executable_git_driver(
+            "filter.probe.clean = /tmp/probe.sh",
+            &mut section
+        ));
+        assert!(line_defines_executable_git_driver(
+            "diff.probe.textconv = /tmp/probe.sh",
+            &mut section
+        ));
+
+        // Section-header form, where the key alone carries no section.
+        let mut section = String::new();
+        assert!(!line_defines_executable_git_driver(
+            "[filter \"probe\"]",
+            &mut section
+        ));
+        assert!(line_defines_executable_git_driver(
+            "\tsmudge = cat",
+            &mut section
+        ));
+
+        // A benign section must not arm the key check.
+        let mut section = String::new();
+        assert!(!line_defines_executable_git_driver("[core]", &mut section));
+        assert!(!line_defines_executable_git_driver(
+            "\tcommand = not-a-driver",
+            &mut section
+        ));
+        assert!(!line_defines_executable_git_driver(
+            "# filter.probe.clean = commented out",
+            &mut section
+        ));
+        assert!(!line_defines_executable_git_driver(
+            "\trequired = true",
+            &mut section
+        ));
+    }
+
+    /// A repository with no such driver still passes, so the refusal is not a
+    /// blanket block on every governed launch.
+    #[cfg(unix)]
+    #[test]
+    fn test_governed_git_preflight_accepts_a_workspace_with_no_executable_driver() {
+        let temp = tempfile::tempdir().expect("temporary Git preflight fixture");
+        let unused_marker = temp.path().join("never-written");
+        let (workspace, _script, _run_git) =
+            governed_git_fixture(temp.path(), "unused.sh", &unused_marker);
+
+        let head = observe_clean_git_head_with_timeout(
+            workspace.to_str().expect("UTF-8 workspace path"),
+            Duration::from_secs(10),
+        )
+        .expect("a repository with no executable driver passes the preflight");
+        assert_eq!(head.len(), 40);
     }
 
     /// The bound and the process-group reap, proven through a repository alias
