@@ -607,6 +607,14 @@ where
                 "governed producer commands require --daemon so the project daemon remains authoritative"
             );
         }
+        Commands::InternalPdfText {
+            path,
+            max_chars,
+            max_pages,
+            memory_limit_bytes,
+        } => {
+            handlers::internal_pdf_text::run(&path, max_chars, max_pages, memory_limit_bytes)?;
+        }
     }
 
     Ok(())

@@ -32,7 +32,7 @@ fn normalize_lexical(path: &Path) -> PathBuf {
 /// canonicalizes the nearest existing ancestor and re-attaches the remainder,
 /// collapsing `..` lexically — so `<root>/../../etc/x` can never be mistaken for
 /// a path under `<root>`.
-fn secure_resolve(path: &Path) -> PathBuf {
+pub(crate) fn secure_resolve(path: &Path) -> PathBuf {
     if let Ok(canonical) = std::fs::canonicalize(path) {
         return canonical;
     }
@@ -239,8 +239,28 @@ impl ToolResult {
 /// Execution context passed to every tool — controls what it can do
 #[derive(Debug, Clone)]
 pub struct ToolContext {
-    /// Path to .impulse/ directory
+    /// Path to .impulse/ directory: the CURRENTLY EFFECTIVE default used
+    /// when a tool's own `impulse_dir`-shaped parameter is omitted. For an
+    /// `ion_repl` session this may be an explicitly-configured
+    /// `IMPULSE_HOME` rather than the launching project's own directory --
+    /// see [`Self::project_impulse_dir`] for the value that is ALWAYS the
+    /// project's own, regardless of what this field currently holds.
     pub impulse_dir: PathBuf,
+    /// The launching project's OWN `.impulse` directory, independent of
+    /// whatever [`Self::impulse_dir`] currently resolves to (review round
+    /// 6, MEDIUM REFUTED on PR #54: when `IMPULSE_HOME` is set,
+    /// `ion_repl::ReplContext::sandbox_tool_context` sets `impulse_dir` to
+    /// `IMPULSE_HOME` itself, so a memory tool validating an explicit
+    /// override against `{ctx.impulse_dir}` alone loses the ability to
+    /// ever reach the PROJECT's own directory again -- both "the current
+    /// default" and "the only other allowed target" collapsed onto the
+    /// same value). Set explicitly by `sandbox_tool_context` to
+    /// `repo_root.join(".impulse")`; every other constructor (`Default`,
+    /// `with_all_capabilities`) mirrors `impulse_dir`'s own default, so
+    /// non-`ion_repl` callers (CLI/daemon/MCP) see no behavior change --
+    /// this field only diverges from `impulse_dir` for an `ion_repl`
+    /// session with an explicitly-configured `IMPULSE_HOME`.
+    pub project_impulse_dir: PathBuf,
     /// Current session ID (if any)
     pub session_id: Option<String>,
     /// Capabilities this invocation is allowed to use
@@ -264,6 +284,7 @@ impl Default for ToolContext {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         Self {
             impulse_dir: PathBuf::from(".impulse"),
+            project_impulse_dir: PathBuf::from(".impulse"),
             session_id: None,
             allowed_capabilities: [Capability::FileSystemRead, Capability::SystemInfo]
                 .into_iter()

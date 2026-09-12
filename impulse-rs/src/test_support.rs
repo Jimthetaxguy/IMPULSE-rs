@@ -87,6 +87,23 @@ pub(crate) fn retrieval_embedding_env_lock() -> std::sync::MutexGuard<'static, (
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Acquire the process-wide lock guarding test mutation of `IMPULSE_HOME`.
+///
+/// Shared by `ion_repl::history`, `ion_repl::mod` (`sandbox_tool_context`,
+/// review round 5, P1 Codex on PR #54, item 2), and
+/// `tooling::builtin::{memory_search,genome_read}` (item 3's tool-scoped
+/// `IMPULSE_HOME` acceptance test) -- before this shared lock existed, each
+/// of those modules defined its OWN private `static ENV_LOCK`, which only
+/// serializes tests within that one file: two tests in DIFFERENT files
+/// mutating the same process-global `IMPULSE_HOME` could still race under
+/// `cargo test`'s default multi-threaded-single-process execution, exactly
+/// the failure mode this module's own doc comment warns about for
+/// `ION_GATE_LAUNCHER`. Poison-safe, matching the sibling locks above.
+pub(crate) fn impulse_home_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Poll until no process command line matches `pattern`, bounded by `timeout`.
 ///
 /// Process-group SIGKILL is synchronous, but reaping can lag under a heavily

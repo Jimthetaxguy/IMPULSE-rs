@@ -239,10 +239,17 @@ never picks a model — ADR-0015's step model stays the only model picker.
 
 ### tool sandbox roots — `[code]`
 The filesystem boundary every path-checking ion REPL tool (`file_read`, `file_write`, `bash_exec`'s
-`cwd`, `document_read`, `ion_verify`'s `repo`) resolves against: a session's `ReplContext.repo_root`
-is its fixed write root (never widened, not even by a literal `CONFIRM`), and
-`ReplContext.allowed_read_roots` is a read-only extension list grown one path at a time via
-`/allow <path>` (which refuses an empty or nonexistent path; a bare `/allow` lists current grants;
+`cwd`, `document_read`, `ion_verify`'s `repo`, and — Stage 1b-B, bridged the same way as
+`file_read`/`file_write` rather than through a bespoke path check — `memory_search`'s and
+`genome_read`'s `impulse_dir`) resolves against: a session's `ReplContext.repo_root`
+is its fixed write root (never widened, not even by a literal `CONFIRM`). Reads are additionally
+granted (unconditionally, not via `/allow`) under Impulse's own home directory
+(`history::impulse_home()`, i.e. `IMPULSE_HOME`/`$HOME/.impulse`) — review round 1, P2-2/P2-3:
+`memory_search`/`genome_read`'s own default previously resolved relative to the process's working
+directory with no relationship to this sandbox at all, and an omitted `impulse_dir` parameter was
+invisible to the generic `validate_paths` check besides. `ReplContext.allowed_read_roots` is a
+further read-only extension list grown one path at a time via `/allow <path>` (which refuses an
+empty or nonexistent path; a bare `/allow` lists current grants;
 a grant of `/`, `$HOME`, or an ancestor of the repo root still succeeds -- the human explicitly
 asked for it -- but prints a loud warning first, since it effectively disables the read sandbox).
 `ReplContext::sandbox_tool_context` builds the `ToolContext` every one of those tools actually
@@ -321,15 +328,130 @@ Ion's read-only `document_read` tool: reads `xlsx` by streaming cells through ca
 reader under a character and cell budget (never the dense-grid parser; a chart or dialog sheet
 holds no cells and is skipped rather than failing the workbook), `docx` by streaming
 `word/document.xml` event by event through quick-xml so the object tree, many times the size of
-the XML, is never built, and `csv` through the `office` parser (files up to 10 MiB; containers
-inflated through a 64 MiB cap first; legacy
-`xls` refused; parsing on the blocking pool) and returns a section outline with
-whole-document offsets plus a bounded character window that ends on a line boundary and names
-the next offset, so a model inside a loop contract can jump to and page through an everyday
-document without flooding its context. Ungated like `file_read`; absolute paths are accepted;
-registered only with the default `office-support` feature.
-- **Source of truth:** `src/ion_repl/tool_document.rs` and
-  `docs/superpowers/specs/2026-09-01-ion-document-tool-design.md`.
+the XML, is never built, `csv` through the `office` parser, and `txt`/`md` as whole-file UTF-8
+reads (`md` additionally outlined by ATX heading, fence-aware) — files up to 10 MiB; containers
+inflated through a 64 MiB cap first; legacy `xls` refused; parsing on the blocking pool — and
+returns a section outline with whole-document offsets plus a bounded character window that ends on
+a line boundary and names the next offset, so a model inside a loop contract can jump to and page
+through an everyday document without flooding its context. Ungated like `file_read`; absolute
+paths are accepted, subject to the same sandbox as every other path this tool resolves; registered
+only with the default `office-support` feature. `document_extract` (a separate, stubbed CLI/daemon
+dynamic tool whose default path always errored) was deleted rather than extended when
+`document_read` gained `pdf`.
+
+**`pdf` runs in an isolated child process, not in-process (review round 1 on PR #54).** A
+self-referencing Form XObject makes `pdf_extract::output_doc_page` recurse until the thread's
+stack is exhausted -- `abort()`, not an unwinding panic, so `spawn_blocking`'s `JoinError`
+containment (what every other kind here still relies on) cannot catch it. `document_read` is
+ungated, so an in-process crash there previously killed `ion` outright. Page rendering is now
+isolated in a hidden `internal-pdf-text` subcommand (`extract_pdf`/`run_pdf_extraction_child` in
+`tool_document.rs`, shared by both `impulse-rs` and `ion` via `handlers::internal_pdf_text`),
+spawned with `kill_on_drop`, a `ProcessGroupGuard`, a 30s wall-clock timeout, and (unix)
+`RLIMIT_AS`/`RLIMIT_CPU`. Its `BoundedSink` (`std::fmt::Write`) refuses a write the instant the
+running character total would exceed budget -- true check-before-push, since the earlier
+per-page-then-check design reached multi-GB RSS on a small crafted file. Encryption is refused via
+a raw `/Encrypt` byte scan run before any parser touches the file, not `doc.is_encrypted()` after
+loading: `lopdf::Document::load` silently authenticates a PDF whose *user* password is empty.
+Annotation/`AcroForm` text is never extracted (only a page's own `/Contents` stream is rendered).
+
+**Review round 2 refuted three round-1 claims:** the unbounded parent-side `child.wait_with_output()`
+read (~3.2 GB RSS from a rogue child, fixed with `read_capped`/`read_capped_tail` on independent
+tasks), `BoundedSink` never having bounded memory in the first place (`pdf-extract`'s own stream
+decompression happens before `BoundedSink` ever runs; fixed with a `preflight_pdf_streams` counting
+pass), and a legal PDF name hex-escape (`/Encr#79pt`) bypassing the raw `/Encrypt` byte scan (fixed
+with a name-escape decoder plus a trailer-dictionary belt-and-braces check).
+
+**Review round 3 found the parent itself still parsed PDF structure, and the preflight missed
+LZW.** The "cheap" in-process page count (`precheck_pdf`, since deleted) called
+`pdf_extract::Document::load` in the PARENT -- but `lopdf::Document::load` eagerly decompresses
+every `/Type /ObjStm` object stream during loading with no hook to bound it, so a crafted ObjStm
+blew up the PARENT before any preflight could run (the review's `objstm_bomb2g.pdf`, 2.04 MB on
+disk, drove the parent to 2,078 MB RSS). Fixed structurally: the parent's entire PDF-specific job
+before spawning the child is now a raw `/Encrypt` byte scan (`pdf_encryption_prescan`) -- page
+count, the trailer re-check, the preflight, and rendering are now exclusively the child's job,
+authoritatively. The preflight also only ever counted `FlateDecode`; `LZWDecode` (`lzwmulti300.pdf`
+reached 4.12 GiB RSS) is now walked via each stream's full filter chain
+(`Stream::filters()`), with an outer `ASCII85Decode`/`ASCIIHexDecode` layer decoded first (fixing a
+real false-refusal on legitimate `[/ASCII85Decode /FlateDecode]` chains along the way) and
+deny-by-default for any filter this preflight cannot bound-count. Since `Document::load`'s own
+eager ObjStm inflation still cannot be pre-counted even confined to the child, a memory-watchdog
+thread (`spawn_memory_watchdog`, polling `getrusage`-derived peak RSS every ~10ms,
+self-terminating via a distinct exit code the parent maps to a typed error) is the real bound for
+that path -- and the ONLY enforced bound on macOS specifically, since `RLIMIT_AS` there is accepted
+by `setrlimit` but silently not kernel-enforced (confirmed empirically). The total decompression
+cap also rose from 64 MiB to 512 MiB (per-stream stays 64 MiB): the old total cap refused ordinary
+multi-hundred-page documents that were never actually proven to pass it, since the round-2
+"legitimacy" fixture had no compressed streams at all.
+- **Source of truth:** `src/ion_repl/tool_document.rs`, `src/handlers/internal_pdf_text.rs`,
+  `tests/pdf_extraction_isolation.rs`, `tests/fakes/rogue-stdout-shim.sh`, and
+  `docs/superpowers/specs/2026-09-01-ion-document-tool-design.md` (full review round 1/2/3 detail
+  and fixture table).
+
+### bridged memory tools — `[code]`
+`memory_search` and `genome_read` (`src/tooling/builtin/{memory_search,genome_read}.rs`) are
+ordinary `src/tooling::DynamicTool`s, registered in `ToolRegistry::with_defaults()` since before
+Stage 1b-B and already reachable from the CLI/daemon/MCP; that lane's addition was bridging them
+into Ion's `ReplToolRegistry` (`registry.rs::with_defaults`) via `DynamicToolBridge`, the same
+mechanism as `file_read`/`file_write`/`bash_exec`, rather than writing new `ReplTool` wrappers.
+They are ungated (read-only, `Capability::FileSystemRead` only).
+
+**`impulse_dir` default and validation (review round 1 P2-2/P2-3, corrected in review round 5, P1
+Codex items 2/3, corrected again in review round 6, MEDIUM REFUTED):** the default is
+`<repo_root>/.impulse` (the PROJECT's own state directory, where `GENOME.md`/`retrieval.db`
+actually live) — never `history::impulse_home()`'s `$HOME/.impulse` fallback, which a normal launch
+(no `IMPULSE_HOME` set) resolved to and which has no relationship to the project. `IMPULSE_HOME` is
+honored only when explicitly set and non-blank (and trimmed before use, since round 6: a padded env
+value used to deny itself). An explicit `impulse_dir` override is no longer routed through the
+shared `ToolRegistry::execute` → `validate_paths` → `ctx.allowed_read_roots` check (declaring it
+`ParamType::FilePath`, round 1's approach, forced widening those SHARED roots to cover an
+out-of-repo `IMPULSE_HOME`, which would have also authorized `file_read`/`document_read` to reach
+it). Both tools declare `impulse_dir` as `ParamType::String` and call a shared
+`tooling::builtin::resolve_and_validate_memory_dir` helper themselves. **Round 6 fix:** round 5's
+check was `{ctx.impulse_dir, IMPULSE_HOME}` — but `sandbox_tool_context` also SETS `ctx.impulse_dir`
+to `IMPULSE_HOME` when it's configured, so with `IMPULSE_HOME` set the "closed set" collapsed onto
+one value and an explicit project `.impulse` override was wrongly denied. `ToolContext` gained a
+`project_impulse_dir: PathBuf` field, set independently of `impulse_dir` by `sandbox_tool_context`
+to `repo_root.join(".impulse")` (mirrors `impulse_dir`'s own default for every other constructor, so
+non-`ion_repl` callers see no change); the check is now `{ctx.impulse_dir, ctx.project_impulse_dir,
+trimmed(IMPULSE_HOME)}` — three independent members that never collapse. An `/allow` grant still
+does NOT extend this tool-scoped reach (unchanged from round 5). `history::impulse_home()` itself is
+untouched, still governing `.impulse/ion_history` only.
+
+**`memory_search` is read-only for real now (review round 5, MEDIUM/Cursor; hardened in review round
+6, MEDIUM REFUTED):** it used to call `retrieval::search_history`/`search_genome`, which open
+`RetrievalStore` write-capable (`create_dir_all` + `Connection::open`, which creates `retrieval.db`,
+plus WAL pragma writes that create `-wal`/`-shm` sidecars) — so pointing this ungated tool at any
+`/allow`-granted directory with no existing index could CREATE real files there. It checks for
+`retrieval.db`'s existence itself (reporting a typed "No retrieval index found" when absent, no side
+effects) and, when present, opens via `RetrievalStore::open_read_only`. **Round 6 fix:** a plain
+`SQLITE_OPEN_READ_ONLY` open of the WAL-mode index still needed to create/touch `-shm`/`-wal`
+sidecars for reader coordination (persisting after `Drop`) and failed outright in a
+permission-restricted directory; `open_read_only` now opens via the SQLite URI form
+`file:<absolute-path>?immutable=1` (`SQLITE_OPEN_READ_ONLY | SQLITE_OPEN_URI`), which tells SQLite no
+connection will ever modify the file, skipping WAL reader-coordination and touching the directory
+not at all. `execute()` now separates `results` from `errors` (a scope's query failure — e.g. a
+corrupted index — lands in `errors`, rendered with the full `.context()` chain, and is never counted
+in `results`/`count`) and reports `mode_applied: "keyword"` so a `semantic` request can't look like
+it ran. Still a disclosed, deliberate narrowing to keyword-only search for this tool specifically
+(semantic/vector mode needs the write-capable path's optional `sqlite-vec` extension loading).
+
+**`genome_read` pages now (review round 5, P2/Codex) and validates its paging params for real
+(review round 6, LOW):** it used to return the whole `GENOME.md` (or whole matched section)
+unbounded, risking `LoopTrip::ContextBudget` on a large genome. `max_chars` (default 12,000, capped
+at 32,000) and `offset` window the content exactly the way `document_read`'s own `window()` does
+(same field names: `content`/`returned_chars`/`truncated`/`next_offset`), reimplemented locally
+since `ion_repl::tool_document` is `office-support`-gated and `genome_read` is not. Round 6: the
+doc comment claims parity with `document_read`'s `parse_request`, but the original parsing silently
+clamped `max_chars: 0` up to 1 and silently fell back to defaults for a negative or non-integer
+`max_chars`/`offset`; it now mirrors `parse_request` exactly, bailing with `ToolError::InvalidParams`
+on all of those instead of guessing.
+
+Internals otherwise unchanged: `genome_read` reads `<impulse_dir>/GENOME.md`; `memory_search`
+queries `RetrievalStore`'s own `search_history_keyword`/`search_genome_keyword` directly.
+- **Source of truth:** `src/ion_repl/registry.rs`, `src/ion_repl/mod.rs`
+  (`ReplContext::sandbox_tool_context`), `src/tooling/builtin/mod.rs`
+  (`resolve_and_validate_memory_dir`), `src/tooling/builtin/{memory_search,genome_read}.rs`,
+  `src/retrieval/store.rs` (`RetrievalStore::open_read_only`).
 
 ### agent registry — `[code]`
 The catalog of platform identity and launch metadata. It answers what can be named, detected, and

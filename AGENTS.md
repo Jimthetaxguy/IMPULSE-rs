@@ -170,7 +170,13 @@ worktrees, and CI.
 ### Code Requirements
 
 1. New modules need unit tests in a `mod tests` block — not just one happy-path test
-2. New CLI commands go in `src/main.rs` with clap derive
+2. New CLI commands are declared as `clap::Subcommand` variants of `Commands` in
+   `impulse-rs/src/cli.rs` (`main.rs` is a thin entrypoint: it only calls `cli::Cli::parse()` and
+   dispatches). The handler is shared, not duplicated per execution mode: `direct_dispatch.rs` and
+   `daemon_dispatch.rs` both match on the same `cli::Commands` variant, routing daemon-only
+   commands to an explicit direct-mode refusal rather than a second implementation; a command also
+   exposed from the `ion` binary (`src/bin/ion.rs`) needs a matching variant on `ion`'s own
+   minimal `IonCommand` enum whose handler still calls the ONE shared function in `handlers::`.
 3. New dynamic tools implement the `DynamicTool` trait in `src/tooling/`
 4. File operations must use atomic writes (temp + rename)
 5. Error handling must use `Result<T>` — never `unwrap()` on user-facing paths

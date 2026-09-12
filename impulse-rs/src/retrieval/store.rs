@@ -1,10 +1,36 @@
 use anyhow::{bail, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::retrieval::types::SearchResult;
+
+/// Percent-encodes `path` for embedding in a SQLite `file:` URI (review
+/// round 6, MEDIUM REFUTED -- used by [`RetrievalStore::open_read_only`]'s
+/// `immutable=1` connection: `immutable` can only be requested via a URI,
+/// and SQLite's own URI parser treats `?`/`#`/`%` -- and, conservatively,
+/// anything else outside the unreserved/`/` set -- as syntactically
+/// significant, so a path containing any of them would otherwise corrupt
+/// the URI or be silently misinterpreted). Keeps `/` and RFC 3986
+/// "unreserved" characters (`A-Za-z0-9-._~`) literal; every other byte
+/// becomes `%XX`. Operates on UTF-8 bytes (`Path::to_string_lossy`),
+/// matching how the rest of this codebase already displays paths.
+fn percent_encode_uri_path(path: &Path) -> String {
+    let mut out = String::new();
+    for byte in path.to_string_lossy().as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                out.push(*byte as char);
+            }
+            other => {
+                out.push('%');
+                out.push_str(&format!("{other:02X}"));
+            }
+        }
+    }
+    out
+}
 
 pub struct RetrievalStore {
     conn: Connection,
@@ -61,6 +87,85 @@ impl RetrievalStore {
         conn.busy_timeout(Duration::from_secs(5))
             .context("Failed to set busy_timeout on retrieval.db")?;
 
+        Ok(Self { conn, db_path })
+    }
+
+    /// Opens `retrieval.db` under `base_path` strictly READ-ONLY: no
+    /// `create_dir_all`, no database-file creation (`OpenFlags::
+    /// SQLITE_OPEN_READ_ONLY` has no `CREATE` bit), no journal-mode/
+    /// pragma writes, and no `init_schema()` call -- every one of those is
+    /// a side effect [`RetrievalStore::open`] performs unconditionally,
+    /// appropriate for a genuine indexer but never appropriate for a
+    /// read-only consumer.
+    ///
+    /// **Why this exists (review round 5, MEDIUM/Cursor on PR #54):** the
+    /// `memory_search` ion tool is registered ungated (read-only,
+    /// `Capability::FileSystemRead` only) precisely because it is supposed
+    /// to be safe to point at any `/allow`-granted directory. But it called
+    /// `retrieval::search_history`/`search_genome`, which call
+    /// `RetrievalStore::open` -- so after granting read access to some
+    /// directory for an unrelated reason, the model could cause
+    /// `retrieval.db` (plus WAL `-wal`/`-shm` sidecars) to be CREATED there,
+    /// a write side effect a read-only tool must never have. This method,
+    /// plus `memory_search`'s own explicit `retrieval.db`-existence check
+    /// before ever calling it, closes that gap: a directory with no
+    /// existing index is left completely untouched.
+    ///
+    /// Returns `Err` if `retrieval.db` does not exist under `base_path` --
+    /// callers needing to distinguish "no index yet" from "index exists but
+    /// failed to open" should check for that file's existence themselves
+    /// first (as `memory_search` does), since this error is a plain
+    /// `anyhow::Error`, not a matchable variant.
+    pub fn open_read_only(base_path: &Path) -> Result<Self> {
+        let db_path = base_path.join("retrieval.db");
+        if !db_path.exists() {
+            bail!(
+                "no retrieval index found at {} (retrieval.db does not exist)",
+                db_path.display()
+            );
+        }
+        // Review round 6, MEDIUM REFUTED (CONFIRMED): a plain
+        // `SQLITE_OPEN_READ_ONLY` open of a WAL-mode database still
+        // materializes `-shm`/`-wal` sidecar files on the FIRST query
+        // (SQLite must still track the WAL read-mark for a consistent
+        // snapshot, which needs those files to exist even for a reader),
+        // and those sidecars persist after this connection is dropped --
+        // exactly the write side effect this method exists to prevent.
+        // `immutable=1` (SQLite's own documented flag for "this file will
+        // not change for the duration I have it open, and no other
+        // connection will change it either") tells SQLite it never needs
+        // WAL bookkeeping at all, so no sidecar is ever created. It can
+        // ONLY be passed via a `file:` URI (there is no `OpenFlags` bit for
+        // it), which requires `SQLITE_OPEN_URI` and an absolute,
+        // percent-encoded path (`std::path::absolute` -- no filesystem
+        // access, so it works even for a relative `base_path` that
+        // resolves to a directory the process cannot otherwise inspect --
+        // and `percent_encode_uri_path` for the reserved-character escaping
+        // SQLite's own URI parser requires).
+        let absolute_db_path = std::path::absolute(&db_path).with_context(|| {
+            format!(
+                "failed to resolve {} to an absolute path",
+                db_path.display()
+            )
+        })?;
+        let uri = format!(
+            "file:{}?immutable=1",
+            percent_encode_uri_path(&absolute_db_path)
+        );
+        let conn = Connection::open_with_flags(
+            &uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .with_context(|| format!("failed to open {} read-only (immutable)", db_path.display()))?;
+        // Read-only AND immutable: no pragma writes (journal_mode/
+        // synchronous/foreign_keys all either write the database header or
+        // are irrelevant to a connection that only ever runs SELECTs).
+        // `busy_timeout` is a connection-local setting with no on-disk side
+        // effect, so it stays -- though an immutable connection never
+        // actually contends with a writer for a lock the way a plain
+        // read-only one could.
+        conn.busy_timeout(Duration::from_secs(5))
+            .context("Failed to set busy_timeout on retrieval.db (read-only)")?;
         Ok(Self { conn, db_path })
     }
 
@@ -1259,6 +1364,70 @@ mod tests {
         let store = RetrievalStore::open(tmp.path()).unwrap();
         store.init_schema().unwrap();
         (tmp, store)
+    }
+
+    #[test]
+    fn test_open_read_only_refuses_when_retrieval_db_does_not_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        // `RetrievalStore` intentionally has no `Debug` impl, so
+        // `unwrap_err()` (which requires `T: Debug`) is not usable here;
+        // match instead.
+        match RetrievalStore::open_read_only(tmp.path()) {
+            Ok(_) => panic!("expected open_read_only to refuse a missing retrieval.db"),
+            Err(err) => assert!(
+                err.to_string().contains("no retrieval index found"),
+                "{err}"
+            ),
+        }
+    }
+
+    #[test]
+    fn test_open_read_only_creates_no_files_when_retrieval_db_does_not_exist() {
+        // Review round 5, MEDIUM/Cursor: the whole point of this method --
+        // a directory with no existing index must be left untouched, not
+        // even the parent directory materialized.
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("not-yet-created");
+
+        let _ = RetrievalStore::open_read_only(&target);
+
+        assert!(
+            !target.exists(),
+            "open_read_only must not create the base directory"
+        );
+    }
+
+    #[test]
+    fn test_open_read_only_succeeds_against_an_existing_index() {
+        let (tmp, store) = open_test_store();
+        store
+            .upsert_history(HistoryUpsert {
+                search_text: "retrieval testing needle",
+                ..test_history_row("s1", "session one")
+            })
+            .unwrap();
+        store.refresh_fts().unwrap();
+        drop(store);
+
+        let ro = RetrievalStore::open_read_only(tmp.path()).unwrap();
+        let results = ro.search_history_keyword("needle", 10).unwrap();
+        assert!(
+            !results.is_empty(),
+            "read-only store must still find rows a writer inserted"
+        );
+    }
+
+    #[test]
+    fn test_open_read_only_connection_refuses_a_write() {
+        let (tmp, store) = open_test_store();
+        drop(store);
+
+        let ro = RetrievalStore::open_read_only(tmp.path()).unwrap();
+        let result = ro.upsert_history(test_history_row("s1", "session one"));
+        assert!(
+            result.is_err(),
+            "a connection opened with SQLITE_OPEN_READ_ONLY must refuse a write"
+        );
     }
 
     fn test_history_row<'a>(session_id: &'a str, session_name: &'a str) -> HistoryUpsert<'a> {

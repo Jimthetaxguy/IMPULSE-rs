@@ -41,6 +41,47 @@
 //!   when [`preflight_container`] has not run;
 //! - `csv` text is checked against [`MAX_EXTRACTED_CHARS`] after parsing,
 //!   where the parser's memory is bounded by the 10 MiB file cap;
+//! - `pdf` page rendering (`pdf-extract`'s `output_doc_page`/
+//!   `PlainTextOutput`, never the whole-document `extract_text`) runs in an
+//!   **isolated child process** (`handlers::internal_pdf_text`, spawned by
+//!   `extract_pdf` below), not in-process like every other format: review
+//!   round 1 found a 677-byte PDF whose Form XObject references itself
+//!   crashes `pdf-extract`'s content-stream interpreter via stack-overflow
+//!   abort, which `spawn_blocking`'s `JoinError` containment cannot catch
+//!   (an abort, not an unwinding panic) -- isolation is what keeps that
+//!   contained to the child. **Review round 3 (F0):** the parent no longer
+//!   parses PDF structure AT ALL, not even for a cheap page count -- a
+//!   prior version called `pdf_extract::Document::load` in-process for
+//!   exactly that, and `lopdf`'s eager, unconditional decompression of
+//!   `/Type /ObjStm` object streams during `load` blew up the PARENT itself
+//!   on a crafted file well before any downstream check could run. The
+//!   parent's ENTIRE PDF-specific job before spawning the child is now a
+//!   raw byte scan for `/Encrypt`; page count, the trailer-based encryption
+//!   re-check, the stream-inflation preflight (now covering `FlateDecode`
+//!   *and* `LZWDecode`, including an outer `ASCII85Decode`/`ASCIIHexDecode`
+//!   layer, deny-by-default for any other filter), and rendering are all
+//!   exclusively the child's job, backed by a memory-watchdog thread that
+//!   is the real ceiling on macOS (`RLIMIT_AS` is accepted but not
+//!   kernel-enforced there). Inside the child, each page's text is checked
+//!   against the character budget *per write*, not once per page after the
+//!   fact (true check-before-push, the same discipline as the workbook and
+//!   Word streamers, and the fix for a review round 1 finding: an unbounded
+//!   per-page sink previously reached multiple GB of RSS on a small crafted
+//!   file); only the text layer is ever read (`PlainTextOutput` has no
+//!   image-handling code path at all, so an image never reaches this
+//!   tool's output, and neither does annotation/`AcroForm` text, which
+//!   lives outside a page's own `/Contents` stream); an encrypted PDF is
+//!   refused via a raw byte scan for `/Encrypt` in the trailer, run before
+//!   any parser touches the file -- `lopdf::Document::load` silently
+//!   authenticates a PDF whose *user* password is empty, so
+//!   `doc.is_encrypted()` after loading cannot be trusted, and this tool
+//!   makes no password attempt of any kind;
+//! - `txt`/`md` are read whole (already bounded by [`MAX_DOCUMENT_BYTES`])
+//!   and require valid UTF-8, refused with a typed error otherwise (this
+//!   tool does not guess an encoding or lossily replace invalid bytes);
+//!   `md` additionally scans ATX headings (`#` through `######`) into an
+//!   outline capped at [`MAX_MD_SECTIONS`] rows, mirroring
+//!   [`MAX_WORD_SECTIONS`];
 //! - legacy `xls` is refused because its binary format has no streaming
 //!   reader and cannot be bounded the same way;
 //! - the content window is capped at [`MAX_CHARS_CAP`] characters; the
@@ -52,9 +93,12 @@
 //! These bound the parser's inputs; they are not an OS sandbox.
 //!
 //! This tool is read-only, so it stays outside `CONFIRMATION_REQUIRED_TOOLS`
-//! like `file_read`. Paths resolve against the REPL's launch directory but
-//! absolute paths are accepted: the everyday-assistance case is a document
-//! that lives outside any repository.
+//! like `file_read`. Paths resolve against the REPL's launch directory;
+//! absolute paths are accepted too (the everyday-assistance case is a
+//! document that lives outside any repository) but, like every path this
+//! tool resolves, only when they land inside the session's read sandbox
+//! (`ReplContext::sandbox_tool_context`) -- `resolve_document_path_with_cap`
+//! is the enforcement point, matching the bridged tools' own sandbox.
 
 use std::path::{Path, PathBuf};
 
@@ -63,7 +107,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::office::{self, ExtractionResult, OfficeFormat};
+use crate::office::{self, ExtractionResult};
 
 use super::tools::{ReplTool, ToolOutcome};
 use super::ReplContext;
@@ -87,10 +131,27 @@ pub const MAX_RENDERED_SECTIONS: usize = 32;
 /// Empty columns inside a row rendered as bare tabs; wider gaps become a
 /// marker so a cell far to the right cannot inflate the text.
 pub const EMPTY_COLUMNS_INLINE: u32 = 8;
+/// Largest number of pages a PDF may have before this tool refuses it. The
+/// section table travels in the payload, one row per non-empty page, so an
+/// unbounded page count would otherwise grow it without bound; checked
+/// before any page is rendered, from the page tree's own count.
+pub const MAX_PDF_PAGES: usize = 4_096;
+/// Most outline sections a Markdown document may contribute, one per ATX
+/// heading line. Past the cap no new section starts and the last one
+/// absorbs the remaining text, mirroring [`MAX_WORD_SECTIONS`], so every
+/// offset reported stays truthful.
+pub const MAX_MD_SECTIONS: usize = 4_096;
 
 const SHEET_HEADER_PREFIX: &str = "=== Sheet: ";
 const SHEET_HEADER_SUFFIX: &str = " ===";
-const SUPPORTED_FORMATS: &str = "xlsx, csv, docx";
+const SUPPORTED_FORMATS: &str = "xlsx, csv, docx, pdf, txt, md";
+/// Extensions this tool accepts, independent of `office::OfficeFormat`
+/// (which backs the separate CLI/daemon `document_parse` dynamic tool and
+/// does not know about `pdf`/`txt`/`md`, nor need to): `csv` still goes
+/// through `office::parse_document`, and `xlsx`/`docx` through this
+/// module's own streamers, but the accepted-extension gate below is this
+/// tool's own, so adding a kind here never needs to touch `office::mod`.
+const READABLE_EXTENSIONS: [&str; 6] = ["xlsx", "csv", "docx", "pdf", "txt", "md"];
 
 pub struct DocumentReadTool;
 
@@ -198,24 +259,29 @@ impl ReplTool for DocumentReadTool {
 
     fn usage(&self) -> &'static str {
         "document_read {\"path\": \"...\", \"sheet\": \"...\", \"outline\": false, \
-         \"offset\": 0, \"max_chars\": 12000} -- read a spreadsheet or Word document \
-         (xlsx/csv/docx) as text, paged by character offset"
+         \"offset\": 0, \"max_chars\": 12000} -- read a spreadsheet, Word document, PDF \
+         (text layer only), plain text, or Markdown file (xlsx/csv/docx/pdf/txt/md) as \
+         text, paged by character offset"
     }
 
     fn json_schema(&self) -> Value {
         json!({
             "name": "document_read",
             "description": format!(
-                "Read a spreadsheet (xlsx, csv) or Word document (docx) as plain text. \
-                 Read-only; files up to {} MiB. The tool loop allows only a few calls per \
-                 turn, so do not page through a large document exhaustively: start with \
-                 outline=true to learn total_chars and the sections with their offsets, then \
-                 read only the windows you need (max_chars up to {}) and answer from what you \
-                 read. Every result ends with either 'complete' or 'truncated, continue with \
-                 offset=N'. Use sheet to read one worksheet (empty worksheets are omitted, \
-                 as are chart, dialog, and macro sheets, which hold no cells), or \
-                 pass a section's offset to jump to it.",
+                "Read a spreadsheet (xlsx, csv), Word document (docx), PDF (text layer only \
+                 -- scanned/image-only pages return no text), plain text (txt), or Markdown \
+                 (md) file as plain text. Read-only; files up to {} MiB, PDFs up to {} pages. \
+                 The tool loop allows only a few calls per turn, so do not page through a \
+                 large document exhaustively: start with outline=true to learn total_chars \
+                 and the sections with their offsets, then read only the windows you need \
+                 (max_chars up to {}) and answer from what you read. Every result ends with \
+                 either 'complete' or 'truncated, continue with offset=N'. Use sheet to read \
+                 one worksheet (empty worksheets are omitted, as are chart, dialog, and macro \
+                 sheets, which hold no cells), or pass a section's offset to jump to it -- for \
+                 PDF a section is one page, for Markdown a section is one ATX heading \
+                 (# through ######).",
                 MAX_DOCUMENT_BYTES / (1024 * 1024),
+                MAX_PDF_PAGES,
                 MAX_CHARS_CAP
             ),
             "input_schema": {
@@ -254,10 +320,22 @@ impl ReplTool for DocumentReadTool {
         let request = parse_request(&args)?;
         let path = resolve_document_path(&request.path, ctx)?;
         preflight_container(&path, &request.path)?;
-        // Parsing is synchronous (calamine, docx-rs). Run it off the async
-        // runtime so the loop contract's wall-clock timeout can still fire
-        // while a large file parses.
-        let window = {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        // PDF rendering is isolated in a child process (review round 1,
+        // P0-1/P0-2 -- see `extract_pdf`'s doc comment): it is not a plain
+        // `spawn_blocking` call like every other format below, so it is
+        // special-cased here rather than folded into `parse_document_bounded`.
+        let window = if ext == "pdf" {
+            let parsed = extract_pdf(&path, &request.path, ExtractBudget::DEFAULT).await?;
+            build_window(&request, &path, &parsed)?
+        } else {
+            // Parsing is synchronous (calamine, docx-rs). Run it off the
+            // async runtime so the loop contract's wall-clock timeout can
+            // still fire while a large file parses.
             let request = request.clone();
             let path = path.clone();
             tokio::task::spawn_blocking(move || -> Result<DocumentWindow> {
@@ -380,7 +458,10 @@ pub fn resolve_document_path_with_cap(
              because its binary format cannot be bounded before parsing; convert it to .xlsx"
         );
     }
-    if !OfficeFormat::from_extension(&ext).is_readable() {
+    if !READABLE_EXTENSIONS
+        .iter()
+        .any(|e| ext.eq_ignore_ascii_case(e))
+    {
         bail!(
             "document_read: '{raw}' has unsupported extension '{ext}' (supported: {SUPPORTED_FORMATS})"
         );
@@ -493,9 +574,16 @@ pub fn check_extracted_size(text: &str, raw: &str, max_chars: usize) -> Result<(
 }
 
 /// Parses one accepted document under `budget`: workbooks are streamed
-/// cell by cell and Word documents event by event by this module; `csv`
-/// goes through the `office` parser and is size-checked afterwards, its
-/// memory already bounded by the 10 MiB file cap.
+/// cell by cell and Word documents event by event, all by this module;
+/// `csv` goes through the `office` parser and is size-checked afterwards,
+/// its memory already bounded by the 10 MiB file cap; `txt`/`md` are read
+/// whole (already bounded by the file cap) and size-checked the same way.
+/// **`pdf` is deliberately NOT dispatched here**: PDF rendering runs in an
+/// isolated child process (see `extract_pdf`'s doc comment, review round 1
+/// P0-1/P0-2), which needs `tokio::process::Command` and is therefore
+/// async, unlike this function and its `spawn_blocking` caller in
+/// `DocumentReadTool::run`. `DocumentReadTool::run` special-cases the `pdf`
+/// extension before ever reaching this dispatcher.
 pub fn parse_document_bounded(
     path: &Path,
     raw: &str,
@@ -509,12 +597,23 @@ pub fn parse_document_bounded(
     match ext.as_str() {
         "xlsx" => extract_workbook(path, raw, budget),
         "docx" => extract_word(path, raw, budget),
+        "txt" => extract_plain_text(path, raw, budget, "txt", "text"),
+        "md" => extract_plain_text(path, raw, budget, "md", "markdown"),
         "csv" => {
             let parsed = office::parse_document(path)
                 .map_err(|e| anyhow::anyhow!("document_read: '{raw}' could not be parsed: {e}"))?;
             check_extracted_size(&parsed.content, raw, budget.max_chars)?;
             Ok(from_extraction(parsed))
         }
+        // `pdf` IS a supported extension (see `resolve_document_path_with_cap`'s
+        // `READABLE_EXTENSIONS`) but must never reach this synchronous
+        // dispatcher -- reaching here would mean a caller bypassed
+        // `DocumentReadTool::run`'s special case, so this says so rather
+        // than the generic (and false) "unsupported extension" message.
+        "pdf" => bail!(
+            "document_read: '{raw}' is a PDF; this synchronous dispatcher never handles PDFs \
+             -- extract_pdf (async, isolated child process) must be called instead"
+        ),
         other => bail!(
             "document_read: '{raw}' has unsupported extension '{other}' (supported: {SUPPORTED_FORMATS})"
         ),
@@ -1038,6 +1137,905 @@ pub fn extract_word(path: &Path, raw: &str, budget: ExtractBudget) -> Result<Par
     })
 }
 
+/// Wall-clock budget for the isolated PDF-extraction child process,
+/// matching the 30s bridged tools get (`bash_exec`'s own default
+/// `timeout_secs`). `docx`/`xlsx` streaming does not get an equivalent
+/// timer: both are already a bounded function of [`MAX_DOCUMENT_BYTES`]/
+/// [`MAX_DECOMPRESSED_BYTES`] (the source file and its inflated container
+/// are capped before any parser runs), so their wall-clock cost cannot grow
+/// past what those caps already allow -- there is no code path in either
+/// streamer that can loop or recurse on attacker-controlled structure the
+/// way a PDF's Form XObjects can (review round 1, item 3).
+const PDF_CHILD_TIMEOUT_SECS: u64 = 30;
+/// Memory ceiling for the isolated PDF-extraction child, in bytes -- checked
+/// two structurally different ways depending on platform, both enforced
+/// entirely inside the child (`handlers::internal_pdf_text`).
+///
+/// **Correction (review round 2):** an earlier version of this comment
+/// claimed "the primary bound is still the sink" -- FALSIFIED.
+/// `internal_pdf_text::BoundedSink` bounds OUTPUT VOLUME and WALL CLOCK, not
+/// memory.
+///
+/// **Correction (review round 3, F0/F2 -- FALSIFIED AGAIN, more deeply):**
+/// round 2's fix (`preflight_pdf_streams`, run in the PARENT against an
+/// already-`Document::load`-ed doc) was itself refuted twice. First
+/// (F0/P0): `lopdf::Document::load` eagerly decompresses every `/Type
+/// /ObjStm` object stream DURING LOAD, storing the inflated bytes back into
+/// the object with `/Filter` stripped -- so by the time any preflight could
+/// run, the memory had already been spent, and the preflight counted zero
+/// for it (a 2.04 MB `objstm_bomb2g.pdf` drove the PARENT itself to 2,078 MB
+/// RSS before the preflight ever got a chance to refuse). Running
+/// `Document::load` in the parent at all was the bug: an attacker-controlled
+/// PDF's structure must never be parsed outside the isolated child. Second
+/// (F1/P1): the preflight only ever counted `FlateDecode` streams;
+/// `LZWDecode` streams (which `lopdf` decodes exactly as readily) were not
+/// counted at all (`lzwmulti300.pdf`, 1.65 MB, reached 4.12 GiB child RSS
+/// while still reporting "OK").
+///
+/// **The round-3 architecture, honestly split by which layer actually
+/// bounds which attack:**
+/// - `Document::load`'s OWN eager ObjStm inflation cannot be intercepted or
+///   pre-counted at all (there is no hook between "lopdf decides to inflate
+///   an object stream" and "lopdf has already inflated it") -- it is bounded
+///   **only** by [`crate::handlers::internal_pdf_text`]'s memory-watchdog
+///   thread, which polls this process's own peak RSS (`getrusage`) roughly
+///   every 10ms and self-terminates the instant it crosses this ceiling.
+/// - Every OTHER stream (a page/Form-XObject content stream, or any stream
+///   object not routed through an ObjStm) is bounded by the extended
+///   `preflight_pdf_streams` -- now living in the child, after `load`, walking
+///   each stream's filter chain (`FlateDecode`, `LZWDecode`, and an outer
+///   `ASCII85Decode`/`ASCIIHexDecode` layer feeding either) and refusing
+///   before any page renders. Any OTHER filter this preflight cannot count
+///   is refused by name (deny-by-default), rather than silently skipped.
+/// - `RLIMIT_AS`, set by the parent (`run_pdf_extraction_child`, below) via
+///   `pre_exec`, is real, kernel-enforced defense-in-depth on Linux -- but
+///   is accepted and silently NOT enforced by macOS's `setrlimit` (confirmed
+///   empirically: a 1 GiB `RLIMIT_AS` let a child reach 4.12 GiB RSS on
+///   macOS). **On macOS specifically, isolation is "crash containment plus
+///   the watchdog," not "RLIMIT_AS."**
+/// - Process isolation (this whole child) bounds blast radius on top of all
+///   three: whichever layer catches an attack, only the child dies.
+///
+/// 1 GiB (unchanged from round 2) is sized with headroom above the new 512
+/// MiB total-decompressed-bytes cap (`internal_pdf_text::
+/// MAX_PDF_TOTAL_DECOMPRESSED_BYTES`, review round 3 F4): decompressed text
+/// plus the raw source file (<= [`MAX_DOCUMENT_BYTES`]) plus this process's
+/// own JSON-serialized stdout buffer (up to ~128 MB for the default budget,
+/// see [`max_child_stdout_bytes`]) plus baseline process/allocator overhead
+/// comfortably fits under 1 GiB for any legitimate document the preflight
+/// accepts, while still being a real ceiling against anything that gets
+/// past it.
+pub(crate) const PDF_CHILD_MEMORY_LIMIT_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
+
+/// Exit code [`crate::handlers::internal_pdf_text`]'s memory watchdog uses
+/// via `std::process::exit` the instant it observes this process's own peak
+/// RSS cross [`PDF_CHILD_MEMORY_LIMIT_BYTES`] (review round 3, F2) --
+/// distinct from a normal error exit (`1`) or a crash signal, so
+/// [`run_pdf_extraction_child`] can tell "the watchdog fired" apart from
+/// every other failure mode and report a specific "exceeded memory ceiling"
+/// error rather than folding it into the generic parse-failure message.
+/// Defined once here (the parent) and referenced from the child so the two
+/// processes can never drift out of agreement on the value. `137` mirrors
+/// the shell convention for "killed by signal 9" (`128 + 9`); this is a
+/// deliberate, in-process self-exit, not an actual `SIGKILL`, but the same
+/// numeric convention makes it immediately legible to anyone used to POSIX
+/// exit codes.
+pub(crate) const PDF_MEMORY_CEILING_EXIT_CODE: i32 = 137;
+
+/// One page's text as reported by the `internal-pdf-text` child (review
+/// round 1, P0-1/P0-2). Shared with `handlers::internal_pdf_text` so parent
+/// and child agree on the wire shape without duplicating the struct.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PdfChildPage {
+    pub page_num: u32,
+    pub text: String,
+}
+
+/// The `internal-pdf-text` child's stdout contract on success: only
+/// non-empty pages, in the order rendered.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PdfChildOutput {
+    pub pages: Vec<PdfChildPage>,
+}
+
+/// Decodes one PDF name token's `#XX` hex escapes (ISO 32000-1 §7.3.5),
+/// starting at the byte right after the leading `/`, stopping at the first
+/// PDF delimiter/whitespace byte or the end of input. A malformed escape (a
+/// `#` not followed by two hex digits) is passed through literally rather
+/// than failing the scan -- lenient the same direction a real-world PDF
+/// parser is, and this function only ever feeds a refusal decision, never
+/// content a model sees.
+fn decode_pdf_name_token(bytes: &[u8]) -> Vec<u8> {
+    const DELIMITERS: &[u8] = b"()<>[]{}/%\0\t\n\x0c\r ";
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if DELIMITERS.contains(&b) {
+            break;
+        }
+        if b == b'#' && i + 2 < bytes.len() {
+            if let Ok(hex_str) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(value) = u8::from_str_radix(hex_str, 16) {
+                    out.push(value);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(b);
+        i += 1;
+    }
+    out
+}
+
+/// Cheap, conservative refusal check for a PDF whose trailer declares
+/// `/Encrypt`, run against the RAW file bytes before any parser sees them.
+///
+/// **Review round 1, P2-1:** `lopdf::Document::load` -- called only inside
+/// the isolated extraction child (review round 3, F0: never in this
+/// process) -- unconditionally tries an EMPTY user password first
+/// (`authenticate_and_setup_encryption`'s first branch in lopdf's reader)
+/// and silently decrypts on success. An empty user password is a common
+/// real-world case (owner-password-only protection, e.g. "printable but
+/// not editable," leaves the user password empty so any reader can open
+/// it), so `doc.is_encrypted()` after `load()` cannot be trusted to catch
+/// it -- this tool no longer calls `is_encrypted()` at all. This scan runs
+/// first and makes no password attempt of any kind, empty or otherwise.
+///
+/// **Review round 2 (CONFIRMED):** the original literal-bytes-only scan is
+/// bypassed by a legal PDF name hex-escape (ISO 32000-1 §7.3.5) -- e.g.
+/// `/Encr#79pt` (`#79` = hex 0x79 = ASCII `y`) parses to the identical name
+/// `Encrypt` in `lopdf` (and every conformant PDF parser) but contains no
+/// literal `/Encrypt` byte sequence at all, so the fast scan missed it.
+/// Fixed with a two-tier scan: the fast literal check first (the common
+/// case, one pass, no allocation), then, only if that finds nothing, a
+/// slower fallback that walks every `/` in the file and decodes that name
+/// token's escapes ([`decode_pdf_name_token`]) before comparing. Bounded by
+/// [`MAX_DOCUMENT_BYTES`] like every other check here, so worst-case work
+/// (a file that is mostly `/` bytes) stays a bounded function of the
+/// already-capped input size.
+///
+/// A false positive (an unencrypted PDF that happens to contain the
+/// literal bytes `/Encrypt`, e.g. as page text) fails closed, the safe
+/// direction. A false negative would require a spec-violating writer: the
+/// `/Encrypt` key that actually matters is always a plain, uncompressed
+/// trailer or XRef-stream-dictionary entry per the PDF spec, never itself
+/// inside a compressed object stream -- **this is also why the false-
+/// positive path is inconsistent** (documented, not fixed further): the
+/// literal bytes `/Encrypt` appearing as ordinary PAGE TEXT trips this scan
+/// when that page's content stream is stored uncompressed, but the same
+/// text inside a `FlateDecode`-compressed content stream (the common case)
+/// does not, since the scan only ever sees the file's raw, on-disk bytes.
+pub(crate) fn pdf_declares_encryption(bytes: &[u8]) -> bool {
+    const NEEDLE: &[u8] = b"/Encrypt";
+    if bytes.windows(NEEDLE.len()).any(|w| w == NEEDLE) {
+        return true;
+    }
+    bytes
+        .iter()
+        .enumerate()
+        .filter(|(_, &b)| b == b'/')
+        .any(|(i, _)| decode_pdf_name_token(&bytes[i + 1..]) == b"Encrypt")
+}
+
+/// The parent-side pre-flight before spawning the extraction child (review
+/// round 3, F0): reads the raw file bytes and runs ONLY the byte-level
+/// `/Encrypt` scan above -- never `pdf_extract::Document::load` or anything
+/// else that parses attacker-controlled PDF structure. That parsing (page
+/// count, the trailer-based encryption re-check, the stream-inflation
+/// preflight, and rendering) now happens exclusively inside the isolated
+/// child process (`handlers::internal_pdf_text::extract`), which is
+/// authoritative for all of it -- this function exists only to reject an
+/// obviously-encrypted file cheaply, before paying the cost of a subprocess
+/// spawn, not as a security boundary the child may skip.
+///
+/// **Why this moved (review round 3, F0, P0, CONFIRMED):** the previous
+/// `precheck_pdf` called `pdf_extract::Document::load` in THIS process to
+/// get a cheap page count ahead of the child. But `lopdf::Document::load`
+/// eagerly decompresses every `/Type /ObjStm` object stream as part of
+/// loading -- unconditionally, with no hook to intercept or bound it -- so
+/// a small file whose ObjStm inflates to gigabytes blew up the PARENT
+/// itself before any preflight downstream ever ran (`objstm_bomb2g.pdf`,
+/// 2.04 MB on disk, drove the parent to 2,078 MB RSS and still reported
+/// "OK"). The parent must never be the process that parses PDF structure;
+/// only the isolated, watchdog-guarded, crash-contained child may.
+fn pdf_encryption_prescan(path: &Path, raw: &str) -> Result<()> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("document_read: '{raw}' could not be read"))?;
+    if pdf_declares_encryption(&bytes) {
+        bail!(
+            "document_read: '{raw}' is an encrypted PDF, which this tool does not support \
+             (it never attempts a password, including an empty one); remove the password \
+             protection and try again"
+        );
+    }
+    Ok(())
+}
+
+/// Reads a PDF's text layer, isolating the actual page-rendering step in a
+/// child process. `PlainTextOutput` implements only the text-output half of
+/// `pdf_extract::OutputDev`: it has no image-handling code path at all, so
+/// an embedded image can never reach this tool's output.
+///
+/// **Review round 1, P0-1 (CONFIRMED, structural fix required):** a
+/// 677-byte PDF whose Form XObject content stream references itself
+/// (`/X0 Do` inside `/X0`'s own content stream) makes
+/// `output_doc_page`'s content-stream interpreter recurse until the
+/// thread's stack is exhausted -- a Rust stack-overflow guard-page hit,
+/// which calls `abort()` (SIGABRT/SIGILL depending on platform), **not** an
+/// unwinding panic. `tokio::task::spawn_blocking`'s `JoinError` containment
+/// -- the mechanism every other format in this module still uses -- only
+/// catches unwinding panics; it cannot catch an abort, and this workspace
+/// does not build with `panic = "abort"`. A hostile PDF read through
+/// `document_read`, an UNGATED tool, previously killed the entire `ion`
+/// process. Process isolation is the only structural fix: the child's
+/// crash kills only the child, which the parent observes as a signaled
+/// exit and reports as a typed error.
+///
+/// **Review round 1, P0-2 (CONFIRMED, structural fix required):** the
+/// previous in-process implementation rendered each page fully into an
+/// unbounded `String` before checking it against the character budget -- a
+/// 4.2 MB crafted PDF (one page, a huge repeated `Tj` string) reached
+/// 7.0 GB RSS / 178.5s, nearly the loop contract's 180s wall clock, which
+/// `spawn_blocking` cannot cancel. The child
+/// (`handlers::internal_pdf_text::BoundedSink`) fixes this at the source
+/// with a `std::fmt::Write` sink that refuses once the running total would
+/// exceed `max_chars`, checked per write during rendering (`output_character`
+/// writes as it goes), not once per page after the fact -- true
+/// check-before-push, the discipline `extract_workbook`/`extract_word`
+/// already apply. Process isolation on top is what makes an RSS ceiling
+/// (`PDF_CHILD_MEMORY_LIMIT_BYTES`, enforced by the child's own memory
+/// watchdog thread plus `RLIMIT_AS` where the platform honors it) safe to
+/// add as a second layer: killing a child's memory-bloated process is
+/// harmless; doing the same to `ion` itself would not be.
+///
+/// A PDF whose page count exceeds [`MAX_PDF_PAGES`] is refused before any
+/// page is rendered -- **inside the child**, not here (review round 3, F0):
+/// the parent never parses PDF structure at all, so it cannot know the page
+/// count in advance; `handlers::internal_pdf_text::extract` enforces this
+/// cap itself, authoritatively, immediately after `Document::load` and
+/// before rendering any page, the same way `preflight_container` measures a
+/// zip container's inflated size before a parser runs.
+///
+/// A page with no extractable text (common for a scanned/image-only PDF)
+/// contributes no line and no section, exactly like a blank Word paragraph;
+/// a PDF with no text layer at all therefore parses successfully to an
+/// empty document with zero sections, which [`render`] calls out explicitly
+/// rather than leaving the model to wonder whether reading failed.
+///
+/// **Not extracted:** annotation and `AcroForm` field text (`/Annots`) --
+/// only each page's own `/Contents` stream is rendered, matching
+/// `output_doc_page`'s own scope; a form field's value is never leaked into
+/// the page text this tool returns.
+pub async fn extract_pdf(path: &Path, raw: &str, budget: ExtractBudget) -> Result<ParsedDocument> {
+    extract_pdf_with_page_cap(path, raw, budget, MAX_PDF_PAGES).await
+}
+
+/// [`extract_pdf`] with an explicit page-count cap; the test seam (building
+/// a many-thousand-page fixture PDF to exercise the real
+/// [`MAX_PDF_PAGES`] would be slow for no extra coverage).
+pub async fn extract_pdf_with_page_cap(
+    path: &Path,
+    raw: &str,
+    budget: ExtractBudget,
+    max_pages: usize,
+) -> Result<ParsedDocument> {
+    let exe = std::env::current_exe().context(
+        "document_read: could not locate the current executable to spawn the PDF extraction \
+         subprocess",
+    )?;
+    extract_pdf_with_exe_and_timeout(
+        path,
+        raw,
+        budget,
+        max_pages,
+        &exe,
+        std::time::Duration::from_secs(PDF_CHILD_TIMEOUT_SECS),
+    )
+    .await
+}
+
+/// [`extract_pdf_with_page_cap`] with the child executable and wall-clock
+/// timeout also injectable -- the seam integration tests use.
+/// `std::env::current_exe()` inside *any* `cargo test` process (lib unit
+/// test or integration test alike) returns that test binary's own path,
+/// never `impulse-rs`/`ion`, neither of which the test binary is -- so
+/// tests that need the real `internal-pdf-text` subcommand must pass
+/// `env!("CARGO_BIN_EXE_impulse-rs")` explicitly. The timeout override lets
+/// a test force the timeout branch deterministically (an absurdly short
+/// timeout against an ordinary, fast-parsing PDF) without needing a
+/// genuinely slow fixture.
+pub async fn extract_pdf_with_exe_and_timeout(
+    path: &Path,
+    raw: &str,
+    budget: ExtractBudget,
+    max_pages: usize,
+    exe: &Path,
+    timeout: std::time::Duration,
+) -> Result<ParsedDocument> {
+    extract_pdf_with_exe_timeout_and_memory_limit(
+        path,
+        raw,
+        budget,
+        max_pages,
+        exe,
+        timeout,
+        PDF_CHILD_MEMORY_LIMIT_BYTES,
+    )
+    .await
+}
+
+/// [`extract_pdf_with_exe_and_timeout`] with the child's memory-watchdog
+/// ceiling also injectable -- a second test seam (review round 3, F2),
+/// mirroring the existing exe/timeout injection pattern exactly. Lets a
+/// test prove the watchdog fires end to end, through the REAL parent
+/// exit-code mapping in [`run_pdf_extraction_child`], using a small
+/// fixture against a small ceiling rather than needing a genuinely
+/// gigabyte-scale bomb in the default test suite. `RLIMIT_AS` (set
+/// unconditionally to [`PDF_CHILD_MEMORY_LIMIT_BYTES`] in
+/// [`run_pdf_extraction_child`]'s `pre_exec`) is deliberately NOT affected
+/// by this override, so a test using a low `memory_limit_bytes` here
+/// exercises the watchdog specifically, not `RLIMIT_AS`.
+pub async fn extract_pdf_with_exe_timeout_and_memory_limit(
+    path: &Path,
+    raw: &str,
+    budget: ExtractBudget,
+    max_pages: usize,
+    exe: &Path,
+    timeout: std::time::Duration,
+    memory_limit_bytes: u64,
+) -> Result<ParsedDocument> {
+    // Review round 3, F0: the ONLY thing the parent does with the file's
+    // bytes before spawning the isolated child -- a raw byte scan, never a
+    // PDF parse. The page count, the trailer-based encryption re-check, the
+    // stream-inflation preflight, and rendering are all now exclusively the
+    // child's job (`handlers::internal_pdf_text::extract`), which enforces
+    // `max_pages` itself, authoritatively.
+    {
+        let path = path.to_path_buf();
+        let raw = raw.to_string();
+        tokio::task::spawn_blocking(move || pdf_encryption_prescan(&path, &raw))
+            .await
+            .context("document_read PDF encryption prescan task panicked")??;
+    }
+
+    let pages = run_pdf_extraction_child(
+        exe,
+        path,
+        raw,
+        budget.max_chars,
+        max_pages,
+        timeout,
+        memory_limit_bytes,
+    )
+    .await?;
+
+    let mut text = String::new();
+    let mut cursor = 0usize;
+    let mut sections = Vec::new();
+    for PdfChildPage {
+        page_num,
+        text: page_text,
+    } in pages
+    {
+        let chars = page_text.chars().count() + 1; // +1 for the trailing newline pushed below
+        sections.push(DocumentSection {
+            index: (page_num.saturating_sub(1)) as usize,
+            kind: "page".to_string(),
+            name: Some(format!("Page {page_num}")),
+            offset: Some(cursor),
+            chars,
+        });
+        text.push_str(&page_text);
+        text.push('\n');
+        cursor += chars;
+    }
+
+    let size_bytes = std::fs::metadata(path)
+        .with_context(|| format!("document_read: '{raw}' could not be read"))?
+        .len();
+    Ok(ParsedDocument {
+        format: "pdf".to_string(),
+        document_type: "pdf".to_string(),
+        size_bytes,
+        text,
+        sections,
+        sheets: Vec::new(),
+    })
+}
+
+/// Spawns the hidden `internal-pdf-text` subcommand
+/// (`handlers::internal_pdf_text`) as an isolated child process and returns
+/// its rendered pages, or a typed error describing why it did not. See
+/// [`extract_pdf`]'s doc comment for the P0-1/P0-2 findings this isolates
+/// against.
+///
+/// Hardening mirrors `agent::ImpulseAgent::harness_query_structured`'s
+/// established subprocess pattern exactly: env scrubbed via the same
+/// `tooling::env_scrub` allowlist `bash_exec` uses, `kill_on_drop(true)` so
+/// a dropped future (timeout or task cancellation) sends SIGKILL,
+/// `process_group(0)` plus a synchronous-from-Drop
+/// [`crate::process_group::ProcessGroupGuard`] so a timeout kills the whole
+/// isolated group and not merely the direct child, and a wall-clock
+/// timeout the child cannot ignore from the outside. On top of that
+/// existing pattern, this spawn additionally sets `RLIMIT_AS`/`RLIMIT_CPU`
+/// on the child via `pre_exec` (review round 1, item 1) -- resource ceilings
+/// `bash_exec`/harness spawns have no equivalent need for, since their
+/// resource use is bounded by what the command itself does, not by
+/// attacker-controlled document structure.
+async fn run_pdf_extraction_child(
+    exe: &Path,
+    path: &Path,
+    raw: &str,
+    max_chars: usize,
+    max_pages: usize,
+    timeout: std::time::Duration,
+    memory_limit_bytes: u64,
+) -> Result<Vec<PdfChildPage>> {
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.arg("internal-pdf-text")
+        .arg(path)
+        .arg("--max-chars")
+        .arg(max_chars.to_string())
+        .arg("--max-pages")
+        .arg(max_pages.to_string())
+        .arg("--memory-limit-bytes")
+        .arg(memory_limit_bytes.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    crate::tooling::env_scrub::scrub_and_allowlist_env(&mut cmd, &[]);
+    cmd.kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        // tokio::process::Command exposes `process_group` natively, the
+        // same call `agent::ImpulseAgent::harness_query_structured` uses.
+        cmd.process_group(0);
+
+        // Review round 3, F2: `RLIMIT_AS` below is real, kernel-enforced
+        // defense-in-depth on Linux, but macOS's `setrlimit` accepts
+        // `RLIMIT_AS` and reports success while silently NOT enforcing it
+        // (confirmed empirically: a 1 GiB limit let a child reach 4.12 GiB
+        // RSS). This is logged here, in the PARENT, before spawning --
+        // never inside the `pre_exec` closure below, which runs after
+        // `fork` in a context where only async-signal-safe calls are sound
+        // and logging is not one of them. The real enforcement on macOS is
+        // the child's own memory-watchdog thread
+        // (`handlers::internal_pdf_text::spawn_memory_watchdog`).
+        #[cfg(target_os = "macos")]
+        tracing::debug!(
+            limit_bytes = PDF_CHILD_MEMORY_LIMIT_BYTES,
+            "RLIMIT_AS will be set on the PDF extraction child but is not kernel-enforced on \
+             macOS; the child's own memory watchdog thread is the real ceiling on this platform"
+        );
+
+        // SAFETY: this closure runs in the child after `fork`, before
+        // `exec`, on a single thread with no other threads from the parent
+        // visible (the OS gives the forked child its own private copy of
+        // process state). It performs only async-signal-safe work -- two
+        // direct `libc::setrlimit` syscalls, no heap allocation, no
+        // locking, and no panicking path (`let _ =` discards a failed
+        // `setrlimit` rather than calling `.unwrap()`/`.expect()`) -- so it
+        // cannot deadlock or corrupt the child's state before `exec`
+        // replaces it entirely. A `setrlimit` failure (e.g. an
+        // already-lower inherited hard limit) is treated as best-effort and
+        // ignored rather than aborting the spawn: the character-budgeted
+        // sink in the child is the primary bound; this is defense in depth
+        // on top of it, not the sole line of defense.
+        unsafe {
+            cmd.pre_exec(|| {
+                let as_limit = libc::rlimit {
+                    rlim_cur: PDF_CHILD_MEMORY_LIMIT_BYTES as libc::rlim_t,
+                    rlim_max: PDF_CHILD_MEMORY_LIMIT_BYTES as libc::rlim_t,
+                };
+                let _ = libc::setrlimit(libc::RLIMIT_AS, &as_limit);
+                let cpu_limit = libc::rlimit {
+                    rlim_cur: PDF_CHILD_TIMEOUT_SECS as libc::rlim_t,
+                    rlim_max: PDF_CHILD_TIMEOUT_SECS as libc::rlim_t,
+                };
+                let _ = libc::setrlimit(libc::RLIMIT_CPU, &cpu_limit);
+                Ok(())
+            });
+        }
+    }
+
+    let mut child = cmd.spawn().with_context(|| {
+        format!(
+            "document_read: '{raw}' failed to spawn the PDF extraction subprocess ({})",
+            exe.display()
+        )
+    })?;
+    let mut guard = crate::process_group::ProcessGroupGuard::new(child.id());
+    let stdout_cap = max_child_stdout_bytes(max_chars, max_pages);
+
+    let output = match tokio::time::timeout(
+        timeout,
+        bounded_wait_with_output(
+            &mut child,
+            &mut guard,
+            stdout_cap,
+            MAX_CHILD_STDERR_BYTES,
+            raw,
+        ),
+    )
+    .await
+    {
+        Ok(result) => {
+            let output = result?;
+            guard.disarm();
+            output
+        }
+        Err(_elapsed) => {
+            // Returning drops the still-armed guard, killing the isolated
+            // process group (matching `harness_query_structured`'s
+            // established timeout-cleanup ordering) before the caller
+            // observes this error.
+            bail!(
+                "document_read: '{raw}' PDF extraction timed out after {:.3}s (possibly a \
+                 maliciously constructed PDF); refusing to extract text from this file",
+                timeout.as_secs_f64()
+            );
+        }
+    };
+
+    if !output.status.success() {
+        // Review round 3, F2: checked BEFORE the signal check below, since
+        // the watchdog's `std::process::exit(PDF_MEMORY_CEILING_EXIT_CODE)`
+        // is a normal (non-signaled) exit -- it would otherwise fall through
+        // to the generic stderr-based error and be indistinguishable from
+        // any other parse failure, losing the specific "this was the memory
+        // ceiling, not a malformed file" signal.
+        if output.status.code() == Some(PDF_MEMORY_CEILING_EXIT_CODE) {
+            bail!(
+                "document_read: '{raw}' PDF extraction subprocess exceeded its memory ceiling \
+                 ({} bytes) while parsing (possibly a maliciously constructed PDF, such as an \
+                 oversized compressed object stream); refusing to extract text from this file",
+                PDF_CHILD_MEMORY_LIMIT_BYTES
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            if let Some(signal) = output.status.signal() {
+                bail!(
+                    "document_read: '{raw}' PDF extraction subprocess was killed by signal \
+                     {signal} while parsing (a crash such as a stack overflow, an \
+                     out-of-memory kill, or a CPU-time kill); refusing to extract text from \
+                     this file"
+                );
+            }
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "document_read: '{raw}' could not be parsed: {}",
+            stderr.trim()
+        );
+    }
+
+    let parsed: PdfChildOutput = serde_json::from_slice(&output.stdout).with_context(|| {
+        format!("document_read: '{raw}' PDF extraction subprocess produced malformed output")
+    })?;
+    Ok(parsed.pages)
+}
+
+/// Worst-case byte size of the child's JSON stdout for a given character
+/// budget and page count: `serde_json` writes each `char` as its UTF-8
+/// bytes (at most 4) plus, in the rare case of a control character, a
+/// `\u00XX` escape (6 bytes) -- 8 bytes/char covers both with margin. The
+/// per-page JSON envelope (`{"page_num":N,"text":"..."}`, commas, field
+/// names) is bounded by a fixed allowance per page; the array/object
+/// wrapper by a small fixed constant.
+fn max_child_stdout_bytes(max_chars: usize, max_pages: usize) -> usize {
+    max_chars
+        .saturating_mul(8)
+        .saturating_add(max_pages.saturating_mul(64))
+        .saturating_add(4096)
+}
+
+/// stderr is diagnostic text, never budget-shaped; a fixed cap keeping the
+/// tail (the most recent bytes are the most relevant to a failure) is
+/// generous for any real error message this tool produces.
+const MAX_CHILD_STDERR_BYTES: usize = 64 * 1024;
+
+/// Bounded `child.wait_with_output()` replacement.
+///
+/// **Review round 2, P1 (CONFIRMED):** `child.wait_with_output()` buffers
+/// the WHOLE child stdout/stderr with no cap at all -- a rogue or
+/// compromised child (the `internal-pdf-text` subcommand itself, or
+/// `exe`/`PATH` tampering pointing at something else entirely) streaming
+/// gigabytes of output drove the PARENT process to gigabytes of RSS and
+/// produced an accepted, multi-gigabyte-character "document" -- the same
+/// unbounded-buffer class of bug `daemon::mod`'s own connection loop was
+/// fixed for (`daemon::read_bounded_line`). This bounds BOTH pipes: stdout
+/// via [`read_capped`] (refuse and kill once it would exceed the
+/// JSON-encoded worst case for the requested budget -- the content is
+/// discarded either way once exceeded, so keeping only a bounded prefix is
+/// fine), stderr via [`read_capped_tail`] (diagnostic text has no fixed
+/// budget to check against, so it always succeeds with whatever tail fit,
+/// bounded regardless of how much a rogue child actually wrote).
+///
+/// Reads both pipes on INDEPENDENT tasks, deliberately NOT joined together
+/// with something like `tokio::join!` that waits for both to resolve
+/// before continuing. Found the hard way (review round 2's own rogue-child
+/// integration test hung for the full wall-clock timeout instead of
+/// returning promptly): once `read_capped` stops draining stdout past its
+/// cap, a child still trying to write more blocks on that pipe's next
+/// `write()` -- it never exits and so never closes ANY of its pipes,
+/// including stderr. `tokio::join!` would then wait forever (well, until
+/// the outer wall-clock timeout) for the stderr read to see EOF, even
+/// though the stdout read already has the answer we need. Spawning lets
+/// the stdout task's result (exceeded or not) act independently of
+/// whatever stderr is doing; only once stdout is known to be within bound
+/// do we also wait on stderr (which, for a well-behaved child that has
+/// therefore already exited or is about to, resolves quickly in practice
+/// -- and remains bounded overall by the caller's wall-clock timeout even
+/// in an unexpected case).
+async fn bounded_wait_with_output(
+    child: &mut tokio::process::Child,
+    guard: &mut crate::process_group::ProcessGroupGuard,
+    stdout_cap: usize,
+    stderr_cap: usize,
+    raw: &str,
+) -> Result<BoundedChildOutput> {
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("PDF extraction subprocess has no piped stdout"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("PDF extraction subprocess has no piped stderr"))?;
+    let stdout_task = tokio::spawn(async move { read_capped(&mut stdout, stdout_cap).await });
+    let stderr_task = tokio::spawn(async move { read_capped_tail(&mut stderr, stderr_cap).await });
+
+    let (stdout_buf, stdout_exceeded) = stdout_task
+        .await
+        .context("document_read: PDF extraction subprocess's stdout reader task panicked")?
+        .with_context(|| {
+            format!("document_read: '{raw}' failed reading the PDF extraction subprocess's stdout")
+        })?;
+
+    if stdout_exceeded {
+        // A rogue/compromised child; do not wait for it to finish
+        // producing arbitrarily more, and do not wait on the (possibly
+        // wedged) stderr task either. `kill_now` kills the whole isolated
+        // process group and disarms the guard so its own Drop does not
+        // double-kill; the child is still reaped below to avoid a zombie.
+        stderr_task.abort();
+        guard.kill_now();
+        let _ = child.wait().await;
+        bail!(
+            "document_read: '{raw}' PDF extraction subprocess exceeded its output bound \
+             ({stdout_cap} bytes); refusing as possible rogue or malicious output -- the child \
+             was killed"
+        );
+    }
+
+    let stderr_buf = stderr_task
+        .await
+        .context("document_read: PDF extraction subprocess's stderr reader task panicked")?
+        .with_context(|| {
+            format!("document_read: '{raw}' failed reading the PDF extraction subprocess's stderr")
+        })?;
+    let status = child.wait().await.with_context(|| {
+        format!("document_read: '{raw}' failed waiting for the PDF extraction subprocess to exit")
+    })?;
+    Ok(BoundedChildOutput {
+        status,
+        stdout: stdout_buf,
+        stderr: stderr_buf,
+    })
+}
+
+struct BoundedChildOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Reads `reader` to EOF, refusing (returning `exceeded = true` and only
+/// the first `cap` bytes) if more than `cap` bytes arrive. Mirrors
+/// `daemon::read_bounded_line`'s `AsyncReadExt::take(cap + 1)` pattern
+/// (peak memory for one read is capped regardless of what the peer sends),
+/// adapted for an EOF-terminated read rather than a line-terminated one.
+async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    cap: usize,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    use tokio::io::AsyncReadExt as _;
+    let mut buf = Vec::new();
+    let mut limited = reader.take(cap as u64 + 1);
+    limited.read_to_end(&mut buf).await?;
+    let exceeded = buf.len() > cap;
+    if exceeded {
+        buf.truncate(cap);
+    }
+    Ok((buf, exceeded))
+}
+
+/// Like [`read_capped`], but for a stream where only the most recent `cap`
+/// bytes matter (stderr diagnostic text): reads in bounded chunks and
+/// keeps only the tail, so peak memory stays at roughly `cap` plus one
+/// chunk regardless of how much a rogue child actually writes -- unlike
+/// `read_capped`, this never refuses (there is no fixed budget content
+/// could violate), it just returns whatever tail fit, always.
+async fn read_capped_tail<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    cap: usize,
+) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt as _;
+    const CHUNK: usize = 8192;
+    let mut tail: Vec<u8> = Vec::new();
+    let mut chunk = vec![0u8; CHUNK];
+    loop {
+        let n = reader.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        tail.extend_from_slice(&chunk[..n]);
+        if tail.len() > cap {
+            let excess = tail.len() - cap;
+            tail.drain(0..excess);
+        }
+    }
+    Ok(tail)
+}
+
+/// Detects one ATX heading line: up to 3 leading spaces (CommonMark
+/// tolerates an ATX heading indented by up to 3 spaces before it counts as
+/// a code block instead), then 1 to 6 `#` characters followed by a
+/// space/tab or end of line (a run of more than 6 `#`s, or one glued
+/// directly to following text like `#tag`, is not a heading). Returns the
+/// heading level and the trimmed heading text, or `None` for an ordinary
+/// line. Deliberately not full CommonMark: an optional closing run of `#`s
+/// (`## Title ##`) is left in the heading text rather than stripped, a
+/// documented simplification for a tool that only needs stable section
+/// boundaries, not a rendered heading.
+pub fn parse_atx_heading(line: &str) -> Option<(u8, String)> {
+    let leading_spaces = line.chars().take_while(|c| *c == ' ').count();
+    if leading_spaces > 3 {
+        return None;
+    }
+    let unindented = &line[leading_spaces..];
+    let hashes = unindented.chars().take_while(|c| *c == '#').count();
+    if hashes == 0 || hashes > 6 {
+        return None;
+    }
+    let rest = &unindented[hashes..];
+    if !rest.is_empty() && !rest.starts_with([' ', '\t']) {
+        return None;
+    }
+    let text = rest.trim_start_matches([' ', '\t']).trim_end();
+    Some((hashes as u8, text.to_string()))
+}
+
+/// Detects a fenced-code-block delimiter line: up to 3 leading spaces, then
+/// 3 or more backticks or 3 or more tildes (CommonMark's two fence
+/// characters). Deliberately does not match the opening fence's exact
+/// character or length against the closing one, nor track an info string --
+/// any such line toggles fence state in [`markdown_sections`], a documented
+/// simplification for a tool that only needs "is a `#`-looking line inside
+/// a fence or not," not a faithful code-block renderer.
+fn is_markdown_fence_marker(line: &str) -> bool {
+    let leading_spaces = line.chars().take_while(|c| *c == ' ').count();
+    if leading_spaces > 3 {
+        return false;
+    }
+    let unindented = &line[leading_spaces..];
+    let backticks = unindented.chars().take_while(|c| *c == '`').count();
+    let tildes = unindented.chars().take_while(|c| *c == '~').count();
+    backticks >= 3 || tildes >= 3
+}
+
+/// Scans `text` for ATX headings and returns the section table this
+/// module's own text is built from directly (unlike Word/xlsx, Markdown
+/// text is not rewritten, so offsets are plain char offsets into `text`
+/// itself). Content before the first heading belongs to no section, mirror-
+/// ing Word's own "no growth before the first non-empty paragraph"
+/// behavior. Past [`MAX_MD_SECTIONS`] headings, no new section starts and
+/// the most recently opened one keeps absorbing text, so every offset
+/// already reported stays truthful.
+///
+/// A `#`-prefixed line inside a fenced code block (opened/closed by
+/// [`is_markdown_fence_marker`]) is never treated as a heading -- a shell
+/// comment or a language's own comment syntax inside a fenced snippet must
+/// not fragment the outline, matching every Markdown renderer's own
+/// behavior. An unterminated fence (no closing marker before the end of
+/// the document) is treated as remaining inside the fence for the rest of
+/// the text, the conservative reading (an unclosed fence is malformed
+/// input either way; refusing to treat anything after it as a heading is
+/// the safer of the two possible guesses).
+pub fn markdown_sections(text: &str) -> Vec<DocumentSection> {
+    let mut sections: Vec<DocumentSection> = Vec::new();
+    let mut cursor = 0usize;
+    let mut open: Option<usize> = None;
+    let mut in_fence = false;
+    for line in text.split_inclusive('\n') {
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        let content = content.strip_suffix('\r').unwrap_or(content);
+        if is_markdown_fence_marker(content) {
+            in_fence = !in_fence;
+        } else if !in_fence {
+            if let Some((_level, heading_text)) = parse_atx_heading(content) {
+                if sections.len() < MAX_MD_SECTIONS {
+                    sections.push(DocumentSection {
+                        index: sections.len(),
+                        kind: "heading".to_string(),
+                        name: Some(heading_text),
+                        offset: Some(cursor),
+                        chars: 0,
+                    });
+                    open = Some(sections.len() - 1);
+                }
+            }
+        }
+        let line_chars = line.chars().count();
+        if let Some(idx) = open {
+            sections[idx].chars += line_chars;
+        }
+        cursor += line_chars;
+    }
+    sections
+}
+
+/// Reads a `txt`/`md` file whole (already bounded by [`MAX_DOCUMENT_BYTES`]
+/// at path-resolution time) and requires valid UTF-8, refusing with a typed
+/// error otherwise -- this tool does not guess an encoding or silently
+/// replace invalid bytes with the Unicode replacement character, which
+/// would make offsets returned to the model line up with a text the model
+/// never actually sees. `format`/`document_type` are supplied by the
+/// caller so this one reader backs both `txt` (no sections: the whole
+/// document is one span, matching `csv`'s single-section shape) and `md`
+/// (sections from [`markdown_sections`]).
+pub fn extract_plain_text(
+    path: &Path,
+    raw: &str,
+    budget: ExtractBudget,
+    format: &str,
+    document_type: &str,
+) -> Result<ParsedDocument> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("document_read: '{raw}' could not be read"))?;
+    let text = String::from_utf8(bytes).map_err(|e| {
+        anyhow::anyhow!(
+            "document_read: '{raw}' is not valid UTF-8 (first invalid byte at offset {}); \
+             this tool reads UTF-8 text only and does not guess an encoding",
+            e.utf8_error().valid_up_to()
+        )
+    })?;
+    check_extracted_size(&text, raw, budget.max_chars)?;
+
+    let sections = if format == "md" {
+        markdown_sections(&text)
+    } else {
+        let total_chars = text.chars().count();
+        if total_chars == 0 {
+            Vec::new()
+        } else {
+            vec![DocumentSection {
+                index: 0,
+                kind: "text".to_string(),
+                name: None,
+                offset: Some(0),
+                chars: total_chars,
+            }]
+        }
+    };
+
+    let size_bytes = std::fs::metadata(path)
+        .with_context(|| format!("document_read: '{raw}' could not be read"))?
+        .len();
+    Ok(ParsedDocument {
+        format: format.to_string(),
+        document_type: document_type.to_string(),
+        size_bytes,
+        text,
+        sections,
+        sheets: Vec::new(),
+    })
+}
+
 /// Renders streamed cells as tab-separated rows. Gaps of up to
 /// [`EMPTY_COLUMNS_INLINE`] empty columns become bare tabs; wider column
 /// gaps and every skipped row become a bracketed marker, so a cell far from
@@ -1307,6 +2305,12 @@ pub fn render(window: &DocumentWindow) -> String {
                 "  (empty worksheets are omitted, as are chart, dialog, and macro sheets, \
                  which are not worksheets; section indexes are workbook positions; section \
                  offsets are whole-document offsets)\n",
+            );
+        }
+        if window.format == "pdf" && window.total_chars == 0 {
+            out.push_str(
+                "  (no extractable text layer: this PDF is likely scanned or image-only; \
+                 this tool never renders images, so there is nothing more to read here)\n",
             );
         }
     }
@@ -1757,13 +2761,17 @@ mod tests {
             "{msg}"
         );
 
-        std::fs::write(dir.path().join("notes.pdf"), "%PDF").unwrap();
-        let err = resolve_document_path("notes.pdf", &ctx).unwrap_err();
+        std::fs::write(dir.path().join("slides.pptx"), "PK").unwrap();
+        let err = resolve_document_path("slides.pptx", &ctx).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.starts_with("document_read: 'notes.pdf'"), "{msg}");
-        assert!(msg.contains("unsupported extension 'pdf'"), "{msg}");
+        assert!(msg.starts_with("document_read: 'slides.pptx'"), "{msg}");
+        assert!(msg.contains("unsupported extension 'pptx'"), "{msg}");
         assert!(
             msg.contains("xlsx") && msg.contains("csv") && msg.contains("docx"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("pdf") && msg.contains("txt") && msg.contains("md"),
             "{msg}"
         );
 
@@ -1779,6 +2787,20 @@ mod tests {
             "{msg}"
         );
         assert!(msg.contains("convert it to .xlsx"), "{msg}");
+    }
+
+    #[test]
+    fn test_resolve_document_path_accepts_pdf_txt_and_md_extensions() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ctx = doc_ctx(dir.path());
+        for name in ["a.pdf", "b.txt", "c.md", "D.PDF", "E.TXT", "F.MD"] {
+            std::fs::write(dir.path().join(name), "content").unwrap();
+            assert_eq!(
+                resolve_document_path(name, &ctx).unwrap(),
+                dir.path().join(name),
+                "{name} should resolve as a supported extension"
+            );
+        }
     }
 
     // ------------------------------------------------------------------
@@ -2225,6 +3247,221 @@ mod tests {
         // Exactly two lines, so the section span still tiles the text.
         assert_eq!(text.matches('\n').count(), 2);
         assert_eq!(sections[0].chars, text.chars().count());
+    }
+
+    // ------------------------------------------------------------------
+    // Markdown ATX heading detection and section accumulation -- pure,
+    // unit-tested directly without a document, matching the WordTextBuilder
+    // tests above.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_atx_heading_recognizes_levels_one_through_six() {
+        assert_eq!(parse_atx_heading("# Title"), Some((1, "Title".to_string())));
+        assert_eq!(
+            parse_atx_heading("###### Deepest"),
+            Some((6, "Deepest".to_string()))
+        );
+        assert_eq!(
+            parse_atx_heading("###   Padded   "),
+            Some((3, "Padded".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_atx_heading_accepts_an_empty_heading() {
+        assert_eq!(parse_atx_heading("##"), Some((2, String::new())));
+        assert_eq!(parse_atx_heading("## "), Some((2, String::new())));
+    }
+
+    #[test]
+    fn test_parse_atx_heading_rejects_non_headings() {
+        assert_eq!(parse_atx_heading("plain text"), None);
+        assert_eq!(
+            parse_atx_heading("#tag-not-a-heading"),
+            None,
+            "no space after #"
+        );
+        assert_eq!(
+            parse_atx_heading("####### seven hashes"),
+            None,
+            "CommonMark caps ATX headings at level 6"
+        );
+        assert_eq!(parse_atx_heading(""), None);
+    }
+
+    #[test]
+    fn test_parse_atx_heading_tolerates_up_to_three_leading_spaces() {
+        assert_eq!(
+            parse_atx_heading("   # Indented"),
+            Some((1, "Indented".to_string())),
+            "3 leading spaces is still an ATX heading per CommonMark"
+        );
+        assert_eq!(
+            parse_atx_heading("    # Too indented"),
+            None,
+            "4+ leading spaces makes it a code block, not a heading"
+        );
+    }
+
+    #[test]
+    fn test_is_markdown_fence_marker_recognizes_both_fence_characters() {
+        assert!(is_markdown_fence_marker("```"));
+        assert!(is_markdown_fence_marker("```rust"));
+        assert!(is_markdown_fence_marker("~~~"));
+        assert!(is_markdown_fence_marker("   ```"), "up to 3 leading spaces");
+        assert!(!is_markdown_fence_marker("    ```"), "4+ leading spaces");
+        assert!(!is_markdown_fence_marker("``"), "only 2 backticks");
+        assert!(!is_markdown_fence_marker("plain text"));
+    }
+
+    #[test]
+    fn test_markdown_sections_ignores_a_heading_looking_line_inside_a_fenced_code_block() {
+        let text = "# Real heading\n```\n# not a heading, just a shell comment\n```\n# Also real\n";
+        let sections = markdown_sections(text);
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].name.as_deref(), Some("Real heading"));
+        assert_eq!(sections[1].name.as_deref(), Some("Also real"));
+    }
+
+    #[test]
+    fn test_markdown_sections_treats_an_unterminated_fence_as_open_to_the_end() {
+        // No closing ``` before EOF: the conservative reading keeps every
+        // subsequent line inside the fence, so a #-looking line after the
+        // unterminated fence is not treated as a heading.
+        let text = "# Real heading\n```\n# looks like a heading but is not\nmore fenced text\n";
+        let sections = markdown_sections(text);
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].name.as_deref(), Some("Real heading"));
+        // The whole rest of the document still belongs to the one real
+        // section (nothing is silently dropped).
+        assert_eq!(sections[0].chars, text.chars().count());
+    }
+
+    #[test]
+    fn test_markdown_sections_empty_text_has_no_sections() {
+        assert!(markdown_sections("").is_empty());
+    }
+
+    #[test]
+    fn test_markdown_sections_content_before_first_heading_has_no_section() {
+        let sections = markdown_sections("intro line\n# First\nbody\n");
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].name.as_deref(), Some("First"));
+        // Offset is the char offset of the "# First" line, i.e. after "intro line\n".
+        assert_eq!(sections[0].offset, Some("intro line\n".chars().count()));
+    }
+
+    #[test]
+    fn test_markdown_sections_spans_run_up_to_the_next_heading() {
+        let text = "# One\nbody one\n## Two\nbody two\nmore\n";
+        let sections = markdown_sections(text);
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].name.as_deref(), Some("One"));
+        assert_eq!(sections[0].offset, Some(0));
+        assert_eq!(sections[0].chars, "# One\nbody one\n".chars().count());
+        assert_eq!(sections[1].name.as_deref(), Some("Two"));
+        assert_eq!(
+            sections[1].offset,
+            Some("# One\nbody one\n".chars().count())
+        );
+        assert_eq!(
+            sections[1].chars,
+            "## Two\nbody two\nmore\n".chars().count()
+        );
+        // Section spans tile the whole document exactly.
+        let total: usize = sections.iter().map(|s| s.chars).sum();
+        assert_eq!(total, text.chars().count());
+    }
+
+    #[test]
+    fn test_markdown_sections_caps_at_max_md_sections_and_last_absorbs_the_rest() {
+        let mut text = String::new();
+        for i in 0..(MAX_MD_SECTIONS + 5) {
+            text.push_str(&format!("# H{i}\nbody\n"));
+        }
+        let sections = markdown_sections(&text);
+        assert_eq!(sections.len(), MAX_MD_SECTIONS);
+        // Every offset reported stays truthful: the last section's offset
+        // plus its char count reaches exactly the end of the text, proving
+        // it really did absorb the 5 headings past the cap rather than
+        // silently dropping their text.
+        let last = sections.last().unwrap();
+        assert_eq!(
+            last.offset.unwrap() + last.chars,
+            text.chars().count(),
+            "last section must absorb every char past the cap"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // extract_plain_text (txt/md whole-file reader) -- pure I/O boundaries,
+    // no ReplTool involved.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_plain_text_empty_file_has_no_sections() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("empty.txt");
+        std::fs::write(&path, "").unwrap();
+
+        let parsed =
+            extract_plain_text(&path, "empty.txt", ExtractBudget::DEFAULT, "txt", "text").unwrap();
+
+        assert_eq!(parsed.text, "");
+        assert!(parsed.sections.is_empty());
+    }
+
+    #[test]
+    fn test_extract_plain_text_accepts_a_budget_hit_exactly_and_refuses_one_more() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("t.txt");
+        std::fs::write(&path, "abcde").unwrap();
+        let budget = ExtractBudget {
+            max_chars: 5,
+            max_cells: 0,
+        };
+        assert!(extract_plain_text(&path, "t.txt", budget, "txt", "text").is_ok());
+
+        std::fs::write(&path, "abcdef").unwrap();
+        let err = extract_plain_text(&path, "t.txt", budget, "txt", "text").unwrap_err();
+        assert!(err.to_string().contains("over the 5 character limit"));
+    }
+
+    #[test]
+    fn test_extract_plain_text_rejects_invalid_utf8() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("bad.txt");
+        std::fs::write(&path, [b'o', b'k', 0xff, 0xfe]).unwrap();
+
+        let err = extract_plain_text(&path, "bad.txt", ExtractBudget::DEFAULT, "txt", "text")
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not valid UTF-8"), "{msg}");
+        assert!(msg.contains("offset 2"), "{msg}");
+    }
+
+    #[test]
+    fn test_extract_plain_text_md_builds_sections_txt_does_not() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("t.md");
+        std::fs::write(&path, "# Heading\nbody\n").unwrap();
+        let parsed =
+            extract_plain_text(&path, "t.md", ExtractBudget::DEFAULT, "md", "markdown").unwrap();
+        assert_eq!(parsed.format, "md");
+        assert_eq!(parsed.document_type, "markdown");
+        assert_eq!(parsed.sections.len(), 1);
+
+        let path_txt = dir.path().join("t.txt");
+        std::fs::write(&path_txt, "# Heading\nbody\n").unwrap();
+        let parsed_txt =
+            extract_plain_text(&path_txt, "t.txt", ExtractBudget::DEFAULT, "txt", "text").unwrap();
+        assert_eq!(parsed_txt.sections.len(), 1);
+        assert_eq!(parsed_txt.sections[0].kind, "text");
+        assert_eq!(
+            parsed_txt.sections[0].chars,
+            parsed_txt.text.chars().count()
+        );
     }
 
     mod fixtures {
@@ -3006,6 +4243,414 @@ mod tests {
                 ),
                 "{msg}"
             );
+        }
+
+        // --------------------------------------------------------------
+        // PDF (text layer only). Fixtures are built with lopdf directly
+        // (re-exported by `pdf_extract::*`, so no extra dependency), the
+        // same low-level construction lopdf's own `create.rs` example
+        // uses: a Type1 Helvetica font (no embedded font file needed for
+        // pdf-extract's built-in core-font metrics), one content stream
+        // per page.
+        // --------------------------------------------------------------
+
+        fn pdf_dict(pairs: &[(&str, pdf_extract::Object)]) -> pdf_extract::Dictionary {
+            let mut dict = pdf_extract::Dictionary::new();
+            for (key, value) in pairs {
+                dict.set(*key, value.clone());
+            }
+            dict
+        }
+
+        /// Builds a PDF with one page per entry of `pages`, each page's text
+        /// written via a single `Tj` operator. An empty `pages` slice is not
+        /// meaningful (`Kids`/`Count` would be empty); callers needing a
+        /// page with no text use `tests/pdf_extraction_isolation.rs`'s own
+        /// `write_pdf_blank_page` instead (this module's own copy was
+        /// removed in review round 3 once page-count/blank-page behavior
+        /// moved to being tested exclusively through the isolated child),
+        /// which still creates one real page, just with no text operators
+        /// in its content stream.
+        fn write_pdf(dir: &tempfile::TempDir, pages: &[&str]) -> PathBuf {
+            use pdf_extract::content::{Content, Operation};
+            use pdf_extract::{Document, Object, Stream};
+
+            let mut doc = Document::with_version("1.5");
+            let font_id = doc.add_object(pdf_dict(&[
+                ("Type", Object::from("Font")),
+                ("Subtype", Object::from("Type1")),
+                ("BaseFont", Object::from("Helvetica")),
+            ]));
+            let resources_id = doc.add_object(pdf_dict(&[(
+                "Font",
+                Object::Dictionary(pdf_dict(&[("F1", Object::Reference(font_id))])),
+            )]));
+            let pages_id = doc.new_object_id();
+            let mut kids = Vec::new();
+            for page_text in pages {
+                let content = Content {
+                    operations: vec![
+                        Operation::new("BT", vec![]),
+                        Operation::new("Tf", vec!["F1".into(), 12.into()]),
+                        Operation::new("Td", vec![72.into(), 700.into()]),
+                        Operation::new("Tj", vec![Object::string_literal(*page_text)]),
+                        Operation::new("ET", vec![]),
+                    ],
+                };
+                let content_id =
+                    doc.add_object(Stream::new(pdf_dict(&[]), content.encode().unwrap()));
+                let page_id = doc.add_object(pdf_dict(&[
+                    ("Type", Object::from("Page")),
+                    ("Parent", Object::Reference(pages_id)),
+                    ("Contents", Object::Reference(content_id)),
+                ]));
+                kids.push(Object::Reference(page_id));
+            }
+            let count = kids.len() as i64;
+            let pages_dict = pdf_dict(&[
+                ("Type", Object::from("Pages")),
+                ("Kids", Object::Array(kids)),
+                ("Count", Object::Integer(count)),
+                ("Resources", Object::Reference(resources_id)),
+                (
+                    "MediaBox",
+                    Object::Array(vec![
+                        Object::Integer(0),
+                        Object::Integer(0),
+                        Object::Integer(612),
+                        Object::Integer(792),
+                    ]),
+                ),
+            ]);
+            doc.objects.insert(pages_id, Object::Dictionary(pages_dict));
+            let catalog_id = doc.add_object(pdf_dict(&[
+                ("Type", Object::from("Catalog")),
+                ("Pages", Object::Reference(pages_id)),
+            ]));
+            doc.trailer.set("Root", catalog_id);
+            let path = dir.path().join("doc.pdf");
+            doc.save(&path).unwrap();
+            path
+        }
+
+        /// A one-page PDF (from [`write_pdf`]) re-saved with RC4 V1
+        /// encryption (the simplest supported scheme, no extra crate
+        /// needed), with a non-empty user password: `pdf_declares_encryption`
+        /// must refuse it via the raw `/Encrypt` byte scan, independent of
+        /// (and run before) any `lopdf::Document::load` call.
+        fn write_encrypted_pdf(dir: &tempfile::TempDir) -> PathBuf {
+            use pdf_extract::{Document, EncryptionState, EncryptionVersion, Object, Permissions};
+
+            let path = write_pdf(dir, &["secret contents"]);
+            let mut doc = Document::load(&path).unwrap();
+            // RC4 key derivation needs the trailer's /ID (first element);
+            // write_pdf's minimal trailer does not set one, so encrypt()
+            // would otherwise fail with DecryptionError::MissingFileID.
+            doc.trailer.set(
+                "ID",
+                Object::Array(vec![
+                    Object::string_literal(b"0123456789abcdef".to_vec()),
+                    Object::string_literal(b"0123456789abcdef".to_vec()),
+                ]),
+            );
+            let permissions = Permissions::PRINTABLE
+                | Permissions::COPYABLE
+                | Permissions::COPYABLE_FOR_ACCESSIBILITY
+                | Permissions::PRINTABLE_IN_HIGH_QUALITY;
+            let state = EncryptionState::try_from(EncryptionVersion::V1 {
+                document: &doc,
+                owner_password: "owner-pw",
+                user_password: "user-pw",
+                permissions,
+            })
+            .unwrap();
+            doc.encrypt(&state).unwrap();
+            let enc_path = dir.path().join("encrypted.pdf");
+            doc.save(&enc_path).unwrap();
+            enc_path
+        }
+
+        // Review round 1: `extract_pdf`/`extract_pdf_with_page_cap` now spawn
+        // a real subprocess (`std::env::current_exe()`, the isolated
+        // `internal-pdf-text` child), which inside *any* `cargo test`
+        // process is that test binary itself -- not `impulse-rs`/`ion`,
+        // neither of which understands the hidden subcommand. Actual PDF
+        // rendering (multi-page read, blank-page note, the self-referencing
+        // XObject crash, the encrypted-empty-password gap, the wall-clock
+        // timeout) is therefore covered by the integration test
+        // `tests/pdf_extraction_isolation.rs`, which has
+        // `CARGO_BIN_EXE_impulse-rs` available and injects it via
+        // `extract_pdf_with_exe_and_timeout`. What stays safe to test
+        // in-process here is everything that does NOT parse PDF structure
+        // at all: `pdf_declares_encryption` (pure byte scan) and
+        // `pdf_encryption_prescan` (the same scan plus file I/O, review
+        // round 3, F0 -- the parent's ENTIRE PDF-specific job before
+        // spawning the child). Page count, the trailer-based encryption
+        // re-check, and the stream-inflation preflight all moved into
+        // `handlers::internal_pdf_text` in review round 3 (F0) and are
+        // tested there instead, since they now require
+        // `pdf_extract::Document::load`, which only the child may call.
+
+        #[test]
+        fn test_pdf_declares_encryption_pure_byte_scan() {
+            assert!(pdf_declares_encryption(
+                b"...trailer<</Root 1 0 R/Encrypt 5 0 R>>..."
+            ));
+            assert!(!pdf_declares_encryption(
+                b"%PDF-1.7\n...no such key here..."
+            ));
+            assert!(!pdf_declares_encryption(b""));
+            // A false positive (the literal bytes appearing as ordinary
+            // content, not a real trailer key) is accepted as the safe
+            // direction, documented in `pdf_declares_encryption`'s doc
+            // comment -- this assertion is here to make that trade-off
+            // explicit and regression-proof, not to claim it is a bug.
+            assert!(pdf_declares_encryption(
+                b"BT (this page just says /Encrypt as text) Tj ET"
+            ));
+        }
+
+        #[test]
+        fn test_pdf_declares_encryption_detects_real_encrypted_fixtures_and_not_plain_ones() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let plain = write_pdf(&dir, &["hello"]);
+            let encrypted = write_encrypted_pdf(&dir);
+
+            assert!(!pdf_declares_encryption(&std::fs::read(&plain).unwrap()));
+            assert!(pdf_declares_encryption(&std::fs::read(&encrypted).unwrap()));
+        }
+
+        #[test]
+        fn test_pdf_encryption_prescan_accepts_a_plain_pdf() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = write_pdf(&dir, &["one", "two", "three"]);
+
+            pdf_encryption_prescan(&path, "doc.pdf").unwrap();
+        }
+
+        #[test]
+        fn test_pdf_encryption_prescan_refuses_an_encrypted_pdf_via_the_byte_scan() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = write_encrypted_pdf(&dir);
+
+            let err = pdf_encryption_prescan(&path, "encrypted.pdf").unwrap_err();
+
+            assert!(err.to_string().contains("encrypted PDF"), "{err}");
+        }
+
+        #[test]
+        fn test_pdf_encryption_prescan_does_not_parse_pdf_structure_at_all() {
+            // Review round 3, F0: unlike the removed `precheck_pdf`, this
+            // function never calls `pdf_extract::Document::load` -- so a
+            // file that is not even valid PDF structure, but does not
+            // declare `/Encrypt`, passes the prescan cleanly (the actual
+            // parse failure surfaces later, from the isolated child, not
+            // from this byte-only scan).
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("not-really.pdf");
+            std::fs::write(&path, b"this is not a pdf at all").unwrap();
+
+            pdf_encryption_prescan(&path, "not-really.pdf").unwrap();
+        }
+
+        // --------------------------------------------------------------
+        // Review round 2 fixes: hex-escaped /Encrypt names, the stream-
+        // inflation preflight, and the bounded child stdout/stderr reader.
+        // --------------------------------------------------------------
+
+        #[test]
+        fn test_decode_pdf_name_token_resolves_hex_escapes() {
+            // "#79" is hex 0x79 = ASCII 'y'.
+            assert_eq!(decode_pdf_name_token(b"Encr#79pt rest"), b"Encrypt");
+            assert_eq!(decode_pdf_name_token(b"Plain>"), b"Plain");
+            assert_eq!(decode_pdf_name_token(b""), b"");
+        }
+
+        #[test]
+        fn test_decode_pdf_name_token_stops_at_the_first_delimiter() {
+            for delim in *b")>]}/% \t\n\r" {
+                let mut input = b"Foo".to_vec();
+                input.push(delim);
+                input.extend_from_slice(b"tail");
+                assert_eq!(decode_pdf_name_token(&input), b"Foo", "delimiter {delim}");
+            }
+        }
+
+        #[test]
+        fn test_decode_pdf_name_token_passes_through_a_malformed_escape_literally() {
+            // '#' not followed by two hex digits is not a valid escape;
+            // this function is lenient (a refusal decision only, never
+            // content a model sees), not a strict validator.
+            assert_eq!(decode_pdf_name_token(b"Foo#zz "), b"Foo#zz");
+            assert_eq!(decode_pdf_name_token(b"Foo#"), b"Foo#");
+        }
+
+        #[test]
+        fn test_pdf_declares_encryption_catches_a_hex_escaped_name() {
+            // Review round 2, CONFIRMED: `/Encr#79pt` has no literal
+            // `/Encrypt` byte sequence but decodes to the identical name.
+            let bytes = b"...trailer<</Root 1 0 R/Encr#79pt 5 0 R>>...";
+            assert!(
+                !bytes.windows(8).any(|w| w == b"/Encrypt"),
+                "sanity: no literal match"
+            );
+            assert!(pdf_declares_encryption(bytes));
+        }
+
+        #[test]
+        fn test_pdf_declares_encryption_hex_escape_does_not_false_positive_on_unrelated_names() {
+            assert!(!pdf_declares_encryption(
+                b"<</Type/Catalog/Enc#79rypt 1 0 R>>"
+            ));
+            assert!(!pdf_declares_encryption(
+                b"<</Type/Font/BaseFont/Helvetica>>"
+            ));
+        }
+
+        #[tokio::test]
+        async fn test_read_capped_accepts_input_at_exactly_the_cap() {
+            use tokio::io::AsyncWriteExt as _;
+            let (mut writer, mut reader) = tokio::io::duplex(4096);
+            let data = vec![b'A'; 100];
+            let data_clone = data.clone();
+            let write_task = tokio::spawn(async move {
+                writer.write_all(&data_clone).await.unwrap();
+            });
+
+            let (buf, exceeded) = read_capped(&mut reader, 100).await.unwrap();
+            write_task.await.unwrap();
+
+            assert!(!exceeded);
+            assert_eq!(buf, data);
+        }
+
+        #[tokio::test]
+        async fn test_read_capped_reports_exceeded_and_a_capped_prefix_when_input_is_too_large() {
+            use tokio::io::AsyncWriteExt as _;
+            let (mut writer, mut reader) = tokio::io::duplex(65536);
+            let write_task = tokio::spawn(async move {
+                // Far more than the cap below; read_capped must stop
+                // pulling bytes once its own limit is hit, not buffer all
+                // of this.
+                let _ = writer.write_all(&vec![b'B'; 1_000_000]).await;
+            });
+
+            let (buf, exceeded) = read_capped(&mut reader, 10).await.unwrap();
+            drop(write_task);
+
+            assert!(exceeded);
+            assert_eq!(
+                buf.len(),
+                10,
+                "must keep only the capped prefix, not everything read"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_read_capped_tail_keeps_only_the_most_recent_bytes() {
+            use tokio::io::AsyncWriteExt as _;
+            let (mut writer, mut reader) = tokio::io::duplex(65536);
+            let write_task = tokio::spawn(async move {
+                writer.write_all(b"0123456789ABCDEFGHIJ").await.unwrap();
+            });
+
+            let tail = read_capped_tail(&mut reader, 5).await.unwrap();
+            write_task.await.unwrap();
+
+            assert_eq!(tail, b"FGHIJ", "must keep the TAIL, not the head");
+        }
+
+        #[tokio::test]
+        async fn test_read_capped_tail_returns_everything_when_under_the_cap() {
+            use tokio::io::AsyncWriteExt as _;
+            let (mut writer, mut reader) = tokio::io::duplex(4096);
+            let write_task = tokio::spawn(async move {
+                writer.write_all(b"short").await.unwrap();
+            });
+
+            let tail = read_capped_tail(&mut reader, 100).await.unwrap();
+            write_task.await.unwrap();
+
+            assert_eq!(tail, b"short");
+        }
+
+        #[test]
+        fn test_max_child_stdout_bytes_scales_with_budget_and_pages() {
+            let small = max_child_stdout_bytes(100, 1);
+            let large = max_child_stdout_bytes(1_000_000, 100);
+            assert!(small < large);
+            assert!(small > 0);
+        }
+
+        // --------------------------------------------------------------
+        // txt / md, through the ReplTool end to end.
+        // --------------------------------------------------------------
+
+        #[tokio::test]
+        async fn test_run_reads_txt_as_one_section() {
+            let dir = tempfile::TempDir::new().unwrap();
+            std::fs::write(dir.path().join("notes.txt"), "Plain notes, no structure.\n").unwrap();
+
+            let outcome = DocumentReadTool
+                .run(json!({"path": "notes.txt"}), &ctx_in(&dir))
+                .await
+                .unwrap();
+
+            assert!(outcome.ok);
+            assert_eq!(outcome.payload["format"], "txt");
+            let sections = outcome.payload["sections"].as_array().unwrap();
+            assert_eq!(sections.len(), 1);
+            assert_eq!(sections[0]["kind"], "text");
+            assert!(outcome.payload["content"]
+                .as_str()
+                .unwrap()
+                .contains("Plain notes"));
+        }
+
+        #[tokio::test]
+        async fn test_run_reads_md_headings_as_sections() {
+            let dir = tempfile::TempDir::new().unwrap();
+            std::fs::write(
+                dir.path().join("plan.md"),
+                "# Plan\nintro\n## Step one\ndo the thing\n",
+            )
+            .unwrap();
+
+            let outline = DocumentReadTool
+                .run(json!({"path": "plan.md", "outline": true}), &ctx_in(&dir))
+                .await
+                .unwrap();
+
+            let sections = outline.payload["sections"].as_array().unwrap();
+            assert_eq!(sections.len(), 2);
+            assert_eq!(sections[0]["name"], "Plan");
+            assert_eq!(sections[1]["name"], "Step one");
+            let jump_offset = sections[1]["offset"].as_u64().unwrap();
+
+            let jumped = DocumentReadTool
+                .run(
+                    json!({"path": "plan.md", "offset": jump_offset}),
+                    &ctx_in(&dir),
+                )
+                .await
+                .unwrap();
+            assert!(jumped.payload["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("## Step one"));
+        }
+
+        #[tokio::test]
+        async fn test_run_rejects_txt_that_is_not_valid_utf8() {
+            let dir = tempfile::TempDir::new().unwrap();
+            std::fs::write(dir.path().join("bad.txt"), [b'o', b'k', 0xff, 0xfe]).unwrap();
+
+            let err = DocumentReadTool
+                .run(json!({"path": "bad.txt"}), &ctx_in(&dir))
+                .await
+                .unwrap_err();
+
+            assert!(err.to_string().contains("not valid UTF-8"), "{err}");
         }
     }
 }

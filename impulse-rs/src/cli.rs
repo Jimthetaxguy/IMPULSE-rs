@@ -700,6 +700,33 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Internal: renders one PDF's text layer, bounded, in this isolated
+    /// process, and prints it as JSON to stdout. Spawned only by ion's
+    /// `document_read` tool (`ion_repl::tool_document::run_pdf_extraction_child`,
+    /// review round 1 P0-1/P0-2) as a crash- and memory-isolated child --
+    /// never invoked directly by a person. Not a public interface: its
+    /// arguments and output shape may change without notice.
+    #[command(hide = true)]
+    InternalPdfText {
+        /// Path to the PDF to render.
+        path: PathBuf,
+        /// Cumulative character budget across every rendered page.
+        #[arg(long)]
+        max_chars: usize,
+        /// Refuse the PDF above this many pages.
+        #[arg(long)]
+        max_pages: usize,
+        /// Memory-watchdog ceiling in bytes (review round 3, F2). Defaults
+        /// to the production ceiling
+        /// (`ion_repl::tool_document::PDF_CHILD_MEMORY_LIMIT_BYTES`) when
+        /// omitted; overridable only so integration tests can prove the
+        /// watchdog actually fires using a small fixture against a small
+        /// ceiling, rather than needing a genuinely gigabyte-scale bomb in
+        /// the default test suite. `RLIMIT_AS` (set by the parent,
+        /// independent of this flag) is unaffected by this override.
+        #[arg(long)]
+        memory_limit_bytes: Option<u64>,
+    },
     /// Fast-forward the canonical branch onto an accepted staged outcome (ADR-0019).
     ///
     /// Operator-class only. A blocked promotion is reported, not an error: the

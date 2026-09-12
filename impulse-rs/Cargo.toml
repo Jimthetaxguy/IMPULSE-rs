@@ -118,6 +118,26 @@ docx = { version = "0.4", optional = true, package = "docx-rs" }
 zip = { version = "0.6", optional = true, default-features = false, features = ["deflate"] }
 # Streaming docx text extraction for ion document_read (calamine already pulls quick-xml 0.31)
 quick-xml = { version = "0.31", optional = true }
+# PDF text-layer extraction for ion document_read (Stage 1b-B). Text layer only, page-by-page
+# via the public output_doc_page/PlainTextOutput API so page count and the extracted-character
+# budget can be enforced before/between pages; never renders images (PlainTextOutput has no
+# image handling). Re-exports lopdf at its crate root (`pdf_extract::Document` etc.), so no
+# separate lopdf dependency is needed for this crate's own PDF handling or its test fixtures.
+pdf-extract = { version = "0.12", optional = true }
+# Bounded FlateDecode stream-inflation preflight for PDFs (review round 2, P2): pdf-extract's own
+# internal decompression of a stream's content is unbounded, so a crafted PDF can inflate a small
+# compressed stream hundreds of times over before BoundedSink's first write-time check ever runs.
+# Already a transitive dependency (via lopdf, zip, image); pinned here as direct so this crate can
+# call its streaming decoder to count inflated bytes without ever materializing them.
+flate2 = { version = "1", optional = true }
+# Bounded LZWDecode stream-inflation preflight for PDFs (review round 3, F1):
+# lopdf can decode /LZWDecode streams but the round-2 preflight only counted
+# FlateDecode, so an LZW-filtered bomb reached multi-GB RSS despite the
+# preflight reporting "OK". Already a transitive dependency (via lopdf, gif,
+# tiff) at the same 0.1.x line; pinned here as direct so this crate can drive
+# its streaming decoder to count decoded bytes without ever materializing
+# them, mirroring the flate2 precedent immediately above.
+weezl = { version = "0.1", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -135,8 +155,18 @@ monty-support = ["dep:pyo3"]
 # DataFusion support enables advanced analytics and aggregation
 datafusion-support = ["dep:datafusion"]
 # Office support enables document parsing and generation
-# Supports: Excel (.xlsx), Word (.docx), CSV
-office-support = ["dep:calamine", "dep:rust_xlsxwriter", "dep:docx", "dep:zip", "dep:quick-xml"]
+# Supports: Excel (.xlsx), Word (.docx), CSV; ion's document_read additionally reads
+# PDF (text layer), txt, and md under this same feature.
+office-support = [
+    "dep:calamine",
+    "dep:rust_xlsxwriter",
+    "dep:docx",
+    "dep:zip",
+    "dep:quick-xml",
+    "dep:pdf-extract",
+    "dep:flate2",
+    "dep:weezl",
+]
 
 [dev-dependencies]
 filetime = "0.2"
