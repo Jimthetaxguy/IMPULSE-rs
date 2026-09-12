@@ -168,6 +168,26 @@ a review outcome. Today it bounds the Ion tool loop and, through
 - **Source of truth:** `src/loop_contract.rs`, `Agent::chat_with_tools` in
   `src/llm_backends/mod.rs`, and ADR-0017.
 
+### context budget — `[code]`
+The characters of working conversation history a loop may carry into one model round
+(`LoopBudget::max_context_chars`; 200,000 for the Ion tool loop, unset for the governed Builder).
+It is the one budget the loop tries to *fit* before it stops: over budget, the loop compacts
+tool-result content oldest-first into a bounded stub that keeps the `tool_use` id and names the
+tool, and only trips `LoopTrip::ContextBudget` when compaction cannot recover enough room. Prose is
+never compacted. Measured in characters, not tokens, so one number is exact and reproducible across
+Anthropic, OpenAI, and MiniMax. `LoopReport::compactions` records how many results a run compacted.
+- **Source of truth:** `LoopBudget`/`LoopTrip`/`LoopReport` in `src/loop_contract.rs`,
+  `enforce_context_budget` in `src/llm_backends/mod.rs`, and ADR-0017's 2026-09-12 addendum.
+
+### wire format — `[code]`
+The per-provider rendering of a chat request (`llm_backends::WireFormat`: `Anthropic` block arrays
+against OpenAI-style `tool_calls` plus `role: "tool"` messages; MiniMax speaks the OpenAI shape).
+Selecting one is mandatory, so no provider can inherit a formatter that drops tool blocks.
+`IMPULSE_PROVIDER` picks which transport a host builds and fails closed on an unknown value; it
+never picks a model — ADR-0015's step model stays the only model picker.
+- **Source of truth:** `format_messages_for` in `src/llm_backends/anthropic.rs`,
+  `provider_from_env`/`build_provider` in `src/llm_backends/mod.rs`, `ChatState::try_from_env`.
+
 ### tool sandbox roots — `[code]`
 The filesystem boundary every path-checking ion REPL tool (`file_read`, `file_write`, `bash_exec`'s
 `cwd`, `document_read`, `ion_verify`'s `repo`) resolves against: a session's `ReplContext.repo_root`

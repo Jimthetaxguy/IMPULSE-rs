@@ -21,9 +21,11 @@ pub use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use crate::agent::step_model::{resolve_step_model, HarnessStepContext};
+use crate::agent::ImpulseProvider;
 use crate::error::AgentError;
 use crate::loop_contract::{
-    error_signature, CallOutcome, LoopBreaker, LoopContract, LoopReport, LoopTermination, LoopTrip,
+    canonical_json, error_signature, CallOutcome, LoopBreaker, LoopContract, LoopReport,
+    LoopTermination, LoopTrip,
 };
 
 // Re-export all providers from consolidated anthropic.rs
@@ -209,6 +211,92 @@ pub const DEFAULT_MAX_TOOL_ROUNDS: usize = crate::loop_contract::ION_DEFAULT_MAX
 /// also stops the loop earlier on repeated identical calls, repeated
 /// identical batches, and same-error streaks (`AgentError::ToolLoopStalled`).
 pub const DEFAULT_TOOL_LOOP_TIMEOUT: Duration = crate::loop_contract::ION_DEFAULT_WALL_CLOCK;
+
+/// Environment variable naming which provider a host builds
+/// (`anthropic`, `openai`, or `minimax`; also the aliases
+/// `ImpulseProvider::parse` accepts). Unset means Anthropic.
+pub const PROVIDER_ENV: &str = "IMPULSE_PROVIDER";
+
+/// Why a host could not build the provider its environment named.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ProviderSelectionError {
+    #[error(
+        "{PROVIDER_ENV}='{value}' names no known provider (expected one of: anthropic, openai, minimax)"
+    )]
+    UnknownProvider { value: String },
+}
+
+/// Resolves the provider named by [`PROVIDER_ENV`], or Anthropic when it is
+/// unset or blank.
+///
+/// Fails closed on an unrecognized value rather than quietly falling back to
+/// a default: a typo'd `IMPULSE_PROVIDER` that silently ran against
+/// Anthropic would send a turn to a model, and bill an account, the operator
+/// did not choose.
+pub fn provider_from_env() -> Result<ImpulseProvider, ProviderSelectionError> {
+    let Ok(raw) = std::env::var(PROVIDER_ENV) else {
+        return Ok(ImpulseProvider::Anthropic);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(ImpulseProvider::Anthropic);
+    }
+    ImpulseProvider::parse(trimmed).ok_or(ProviderSelectionError::UnknownProvider {
+        value: trimmed.to_string(),
+    })
+}
+
+/// Builds the concrete provider for `provider`, reading that provider's own
+/// API key from configuration or its own environment variable
+/// (`ImpulseProvider::resolve_api_key`). A missing key is not an error here:
+/// every provider checks its key before opening a connection and returns
+/// `AgentError::MissingApiKey`, which is the lazy-failure path the ion REPL
+/// already renders as a one-line notice.
+pub fn build_provider(provider: ImpulseProvider) -> Box<dyn LlmProvider> {
+    let api_key = provider.resolve_api_key(None).unwrap_or_default();
+    match provider {
+        ImpulseProvider::Anthropic => Box::new(AnthropicProvider::new(api_key)),
+        ImpulseProvider::OpenAi => Box::new(OpenAiProvider::new(api_key)),
+        ImpulseProvider::Minimax => Box::new(MinimaxProvider::new(api_key)),
+    }
+}
+
+/// A provider that exists only to carry a selection failure to the first
+/// turn, where the host already renders `AgentError`s.
+///
+/// This is not a stub standing in for a real backend (it never returns
+/// fabricated content and never succeeds); it is the fail-closed end of
+/// [`provider_from_env`], for hosts whose constructor cannot itself return a
+/// `Result`. It mirrors the existing missing-API-key path exactly: build the
+/// agent, refuse at the first `chat`, with the typed reason intact.
+pub struct UnconfiguredProvider {
+    error: ProviderSelectionError,
+}
+
+impl UnconfiguredProvider {
+    pub fn new(error: ProviderSelectionError) -> Self {
+        Self { error }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for UnconfiguredProvider {
+    fn name(&self) -> &str {
+        "unconfigured"
+    }
+
+    fn default_model(&self) -> &str {
+        "unconfigured"
+    }
+
+    async fn chat(&self, _request: ChatRequest) -> AgentResult<ChatResponse> {
+        Err(AgentError::InvalidRequest(self.error.to_string()))
+    }
+
+    fn supported_models(&self) -> Vec<&str> {
+        Vec::new()
+    }
+}
 
 pub struct Agent {
     pub id: String,
@@ -442,6 +530,138 @@ impl Agent {
     }
 }
 
+/// Characters one message contributes to the measured working history.
+///
+/// Counts everything that will be rendered onto the wire: the prose, each
+/// requested call's id, name, and canonicalized input, and each result's id
+/// and content. Canonical JSON is used for inputs so the measurement does not
+/// drift with map ordering — the same history always measures the same.
+/// Provider envelope overhead (role keys, block wrappers, the system prompt,
+/// the tool schemas) is deliberately excluded: it differs per provider, and
+/// the budget is a working-set cap rather than an exact request size.
+fn message_chars(message: &Message) -> usize {
+    let mut total = message.content.chars().count();
+    for call in &message.tool_calls {
+        total += call.id.chars().count()
+            + call.name.chars().count()
+            + canonical_json(&call.input).chars().count();
+    }
+    for result in &message.tool_results {
+        total += result.tool_use_id.chars().count() + result.content.chars().count();
+    }
+    total
+}
+
+/// The measured size of a working conversation history, in characters.
+/// See [`message_chars`] for exactly what is counted.
+pub fn history_chars(messages: &[Message]) -> usize {
+    messages.iter().map(message_chars).sum()
+}
+
+/// Opening marker of a compaction stub. Also the test used to recognize a
+/// result this loop already compacted, so a second pass does not re-measure
+/// (and re-count) text that is already a stub. A genuine tool output that
+/// happens to open this way is simply skipped, which costs a compaction
+/// opportunity but never corrupts a result.
+const COMPACTION_STUB_OPEN: &str = "[compacted ";
+
+/// The bounded stub that replaces one tool result's content.
+///
+/// Deliberately short and fixed-shape: it names the tool the result came
+/// from (resolved through the matching `tool_use` id) and how much text was
+/// dropped, so the model can see that something was elided and ask for it
+/// again rather than silently reasoning over a gap. The `tool_use_id` is
+/// never touched, so the `tool_use`/`tool_result` pairing every provider
+/// validates stays intact.
+fn compaction_stub(dropped_chars: usize, tool: Option<&str>) -> String {
+    match tool {
+        Some(name) => format!("{COMPACTION_STUB_OPEN}{dropped_chars} chars from tool '{name}']"),
+        None => format!("{COMPACTION_STUB_OPEN}{dropped_chars} chars]"),
+    }
+}
+
+fn is_compaction_stub(content: &str) -> bool {
+    content.starts_with(COMPACTION_STUB_OPEN) && content.ends_with(']')
+}
+
+/// Brings `working` under the contract's context budget, or reports the trip
+/// that says it could not (ADR-0017 addendum, 2026-09-12).
+///
+/// The algorithm, in full:
+///
+/// 1. With no `max_context_chars` set, do nothing.
+/// 2. Measure the history ([`history_chars`]). At or under the budget, do
+///    nothing — the common case costs one pass and no allocation.
+/// 3. Otherwise replace tool-result content with a bounded stub
+///    ([`compaction_stub`]), **oldest first** (message order, then result
+///    order within a message), stopping the moment the running total is back
+///    under the budget. Oldest-first because the newest results are the ones
+///    the model is actually reasoning about this round.
+/// 4. A result is skipped when it is already a stub, or when its stub would
+///    not be shorter than the content it replaces — compaction may never make
+///    the history bigger.
+/// 5. If every eligible result has been compacted and the history is still
+///    over budget, return [`LoopTrip::ContextBudget`]. Only tool results are
+///    compacted: the user's and the model's own words are the turn, and a
+///    loop that cannot fit them is over budget in a way this pass must not
+///    paper over.
+///
+/// Only `working` — the caller's copy — is mutated, so the
+/// history-untouched-on-error invariant is unaffected: a trip discards
+/// `working` entirely, and `self.history` only ever receives it on success.
+/// On success the stubs *do* persist into history, which is the point: a
+/// compacted result stays compacted for the rest of the session rather than
+/// being re-measured every round.
+fn enforce_context_budget(working: &mut [Message], breaker: &mut LoopBreaker) -> Option<LoopTrip> {
+    let limit = breaker.contract().budget.max_context_chars?;
+    let mut total = history_chars(working);
+    if total <= limit {
+        return None;
+    }
+
+    // `tool_use` id -> tool name, so a stub can still say which tool the
+    // elided text came from.
+    // Owned rather than borrowed: the mutable pass below reborrows
+    // `working`, so the map cannot hold references into it.
+    let names: std::collections::HashMap<String, String> = working
+        .iter()
+        .flat_map(|message| message.tool_calls.iter())
+        .map(|call| (call.id.clone(), call.name.clone()))
+        .collect();
+
+    for message in working.iter_mut() {
+        for result in message.tool_results.iter_mut() {
+            if total <= limit {
+                break;
+            }
+            if is_compaction_stub(&result.content) {
+                continue;
+            }
+            let original = result.content.chars().count();
+            let stub =
+                compaction_stub(original, names.get(&result.tool_use_id).map(String::as_str));
+            let stub_chars = stub.chars().count();
+            if stub_chars >= original {
+                continue;
+            }
+            result.content = stub;
+            total -= original - stub_chars;
+            breaker.observe_compaction();
+        }
+        if total <= limit {
+            break;
+        }
+    }
+
+    if total > limit {
+        return Some(LoopTrip::ContextBudget {
+            chars: total,
+            limit,
+        });
+    }
+    None
+}
+
 /// The round-loop body behind [`Agent::chat_with_tools_capped_timeout`],
 /// extracted to a free fn that borrows only `provider`/`model`/
 /// `system_prompt` (never `&mut Agent`) so its returned future can be
@@ -462,6 +682,11 @@ async fn run_tool_loop(
 ) -> Result<(String, Vec<Message>), LoopExit> {
     loop {
         let tool_round = breaker.begin_round().map_err(LoopExit::Tripped)?;
+        // Fit the working history to the contract's context budget before
+        // spending a provider call on it.
+        if let Some(trip) = enforce_context_budget(&mut working, breaker) {
+            return Err(LoopExit::Tripped(trip));
+        }
         let mut messages = Vec::new();
         if let Some(system) = system_prompt {
             messages.push(Message::text(Role::System, system.clone()));
@@ -1636,5 +1861,382 @@ mod tests {
             Err(AgentError::ToolLoopLimitExceeded { rounds: 4 })
         ));
         assert_eq!(executor.invocations.lock().unwrap().len(), 4);
+    }
+
+    // ---------------------------------------------------------------
+    // Context budget (Stage 1b-A)
+    // ---------------------------------------------------------------
+
+    use crate::loop_contract::LoopBudget;
+
+    /// A history holding one tool call and one result of `result_chars`
+    /// characters, plus a short user turn.
+    fn history_with_tool_result(result_chars: usize) -> Vec<Message> {
+        vec![
+            Message::text(Role::User, "go"),
+            Message::assistant_tool_use(
+                String::new(),
+                vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: "file_read".to_string(),
+                    input: serde_json::json!({}),
+                }],
+            ),
+            Message::tool_results(vec![ToolResult {
+                tool_use_id: "call_1".to_string(),
+                content: "x".repeat(result_chars),
+                is_error: false,
+            }]),
+        ]
+    }
+
+    fn breaker_with_context_budget(limit: Option<usize>) -> LoopBreaker {
+        let mut contract = LoopContract::ion_tool_loop();
+        contract.budget.max_context_chars = limit;
+        LoopBreaker::new(contract)
+    }
+
+    #[test]
+    fn test_history_chars_counts_prose_calls_and_results() {
+        let messages = history_with_tool_result(100);
+        let measured = history_chars(&messages);
+        // "go" + call id/name/input + result id/content, all counted.
+        assert!(measured > 100, "got: {measured}");
+        assert_eq!(history_chars(&[]), 0);
+    }
+
+    #[test]
+    fn test_history_chars_is_stable_under_input_key_order() {
+        let mut a = history_with_tool_result(10);
+        let mut b = history_with_tool_result(10);
+        a[1].tool_calls[0].input = serde_json::json!({"alpha": 1, "beta": 2});
+        b[1].tool_calls[0].input = serde_json::json!({"beta": 2, "alpha": 1});
+        assert_eq!(history_chars(&a), history_chars(&b));
+    }
+
+    #[test]
+    fn test_enforce_context_budget_does_nothing_without_a_budget() {
+        let mut working = history_with_tool_result(10_000);
+        let before = working.clone();
+        let mut breaker = breaker_with_context_budget(None);
+        assert_eq!(enforce_context_budget(&mut working, &mut breaker), None);
+        assert_eq!(
+            working[2].tool_results[0].content,
+            before[2].tool_results[0].content
+        );
+        assert_eq!(breaker.compactions(), 0);
+    }
+
+    #[test]
+    fn test_enforce_context_budget_does_nothing_when_under_budget() {
+        let mut working = history_with_tool_result(50);
+        let mut breaker = breaker_with_context_budget(Some(100_000));
+        assert_eq!(enforce_context_budget(&mut working, &mut breaker), None);
+        assert_eq!(working[2].tool_results[0].content.len(), 50);
+        assert_eq!(breaker.compactions(), 0);
+    }
+
+    #[test]
+    fn test_enforce_context_budget_compacts_a_tool_result_and_keeps_the_pairing() {
+        let mut working = history_with_tool_result(5_000);
+        let mut breaker = breaker_with_context_budget(Some(200));
+        assert_eq!(enforce_context_budget(&mut working, &mut breaker), None);
+
+        let result = &working[2].tool_results[0];
+        // The id is untouched, so the tool_use/tool_result pair stays valid.
+        assert_eq!(result.tool_use_id, "call_1");
+        assert_eq!(working[1].tool_calls[0].id, "call_1");
+        assert_eq!(working[1].tool_calls[0].name, "file_read");
+        // The stub names the tool and how much was dropped.
+        assert!(
+            result.content.contains("[compacted 5000 chars"),
+            "got: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("file_read"),
+            "got: {}",
+            result.content
+        );
+        assert!(history_chars(&working) <= 200);
+        assert_eq!(breaker.compactions(), 1);
+        assert_eq!(
+            breaker.report(LoopTermination::Completed).compactions,
+            1,
+            "the report must carry the compaction"
+        );
+    }
+
+    #[test]
+    fn test_enforce_context_budget_compacts_oldest_first_and_stops_early() {
+        // Two large results; compacting the older one alone gets under budget,
+        // so the newer one -- what the model is reasoning about now -- is left
+        // whole.
+        let mut working = vec![
+            Message::assistant_tool_use(
+                String::new(),
+                vec![
+                    ToolCall {
+                        id: "old".to_string(),
+                        name: "t".to_string(),
+                        input: serde_json::json!({}),
+                    },
+                    ToolCall {
+                        id: "new".to_string(),
+                        name: "t".to_string(),
+                        input: serde_json::json!({}),
+                    },
+                ],
+            ),
+            Message::tool_results(vec![
+                ToolResult {
+                    tool_use_id: "old".to_string(),
+                    content: "o".repeat(4_000),
+                    is_error: false,
+                },
+                ToolResult {
+                    tool_use_id: "new".to_string(),
+                    content: "n".repeat(1_000),
+                    is_error: false,
+                },
+            ]),
+        ];
+        let mut breaker = breaker_with_context_budget(Some(1_200));
+        assert_eq!(enforce_context_budget(&mut working, &mut breaker), None);
+
+        assert!(working[1].tool_results[0]
+            .content
+            .starts_with("[compacted 4000 chars"));
+        assert_eq!(
+            working[1].tool_results[1].content,
+            "n".repeat(1_000),
+            "the newest result must survive when the older one freed enough room"
+        );
+        assert_eq!(breaker.compactions(), 1);
+    }
+
+    #[test]
+    fn test_enforce_context_budget_skips_results_too_small_to_gain() {
+        // The stub is longer than the content it would replace, so compacting
+        // would grow the history. The pass must refuse and trip instead.
+        let mut working = vec![Message::tool_results(vec![ToolResult {
+            tool_use_id: "a".to_string(),
+            content: "tiny".to_string(),
+            is_error: false,
+        }])];
+        let mut breaker = breaker_with_context_budget(Some(1));
+        let trip = enforce_context_budget(&mut working, &mut breaker);
+        assert!(
+            matches!(trip, Some(LoopTrip::ContextBudget { .. })),
+            "got: {trip:?}"
+        );
+        assert_eq!(working[0].tool_results[0].content, "tiny");
+        assert_eq!(breaker.compactions(), 0);
+    }
+
+    #[test]
+    fn test_enforce_context_budget_never_recompacts_a_stub() {
+        let mut working = history_with_tool_result(5_000);
+        let mut breaker = breaker_with_context_budget(Some(200));
+        assert_eq!(enforce_context_budget(&mut working, &mut breaker), None);
+        let after_first = working.clone();
+        // A second pass over the same history sees a stub and leaves it alone.
+        assert_eq!(enforce_context_budget(&mut working, &mut breaker), None);
+        assert_eq!(
+            working[2].tool_results[0].content,
+            after_first[2].tool_results[0].content
+        );
+        assert_eq!(
+            breaker.compactions(),
+            1,
+            "the stub must not be counted twice"
+        );
+    }
+
+    #[test]
+    fn test_enforce_context_budget_trips_when_prose_alone_is_over_budget() {
+        // No tool results to compact: the user's and the model's own words are
+        // the turn, and this pass must not silently drop them.
+        let mut working = vec![Message::text(Role::User, "p".repeat(5_000))];
+        let mut breaker = breaker_with_context_budget(Some(100));
+        let trip = enforce_context_budget(&mut working, &mut breaker);
+        match trip {
+            Some(LoopTrip::ContextBudget { chars, limit }) => {
+                assert_eq!(chars, 5_000);
+                assert_eq!(limit, 100);
+            }
+            other => panic!("expected a ContextBudget trip, got: {other:?}"),
+        }
+        assert_eq!(working[0].content.len(), 5_000, "prose is never compacted");
+    }
+
+    #[test]
+    fn test_compaction_stub_shapes() {
+        assert_eq!(
+            compaction_stub(12, Some("file_read")),
+            "[compacted 12 chars from tool 'file_read']"
+        );
+        assert_eq!(compaction_stub(12, None), "[compacted 12 chars]");
+        assert!(is_compaction_stub(&compaction_stub(1, None)));
+        assert!(is_compaction_stub(&compaction_stub(1, Some("t"))));
+        assert!(!is_compaction_stub("ordinary output"));
+        assert!(!is_compaction_stub("[compacted but unterminated"));
+    }
+
+    #[tokio::test]
+    async fn test_chat_with_tools_trips_on_the_context_budget_and_keeps_history() {
+        // A budget nothing can fit under: the first round trips before any
+        // provider call, and history is left exactly as it was.
+        let contract = LoopContract {
+            name: "tiny_context".to_string(),
+            budget: LoopBudget {
+                max_rounds: 4,
+                wall_clock: Duration::from_secs(5),
+                max_repeated_call_streak: None,
+                max_same_error_streak: None,
+                max_context_chars: Some(1),
+            },
+        };
+        let mut agent = test_agent(OneShotToolProvider::new())
+            .with_loop_contract(contract)
+            .expect("contract is valid");
+        let executor = EchoExecutor::new();
+
+        let result = agent
+            .chat_with_tools(
+                "a user turn that is longer than one character",
+                &[],
+                &executor,
+            )
+            .await;
+
+        match result {
+            Err(AgentError::ToolLoopStalled {
+                trip: LoopTrip::ContextBudget { limit, .. },
+            }) => assert_eq!(limit, 1),
+            other => panic!("expected a ContextBudget stall, got: {other:?}"),
+        }
+        assert!(
+            agent.history.is_empty(),
+            "history must be untouched on a trip"
+        );
+        let report = agent.last_loop_report().expect("a trip leaves a report");
+        assert!(matches!(
+            report.termination,
+            LoopTermination::Tripped {
+                trip: LoopTrip::ContextBudget { .. }
+            }
+        ));
+        assert_eq!(executor.invocations.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_chat_with_tools_records_zero_compactions_on_a_normal_run() {
+        let mut agent = test_agent(FixedReplyProvider { content: "hi" });
+        let executor = EchoExecutor::new();
+        let reply = agent
+            .chat_with_tools("hello", &[], &executor)
+            .await
+            .unwrap();
+        assert_eq!(reply, "hi");
+        assert_eq!(agent.last_loop_report().unwrap().compactions, 0);
+    }
+
+    // ---------------------------------------------------------------
+    // Provider selection (Stage 1b-A)
+    // ---------------------------------------------------------------
+
+    /// `IMPULSE_PROVIDER` is process-global, so the selection tests share one
+    /// mutex rather than racing each other under the test harness's threads.
+    static PROVIDER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_provider_env<T>(value: Option<&str>, body: impl FnOnce() -> T) -> T {
+        let _guard = PROVIDER_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var(PROVIDER_ENV).ok();
+        match value {
+            Some(value) => std::env::set_var(PROVIDER_ENV, value),
+            None => std::env::remove_var(PROVIDER_ENV),
+        }
+        let outcome = body();
+        match previous {
+            Some(previous) => std::env::set_var(PROVIDER_ENV, previous),
+            None => std::env::remove_var(PROVIDER_ENV),
+        }
+        outcome
+    }
+
+    #[test]
+    fn test_provider_from_env_defaults_to_anthropic_when_unset_or_blank() {
+        assert_eq!(
+            with_provider_env(None, provider_from_env),
+            Ok(ImpulseProvider::Anthropic)
+        );
+        assert_eq!(
+            with_provider_env(Some("   "), provider_from_env),
+            Ok(ImpulseProvider::Anthropic)
+        );
+    }
+
+    #[test]
+    fn test_provider_from_env_selects_each_supported_provider() {
+        for (value, expected) in [
+            ("anthropic", ImpulseProvider::Anthropic),
+            ("OpenAI", ImpulseProvider::OpenAi),
+            (" minimax ", ImpulseProvider::Minimax),
+        ] {
+            assert_eq!(
+                with_provider_env(Some(value), provider_from_env),
+                Ok(expected),
+                "for {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_provider_from_env_fails_closed_on_an_unknown_value() {
+        let err = with_provider_env(Some("gemini"), provider_from_env)
+            .expect_err("an unknown provider must not fall back to a default");
+        assert_eq!(
+            err,
+            ProviderSelectionError::UnknownProvider {
+                value: "gemini".to_string()
+            }
+        );
+        let rendered = format!("{err}");
+        assert!(rendered.contains("gemini"), "got: {rendered}");
+        assert!(rendered.contains("IMPULSE_PROVIDER"), "got: {rendered}");
+        assert!(rendered.contains("minimax"), "got: {rendered}");
+    }
+
+    #[test]
+    fn test_build_provider_returns_the_named_backend() {
+        assert_eq!(
+            build_provider(ImpulseProvider::Anthropic).name(),
+            "anthropic"
+        );
+        assert_eq!(build_provider(ImpulseProvider::OpenAi).name(), "openai");
+        assert_eq!(build_provider(ImpulseProvider::Minimax).name(), "minimax");
+    }
+
+    #[tokio::test]
+    async fn test_unconfigured_provider_refuses_every_request_with_the_typed_reason() {
+        let provider = UnconfiguredProvider::new(ProviderSelectionError::UnknownProvider {
+            value: "gemini".to_string(),
+        });
+        assert!(provider.supported_models().is_empty());
+        let err = provider
+            .chat(ChatRequest {
+                model: "m".to_string(),
+                messages: vec![Message::text(Role::User, "hi")],
+                temperature: 0.0,
+                max_tokens: None,
+                tools: Vec::new(),
+            })
+            .await
+            .expect_err("an unconfigured provider must never succeed");
+        assert!(matches!(err, AgentError::InvalidRequest(_)), "got: {err:?}");
+        assert!(format!("{err}").contains("gemini"), "got: {err}");
     }
 }

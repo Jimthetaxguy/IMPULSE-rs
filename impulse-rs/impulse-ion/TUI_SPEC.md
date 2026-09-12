@@ -403,6 +403,32 @@ pass the repo gate: `cargo build && cargo test && cargo clippy -- -D warnings &&
   `ChatState::last_loop_report`. `DEFAULT_MAX_TOOL_ROUNDS` and
   `DEFAULT_TOOL_LOOP_TIMEOUT` are sourced from the contract. See
   `docs/decisions/0017-canonical-loop-contract.md`.
+- **T9 provider neutrality + context budget (Stage 1b-A, 2026-09-12). DONE.**
+  Tool calling is no longer Anthropic-only. `llm_backends::WireFormat` /
+  `format_messages_for` give each provider its own message formatter, replacing
+  the old `BaseProvider::format_messages`, which read only `Message::content`
+  and therefore silently dropped `tool_calls`/`tool_results` on the OpenAI and
+  MiniMax paths. OpenAI sends `tools` as function schemas, parses `tool_calls`
+  and `finish_reason` back into the provider-neutral `ChatResponse`, and returns
+  results as `role: "tool"` messages keyed by `tool_call_id`; MiniMax's
+  `chatcompletion_v2` is the same wire shape and shares the code. A
+  `function.arguments` payload that is not valid JSON fails with
+  `AgentError::ApiResponse` rather than being executed as an empty input.
+  `IMPULSE_PROVIDER` (`anthropic` | `openai` | `minimax`, default `anthropic`)
+  selects the transport in `ChatState::from_env`, each provider reading its own
+  key and default model; an unknown value fails closed with a typed
+  `ProviderSelectionError` carried to the first turn by `UnconfiguredProvider`,
+  exactly like the existing missing-key path. This picks a transport, never a
+  model — ADR-0015 remains the only model picker. `AnthropicProvider` also marks
+  its system-and-tools prefix with one ephemeral `cache_control` breakpoint (on
+  by default, `with_prompt_cache(false)` to disable), placed on the system block
+  when there is a system prompt and on the last tool otherwise, never inside
+  `messages`. Separately, `LoopBudget` gained `max_context_chars` (200,000 for
+  the Ion contract): before each provider call the loop compacts tool-result
+  content oldest-first into a `[compacted N chars from tool 'x']` stub that keeps
+  the `tool_use` id, and trips `LoopTrip::ContextBudget` only when compaction
+  cannot recover enough room. See
+  `docs/decisions/0017-canonical-loop-contract.md` (2026-09-12 addendum).
 - **T10 (optional) — ratatui inline polish.** Spinner during gate runs, colored
   verdict table, status line. *(Depends T7. Do not start before T9 is stable.)*
 

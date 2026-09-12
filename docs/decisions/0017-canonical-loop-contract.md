@@ -3,13 +3,13 @@ title: "ADR-0017: Canonical Loop Contract"
 description: Typed loop budgets, layered stop conditions, and termination evidence for Impulse-owned loops
 status: review
 created: 2026-09-01
-updated: 2026-09-01
+updated: 2026-09-12
 type: decision
 category: architecture
 phase: all
 audience: builders
 deciders: [Impulse Maintainers]
-tags: [adr, loop, ion, governance, evidence]
+tags: [adr, loop, ion, governance, evidence, context-budget]
 ---
 
 # ADR-0017: Canonical Loop Contract
@@ -124,6 +124,45 @@ This decision is represented when tests prove:
 
 Source of truth: `impulse-rs/src/loop_contract.rs`, `impulse-rs/src/llm_backends/mod.rs`,
 `impulse-rs/src/error.rs`.
+
+
+## Addendum, 2026-09-12: context budget (Stage 1b-A)
+
+Status unchanged. This addendum records one additive rule; it revises nothing above.
+
+**Rule 7. A loop may also declare what its own conversation may weigh, and must try to fit before
+it trips.** `LoopBudget` gains `max_context_chars: Option<usize>` (serde default `None`, rejected
+when `Some(0)`), `LoopTrip` gains `ContextBudget { chars, limit }`, and `LoopReport` gains
+`compactions`. Unlike every trip in rule 2, this one is not reached on first breach: the loop first
+compacts tool-result content oldest-first into a bounded stub that preserves the `tool_use` id and
+names the originating tool, and only trips when compaction cannot get the history back under
+budget. Prose — the user's turn and the model's own words — is never compacted; a loop that cannot
+fit it trips instead of silently dropping it.
+
+Measurement and compaction live with the caller (`llm_backends`), which owns the message types;
+this module declares the limit, counts the compactions, and names the trip. Rule 6 is therefore
+preserved: `loop_contract` still depends on no provider, tool, or daemon type.
+
+The Ion contract defaults to 200,000 characters (`ION_DEFAULT_MAX_CONTEXT_CHARS`); the governed
+Builder contract leaves the budget unset, because the daemon holds claim records rather than a
+conversation. `LoopReport::compactions` is omitted from the wire form when zero, so every
+already-persisted governed `loop_report_digest` reproduces byte-for-byte and
+`GOVERNED_BUILDER_LOOP_VERSION` does not move.
+
+Rule 3's invariant is unchanged: compaction mutates only the caller's working copy, a trip discards
+it, and history is committed only on success. A `ContextBudget` trip surfaces through the existing
+`AgentError::ToolLoopStalled { trip }` rather than a new error variant.
+
+**Verification.** This addendum is represented when tests prove: a budget of `Some(0)` is rejected;
+`LoopBudget`, `LoopTrip::ContextBudget`, and a `LoopReport` carrying `compactions` round-trip
+through serde, and JSON written before either field existed still loads; a zero compaction count
+never reaches the wire form; compaction preserves `tool_use_id`, runs oldest-first, stops as soon
+as it is under budget, refuses to grow the history, and never re-compacts a stub; a history of
+prose alone over budget trips; and `chat_with_tools` surfaces the trip as `ToolLoopStalled` with
+history untouched and a `Tripped` report.
+
+Full design, including the algorithm's exact ordering and what was deliberately not adopted:
+`docs/superpowers/specs/2026-09-01-loop-contract-design.md` (addendum of the same date).
 
 ## Related Documents
 

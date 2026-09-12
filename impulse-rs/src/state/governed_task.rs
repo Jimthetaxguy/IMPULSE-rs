@@ -1738,6 +1738,10 @@ fn governed_builder_loop_state(
             .filter(|verification| verification.outcome != GovernedVerificationOutcome::Passed)
             .count(),
         tool_calls_interrupted: 0,
+        // The governed Builder contract sets no context budget, so this
+        // report can never carry a compaction; the field is skipped when zero
+        // so existing `loop_report_digest` values stay reproducible.
+        compactions: 0,
         elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
     };
     let version = current_governed_loop_version();
