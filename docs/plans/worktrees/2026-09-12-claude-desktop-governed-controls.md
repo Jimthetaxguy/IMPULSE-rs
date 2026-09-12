@@ -334,10 +334,17 @@ is unchanged.
 ### P2 — promote-side matrix cross-check
 
 `test_promotability_is_between_the_daemon_and_state_layer_rules_over_the_matrix` walks
-9 reviews × 4 executions × 4 scopes × 3 staged statuses × 3 promotion outcomes (432 cases) and
+9 reviews × 4 executions × 4 scopes × 3 staged statuses × 3 promotion outcomes = **1296 cases** and
 asserts `governed_outcome_is_promotable` is a superset of the daemon endpoint's inline checks and a
 subset of the state layer's `RecordPromotion` preconditions, plus that the promotable set is
 non-empty so the upper bound is not vacuous.
+
+> **Correction (round 2).** This section, and commit `88fcfd4`'s message, first said "432 cases".
+> That was arithmetic error, not a change in the test: the test computes its own expected total as
+> the product of the five axis lengths and always walked 1296. The commit message keeps the wrong
+> figure because rewriting a pushed commit is worse than a footnote; this line is the correction.
+> Its `compared >= 400` floor is a deliberately loose "not a sample" guard, well under the real
+> total, and is unchanged.
 
 **Boundary, stated:** both authorities live in `impulse-rs` (`src/daemon/governed_wiring.rs`,
 `src/state/governed_task.rs`), which `impulse-ops` cannot depend on and which this lane does not
