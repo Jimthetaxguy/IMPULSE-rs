@@ -181,6 +181,21 @@ pub async fn dispatch(
         } => {
             handle_governed_review(client, project_id, task_id, json).await?;
         }
+        Commands::GovernedPromote {
+            project_id,
+            task_id,
+            json,
+        } => {
+            handle_governed_promote(client, project_id, task_id, json).await?;
+        }
+        Commands::GovernedDiscard {
+            project_id,
+            task_id,
+            reason,
+            json,
+        } => {
+            handle_governed_discard(client, project_id, task_id, reason, json).await?;
+        }
         Commands::SearchHistory { .. }
         | Commands::SearchGenome { .. }
         | Commands::IndexMemory { .. }
@@ -288,7 +303,7 @@ async fn handle_governed_verify(
             expected_revision: task.revision,
         })
         .await?;
-    print_governed_ack(&acknowledged, json, "Verification acknowledged")
+    print_producer_ack(&acknowledged, json, "Verification acknowledged")
 }
 
 async fn handle_governed_review(
@@ -308,7 +323,103 @@ async fn handle_governed_review(
             },
         )
         .await?;
-    print_governed_ack(&acknowledged, json, "Supervisor review acknowledged")
+    print_producer_ack(&acknowledged, json, "Supervisor review acknowledged")
+}
+
+/// Report a producer acknowledgement, including the reservation journal's
+/// explanation when this request is rerunning work a crashed process left
+/// unreceipted (ADR-0012 amendment).
+fn print_producer_ack(
+    acknowledged: &impulse_ops::governed_wiring::GovernedProducerAck,
+    json: bool,
+    label: &str,
+) -> Result<()> {
+    if json {
+        return print_json(acknowledged)
+            .context("Failed to serialize governed producer acknowledgement");
+    }
+    print_governed_ack(&acknowledged.task, json, label)?;
+    if acknowledged.replayed {
+        println!("  replayed: the recorded receipt was returned; no side effect ran");
+    }
+    if let Some(reason) = &acknowledged.pending_rerun_reason {
+        println!("  rerun after an interrupted producer reservation: {reason}");
+    }
+    Ok(())
+}
+
+async fn handle_governed_promote(
+    client: &DaemonClient,
+    project_id: Option<String>,
+    task_id: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let (project_id, task_id, task) = current_governed_task(client, project_id, task_id).await?;
+    let acknowledged = client
+        .promote_governed_outcome(impulse_ops::governed_wiring::GovernedPromotionRequest {
+            request_id: governed_request_id("promote"),
+            project_id,
+            task_id,
+            expected_revision: task.revision,
+        })
+        .await?;
+    if json {
+        return print_json(&acknowledged)
+            .context("Failed to serialize governed promotion acknowledgement");
+    }
+    print_producer_ack(&acknowledged, json, "Promotion acknowledged")?;
+    match acknowledged.task.latest_promotion() {
+        Some(promotion) => match &promotion.outcome {
+            impulse_ops::governed_task::GovernedPromotionOutcome::Promoted {
+                promoted_revision,
+            } => {
+                println!("  promoted: the canonical branch now points at {promoted_revision}");
+            }
+            impulse_ops::governed_task::GovernedPromotionOutcome::PromotionBlocked {
+                canonical_head,
+                reason,
+            } => {
+                println!(
+                    "  blocked ({reason}): the canonical head is {canonical_head}. The run stays                      accepted and the staged worktree stays active; reconcile the canonical                      branch and retry."
+                );
+            }
+        },
+        None => println!("  no promotion record was written"),
+    }
+    Ok(())
+}
+
+async fn handle_governed_discard(
+    client: &DaemonClient,
+    project_id: Option<String>,
+    task_id: Option<String>,
+    reason: String,
+    json: bool,
+) -> Result<()> {
+    let (project_id, task_id, task) = current_governed_task(client, project_id, task_id).await?;
+    let acknowledged = client
+        .discard_governed_staged_worktree(
+            impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardRequest {
+                request_id: governed_request_id("discard"),
+                project_id,
+                task_id,
+                expected_revision: task.revision,
+                reason,
+            },
+        )
+        .await?;
+    if json {
+        return print_json(&acknowledged)
+            .context("Failed to serialize governed discard acknowledgement");
+    }
+    print_governed_ack(&acknowledged.task, json, "Staged worktree discarded")?;
+    println!("  removed: {}", acknowledged.discarded_root);
+    if let Some(commit) = &acknowledged.unreferenced_accepted_commit {
+        println!(
+            "  WARNING: the accepted commit {commit} was never promoted onto the canonical              branch, so this discard dropped its only ref. It is reachable through the reflog              until that expires; `git cat-file -p {commit}` recovers it deliberately."
+        );
+    }
+    Ok(())
 }
 
 // ============================================================================

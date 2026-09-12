@@ -133,7 +133,21 @@ impl DaemonClient {
     /// depends on the task's verification profile, which only the daemon
     /// holds). Other request groups skip the extra round trip entirely.
     fn requires_operator_class(request: &DaemonRequest) -> bool {
-        matches!(request, DaemonRequest::MutateGovernedTask { .. })
+        matches!(
+            request,
+            DaemonRequest::MutateGovernedTask { .. }
+                // ADR-0019 (protocol v9): promotion makes a Builder's work
+                // canonical and discard destroys work, so both are refused off
+                // a non-operator connection. Registration is included because a
+                // staged world scope materializes a daemon-owned worktree
+                // during registration and is operator-initiated; a
+                // non-staged registration presents the capability harmlessly
+                // rather than making this client re-derive a scope the daemon
+                // owns.
+                | DaemonRequest::RegisterGovernedTask { .. }
+                | DaemonRequest::PromoteGovernedOutcome { .. }
+                | DaemonRequest::DiscardGovernedStagedWorktree { .. }
+        )
     }
 
     pub async fn send(&self, request: DaemonRequest) -> Result<DaemonResponse> {
@@ -333,12 +347,17 @@ impl DaemonClient {
         }
     }
 
-    async fn governed_task_response(
+    /// Send an acknowledged governed request and decode its typed response.
+    ///
+    /// Every producer acknowledgement flattens the governed task into the
+    /// response object, so `T` may be the bare `GovernedTaskRun` or one of the
+    /// richer v9 acknowledgement envelopes.
+    async fn governed_response<T: serde::de::DeserializeOwned>(
         &self,
         request: DaemonRequest,
         operation: &str,
         timeout: Duration,
-    ) -> Result<impulse_ops::governed_task::GovernedTaskRun> {
+    ) -> Result<T> {
         let mut last_error = None;
         let mut response = None;
         for _ in 0..ACKNOWLEDGED_REQUEST_ATTEMPTS {
@@ -395,7 +414,7 @@ impl DaemonClient {
         &self,
         request: impulse_ops::governed_task::GovernedClaimRequest,
     ) -> Result<impulse_ops::governed_task::GovernedTaskRun> {
-        self.governed_task_response(
+        self.governed_response(
             DaemonRequest::SubmitGovernedClaim { request },
             "submit governed claim",
             RESPONSE_TIMEOUT,
@@ -406,8 +425,8 @@ impl DaemonClient {
     pub async fn run_governed_verification(
         &self,
         request: impulse_ops::governed_task::GovernedVerificationRequest,
-    ) -> Result<impulse_ops::governed_task::GovernedTaskRun> {
-        self.governed_task_response(
+    ) -> Result<impulse_ops::governed_wiring::GovernedProducerAck> {
+        self.governed_response(
             DaemonRequest::RunGovernedVerification { request },
             "run governed verification",
             GOVERNED_VERIFICATION_RESPONSE_TIMEOUT,
@@ -418,10 +437,42 @@ impl DaemonClient {
     pub async fn run_governed_supervisor_review(
         &self,
         request: impulse_ops::governed_task::GovernedSupervisorReviewRequest,
-    ) -> Result<impulse_ops::governed_task::GovernedTaskRun> {
-        self.governed_task_response(
+    ) -> Result<impulse_ops::governed_wiring::GovernedProducerAck> {
+        self.governed_response(
             DaemonRequest::RunGovernedSupervisorReview { request },
             "run governed Supervisor review",
+            RESPONSE_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Fast-forward the canonical branch onto an accepted staged outcome
+    /// (ADR-0019).
+    ///
+    /// A *blocked* promotion is a successful response: the acknowledgement
+    /// carries the recorded outcome on the task, and the run stays accepted.
+    /// Only a genuine failure — a non-operator connection, a task that is not
+    /// staged or not accepted, a Git error — comes back as `Err`.
+    pub async fn promote_governed_outcome(
+        &self,
+        request: impulse_ops::governed_wiring::GovernedPromotionRequest,
+    ) -> Result<impulse_ops::governed_wiring::GovernedProducerAck> {
+        self.governed_response(
+            DaemonRequest::PromoteGovernedOutcome { request },
+            "promote governed outcome",
+            RESPONSE_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Reclaim a finished staged worktree (ADR-0019).
+    pub async fn discard_governed_staged_worktree(
+        &self,
+        request: impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardRequest,
+    ) -> Result<impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardAck> {
+        self.governed_response(
+            DaemonRequest::DiscardGovernedStagedWorktree { request },
+            "discard governed staged worktree",
             RESPONSE_TIMEOUT,
         )
         .await
