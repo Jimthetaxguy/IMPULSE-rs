@@ -333,25 +333,27 @@ is unchanged.
 
 ### P2 — promote-side matrix cross-check
 
-`test_promotability_is_between_the_daemon_and_state_layer_rules_over_the_matrix` walks
-9 reviews × 4 executions × 4 scopes × 3 staged statuses × 3 promotion outcomes = **1296 cases** and
-asserts `governed_outcome_is_promotable` is a superset of the daemon endpoint's inline checks and a
-subset of the state layer's `RecordPromotion` preconditions, plus that the promotable set is
-non-empty so the upper bound is not vacuous.
+**Removed on rebase onto the merged #52.** This lane carried a *restated* cross-check
+(`test_promotability_is_between_the_daemon_and_state_layer_rules_over_the_matrix`, 1296 cases over
+9 reviews x 4 executions x 4 scopes x 3 staged statuses x 3 promotion outcomes) because both
+authorities live in `impulse-rs`, which `impulse-ops` cannot depend on and this lane did not own. It
+mirrored the daemon endpoint's inline checks and the ledger's `RecordPromotion` preconditions rather
+than importing them.
 
-> **Correction (round 2).** This section, and commit `88fcfd4`'s message, first said "432 cases".
-> That was arithmetic error, not a change in the test: the test computes its own expected total as
-> the product of the five axis lengths and always walked 1296. The commit message keeps the wrong
-> figure because rewriting a pushed commit is worse than a footnote; this line is the correction.
-> Its `compared >= 400` floor is a deliberately loose "not a sample" guard, well under the real
-> total, and is unchanged.
+#52 landed the real thing: `promotability_sits_between_the_endpoint_and_the_ledger_over_the_whole_matrix`
+in `src/daemon/governed_wiring.rs`, which **imports** the actual functions over its own 432-case
+matrix. The restated version was deleted rather than kept alongside it.
 
-**Boundary, stated:** both authorities live in `impulse-rs` (`src/daemon/governed_wiring.rs`,
-`src/state/governed_task.rs`), which `impulse-ops` cannot depend on and which this lane does not
-own, so the two rules are **restated** in the test from those exact sites rather than imported. The
-version that imports the real functions belongs directly beside
-`both_discardability_rules_agree_over_the_whole_state_matrix` in `src/daemon/governed_wiring.rs` —
-a one-test handoff for whoever owns that file next.
+Two numbers appear above and they are both right, for different tests: 1296 was this lane's
+restatement (five axes), 432 is #52's importing test (its own axis set). Neither corrects the other.
+
+Deleting the restatement was not merely tidying. It mirrored
+`daemon::governed_wiring::promote_governed_outcome`'s inline checks faithfully, but the promotion
+producer one layer down (`governed_producers::promote_governed_outcome`) also requires
+`latest_claim()`, and the restatement did not. So it passed while asserting a superset property that
+did not hold — green against a wrong mirror, which is worse than no test. #52's predicate carries
+that clause (`latest_claim().is_some()`, plus a `MAX_GOVERNED_RECORDS_PER_KIND` capacity guard) and
+its importing test cannot drift that way by construction.
 
 ### P2 — ack-only fields no longer dropped
 
@@ -494,3 +496,108 @@ driver executed. That is exactly what Cursor said would happen.
 A plain repository with no includes still passes
 (`test_governed_git_preflight_accepts_a_workspace_with_no_executable_driver`), so this is not a
 blanket block.
+
+## Rebase onto merged main
+
+PR #52 merged to `main` as squash `4dbb8b3` and its branch was deleted, so this lane was rebased off
+its old base with the one sanctioned rewrite:
+
+```
+git rebase --onto origin/main bb63a7e claude/desktop-governed-controls-20260912
+```
+
+`bb63a7e` is the **merge-base with #52 at the time this lane branched**, not #52's tip when it
+merged — #52 had advanced to `d8df6aa` by then, which is not an ancestor of this branch. Recorded
+because the distinction is easy to get wrong once the branch is gone.
+
+### What was dropped in favour of main
+
+- **`governed_outcome_is_promotable`.** Both branches defined it; they were **not** semantically
+  identical. #52's is strictly stricter, adding `latest_claim().is_some()` and
+  `promotions.len() < MAX_GOVERNED_RECORDS_PER_KIND`. This lane's version was wrong: the promotion
+  producer reads the accepted revision off the claim, so a claimless accepted run would have been
+  offered a Promote the endpoint then refuses. Main's version taken wholesale; nothing merged.
+- **`unreferenced_accepted_commit_on_discard`.** Verified body-for-body identical across the two
+  branches before dropping this lane's copy — the round-1 P1 fallback
+  (`None => task.latest_claim().map(...)`) is present in main's, so nothing was lost. Checked rather
+  than assumed, because dropping the wrong one would have silently reinstated a P1.
+- **The restated promote matrix test.** See the section above.
+
+### Fixtures that had to change
+
+Three fixtures modelled a claimless accepted run, which #52's predicate correctly rejects and which
+the ledger does not produce in the first place:
+
+- `impulse-ops`: `test_promotable_requires_a_staged_scope_acceptance_and_an_active_worktree` and
+  `test_a_blocked_promotion_stays_promotable_and_a_promoted_one_does_not` now build with
+  `with_claim(...)`; the first also gained an explicit claimless negative case.
+- `impulse-desktop`: the claim moved **into** `staged_governed_task()` rather than staying opt-in.
+- `test_dismissal_clears_only_the_dismissed_task_s_notice` had to stop using the fixture's own claim
+  revision as its acknowledgement OID. That OID now legitimately appears in the discard *cost*
+  notice for an accepted, unpromoted run, so "the OID is gone after dismissal" was failing because
+  the P1 fix was working. The ack uses a distinct OID.
+- `SharedRepositoryConfigDigest` gained a `scheme_version` field in #52; the desktop fixture uses its
+  `current()` constructor rather than pinning a literal that will drift.
+
+### The typed staged-config refusal
+
+`staged_config_refusal_notice` no longer matches on prose. It takes
+`&StagedConfigRefusalReason` plus the ack's own `remedy` and renders that remedy **verbatim** — the
+ack carries `reason.remedy()` precisely so a surface keeps no second copy of the mapping. The
+desktop adds only its headline, which names the specific component or path. The three text-matching
+tests are replaced by one typed test that builds the ack the way the daemon does, so the remedy under
+assertion is the one that actually crosses the wire.
+
+`BridgeStatusUpdate::staged_config_refusal()` and the banner's dual rendering are **deleted**, not
+ported. Both existed only to interpret a prose string; a typed refusal arrives on the request that
+raised it, so the banner now shows the daemon's own words with nothing interposed.
+
+### Gap found while doing this, not fixed here
+
+`PromoteGovernedOutcome` **can** raise `StagedConfigRefusal`: `governed_producers::promote_governed_outcome`
+calls `ensure_no_submodule_configuration`, which returns `StagedConfigRefusal::UnsupportedSubmodules`.
+But the promote endpoint does not route its error through `respond_producer_error`, so that refusal
+comes back as a plain error string rather than a `GovernedStagedConfigRefusalAck` — unlike claim and
+verification, which do. The desktop therefore cannot render a typed refusal for the one refusal its
+own requests can provoke.
+
+The fix is one line in `src/daemon/governed_wiring.rs` (route the promote error through
+`respond_producer_error`, as claim and verification already do), in a path this lane does not own.
+The typed builder here is ready for it the moment it lands. Handed off rather than reached for.
+
+## Review round 5
+
+A second Cursor security thread (`runtime.rs:2125`, MEDIUM), folded into the rebase commit series.
+Three ways `refuse_executable_git_drivers` still reported "nothing here" about something it had not
+actually checked.
+
+1. **Git's dotted section form.** `[filter.probe]` is the same section as `[filter "probe"]`, and the
+   old parser matched only `[filter]` and the space-separated form. A driver written the dotted way
+   was invisible. Both spellings — plus the bare form — now normalize through one
+   `git_config_section_name`, which stops at a quote and then at a dot. The include check shares it,
+   so `[includeIf.gitdir:...]` resolves to `includeif` rather than to a section of its own.
+2. **`filter.<name>.process`.** The long-running filter protocol was missing from
+   `EXECUTABLE_GIT_CONFIG_KEY_MARKERS` while the section-header path already treated `process` as
+   executable — so only the fully-qualified spelling slipped through. Added.
+3. **Unreadable files were skipped.** `read_to_string` failing on invalid UTF-8 (or on a permission
+   error) hit a `continue`. Git parses configuration as **bytes** and does not need it to be UTF-8,
+   so a Latin-1 byte in a comment did not stop Git from applying a driver defined further down — it
+   only stopped this check from looking. Both now refuse, naming the file, on the same reasoning as
+   the include rule: what cannot be read cannot be cleared.
+
+All three are proven by tests that plant a real driver and assert its marker is never written, and
+all three failed when the corresponding fix was neutralized — each time with *"closed-loop governed
+launch requires a clean committed workspace"*, which is the filter having run and dirtied the tree.
+
+**The first negative control was initially wrong and is worth recording.** Reverting
+`section_is_executable` to its old body did **not** break the dotted-section test, because
+`git_config_section_name` had already normalized `filter.probe` to `filter` before it was consulted.
+The simplification of `section_is_executable` is cosmetic; the normalizer is the fix. Re-running the
+control against the normalizer failed as expected. A control that passes is not evidence the code is
+right — it is evidence the control targeted the wrong line.
+
+**Usability cost, accepted deliberately:** a repository whose `.git/config`, `config.worktree`, or
+`info/attributes` contains a non-UTF-8 byte anywhere — including in a comment — can no longer launch
+a governed agent until the file is re-encoded. That is a real cost on repositories that have done
+nothing wrong. It is taken because the alternative is a check that silently passes on a file it
+could not read, which is the failure mode this whole function exists to prevent.

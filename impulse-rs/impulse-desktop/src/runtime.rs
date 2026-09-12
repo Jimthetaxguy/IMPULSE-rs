@@ -1932,7 +1932,17 @@ fn run_bounded_governed_git(
 /// materialization and refusing to run when the pin no longer holds. This
 /// preflight owns no pin — it runs in the operator's own checkout before any
 /// staged worktree exists — so it refuses outright instead.
-const EXECUTABLE_GIT_CONFIG_KEY_MARKERS: [&str; 4] = [".clean", ".smudge", ".textconv", ".command"];
+const EXECUTABLE_GIT_CONFIG_KEY_MARKERS: [&str; 5] = [
+    ".clean",
+    ".smudge",
+    ".textconv",
+    ".command",
+    // `filter.<name>.process` is the long-running filter protocol: one process
+    // serving many paths. It was missing here while the section-header form
+    // already treated `process` as executable, so only the fully-qualified
+    // spelling slipped through (review round 5, Cursor).
+    ".process",
+];
 const EXECUTABLE_GIT_CONFIG_SECTIONS: [&str; 2] = ["filter", "diff"];
 
 /// Files this refusal reads. Filesystem reads only — it must run *before* the
@@ -2066,9 +2076,8 @@ fn line_opens_a_git_include(line: &str) -> bool {
         return false;
     }
     if let Some(header) = trimmed.strip_prefix('[').and_then(|s| s.split(']').next()) {
-        let header = header.trim().to_ascii_lowercase();
-        if header == "include" || header.starts_with("include ") || header.starts_with("includeif")
-        {
+        let section = git_config_section_name(header);
+        if section == "include" || section == "includeif" {
             return true;
         }
     }
@@ -2093,7 +2102,7 @@ fn line_defines_executable_git_driver(line: &str, section: &mut String) -> bool 
         return false;
     }
     if let Some(header) = trimmed.strip_prefix('[').and_then(|s| s.split(']').next()) {
-        *section = header.to_ascii_lowercase();
+        *section = git_config_section_name(header);
         // `[filter "x"]` with the key on a later line, and also the one-line
         // form `[filter "x"] clean = ...` Git accepts.
         let rest = trimmed
@@ -2122,10 +2131,31 @@ fn line_defines_executable_git_driver(line: &str, section: &mut String) -> bool 
     false
 }
 
+/// The section name a `[...]` header names, normalized.
+///
+/// Git accepts three spellings for the same thing, and a check that recognizes
+/// only some of them is worse than no check because it reads as coverage:
+///
+/// - `[filter]` — bare section
+/// - `[filter "probe"]` — quoted subsection (case-sensitive subsection)
+/// - `[filter.probe]` — dotted subsection (subsection case-folded)
+///
+/// All three resolve to `filter` here. `[includeIf "gitdir:~/w/"]` resolves to
+/// `includeif`, which is why the include check shares this helper: a condition
+/// full of dots and colons must not change which section it is.
+fn git_config_section_name(header: &str) -> String {
+    let header = header.trim();
+    // Stop at a quoted subsection, then at a dotted one. Order matters: a
+    // quoted subsection may itself contain dots.
+    let head = header.split('"').next().unwrap_or(header).trim();
+    let name = head.split('.').next().unwrap_or(head).trim();
+    // A bare `[filter "x"]` written without quotes is `[filter x]`.
+    let name = name.split_whitespace().next().unwrap_or(name);
+    name.to_ascii_lowercase()
+}
+
 fn section_is_executable(section: &str) -> bool {
-    EXECUTABLE_GIT_CONFIG_SECTIONS
-        .iter()
-        .any(|s| section == *s || section.starts_with(&format!("{s} ")))
+    EXECUTABLE_GIT_CONFIG_SECTIONS.contains(&section)
 }
 
 fn key_is_executable(key: &str) -> bool {
@@ -2150,8 +2180,41 @@ fn key_is_executable(key: &str) -> bool {
 /// the first Git process is spawned.
 fn refuse_executable_git_drivers(workspace_root: &Path) -> Result<(), DesktopBridgeError> {
     for (path, kind) in shared_git_config_paths(workspace_root) {
-        let Ok(contents) = std::fs::read_to_string(&path) else {
-            continue;
+        // A file that is not there hides nothing. A file that is there and
+        // cannot be read does: Git parses configuration as bytes and does not
+        // need it to be UTF-8, nor to be readable by this process for the same
+        // reasons. Skipping it would report "nothing here" about a file never
+        // looked at, which is the whole class of bug this check exists to
+        // avoid, so an unreadable file refuses exactly as an include does
+        // (review round 5, Cursor).
+        let contents = match std::fs::read(&path) {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(text) => text,
+                Err(_) => {
+                    return Err(DesktopBridgeError::GovernedTaskFailed {
+                        message: format!(
+                            "closed-loop governed launch refuses this workspace: {} is not valid \
+                             UTF-8, so this preflight cannot check it for an executable Git filter \
+                             or diff driver. Git reads that file as bytes and would apply any \
+                             driver it defines. Re-encode the file as UTF-8 before launching a \
+                             governed agent.",
+                            path.display()
+                        ),
+                    });
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(DesktopBridgeError::GovernedTaskFailed {
+                    message: format!(
+                        "closed-loop governed launch refuses this workspace: {} exists but could \
+                         not be read ({error}), so this preflight cannot check it for an \
+                         executable Git filter or diff driver that would run during its own `git \
+                         status`.",
+                        path.display()
+                    ),
+                });
+            }
         };
         let mut section = String::new();
         for line in contents.lines() {
@@ -3319,6 +3382,129 @@ mod tests {
         assert!(
             !filter_marker.exists(),
             "an included driver must not have run"
+        );
+    }
+
+    /// Review round 5 (Cursor, MEDIUM), spelling 1 of 3: Git's **dotted**
+    /// section form. `[filter.probe]` is the same section as `[filter "probe"]`
+    /// and the old `section_is_executable` matched neither it nor anything but
+    /// the bare and space-separated forms, so a driver written this way was
+    /// invisible.
+    #[cfg(unix)]
+    #[test]
+    fn test_governed_git_preflight_refuses_a_driver_in_the_dotted_section_form() {
+        let temp = tempfile::tempdir().expect("temporary Git preflight fixture");
+        let filter_marker = temp.path().join("filter-ran");
+        let (workspace, filter, run_git) =
+            governed_git_fixture(temp.path(), "dotted-filter.sh", &filter_marker);
+        commit_filtered_fixture(&workspace, &run_git);
+
+        // Written straight into `.git/config` in the dotted form, which `git
+        // config` itself normalizes away if asked to write it.
+        let config = workspace.join(".git").join("config");
+        let existing = std::fs::read_to_string(&config).expect("read config");
+        std::fs::write(
+            &config,
+            format!(
+                "{existing}[filter.probe]\n\tclean = {}\n",
+                filter.to_str().expect("UTF-8 filter path")
+            ),
+        )
+        .expect("write dotted section");
+
+        assert_refuses_before_running(&workspace, &filter_marker, "executable Git filter");
+    }
+
+    /// Spelling 2 of 3: the fully-qualified `filter.<name>.process` key. The
+    /// marker list lacked `.process` while the section-header path already
+    /// treated `process` as executable, so only this spelling slipped through.
+    #[cfg(unix)]
+    #[test]
+    fn test_governed_git_preflight_refuses_a_fully_qualified_process_filter() {
+        let temp = tempfile::tempdir().expect("temporary Git preflight fixture");
+        let filter_marker = temp.path().join("filter-ran");
+        let (workspace, filter, run_git) =
+            governed_git_fixture(temp.path(), "process-filter.sh", &filter_marker);
+        commit_filtered_fixture(&workspace, &run_git);
+
+        let config = workspace.join(".git").join("config");
+        let existing = std::fs::read_to_string(&config).expect("read config");
+        std::fs::write(
+            &config,
+            format!(
+                "{existing}filter.probe.process = {}\n",
+                filter.to_str().expect("UTF-8 filter path")
+            ),
+        )
+        .expect("write qualified process key");
+
+        assert_refuses_before_running(&workspace, &filter_marker, "executable Git filter");
+    }
+
+    /// Spelling 3 of 3, and the most dangerous: a file this check cannot decode.
+    /// Git parses configuration as bytes, so a Latin-1 byte anywhere in the file
+    /// does not stop Git from applying a driver defined lower down — but it did
+    /// stop `read_to_string`, and the old code answered that by `continue`ing,
+    /// reporting "nothing here" about a file it had never read.
+    #[cfg(unix)]
+    #[test]
+    fn test_governed_git_preflight_refuses_a_config_it_cannot_decode() {
+        let temp = tempfile::tempdir().expect("temporary Git preflight fixture");
+        let filter_marker = temp.path().join("filter-ran");
+        let (workspace, filter, run_git) =
+            governed_git_fixture(temp.path(), "latin1-filter.sh", &filter_marker);
+        commit_filtered_fixture(&workspace, &run_git);
+
+        let config = workspace.join(".git").join("config");
+        let mut bytes = std::fs::read(&config).expect("read config");
+        // A lone 0xE9 (Latin-1 'é') is not valid UTF-8; Git reads it happily.
+        bytes.extend_from_slice(b"\t# comment \xe9\n");
+        bytes.extend_from_slice(
+            format!(
+                "[filter \"probe\"]\n\tclean = {}\n",
+                filter.to_str().expect("UTF-8 filter path")
+            )
+            .as_bytes(),
+        );
+        std::fs::write(&config, bytes).expect("write non-UTF-8 config");
+        assert!(
+            std::fs::read_to_string(&config).is_err(),
+            "the fixture must actually be undecodable, or the test proves nothing"
+        );
+
+        assert_refuses_before_running(&workspace, &filter_marker, "not valid UTF-8");
+    }
+
+    /// Commit a tracked file plus a `.gitattributes` routing it through the
+    /// `probe` filter, so any driver named `probe` executes on `git status`.
+    #[cfg(unix)]
+    fn commit_filtered_fixture(workspace: &Path, run_git: &GovernedGitFixtureCommand) {
+        std::fs::write(workspace.join("tracked.txt"), "committed\n").expect("write tracked file");
+        std::fs::write(workspace.join(".gitattributes"), "* filter=probe\n")
+            .expect("write gitattributes");
+        run_git(&["add", "tracked.txt", ".gitattributes"]);
+        run_git(&["commit", "--quiet", "-m", "tracked"]);
+    }
+
+    /// The preflight refuses, names why, and no Git process ever ran the driver.
+    #[cfg(unix)]
+    fn assert_refuses_before_running(workspace: &Path, marker: &Path, expected: &str) {
+        let error = observe_clean_git_head_with_timeout(
+            workspace.to_str().expect("UTF-8 workspace path"),
+            Duration::from_secs(10),
+        )
+        .expect_err("this workspace must be refused");
+        match error {
+            DesktopBridgeError::GovernedTaskFailed { ref message } => assert!(
+                message.contains(expected),
+                "the refusal must name {expected}, got: {message}"
+            ),
+            other => panic!("expected a governed refusal, got {other:?}"),
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !marker.exists(),
+            "the refusal must happen before any Git process runs the driver"
         );
     }
 

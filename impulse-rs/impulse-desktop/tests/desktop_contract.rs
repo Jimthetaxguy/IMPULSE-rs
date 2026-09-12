@@ -3174,7 +3174,7 @@ fn test_footer_stream_health_reads_down_when_transport_degraded() {
 /// An accepted, staged governed task with an active checkout.
 fn staged_governed_task() -> impulse_ops::governed_task::GovernedTaskRun {
     use impulse_ops::governed_task as gt;
-    gt::GovernedTaskRun {
+    with_accepted_claim(gt::GovernedTaskRun {
         id: gt::GovernedTaskId::try_new("staged-task").expect("task id"),
         revision: 7,
         project_id: "impulse-rs".to_string(),
@@ -3201,12 +3201,15 @@ fn staged_governed_task() -> impulse_ops::governed_task::GovernedTaskRun {
             // Pinned on purpose: an *unpinned* worktree can never be promoted,
             // so ADR-0019 rule 7 makes it discardable from any state, which
             // would mask the accepted-run rule these tests exercise.
+            // #52 added a pin scheme version; `current()` is its constructor,
+            // so the fixture tracks the live scheme instead of pinning a
+            // literal that will drift the next time the scheme moves.
             shared_config_digest: gt::SharedRepositoryConfigPin::Recorded(
-                gt::SharedRepositoryConfigDigest {
-                    repository_config: format!("sha256:{}", "d".repeat(64)),
-                    worktree_config: None,
-                    info_attributes: None,
-                },
+                gt::SharedRepositoryConfigDigest::current(
+                    format!("sha256:{}", "d".repeat(64)),
+                    None,
+                    None,
+                ),
             ),
             status: gt::StagedWorktreeStatus::Active,
             materialized_at: "2026-09-12T00:00:00Z".to_string(),
@@ -3222,7 +3225,7 @@ fn staged_governed_task() -> impulse_ops::governed_task::GovernedTaskRun {
         events: vec![],
         created_at: "2026-09-12T00:00:00Z".to_string(),
         updated_at: "2026-09-12T00:00:00Z".to_string(),
-    }
+    })
 }
 
 fn with_promotion(
@@ -3246,8 +3249,13 @@ fn with_promotion(
     task
 }
 
-/// The same staged fixture with an accepted worker claim, so the record can
-/// name the commit a discard would strand.
+/// Attach the accepted worker claim.
+///
+/// Folded into the base fixture rather than opt-in: an accepted run cannot
+/// exist without the claim its acceptance was granted against, and #52's
+/// `governed_outcome_is_promotable` requires one because the promotion producer
+/// reads the accepted revision off it. A claimless fixture modelled a state the
+/// ledger does not produce.
 fn with_accepted_claim(
     mut task: impulse_ops::governed_task::GovernedTaskRun,
 ) -> impulse_ops::governed_task::GovernedTaskRun {
@@ -3559,70 +3567,6 @@ fn test_the_discard_cost_notice_names_the_unreferenced_accepted_commit() {
     assert_eq!(discard_cost_notice(&rejected), None);
 }
 
-/// A staged-configuration refusal is the daemon declining to run Git in a tree
-/// whose pin no longer holds. It reaches the cockpit as a bridge status today,
-/// and must read as a refusal with a remedy rather than "host call failed".
-#[test]
-fn test_a_staged_config_refusal_reads_as_a_refusal_not_a_failed_host_call() {
-    use impulse_desktop::ui::staged_config_refusal_notice;
-
-    let changed = BridgeStatusUpdate {
-        status: "governed_promotion_failed".to_string(),
-        reason: Some(
-            "shared repository configuration changed since governed task `staged-task`'s staged \
-             worktree was materialized (.git/config); refusing to run Git in that worktree"
-                .to_string(),
-        ),
-    };
-    let notice = changed
-        .staged_config_refusal()
-        .expect("a changed pin is a refusal");
-    assert!(notice.headline.contains("refused to run Git"));
-    assert!(notice.remedy.contains("Nothing was touched."));
-    assert!(notice.remedy.contains("re-materialize"));
-    assert_eq!(
-        changed.headline(),
-        "Staged worktree refused: the daemon did not run Git in it"
-    );
-
-    let unpinned = staged_config_refusal_notice(
-        "governed task `staged-task`'s staged worktree carries no comparable \
-         shared-repository-configuration pin; discard it and re-materialize before running a \
-         producer",
-    )
-    .expect("an unpinned worktree is a refusal");
-    assert!(unpinned
-        .headline
-        .contains("no comparable shared-configuration pin"));
-    assert!(unpinned.remedy.contains("Discard the staged worktree"));
-
-    let submodules = staged_config_refusal_notice(
-        "governed task `staged-task` targets a repository with submodule configuration \
-         (/tmp/impulse-rs/.gitmodules); the staged world scope does not support submodules",
-    )
-    .expect("a submodule repository is a refusal");
-    assert!(submodules.remedy.contains("without a staged world scope"));
-
-    // An ordinary failure must not be dressed up as a refusal.
-    let ordinary = BridgeStatusUpdate {
-        status: "governed_promotion_failed".to_string(),
-        reason: Some(
-            "connect to daemon at /tmp/impulse.sock: No such file or directory".to_string(),
-        ),
-    };
-    assert_eq!(ordinary.staged_config_refusal(), None);
-    assert_eq!(ordinary.headline(), "Host call failed: governed promotion");
-    assert_eq!(
-        BridgeStatusUpdate {
-            status: "governed_discard_failed".to_string(),
-            reason: None,
-        }
-        .staged_config_refusal(),
-        None,
-        "a status with no reason carries no refusal to classify"
-    );
-}
-
 /// Both controls reach the host through the same named bridge entry points the
 /// JS bootstrap installs; a rename on either side is a silent dead button.
 #[test]
@@ -3676,7 +3620,7 @@ fn test_an_unpinned_accepted_run_names_the_commit_a_discard_would_strand() {
     };
     use impulse_ops::governed_task as gt;
 
-    let mut unpinned = with_accepted_claim(staged_governed_task());
+    let mut unpinned = staged_governed_task();
     if let Some(staged) = unpinned.staged_worktree.as_mut() {
         staged.shared_config_digest = gt::SharedRepositoryConfigPin::Unknown;
     }
@@ -3712,7 +3656,7 @@ fn test_no_accepted_run_is_ever_told_that_nothing_was_accepted() {
     use impulse_desktop::ui::discard_reassurance_notice;
     use impulse_ops::governed_task as gt;
 
-    let accepted = with_accepted_claim(staged_governed_task());
+    let accepted = staged_governed_task();
 
     let mut claimless = accepted.clone();
     claimless.claims.clear();
@@ -3744,69 +3688,6 @@ fn test_no_accepted_run_is_ever_told_that_nothing_was_accepted() {
     assert!(discard_reassurance_notice(&rejected)
         .expect("a rejected run costs nothing")
         .contains("never accepted"));
-}
-
-/// **P2.** The classifier reads a message it does not own, so a near-miss must
-/// not be dressed up with a remedy that does not apply.
-#[test]
-fn test_a_near_miss_refusal_message_is_not_classified_as_a_changed_pin() {
-    use impulse_desktop::ui::staged_config_refusal_notice;
-
-    assert_eq!(
-        staged_config_refusal_notice(
-            "governed task `staged-task` has uncommitted changes; refusing to run Git in that \
-             worktree because it is dirty"
-        ),
-        None,
-        "the trailing consequence clause is not the refusal's identity; only the \
-         changed-since clause is"
-    );
-    assert!(
-        staged_config_refusal_notice(
-            "shared repository configuration changed since governed task `staged-task`'s staged \
-             worktree was materialized (.git/config); refusing to run Git in that worktree"
-        )
-        .is_some(),
-        "the real changed-pin refusal must still classify"
-    );
-}
-
-/// **P2.** The banner must show the daemon's own words alongside any
-/// interpretation of them.
-#[test]
-fn test_the_bridge_banner_shows_the_raw_daemon_text_next_to_any_interpretation() {
-    let raw = "shared repository configuration changed since governed task `staged-task`'s staged \
-               worktree was materialized (.git/config); refusing to run Git in that worktree";
-    let mut vdom = VirtualDom::new_with_props(
-        DesktopShellWithSnapshot,
-        DesktopShellWithSnapshotProps {
-            snapshot: ProjectOpsSnapshot::default(),
-            runtime_agents: Vec::new(),
-            agent_platforms: Vec::new(),
-            workspaces: Vec::new(),
-            mcp_tools: Vec::new(),
-            last_invocations: Vec::new(),
-            review_queue: Vec::new(),
-            bridge_status: Some(BridgeStatusUpdate {
-                status: "governed_promotion_failed".to_string(),
-                reason: Some(raw.to_string()),
-            }),
-            daemon_ops_status: None,
-            governed_acks: Default::default(),
-            on_dismiss_governed_ack: None,
-            initial_view: DesktopView::Supervisor,
-        },
-    );
-    vdom.rebuild_in_place();
-    let html = dioxus_ssr::render(&vdom);
-
-    assert!(html.contains("data-staged-config-refusal=\"true\""));
-    assert!(html.contains("data-bridge-status-raw=\"true\""));
-    assert!(
-        html.contains("materialized (.git/config)"),
-        "the raw daemon text must survive to the operator's eyes"
-    );
-    assert!(html.contains("Staged worktree refused"));
 }
 
 /// **P2.** `pending_rerun_reason` and `unreferenced_accepted_commit` exist only
@@ -4042,7 +3923,11 @@ fn test_the_stranded_commit_notice_survives_a_card_remount() {
 fn test_dismissal_clears_only_the_dismissed_task_s_notice() {
     use impulse_desktop::ui::GovernedAckNotice;
 
-    let commit = "b".repeat(40);
+    // Deliberately NOT the fixture's claim revision. That OID legitimately
+    // appears in the discard *cost* notice for an accepted, unpromoted run, so
+    // reusing it here would make "the OID is gone" unprovable -- the assertion
+    // would fail for a reason that is the P1 fix working correctly.
+    let commit = "e".repeat(40);
     let other = "c".repeat(40);
     let mut acks = std::collections::BTreeMap::new();
     for (task_id, oid) in [("staged-task", &commit), ("other-task", &other)] {
@@ -4136,4 +4021,69 @@ fn test_the_bridge_emits_a_durable_ack_alongside_the_transient_banner() {
     assert!(bootstrap.contains("governed_promotion_rerun_pending"));
     // The notice is filed against the task the request named.
     assert!(bootstrap.contains("request?.task_id"));
+}
+
+/// The staged-configuration refusal is typed now (#52), so the surface builds
+/// its notice from `StagedConfigRefusalReason` and renders the daemon's own
+/// `remedy` verbatim. That is the point of the ack carrying `reason.remedy()`:
+/// there is exactly one copy of the mapping, and it is not this one.
+#[test]
+fn test_the_refusal_notice_is_built_from_the_typed_reason_and_quotes_the_daemon_remedy() {
+    use impulse_desktop::ui::staged_config_refusal_notice;
+    use impulse_ops::governed_task::SharedConfigComponent;
+    use impulse_ops::governed_wiring::{GovernedStagedConfigRefusalAck, StagedConfigRefusalReason};
+
+    for reason in [
+        StagedConfigRefusalReason::Unpinned,
+        StagedConfigRefusalReason::Changed {
+            component: SharedConfigComponent::RepositoryConfig,
+        },
+        StagedConfigRefusalReason::UnsupportedSubmodules {
+            path: "/tmp/impulse-rs/.gitmodules".to_string(),
+        },
+    ] {
+        // Build the ack the way the daemon does, so the remedy under test is
+        // the one that actually crosses the wire.
+        let ack = GovernedStagedConfigRefusalAck::new(staged_governed_task(), reason.clone());
+        assert!(ack.refused, "the ack discriminates on one field");
+        let notice = staged_config_refusal_notice(&ack.reason, &ack.remedy);
+
+        assert_eq!(
+            notice.remedy, ack.remedy,
+            "the remedy is rendered verbatim, never re-derived locally"
+        );
+        assert!(
+            notice.headline.contains("Nothing was touched."),
+            "a refusal never reads as a run failure: {}",
+            notice.headline
+        );
+        assert!(
+            !notice.remedy.contains("  "),
+            "the wire remedy must not carry a run of interior spaces: {:?}",
+            notice.remedy
+        );
+    }
+
+    // Each reason names the specific thing the operator has to look at.
+    let changed = StagedConfigRefusalReason::Changed {
+        component: SharedConfigComponent::InfoAttributes,
+    };
+    let ack = GovernedStagedConfigRefusalAck::new(staged_governed_task(), changed);
+    let notice = staged_config_refusal_notice(&ack.reason, &ack.remedy);
+    assert!(
+        notice.headline.contains(".git/info/attributes"),
+        "a changed pin must name the component, got: {}",
+        notice.headline
+    );
+
+    let submodules = StagedConfigRefusalReason::UnsupportedSubmodules {
+        path: "/tmp/impulse-rs/.gitmodules".to_string(),
+    };
+    let ack = GovernedStagedConfigRefusalAck::new(staged_governed_task(), submodules);
+    let notice = staged_config_refusal_notice(&ack.reason, &ack.remedy);
+    assert!(
+        notice.headline.contains("/tmp/impulse-rs/.gitmodules"),
+        "an unsupported-submodule refusal must name the path, got: {}",
+        notice.headline
+    );
 }

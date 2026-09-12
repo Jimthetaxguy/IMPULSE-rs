@@ -12,7 +12,7 @@ use impulse_ops::{
     governed_wiring::{
         governed_outcome_is_promotable, staged_worktree_is_discardable,
         unreferenced_accepted_commit_on_discard, GovernedPromotionRequest,
-        GovernedStagedWorktreeDiscardRequest,
+        GovernedStagedWorktreeDiscardRequest, StagedConfigRefusalReason,
     },
     role_assignment::{
         canonical_governed_builder_assignment, evaluate_role_compatibility, AgentRoleAssignment,
@@ -769,12 +769,6 @@ impl BridgeStatusUpdate {
             GOVERNED_UNREFERENCED_COMMIT_STATUS => {
                 "Discarded staged worktree held the only ref to an accepted commit".to_string()
             }
-            // A staged-configuration refusal is a daemon decision not to touch
-            // the tree, not a failed host call, so it gets its own headline
-            // rather than "Host call failed".
-            _ if self.staged_config_refusal().is_some() => {
-                "Staged worktree refused: the daemon did not run Git in it".to_string()
-            }
             // A revision conflict means this board is looking at a task the
             // daemon has already moved past — the operator's next action is to
             // refresh, not to debug a transport problem (review round 1 nit).
@@ -793,14 +787,6 @@ impl BridgeStatusUpdate {
         }
     }
 
-    /// The staged-configuration refusal this status carries, if any.
-    ///
-    /// See [`staged_config_refusal_notice`] for why this reads the message text
-    /// and what replaces it once the typed daemon response variant lands.
-    pub fn staged_config_refusal(&self) -> Option<StagedConfigRefusalNotice> {
-        staged_config_refusal_notice(self.reason.as_deref()?)
-    }
-
     fn revokes_agent_platform_catalog(&self) -> bool {
         self.status == "agent_platforms_failed"
     }
@@ -815,7 +801,6 @@ fn BridgeStatusBanner(status: BridgeStatusUpdate) -> Element {
         .reason
         .clone()
         .unwrap_or_else(|| "no detail reported".to_string());
-    let staged_refusal = status.staged_config_refusal();
     rsx! {
         div {
             class: "bridge-status-banner",
@@ -823,16 +808,10 @@ fn BridgeStatusBanner(status: BridgeStatusUpdate) -> Element {
             "data-bridge-status": "{status.status}",
             span { class: "bridge-status-mark", "!" }
             span { class: "bridge-status-headline", "{status.headline()}" }
-            if let Some(refusal) = staged_refusal.as_ref() {
-                // Both, never the interpretation alone: the classifier reads a
-                // message it does not own, so an operator has to be able to see
-                // what the daemon actually said (review round 1, P2).
-                span {
-                    class: "bridge-status-reason",
-                    "data-staged-config-refusal": "true",
-                    "{refusal.headline} {refusal.remedy}"
-                }
-            }
+            // The daemon's own words, with nothing interposed. A typed refusal
+            // arrives as a `GovernedStagedConfigRefusalAck` on the request that
+            // raised it, never as a status string, so there is nothing here to
+            // interpret -- and nothing to misread.
             span { class: "bridge-status-reason", "data-bridge-status-raw": "true", "{reason}" }
         }
     }
@@ -2560,58 +2539,42 @@ pub struct StagedConfigRefusalNotice {
     pub remedy: String,
 }
 
-/// Classify a daemon error message as a staged-configuration refusal.
+/// Build the operator-facing notice for a typed staged-configuration refusal.
 ///
-/// **Text matching is deliberate and temporary.** ADR-0019's P1 lane
-/// (`claude/adr0019-p1-fixes-20260912`, PR #53) introduces a downcastable
-/// `governed_producers::StagedConfigRefusal`, and #52's post-merge work turns it
-/// into a typed daemon response. Until that response variant exists, the only
-/// thing that crosses the socket is the `Display` string, so this reads it.
+/// `reason` and `remedy` both come off `GovernedStagedConfigRefusalAck`: the
+/// daemon computes the reason and carries `reason.remedy()` on the wire
+/// precisely so a surface does not keep its own copy of that mapping. The
+/// remedy is therefore rendered **verbatim** — this function only adds the
+/// desktop's own headline, which is a UI concern rather than a governance one.
 ///
-/// **It matches nothing on this lane's base**, which is correct: the strings it
-/// targets are introduced by PR #53 and do not exist until that merges. The
-/// classifier is inert rather than wrong, and it starts working the moment the
-/// producer it targets is on the branch. Review round 1 confirmed this and
-/// asked that it be stated rather than implied.
-///
-/// Each arm keys off the *distinguishing* clause, never a clause another
-/// refusal could reuse. The changed-pin arm in particular requires "shared
-/// repository configuration changed since" and does **not** accept "refusing to
-/// run Git in that worktree" on its own — that trailing clause is a generic
-/// consequence any future refusal might also print, and matching it would let an
-/// unrelated refusal render a discard-and-re-materialize remedy that does not
-/// apply (review round 1, P2).
-///
-/// When the typed variant lands, `StagedConfigRefusalNotice` is constructed
-/// from it directly and this function's body is the only thing that changes;
-/// its callers and its tests describe behavior, not the matching strategy.
-pub fn staged_config_refusal_notice(error: &str) -> Option<StagedConfigRefusalNotice> {
-    let unpinned = error.contains("no comparable shared-repository-configuration pin");
-    let changed = error.contains("shared repository configuration changed since");
-    let submodules = error.contains("the staged world scope does not support submodules");
-    if !(unpinned || changed || submodules) {
-        return None;
-    }
-    let (headline, remedy) = if submodules {
-        (
-            "This repository carries submodule configuration, which the staged world scope does not support.",
-            "A submodule defines configuration of its own that executes during an ordinary `git status`, and the staged scope cannot pin it. Run this task without a staged world scope.",
-        )
-    } else if unpinned {
-        (
-            "The staged worktree carries no comparable shared-configuration pin, so the daemon refused to run Git in it.",
-            "Nothing was touched. Discard the staged worktree and re-materialize it, then re-run the task.",
-        )
-    } else {
-        (
-            "Shared repository configuration changed since this staged worktree was materialized, so the daemon refused to run Git in it.",
-            "Nothing was touched. Inspect what changed in the repository-level Git configuration, then discard the staged worktree and re-materialize it.",
-        )
+/// This replaced a classifier that matched on the producer's prose. That was a
+/// deliberate stopgap while the typed variant was still on an unmerged branch;
+/// it is gone now, and with it the whole class of bug where improving an error
+/// message silently reclassifies a refusal (review rounds 1 and 3, closed on
+/// rebase onto the merged #52).
+pub fn staged_config_refusal_notice(
+    reason: &StagedConfigRefusalReason,
+    remedy: &str,
+) -> StagedConfigRefusalNotice {
+    let headline = match reason {
+        StagedConfigRefusalReason::Unpinned => {
+            "The staged worktree carries no comparable shared-configuration pin, so the daemon \
+             refused to run Git in it. Nothing was touched."
+                .to_string()
+        }
+        StagedConfigRefusalReason::Changed { component } => format!(
+            "Shared repository configuration changed since this staged worktree was materialized \
+             ({component}), so the daemon refused to run Git in it. Nothing was touched."
+        ),
+        StagedConfigRefusalReason::UnsupportedSubmodules { path } => format!(
+            "This repository carries submodule configuration ({path}), which the staged world \
+             scope cannot pin and therefore refuses to run in. Nothing was touched."
+        ),
     };
-    Some(StagedConfigRefusalNotice {
-        headline: headline.to_string(),
+    StagedConfigRefusalNotice {
+        headline,
         remedy: remedy.to_string(),
-    })
+    }
 }
 
 fn promotion_request(task: &GovernedTaskRun) -> Option<GovernedPromotionRequest> {
