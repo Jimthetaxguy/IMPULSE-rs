@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::governed_task::{
     GovernedExecutionState, GovernedRequestId, GovernedReviewState, GovernedTaskContractError,
-    GovernedTaskId, GovernedTaskRun, MAX_GOVERNED_TEXT_BYTES,
+    GovernedTaskId, GovernedTaskRun, WorldScope, MAX_GOVERNED_TEXT_BYTES,
 };
 
 /// Trigger for the daemon-owned promotion producer (ADR-0019).
@@ -164,6 +164,31 @@ pub fn staged_worktree_is_discardable(task: &GovernedTaskRun) -> bool {
         GovernedReviewState::Accepted => task.latest_promotion().is_some(),
         _ => false,
     }
+}
+
+/// Every condition `PromoteGovernedOutcome` checks before it runs Git
+/// (ADR-0019 rule 5), so an operator surface can disable the control rather
+/// than offering a button whose only outcome is a typed daemon refusal.
+///
+/// The enforcing authority is the daemon endpoint
+/// (`daemon::governed_wiring::promote_governed_outcome`) and, for the
+/// at-most-once rule, the state layer's `RecordPromotion` transition. This is
+/// the same predicate expressed once so a surface and the daemon cannot drift,
+/// exactly as [`staged_worktree_is_discardable`] is for the discard path.
+///
+/// Deliberately *not* included: whether the canonical branch can actually be
+/// advanced. That is observable only by running Git, and a canonical head that
+/// moved is an execution fact the daemon reports as
+/// `GovernedPromotionOutcome::PromotionBlocked` — never a reason to refuse the
+/// attempt up front.
+pub fn governed_outcome_is_promotable(task: &GovernedTaskRun) -> bool {
+    task.world_scope == WorldScope::StagedAuthoritative
+        && task.is_accepted()
+        && task.active_staged_worktree().is_some()
+        // A run is promoted at most once; a blocked run may still be retried.
+        && !task
+            .latest_promotion()
+            .is_some_and(|promotion| promotion.outcome.is_promoted())
 }
 
 /// The accepted commit that discarding this staged worktree would leave
@@ -524,5 +549,73 @@ mod tests {
         let mut rejected = with_claim(with_staged(task(), pinned()));
         rejected.review_state = GovernedReviewState::Rejected;
         assert_eq!(unreferenced_accepted_commit_on_discard(&rejected), None);
+    }
+
+    /// Every clause the daemon endpoint checks before it runs Git, one at a
+    /// time. A surface that disables Promote on a different rule than the
+    /// daemon enforces is the drift this predicate exists to prevent.
+    #[test]
+    fn test_promotable_requires_a_staged_scope_acceptance_and_an_active_worktree() {
+        let mut accepted = with_staged(task(), pinned());
+        accepted.review_state = GovernedReviewState::Accepted;
+        assert!(governed_outcome_is_promotable(&accepted));
+
+        let mut authoritative = accepted.clone();
+        authoritative.world_scope = WorldScope::Authoritative;
+        assert!(
+            !governed_outcome_is_promotable(&authoritative),
+            "promotion is a staged-scope operation"
+        );
+
+        let mut awaiting_operator = accepted.clone();
+        awaiting_operator.review_state = GovernedReviewState::AwaitingOperator;
+        assert!(
+            !governed_outcome_is_promotable(&awaiting_operator),
+            "nothing is promoted before an operator accepts it"
+        );
+
+        let mut discarded = accepted.clone();
+        if let Some(staged) = discarded.staged_worktree.as_mut() {
+            staged.status = StagedWorktreeStatus::Discarded;
+        }
+        assert!(
+            !governed_outcome_is_promotable(&discarded),
+            "a reclaimed checkout has nothing left to promote"
+        );
+
+        let mut unstaged = accepted;
+        unstaged.staged_worktree = None;
+        assert!(!governed_outcome_is_promotable(&unstaged));
+    }
+
+    /// ADR-0019 rule 6: a blocked promotion is an execution fact and the
+    /// operator may retry it; a successful one is final.
+    #[test]
+    fn test_a_blocked_promotion_stays_promotable_and_a_promoted_one_does_not() {
+        let mut accepted = with_staged(task(), pinned());
+        accepted.review_state = GovernedReviewState::Accepted;
+
+        let blocked = with_promotion(
+            accepted.clone(),
+            GovernedPromotionOutcome::PromotionBlocked {
+                canonical_head: oid('c'),
+                reason: PromotionBlockedReason::ConcurrentBranchUpdate,
+            },
+        );
+        assert!(
+            governed_outcome_is_promotable(&blocked),
+            "reconciling the canonical branch and retrying is the documented remedy"
+        );
+
+        let promoted = with_promotion(
+            accepted,
+            GovernedPromotionOutcome::Promoted {
+                promoted_revision: oid('b'),
+            },
+        );
+        assert!(
+            !governed_outcome_is_promotable(&promoted),
+            "a run is promoted at most once"
+        );
     }
 }

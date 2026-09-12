@@ -14,6 +14,10 @@ use impulse_ops::governed_task::{
     GovernedTaskMutation, GovernedTaskMutationRequest, GovernedTaskRegistration, GovernedTaskRun,
     GovernedVerificationProfile,
 };
+use impulse_ops::governed_wiring::{
+    GovernedProducerAck, GovernedPromotionRequest, GovernedStagedWorktreeDiscardAck,
+    GovernedStagedWorktreeDiscardRequest,
+};
 use impulse_ops::role_assignment::{AgentRoleAssignment, EnforcementStrength, RoleCompatibility};
 use impulse_ops::{AgentRole, AgentStatus, ContextHealthSummary, MachineTarget};
 use impulse_term::TerminalBackend;
@@ -46,6 +50,33 @@ pub trait GovernedTaskGateway: Send + Sync {
         request_id: impulse_ops::governed_task::GovernedRequestId,
         mutation: GovernedTaskMutation,
     ) -> Result<GovernedTaskRun, String>;
+
+    /// Fast-forward the canonical branch onto an accepted staged outcome
+    /// (ADR-0019 rule 5, protocol v9).
+    ///
+    /// A *blocked* promotion comes back as `Ok`: the acknowledged task carries
+    /// `GovernedPromotionOutcome::PromotionBlocked`, the run stays accepted, and
+    /// the staged worktree stays active. `Err` means the request never reached a
+    /// verdict. Defaulted so a gateway that predates protocol v9 — every test
+    /// double in this workspace — keeps compiling and fails closed.
+    fn promote_outcome(
+        &self,
+        _request: GovernedPromotionRequest,
+    ) -> Result<GovernedProducerAck, String> {
+        Err("this governed task gateway does not implement staged-outcome promotion".to_string())
+    }
+
+    /// Reclaim a finished staged worktree (ADR-0019 rule 7, protocol v9).
+    ///
+    /// The acknowledgement names the removed checkout and, when the discard
+    /// dropped the only ref to an accepted-but-blocked commit, that commit's
+    /// OID.
+    fn discard_staged_worktree(
+        &self,
+        _request: GovernedStagedWorktreeDiscardRequest,
+    ) -> Result<GovernedStagedWorktreeDiscardAck, String> {
+        Err("this governed task gateway does not implement staged-worktree discard".to_string())
+    }
 
     fn routing_metadata(&self) -> Option<GovernedRoutingMetadata> {
         None
@@ -1219,7 +1250,94 @@ impl DesktopRuntime {
         let updated = gateway
             .mutate(request)
             .map_err(|message| DesktopBridgeError::GovernedTaskFailed { message })?;
-        if updated.id != expected_task_id
+        self.adopt_acknowledged_governed_task(
+            updated,
+            &expected_project_id,
+            &expected_task_id,
+            expected_revision,
+        )
+    }
+
+    /// Fast-forward the canonical branch onto an accepted staged outcome
+    /// (ADR-0019, protocol v9).
+    ///
+    /// A blocked promotion is an execution fact, not a failure: it returns `Ok`
+    /// carrying a task whose latest promotion is
+    /// `GovernedPromotionOutcome::PromotionBlocked`. Callers render the reason
+    /// and keep the task actionable.
+    pub fn promote_governed_outcome(
+        &self,
+        request: GovernedPromotionRequest,
+    ) -> Result<GovernedProducerAck, DesktopBridgeError> {
+        let gateway = self.governed_task_gateway()?;
+        let expected_task_id = request.task_id.clone();
+        let expected_project_id = request.project_id.clone();
+        let expected_revision = request.expected_revision;
+        let acknowledged = gateway
+            .promote_outcome(request)
+            .map_err(|message| DesktopBridgeError::GovernedTaskFailed { message })?;
+        let task = self.adopt_acknowledged_governed_task(
+            acknowledged.task,
+            &expected_project_id,
+            &expected_task_id,
+            expected_revision,
+        )?;
+        Ok(GovernedProducerAck::new(
+            task,
+            acknowledged.replayed,
+            acknowledged.pending_rerun_reason,
+        ))
+    }
+
+    /// Reclaim a finished staged worktree (ADR-0019, protocol v9).
+    pub fn discard_governed_staged_worktree(
+        &self,
+        request: GovernedStagedWorktreeDiscardRequest,
+    ) -> Result<GovernedStagedWorktreeDiscardAck, DesktopBridgeError> {
+        let gateway = self.governed_task_gateway()?;
+        let expected_task_id = request.task_id.clone();
+        let expected_project_id = request.project_id.clone();
+        let expected_revision = request.expected_revision;
+        let acknowledged = gateway
+            .discard_staged_worktree(request)
+            .map_err(|message| DesktopBridgeError::GovernedTaskFailed { message })?;
+        let task = self.adopt_acknowledged_governed_task(
+            acknowledged.task,
+            &expected_project_id,
+            &expected_task_id,
+            expected_revision,
+        )?;
+        Ok(GovernedStagedWorktreeDiscardAck {
+            task,
+            discarded_root: acknowledged.discarded_root,
+            unreferenced_accepted_commit: acknowledged.unreferenced_accepted_commit,
+        })
+    }
+
+    fn governed_task_gateway(&self) -> Result<&Arc<dyn GovernedTaskGateway>, DesktopBridgeError> {
+        self.inner.governed_task_gateway.as_ref().ok_or_else(|| {
+            DesktopBridgeError::GovernedTaskFailed {
+                message: "daemon task gateway is unavailable".to_string(),
+            }
+        })
+    }
+
+    /// Validate an acknowledged governed task against the coordinates that were
+    /// requested, refresh the runtime's cached copy, and publish the resulting
+    /// snapshot.
+    ///
+    /// Shared by every acknowledged daemon governed command so a promotion or a
+    /// discard cannot bypass the identity checks the mutation path has always
+    /// applied: the daemon must answer about the same project and task, at a
+    /// strictly newer revision, without changing immutable identity fields.
+    fn adopt_acknowledged_governed_task(
+        &self,
+        updated: GovernedTaskRun,
+        expected_project_id: &str,
+        expected_task_id: &impulse_ops::governed_task::GovernedTaskId,
+        expected_revision: u64,
+    ) -> Result<GovernedTaskRun, DesktopBridgeError> {
+        if &updated.id != expected_task_id
             || updated.project_id != expected_project_id
             || updated.revision <= expected_revision
         {
@@ -1659,7 +1777,32 @@ fn scrub_governed_git_environment(command: &mut Command) {
             command.env(name, value);
         }
     }
+    // `HOME` stays on the allowlist because Git needs it to resolve `~` in the
+    // paths it is *given*, but the two files it would otherwise read from there
+    // (and from the system prefix) can define `core.fsmonitor`, `filter.*`, and
+    // `diff.*` drivers, all of which execute during an ordinary probe. Pointing
+    // both at `/dev/null` neutralizes them without removing `HOME`.
+    for name in ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"] {
+        command.env(name, "/dev/null");
+    }
 }
+
+/// Command-line overrides for every executable hook Git would otherwise run
+/// during this preflight.
+///
+/// `-c` beats repository configuration, which is the level that matters: the
+/// preflight runs in the operator's own checkout, and `.git/config` there is
+/// writable by anything that has already run in the project. `post-index-change`
+/// and `fsmonitor-watchman` both fire on a bare `git status`, which this
+/// preflight runs. Mirrors `governed_producers::hook_free_git`, extended with
+/// the `core.fsmonitor` suppression that module's callers get from running in a
+/// daemon-materialized worktree.
+const HOOK_FREE_GIT_OVERRIDES: [&str; 4] = [
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.fsmonitor=false",
+];
 
 fn run_bounded_governed_git(
     workspace_root: &str,
@@ -1670,6 +1813,7 @@ fn run_bounded_governed_git(
     command
         .arg("-C")
         .arg(workspace_root)
+        .args(HOOK_FREE_GIT_OVERRIDES)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -2633,16 +2777,28 @@ mod tests {
         );
     }
 
+    /// Build a real single-commit Git repository plus an executable shell
+    /// script that touches `marker` after a delay and leaves a backgrounded
+    /// descendant behind. Shared by the two governed-preflight Git tests so
+    /// they agree on the fixture and differ only in how the script is wired in.
+    /// Run one `git` command against the fixture workspace and assert it
+    /// succeeded.
     #[cfg(unix)]
-    #[test]
-    fn test_governed_git_preflight_bounds_and_reaps_hanging_fsmonitor_tree() {
-        let temp = tempfile::tempdir().expect("temporary Git preflight fixture");
-        let workspace = temp.path().join("workspace");
-        std::fs::create_dir(&workspace).expect("create Git workspace");
-        let run_git = |args: &[&str]| {
+    type GovernedGitFixtureCommand = Box<dyn Fn(&[&str]) + Send>;
+
+    #[cfg(unix)]
+    fn governed_git_fixture(
+        temp: &Path,
+        script_name: &str,
+        marker: &Path,
+    ) -> (PathBuf, PathBuf, GovernedGitFixtureCommand) {
+        let workspace = temp.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("create Git workspace");
+        let fixture_workspace = workspace.clone();
+        let run_git = move |args: &[&str]| {
             let status = Command::new("git")
                 .arg("-C")
-                .arg(&workspace)
+                .arg(&fixture_workspace)
                 .args(args)
                 .status()
                 .expect("run Git fixture command");
@@ -2653,36 +2809,110 @@ mod tests {
         run_git(&["config", "user.name", "Impulse Test"]);
         run_git(&["commit", "--allow-empty", "--quiet", "-m", "initial"]);
 
-        let escaped_marker = temp.path().join("escaped-fsmonitor-descendant");
-        let fsmonitor = temp.path().join("hanging-fsmonitor.sh");
+        let script = temp.join(script_name);
         std::fs::write(
-            &fsmonitor,
-            format!(
-                "#!/bin/sh\n(sleep 1; : > '{}') &\nwait\n",
-                escaped_marker.display()
-            ),
+            &script,
+            format!("#!/bin/sh\n(sleep 1; : > '{}') &\nwait\n", marker.display()),
         )
-        .expect("write hanging fsmonitor");
-        let mut permissions = std::fs::metadata(&fsmonitor).unwrap().permissions();
+        .expect("write governed Git fixture script");
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
         permissions.set_mode(0o755);
-        std::fs::set_permissions(&fsmonitor, permissions).expect("mark fsmonitor executable");
+        std::fs::set_permissions(&script, permissions).expect("mark fixture script executable");
+        (workspace, script, Box::new(run_git))
+    }
+
+    /// ADR-0019's producers build every Git invocation through
+    /// `governed_producers::hook_free_git`; this preflight is a Git invocation
+    /// on the same governed path and had none of that hardening (recorded as a
+    /// residual by the ADR-0019 P1 lane). `post-index-change` and a
+    /// `core.fsmonitor` script both fire on the bare `git status` this preflight
+    /// runs — verified against Git 2.50.1 by removing the overrides, which makes
+    /// both markers appear.
+    #[cfg(unix)]
+    #[test]
+    fn test_governed_git_preflight_runs_neither_repository_hooks_nor_fsmonitor() {
+        let temp = tempfile::tempdir().expect("temporary Git preflight fixture");
+        let fsmonitor_marker = temp.path().join("fsmonitor-ran");
+        let (workspace, fsmonitor, run_git) =
+            governed_git_fixture(temp.path(), "observing-fsmonitor.sh", &fsmonitor_marker);
+
+        // A tracked file whose stat data is stale is what makes `git status`
+        // rewrite the index, which is what fires `post-index-change`.
+        std::fs::write(workspace.join("tracked.txt"), "committed\n").expect("write tracked file");
+        run_git(&["add", "tracked.txt"]);
+        run_git(&["commit", "--quiet", "-m", "tracked"]);
+
+        let hook_marker = temp.path().join("hook-ran");
+        let hooks = workspace.join(".git").join("hooks");
+        std::fs::create_dir_all(&hooks).expect("create hooks directory");
+        let hook = hooks.join("post-index-change");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\n: > '{}'\n", hook_marker.display()),
+        )
+        .expect("plant post-index-change hook");
+        let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&hook, permissions).expect("mark hook executable");
         run_git(&[
             "config",
             "core.fsmonitor",
             fsmonitor.to_str().expect("UTF-8 fsmonitor path"),
         ]);
+        filetime_touch(&workspace.join("tracked.txt"));
+
+        let head = observe_clean_git_head_with_timeout(
+            workspace.to_str().expect("UTF-8 workspace path"),
+            Duration::from_secs(10),
+        )
+        .expect("a clean repository must pass the preflight with hooks suppressed");
+        assert_eq!(head.len(), 40, "the preflight still resolves a commit OID");
+        assert!(
+            !hook_marker.exists(),
+            "a repository-planted post-index-change hook must not run in the governed preflight"
+        );
+        assert!(
+            !fsmonitor_marker.exists(),
+            "a repository-configured core.fsmonitor script must not run in the governed preflight"
+        );
+    }
+
+    /// Rewrite a tracked file's mtime far enough into the past that Git treats
+    /// its cached stat data as stale. Avoids a real sleep in the test.
+    #[cfg(unix)]
+    fn filetime_touch(path: &Path) {
+        let contents = std::fs::read(path).expect("read tracked file");
+        std::fs::write(path, contents).expect("rewrite tracked file");
+    }
+
+    /// The bound and the process-group reap, proven through a repository alias
+    /// rather than `core.fsmonitor`: `-c` overrides suppress the hook vectors,
+    /// but an alias is still executed, so it remains a real way for repository
+    /// configuration to hang the preflight.
+    #[cfg(unix)]
+    #[test]
+    fn test_governed_git_preflight_bounds_and_reaps_a_hanging_child_process_tree() {
+        let temp = tempfile::tempdir().expect("temporary Git preflight fixture");
+        let escaped_marker = temp.path().join("escaped-descendant");
+        let (workspace, script, run_git) =
+            governed_git_fixture(temp.path(), "hanging-alias.sh", &escaped_marker);
+        run_git(&[
+            "config",
+            "alias.impulse-preflight-probe",
+            &format!("!{}", script.to_str().expect("UTF-8 script path")),
+        ]);
 
         let started = Instant::now();
-        let error = observe_clean_git_head_with_timeout(
+        let output = run_bounded_governed_git(
             workspace.to_str().expect("UTF-8 workspace path"),
+            &["impulse-preflight-probe"],
             Duration::from_millis(500),
         )
-        .expect_err("hanging fsmonitor must hit the bounded Git preflight deadline");
-        assert!(matches!(
-            error,
-            DesktopBridgeError::GovernedTaskFailed { ref message }
-                if message.contains("timed out")
-        ));
+        .expect("a bounded Git invocation reports a timeout rather than erroring");
+        assert!(
+            output.timed_out,
+            "a hanging Git child must hit the bounded preflight deadline"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "Git preflight must return within its cleanup bound"
@@ -2691,7 +2921,7 @@ mod tests {
         thread::sleep(Duration::from_millis(700));
         assert!(
             !escaped_marker.exists(),
-            "timed-out Git preflight must kill background fsmonitor descendants"
+            "timed-out Git preflight must kill backgrounded descendants of the Git child"
         );
     }
 
