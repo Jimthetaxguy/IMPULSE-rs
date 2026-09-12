@@ -480,3 +480,196 @@ mod tests {
         assert_eq!(ToolSource::ExternalProcess.as_str(), "external_process");
     }
 }
+
+/// Property-based / fuzz-style tests over [`secure_resolve`]/
+/// [`ToolContext::is_path_allowed`] -- see
+/// `docs/superpowers/specs/2026-09-12-governed-parser-property-tests.md`.
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn ctx_for(root: &Path) -> ToolContext {
+        ToolContext {
+            allowed_write_roots: vec![root.to_path_buf()],
+            allowed_read_roots: vec![root.to_path_buf()],
+            ..ToolContext::with_all_capabilities()
+        }
+    }
+
+    proptest! {
+        /// Never panics for arbitrary path-shaped strings, with or without
+        /// sandbox roots configured, whether or not the path exists.
+        #[test]
+        fn is_path_allowed_never_panics(
+            raw in "(\\.\\./|/|~/|[a-zA-Z0-9_./-]){0,12}",
+            write in any::<bool>(),
+            rooted in any::<bool>(),
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = if rooted { ctx_for(dir.path()) } else { ToolContext::default() };
+            let _ = ctx.is_path_allowed(Path::new(&raw), write);
+        }
+
+        /// Deterministic: the same path and mode always yield the same
+        /// verdict (no hidden time- or order-dependence).
+        #[test]
+        fn is_path_allowed_is_deterministic(
+            raw in "(\\.\\./|/|[a-zA-Z0-9_./-]){0,12}",
+            write in any::<bool>(),
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = ctx_for(dir.path());
+            let path = dir.path().join(&raw);
+            let a = ctx.is_path_allowed(&path, write);
+            let b = ctx.is_path_allowed(&path, write);
+            prop_assert_eq!(a, b);
+        }
+
+        /// Empty roots mean "no restriction" for that access mode --
+        /// documented directly on `is_path_allowed`. `with_all_capabilities`
+        /// is the constructor with empty `allowed_read_roots`/
+        /// `allowed_write_roots`; `ToolContext::default()` is NOT empty --
+        /// it defaults to `[cwd, .impulse]`/`[.impulse]` -- so this
+        /// deliberately does not use `default()`.
+        #[test]
+        fn is_path_allowed_with_no_roots_configured_allows_anything(
+            raw in ".{0,64}",
+            write in any::<bool>(),
+        ) {
+            let ctx = ToolContext::with_all_capabilities();
+            prop_assert!(ctx.is_path_allowed(Path::new(&raw), write));
+        }
+    }
+
+    // Allowed => the resolved candidate is truly under a resolved root.
+    // Built over a real filesystem tree (an existing subdirectory and an
+    // existing file inside it, plus an existing sibling directory outside
+    // the sandboxed root) so `canonicalize` succeeds cleanly on every
+    // generated candidate -- the property is about the sandbox check, not
+    // about `secure_resolve`'s not-yet-created-file fallback path (covered
+    // separately below).
+    proptest! {
+        #[test]
+        fn is_path_allowed_true_implies_resolved_path_is_under_a_resolved_root(
+            segment in "[a-z][a-z0-9_]{0,8}",
+            write in any::<bool>(),
+            escape_levels in 0..4usize,
+        ) {
+            let base = tempfile::tempdir().unwrap();
+            let root = base.path().join("root");
+            let inside = root.join("inside");
+            std::fs::create_dir_all(&inside).unwrap();
+            std::fs::write(inside.join("file.txt"), b"x").unwrap();
+            let ctx = ctx_for(&root);
+
+            // A candidate that walks `escape_levels` directories up from
+            // `inside` before appending a fresh segment -- at `escape_levels
+            // <= 1` it stays under `root`; at higher values it (usually)
+            // escapes above `root` into `base` or above.
+            let mut candidate = inside.clone();
+            for _ in 0..escape_levels {
+                candidate.push("..");
+            }
+            candidate.push(&segment);
+
+            let allowed = ctx.is_path_allowed(&candidate, write);
+            if allowed {
+                let resolved = secure_resolve(&candidate);
+                let resolved_root = secure_resolve(&root);
+                prop_assert!(
+                    resolved.starts_with(&resolved_root),
+                    "is_path_allowed said true for {candidate:?} (resolved {resolved:?}), \
+                     which does not start with the resolved root {resolved_root:?}"
+                );
+            }
+        }
+
+        /// A trailing slash on an existing in-sandbox directory never
+        /// changes the verdict compared to the same path without one.
+        #[test]
+        fn is_path_allowed_trailing_slash_does_not_change_the_verdict(
+            segment in "[a-z][a-z0-9_]{0,8}",
+            write in any::<bool>(),
+        ) {
+            let base = tempfile::tempdir().unwrap();
+            let root = base.path().join("root");
+            let sub = root.join(&segment);
+            std::fs::create_dir_all(&sub).unwrap();
+            let ctx = ctx_for(&root);
+
+            let without_slash = ctx.is_path_allowed(&sub, write);
+            let mut with_slash = sub.as_os_str().to_owned();
+            with_slash.push("/");
+            let with_slash = ctx.is_path_allowed(Path::new(&with_slash), write);
+            prop_assert_eq!(without_slash, with_slash);
+        }
+    }
+
+    /// A `..`-traversal candidate that lexically escapes the sandbox root,
+    /// for a target that does not exist yet (the write-a-new-file case
+    /// `secure_resolve`'s doc comment calls out): denied, never accidentally
+    /// allowed because canonicalize failed open.
+    #[test]
+    fn is_path_allowed_denies_a_traversal_to_a_not_yet_created_file_outside_the_root() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let ctx = ctx_for(&root);
+
+        let candidate = root.join("../../etc/definitely-not-created-by-this-test");
+        assert!(
+            !ctx.is_path_allowed(&candidate, true),
+            "a `..`-traversal to a nonexistent target outside the root must be denied"
+        );
+    }
+
+    /// A symlink loop (`a` -> `b`, `b` -> `a`) must not panic or hang --
+    /// `canonicalize` detects the cycle and errors, and `secure_resolve`'s
+    /// ancestor fallback walk is bounded by path depth regardless.
+    #[test]
+    fn is_path_allowed_does_not_panic_or_hang_on_a_symlink_loop() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let a = root.join("a");
+        let b = root.join("b");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&b, &a).unwrap();
+            std::os::unix::fs::symlink(&a, &b).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            // No portable symlink-loop construction on this target; nothing
+            // to probe, but the test still proves the harness itself builds.
+            return;
+        }
+        let ctx = ctx_for(&root);
+        let _ = ctx.is_path_allowed(&a, false);
+        let _ = ctx.is_path_allowed(&a.join("further/nested/tail"), false);
+    }
+
+    /// A real self-referential symlink (`self -> self`) is the degenerate
+    /// one-node cycle -- same panic/hang-safety property as the two-node
+    /// loop above, exercised separately since it stresses
+    /// `secure_resolve`'s ancestor walk differently (the symlink's own
+    /// parent is real and resolves immediately).
+    #[test]
+    fn is_path_allowed_does_not_panic_or_hang_on_a_self_referential_symlink() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let looped = root.join("self_loop");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&looped, &looped).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            return;
+        }
+        let ctx = ctx_for(&root);
+        let _ = ctx.is_path_allowed(&looped, false);
+    }
+}

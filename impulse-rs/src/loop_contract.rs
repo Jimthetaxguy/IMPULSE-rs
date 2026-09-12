@@ -1219,3 +1219,83 @@ mod tests {
         assert_eq!(first, second);
     }
 }
+
+/// Property-based / fuzz-style tests over [`error_signature`] -- see
+/// `docs/superpowers/specs/2026-09-12-governed-parser-property-tests.md`.
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn error_signature_never_panics(content in ".{0,4096}") {
+            let _ = error_signature(&content);
+        }
+
+        #[test]
+        fn error_signature_is_bounded_by_the_max_char_constant(content in "(?s).{0,4096}") {
+            prop_assert!(error_signature(&content).chars().count() <= ERROR_SIGNATURE_MAX_CHARS);
+        }
+    }
+
+    fn no_alnum_strategy() -> impl Strategy<Value = String> {
+        "[ \t!@#.,;:_=-]{0,10}"
+    }
+
+    /// Guarantees at least one alphanumeric character lands in the line, by
+    /// construction (the middle segment is drawn from `[a-zA-Z0-9]{1,10}`).
+    fn has_alnum_strategy() -> impl Strategy<Value = String> {
+        ("[ \t!@#]{0,5}", "[a-zA-Z0-9]{1,10}", "[ \t!@#]{0,5}")
+            .prop_map(|(a, b, c)| format!("{a}{b}{c}"))
+    }
+
+    #[derive(Clone, Debug)]
+    enum LineSpec {
+        NoAlnum(String),
+        HasAlnum(String),
+    }
+
+    fn line_spec_strategy() -> impl Strategy<Value = LineSpec> {
+        prop_oneof![
+            no_alnum_strategy().prop_map(LineSpec::NoAlnum),
+            has_alnum_strategy().prop_map(LineSpec::HasAlnum),
+        ]
+    }
+
+    proptest! {
+        /// Builds multi-line content from a mix of alnum-free and
+        /// alnum-carrying lines and checks `error_signature` picks exactly
+        /// the documented source: the first (trimmed) line containing an
+        /// alphanumeric character when one exists, else the whole trimmed
+        /// content -- capped at [`ERROR_SIGNATURE_MAX_CHARS`] either way.
+        #[test]
+        fn error_signature_selects_the_first_alnum_bearing_line_or_falls_back_to_the_whole_trim(
+            specs in proptest::collection::vec(line_spec_strategy(), 0..8),
+        ) {
+            let lines: Vec<String> = specs
+                .iter()
+                .map(|spec| match spec {
+                    LineSpec::NoAlnum(s) => s.clone(),
+                    LineSpec::HasAlnum(s) => s.clone(),
+                })
+                .collect();
+            let content = lines.join("\n");
+
+            let expected_source: String = {
+                let mut found = None;
+                for line in content.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.chars().any(char::is_alphanumeric) {
+                        found = Some(trimmed.to_string());
+                        break;
+                    }
+                }
+                found.unwrap_or_else(|| content.trim().to_string())
+            };
+            let expected: String = expected_source.chars().take(ERROR_SIGNATURE_MAX_CHARS).collect();
+
+            prop_assert_eq!(error_signature(&content), expected);
+        }
+    }
+}

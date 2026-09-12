@@ -4,6 +4,11 @@ target2/
 .superpowers/
 Impulse.app/
 
+# proptest failure-seed corpus (local re-run aid, not portable across
+# generator changes) -- introduced with the proptest dev-dependency by the
+# governed-fuzz-harness lane, docs/superpowers/specs/2026-09-12-governed-parser-property-tests.md
+proptest-regressions/
+
 # OS metadata
 .DS_Store
 
