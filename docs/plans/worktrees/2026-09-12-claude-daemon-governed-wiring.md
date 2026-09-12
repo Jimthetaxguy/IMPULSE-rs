@@ -271,6 +271,13 @@ promotion, digest sorting, `MarkRunning`'s staged fallback) is in that function.
 - **Registration no longer needs a separate materialize step.** Register with
   `.world_scope(WorldScope::StagedAuthoritative)` and the returned record already carries an active
   staged worktree; take the pane cwd from `task.launch_working_directory()`.
+- **Switch `staged_config_refusal_notice` off string matching.** PR #58 recognizes #53's
+  `StagedConfigRefusal` by text-matching its strings at one replacement point in
+  `impulse-desktop/src/ui.rs`. Once this lane adds the typed response variant (post-#53 checklist
+  step 5), that notice should read the variant and its `component` instead. Text matching on an
+  error message is a contract nobody declared: it breaks silently the first time the wording is
+  improved, and the wording of exactly these operator-facing strings has already been corrected
+  once in this lane's review round 1.
 - **Producer responses changed shape (additively).** `RunGovernedVerification`,
   `RunGovernedSupervisorReview`, and `PromoteGovernedOutcome` now answer with the task flattened
   plus `replayed` and `pending_rerun_reason`. Existing code that deserializes a `GovernedTaskRun`
@@ -437,7 +444,60 @@ both sides. When it lands:
      not an error-string convention. Bump nothing — it is additive within v9 if it lands before
      this PR merges; if v9 has already shipped, it takes v10.
 
-6. Re-run the full gate, push, and report the new totals. Do not merge.
+6. **Reconcile with PR #58 (desktop controls, stacked on this branch).** It edits
+   `impulse-ops/src/governed_wiring.rs`, which is this lane's file, so the merge-in is where the two
+   meet.
+
+   - **A real hole in this lane's `unreferenced_accepted_commit_on_discard`, found by #58.** As
+     delivered here it returns `None` whenever no promotion is recorded — it reads
+     `task.latest_promotion()?` and gives up. That is wrong for exactly one reachable state, and it
+     is a state this lane's own discardability rule creates: an **accepted** task whose staged
+     worktree carries an `Unknown` configuration pin is discardable *without* any promotion
+     attempt (`staged_worktree_is_discardable` short-circuits on an unpinned worktree, because such
+     a worktree can never be promoted and discarding is the only way forward). Discarding it drops
+     the only ref to the accepted commit, and the operator is told nothing. #58 widened the
+     function to fall back to the accepted claim's `subject_revision`. **Take #58's version.** Then:
+     - `impulse-ops`'s `test_only_an_accepted_but_blocked_promotion_names_an_unreferenced_commit`
+       asserts the old semantics (`None` when no promotion has been attempted) and **will fail**
+       after the merge. That failure is correct and expected; rewrite the assertion rather than
+       reverting the widening, and rename the test, since "only an accepted but blocked promotion"
+       stops being true.
+     - Add the **accepted / unpinned / zero-promotions** case to both sides of the chain that fills
+       from this function: `GovernedStagedWorktreeDiscardAck.unreferenced_accepted_commit` (the
+       endpoint test in `src/daemon/governed_wiring.rs`) and
+       `unreferenced_commit_warning` (`governed_message_tests`). Re-run both suites: neither
+       currently exercises an unpinned worktree.
+
+   - **Add the importing counterpart to #58's promotability matrix.** #58 added
+     `impulse_ops::governed_wiring::governed_outcome_is_promotable` plus a 432-case matrix test that
+     *restates* this lane's inline promote checks and the state layer's `RecordPromotion`
+     preconditions, because from `impulse-ops` it cannot import either. A restatement is exactly the
+     drift risk P2-4 was raised about, so the counterpart belongs here, beside
+     `both_discardability_rules_agree_over_the_whole_state_matrix`, where both are importable: over
+     the same matrix, assert `governed_outcome_is_promotable` is a **superset** of this lane's
+     inline checks (`is_accepted` + `active_staged_worktree().is_some()` + staged scope — every task
+     the endpoint would let through, the shared predicate must also allow) and a **subset** of the
+     state layer's `RecordPromotion` preconditions (nothing the predicate promises is promotable may
+     be refused by the ledger).
+
+     **The subset half needs a decision, and it is the same one P2-4 needed.** The
+     `RecordPromotion` preconditions live inside `apply_mutation` in `src/state/governed_task.rs`
+     and are not separately callable. Two options: (a) extract them into a
+     `pub(crate) fn record_promotion_preconditions_hold(task) -> bool` — a sixth blocked-path hunk,
+     but the same one-keyword shape as the `staged_worktree_is_discardable` change and the honest
+     fix; or (b) drive `state.mutate_governed_task` once per matrix case against a real ledger and
+     classify accept/refuse, which needs no blocked-file edit but is far slower and has to
+     construct 432 valid ledger states. **Recommendation: (a).** Option (b) tests the real path but
+     the setup cost buys nothing the predicate comparison does not already give, and a matrix test
+     that takes minutes will get deleted. Raise it with the owner before writing it.
+
+   - **Record the desktop follow-up.** #58 text-matches `StagedConfigRefusal`'s strings at a single
+     replacement point, `staged_config_refusal_notice` in `impulse-desktop/src/ui.rs`. When step 5's
+     typed response variant lands, #58 should switch that notice to the typed variant instead of
+     string matching. `impulse-desktop/**` is blocked for this lane, so this is a handoff, not a
+     change to make here — it is listed under "For the desktop track" below.
+
+7. Re-run the full gate, push, and report the new totals. Do not merge.
 
 ### Residual gaps this lane knowingly leaves
 
@@ -448,6 +508,13 @@ both sides. When it lands:
   re-materializes it. Recovery today is an operator-composed `MutateGovernedTask`. A dedicated
   `MaterializeGovernedStagedWorktree` endpoint would close it; it was left out because the brief
   scopes materialization to registration.
+- **`unreferenced_accepted_commit_on_discard` misses one reachable state as delivered here.** It
+  returns `None` whenever no promotion is recorded, but an accepted task with an `Unknown`
+  configuration pin is discardable with no promotion attempt — this lane's own discardability rule
+  says so — and discarding it drops the only ref to the accepted commit with no warning. Found by
+  PR #58, which widened the function to fall back to the accepted claim's `subject_revision`. Fixed
+  on merge-in, not here, because #58 is stacked on this branch and already owns the change; see the
+  post-#53 checklist for the tests that must move with it.
 - **`with_reservation` is not panic-safe and this wiring adds no `catch_unwind`.** An in-process
   panic inside a producer closure is treated exactly like a process crash: the reservation stays
   open until a restart's reconcile, or until the revision-scoped duplicate check closes it when the
