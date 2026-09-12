@@ -1273,6 +1273,14 @@ pub(crate) async fn handle_governed_producer_request(
     request: DaemonRequest,
     state: &SharedState,
 ) -> DaemonResponse {
+    // Read before the producer runs, for the refusal path only: a refusal
+    // records nothing, so the response echoes the record exactly as it stood.
+    let claim_task_for_refusal = match &request {
+        DaemonRequest::SubmitGovernedClaim { request } => {
+            require_current_governed_task(state, &request.project_id, &request.task_id).ok()
+        }
+        _ => None,
+    };
     // Verification runs its side effect and persists its receipt inside one
     // durable producer reservation (ADR-0012 amendment), which needs the whole
     // request — side effect *and* mutation — in one closure. It therefore owns
@@ -1331,7 +1339,16 @@ pub(crate) async fn handle_governed_producer_request(
 
     match result {
         Ok(task) => respond_ok(&task),
-        Err(error) => respond_err(error),
+        // A staged-configuration refusal (ADR-0019 rule 13) is answered as a
+        // typed successful-shape response, not an error: the claim producer
+        // refused to run Git in a staged worktree whose pinned configuration
+        // drifted, which is an operator action to take rather than a failure to
+        // report. `super::governed_wiring` owns the recognition so the claim
+        // and verification endpoints cannot disagree about it.
+        Err(error) => match claim_task_for_refusal {
+            Some(task) => super::governed_wiring::respond_producer_error(&task, error),
+            None => respond_err(format!("{error:#}")),
+        },
     }
 }
 

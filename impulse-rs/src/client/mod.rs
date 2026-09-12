@@ -87,6 +87,39 @@ fn daemon_busy_error(
     anyhow!("Daemon {resource} is busy; retry after at least {retry_after_ms}ms")
 }
 
+/// What a daemon-owned producer request came back with.
+///
+/// A staged-configuration refusal (ADR-0019 rule 13) is a successful response
+/// carrying a typed reason, not an error: the producer declined to run Git in a
+/// staged worktree whose pinned configuration drifted, nothing was recorded,
+/// and the remedy is a specific operator action.
+#[derive(Debug, Clone)]
+pub enum GovernedProducerOutcome<T> {
+    Recorded(T),
+    // Boxed: the refusal acknowledgement carries a whole flattened
+    // `GovernedTaskRun` (~824 bytes) while the recorded variant is often much
+    // smaller, and it is the rare branch. Without the box every caller pays the
+    // larger size on the common path.
+    StagedConfigRefused(Box<impulse_ops::governed_wiring::GovernedStagedConfigRefusalAck>),
+}
+
+impl<T> GovernedProducerOutcome<T> {
+    /// The recorded value, or an error naming the refusal and its remedy.
+    ///
+    /// For callers that genuinely have nothing to do with a refusal beyond
+    /// reporting it.
+    pub fn into_recorded(self, operation: &str) -> Result<T> {
+        match self {
+            Self::Recorded(value) => Ok(value),
+            Self::StagedConfigRefused(refusal) => anyhow::bail!(
+                "{operation} refused: {} — {}",
+                refusal.reason,
+                refusal.remedy
+            ),
+        }
+    }
+}
+
 pub struct DaemonClient {
     socket_path: PathBuf,
 }
@@ -384,6 +417,35 @@ impl DaemonClient {
         }
     }
 
+    /// Decode a producer response that may be a typed staged-configuration
+    /// refusal instead of a record.
+    ///
+    /// Both shapes are `Ok` on the wire — a refusal is not a failure — so the
+    /// discrimination happens here, on the `refused` flag, rather than leaving
+    /// every caller to guess from the shape.
+    async fn governed_producer_outcome<T: serde::de::DeserializeOwned>(
+        &self,
+        request: DaemonRequest,
+        operation: &str,
+        timeout: Duration,
+    ) -> Result<GovernedProducerOutcome<T>> {
+        let value: serde_json::Value = self.governed_response(request, operation, timeout).await?;
+        if value
+            .get("refused")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            let refusal = serde_json::from_value(value)
+                .with_context(|| format!("{operation}: invalid staged-config refusal response"))?;
+            return Ok(GovernedProducerOutcome::StagedConfigRefused(Box::new(
+                refusal,
+            )));
+        }
+        serde_json::from_value(value)
+            .map(GovernedProducerOutcome::Recorded)
+            .with_context(|| format!("{operation}: invalid governed producer response"))
+    }
+
     pub async fn get_governed_task(
         &self,
         project_id: String,
@@ -413,8 +475,8 @@ impl DaemonClient {
     pub async fn submit_governed_claim(
         &self,
         request: impulse_ops::governed_task::GovernedClaimRequest,
-    ) -> Result<impulse_ops::governed_task::GovernedTaskRun> {
-        self.governed_response(
+    ) -> Result<GovernedProducerOutcome<impulse_ops::governed_task::GovernedTaskRun>> {
+        self.governed_producer_outcome(
             DaemonRequest::SubmitGovernedClaim { request },
             "submit governed claim",
             RESPONSE_TIMEOUT,
@@ -425,8 +487,8 @@ impl DaemonClient {
     pub async fn run_governed_verification(
         &self,
         request: impulse_ops::governed_task::GovernedVerificationRequest,
-    ) -> Result<impulse_ops::governed_wiring::GovernedProducerAck> {
-        self.governed_response(
+    ) -> Result<GovernedProducerOutcome<impulse_ops::governed_wiring::GovernedProducerAck>> {
+        self.governed_producer_outcome(
             DaemonRequest::RunGovernedVerification { request },
             "run governed verification",
             GOVERNED_VERIFICATION_RESPONSE_TIMEOUT,

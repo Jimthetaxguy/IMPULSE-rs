@@ -285,7 +285,36 @@ async fn handle_governed_claim(
             artifact_ids,
         })
         .await?;
-    print_governed_ack(&acknowledged, json, "Claim acknowledged")
+    match acknowledged {
+        crate::client::GovernedProducerOutcome::Recorded(task) => {
+            print_governed_ack(&task, json, "Claim acknowledged")
+        }
+        crate::client::GovernedProducerOutcome::StagedConfigRefused(refusal) => {
+            print_staged_config_refusal(&refusal, json, "Claim refused")
+        }
+    }
+}
+
+/// Report a staged-configuration refusal (ADR-0019 rule 13).
+///
+/// Not an error path: nothing ran, nothing was recorded, and retrying changes
+/// nothing — so the operator gets the reason and the remedy, and the process
+/// still exits non-zero only because the producer did not produce.
+fn print_staged_config_refusal(
+    refusal: &impulse_ops::governed_wiring::GovernedStagedConfigRefusalAck,
+    json: bool,
+    label: &str,
+) -> Result<()> {
+    if json {
+        return print_json(refusal).context("Failed to serialize governed refusal");
+    }
+    println!(
+        "{label}: {} revision {} — {}",
+        refusal.task.id, refusal.task.revision, refusal.reason
+    );
+    println!("  remedy: {}", refusal.remedy);
+    println!("  nothing was recorded; the task is unchanged");
+    Ok(())
 }
 
 async fn handle_governed_verify(
@@ -303,7 +332,14 @@ async fn handle_governed_verify(
             expected_revision: task.revision,
         })
         .await?;
-    print_producer_ack(&acknowledged, json, "Verification acknowledged")
+    match acknowledged {
+        crate::client::GovernedProducerOutcome::Recorded(ack) => {
+            print_producer_ack(&ack, json, "Verification acknowledged")
+        }
+        crate::client::GovernedProducerOutcome::StagedConfigRefused(refusal) => {
+            print_staged_config_refusal(&refusal, json, "Verification refused")
+        }
+    }
 }
 
 async fn handle_governed_review(
@@ -494,6 +530,26 @@ mod governed_message_tests {
         assert!(
             line.contains("stays accepted"),
             "a blocked promotion must not read as a failed run: {line}"
+        );
+    }
+
+    /// The accepted/unpinned/zero-promotions case: an accepted run whose staged
+    /// worktree has no configuration pin is discardable with no promotion
+    /// attempt, so the warning must be reachable without a recorded promotion.
+    /// The CLI fills this line straight from
+    /// `GovernedStagedWorktreeDiscardAck.unreferenced_accepted_commit`, so the
+    /// only thing this side has to get right is that it renders whatever the
+    /// ack carries -- including a revision that came from the accepted claim
+    /// rather than from a promotion record.
+    #[test]
+    fn test_unreferenced_commit_warning_renders_a_claim_sourced_revision() {
+        let from_claim = unreferenced_commit_warning("c1a1mc0mm1t");
+        assert!(from_claim.contains("c1a1mc0mm1t"));
+        assert!(from_claim.contains("never promoted onto the canonical branch"));
+        assert!(from_claim.contains("git cat-file -p c1a1mc0mm1t"));
+        assert!(
+            !from_claim.contains("blocked"),
+            "the wording must not assume a promotion was attempted: {from_claim}"
         );
     }
 

@@ -366,6 +366,73 @@ rollback removes only the checkout it created itself. Closing it properly means 
 registration the same way the three producers reserve, which is the same `ProducerKind` addition
 P2-2 needs.
 
+## Post-#53 merge-in (2026-09-12)
+
+`origin/main` at `1f866d6` (#53 squashed as `ceb29a8`, plus #51 and #55) merged in with a merge
+commit. Every checklist item below was executed; the checklist itself is kept underneath as the
+record of what was planned.
+
+### Merge resolution
+
+One conflict, in `CONTEXT.md`'s **world scope** entry: #53 documented the three invariants its
+fixes hardened, this lane documented v9 reachability. Both kept, joined into one paragraph. The two
+cherry-picked commits (`8dca0a1`, `e533b09`) arrived from both sides and merged as no-ops, and
+`is_untracked_impulse_runtime_artifact` auto-merged with **both** exemption entries present
+(`PRODUCER_RESERVATIONS.json` from this lane, `MEMORY_CANDIDATES.json` from the cherry-pick) —
+verified by inspection, not assumed.
+
+### What #53 changed under this lane
+
+- `launch_working_directory()` returns `Result`, so both call sites (`src/daemon/governed_wiring.rs`,
+  `tests/daemon_governed_wiring.rs`) take `.expect("a materialized staged task has a launch working
+  directory")`. `LaunchWorkingDirectoryError` losing `Copy` touched nothing: both sites use the
+  `Ok` value.
+- `SharedRepositoryConfigDigest` gained `scheme_version`, so two test fixtures switched to the
+  `::current(..)` constructor rather than a struct literal — which is the right call anyway, since a
+  literal would pin the legacy scheme silently.
+- `MarkRunning` now refuses a staged task before materialization. Registration-time materialization
+  already satisfies it; `staged_registration_materializes_the_worktree_before_any_launch` covers it.
+
+### Delivered this round
+
+| Item | What landed |
+|---|---|
+| **Staged end-to-end** | `one_staged_run_completes_through_every_endpoint`: register (materializes) -> launch -> Builder commit -> claim -> **real Cargo verification** -> Supervisor review -> operator approval -> promote -> discard, against a real repository. Asserts the canonical branch does not move until promotion, that promotion syncs the working tree and not just the ref, that a promoted run orphans no commit, and that every producer released its reservation. This is the chain that could not complete before #53. |
+| **Typed `StagedConfigRefusal`** | New `StagedConfigRefusalReason` + `GovernedStagedConfigRefusalAck` in `impulse-ops`, recognized by `governed_wiring::staged_config_refusal` and answered as a successful-shape response by `SubmitGovernedClaim` and `RunGovernedVerification`. Covers all three producer variants, not just the two named in the handoff — `UnsupportedSubmodules` is a refusal too, and dropping it would have left one class rendering as a generic error. `DaemonClient` returns `GovernedProducerOutcome::{Recorded, StagedConfigRefused}`; the CLI and Ion's `governed_submit_claim` print the reason and the remedy. |
+| **Refusal releases its reservation** | `a_refused_verification_releases_its_reservation` plants the driver *between* the claim and the verification, asserts the typed refusal, that no Git ran, that nothing was recorded, and that `open_reservations()` is empty — the property the remedy's retry depends on. |
+| **`unreferenced_accepted_commit_on_discard` widened** | Falls back to the accepted claim's `subject_revision` when no promotion is recorded. The `impulse-ops` test was rewritten and renamed (`test_an_accepted_run_that_was_never_promoted_names_its_unreferenced_commit`), and the accepted/unpinned/zero-promotions case added at both fill sites. |
+| **Promotion preconditions extracted** | `record_promotion_preconditions_hold` + `PromotionPreconditionFailure` in `src/state/governed_task.rs`, called from the `RecordPromotion` arm so predicate and mutation cannot drift; each variant's `Display` is the message the arm produced inline, so nothing an operator reads changed. |
+| **Promotability sandwich test** | `promotability_sits_between_the_endpoint_and_the_ledger_over_the_whole_matrix`: 432 states x claim/no-claim = 864 comparisons, asserting the shared predicate is a superset of the endpoint's admission and a subset of the ledger's preconditions, plus an assertion that it admits something (a sandwich that admits nothing proves nothing). |
+
+### What the sandwich test caught
+
+The endpoint's inline promote preflight was **weaker than the ledger's**: it checked only "accepted"
+and "has an active staged worktree", so an accepted staged task with no claim, or one already
+promoted, was admitted — a durable reservation taken and the producer called — and then refused by
+the ledger. Benign in outcome, wrong in shape. Fixed by making the endpoint call the ledger's own
+predicate (`promote_preflight`), so all three now agree by construction rather than by coincidence;
+the test calls that function rather than restating it, so changing the endpoint changes the test.
+This is exactly the class of drift the P2-4 cross-check was raised about, found the first time the
+same technique was pointed at promotion.
+
+### Deliberate deviations from the plan
+
+- **`governed_outcome_is_promotable` is implemented here, not taken from #58.** #58 is stacked on
+  this branch and is not on `main`, so the function did not exist to import. It is written in
+  `impulse-ops/src/governed_wiring.rs` — this lane's file — with the sandwich relationship stated in
+  its doc comment. **#58 should drop its copy and rebase onto this one**; if the two differ, the
+  sandwich test is what will say so.
+- **The accepted/unpinned/zero-promotions case is proven at the function, not at the endpoint.**
+  That state is real but **not producible by this build**: `materialize_staged_worktree` always
+  records a pin, so an unpinned worktree can only arrive on a ledger written before the pin existed.
+  Synthesizing one by editing `GOVERNED_TASKS.json` fails closed on ADR-0019 rule 11's replay
+  validation — correct behavior, and not worth defeating for a test. The behavior is covered in
+  `impulse-ops`; `the_discard_ack_is_filled_from_the_shared_orphaned_commit_rule` covers the wiring
+  that carries it to the operator.
+- **The prepared e2e's negative branch became its own test.** `a_drifted_config_pin_refuses_the_claim_with_a_typed_reason`
+  is separate from the happy path rather than a branch inside it: one test asserting a run completes
+  and another asserting a run is refused read better than one test doing both.
+
 ## Post-#53 merge checklist
 
 PR #53 (`claude/adr0019-p1-fixes-20260912`) merges **before** this one. It contains verbatim

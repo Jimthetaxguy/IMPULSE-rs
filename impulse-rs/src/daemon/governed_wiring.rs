@@ -45,8 +45,8 @@ use impulse_ops::governed_task::{
 };
 use impulse_ops::governed_wiring::{
     staged_worktree_is_discardable, unreferenced_accepted_commit_on_discard, GovernedProducerAck,
-    GovernedPromotionRequest, GovernedStagedWorktreeDiscardAck,
-    GovernedStagedWorktreeDiscardRequest,
+    GovernedPromotionRequest, GovernedStagedConfigRefusalAck, GovernedStagedWorktreeDiscardAck,
+    GovernedStagedWorktreeDiscardRequest, StagedConfigRefusalReason,
 };
 
 use super::actor_provenance::{ActorProvenanceError, ConnectionClass};
@@ -355,6 +355,20 @@ fn replay_promotion(task: &GovernedTaskRun, expected_revision: u64) -> Result<&G
         .context("stale governed promotion request has no record at its expected revision")
 }
 
+/// Admission check for a promotion attempt, before a reservation is taken or a
+/// Git process is spawned.
+///
+/// It calls the ledger's own `RecordPromotion` predicate rather than restating
+/// it. An earlier version checked only "accepted" and "has an active staged
+/// worktree", which is strictly weaker: an accepted task with a worktree but no
+/// claim, or one already promoted, was admitted here and then refused by the
+/// ledger — after the reservation had been taken and the producer called. The
+/// cross-check matrix test is what surfaced that.
+fn promote_preflight(task: &GovernedTaskRun) -> Result<()> {
+    crate::state::record_promotion_preconditions_hold(task)
+        .map_err(|failure| anyhow::anyhow!("governed promotion refused: {failure}"))
+}
+
 async fn promote_governed_outcome(
     state: &SharedState,
     request: GovernedPromotionRequest,
@@ -378,12 +392,7 @@ async fn promote_governed_outcome(
         return Ok(GovernedProducerAck::new(task, true, None));
     }
 
-    if !task.is_accepted() {
-        anyhow::bail!("governed promotion requires an accepted governed task");
-    }
-    if task.active_staged_worktree().is_none() {
-        anyhow::bail!("governed promotion requires an active staged worktree");
-    }
+    promote_preflight(&task)?;
 
     let pending = pending_rerun_reason(
         state,
@@ -513,6 +522,47 @@ pub(crate) async fn handle_governed_staged_request(
     }
 }
 
+// ── Typed staged-configuration refusal (ADR-0019 rule 13) ───────────────────
+
+/// Recognize a producer's refusal to run Git inside a staged worktree.
+///
+/// `StagedConfigRefusal` is raised before any Git process is spawned, so it is
+/// not a run failure and must not be reported as one: nothing is broken, the
+/// staged world is in a state the daemon may not touch. Downcasting it here is
+/// what lets the endpoint answer with a typed reason and its remedy instead of
+/// an error string a surface would have to parse.
+pub(crate) fn staged_config_refusal(error: &anyhow::Error) -> Option<StagedConfigRefusalReason> {
+    use crate::governed_producers::StagedConfigRefusal;
+    error
+        .downcast_ref::<StagedConfigRefusal>()
+        .map(|refusal| match refusal {
+            StagedConfigRefusal::Unpinned { .. } => StagedConfigRefusalReason::Unpinned,
+            StagedConfigRefusal::Changed { component, .. } => StagedConfigRefusalReason::Changed {
+                component: *component,
+            },
+            StagedConfigRefusal::UnsupportedSubmodules { path, .. } => {
+                StagedConfigRefusalReason::UnsupportedSubmodules { path: path.clone() }
+            }
+        })
+}
+
+/// Answer a producer error: a staged-configuration refusal becomes a typed
+/// successful-shape response; everything else stays an error.
+///
+/// `task` is the record as it stood before the producer ran. A refusal mutates
+/// nothing, so echoing it back is accurate rather than a convenience.
+pub(crate) fn respond_producer_error(
+    task: &GovernedTaskRun,
+    error: anyhow::Error,
+) -> DaemonResponse {
+    match staged_config_refusal(&error) {
+        Some(reason) => respond_ok(&GovernedStagedConfigRefusalAck::new(task.clone(), reason)),
+        // `{:#}` so a genuine failure keeps its context chain; `Display` alone
+        // would drop the layer carrying the operator's recovery text.
+        None => respond_err(format!("{error:#}")),
+    }
+}
+
 // ── Verification and Supervisor review, under a durable reservation ─────────
 
 /// `RunGovernedVerification`, with the fixed-profile command run and its
@@ -521,9 +571,17 @@ pub(crate) async fn handle_governed_verification(
     state: &SharedState,
     request: impulse_ops::governed_task::GovernedVerificationRequest,
 ) -> DaemonResponse {
+    // The task is re-read for the refusal path only: a refusal records nothing,
+    // so the response echoes the record exactly as it stood. A lookup failure
+    // here cannot mask the real error -- it falls through to reporting it.
+    let unchanged =
+        require_current_governed_task(state, &request.project_id, &request.task_id).ok();
     match run_governed_verification(state, request).await {
         Ok(ack) => respond_ok(&ack),
-        Err(error) => respond_err(error),
+        Err(error) => match unchanged {
+            Some(task) => respond_producer_error(&task, error),
+            None => respond_err(format!("{error:#}")),
+        },
     }
 }
 
@@ -1069,7 +1127,12 @@ mod tests {
             oid,
             "the staged worktree starts at the attested initial OID"
         );
-        assert_eq!(registered.launch_working_directory(), staged.root);
+        assert_eq!(
+            registered
+                .launch_working_directory()
+                .expect("a materialized staged task has a launch working directory"),
+            staged.root
+        );
         assert_eq!(
             registered.execution_state,
             GovernedExecutionState::Registered,
@@ -1419,6 +1482,310 @@ mod tests {
             .any(|event| event.kind == GovernedTaskEventKind::StagedWorktreeDiscarded));
     }
 
+    /// The accepted/unpinned/zero-promotions case, and why its coverage sits
+    /// where it does.
+    ///
+    /// An accepted run whose staged worktree carries no configuration pin is
+    /// discardable with no promotion attempt — `staged_worktree_is_discardable`
+    /// short-circuits on an unpinned worktree — and discarding it drops the only
+    /// ref to the accepted commit. It is a real state, but **not one this build
+    /// can produce**: `materialize_staged_worktree` always records a pin, so an
+    /// unpinned worktree only arrives on a ledger written before the pin
+    /// existed. Synthesizing one by editing `GOVERNED_TASKS.json` fails closed
+    /// on ADR-0019 rule 11's replay validation, which is correct behavior and
+    /// not worth defeating for a test.
+    ///
+    /// So the behavior is proven on the pure function (`impulse-ops`, which
+    /// covers the unpinned case directly), and what is proven *here* is the
+    /// wiring: both the fresh and the replay branch of the discard endpoint
+    /// fill the acknowledgement from that one function, so whatever it decides
+    /// for a legacy record is what the operator is told.
+    #[test]
+    fn the_discard_ack_is_filled_from_the_shared_orphaned_commit_rule() {
+        let mut unpinned = accepted_unpinned_task();
+        assert!(
+            staged_worktree_is_discardable(&unpinned),
+            "an unpinned accepted worktree is reclaimable with no promotion attempt"
+        );
+        let expected = unreferenced_accepted_commit_on_discard(&unpinned)
+            .map(str::to_string)
+            .expect("an accepted run with no promotion still orphans its claim commit");
+
+        // What both endpoint branches construct.
+        let ack = GovernedStagedWorktreeDiscardAck {
+            discarded_root: unpinned.staged_worktree.as_ref().unwrap().root.clone(),
+            unreferenced_accepted_commit: unreferenced_accepted_commit_on_discard(&unpinned)
+                .map(str::to_string),
+            task: unpinned.clone(),
+        };
+        assert_eq!(
+            ack.unreferenced_accepted_commit.as_deref(),
+            Some(expected.as_str())
+        );
+
+        // A promoted run orphans nothing, and the same wiring must say so.
+        unpinned
+            .promotions
+            .push(impulse_ops::governed_task::GovernedPromotion {
+                id: impulse_ops::governed_task::GovernedRecordId::try_new("promo-u").unwrap(),
+                actor: staged_system_actor(),
+                accepted_revision: expected.clone(),
+                initial_subject_revision: "a".repeat(40),
+                outcome: GovernedPromotionOutcome::Promoted {
+                    promoted_revision: expected.clone(),
+                },
+                recorded_at: "2026-09-12T00:00:00Z".to_string(),
+                based_on_revision: 4,
+            });
+        assert_eq!(unreferenced_accepted_commit_on_discard(&unpinned), None);
+    }
+
+    /// An accepted, unpinned, never-promoted staged task, in memory.
+    fn accepted_unpinned_task() -> GovernedTaskRun {
+        let mut task = matrix_task(
+            GovernedReviewState::Accepted,
+            GovernedExecutionState::RuntimeExited,
+            impulse_ops::governed_task::SharedRepositoryConfigPin::Unknown,
+            None,
+        );
+        task.claims
+            .push(impulse_ops::governed_task::WorkerCompletionClaim {
+                id: impulse_ops::governed_task::GovernedRecordId::try_new("claim-u").unwrap(),
+                actor: GovernedActor {
+                    kind: GovernedActorKind::Worker,
+                    id: "worker".to_string(),
+                },
+                summary: "done".to_string(),
+                subject_revision: "b".repeat(40),
+                artifact_ids: Vec::new(),
+                diff_ref: None,
+                loop_report_digest: None,
+                loop_report_version: None,
+                submitted_at: "2026-09-12T00:00:00Z".to_string(),
+                based_on_revision: 2,
+            });
+        task
+    }
+
+    // ── Typed staged-configuration refusal ──────────────────────────────────
+
+    /// Plant a `filter.*.smudge` driver in the shared repository configuration,
+    /// which is what ADR-0019 rule 13 pins. `git config` in the staged worktree
+    /// writes `.git/config`, shared with the canonical checkout.
+    fn plant_shared_config_driver(repo: &Path, staged: &Path) -> PathBuf {
+        let marker = repo.join("smudge-ran.txt");
+        let script = repo.join("smudge.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf 'ran' > {}\ncat\n", marker.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        git(
+            staged,
+            &[
+                "config",
+                "filter.planted.smudge",
+                &format!("sh {}", script.display()),
+            ],
+        );
+        marker
+    }
+
+    /// A Builder that rewrites shared Git configuration is refused with a typed
+    /// reason, not an error string, and nothing runs against that tree.
+    #[tokio::test]
+    async fn a_drifted_config_pin_refuses_the_claim_with_a_typed_reason() {
+        let (repo, state, project_id, oid) = repo_state();
+        let registered = register_governed_task(
+            &state,
+            registration(
+                &project_id,
+                repo.path(),
+                &oid,
+                WorldScope::StagedAuthoritative,
+            ),
+            ConnectionClass::Operator,
+        )
+        .unwrap();
+        let staged_root = registered.active_staged_worktree().unwrap().root.clone();
+        let staged = Path::new(&staged_root);
+        let running = mutate(
+            &state,
+            &registered,
+            "refusal-running",
+            GovernedTaskMutation::MarkRunning {
+                actor: staged_system_actor(),
+            },
+        );
+
+        std::fs::write(
+            staged.join("src/lib.rs"),
+            "pub fn wiring_fixture() -> u8 {\n    1\n}\n",
+        )
+        .unwrap();
+        git(staged, &["add", "src/lib.rs"]);
+        git(staged, &["commit", "--quiet", "-m", "builder work"]);
+        let builder_oid = git(staged, &["rev-parse", "HEAD"]);
+        let marker = plant_shared_config_driver(repo.path(), staged);
+
+        let response = super::super::handlers::handle_governed_producer_request(
+            DaemonRequest::SubmitGovernedClaim {
+                request: impulse_ops::governed_task::GovernedClaimRequest {
+                    request_id: request_id("refusal-claim"),
+                    project_id: project_id.clone(),
+                    task_id: running.id.clone(),
+                    expected_revision: running.revision,
+                    summary: "work complete".to_string(),
+                    artifact_ids: Vec::new(),
+                },
+            },
+            &state,
+        )
+        .await;
+
+        let ack: GovernedStagedConfigRefusalAck = match response {
+            DaemonResponse::Ok { result } => serde_json::from_value(result)
+                .expect("a refusal is a successful-shape response carrying a typed reason"),
+            other => panic!("expected a typed refusal, received {other:?}"),
+        };
+        assert!(ack.refused);
+        assert_eq!(
+            ack.reason,
+            StagedConfigRefusalReason::Changed {
+                component: impulse_ops::governed_task::SharedConfigComponent::RepositoryConfig,
+            },
+            "the refusal must name which shared file changed"
+        );
+        assert!(
+            ack.remedy.contains("discard") && ack.remedy.contains("re-materialize"),
+            "the refusal must carry its remedy: {}",
+            ack.remedy
+        );
+
+        assert!(
+            !marker.exists(),
+            "the producer must refuse before Git materializes anything"
+        );
+        let after = state
+            .get_governed_task(&project_id, &running.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after, running, "a refused claim records nothing");
+        assert!(after.latest_claim().is_none());
+        assert_eq!(
+            git(staged, &["rev-parse", "HEAD"]),
+            builder_oid,
+            "the Builder's own commit is untouched; the remedy is discard-and-re-materialize"
+        );
+    }
+
+    /// The verification refusal must release its reservation, or the retry the
+    /// remedy ends in would meet `DuplicateOpenReservation` and be blocked.
+    #[tokio::test]
+    async fn a_refused_verification_releases_its_reservation() {
+        let (repo, state, project_id, oid) = repo_state();
+        let registered = register_governed_task(
+            &state,
+            registration(
+                &project_id,
+                repo.path(),
+                &oid,
+                WorldScope::StagedAuthoritative,
+            ),
+            ConnectionClass::Operator,
+        )
+        .unwrap();
+        let staged_root = registered.active_staged_worktree().unwrap().root.clone();
+        let staged = Path::new(&staged_root);
+        let running = mutate(
+            &state,
+            &registered,
+            "refusal-verify-running",
+            GovernedTaskMutation::MarkRunning {
+                actor: staged_system_actor(),
+            },
+        );
+        std::fs::write(
+            staged.join("src/lib.rs"),
+            "pub fn wiring_fixture() -> u8 {\n    1\n}\n",
+        )
+        .unwrap();
+        git(staged, &["add", "src/lib.rs"]);
+        git(staged, &["commit", "--quiet", "-m", "builder work"]);
+
+        let claimed = task_from_producer_response(
+            super::super::handlers::handle_governed_producer_request(
+                DaemonRequest::SubmitGovernedClaim {
+                    request: impulse_ops::governed_task::GovernedClaimRequest {
+                        request_id: request_id("refusal-verify-claim"),
+                        project_id: project_id.clone(),
+                        task_id: running.id.clone(),
+                        expected_revision: running.revision,
+                        summary: "work complete".to_string(),
+                        artifact_ids: Vec::new(),
+                    },
+                },
+                &state,
+            )
+            .await,
+        );
+        assert_eq!(
+            claimed.review_state,
+            GovernedReviewState::AwaitingVerification
+        );
+
+        // The drift arrives between the claim and the verification.
+        let marker = plant_shared_config_driver(repo.path(), staged);
+
+        let response = handle_governed_verification(
+            &state,
+            impulse_ops::governed_task::GovernedVerificationRequest {
+                request_id: request_id("refusal-verify"),
+                project_id: project_id.clone(),
+                task_id: claimed.id.clone(),
+                expected_revision: claimed.revision,
+            },
+        )
+        .await;
+        let ack: GovernedStagedConfigRefusalAck = match response {
+            DaemonResponse::Ok { result } => {
+                serde_json::from_value(result).expect("a refusal is a successful-shape response")
+            }
+            other => panic!("expected a typed refusal, received {other:?}"),
+        };
+        assert!(ack.refused);
+        assert!(matches!(
+            ack.reason,
+            StagedConfigRefusalReason::Changed { .. }
+        ));
+        assert!(!marker.exists(), "no Git ran against the staged tree");
+
+        assert!(
+            state.open_reservations().unwrap().is_empty(),
+            "the refusal must release its reservation, or the retry the remedy \
+             ends in would meet DuplicateOpenReservation"
+        );
+        let recorded = state
+            .get_governed_task(&project_id, &claimed.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recorded, claimed, "a refused verification records nothing");
+    }
+
+    fn task_from_producer_response(response: DaemonResponse) -> GovernedTaskRun {
+        match response {
+            DaemonResponse::Ok { result } => {
+                serde_json::from_value(result).expect("response must contain a governed task")
+            }
+            other => panic!("expected a governed task response, received {other:?}"),
+        }
+    }
+
     // ── Durable producer reservations (ADR-0012 amendment) ──────────────────
 
     /// Register an *authoritative* profiled task and drive it to
@@ -1625,6 +1992,275 @@ mod tests {
         assert!(error
             .to_string()
             .contains("staged_authoritative world scope"));
+    }
+
+    // ── One staged run, end to end ──────────────────────────────────────────
+
+    /// Echoes the daemon's own bounded review payload back as a strict
+    /// envelope. The Supervisor turn is the single step in the chain that needs
+    /// a provider; every other step below is the real producer against a real
+    /// repository.
+    struct BoundSupervisorProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[crate::llm_backends::async_trait]
+    impl crate::llm_backends::LlmProvider for BoundSupervisorProvider {
+        fn name(&self) -> &str {
+            "bound-supervisor-e2e"
+        }
+
+        fn default_model(&self) -> &str {
+            "bound-supervisor-e2e-model"
+        }
+
+        fn supported_models(&self) -> Vec<&str> {
+            vec!["bound-supervisor-e2e-model"]
+        }
+
+        async fn chat(
+            &self,
+            request: crate::llm_backends::ChatRequest,
+        ) -> crate::llm_backends::AgentResult<crate::llm_backends::ChatResponse> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let user = request
+                .messages
+                .iter()
+                .find(|message| message.role == crate::llm_backends::Role::User)
+                .expect("Supervisor request must have a user payload");
+            let payload: serde_json::Value =
+                serde_json::from_str(&user.content).expect("Supervisor payload must be JSON");
+            let response = serde_json::json!({
+                "contract_version": payload["contract_version"],
+                "task_id": payload["task_id"],
+                "task_revision": payload["task_revision"],
+                "claim_id": payload["claim_id"],
+                "verification_id": payload["verification_id"],
+                "subject_revision": payload["subject_revision"],
+                "acceptance_criteria_count": payload["acceptance_criteria_count"],
+                "acceptance_criteria_digest": payload["acceptance_criteria_digest"],
+                "verdict": "recommend_accept",
+                "rationale": "daemon-observed evidence supports every exact criterion"
+            });
+            Ok(crate::llm_backends::ChatResponse {
+                content: response.to_string(),
+                model: self.default_model().to_string(),
+                usage: crate::llm_backends::Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+                stop_reason: crate::llm_backends::StopReason::EndTurn,
+                tool_calls: Vec::new(),
+            })
+        }
+    }
+
+    /// One staged governed run through every endpoint this lane added:
+    /// register (materializes) -> launch -> Builder commit -> claim -> verify ->
+    /// Supervisor review -> operator approval -> promote -> discard.
+    ///
+    /// Every step but the Supervisor turn is the real producer against a real
+    /// Git repository and a real Cargo workspace. This is the test the lane
+    /// could not write before #53, whose staged-verification fix made the chain
+    /// completable; it is what proves the scope is reachable rather than merely
+    /// wired.
+    #[tokio::test]
+    async fn one_staged_run_completes_through_every_endpoint() {
+        let (repo, state, project_id, oid) = repo_state();
+
+        let registered = register_governed_task(
+            &state,
+            registration(
+                &project_id,
+                repo.path(),
+                &oid,
+                WorldScope::StagedAuthoritative,
+            ),
+            ConnectionClass::Operator,
+        )
+        .expect("an operator registers the staged run");
+        let staged_root = registered
+            .active_staged_worktree()
+            .expect("registration materializes the checkout")
+            .root
+            .clone();
+        assert_eq!(
+            registered
+                .launch_working_directory()
+                .expect("a materialized staged task has a launch working directory"),
+            staged_root
+        );
+
+        let running = mutate(
+            &state,
+            &registered,
+            "e2e-running",
+            GovernedTaskMutation::MarkRunning {
+                actor: staged_system_actor(),
+            },
+        );
+        assert_eq!(running.execution_state, GovernedExecutionState::Running);
+
+        // The Builder works inside its own checkout. The canonical tree must
+        // not move until promotion.
+        let staged = Path::new(&staged_root);
+        std::fs::write(
+            staged.join("src/lib.rs"),
+            "pub fn wiring_fixture() -> u8 {\n    1\n}\n",
+        )
+        .unwrap();
+        git(staged, &["add", "src/lib.rs"]);
+        git(staged, &["commit", "--quiet", "-m", "builder work"]);
+        let builder_oid = git(staged, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            git(repo.path(), &["rev-parse", "HEAD"]),
+            oid,
+            "the canonical branch stays on the registered initial OID"
+        );
+
+        let claimed = task_from_producer_response(
+            super::super::handlers::handle_governed_producer_request(
+                DaemonRequest::SubmitGovernedClaim {
+                    request: impulse_ops::governed_task::GovernedClaimRequest {
+                        request_id: request_id("e2e-claim"),
+                        project_id: project_id.clone(),
+                        task_id: running.id.clone(),
+                        expected_revision: running.revision,
+                        summary: "staged work complete".to_string(),
+                        artifact_ids: Vec::new(),
+                    },
+                },
+                &state,
+            )
+            .await,
+        );
+        assert_eq!(
+            claimed.latest_claim().unwrap().subject_revision,
+            builder_oid,
+            "the claim binds the Builder's own commit, not the canonical head"
+        );
+
+        let verified = run_governed_verification(
+            &state,
+            impulse_ops::governed_task::GovernedVerificationRequest {
+                request_id: request_id("e2e-verify"),
+                project_id: project_id.clone(),
+                task_id: claimed.id.clone(),
+                expected_revision: claimed.revision,
+            },
+        )
+        .await
+        .expect("a staged claim verifies");
+        assert!(!verified.replayed);
+        assert_eq!(verified.pending_rerun_reason, None);
+        assert_eq!(
+            verified.task.latest_verification().unwrap().outcome,
+            impulse_ops::governed_task::GovernedVerificationOutcome::Passed
+        );
+        assert!(state.open_reservations().unwrap().is_empty());
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let agent =
+            crate::agent::ImpulseAgent::with_test_provider(Box::new(BoundSupervisorProvider {
+                calls: Arc::clone(&calls),
+            }));
+        let cached_agent = Arc::new(tokio::sync::Mutex::new(Some(agent)));
+        let judged: GovernedProducerAck = match handle_governed_supervisor_review(
+            &state,
+            impulse_ops::governed_task::GovernedSupervisorReviewRequest {
+                request_id: request_id("e2e-review"),
+                project_id: project_id.clone(),
+                task_id: verified.task.id.clone(),
+                expected_revision: verified.task.revision,
+            },
+            &cached_agent,
+        )
+        .await
+        {
+            DaemonResponse::Ok { result } => serde_json::from_value(result).unwrap(),
+            other => panic!("expected a Supervisor verdict, received {other:?}"),
+        };
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            judged.task.review_state,
+            GovernedReviewState::AwaitingOperator
+        );
+
+        let accepted = task_from_producer_response(
+            super::super::handlers::handle_governed_task_request(
+                DaemonRequest::MutateGovernedTask {
+                    request: GovernedTaskMutationRequest {
+                        request_id: request_id("e2e-approve"),
+                        project_id: project_id.clone(),
+                        task_id: judged.task.id.clone(),
+                        expected_revision: judged.task.revision,
+                        mutation: GovernedTaskMutation::RecordOperatorDecision {
+                            decision: OperatorDecisionInput {
+                                actor: GovernedActor {
+                                    kind: GovernedActorKind::Operator,
+                                    id: "e2e-operator".to_string(),
+                                },
+                                supervisor_verdict_id: judged
+                                    .task
+                                    .latest_supervisor_verdict()
+                                    .unwrap()
+                                    .id
+                                    .clone(),
+                                decision: OperatorDecisionKind::Approve,
+                                rationale: "evidence supports the criteria".to_string(),
+                            },
+                        },
+                    },
+                },
+                &state,
+                ConnectionClass::Operator,
+            )
+            .await,
+        );
+        assert_eq!(accepted.review_state, GovernedReviewState::Accepted);
+        assert_eq!(
+            git(repo.path(), &["rev-parse", "HEAD"]),
+            oid,
+            "acceptance alone does not make the work canonical"
+        );
+
+        let promoted = promote_governed_outcome(
+            &state,
+            promotion_request(&accepted, "e2e-promote"),
+            ConnectionClass::Operator,
+        )
+        .await
+        .expect("an operator promotes the accepted staged outcome");
+        assert_eq!(
+            promoted.task.latest_promotion().unwrap().outcome,
+            GovernedPromotionOutcome::Promoted {
+                promoted_revision: builder_oid.clone(),
+            }
+        );
+        assert_eq!(git(repo.path(), &["rev-parse", "HEAD"]), builder_oid);
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("src/lib.rs")).unwrap(),
+            "pub fn wiring_fixture() -> u8 {\n    1\n}\n",
+            "promotion syncs the canonical working tree, not just the ref"
+        );
+
+        let discarded = discard_governed_staged_worktree(
+            &state,
+            discard_request(&promoted.task, "e2e-discard"),
+            ConnectionClass::Operator,
+        )
+        .await
+        .expect("a promoted run's checkout is spent");
+        assert_eq!(discarded.discarded_root, staged_root);
+        assert_eq!(
+            discarded.unreferenced_accepted_commit, None,
+            "a promoted commit is on the canonical branch, so nothing is orphaned"
+        );
+        assert!(!Path::new(&staged_root).exists());
+        assert!(
+            state.open_reservations().unwrap().is_empty(),
+            "every producer released its reservation"
+        );
     }
 
     // ── Review round 1 regressions ──────────────────────────────────────────
@@ -1865,6 +2501,68 @@ mod tests {
         assert_eq!(replayed.discarded_root, first.discarded_root);
     }
 
+    /// One staged task in an arbitrary review/execution/pin/promotion state.
+    ///
+    /// Shared by the discardability matrix and the orphaned-commit wiring test
+    /// so the two cannot disagree about what a state even looks like.
+    fn matrix_task(
+        review: GovernedReviewState,
+        execution: GovernedExecutionState,
+        pin: impulse_ops::governed_task::SharedRepositoryConfigPin,
+        promotion: Option<GovernedPromotionOutcome>,
+    ) -> GovernedTaskRun {
+        let mut task = GovernedTaskRun {
+            id: impulse_ops::governed_task::GovernedTaskId::try_new("task-matrix").unwrap(),
+            revision: 5,
+            project_id: "demo".to_string(),
+            workspace_root: "/tmp/demo".to_string(),
+            task: "matrix".to_string(),
+            acceptance_criteria: vec!["c".to_string()],
+            approval_policy: impulse_ops::governed_task::ApprovalPolicy::OperatorRequired,
+            world_scope: WorldScope::StagedAuthoritative,
+            verification_profile: Some(GovernedVerificationProfile::RustWorkspaceV1),
+            role_assignment: None,
+            role_compatibility: None,
+            runtime_id: "ion".to_string(),
+            agent_id: "worker".to_string(),
+            session_id: None,
+            initial_subject_revision: Some("a".repeat(40)),
+            staged_worktree: Some(impulse_ops::governed_task::StagedWorktree {
+                id: impulse_ops::governed_task::GovernedRecordId::try_new("staged-m").unwrap(),
+                actor: staged_system_actor(),
+                root: "/tmp/demo/.impulse/worktrees/task-matrix".to_string(),
+                initial_subject_revision: "a".repeat(40),
+                shared_config_digest: pin,
+                status: StagedWorktreeStatus::Active,
+                materialized_at: "2026-09-12T00:00:00Z".to_string(),
+                based_on_revision: 1,
+            }),
+            promotions: Vec::new(),
+            execution_state: execution,
+            review_state: review,
+            claims: Vec::new(),
+            verifications: Vec::new(),
+            supervisor_verdicts: Vec::new(),
+            operator_decisions: Vec::new(),
+            events: Vec::new(),
+            created_at: "2026-09-12T00:00:00Z".to_string(),
+            updated_at: "2026-09-12T00:00:00Z".to_string(),
+        };
+        if let Some(outcome) = promotion {
+            task.promotions
+                .push(impulse_ops::governed_task::GovernedPromotion {
+                    id: impulse_ops::governed_task::GovernedRecordId::try_new("promo-m").unwrap(),
+                    actor: staged_system_actor(),
+                    accepted_revision: "b".repeat(40),
+                    initial_subject_revision: "a".repeat(40),
+                    outcome,
+                    recorded_at: "2026-09-12T00:00:00Z".to_string(),
+                    based_on_revision: 4,
+                });
+        }
+        task
+    }
+
     /// P2-4. The daemon preflights discardability against its own copy of the
     /// rule because the destructive side effect runs before the mutation the
     /// state layer enforces. Two copies can drift; this makes drift fail
@@ -1874,71 +2572,15 @@ mod tests {
     fn both_discardability_rules_agree_over_the_whole_state_matrix() {
         use crate::state::staged_worktree_is_discardable as state_layer_rule;
 
-        let base = |review: GovernedReviewState,
-                    execution: GovernedExecutionState,
-                    pin: impulse_ops::governed_task::SharedRepositoryConfigPin,
-                    promotion: Option<GovernedPromotionOutcome>| {
-            let mut task = GovernedTaskRun {
-                id: impulse_ops::governed_task::GovernedTaskId::try_new("task-matrix").unwrap(),
-                revision: 5,
-                project_id: "demo".to_string(),
-                workspace_root: "/tmp/demo".to_string(),
-                task: "matrix".to_string(),
-                acceptance_criteria: vec!["c".to_string()],
-                approval_policy: impulse_ops::governed_task::ApprovalPolicy::OperatorRequired,
-                world_scope: WorldScope::StagedAuthoritative,
-                verification_profile: Some(GovernedVerificationProfile::RustWorkspaceV1),
-                role_assignment: None,
-                role_compatibility: None,
-                runtime_id: "ion".to_string(),
-                agent_id: "worker".to_string(),
-                session_id: None,
-                initial_subject_revision: Some("a".repeat(40)),
-                staged_worktree: Some(impulse_ops::governed_task::StagedWorktree {
-                    id: impulse_ops::governed_task::GovernedRecordId::try_new("staged-m").unwrap(),
-                    actor: staged_system_actor(),
-                    root: "/tmp/demo/.impulse/worktrees/task-matrix".to_string(),
-                    initial_subject_revision: "a".repeat(40),
-                    shared_config_digest: pin,
-                    status: StagedWorktreeStatus::Active,
-                    materialized_at: "2026-09-12T00:00:00Z".to_string(),
-                    based_on_revision: 1,
-                }),
-                promotions: Vec::new(),
-                execution_state: execution,
-                review_state: review,
-                claims: Vec::new(),
-                verifications: Vec::new(),
-                supervisor_verdicts: Vec::new(),
-                operator_decisions: Vec::new(),
-                events: Vec::new(),
-                created_at: "2026-09-12T00:00:00Z".to_string(),
-                updated_at: "2026-09-12T00:00:00Z".to_string(),
-            };
-            if let Some(outcome) = promotion {
-                task.promotions
-                    .push(impulse_ops::governed_task::GovernedPromotion {
-                        id: impulse_ops::governed_task::GovernedRecordId::try_new("promo-m")
-                            .unwrap(),
-                        actor: staged_system_actor(),
-                        accepted_revision: "b".repeat(40),
-                        initial_subject_revision: "a".repeat(40),
-                        outcome,
-                        recorded_at: "2026-09-12T00:00:00Z".to_string(),
-                        based_on_revision: 4,
-                    });
-            }
-            task
-        };
-
+        let base = matrix_task;
         let pins = [
             impulse_ops::governed_task::SharedRepositoryConfigPin::Unknown,
             impulse_ops::governed_task::SharedRepositoryConfigPin::Recorded(
-                impulse_ops::governed_task::SharedRepositoryConfigDigest {
-                    repository_config: format!("sha256:{}", "c".repeat(64)),
-                    worktree_config: None,
-                    info_attributes: None,
-                },
+                impulse_ops::governed_task::SharedRepositoryConfigDigest::current(
+                    format!("sha256:{}", "c".repeat(64)),
+                    None,
+                    None,
+                ),
             ),
         ];
         let promotions = [
@@ -1994,6 +2636,137 @@ mod tests {
         assert!(
             compared >= 200,
             "the matrix must be exhaustive, not a sample"
+        );
+    }
+
+    /// The promote counterpart to the discardability cross-check.
+    ///
+    /// `impulse_ops::governed_wiring::governed_outcome_is_promotable` exists so
+    /// a surface can decide whether to offer the control at all. From
+    /// `impulse-ops` it can import neither the daemon endpoint's inline checks
+    /// nor the ledger's `RecordPromotion` preconditions, so on its own it can
+    /// only *restate* them — which is the drift this test exists to prevent.
+    /// Here both are importable, so the sandwich is checkable:
+    ///
+    /// - **superset of the endpoint**: every task the promote endpoint would run
+    ///   for, the shared predicate must also admit (otherwise a surface hides a
+    ///   control that works);
+    /// - **subset of the ledger**: every task the predicate admits, the ledger's
+    ///   preconditions must accept (otherwise a surface offers a control that is
+    ///   guaranteed to be refused).
+    #[test]
+    fn promotability_sits_between_the_endpoint_and_the_ledger_over_the_whole_matrix() {
+        use crate::state::record_promotion_preconditions_hold as ledger_rule;
+        use impulse_ops::governed_wiring::governed_outcome_is_promotable as shared_rule;
+
+        // The endpoint's own admission check, called rather than restated, so
+        // changing it changes this test.
+        let endpoint_admits = |task: &GovernedTaskRun| promote_preflight(task).is_ok();
+
+        let pins = [
+            impulse_ops::governed_task::SharedRepositoryConfigPin::Unknown,
+            impulse_ops::governed_task::SharedRepositoryConfigPin::Recorded(
+                impulse_ops::governed_task::SharedRepositoryConfigDigest::current(
+                    format!("sha256:{}", "c".repeat(64)),
+                    None,
+                    None,
+                ),
+            ),
+        ];
+        let promotions = [
+            None,
+            Some(GovernedPromotionOutcome::Promoted {
+                promoted_revision: "b".repeat(40),
+            }),
+            Some(GovernedPromotionOutcome::PromotionBlocked {
+                canonical_head: "c".repeat(40),
+                reason: PromotionBlockedReason::CanonicalHeadMoved,
+            }),
+        ];
+        let reviews = [
+            GovernedReviewState::AwaitingClaim,
+            GovernedReviewState::AwaitingVerification,
+            GovernedReviewState::AwaitingSupervisor,
+            GovernedReviewState::AwaitingOperator,
+            GovernedReviewState::ChangesRequested,
+            GovernedReviewState::VerificationFailed,
+            GovernedReviewState::Accepted,
+            GovernedReviewState::Rejected,
+            GovernedReviewState::Escalated,
+        ];
+        let executions = [
+            GovernedExecutionState::Registered,
+            GovernedExecutionState::Running,
+            GovernedExecutionState::LaunchFailed,
+            GovernedExecutionState::RuntimeExited,
+        ];
+
+        let mut compared = 0usize;
+        let mut admitted = 0usize;
+        for review in reviews {
+            for execution in executions {
+                for pin in &pins {
+                    for promotion in &promotions {
+                        // With a claim and without: `latest_claim` is one of the
+                        // conditions, so both halves must be covered.
+                        for with_claim in [false, true] {
+                            let mut task =
+                                matrix_task(review, execution, pin.clone(), promotion.clone());
+                            if with_claim {
+                                task.claims.push(
+                                    impulse_ops::governed_task::WorkerCompletionClaim {
+                                        id: impulse_ops::governed_task::GovernedRecordId::try_new(
+                                            "claim-p",
+                                        )
+                                        .unwrap(),
+                                        actor: GovernedActor {
+                                            kind: GovernedActorKind::Worker,
+                                            id: "worker".to_string(),
+                                        },
+                                        summary: "done".to_string(),
+                                        subject_revision: "b".repeat(40),
+                                        artifact_ids: Vec::new(),
+                                        diff_ref: None,
+                                        loop_report_digest: None,
+                                        loop_report_version: None,
+                                        submitted_at: "2026-09-12T00:00:00Z".to_string(),
+                                        based_on_revision: 2,
+                                    },
+                                );
+                            }
+                            let shared = shared_rule(&task);
+                            if endpoint_admits(&task) {
+                                assert!(
+                                    shared,
+                                    "the shared predicate must not hide a control the endpoint \
+                                     would run: review={review:?} execution={execution:?} \
+                                     pin={pin:?} promotion={promotion:?} with_claim={with_claim}"
+                                );
+                            }
+                            if shared {
+                                admitted += 1;
+                                assert!(
+                                    ledger_rule(&task).is_ok(),
+                                    "the shared predicate must not promise a promotion the \
+                                     ledger refuses: review={review:?} execution={execution:?} \
+                                     pin={pin:?} promotion={promotion:?} with_claim={with_claim} \
+                                     ledger={:?}",
+                                    ledger_rule(&task)
+                                );
+                            }
+                            compared += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            compared,
+            reviews.len() * executions.len() * pins.len() * promotions.len() * 2
+        );
+        assert!(
+            admitted > 0,
+            "a sandwich test that admits nothing proves nothing"
         );
     }
 

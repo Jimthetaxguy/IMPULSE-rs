@@ -275,7 +275,12 @@ async fn a_builder_socket_cannot_stage_its_own_world_scope_but_the_operator_surf
         oid,
         "the staged worktree starts at the daemon-attested initial OID"
     );
-    assert_eq!(registered.launch_working_directory(), staged.root);
+    assert_eq!(
+        registered
+            .launch_working_directory()
+            .expect("a materialized staged task has a launch working directory"),
+        staged.root
+    );
 
     // The canonical tree is untouched.
     assert_eq!(run_git(repo.path(), &["rev-parse", "HEAD"]), oid);

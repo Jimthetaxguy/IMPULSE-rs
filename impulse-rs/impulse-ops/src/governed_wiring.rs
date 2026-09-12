@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::governed_task::{
     GovernedExecutionState, GovernedRequestId, GovernedReviewState, GovernedTaskContractError,
-    GovernedTaskId, GovernedTaskRun, MAX_GOVERNED_TEXT_BYTES,
+    GovernedTaskId, GovernedTaskRun, SharedConfigComponent, MAX_GOVERNED_TEXT_BYTES,
 };
 
 /// Trigger for the daemon-owned promotion producer (ADR-0019).
@@ -130,6 +130,98 @@ pub struct GovernedStagedWorktreeDiscardAck {
     pub unreferenced_accepted_commit: Option<String>,
 }
 
+/// Why a daemon-owned producer refused to run Git inside a staged worktree at
+/// all (ADR-0019 rule 13).
+///
+/// Carried on a *successful-shape* response, exactly like a blocked promotion:
+/// the run is not broken and the evidence is not wrong — the staged world is in
+/// a state the daemon may not touch, and the remedy is a specific operator
+/// action rather than a retry. Making it typed rather than an error string is
+/// what lets a surface render the remedy; the desktop currently recognizes this
+/// condition by matching on the producer's prose, which breaks the first time
+/// that prose is improved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StagedConfigRefusalReason {
+    /// The staged worktree predates the configuration pin, so there is nothing
+    /// to compare against.
+    Unpinned,
+    /// Worktree-shared repository configuration changed since materialization.
+    /// The component names which file, because benign drift blocks too and the
+    /// operator must not have to guess.
+    Changed { component: SharedConfigComponent },
+    /// The repository carries submodule configuration, which the staged scope
+    /// cannot pin and therefore refuses to run in.
+    UnsupportedSubmodules { path: String },
+}
+
+impl StagedConfigRefusalReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Unpinned => "repository_config_unpinned",
+            Self::Changed { .. } => "repository_config_changed",
+            Self::UnsupportedSubmodules { .. } => "unsupported_submodules",
+        }
+    }
+
+    /// What the operator has to do about it. One remedy per reason, so a
+    /// surface never has to infer one.
+    pub fn remedy(&self) -> &'static str {
+        match self {
+            Self::Unpinned | Self::Changed { .. } => {
+                "discard the staged worktree and re-materialize it, then re-run the producer"
+            }
+            Self::UnsupportedSubmodules { .. } => {
+                "register this task with the authoritative world scope; the staged scope does not                  support submodule repositories"
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for StagedConfigRefusalReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Changed { component } => {
+                write!(formatter, "{} ({component})", self.as_str())
+            }
+            Self::UnsupportedSubmodules { path } => {
+                write!(formatter, "{} ({path})", self.as_str())
+            }
+            other => formatter.write_str(other.as_str()),
+        }
+    }
+}
+
+/// A producer request answered with a refusal rather than a record.
+///
+/// Flattened like the other acknowledgements, so the governed task is still
+/// readable straight off the response, and `refused` is the discriminator a
+/// client checks. The task is unchanged — a refusal records nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernedStagedConfigRefusalAck {
+    #[serde(flatten)]
+    pub task: GovernedTaskRun,
+    /// Always `true`. Present so a client can discriminate on one field rather
+    /// than on the presence of `reason`.
+    pub refused: bool,
+    pub reason: StagedConfigRefusalReason,
+    /// `reason.remedy()`, carried on the wire so a surface does not have to
+    /// keep its own copy of the mapping.
+    pub remedy: String,
+}
+
+impl GovernedStagedConfigRefusalAck {
+    pub fn new(task: GovernedTaskRun, reason: StagedConfigRefusalReason) -> Self {
+        let remedy = reason.remedy().to_string();
+        Self {
+            task,
+            refused: true,
+            reason,
+            remedy,
+        }
+    }
+}
+
 /// Every state a staged worktree can legitimately be reclaimed from (ADR-0019
 /// rule 7), so a live Builder's work cannot be deleted out from under it.
 ///
@@ -166,20 +258,56 @@ pub fn staged_worktree_is_discardable(task: &GovernedTaskRun) -> bool {
     }
 }
 
+/// Whether a governed task's *state* admits a promotion attempt.
+///
+/// Shared so a surface can decide whether to offer the control at all without
+/// restating the daemon endpoint's checks or the ledger's preconditions. The
+/// relationship the cross-check test in `src/daemon/governed_wiring.rs` pins:
+/// this is a **superset** of what the promote endpoint lets through (never
+/// refuse something the endpoint would run) and a **subset** of the ledger's
+/// `RecordPromotion` preconditions (never promise something the ledger would
+/// refuse). It says nothing about whether the promotion would *succeed* — a
+/// canonical head that moved is a blocked outcome, not an inadmissible request.
+pub fn governed_outcome_is_promotable(task: &GovernedTaskRun) -> bool {
+    task.world_scope == crate::governed_task::WorldScope::StagedAuthoritative
+        && task.is_accepted()
+        && task.active_staged_worktree().is_some()
+        && task.latest_claim().is_some()
+        && !task
+            .latest_promotion()
+            .is_some_and(|previous| previous.outcome.is_promoted())
+        && task.promotions.len() < crate::governed_task::MAX_GOVERNED_RECORDS_PER_KIND
+}
+
 /// The accepted commit that discarding this staged worktree would leave
 /// reachable only through the reflog.
 ///
-/// A blocked promotion never advanced the canonical branch, so the accepted
-/// commit exists nowhere but the staged checkout.
+/// The canonical branch stays on the registered initial OID until a promotion
+/// succeeds, so for any accepted run that has not been promoted, the accepted
+/// commit exists nowhere but the staged checkout. Two such states reach a
+/// discard:
+///
+/// - **A blocked promotion.** The attempt was made and refused; the recorded
+///   outcome carries the revision.
+/// - **No promotion at all.** An accepted task whose staged worktree has an
+///   `Unknown` configuration pin is discardable *without* a promotion attempt —
+///   [`staged_worktree_is_discardable`] short-circuits on an unpinned worktree,
+///   because such a worktree can never be promoted and discarding is the only
+///   way forward. The first version of this function returned `None` there,
+///   which silently dropped the warning in exactly the state that has no other
+///   escape. The accepted claim's `subject_revision` is the answer, and it is
+///   the same value a recorded promotion would have carried.
 pub fn unreferenced_accepted_commit_on_discard(task: &GovernedTaskRun) -> Option<&str> {
     if !task.is_accepted() {
         return None;
     }
-    let promotion = task.latest_promotion()?;
-    if promotion.outcome.is_promoted() {
-        return None;
+    match task.latest_promotion() {
+        Some(promotion) if promotion.outcome.is_promoted() => None,
+        Some(promotion) => Some(promotion.accepted_revision.as_str()),
+        None => task
+            .latest_claim()
+            .map(|claim| claim.subject_revision.as_str()),
     }
-    Some(promotion.accepted_revision.as_str())
 }
 
 #[cfg(test)]
@@ -249,11 +377,13 @@ mod tests {
     }
 
     fn pinned() -> SharedRepositoryConfigPin {
-        SharedRepositoryConfigPin::Recorded(crate::governed_task::SharedRepositoryConfigDigest {
-            repository_config: format!("sha256:{}", "c".repeat(64)),
-            worktree_config: None,
-            info_attributes: None,
-        })
+        SharedRepositoryConfigPin::Recorded(
+            crate::governed_task::SharedRepositoryConfigDigest::current(
+                format!("sha256:{}", "c".repeat(64)),
+                None,
+                None,
+            ),
+        )
     }
 
     fn with_claim(mut task: GovernedTaskRun) -> GovernedTaskRun {
@@ -484,15 +614,40 @@ mod tests {
     }
 
     #[test]
-    fn test_only_an_accepted_but_blocked_promotion_names_an_unreferenced_commit() {
+    fn test_an_accepted_run_that_was_never_promoted_names_its_unreferenced_commit() {
         let mut accepted = with_claim(with_staged(task(), pinned()));
         accepted.review_state = GovernedReviewState::Accepted;
 
+        // Renamed from "only an accepted but blocked promotion ...", which
+        // stopped being true: the canonical branch stays on the initial OID
+        // until a promotion *succeeds*, so an accepted run with no promotion
+        // attempt orphans its commit just as a blocked one does. That state is
+        // reachable -- an accepted task with an unpinned worktree is
+        // discardable without any promotion attempt -- and returning `None`
+        // there dropped the warning in the one case that has no other escape.
         assert_eq!(
             unreferenced_accepted_commit_on_discard(&accepted),
-            None,
-            "no promotion has been attempted yet"
+            Some(oid('b').as_str()),
+            "an accepted run with no promotion attempt still orphans its commit"
         );
+
+        // The state that actually reaches a discard with no promotion.
+        let mut unpinned = with_claim(with_staged(task(), SharedRepositoryConfigPin::Unknown));
+        unpinned.review_state = GovernedReviewState::Accepted;
+        assert!(
+            staged_worktree_is_discardable(&unpinned),
+            "an unpinned worktree is discardable with no promotion attempt"
+        );
+        assert_eq!(
+            unreferenced_accepted_commit_on_discard(&unpinned),
+            Some(oid('b').as_str()),
+            "the accepted/unpinned/zero-promotions case must not lose its warning"
+        );
+
+        // With no claim there is nothing to name, and nothing to lose.
+        let mut claimless = with_staged(task(), SharedRepositoryConfigPin::Unknown);
+        claimless.review_state = GovernedReviewState::Accepted;
+        assert_eq!(unreferenced_accepted_commit_on_discard(&claimless), None);
 
         let promoted = with_promotion(
             accepted.clone(),

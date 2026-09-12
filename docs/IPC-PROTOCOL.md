@@ -227,6 +227,32 @@ promotion outcome. When the discard drops the only ref to an accepted commit a b
 never made canonical, the acknowledgement carries `unreferenced_accepted_commit` with that OID: the
 commit survives only in the reflog afterwards, and the operator surface must say so.
 
+**A drifted staged configuration is a typed refusal, not an error.** ADR-0019 rule 13 pins the
+worktree-shared repository configuration across a staged run, because a `filter.<name>.smudge` or
+`diff.<name>.textconv` defined there executes whenever Git materializes a file — including inside a
+daemon-owned producer. When that pin no longer holds, `SubmitGovernedClaim` and
+`RunGovernedVerification` refuse **before spawning any Git process** and answer `Ok` with a refusal
+acknowledgement rather than an error: the governed task flattened as usual, plus
+`"refused": true`, a typed `reason`, and the `remedy` to apply. The task is unchanged — a refusal
+records nothing — and any producer reservation taken for the attempt is released, so the retry the
+remedy ends in is not blocked.
+
+```json
+{"type": "Ok", "data": {"result": {
+  "id": "task-1", "revision": 7, "...": "...",
+  "refused": true,
+  "reason": {"kind": "changed", "component": "repository_config"},
+  "remedy": "discard the staged worktree and re-materialize it, then re-run the producer"
+}}}
+```
+
+`reason.kind` is `unpinned` (the worktree predates the pin, so there is nothing to compare),
+`changed` (with the `component` that differs: `repository_config`, `worktree_config`, or
+`info_attributes`), or `unsupported_submodules` (with the `path`; the staged scope cannot pin a
+submodule's own configuration and refuses to run in such a repository). Clients discriminate on the
+`refused` flag. An `Error` response from these endpoints still means what it always did: the
+producer genuinely failed.
+
 **Producer acknowledgements and the reservation journal.** `RunGovernedVerification`,
 `RunGovernedSupervisorReview`, and `PromoteGovernedOutcome` run their side effect *and* persist the
 governed-task mutation that records it inside one durable producer reservation (ADR-0012's
@@ -589,6 +615,10 @@ Added 2026-09-12 (ADR-0012 amendment, ADR-0019):
   treated exactly like a crash.
 - CLI `impulse-rs --daemon governed-promote` and `impulse-rs --daemon governed-discard`.
 - A blocked promotion is a successful response carrying the typed outcome, never an error.
+- A staged run whose pinned shared repository configuration drifted is refused by
+  `SubmitGovernedClaim` and `RunGovernedVerification` before any Git process is spawned, answered as
+  a successful-shape acknowledgement carrying `refused`, a typed `reason`, and a `remedy`. Additive
+  within v9: it adds a response shape to two existing requests and no request variant.
 
 ### v8 — Builder staged-worktree world scope
 
