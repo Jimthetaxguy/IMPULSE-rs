@@ -1,5 +1,7 @@
 //! Integration tests for the isolated PDF-extraction child process
-//! (review round 1, PR #54, Stage 1b-B, findings P0-1/P0-2/P2-1).
+//! (PR #54, Stage 1b-B, review round 1 findings P0-1/P0-2/P2-1 and review
+//! round 2 finding P1 -- the unbounded child-stdout read, exercised here
+//! via `tests/fakes/rogue-stdout-shim.sh`).
 //!
 //! These tests spawn the REAL compiled `impulse-rs` binary
 //! (`env!("CARGO_BIN_EXE_impulse-rs")`) as the `internal-pdf-text` child,
@@ -544,4 +546,54 @@ fn test_internal_pdf_text_subcommand_is_hidden_but_directly_invocable() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("direct invocation"), "{stdout}");
+}
+
+/// **Review round 2, P1 (CONFIRMED).** `child.wait_with_output()` buffered
+/// the whole child stdout with no cap: a rogue child streaming ~1 GiB drove
+/// the PARENT to ~3.2 GB RSS and produced an accepted, multi-gigabyte-
+/// character "document". `tests/fakes/rogue-stdout-shim.sh` stands in for
+/// a compromised/malicious `internal-pdf-text` (or a `current_exe()`/PATH
+/// substitution pointing at something else): it ignores every argument and
+/// writes far more than any reasonable stdout cap. Pointed at as `exe`
+/// directly (bypassing the real subcommand entirely), this exercises the
+/// SAME bounded-read code path (`read_capped`) the real child output goes
+/// through, independent of PDF parsing.
+#[tokio::test]
+async fn test_extract_pdf_refuses_a_rogue_child_that_exceeds_the_stdout_bound() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = write_pdf(&dir, &["irrelevant text; the shim ignores every argument"]);
+    // A small budget keeps the computed stdout cap small (a few KB), so
+    // the shim's fixed ~1 GiB of output is refused almost immediately --
+    // read_capped's `.take(cap + 1)` stops pulling bytes from the pipe the
+    // instant the cap is reached, it does not wait for the shim to finish.
+    let budget = ExtractBudget {
+        max_chars: 1000,
+        max_cells: 0,
+    };
+
+    let started = std::time::Instant::now();
+    let err = extract_pdf_with_exe_and_timeout(
+        &path,
+        "doc.pdf",
+        budget,
+        10,
+        &rogue_stdout_shim(),
+        Duration::from_secs(30),
+    )
+    .await
+    .expect_err("a rogue child streaming far more than the computed bound must be refused");
+    let elapsed = started.elapsed();
+
+    assert!(
+        err.to_string().contains("exceeded its output bound"),
+        "{err}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "must be detected and the child killed promptly, took {elapsed:?}"
+    );
+}
+
+fn rogue_stdout_shim() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fakes/rogue-stdout-shim.sh")
 }

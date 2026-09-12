@@ -124,6 +124,12 @@ quick-xml = { version = "0.31", optional = true }
 # image handling). Re-exports lopdf at its crate root (`pdf_extract::Document` etc.), so no
 # separate lopdf dependency is needed for this crate's own PDF handling or its test fixtures.
 pdf-extract = { version = "0.12", optional = true }
+# Bounded FlateDecode stream-inflation preflight for PDFs (review round 2, P2): pdf-extract's own
+# internal decompression of a stream's content is unbounded, so a crafted PDF can inflate a small
+# compressed stream hundreds of times over before BoundedSink's first write-time check ever runs.
+# Already a transitive dependency (via lopdf, zip, image); pinned here as direct so this crate can
+# call its streaming decoder to count inflated bytes without ever materializing them.
+flate2 = { version = "1", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -150,6 +156,7 @@ office-support = [
     "dep:zip",
     "dep:quick-xml",
     "dep:pdf-extract",
+    "dep:flate2",
 ]
 
 [dev-dependencies]

@@ -331,3 +331,176 @@ python3 docs/validate_docs.py --all                         # only pre-existing 
 Full lib total across both review rounds combined: 2017 passed, 0 failed, 5 ignored (net +14 from
 round 1's 2003, reflecting new tests added minus the 6 old PDF fixture tests that moved to the
 integration suite because they now require a real compiled binary).
+
+## Review round 2 (2026-09-12)
+
+A second adversarial pass (fixtures at
+`/private/tmp/claude-501/-Users-jamespustorino-code-IMPULSE-rs/c575264d-f5e1-49ac-b2c6-0834ed929caf/scratchpad/review54-r2/`)
+CONFIRMED isolation itself (self-referencing fixture -> child signal 6, parent alive at 37 MB;
+process group reaped including a grandchild; stdin null; env exactly `HOME`/`PATH`/`TMPDIR`;
+`current_exe()` works via symlink/PATH/relative invocation; a legitimate 600-page, 9.9 MB PDF
+renders in 0.68s at 54 MB child RSS) plus the round-1 encryption fixtures and sandbox defaults,
+and all round-1 nits. Three round-1 fixes were REFUTED and are corrected here; one missing test
+(P3) was added.
+
+### P1 REFUTED (d): `child.wait_with_output()` is unbounded — a rogue child drove the PARENT to 3.2 GB RSS
+
+`run_pdf_extraction_child` (the code that reads the isolated child's output) used
+`child.wait_with_output()`, which buffers the WHOLE child stdout/stderr with no cap at all —
+process isolation bounds what a CRASHING child can do to the parent, but says nothing about a
+child that stays alive and just produces too much output. The reviewer's own rogue-child fixture
+streaming ~1 GiB of valid-looking JSON drove the PARENT process to 3.23 GB RSS and produced an
+*accepted* 1,073,741,825-character "document" — isolation alone does not bound a well-behaved-
+looking but overproducing child.
+
+**Fix:** `read_capped` (stdout — refuses and reports `exceeded` once more than the JSON-encoded
+worst case for the requested `max_chars`/`max_pages` would arrive, via `AsyncReadExt::take(cap +
+1)`, the same pattern `daemon::read_bounded_line` already uses) and `read_capped_tail` (stderr —
+bounded to 64 KiB, keeping the tail via a drain-on-overflow loop, since diagnostic text has no
+fixed budget to violate and always succeeds with whatever fits). On `exceeded`, the whole isolated
+process group is killed immediately (`ProcessGroupGuard::kill_now`) rather than waiting for the
+child to finish producing arbitrarily more.
+
+**A genuine second bug found while building the fix, not by the reviewer:** the first
+implementation read stdout and stderr via `tokio::join!` (wait for both to resolve). The rogue-
+child integration test then hung for the FULL 30s wall-clock timeout instead of returning
+promptly: once `read_capped` stops draining stdout past its cap, the child (still alive, blocked
+on its next stdout `write()` because the pipe is full and nobody is reading past the cap) never
+closes ANY of its pipes, including stderr — so `tokio::join!`, which needs both futures to resolve
+before continuing, waited on a stderr read that could only ever complete once the child exited,
+which only happens once we kill it, which only happens once `tokio::join!` returns. Fixed by
+reading each pipe on an INDEPENDENT `tokio::spawn`ed task: the stdout task's result (exceeded or
+not) is awaited and acted on first, aborting the stderr task before killing the child if exceeded,
+rather than requiring both to resolve together.
+
+**Test:** `tests/fakes/rogue-stdout-shim.sh` — NOT a production `MOCK_MODE` branch, a standalone
+shell shim (mirroring the existing `tests/fakes/ion-verify-stub-gate*.sh` precedent) that ignores
+every argument and streams far more than any reasonable computed cap. Pointed at as `exe` directly
+in `tests/pdf_extraction_isolation.rs`'s
+`test_extract_pdf_refuses_a_rogue_child_that_exceeds_the_stdout_bound`, bypassing PDF parsing
+entirely to exercise the bounded-read code path in isolation. **Measured after the fix:** the
+integration test process's own peak RSS while running this test is **9.3 MB** (down from the
+unfixed parent's reported 3.2 GB), completing in 0.01s.
+
+### P2 REFUTED: `BoundedSink` bounds output volume and wall clock, not memory — a compression bomb reached 5.55–7.0 GB regardless of `max_chars`
+
+The round-1 fix's own doc comment claimed "the primary bound is still the sink" — false.
+`pdf-extract`'s own internal decompression of a `FlateDecode` stream's content happens lazily,
+deep inside `output_doc_page`, well BEFORE `BoundedSink`'s first write-time check could ever run.
+The reviewer's `textbomb2g.pdf` (4.2 MB) inflates 476:1 before that first write and peaked at 5.55
+GB in the child / 6.44 GB total; passing `--max-chars 1000` made no difference (1.92 GB peak) —
+the character budget was never the bound that mattered, and `RLIMIT_AS` is not kernel-enforced on
+macOS.
+
+**Fix:** `preflight_pdf_streams` — the PDF analogue of `preflight_container`'s zip-container check
+— iterates every `FlateDecode`-filtered stream object in the loaded `Document` and inflates it
+through `inflate_bounded` (a streaming `flate2::read::ZlibDecoder`, discarding each chunk
+immediately after counting it, so peak memory is the decoder's own window plus one 64 KiB read
+buffer, never proportional to how much the stream would actually inflate to), refusing with a
+typed error once a per-stream cap or the combined total exceeds 64 MiB (reusing
+`MAX_DECOMPRESSED_BYTES`'s value, a new `MAX_PDF_DECOMPRESSED_BYTES`/
+`MAX_PDF_STREAM_DECOMPRESSED_BYTES` pair since the PDF and zip-container checks are independent
+mechanisms). Runs before any page renders, in BOTH the parent's cheap pre-check (`precheck_pdf`)
+and the child's own independent, authoritative check (`internal_pdf_text::extract`) — new direct
+dependency `flate2` (already transitively present via `lopdf`/`zip`/`image`; `cargo audit`
+unchanged, zero new advisories). Only `FlateDecode` is checked — documented as a limitation, not a
+silent gap: it is the PDF ecosystem's dominant filter and the one this attack class actually uses;
+`LZWDecode`/`ASCII85Decode`/`RunLengthDecode` cannot reach comparable ratios, and `DCTDecode` is
+JPEG data `PlainTextOutput` never reads.
+
+**Measured peak RSS after the fix** (this checkout's release build, `/usr/bin/time -l`, invoking
+`internal-pdf-text` directly against the reviewer's own fixtures):
+
+| Fixture | Before (reviewer's numbers) | After (measured this round) |
+|---|---|---|
+| `textbomb500.pdf` (1.05 MB) | 2.41 GB / 48.8s | **13.1 MB / 0.56s** |
+| `textbomb2g.pdf` (4.2 MB) | 7.0 GB / 178.5s | **22.2 MB / 0.03s** |
+| `legit10m.pdf` (9.9 MB, legitimate, 600 pages) | 54 MB / 0.68s (round 1 baseline) | **51.2 MB / 0.73s** (no regression) |
+
+Both bombs land well within the reviewer's "target: tens of MB" and are refused before any page
+rendering begins; the legitimate document's output is unchanged (verified: real extracted text in
+the JSON output).
+
+**Doc corrections:** `tool_document.rs:1144-1148`'s "the primary bound is still the sink" claim
+replaced with a corrected comment naming `preflight_pdf_streams` as the actual memory bound (three
+layers now stated explicitly: sink bounds output/time, preflight bounds memory, isolation bounds
+blast radius); `internal_pdf_text.rs`'s module doc gained the same distinction; the spec's PDF
+section and its new "Review round 2" section state it explicitly.
+
+### P2 REFUTED: the `/Encrypt` raw scan is bypassed by a legal name hex-escape
+
+`/Encr#79pt` (ISO 32000-1 §7.3.5: `#79` = hex 0x79 = ASCII `y`) has no literal `/Encrypt` byte
+sequence anywhere in the file but decodes to the identical name `Encrypt` — `lopdf` parses it,
+decrypts with the empty user password, and `document_read` returned the plaintext. Verified
+against the reviewer's own `enc_emptyuser_hexname.pdf` fixture directly: before the fix,
+`internal-pdf-text` against this file exits 0 with real text; after, it is refused identically to
+the literal-bytes case.
+
+**Fix (both halves the review asked for):**
+1. `pdf_declares_encryption` gained a two-tier scan: the fast literal-bytes check first (the
+   common case, one pass, no allocation), then, only if that finds nothing, a fallback
+   (`decode_pdf_name_token`) that walks every `/` in the file, decodes that name token's `#XX`
+   escapes, and compares the decoded bytes against `Encrypt`. Bounded by `MAX_DOCUMENT_BYTES` like
+   every other check here.
+2. Belt and braces: after `Document::load`, both `precheck_pdf` (parent) and
+   `internal_pdf_text::extract` (child) additionally re-assert directly against the PARSED
+   trailer dictionary (`doc.trailer.get(b"Encrypt")`) that no `Encrypt` key exists — a
+   structurally independent path from the byte scan. `lopdf`'s auto-decrypt-on-load transparently
+   decrypts object CONTENTS but does not remove the trailer's own `/Encrypt` reference, so this
+   check catches the same case even if the byte scan somehow had a further gap.
+
+**The false-positive inconsistency the review flagged was verified empirically, not just noted:**
+ran both `encrypt_in_content.pdf` (literal `/Encrypt` as page text in an UNCOMPRESSED content
+stream) and `encrypt_in_compressed_content.pdf` (identical text, `FlateDecode`-compressed) through
+`internal-pdf-text` directly. The first is refused (false positive — the scan cannot distinguish
+page text from a real trailer key when reading raw file bytes); the second parses normally (the
+compressed on-disk bytes never contain the literal string). Documented in the spec as accepted,
+not fixed further: a false positive fails closed, the safe direction, and closing the gap would
+require decompressing every stream before the encryption scan can run — the opposite ordering
+`preflight_pdf_streams` deliberately assumes is not yet safe to do.
+
+### P3: missing regression test for an explicit out-of-sandbox `impulse_dir`
+
+The round-1 tests for `memory_search`/`genome_read`'s sandbox defaults called `tool.execute(...)`
+directly, bypassing `ToolRegistry::execute`'s `validate_paths` step entirely — they proved the
+ctx-default SELECTION logic, not that an out-of-sandbox EXPLICIT value is actually denied.  Added
+three new tests in `tool_bridge.rs`, through the real `DynamicToolBridge::run` ->
+`ctx.sandbox_tool_context()` -> `ToolRegistry::execute` -> `validate_paths` path: an explicit
+out-of-sandbox `impulse_dir` is refused for both tools, and (positive control) the identical path
+granted via `/allow` succeeds — proving the refusal is about the sandbox specifically, not merely
+"any path outside `repo_root` fails."
+
+### Gate evidence (review round 2, this checkout)
+
+```
+cd impulse-rs
+cargo build --workspace                                    # clean
+cargo test --workspace                                     # 2036 passed / 0 failed / 5 ignored
+                                                             # (lib) + all integration binaries
+                                                             # green, including 11/11 in
+                                                             # tests/pdf_extraction_isolation.rs
+cargo clippy --workspace --all-targets -- -D warnings       # clean
+cargo fmt --all -- --check                                  # clean
+cargo build --no-default-features                           # clean, zero warnings
+cargo test --no-default-features --lib -- ion_repl::registry  # 5/5 passed
+cargo audit                                                 # unchanged: 11 pre-existing
+                                                             # vulnerabilities / 18 warnings;
+                                                             # flate2 (the one new direct
+                                                             # dependency this round) not flagged
+                                                             # by name; Cargo.lock diff is a
+                                                             # single added line
+python3 docs/validate_docs.py --all                         # only pre-existing failures on main
+```
+
+Isolated re-run of `tests/pdf_extraction_isolation.rs` (11 tests, including the new rogue-shim
+test): 11/11 passed, 1.75s standalone / 0.05s inside the full `cargo test --workspace` run above.
+
+One `clippy::byte_char_slices` warning was caught and fixed mid-round (a test's
+`[b')', b'>', ...]` array literal rewritten as the byte-string form clippy suggested,
+`*b")>]}/% \t\n\r"`) before the final clean gate above.
+
+Full lib total across all three review rounds combined: 2036 passed, 0 failed, 5 ignored (net +19
+from round 2's 2017, matching the 19 new tests added this round: 16 in `tool_document.rs`
+covering `decode_pdf_name_token`/hex-escape detection/`inflate_bounded`/`stream_uses_flate_decode`/
+`preflight_pdf_streams`/`read_capped`/`read_capped_tail`/`max_child_stdout_bytes`, plus 3 P3
+sandbox-denial tests in `tool_bridge.rs`).

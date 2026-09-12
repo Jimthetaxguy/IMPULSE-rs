@@ -193,16 +193,23 @@ originally left open.
   added). Page rendering runs in an **isolated child process** (see "Review round 1" below for why
   -- every other kind runs in-process on the blocking pool); the page count is read from
   `lopdf::Document::get_pages` in-process first (walking the page tree once, no text extraction)
-  and refused above `MAX_PDF_PAGES` (4096) before any page is rendered. Inside the child, each
-  page's text is checked against the character budget *per write*, not once per page after the
-  fact -- true check-before-push, the same discipline as the workbook and Word streamers.
+  and refused above `MAX_PDF_PAGES` (4096) before any page is rendered. Also before any page is
+  rendered, every `FlateDecode`-filtered stream object is inflated once through a bounded,
+  discard-the-bytes counting decoder (`preflight_pdf_streams`, the PDF analogue of
+  `preflight_container`'s zip-container check), refusing above a 64 MiB per-stream/total cap --
+  see "Review round 2" below for why this, not the character budget, is what actually bounds
+  memory. Inside the child, each page's text is ALSO checked against the character budget *per
+  write*, not once per page after the fact -- true check-before-push, the same discipline as the
+  workbook and Word streamers, but a bound on OUTPUT VOLUME and WALL CLOCK, not memory.
   `PlainTextOutput` implements only the text-output half of `pdf_extract::OutputDev` -- it has no
   image-handling code at all, so an embedded image can never reach this tool's output regardless
   of what the PDF contains, and neither can annotation or `AcroForm` field text (`/Annots`): only a
-  page's own `/Contents` stream is rendered. An encrypted PDF is refused via a raw byte scan for
-  `/Encrypt` in the file, run before any parser touches it -- `lopdf::Document::load` silently
-  authenticates a PDF whose *user* password is empty, so `doc.is_encrypted()` after loading cannot
-  be trusted (see "Review round 1"), and this tool makes no password attempt of any kind. A page
+  page's own `/Contents` stream is rendered. An encrypted PDF is refused via a name-escape-aware
+  raw byte scan for `/Encrypt` in the file, run before any parser touches it, plus an independent
+  "belt and braces" check against the parsed trailer after `Document::load` -- `lopdf::Document::load`
+  silently authenticates a PDF whose *user* password is empty, so `doc.is_encrypted()` after
+  loading cannot be trusted (see "Review round 1"), and this tool makes no password attempt of any
+  kind. A page
   with no extractable text (a scanned/image-only page) contributes no line and no section, exactly
   like a blank Word paragraph, so a PDF with no text layer at all parses successfully to an empty
   document with zero sections -- `render` says so explicitly (`(no extractable text layer: this
@@ -265,6 +272,75 @@ map keys rather than assuming a contiguous `1..=N` range, and the module doc's e
 paths are accepted" wording was corrected to name the sandbox constraint that already applied via
 `resolve_document_path_with_cap` (it undersold what was actually enforced, not a security gap).
 
+### Review round 2 (2026-09-12): unbounded child stdout, a compression bomb, and a name escape
+
+A second adversarial pass refuted three round-1 claims and added one missing test.
+
+- **P1.** `run_pdf_extraction_child` used `child.wait_with_output()`, which buffers the whole
+  child stdout/stderr with no cap -- a rogue or compromised child streaming ~1 GiB of output drove
+  the PARENT to ~3.2 GB RSS and produced an accepted, multi-gigabyte-character document. Fixed
+  with `read_capped` (stdout: refuse and kill the child once the JSON-encoded worst case for the
+  requested budget would be exceeded) and `read_capped_tail` (stderr: bounded to 64 KiB, keeping
+  the tail, which never refuses since there is no fixed budget diagnostic text could violate).
+  Both pipes are read on independent `tokio::spawn`ed tasks rather than joined with something like
+  `tokio::join!`: a child blocked writing past the stdout cap never closes ANY of its pipes,
+  including stderr, so waiting for both to resolve together would hang until the wall-clock
+  timeout instead of returning promptly. Regression test:
+  `tests/fakes/rogue-stdout-shim.sh` (a shell script that ignores every argument and writes far
+  more than any reasonable stdout cap) stands in for `exe` directly, proving the parent detects
+  and kills it well under a second.
+- **P2.** `BoundedSink` bounds output volume and wall clock, never memory: `pdf-extract`'s own
+  internal decompression of a stream's content happens BEFORE `BoundedSink` ever sees a
+  character, and is itself completely unbounded. The review's `textbomb2g.pdf` (4.2 MB) inflated
+  476x before the first sink write, reaching multiple GB of RSS in the earlier fix regardless of
+  how small `max_chars` was set. Fixed with `preflight_pdf_streams` -- the PDF analogue of
+  `preflight_container`'s zip-container check -- run before any page renders, in both the
+  parent's cheap pre-check and the child's own independent check: it inflates every
+  `FlateDecode`-filtered stream object through a streaming decoder into a counting sink,
+  discarding bytes as it counts them, refusing with a typed error once a per-stream cap (64 MiB)
+  or the combined total (64 MiB) is exceeded. Peak memory after the fix, measured on this
+  checkout's release build: `textbomb500.pdf` (1.05 MB) refuses in ~0.56s at ~13 MB peak RSS;
+  `textbomb2g.pdf` (4.2 MB) refuses in ~0.03s at ~22 MB peak RSS -- both far under the review's
+  "tens of MB" target, and both refused before any page rendering begins. The 600-page, 9.9 MB
+  legitimate fixture (`legit10m.pdf`) still renders correctly after the fix, in ~0.73s at ~51 MB
+  peak RSS (matching the review's own pre-fix baseline of ~0.68s/54 MB, confirming no regression
+  to the happy path). Only `FlateDecode` streams are checked -- a documented limitation: it is
+  both the PDF ecosystem's dominant filter and the one this attack class actually uses; the
+  alternatives (`LZWDecode`, `ASCII85Decode`, `RunLengthDecode`) cannot reach comparable inflation
+  ratios, and `DCTDecode` is JPEG image data `PlainTextOutput` never reads.
+- **P2.** The raw `/Encrypt` byte scan is a literal-bytes-only match, bypassed by a legal PDF name
+  hex-escape (ISO 32000-1 §7.3.5): `/Encr#79pt` (`#79` = hex 0x79 = ASCII `y`) parses to the
+  identical name `Encrypt` in `lopdf` (and every conformant parser) but contains no literal
+  `/Encrypt` byte sequence at all. Verified against the review's own `enc_emptyuser_hexname.pdf`
+  fixture: before the fix this parsed successfully and returned plaintext; after, it is refused
+  identically to the literal-bytes case. Fixed with a two-tier scan -- the fast literal check
+  first (the common case), then, only if that finds nothing, a fallback that decodes every `/`
+  token's escapes (`decode_pdf_name_token`) before comparing -- plus a second, structurally
+  independent "belt and braces" check directly against the *parsed* trailer dictionary
+  (`doc.trailer.get(b"Encrypt")`) after `Document::load`, in both the parent and the child:
+  `lopdf`'s auto-decrypt-on-load transparently decrypts object CONTENTS but does not remove the
+  trailer's own `/Encrypt` reference, so this check catches the same case through an independent
+  path. **The false-positive path is genuinely inconsistent, verified empirically rather than
+  merely asserted:** a page whose own text contains the literal characters `/Encrypt`, stored in
+  an UNCOMPRESSED content stream (`encrypt_in_content.pdf`), is refused -- the scan runs over raw
+  file bytes and cannot distinguish page text from a real trailer key. The identical text stored
+  in a `FlateDecode`-COMPRESSED content stream (`encrypt_in_compressed_content.pdf`) parses
+  normally, because the compressed on-disk bytes never contain the literal string at all. This is
+  accepted, not fixed further: a false positive fails closed (the safe direction), and resolving
+  the inconsistency would require decompressing every stream before the encryption scan can even
+  run, which is exactly the ordering `preflight_pdf_streams` (the memory bound) does NOT want to
+  assume is already safe to do.
+- **P3.** Added the missing regression test that an EXPLICITLY-supplied out-of-sandbox
+  `impulse_dir` is denied for both `memory_search` and `genome_read`, through the real
+  `DynamicToolBridge`/`ToolRegistry::execute`/`validate_paths` path rather than by calling each
+  tool's `execute()` directly (which the round-1 tests did, proving only the ctx-default selection
+  logic, not that the sandbox actually denies an out-of-bounds explicit value).
+
+Two doc-comment corrections from this pass: `tool_document.rs`'s `PDF_CHILD_MEMORY_LIMIT_BYTES`
+comment previously claimed "the primary bound is still the sink" -- false, per P2 above --
+and `internal_pdf_text.rs`'s module doc gained a note distinguishing what `BoundedSink` bounds
+(output volume, wall clock) from what `preflight_pdf_streams` bounds (memory).
+
 ### Fixture table
 
 | Fixture | Proves |
@@ -286,6 +362,13 @@ paths are accepted" wording was corrected to name the sandbox constraint that al
 | `.md` with `MAX_MD_SECTIONS + 5` headings | exactly `MAX_MD_SECTIONS` sections, and the last one's offset+chars reaches the true end of the text |
 | `.md` with a `#`-looking line inside a fenced code block | not treated as a heading |
 | A previously-`.pdf`-specific "unsupported extension" test, now retargeted at `.pptx` | `pdf`/`txt`/`md` are supported extensions; a still-unsupported one still names them all in its error |
+| A rogue shim (`tests/fakes/rogue-stdout-shim.sh`) that ignores every argument and streams far more than any reasonable stdout cap, pointed at as `exe` directly | the typed "exceeded its output bound" refusal, detected and the child killed well under a second |
+| `BoundedSink::write_str` fed a single 10 MB write, and fed writes seeded with a prior page's running count | peak buffer size never exceeds the cap; the cap is cumulative across pages, not reset per page |
+| A `FlateDecode` stream compressing 1,000,000 repeated bytes down to a few KB, fed to `inflate_bounded`/`preflight_pdf_streams` with a small injected cap | the typed "over the limit" refusal, and the true inflated size when under cap |
+| A PDF whose page content stream is itself a `FlateDecode` bomb (compact on disk, inflates far past 64 MiB), read through the real `internal-pdf-text` child | refused before any page renders, at tens of MB of peak RSS, not gigabytes |
+| A PDF whose trailer names `/Encr#79pt` (ISO 32000-1 §7.3.5 hex escape) instead of the literal `/Encrypt` | the same encrypted-PDF refusal as the literal form -- proves the scan decodes name escapes, not just literal bytes |
+| The identical literal text `/Encrypt`, once in an uncompressed content stream and once in a `FlateDecode`-compressed one | refused in the first case (false positive, documented and accepted), parses normally in the second -- the scan operates on raw file bytes only |
+| `memory_search`/`genome_read`, called through the real `DynamicToolBridge`/`ToolRegistry::execute` path with an explicit `impulse_dir` outside the sandbox | refused by `validate_paths` before either tool's own `execute` runs; the identical path granted via `/allow` succeeds |
 
 ## Out of scope
 

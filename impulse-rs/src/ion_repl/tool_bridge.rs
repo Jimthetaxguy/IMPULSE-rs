@@ -338,4 +338,102 @@ mod tests {
         assert!(result.is_err());
         assert!(!target.exists());
     }
+
+    // ------------------------------------------------------------------
+    // Review round 2, P3: an EXPLICITLY-supplied out-of-sandbox
+    // `impulse_dir` must be refused for memory_search/genome_read, the
+    // same way file_read's `path` is refused above. The review round 1
+    // tests for these two tools called `tool.execute(...)` directly,
+    // bypassing `ToolRegistry::execute`'s `validate_paths` step entirely --
+    // they proved the ctx-default selection logic, not that an
+    // out-of-sandbox explicit value is actually denied end to end through
+    // the bridge. These go through the real path: DynamicToolBridge::run
+    // -> ctx.sandbox_tool_context() -> ToolRegistry::execute ->
+    // validate_paths.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn run_memory_search_with_an_out_of_sandbox_impulse_dir_is_refused() {
+        let repo_root = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("tempdir");
+        let registry = Arc::new(ToolRegistry::with_defaults());
+        let bridge = DynamicToolBridge::new(registry, "memory_search", "n/a");
+        let ctx = ReplContext {
+            repo_root: repo_root.path().to_path_buf(),
+            ..ReplContext::default()
+        };
+
+        let result = bridge
+            .run(
+                serde_json::json!({
+                    "query": "auth",
+                    "impulse_dir": outside.path().display().to_string()
+                }),
+                &ctx,
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "an out-of-sandbox explicit impulse_dir must be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_genome_read_with_an_out_of_sandbox_impulse_dir_is_refused() {
+        let repo_root = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            outside.path().join("GENOME.md"),
+            "# should not be reachable",
+        )
+        .unwrap();
+        let registry = Arc::new(ToolRegistry::with_defaults());
+        let bridge = DynamicToolBridge::new(registry, "genome_read", "n/a");
+        let ctx = ReplContext {
+            repo_root: repo_root.path().to_path_buf(),
+            ..ReplContext::default()
+        };
+
+        let result = bridge
+            .run(
+                serde_json::json!({"impulse_dir": outside.path().display().to_string()}),
+                &ctx,
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "an out-of-sandbox explicit impulse_dir must be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_memory_search_with_an_impulse_dir_inside_the_allow_grant_succeeds() {
+        // Positive control for the two refusal tests above: the SAME
+        // out-of-repo_root directory, but explicitly /allow-granted, must
+        // be reachable -- proving the refusal above is about the sandbox,
+        // not merely "any impulse_dir outside repo_root fails".
+        let repo_root = tempfile::tempdir().expect("tempdir");
+        let granted = tempfile::tempdir().expect("tempdir");
+        let registry = Arc::new(ToolRegistry::with_defaults());
+        let bridge = DynamicToolBridge::new(registry, "memory_search", "n/a");
+        let ctx = ReplContext {
+            repo_root: repo_root.path().to_path_buf(),
+            allowed_read_roots: vec![granted.path().to_path_buf()],
+        };
+
+        let outcome = bridge
+            .run(
+                serde_json::json!({
+                    "query": "auth",
+                    "impulse_dir": granted.path().display().to_string()
+                }),
+                &ctx,
+            )
+            .await
+            .expect("an /allow-granted impulse_dir must be reachable");
+
+        assert!(outcome.ok);
+    }
 }

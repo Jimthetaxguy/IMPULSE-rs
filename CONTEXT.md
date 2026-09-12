@@ -252,7 +252,21 @@ loading: `lopdf::Document::load` silently authenticates a PDF whose *user* passw
 count is still checked cheaply in-process (`precheck_pdf`, proven safe against page-tree cycles/
 deep nesting) before any page is rendered. Annotation/`AcroForm` text is never extracted (only a
 page's own `/Contents` stream is rendered).
-- **Source of truth:** `src/ion_repl/tool_document.rs` and
+
+**Review round 2 on PR #54 refuted three round-1 claims.** (1) `child.wait_with_output()` buffered
+the whole child stdout/stderr unboundedly -- a rogue child streaming ~1 GiB drove the PARENT to
+~3.2 GB RSS. Fixed with `read_capped`/`read_capped_tail`, read on independent `tokio::spawn`ed
+tasks (not `tokio::join!`, which would hang: a child blocked writing past the stdout cap never
+closes stderr either). (2) `BoundedSink` bounds output volume and wall clock, never memory --
+`pdf-extract`'s own stream decompression is unbounded and happens before `BoundedSink` ever runs;
+a `FlateDecode` stream inflated 476x on the review's own fixture. Fixed with
+`preflight_pdf_streams` (the PDF analogue of `preflight_container`), run before any page renders,
+bringing peak RSS on the review's text-bomb fixtures from multi-GB down to ~13-22 MB. (3) The raw
+`/Encrypt` scan missed a legal PDF name hex-escape (`/Encr#79pt`, ISO 32000-1 §7.3.5) with no
+literal `/Encrypt` bytes. Fixed with a name-escape decoder plus a second, independent check
+directly against the parsed trailer dictionary.
+- **Source of truth:** `src/ion_repl/tool_document.rs`, `src/handlers/internal_pdf_text.rs`,
+  `tests/pdf_extraction_isolation.rs`, `tests/fakes/rogue-stdout-shim.sh`, and
   `docs/superpowers/specs/2026-09-01-ion-document-tool-design.md`.
 
 ### bridged memory tools — `[code]`

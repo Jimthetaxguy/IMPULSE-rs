@@ -1137,13 +1137,25 @@ pub fn extract_word(path: &Path, raw: &str, budget: ExtractBudget) -> Result<Par
 /// way a PDF's Form XObjects can (review round 1, item 3).
 const PDF_CHILD_TIMEOUT_SECS: u64 = 30;
 /// Soft/hard `RLIMIT_AS` ceiling for the isolated PDF-extraction child, in
-/// bytes. Defense in depth on top of the character-budgeted sink
-/// (`internal_pdf_text::BoundedSink`): even if `pdf-extract` or a font/
-/// decoder path allocates large internal buffers before ever calling the
-/// sink, this caps how far the child can go before the kernel kills it.
-/// Not fully enforced on macOS (`RLIMIT_AS` is accepted by `setrlimit` but
-/// not kernel-enforced the way Linux enforces it); real enforcement is
-/// Linux. The primary bound is still the sink.
+/// bytes -- one more layer among several, not the memory bound.
+///
+/// **Correction (review round 2):** an earlier version of this comment
+/// claimed "the primary bound is still the sink" -- FALSIFIED.
+/// `internal_pdf_text::BoundedSink` bounds OUTPUT VOLUME and WALL CLOCK; it
+/// was never a memory bound, and measurably is not one: a `FlateDecode`
+/// content stream inflates before any sink write ever runs (`pdf-extract`'s
+/// own internal decompression is unbounded), so a small compressed stream
+/// reached multiple GB of RSS regardless of how small the character budget
+/// was set. [`preflight_pdf_streams`] -- which discards inflated bytes as
+/// it counts them, refusing before any page renders -- is what actually
+/// bounds memory. `RLIMIT_AS` here is a THIRD, best-effort layer on top of
+/// both (not fully kernel-enforced on macOS, where `setrlimit` accepts it
+/// but does not enforce it the way Linux does; real enforcement is Linux).
+/// Isolation (this whole child process) bounds blast radius on top of all
+/// three. Measured after the preflight fix: the review's own
+/// `textbomb500.pdf` (1.05 MB) peaks at ~13 MB RSS in ~0.56s;
+/// `textbomb2g.pdf` (4.2 MB) peaks at ~22 MB RSS in ~0.03s -- both refused
+/// by the preflight before any page rendering begins.
 const PDF_CHILD_MEMORY_LIMIT_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
 
 /// One page's text as reported by the `internal-pdf-text` child (review
@@ -1162,6 +1174,37 @@ pub struct PdfChildOutput {
     pub pages: Vec<PdfChildPage>,
 }
 
+/// Decodes one PDF name token's `#XX` hex escapes (ISO 32000-1 §7.3.5),
+/// starting at the byte right after the leading `/`, stopping at the first
+/// PDF delimiter/whitespace byte or the end of input. A malformed escape (a
+/// `#` not followed by two hex digits) is passed through literally rather
+/// than failing the scan -- lenient the same direction a real-world PDF
+/// parser is, and this function only ever feeds a refusal decision, never
+/// content a model sees.
+fn decode_pdf_name_token(bytes: &[u8]) -> Vec<u8> {
+    const DELIMITERS: &[u8] = b"()<>[]{}/%\0\t\n\x0c\r ";
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if DELIMITERS.contains(&b) {
+            break;
+        }
+        if b == b'#' && i + 2 < bytes.len() {
+            if let Ok(hex_str) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(value) = u8::from_str_radix(hex_str, 16) {
+                    out.push(value);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(b);
+        i += 1;
+    }
+    out
+}
+
 /// Cheap, conservative refusal check for a PDF whose trailer declares
 /// `/Encrypt`, run against the RAW file bytes before any parser sees them.
 ///
@@ -1176,15 +1219,154 @@ pub struct PdfChildOutput {
 /// it -- this tool no longer calls `is_encrypted()` at all. This scan runs
 /// first and makes no password attempt of any kind, empty or otherwise.
 ///
+/// **Review round 2 (CONFIRMED):** the original literal-bytes-only scan is
+/// bypassed by a legal PDF name hex-escape (ISO 32000-1 §7.3.5) -- e.g.
+/// `/Encr#79pt` (`#79` = hex 0x79 = ASCII `y`) parses to the identical name
+/// `Encrypt` in `lopdf` (and every conformant PDF parser) but contains no
+/// literal `/Encrypt` byte sequence at all, so the fast scan missed it.
+/// Fixed with a two-tier scan: the fast literal check first (the common
+/// case, one pass, no allocation), then, only if that finds nothing, a
+/// slower fallback that walks every `/` in the file and decodes that name
+/// token's escapes ([`decode_pdf_name_token`]) before comparing. Bounded by
+/// [`MAX_DOCUMENT_BYTES`] like every other check here, so worst-case work
+/// (a file that is mostly `/` bytes) stays a bounded function of the
+/// already-capped input size.
+///
 /// A false positive (an unencrypted PDF that happens to contain the
 /// literal bytes `/Encrypt`, e.g. as page text) fails closed, the safe
 /// direction. A false negative would require a spec-violating writer: the
 /// `/Encrypt` key that actually matters is always a plain, uncompressed
 /// trailer or XRef-stream-dictionary entry per the PDF spec, never itself
-/// inside a compressed object stream.
+/// inside a compressed object stream -- **this is also why the false-
+/// positive path is inconsistent** (documented, not fixed further): the
+/// literal bytes `/Encrypt` appearing as ordinary PAGE TEXT trips this scan
+/// when that page's content stream is stored uncompressed, but the same
+/// text inside a `FlateDecode`-compressed content stream (the common case)
+/// does not, since the scan only ever sees the file's raw, on-disk bytes.
 pub(crate) fn pdf_declares_encryption(bytes: &[u8]) -> bool {
     const NEEDLE: &[u8] = b"/Encrypt";
-    bytes.windows(NEEDLE.len()).any(|w| w == NEEDLE)
+    if bytes.windows(NEEDLE.len()).any(|w| w == NEEDLE) {
+        return true;
+    }
+    bytes
+        .iter()
+        .enumerate()
+        .filter(|(_, &b)| b == b'/')
+        .any(|(i, _)| decode_pdf_name_token(&bytes[i + 1..]) == b"Encrypt")
+}
+
+/// Largest total inflated bytes every `FlateDecode` stream object in a PDF
+/// may produce combined, mirroring [`MAX_DECOMPRESSED_BYTES`] (the
+/// analogous zip-container cap `xlsx`/`docx` already enforce) for the PDF
+/// version of the same vulnerability class.
+pub const MAX_PDF_DECOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
+/// Per-stream inflation cap: generous for any legitimate single page/Form
+/// XObject content stream (review round 2's own 600-page, 9.9 MB
+/// legitimate fixture rendered fine well under this), far below what a
+/// pathological single stream can otherwise reach.
+pub const MAX_PDF_STREAM_DECOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Inflates `compressed` through a streaming zlib decoder, discarding each
+/// chunk immediately after counting it rather than accumulating output, so
+/// peak memory for this call is the decoder's own internal window plus one
+/// small read buffer -- never proportional to how much the stream would
+/// actually inflate to. Refuses once the running total exceeds `cap`.
+fn inflate_bounded(compressed: &[u8], cap: u64) -> Result<u64> {
+    use std::io::Read as _;
+    let mut decoder = flate2::read::ZlibDecoder::new(compressed);
+    let mut buf = [0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = decoder
+            .read(&mut buf)
+            .map_err(|e| anyhow::anyhow!("could not inflate PDF stream: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        if total > cap {
+            bail!("PDF stream inflates to more than {cap} bytes, over the limit");
+        }
+    }
+    Ok(total)
+}
+
+/// `true` when `dict`'s `/Filter` entry names (or includes, in a filter
+/// chain array) `FlateDecode` -- the PDF ecosystem's dominant stream
+/// filter, and the one review round 2's actual compression-bomb attack
+/// uses.
+fn stream_uses_flate_decode(dict: &pdf_extract::Dictionary) -> bool {
+    match dict.get(b"Filter") {
+        Ok(pdf_extract::Object::Name(name)) => name == b"FlateDecode",
+        Ok(pdf_extract::Object::Array(names)) => names
+            .iter()
+            .any(|n| matches!(n, pdf_extract::Object::Name(name) if name == b"FlateDecode")),
+        _ => false,
+    }
+}
+
+/// Inflates every `FlateDecode`-filtered stream object in `doc` once,
+/// through [`inflate_bounded`], before any page is rendered -- the PDF
+/// analogue of `preflight_container`'s zip-container check.
+///
+/// **Review round 2, P2 (CONFIRMED):** `pdf-extract`'s own internal
+/// decompression of a stream's content -- which happens lazily, the moment
+/// a page or Form XObject's content stream is actually read for rendering,
+/// deep inside `output_doc_page`, well after `BoundedSink`'s first write
+/// could ever run -- is itself completely unbounded. A crafted PDF
+/// declaring one `FlateDecode` stream inflated to 476x its compressed size
+/// on the review's own fixture, reaching multiple GB of RSS regardless of
+/// how small `max_chars` was set, since the character budget was never the
+/// bound that mattered: **`BoundedSink` bounds output volume and wall
+/// clock, not memory. This preflight is what actually bounds memory.**
+/// Isolation (the child process) bounds blast radius on top of both.
+///
+/// Refuses with a typed error if a single stream or the combined total
+/// exceeds its cap. Streams under any OTHER declared filter (`LZWDecode`,
+/// `ASCII85Decode`, `RunLengthDecode`, `DCTDecode`, none) are not
+/// independently bounded here -- a documented limitation: `FlateDecode` is
+/// both the dominant real-world filter and the one this attack class
+/// actually uses, and the alternatives either cannot reach comparable
+/// inflation ratios (`ASCII85Decode`/`RunLengthDecode` are a few times
+/// larger at most) or are not text-content filters at all (`DCTDecode` is
+/// JPEG image data `PlainTextOutput` never reads).
+pub fn preflight_pdf_streams(doc: &pdf_extract::Document, raw: &str) -> Result<()> {
+    preflight_pdf_streams_with_caps(
+        doc,
+        raw,
+        MAX_PDF_STREAM_DECOMPRESSED_BYTES,
+        MAX_PDF_DECOMPRESSED_BYTES,
+    )
+}
+
+/// [`preflight_pdf_streams`] with explicit per-stream/total caps; the test
+/// seam (compressing a fixture large enough to exceed the real 64 MiB caps
+/// would be slow for no extra coverage).
+pub fn preflight_pdf_streams_with_caps(
+    doc: &pdf_extract::Document,
+    raw: &str,
+    per_stream_cap: u64,
+    total_cap: u64,
+) -> Result<()> {
+    let mut total: u64 = 0;
+    for object in doc.objects.values() {
+        let pdf_extract::Object::Stream(stream) = object else {
+            continue;
+        };
+        if !stream_uses_flate_decode(&stream.dict) {
+            continue;
+        }
+        let inflated = inflate_bounded(&stream.content, per_stream_cap)
+            .map_err(|e| anyhow::anyhow!("document_read: '{raw}' could not be parsed: {e}"))?;
+        total = total.saturating_add(inflated);
+        if total > total_cap {
+            bail!(
+                "document_read: '{raw}' PDF stream content inflates to more than {total_cap} \
+                 bytes combined, over the limit"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Cheap, safe pre-checks run in-process: the raw encryption scan above,
@@ -1195,6 +1377,15 @@ pub(crate) fn pdf_declares_encryption(bytes: &[u8]) -> bool {
 /// safe here -- rendering one page's content stream into text -- never
 /// happens in this function; it happens only inside the isolated child
 /// process [`run_pdf_extraction_child`] spawns.
+///
+/// **Belt and braces (review round 2):** after `Document::load`, this also
+/// re-asserts directly against the PARSED trailer dictionary
+/// (`doc.trailer.get(b"Encrypt")`) that no `Encrypt` key exists, rather
+/// than relying solely on the raw byte scan or on `doc.is_encrypted()`
+/// (unreliable per P2-1 above). `lopdf`'s auto-decrypt-on-load transparently
+/// decrypts object CONTENTS but does not remove the trailer's `/Encrypt`
+/// reference itself, so this check catches the same case as the byte scan
+/// through a structurally independent path.
 fn precheck_pdf(path: &Path, raw: &str) -> Result<usize> {
     let bytes =
         std::fs::read(path).with_context(|| format!("document_read: '{raw}' could not be read"))?;
@@ -1207,6 +1398,14 @@ fn precheck_pdf(path: &Path, raw: &str) -> Result<usize> {
     }
     let doc = pdf_extract::Document::load(path)
         .map_err(|e| anyhow::anyhow!("document_read: '{raw}' could not be parsed: {e}"))?;
+    if doc.trailer.get(b"Encrypt").is_ok() {
+        bail!(
+            "document_read: '{raw}' is an encrypted PDF, which this tool does not support \
+             (it never attempts a password, including an empty one); remove the password \
+             protection and try again"
+        );
+    }
+    preflight_pdf_streams(&doc, raw)?;
     Ok(doc.get_pages().len())
 }
 
@@ -1430,19 +1629,29 @@ async fn run_pdf_extraction_child(
         }
     }
 
-    let child = cmd.spawn().with_context(|| {
+    let mut child = cmd.spawn().with_context(|| {
         format!(
             "document_read: '{raw}' failed to spawn the PDF extraction subprocess ({})",
             exe.display()
         )
     })?;
     let mut guard = crate::process_group::ProcessGroupGuard::new(child.id());
+    let stdout_cap = max_child_stdout_bytes(max_chars, max_pages);
 
-    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+    let output = match tokio::time::timeout(
+        timeout,
+        bounded_wait_with_output(
+            &mut child,
+            &mut guard,
+            stdout_cap,
+            MAX_CHILD_STDERR_BYTES,
+            raw,
+        ),
+    )
+    .await
+    {
         Ok(result) => {
-            let output = result.with_context(|| {
-                format!("document_read: '{raw}' failed to run the PDF extraction subprocess")
-            })?;
+            let output = result?;
             guard.disarm();
             output
         }
@@ -1483,6 +1692,169 @@ async fn run_pdf_extraction_child(
         format!("document_read: '{raw}' PDF extraction subprocess produced malformed output")
     })?;
     Ok(parsed.pages)
+}
+
+/// Worst-case byte size of the child's JSON stdout for a given character
+/// budget and page count: `serde_json` writes each `char` as its UTF-8
+/// bytes (at most 4) plus, in the rare case of a control character, a
+/// `\u00XX` escape (6 bytes) -- 8 bytes/char covers both with margin. The
+/// per-page JSON envelope (`{"page_num":N,"text":"..."}`, commas, field
+/// names) is bounded by a fixed allowance per page; the array/object
+/// wrapper by a small fixed constant.
+fn max_child_stdout_bytes(max_chars: usize, max_pages: usize) -> usize {
+    max_chars
+        .saturating_mul(8)
+        .saturating_add(max_pages.saturating_mul(64))
+        .saturating_add(4096)
+}
+
+/// stderr is diagnostic text, never budget-shaped; a fixed cap keeping the
+/// tail (the most recent bytes are the most relevant to a failure) is
+/// generous for any real error message this tool produces.
+const MAX_CHILD_STDERR_BYTES: usize = 64 * 1024;
+
+/// Bounded `child.wait_with_output()` replacement.
+///
+/// **Review round 2, P1 (CONFIRMED):** `child.wait_with_output()` buffers
+/// the WHOLE child stdout/stderr with no cap at all -- a rogue or
+/// compromised child (the `internal-pdf-text` subcommand itself, or
+/// `exe`/`PATH` tampering pointing at something else entirely) streaming
+/// gigabytes of output drove the PARENT process to gigabytes of RSS and
+/// produced an accepted, multi-gigabyte-character "document" -- the same
+/// unbounded-buffer class of bug `daemon::mod`'s own connection loop was
+/// fixed for (`daemon::read_bounded_line`). This bounds BOTH pipes: stdout
+/// via [`read_capped`] (refuse and kill once it would exceed the
+/// JSON-encoded worst case for the requested budget -- the content is
+/// discarded either way once exceeded, so keeping only a bounded prefix is
+/// fine), stderr via [`read_capped_tail`] (diagnostic text has no fixed
+/// budget to check against, so it always succeeds with whatever tail fit,
+/// bounded regardless of how much a rogue child actually wrote).
+///
+/// Reads both pipes on INDEPENDENT tasks, deliberately NOT joined together
+/// with something like `tokio::join!` that waits for both to resolve
+/// before continuing. Found the hard way (review round 2's own rogue-child
+/// integration test hung for the full wall-clock timeout instead of
+/// returning promptly): once `read_capped` stops draining stdout past its
+/// cap, a child still trying to write more blocks on that pipe's next
+/// `write()` -- it never exits and so never closes ANY of its pipes,
+/// including stderr. `tokio::join!` would then wait forever (well, until
+/// the outer wall-clock timeout) for the stderr read to see EOF, even
+/// though the stdout read already has the answer we need. Spawning lets
+/// the stdout task's result (exceeded or not) act independently of
+/// whatever stderr is doing; only once stdout is known to be within bound
+/// do we also wait on stderr (which, for a well-behaved child that has
+/// therefore already exited or is about to, resolves quickly in practice
+/// -- and remains bounded overall by the caller's wall-clock timeout even
+/// in an unexpected case).
+async fn bounded_wait_with_output(
+    child: &mut tokio::process::Child,
+    guard: &mut crate::process_group::ProcessGroupGuard,
+    stdout_cap: usize,
+    stderr_cap: usize,
+    raw: &str,
+) -> Result<BoundedChildOutput> {
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("PDF extraction subprocess has no piped stdout"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("PDF extraction subprocess has no piped stderr"))?;
+    let stdout_task = tokio::spawn(async move { read_capped(&mut stdout, stdout_cap).await });
+    let stderr_task = tokio::spawn(async move { read_capped_tail(&mut stderr, stderr_cap).await });
+
+    let (stdout_buf, stdout_exceeded) = stdout_task
+        .await
+        .context("document_read: PDF extraction subprocess's stdout reader task panicked")?
+        .with_context(|| {
+            format!("document_read: '{raw}' failed reading the PDF extraction subprocess's stdout")
+        })?;
+
+    if stdout_exceeded {
+        // A rogue/compromised child; do not wait for it to finish
+        // producing arbitrarily more, and do not wait on the (possibly
+        // wedged) stderr task either. `kill_now` kills the whole isolated
+        // process group and disarms the guard so its own Drop does not
+        // double-kill; the child is still reaped below to avoid a zombie.
+        stderr_task.abort();
+        guard.kill_now();
+        let _ = child.wait().await;
+        bail!(
+            "document_read: '{raw}' PDF extraction subprocess exceeded its output bound \
+             ({stdout_cap} bytes); refusing as possible rogue or malicious output -- the child \
+             was killed"
+        );
+    }
+
+    let stderr_buf = stderr_task
+        .await
+        .context("document_read: PDF extraction subprocess's stderr reader task panicked")?
+        .with_context(|| {
+            format!("document_read: '{raw}' failed reading the PDF extraction subprocess's stderr")
+        })?;
+    let status = child.wait().await.with_context(|| {
+        format!("document_read: '{raw}' failed waiting for the PDF extraction subprocess to exit")
+    })?;
+    Ok(BoundedChildOutput {
+        status,
+        stdout: stdout_buf,
+        stderr: stderr_buf,
+    })
+}
+
+struct BoundedChildOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Reads `reader` to EOF, refusing (returning `exceeded = true` and only
+/// the first `cap` bytes) if more than `cap` bytes arrive. Mirrors
+/// `daemon::read_bounded_line`'s `AsyncReadExt::take(cap + 1)` pattern
+/// (peak memory for one read is capped regardless of what the peer sends),
+/// adapted for an EOF-terminated read rather than a line-terminated one.
+async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    cap: usize,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    use tokio::io::AsyncReadExt as _;
+    let mut buf = Vec::new();
+    let mut limited = reader.take(cap as u64 + 1);
+    limited.read_to_end(&mut buf).await?;
+    let exceeded = buf.len() > cap;
+    if exceeded {
+        buf.truncate(cap);
+    }
+    Ok((buf, exceeded))
+}
+
+/// Like [`read_capped`], but for a stream where only the most recent `cap`
+/// bytes matter (stderr diagnostic text): reads in bounded chunks and
+/// keeps only the tail, so peak memory stays at roughly `cap` plus one
+/// chunk regardless of how much a rogue child actually writes -- unlike
+/// `read_capped`, this never refuses (there is no fixed budget content
+/// could violate), it just returns whatever tail fit, always.
+async fn read_capped_tail<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    cap: usize,
+) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt as _;
+    const CHUNK: usize = 8192;
+    let mut tail: Vec<u8> = Vec::new();
+    let mut chunk = vec![0u8; CHUNK];
+    loop {
+        let n = reader.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        tail.extend_from_slice(&chunk[..n]);
+        if tail.len() > cap {
+            let excess = tail.len() - cap;
+            tail.drain(0..excess);
+        }
+    }
+    Ok(tail)
 }
 
 /// Detects one ATX heading line: up to 3 leading spaces (CommonMark
@@ -4105,6 +4477,276 @@ mod tests {
                     .starts_with("document_read: 'not-really.pdf' could not be parsed"),
                 "{err}"
             );
+        }
+
+        // --------------------------------------------------------------
+        // Review round 2 fixes: hex-escaped /Encrypt names, the stream-
+        // inflation preflight, and the bounded child stdout/stderr reader.
+        // --------------------------------------------------------------
+
+        #[test]
+        fn test_decode_pdf_name_token_resolves_hex_escapes() {
+            // "#79" is hex 0x79 = ASCII 'y'.
+            assert_eq!(decode_pdf_name_token(b"Encr#79pt rest"), b"Encrypt");
+            assert_eq!(decode_pdf_name_token(b"Plain>"), b"Plain");
+            assert_eq!(decode_pdf_name_token(b""), b"");
+        }
+
+        #[test]
+        fn test_decode_pdf_name_token_stops_at_the_first_delimiter() {
+            for delim in *b")>]}/% \t\n\r" {
+                let mut input = b"Foo".to_vec();
+                input.push(delim);
+                input.extend_from_slice(b"tail");
+                assert_eq!(decode_pdf_name_token(&input), b"Foo", "delimiter {delim}");
+            }
+        }
+
+        #[test]
+        fn test_decode_pdf_name_token_passes_through_a_malformed_escape_literally() {
+            // '#' not followed by two hex digits is not a valid escape;
+            // this function is lenient (a refusal decision only, never
+            // content a model sees), not a strict validator.
+            assert_eq!(decode_pdf_name_token(b"Foo#zz "), b"Foo#zz");
+            assert_eq!(decode_pdf_name_token(b"Foo#"), b"Foo#");
+        }
+
+        #[test]
+        fn test_pdf_declares_encryption_catches_a_hex_escaped_name() {
+            // Review round 2, CONFIRMED: `/Encr#79pt` has no literal
+            // `/Encrypt` byte sequence but decodes to the identical name.
+            let bytes = b"...trailer<</Root 1 0 R/Encr#79pt 5 0 R>>...";
+            assert!(
+                !bytes.windows(8).any(|w| w == b"/Encrypt"),
+                "sanity: no literal match"
+            );
+            assert!(pdf_declares_encryption(bytes));
+        }
+
+        #[test]
+        fn test_pdf_declares_encryption_hex_escape_does_not_false_positive_on_unrelated_names() {
+            assert!(!pdf_declares_encryption(
+                b"<</Type/Catalog/Enc#79rypt 1 0 R>>"
+            ));
+            assert!(!pdf_declares_encryption(
+                b"<</Type/Font/BaseFont/Helvetica>>"
+            ));
+        }
+
+        fn compress_zlib(data: &[u8]) -> Vec<u8> {
+            use flate2::write::ZlibEncoder;
+            use flate2::Compression;
+            use std::io::Write as _;
+            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+            encoder.write_all(data).unwrap();
+            encoder.finish().unwrap()
+        }
+
+        #[test]
+        fn test_inflate_bounded_accepts_under_the_cap_and_reports_the_true_size() {
+            let payload = vec![b'A'; 1000];
+            let compressed = compress_zlib(&payload);
+
+            let size = inflate_bounded(&compressed, 2000).unwrap();
+
+            assert_eq!(size, 1000);
+        }
+
+        #[test]
+        fn test_inflate_bounded_refuses_once_the_running_total_exceeds_the_cap() {
+            // A highly compressible payload: real zlib bytes, large ratio,
+            // mirroring the review's own textbomb fixtures -- but sized for
+            // a fast, deterministic test rather than gigabytes.
+            let payload = vec![b'A'; 1_000_000];
+            let compressed = compress_zlib(&payload);
+            assert!(
+                compressed.len() < 10_000,
+                "fixture should compress far smaller than its inflated size: {}",
+                compressed.len()
+            );
+
+            let err = inflate_bounded(&compressed, 1000).unwrap_err();
+
+            assert!(err.to_string().contains("over the limit"), "{err}");
+        }
+
+        #[test]
+        fn test_stream_uses_flate_decode_recognizes_a_name_and_a_filter_chain_array() {
+            let mut named = pdf_extract::Dictionary::new();
+            named.set("Filter", pdf_extract::Object::from("FlateDecode"));
+            assert!(stream_uses_flate_decode(&named));
+
+            let mut chained = pdf_extract::Dictionary::new();
+            chained.set(
+                "Filter",
+                pdf_extract::Object::Array(vec![
+                    pdf_extract::Object::from("ASCII85Decode"),
+                    pdf_extract::Object::from("FlateDecode"),
+                ]),
+            );
+            assert!(stream_uses_flate_decode(&chained));
+
+            let mut other = pdf_extract::Dictionary::new();
+            other.set("Filter", pdf_extract::Object::from("DCTDecode"));
+            assert!(!stream_uses_flate_decode(&other));
+
+            assert!(!stream_uses_flate_decode(&pdf_extract::Dictionary::new()));
+        }
+
+        /// Builds a one-page PDF whose page content stream is itself a
+        /// highly compressible `FlateDecode` bomb: real zlib bytes (so
+        /// `stream_uses_flate_decode`/`inflate_bounded` see genuine
+        /// declared+compressed data, exactly like `write_pdf`'s legitimate
+        /// fixture), but `payload_len` bytes of a single repeated byte, so
+        /// a modest `payload_len` still inflates far past a small test cap
+        /// -- mirroring the review's `textbomb2g`/`textbomb500` fixtures at
+        /// test-appropriate scale rather than gigabytes.
+        fn write_pdf_with_bomb_stream(dir: &tempfile::TempDir, payload_len: usize) -> PathBuf {
+            use pdf_extract::{Document, Object, Stream};
+
+            let mut doc = Document::with_version("1.5");
+            let pages_id = doc.new_object_id();
+            let bomb = compress_zlib(&vec![b'A'; payload_len]);
+            let mut content_dict = pdf_dict(&[]);
+            content_dict.set("Filter", Object::from("FlateDecode"));
+            let content_id = doc.add_object(Stream::new(content_dict, bomb));
+            let page_id = doc.add_object(pdf_dict(&[
+                ("Type", Object::from("Page")),
+                ("Parent", Object::Reference(pages_id)),
+                ("Contents", Object::Reference(content_id)),
+            ]));
+            let pages_dict = pdf_dict(&[
+                ("Type", Object::from("Pages")),
+                ("Kids", Object::Array(vec![Object::Reference(page_id)])),
+                ("Count", Object::Integer(1)),
+                (
+                    "MediaBox",
+                    Object::Array(vec![
+                        Object::Integer(0),
+                        Object::Integer(0),
+                        Object::Integer(612),
+                        Object::Integer(792),
+                    ]),
+                ),
+            ]);
+            doc.objects.insert(pages_id, Object::Dictionary(pages_dict));
+            let catalog_id = doc.add_object(pdf_dict(&[
+                ("Type", Object::from("Catalog")),
+                ("Pages", Object::Reference(pages_id)),
+            ]));
+            doc.trailer.set("Root", catalog_id);
+            let path = dir.path().join("bomb.pdf");
+            doc.save(&path).unwrap();
+            path
+        }
+
+        #[test]
+        fn test_preflight_pdf_streams_refuses_a_compression_bomb_before_any_page_renders() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = write_pdf_with_bomb_stream(&dir, 1_000_000);
+            let doc = pdf_extract::Document::load(&path).unwrap();
+
+            let err =
+                preflight_pdf_streams_with_caps(&doc, "bomb.pdf", 10_000, 10_000).unwrap_err();
+
+            assert!(err.to_string().contains("over the limit"), "{err}");
+        }
+
+        #[test]
+        fn test_preflight_pdf_streams_accepts_a_legitimate_document_under_the_cap() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = write_pdf(&dir, &["ordinary page text, nothing pathological here"]);
+            let doc = pdf_extract::Document::load(&path).unwrap();
+
+            preflight_pdf_streams(&doc, "doc.pdf").unwrap();
+        }
+
+        #[test]
+        fn test_precheck_pdf_refuses_a_compression_bomb_via_the_default_caps() {
+            // End-to-end through precheck_pdf's own call to
+            // preflight_pdf_streams (the real 64 MiB caps): a bomb sized to
+            // clear 64 MiB inflated while staying fast to build/compress.
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = write_pdf_with_bomb_stream(&dir, 80 * 1024 * 1024);
+
+            let err = precheck_pdf(&path, "bomb.pdf").unwrap_err();
+
+            assert!(err.to_string().contains("over the limit"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn test_read_capped_accepts_input_at_exactly_the_cap() {
+            use tokio::io::AsyncWriteExt as _;
+            let (mut writer, mut reader) = tokio::io::duplex(4096);
+            let data = vec![b'A'; 100];
+            let data_clone = data.clone();
+            let write_task = tokio::spawn(async move {
+                writer.write_all(&data_clone).await.unwrap();
+            });
+
+            let (buf, exceeded) = read_capped(&mut reader, 100).await.unwrap();
+            write_task.await.unwrap();
+
+            assert!(!exceeded);
+            assert_eq!(buf, data);
+        }
+
+        #[tokio::test]
+        async fn test_read_capped_reports_exceeded_and_a_capped_prefix_when_input_is_too_large() {
+            use tokio::io::AsyncWriteExt as _;
+            let (mut writer, mut reader) = tokio::io::duplex(65536);
+            let write_task = tokio::spawn(async move {
+                // Far more than the cap below; read_capped must stop
+                // pulling bytes once its own limit is hit, not buffer all
+                // of this.
+                let _ = writer.write_all(&vec![b'B'; 1_000_000]).await;
+            });
+
+            let (buf, exceeded) = read_capped(&mut reader, 10).await.unwrap();
+            drop(write_task);
+
+            assert!(exceeded);
+            assert_eq!(
+                buf.len(),
+                10,
+                "must keep only the capped prefix, not everything read"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_read_capped_tail_keeps_only_the_most_recent_bytes() {
+            use tokio::io::AsyncWriteExt as _;
+            let (mut writer, mut reader) = tokio::io::duplex(65536);
+            let write_task = tokio::spawn(async move {
+                writer.write_all(b"0123456789ABCDEFGHIJ").await.unwrap();
+            });
+
+            let tail = read_capped_tail(&mut reader, 5).await.unwrap();
+            write_task.await.unwrap();
+
+            assert_eq!(tail, b"FGHIJ", "must keep the TAIL, not the head");
+        }
+
+        #[tokio::test]
+        async fn test_read_capped_tail_returns_everything_when_under_the_cap() {
+            use tokio::io::AsyncWriteExt as _;
+            let (mut writer, mut reader) = tokio::io::duplex(4096);
+            let write_task = tokio::spawn(async move {
+                writer.write_all(b"short").await.unwrap();
+            });
+
+            let tail = read_capped_tail(&mut reader, 100).await.unwrap();
+            write_task.await.unwrap();
+
+            assert_eq!(tail, b"short");
+        }
+
+        #[test]
+        fn test_max_child_stdout_bytes_scales_with_budget_and_pages() {
+            let small = max_child_stdout_bytes(100, 1);
+            let large = max_child_stdout_bytes(1_000_000, 100);
+            assert!(small < large);
+            assert!(small > 0);
         }
 
         // --------------------------------------------------------------

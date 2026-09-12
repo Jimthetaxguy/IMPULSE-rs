@@ -22,6 +22,17 @@
 //!   file. [`BoundedSink`] fixes this at the source: it refuses a write the
 //!   instant the running total would exceed the budget, during rendering,
 //!   not after a page completes.
+//!
+//! **`BoundedSink` bounds OUTPUT VOLUME and WALL CLOCK, not memory in
+//! general (review round 2, P2 -- a second, distinct finding from P0-2
+//! above, and correcting an earlier doc comment that conflated the two):**
+//! `pdf-extract`'s own internal decompression of a stream's content, which
+//! happens before `BoundedSink` ever sees a single character, is itself
+//! unbounded -- a `FlateDecode` content stream can inflate hundreds of
+//! times its compressed size. `extract`'s call to
+//! `ion_repl::tool_document::preflight_pdf_streams` is what actually
+//! bounds memory, run before any page rendering (and so before
+//! `BoundedSink`) begins.
 
 use std::path::Path;
 
@@ -139,6 +150,26 @@ fn extract(path: &Path, max_chars: usize, max_pages: usize) -> Result<ChildOutpu
 
     let doc = pdf_extract::Document::load(path)
         .map_err(|e| anyhow::anyhow!("could not parse {}: {e}", path.display()))?;
+    // Belt and braces (review round 2), independent of the parent's own
+    // identical check in `precheck_pdf`: this process is the authoritative
+    // extraction step and re-derives every safety check itself rather than
+    // trusting the parent's pre-check, which exists only to avoid spawning
+    // a subprocess for obviously-bad input.
+    if doc.trailer.get(b"Encrypt").is_ok() {
+        anyhow::bail!(
+            "{} is an encrypted PDF, which this tool does not support (it never attempts a \
+             password, including an empty one); remove the password protection and try again",
+            path.display()
+        );
+    }
+    // Bounds memory (review round 2, P2): BoundedSink bounds output volume
+    // and wall clock, not memory -- a FlateDecode stream can inflate
+    // hundreds of times its compressed size before BoundedSink's first
+    // write-time check ever runs. This preflight is what actually bounds
+    // memory, discarding inflated bytes as it counts them rather than
+    // materializing them.
+    crate::ion_repl::tool_document::preflight_pdf_streams(&doc, &path.display().to_string())?;
+
     let pages = doc.get_pages();
     let page_count = pages.len();
     if page_count > max_pages {

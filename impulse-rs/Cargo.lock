@@ -4680,6 +4680,7 @@ dependencies = [
  "dirs",
  "docx-rs",
  "filetime",
+ "flate2",
  "glob",
  "impulse-ion",
  "impulse-ops",
