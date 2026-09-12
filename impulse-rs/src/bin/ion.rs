@@ -5,6 +5,8 @@
 //! gate run sharing `handle_ion_verify` with `impulse-rs ion-verify` — same
 //! flags, same exit-code convention.
 
+use std::path::PathBuf;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
@@ -32,6 +34,23 @@ enum IonCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Internal: renders one PDF's text layer, bounded, in this isolated
+    /// process, and prints it as JSON to stdout. Spawned only by
+    /// `document_read`'s `run_pdf_extraction_child` (review round 1,
+    /// P0-1/P0-2) as a crash- and memory-isolated child of the running
+    /// `ion` process itself (`std::env::current_exe()` inside `ion`
+    /// resolves to this binary). Shares `handlers::internal_pdf_text::run`
+    /// with `impulse-rs internal-pdf-text` so the two binaries cannot
+    /// drift on this surface. Not a public interface; `hide = true` keeps
+    /// it out of `--help`.
+    #[command(hide = true)]
+    InternalPdfText {
+        path: PathBuf,
+        #[arg(long)]
+        max_chars: usize,
+        #[arg(long)]
+        max_pages: usize,
+    },
 }
 
 #[tokio::main]
@@ -52,5 +71,10 @@ async fn main() -> Result<()> {
             // drift on the ion-verify surface.
             impulse_rs::handlers::ion::handle_ion_verify(repo, diff_ref, description, json).await
         }
+        Some(IonCommand::InternalPdfText {
+            path,
+            max_chars,
+            max_pages,
+        }) => impulse_rs::handlers::internal_pdf_text::run(&path, max_chars, max_pages),
     }
 }

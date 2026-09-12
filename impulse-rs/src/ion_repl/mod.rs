@@ -77,17 +77,46 @@ impl ReplContext {
     /// The sandboxed `ToolContext` every bridged tool
     /// (`tool_bridge::DynamicToolBridge`) actually executes under: writes
     /// limited to [`ReplContext::effective_repo_root`]; reads limited to
-    /// that same root plus every `/allow`-granted path. All capabilities
-    /// are still granted (`ion` is a CLI-launched coding agent, matching
-    /// `ToolContext::with_all_capabilities`'s existing precedent) -- only
-    /// the filesystem roots are narrowed, which is the piece that was
-    /// previously unrestricted.
+    /// that root, Impulse's own home directory, and every `/allow`-granted
+    /// path. All capabilities are still granted (`ion` is a CLI-launched
+    /// coding agent, matching `ToolContext::with_all_capabilities`'s
+    /// existing precedent) -- only the filesystem roots are narrowed, which
+    /// is the piece that was previously unrestricted.
+    ///
+    /// **`impulse_dir` (review round 1, P2-2/P2-3 on PR #54):** `memory_search`/
+    /// `genome_read` (bridged the same way as `file_read`/`file_write`)
+    /// default their own `impulse_dir` parameter to the literal string
+    /// `".impulse"` when a caller omits it, which the framework's generic
+    /// `ToolContext::resolve_path`/`validate_paths` treats as relative to
+    /// the PROCESS's own working directory -- not necessarily the same as
+    /// `repo_root`, and never the `IMPULSE_HOME`-aware convention every
+    /// other `.impulse/` consumer in this codebase uses. Worse, an OMITTED
+    /// parameter is invisible to `validate_paths` (`src/tooling/executor.rs`
+    /// only checks params a caller actually supplied), so the sandbox check
+    /// silently did not run at all for the common case of not passing
+    /// `impulse_dir`. This field is set from `history::impulse_home()` (the
+    /// same `IMPULSE_HOME`/`$HOME/.impulse` resolution `.impulse/ion_history`
+    /// itself uses) and added to the read roots explicitly below -- it is
+    /// Impulse's own state directory, not arbitrary host filesystem, so
+    /// granting it read access here is not a widening of the sandbox the
+    /// way an arbitrary `/allow` grant would be. `memory_search`/
+    /// `genome_read` were updated to default from `ctx.impulse_dir` instead
+    /// of the bare literal, so the default now actually resolves to the
+    /// directory this context grants -- an explicitly-supplied `impulse_dir`
+    /// pointing elsewhere is still checked (and denied when out of the
+    /// sandbox) exactly as before, since `validate_paths` already handles
+    /// present parameters correctly.
     pub fn sandbox_tool_context(&self) -> crate::tooling::ToolContext {
         let repo_root = self.effective_repo_root();
+        let impulse_dir = history::impulse_home();
         let mut read_roots = vec![repo_root.clone()];
+        if impulse_dir != repo_root {
+            read_roots.push(impulse_dir.clone());
+        }
         read_roots.extend(self.allowed_read_roots.iter().cloned());
         crate::tooling::ToolContext {
             execution_origin: crate::tooling::ExecutionOrigin::Cli,
+            impulse_dir,
             allowed_read_roots: read_roots,
             allowed_write_roots: vec![repo_root],
             ..crate::tooling::ToolContext::with_all_capabilities()
@@ -288,12 +317,23 @@ impl ReplSession {
     }
 }
 
-/// One-line notice shown when a chat turn is attempted with no usable API
-/// key configured (`AgentError::MissingApiKey`). Slash commands (`/verify`,
+/// Notice shown when a chat turn is attempted with no usable API key
+/// configured (`AgentError::MissingApiKey`). Slash commands (`/verify`,
 /// `/tools`, `/help`, `/clear`) are unaffected — this only fires on the
 /// `ChatTurn` branch below.
-const MISSING_API_KEY_NOTICE: &str =
-    "No ANTHROPIC_API_KEY set -- chat is unavailable, but /verify and /tools still work.";
+///
+/// **Fix (PR #55 handoff, sibling lane `claude/ion-provider-neutral-20260912`):**
+/// this used to be a fixed string hard-coding `ANTHROPIC_API_KEY`
+/// regardless of which provider was actually configured
+/// (`IMPULSE_PROVIDER=openai`/`minimax`), so a user who set
+/// `OPENAI_API_KEY` and nothing else was told to set a key that was
+/// already set. `AgentError::MissingApiKey` already carries the provider
+/// that was missing a key; this interpolates it instead.
+fn missing_api_key_notice(provider: &str) -> String {
+    format!(
+        "No API key set for provider '{provider}'. Set its API key environment variable to chat."
+    )
+}
 
 /// Pure-ish rendering step: given a routed outcome, returns the text to
 /// print and whether the session should exit. Kept separate from
@@ -330,8 +370,8 @@ async fn respond(
         RouterOutcome::ChatTurn(text) => {
             let reply = match chat.turn(&text, tools, ctx).await {
                 Ok(reply) => reply,
-                Err(crate::error::AgentError::MissingApiKey { .. }) => {
-                    MISSING_API_KEY_NOTICE.to_string()
+                Err(crate::error::AgentError::MissingApiKey { provider }) => {
+                    missing_api_key_notice(&provider)
                 }
                 // AgentError::ToolLoopTimedOut (Opus adversarial-review
                 // follow-up to T9, finding S2) falls through to the generic
@@ -751,7 +791,7 @@ mod tests {
             &mut chat,
         )
         .await;
-        assert_eq!(text, MISSING_API_KEY_NOTICE);
+        assert_eq!(text, missing_api_key_notice("missing-key-fake"));
         assert!(!should_exit);
         // Slash commands must still work after a missing-key chat turn.
         let (help_text, _) = respond(
@@ -762,6 +802,28 @@ mod tests {
         )
         .await;
         assert!(help_text.contains("/verify"));
+    }
+
+    #[test]
+    fn test_missing_api_key_notice_names_the_actual_provider_not_a_hardcoded_anthropic() {
+        // PR #55 handoff: with IMPULSE_PROVIDER=openai and only
+        // OPENAI_API_KEY set, the old hard-coded string told the user to
+        // set ANTHROPIC_API_KEY -- a key that was never the problem. The
+        // notice must name whichever provider AgentError::MissingApiKey
+        // actually reports.
+        assert_eq!(
+            missing_api_key_notice("openai"),
+            "No API key set for provider 'openai'. Set its API key environment variable to chat."
+        );
+        assert_eq!(
+            missing_api_key_notice("minimax"),
+            "No API key set for provider 'minimax'. Set its API key environment variable to chat."
+        );
+        assert_ne!(
+            missing_api_key_notice("openai"),
+            missing_api_key_notice("anthropic"),
+            "different providers must not collapse to the same notice"
+        );
     }
 
     #[test]
@@ -801,13 +863,41 @@ mod tests {
             tool_ctx.allowed_write_roots,
             vec![std::path::PathBuf::from("/tmp/some-repo")]
         );
+        // Review round 1 (P2-2/P2-3): read roots now also include
+        // history::impulse_home() -- computed from this test process's own
+        // ambient IMPULSE_HOME/HOME env, so asserted by membership/order
+        // rather than a hardcoded literal list, which would be
+        // environment-dependent and brittle.
         assert_eq!(
-            tool_ctx.allowed_read_roots,
-            vec![
-                std::path::PathBuf::from("/tmp/some-repo"),
-                std::path::PathBuf::from("/tmp/granted"),
-            ]
+            tool_ctx.allowed_read_roots[0],
+            std::path::PathBuf::from("/tmp/some-repo")
         );
+        assert!(
+            tool_ctx
+                .allowed_read_roots
+                .contains(&std::path::PathBuf::from("/tmp/granted")),
+            "{:?}",
+            tool_ctx.allowed_read_roots
+        );
+        assert_eq!(
+            tool_ctx.allowed_read_roots.last(),
+            Some(&std::path::PathBuf::from("/tmp/granted")),
+            "/allow grants must stay last, after repo_root and impulse_home"
+        );
+        assert_eq!(tool_ctx.impulse_dir, history::impulse_home());
+    }
+
+    #[test]
+    fn test_sandbox_tool_context_does_not_duplicate_impulse_home_when_it_equals_repo_root() {
+        // When repo_root IS Impulse's own home (an unusual but possible
+        // launch), the read roots must not contain the same path twice.
+        let home = history::impulse_home();
+        let ctx = ReplContext {
+            repo_root: home.clone(),
+            allowed_read_roots: Vec::new(),
+        };
+        let tool_ctx = ctx.sandbox_tool_context();
+        assert_eq!(tool_ctx.allowed_read_roots, vec![home]);
     }
 
     #[test]

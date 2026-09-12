@@ -57,15 +57,20 @@ impl DynamicTool for GenomeReadTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
+        // Review round 1 (P2-2/P2-3 on PR #54): default from `ctx.impulse_dir`
+        // rather than the bare literal ".impulse" -- see memory_search.rs's
+        // identical fix and `ReplContext::sandbox_tool_context`'s doc
+        // comment for the full rationale.
         let impulse_dir = params
             .get("impulse_dir")
             .and_then(|v| v.as_str())
-            .unwrap_or(".impulse");
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| ctx.impulse_dir.clone());
         let section_filter = params.get("section").and_then(|v| v.as_str());
 
-        let genome_path = std::path::PathBuf::from(impulse_dir).join("GENOME.md");
+        let genome_path = impulse_dir.join("GENOME.md");
 
         if !genome_path.exists() {
             return Ok(ToolResult::json(serde_json::json!({
@@ -170,5 +175,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.output["exists"], false);
+    }
+
+    #[tokio::test]
+    async fn test_execute_defaults_impulse_dir_from_ctx_when_the_param_is_omitted() {
+        // Review round 1, P2-2/P2-3: an omitted `impulse_dir` must resolve
+        // via `ctx.impulse_dir` (what `ReplContext::sandbox_tool_context`
+        // sets from `history::impulse_home()`), not a bare ".impulse"
+        // relative to the process's own working directory.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("GENOME.md"), "# From ctx.impulse_dir").unwrap();
+        let ctx = ToolContext {
+            impulse_dir: dir.path().to_path_buf(),
+            ..ToolContext::with_all_capabilities()
+        };
+
+        let tool = GenomeReadTool;
+        let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
+
+        assert_eq!(result.output["exists"], true);
+        assert!(result.output["content"]
+            .as_str()
+            .unwrap()
+            .contains("From ctx.impulse_dir"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_explicit_impulse_dir_still_overrides_ctx() {
+        let ctx_dir = tempfile::TempDir::new().unwrap();
+        let explicit_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(ctx_dir.path().join("GENOME.md"), "# ctx default").unwrap();
+        std::fs::write(explicit_dir.path().join("GENOME.md"), "# explicit override").unwrap();
+        let ctx = ToolContext {
+            impulse_dir: ctx_dir.path().to_path_buf(),
+            ..ToolContext::with_all_capabilities()
+        };
+
+        let tool = GenomeReadTool;
+        let result = tool
+            .execute(
+                serde_json::json!({"impulse_dir": explicit_dir.path().to_str().unwrap()}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.output["content"]
+            .as_str()
+            .unwrap()
+            .contains("explicit override"));
     }
 }

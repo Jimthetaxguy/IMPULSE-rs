@@ -82,7 +82,7 @@ impl DynamicTool for MemorySearchTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
         let query = params
             .get("query")
@@ -97,12 +97,18 @@ impl DynamicTool for MemorySearchTool {
             .and_then(|v| v.as_str())
             .unwrap_or("keyword");
         let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
-        let impulse_dir = params
+        // Review round 1 (P2-2/P2-3 on PR #54): default from `ctx.impulse_dir`
+        // (the caller's IMPULSE_HOME-aware, sandbox-granted directory) rather
+        // than the bare literal ".impulse", which resolved relative to the
+        // process's own working directory and had no relationship to the
+        // sandbox at all. An explicitly-supplied `impulse_dir` is unchanged
+        // (still whatever the caller passed, still checked by the shared
+        // `validate_paths` step against the sandbox before this method runs).
+        let base_path = params
             .get("impulse_dir")
             .and_then(|v| v.as_str())
-            .unwrap_or(".impulse");
-
-        let base_path = std::path::PathBuf::from(impulse_dir);
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| ctx.impulse_dir.clone());
 
         if !base_path.exists() {
             return Ok(ToolResult::json(serde_json::json!({
@@ -246,5 +252,55 @@ mod tests {
             .await
             .unwrap();
         assert!(result.output.get("error").is_some() || result.output["count"] == 0);
+    }
+
+    #[tokio::test]
+    async fn test_execute_defaults_impulse_dir_from_ctx_when_the_param_is_omitted() {
+        // Review round 1, P2-2/P2-3: an omitted `impulse_dir` must resolve
+        // via `ctx.impulse_dir`, not a bare ".impulse" relative to the
+        // process's own working directory -- see
+        // `ReplContext::sandbox_tool_context`'s doc comment. A nonexistent
+        // `ctx.impulse_dir` reports "Impulse directory not found" just
+        // like an explicit nonexistent path did before this fix, proving
+        // the default is actually consulted.
+        let ctx = ToolContext {
+            impulse_dir: std::path::PathBuf::from("/tmp/nonexistent_impulse_from_ctx_xyz"),
+            ..ToolContext::with_all_capabilities()
+        };
+
+        let tool = MemorySearchTool;
+        let result = tool
+            .execute(serde_json::json!({"query": "auth"}), &ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(result.output["error"], "Impulse directory not found");
+    }
+
+    #[tokio::test]
+    async fn test_execute_explicit_impulse_dir_still_overrides_ctx() {
+        // ctx points to a real, existing directory; the explicit param
+        // points to a nonexistent one. If the explicit value were ignored
+        // in favor of ctx.impulse_dir, this would NOT report "not found" --
+        // so seeing that error proves the explicit param actually won.
+        let ctx_dir = tempfile::TempDir::new().unwrap();
+        let ctx = ToolContext {
+            impulse_dir: ctx_dir.path().to_path_buf(),
+            ..ToolContext::with_all_capabilities()
+        };
+
+        let tool = MemorySearchTool;
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "query": "auth",
+                    "impulse_dir": "/tmp/nonexistent_impulse_explicit_xyz"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.output["error"], "Impulse directory not found");
     }
 }

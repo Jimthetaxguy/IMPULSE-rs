@@ -700,4 +700,21 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Internal: renders one PDF's text layer, bounded, in this isolated
+    /// process, and prints it as JSON to stdout. Spawned only by ion's
+    /// `document_read` tool (`ion_repl::tool_document::run_pdf_extraction_child`,
+    /// review round 1 P0-1/P0-2) as a crash- and memory-isolated child --
+    /// never invoked directly by a person. Not a public interface: its
+    /// arguments and output shape may change without notice.
+    #[command(hide = true)]
+    InternalPdfText {
+        /// Path to the PDF to render.
+        path: PathBuf,
+        /// Cumulative character budget across every rendered page.
+        #[arg(long)]
+        max_chars: usize,
+        /// Refuse the PDF above this many pages.
+        #[arg(long)]
+        max_pages: usize,
+    },
 }

@@ -190,25 +190,25 @@ originally left open.
 
 - **PDF (text layer only).** New dependency: `pdf-extract` (crate `pdf-extract`, MIT, behind
   `office-support`; re-exports `lopdf` at its crate root, so no separate `lopdf` dependency was
-  added). Pages are streamed one at a time through `pdf-extract`'s public
-  `output_doc_page`/`PlainTextOutput` API -- never the crate's own whole-document
-  `extract_text`/`extract_text_by_pages`, both of which build the full result before this tool
-  could check anything. The page count is read from `lopdf::Document::get_pages` (walking the
-  page tree once, no text extraction) and refused above `MAX_PDF_PAGES` (4096) before any page is
-  rendered; each page's text is checked against the character budget before it is appended
-  (check-before-push, the same discipline as the workbook and Word streamers). `PlainTextOutput`
-  implements only the text-output half of `pdf_extract::OutputDev` -- it has no image-handling
-  code at all, so an embedded image can never reach this tool's output regardless of what the PDF
-  contains. An encrypted PDF (`doc.is_encrypted()`) is refused unconditionally and immediately,
-  before any page is read: `pdf-extract`'s own whole-document helpers try an empty password first
-  and only fail if that does not work, which would make "encrypted" support depend on how the
-  file happened to be protected; this tool makes no such attempt. A page with no extractable text
-  (a scanned/image-only page) contributes no line and no section, exactly like a blank Word
-  paragraph, so a PDF with no text layer at all parses successfully to an empty document with zero
-  sections -- `render` says so explicitly (`(no extractable text layer: this PDF is likely scanned
-  or image-only ...)`) rather than leaving the model to wonder whether reading failed. One section
-  per non-empty page (`kind: "page"`, `name: "Page N"`), same shape as a workbook's one section per
-  sheet.
+  added). Page rendering runs in an **isolated child process** (see "Review round 1" below for why
+  -- every other kind runs in-process on the blocking pool); the page count is read from
+  `lopdf::Document::get_pages` in-process first (walking the page tree once, no text extraction)
+  and refused above `MAX_PDF_PAGES` (4096) before any page is rendered. Inside the child, each
+  page's text is checked against the character budget *per write*, not once per page after the
+  fact -- true check-before-push, the same discipline as the workbook and Word streamers.
+  `PlainTextOutput` implements only the text-output half of `pdf_extract::OutputDev` -- it has no
+  image-handling code at all, so an embedded image can never reach this tool's output regardless
+  of what the PDF contains, and neither can annotation or `AcroForm` field text (`/Annots`): only a
+  page's own `/Contents` stream is rendered. An encrypted PDF is refused via a raw byte scan for
+  `/Encrypt` in the file, run before any parser touches it -- `lopdf::Document::load` silently
+  authenticates a PDF whose *user* password is empty, so `doc.is_encrypted()` after loading cannot
+  be trusted (see "Review round 1"), and this tool makes no password attempt of any kind. A page
+  with no extractable text (a scanned/image-only page) contributes no line and no section, exactly
+  like a blank Word paragraph, so a PDF with no text layer at all parses successfully to an empty
+  document with zero sections -- `render` says so explicitly (`(no extractable text layer: this
+  PDF is likely scanned or image-only ...)`) rather than leaving the model to wonder whether
+  reading failed. One section per non-empty page (`kind: "page"`, `name: "Page N"`), same shape as
+  a workbook's one section per sheet.
 - **txt.** Read whole (already bounded by `MAX_DOCUMENT_BYTES` at path-resolution time) and
   requires valid UTF-8; invalid UTF-8 is a typed error naming the first invalid byte's offset
   (`String::from_utf8`'s `valid_up_to()`) rather than a lossy replacement -- this tool does not
@@ -217,14 +217,53 @@ originally left open.
   `csv`'s single-section shape.
 - **md.** Same whole-file UTF-8 read as `txt`, plus an outline built from ATX headings (`#`
   through `######`, requiring a following space/tab or end of line, per CommonMark's basic rule --
-  a run of more than 6 `#`s, or one glued directly to text like `#tag`, is not a heading).
-  Deliberately not full CommonMark: an optional closing run of `#`s (`## Title ##`) is left in the
-  heading text rather than stripped, a documented simplification for a tool that only needs stable
-  section boundaries, not a rendered heading. Content before the first heading belongs to no
-  section (mirrors Word's "no growth before the first non-empty paragraph"). Bounded at
-  `MAX_MD_SECTIONS` (4096) the same way Word's outline is bounded at `MAX_WORD_SECTIONS`: past the
-  cap no new section starts and the most recently opened one keeps absorbing text, so every offset
-  already reported stays truthful.
+  a run of more than 6 `#`s, or one glued directly to text like `#tag`, is not a heading; up to 3
+  leading spaces are tolerated before the `#`s, also per CommonMark). A `#`-prefixed line inside a
+  fenced code block (` ``` ` to ` ``` `, or `~~~` to `~~~`) is not treated as a heading, matching
+  every Markdown renderer's own behavior -- a shell comment or a Python-style ATX-looking string
+  literal inside a fenced snippet must not fragment the outline. An unterminated fence (no closing
+  marker before the end of the file) is treated as remaining inside the fence for the rest of the
+  document, the conservative reading. Deliberately not full CommonMark beyond these two rules: an
+  optional closing run of `#`s (`## Title ##`) is left in the heading text rather than stripped, a
+  documented simplification for a tool that only needs stable section boundaries, not a rendered
+  heading. Content before the first heading belongs to no section (mirrors Word's "no growth
+  before the first non-empty paragraph"). Bounded at `MAX_MD_SECTIONS` (4096) the same way Word's
+  outline is bounded at `MAX_WORD_SECTIONS`: past the cap no new section starts and the most
+  recently opened one keeps absorbing text, so every offset already reported stays truthful.
+
+### Review round 1 (2026-09-12): PDF isolation redesign
+
+An adversarial pass against the first PDF landing found two P0s and one P2 in the in-process
+design above, all now fixed by moving page *rendering* (never the cheap page-count check) into an
+isolated child process:
+
+- **P0-1.** A 677-byte PDF whose Form XObject content stream references itself (`/X0 Do` inside
+  `/X0`'s own content stream) makes `pdf_extract::output_doc_page`'s content-stream interpreter
+  recurse until the thread's stack is exhausted -- a Rust stack-overflow guard-page hit, which
+  calls `abort()`, not an unwinding panic. `tokio::task::spawn_blocking`'s `JoinError` containment
+  only catches unwinding panics, so a hostile PDF read through `document_read` -- an ungated tool
+  -- killed the entire `ion` process. Fix: PDF page rendering runs in a hidden `internal-pdf-text`
+  subcommand (`#[command(hide = true)]`, both `impulse-rs` and `ion` binaries share one handler),
+  spawned via `tokio::process::Command` with `kill_on_drop`, a process-group guard, a 30s
+  wall-clock timeout, and (unix) `RLIMIT_AS`/`RLIMIT_CPU` set via `pre_exec`. The child's crash
+  kills only the child; the parent observes a signaled exit and reports a typed error.
+- **P0-2.** The original per-page sink rendered a whole page into an unbounded `String` before
+  checking it against the character budget -- a 4.2 MB crafted PDF (one page, a huge repeated `Tj`
+  string) reached 7.0 GB RSS / 178.5s in testing. Fix: the child's sink is a `std::fmt::Write`
+  implementation (`BoundedSink`) that refuses a write the instant the running total (cumulative
+  across pages, not reset per page) would exceed the budget -- checked during rendering, not
+  after. `RLIMIT_AS` (default 1 GiB) is a second, best-effort layer on top (not fully enforced on
+  macOS; real enforcement is Linux).
+- **P2-1.** `lopdf::Document::load` unconditionally tries an *empty* user password first and
+  silently decrypts on success -- a common real-world case (owner-password-only protection leaves
+  the user password empty) -- so `doc.is_encrypted()` after loading cannot be trusted. Fix: a raw
+  byte scan for the literal `/Encrypt` token, run against the file's bytes before any parser sees
+  them, in both the parent's cheap pre-check and the child's own independent check.
+
+Two nits from the same pass, also fixed: the child iterates `lopdf::Document::get_pages()`'s own
+map keys rather than assuming a contiguous `1..=N` range, and the module doc's earlier "absolute
+paths are accepted" wording was corrected to name the sandbox constraint that already applied via
+`resolve_document_path_with_cap` (it undersold what was actually enforced, not a security gap).
 
 ### Fixture table
 
@@ -232,15 +271,20 @@ originally left open.
 |---|---|
 | PDF with two pages of real text, built with `lopdf` (re-exported by `pdf_extract::*`) the way `create.rs` in lopdf's own examples does | two `page` sections named `Page 1`/`Page 2`; both pages' text is in the window; render ends `complete` |
 | PDF with one page and an empty content stream (no text operators at all) | zero sections, `total_chars == 0`, and `render`'s explicit "no extractable text layer" note |
-| PDF re-saved with RC4 V1 encryption (`doc.encrypt`) | the typed encrypted-PDF refusal, before any page is read |
+| PDF whose page content stream draws a Form XObject that draws itself | a typed error naming a signal, and the calling process (the integration test) demonstrably still alive afterward -- run only via the isolated child, never in-process |
+| PDF re-saved with RC4 V1 encryption, non-empty user password | the typed encrypted-PDF refusal, before any page is read |
+| PDF re-saved with RC4 V1 encryption, EMPTY user password | the same refusal -- proves the byte scan, not `is_encrypted()`, is authoritative |
 | PDF with more pages than an injected page-cap test seam | the typed page-count refusal, without building a real multi-thousand-page fixture |
-| PDF whose single page's text exceeds an injected tiny character budget | the typed over-the-limit refusal |
+| PDF whose single page's text exceeds an injected tiny character budget | the typed over-the-limit refusal, and promptly (proving check-before-push, not build-then-check) |
+| An impossibly short injected timeout against an ordinary, fast-parsing PDF | the typed timeout refusal, deterministically, without a genuinely slow fixture |
+| A single 10 MB `write_str` call against `BoundedSink` directly (no PDF/subprocess at all) | the buffer never grows past the character cap, asserted on the count, not just an error string |
 | Bytes that are not a PDF at all, saved with a `.pdf` extension | a typed parse error, not a panic |
 | Empty `.txt` file | empty text, zero sections |
 | `.txt` exactly at a budget, then one character over | accepted, then the typed over-the-limit refusal |
 | `.txt` with a byte that is not valid UTF-8 | the typed UTF-8 refusal naming the invalid byte's offset |
 | `.md` with a heading, read via `outline=true` then jumped to by the heading's own offset | the section table and offset-based jump agree |
 | `.md` with `MAX_MD_SECTIONS + 5` headings | exactly `MAX_MD_SECTIONS` sections, and the last one's offset+chars reaches the true end of the text |
+| `.md` with a `#`-looking line inside a fenced code block | not treated as a heading |
 | A previously-`.pdf`-specific "unsupported extension" test, now retargeted at `.pptx` | `pdf`/`txt`/`md` are supported extensions; a still-unsupported one still names them all in its error |
 
 ## Out of scope

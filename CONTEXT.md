@@ -173,9 +173,14 @@ The filesystem boundary every path-checking ion REPL tool (`file_read`, `file_wr
 `cwd`, `document_read`, `ion_verify`'s `repo`, and — Stage 1b-B, bridged the same way as
 `file_read`/`file_write` rather than through a bespoke path check — `memory_search`'s and
 `genome_read`'s `impulse_dir`) resolves against: a session's `ReplContext.repo_root`
-is its fixed write root (never widened, not even by a literal `CONFIRM`), and
-`ReplContext.allowed_read_roots` is a read-only extension list grown one path at a time via
-`/allow <path>` (which refuses an empty or nonexistent path; a bare `/allow` lists current grants;
+is its fixed write root (never widened, not even by a literal `CONFIRM`). Reads are additionally
+granted (unconditionally, not via `/allow`) under Impulse's own home directory
+(`history::impulse_home()`, i.e. `IMPULSE_HOME`/`$HOME/.impulse`) — review round 1, P2-2/P2-3:
+`memory_search`/`genome_read`'s own default previously resolved relative to the process's working
+directory with no relationship to this sandbox at all, and an omitted `impulse_dir` parameter was
+invisible to the generic `validate_paths` check besides. `ReplContext.allowed_read_roots` is a
+further read-only extension list grown one path at a time via `/allow <path>` (which refuses an
+empty or nonexistent path; a bare `/allow` lists current grants;
 a grant of `/`, `$HOME`, or an ancestor of the repo root still succeeds -- the human explicitly
 asked for it -- but prints a loud warning first, since it effectively disables the read sandbox).
 `ReplContext::sandbox_tool_context` builds the `ToolContext` every one of those tools actually
@@ -220,17 +225,33 @@ Ion's read-only `document_read` tool: reads `xlsx` by streaming cells through ca
 reader under a character and cell budget (never the dense-grid parser; a chart or dialog sheet
 holds no cells and is skipped rather than failing the workbook), `docx` by streaming
 `word/document.xml` event by event through quick-xml so the object tree, many times the size of
-the XML, is never built, `csv` through the `office` parser, `pdf` (text layer only) by streaming
-pages one at a time through `pdf-extract`'s public page-render API (page count capped before any
-page renders; an encrypted PDF is refused outright; `PlainTextOutput` never renders images), and
-`txt`/`md` as whole-file UTF-8 reads (`md` additionally outlined by ATX heading) — files up to
-10 MiB; containers inflated through a 64 MiB cap first; legacy `xls` refused; parsing on the
-blocking pool — and returns a section outline with whole-document offsets plus a bounded
-character window that ends on a line boundary and names the next offset, so a model inside a
-loop contract can jump to and page through an everyday document without flooding its context.
-Ungated like `file_read`; absolute paths are accepted; registered only with the default
-`office-support` feature. `document_extract` (a separate, stubbed CLI/daemon dynamic tool whose
-default path always errored) was deleted rather than extended when `document_read` gained `pdf`.
+the XML, is never built, `csv` through the `office` parser, and `txt`/`md` as whole-file UTF-8
+reads (`md` additionally outlined by ATX heading, fence-aware) — files up to 10 MiB; containers
+inflated through a 64 MiB cap first; legacy `xls` refused; parsing on the blocking pool — and
+returns a section outline with whole-document offsets plus a bounded character window that ends on
+a line boundary and names the next offset, so a model inside a loop contract can jump to and page
+through an everyday document without flooding its context. Ungated like `file_read`; absolute
+paths are accepted, subject to the same sandbox as every other path this tool resolves; registered
+only with the default `office-support` feature. `document_extract` (a separate, stubbed CLI/daemon
+dynamic tool whose default path always errored) was deleted rather than extended when
+`document_read` gained `pdf`.
+
+**`pdf` runs in an isolated child process, not in-process (review round 1 on PR #54).** A
+self-referencing Form XObject makes `pdf_extract::output_doc_page` recurse until the thread's
+stack is exhausted -- `abort()`, not an unwinding panic, so `spawn_blocking`'s `JoinError`
+containment (what every other kind here still relies on) cannot catch it. `document_read` is
+ungated, so an in-process crash there previously killed `ion` outright. Page rendering is now
+isolated in a hidden `internal-pdf-text` subcommand (`extract_pdf`/`run_pdf_extraction_child` in
+`tool_document.rs`, shared by both `impulse-rs` and `ion` via `handlers::internal_pdf_text`),
+spawned with `kill_on_drop`, a `ProcessGroupGuard`, a 30s wall-clock timeout, and (unix)
+`RLIMIT_AS`/`RLIMIT_CPU`. Its `BoundedSink` (`std::fmt::Write`) refuses a write the instant the
+running character total would exceed budget -- true check-before-push, since the earlier
+per-page-then-check design reached multi-GB RSS on a small crafted file. Encryption is refused via
+a raw `/Encrypt` byte scan run before any parser touches the file, not `doc.is_encrypted()` after
+loading: `lopdf::Document::load` silently authenticates a PDF whose *user* password is empty. Page
+count is still checked cheaply in-process (`precheck_pdf`, proven safe against page-tree cycles/
+deep nesting) before any page is rendered. Annotation/`AcroForm` text is never extracted (only a
+page's own `/Contents` stream is rendered).
 - **Source of truth:** `src/ion_repl/tool_document.rs` and
   `docs/superpowers/specs/2026-09-01-ion-document-tool-design.md`.
 
@@ -240,12 +261,17 @@ ordinary `src/tooling::DynamicTool`s, registered in `ToolRegistry::with_defaults
 Stage 1b-B and already reachable from the CLI/daemon/MCP; that lane's addition was bridging them
 into Ion's `ReplToolRegistry` (`registry.rs::with_defaults`) via `DynamicToolBridge`, the same
 mechanism as `file_read`/`file_write`/`bash_exec`, rather than writing new `ReplTool` wrappers.
-They are ungated (read-only, `Capability::FileSystemRead` only) and get the tool sandbox for free:
-their `impulse_dir` parameter is declared `ParamType::FilePath`, so the shared
+They are ungated (read-only, `Capability::FileSystemRead` only). An EXPLICITLY-supplied
+`impulse_dir` gets the sandbox for free: it is declared `ParamType::FilePath`, so the shared
 `ToolRegistry::execute` → `validate_paths` step checks it against `ctx.sandbox_tool_context()`
-before either tool's own `execute` runs — no bespoke sandboxing code was needed. Internals
-(`genome_read` reads `.impulse/GENOME.md`; `memory_search` queries `retrieval::search_history`/
-`search_genome`) are unchanged by the bridging and out of this entry's scope.
+before either tool's own `execute` runs. An OMITTED `impulse_dir` needed one real fix (review
+round 1, P2-2/P2-3 on PR #54): `validate_paths` only checks parameters a caller supplied, so the
+default previously fell through to each tool's own bare `".impulse"` literal — unrelated to
+`IMPULSE_HOME`/the sandbox. Both tools now default from `ctx.impulse_dir`, and
+`ReplContext::sandbox_tool_context` sets that field from `history::impulse_home()` and adds it to
+the read roots explicitly (it is Impulse's own state directory, not arbitrary host filesystem).
+Internals (`genome_read` reads `<impulse_dir>/GENOME.md`; `memory_search` queries
+`retrieval::search_history`/`search_genome`) are otherwise unchanged by the bridging.
 - **Source of truth:** `src/ion_repl/registry.rs`, `src/tooling/builtin/{memory_search,
   genome_read}.rs`.
 

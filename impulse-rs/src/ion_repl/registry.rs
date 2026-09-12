@@ -77,16 +77,27 @@ impl ReplToolRegistry {
     /// `memory_search`/`genome_read` are read-only (`Capability::FileSystemRead`
     /// only) and stay outside `CONFIRMATION_REQUIRED_TOOLS` like `file_read`
     /// and `document_read`. Bridging them through `DynamicToolBridge` (rather
-    /// than a bespoke `ReplTool`) is what gives them the sandbox for free:
-    /// both declare their `impulse_dir` parameter as `ParamType::FilePath`,
-    /// so `ToolRegistry::execute`'s generic `validate_paths` step (`src/
-    /// tooling/executor.rs`) already checks it against `ctx.sandbox_tool_context()`
-    /// the same way it checks `file_read`'s `path` -- no new sandboxing code
-    /// needed here, and a call that tries to point `impulse_dir` outside the
-    /// session's read roots is refused before either tool's own `execute`
-    /// runs. Neither tool's `impulse_dir` default (`.impulse`) changes: it
-    /// resolves relative to the process's own working directory, which for
-    /// an `ion` session is `IMPULSE_HOME`/the repo root in ordinary use.
+    /// than a bespoke `ReplTool`) is most of what gives them the sandbox for
+    /// free: both declare their `impulse_dir` parameter as
+    /// `ParamType::FilePath`, so `ToolRegistry::execute`'s generic
+    /// `validate_paths` step (`src/tooling/executor.rs`) already checks an
+    /// EXPLICITLY-supplied `impulse_dir` against `ctx.sandbox_tool_context()`
+    /// the same way it checks `file_read`'s `path`, with no extra code
+    /// needed for that case.
+    ///
+    /// **Correction (review round 1, P2-2/P2-3 on PR #54):** this doc
+    /// comment originally also claimed the OMITTED case needed no new code.
+    /// It did: `validate_paths` only checks parameters a caller actually
+    /// supplied, so when `impulse_dir` was omitted the sandbox check simply
+    /// did not run, and each tool's own fallback -- the bare literal
+    /// `".impulse"`, resolved relative to the process's own working
+    /// directory -- had no relationship to `IMPULSE_HOME`/the sandbox at
+    /// all. Both tools were changed to default from `ctx.impulse_dir`
+    /// instead (see their own `execute` methods), and
+    /// `ReplContext::sandbox_tool_context` now sets that field from
+    /// `history::impulse_home()` and adds it to the read roots explicitly
+    /// -- so the default now actually resolves to a directory this context
+    /// grants, rather than to an unchecked, possibly-wrong one.
     pub fn with_defaults() -> Self {
         let mut registry = Self::new();
         registry.register(Box::new(IonVerifyTool));

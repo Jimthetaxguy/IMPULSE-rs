@@ -148,7 +148,186 @@ tags: [worktree, lane, ion, document-analysis, memory, tools]
 - `lane-memory-adr0020` (Stage 6, memory promotion) proposed `memory_search` read a new
   `.impulse/GENOME_PROJECTION.md`; declined here as out of scope (see Decisions) and left to that
   lane's own PR against `src/tooling/builtin/memory_search.rs`.
-- Not attempted: regenerating the stale, already-drifted `impulse-rs/.impulse/impulse-capabilities.json`
-  (dated 2026-03-27, missing many tools added since including `document_read` itself) — pre-existing
-  drift unrelated to this lane's deletion of `document_extract`; flagged separately rather than
-  folded into this diff.
+- The stale `impulse-rs/.impulse/impulse-capabilities.json` (dated 2026-03-27) was regenerated for
+  real in review round 1 via `impulse-rs tooling-reload` (see that section below), not hand-edited.
+
+## Review round 1 (2026-09-12)
+
+Adversarial review of PR #54 (probe crate, measured in release mode; fixtures at
+`/private/tmp/claude-501/-Users-jamespustorino-code-IMPULSE-rs/c575264d-f5e1-49ac-b2c6-0834ed929caf/scratchpad/review54/`)
+returned "needs changes": two P0s in the PDF path, two P2s, and several nits. txt/md, the sandbox
+check before open, the page-tree hardening (cycles, 50k-deep `Kids`, 180k objects), rule 9, and the
+audit claim all held and needed no changes. Everything below is fixed on this branch.
+
+### P0-1 (CONFIRMED): self-referencing Form XObject stack-overflow-aborts the whole `ion` process
+
+A 677-byte PDF whose Form XObject content stream draws itself (`/X0 Do` inside `/X0`'s own content
+stream) makes `pdf_extract::output_doc_page`'s content-stream interpreter recurse until the
+thread's stack is exhausted — a Rust stack-overflow guard-page hit, which calls `abort()`, not an
+unwinding panic. `spawn_blocking`'s `JoinError` containment (what every other `document_read` kind
+still relies on) only catches unwinding panics, so this killed the entire `ion` process from an
+ungated tool.
+
+**Fix (structural, not a pre-scan):** PDF page rendering moved into a hidden `internal-pdf-text`
+subcommand (`#[command(hide = true)]` in `cli.rs`; `src/handlers/internal_pdf_text.rs`; shared by
+both `impulse-rs` and `ion` binaries), spawned by
+`ion_repl::tool_document::run_pdf_extraction_child` via `tokio::process::Command` with
+`kill_on_drop(true)`, `process_group(0)` + a synchronous-from-Drop `ProcessGroupGuard` (mirroring
+`agent::ImpulseAgent::harness_query_structured`'s established pattern exactly), a 30s wall-clock
+timeout, env scrubbed via the shared `tooling::env_scrub`, stdin closed, and (unix, `pre_exec`)
+`RLIMIT_AS`/`RLIMIT_CPU` set via the `libc` crate — already a direct workspace dependency
+(`[target.'cfg(unix)'.dependencies] libc = "0.2"`; verified with `cargo tree -i libc`, no
+Cargo.toml/Cargo.lock change needed). The child's crash, abort, OOM, or hang becomes a typed
+`document_read` error naming the cause (signal number, non-zero exit with the child's own stderr,
+or a timeout) — never a parent crash.
+
+**Test (integration, real subprocess, `tests/pdf_extraction_isolation.rs`):**
+`test_extract_pdf_self_referencing_xobject_crashes_only_the_child_not_this_process` builds the
+self-referencing-XObject fixture with `lopdf` directly, asserts the call returns a typed `Err`
+naming a signal, then runs a follow-up async sleep AND a second, independent extraction to
+completion — proving the test process itself (not just "some process") is still alive and the
+tokio runtime is healthy. This must be an integration test, not a lib unit test: calling the
+crashing path directly in-process, even inside one `#[test]`, would abort the whole `cargo test`
+binary, not just fail one test — isolation is exactly what makes it safe to test at all, and can
+only be exercised from outside the process it protects.
+
+### P0-2 (CONFIRMED): unbounded per-page sink reached 7 GB RSS on a small crafted PDF
+
+The previous per-page sink rendered a whole page into an unbounded `String` before checking it
+against the character budget. Reviewer numbers: a 1.05 MB PDF reached 2.41 GB RSS / 48.8s; a 4.2 MB
+one reached 7.0 GB / 178.5s, straddling the 180s loop-contract timeout, which cannot cancel
+`spawn_blocking`. The existing budget fixture used a tiny page, so it passed with or without the
+bug — a false sense of coverage.
+
+**Fix:** the child's sink (`internal_pdf_text::BoundedSink`, a `std::fmt::Write` impl) refuses a
+write the instant the RUNNING total across every page processed so far (seeded from the previous
+page's final count, never reset) would exceed the budget — checked per write during rendering
+(`PlainTextOutput::output_character` calls `write!` once per glyph plus spacing), not once per page
+after the fact. This is what makes "check-before-push, same discipline as
+`extract_workbook`/`extract_word`" actually true for PDF; it was not before. `RLIMIT_AS` (1 GiB
+default) is a second, best-effort layer on top (not fully kernel-enforced on macOS; real
+enforcement is Linux) — the sink is the primary bound.
+
+**Tests:** `internal_pdf_text::tests` unit-tests `BoundedSink` directly (no PDF/subprocess at all):
+accepts writes up to exactly the cap; refuses the write that would exceed it *without growing the
+buffer at all* (asserted on `buf.chars().count()`/`count`, not just an error string, per the
+review's explicit ask); refuses a single 10 MB write (mirroring the textbomb fixture's one giant
+`Tj` string) without buffering any of it; and proves the seeded `count` carries the cumulative
+total across pages, not a per-page-reset one. The integration suite's
+`test_extract_pdf_over_budget_page_is_refused_promptly` additionally asserts wall-clock elapsed
+time stays well under 10s for an over-budget page, proving the refusal is prompt (check-before-push)
+rather than build-then-check.
+
+### P2-1 (CONFIRMED): `doc.is_encrypted()` is unreliable — `lopdf::Document::load` silently decrypts an empty-user-password PDF
+
+`lopdf::Document::load` (`authenticate_and_setup_encryption` internally) unconditionally tries an
+*empty* user password first and silently decrypts on success — a common real-world case
+(owner-password-only protection leaves the user password empty so any reader can open it) — so
+`doc.is_encrypted()` after loading can report `false` for a PDF that is, in fact, encrypted. The
+previous refusal relied on exactly that call.
+
+**Fix:** `pdf_declares_encryption` — a raw byte scan for the literal `/Encrypt` token, run against
+the file's bytes BEFORE any parser (`lopdf::Document::load` included) ever sees them, in both the
+parent's cheap pre-check (`precheck_pdf`) and the child's own independent, authoritative check. A
+false positive (the literal bytes appearing as ordinary page text) fails closed, the safe
+direction; a false negative would require a spec-violating writer, since `/Encrypt` in the
+trailer/XRef-stream dictionary is never itself inside a compressed object stream.
+
+**Tests:** unit tests on the pure byte-scan function plus real fixtures (`write_encrypted_pdf`
+with `user_password: ""` in the integration suite —
+`test_extract_pdf_refuses_encryption_even_with_an_empty_user_password` — and a non-empty-password
+variant, mirroring the review's `enc_emptyuser.pdf`/`enc_userpw.pdf`).
+
+### Item 3: native `ReplTool` wall clocks
+
+The child timeout (30s, `PDF_CHILD_TIMEOUT_SECS`) covers `pdf`. `docx`/`xlsx` streaming does not
+get an equivalent timer: both are already a bounded function of `MAX_DOCUMENT_BYTES`/
+`MAX_DECOMPRESSED_BYTES` (source file and inflated container capped before any parser runs), and
+neither has a code path that can loop or recurse on attacker-controlled structure the way a PDF's
+Form XObjects can — there is no unbounded-recursion class of bug available to them the way P0-1
+found for PDF. Documented in `tool_document.rs`'s `PDF_CHILD_TIMEOUT_SECS` doc comment and the spec.
+
+### P2-2/P2-3 (CONFIRMED): `memory_search`/`genome_read`'s `impulse_dir` default was neither `IMPULSE_HOME`-aware nor sandbox-checked
+
+Both tools defaulted an omitted `impulse_dir` to the bare literal `".impulse"`, resolved relative
+to the process's own working directory — not `IMPULSE_HOME`/`$HOME/.impulse`, and unrelated to
+`repo_root`. Worse, `src/tooling/executor.rs`'s generic `validate_paths` only checks parameters a
+caller actually supplied, so an OMITTED `impulse_dir` was invisible to the sandbox check entirely
+— outside the impulse-rs repo the tools silently returned nothing (wrong directory), and pointing
+them at the real home via `/allow` still didn't help since the default itself never resolved there.
+
+**Fix:** `ReplContext::sandbox_tool_context` now sets `ToolContext.impulse_dir` from
+`history::impulse_home()` (the same `IMPULSE_HOME`/`$HOME/.impulse` resolution `.impulse/ion_history`
+itself uses) and adds it to the read roots explicitly (deduplicated against `repo_root` when they
+coincide) — it is Impulse's own state directory, not arbitrary host filesystem, so granting it read
+access is not a sandbox widening. `memory_search`/`genome_read`'s `execute()` methods now default
+from `ctx.impulse_dir` instead of the bare literal; an explicitly-supplied `impulse_dir` is
+unchanged (still checked by the pre-existing `validate_paths` path). `registry.rs`'s doc comment,
+which originally claimed "no new sandboxing code needed," was corrected in place rather than
+silently rewritten.
+
+**Note on scope:** `src/tooling/builtin/{memory_search,genome_read}.rs` were not in this lane's
+original owned-paths list; this fix required editing them directly (the default lives in each
+tool's own `execute()`). Flagged here explicitly since it is a deliberate, reviewer-directed
+expansion of scope, not a silent one.
+
+**Tests:** `ion_repl::tests::test_sandbox_tool_context_limits_write_to_repo_root_and_extends_reads_with_allow_grants`
+updated (env-dependent `impulse_home()` now asserted by membership/order, not a hardcoded literal
+list) plus a new dedup test; `memory_search`/`genome_read` each gain a "defaults from ctx when
+omitted" test and an "explicit value still overrides ctx" test.
+
+### Nits
+
+- `markdown_sections` now tracks fenced code blocks (` ``` `/`~~~`, up to 3 leading spaces) so a
+  `#`-looking line inside a fence is never treated as a heading, and `parse_atx_heading` now
+  tolerates up to 3 leading spaces before the `#`s, both per CommonMark's actual rules.
+- The `internal_pdf_text` child iterates `lopdf::Document::get_pages()`'s own map keys rather than
+  assuming a contiguous `1..=N` range.
+- `tool_document.rs`'s stale "absolute paths are accepted" module doc (undersold the sandbox
+  constraint that already applied via `resolve_document_path_with_cap`) was corrected.
+- `impulse-rs/.impulse/impulse-capabilities.json` was regenerated for real via the existing, narrow
+  `impulse-rs tooling-reload` CLI command (validates external manifests + rewrites the manifest
+  from the live `ToolRegistry`; touches nothing else — deliberately NOT `impulse-rs init`, which
+  would also overwrite `GENOME.md`/`config.json`/`LIVE_STATE.json`). Diff: `document_extract`
+  removed; unrelated pre-existing drift (`bash_exec`/`file_write` had never been captured in the
+  committed snapshot either) also resolved as a side effect.
+- The spec (`docs/superpowers/specs/2026-09-01-ion-document-tool-design.md`) now states annotation/
+  `AcroForm` text is never extracted (only a page's own `/Contents` stream is rendered) and carries
+  a full "Review round 1" section plus updated fixture table.
+
+### Also addressed in this fix round (routed via the coordinator, not from the PDF probe)
+
+- **`src/ion_repl/mod.rs`'s `MissingApiKey` notice hard-coded `ANTHROPIC_API_KEY`** regardless of
+  the actually-configured provider (`IMPULSE_PROVIDER=openai`/`minimax`), a handoff from sibling PR
+  #55 (`claude/ion-provider-neutral-20260912`, which owns `chat.rs`/`llm_backends` and could not
+  land the one-line fix itself since `mod.rs` is this lane's owned path). Fixed: `respond()`'s
+  `MissingApiKey { provider }` arm now interpolates the actual provider via a new
+  `missing_api_key_notice(provider: &str)` function. Tests: the existing
+  `test_respond_chat_turn_missing_api_key_prints_graceful_notice_not_panic` updated, plus a new
+  `test_missing_api_key_notice_names_the_actual_provider_not_a_hardcoded_anthropic` covering the
+  `openai`/`minimax` cases explicitly (per the coordinator's request). This closes PR #55's handoff.
+
+### Gate evidence (review round 1, this checkout)
+
+```
+cd impulse-rs
+cargo build --workspace                                    # clean
+cargo test --workspace                                     # 2017 passed / 0 failed / 5 ignored (lib)
+                                                             # + all integration binaries green,
+                                                             # including 10/10 in the new
+                                                             # tests/pdf_extraction_isolation.rs
+cargo clippy --workspace --all-targets -- -D warnings       # clean
+cargo fmt --all -- --check                                  # clean
+cargo build --no-default-features                           # clean, zero warnings
+cargo test --no-default-features --lib -- ion_repl::registry  # 5/5 passed
+cargo audit                                                 # unchanged: 11 pre-existing
+                                                             # vulnerabilities / 18 warnings, zero
+                                                             # attributable to libc (already a
+                                                             # direct dep) or any crate touched
+                                                             # this round
+python3 docs/validate_docs.py --all                         # only pre-existing failures on main
+```
+
+Full lib total across both review rounds combined: 2017 passed, 0 failed, 5 ignored (net +14 from
+round 1's 2003, reflecting new tests added minus the 6 old PDF fixture tests that moved to the
+integration suite because they now require a real compiled binary).
