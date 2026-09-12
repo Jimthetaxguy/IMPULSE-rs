@@ -962,3 +962,126 @@ fn test_promotion_blocks_a_pin_recorded_under_a_superseded_scheme() {
     assert_eq!(head(&repo), initial);
     assert!(!repo.join("feature.txt").exists());
 }
+
+// ---------------------------------------------------------------------------
+// Review round 1 on PR #53 (2026-09-12)
+// ---------------------------------------------------------------------------
+
+/// A `filter.evil` driver whose `clean` side writes a marker. `clean` runs when
+/// Git compares working-tree content against the index, which a bare
+/// `git status` does for any file whose stat data changed — so it fires inside a
+/// producer's very first observation.
+fn evil_clean_command(marker: &Path) -> String {
+    format!("sh -c 'echo CLEAN_FIRED >> {}; cat'", marker.display())
+}
+
+/// Make Git re-read a file's content on the next status, so a `clean` filter
+/// assigned to it actually runs.
+fn invalidate_stat_cache(path: &Path) {
+    let contents = std::fs::read(path).expect("read file");
+    std::fs::write(path, contents).expect("rewrite file");
+}
+
+/// Round-1 P1: the staged worktree has a Git directory of its own, and Git reads
+/// `<common>/worktrees/<id>/config.worktree` for every command run there.
+/// Pinning only the canonical worktree's copy left that file unpinned.
+///
+/// `extensions.worktreeConfig` being *already* on is the reachable case —
+/// turning it on rewrites `.git/config` and would be caught, but
+/// `git sparse-checkout` in a linked worktree turns it on for ordinary reasons.
+/// The Builder then defines the driver and a `core.attributesFile` there, leaves
+/// `.git/config` byte-identical, and the script runs in a daemon-owned producer.
+#[test]
+fn test_promotion_blocks_a_driver_planted_in_the_staged_worktrees_own_config() {
+    let (_dir, repo) = init_repo();
+    // Legitimately enabled before the run, as a linked-worktree sparse checkout
+    // would have done.
+    git(&repo, &["config", "extensions.worktreeConfig", "true"]);
+    let initial = head(&repo);
+    let config_before = std::fs::read(repo.join(".git").join("config")).expect("read config");
+
+    let registered = task(&repo, &initial);
+    let staged = materialize_staged_worktree(&registered).expect("materialize staged worktree");
+    let staged_root = PathBuf::from(&staged.root);
+    let marker = repo.join(".git").join("worktree-config-filter-ran.txt");
+    let attributes = repo.join(".git").join("planted-attributes");
+    std::fs::write(&attributes, "* filter=evil\n").expect("write attributes");
+
+    git(
+        &staged_root,
+        &[
+            "config",
+            "--worktree",
+            "filter.evil.clean",
+            &evil_clean_command(&marker),
+        ],
+    );
+    git(
+        &staged_root,
+        &["config", "--worktree", "filter.evil.smudge", "cat"],
+    );
+    git(
+        &staged_root,
+        &[
+            "config",
+            "--worktree",
+            "core.attributesFile",
+            &attributes.display().to_string(),
+        ],
+    );
+    let builder_commit = commit_in(&staged_root, "feature.txt", "builder work\n");
+
+    // The shared `.git/config` is untouched: the old pin saw nothing at all.
+    assert_eq!(
+        std::fs::read(repo.join(".git").join("config")).unwrap(),
+        config_before,
+        "the attack leaves the canonical shared config byte-identical"
+    );
+    // Negative control: the driver really does fire on a plain status in the
+    // staged worktree, which is a producer's first observation.
+    invalidate_stat_cache(&staged_root.join("feature.txt"));
+    git(&staged_root, &["status", "--porcelain"]);
+    assert!(
+        marker.exists(),
+        "the planted per-worktree driver is not armed; this test would pass vacuously"
+    );
+    std::fs::remove_file(&marker).expect("reset the marker");
+    invalidate_stat_cache(&staged_root.join("feature.txt"));
+
+    let task = accepted(&registered, &staged, &initial, &builder_commit);
+    let promotion = promote_governed_outcome(&task).expect("promotion reports, never executes");
+
+    assert!(
+        !marker.exists(),
+        "a driver in the staged worktree's own config executed during promotion: {}",
+        std::fs::read_to_string(&marker).unwrap_or_default()
+    );
+    assert_eq!(
+        promotion.outcome.blocked_reason(),
+        Some(PromotionBlockedReason::RepositoryConfigChanged {
+            component: SharedConfigComponent::WorktreeConfig
+        }),
+        "the staged worktree's own config.worktree must be pinned and named"
+    );
+    assert_eq!(head(&repo), initial);
+}
+
+/// The symmetric non-vacuity check for the test above: with
+/// `extensions.worktreeConfig` on and nothing planted, an ordinary staged run
+/// still promotes. The new path in the pin must refuse change, not presence.
+#[test]
+fn test_worktree_config_extension_alone_does_not_block_promotion() {
+    let (_dir, repo) = init_repo();
+    git(&repo, &["config", "extensions.worktreeConfig", "true"]);
+    let (task, _initial, builder_commit, _root) = staged_with_builder_commit(&repo);
+
+    let promotion = promote_governed_outcome(&task).expect("promote accepted outcome");
+
+    assert_eq!(
+        promotion.outcome,
+        GovernedPromotionOutcome::Promoted {
+            promoted_revision: builder_commit.clone()
+        }
+    );
+    assert_eq!(head(&repo), builder_commit);
+}

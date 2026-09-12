@@ -165,14 +165,21 @@ in the task record.
     every record written before this ADR the two numbers are identical, so no stored candidate
     digest changes.
 
-13. **Worktree-shared repository configuration is pinned across the run.** `.git/config`,
-    `.git/info/attributes`, and `.git/config.worktree` are shared by the main worktree and every
-    linked one, so a staged Builder can write them from inside its own checkout —
-    `info/attributes` never appears in a diff of the work tree, so it is invisible to code review.
-    `config.worktree` is pinned too: worktree-scoped config *not* accepting filter keys is
-    convention, not a Git guarantee (the file takes arbitrary keys, and is read only when
-    `extensions.worktreeConfig` is on — turning that on would itself rewrite `.git/config` and be
-    caught, but pinning the file directly removes the argument). A `filter.<name>.smudge` or
+13. **Every repository-level configuration file Git reads is pinned across the run.**
+    `.git/config` and `.git/info/attributes` are shared by the main worktree and every linked one,
+    so a staged Builder can write them from inside its own checkout — `info/attributes` never
+    appears in a diff of the work tree, so it is invisible to code review. `config.worktree` is
+    pinned too, and **per worktree**: it is not shared, and the copy that matters most is the
+    *staged* worktree's own `<common>/worktrees/<task id>/config.worktree`, which Git reads for
+    every command a producer runs in that checkout. The original draft of this rule argued that
+    `config.worktree` was covered because enabling `extensions.worktreeConfig` rewrites
+    `.git/config` and would be caught. That argument is wrong whenever the extension is *already*
+    on — `git sparse-checkout` in a linked worktree turns it on for entirely ordinary reasons — and
+    the review of the post-merge fixes reproduced the consequence end to end: a `filter.<name>.clean`
+    plus a `core.attributesFile` written there leaves `.git/config` byte-identical and still
+    executes inside a daemon-owned producer. The pin covers the canonical worktree's copy, the
+    common-directory copy, and the staged worktree's own, and it is recorded at materialization
+    *after* the staged worktree exists so all three are in it. A `filter.<name>.smudge` or
     `diff.<name>.textconv` defined there executes whenever Git materializes a file — including the
     working-tree sync promotion performs, in the canonical workspace, under operator authority,
     after review has already passed. Disabling hooks (rule 5's `core.hooksPath`) does not touch
@@ -180,13 +187,20 @@ in the task record.
     digest of that shared state on the `StagedWorktree` record — the **raw bytes** of each pinned
     file, plus the raw bytes of every file reachable through the `include`/`includeIf` paths those
     files name — as a
-    `SharedRepositoryConfigPin`, so a worktree recorded before the pin existed loads as `Unknown`
+    `SharedRepositoryConfigPin` covering the canonical worktree, the common directory, and the
+    staged worktree, so a worktree recorded before the pin existed loads as `Unknown`
     rather than failing the whole ledger on a missing field, and promotion refuses it with its own
     `repository_config_unpinned` reason telling the operator to discard and re-materialize. The pin
     carries the `scheme_version` it was computed under, and a pin from any other scheme is refused
     the same way rather than compared across schemes. The comparison, and the digest itself, read
-    files and run no Git process, so promotion can refuse **before** any Git invocation touches the
-    repository whose configuration is in question. An
+    files and run no Git process, so a producer can refuse **before** any Git invocation touches the
+    repository whose configuration is in question. **Every** producer that runs Git in the staged
+    worktree compares it first, not only promotion: the claim and verification producers run
+    `git status` there, which applies a `filter.<name>.clean` to any file the attributes route
+    through it, so a Builder that planted one executed its own script at claim time — before an
+    operator ever saw the run — until they were gated too. They refuse with a typed
+    `StagedConfigRefusal`, which is an error rather than a recorded outcome because, unlike
+    promotion, there is no accepted run to record it against. An
     empty digest would have been the wrong default: it would either compare equal to nothing
     (silently unsafe) or to everything (blocked with no explanation). Promotion refuses to check
     anything out unless the same digests still hold, reporting
@@ -197,9 +211,20 @@ in the task record.
     looks at it. An in-tree `.gitattributes` the Builder commits stays legitimate work, because a
     driver it names cannot be *defined* without changing the pinned digest.
 
-    **The load-bearing argument is detection, not enumeration.** This gate is safe because it
+    Global and system configuration are outside the pin and cannot be brought inside it — they are
+    not repository state — so every producer Git invocation suppresses them with
+    `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_SYSTEM=/dev/null`. The env scrub keeps `HOME`, so
+    without that a `filter.<name>.clean` in the operator's own `~/.gitconfig` would execute inside
+    a daemon-owned producer.
+
+    **The load-bearing argument is detection, not enumeration — within the files it covers.** This
+    gate is safe because it
     compares bytes and refuses on any difference, so it never has to know which Git keys are
-    dangerous. That distinction matters for how this ADR should be read: an enumeration claim
+    dangerous. What it is *not* immune to is being wrong about **which files Git reads**: a
+    configuration source outside the list is outside the gate, which is exactly how the staged
+    worktree's own `config.worktree` was missed in the first draft and how global configuration was
+    reachable until it was suppressed. The file list is the security-relevant surface and must be
+    re-derived whenever Git grows a new source. That distinction matters for how this ADR should be read: an enumeration claim
     ("no Git switch suppresses repository config", "`-c` cannot mask an attacker-named key") is a
     statement about a large surface that is right until one version or one key makes it not, and
     it appears here only as supporting evidence. If a reviewer disproves it, or a future Git adds
@@ -407,6 +432,53 @@ twice: asking Git a question is not a neutral act inside a repository whose conf
 thing under suspicion. Reading bytes is. Second, every one of these was a gap between what the ADR
 *said* and what the code did — rule 13 promised raw bytes, rule 4 promised the Builder's cwd — which
 is an argument for reviewing prose against implementation, not only implementation against itself.
+
+### Review round 1 on the fixes (PR #53)
+
+An adversarial review of the fixes above confirmed all five claims and the non-vacuity of every
+test, and found four more defects plus two residuals. All four are fixed; the rules above are
+written as amended.
+
+- **The staged worktree's own `config.worktree` was unpinned.** The pin was computed against the
+  canonical workspace only, so it covered `<repo>/.git/config.worktree` and the common-directory
+  copy but never `<common>/worktrees/<task id>/config.worktree` — which is the file Git actually
+  reads for commands run in the staged checkout, and the first thing every producer does there is
+  `git status`. Reachable whenever `extensions.worktreeConfig` is already on, which
+  `git sparse-checkout` in a linked worktree does for ordinary reasons; `.git/config` then stays
+  byte-identical. Reproduced end to end. Rule 13 is rewritten: the pin is recorded after the staged
+  worktree exists and covers all three copies, and the old "enabling the extension would be caught"
+  argument is retracted in place.
+
+- **Only promotion compared the pin.** `derive_claim` and `run_verification` spawned Git against the
+  staged tree with no comparison at all, so a `filter.<name>.clean` in the shared `.git/config`
+  plus a committed `.gitattributes` executed during `governed-claim` — the earliest producer, before
+  an operator sees anything. Both now compare first and refuse with a typed `StagedConfigRefusal`.
+  Note the failure mode the regression had to be written around: without the gate the producer
+  *succeeds*, because a passthrough `clean` filter leaves the tree reading clean. The marker file,
+  not the error, is what proves nothing ran.
+
+- **Global and system configuration were in force.** The env scrub keeps `HOME` and nothing set
+  `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`, so a driver in the operator's own `~/.gitconfig` would
+  execute inside a producer — a file the repository pin does not and cannot cover. Both are now
+  suppressed for every producer invocation. The test harness had been setting them all along, which
+  is how the gap stayed invisible: a harness that is safer than production hides the thing it is
+  meant to test.
+
+- **The `MarkRunning` precondition was enforced during replay.** A #50-era ledger can legitimately
+  hold a staged task that reached `running` with no materialized worktree — that *is* the bug — and
+  re-judging it under the new rule made `GovernedTaskLedger::load` fail on that task, taking every
+  unrelated task in the file down with it. `MutationContext` now carries `is_replay`, and
+  transition *rejections* are live-only. This is the general rule, not a special case: replay
+  reproduces decisions, it does not re-authorize them. Clock-derived *computations* (rule 11) are
+  the opposite case and are still recomputed.
+
+**Residuals, accepted for now and named so they are not rediscovered as findings.** The include walk
+does not resolve `~user/` — Git does, but it needs a passwd lookup the standard library does not
+offer; `~/` and backslash line continuation are both handled. And a repository using Git's
+`reftable` backend cannot have its HEAD read without Git, so a promotion blocked on configuration
+returns an error instead of the typed `PromotionBlocked` record; it still fails closed and still
+names the component that changed, but the operator does not get a recorded outcome. Both are
+narrow, both fail safe, and both are cheaper to fix once something needs them than to guess at now.
 
 ## Review round 1
 

@@ -115,6 +115,31 @@ so the two PRs do not diverge:
   `.gitignore`, with a negative control asserting Git can actually see the candidate ledger.
   Reverting the exemption fails it.
 
+## Review round 1 (2026-09-12, PR #53)
+
+An adversarial review confirmed all five claims and the whole non-vacuity table, and returned two
+P1s, three P2s, and two nits. All addressed on this branch.
+
+| Finding | Fix | Test | Revert-check |
+|---|---|---|---|
+| **P1** — the staged worktree's own `<common>/worktrees/<id>/config.worktree` was unpinned; reachable whenever `extensions.worktreeConfig` is already on, with `.git/config` left byte-identical | `shared_repository_config_digest` takes the staged root and pins the canonical, common, and staged copies; recorded after the worktree exists; every comparison passes the same root | `test_promotion_blocks_a_driver_planted_in_the_staged_worktrees_own_config`, `test_worktree_config_extension_alone_does_not_block_promotion` | dropping the staged paths fails it |
+| **P1** — no pin comparison on the claim or verification paths; a `filter.*.clean` executed during `governed-claim` | `ensure_staged_config_pin_holds` before the first Git call in both, typed `StagedConfigRefusal::{Changed,Unpinned}` | `test_derive_claim_refuses_a_staged_worktree_whose_shared_config_changed`, `test_run_verification_refuses_a_staged_worktree_whose_shared_config_changed`, `test_derive_claim_refuses_an_unpinned_staged_worktree` | removing the gate fails with *the planted driver executed inside the claim producer: CLEAN_FIRED* |
+| **P2** — the `MarkRunning` precondition was enforced during replay, so a #50-era ledger failed to load entirely | `MutationContext::is_replay`; transition rejections are live-only | `test_a_staged_ledger_that_ran_before_materialization_still_replays` (also asserts the live path still refuses) | enforcing it on replay fails it |
+| **P2** — global/system Git config in force for every producer | `hook_free_git` sets `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` to `/dev/null`, documented | `test_producer_git_invocations_suppress_global_and_system_config` | dropping it fails it |
+| **P2** — include parser missed backslash continuation and `~user/` | continuation handled (`join_continued_lines`); `~user/` recorded as a residual in ADR-0019 | `test_config_include_paths_honors_backslash_line_continuation` | dropping the join fails it |
+| **P2** — reftable repositories return `Err` instead of a typed blocked record | documented as a residual in ADR-0019 (fails closed, still names the component) | — | — |
+| Nit — the launch error did not name the task | `LaunchWorkingDirectoryError::StagedWorktreeNotMaterialized { task_id, scope }` | assertion added to `test_launch_working_directory_refuses_a_staged_task_without_a_worktree` | — |
+| Nit — `read_head_oid_without_git` read the same directory twice in a main worktree | deduplicated | existing `test_read_head_oid_without_git_matches_git_for_every_ref_shape` | — |
+
+The digest docstring's "survives being wrong about Git" claim is toned down in both the code and
+ADR-0019: within the files it covers the gate detects change without enumerating keys, but it is
+*not* immune to being wrong about **which files Git reads** — which is exactly how both P1s
+happened. The file list is now named as the security-relevant surface.
+
+One lesson worth keeping: the test harness had been setting `GIT_CONFIG_GLOBAL=/dev/null` all
+along while production did not. A harness safer than production hides the thing it is meant to
+test.
+
 ## Follow-ups
 
 - `staged_worktree_is_discardable` is duplicated: the state layer holds the enforcing copy, and

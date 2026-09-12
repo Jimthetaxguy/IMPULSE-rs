@@ -1342,6 +1342,7 @@ impl GovernedTaskRun {
             Some(staged) => Ok(staged.root.as_str()),
             None if self.world_scope == WorldScope::StagedAuthoritative => {
                 Err(LaunchWorkingDirectoryError::StagedWorktreeNotMaterialized {
+                    task_id: self.id.as_str().to_string(),
                     scope: self.world_scope,
                 })
             }
@@ -1351,12 +1352,12 @@ impl GovernedTaskRun {
 }
 
 /// Why a governed task has no directory a runtime may be launched in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LaunchWorkingDirectoryError {
     #[error(
-        "a {scope} governed task has no launch working directory until its staged worktree is materialized"
+        "{scope} governed task `{task_id}` has no launch working directory until its staged worktree is materialized"
     )]
-    StagedWorktreeNotMaterialized { scope: WorldScope },
+    StagedWorktreeNotMaterialized { task_id: String, scope: WorldScope },
 }
 
 /// The snapshot intentionally carries the full typed record in the first
@@ -1777,10 +1778,13 @@ mod tests {
             assert_eq!(
                 error,
                 LaunchWorkingDirectoryError::StagedWorktreeNotMaterialized {
-                    scope: WorldScope::StagedAuthoritative
+                    task_id: task.id.as_str().to_string(),
+                    scope: WorldScope::StagedAuthoritative,
                 }
             );
             assert!(error.to_string().contains("staged_authoritative"));
+            // The operator has to know *which* task refused.
+            assert!(error.to_string().contains(task.id.as_str()));
         }
     }
 

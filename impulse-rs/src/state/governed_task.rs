@@ -969,6 +969,7 @@ fn validate_task_history(task: &GovernedTaskRun) -> Result<BTreeMap<u64, String>
                 now: &event.created_at,
                 operator_authentication: replay_operator_authentication,
                 replay_claim,
+                is_replay: true,
             },
         )
         .with_context(|| {
@@ -1214,6 +1215,17 @@ struct MutationContext<'a> {
     operator_authentication: OperatorAuthentication,
     /// Set only while replaying a claim event out of the ledger.
     replay_claim: Option<ReplayedClaimEvidence<'a>>,
+    /// True while replaying stored history rather than applying a new mutation.
+    ///
+    /// Preconditions that *reject* a transition must not be evaluated during
+    /// replay: a ledger written before the precondition existed recorded a
+    /// transition that was legal when it happened, and re-judging it under
+    /// today's rules fails the whole ledger closed — taking every unrelated task
+    /// in the file down with it. Replay reproduces decisions; it does not
+    /// re-authorize them. (Clock-derived *computations*, like the loop verdict,
+    /// are the opposite case and are deliberately recomputed — see ADR-0019
+    /// rule 11.)
+    is_replay: bool,
 }
 
 impl<'a> MutationContext<'a> {
@@ -1222,6 +1234,7 @@ impl<'a> MutationContext<'a> {
             now,
             operator_authentication,
             replay_claim: None,
+            is_replay: false,
         }
     }
 }
@@ -1393,7 +1406,13 @@ fn apply_mutation(
             // filesystem access under a record that says `staged_authoritative`.
             // Refuse the transition instead, so the scope cannot be defeated by
             // a launcher that simply skipped materialization.
-            if task.world_scope == WorldScope::StagedAuthoritative
+            //
+            // Live mutations only. A #50-era ledger can hold a staged task that
+            // reached `running` without a worktree — that is the bug — and
+            // enforcing this during replay would make such a ledger unloadable
+            // in its entirety rather than merely unable to repeat the mistake.
+            if !context.is_replay
+                && task.world_scope == WorldScope::StagedAuthoritative
                 && task.active_staged_worktree().is_none()
             {
                 return invalid_transition(
@@ -5196,6 +5215,46 @@ mod tests {
         assert!(staged.shared_config_digest.recorded().is_some());
         assert!(!staged.shared_config_digest.is_comparable());
         assert!(staged_worktree_is_discardable(&stored));
+    }
+
+    /// Review round 1 on PR #53: the staged `MarkRunning` precondition must be
+    /// live-only. A #50-era ledger can hold exactly the shape the precondition
+    /// now refuses — a staged task that reached `running` with no materialized
+    /// worktree — and enforcing it during replay made `GovernedTaskLedger::load`
+    /// fail on that task, taking every unrelated task in the file with it.
+    ///
+    /// The fixture is that ledger's shape: a real history whose `Running` event
+    /// was legal when it was recorded, replayed as a staged task.
+    #[test]
+    fn test_a_staged_ledger_that_ran_before_materialization_still_replays() {
+        let (_root, state) = state();
+        let task = state
+            .register_governed_task(registration(&state, "p1-replay-staged"))
+            .unwrap();
+        let task = launch(&state, &task, "p1-replay-staged-run");
+        let task = claim(&state, &task, "p1-replay-staged-claim");
+
+        let mut legacy = task.clone();
+        legacy.world_scope = WorldScope::StagedAuthoritative;
+        assert!(legacy.staged_worktree.is_none());
+        assert_eq!(legacy.execution_state, GovernedExecutionState::Running);
+
+        validate_task_history(&legacy)
+            .expect("a ledger written before the precondition existed must still replay");
+
+        // ...while the live path still refuses the same transition.
+        let fresh = state
+            .register_governed_task(staged_registration(&state, "p1-replay-staged-live"))
+            .unwrap();
+        assert!(state
+            .mutate_governed_task(mutation(
+                &fresh,
+                "p1-replay-staged-live-run",
+                GovernedTaskMutation::MarkRunning {
+                    actor: actor(GovernedActorKind::System, "impulse-daemon"),
+                },
+            ))
+            .is_err());
     }
 
     /// Third #50 P1 finding: a pin recorded under the superseded sorted-listing
