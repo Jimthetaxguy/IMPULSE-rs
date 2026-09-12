@@ -1885,7 +1885,12 @@ fn require_expected_staged_root(task: &GovernedTaskRun, root: &str) -> Result<()
 /// The first version of this allowed only `Rejected` and a promoted `Accepted`,
 /// which leaked the worktree for exactly the terminal state this ADR's own loop
 /// contract produces (`Escalated`) and for a runtime that never came up.
-fn staged_worktree_is_discardable(task: &GovernedTaskRun) -> bool {
+// `pub(crate)` for one reason: the daemon must refuse a discard *before* it
+// deletes the checkout, so `impulse_ops::governed_wiring` carries a copy of
+// this rule as a preflight. A cross-check test in `src/daemon/governed_wiring.rs`
+// runs both over the same state matrix so the two cannot drift silently. This
+// function remains the enforcing authority.
+pub(crate) fn staged_worktree_is_discardable(task: &GovernedTaskRun) -> bool {
     // A runtime that failed to launch leaves a worktree nothing will ever use,
     // whatever the review state says.
     if task.execution_state == GovernedExecutionState::LaunchFailed {
