@@ -168,6 +168,34 @@ a review outcome. Today it bounds the Ion tool loop and, through
 - **Source of truth:** `src/loop_contract.rs`, `Agent::chat_with_tools` in
   `src/llm_backends/mod.rs`, and ADR-0017.
 
+### context budget — `[code]`
+The characters of working conversation history a loop may carry into one model round
+(`LoopBudget::max_context_chars`; 200,000 for the Ion tool loop, unset for the governed Builder).
+It is the one budget the loop tries to *fit* before it stops: over budget, the loop compacts
+tool-result content oldest-first into a bounded stub that keeps the `tool_use` id and names the
+tool, and only trips `LoopTrip::ContextBudget` when compaction cannot recover enough room. Two
+things are never compacted: prose, and the results the current run produced (which the model has
+not been shown yet) — a result carried in from an earlier completed turn is ordinary compactible
+history. A stub quotes the model-supplied tool name as an escaped, length-bounded JSON
+string and is re-wrapped in the executor's own untrusted-output framing via
+`ToolExecutor::wrap_compaction_stub`. Which results are already compacted is tracked by
+`tool_use_id` in a `CompactedResults` set that travels with the working history (committed on
+success, discarded on error), never by matching the stub's text against tool output. Measured in characters, not tokens, at the widest wire
+rendering of each input, so the number is exact, reproducible, and never below what any of
+Anthropic, OpenAI, or MiniMax actually sends. `LoopReport::compactions` records how many results a
+run compacted.
+- **Source of truth:** `LoopBudget`/`LoopTrip`/`LoopReport` in `src/loop_contract.rs`,
+  `enforce_context_budget` in `src/llm_backends/mod.rs`, and ADR-0017's 2026-09-12 addendum.
+
+### wire format — `[code]`
+The per-provider rendering of a chat request (`llm_backends::WireFormat`: `Anthropic` block arrays
+against OpenAI-style `tool_calls` plus `role: "tool"` messages; MiniMax speaks the OpenAI shape).
+Selecting one is mandatory, so no provider can inherit a formatter that drops tool blocks.
+`IMPULSE_PROVIDER` picks which transport a host builds and fails closed on an unknown value; it
+never picks a model — ADR-0015's step model stays the only model picker.
+- **Source of truth:** `format_messages_for` in `src/llm_backends/anthropic.rs`,
+  `provider_from_env`/`build_provider` in `src/llm_backends/mod.rs`, `ChatState::try_from_env`.
+
 ### tool sandbox roots — `[code]`
 The filesystem boundary every path-checking ion REPL tool (`file_read`, `file_write`, `bash_exec`'s
 `cwd`, `document_read`, `ion_verify`'s `repo`, and — Stage 1b-B, bridged the same way as
@@ -216,6 +244,14 @@ initial OID, and only a separate `PromoteGovernedOutcome` step after operator ac
 fast-forwards the canonical branch — or reports `PromotionBlocked{canonical_head}` if that head
 moved. It is a Git-level boundary, so the compatibility preview reports `filesystem.scoped` as
 **mediated**, never structural: nothing stops the process from writing outside the checkout.
+Three invariants the scope depends on, all hardened by the 2026-09-12 post-merge review: a staged
+task has **no** launch working directory until its worktree is materialized (`MarkRunning` refuses
+it, and `launch_working_directory` returns an error rather than the canonical workspace); every
+daemon-owned producer — claim *and* verification — observes that staged root rather than the
+canonical checkout; and the shared-repository-configuration pin is a digest of **raw file bytes**
+(including files reached through `include`/`includeIf`) that promotion compares before spawning any
+Git process, since asking Git a question inside a repository whose configuration is in question is
+not a neutral act.
 - **Source of truth:** `WorldScope` and `StagedWorktree` in
   `impulse-rs/impulse-ops/src/governed_task.rs`, the staged producers in
   `impulse-rs/src/governed_producers.rs`, and ADR-0019.

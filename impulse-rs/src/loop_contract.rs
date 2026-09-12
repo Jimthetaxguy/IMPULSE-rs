@@ -34,6 +34,26 @@ pub const ION_DEFAULT_WALL_CLOCK: Duration = Duration::from_secs(180);
 pub const ION_DEFAULT_REPEATED_CALL_STREAK: usize = 3;
 /// Default consecutive identical tool errors that trip the Ion loop.
 pub const ION_DEFAULT_SAME_ERROR_STREAK: usize = 3;
+/// Default context budget for the Ion tool loop, in characters of working
+/// conversation history.
+///
+/// Characters, not tokens: the budget has to be measurable without a
+/// tokenizer, because the same contract bounds Anthropic, OpenAI, and
+/// MiniMax runs and every one of them tokenizes differently. A character
+/// count is the cheapest measure that is exact, provider-neutral, and
+/// reproducible from a stored history.
+///
+/// 200,000 is chosen against the *smallest* context window in the supported
+/// model set (200k tokens). At the commonly cited ~3.5-4 characters per
+/// token for English prose and code, 200,000 characters is roughly 50-57k
+/// tokens — about a quarter of that window. The remaining headroom is
+/// deliberate: the measured history excludes the system prompt and the tool
+/// schemas that ride along on every request, the model's own reply has to
+/// fit, and a compaction pass that only begins once the window is nearly
+/// full has nothing cheap left to drop. The budget is a *working-set* cap
+/// that keeps turns small and affordable, not a last-resort guard against
+/// provider rejection.
+pub const ION_DEFAULT_MAX_CONTEXT_CHARS: usize = 200_000;
 
 /// Claim cycles a governed Builder may spend on one task (ADR-0019 rule 6).
 pub const GOVERNED_BUILDER_MAX_CLAIM_CYCLES: usize = 5;
@@ -75,6 +95,19 @@ pub struct LoopBudget {
     /// tool with the same error signature.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_same_error_streak: Option<usize>,
+    /// Characters of working conversation history the loop may carry into a
+    /// model round. Unlike the caps above this one is not purely a stop
+    /// condition: a loop that exceeds it first tries to get back under it by
+    /// compacting (see [`LoopTrip::ContextBudget`] and the caller-side
+    /// compaction in `llm_backends`), and only trips when compaction cannot.
+    /// `None` disables the budget. Must be non-zero when set.
+    ///
+    /// Measurement and compaction live with the caller, which owns the
+    /// message types; this module only declares the limit, counts the
+    /// compactions, and names the trip (ADR-0017 rule 6: no provider, tool,
+    /// or daemon types here).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_chars: Option<usize>,
 }
 
 impl LoopBudget {
@@ -85,6 +118,7 @@ impl LoopBudget {
             wall_clock: ION_DEFAULT_WALL_CLOCK,
             max_repeated_call_streak: Some(ION_DEFAULT_REPEATED_CALL_STREAK),
             max_same_error_streak: Some(ION_DEFAULT_SAME_ERROR_STREAK),
+            max_context_chars: Some(ION_DEFAULT_MAX_CONTEXT_CHARS),
         }
     }
 
@@ -94,12 +128,17 @@ impl LoopBudget {
     /// the wall clock is measured from task registration rather than from a
     /// single exchange. The repeated-call detector is disabled: the daemon
     /// never sees the Builder's individual tool calls.
+    ///
+    /// The context budget is disabled for the same reason: the daemon holds
+    /// claim records, not the Builder's conversation, so it has no history to
+    /// measure or compact.
     pub fn governed_builder() -> Self {
         Self {
             max_rounds: GOVERNED_BUILDER_MAX_CLAIM_CYCLES,
             wall_clock: GOVERNED_BUILDER_WALL_CLOCK,
             max_repeated_call_streak: None,
             max_same_error_streak: Some(GOVERNED_BUILDER_SAME_FAILURE_STREAK),
+            max_context_chars: None,
         }
     }
 
@@ -169,6 +208,8 @@ pub enum LoopContractError {
     ZeroWallClock { name: String },
     #[error("loop contract '{name}' streak limit '{limit}' must be non-zero when set")]
     ZeroStreak { name: String, limit: &'static str },
+    #[error("loop contract '{name}' context budget must be non-zero when set")]
+    ZeroContextBudget { name: String },
 }
 
 impl LoopContract {
@@ -212,6 +253,11 @@ impl LoopContract {
                 limit: "max_same_error_streak",
             });
         }
+        if self.budget.max_context_chars == Some(0) {
+            return Err(LoopContractError::ZeroContextBudget {
+                name: self.name.clone(),
+            });
+        }
         Ok(())
     }
 }
@@ -239,6 +285,12 @@ pub enum LoopTrip {
         streak: usize,
         signature: String,
     },
+    /// The working conversation history was still over
+    /// [`LoopBudget::max_context_chars`] after every compaction the caller
+    /// could apply. `chars` is the measured size at that point, `limit` the
+    /// budget. Unlike the other trips this one is reached only after
+    /// compaction has already been tried and failed to recover enough room.
+    ContextBudget { chars: usize, limit: usize },
 }
 
 impl fmt::Display for LoopTrip {
@@ -265,6 +317,10 @@ impl fmt::Display for LoopTrip {
             } => write!(
                 f,
                 "tool '{tool}' failed {streak} times in a row with the same error: {signature}"
+            ),
+            LoopTrip::ContextBudget { chars, limit } => write!(
+                f,
+                "conversation history is {chars} characters after compaction, over the {limit}-character context budget"
             ),
         }
     }
@@ -300,7 +356,26 @@ pub struct LoopReport {
     /// was cut off (wall clock) while they were in flight.
     #[serde(default)]
     pub tool_calls_interrupted: usize,
+    /// Tool results whose content this run replaced with a compaction stub to
+    /// stay under [`LoopBudget::max_context_chars`]. Zero for a run that
+    /// never approached the budget, and for every contract that leaves the
+    /// budget unset.
+    ///
+    /// Omitted from the serialized form when zero, which is what keeps this
+    /// additive field out of every already-persisted governed
+    /// `loop_report_digest`: the governed Builder contract sets no context
+    /// budget, so its reports serialize byte-identically to the ones written
+    /// before this field existed and `GOVERNED_BUILDER_LOOP_VERSION` does not
+    /// have to move.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub compactions: usize,
     pub elapsed_ms: u64,
+}
+
+/// `skip_serializing_if` predicate for count fields that must stay out of the
+/// wire form (and therefore out of any digest over it) when they are zero.
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 /// Outcome of one executed tool call, as the breaker needs to see it.
@@ -330,6 +405,7 @@ pub struct LoopBreaker {
     round_keys: Vec<String>,
     last_round_keys: Option<Vec<String>>,
     repeated_round_streak: usize,
+    compactions: usize,
 }
 
 impl LoopBreaker {
@@ -348,6 +424,7 @@ impl LoopBreaker {
             round_keys: Vec::new(),
             last_round_keys: None,
             repeated_round_streak: 0,
+            compactions: 0,
         }
     }
 
@@ -357,6 +434,19 @@ impl LoopBreaker {
 
     pub fn rounds_used(&self) -> usize {
         self.rounds_used
+    }
+
+    /// Tool results compacted so far in this run.
+    pub fn compactions(&self) -> usize {
+        self.compactions
+    }
+
+    /// Records that the caller replaced one tool result's content with a
+    /// compaction stub to stay under the context budget. The caller owns the
+    /// message types and therefore the compaction itself (ADR-0017 rule 6);
+    /// the breaker only counts it so the report is complete.
+    pub fn observe_compaction(&mut self) {
+        self.compactions += 1;
     }
 
     /// Admits the next model round, returning its zero-based index, or trips
@@ -472,6 +562,7 @@ impl LoopBreaker {
             tool_calls: self.tool_calls,
             tool_errors: self.tool_errors,
             tool_calls_interrupted: self.dispatched.saturating_sub(self.tool_calls),
+            compactions: self.compactions,
             elapsed_ms: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
         }
     }
@@ -546,6 +637,7 @@ mod tests {
                 wall_clock: Duration::from_secs(5),
                 max_repeated_call_streak: repeated,
                 max_same_error_streak: same_error,
+                max_context_chars: None,
             },
         }
     }
@@ -577,6 +669,7 @@ mod tests {
             wall_clock: Duration::from_millis(1),
             max_repeated_call_streak: None,
             max_same_error_streak: None,
+            max_context_chars: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         assert!(
@@ -632,6 +725,7 @@ mod tests {
             tool_calls: 9,
             tool_errors: 2,
             tool_calls_interrupted: 1,
+            compactions: 2,
             elapsed_ms: 1234,
         };
         let json = serde_json::to_string(&original).unwrap();
@@ -1197,6 +1291,7 @@ mod tests {
             wall_clock: Duration::from_secs(60),
             max_repeated_call_streak: None,
             max_same_error_streak: None,
+            max_context_chars: None,
         };
         let observed = LoopObservation {
             rounds_used: 1,
@@ -1217,5 +1312,149 @@ mod tests {
         let first = budget.evaluate_observed(&observed);
         let second = budget.evaluate_observed(&observed);
         assert_eq!(first, second);
+    }
+
+    // ---------------------------------------------------------------
+    // Context budget (Stage 1b-A)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_ion_default_budget_sets_the_documented_context_budget() {
+        let budget = LoopBudget::ion_default();
+        assert_eq!(
+            budget.max_context_chars,
+            Some(ION_DEFAULT_MAX_CONTEXT_CHARS),
+            "the Ion contract must carry the documented default context budget"
+        );
+        assert_eq!(ION_DEFAULT_MAX_CONTEXT_CHARS, 200_000);
+    }
+
+    #[test]
+    fn test_governed_builder_budget_leaves_the_context_budget_unset() {
+        // The daemon holds claim records, not a conversation: there is
+        // nothing for it to measure or compact.
+        assert_eq!(LoopBudget::governed_builder().max_context_chars, None);
+    }
+
+    #[test]
+    fn test_validate_rejects_a_zero_context_budget() {
+        let mut contract = LoopContract::ion_tool_loop();
+        contract.budget.max_context_chars = Some(0);
+        assert_eq!(
+            contract.validate(),
+            Err(LoopContractError::ZeroContextBudget {
+                name: "ion_tool_loop".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_validate_accepts_a_one_character_context_budget() {
+        // Non-zero is the whole requirement; an absurdly small budget is a
+        // budget that trips immediately, not an invalid contract.
+        let mut contract = LoopContract::ion_tool_loop();
+        contract.budget.max_context_chars = Some(1);
+        assert!(contract.validate().is_ok());
+    }
+
+    #[test]
+    fn test_zero_context_budget_error_display_names_the_contract() {
+        let err = LoopContractError::ZeroContextBudget {
+            name: "ion_tool_loop".to_string(),
+        };
+        let rendered = format!("{err}");
+        assert!(rendered.contains("ion_tool_loop"), "got: {rendered}");
+        assert!(rendered.contains("context budget"), "got: {rendered}");
+    }
+
+    #[test]
+    fn test_context_budget_trip_display_reports_both_numbers() {
+        let trip = LoopTrip::ContextBudget {
+            chars: 4_096,
+            limit: 1_024,
+        };
+        let rendered = format!("{trip}");
+        assert!(rendered.contains("4096"), "got: {rendered}");
+        assert!(rendered.contains("1024"), "got: {rendered}");
+        assert!(rendered.contains("compaction"), "got: {rendered}");
+    }
+
+    #[test]
+    fn test_context_budget_trip_round_trips_through_serde() {
+        let trip = LoopTrip::ContextBudget { chars: 9, limit: 4 };
+        let json = serde_json::to_string(&trip).unwrap();
+        assert!(json.contains("context_budget"), "got: {json}");
+        let recovered: LoopTrip = serde_json::from_str(&json).unwrap();
+        assert_eq!(recovered, trip);
+    }
+
+    #[test]
+    fn test_budget_with_context_chars_round_trips_through_serde() {
+        let original = LoopBudget::ion_default();
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("max_context_chars"), "got: {json}");
+        let recovered: LoopBudget = serde_json::from_str(&json).unwrap();
+        assert_eq!(recovered, original);
+    }
+
+    #[test]
+    fn test_budget_json_without_a_context_budget_still_loads() {
+        // Every budget persisted before this field existed must still load.
+        let json = r#"{"max_rounds":4,"wall_clock":{"secs":30,"nanos":0}}"#;
+        let recovered: LoopBudget = serde_json::from_str(json).unwrap();
+        assert_eq!(recovered.max_rounds, 4);
+        assert_eq!(recovered.max_context_chars, None);
+    }
+
+    #[test]
+    fn test_report_with_compactions_round_trips_through_serde() {
+        let breaker = LoopBreaker::new(LoopContract::ion_tool_loop());
+        let mut report = breaker.report(LoopTermination::Completed);
+        report.compactions = 3;
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("compactions"), "got: {json}");
+        let recovered: LoopReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(recovered, report);
+    }
+
+    #[test]
+    fn test_report_omits_compactions_when_zero_so_stored_digests_hold() {
+        // Serialized reports feed the governed `loop_report_digest`; a run
+        // that never compacted must serialize exactly as it did before this
+        // field existed.
+        let breaker = LoopBreaker::new(LoopContract::governed_builder());
+        let report = breaker.report(LoopTermination::Completed);
+        assert_eq!(report.compactions, 0);
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(
+            !json.contains("compactions"),
+            "a zero compaction count must not reach the wire form: {json}"
+        );
+        let recovered: LoopReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(recovered, report);
+    }
+
+    #[test]
+    fn test_observe_compaction_counts_into_the_report() {
+        let mut breaker = LoopBreaker::new(LoopContract::ion_tool_loop());
+        assert_eq!(breaker.compactions(), 0);
+        breaker.observe_compaction();
+        breaker.observe_compaction();
+        assert_eq!(breaker.compactions(), 2);
+        assert_eq!(
+            breaker.report(LoopTermination::Completed).compactions,
+            2,
+            "the report must carry the compactions the run performed"
+        );
+    }
+
+    #[test]
+    fn test_evaluate_observed_ignores_the_context_budget() {
+        // `evaluate_observed` reads durable counts, never message content, so
+        // a context budget it cannot measure must not change its verdict.
+        let mut budget = LoopBudget::governed_builder();
+        budget.max_context_chars = Some(1);
+        let observed = observation(1, Duration::from_secs(1));
+        assert_eq!(budget.evaluate_observed(&observed), None);
     }
 }
