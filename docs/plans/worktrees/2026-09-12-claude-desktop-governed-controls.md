@@ -1,6 +1,6 @@
 ---
 title: Desktop Governed Controls Lane
-description: Work card for the lane that gives the Dioxus cockpit ADR-0019's Promote and Discard controls, their typed banners, and a hook-free governed Git preflight
+description: Work card for the lane that gives the Dioxus cockpit ADR-0019's Promote and Discard controls, their typed banners, and a hardened governed Git preflight
 updated: 2026-09-12
 type: doc
 category: planning
@@ -114,7 +114,7 @@ thing that changes. Its callers take a `StagedConfigRefusalNotice`, and its test
 refusal reads as a refusal, that an ordinary transport failure does not — not the matching strategy.
 No TODO comment is left behind; this paragraph is the record.
 
-### 5. The governed Git preflight is hook-free
+### 5. The governed Git preflight is hook- and global-config-free
 
 PR #53's handoff recorded `impulse-desktop/src/runtime.rs`'s `run_bounded_governed_git` as a Git
 invocation on a governed path with none of the producers' hardening: no `core.hooksPath`, no
@@ -256,3 +256,113 @@ reaching any application code — while a *second* lane's `cargo test --workspac
 same way for thirteen hours. It is machine-level contention between concurrent lanes, not a code
 fault: nothing that suite exercises is touched here, and a clean re-run with the machine quieter
 passed the whole suite. If it wedges again, re-run rather than bisecting.
+
+## Review round 1
+
+Adversarial review of PR #58. 417 desktop + ops tests green; claims a, b, c, f and the host-bridge
+envelope route confirmed. The brief's XDG premise was **refuted** — `GIT_CONFIG_GLOBAL=/dev/null`
+already covers it and `XDG_CONFIG_HOME` is scrubbed by the env allowlist, so nothing was changed for
+it. What follows is what round 1 found and what changed.
+
+### P1 — the confirmation told an operator a discard cost nothing when it cost a commit
+
+`unreferenced_accepted_commit_on_discard` answered `None` for an **accepted run with no promotion
+attempt**, because it read the question as "was a promotion blocked". That population is reachable:
+`staged_worktree_is_discardable` short-circuits to `true` for a worktree whose pin is `Unknown` —
+the pre-pin records `PromotionBlockedReason::RepositoryConfigUnpinned` exists for — so an accepted,
+never-promoted run is discardable with zero promotions recorded. The confirmation then rendered
+"No accepted commit loses its only reference: nothing here was accepted and left unpromoted."
+immediately before an irreversible action, with no OID.
+
+Fixed in `impulse_ops::governed_wiring::unreferenced_accepted_commit_on_discard`: an accepted run
+with no `Promoted` outcome now answers with the accepted claim's `subject_revision` — the same value
+`governed_producers::promote_governed_outcome` uses for `accepted_revision` — preferring a blocked
+promotion's already-recorded `accepted_revision` when one exists. **This widens the daemon's
+acknowledgement too**: `GovernedStagedWorktreeDiscardAck::unreferenced_accepted_commit` is filled
+from this function, so the CLI's `unreferenced_commit_warning` and the daemon's discard endpoint now
+also report the unpinned-accepted case. That is the intended consequence, not a side effect — the
+field's contract is "the commit this discard strands", and it was under-reporting.
+
+On the UI side, `discard_reassurance_notice` replaces the old unconditional `else` branch. An
+accepted run can never reach a "nothing was accepted" sentence: it gets the cost notice with its
+OID, or — for the claimless record the state layer should not produce — an explicit admission that
+the commit cannot be named and the staged HEAD should be checked before discarding.
+
+The round-0 test that asserted the buggy behavior
+(`test_only_an_accepted_but_blocked_promotion_names_an_unreferenced_commit`) was renamed and its
+assertion corrected rather than deleted, so the diff shows the belief that changed.
+
+### P2 — "hook-free" overstated the guarantee
+
+A repository-level `filter.*.clean` still executes during the preflight's `git status`, reproduced
+by the reviewer with a `.gitattributes` line of `* filter=probe`, and **no Git switch disables it**:
+`-c filter.x.clean=` breaks one name, and the set of names is whatever the repository defines.
+
+Wording is now "hook- and global-config-free" in the ADR line, the lane card, and the PR body. More
+than wording: `refuse_executable_git_drivers` runs before the first Git process and refuses the
+preflight, by filesystem read only, if `.git/config`, `.git/config.worktree`, or
+`.git/info/attributes` defines a `filter.*.clean`/`.smudge` or `diff.*.textconv`/`.command`/`.process`
+key. The daemon's producers answer this with a materialization-time pin; this preflight owns no pin
+(it runs in the operator's own checkout before any staged worktree exists), so refusing is the
+honest equivalent. Proven with the reviewer's reproduction — the filter's marker file is never
+written — plus a negative control (removing the refusal makes the marker appear) and an
+acceptance case so it is not a blanket block.
+
+**Residuals, recorded rather than implied:**
+
+- An `include.path` / `includeIf` directive in `.git/config` can pull a driver in from a file this
+  check does not read. Following includes means implementing Git's include resolution, which is the
+  producers' pin machinery by another name.
+- `.git`-as-a-file is followed one level (`gitdir:`); a deeper chain, and `commondir` indirection,
+  are not resolved.
+- The parser is line-level and case-insensitive on keys. It accepts both the section-header and
+  fully-qualified spellings and ignores comments; it does not implement Git's full config grammar
+  (line continuations, quoted values containing `=`).
+
+### P2 — `staged_config_refusal_notice` matched loosely and hid the daemon's own words
+
+Three changes. The classifier **matches nothing on this base** — the strings it targets are
+introduced by PR #53 — which is now stated in its doc comment as a fact rather than left to be
+discovered. The changed-pin arm no longer accepts "refusing to run Git in that worktree" on its own:
+that trailing clause is a generic consequence a future unrelated refusal could reuse, and matching
+it would attach a discard-and-re-materialize remedy that does not apply. A near-miss test
+("...refusing to run Git in that worktree because it is dirty") pins that. And `BridgeStatusBanner`
+now renders the raw daemon text **alongside** any interpretation instead of replacing it, because
+the classifier reads a message it does not own. The single replacement point for the typed variant
+is unchanged.
+
+### P2 — promote-side matrix cross-check
+
+`test_promotability_is_between_the_daemon_and_state_layer_rules_over_the_matrix` walks
+9 reviews × 4 executions × 4 scopes × 3 staged statuses × 3 promotion outcomes (432 cases) and
+asserts `governed_outcome_is_promotable` is a superset of the daemon endpoint's inline checks and a
+subset of the state layer's `RecordPromotion` preconditions, plus that the promotable set is
+non-empty so the upper bound is not vacuous.
+
+**Boundary, stated:** both authorities live in `impulse-rs` (`src/daemon/governed_wiring.rs`,
+`src/state/governed_task.rs`), which `impulse-ops` cannot depend on and which this lane does not
+own, so the two rules are **restated** in the test from those exact sites rather than imported. The
+version that imports the real functions belongs directly beside
+`both_discardability_rules_agree_over_the_whole_state_matrix` in `src/daemon/governed_wiring.rs` —
+a one-test handoff for whoever owns that file next.
+
+### P2 — ack-only fields no longer dropped
+
+`pending_rerun_reason` (promotion) and `unreferenced_accepted_commit` + `discarded_root` (discard)
+exist only on the acknowledgement; the `ops_update` the card waits for carries none of them. The JS
+bridge now forwards each into the existing bridge-status banner channel under its own status
+(`governed_promotion_rerun_pending`, `governed_discard_unreferenced_commit`), each with a headline
+that does not read as a failed host call.
+
+### Nits
+
+- **Discard drafts survive an unrelated revision bump.** The card stays keyed `id:revision` —
+  deliberately, so a new daemon revision clears the *decision rationale* — but the discard draft and
+  armed flag moved up into `OperatorBoard`, keyed by task id alone. A half-typed discard reason is no
+  longer collateral damage of an unrelated `ops_update`.
+- **World scope pinned by assertion.** `test_every_desktop_registration_is_authoritative_scoped`
+  asserts against the source that `impulse-desktop/src/runtime.rs` contains no `.world_scope(` call,
+  so adding a staged launch trips the test rather than silently shipping a staged registration on a
+  connection that never presents the operator capability.
+- **Stale revisions read as a stale board.** A `revision conflict` reason now headlines as "Board is
+  out of date: this task changed on the daemon — refresh and retry" instead of "Host call failed".

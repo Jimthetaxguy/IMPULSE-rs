@@ -3220,6 +3220,30 @@ fn with_promotion(
     task
 }
 
+/// The same staged fixture with an accepted worker claim, so the record can
+/// name the commit a discard would strand.
+fn with_accepted_claim(
+    mut task: impulse_ops::governed_task::GovernedTaskRun,
+) -> impulse_ops::governed_task::GovernedTaskRun {
+    use impulse_ops::governed_task as gt;
+    task.claims.push(gt::WorkerCompletionClaim {
+        id: gt::GovernedRecordId::try_new("claim-1").expect("claim id"),
+        actor: gt::GovernedActor {
+            kind: gt::GovernedActorKind::Worker,
+            id: "builder-01".to_string(),
+        },
+        summary: "the gate is green".to_string(),
+        subject_revision: "b".repeat(40),
+        artifact_ids: Vec::new(),
+        diff_ref: None,
+        loop_report_digest: None,
+        loop_report_version: None,
+        submitted_at: "2026-09-12T00:00:30Z".to_string(),
+        based_on_revision: task.revision,
+    });
+    task
+}
+
 fn operator_board_html(tasks: Vec<impulse_ops::governed_task::GovernedTaskRun>) -> String {
     let snapshot = ProjectOpsSnapshot {
         governed_tasks: tasks,
@@ -3608,4 +3632,241 @@ fn test_staged_control_bridge_scripts_target_the_installed_bridge_entry_points()
     assert!(bootstrap.contains("governed_staged_worktree_discard"));
     assert!(bootstrap.contains("governed_promotion_failed"));
     assert!(bootstrap.contains("governed_discard_failed"));
+}
+
+// ───────────────────────── review round 1 regressions ─────────────────────────
+
+/// **P1.** An accepted staged run whose pin is `Unknown` — the pre-pin
+/// population `RepositoryConfigUnpinned` exists for — is discardable through the
+/// unknown-pin short-circuit with *zero* promotion attempts. The confirmation
+/// used to tell the operator "nothing here was accepted and left unpromoted"
+/// right before an irreversible action that stranded a commit.
+#[test]
+fn test_an_unpinned_accepted_run_names_the_commit_a_discard_would_strand() {
+    use impulse_desktop::ui::{
+        discard_control_state, discard_cost_notice, discard_reassurance_notice,
+    };
+    use impulse_ops::governed_task as gt;
+
+    let mut unpinned = with_accepted_claim(staged_governed_task());
+    if let Some(staged) = unpinned.staged_worktree.as_mut() {
+        staged.shared_config_digest = gt::SharedRepositoryConfigPin::Unknown;
+    }
+    assert_eq!(unpinned.review_state, gt::GovernedReviewState::Accepted);
+    assert!(
+        unpinned.promotions.is_empty(),
+        "this reaches discard with no promotion attempt at all"
+    );
+    assert!(
+        discard_control_state(&unpinned).is_enabled(),
+        "an unpinned worktree can never be promoted, so discard is the only way forward"
+    );
+
+    let cost = discard_cost_notice(&unpinned)
+        .expect("an accepted, unpromoted run always costs its commit");
+    assert!(
+        cost.contains(&"b".repeat(40)),
+        "the OID must be shown: {cost}"
+    );
+    assert!(cost.contains("git cat-file -p"));
+    assert_eq!(
+        discard_reassurance_notice(&unpinned),
+        None,
+        "a run with a real cost must never also carry a reassurance"
+    );
+}
+
+/// The reassurance sentence must never claim "nothing was accepted" about an
+/// accepted run, in any shape — including the claimless record the state layer
+/// should not produce.
+#[test]
+fn test_no_accepted_run_is_ever_told_that_nothing_was_accepted() {
+    use impulse_desktop::ui::discard_reassurance_notice;
+    use impulse_ops::governed_task as gt;
+
+    let accepted = with_accepted_claim(staged_governed_task());
+
+    let mut claimless = accepted.clone();
+    claimless.claims.clear();
+    let claimless_notice =
+        discard_reassurance_notice(&claimless).expect("a claimless accepted run still needs words");
+    assert!(
+        !claimless_notice.contains("never accepted")
+            && !claimless_notice.contains("nothing here was accepted"),
+        "an accepted run must not be told nothing was accepted, got: {claimless_notice}"
+    );
+    assert!(
+        claimless_notice.contains("Check the staged checkout's HEAD"),
+        "with no OID to show, the surface must admit it rather than reassure: {claimless_notice}"
+    );
+
+    let promoted = with_promotion(
+        accepted.clone(),
+        gt::GovernedPromotionOutcome::Promoted {
+            promoted_revision: "b".repeat(40),
+        },
+    );
+    let promoted_notice =
+        discard_reassurance_notice(&promoted).expect("a promoted run genuinely costs nothing");
+    assert!(promoted_notice.contains("already on the canonical branch"));
+
+    let mut rejected = accepted;
+    rejected.review_state = gt::GovernedReviewState::Rejected;
+    rejected.claims.clear();
+    assert!(discard_reassurance_notice(&rejected)
+        .expect("a rejected run costs nothing")
+        .contains("never accepted"));
+}
+
+/// **P2.** The classifier reads a message it does not own, so a near-miss must
+/// not be dressed up with a remedy that does not apply.
+#[test]
+fn test_a_near_miss_refusal_message_is_not_classified_as_a_changed_pin() {
+    use impulse_desktop::ui::staged_config_refusal_notice;
+
+    assert_eq!(
+        staged_config_refusal_notice(
+            "governed task `staged-task` has uncommitted changes; refusing to run Git in that \
+             worktree because it is dirty"
+        ),
+        None,
+        "the trailing consequence clause is not the refusal's identity; only the \
+         changed-since clause is"
+    );
+    assert!(
+        staged_config_refusal_notice(
+            "shared repository configuration changed since governed task `staged-task`'s staged \
+             worktree was materialized (.git/config); refusing to run Git in that worktree"
+        )
+        .is_some(),
+        "the real changed-pin refusal must still classify"
+    );
+}
+
+/// **P2.** The banner must show the daemon's own words alongside any
+/// interpretation of them.
+#[test]
+fn test_the_bridge_banner_shows_the_raw_daemon_text_next_to_any_interpretation() {
+    let raw = "shared repository configuration changed since governed task `staged-task`'s staged \
+               worktree was materialized (.git/config); refusing to run Git in that worktree";
+    let mut vdom = VirtualDom::new_with_props(
+        DesktopShellWithSnapshot,
+        DesktopShellWithSnapshotProps {
+            snapshot: ProjectOpsSnapshot::default(),
+            runtime_agents: Vec::new(),
+            agent_platforms: Vec::new(),
+            workspaces: Vec::new(),
+            mcp_tools: Vec::new(),
+            last_invocations: Vec::new(),
+            review_queue: Vec::new(),
+            bridge_status: Some(BridgeStatusUpdate {
+                status: "governed_promotion_failed".to_string(),
+                reason: Some(raw.to_string()),
+            }),
+            daemon_ops_status: None,
+            initial_view: DesktopView::Supervisor,
+        },
+    );
+    vdom.rebuild_in_place();
+    let html = dioxus_ssr::render(&vdom);
+
+    assert!(html.contains("data-staged-config-refusal=\"true\""));
+    assert!(html.contains("data-bridge-status-raw=\"true\""));
+    assert!(
+        html.contains("materialized (.git/config)"),
+        "the raw daemon text must survive to the operator's eyes"
+    );
+    assert!(html.contains("Staged worktree refused"));
+}
+
+/// **P2.** `pending_rerun_reason` and `unreferenced_accepted_commit` exist only
+/// on the acknowledgement — the `ops_update` the card waits for carries neither
+/// — so the bridge forwards them into the banner channel or they are lost.
+#[test]
+fn test_ack_only_facts_reach_the_banner_channel() {
+    use impulse_desktop::ui::{GOVERNED_RERUN_PENDING_STATUS, GOVERNED_UNREFERENCED_COMMIT_STATUS};
+
+    let bootstrap = desktop_event_bridge_script();
+    assert!(
+        bootstrap.contains("ack?.pending_rerun_reason"),
+        "the promotion bridge must read the ack-only rerun reason"
+    );
+    assert!(
+        bootstrap.contains(GOVERNED_RERUN_PENDING_STATUS),
+        "and forward it under the status the banner knows"
+    );
+    assert!(
+        bootstrap.contains("ack?.unreferenced_accepted_commit"),
+        "the discard bridge must read the ack-only stranded commit"
+    );
+    assert!(bootstrap.contains(GOVERNED_UNREFERENCED_COMMIT_STATUS));
+
+    // Neither reads as a failed host call.
+    let rerun = BridgeStatusUpdate {
+        status: GOVERNED_RERUN_PENDING_STATUS.to_string(),
+        reason: Some("a previous promotion producer was interrupted".to_string()),
+    };
+    assert!(rerun.headline().contains("redoing an interrupted producer"));
+    assert!(!rerun.headline().contains("Host call failed"));
+
+    let stranded = BridgeStatusUpdate {
+        status: GOVERNED_UNREFERENCED_COMMIT_STATUS.to_string(),
+        reason: Some(format!(
+            "Accepted commit {} was never promoted",
+            "b".repeat(40)
+        )),
+    };
+    assert!(stranded
+        .headline()
+        .contains("only ref to an accepted commit"));
+}
+
+/// Nit: a stale revision means the board is looking at a task the daemon has
+/// already moved past. "Host call failed: governed promotion" sends the operator
+/// hunting for a transport problem that does not exist.
+#[test]
+fn test_a_revision_conflict_reads_as_a_stale_board_not_a_transport_failure() {
+    let conflict = BridgeStatusUpdate {
+        status: "governed_promotion_failed".to_string(),
+        reason: Some("governed task revision conflict: expected 7, current 9".to_string()),
+    };
+    let headline = conflict.headline();
+    assert!(headline.contains("Board is out of date"), "got: {headline}");
+    assert!(headline.contains("refresh and retry"));
+    assert!(!headline.contains("Host call failed"));
+}
+
+/// Nit: the desktop launch path never declares a world scope, so every
+/// registration it builds is `Authoritative`. That is precisely why
+/// `RegisterGovernedTask` is absent from the desktop's operator-class list —
+/// the daemon gates registration only for a staged scope.
+#[test]
+fn test_every_desktop_registration_is_authoritative_scoped() {
+    use impulse_ops::governed_task as gt;
+
+    // Structural: the launch path never calls the builder's scope setter, so
+    // the registration cannot be anything but the default. Checked against the
+    // source so that adding a staged launch trips this test rather than
+    // silently shipping an unauthenticated staged registration.
+    let runtime_source = include_str!("../src/runtime.rs");
+    assert!(
+        !runtime_source.contains(".world_scope("),
+        "the desktop declares a world scope now; RegisterGovernedTask must join \
+         UnixDaemonOpsClient::requires_operator_class at the same time, because the daemon \
+         gates staged-scope registration as operator-class"
+    );
+
+    // And the default that therefore applies is `Authoritative`.
+    let registration = gt::GovernedTaskRegistration::builder(
+        "request-1".to_string(),
+        "task-1".to_string(),
+        "impulse-rs".to_string(),
+        "/tmp/impulse-rs".to_string(),
+        "Launch a governed agent".to_string(),
+        "builder-01".to_string(),
+        "codex",
+    )
+    .build()
+    .expect("a minimal registration builds");
+    assert_eq!(registration.world_scope, gt::WorldScope::Authoritative);
 }
