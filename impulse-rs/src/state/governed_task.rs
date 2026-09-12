@@ -1331,48 +1331,32 @@ fn apply_mutation(
             ));
         }
         GovernedTaskMutation::RecordPromotion { promotion } => {
-            require_capacity(
-                "governed promotions",
-                task.promotions.len(),
-                MAX_GOVERNED_RECORDS_PER_KIND,
-            )?;
+            // Task-state preconditions live in one predicate so the daemon
+            // endpoint and a shared `impulse-ops` helper can be checked against
+            // the ledger's real rule instead of restating it. Input-bound checks
+            // stay here, because they read `promotion`. Order matters: the
+            // predicate proves `staged` and `claim` exist, which the checks
+            // below then borrow.
+            record_promotion_preconditions_hold(task).map_err(|failure| {
+                GovernedTaskStateError::InvalidTransition(failure.to_string())
+            })?;
             require_actor(&promotion.actor, GovernedActorKind::System)?;
-            if task.world_scope != WorldScope::StagedAuthoritative {
-                return invalid_transition(
-                    "only a staged_authoritative world scope promotes an outcome",
-                );
-            }
-            if task.review_state != GovernedReviewState::Accepted {
-                return invalid_transition("promotion requires an accepted governed task");
-            }
             let staged = task
                 .active_staged_worktree()
-                .ok_or_else(|| {
-                    GovernedTaskStateError::InvalidTransition(
-                        "promotion requires an active staged worktree".to_string(),
-                    )
-                })?
+                .expect("precondition proved an active staged worktree")
                 .clone();
             if promotion.initial_subject_revision != staged.initial_subject_revision {
                 return invalid_transition(
                     "promotion must reference the staged worktree's initial Git OID",
                 );
             }
-            let claim = task.latest_claim().ok_or_else(|| {
-                GovernedTaskStateError::InvalidTransition(
-                    "promotion requires an accepted worker claim".to_string(),
-                )
-            })?;
+            let claim = task
+                .latest_claim()
+                .expect("precondition proved a current worker claim");
             if promotion.accepted_revision != claim.subject_revision {
                 return invalid_transition(
                     "promotion must reference the accepted claim's subject revision",
                 );
-            }
-            if task
-                .latest_promotion()
-                .is_some_and(|previous| previous.outcome.is_promoted())
-            {
-                return invalid_transition("this governed outcome was already promoted");
             }
             validate_promotion_outcome(&promotion)?;
             let id = new_record_id("promotion");
@@ -1934,7 +1918,72 @@ fn require_expected_staged_root(task: &GovernedTaskRun, root: &str) -> Result<()
 /// The first version of this allowed only `Rejected` and a promoted `Accepted`,
 /// which leaked the worktree for exactly the terminal state this ADR's own loop
 /// contract produces (`Escalated`) and for a runtime that never came up.
-fn staged_worktree_is_discardable(task: &GovernedTaskRun) -> bool {
+/// Why a `RecordPromotion` mutation cannot be applied to a task's current state.
+///
+/// One variant per task-state precondition, each carrying the exact message the
+/// arm used to produce inline, so extracting them changed nothing an operator
+/// reads. Input-bound checks (actor kind, the two revision identities, outcome
+/// validation) are not here: they read the `GovernedPromotionInput`, which this
+/// predicate deliberately does not take.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum PromotionPreconditionFailure {
+    #[error("governed promotions reached its limit of {limit}")]
+    CapacityExhausted { limit: usize },
+    #[error("only a staged_authoritative world scope promotes an outcome")]
+    NotStagedScope,
+    #[error("promotion requires an accepted governed task")]
+    NotAccepted,
+    #[error("promotion requires an active staged worktree")]
+    NoActiveStagedWorktree,
+    #[error("promotion requires an accepted worker claim")]
+    NoClaim,
+    #[error("this governed outcome was already promoted")]
+    AlreadyPromoted,
+}
+
+/// The task-state half of `RecordPromotion`'s preconditions.
+///
+/// Called from the `RecordPromotion` arm of `apply_mutation`, so the predicate
+/// and the mutation cannot drift: a predicate that merely restated the arm
+/// would be the failure mode the cross-check test exists to catch. `pub(crate)`
+/// so `src/daemon/governed_wiring.rs` can assert the shared
+/// `impulse_ops::governed_wiring::governed_outcome_is_promotable` never promises
+/// a promotion this ledger would refuse.
+pub(crate) fn record_promotion_preconditions_hold(
+    task: &GovernedTaskRun,
+) -> Result<(), PromotionPreconditionFailure> {
+    if task.promotions.len() >= MAX_GOVERNED_RECORDS_PER_KIND {
+        return Err(PromotionPreconditionFailure::CapacityExhausted {
+            limit: MAX_GOVERNED_RECORDS_PER_KIND,
+        });
+    }
+    if task.world_scope != WorldScope::StagedAuthoritative {
+        return Err(PromotionPreconditionFailure::NotStagedScope);
+    }
+    if task.review_state != GovernedReviewState::Accepted {
+        return Err(PromotionPreconditionFailure::NotAccepted);
+    }
+    if task.active_staged_worktree().is_none() {
+        return Err(PromotionPreconditionFailure::NoActiveStagedWorktree);
+    }
+    if task.latest_claim().is_none() {
+        return Err(PromotionPreconditionFailure::NoClaim);
+    }
+    if task
+        .latest_promotion()
+        .is_some_and(|previous| previous.outcome.is_promoted())
+    {
+        return Err(PromotionPreconditionFailure::AlreadyPromoted);
+    }
+    Ok(())
+}
+
+// `pub(crate)` for one reason: the daemon must refuse a discard *before* it
+// deletes the checkout, so `impulse_ops::governed_wiring` carries a copy of
+// this rule as a preflight. A cross-check test in `src/daemon/governed_wiring.rs`
+// runs both over the same state matrix so the two cannot drift silently. This
+// function remains the enforcing authority.
+pub(crate) fn staged_worktree_is_discardable(task: &GovernedTaskRun) -> bool {
     // A runtime that failed to launch leaves a worktree nothing will ever use,
     // whatever the review state says.
     if task.execution_state == GovernedExecutionState::LaunchFailed {

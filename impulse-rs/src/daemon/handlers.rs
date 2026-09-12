@@ -781,6 +781,15 @@ pub(crate) async fn process_request(
     }
     | DaemonRequest::RunGovernedSupervisorReview {
         request: impulse_ops::governed_task::GovernedSupervisorReviewRequest { ref project_id, .. },
+    }
+    | DaemonRequest::PromoteGovernedOutcome {
+        request: impulse_ops::governed_wiring::GovernedPromotionRequest { ref project_id, .. },
+    }
+    | DaemonRequest::DiscardGovernedStagedWorktree {
+        request:
+            impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardRequest {
+                ref project_id, ..
+            },
     } = request
     {
         if let Err(error) = crate::validate::reject_control_chars(project_id, "project_id") {
@@ -850,6 +859,19 @@ pub(crate) async fn process_request(
         DaemonRequest::SubmitGovernedClaim { .. }
         | DaemonRequest::RunGovernedVerification { .. } => {
             handle_governed_producer_request(request, &state).await
+        }
+
+        // ADR-0019 staged producers. Both mint or destroy canonical state, so
+        // both are operator-class only; the check lives at the top of
+        // `governed_wiring`, before any state read.
+        DaemonRequest::PromoteGovernedOutcome { .. }
+        | DaemonRequest::DiscardGovernedStagedWorktree { .. } => {
+            super::governed_wiring::handle_governed_staged_request(
+                request,
+                &state,
+                connection_class,
+            )
+            .await
         }
 
         // Supervisor group
@@ -954,6 +976,21 @@ pub(crate) async fn handle_governed_task_request(
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
         match request {
             DaemonRequest::RegisterGovernedTask { registration } => {
+                // Authorization first, before *anything* reads the request's
+                // caller-supplied paths. The profiled preflight below runs
+                // `AgentRegistry::registry_for_runtime` and then
+                // `observe_clean_git_subject`, which spawns `git` inside
+                // `registration.workspace_root` -- a path the caller chose. A
+                // staged registration is operator-only, so a non-operator
+                // connection must be refused before it can use this endpoint to
+                // probe the filesystem or start a subprocess. Review round 1
+                // caught this ordering: a non-operator staged registration
+                // against a non-Git path answered "git root discovery failed"
+                // rather than the class refusal.
+                super::governed_wiring::require_staged_registration_class(
+                    &registration,
+                    connection_class,
+                )?;
                 if registration.verification_profile.is_some() {
                     registration.validate()?;
                     let assignment = registration
@@ -985,8 +1022,12 @@ pub(crate) async fn handle_governed_task_request(
                         );
                     }
                 }
-                serde_json::to_value(state.register_governed_task(registration)?)
-                    .context("Failed to serialize registered governed task")
+                serde_json::to_value(super::governed_wiring::register_governed_task(
+                    &state,
+                    registration,
+                    connection_class,
+                )?)
+                .context("Failed to serialize registered governed task")
             }
             DaemonRequest::GetGovernedTask {
                 project_id,
@@ -1053,12 +1094,19 @@ pub(crate) async fn handle_governed_task_request(
 
     match result {
         Ok(Ok(result)) => DaemonResponse::Ok { result },
-        Ok(Err(error)) => respond_err(error),
+        // `{:#}` rather than `{}`: these errors are built with `.context()`
+        // chains whose outer layer names the operation and whose inner layers
+        // carry the operator's actual recovery instructions (the staged
+        // producer's "delete the leftover directory and run `git worktree
+        // prune`" text, for one). Rendering with `Display` collapses the chain
+        // to the outermost message and drops exactly the part the operator
+        // needs.
+        Ok(Err(error)) => respond_err(format!("{error:#}")),
         Err(error) => respond_err(format!("Governed task worker failed: {error}")),
     }
 }
 
-fn require_current_governed_task(
+pub(super) fn require_current_governed_task(
     state: &SharedState,
     project_id: &str,
     task_id: &impulse_ops::governed_task::GovernedTaskId,
@@ -1068,7 +1116,7 @@ fn require_current_governed_task(
         .ok_or_else(|| anyhow::anyhow!("governed task `{task_id}` was not found"))
 }
 
-async fn persist_governed_mutation(
+pub(super) async fn persist_governed_mutation(
     state: &SharedState,
     request: impulse_ops::governed_task::GovernedTaskMutationRequest,
 ) -> Result<impulse_ops::governed_task::GovernedTaskRun> {
@@ -1078,7 +1126,7 @@ async fn persist_governed_mutation(
         .context("governed producer persistence worker panicked")?
 }
 
-fn require_producer_request_state(
+pub(super) fn require_producer_request_state(
     state: &SharedState,
     task: &impulse_ops::governed_task::GovernedTaskRun,
     request_id: &impulse_ops::governed_task::GovernedRequestId,
@@ -1128,7 +1176,9 @@ fn preflight_claim(
     Ok(())
 }
 
-fn preflight_verification(task: &impulse_ops::governed_task::GovernedTaskRun) -> Result<()> {
+pub(super) fn preflight_verification(
+    task: &impulse_ops::governed_task::GovernedTaskRun,
+) -> Result<()> {
     if task.review_state != impulse_ops::governed_task::GovernedReviewState::AwaitingVerification {
         anyhow::bail!("governed verification requires an awaiting-verification task");
     }
@@ -1141,7 +1191,9 @@ fn preflight_verification(task: &impulse_ops::governed_task::GovernedTaskRun) ->
     Ok(())
 }
 
-fn preflight_supervisor_review(task: &impulse_ops::governed_task::GovernedTaskRun) -> Result<()> {
+pub(super) fn preflight_supervisor_review(
+    task: &impulse_ops::governed_task::GovernedTaskRun,
+) -> Result<()> {
     if !matches!(
         task.review_state,
         impulse_ops::governed_task::GovernedReviewState::AwaitingSupervisor
@@ -1179,7 +1231,7 @@ fn replay_claim_input(
     })
 }
 
-fn replay_verification_input(
+pub(super) fn replay_verification_input(
     task: &impulse_ops::governed_task::GovernedTaskRun,
     expected_revision: u64,
 ) -> Result<impulse_ops::governed_task::GovernedVerificationInput> {
@@ -1200,7 +1252,7 @@ fn replay_verification_input(
     })
 }
 
-fn replay_supervisor_input(
+pub(super) fn replay_supervisor_input(
     task: &impulse_ops::governed_task::GovernedTaskRun,
     expected_revision: u64,
 ) -> Result<impulse_ops::governed_task::SupervisorVerdictInput> {
@@ -1221,6 +1273,25 @@ pub(crate) async fn handle_governed_producer_request(
     request: DaemonRequest,
     state: &SharedState,
 ) -> DaemonResponse {
+    // Read before the producer runs, for the refusal path only: a refusal
+    // records nothing, so the response echoes the record exactly as it stood.
+    let claim_task_for_refusal = match &request {
+        DaemonRequest::SubmitGovernedClaim { request } => {
+            require_current_governed_task(state, &request.project_id, &request.task_id).ok()
+        }
+        _ => None,
+    };
+    // Verification runs its side effect and persists its receipt inside one
+    // durable producer reservation (ADR-0012 amendment), which needs the whole
+    // request — side effect *and* mutation — in one closure. It therefore owns
+    // its own handler rather than sharing this function's
+    // build-a-mutation-then-persist shape.
+    let request = match request {
+        DaemonRequest::RunGovernedVerification { request } => {
+            return super::governed_wiring::handle_governed_verification(state, request).await;
+        }
+        other => other,
+    };
     let result = async {
         let (_producer_guard, mutation_request) = match request {
             DaemonRequest::SubmitGovernedClaim { request } => {
@@ -1259,39 +1330,6 @@ pub(crate) async fn handle_governed_producer_request(
                 };
                 (_producer_guard, mutation_request)
             }
-            DaemonRequest::RunGovernedVerification { request } => {
-                let _producer_guard = state.acquire_governed_producer_lock(&request.task_id).await;
-                let task =
-                    require_current_governed_task(state, &request.project_id, &request.task_id)?;
-                if task.verification_profile.is_none() {
-                    anyhow::bail!(
-                        "governed verification producer requires a closed-loop task profile"
-                    );
-                }
-                let replay = require_producer_request_state(
-                    state,
-                    &task,
-                    &request.request_id,
-                    request.expected_revision,
-                )?;
-                let verification = if replay {
-                    replay_verification_input(&task, request.expected_revision)?
-                } else {
-                    preflight_verification(&task)?;
-                    crate::governed_producers::run_verification(&task).await?
-                };
-                let mutation_request = impulse_ops::governed_task::GovernedTaskMutationRequest {
-                    request_id: request.request_id,
-                    project_id: request.project_id,
-                    task_id: request.task_id,
-                    expected_revision: request.expected_revision,
-                    mutation:
-                        impulse_ops::governed_task::GovernedTaskMutation::RecordVerification {
-                            verification,
-                        },
-                };
-                (_producer_guard, mutation_request)
-            }
             _ => anyhow::bail!("Internal routing error: not a governed producer request"),
         };
 
@@ -1301,7 +1339,16 @@ pub(crate) async fn handle_governed_producer_request(
 
     match result {
         Ok(task) => respond_ok(&task),
-        Err(error) => respond_err(error),
+        // A staged-configuration refusal (ADR-0019 rule 13) is answered as a
+        // typed successful-shape response, not an error: the claim producer
+        // refused to run Git in a staged worktree whose pinned configuration
+        // drifted, which is an operator action to take rather than a failure to
+        // report. `super::governed_wiring` owns the recognition so the claim
+        // and verification endpoints cannot disagree about it.
+        Err(error) => match claim_task_for_refusal {
+            Some(task) => super::governed_wiring::respond_producer_error(&task, error),
+            None => respond_err(format!("{error:#}")),
+        },
     }
 }
 
@@ -1813,9 +1860,9 @@ pub(crate) async fn handle_ops_request(
 const AGENT_BUSY_RETRY_AFTER_MS: u64 = 250;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct AgentTurnBusy;
+pub(super) struct AgentTurnBusy;
 
-fn agent_turn_busy_response() -> DaemonResponse {
+pub(super) fn agent_turn_busy_response() -> DaemonResponse {
     DaemonResponse::Busy {
         resource: impulse_ops::DaemonBusyResource::AgentTurn,
         retry_after_ms: AGENT_BUSY_RETRY_AFTER_MS,
@@ -1840,7 +1887,7 @@ fn agent_turn_busy_response() -> DaemonResponse {
 /// guard forever. Fail-fast acquisition also guarantees a request cannot wait
 /// behind another full provider timeout and later commit a turn after its
 /// client has disconnected.
-fn try_lock_agent_for_turn<'a>(
+pub(super) fn try_lock_agent_for_turn<'a>(
     cached_agent: &'a tokio::sync::Mutex<Option<crate::agent::ImpulseAgent>>,
     state: &SharedState,
 ) -> Result<tokio::sync::MutexGuard<'a, Option<crate::agent::ImpulseAgent>>, AgentTurnBusy> {
@@ -1940,89 +1987,11 @@ pub(crate) async fn handle_supervisor_request(
             }
         }
         DaemonRequest::RunGovernedSupervisorReview { request } => {
-            let _producer_guard = state.acquire_governed_producer_lock(&request.task_id).await;
-            let task =
-                match require_current_governed_task(state, &request.project_id, &request.task_id) {
-                    Ok(task) => task,
-                    Err(error) => return respond_err(error),
-                };
-            if task.verification_profile.is_none() {
-                return respond_err(
-                    "governed Supervisor producer requires a closed-loop task profile",
-                );
-            }
-            let replay = match require_producer_request_state(
-                state,
-                &task,
-                &request.request_id,
-                request.expected_revision,
-            ) {
-                Ok(replay) => replay,
-                Err(error) => return respond_err(error),
-            };
-
-            let verdict = if replay {
-                match replay_supervisor_input(&task, request.expected_revision) {
-                    Ok(verdict) => verdict,
-                    Err(error) => return respond_err(error),
-                }
-            } else {
-                if let Err(error) = preflight_supervisor_review(&task) {
-                    return respond_err(error);
-                }
-                let (system_prompt, user_prompt) =
-                    match crate::governed_producers::supervisor_review_prompt(&task) {
-                        Ok(prompt) => prompt,
-                        Err(error) => return respond_err(error),
-                    };
-                let mut agent_guard = match try_lock_agent_for_turn(cached_agent, state) {
-                    Ok(guard) => guard,
-                    Err(_) => return agent_turn_busy_response(),
-                };
-                let agent = match agent_guard.as_mut() {
-                    Some(agent) if agent.is_ready() => agent,
-                    Some(_) => return respond_err(
-                        "Impulse Agent is configured but not ready for governed Supervisor review",
-                    ),
-                    None => {
-                        return respond_err(
-                            "Impulse Agent must be configured before governed Supervisor review",
-                        )
-                    }
-                };
-                let supervisor_actor = agent.governed_review_actor();
-                let response = match agent.query_stateless(&system_prompt, &user_prompt).await {
-                    Ok(response) => response,
-                    Err(error) => {
-                        return respond_err(format!(
-                            "governed Supervisor review turn failed: {error}"
-                        ))
-                    }
-                };
-                match crate::governed_producers::bind_supervisor_review(
-                    &task,
-                    &response,
-                    supervisor_actor,
-                ) {
-                    Ok(verdict) => verdict,
-                    Err(error) => return respond_err(error),
-                }
-            };
-
-            let mutation_request = impulse_ops::governed_task::GovernedTaskMutationRequest {
-                request_id: request.request_id,
-                project_id: request.project_id,
-                task_id: request.task_id,
-                expected_revision: request.expected_revision,
-                mutation:
-                    impulse_ops::governed_task::GovernedTaskMutation::RecordSupervisorVerdict {
-                        verdict,
-                    },
-            };
-            match persist_governed_mutation(state, mutation_request).await {
-                Ok(task) => respond_ok(&task),
-                Err(error) => respond_err(error),
-            }
+            // The model turn and the mutation that records its verdict run
+            // inside one durable producer reservation, so the handler lives in
+            // `governed_wiring` with the rest of that wiring.
+            super::governed_wiring::handle_governed_supervisor_review(state, request, cached_agent)
+                .await
         }
         DaemonRequest::RunSupervisorAction { action } => {
             match run_supervisor_action(

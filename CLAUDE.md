@@ -110,7 +110,7 @@ Before implementing, consider alternative approaches. Choose the simplest soluti
 - **Daemon mode** — long-running Unix socket authority for the TUI and Dioxus cockpit. In-memory state with periodic sync.
 - **Desktop mode** — Dioxus Desktop cockpit with xterm.js terminal bridge, backed by Rust daemon/runtime state. Tauri-shaped command/event code is compatibility-only.
 
-**IPC Protocol (PROTOCOL_VERSION = 6):**
+**IPC Protocol (PROTOCOL_VERSION = 9):**
 
 The daemon exposes a JSON-line Unix socket protocol. Key endpoint groups:
 
@@ -121,7 +121,7 @@ The daemon exposes a JSON-line Unix socket protocol. Key endpoint groups:
 | Delegation | `RegisterDelegation`, `CompleteDelegation`, `ListDelegations` | Phase 1B cross-agent delegation tracking |
 | Conflict Resolution | `GetConflictHistory`, `ClearResolvedConflicts` | File conflict tracking and resolution |
 | Agent Pool | `GetAgentPool` | All sessions grouped by role (Phase 2B) |
-| Governed Tasks | `RegisterGovernedTask`, `GetGovernedTask`, `ListGovernedTasks`, `MutateGovernedTask`, `SubmitGovernedClaim`, `RunGovernedVerification`, `RunGovernedSupervisorReview` | Durable revisioned task state plus daemon-owned profiled producers and operator-required acceptance |
+| Governed Tasks | `RegisterGovernedTask`, `GetGovernedTask`, `ListGovernedTasks`, `MutateGovernedTask`, `SubmitGovernedClaim`, `RunGovernedVerification`, `RunGovernedSupervisorReview`, `PromoteGovernedOutcome`, `DiscardGovernedStagedWorktree` | Durable revisioned task state plus daemon-owned profiled producers, staged-worktree materialization/promotion/discard (operator-class), and operator-required acceptance |
 
 Responses use `AgentAssistResult` (with `recommendations` + `pane_summaries`) or `AgentSpecializedResult` (for review/analyze/summarize). Full protocol spec: [`docs/IPC-PROTOCOL.md`](docs/IPC-PROTOCOL.md).
 

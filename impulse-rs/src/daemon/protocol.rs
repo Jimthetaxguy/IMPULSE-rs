@@ -136,6 +136,18 @@ pub enum DaemonRequest {
     RunGovernedSupervisorReview {
         request: impulse_ops::governed_task::GovernedSupervisorReviewRequest,
     },
+    /// Fast-forward the canonical branch onto an accepted staged outcome
+    /// (ADR-0019). Operator-class only: this is the step that makes a
+    /// Builder's work canonical. A blocked promotion is a successful response
+    /// carrying the typed outcome, not an error.
+    PromoteGovernedOutcome {
+        request: impulse_ops::governed_wiring::GovernedPromotionRequest,
+    },
+    /// Reclaim a finished staged worktree (ADR-0019). Operator-class only: it
+    /// destroys work.
+    DiscardGovernedStagedWorktree {
+        request: impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardRequest,
+    },
     /// Request AI coordination assistance via the Impulse Agent.
     /// When `insights` is provided, they are formatted into a structured
     /// cross-pane context block and prepended to the user prompt.
@@ -306,6 +318,8 @@ pub(crate) fn request_type_name(req: &DaemonRequest) -> &'static str {
         DaemonRequest::SubmitGovernedClaim { .. } => "SubmitGovernedClaim",
         DaemonRequest::RunGovernedVerification { .. } => "RunGovernedVerification",
         DaemonRequest::RunGovernedSupervisorReview { .. } => "RunGovernedSupervisorReview",
+        DaemonRequest::PromoteGovernedOutcome { .. } => "PromoteGovernedOutcome",
+        DaemonRequest::DiscardGovernedStagedWorktree { .. } => "DiscardGovernedStagedWorktree",
         DaemonRequest::AgentAssist { .. } => "AgentAssist",
         DaemonRequest::GuardEvaluate { .. } => "GuardEvaluate",
         DaemonRequest::GuardList => "GuardList",
@@ -332,13 +346,17 @@ mod tests {
     // ── PROTOCOL_VERSION ───────────────────────────────────────────────
 
     #[test]
-    fn test_protocol_version_is_eight() {
+    fn test_protocol_version_is_nine() {
         // v7 (ADR-0018) adds PresentOperatorCapability and the operator-class
-        // requirement on RecordOperatorDecision. v8 (ADR-0019, this lane,
-        // stacked on top of it) adds the staged-worktree world scope: the
-        // MaterializeStagedWorktree / DiscardStagedWorktree / RecordPromotion
-        // mutations and the promotion outcome they carry.
-        assert_eq!(PROTOCOL_VERSION, 8);
+        // requirement on RecordOperatorDecision. v8 (ADR-0019) adds the
+        // staged-worktree world scope: the MaterializeStagedWorktree /
+        // DiscardStagedWorktree / RecordPromotion mutations and the promotion
+        // outcome they carry. v9 makes those reachable over the socket:
+        // PromoteGovernedOutcome, DiscardGovernedStagedWorktree, staged
+        // materialization inside RegisterGovernedTask, and the flattened
+        // producer acknowledgements carrying `replayed` plus a reservation's
+        // `pending_rerun_reason`.
+        assert_eq!(PROTOCOL_VERSION, 9);
     }
 
     #[test]
@@ -856,6 +874,12 @@ mod tests {
             impulse_ops::WorkbenchDaemonRequest::RunGovernedSupervisorReview { .. } => {
                 "RunGovernedSupervisorReview"
             }
+            impulse_ops::WorkbenchDaemonRequest::PromoteGovernedOutcome { .. } => {
+                "PromoteGovernedOutcome"
+            }
+            impulse_ops::WorkbenchDaemonRequest::DiscardGovernedStagedWorktree { .. } => {
+                "DiscardGovernedStagedWorktree"
+            }
             impulse_ops::WorkbenchDaemonRequest::GuardList => "GuardList",
             impulse_ops::WorkbenchDaemonRequest::GetConflictHistory => "GetConflictHistory",
             impulse_ops::WorkbenchDaemonRequest::ClearResolvedConflicts => "ClearResolvedConflicts",
@@ -992,6 +1016,33 @@ mod tests {
                     project_id: "demo".into(),
                     task_id: impulse_ops::governed_task::GovernedTaskId::try_new("task-1").unwrap(),
                     expected_revision: 3,
+                },
+            },
+        );
+        assert_shared_request_compatible(
+            impulse_ops::WorkbenchDaemonRequest::PromoteGovernedOutcome {
+                request: impulse_ops::governed_wiring::GovernedPromotionRequest {
+                    request_id: impulse_ops::governed_task::GovernedRequestId::try_new(
+                        "request-promote",
+                    )
+                    .unwrap(),
+                    project_id: "demo".into(),
+                    task_id: impulse_ops::governed_task::GovernedTaskId::try_new("task-1").unwrap(),
+                    expected_revision: 4,
+                },
+            },
+        );
+        assert_shared_request_compatible(
+            impulse_ops::WorkbenchDaemonRequest::DiscardGovernedStagedWorktree {
+                request: impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardRequest {
+                    request_id: impulse_ops::governed_task::GovernedRequestId::try_new(
+                        "request-discard",
+                    )
+                    .unwrap(),
+                    project_id: "demo".into(),
+                    task_id: impulse_ops::governed_task::GovernedTaskId::try_new("task-1").unwrap(),
+                    expected_revision: 5,
+                    reason: "the run was rejected".into(),
                 },
             },
         );

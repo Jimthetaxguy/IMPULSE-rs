@@ -87,6 +87,39 @@ fn daemon_busy_error(
     anyhow!("Daemon {resource} is busy; retry after at least {retry_after_ms}ms")
 }
 
+/// What a daemon-owned producer request came back with.
+///
+/// A staged-configuration refusal (ADR-0019 rule 13) is a successful response
+/// carrying a typed reason, not an error: the producer declined to run Git in a
+/// staged worktree whose pinned configuration drifted, nothing was recorded,
+/// and the remedy is a specific operator action.
+#[derive(Debug, Clone)]
+pub enum GovernedProducerOutcome<T> {
+    Recorded(T),
+    // Boxed: the refusal acknowledgement carries a whole flattened
+    // `GovernedTaskRun` (~824 bytes) while the recorded variant is often much
+    // smaller, and it is the rare branch. Without the box every caller pays the
+    // larger size on the common path.
+    StagedConfigRefused(Box<impulse_ops::governed_wiring::GovernedStagedConfigRefusalAck>),
+}
+
+impl<T> GovernedProducerOutcome<T> {
+    /// The recorded value, or an error naming the refusal and its remedy.
+    ///
+    /// For callers that genuinely have nothing to do with a refusal beyond
+    /// reporting it.
+    pub fn into_recorded(self, operation: &str) -> Result<T> {
+        match self {
+            Self::Recorded(value) => Ok(value),
+            Self::StagedConfigRefused(refusal) => anyhow::bail!(
+                "{operation} refused: {} — {}",
+                refusal.reason,
+                refusal.remedy
+            ),
+        }
+    }
+}
+
 pub struct DaemonClient {
     socket_path: PathBuf,
 }
@@ -133,7 +166,21 @@ impl DaemonClient {
     /// depends on the task's verification profile, which only the daemon
     /// holds). Other request groups skip the extra round trip entirely.
     fn requires_operator_class(request: &DaemonRequest) -> bool {
-        matches!(request, DaemonRequest::MutateGovernedTask { .. })
+        matches!(
+            request,
+            DaemonRequest::MutateGovernedTask { .. }
+                // ADR-0019 (protocol v9): promotion makes a Builder's work
+                // canonical and discard destroys work, so both are refused off
+                // a non-operator connection. Registration is included because a
+                // staged world scope materializes a daemon-owned worktree
+                // during registration and is operator-initiated; a
+                // non-staged registration presents the capability harmlessly
+                // rather than making this client re-derive a scope the daemon
+                // owns.
+                | DaemonRequest::RegisterGovernedTask { .. }
+                | DaemonRequest::PromoteGovernedOutcome { .. }
+                | DaemonRequest::DiscardGovernedStagedWorktree { .. }
+        )
     }
 
     pub async fn send(&self, request: DaemonRequest) -> Result<DaemonResponse> {
@@ -333,12 +380,17 @@ impl DaemonClient {
         }
     }
 
-    async fn governed_task_response(
+    /// Send an acknowledged governed request and decode its typed response.
+    ///
+    /// Every producer acknowledgement flattens the governed task into the
+    /// response object, so `T` may be the bare `GovernedTaskRun` or one of the
+    /// richer v9 acknowledgement envelopes.
+    async fn governed_response<T: serde::de::DeserializeOwned>(
         &self,
         request: DaemonRequest,
         operation: &str,
         timeout: Duration,
-    ) -> Result<impulse_ops::governed_task::GovernedTaskRun> {
+    ) -> Result<T> {
         let mut last_error = None;
         let mut response = None;
         for _ in 0..ACKNOWLEDGED_REQUEST_ATTEMPTS {
@@ -363,6 +415,35 @@ impl DaemonClient {
             } => Err(daemon_busy_error(resource, retry_after_ms)),
             _ => anyhow::bail!("{operation}: unexpected response type"),
         }
+    }
+
+    /// Decode a producer response that may be a typed staged-configuration
+    /// refusal instead of a record.
+    ///
+    /// Both shapes are `Ok` on the wire — a refusal is not a failure — so the
+    /// discrimination happens here, on the `refused` flag, rather than leaving
+    /// every caller to guess from the shape.
+    async fn governed_producer_outcome<T: serde::de::DeserializeOwned>(
+        &self,
+        request: DaemonRequest,
+        operation: &str,
+        timeout: Duration,
+    ) -> Result<GovernedProducerOutcome<T>> {
+        let value: serde_json::Value = self.governed_response(request, operation, timeout).await?;
+        if value
+            .get("refused")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            let refusal = serde_json::from_value(value)
+                .with_context(|| format!("{operation}: invalid staged-config refusal response"))?;
+            return Ok(GovernedProducerOutcome::StagedConfigRefused(Box::new(
+                refusal,
+            )));
+        }
+        serde_json::from_value(value)
+            .map(GovernedProducerOutcome::Recorded)
+            .with_context(|| format!("{operation}: invalid governed producer response"))
     }
 
     pub async fn get_governed_task(
@@ -394,8 +475,8 @@ impl DaemonClient {
     pub async fn submit_governed_claim(
         &self,
         request: impulse_ops::governed_task::GovernedClaimRequest,
-    ) -> Result<impulse_ops::governed_task::GovernedTaskRun> {
-        self.governed_task_response(
+    ) -> Result<GovernedProducerOutcome<impulse_ops::governed_task::GovernedTaskRun>> {
+        self.governed_producer_outcome(
             DaemonRequest::SubmitGovernedClaim { request },
             "submit governed claim",
             RESPONSE_TIMEOUT,
@@ -406,8 +487,8 @@ impl DaemonClient {
     pub async fn run_governed_verification(
         &self,
         request: impulse_ops::governed_task::GovernedVerificationRequest,
-    ) -> Result<impulse_ops::governed_task::GovernedTaskRun> {
-        self.governed_task_response(
+    ) -> Result<GovernedProducerOutcome<impulse_ops::governed_wiring::GovernedProducerAck>> {
+        self.governed_producer_outcome(
             DaemonRequest::RunGovernedVerification { request },
             "run governed verification",
             GOVERNED_VERIFICATION_RESPONSE_TIMEOUT,
@@ -418,10 +499,42 @@ impl DaemonClient {
     pub async fn run_governed_supervisor_review(
         &self,
         request: impulse_ops::governed_task::GovernedSupervisorReviewRequest,
-    ) -> Result<impulse_ops::governed_task::GovernedTaskRun> {
-        self.governed_task_response(
+    ) -> Result<impulse_ops::governed_wiring::GovernedProducerAck> {
+        self.governed_response(
             DaemonRequest::RunGovernedSupervisorReview { request },
             "run governed Supervisor review",
+            RESPONSE_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Fast-forward the canonical branch onto an accepted staged outcome
+    /// (ADR-0019).
+    ///
+    /// A *blocked* promotion is a successful response: the acknowledgement
+    /// carries the recorded outcome on the task, and the run stays accepted.
+    /// Only a genuine failure — a non-operator connection, a task that is not
+    /// staged or not accepted, a Git error — comes back as `Err`.
+    pub async fn promote_governed_outcome(
+        &self,
+        request: impulse_ops::governed_wiring::GovernedPromotionRequest,
+    ) -> Result<impulse_ops::governed_wiring::GovernedProducerAck> {
+        self.governed_response(
+            DaemonRequest::PromoteGovernedOutcome { request },
+            "promote governed outcome",
+            RESPONSE_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Reclaim a finished staged worktree (ADR-0019).
+    pub async fn discard_governed_staged_worktree(
+        &self,
+        request: impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardRequest,
+    ) -> Result<impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardAck> {
+        self.governed_response(
+            DaemonRequest::DiscardGovernedStagedWorktree { request },
+            "discard governed staged worktree",
             RESPONSE_TIMEOUT,
         )
         .await

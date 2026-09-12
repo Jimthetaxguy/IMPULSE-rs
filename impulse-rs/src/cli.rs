@@ -700,4 +700,28 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Fast-forward the canonical branch onto an accepted staged outcome (ADR-0019).
+    ///
+    /// Operator-class only. A blocked promotion is reported, not an error: the
+    /// run stays accepted and the staged worktree stays active.
+    GovernedPromote {
+        #[arg(long)]
+        project_id: Option<String>,
+        #[arg(long)]
+        task_id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reclaim a finished staged worktree (ADR-0019). Operator-class only.
+    GovernedDiscard {
+        #[arg(long)]
+        project_id: Option<String>,
+        #[arg(long)]
+        task_id: Option<String>,
+        /// Why the checkout is being reclaimed; recorded on the discard event.
+        #[arg(long, default_value = "operator reclaimed the staged worktree")]
+        reason: String,
+        #[arg(long)]
+        json: bool,
+    },
 }

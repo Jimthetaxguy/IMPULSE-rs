@@ -283,9 +283,12 @@ reachable only through the reflog until it expires. Discard is still the right e
 the surface offering it must say what it costs, and should show the commit OID so an operator can
 recover it deliberately. The desktop track owns that wording.
 
-**None of this is reachable in a running system yet.** These producers have no IPC endpoint and no
-CLI handler; the daemon lane owns both. Live exploitability of the vectors above is zero today,
-which is exactly why they were worth fixing now rather than after something calls them.
+**~~None of this is reachable in a running system yet.~~** *(Superseded 2026-09-12.)* When this ADR
+landed, these producers had no IPC endpoint and no CLI handler, which is why the vectors above were
+worth fixing before anything called them. Protocol v9 calls them: materialization runs inside
+`RegisterGovernedTask`, and `PromoteGovernedOutcome` / `DiscardGovernedStagedWorktree` are live
+operator-class endpoints. Every one of the hardening rules above is now load-bearing rather than
+anticipatory.
 
 **A surviving staged directory fails closed, and names its own recovery.** If a run is interrupted
 between `git worktree add` and the recording mutation, the directory outlives the task and blocks
@@ -301,6 +304,16 @@ last one. And it is computed without running Git — the Git directory and the c
 resolved by reading `.git` and `commondir` the way Git does — so promotion compares the pin
 *before* it spawns any Git process against that repository. Both properties were forced by the
 post-merge review; both are load-bearing.
+
+**Discard is the one producer that does not compare the pin.** Materialization records it, and
+claim, verification and promotion all compare it before spawning Git — but `discard_staged_worktree`
+runs `git worktree remove --force --force` under the hook-free constructor and nothing else. That is
+deliberate rather than an oversight: the comparison exists to stop a Builder-defined filter or
+textconv driver from executing while Git *materializes* files, and removing a checkout materializes
+nothing — there is no status walk, no checkout, and no index refresh for a driver to fire on. It is
+also load-bearing that it stays this way: an unpinned or drifted worktree is precisely the one an
+operator most needs to be able to reclaim, and gating discard behind the same comparison would leave
+it with no way out. Do not "fix" this by adding a pin check to discard.
 
 **The configuration pin is a change detector, not a sandbox.** It catches a driver the Builder
 *introduced*, which is the reachable attack. It does not stop a Builder from committing a
@@ -321,9 +334,14 @@ disables `core.fsmonitor`, which is a second hook mechanism `core.hooksPath` doe
 that flag is supporting defense, not the guarantee. The guarantee for promotion is the ordering
 above: the configuration comparison happens before any Git process exists to be protected.
 
-**A crash between the Git side effect and its receipt is still not covered.** Promotion inherits
-the same window every other producer has. The side effect is isolated in one function so the
-sibling reservation lane can wrap it; this lane does not implement reservations.
+**~~A crash between the Git side effect and its receipt is still not covered.~~** *(Closed
+2026-09-12.)* Promotion inherited the same window every other producer had, and the side effect was
+isolated in one function so the sibling reservation lane could wrap it. The daemon-wiring lane did:
+the promote endpoint runs `promote_governed_outcome` and persists its `RecordPromotion` receipt
+inside one `State::with_reservation` closure under `ProducerKind::Promotion`, so a crash between the
+compare-and-swap and the receipt is reconciled to `needs_rerun` and surfaced instead of silently
+repeating. See ADR-0012's "Handler wiring landed (2026-09-12)" note for the exact guarantees and
+the residual panic case.
 
 **The loop budget is a guess informed by nothing yet.** Five cycles and four hours are starting
 values with no production data behind them. They are constants in `loop_contract.rs` and are meant
@@ -350,9 +368,9 @@ mutation into the picture, and it lands before ADR-0020.
 
 ## Not delivered by this ADR's lane
 
-| Deferred | Owner |
-|---|---|
-| `PromoteGovernedOutcome` daemon endpoint, protocol bump, and CLI subcommand | the daemon / socket-provenance lane (`src/daemon/**`) |
+| Deferred | Owner | Status |
+|---|---|---|
+| `PromoteGovernedOutcome` daemon endpoint, protocol bump, and CLI subcommand | the daemon / socket-provenance lane (`src/daemon/**`) | **Delivered 2026-09-12** (protocol v9): `PromoteGovernedOutcome` and `DiscardGovernedStagedWorktree` endpoints, staged materialization inside `RegisterGovernedTask`, `DaemonClient` methods, and `--daemon governed-promote` / `--daemon governed-discard`. All three are operator-class, checked before any state read. |
 
 ## Stacking on ADR-0018 (recorded 2026-09-03 during the merge train)
 
@@ -378,11 +396,11 @@ This lane is stacked on ADR-0018's socket actor provenance, so:
   no-catch-all match is what forced this classification at compile time -- `RecordPromotion` is the
   exact variant that rule was written to catch.
 
-| Desktop launch wiring: registering with a staged scope, materializing before the PTY starts, and using `launch_working_directory` as the pane cwd | the desktop track (`impulse-desktop/**`) |
-| Durable producer reservation around `fast_forward_canonical_branch` | the producer-reservation-journal lane |
-| Materializing `ReadOnlySnapshot` and `DisposableScratch` | future work; registration refuses them today |
-| A promotion reservation covering the crash window between the compare-and-swap and its receipt | producer-reservation-journal lane |
-| OS-level sandboxing, egress allowlists, container runtimes | explicitly deferred by the staging plan |
+| Desktop launch wiring: registering with a staged scope, materializing before the PTY starts, and using `launch_working_directory` as the pane cwd | the desktop track (`impulse-desktop/**`) | Still open. The daemon now materializes during registration, so the desktop's remaining work is to declare the scope and take the pane cwd from `launch_working_directory()`. Promote/discard buttons are also still open; the desktop already presents the operator capability (#48). |
+| Durable producer reservation around `fast_forward_canonical_branch` | the producer-reservation-journal lane | **Delivered 2026-09-12**: the promote endpoint wraps the producer and its receipt in `State::with_reservation` under `ProducerKind::Promotion`. |
+| Materializing `ReadOnlySnapshot` and `DisposableScratch` | future work; registration refuses them today | Still open. |
+| A promotion reservation covering the crash window between the compare-and-swap and its receipt | producer-reservation-journal lane | **Delivered 2026-09-12**, same wiring as the row above. |
+| OS-level sandboxing, egress allowlists, container runtimes | explicitly deferred by the staging plan | Still open. |
 
 ## Research
 
