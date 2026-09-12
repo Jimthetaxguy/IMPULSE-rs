@@ -2,7 +2,7 @@
 title: "ADR-0012: Daemon-Owned Governed Runtime Producers"
 status: accepted
 created: 2026-07-13
-updated: 2026-09-02
+updated: 2026-09-12
 deciders: [Impulse Maintainers]
 ---
 
@@ -226,6 +226,45 @@ annotated) but not yet load-bearing (a replayed request after a crash still reru
 exactly as before). See the design spec for the exact adoption shape.
 
 Design spec: [`../superpowers/specs/2026-09-02-producer-reservation-journal.md`](../superpowers/specs/2026-09-02-producer-reservation-journal.md).
+
+### Handler wiring landed (2026-09-12)
+
+The amendment above closed the state-layer half and said the gap was "observable but not yet
+load-bearing". It is load-bearing now. What changed, and what is therefore true of a running daemon:
+
+- **Three producers reserve.** `RunGovernedVerification`, `RunGovernedSupervisorReview`, and the new
+  `PromoteGovernedOutcome` endpoint each run their external side effect *and* persist the
+  governed-task mutation that records it inside one `with_reservation` closure
+  (`src/daemon/governed_wiring.rs`). Releasing between the two would reopen exactly the window the
+  journal exists to close, so the helper does not offer that shape and neither does this wiring.
+  `ProducerKind::Promotion` stops being reserved-for-later and becomes live.
+- **`acquire_governed_producer_lock` stays, demoted to what it always was.** It keeps two concurrent
+  in-process requests from both reaching `reserve()`, which the durable journal would then have to
+  refuse. It is an in-memory optimization, not the crash-safety boundary.
+- **A crash is now distinguishable from ordinary work at the wire.** A reservation left open by an
+  interrupted process is reconciled to `needs_rerun` at the next `State::new`, noted on the owning
+  task's own event chain, and reported to the caller whose request id took it through
+  `pending_rerun_reason` on the producer acknowledgement (protocol v9). The rerun proceeds — the
+  field explains why work is being redone, it does not block it. A request arriving while a
+  same-revision reservation is genuinely still open is refused with the journal's typed
+  `DuplicateOpenReservation`.
+- **The replay path deliberately does not reserve.** When the existing receipt check recognizes a
+  request id, the recorded evidence is replayed verbatim and no side effect runs, so there is
+  nothing to reserve. That is the case the spec's acceptance criterion names as "a replayed request
+  does not re-run cargo".
+- **A panic is treated as a crash, not as an error.** `with_reservation` has no `catch_unwind`; the
+  wiring adds none. A panic inside a producer closure leaves the reservation open and propagates,
+  and is closed either by a real process restart's reconcile or by the revision-scoped duplicate
+  check once the task's revision next advances.
+
+**One consequence worth recording because it was not obvious.** Adopting the journal made the
+daemon write `.impulse/PRODUCER_RESERVATIONS.json` on a governed path for the first time. In a
+project whose `.impulse` namespace is not gitignored, that file made the canonical worktree read as
+dirty the moment a verification reserved, which broke every later claim, registration, and
+promotion in the same workspace. The file is now both exempted in
+`governed_producers::is_untracked_impulse_runtime_artifact` and added to the ignore list
+`impulse init` writes. `MEMORY_CANDIDATES.json` has the same shape of gap — gitignored by `init` but
+not exempted — and is left to the lane that owns `governed_producers.rs`.
 
 ## Related Documents
 
