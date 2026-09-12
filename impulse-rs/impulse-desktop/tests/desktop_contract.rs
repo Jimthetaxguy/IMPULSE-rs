@@ -3142,3 +3142,470 @@ fn test_footer_stream_health_reads_down_when_transport_degraded() {
     assert!(html.contains("0 cached interventions"));
     assert!(html.contains("supervisor_local_action · down"));
 }
+
+// ─────────────── ADR-0019 staged-worktree controls (protocol v9) ───────────────
+
+/// An accepted, staged governed task with an active checkout.
+fn staged_governed_task() -> impulse_ops::governed_task::GovernedTaskRun {
+    use impulse_ops::governed_task as gt;
+    gt::GovernedTaskRun {
+        id: gt::GovernedTaskId::try_new("staged-task").expect("task id"),
+        revision: 7,
+        project_id: "impulse-rs".to_string(),
+        workspace_root: "/tmp/impulse-rs".to_string(),
+        task: "Wire the cockpit's staged controls".to_string(),
+        acceptance_criteria: vec!["the workspace gate is green".to_string()],
+        approval_policy: gt::ApprovalPolicy::OperatorRequired,
+        verification_profile: Some(gt::GovernedVerificationProfile::RustWorkspaceV1),
+        role_assignment: None,
+        role_compatibility: None,
+        runtime_id: "ion".to_string(),
+        agent_id: "builder-01".to_string(),
+        session_id: None,
+        initial_subject_revision: Some("a".repeat(40)),
+        world_scope: gt::WorldScope::StagedAuthoritative,
+        staged_worktree: Some(gt::StagedWorktree {
+            id: gt::GovernedRecordId::try_new("staged-1").expect("staged id"),
+            actor: gt::GovernedActor {
+                kind: gt::GovernedActorKind::System,
+                id: "impulse-daemon:staged_worktree".to_string(),
+            },
+            root: "/tmp/impulse-rs/.impulse/worktrees/staged-task".to_string(),
+            initial_subject_revision: "a".repeat(40),
+            // Pinned on purpose: an *unpinned* worktree can never be promoted,
+            // so ADR-0019 rule 7 makes it discardable from any state, which
+            // would mask the accepted-run rule these tests exercise.
+            shared_config_digest: gt::SharedRepositoryConfigPin::Recorded(
+                gt::SharedRepositoryConfigDigest {
+                    repository_config: format!("sha256:{}", "d".repeat(64)),
+                    worktree_config: None,
+                    info_attributes: None,
+                },
+            ),
+            status: gt::StagedWorktreeStatus::Active,
+            materialized_at: "2026-09-12T00:00:00Z".to_string(),
+            based_on_revision: 1,
+        }),
+        promotions: vec![],
+        execution_state: gt::GovernedExecutionState::RuntimeExited,
+        review_state: gt::GovernedReviewState::Accepted,
+        claims: vec![],
+        verifications: vec![],
+        supervisor_verdicts: vec![],
+        operator_decisions: vec![],
+        events: vec![],
+        created_at: "2026-09-12T00:00:00Z".to_string(),
+        updated_at: "2026-09-12T00:00:00Z".to_string(),
+    }
+}
+
+fn with_promotion(
+    mut task: impulse_ops::governed_task::GovernedTaskRun,
+    outcome: impulse_ops::governed_task::GovernedPromotionOutcome,
+) -> impulse_ops::governed_task::GovernedTaskRun {
+    use impulse_ops::governed_task as gt;
+    task.promotions.push(gt::GovernedPromotion {
+        id: gt::GovernedRecordId::try_new("promotion-1").expect("promotion id"),
+        actor: gt::GovernedActor {
+            kind: gt::GovernedActorKind::Operator,
+            id: "local-operator-ui".to_string(),
+        },
+        accepted_revision: "b".repeat(40),
+        initial_subject_revision: "a".repeat(40),
+        outcome,
+        recorded_at: "2026-09-12T00:01:00Z".to_string(),
+        based_on_revision: task.revision,
+    });
+    task.revision += 1;
+    task
+}
+
+fn operator_board_html(tasks: Vec<impulse_ops::governed_task::GovernedTaskRun>) -> String {
+    let snapshot = ProjectOpsSnapshot {
+        governed_tasks: tasks,
+        ..ProjectOpsSnapshot::default()
+    };
+    let mut vdom = VirtualDom::new_with_props(
+        DesktopShellWithSnapshot,
+        DesktopShellWithSnapshotProps {
+            snapshot,
+            runtime_agents: Vec::new(),
+            agent_platforms: Vec::new(),
+            workspaces: Vec::new(),
+            mcp_tools: Vec::new(),
+            last_invocations: Vec::new(),
+            review_queue: Vec::new(),
+            bridge_status: None,
+            daemon_ops_status: None,
+            initial_view: DesktopView::Supervisor,
+        },
+    );
+    vdom.rebuild_in_place();
+    dioxus_ssr::render(&vdom)
+}
+
+/// The two controls exist, are labelled, and name the staged checkout they act
+/// on. Promote is live on an accepted staged run; Discard is not, because
+/// ADR-0019 rule 7 keeps an accepted run's checkout until a promotion has been
+/// attempted — and the surface must say which rule stopped it.
+#[test]
+fn test_staged_controls_render_with_a_named_reason_when_a_control_is_unavailable() {
+    let html = operator_board_html(vec![staged_governed_task()]);
+
+    assert!(html.contains("data-world-scope=\"staged_authoritative\""));
+    assert!(html.contains("/tmp/impulse-rs/.impulse/worktrees/staged-task"));
+    assert!(html.contains("data-governed-control=\"promote\""));
+    assert!(html.contains("data-governed-control=\"discard\""));
+    assert!(html.contains("Promote onto the canonical branch"));
+    assert!(html.contains("Discard staged worktree"));
+    assert!(
+        html.contains("data-governed-control-disabled=\"discard\""),
+        "a disabled control must render its reason, not just grey out"
+    );
+    assert!(html.contains("promote it first, then discard"));
+    assert!(
+        !html.contains("data-governed-control-disabled=\"promote\""),
+        "an accepted staged run with an active worktree is promotable"
+    );
+    assert!(
+        !html.contains("data-governed-control=\"discard-confirmation\""),
+        "the discard confirmation is armed by a click, never rendered up front"
+    );
+}
+
+/// A non-staged run has nothing to promote or reclaim, so the section is absent
+/// rather than a wall of disabled buttons.
+#[test]
+fn test_an_authoritative_run_renders_no_staged_controls() {
+    let mut authoritative = staged_governed_task();
+    authoritative.world_scope = impulse_ops::governed_task::WorldScope::Authoritative;
+    authoritative.staged_worktree = None;
+    let html = operator_board_html(vec![authoritative]);
+
+    assert!(!html.contains("data-governed-control=\"promote\""));
+    assert!(!html.contains("data-governed-control=\"discard\""));
+    assert!(!html.contains("data-world-scope=\"staged_authoritative\""));
+}
+
+/// ADR-0019 rule 6. A blocked promotion is rendered as a typed execution fact
+/// carrying the canonical head and a per-reason remedy, and the run stays
+/// actionable — Promote is still live for the retry the remedy describes.
+#[test]
+fn test_a_blocked_promotion_renders_as_an_execution_fact_with_its_remedy() {
+    use impulse_ops::governed_task as gt;
+
+    for (reason, slug, expected_remedy_fragment) in [
+        (
+            gt::PromotionBlockedReason::CanonicalHeadMoved,
+            "canonical_head_moved",
+            "retry the promotion",
+        ),
+        (
+            gt::PromotionBlockedReason::DetachedHead,
+            "detached_head",
+            "Check out the branch this work belongs on",
+        ),
+        (
+            gt::PromotionBlockedReason::ConcurrentBranchUpdate,
+            "concurrent_branch_update",
+            "Nothing was written.",
+        ),
+        (
+            gt::PromotionBlockedReason::RepositoryConfigChanged {
+                component: gt::SharedConfigComponent::InfoAttributes,
+            },
+            "repository_config_changed",
+            ".git/info/attributes",
+        ),
+        (
+            gt::PromotionBlockedReason::RepositoryConfigUnpinned,
+            "repository_config_unpinned",
+            "re-materialize it",
+        ),
+    ] {
+        let blocked = with_promotion(
+            staged_governed_task(),
+            gt::GovernedPromotionOutcome::PromotionBlocked {
+                canonical_head: "c".repeat(40),
+                reason,
+            },
+        );
+        let html = operator_board_html(vec![blocked]);
+
+        assert!(
+            html.contains(&format!("data-promotion-blocked-reason=\"{slug}\"")),
+            "{slug} must be rendered as a typed banner"
+        );
+        assert!(
+            html.contains(&"c".repeat(40)),
+            "{slug} must show the canonical head the operator has to reconcile"
+        );
+        assert!(
+            html.contains(expected_remedy_fragment),
+            "{slug} must carry its own remedy line"
+        );
+        assert!(
+            html.contains("The run stays accepted and the staged worktree stays active."),
+            "{slug} must not read as a failed run"
+        );
+        assert!(
+            !html.contains("data-governed-control-disabled=\"promote\""),
+            "{slug} leaves the run retryable"
+        );
+        assert!(
+            html.contains("data-review-state=\"accepted\""),
+            "{slug} must not change the review state the card reports"
+        );
+    }
+}
+
+/// A successful promotion is final: the run is promoted at most once, and the
+/// checkout it used becomes reclaimable.
+#[test]
+fn test_a_promoted_run_offers_discard_and_no_longer_offers_promote() {
+    let promoted = with_promotion(
+        staged_governed_task(),
+        impulse_ops::governed_task::GovernedPromotionOutcome::Promoted {
+            promoted_revision: "b".repeat(40),
+        },
+    );
+    let html = operator_board_html(vec![promoted.clone()]);
+
+    assert!(html.contains("data-governed-control-disabled=\"promote\""));
+    assert!(html.contains("promoted at most once"));
+    assert!(!html.contains("data-governed-control-disabled=\"discard\""));
+    assert!(!html.contains("data-promotion-blocked-reason"));
+    assert_eq!(
+        impulse_desktop::ui::blocked_promotion_notice(&promoted),
+        None,
+        "a successful promotion is not something to warn about"
+    );
+}
+
+/// The enable decision is the shared `impulse_ops` predicate and nothing else,
+/// so the cockpit cannot offer a control the daemon would refuse — or withhold
+/// one it would accept.
+#[test]
+fn test_control_states_track_the_shared_impulse_ops_predicates() {
+    use impulse_desktop::ui::{discard_control_state, promote_control_state};
+    use impulse_ops::governed_task as gt;
+    use impulse_ops::governed_wiring::{
+        governed_outcome_is_promotable, staged_worktree_is_discardable,
+    };
+
+    let mut candidates = vec![staged_governed_task()];
+    for review_state in [
+        gt::GovernedReviewState::AwaitingClaim,
+        gt::GovernedReviewState::AwaitingOperator,
+        gt::GovernedReviewState::Rejected,
+        gt::GovernedReviewState::Escalated,
+        gt::GovernedReviewState::Accepted,
+    ] {
+        let mut task = staged_governed_task();
+        task.review_state = review_state;
+        candidates.push(task);
+    }
+    candidates.push(with_promotion(
+        staged_governed_task(),
+        gt::GovernedPromotionOutcome::Promoted {
+            promoted_revision: "b".repeat(40),
+        },
+    ));
+    candidates.push(with_promotion(
+        staged_governed_task(),
+        gt::GovernedPromotionOutcome::PromotionBlocked {
+            canonical_head: "c".repeat(40),
+            reason: gt::PromotionBlockedReason::DetachedHead,
+        },
+    ));
+    let mut launch_failed = staged_governed_task();
+    launch_failed.execution_state = gt::GovernedExecutionState::LaunchFailed;
+    launch_failed.review_state = gt::GovernedReviewState::AwaitingClaim;
+    candidates.push(launch_failed);
+
+    for task in candidates {
+        let promote = promote_control_state(&task);
+        assert_eq!(
+            promote.is_enabled(),
+            governed_outcome_is_promotable(&task),
+            "promote control disagreed with the daemon predicate for {:?}/{:?}",
+            task.review_state,
+            task.execution_state
+        );
+        if !promote.is_enabled() {
+            assert!(
+                promote.reason().is_some_and(|reason| !reason.is_empty()),
+                "a disabled promote control must name its reason"
+            );
+        }
+
+        let discard = discard_control_state(&task);
+        let daemon_would_discard =
+            staged_worktree_is_discardable(&task) && task.active_staged_worktree().is_some();
+        assert_eq!(
+            discard.is_enabled(),
+            daemon_would_discard,
+            "discard control disagreed with the daemon predicate for {:?}/{:?}",
+            task.review_state,
+            task.execution_state
+        );
+        if !discard.is_enabled() {
+            assert!(
+                discard.reason().is_some_and(|reason| !reason.is_empty()),
+                "a disabled discard control must name its reason"
+            );
+        }
+    }
+}
+
+/// ADR-0019's Consequences: the surface offering a discard must say what it
+/// costs and show the OID, and it must do so *before* the request is sent. The
+/// notice is computed from the task through the same predicate that fills the
+/// acknowledgement's `unreferenced_accepted_commit`.
+#[test]
+fn test_the_discard_cost_notice_names_the_unreferenced_accepted_commit() {
+    use impulse_desktop::ui::discard_cost_notice;
+    use impulse_ops::governed_task as gt;
+
+    let blocked = with_promotion(
+        staged_governed_task(),
+        gt::GovernedPromotionOutcome::PromotionBlocked {
+            canonical_head: "c".repeat(40),
+            reason: gt::PromotionBlockedReason::CanonicalHeadMoved,
+        },
+    );
+    let notice = discard_cost_notice(&blocked).expect("a blocked run's commit has only one ref");
+    assert!(notice.contains(&"b".repeat(40)), "the OID must be shown");
+    assert!(
+        notice.contains("drops its only ref"),
+        "the cost must be stated, got: {notice}"
+    );
+    assert!(
+        notice.contains("git cat-file -p"),
+        "recovery must be actionable, not just described"
+    );
+    assert_eq!(
+        impulse_ops::governed_wiring::unreferenced_accepted_commit_on_discard(&blocked),
+        Some("b".repeat(40).as_str()),
+        "the notice must be derived from the same predicate that fills the acknowledgement"
+    );
+
+    let promoted = with_promotion(
+        staged_governed_task(),
+        gt::GovernedPromotionOutcome::Promoted {
+            promoted_revision: "b".repeat(40),
+        },
+    );
+    assert_eq!(
+        discard_cost_notice(&promoted),
+        None,
+        "a promoted commit is on the canonical branch and costs nothing to discard"
+    );
+
+    let mut rejected = staged_governed_task();
+    rejected.review_state = gt::GovernedReviewState::Rejected;
+    assert_eq!(discard_cost_notice(&rejected), None);
+}
+
+/// A staged-configuration refusal is the daemon declining to run Git in a tree
+/// whose pin no longer holds. It reaches the cockpit as a bridge status today,
+/// and must read as a refusal with a remedy rather than "host call failed".
+#[test]
+fn test_a_staged_config_refusal_reads_as_a_refusal_not_a_failed_host_call() {
+    use impulse_desktop::ui::staged_config_refusal_notice;
+
+    let changed = BridgeStatusUpdate {
+        status: "governed_promotion_failed".to_string(),
+        reason: Some(
+            "shared repository configuration changed since governed task `staged-task`'s staged \
+             worktree was materialized (.git/config); refusing to run Git in that worktree"
+                .to_string(),
+        ),
+    };
+    let notice = changed
+        .staged_config_refusal()
+        .expect("a changed pin is a refusal");
+    assert!(notice.headline.contains("refused to run Git"));
+    assert!(notice.remedy.contains("Nothing was touched."));
+    assert!(notice.remedy.contains("re-materialize"));
+    assert_eq!(
+        changed.headline(),
+        "Staged worktree refused: the daemon did not run Git in it"
+    );
+
+    let unpinned = staged_config_refusal_notice(
+        "governed task `staged-task`'s staged worktree carries no comparable \
+         shared-repository-configuration pin; discard it and re-materialize before running a \
+         producer",
+    )
+    .expect("an unpinned worktree is a refusal");
+    assert!(unpinned
+        .headline
+        .contains("no comparable shared-configuration pin"));
+    assert!(unpinned.remedy.contains("Discard the staged worktree"));
+
+    let submodules = staged_config_refusal_notice(
+        "governed task `staged-task` targets a repository with submodule configuration \
+         (/tmp/impulse-rs/.gitmodules); the staged world scope does not support submodules",
+    )
+    .expect("a submodule repository is a refusal");
+    assert!(submodules.remedy.contains("without a staged world scope"));
+
+    // An ordinary failure must not be dressed up as a refusal.
+    let ordinary = BridgeStatusUpdate {
+        status: "governed_promotion_failed".to_string(),
+        reason: Some(
+            "connect to daemon at /tmp/impulse.sock: No such file or directory".to_string(),
+        ),
+    };
+    assert_eq!(ordinary.staged_config_refusal(), None);
+    assert_eq!(ordinary.headline(), "Host call failed: governed promotion");
+    assert_eq!(
+        BridgeStatusUpdate {
+            status: "governed_discard_failed".to_string(),
+            reason: None,
+        }
+        .staged_config_refusal(),
+        None,
+        "a status with no reason carries no refusal to classify"
+    );
+}
+
+/// Both controls reach the host through the same named bridge entry points the
+/// JS bootstrap installs; a rename on either side is a silent dead button.
+#[test]
+fn test_staged_control_bridge_scripts_target_the_installed_bridge_entry_points() {
+    use impulse_desktop::ui::{governed_discard_bridge_script, governed_promotion_bridge_script};
+    use impulse_ops::governed_task as gt;
+
+    let promote =
+        governed_promotion_bridge_script(&impulse_ops::governed_wiring::GovernedPromotionRequest {
+            request_id: gt::GovernedRequestId::try_new("ui-promote-1").expect("request id"),
+            project_id: "impulse-rs".to_string(),
+            task_id: gt::GovernedTaskId::try_new("staged-task").expect("task id"),
+            expected_revision: 7,
+        });
+    assert!(promote.contains("bridge.promoteGovernedOutcome"));
+    assert!(promote.contains("\"expected_revision\":7"));
+    assert!(promote.contains("degraded"));
+
+    let discard = governed_discard_bridge_script(
+        &impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardRequest {
+            request_id: gt::GovernedRequestId::try_new("ui-discard-1").expect("request id"),
+            project_id: "impulse-rs".to_string(),
+            task_id: gt::GovernedTaskId::try_new("staged-task").expect("task id"),
+            expected_revision: 7,
+            reason: "the checkout is finished with".to_string(),
+        },
+    );
+    assert!(discard.contains("bridge.discardGovernedStagedWorktree"));
+    assert!(discard.contains("the checkout is finished with"));
+
+    let bootstrap = desktop_event_bridge_script();
+    assert!(bootstrap.contains("promoteGovernedOutcome"));
+    assert!(bootstrap.contains("discardGovernedStagedWorktree"));
+    assert!(bootstrap.contains("governed_outcome_promote"));
+    assert!(bootstrap.contains("governed_staged_worktree_discard"));
+    assert!(bootstrap.contains("governed_promotion_failed"));
+    assert!(bootstrap.contains("governed_discard_failed"));
+}

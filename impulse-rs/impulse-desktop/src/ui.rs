@@ -4,10 +4,15 @@ use dioxus::prelude::*;
 use impulse_ops::{
     agent_registry::AgentPlatformInfo,
     governed_task::{
-        GovernedActor, GovernedActorKind, GovernedRequestId, GovernedReviewState,
-        GovernedTaskMutation, GovernedTaskMutationRequest, GovernedTaskRun,
-        GovernedVerificationProfile, OperatorDecisionInput, OperatorDecisionKind,
-        SupervisorVerdictInput, SupervisorVerdictKind,
+        GovernedActor, GovernedActorKind, GovernedPromotion, GovernedPromotionOutcome,
+        GovernedRequestId, GovernedReviewState, GovernedTaskMutation, GovernedTaskMutationRequest,
+        GovernedTaskRun, GovernedVerificationProfile, OperatorDecisionInput, OperatorDecisionKind,
+        PromotionBlockedReason, SupervisorVerdictInput, SupervisorVerdictKind,
+    },
+    governed_wiring::{
+        governed_outcome_is_promotable, staged_worktree_is_discardable,
+        unreferenced_accepted_commit_on_discard, GovernedPromotionRequest,
+        GovernedStagedWorktreeDiscardRequest,
     },
     role_assignment::{
         canonical_governed_builder_assignment, evaluate_role_compatibility, AgentRoleAssignment,
@@ -317,6 +322,41 @@ const DESKTOP_EVENT_BRIDGE_SCRIPT: &str = concat!(
       throw error;
     }
   };
+  window.__impulseOpsBridge.promoteGovernedOutcome = async (request) => {
+    if (!invoke) {
+      forward("bridge_status", { status: "governed_promotion_failed", reason: "host invoke API unavailable" });
+      return null;
+    }
+    try {
+      // A blocked promotion resolves here, not in the catch: ADR-0019 makes it
+      // an execution fact carried on the acknowledged task, and the card reads
+      // it off the authoritative ops_update that follows.
+      return await invoke("governed_outcome_promote", { request });
+    } catch (error) {
+      forward("bridge_status", {
+        status: "governed_promotion_failed",
+        reason: String(error),
+        request,
+      });
+      throw error;
+    }
+  };
+  window.__impulseOpsBridge.discardGovernedStagedWorktree = async (request) => {
+    if (!invoke) {
+      forward("bridge_status", { status: "governed_discard_failed", reason: "host invoke API unavailable" });
+      return null;
+    }
+    try {
+      return await invoke("governed_staged_worktree_discard", { request });
+    } catch (error) {
+      forward("bridge_status", {
+        status: "governed_discard_failed",
+        reason: String(error),
+        request,
+      });
+      throw error;
+    }
+  };
 
   if (!listen) {
     markEventBridgeDegraded("host event API unavailable");
@@ -587,11 +627,25 @@ impl BridgeStatusUpdate {
     pub fn headline(&self) -> String {
         match self.status.as_str() {
             "degraded" => "Host bridge degraded".to_string(),
+            // A staged-configuration refusal is a daemon decision not to touch
+            // the tree, not a failed host call, so it gets its own headline
+            // rather than "Host call failed".
+            _ if self.staged_config_refusal().is_some() => {
+                "Staged worktree refused: the daemon did not run Git in it".to_string()
+            }
             other => {
                 let action = other.trim_end_matches("_failed").replace('_', " ");
                 format!("Host call failed: {action}")
             }
         }
+    }
+
+    /// The staged-configuration refusal this status carries, if any.
+    ///
+    /// See [`staged_config_refusal_notice`] for why this reads the message text
+    /// and what replaces it once the typed daemon response variant lands.
+    pub fn staged_config_refusal(&self) -> Option<StagedConfigRefusalNotice> {
+        staged_config_refusal_notice(self.reason.as_deref()?)
     }
 
     fn revokes_agent_platform_catalog(&self) -> bool {
@@ -608,6 +662,7 @@ fn BridgeStatusBanner(status: BridgeStatusUpdate) -> Element {
         .reason
         .clone()
         .unwrap_or_else(|| "no detail reported".to_string());
+    let staged_refusal = status.staged_config_refusal();
     rsx! {
         div {
             class: "bridge-status-banner",
@@ -615,7 +670,15 @@ fn BridgeStatusBanner(status: BridgeStatusUpdate) -> Element {
             "data-bridge-status": "{status.status}",
             span { class: "bridge-status-mark", "!" }
             span { class: "bridge-status-headline", "{status.headline()}" }
-            span { class: "bridge-status-reason", "{reason}" }
+            if let Some(refusal) = staged_refusal.as_ref() {
+                span {
+                    class: "bridge-status-reason",
+                    "data-staged-config-refusal": "true",
+                    "{refusal.headline} {refusal.remedy}"
+                }
+            } else {
+                span { class: "bridge-status-reason", "{reason}" }
+            }
         }
     }
 }
@@ -1334,6 +1397,36 @@ pub fn governed_task_mutation_bridge_script(request: &GovernedTaskMutationReques
     )
 }
 
+/// Drive the ADR-0019 promotion producer from the operator board.
+pub fn governed_promotion_bridge_script(request: &GovernedPromotionRequest) -> String {
+    let payload = serde_json::to_string(request).unwrap_or_else(|_| "{}".to_string());
+    format!(
+        r#"(async () => {{
+  const bridge = window.__impulseOpsBridge;
+  if (!bridge?.promoteGovernedOutcome) {{
+    console.warn("impulse governed promotion bridge unavailable");
+    return "degraded";
+  }}
+  return await bridge.promoteGovernedOutcome({payload});
+}})();"#
+    )
+}
+
+/// Drive the ADR-0019 staged-worktree discard producer from the operator board.
+pub fn governed_discard_bridge_script(request: &GovernedStagedWorktreeDiscardRequest) -> String {
+    let payload = serde_json::to_string(request).unwrap_or_else(|_| "{}".to_string());
+    format!(
+        r#"(async () => {{
+  const bridge = window.__impulseOpsBridge;
+  if (!bridge?.discardGovernedStagedWorktree) {{
+    console.warn("impulse governed discard bridge unavailable");
+    return "degraded";
+  }}
+  return await bridge.discardGovernedStagedWorktree({payload});
+}})();"#
+    )
+}
+
 /// First-class review queue surface. It shows staged payloads and exposes
 /// apply/skip events to the parent shell, which will route them through the
 /// host MCP decision path in the live app.
@@ -1432,6 +1525,8 @@ fn OperatorBoard(
     last_invocations: Vec<McpInvocation>,
     governed_tasks: Vec<GovernedTaskRun>,
     on_governed_mutation: EventHandler<GovernedTaskMutationRequest>,
+    on_governed_promotion: EventHandler<GovernedPromotionRequest>,
+    on_governed_discard: EventHandler<GovernedStagedWorktreeDiscardRequest>,
 ) -> Element {
     let queued = governed_tasks
         .iter()
@@ -1491,6 +1586,8 @@ fn OperatorBoard(
                             key: "{task.id}:{task.revision}",
                             task,
                             on_mutation: on_governed_mutation,
+                            on_promote: on_governed_promotion,
+                            on_discard: on_governed_discard,
                         }
                     }
                 }
@@ -1530,6 +1627,8 @@ fn OperatorBoard(
 fn GovernedTaskCard(
     task: GovernedTaskRun,
     on_mutation: EventHandler<GovernedTaskMutationRequest>,
+    on_promote: EventHandler<GovernedPromotionRequest>,
+    on_discard: EventHandler<GovernedStagedWorktreeDiscardRequest>,
 ) -> Element {
     let mut rationale = use_signal(String::new);
     let review_state = governed_review_state_label(task.review_state);
@@ -1548,6 +1647,27 @@ fn GovernedTaskCard(
     let escalate_task = task.clone();
     let approve_task = task.clone();
     let reject_task = task.clone();
+
+    // ADR-0019 staged controls. They exist only for a staged_authoritative run;
+    // every other world scope writes into the canonical tree directly and has
+    // nothing to promote or reclaim.
+    let mut discard_armed = use_signal(|| false);
+    let mut discard_reason = use_signal(String::new);
+    let is_staged = task.world_scope == impulse_ops::governed_task::WorldScope::StagedAuthoritative;
+    let staged_root = task
+        .active_staged_worktree()
+        .map(|staged| staged.root.clone());
+    let promote_state = promote_control_state(&task);
+    let discard_state = discard_control_state(&task);
+    let promote_enabled = promote_state.is_enabled();
+    let discard_enabled = discard_state.is_enabled();
+    let promote_reason = promote_state.reason().map(str::to_string);
+    let discard_reason_disabled = discard_state.reason().map(str::to_string);
+    let blocked_promotion = blocked_promotion_notice(&task);
+    let discard_cost = discard_cost_notice(&task);
+    let can_discard = discard_enabled && !discard_reason().trim().is_empty();
+    let promote_task = task.clone();
+    let discard_task = task.clone();
 
     rsx! {
         article {
@@ -1771,6 +1891,115 @@ fn GovernedTaskCard(
                     }
                 }
             }
+            if is_staged {
+                section {
+                    class: "governed-staged-controls",
+                    "aria-label": "Staged worktree controls",
+                    "data-world-scope": "staged_authoritative",
+                    h4 { "Staged worktree" }
+                    if let Some(root) = staged_root.as_deref() {
+                        code { class: "governed-staged-root", "{root}" }
+                    } else {
+                        p { class: "section-empty", "No active staged checkout." }
+                    }
+                    if let Some(notice) = blocked_promotion.as_ref() {
+                        // Deliberately not role="alert" and not an error class:
+                        // ADR-0019 rule 6 makes a blocked promotion an execution
+                        // fact recorded against an accepted run. The run stays
+                        // accepted and the control below stays live.
+                        div {
+                            class: "governed-promotion-blocked",
+                            "data-promotion-blocked-reason": "{notice.reason_slug}",
+                            strong { "Promotion blocked · {notice.reason_label}" }
+                            p { class: "governed-evidence-copy", "{notice.headline}" }
+                            code { "canonical head {notice.canonical_head}" }
+                            p { class: "governed-evidence-copy", "{notice.remedy}" }
+                            p { class: "governed-evidence-copy", "The run stays accepted and the staged worktree stays active." }
+                        }
+                    }
+                    div { class: "review-actions governed-task-actions",
+                        button {
+                            class: "invoke-button",
+                            "data-governed-control": "promote",
+                            disabled: !promote_enabled,
+                            onclick: move |_| {
+                                if let Some(request) = promotion_request(&promote_task) {
+                                    on_promote.call(request);
+                                }
+                            },
+                            "Promote onto the canonical branch"
+                        }
+                        button {
+                            class: "invoke-button secondary",
+                            "data-governed-control": "discard",
+                            disabled: !discard_enabled,
+                            onclick: move |_| discard_armed.set(true),
+                            "Discard staged worktree"
+                        }
+                    }
+                    if let Some(reason) = promote_reason.as_deref() {
+                        p {
+                            class: "governed-control-disabled-reason",
+                            "data-governed-control-disabled": "promote",
+                            "Promote unavailable: {reason}"
+                        }
+                    }
+                    if let Some(reason) = discard_reason_disabled.as_deref() {
+                        p {
+                            class: "governed-control-disabled-reason",
+                            "data-governed-control-disabled": "discard",
+                            "Discard unavailable: {reason}"
+                        }
+                    }
+                    if discard_armed() && discard_enabled {
+                        div {
+                            class: "governed-discard-confirmation",
+                            "data-governed-control": "discard-confirmation",
+                            role: "alertdialog",
+                            "aria-label": "Confirm staged worktree discard",
+                            strong { "Discard removes this checkout and its administrative entry." }
+                            if let Some(cost) = discard_cost.as_deref() {
+                                p {
+                                    class: "governed-discard-cost",
+                                    "data-governed-discard-cost": "unreferenced-accepted-commit",
+                                    "{cost}"
+                                }
+                            } else {
+                                p { class: "governed-evidence-copy", "No accepted commit loses its only reference: nothing here was accepted and left unpromoted." }
+                            }
+                            label { class: "workspace-field wide governed-rationale",
+                                span { "Why this staged worktree is being reclaimed" }
+                                textarea {
+                                    placeholder: "State why this checkout is finished with",
+                                    value: "{discard_reason}",
+                                    oninput: move |event| discard_reason.set(event.value()),
+                                }
+                            }
+                            div { class: "review-actions governed-task-actions",
+                                button {
+                                    class: "invoke-button",
+                                    "data-governed-control": "discard-confirm",
+                                    disabled: !can_discard,
+                                    onclick: move |_| {
+                                        if let Some(request) = discard_request(&discard_task, &discard_reason()) {
+                                            on_discard.call(request);
+                                            discard_armed.set(false);
+                                            discard_reason.set(String::new());
+                                        }
+                                    },
+                                    "Confirm discard"
+                                }
+                                button {
+                                    class: "invoke-button secondary",
+                                    "data-governed-control": "discard-cancel",
+                                    onclick: move |_| discard_armed.set(false),
+                                    "Cancel"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -1863,6 +2092,266 @@ fn operator_mutation(
             },
         },
     })
+}
+
+/// Whether an ADR-0019 staged control is offered, and why not when it is not.
+///
+/// A disabled control always names its reason. A governed surface that greys a
+/// button out silently makes an operator guess whether the run is not ready or
+/// the cockpit is broken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GovernedControlState {
+    Enabled,
+    Disabled { reason: String },
+}
+
+impl GovernedControlState {
+    pub fn is_enabled(&self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Enabled => None,
+            Self::Disabled { reason } => Some(reason.as_str()),
+        }
+    }
+}
+
+/// Offer Promote exactly when the daemon would accept it.
+///
+/// The enable/disable decision is [`governed_outcome_is_promotable`] and
+/// nothing else — the same predicate the daemon endpoint applies — so the two
+/// cannot drift. Everything below it only explains the refusal the predicate
+/// already made; `test_promote_control_state_tracks_the_shared_predicate` pins
+/// the two together.
+pub fn promote_control_state(task: &GovernedTaskRun) -> GovernedControlState {
+    if governed_outcome_is_promotable(task) {
+        return GovernedControlState::Enabled;
+    }
+    let reason = if task.world_scope != impulse_ops::governed_task::WorldScope::StagedAuthoritative
+    {
+        format!(
+            "Promotion applies to a staged_authoritative run; this one is {}.",
+            task.world_scope.as_str()
+        )
+    } else if task
+        .latest_promotion()
+        .is_some_and(|promotion| promotion.outcome.is_promoted())
+    {
+        "This outcome was already promoted onto the canonical branch; a run is promoted at most once."
+            .to_string()
+    } else if !task.is_accepted() {
+        format!(
+            "Promotion needs an accepted run; this one is {}.",
+            governed_review_state_label(task.review_state)
+        )
+    } else {
+        "The staged worktree is no longer active, so there is nothing left to promote.".to_string()
+    };
+    GovernedControlState::Disabled { reason }
+}
+
+/// Offer Discard exactly when the daemon would accept it (ADR-0019 rule 7).
+pub fn discard_control_state(task: &GovernedTaskRun) -> GovernedControlState {
+    if task.active_staged_worktree().is_none() {
+        return GovernedControlState::Disabled {
+            reason: "This run has no active staged worktree to reclaim.".to_string(),
+        };
+    }
+    if staged_worktree_is_discardable(task) {
+        return GovernedControlState::Enabled;
+    }
+    let reason = if task.is_accepted() {
+        "An accepted run keeps its checkout until a promotion has been attempted; promote it first, then discard."
+            .to_string()
+    } else {
+        format!(
+            "A staged worktree is reclaimed only from a finished run; this one is {}.",
+            governed_review_state_label(task.review_state)
+        )
+    };
+    GovernedControlState::Disabled { reason }
+}
+
+/// What an operator is told when a promotion could not move the canonical
+/// branch.
+///
+/// ADR-0019 rule 6: this is an execution fact recorded against an
+/// already-accepted run, never an error. The run stays accepted, the staged
+/// worktree stays active, and the remedy is per reason. Modelled on the CLI's
+/// `blocked_promotion_line`, which carries the same contract in
+/// `handlers/daemon_dispatch.rs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockedPromotionNotice {
+    pub reason: PromotionBlockedReason,
+    /// Stable machine value (`PromotionBlockedReason::as_str`), used as the
+    /// banner's `data-` attribute so a test or a stylesheet keys off the variant
+    /// rather than off prose.
+    pub reason_slug: &'static str,
+    /// Human label (`Display`), which for a configuration change also names the
+    /// file that changed.
+    pub reason_label: String,
+    pub canonical_head: String,
+    pub headline: String,
+    pub remedy: String,
+}
+
+/// Read the blocked outcome off a task's latest promotion, if it has one.
+///
+/// `None` covers both "never promoted" and "promoted successfully"; neither is
+/// something to warn about.
+pub fn blocked_promotion_notice(task: &GovernedTaskRun) -> Option<BlockedPromotionNotice> {
+    blocked_promotion_notice_for(task.latest_promotion()?)
+}
+
+fn blocked_promotion_notice_for(promotion: &GovernedPromotion) -> Option<BlockedPromotionNotice> {
+    let GovernedPromotionOutcome::PromotionBlocked {
+        canonical_head,
+        reason,
+    } = &promotion.outcome
+    else {
+        return None;
+    };
+    let (headline, remedy) = match reason {
+        PromotionBlockedReason::CanonicalHeadMoved => (
+            "The canonical branch moved after this run was registered.",
+            "Reconcile the canonical branch back onto the registered commit, or re-run the task from the branch's new head, then retry the promotion.",
+        ),
+        PromotionBlockedReason::DetachedHead => (
+            "The canonical checkout is on a detached HEAD, so there is no branch to advance.",
+            "Check out the branch this work belongs on in the canonical worktree, then retry the promotion.",
+        ),
+        PromotionBlockedReason::ConcurrentBranchUpdate => (
+            "Another writer advanced the canonical branch between the check and the ref update.",
+            "Nothing was written. Re-read the canonical branch and retry the promotion.",
+        ),
+        PromotionBlockedReason::RepositoryConfigChanged { component } => (
+            "Shared repository configuration changed while the Builder was working.",
+            // A `filter`/`diff` driver defined there would execute during the
+            // checkout promotion performs, so the operator has to look at the
+            // file itself before anything is promoted. Naming the component is
+            // the point: benign churn hard-blocks too.
+            match component {
+                impulse_ops::governed_task::SharedConfigComponent::RepositoryConfig =>
+                    "Inspect `.git/config` for what changed. It is shared with every linked worktree and can define drivers that execute during checkout. Discard the staged worktree and re-materialize once you are satisfied.",
+                impulse_ops::governed_task::SharedConfigComponent::WorktreeConfig =>
+                    "Inspect `.git/config.worktree` for what changed, then discard the staged worktree and re-materialize.",
+                impulse_ops::governed_task::SharedConfigComponent::InfoAttributes =>
+                    "Inspect `.git/info/attributes` for what changed. It is shared and invisible to a diff of the work tree. Discard the staged worktree and re-materialize.",
+            },
+        ),
+        PromotionBlockedReason::RepositoryConfigUnpinned => (
+            "This staged worktree was materialized before shared configuration was pinned, so there is nothing to compare against.",
+            "Not a failure of the run: discard the staged worktree and re-materialize it, then re-run the task.",
+        ),
+    };
+    Some(BlockedPromotionNotice {
+        reason: *reason,
+        reason_slug: reason.as_str(),
+        reason_label: reason.to_string(),
+        canonical_head: canonical_head.clone(),
+        headline: headline.to_string(),
+        remedy: remedy.to_string(),
+    })
+}
+
+/// What a discard costs when it drops the only ref to an accepted commit.
+///
+/// ADR-0019's Consequences require the surface offering the discard to say so
+/// **and to show the OID**, so an operator can recover the commit deliberately.
+/// Computed from the task before anything is sent, through the same
+/// `impulse_ops` predicate the daemon uses to fill the acknowledgement's
+/// `unreferenced_accepted_commit`; the acknowledgement then confirms it.
+pub fn discard_cost_notice(task: &GovernedTaskRun) -> Option<String> {
+    let commit = unreferenced_accepted_commit_on_discard(task)?;
+    Some(format!(
+        "This run's accepted commit {commit} was never promoted onto the canonical branch, so discarding \
+         the staged worktree drops its only ref. It stays reachable through the reflog until that expires; \
+         `git cat-file -p {commit}` recovers it deliberately."
+    ))
+}
+
+/// A daemon refusal to run Git inside a staged worktree whose pinned shared
+/// configuration no longer holds.
+///
+/// Not a run failure: the tree was never touched, and the remedy is
+/// discard-and-re-materialize. Rendering it as a red error would tell an
+/// operator the Builder's work broke when nothing of the kind happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedConfigRefusalNotice {
+    pub headline: String,
+    pub remedy: String,
+}
+
+/// Classify a daemon error message as a staged-configuration refusal.
+///
+/// **Text matching is deliberate and temporary.** ADR-0019's P1 lane
+/// (`claude/adr0019-p1-fixes-20260912`, PR #53) introduces a downcastable
+/// `governed_producers::StagedConfigRefusal`, and #52's post-merge work turns it
+/// into a typed daemon response. Until that response variant exists, the only
+/// thing that crosses the socket is the `Display` string, so this reads it —
+/// and reads it off the *substrings that are the refusal's identity* rather
+/// than the whole sentence, so a wording tweak upstream does not silently
+/// reclassify a refusal as a generic error.
+///
+/// When the typed variant lands, `StagedConfigRefusalNotice` is constructed
+/// from it directly and this function's body is the only thing that changes;
+/// its callers and its tests describe behavior, not the matching strategy.
+pub fn staged_config_refusal_notice(error: &str) -> Option<StagedConfigRefusalNotice> {
+    let unpinned = error.contains("no comparable shared-repository-configuration pin");
+    let changed = error.contains("shared repository configuration changed since")
+        || error.contains("refusing to run Git in that worktree");
+    let submodules = error.contains("the staged world scope does not support submodules");
+    if !(unpinned || changed || submodules) {
+        return None;
+    }
+    let (headline, remedy) = if submodules {
+        (
+            "This repository carries submodule configuration, which the staged world scope does not support.",
+            "A submodule defines configuration of its own that executes during an ordinary `git status`, and the staged scope cannot pin it. Run this task without a staged world scope.",
+        )
+    } else if unpinned {
+        (
+            "The staged worktree carries no comparable shared-configuration pin, so the daemon refused to run Git in it.",
+            "Nothing was touched. Discard the staged worktree and re-materialize it, then re-run the task.",
+        )
+    } else {
+        (
+            "Shared repository configuration changed since this staged worktree was materialized, so the daemon refused to run Git in it.",
+            "Nothing was touched. Inspect what changed in the repository-level Git configuration, then discard the staged worktree and re-materialize it.",
+        )
+    };
+    Some(StagedConfigRefusalNotice {
+        headline: headline.to_string(),
+        remedy: remedy.to_string(),
+    })
+}
+
+fn promotion_request(task: &GovernedTaskRun) -> Option<GovernedPromotionRequest> {
+    Some(GovernedPromotionRequest {
+        request_id: GovernedRequestId::try_new(format!("ui-promote-{}", uuid::Uuid::new_v4()))
+            .ok()?,
+        project_id: task.project_id.clone(),
+        task_id: task.id.clone(),
+        expected_revision: task.revision,
+    })
+}
+
+fn discard_request(
+    task: &GovernedTaskRun,
+    reason: &str,
+) -> Option<GovernedStagedWorktreeDiscardRequest> {
+    let request = GovernedStagedWorktreeDiscardRequest {
+        request_id: GovernedRequestId::try_new(format!("ui-discard-{}", uuid::Uuid::new_v4()))
+            .ok()?,
+        project_id: task.project_id.clone(),
+        task_id: task.id.clone(),
+        expected_revision: task.revision,
+        reason: reason.trim().to_string(),
+    };
+    request.validate().ok()?;
+    Some(request)
 }
 
 #[component]
@@ -2616,6 +3105,18 @@ pub fn DesktopShellWithSnapshot(
                                 governed_tasks: snapshot.governed_tasks.clone(),
                                 on_governed_mutation: move |request| {
                                     let script = governed_task_mutation_bridge_script(&request);
+                                    spawn(async move {
+                                        let _ = document::eval(&script).await;
+                                    });
+                                },
+                                on_governed_promotion: move |request| {
+                                    let script = governed_promotion_bridge_script(&request);
+                                    spawn(async move {
+                                        let _ = document::eval(&script).await;
+                                    });
+                                },
+                                on_governed_discard: move |request| {
+                                    let script = governed_discard_bridge_script(&request);
                                     spawn(async move {
                                         let _ = document::eval(&script).await;
                                     });
