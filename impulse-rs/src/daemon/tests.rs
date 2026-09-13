@@ -754,15 +754,74 @@ mod tests {
 
     // -- Plugin registry initialization test --------------------------------------
 
+    // `init_global_registry` registers the office context provider only when the
+    // `office-support` feature is compiled in (`src/plugin/registry.rs`). Without
+    // it, nothing registers a context provider or an action handler, so the two
+    // variants below assert what each configuration actually produces instead of
+    // one assertion that is only true under the default feature set.
+
+    #[cfg(feature = "office-support")]
     #[test]
-    fn test_plugin_registry_initialized_after_init() {
-        crate::plugin::registry::init_global_registry();
-        let registry = crate::plugin::registry::global_registry();
-        // After init, the office context provider should be registered
+    fn test_init_global_registry_with_office_support_registers_office_provider() {
+        let registry = crate::plugin::registry::init_global_registry();
         let providers = registry.list_context_providers().unwrap();
         assert!(
-            !providers.is_empty(),
-            "init_global_registry should register at least the office context provider"
+            providers.iter().any(|p| p.name == "office"),
+            "init_global_registry should register the office context provider, got {:?}",
+            providers
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>()
+        );
+        for format in [
+            crate::office::OfficeFormat::Docx,
+            crate::office::OfficeFormat::Xlsx,
+            crate::office::OfficeFormat::Xls,
+            crate::office::OfficeFormat::Csv,
+        ] {
+            assert!(
+                registry.supports_format(format).unwrap(),
+                "office provider should be registered for {}",
+                format.as_str()
+            );
+        }
+    }
+
+    #[cfg(not(feature = "office-support"))]
+    #[test]
+    fn test_init_global_registry_without_office_support_registers_no_plugins() {
+        let registry = crate::plugin::registry::init_global_registry();
+        let providers = registry.list_context_providers().unwrap();
+        assert!(
+            providers.is_empty(),
+            "no context provider is registered without office-support, got {:?}",
+            providers
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            registry.list_action_handlers().unwrap().is_empty(),
+            "no action handler is registered by init_global_registry"
+        );
+    }
+
+    #[test]
+    fn test_init_global_registry_is_idempotent_and_returns_global() {
+        let first = crate::plugin::registry::init_global_registry();
+        let second = crate::plugin::registry::init_global_registry();
+        assert!(
+            std::ptr::eq(first, second),
+            "init_global_registry must return the single global registry"
+        );
+        assert!(
+            std::ptr::eq(first, crate::plugin::registry::global_registry()),
+            "init_global_registry must return the same instance as global_registry"
+        );
+        assert_eq!(
+            first.list_context_providers().unwrap().len(),
+            second.list_context_providers().unwrap().len(),
+            "re-initializing must not change the provider set"
         );
     }
 
