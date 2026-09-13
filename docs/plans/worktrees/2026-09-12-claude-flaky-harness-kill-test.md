@@ -89,17 +89,22 @@ tags: [worktree, lane, testing, agent, harness, tokio]
   fixed timeout (10 s, 30 s) would only move the race and slow the suite. The
   rewritten test runs the query with an effectively infinite timeout (3600 s),
   waits (bounded, 30 s liveness guard) for the wrapper to publish both pids,
-  then calls `tokio::time::pause()`. With the clock paused, tokio auto-advances
-  to the next pending timer as soon as the runtime is idle
-  (`runtime/time/mod.rs` `park_internal`: `park_timeout(0)` then
-  `clock.advance`), so the `HarnessTimedOut` branch fires on the next idle
-  turn regardless of pending child I/O, and can only fire after the pids are
-  known. `tokio::time::resume()` restores real time before the pid liveness
-  poll so its 10 s bound stays a real bound. The 30 s pid-file guard is the
-  only remaining bound and it gates nothing the code under test does.
+  then calls `tokio::time::pause()` and `tokio::time::advance(3600 s)`. The
+  explicit advance (rather than relying on the paused clock's idle
+  auto-advance) is the reviewer's P2: auto-advance is suppressed while any
+  blocking task is alive on the runtime (`runtime/blocking/schedule.rs`
+  bumps `auto_advance_inhibit_count`), so a future `spawn_blocking` or
+  `tokio::fs` call in the code path would have turned the test into a silent
+  one-hour hang; `Clock::advance` checks only that time is frozen, and the
+  next runtime turn fires the expired timer. Either way the
+  `HarnessTimedOut` branch can only fire after the pids are known.
+  `tokio::time::resume()` restores real time before the pid liveness poll so
+  its 10 s bound stays a real bound. The 30 s pid-file guard is the only
+  remaining bound and it gates nothing the code under test does.
 - 2026-09-12: **`tokio` `test-util` is a dev-dependency feature only.** It
-  adds `pause`/`resume`/`advance` and makes `tokio::time::Instant::now()`
-  consult the runtime clock; it changes nothing when time is not paused.
+  adds `pause`/`resume`/`advance`, routes `tokio::time::Instant::now()`
+  through the runtime clock, and adds inhibit bookkeeping on blocking tasks;
+  nothing observable changes while time is not paused.
   Feature unification means test builds of the workspace see it; release
   builds do not.
 - 2026-09-12: **Sibling abort test shares the helpers.**
@@ -142,3 +147,11 @@ tags: [worktree, lane, testing, agent, harness, tokio]
 - 2026-09-12 22:36 ET: full gate green in the isolated target dir: build 0,
   test 0 (34 binaries, 3055 passed / 0 failed / 9 ignored), clippy 0, fmt 0.
   Adversarial refutation pass in flight; PR opens as draft until it clears.
+- 2026-09-12 22:39 ET: refutation pass (read-only reviewer against the tokio
+  1.49 source) returned no P0/P1. Adopted: explicit `tokio::time::advance`
+  instead of idle auto-advance (blocking-task inhibit hazard); the pid-file
+  poll now requires the trailing newline (torn-read hardening); comments and
+  this card corrected to match. Survived refutation: paused timeout firing,
+  monotonic clock after `resume`, zombie wrapper reaped within the 10 s
+  bound (`runtime/process.rs` reaps orphans on every park), ordering, and
+  portability.

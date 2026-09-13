@@ -1795,7 +1795,12 @@ mod tests {
     async fn wait_for_published_pids(pid_file: &std::path::Path) -> Vec<u32> {
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                if let Ok(contents) = std::fs::read_to_string(pid_file) {
+                // The wrapper writes both lines in one `printf`; requiring the
+                // trailing newline rejects a torn read of the second pid.
+                if let Some(contents) = std::fs::read_to_string(pid_file)
+                    .ok()
+                    .filter(|contents| contents.ends_with('\n'))
+                {
                     let pids = contents
                         .lines()
                         .filter_map(|line| line.parse::<u32>().ok())
@@ -1819,15 +1824,19 @@ mod tests {
         //
         // Ordering is controlled rather than bet on. The query runs with an
         // effectively infinite timeout while the test waits (bounded) for the
-        // pid file, then pauses tokio's clock: with time paused, the runtime
-        // auto-advances to the next pending timer as soon as it is idle, so
-        // the `HarnessTimedOut` branch fires immediately -- and only after
-        // both pids are known. The previous shape passed a fixed 2 s timeout
-        // and read the pid file afterwards; under load (six concurrent cargo
-        // gates on 10 cores) `sh` had not reached its `printf` when the group
-        // was killed, and the test failed on its own precondition
-        // ("fake harness must publish ... before timeout: NotFound") rather
-        // than on the property under test.
+        // pid file, then pauses tokio's clock and advances it past the
+        // deadline explicitly, so the `HarnessTimedOut` branch fires on the
+        // next runtime turn -- and only after both pids are known. The
+        // explicit `advance` is deliberate: the paused clock's *auto*-advance
+        // is suppressed while any blocking task is alive on the runtime, which
+        // would turn a future `spawn_blocking`/`tokio::fs` call in this code
+        // path into a silent one-hour hang instead of a failure. The previous
+        // shape passed a fixed 2 s timeout and read the pid file afterwards;
+        // under load (six concurrent cargo gates on 10 cores) `sh` had not
+        // reached its `printf` when the group was killed, and the test failed
+        // on its own precondition ("fake harness must publish ... before
+        // timeout: NotFound") rather than on the property under test.
+        const HARNESS_BUDGET: Duration = Duration::from_secs(3600);
         let (_dir, script_path, pid_file) = write_pid_publishing_fake_harness();
         let config = ImpulseAgentConfig::harness(ImpulseHarness::ClaudeCode);
         let agent = ImpulseAgent::new(config)
@@ -1835,19 +1844,14 @@ mod tests {
             .with_test_harness_command(script_path);
         let task = tokio::spawn(async move {
             agent
-                .harness_query_structured_with_timeout(
-                    "system",
-                    "hello",
-                    &[],
-                    None,
-                    Duration::from_secs(3600),
-                )
+                .harness_query_structured_with_timeout("system", "hello", &[], None, HARNESS_BUDGET)
                 .await
         });
 
         let pids = wait_for_published_pids(&pid_file).await;
 
         tokio::time::pause();
+        tokio::time::advance(HARNESS_BUDGET).await;
         let result = task.await.expect("harness query task must not panic");
         tokio::time::resume();
         match result {
@@ -1856,7 +1860,11 @@ mod tests {
                     command.ends_with("claude"),
                     "timeout must identify the injected harness executable: {command}"
                 );
-                assert_eq!(seconds, 3600, "timeout must report the configured budget");
+                assert_eq!(
+                    seconds,
+                    HARNESS_BUDGET.as_secs(),
+                    "timeout must report the configured budget"
+                );
             }
             other => panic!("expected HarnessTimedOut, got: {other:?}"),
         }
