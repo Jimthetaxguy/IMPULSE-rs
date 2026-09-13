@@ -5,7 +5,7 @@ updated: 2026-09-12
 type: doc
 category: planning
 phase: all
-status: active
+status: ready
 audience: builders
 tags: [worktree, lane, testing, agent, harness, tokio]
 ---
@@ -155,3 +155,6 @@ tags: [worktree, lane, testing, agent, harness, tokio]
   monotonic clock after `resume`, zombie wrapper reaped within the 10 s
   bound (`runtime/process.rs` reaps orphans on every park), ordering, and
   portability.
+- 2026-09-12 23:22 ET: round 2 (`eb0a82e`) CI 4/4 green (Lint, Build
+  release, Test ubuntu, Test macOS); re-gate green; 30/30 under load. PR #61
+  marked ready for review. Card status → ready.
