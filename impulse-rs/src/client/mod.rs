@@ -511,15 +511,18 @@ impl DaemonClient {
     /// Fast-forward the canonical branch onto an accepted staged outcome
     /// (ADR-0019).
     ///
-    /// A *blocked* promotion is a successful response: the acknowledgement
-    /// carries the recorded outcome on the task, and the run stays accepted.
+    /// A *blocked* promotion is a recorded acknowledgement: the outcome is on
+    /// the task, and the run stays accepted. A staged-configuration refusal —
+    /// submodule configuration the Builder introduced mid-run (ADR-0019 rule
+    /// 13) — is the typed `StagedConfigRefused` outcome, exactly as for the
+    /// claim and verification producers; nothing ran and nothing was recorded.
     /// Only a genuine failure — a non-operator connection, a task that is not
     /// staged or not accepted, a Git error — comes back as `Err`.
     pub async fn promote_governed_outcome(
         &self,
         request: impulse_ops::governed_wiring::GovernedPromotionRequest,
-    ) -> Result<impulse_ops::governed_wiring::GovernedProducerAck> {
-        self.governed_response(
+    ) -> Result<GovernedProducerOutcome<impulse_ops::governed_wiring::GovernedProducerAck>> {
+        self.governed_producer_outcome(
             DaemonRequest::PromoteGovernedOutcome { request },
             "promote governed outcome",
             RESPONSE_TIMEOUT,

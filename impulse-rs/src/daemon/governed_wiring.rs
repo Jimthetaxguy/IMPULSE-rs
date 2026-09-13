@@ -507,10 +507,7 @@ pub(crate) async fn handle_governed_staged_request(
 ) -> DaemonResponse {
     match request {
         DaemonRequest::PromoteGovernedOutcome { request } => {
-            match promote_governed_outcome(state, request, connection_class).await {
-                Ok(ack) => respond_ok(&ack),
-                Err(error) => respond_err(error),
-            }
+            handle_governed_promotion(state, request, connection_class).await
         }
         DaemonRequest::DiscardGovernedStagedWorktree { request } => {
             match discard_governed_staged_worktree(state, request, connection_class).await {
@@ -560,6 +557,44 @@ pub(crate) fn respond_producer_error(
         // `{:#}` so a genuine failure keeps its context chain; `Display` alone
         // would drop the layer carrying the operator's recovery text.
         None => respond_err(format!("{error:#}")),
+    }
+}
+
+/// `PromoteGovernedOutcome`, with a staged-configuration refusal answered in
+/// the same typed shape `SubmitGovernedClaim` and `RunGovernedVerification`
+/// use, instead of the error string it used to fall through to.
+///
+/// The operator-class check runs first and on its own: the refusal path
+/// re-reads the task before the producer runs, and a non-operator connection
+/// must not cause even that read — v9 documents the operator-class requests as
+/// checked before any state read. `promote_governed_outcome` repeats the check;
+/// the repetition is cheap and keeps that function safe to call on its own.
+///
+/// Of promotion's two staged-configuration gates only the submodule check
+/// reaches this path. A drifted pin at promotion is ADR-0019 rule 6's recorded
+/// `promotion_blocked { repository_config_changed }` on the accepted run —
+/// there is an accepted run to record it against, which the claim and
+/// verification producers never have — so it arrives here as an `Ok` and is
+/// answered as an ordinary producer acknowledgement.
+pub(crate) async fn handle_governed_promotion(
+    state: &SharedState,
+    request: GovernedPromotionRequest,
+    connection_class: ConnectionClass,
+) -> DaemonResponse {
+    if let Err(error) = require_operator_class(connection_class, "PromoteGovernedOutcome") {
+        return respond_err(error);
+    }
+    // The task is re-read for the refusal path only: a refusal records nothing,
+    // so the response echoes the record exactly as it stood. A lookup failure
+    // here cannot mask the real error -- it falls through to reporting it.
+    let unchanged =
+        require_current_governed_task(state, &request.project_id, &request.task_id).ok();
+    match promote_governed_outcome(state, request, connection_class).await {
+        Ok(ack) => respond_ok(&ack),
+        Err(error) => match unchanged {
+            Some(task) => respond_producer_error(&task, error),
+            None => respond_err(format!("{error:#}")),
+        },
     }
 }
 
@@ -1863,6 +1898,204 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(recorded, claimed, "a refused verification records nothing");
+    }
+
+    /// Promotion answers a staged-configuration refusal in the same typed shape
+    /// the claim and verification endpoints use. Of promotion's two gates only
+    /// the submodule check refuses — a drifted pin is a recorded blocked
+    /// outcome, pinned by the next test — so the trigger is a `.gitmodules` the
+    /// Builder introduced after acceptance.
+    ///
+    /// The planted smudge driver is the tripwire, not the trigger. Its absence
+    /// proves nothing was materialized, and its presence proves the submodule
+    /// gate runs *before* the pin comparison: a comparison reached first would
+    /// have answered `promotion_blocked`, not this refusal.
+    #[tokio::test]
+    async fn a_submodule_introduced_after_acceptance_refuses_the_promotion_with_a_typed_reason() {
+        let (repo, state, project_id, oid) = repo_state();
+        let registered = register_governed_task(
+            &state,
+            registration(
+                &project_id,
+                repo.path(),
+                &oid,
+                WorldScope::StagedAuthoritative,
+            ),
+            ConnectionClass::Operator,
+        )
+        .unwrap();
+        let (accepted, accepted_oid) = accepted_staged_task(&state, registered);
+        let staged_root = accepted.active_staged_worktree().unwrap().root.clone();
+        let staged = Path::new(&staged_root);
+
+        let marker = plant_shared_config_driver(repo.path(), staged);
+        let gitmodules = staged.join(".gitmodules");
+        std::fs::write(
+            &gitmodules,
+            "[submodule \"sub\"]\n\tpath = sub\n\turl = ../sub\n",
+        )
+        .unwrap();
+
+        let response = handle_governed_staged_request(
+            DaemonRequest::PromoteGovernedOutcome {
+                request: promotion_request(&accepted, "promote-submodule"),
+            },
+            &state,
+            ConnectionClass::Operator,
+        )
+        .await;
+
+        let ack: GovernedStagedConfigRefusalAck = match response {
+            DaemonResponse::Ok { result } => serde_json::from_value(result)
+                .expect("a refusal is a successful-shape response carrying a typed reason"),
+            other => panic!("expected a typed refusal, received {other:?}"),
+        };
+        assert!(ack.refused);
+        assert_eq!(
+            ack.reason,
+            StagedConfigRefusalReason::UnsupportedSubmodules {
+                path: gitmodules.display().to_string(),
+            },
+            "the refusal must name the submodule configuration it found"
+        );
+        assert_eq!(
+            ack.remedy,
+            ack.reason.remedy(),
+            "the remedy travels on the wire so no surface keeps its own mapping"
+        );
+        assert_eq!(
+            ack.task, accepted,
+            "the refusal echoes the record as it stood"
+        );
+
+        assert!(
+            !marker.exists(),
+            "the refusal precedes every Git invocation; nothing was materialized"
+        );
+        assert!(
+            state.open_reservations().unwrap().is_empty(),
+            "the refusal must release its reservation, or the retry the remedy \
+             ends in would meet DuplicateOpenReservation"
+        );
+        let after = state
+            .get_governed_task(&project_id, &accepted.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after, accepted, "a refused promotion records nothing");
+        assert!(after.latest_promotion().is_none());
+        assert_eq!(after.review_state, GovernedReviewState::Accepted);
+        assert_eq!(
+            git(repo.path(), &["rev-parse", "HEAD"]),
+            oid,
+            "the canonical branch never moved"
+        );
+        assert_eq!(
+            git(staged, &["rev-parse", "HEAD"]),
+            accepted_oid,
+            "the Builder's accepted commit is untouched"
+        );
+    }
+
+    /// The asymmetry the previous test relies on, pinned at the endpoint: a
+    /// drifted pin at promotion is ADR-0019 rule 6's recorded
+    /// `promotion_blocked { repository_config_changed }` on the accepted run,
+    /// answered as a producer acknowledgement — not the typed refusal the claim
+    /// and verification endpoints give the very same drift, because promotion
+    /// has an accepted run to record the outcome against and they do not.
+    #[tokio::test]
+    async fn a_drifted_config_pin_at_promotion_is_a_recorded_blocked_outcome_not_a_refusal() {
+        let (repo, state, project_id, oid) = repo_state();
+        let registered = register_governed_task(
+            &state,
+            registration(
+                &project_id,
+                repo.path(),
+                &oid,
+                WorldScope::StagedAuthoritative,
+            ),
+            ConnectionClass::Operator,
+        )
+        .unwrap();
+        let (accepted, _accepted_oid) = accepted_staged_task(&state, registered);
+        let staged_root = accepted.active_staged_worktree().unwrap().root.clone();
+        let marker = plant_shared_config_driver(repo.path(), Path::new(&staged_root));
+
+        let response = handle_governed_staged_request(
+            DaemonRequest::PromoteGovernedOutcome {
+                request: promotion_request(&accepted, "promote-drifted"),
+            },
+            &state,
+            ConnectionClass::Operator,
+        )
+        .await;
+
+        let value = match response {
+            DaemonResponse::Ok { result } => result,
+            other => panic!("a blocked promotion is a successful response, received {other:?}"),
+        };
+        assert!(
+            value.get("refused").is_none(),
+            "a blocked promotion is not a refusal: {value}"
+        );
+        let ack: GovernedProducerAck =
+            serde_json::from_value(value).expect("a producer acknowledgement");
+        assert!(!ack.replayed);
+        let promotion = ack
+            .task
+            .latest_promotion()
+            .expect("the blocked outcome is recorded on the accepted run");
+        assert_eq!(
+            promotion.outcome,
+            GovernedPromotionOutcome::PromotionBlocked {
+                canonical_head: oid.clone(),
+                reason: PromotionBlockedReason::RepositoryConfigChanged {
+                    component: impulse_ops::governed_task::SharedConfigComponent::RepositoryConfig,
+                },
+            }
+        );
+        assert_eq!(ack.task.review_state, GovernedReviewState::Accepted);
+        assert!(!marker.exists(), "no Git ran against either tree");
+        assert!(state.open_reservations().unwrap().is_empty());
+        assert_eq!(git(repo.path(), &["rev-parse", "HEAD"]), oid);
+    }
+
+    /// Only a staged-configuration refusal is re-shaped. Every other promotion
+    /// failure still comes back as the error it always was — here a
+    /// precondition the ledger refuses, with its context chain intact.
+    #[tokio::test]
+    async fn a_genuine_promotion_failure_still_answers_as_an_error() {
+        let (repo, state, project_id, oid) = repo_state();
+        let registered = register_governed_task(
+            &state,
+            registration(
+                &project_id,
+                repo.path(),
+                &oid,
+                WorldScope::StagedAuthoritative,
+            ),
+            ConnectionClass::Operator,
+        )
+        .unwrap();
+
+        let response = handle_governed_staged_request(
+            DaemonRequest::PromoteGovernedOutcome {
+                request: promotion_request(&registered, "promote-unaccepted"),
+            },
+            &state,
+            ConnectionClass::Operator,
+        )
+        .await;
+        match response {
+            DaemonResponse::Error { message } => {
+                assert!(
+                    message.contains("governed promotion refused"),
+                    "got: {message}"
+                );
+            }
+            other => panic!("an unaccepted run cannot be promoted, received {other:?}"),
+        }
+        assert!(state.open_reservations().unwrap().is_empty());
+        assert_eq!(git(repo.path(), &["rev-parse", "HEAD"]), oid);
     }
 
     fn task_from_producer_response(response: DaemonResponse) -> GovernedTaskRun {

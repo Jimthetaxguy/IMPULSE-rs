@@ -218,8 +218,10 @@ or `{"kind": "promotion_blocked", "canonical_head": "<oid>", "reason": "..."}` w
 `canonical_head_moved`, `detached_head`, `concurrent_branch_update`, `repository_config_changed`
 (with the `component` that changed), or `repository_config_unpinned`. Review state stays `accepted`
 and the staged worktree stays active, so an operator who reconciles the canonical branch can retry.
-`Err` is reserved for a genuine failure: a non-operator connection, a task that is not staged or not
-accepted, a revision conflict, or a Git error.
+Submodule configuration found at promotion time is neither a blocked outcome nor an error: it is
+the typed staged-configuration refusal described below. `Err` is reserved for a genuine failure: a
+non-operator connection, a task that is not staged or not accepted, a revision conflict, or a Git
+error.
 
 **Discard states what it costs.** `DiscardGovernedStagedWorktree` is refused, before anything is
 deleted, unless the run is rejected, escalated, launch-failed, unpinned, or accepted with a recorded
@@ -235,7 +237,10 @@ daemon-owned producer. When that pin no longer holds, `SubmitGovernedClaim` and
 acknowledgement rather than an error: the governed task flattened as usual, plus
 `"refused": true`, a typed `reason`, and the `remedy` to apply. The task is unchanged — a refusal
 records nothing — and any producer reservation taken for the attempt is released, so the retry the
-remedy ends in is not blocked.
+remedy ends in is not blocked. `PromoteGovernedOutcome` answers the same acknowledgement for the one
+gate that refuses at promotion — submodule configuration, `unsupported_submodules` — while a drifted
+pin at promotion is the recorded `promotion_blocked` outcome above, because promotion has an accepted
+run to record it against and the other two producers do not.
 
 ```json
 {"type": "Ok", "data": {"result": {
@@ -620,6 +625,10 @@ Added 2026-09-12 (ADR-0012 amendment, ADR-0019):
   `SubmitGovernedClaim` and `RunGovernedVerification` before any Git process is spawned, answered as
   a successful-shape acknowledgement carrying `refused`, a typed `reason`, and a `remedy`. Additive
   within v9: it adds a response shape to two existing requests and no request variant.
+- 2026-09-12 follow-up, additive within v9: `PromoteGovernedOutcome` answers the same refusal
+  acknowledgement (`unsupported_submodules`) where it previously fell through to a plain `Error`
+  string; its reservation is released and the task is unchanged, as for the other two. A drifted pin
+  at promotion stays the recorded `promotion_blocked` outcome (ADR-0019 rule 6).
 
 ### v8 — Builder staged-worktree world scope
 

@@ -391,14 +391,20 @@ async fn handle_governed_promote(
     json: bool,
 ) -> Result<()> {
     let (project_id, task_id, task) = current_governed_task(client, project_id, task_id).await?;
-    let acknowledged = client
+    let acknowledged = match client
         .promote_governed_outcome(impulse_ops::governed_wiring::GovernedPromotionRequest {
             request_id: governed_request_id("promote"),
             project_id,
             task_id,
             expected_revision: task.revision,
         })
-        .await?;
+        .await?
+    {
+        crate::client::GovernedProducerOutcome::Recorded(acknowledged) => acknowledged,
+        crate::client::GovernedProducerOutcome::StagedConfigRefused(refusal) => {
+            return print_staged_config_refusal(&refusal, json, "Promotion refused");
+        }
+    };
     if json {
         return print_json(&acknowledged)
             .context("Failed to serialize governed promotion acknowledgement");
