@@ -10,7 +10,7 @@ category: docs
 # Navigation Tree
 
 roadmap_contract: >-
-  Now=control-plane foundations + governed runtime producers + accepted-run review candidates; Next=stronger same-user actor authorization + full launched Builder/Supervisor proof; Later=explicit memory promotion/dismissal + general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only
+  Now=control-plane foundations + governed runtime producers + accepted-run review candidates; Next=stronger same-user actor authorization + full launched Builder/Supervisor proof; Later=memory promotion/dismissal daemon/UI/runtime wiring + general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only
 
 quick_reference:
   - name: VISION.md

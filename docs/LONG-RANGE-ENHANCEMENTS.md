@@ -1,12 +1,13 @@
 ---
 title: Long-Range Enhancement Roadmap
-description: PR-organized enhancement backlog across 8 themed lanes
+description: Historical 33-candidate enhancement backlog across 8 themed lanes
 version: '1.0'
 updated: 2026-03-17
 type: doc
 category: roadmap
-phase: all
-status: active
+phase: historical
+status: archive
+archived: 2026-09-14
 audience: builder
 tags: [roadmap, enhancements, planning, backlog]
 last_updated: 2026-03-17
@@ -16,6 +17,19 @@ authors:
 ---
 
 # Long-Range Enhancement Roadmap — Impulse
+
+> **Historical backlog snapshot; archived 2026-09-14.** All 33 candidates, their
+> acceptance ideas, dependency graph, and provenance below are retained. Their March
+> Now/Next/Later labels and readiness statements are historical, not current work authorization.
+> The roadmap anchor below is itself superseded. Use [VISION.md](../VISION.md),
+> [the canonical contract](spec/RUST-CANONICAL-CONTRACT.md), and
+> [the collaboration guide](guides/COLLABORATIVE-AGENTIC-CODING.md) for current priorities and ownership.
+>
+> The archive review confirmed shipped overlaps: `PublishTerminalOps` is handled in
+> `impulse-rs/src/daemon/handlers.rs`, and `impulse-rs/src/ops_workbench.rs` has telemetry
+> freshness/purge behavior described as future work in candidates 2.1/2.2. This does not
+> certify those candidates' full acceptance criteria or revalidate the other candidates.
+> Their original dates and detailed tables remain unchanged.
 
 > **Updated:** 2026-03-17
 > **Purpose:** Organize the full enhancement backlog into themed lanes with PR-sized work packages.

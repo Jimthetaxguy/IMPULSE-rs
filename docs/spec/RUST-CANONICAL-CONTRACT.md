@@ -2,7 +2,7 @@
 title: Rust Canonical Product Contract
 description: Authoritative product contract for Impulse based on impulse-rs
 version: '2.1'
-updated: 2026-07-15
+updated: 2026-09-14
 type: specification
 category: core
 phase: all
@@ -90,7 +90,7 @@ Historical migration sequence: `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md`
 | --- | --- | --- |
 | **Now** | Rust control-plane foundation, daemon-owned governed runtime producers, and deterministic accepted-run review candidates | Active |
 | **Next** | Add stronger same-user actor authorization and one full launched Builder/Supervisor workflow proof | Active |
-| **Later** | Add explicit candidate promotion/dismissal, general role contracts, runtime capability negotiation, typed agent messaging, and multi-project supervisor attention | Planned |
+| **Later** | Wire candidate promotion/dismissal daemon/UI/runtime surfaces, general role contracts, runtime capability negotiation, typed agent messaging, and multi-project supervisor attention | Planned |
 | **Legacy** | egui / `impulse-gui` compile-maintenance only | Frozen |
 
 ### Out of Scope for Current Contract
@@ -112,7 +112,7 @@ Historical migration sequence: `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md`
 | Pane | Cockpit view/input attachment | TUI panes and desktop terminal ids; never an authority boundary |
 | Workspace target | Explicit filesystem execution root | Desktop `WorkspaceTarget`/`WorkspaceRegistry` |
 | Project | Governance scope for memory, artifacts, policy, and verification | Project-scoped `.impulse/` state and `ProjectOpsSnapshot`; often maps 1:1 to a workspace today |
-| Memory candidate | Review proposal derived from accepted episodic evidence | `AcceptedRunMemoryCandidate` is a deterministic pending projection, not curated memory or a `GENOME` write |
+| Memory candidate | Review proposal derived from accepted episodic evidence | `AcceptedRunMemoryCandidate` is a deterministic review projection with status-preserving state-layer decisions; it remains distinct from promoted records and never writes `GENOME` |
 
 ### Platform Service Contract
 
@@ -176,7 +176,9 @@ Supervisor review is one API-only, tool-free, history-free, temperature-zero tur
 contract-versioned envelope must bind the exact task revision, claim, verification, subject, and
 acceptance-criteria digest. Generic external harness mode fails closed before spawning because it
 cannot guarantee a structurally read-only review. Dioxus renders evidence and terminal command
-guidance; it does not yet expose producer buttons. Only the operator can record final acceptance.
+guidance for claim, verification, and Supervisor review. ADR-0019's operator-only staged-worktree
+Promote/Discard controls are live; they are separate from memory-candidate decisions. Only the
+operator can record final acceptance.
 
 All governed mutations route through the single project-bound daemon writer. Expected-revision CAS
 and atomic replacement do not authorize two daemon processes to write the same ledger.
@@ -187,19 +189,25 @@ revision. Forged materialized states, broken history, missing receipts, and malf
 evidence fail closed before becoming workbench truth.
 
 That receipt contract deduplicates persisted requests, and one per-task daemon lock serializes live
-producer and lifecycle mutations. It is not crash-safe exactly-once execution: if the daemon dies
-after a producer side effect but before durable receipt storage, retry can repeat the side effect.
-A durable producer reservation journal remains required.
+producer and lifecycle mutations. Durable, owner-only `PRODUCER_RESERVATIONS.json` entries now cover
+verification, Supervisor review, and ADR-0019 staged-worktree promotion. In
+[`governed_wiring.rs`](../../impulse-rs/src/daemon/governed_wiring.rs), `reserved_producer` runs the
+side effect and its governed-task receipt persistence inside one `with_reservation` closure;
+release follows that durable result. A same-revision open reservation is refused, and interrupted
+attempts reconcile to `NeedsRerun` with a task event and `pending_rerun_reason` on a subsequent
+producer acknowledgement. This detects interrupted work; it does not roll back arbitrary effects
+or guarantee exactly-once execution. A panic leaves the reservation open for reconciliation rather
+than treating it as an ordinary returned error. See
+[`producer_reservation.rs`](../../impulse-rs/src/state/producer_reservation.rs).
 
-This is not a generalized role/runtime contract. Typed actor kinds are auditable provenance and
-transition checks, not cryptographic authorization between processes running as the same OS user.
-In particular, `RecordOperatorDecision` is gated only on the client-declared actor kind and travels
-the same unauthenticated socket that the Desktop operator surface and profiled Builders both use, so
-a same-user Builder can in principle forge the operator-required acceptance record. The
-daemon-computed claim, verification, and Supervisor producers are the only transitions that are
-structurally unforgeable; enforcing operator-decision provenance requires socket peer-credential
-authorization and is tracked as follow-up (see
-`docs/superpowers/plans/2026-07-13-governed-runtime-producers.md`).
+This is not a generalized role/runtime contract. Typed actor kinds remain provenance, not proof of
+a client's authority. [ADR-0018](../decisions/0018-socket-actor-provenance.md) now gates socket
+operator decisions with kernel peer credentials plus a per-daemon-run operator capability;
+[`actor_provenance.rs`](../../impulse-rs/src/daemon/actor_provenance.rs) classifies the connection,
+and the daemon stamps authentication provenance before persisting the decision. Launched runtimes
+are not handed that capability. A same-UID process that deliberately discovers and reads the
+capability file remains inside the explicit threat-model limit; this is not cryptographic
+separation from an adversary running as the same user.
 Unprofiled caller-composed evidence retains its existing validation boundary; profiled automatic
 records are derived by the daemon and cannot enter through generic mutations. One daemon adapter
 remains bound to one project, project identity is currently
@@ -217,17 +225,29 @@ or floats; it does not semantically normalize Unicode.
 
 The candidate ledger is a materialized view rather than a second acceptance authority. Identical
 request replay and daemon startup repair missing projections; orphaned, duplicate-task, malformed,
-or source-mismatched records fail closed. V1 has only `pending_review`, adds no mutation endpoint,
-and never writes `GENOME.md` or `HISTORY.jsonl`. Accepted/rejected decisions are terminal, so an
-accepted source cannot later be rejected and orphan its candidate. The ledgers use separate
-private-file replacements; they are not a cross-file transaction, and the helper does not fsync the
-parent directory. Explicit promotion/dismissal is a later contract.
+or source-mismatched records fail closed. ADR-0013's initial slice had only `pending_review` and
+added no mutation endpoint. Accepted/rejected governed-task decisions remain terminal, so an
+accepted source cannot later be rejected and orphan its candidate.
+
+[ADR-0020](../decisions/0020-scoped-memory-promotion-and-dismissal.md), still recorded as `review`,
+has an implemented state and request-type slice. It preserves candidate promotion/dismissal status
+across re-derivation, records promoted facts in append-only, hash-chained `MEMORY.jsonl`, and renders
+them into a separate `GENOME_PROJECTION.md`; `GENOME.md` remains hand-curated and `HISTORY.jsonl`
+is not rewritten. The state method orders log append, candidate-ledger commit, and projection
+rebuild with explicit replay/recovery semantics; these artifacts are not one cross-file transaction.
+See [`state/memory_candidate.rs`](../../impulse-rs/src/state/memory_candidate.rs),
+[`state/memory_record.rs`](../../impulse-rs/src/state/memory_record.rs), and
+[`memory_wiring.rs`](../../impulse-rs/impulse-ops/src/memory_wiring.rs). The request/ack types are
+not a registered daemon endpoint: `DecideMemoryCandidate`, Dioxus Memory Promote/Dismiss controls,
+and Ion memory integration remain deferred. This source-state description does not mark the ADR
+accepted or claim an end-to-end memory-promotion workflow.
 
 A future generalized/dynamic adapter contract must still define runtime discovery, optional and
 emulated operations, attestation freshness, and post-launch re-evaluation. General role
 composition, stronger same-user actor authorization, producer profiles beyond Rust, and a complete
-launched Builder/Supervisor proof remain outside this slice. Candidate promotion/dismissal and the
-curated semantic-memory write boundary remain later work.
+launched Builder/Supervisor proof remain outside this slice. End-to-end candidate promotion/dismissal
+still requires the daemon, Dioxus, and runtime wiring above; its state-layer artifact boundary is
+already implemented separately from hand-curated GENOME.
 
 ## 4) Public Interface Contract
 
@@ -245,12 +265,13 @@ The executable command registry is defined by Clap in `impulse-rs/src/cli.rs` an
   `retrieval-status`, `steward`, `swarm`
 - **Agent and platform integration:** `hooks`, `validate-hooks`, `list-providers`,
   `agent-configure`, `agent-status`, `agent-query`, `guard`, `ion-verify`, `governed-claim`,
-  `governed-verify`, `governed-review`, `mcp serve`
+  `governed-verify`, `governed-review`, `governed-promote`, `governed-discard`, `mcp serve`
 
-The packaged executable is `impulse-rs`. The three governed producer subcommands are daemon-only;
+The packaged executable is `impulse-rs`. All five listed `governed-*` subcommands are daemon-only;
 installed invocations use `impulse-rs --daemon governed-*`, while governed panes preserve their
 exact injected executable path through `"$IMPULSE_CONTROL_CLI" --daemon governed-*` only when they
-carry a governed verification profile.
+carry a governed verification profile. `governed-promote` and `governed-discard` additionally require
+an operator-class connection and act on ADR-0019 staged worktrees, not memory candidates.
 - **Tools and content:** `tools`, `tooling-list`, `tooling-describe`, `tooling-run`,
   `tooling-schema`, `tooling-validate`, `tooling-reload`, `docs`, `model`, `office`,
   `credentials`, `extract`, `calc`, `exec`
@@ -269,7 +290,10 @@ The exact direct/daemon support matrix and flags live in [`docs/CLI-COMMANDS.md`
 | `.impulse/GENOME.md` | Durable decisions/preferences | Durable project memory |
 | `.impulse/config.json` | Runtime configuration | Durable config |
 | `.impulse/GOVERNED_TASKS.json` | Daemon-owned governed task records plus idempotency receipts | Durable project control-plane state; atomically replaced at mode `0600` |
-| `.impulse/MEMORY_CANDIDATES.json` | Deterministic accepted-run pending-review projection | Owner-only local control-plane state; atomically replaced at mode `0600`; not curated memory |
+| `.impulse/PRODUCER_RESERVATIONS.json` | Producer intent, receipt references, and interrupted-attempt recovery | Owner-only durable journal; reserved before verification/review/staged promotion effects |
+| `.impulse/MEMORY_CANDIDATES.json` | Accepted-run review projections plus status-preserving decision receipts | Owner-only local control-plane state; atomically replaced at mode `0600`; distinct from curated memory |
+| `.impulse/MEMORY.jsonl` | Append-only, hash-chained promoted-record log | Implemented ADR-0020 state-layer artifact; daemon/UI/runtime decision wiring remains deferred |
+| `.impulse/GENOME_PROJECTION.md` | Derived rendering of committed memory records | Regenerated from the separate log; never merged into hand-curated `GENOME.md` |
 | `.impulse/DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.json` | Bounded write-ahead desktop launch/exit intent awaiting daemon reconciliation | Durable local recovery state; cross-process sibling lock, mode `0600`, removed/emptied after acknowledgment |
 | `.impulse/context/current-task.md` | Shared current context | Generated via `sync-context` |
 | `.impulse/context/handoff-*.md` | Tool handoff artifacts | Generated via `handoff` |

@@ -53,7 +53,7 @@ CONTRACT_KEY_FILES = [
 DURABLE_ROADMAP_MARKER = (
     "Now=control-plane foundations + governed runtime producers + accepted-run review candidates; "
     "Next=stronger same-user actor authorization + full launched Builder/Supervisor proof; "
-    "Later=explicit memory promotion/dismissal + general roles + negotiated runtimes + "
+    "Later=memory promotion/dismissal daemon/UI/runtime wiring + general roles + negotiated runtimes + "
     "multi-project routing; Legacy=egui compile-maintenance only"
 )
 

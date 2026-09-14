@@ -4,7 +4,7 @@
 - **Updated:** 2026-09-02
 - **Canonical implementation contract:** [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
 - **Current code boundary map:** [`docs/ARCHITECTURE-CLARIFICATION.md`](docs/ARCHITECTURE-CLARIFICATION.md)
-- **Roadmap contract:** Now=control-plane foundations + governed runtime producers + accepted-run review candidates; Next=stronger same-user actor authorization + full launched Builder/Supervisor proof; Later=explicit memory promotion/dismissal + general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only.
+- **Roadmap contract:** Now=control-plane foundations + governed runtime producers + accepted-run review candidates; Next=stronger same-user actor authorization + full launched Builder/Supervisor proof; Later=memory promotion/dismissal daemon/UI/runtime wiring + general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only.
 - **Current governed slice:** profiled pre-PTY Builder registration, exact acceptance criteria, daemon-attested clean Git subjects, daemon-derived claims and detached Rust verification, strict API-only Supervisor review, operator-required acceptance, and deterministic pending memory candidates that do not mutate `GENOME`/`HISTORY`.
 - **Next governed slice:** stronger local actor authorization and one full process proof with launched Builder and Supervisor runtimes; explicit candidate promotion/dismissal remains a later memory-writing contract.
 

@@ -90,6 +90,10 @@ fn run_producer(
                     Err(error) => panic!("CLI did not connect to its socket fixture: {error}"),
                 }
             };
+            // BSD/macOS can inherit the listener's O_NONBLOCK flag on accept.
+            // Normalize before cloning: these line reads require blocking I/O,
+            // bounded by the existing read timeout rather than request timing.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(10)))
                 .unwrap();

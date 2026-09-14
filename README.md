@@ -96,6 +96,20 @@ Durable project inputs such as `.impulse/GENOME.md`, `.impulse/config.json`, and
 `.impulse/impulse-capabilities.json` therefore remain available to commit unless an existing
 operator-owned blanket rule already hides them. Init preserves but warns about that broader rule.
 
+### Release artifacts
+
+Tagged releases contain the `impulse-rs` CLI for macOS (Intel and Apple silicon) and Linux
+(x86_64 and ARM64), with `SHA256SUMS.txt`. The release workflow builds each CLI, smoke-tests
+the renamed executable’s root, daemon, and MCP serve help parsers on its native architecture,
+then verifies the complete four-artifact checksum set. Relevant pull requests run the same build/package checks with read-only permissions;
+GitHub Release publication runs only for pushed `v*` tags.
+
+Desktop `.app` bundles and DMGs are unavailable until the Dioxus packaging and real launch gates
+in [EGUI decommission, Track A / R1](docs/plans/EGUI-DECOMMISSION.md#r1--make-release-state-truthful)
+are satisfied. The old `scripts/build-macos-app.sh` entry point exits with an explanation before
+building or changing artifacts. This CLI-only release path does not satisfy Dioxus operational
+acceptance or unblock Tauri-adapter retirement.
+
 ### Governed Builder workflow
 
 In the Dioxus cockpit, use the governed Builder launch path:
