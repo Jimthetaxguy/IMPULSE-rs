@@ -22,7 +22,7 @@ tags: [worktree, lane, release, verification]
 - Blocked/shared paths: Rust source and manifests/locks, GUI/desktop implementations, unrelated workflows and prior worktrees.
 - Plan/spec: `docs/plans/EGUI-DECOMMISSION.md` Track A/R1 explicitly chosen CLI-only fallback.
 - Verification: complete Rust workspace build/check/test/strict Clippy/fmt; tag-equivalent native CLI build/copy/smoke/checksum; legacy bundler refusal before side effects; workflow validation; documentation validators.
-- Latest status: release implementation reviewed; Rust workspace gates passed. All local release, Rust, documentation, and independent scheduler-example gates passed. Draft PR/hosted checks are the next boundary. Canonical and prior PR worktrees remain preserved.
+- Latest status: release implementation reviewed; Rust workspace gates passed. PR #63 is published for review. The first hosted macOS CI run exposed a fixture portability race; its causal fix and all local follow-up gates passed. Root owns hosted verification and merge. Canonical and prior PR worktrees remain preserved.
 
 ## Decisions
 
@@ -66,3 +66,20 @@ tags: [worktree, lane, release, verification]
 
 - Root owns final merge decisions. Normal branch push and a draft PR are authorized; no tags, package publication, signing, secrets, or manual release dispatch.
 - Rollback is a normal revert of this isolated change; existing GUI source and prior artifacts remain preserved.
+
+## Hosted CI portability follow-up
+
+The first hosted macOS run failed both `governed_refusal_cli` tests when the accepted socket
+returned `WouldBlock` before request bytes arrived. The nonblocking listener bounds accept,
+but BSD/macOS can inherit that mode onto each accepted stream; setting a read timeout does not
+clear it. The fixture now explicitly restores blocking mode before cloning the stream and
+applying the unchanged read timeout. Producer assertions, accept deadline, and product code
+are unchanged.
+
+A standalone offline transport proof observed inherited `O_NONBLOCK` on macOS and reproduced
+OS error 35 before any client bytes. The correction cleared that flag on both the original and
+reader clone; the same reader then received a delayed, fragmented request successfully.
+The focused CLI test target passed 25 consecutive runs with two test threads, covering 200
+real CLI process invocations. The complete Rust fmt/build/check/test/strict Clippy gates passed
+again: 3,064 passed, zero failed, nine ignored. Documentation contract/all/self-test gates passed again.
+The original hosted failure, source backup, causal experiment, and all logs remain preserved.
