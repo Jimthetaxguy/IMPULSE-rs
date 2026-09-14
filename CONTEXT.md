@@ -300,7 +300,9 @@ three operator-class, checked before any state read, with a blocked promotion an
 pin answered as a typed `StagedConfigRefusal` whose remedy is discard-and-re-materialize by claim
 and verification (promotion records the same drift as its blocked outcome instead, since it has an
 accepted run to record against); submodule configuration is the typed refusal on all three
-endpoints, promotion included since 2026-09-12. Claim, verification and promotion each compare the
+endpoints, promotion included since 2026-09-12. CLI refusals preserve text/JSON output and exit
+nonzero; the desktop promotion path displays the typed reason and remedy without adopting an
+unchanged task as a mutation acknowledgement. Claim, verification and promotion each compare the
 pin before spawning Git; **discard deliberately does not** — it removes a checkout and materializes
 no files, so no driver can fire, and an unpinned or drifted worktree is exactly the one an operator
 most needs to be able to reclaim.

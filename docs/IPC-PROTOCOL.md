@@ -259,6 +259,13 @@ scope cannot pin a submodule's own configuration and refuses to run in such a re
 `refused` flag. An `Error` response from these endpoints still means what it always did: the
 producer genuinely failed.
 
+The CLI prints this refusal in text or as the unchanged JSON acknowledgement and exits nonzero
+for `governed-claim`, `governed-verify`, and `governed-promote`: a completed protocol exchange does
+not mean the requested producer ran. The desktop promotion gateway discriminates `refused` before
+mutation adoption, validates the echoed project/task and unchanged revision, and forwards the typed
+reason and daemon remedy to a durable per-task notice. Recorded mutation acknowledgements still
+require a strictly newer revision; a refusal never updates cached task state.
+
 **Producer acknowledgements and the reservation journal.** `RunGovernedVerification`,
 `RunGovernedSupervisorReview`, and `PromoteGovernedOutcome` run their side effect *and* persist the
 governed-task mutation that records it inside one durable producer reservation (ADR-0012's

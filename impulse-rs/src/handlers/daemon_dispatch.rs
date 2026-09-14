@@ -297,24 +297,25 @@ async fn handle_governed_claim(
 
 /// Report a staged-configuration refusal (ADR-0019 rule 13).
 ///
-/// Not an error path: nothing ran, nothing was recorded, and retrying changes
-/// nothing — so the operator gets the reason and the remedy, and the process
-/// still exits non-zero only because the producer did not produce.
+/// The daemon completed its exchange, but the producer did not run or record
+/// anything. Preserve the reason/remedy on stdout, then return an error so
+/// shell automation receives a nonzero status in both text and JSON modes.
 fn print_staged_config_refusal(
     refusal: &impulse_ops::governed_wiring::GovernedStagedConfigRefusalAck,
     json: bool,
     label: &str,
 ) -> Result<()> {
     if json {
-        return print_json(refusal).context("Failed to serialize governed refusal");
+        print_json(refusal).context("Failed to serialize governed refusal")?;
+    } else {
+        println!(
+            "{label}: {} revision {} — {}",
+            refusal.task.id, refusal.task.revision, refusal.reason
+        );
+        println!("  remedy: {}", refusal.remedy);
+        println!("  nothing was recorded; the task is unchanged");
     }
-    println!(
-        "{label}: {} revision {} — {}",
-        refusal.task.id, refusal.task.revision, refusal.reason
-    );
-    println!("  remedy: {}", refusal.remedy);
-    println!("  nothing was recorded; the task is unchanged");
-    Ok(())
+    anyhow::bail!("{label}: the producer did not run; the task is unchanged")
 }
 
 async fn handle_governed_verify(
