@@ -25,6 +25,11 @@ whole product.
 Workspace: `impulse-rs/` (Cargo workspace). Main crates: `impulse-rs`, `impulse-ops`,
 `impulse-term`, `impulse-desktop`, and `impulse-ion`; `impulse-gui` is legacy/frozen.
 
+**Release boundary — `[code]`:** tagged artifacts contain the `impulse-rs` CLI for native macOS
+and Linux on x86_64/ARM64, with smoke checks and checksums. Desktop bundles/DMGs remain unavailable
+pending the Dioxus packaging and launch gates in `docs/plans/EGUI-DECOMMISSION.md` R1; the CLI-only
+fallback does not unblock Tauri-adapter retirement.
+
 ---
 
 ## Identity and hierarchy

@@ -3,16 +3,29 @@ status: active
 phase: all
 audience: builder
 tags: [guide, rust, multi-agent, orchestration]
-last_updated: 2026-03-31
+last_updated: 2026-09-14
 ---
 
 # Rust Multi-Agent Programming Guide
 
-> **Version:** 1.0 | **Status:** Practical Guide | **Updated:** 2026-03-31
+> **Version:** 1.1 | **Status:** Practical Guide | **Updated:** 2026-09-14
 > **Purpose:** Turn multi-agent architecture ideas into concrete Rust programming patterns that fit Impulse.
 > **Scope:** This guide covers implementation patterns. It does not claim that every pattern here is already implemented in the repo.
 
 ---
+
+## Current implementation boundary
+
+Reviewed on 2026-09-14 against the [current contract map](RUST-MULTI-AGENT-PATTERNS.md#current-impulse-contract)
+and the source files it links. The role, envelope, and capability types below are illustrative;
+production changes must extend `impulse_ops::governed_task`, the daemon protocol, and existing
+producer wiring. A role name never substitutes for a connection's operator authentication.
+General team-memory and harness-registry sketches are design options, not shipped interfaces.
+
+The active path separates registration, claim, verification, Supervisor review, and operator
+acceptance. Durable producer reservations cover verification/review/promotion side effects and
+their receipts; cancellation and crash recovery still need explicit evidence. Dioxus is a consumer
+of that authority, not a second owner of task state.
 
 ## 1. Start With the Simplest Topology
 
@@ -25,16 +38,17 @@ Use multiple agents only when:
 - handoffs can be represented as files, typed messages, or explicit artifacts
 - the operator can inspect progress and failures without reading prompt internals
 
-The safest default topology for Rust systems is:
+A useful decomposition for Rust systems is:
 
-| Role | Purpose | Mutates State? |
-|------|---------|----------------|
-| Orchestrator | decomposes task and chooses next worker | no |
-| Implementer | changes code or configuration | yes, scoped |
-| Verifier | runs tests, profiling, or audits | no |
-| Steward | enforces budget, approvals, or policy | no direct product writes |
+| Role | Purpose | Expected write boundary |
+|------|---------|-------------------------|
+| Orchestrator | decomposes task and chooses next worker | scoped planning and handoff records |
+| Implementer | changes code or configuration | approved checkout paths |
+| Verifier | runs tests, profiling, or audits | owned test worktrees, caches, and evidence; producer receipts through the daemon |
+| Steward | reviews budget, approvals, or policy | audit records and explicitly authorized policy operations |
 
-This keeps write authority narrow and reviewable.
+Verification can execute code and write artifacts. Give it an isolated, declared scope; the role
+name itself grants no product-write or operator authority.
 
 ---
 
@@ -148,7 +162,17 @@ Good ephemeral candidates:
 - in-flight evaluation jobs
 - temporary trust warnings
 
-This split keeps restart behavior predictable and prevents the daemon from becoming a hidden database.
+These are storage categories, not a claim that every proposed artifact exists. Current governed
+truth lives in `.impulse/GOVERNED_TASKS.json`; recovery also uses durable producer reservations.
+The memory boundary keeps `.impulse/MEMORY_CANDIDATES.json`, `MEMORY.jsonl`,
+`GENOME_PROJECTION.md`, and hand-curated `GENOME.md` distinct.
+[ADR-0020](../decisions/0020-scoped-memory-promotion-and-dismissal.md) implements state and wire
+contracts while deferring daemon endpoint, Dioxus Promote/Dismiss controls, and Ion integration.
+Do not confuse this with the wired staged-worktree Promote/Discard operation in
+[ADR-0019](../decisions/0019-builder-staged-worktree-world-scope.md).
+
+This split keeps restart and recovery behavior explicit; in-flight work is not safely ephemeral
+merely because its process can be restarted.
 
 ---
 
@@ -189,7 +213,10 @@ Then enforce:
 - action preconditions
 - audit emission on denied or escalated actions
 
-This aligns with the existing guardrail direction in Impulse.
+The sample enum is not an authorization implementation. The shipped socket boundary uses peer
+credentials plus a per-daemon-run capability, and the daemon checks operator class before protected
+mutations. Same-UID deliberate token discovery is an explicit limit; the role field in an incoming
+message is insufficient proof. Reuse the existing tool capability registry for tool execution.
 
 ---
 
@@ -201,7 +228,7 @@ If you want Meta-Harness style iteration in Rust, the minimum loop is:
 2. run a bounded evaluation set
 3. record score plus traces plus snapshot ID
 4. compare against prior runs
-5. promote only after review or threshold checks
+5. retain scores as evidence; promote only through an explicitly authorized, gated path
 
 That implies three durable concepts:
 
@@ -209,7 +236,7 @@ That implies three durable concepts:
 - `EvaluationTrace`
 - `PolicySnapshot`
 
-Without those, you only have logs, not harness optimization.
+These are conceptual records, not required new Rust types. Map them onto existing governed-task and artifact identities first. A score or model review is evidence for an operator decision, not permission to apply a change.
 
 ---
 
@@ -235,11 +262,11 @@ Only add heavier service crates such as `axum` when the system actually needs a 
 
 ### Good next implementation moves
 
-- externalize routing policy into a typed config artifact
-- add a harness run registry linked to traces
-- define a team-memory artifact format
-- make trust-state transitions explicit in daemon-owned state
-- expose run comparison and stale-run visibility in operator surfaces
+- extend existing governed records with scoped, versioned evidence rather than a second run registry
+- test stale-revision refusals, request replay, and durable producer recovery at real dispatch boundaries
+- keep operator authorization separate from worker-supplied actor and role fields
+- preserve memory candidates and source evidence; implement remaining ADR-0020 surfaces only with explicit acceptance gates
+- expose verified state and recovery needs in operator surfaces without treating a model verdict as acceptance
 
 ### Bad next implementation moves
 
