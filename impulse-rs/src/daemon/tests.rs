@@ -809,7 +809,19 @@ mod tests {
     #[test]
     fn test_init_global_registry_is_idempotent_and_returns_global() {
         let first = crate::plugin::registry::init_global_registry();
+        let providers_before = first
+            .list_context_providers()
+            .unwrap()
+            .into_iter()
+            .map(|provider| provider.name)
+            .collect::<std::collections::BTreeSet<_>>();
         let second = crate::plugin::registry::init_global_registry();
+        let providers_after = second
+            .list_context_providers()
+            .unwrap()
+            .into_iter()
+            .map(|provider| provider.name)
+            .collect::<std::collections::BTreeSet<_>>();
         assert!(
             std::ptr::eq(first, second),
             "init_global_registry must return the single global registry"
@@ -819,8 +831,7 @@ mod tests {
             "init_global_registry must return the same instance as global_registry"
         );
         assert_eq!(
-            first.list_context_providers().unwrap().len(),
-            second.list_context_providers().unwrap().len(),
+            providers_before, providers_after,
             "re-initializing must not change the provider set"
         );
     }
