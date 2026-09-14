@@ -14,8 +14,8 @@ use std::time::Duration;
 use impulse_ops::{AgentRuntime, ContextHealthSummary, MachineTarget, TerminalOpsReport};
 
 use crate::runtime::{
-    AgentRuntimeSnapshot, DesktopEvent, DesktopEventSink, GovernedRoutingMetadata,
-    GovernedTaskGateway,
+    AgentRuntimeSnapshot, DesktopEvent, DesktopEventSink, GovernedPromotionResponse,
+    GovernedRoutingMetadata, GovernedTaskGateway,
 };
 
 /// Desktop heartbeats stay well below the daemon's ten-second stale boundary.
@@ -1182,7 +1182,7 @@ mod unix {
         fn promote_outcome(
             &self,
             request: impulse_ops::governed_wiring::GovernedPromotionRequest,
-        ) -> Result<impulse_ops::governed_wiring::GovernedProducerAck, String> {
+        ) -> Result<GovernedPromotionResponse, String> {
             // Acknowledged, not fire-and-forget: the request carries its own
             // idempotency key and expected revision, so a daemon commit followed
             // by a lost response is replayed off the stored receipt rather than
@@ -1192,8 +1192,15 @@ mod unix {
                 self.governed_producer_read_timeout,
             )?;
             let value = Self::ok_result(response)?;
-            serde_json::from_value(value)
-                .map_err(|error| format!("parse governed promotion acknowledgement: {error}"))
+            match value.get("refused") {
+                Some(serde_json::Value::Bool(true)) => serde_json::from_value(value)
+                    .map(GovernedPromotionResponse::StagedConfigRefused)
+                    .map_err(|error| format!("parse governed promotion refusal: {error}")),
+                None => serde_json::from_value(value)
+                    .map(GovernedPromotionResponse::Recorded)
+                    .map_err(|error| format!("parse governed promotion acknowledgement: {error}")),
+                Some(_) => Err("invalid governed promotion refusal discriminator".to_string()),
+            }
         }
 
         fn discard_staged_worktree(
@@ -3228,6 +3235,9 @@ mod unix {
                     expected_revision: 7,
                 })
                 .expect("a blocked promotion is a successful response");
+            let GovernedPromotionResponse::Recorded(acknowledged) = acknowledged else {
+                panic!("a recorded blocked promotion is not a refusal");
+            };
             assert_eq!(acknowledged.task, blocked);
             assert_eq!(
                 acknowledged
@@ -3261,6 +3271,113 @@ mod unix {
                 WorkbenchDaemonRequest::PromoteGovernedOutcome { .. }
             ));
             server.join().unwrap();
+        }
+
+        #[test]
+        fn promotion_refusal_crosses_the_socket_and_runtime_without_a_mutation_event() {
+            use impulse_ops::governed_wiring::{
+                GovernedStagedConfigRefusalAck, StagedConfigRefusalReason,
+            };
+            #[derive(Default)]
+            struct Sink(Mutex<Vec<DesktopEvent>>);
+            impl DesktopEventSink for Sink {
+                fn emit(&self, event: DesktopEvent) {
+                    self.0.lock().unwrap().push(event);
+                }
+            }
+            let expected = staged_accepted_task();
+            for scenario in [
+                "refused",
+                "wrong-project",
+                "wrong-task",
+                "wrong-revision",
+                "recorded-unchanged",
+                "recorded-newer",
+                "bad-flag",
+                "missing-reason",
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let socket = dir.path().join("refusal.sock");
+                publish_capability(&socket, &"a".repeat(64));
+                let listener = UnixListener::bind(&socket).unwrap();
+                let refusal = GovernedStagedConfigRefusalAck::new(
+                    expected.clone(),
+                    StagedConfigRefusalReason::UnsupportedSubmodules {
+                        path: "/tmp/project/.gitmodules".to_string(),
+                    },
+                );
+                let mut value = serde_json::to_value(&refusal).unwrap();
+                match scenario {
+                    "wrong-project" => value["project_id"] = serde_json::json!("other-project"),
+                    "wrong-task" => value["id"] = serde_json::json!("other-task"),
+                    "wrong-revision" => {
+                        value["revision"] = serde_json::json!(expected.revision + 1)
+                    }
+                    "bad-flag" => value["refused"] = serde_json::json!("true"),
+                    "missing-reason" => {
+                        value.as_object_mut().unwrap().remove("reason");
+                    }
+                    "recorded-unchanged" | "recorded-newer" => {
+                        let mut task = expected.clone();
+                        if scenario == "recorded-newer" {
+                            task.revision += 1;
+                        }
+                        value = serde_json::to_value(
+                            impulse_ops::governed_wiring::GovernedProducerAck::new(
+                                task, false, None,
+                            ),
+                        )
+                        .unwrap();
+                    }
+                    _ => {}
+                }
+                let (server, _requests) = serve_capability_then_one_request(
+                    listener,
+                    WorkbenchDaemonResponse::Ok { result: value },
+                );
+                let sink = Arc::new(Sink::default());
+                let runtime = crate::runtime::DesktopRuntime::builder()
+                    .with_event_sink(sink.clone())
+                    .with_governed_task_gateway(Arc::new(UnixDaemonOpsClient::new(socket)))
+                    .build();
+                let result = runtime.promote_governed_outcome(
+                    impulse_ops::governed_wiring::GovernedPromotionRequest {
+                        request_id: impulse_ops::governed_task::GovernedRequestId::try_new(
+                            "promote-refusal",
+                        )
+                        .unwrap(),
+                        project_id: expected.project_id.clone(),
+                        task_id: expected.id.clone(),
+                        expected_revision: expected.revision,
+                    },
+                );
+                match scenario {
+                    "refused" => {
+                        let GovernedPromotionResponse::StagedConfigRefused(actual) =
+                            result.unwrap()
+                        else {
+                            panic!("refusal became a record");
+                        };
+                        assert_eq!(actual, refusal);
+                        let host_wire = serde_json::to_value(
+                            GovernedPromotionResponse::StagedConfigRefused(actual),
+                        )
+                        .unwrap();
+                        assert_eq!(host_wire["refused"], true);
+                        assert_eq!(host_wire["revision"], expected.revision);
+                        assert_eq!(host_wire["remedy"], refusal.remedy);
+                    }
+                    "recorded-newer" => {
+                        assert!(matches!(result, Ok(GovernedPromotionResponse::Recorded(_))))
+                    }
+                    _ => assert!(result.is_err(), "{scenario} must fail closed"),
+                }
+                assert!(
+                    sink.0.lock().unwrap().is_empty(),
+                    "an uncached task or refusal cannot invent a runtime state change"
+                );
+                server.join().unwrap();
+            }
         }
 
         /// The discard acknowledgement is what tells the cockpit an accepted

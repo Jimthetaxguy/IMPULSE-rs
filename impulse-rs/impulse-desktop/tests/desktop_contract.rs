@@ -1281,6 +1281,11 @@ window.__TAURI__ = {{
       if (command === "review_queue") return [reviewItem];
       if (command === "mcp_invoke") return spawnInvocation;
       if (command === "review_decision") return reviewInvocation;
+      if (command === "governed_outcome_promote") return {{
+        id: "staged-task", revision: 7, refused: true,
+        reason: {{ kind: "unsupported_submodules", path: "staged/.gitmodules" }},
+        remedy: "discard and re-materialize the staged worktree"
+      }};
       throw new Error(`unexpected invoke ${{command}}`);
     }}
   }},
@@ -1319,6 +1324,8 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
     decision: "skip",
     target_agent_id: null
   }});
+  const refused = await window.__impulseOpsBridge.promoteGovernedOutcome({{ task_id: "staged-task" }});
+  if (!refused.refused || refused.revision !== 7) throw new Error("lost unchanged refusal");
   console.log(JSON.stringify({{ attrs, invoked, sent }}));
   process.exit(0);
 }})().catch((error) => {{
@@ -1357,6 +1364,27 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
     let smoke: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("parse bridge smoke output");
+    let refusal_message = smoke["sent"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| {
+            message["kind"] == "governed_ack" && message["payload"]["kind"] == "promotion_refused"
+        })
+        .expect("the executed JS bridge forwards a typed refusal notice");
+    assert_eq!(
+        refusal_message["payload"]["reason"]["kind"],
+        "unsupported_submodules"
+    );
+    assert_eq!(
+        refusal_message["payload"]["remedy"],
+        "discard and re-materialize the staged worktree"
+    );
+    assert!(!smoke["sent"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| message["payload"]["status"] == "governed_promotion_failed"));
     assert_eq!(
         smoke["attrs"]["data-impulse-ops-bridge"],
         serde_json::Value::String("mounted".to_string())
@@ -1418,9 +1446,16 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
     let mut mcp_tools = Vec::new();
     let mut review_queue = Vec::new();
     let mut last_invocations = Vec::new();
+    let mut governed_notices = std::collections::BTreeMap::new();
     for message in messages {
         let message = serde_json::from_value::<DesktopBridgeMessage>(message.clone())
             .expect("smoke message should match DesktopBridgeMessage");
+        // The live shell files these notices outside the snapshot reducer so
+        // subsequent daemon updates cannot erase acknowledgement-only facts.
+        if let Some(notice) = impulse_desktop::ui::GovernedAckNotice::parse(&message) {
+            governed_notices.insert(notice.task_id.clone(), notice);
+            continue;
+        }
         apply_desktop_bridge_message(
             DesktopBridgeStateMut::new(
                 &mut snapshot,
@@ -1436,6 +1471,13 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
         .expect("smoke message should reduce into desktop state");
     }
 
+    assert_eq!(
+        governed_notices["staged-task"].kind,
+        impulse_desktop::ui::GovernedAckKind::PromotionRefused
+    );
+    assert!(governed_notices["staged-task"]
+        .detail
+        .contains("staged/.gitmodules"));
     assert_eq!(snapshot.generated_at, "2026-06-13T23:59:00Z");
     assert_eq!(runtime_agents.len(), 1);
     assert_eq!(runtime_agents[0].agent_id, "codex-live");
@@ -4086,4 +4128,39 @@ fn test_the_refusal_notice_is_built_from_the_typed_reason_and_quotes_the_daemon_
         "an unsupported-submodule refusal must name the path, got: {}",
         notice.headline
     );
+}
+
+#[test]
+fn test_promotion_refusal_reaches_the_task_card_with_typed_reason_and_verbatim_remedy() {
+    use impulse_desktop::ui::{GovernedAckKind, GovernedAckNotice};
+    use impulse_ops::governed_wiring::StagedConfigRefusalReason;
+    let remedy = "Keep the accepted work; discard and re-materialize before retrying.";
+    let message = DesktopBridgeMessage {
+        kind: "governed_ack".to_string(),
+        payload: json!({
+            "task_id": "staged-task",
+            "kind": "promotion_refused",
+            "reason": StagedConfigRefusalReason::UnsupportedSubmodules { path: "nested/.gitmodules".to_string() },
+            "remedy": remedy,
+            "detail": remedy,
+        }),
+    };
+    let notice = GovernedAckNotice::parse(&message).expect("typed refusal notice");
+    assert_eq!(notice.kind, GovernedAckKind::PromotionRefused);
+    assert!(notice.detail.contains("nested/.gitmodules"));
+    assert!(notice.detail.ends_with(remedy));
+    let html = board_html_with_acks(
+        vec![staged_governed_task()],
+        [(notice.task_id.clone(), notice)].into(),
+    );
+    assert!(html.contains("data-governed-ack=\"promotion_refused\""));
+    assert!(html.contains("Promotion refused; the task is unchanged"));
+    assert!(html.contains(remedy));
+    assert!(!html.contains("Host call failed"));
+    let mut malformed = message;
+    malformed.payload.as_object_mut().unwrap().remove("reason");
+    assert!(GovernedAckNotice::parse(&malformed).is_none());
+    assert!(desktop_event_bridge_script().contains("if (ack?.refused === true)"));
+    assert!(desktop_event_bridge_script().contains("reason: ack.reason"));
+    assert!(desktop_event_bridge_script().contains("remedy: ack.remedy"));
 }

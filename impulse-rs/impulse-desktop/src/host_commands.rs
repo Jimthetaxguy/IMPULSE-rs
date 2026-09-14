@@ -179,14 +179,14 @@ async fn governed_task_mutate_runtime(
 /// Fast-forward the canonical branch onto an accepted staged outcome
 /// (ADR-0019, protocol v9).
 ///
-/// A blocked promotion is an `Ok` whose task carries the blocked outcome; only
-/// a request that never reached a verdict is an `Err`.
+/// A blocked promotion is a recorded `Ok`; a typed refusal is a distinct `Ok`
+/// carrying the unchanged task and remedy. Transport or invalid responses are `Err`.
 #[cfg(feature = "legacy-tauri-runtime")]
 #[tauri::command]
 pub async fn governed_outcome_promote(
     state: tauri::State<'_, DesktopShellState>,
     request: impulse_ops::governed_wiring::GovernedPromotionRequest,
-) -> Result<impulse_ops::governed_wiring::GovernedProducerAck, String> {
+) -> Result<crate::runtime::GovernedPromotionResponse, String> {
     governed_outcome_promote_runtime(std::sync::Arc::clone(&state.inner().runtime), request).await
 }
 
@@ -194,14 +194,14 @@ pub async fn governed_outcome_promote(
 pub async fn governed_outcome_promote(
     state: &DesktopShellState,
     request: impulse_ops::governed_wiring::GovernedPromotionRequest,
-) -> Result<impulse_ops::governed_wiring::GovernedProducerAck, String> {
+) -> Result<crate::runtime::GovernedPromotionResponse, String> {
     governed_outcome_promote_runtime(std::sync::Arc::clone(&state.runtime), request).await
 }
 
 async fn governed_outcome_promote_runtime(
     runtime: std::sync::Arc<DesktopRuntime>,
     request: impulse_ops::governed_wiring::GovernedPromotionRequest,
-) -> Result<impulse_ops::governed_wiring::GovernedProducerAck, String> {
+) -> Result<crate::runtime::GovernedPromotionResponse, String> {
     tokio::task::spawn_blocking(move || {
         runtime
             .promote_governed_outcome(request)

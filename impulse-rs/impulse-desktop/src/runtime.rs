@@ -15,8 +15,8 @@ use impulse_ops::governed_task::{
     GovernedVerificationProfile,
 };
 use impulse_ops::governed_wiring::{
-    GovernedProducerAck, GovernedPromotionRequest, GovernedStagedWorktreeDiscardAck,
-    GovernedStagedWorktreeDiscardRequest,
+    GovernedProducerAck, GovernedPromotionRequest, GovernedStagedConfigRefusalAck,
+    GovernedStagedWorktreeDiscardAck, GovernedStagedWorktreeDiscardRequest,
 };
 use impulse_ops::role_assignment::{AgentRoleAssignment, EnforcementStrength, RoleCompatibility};
 use impulse_ops::{AgentRole, AgentStatus, ContextHealthSummary, MachineTarget};
@@ -35,6 +35,15 @@ const MAX_GOVERNED_TASK_BYTES: usize = impulse_ops::governed_task::MAX_GOVERNED_
 const GOVERNED_GIT_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const GOVERNED_GIT_OUTPUT_LIMIT: usize = 64 * 1024;
 const GOVERNED_GIT_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Promotion either records a mutation or refuses without changing the task.
+/// Untagged serialization preserves the daemon's existing flattened wire shapes.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum GovernedPromotionResponse {
+    Recorded(GovernedProducerAck),
+    StagedConfigRefused(GovernedStagedConfigRefusalAck),
+}
 
 /// Acknowledged daemon command seam used by the synchronous pre-PTY gate.
 /// Implementations must return daemon-owned task state, never optimistic UI state.
@@ -56,13 +65,14 @@ pub trait GovernedTaskGateway: Send + Sync {
     ///
     /// A *blocked* promotion comes back as `Ok`: the acknowledged task carries
     /// `GovernedPromotionOutcome::PromotionBlocked`, the run stays accepted, and
-    /// the staged worktree stays active. `Err` means the request never reached a
-    /// verdict. Defaulted so a gateway that predates protocol v9 — every test
+    /// the staged worktree stays active. A staged-configuration refusal is a
+    /// separate successful response carrying an unchanged task. `Err` means the
+    /// request failed or its response was invalid. Defaulted so a gateway that predates protocol v9 — every test
     /// double in this workspace — keeps compiling and fails closed.
     fn promote_outcome(
         &self,
         _request: GovernedPromotionRequest,
-    ) -> Result<GovernedProducerAck, String> {
+    ) -> Result<GovernedPromotionResponse, String> {
         Err("this governed task gateway does not implement staged-outcome promotion".to_string())
     }
 
@@ -1264,11 +1274,12 @@ impl DesktopRuntime {
     /// A blocked promotion is an execution fact, not a failure: it returns `Ok`
     /// carrying a task whose latest promotion is
     /// `GovernedPromotionOutcome::PromotionBlocked`. Callers render the reason
-    /// and keep the task actionable.
+    /// and keep the task actionable. A typed refusal instead keeps the task and
+    /// revision unchanged and returns a notice without publishing a mutation.
     pub fn promote_governed_outcome(
         &self,
         request: GovernedPromotionRequest,
-    ) -> Result<GovernedProducerAck, DesktopBridgeError> {
+    ) -> Result<GovernedPromotionResponse, DesktopBridgeError> {
         let gateway = self.governed_task_gateway()?;
         let expected_task_id = request.task_id.clone();
         let expected_project_id = request.project_id.clone();
@@ -1276,17 +1287,52 @@ impl DesktopRuntime {
         let acknowledged = gateway
             .promote_outcome(request)
             .map_err(|message| DesktopBridgeError::GovernedTaskFailed { message })?;
-        let task = self.adopt_acknowledged_governed_task(
-            acknowledged.task,
-            &expected_project_id,
-            &expected_task_id,
-            expected_revision,
-        )?;
-        Ok(GovernedProducerAck::new(
-            task,
-            acknowledged.replayed,
-            acknowledged.pending_rerun_reason,
-        ))
+        match acknowledged {
+            GovernedPromotionResponse::Recorded(acknowledged) => {
+                let task = self.adopt_acknowledged_governed_task(
+                    acknowledged.task,
+                    &expected_project_id,
+                    &expected_task_id,
+                    expected_revision,
+                )?;
+                Ok(GovernedPromotionResponse::Recorded(
+                    GovernedProducerAck::new(
+                        task,
+                        acknowledged.replayed,
+                        acknowledged.pending_rerun_reason,
+                    ),
+                ))
+            }
+            GovernedPromotionResponse::StagedConfigRefused(refusal) => {
+                // Refusal is not a mutation acknowledgement. Verify its binding
+                // without adopting it or publishing an invented state change.
+                if !refusal.refused
+                    || refusal.task.id != expected_task_id
+                    || refusal.task.project_id != expected_project_id
+                    || refusal.task.revision != expected_revision
+                {
+                    return Err(DesktopBridgeError::GovernedTaskFailed {
+                        message: "daemon refusal did not match the requested governed task"
+                            .to_string(),
+                    });
+                }
+                let state = self.lock_state();
+                if let Some(current) = state
+                    .agents
+                    .values()
+                    .filter_map(|record| record.governed_task.as_ref())
+                    .find(|task| task.id == expected_task_id)
+                {
+                    if current != &refusal.task {
+                        return Err(DesktopBridgeError::GovernedTaskFailed {
+                            message: "daemon refusal changed the unchanged governed task"
+                                .to_string(),
+                        });
+                    }
+                }
+                Ok(GovernedPromotionResponse::StagedConfigRefused(refusal))
+            }
+        }
     }
 
     /// Reclaim a finished staged worktree (ADR-0019, protocol v9).
@@ -2843,6 +2889,7 @@ mod tests {
     #[derive(Default)]
     struct TestGovernedTaskGateway {
         tasks: Mutex<HashMap<GovernedTaskId, GovernedTaskRun>>,
+        promotion_response: Mutex<Option<GovernedPromotionResponse>>,
         reject_registration: bool,
         corrupt_registration: bool,
         reject_running: bool,
@@ -2853,6 +2900,7 @@ mod tests {
         fn rejecting() -> Self {
             Self {
                 tasks: Mutex::new(HashMap::new()),
+                promotion_response: Mutex::new(None),
                 reject_registration: true,
                 corrupt_registration: false,
                 reject_running: false,
@@ -2891,6 +2939,17 @@ mod tests {
     }
 
     impl GovernedTaskGateway for TestGovernedTaskGateway {
+        fn promote_outcome(
+            &self,
+            _request: GovernedPromotionRequest,
+        ) -> Result<GovernedPromotionResponse, String> {
+            self.promotion_response
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| "no test promotion response".to_string())
+        }
+
         fn register(
             &self,
             registration: GovernedTaskRegistration,
@@ -4290,6 +4349,72 @@ mod tests {
     }
 
     // --- missing-session error paths ---
+
+    #[test]
+    fn test_promotion_refusal_preserves_cached_task_and_rejects_same_revision_content_changes() {
+        let (runtime, gateway) = runtime_with_task_gateway();
+        let mut request = spawn_request(24, 80, Some("sh"));
+        request.args = vec!["-c".to_string(), "sleep 30".to_string()];
+        request.task = Some("prove refusal does not rewrite a cached task".to_string());
+        request.role_assignment = Some(role_assignment(
+            "workspace.target",
+            EnforcementStrength::Mediated,
+            true,
+        ));
+        let _workspace = bind_to_temporary_workspace(&mut request);
+        let spawned = runtime.spawn_agent(request).unwrap();
+        let task = runtime
+            .lock_state()
+            .agents
+            .get(&spawned.agent_id)
+            .unwrap()
+            .governed_task
+            .clone()
+            .unwrap();
+        let request = GovernedPromotionRequest {
+            request_id: impulse_ops::governed_task::GovernedRequestId::try_new("refusal-cache")
+                .unwrap(),
+            project_id: task.project_id.clone(),
+            task_id: task.id.clone(),
+            expected_revision: task.revision,
+        };
+        for corrupt in [false, true] {
+            let mut echoed = task.clone();
+            if corrupt {
+                echoed.task = "unapproved changed assignment".to_string();
+            }
+            let refusal = GovernedStagedConfigRefusalAck::new(
+                echoed,
+                impulse_ops::governed_wiring::StagedConfigRefusalReason::Unpinned,
+            );
+            *gateway.promotion_response.lock().unwrap() =
+                Some(GovernedPromotionResponse::StagedConfigRefused(refusal));
+            let result = runtime.promote_governed_outcome(request.clone());
+            if corrupt {
+                assert!(result.is_err());
+            } else {
+                assert!(matches!(
+                    result,
+                    Ok(GovernedPromotionResponse::StagedConfigRefused(_))
+                ));
+            }
+            assert_eq!(
+                runtime
+                    .lock_state()
+                    .agents
+                    .get(&spawned.agent_id)
+                    .unwrap()
+                    .governed_task
+                    .as_ref(),
+                Some(&task)
+            );
+        }
+        runtime
+            .close_agent(TerminalCloseRequest {
+                session_id: spawned.agent_id,
+            })
+            .unwrap();
+    }
 
     #[test]
     fn test_write_agent_missing_session_returns_missing_session() {

@@ -332,6 +332,16 @@ const DESKTOP_EVENT_BRIDGE_SCRIPT: &str = concat!(
       // an execution fact carried on the acknowledged task, and the card reads
       // it off the authoritative ops_update that follows.
       const ack = await invoke("governed_outcome_promote", { request });
+      if (ack?.refused === true) {
+        forward("governed_ack", {
+          task_id: String(ack.id),
+          kind: "promotion_refused",
+          reason: ack.reason,
+          remedy: ack.remedy,
+          detail: ack.remedy,
+        });
+        return ack;
+      }
       // `pending_rerun_reason` exists only on the acknowledgement -- the
       // ops_update the card waits for does not carry it -- so it is forwarded
       // here or it is lost.
@@ -638,6 +648,8 @@ pub enum GovernedAckKind {
     DiscardStrandedCommit,
     /// A promotion is redoing an interrupted producer's work.
     PromotionRerunPending,
+    /// Promotion refused to run; the task and its revision are unchanged.
+    PromotionRefused,
 }
 
 impl GovernedAckKind {
@@ -645,6 +657,7 @@ impl GovernedAckKind {
         match self {
             Self::DiscardStrandedCommit => "discard_stranded_commit",
             Self::PromotionRerunPending => "promotion_rerun_pending",
+            Self::PromotionRefused => "promotion_refused",
         }
     }
 }
@@ -687,7 +700,17 @@ impl GovernedAckNotice {
         if message.kind != "governed_ack" {
             return None;
         }
-        let notice: Self = serde_json::from_value(message.payload.clone()).ok()?;
+        let mut notice: Self = serde_json::from_value(message.payload.clone()).ok()?;
+        if notice.kind == GovernedAckKind::PromotionRefused {
+            let reason: StagedConfigRefusalReason =
+                serde_json::from_value(message.payload.get("reason")?.clone()).ok()?;
+            let remedy = message.payload.get("remedy")?.as_str()?;
+            if remedy.trim().is_empty() {
+                return None;
+            }
+            let refusal = staged_config_refusal_notice(&reason, remedy);
+            notice.detail = format!("{}\n{}", refusal.headline, refusal.remedy);
+        }
         if notice.task_id.trim().is_empty() || notice.detail.trim().is_empty() {
             return None;
         }
@@ -703,6 +726,7 @@ impl GovernedAckNotice {
             GovernedAckKind::PromotionRerunPending => {
                 "This promotion is redoing an interrupted producer's work"
             }
+            GovernedAckKind::PromotionRefused => "Promotion refused; the task is unchanged",
         }
     }
 }
