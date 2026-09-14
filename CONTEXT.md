@@ -112,21 +112,24 @@ The operator-class decision that turns one pending candidate into a memory recor
 then regenerate the projection and mark the retrieval index dirty. Its sibling is dismissal, which
 requires a nonblank reason and produces no record. Both are terminal, idempotent by request id, and
 refused on a candidate that no longer matches its accepted governed-task derivation.
-- **Boundary:** the decision input carries no authentication field; the daemon stamps provenance
-  from the connection class, as it does for an operator decision (ADR-0018).
+- **Boundary:** this state-layer method and its request types are implemented; the daemon decision
+  endpoint, Dioxus Memory controls, and Ion integration remain deferred. The input carries no
+  authentication field; the future daemon endpoint must stamp provenance from the connection
+  class, as the existing operator-decision endpoint does (ADR-0018).
 - **Source:** `impulse-ops/src/memory_wiring.rs`, `src/state/memory_candidate.rs`, ADR-0020.
 
 ### projection — `[code]`
 `.impulse/GENOME_PROJECTION.md`: the deterministic, byte-stable markdown rendering of the currently
-valid memory records, regenerated wholesale and never hand-edited or merged into. It is what a
-runtime memory tool reads; the raw candidate ledger is never exposed to one.
-- **Boundary:** distinct from `GENOME.md`, which stays hand-curated by `impulse memory add` and is
-  never regenerated — raw candidates, promoted records, and the projection are separate artifacts.
+valid memory records, regenerated wholesale and never hand-edited or merged into. Runtime memory
+consumers must use the projection rather than raw candidates; ADR-0020's Ion integration remains
+deferred.
+- **Boundary:** distinct from `GENOME.md`, which stays hand-curated and is never regenerated —
+  raw candidates, promoted records, and the projection are separate artifacts.
 - **Source:** `src/state/memory_record.rs`, ADR-0020.
 
 ### producer reservation — `[code]`
 A durable record of intent to run a daemon-owned producer side effect (verification, Supervisor
-review, and — reserved for ADR-0019 — promote), persisted independently of `GOVERNED_TASKS.json` in
+review, and ADR-0019 staged-worktree promotion), persisted independently of `GOVERNED_TASKS.json` in
 owner-only, digest-verified `PRODUCER_RESERVATIONS.json`. Reserved before the side effect, released
 with a receipt reference once the effect and its governed-task mutation are both durable; a
 reservation still open on reload is reconciled to `NeedsRerun` and noted on the owning governed
@@ -553,11 +556,13 @@ client-tool schemas from the live registry, then executes through `VoiceToolBrid
 
 ---
 
-## Live-versus-direction boundary (2026-07-15)
+## Live-versus-direction boundary (2026-09-14)
 
 - **Live foundation:** PTY/workbench truth, managed turns, registry-backed platforms/Ion, shared
   services, profiled Builder launch, routed claims, detached verification, strict API review,
-  operator acceptance, and repairable pending candidates with no `GENOME`/`HISTORY` mutation.
+  operator acceptance, durable producer reservations/recovery, and repairable review candidates
+  with no `GENOME`/`HISTORY` mutation. ADR-0020 adds state and request-type memory-decision contracts;
+  its daemon/UI/runtime surfaces remain deferred.
 - **Next:** stronger same-user actor authorization and one full launched Builder/Supervisor proof.
-- **Later:** explicit candidate promotion/dismissal, reassignment/resume, generalized
+- **Later:** candidate promotion/dismissal daemon/UI/runtime wiring, reassignment/resume, generalized
   roles/adapters/capabilities, multi-project routing, and typed cross-agent messaging.

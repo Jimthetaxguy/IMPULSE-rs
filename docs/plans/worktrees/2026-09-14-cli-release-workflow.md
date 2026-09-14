@@ -83,3 +83,32 @@ The focused CLI test target passed 25 consecutive runs with two test threads, co
 real CLI process invocations. The complete Rust fmt/build/check/test/strict Clippy gates passed
 again: 3,064 passed, zero failed, nine ignored. Documentation contract/all/self-test gates passed again.
 The original hosted failure, source backup, causal experiment, and all logs remain preserved.
+
+## Current-contract review follow-up
+
+Root assigned explicit ownership of the shared `AGENTS.md`, `CLAUDE.md`, `CONTEXT.md`, and
+`docs/spec/RUST-CANONICAL-CONTRACT.md` statements after PR review found an obsolete future-reservation
+claim. The correction follows `governed_wiring`'s actual `reserved_producer`/`with_reservation`
+call sites and the journal's recovery behavior. It preserves the panic/retry and same-UID
+operator-capability limits instead of claiming rollback, exactly-once effects, or a general
+runtime authority boundary.
+
+The same bounded refresh distinguishes live ADR-0019 staged-worktree Promote/Discard commands
+from ADR-0020's implemented memory state/request types and still-deferred daemon, Memory UI,
+and Ion integration. Existing ADR status remains unchanged. The canonical CLI list now includes
+the two shipped staged-worktree operator commands. Runtime code, protocol definitions, ADR status,
+and Cargo manifests/locks are unchanged.
+
+The strict validator pins one shared roadmap marker. Its only change is the expected Later clause,
+updated to the same daemon/UI/runtime wiring wording in AGENTS, CLAUDE, VISION, INDEX, and both
+SUMMARY mirrors. Exact-match enforcement and self-tests are unchanged; a temporary-copy negative
+proof restores the stale AGENTS clause and requires rejection. The earlier commits' unchanged-validator
+receipts remain historical evidence, not a claim about this follow-up.
+
+Original shared docs were backed up before edits. Source-callsite reconciliation, new relative-link
+targets, documentation contract/all/self-test gates (185 valid, zero invalid), Python compilation,
+and whitespace checks passed. The temporary-copy guard passed with the current marker and rejected
+the restored stale AGENTS marker without changing source files. Root reviewed the diff and owns
+review-thread resolution/merge. This follow-up is sequenced after both hosted workflows on
+`b3d1f42` completed successfully, including all four native CLI builds and checksum packaging;
+publication was correctly skipped.
