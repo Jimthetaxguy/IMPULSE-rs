@@ -496,6 +496,14 @@ A deny-by-default permission required by a typed tool. Tool availability varies 
 conceptual parity does not imply identical enforcement.
 - **Source of truth:** `src/tooling/{traits,registry,executor}.rs`, `src/mcp/`, and desktop MCP.
 
+### calculator — `[code]`
+The `calculator` tool evaluates a mathematical expression only: digits, `+ - * / % ( ) .`,
+scientific `e`/`E`, and whitespace. No identifiers, `sqrt`, `abs`, or other names. Input is
+still interpolated into `python3 -c` after that allowlist; the interpolating format string is
+not a sandbox. Evaluation is bounded by a 5s wall-clock timeout that kills the child.
+- **Source of truth:** `src/tools/python.rs` (`is_restricted_math_expression`, `calculate`,
+  `execute_python_with_timeout`) and `src/tooling/builtin/calculator.rs`.
+
 ### supervisor policy — `[code]`
 The concrete permission and confirmation policy for supervisor actions such as monitoring, memory
 search, focus, input, context operations, and permission changes. It is the first role-specific

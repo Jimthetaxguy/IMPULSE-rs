@@ -2,8 +2,13 @@
 // Provides a safe way to run Python code from Rust
 
 use anyhow::{Context, Result};
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// Default wall-clock budget for `python3 -c` (calculator and python_exec).
+pub const DEFAULT_PYTHON_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct PythonResult {
@@ -12,34 +17,69 @@ pub struct PythonResult {
     pub exit_code: i32,
 }
 
-/// Execute Python code and return the result
-/// Uses system Python interpreter
+/// Execute Python code and return the result.
+/// Uses system Python interpreter. Bounded by [`DEFAULT_PYTHON_TIMEOUT`].
 pub fn execute_python(code: &str) -> Result<PythonResult> {
-    // Try python3 first, then python
+    execute_python_with_timeout(code, DEFAULT_PYTHON_TIMEOUT)
+}
+
+/// Execute Python with an explicit wall-clock budget. On timeout the child
+/// process group is killed (same contract as `bash_exec`).
+pub fn execute_python_with_timeout(code: &str, timeout: Duration) -> Result<PythonResult> {
     let python_cmd = if cfg!(target_os = "windows") {
         "python"
     } else {
         "python3"
     };
 
-    let output = Command::new(python_cmd)
-        .args(["-c", code])
-        .output()
-        .context("Failed to execute Python")?;
+    let mut cmd = Command::new(python_cmd);
+    cmd.args(["-c", code])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
 
-    let exit_code = output.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let mut child = cmd.spawn().context("Failed to execute Python")?;
+    let mut guard = crate::process_group::ProcessGroupGuard::new(Some(child.id()));
+    let deadline = Instant::now() + timeout;
 
-    Ok(PythonResult {
-        output: stdout,
-        error: if stderr.is_empty() {
-            None
-        } else {
-            Some(stderr)
-        },
-        exit_code,
-    })
+    loop {
+        match child.try_wait().context("waiting for python")? {
+            Some(status) => {
+                guard.disarm();
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                if let Some(mut pipe) = child.stdout.take() {
+                    let _ = pipe.read_to_end(&mut stdout);
+                }
+                if let Some(mut pipe) = child.stderr.take() {
+                    let _ = pipe.read_to_end(&mut stderr);
+                }
+                let stdout = String::from_utf8_lossy(&stdout).to_string();
+                let stderr = String::from_utf8_lossy(&stderr).to_string();
+                return Ok(PythonResult {
+                    output: stdout,
+                    error: if stderr.is_empty() {
+                        None
+                    } else {
+                        Some(stderr)
+                    },
+                    exit_code: status.code().unwrap_or(-1),
+                });
+            }
+            None if Instant::now() >= deadline => {
+                guard.kill_now();
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!("python timed out after {timeout:?}");
+            }
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
 }
 
 /// Check if Python is available
@@ -197,6 +237,21 @@ mod tests {
         let r = result.unwrap();
         assert_eq!(r.exit_code, 0);
         assert!(r.output.contains("Hello from Python"));
+    }
+
+    #[test]
+    fn test_execute_python_times_out_and_kills_the_child() {
+        let started = Instant::now();
+        let err =
+            execute_python_with_timeout("import time; time.sleep(30)", Duration::from_millis(300))
+                .expect_err("sleep must not run to completion");
+        let msg = err.to_string();
+        assert!(msg.contains("timed out"), "got {msg}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "kill must be prompt, took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
