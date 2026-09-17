@@ -241,10 +241,19 @@ mod tests {
 
     #[test]
     fn test_execute_python_times_out_and_kills_the_child() {
+        // Unique token in python3 -c argv so a concurrent sleep cannot be
+        // mistaken for this child (same reason bash_exec uses a unique duration).
+        let marker = format!(
+            "ion-py-timeout-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let code = format!("import time; time.sleep(30) # {marker}");
         let started = Instant::now();
-        let err =
-            execute_python_with_timeout("import time; time.sleep(30)", Duration::from_millis(300))
-                .expect_err("sleep must not run to completion");
+        let err = execute_python_with_timeout(&code, Duration::from_millis(300))
+            .expect_err("sleep must not run to completion");
         let msg = err.to_string();
         assert!(msg.contains("timed out"), "got {msg}");
         assert!(
@@ -252,6 +261,26 @@ mod tests {
             "kill must be prompt, took {:?}",
             started.elapsed()
         );
+        #[cfg(unix)]
+        {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let check = Command::new("pgrep")
+                    .args(["-f", &marker])
+                    .output()
+                    .expect("pgrep");
+                if check.stdout.is_empty() {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    panic!(
+                        "python child still alive after timeout: {}",
+                        String::from_utf8_lossy(&check.stdout)
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
     }
 
     #[test]
