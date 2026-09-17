@@ -53,10 +53,11 @@
 //! confirmation step -- unlike `claude`/`codex`, which prompt before
 //! write/bash actions by default (auto-accept/yolo mode is opt-in, not the
 //! default). [`CONFIRMATION_REQUIRED_TOOLS`] gates `bash_exec`/`file_write`
-//! specifically (mutating capabilities) behind [`ReplToolExecutor::confirm`]
-//! -- a declined confirmation short-circuits before `ReplTool::run` is ever
-//! called, so nothing executes. `ion_verify`/`file_read` are read-only and
-//! stay auto-approved, matching `/verify`'s existing ungated behavior.
+//! (mutating filesystem/shell) and `governed_submit_claim` (daemon-owned
+//! governed-task mutation) behind [`ReplToolExecutor::confirm`] -- a declined
+//! confirmation short-circuits before `ReplTool::run` is ever called, so
+//! nothing executes. `ion_verify`/`file_read` are read-only and stay
+//! auto-approved, matching `/verify`'s existing ungated behavior.
 //!
 //! **Guardrail-scanned confirmation (ROSA reverse-transfer, same-day
 //! follow-up -- see `impulse-ion/TUI_SPEC.md` "ROSA reverse-transfer
@@ -408,12 +409,14 @@ fn tool_definitions(registry: &ReplToolRegistry) -> Vec<ToolDefinition> {
 }
 
 /// Tool names whose execution mutates state (filesystem writes, shell
-/// commands) and therefore require an interactive confirmation before
-/// running when triggered by model-generated `tool_use` output. `ion_verify`
-/// (read-only, spec-a gate), `file_read`, and `document_read` are
-/// deliberately not gated: `ion_verify` is already ungated when hand-typed
-/// via `/verify`, and the two readers cannot mutate anything.
-const CONFIRMATION_REQUIRED_TOOLS: &[&str] = &["bash_exec", "file_write"];
+/// commands, daemon-owned governed-task claims) and therefore require an
+/// interactive confirmation before running when triggered by model-generated
+/// `tool_use` output. `ion_verify` (read-only, spec-a gate), `file_read`,
+/// `document_read`, `memory_search`, and `genome_read` are deliberately not
+/// gated: `ion_verify` is already ungated when hand-typed via `/verify`, and
+/// the readers cannot mutate durable workbench truth.
+const CONFIRMATION_REQUIRED_TOOLS: &[&str] =
+    &["bash_exec", "file_write", "governed_submit_claim"];
 
 /// An unforgeable proof that a mutating tool call was approved -- adapted
 /// from ROSA's `ApprovalGrant`/`Gate` design (see module doc comment).
@@ -812,6 +815,8 @@ impl ToolExecutor for ReplToolExecutor<'_> {
         let _grant: Option<ApprovalGrant> = if CONFIRMATION_REQUIRED_TOOLS.contains(&name) {
             let tool_ctx = self.ctx.sandbox_tool_context();
             let write = matches!(name, "file_write" | "bash_exec");
+            // governed_submit_claim has no filesystem path; sandbox_escape is
+            // a no-op for it. Confirmation still mints the grant.
             let resolved_paths = resolved_paths_for(name, &input, &tool_ctx);
             let mut verdict = sandbox_escape_verdict(&resolved_paths, &tool_ctx, write);
             verdict = most_severe_verdict(
@@ -1527,6 +1532,43 @@ mod tests {
         assert!(result.is_error);
         assert!(!result.content.contains("declined"));
         assert!(asked.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_governed_submit_claim_is_gated_behind_confirmation() {
+        // Claim submission mutates daemon-owned governed-task truth. A
+        // declined confirm must short-circuit before ReplTool::run (no
+        // socket, no Git, no claim record). Proven by a confirm stub that
+        // always returns false: the declined message, confirm consulted,
+        // and no panic from missing IMPULSE_SOCKET_PATH (run never starts).
+        let tools = ReplToolRegistry::with_defaults();
+        let ctx = ReplContext::default();
+        let asked: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        let confirm = |name: &str, _input: &Value, _verdict: &GuardVerdict, _paths: &[PathBuf]| {
+            asked.lock().unwrap().push(name.to_string());
+            false
+        };
+        let untrusted_seen = std::sync::atomic::AtomicBool::new(false);
+        let executor = ReplToolExecutor {
+            tools: &tools,
+            ctx: &ctx,
+            confirm: &confirm,
+            untrusted_seen: &untrusted_seen,
+        };
+
+        let result = executor
+            .execute(
+                "governed_submit_claim",
+                serde_json::json!({"summary": "synthetic claim that must not reach the daemon"}),
+            )
+            .await;
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("declined"),
+            "ungated claim would fail on missing launch env instead of declining: {}",
+            result.content
+        );
+        assert_eq!(asked.lock().unwrap().as_slice(), ["governed_submit_claim"]);
     }
 
     #[cfg(feature = "office-support")]
