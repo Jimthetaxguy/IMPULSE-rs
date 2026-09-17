@@ -1532,6 +1532,22 @@ mod tests {
         assert!(result.is_error);
         assert!(!result.content.contains("declined"));
         assert!(asked.lock().unwrap().is_empty());
+
+        // ion_verify is the spec-a read-only gate; model-issued verify must
+        // not consult confirm (hand-typed /verify is already ungated).
+        asked.lock().unwrap().clear();
+        let verify = executor
+            .execute(
+                "ion_verify",
+                serde_json::json!({"description": "synthetic; must not prompt"}),
+            )
+            .await;
+        assert!(!verify.content.contains("declined"));
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "ion_verify must stay outside CONFIRMATION_REQUIRED_TOOLS: {:?}",
+            asked.lock().unwrap()
+        );
     }
 
     #[tokio::test]
