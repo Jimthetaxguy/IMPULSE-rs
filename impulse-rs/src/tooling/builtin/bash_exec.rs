@@ -602,4 +602,30 @@ mod tests {
             .unwrap()
             .contains("marker.txt"));
     }
+
+    #[tokio::test]
+    async fn test_execute_rejects_cwd_on_read_root_that_is_not_a_write_root() {
+        // /allow widens reads only. bash_exec cwd is a write-root check.
+        let tool = BashExecTool;
+        let write_root = tempfile::tempdir().expect("write root");
+        let read_only = tempfile::tempdir().expect("read root");
+        let ctx = ToolContext {
+            allowed_read_roots: vec![read_only.path().to_path_buf()],
+            allowed_write_roots: vec![write_root.path().to_path_buf()],
+            ..ToolContext::with_all_capabilities()
+        };
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "command": "echo must-not-run",
+                    "cwd": read_only.path().display().to_string()
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ToolError::PathNotAllowed(_))),
+            "cwd on a read-only root must not run: {result:?}"
+        );
+    }
 }
