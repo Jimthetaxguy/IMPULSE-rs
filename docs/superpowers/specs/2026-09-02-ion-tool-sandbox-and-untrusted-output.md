@@ -85,11 +85,14 @@ resolve a caller-supplied path):
 
 `ion_repl::chat::ReplToolExecutor::execute` additionally computes the resolved path(s) a *pending*
 `file_write`/`bash_exec` call would touch before the tool runs, so a human sees the denial at
-confirmation time -- see Decision 2. This confirmation-layer check exists **only** for the two tools
-in `CONFIRMATION_REQUIRED_TOOLS`; `file_read`, `document_read`, and `ion_verify` are ungated and
+confirmation time -- see Decision 2. This confirmation-layer path-check exists **only** for the filesystem tools
+in `CONFIRMATION_REQUIRED_TOOLS` (`file_write`, `bash_exec`'s `cwd`); `file_read`, `document_read`, and `ion_verify` are ungated and
 never reach it, but they still enforce the sandbox themselves at the tool layer described above --
 a denial there just surfaces as that tool's own error text rather than a dedicated confirmation
-prompt.
+prompt. `governed_submit_claim` is also on `CONFIRMATION_REQUIRED_TOOLS` (Ion
+Builder `Allow? [y/N]`, or `CONFIRM` if `untrusted_seen`) but has no path
+argument; this sandbox does not apply to it. CLI `"$IMPULSE_CONTROL_CLI"
+--daemon governed-claim` stays the ungated operator path.
 
 **Not covered by this sandbox:** `bash_exec`'s shell command TEXT can still reach anywhere the
 sandboxed `cwd` process can reach via redirection, `cat`, `cd`, etc. -- the `ToolContext` roots only
@@ -97,7 +100,8 @@ constrain path *arguments* the tools themselves resolve (`path`, `cwd`), not wha
 interprets from free text. See Decision 2b for the advisory-only heuristic this lane adds on top,
 and "Explicitly out of scope" below for why full command confinement isn't attempted.
 `governed_submit_claim` is a separate, non-bridged `ReplTool` that mutates daemon-owned governed-task
-state; it is not a path-checking tool and this sandbox does not apply to it at all.
+state; it is not a path-checking tool and this sandbox does not apply to it at all. Model-issued
+calls are confirmation-gated; the CLI operator `governed-claim` path is not.
 
 ### 2. Sandbox-escape confirmation escalation
 
@@ -284,8 +288,9 @@ heuristic's advisory-only framing from round 1.
   in the next-stages plan).
 - Workflow fixture tests (a spreadsheet receipt, a Markdown plan, a GENOME with two decisions),
   named in the plan's Stage 1 bullet list but not required by this lane's acceptance criteria.
-- `governed_submit_claim` (mutates daemon-owned governed-task state, ungated, not a path-checking
-  tool) is unaffected by any of this lane's changes.
+- `governed_submit_claim` (mutates daemon-owned governed-task state, not a path-checking
+  tool) is confirmation-gated in Ion; this sandbox still does not apply to it. CLI
+  `"$IMPULSE_CONTROL_CLI" --daemon governed-claim` remains the ungated operator path.
 
 ## Research
 
