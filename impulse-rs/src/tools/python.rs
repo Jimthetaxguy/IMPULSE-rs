@@ -106,9 +106,41 @@ pub fn execute_script(script_path: &PathBuf) -> Result<PythonResult> {
     })
 }
 
-/// Calculate expression using Python (safe eval)
+/// True when `expression` is a numeric formula only (digits, `+ - * / % ( ) .`,
+/// optional scientific `e`/`E`, whitespace). Rejects identifiers so
+/// `calculate()` cannot interpolate arbitrary Python into `python3 -c`.
+pub fn is_restricted_math_expression(expression: &str) -> bool {
+    let trimmed = expression.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let mut prev_was_exponent = false;
+    for c in trimmed.chars() {
+        match c {
+            '0'..='9' | '+' | '-' | '*' | '/' | '%' | '(' | ')' | '.' | ' ' | '\t' => {
+                prev_was_exponent = false;
+            }
+            'e' | 'E' => {
+                if prev_was_exponent {
+                    return false;
+                }
+                prev_was_exponent = true;
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Calculate expression using Python (`python3 -c`), after restricting the
+/// input to a mathematical expression. The interpolating format string is
+/// not a sandbox; the allowlist is.
 pub fn calculate(expression: &str) -> Result<String> {
-    // Wrap in safe eval
+    if !is_restricted_math_expression(expression) {
+        return Err(anyhow::anyhow!(
+            "calculate() accepts a mathematical expression only (digits and + - * / % ( ) . e); got non-math input"
+        ));
+    }
     let code = format!(
         "import json; result = {}; print(json.dumps({{'result': str(result)}}))",
         expression
@@ -179,5 +211,30 @@ mod tests {
         let result = calculate("(10 + 5) * 2");
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "\"30\"");
+    }
+
+    #[test]
+    fn test_is_restricted_math_expression_accepts_formulas() {
+        assert!(is_restricted_math_expression("2 + 2"));
+        assert!(is_restricted_math_expression("(10 + 5) * 2"));
+        assert!(is_restricted_math_expression("1e-3"));
+        assert!(is_restricted_math_expression("  -4.5 / 2  "));
+        assert!(!is_restricted_math_expression(""));
+        assert!(!is_restricted_math_expression(
+            "__import__('os').system('id')"
+        ));
+        assert!(!is_restricted_math_expression("os.system('echo pwned')"));
+        assert!(!is_restricted_math_expression("2 + foo"));
+    }
+
+    #[test]
+    fn test_calculate_rejects_python_injection() {
+        let err = calculate("__import__('os').system('id')")
+            .expect_err("arbitrary python must not reach python3 -c");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("mathematical expression only"),
+            "error should name the math-only contract, got {msg}"
+        );
     }
 }

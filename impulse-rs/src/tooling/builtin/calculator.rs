@@ -33,8 +33,12 @@ impl DynamicTool for CalculatorTool {
 
     fn validate_params(&self, params: &serde_json::Value) -> Result<(), ToolError> {
         match params.get("expression").and_then(|v| v.as_str()) {
-            Some(expr) if !expr.trim().is_empty() => Ok(()),
-            _ => Err(ToolError::InvalidParams(
+            Some(expr) if crate::tools::python::is_restricted_math_expression(expr) => Ok(()),
+            Some(_) => Err(ToolError::InvalidParams(
+                "expression must be a mathematical formula (digits and + - * / % ( ) . e), not Python"
+                    .into(),
+            )),
+            None => Err(ToolError::InvalidParams(
                 "missing or empty 'expression' string".into(),
             )),
         }
@@ -99,6 +103,17 @@ mod tests {
         let tool = CalculatorTool;
         let params = serde_json::json!({"expression": ""});
         assert!(tool.validate_params(&params).is_err());
+    }
+
+    #[test]
+    fn test_validate_params_rejects_python_injection() {
+        let tool = CalculatorTool;
+        let params = serde_json::json!({"expression": "__import__('os').system('id')"});
+        let err = tool
+            .validate_params(&params)
+            .expect_err("calculator must not accept arbitrary Python");
+        let msg = err.to_string();
+        assert!(msg.contains("mathematical formula"), "got {msg}");
     }
 
     #[tokio::test]
