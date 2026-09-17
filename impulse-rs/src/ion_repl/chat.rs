@@ -2546,7 +2546,9 @@ mod tests {
         // would, forcing CONFIRM on a later, otherwise-innocuous bash_exec
         // in the same turn.
         let mut tools = ReplToolRegistry::new();
-        tools.register(Box::new(InstructionShapedErrorTool));
+        tools
+            .register(Box::new(InstructionShapedErrorTool))
+            .expect("test spy tool");
         let ctx = ReplContext::default();
         let confirm = |_name: &str, _input: &Value, verdict: &GuardVerdict, _paths: &[PathBuf]| {
             decide_approval(verdict, "y")
