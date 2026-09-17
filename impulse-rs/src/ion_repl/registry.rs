@@ -167,6 +167,36 @@ impl Default for ReplToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use serde_json::Value;
+
+    use super::super::tools::{ReplTool, ToolOutcome};
+    use super::super::ReplContext;
+
+    struct NamedUsageTool {
+        name: &'static str,
+        usage: &'static str,
+    }
+
+    #[async_trait]
+    impl ReplTool for NamedUsageTool {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn usage(&self) -> &'static str {
+            self.usage
+        }
+        fn json_schema(&self) -> Value {
+            serde_json::json!({"name": self.name})
+        }
+        async fn run(&self, _args: Value, _ctx: &ReplContext) -> anyhow::Result<ToolOutcome> {
+            Ok(ToolOutcome {
+                rendered: String::new(),
+                payload: Value::Null,
+                ok: true,
+            })
+        }
+    }
 
     #[test]
     fn test_with_defaults_registers_ion_verify_and_write_capable_tools() {
@@ -235,6 +265,26 @@ mod tests {
             "duplicate error should name the tool, got {err}"
         );
         assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn test_register_keeps_first_instance_on_duplicate_name() {
+        let mut registry = ReplToolRegistry::new();
+        registry
+            .register(Box::new(NamedUsageTool {
+                name: "dup",
+                usage: "first",
+            }))
+            .expect("first dup");
+        let err = registry
+            .register(Box::new(NamedUsageTool {
+                name: "dup",
+                usage: "second",
+            }))
+            .expect_err("second dup must not steal the name");
+        assert!(err.contains("dup"), "got {err}");
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.get("dup").expect("first remains").usage(), "first");
     }
 
     #[test]

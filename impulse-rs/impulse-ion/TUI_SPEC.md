@@ -360,12 +360,15 @@ pass the repo gate: `cargo build && cargo test && cargo clippy -- -D warnings &&
   the first time (previously they were registered but never dispatched) with
   no confirmation step — unlike `claude`/`codex`, which prompt before
   write/bash actions by default. `ion_repl::chat::ReplToolExecutor` now
-  gates `CONFIRMATION_REQUIRED_TOOLS` (`bash_exec`, `file_write`) behind a
+  gates `CONFIRMATION_REQUIRED_TOOLS` (`bash_exec`, `file_write`,
+  `governed_submit_claim`) behind a
   `confirm` hook (`confirm_via_stdin` in production, printing the pending
   call and reading `y`/`N`; default deny). A decline short-circuits before
   `ReplTool::run` is ever called — the mutating call never executes.
   `ion_verify`/`file_read` stay ungated (read-only, and `ion_verify` was
-  already ungated via `/verify`). `ChatState::with_confirm` (test-only) is
+  already ungated via `/verify`). CLI `"$IMPULSE_CONTROL_CLI" --daemon
+  governed-claim` is the operator path and does not use this Ion gate.
+  `ChatState::with_confirm` (test-only) is
   the DI seam so tests can drive the gate without blocking on real stdin.
 
   **Wall-clock timeout (adversarial-review follow-up, finding S2, same-day):**

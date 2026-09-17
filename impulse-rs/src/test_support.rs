@@ -104,6 +104,14 @@ pub(crate) fn impulse_home_env_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Acquire the process-wide lock guarding test mutation of governed-launch
+/// env (`IMPULSE_PROJECT_ID`, `IMPULSE_GOVERNED_TASK_ID`). Claim-confirmation
+/// prelude tests read those vars; they must not race other lib tests.
+pub(crate) fn governed_launch_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Poll until no process command line matches `pattern`, bounded by `timeout`.
 ///
 /// Process-group SIGKILL is synchronous, but reaping can lag under a heavily

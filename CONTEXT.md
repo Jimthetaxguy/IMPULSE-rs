@@ -278,7 +278,8 @@ false-positive-prone); a match sets a flag sticky for the rest of the SESSION (n
 to survive both out-of-order batch confirmation and content persisting in history) that escalates
 every later gated call to the same `CONFIRM` gate, reset only by `/clear`. `governed_submit_claim`
 is a separate, non-bridged `ReplTool` that mutates daemon-owned governed-task state. Model-issued
-calls go through `CONFIRMATION_REQUIRED_TOOLS` with `bash_exec` and `file_write`, so a declined
+calls go through `CONFIRMATION_REQUIRED_TOOLS` with `bash_exec`, `file_write`, and
+`governed_submit_claim`, so a declined
 confirm never reaches `run` and sticky `untrusted_seen` escalates later claims to literal
 `CONFIRM`. CLI `"$IMPULSE_CONTROL_CLI" --daemon governed-claim` is the operator path and does not
 use this gate. `ion_verify`, `file_read`, `document_read`, `memory_search`, and `genome_read` stay
