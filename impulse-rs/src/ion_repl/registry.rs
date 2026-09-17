@@ -40,15 +40,16 @@ impl ReplToolRegistry {
         }
     }
 
-    /// Register a tool by its own `name()`. Later registrations with the
-    /// same name replace earlier ones (last-write-wins), matching the
-    /// permissive behavior of a small, hand-populated registry -- unlike
-    /// `src/tooling::ToolRegistry::register`, which errors on a duplicate ID
-    /// (that registry aggregates independently-loaded tool sources, e.g.
-    /// external-process manifests, where a silent collision would be a real
-    /// misconfiguration bug worth surfacing).
-    pub fn register(&mut self, tool: Box<dyn ReplTool>) {
-        self.tools.insert(tool.name(), tool);
+    /// Register a tool by its own `name()`. Duplicate names are an error --
+    /// same contract as `src/tooling::ToolRegistry::register` -- so a later
+    /// plugin cannot silently steal `governed_submit_claim` or `file_write`.
+    pub fn register(&mut self, tool: Box<dyn ReplTool>) -> Result<(), String> {
+        let name = tool.name();
+        if self.tools.contains_key(name) {
+            return Err(format!("duplicate ReplTool name {name}"));
+        }
+        self.tools.insert(name, tool);
+        Ok(())
     }
 
     pub fn get(&self, name: &str) -> Option<&dyn ReplTool> {
@@ -100,42 +101,58 @@ impl ReplToolRegistry {
     /// grants, rather than to an unchecked, possibly-wrong one.
     pub fn with_defaults() -> Self {
         let mut registry = Self::new();
-        registry.register(Box::new(IonVerifyTool));
-        registry.register(Box::new(GovernedSubmitClaimTool));
+        registry
+            .register(Box::new(IonVerifyTool))
+            .expect("default ion_verify");
+        registry
+            .register(Box::new(GovernedSubmitClaimTool))
+            .expect("default governed_submit_claim");
         #[cfg(feature = "office-support")]
-        registry.register(Box::new(DocumentReadTool));
+        registry
+            .register(Box::new(DocumentReadTool))
+            .expect("default document_read");
 
         let dynamic = Arc::new(ToolRegistry::with_defaults());
-        registry.register(Box::new(DynamicToolBridge::new(
-            Arc::clone(&dynamic),
-            "file_read",
-            "file_read {\"path\": \"...\", \"start_line\": 1, \"max_lines\": 200} \
+        registry
+            .register(Box::new(DynamicToolBridge::new(
+                Arc::clone(&dynamic),
+                "file_read",
+                "file_read {\"path\": \"...\", \"start_line\": 1, \"max_lines\": 200} \
              -- read a file",
-        )));
-        registry.register(Box::new(DynamicToolBridge::new(
-            Arc::clone(&dynamic),
-            "file_write",
-            "file_write {\"path\": \"...\", \"content\": \"...\"} \
+            )))
+            .expect("default file_read");
+        registry
+            .register(Box::new(DynamicToolBridge::new(
+                Arc::clone(&dynamic),
+                "file_write",
+                "file_write {\"path\": \"...\", \"content\": \"...\"} \
              -- atomically write (create/overwrite) a file",
-        )));
-        registry.register(Box::new(DynamicToolBridge::new(
-            Arc::clone(&dynamic),
-            "bash_exec",
-            "bash_exec {\"command\": \"...\", \"cwd\": \"...\", \"timeout_secs\": 30} \
+            )))
+            .expect("default file_write");
+        registry
+            .register(Box::new(DynamicToolBridge::new(
+                Arc::clone(&dynamic),
+                "bash_exec",
+                "bash_exec {\"command\": \"...\", \"cwd\": \"...\", \"timeout_secs\": 30} \
              -- run a shell command",
-        )));
-        registry.register(Box::new(DynamicToolBridge::new(
-            Arc::clone(&dynamic),
-            "memory_search",
-            "memory_search {\"query\": \"...\", \"scope\": \"all\", \"mode\": \"keyword\", \
+            )))
+            .expect("default bash_exec");
+        registry
+            .register(Box::new(DynamicToolBridge::new(
+                Arc::clone(&dynamic),
+                "memory_search",
+                "memory_search {\"query\": \"...\", \"scope\": \"all\", \"mode\": \"keyword\", \
              \"limit\": 5} -- search GENOME decisions and session history",
-        )));
-        registry.register(Box::new(DynamicToolBridge::new(
-            dynamic,
-            "genome_read",
-            "genome_read {\"section\": \"...\"} -- read permanent project decisions \
+            )))
+            .expect("default memory_search");
+        registry
+            .register(Box::new(DynamicToolBridge::new(
+                dynamic,
+                "genome_read",
+                "genome_read {\"section\": \"...\"} -- read permanent project decisions \
              and preferences from GENOME.md",
-        )));
+            )))
+            .expect("default genome_read");
 
         registry
     }
@@ -188,6 +205,22 @@ mod tests {
         assert_eq!(memory_search.json_schema()["name"], "memory_search");
         let genome_read = registry.get("genome_read").expect("genome_read registered");
         assert_eq!(genome_read.json_schema()["name"], "genome_read");
+    }
+
+    #[test]
+    fn test_register_rejects_duplicate_name() {
+        let mut registry = ReplToolRegistry::new();
+        registry
+            .register(Box::new(IonVerifyTool))
+            .expect("first ion_verify");
+        let err = registry
+            .register(Box::new(IonVerifyTool))
+            .expect_err("second ion_verify must not steal the name");
+        assert!(
+            err.contains("ion_verify"),
+            "duplicate error should name the tool, got {err}"
+        );
+        assert_eq!(registry.len(), 1);
     }
 
     #[test]
