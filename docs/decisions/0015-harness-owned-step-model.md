@@ -191,6 +191,18 @@ Jim locked 2026-08-19: Impulse stays the only picker. ROSA has no step picker an
 
 Do not add LiteLLM, OpenRouter, or a ROSA sibling of `decide_step_model`.
 
+## Addendum: discrete semantic judgments are not this function (2026-09-17)
+
+`decide_step_model` stays a **deterministic** per-step model-id policy: actor, verification/review, `configured`, optional host-admitted `escalate_model`. It does not classify tools, score intent, or call a critic.
+
+Dev-time critics (typed noul/choice/score over an authored answer space) may be used **outside** this crate to find holes. Findings land as ordinary Impulse tests and gates (capability, confirmation, sandbox, allowlists). They must not:
+
+- grow `impulse-step-model` with probability inputs,
+- become a second picker or vendor router,
+- run in product runtime as a model-in-the-loop for `ChatRequest.model`.
+
+If a critic pack’s “should we escalate?” is always “only after verification failed,” that fact is already this function. Do not duplicate it.
+
 ## Related Documents
 
 - [`0011-governed-task-run-lifecycle.md`](0011-governed-task-run-lifecycle.md)
