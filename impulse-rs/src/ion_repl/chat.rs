@@ -1559,6 +1559,20 @@ mod tests {
             "genome_read must stay outside CONFIRMATION_REQUIRED_TOOLS: {:?}",
             asked.lock().unwrap()
         );
+
+        asked.lock().unwrap().clear();
+        let memory = executor
+            .execute(
+                "memory_search",
+                serde_json::json!({"query": "synthetic", "limit": 1}),
+            )
+            .await;
+        assert!(!memory.content.contains("declined"));
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "memory_search must stay outside CONFIRMATION_REQUIRED_TOOLS: {:?}",
+            asked.lock().unwrap()
+        );
     }
 
     #[tokio::test]
