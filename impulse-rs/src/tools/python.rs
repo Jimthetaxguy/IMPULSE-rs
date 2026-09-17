@@ -45,41 +45,56 @@ pub fn execute_python_with_timeout(code: &str, timeout: Duration) -> Result<Pyth
 
     let mut child = cmd.spawn().context("Failed to execute Python")?;
     let mut guard = crate::process_group::ProcessGroupGuard::new(Some(child.id()));
-    let deadline = Instant::now() + timeout;
 
-    loop {
+    // Drain pipes while the child runs. Reading only after try_wait fills
+    // the OS pipe buffer (~64KiB) and deadlocks a large print until the
+    // timeout kill — same contract as process_util::run_with_timeout.
+    let child_stdout = child.stdout.take();
+    let child_stderr = child.stderr.take();
+    let stdout_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = child_stdout {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = child_stderr {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
         match child.try_wait().context("waiting for python")? {
-            Some(status) => {
-                guard.disarm();
-                let mut stdout = Vec::new();
-                let mut stderr = Vec::new();
-                if let Some(mut pipe) = child.stdout.take() {
-                    let _ = pipe.read_to_end(&mut stdout);
-                }
-                if let Some(mut pipe) = child.stderr.take() {
-                    let _ = pipe.read_to_end(&mut stderr);
-                }
-                let stdout = String::from_utf8_lossy(&stdout).to_string();
-                let stderr = String::from_utf8_lossy(&stderr).to_string();
-                return Ok(PythonResult {
-                    output: stdout,
-                    error: if stderr.is_empty() {
-                        None
-                    } else {
-                        Some(stderr)
-                    },
-                    exit_code: status.code().unwrap_or(-1),
-                });
-            }
+            Some(status) => break status,
             None if Instant::now() >= deadline => {
                 guard.kill_now();
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = stdout_handle.join();
+                let _ = stderr_handle.join();
                 anyhow::bail!("python timed out after {timeout:?}");
             }
             None => std::thread::sleep(Duration::from_millis(10)),
         }
-    }
+    };
+    guard.disarm();
+    let stdout = stdout_handle.join().unwrap_or_default();
+    let stderr = stderr_handle.join().unwrap_or_default();
+    let stdout = String::from_utf8_lossy(&stdout).to_string();
+    let stderr = String::from_utf8_lossy(&stderr).to_string();
+    Ok(PythonResult {
+        output: stdout,
+        error: if stderr.is_empty() {
+            None
+        } else {
+            Some(stderr)
+        },
+        exit_code: status.code().unwrap_or(-1),
+    })
 }
 
 /// Check if Python is available
@@ -237,6 +252,30 @@ mod tests {
         let r = result.unwrap();
         assert_eq!(r.exit_code, 0);
         assert!(r.output.contains("Hello from Python"));
+    }
+
+    #[test]
+    fn test_execute_python_returns_large_stdout_without_deadlocking() {
+        // 2MB exceeds the typical OS pipe buffer. Reading pipes only after
+        // try_wait deadlocks until the 5s kill; draining concurrently must
+        // return Ok well before that budget.
+        let started = Instant::now();
+        let result = execute_python("print('x' * 2000000)")
+            .expect("2MB print must not deadlock on the stdout pipe");
+        assert_eq!(result.exit_code, 0, "stderr={:?}", result.error);
+        let xs = result.output.matches('x').count();
+        assert_eq!(
+            xs,
+            2_000_000,
+            "got {} x's (len {})",
+            xs,
+            result.output.len()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "large stdout must finish without waiting out the 5s kill, took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
