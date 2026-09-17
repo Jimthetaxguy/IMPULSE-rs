@@ -2318,6 +2318,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_bash_exec_cwd_outside_repo_root_escalates_to_confirm_and_a_plain_yes_is_refused() {
+        // cwd is a write-root path. Outside repo_root must not run on a
+        // plain "y"; the command must never execute.
+        let repo_root = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("tempdir");
+        let marker = outside.path().join("must-not-run.txt");
+        let tools = ReplToolRegistry::with_defaults();
+        let ctx = ReplContext {
+            repo_root: repo_root.path().to_path_buf(),
+            ..ReplContext::default()
+        };
+        let confirm = |_name: &str, _input: &Value, verdict: &GuardVerdict, _paths: &[PathBuf]| {
+            decide_approval(verdict, "y")
+        };
+        let untrusted_seen = std::sync::atomic::AtomicBool::new(false);
+        let executor = ReplToolExecutor {
+            tools: &tools,
+            ctx: &ctx,
+            confirm: &confirm,
+            untrusted_seen: &untrusted_seen,
+        };
+
+        let result = executor
+            .execute(
+                "bash_exec",
+                serde_json::json!({
+                    "command": format!("echo pwned > {}", marker.display()),
+                    "cwd": outside.path().display().to_string()
+                }),
+            )
+            .await;
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("declined"),
+            "plain y must not approve out-of-root bash cwd: {}",
+            result.content
+        );
+        assert!(!marker.exists(), "bash_exec must never have run");
+    }
+
+    #[tokio::test]
+    async fn test_bash_exec_cwd_outside_repo_root_confirm_still_refused_by_sandbox() {
+        let repo_root = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("tempdir");
+        let marker = outside.path().join("must-not-run.txt");
+        let tools = ReplToolRegistry::with_defaults();
+        let ctx = ReplContext {
+            repo_root: repo_root.path().to_path_buf(),
+            ..ReplContext::default()
+        };
+        let confirm = |_name: &str, _input: &Value, verdict: &GuardVerdict, _paths: &[PathBuf]| {
+            decide_approval(verdict, "CONFIRM")
+        };
+        let untrusted_seen = std::sync::atomic::AtomicBool::new(false);
+        let executor = ReplToolExecutor {
+            tools: &tools,
+            ctx: &ctx,
+            confirm: &confirm,
+            untrusted_seen: &untrusted_seen,
+        };
+
+        let result = executor
+            .execute(
+                "bash_exec",
+                serde_json::json!({
+                    "command": format!("echo pwned > {}", marker.display()),
+                    "cwd": outside.path().display().to_string()
+                }),
+            )
+            .await;
+        assert!(result.is_error, "sandbox must still refuse out-of-root cwd");
+        assert!(!marker.exists(), "bash_exec must never have run");
+    }
+
+    #[tokio::test]
     async fn test_file_write_outside_repo_root_escalates_to_confirm_and_a_plain_yes_is_refused() {
         // End-to-end acceptance test (Stage 1 lane acceptance criterion):
         // an out-of-root write must be refused BEFORE ToolRegistry::execute
