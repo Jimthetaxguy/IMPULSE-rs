@@ -263,9 +263,9 @@ asked for it -- but prints a loud warning first, since it effectively disables t
 `ReplContext::sandbox_tool_context` builds the `ToolContext` every one of those tools actually
 checks paths against -- `tool_bridge::DynamicToolBridge::run` for the bridged tools,
 `resolve_document_path`/`IonVerifyTool::run` directly for the other two, all against the same roots.
-`ion_repl::chat::ReplToolExecutor` independently checks a *pending* `file_write`/`bash_exec cwd`
+`ion_repl::chat::ReplToolExecutor` independently checks a *pending* `file_write` / `bash_exec cwd`
 call's resolved path(s) before confirmation, escalating an out-of-sandbox target to a literal
-`CONFIRM` gate; a heuristic scan of `bash_exec`'s shell TEXT (absolute-path tokens -- including
+`CONFIRM` gate (`bash_exec` cwd is a write-root check; `/allow` does not widen it); a heuristic scan of `bash_exec`'s shell TEXT (absolute-path tokens -- including
 one glued directly to a redirect/pipe with no whitespace, e.g. `>/tmp/f` or `</etc/passwd` -- plus
 `..`, `~`, `$HOME`/`${HOME}`, and an escaping `cd` target) escalates the same way but is explicitly
 advisory, not enforcement -- the sandbox does not confine what a shell command's own text can touch
@@ -277,9 +277,13 @@ delimiter) and scanned against `GuardTarget::ToolCall` built-in rules (documente
 false-positive-prone); a match sets a flag sticky for the rest of the SESSION (not just the turn,
 to survive both out-of-order batch confirmation and content persisting in history) that escalates
 every later gated call to the same `CONFIRM` gate, reset only by `/clear`. `governed_submit_claim`
-is a separate, non-bridged `ReplTool` that mutates daemon-owned governed-task state, is ungated,
-and is a conscious carry-forward gap: the sticky `untrusted_seen` escalation does not reach it
-because it never goes through `ReplToolExecutor`'s `CONFIRMATION_REQUIRED_TOOLS` gate at all.
+is a separate, non-bridged `ReplTool` that mutates daemon-owned governed-task state. Model-issued
+calls go through `CONFIRMATION_REQUIRED_TOOLS` with `bash_exec` and `file_write`, so a declined
+confirm never reaches `run` and sticky `untrusted_seen` escalates later claims to literal
+`CONFIRM`. CLI `"$IMPULSE_CONTROL_CLI" --daemon governed-claim` is the operator path and does not
+use this gate. `ion_verify`, `file_read`, `document_read`, `memory_search`, and `genome_read` stay
+ungated. `decide_step_model` is a different seam (which admitted model id this step uses) and is
+not this confirmation list.
 - **Source of truth:** `src/ion_repl/{mod,chat,tool_bridge,tool_document,tool_verify}.rs`,
   `src/guardrail/defaults.rs`, and
   `docs/superpowers/specs/2026-09-02-ion-tool-sandbox-and-untrusted-output.md`.
