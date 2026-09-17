@@ -208,6 +208,20 @@ mod tests {
     }
 
     #[test]
+    fn test_default_tools_schema_name_matches_name() {
+        let registry = ReplToolRegistry::with_defaults();
+        for tool in registry.list() {
+            let schema = tool.json_schema();
+            let schema_name = schema.get("name").and_then(|v| v.as_str());
+            assert_eq!(
+                schema_name,
+                Some(tool.name()),
+                "dispatch name and schema name must be the same identity"
+            );
+        }
+    }
+
+    #[test]
     fn test_register_rejects_duplicate_name() {
         let mut registry = ReplToolRegistry::new();
         registry
