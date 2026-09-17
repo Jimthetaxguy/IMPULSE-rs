@@ -1548,6 +1548,17 @@ mod tests {
             "ion_verify must stay outside CONFIRMATION_REQUIRED_TOOLS: {:?}",
             asked.lock().unwrap()
         );
+
+        asked.lock().unwrap().clear();
+        let genome = executor
+            .execute("genome_read", serde_json::json!({"section": "none"}))
+            .await;
+        assert!(!genome.content.contains("declined"));
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "genome_read must stay outside CONFIRMATION_REQUIRED_TOOLS: {:?}",
+            asked.lock().unwrap()
+        );
     }
 
     #[tokio::test]
