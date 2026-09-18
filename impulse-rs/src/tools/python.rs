@@ -2,8 +2,13 @@
 // Provides a safe way to run Python code from Rust
 
 use anyhow::{Context, Result};
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// Default wall-clock budget for `python3 -c` (calculator and python_exec).
+pub const DEFAULT_PYTHON_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct PythonResult {
@@ -12,25 +17,75 @@ pub struct PythonResult {
     pub exit_code: i32,
 }
 
-/// Execute Python code and return the result
-/// Uses system Python interpreter
+/// Execute Python code and return the result.
+/// Uses system Python interpreter. Bounded by [`DEFAULT_PYTHON_TIMEOUT`].
 pub fn execute_python(code: &str) -> Result<PythonResult> {
-    // Try python3 first, then python
+    execute_python_with_timeout(code, DEFAULT_PYTHON_TIMEOUT)
+}
+
+/// Execute Python with an explicit wall-clock budget. On timeout the child
+/// process group is killed (same contract as `bash_exec`).
+pub fn execute_python_with_timeout(code: &str, timeout: Duration) -> Result<PythonResult> {
     let python_cmd = if cfg!(target_os = "windows") {
         "python"
     } else {
         "python3"
     };
 
-    let output = Command::new(python_cmd)
-        .args(["-c", code])
-        .output()
-        .context("Failed to execute Python")?;
+    let mut cmd = Command::new(python_cmd);
+    cmd.args(["-c", code])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
 
-    let exit_code = output.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let mut child = cmd.spawn().context("Failed to execute Python")?;
+    let mut guard = crate::process_group::ProcessGroupGuard::new(Some(child.id()));
 
+    // Drain pipes while the child runs. Reading only after try_wait fills
+    // the OS pipe buffer (~64KiB) and deadlocks a large print until the
+    // timeout kill — same contract as process_util::run_with_timeout.
+    let child_stdout = child.stdout.take();
+    let child_stderr = child.stderr.take();
+    let stdout_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = child_stdout {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = child_stderr {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait().context("waiting for python")? {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                guard.kill_now();
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_handle.join();
+                let _ = stderr_handle.join();
+                anyhow::bail!("python timed out after {timeout:?}");
+            }
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    guard.disarm();
+    let stdout = stdout_handle.join().unwrap_or_default();
+    let stderr = stderr_handle.join().unwrap_or_default();
+    let stdout = String::from_utf8_lossy(&stdout).to_string();
+    let stderr = String::from_utf8_lossy(&stderr).to_string();
     Ok(PythonResult {
         output: stdout,
         error: if stderr.is_empty() {
@@ -38,7 +93,7 @@ pub fn execute_python(code: &str) -> Result<PythonResult> {
         } else {
             Some(stderr)
         },
-        exit_code,
+        exit_code: status.code().unwrap_or(-1),
     })
 }
 
@@ -197,6 +252,74 @@ mod tests {
         let r = result.unwrap();
         assert_eq!(r.exit_code, 0);
         assert!(r.output.contains("Hello from Python"));
+    }
+
+    #[test]
+    fn test_execute_python_returns_large_stdout_without_deadlocking() {
+        // 2MB exceeds the typical OS pipe buffer. Reading pipes only after
+        // try_wait deadlocks until the 5s kill; draining concurrently must
+        // return Ok well before that budget.
+        let started = Instant::now();
+        let result = execute_python("print('x' * 2000000)")
+            .expect("2MB print must not deadlock on the stdout pipe");
+        assert_eq!(result.exit_code, 0, "stderr={:?}", result.error);
+        let xs = result.output.matches('x').count();
+        assert_eq!(
+            xs,
+            2_000_000,
+            "got {} x's (len {})",
+            xs,
+            result.output.len()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "large stdout must finish without waiting out the 5s kill, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn test_execute_python_times_out_and_kills_the_child() {
+        // Unique token in python3 -c argv so a concurrent sleep cannot be
+        // mistaken for this child (same reason bash_exec uses a unique duration).
+        let marker = format!(
+            "ion-py-timeout-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let code = format!("import time; time.sleep(30) # {marker}");
+        let started = Instant::now();
+        let err = execute_python_with_timeout(&code, Duration::from_millis(300))
+            .expect_err("sleep must not run to completion");
+        let msg = err.to_string();
+        assert!(msg.contains("timed out"), "got {msg}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "kill must be prompt, took {:?}",
+            started.elapsed()
+        );
+        #[cfg(unix)]
+        {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let check = Command::new("pgrep")
+                    .args(["-f", &marker])
+                    .output()
+                    .expect("pgrep");
+                if check.stdout.is_empty() {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    panic!(
+                        "python child still alive after timeout: {}",
+                        String::from_utf8_lossy(&check.stdout)
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
     }
 
     #[test]

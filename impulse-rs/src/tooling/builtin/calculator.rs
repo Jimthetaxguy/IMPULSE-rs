@@ -17,12 +17,12 @@ impl DynamicTool for CalculatorTool {
         ToolDescriptor {
             id: "calculator".into(),
             name: "Calculator".into(),
-            description: "Evaluate mathematical expressions using Python".into(),
+            description: "Evaluate a mathematical expression (digits and + - * / % ( ) . e/E, whitespace; no names, sqrt, or abs). Times out after 5s.".into(),
             version: "0.1.0".into(),
             category: ToolCategory::Utility,
             params: vec![ToolParam {
                 name: "expression".into(),
-                description: "Mathematical expression to evaluate (e.g., '2 + 2', '(10 * 5) / 3')"
+                description: "Mathematical formula only: digits, + - * / % ( ) . e/E, whitespace. Example: '2 + 2', '(10 * 5) / 3'. No identifiers."
                     .into(),
                 param_type: ParamType::String,
                 required: true,
@@ -82,6 +82,11 @@ mod tests {
         assert_eq!(desc.id, "calculator");
         assert_eq!(desc.category, ToolCategory::Utility);
         assert_eq!(desc.params.len(), 1);
+        assert!(
+            desc.description.contains("digits") && desc.description.contains("no names"),
+            "descriptor must name the math grammar, got {}",
+            desc.description
+        );
     }
 
     #[test]
