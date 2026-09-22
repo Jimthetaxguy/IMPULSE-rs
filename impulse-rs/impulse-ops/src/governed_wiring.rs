@@ -247,6 +247,16 @@ pub fn staged_worktree_is_discardable(task: &GovernedTaskRun) -> bool {
     if task.execution_state == GovernedExecutionState::LaunchFailed {
         return true;
     }
+    // A mid-run cancel marks the runtime exited while review is still awaiting
+    // a claim. That checkout will not be promoted, so it is reclaimable the
+    // same way a launch failure is. An accepted exit is a different state: the
+    // happy-path promote window stays protected until a promotion outcome
+    // exists (see the `Accepted` arm below).
+    if task.execution_state == GovernedExecutionState::RuntimeExited
+        && task.review_state == GovernedReviewState::AwaitingClaim
+    {
+        return true;
+    }
     // A worktree with no shared-configuration pin can never be promoted, so
     // discarding it is the only way forward and must always be available.
     if task
@@ -790,6 +800,28 @@ mod tests {
 
         let unpinned = with_staged(task(), SharedRepositoryConfigPin::Unknown);
         assert!(staged_worktree_is_discardable(&unpinned));
+    }
+
+    /// ADR-0019 miss: cancelling a run records `RuntimeExited` and leaves
+    /// review at `AwaitingClaim`. That checkout is as unused as a launch that
+    /// never started. The accepted promote path uses the same execution state
+    /// and must stay non-discardable until a promotion outcome exists.
+    #[test]
+    fn test_runtime_exited_while_awaiting_claim_is_discardable_like_launch_failed() {
+        let mut cancelled = with_staged(task(), pinned());
+        cancelled.execution_state = GovernedExecutionState::RuntimeExited;
+        cancelled.review_state = GovernedReviewState::AwaitingClaim;
+        assert!(
+            staged_worktree_is_discardable(&cancelled),
+            "a mid-run cancel must be reclaimable, the same as a launch failure"
+        );
+
+        let mut accepted = cancelled;
+        accepted.review_state = GovernedReviewState::Accepted;
+        assert!(
+            !staged_worktree_is_discardable(&accepted),
+            "an accepted run with no promotion outcome still owns its checkout"
+        );
     }
 
     #[test]
