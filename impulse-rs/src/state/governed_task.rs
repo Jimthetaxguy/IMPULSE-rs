@@ -1480,6 +1480,21 @@ fn apply_mutation(
             ) {
                 return invalid_transition("review state does not accept a worker claim");
             }
+            // A staged claim names work in the disposable checkout. After
+            // discard — or if the checkout was never materialized — there is
+            // no tree to claim against. Authoritative tasks have no staged
+            // worktree and stay admissible. Replay does not re-judge this: a
+            // ledger written before the gate may already contain the
+            // transition, and failing it closed would unload every other task
+            // in the file (see `MutationContext::is_replay`).
+            if !context.is_replay
+                && task.world_scope.requires_staged_worktree()
+                && task.active_staged_worktree().is_none()
+            {
+                return invalid_transition(
+                    "a staged_authoritative claim requires an active staged worktree",
+                );
+            }
             require_text("claim summary", &claim.summary)?;
             require_bounded_text(
                 "claim subject revision",
@@ -4197,6 +4212,83 @@ pub(in crate::state) mod tests {
                 .map(|staged| staged.status),
             Some(StagedWorktreeStatus::Discarded)
         );
+    }
+
+    /// After a mid-run cancel the checkout can be discarded while review is
+    /// still `AwaitingClaim`. A later claim has no tree to name and must be
+    /// refused. Review stays awaiting a claim; this gate does not move it.
+    #[test]
+    fn test_submit_claim_refuses_after_discarded_staged_worktree() {
+        let (_root, state) = state();
+        let task = state
+            .register_governed_task(staged_registration(&state, "claim-after-discard"))
+            .unwrap();
+        let task = materialize(&state, &task, "claim-after-discard-worktree");
+        let task = launch(&state, &task, "claim-after-discard-run");
+        let exited = state
+            .mutate_governed_task(mutation(
+                &task,
+                "claim-after-discard-exit",
+                GovernedTaskMutation::MarkRuntimeExited {
+                    actor: actor(GovernedActorKind::System, "impulse-daemon"),
+                    reason: Some("operator cancelled the run".into()),
+                },
+            ))
+            .unwrap();
+        assert_eq!(
+            exited.execution_state,
+            GovernedExecutionState::RuntimeExited
+        );
+        assert_eq!(exited.review_state, GovernedReviewState::AwaitingClaim);
+
+        let discarded = state
+            .mutate_governed_task(mutation(
+                &exited,
+                "claim-after-discard-discard",
+                GovernedTaskMutation::DiscardStagedWorktree {
+                    actor: actor(GovernedActorKind::System, "impulse-daemon"),
+                    reason: "mid-run cancel left an unused checkout".into(),
+                },
+            ))
+            .unwrap();
+        assert!(discarded.active_staged_worktree().is_none());
+        assert_eq!(
+            discarded
+                .staged_worktree
+                .as_ref()
+                .map(|staged| staged.status),
+            Some(StagedWorktreeStatus::Discarded)
+        );
+        assert_eq!(discarded.review_state, GovernedReviewState::AwaitingClaim);
+
+        let error = state
+            .mutate_governed_task(mutation(
+                &discarded,
+                "claim-after-discard-claim",
+                GovernedTaskMutation::SubmitClaim {
+                    claim: WorkerCompletionClaimInput {
+                        actor: actor(GovernedActorKind::Worker, "worker-1"),
+                        summary: "implementation complete".into(),
+                        subject_revision: staged_oid('b'),
+                        artifact_ids: vec![],
+                        diff_ref: None,
+                    },
+                },
+            ))
+            .expect_err("a discarded staged checkout cannot accept a worker claim");
+        assert!(error.to_string().contains("active staged worktree"));
+
+        let stored = state
+            .get_governed_task("impulse-test", &discarded.id)
+            .unwrap()
+            .expect("the discarded task remains on the ledger");
+        assert!(stored.claims.is_empty());
+        assert_eq!(stored.review_state, GovernedReviewState::AwaitingClaim);
+        assert_eq!(
+            stored.execution_state,
+            GovernedExecutionState::RuntimeExited
+        );
+        assert_eq!(stored.revision, discarded.revision);
     }
 
     #[test]
