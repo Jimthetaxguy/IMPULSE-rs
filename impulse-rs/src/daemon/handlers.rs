@@ -1170,6 +1170,13 @@ fn preflight_claim(
     ) {
         anyhow::bail!("governed task review state does not accept a worker claim");
     }
+    // Same gate as the ledger's `SubmitClaim` arm, so the daemon refuses
+    // before it runs Git. A discarded checkout is `Some` with status
+    // `Discarded`; `active_staged_worktree` is what makes that inactive.
+    // Authoritative tasks are unchanged.
+    if task.world_scope.requires_staged_worktree() && task.active_staged_worktree().is_none() {
+        anyhow::bail!("governed claim requires an active staged worktree");
+    }
     if task.claims.len() >= impulse_ops::governed_task::MAX_GOVERNED_RECORDS_PER_KIND {
         anyhow::bail!("governed worker claim capacity is exhausted");
     }
@@ -3399,5 +3406,52 @@ mod governed_producer_handler_tests {
             .unwrap()
             .unwrap();
         assert_eq!(persisted, accepted);
+    }
+
+    #[test]
+    fn test_preflight_claim_refuses_staged_scope_without_an_active_worktree() {
+        let task: impulse_ops::governed_task::GovernedTaskRun =
+            serde_json::from_value(serde_json::json!({
+                "id": "task-1",
+                "revision": 4,
+                "project_id": "impulse-test",
+                "workspace_root": "/tmp/impulse-test",
+                "task": "Ship the staged scope",
+                "world_scope": "staged_authoritative",
+                "runtime_id": "ion",
+                "agent_id": "worker-1",
+                "execution_state": "runtime_exited",
+                "review_state": "awaiting_claim",
+                "staged_worktree": {
+                    "id": "staged-1",
+                    "actor": { "kind": "system", "id": "impulse-daemon" },
+                    "root": "/tmp/impulse-test/.impulse/worktrees/task-1",
+                    "initial_subject_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "status": "discarded",
+                    "materialized_at": "2026-09-23T00:00:00Z",
+                    "based_on_revision": 2
+                },
+                "created_at": "2026-09-23T00:00:00Z",
+                "updated_at": "2026-09-23T00:00:00Z"
+            }))
+            .expect("fixture task deserializes");
+        assert!(task.active_staged_worktree().is_none());
+        let request = GovernedClaimRequest {
+            request_id: GovernedRequestId::try_new("claim-after-discard").unwrap(),
+            project_id: "impulse-test".into(),
+            task_id: task.id.clone(),
+            expected_revision: task.revision,
+            summary: "implementation complete".into(),
+            artifact_ids: Vec::new(),
+        };
+        let error = super::preflight_claim(&task, &request)
+            .expect_err("a discarded staged checkout is not claimable");
+        assert!(error.to_string().contains("active staged worktree"));
+
+        let mut authoritative = task;
+        authoritative.world_scope = impulse_ops::governed_task::WorldScope::Authoritative;
+        authoritative.staged_worktree = None;
+        super::preflight_claim(&authoritative, &request)
+            .expect("an authoritative claim does not need a staged worktree");
     }
 }
