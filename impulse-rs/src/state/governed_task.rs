@@ -1989,6 +1989,17 @@ pub(crate) fn staged_worktree_is_discardable(task: &GovernedTaskRun) -> bool {
     if task.execution_state == GovernedExecutionState::LaunchFailed {
         return true;
     }
+    // A mid-run cancel marks the runtime exited while review is still awaiting
+    // a claim. That checkout will not be promoted, so it is reclaimable the
+    // same way a launch failure is. An accepted exit is a different state: the
+    // happy-path promote window stays protected until a promotion outcome
+    // exists (see the `Accepted` arm below). Keep this clause identical to
+    // `impulse_ops::governed_wiring::staged_worktree_is_discardable`.
+    if task.execution_state == GovernedExecutionState::RuntimeExited
+        && task.review_state == GovernedReviewState::AwaitingClaim
+    {
+        return true;
+    }
     // A worktree whose shared-configuration pin this build cannot compare —
     // absent, or recorded under a superseded digest scheme — can never be
     // promoted, so discarding it is the only way forward and must always be
@@ -4132,6 +4143,60 @@ pub(in crate::state) mod tests {
         assert!(error
             .to_string()
             .contains("after rejection or a completed promotion"));
+    }
+
+    /// ADR-0019: a cancel records runtime exit and leaves review awaiting a
+    /// claim. The ledger must accept the discard. The same execution state
+    /// after acceptance, with no promotion, must still refuse.
+    #[test]
+    fn test_runtime_exited_while_awaiting_claim_can_discard_the_staged_worktree() {
+        let (_root, state) = state();
+        let task = state
+            .register_governed_task(staged_registration(&state, "cancel-discard"))
+            .unwrap();
+        let task = materialize(&state, &task, "cancel-discard-worktree");
+        let task = launch(&state, &task, "cancel-discard-run");
+        let exited = state
+            .mutate_governed_task(mutation(
+                &task,
+                "cancel-discard-exit",
+                GovernedTaskMutation::MarkRuntimeExited {
+                    actor: actor(GovernedActorKind::System, "impulse-daemon"),
+                    reason: Some("operator cancelled the run".into()),
+                },
+            ))
+            .unwrap();
+        assert_eq!(
+            exited.execution_state,
+            GovernedExecutionState::RuntimeExited
+        );
+        assert_eq!(exited.review_state, GovernedReviewState::AwaitingClaim);
+        assert!(staged_worktree_is_discardable(&exited));
+
+        let mut accepted = exited.clone();
+        accepted.review_state = GovernedReviewState::Accepted;
+        assert!(
+            !staged_worktree_is_discardable(&accepted),
+            "an accepted exit with no promotion still owns its checkout"
+        );
+
+        let discarded = state
+            .mutate_governed_task(mutation(
+                &exited,
+                "cancel-discard-discard",
+                GovernedTaskMutation::DiscardStagedWorktree {
+                    actor: actor(GovernedActorKind::System, "impulse-daemon"),
+                    reason: "mid-run cancel left an unused checkout".into(),
+                },
+            ))
+            .expect("a cancelled run's staged worktree must be discardable");
+        assert_eq!(
+            discarded
+                .staged_worktree
+                .as_ref()
+                .map(|staged| staged.status),
+            Some(StagedWorktreeStatus::Discarded)
+        );
     }
 
     #[test]

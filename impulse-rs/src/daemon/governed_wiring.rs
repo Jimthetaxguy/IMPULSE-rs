@@ -471,7 +471,8 @@ async fn discard_governed_staged_worktree(
     if !staged_worktree_is_discardable(&task) {
         anyhow::bail!(
             "a staged worktree is discarded only after a rejection, an escalation, a launch \
-             failure, or a recorded promotion outcome; this task is execution={:?} review={:?}",
+             failure, a runtime that exited before a claim, or a recorded promotion outcome; \
+             this task is execution={:?} review={:?}",
             task.execution_state,
             task.review_state
         );
