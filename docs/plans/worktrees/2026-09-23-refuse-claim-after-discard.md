@@ -21,7 +21,7 @@ tags: [worktree, lane, handoff]
 - Blocked/shared paths: `decide_step_model`, Ion expand, NanoMachine, discard predicates, review-state transitions
 - Plan/spec: ADR-0019 follow-on after #67 (`fbb9c10`)
 - Verification: `cargo +stable test --locked` for the governed-task ledger test and the claim preflight
-- Latest status: implementing the thin gate
+- Latest status: draft PR https://github.com/Jimthetaxguy/IMPULSE-rs/pull/68 ; relevant locked tests passed
 
 ## Decisions
 - 2026-09-23: staged-scope `SubmitClaim` requires an active staged worktree. Review stays `AwaitingClaim` after a mid-run cancel. Accepted-without-promotion discard stays as it is.
@@ -31,8 +31,10 @@ tags: [worktree, lane, handoff]
 - `preflight_claim` refuses with the same condition before Git runs.
 
 ## Tests
-- `test_submit_claim_refuses_after_discarded_staged_worktree`
-- `test_preflight_claim_refuses_staged_scope_without_an_active_worktree`
+- `test_submit_claim_refuses_after_discarded_staged_worktree` — passed
+- `test_preflight_claim_refuses_staged_scope_without_an_active_worktree` — passed
+- `test_runtime_exited_while_awaiting_claim_can_discard_the_staged_worktree` — passed
+- `daemon_owned_producers_complete_one_persistent_governed_run` — passed (authoritative claim still admitted)
 
 ## Handoff
 - Open item: Supervisor review may still be requested while review is `AwaitingClaim` after cancel. That is a separate, stronger follow-on.
