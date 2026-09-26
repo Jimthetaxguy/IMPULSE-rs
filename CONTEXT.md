@@ -503,11 +503,23 @@ conceptual parity does not imply identical enforcement.
 
 ### calculator — `[code]`
 The `calculator` tool evaluates a mathematical expression only: digits, `+ - * / % ( ) .`,
-scientific `e`/`E`, and whitespace. No identifiers, `sqrt`, `abs`, or other names. Input is
-still interpolated into `python3 -c` after that allowlist; the interpolating format string is
-not a sandbox. Evaluation is bounded by a 5s wall-clock timeout that kills the child.
-- **Source of truth:** `src/tools/python.rs` (`is_restricted_math_expression`, `calculate`,
-  `execute_python_with_timeout`) and `src/tooling/builtin/calculator.rs`.
+scientific `e`/`E`, and whitespace. No identifiers, `sqrt`, `abs`, or other names. The allowed
+expression is then evaluated inside the Python sandbox below, so the allowlist is defense in depth,
+not the boundary.
+- **Source of truth:** `src/tools/python.rs` (`is_restricted_math_expression`, `calculate`) and
+  `src/tooling/builtin/calculator.rs`.
+
+### Python sandbox — `[code]`
+`calculator`, `python_exec`, `calc`, and `exec` run Python inside Monty, pydantic's Python interpreter
+written in Rust, in process. No host functions, mounts, or inputs are wired, so the code has no
+filesystem, network, process, or environment access (`open()` and `os.getenv()` raise
+`NotImplementedError`; `subprocess` and `socket` do not exist). Limits: 64 MiB heap, 5 s wall clock,
+16 MiB of collected print output; `time.sleep` returns at once. Every failure comes back as a `PythonResult`
+whose `fault` is one of `syntax`, `unsupported`, `runtime`, `timeout`, `memory`; nothing falls back to
+system CPython. The interpreter shares the daemon process, so a stack-overflow or allocator abort is
+not isolated (ADR-0021 follow-up: `monty-pool`). Distinct from `src/monty/`, the unbuilt PyO3 stub.
+- **Source of truth:** `src/tools/python.rs` (`execute_python`, `execute_python_with_timeout`,
+  `PythonResult`, `fault`) and ADR-0021.
 
 ### supervisor policy — `[code]`
 The concrete permission and confirmation policy for supervisor actions such as monitoring, memory

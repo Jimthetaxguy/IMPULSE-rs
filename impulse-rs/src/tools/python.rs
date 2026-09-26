@@ -1,169 +1,161 @@
-// Python integration module - execute Python code for calculations and data processing
-// Provides a safe way to run Python code from Rust
+//! Sandboxed Python execution for the calculator and python_exec tools.
+//!
+//! Code runs inside Monty, pydantic's Python interpreter written in Rust, in
+//! this process. No host functions, filesystem mounts, or inputs are wired,
+//! so the interpreter is the whole boundary: programs have no filesystem,
+//! network, process, or environment access. Time and memory budgets are
+//! enforced by the interpreter and come back as typed faults on
+//! [`PythonResult`]. Nothing here falls back to system CPython.
+//!
+//! Crash isolation is not provided: a stack-overflow or allocator abort inside
+//! Monty takes this process down. `monty-pool` (subprocess workers) is the
+//! follow-up for that. See ADR-0021.
 
-use anyhow::{Context, Result};
-use std::io::Read;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use anyhow::{anyhow, Result};
+use monty::MontyRun;
+use monty_types::{
+    CompileOptions, ExcType, MontyException, OsPolicy, PrintWriter, ResourceLimits,
+    ResourceTracker, SleepMode, MONTY_VERSION,
+};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::time::Duration;
 
-/// Default wall-clock budget for `python3 -c` (calculator and python_exec).
+/// Default wall-clock budget for one program (calculator and python_exec).
 pub const DEFAULT_PYTHON_TIMEOUT: Duration = Duration::from_secs(5);
+/// Heap budget for one program, enforced by Monty's allocation accounting.
+pub const DEFAULT_PYTHON_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
+/// Cap on collected `print` output. Exceeding it is a [`fault::MEMORY`] fault.
+pub const DEFAULT_PYTHON_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
+/// File name shown in tracebacks.
+const SCRIPT_NAME: &str = "exec.py";
 
-#[derive(Debug, Clone)]
+/// Failure classes reported in [`PythonResult::fault`]. Callers branch on these
+/// instead of parsing `error` text.
+pub mod fault {
+    /// The code did not parse.
+    pub const SYNTAX: &str = "syntax";
+    /// The code parsed but uses a Python feature or module the sandbox does not implement.
+    pub const UNSUPPORTED: &str = "unsupported";
+    /// An ordinary Python exception escaped the program.
+    pub const RUNTIME: &str = "runtime";
+    /// The wall-clock budget was exhausted.
+    pub const TIMEOUT: &str = "timeout";
+    /// The memory budget (heap or collected print output) was exhausted.
+    pub const MEMORY: &str = "memory";
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PythonResult {
     pub output: String,
     pub error: Option<String>,
     pub exit_code: i32,
+    /// Which [`fault`] class produced `error`, if any. `None` means the program
+    /// ran to completion.
+    pub fault: Option<&'static str>,
 }
 
-/// Execute Python code and return the result.
-/// Uses system Python interpreter. Bounded by [`DEFAULT_PYTHON_TIMEOUT`].
+/// Run a Python program in the sandbox under the default budgets.
 pub fn execute_python(code: &str) -> Result<PythonResult> {
     execute_python_with_timeout(code, DEFAULT_PYTHON_TIMEOUT)
 }
 
-/// Execute Python with an explicit wall-clock budget. On timeout the child
-/// process group is killed (same contract as `bash_exec`).
+/// Run a Python program in the sandbox with an explicit wall-clock budget.
+///
+/// Program failures of every class are `Ok(PythonResult { fault: Some(..) })`.
+/// `Err` is reserved for the interpreter itself failing (a Rust panic inside
+/// Monty), which is a bug in the interpreter, not a property of the program.
 pub fn execute_python_with_timeout(code: &str, timeout: Duration) -> Result<PythonResult> {
-    let python_cmd = if cfg!(target_os = "windows") {
-        "python"
-    } else {
-        "python3"
+    let limits = ResourceLimits {
+        max_memory: Some(DEFAULT_PYTHON_MEMORY_LIMIT),
+        max_feed_duration: Some(timeout),
+        ..ResourceLimits::default()
     };
+    catch_interpreter_panic(|| run_sandboxed(code, limits))
+}
 
-    let mut cmd = Command::new(python_cmd);
-    cmd.args(["-c", code])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
+/// Compile and run `code` with no inputs, no host functions, and no mounts.
+fn run_sandboxed(code: &str, limits: ResourceLimits) -> PythonResult {
+    let mut output = String::new();
+    let outcome = MontyRun::new(
+        code.to_owned(),
+        SCRIPT_NAME,
+        vec![],
+        CompileOptions::default(),
+    )
+    .and_then(|runner| {
+        // Sleeps return at once, so a program cannot hold the caller for the
+        // whole budget while spending none of it.
+        let mut runner = runner.with_os_policy(OsPolicy {
+            sleep: SleepMode::Zero,
+            ..OsPolicy::default()
+        });
+        let sink = PrintWriter::CollectString(&mut output, Some(DEFAULT_PYTHON_OUTPUT_LIMIT));
+        // The final expression's value is dropped, as `python3 -c` did.
+        runner
+            .run(vec![], ResourceTracker::new(limits), sink)
+            .map(|_final_value| ())
+    });
+    match outcome {
+        Ok(()) => PythonResult {
+            output,
+            error: None,
+            exit_code: 0,
+            fault: None,
+        },
+        // Exit code 1 is what `python3 -c` reported for an uncaught exception,
+        // so callers that branch on it keep working.
+        Err(exc) => PythonResult {
+            output,
+            error: Some(exc.to_string()),
+            exit_code: 1,
+            fault: Some(classify(&exc)),
+        },
     }
+}
 
-    let mut child = cmd.spawn().context("Failed to execute Python")?;
-    let mut guard = crate::process_group::ProcessGroupGuard::new(Some(child.id()));
+/// Map a Monty exception to a [`fault`] class. A program that raises
+/// `TimeoutError` or `MemoryError` itself lands in the same class as the
+/// matching budget; callers do not need to tell those apart.
+fn classify(exc: &MontyException) -> &'static str {
+    match exc.exc_type() {
+        ExcType::SyntaxError => fault::SYNTAX,
+        // Monty raises NotImplementedError for Python it does not implement and
+        // ModuleNotFoundError for modules outside its stdlib subset.
+        ExcType::NotImplementedError | ExcType::ModuleNotFoundError => fault::UNSUPPORTED,
+        ExcType::TimeoutError => fault::TIMEOUT,
+        ExcType::MemoryError => fault::MEMORY,
+        _ => fault::RUNTIME,
+    }
+}
 
-    // Drain pipes while the child runs. Reading only after try_wait fills
-    // the OS pipe buffer (~64KiB) and deadlocks a large print until the
-    // timeout kill — same contract as process_util::run_with_timeout.
-    let child_stdout = child.stdout.take();
-    let child_stderr = child.stderr.take();
-    let stdout_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut pipe) = child_stdout {
-            let _ = pipe.read_to_end(&mut buf);
-        }
-        buf
-    });
-    let stderr_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut pipe) = child_stderr {
-            let _ = pipe.read_to_end(&mut buf);
-        }
-        buf
-    });
-
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait().context("waiting for python")? {
-            Some(status) => break status,
-            None if Instant::now() >= deadline => {
-                guard.kill_now();
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_handle.join();
-                let _ = stderr_handle.join();
-                anyhow::bail!("python timed out after {timeout:?}");
-            }
-            None => std::thread::sleep(Duration::from_millis(10)),
-        }
-    };
-    guard.disarm();
-    let stdout = stdout_handle.join().unwrap_or_default();
-    let stderr = stderr_handle.join().unwrap_or_default();
-    let stdout = String::from_utf8_lossy(&stdout).to_string();
-    let stderr = String::from_utf8_lossy(&stderr).to_string();
-    Ok(PythonResult {
-        output: stdout,
-        error: if stderr.is_empty() {
-            None
-        } else {
-            Some(stderr)
-        },
-        exit_code: status.code().unwrap_or(-1),
+/// Keep an interpreter panic from unwinding into the daemon. Aborts (stack
+/// overflow, allocator failure) cannot be caught here; see the module docs.
+fn catch_interpreter_panic(run: impl FnOnce() -> PythonResult) -> Result<PythonResult> {
+    catch_unwind(AssertUnwindSafe(run)).map_err(|payload| {
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("unknown panic payload");
+        anyhow!("python sandbox panicked: {message}")
     })
 }
 
-/// Check if Python is available
+/// The sandbox is compiled into this binary, so it is always available. Kept
+/// for the `system` and `health` surfaces that report interpreter presence.
 pub fn is_python_available() -> bool {
-    let python_cmd = if cfg!(target_os = "windows") {
-        "python"
-    } else {
-        "python3"
-    };
-
-    Command::new(python_cmd)
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    true
 }
 
-/// Get Python version
+/// Version of the embedded interpreter. This is Monty's version, not a CPython
+/// version; Monty implements a subset of Python.
 pub fn get_python_version() -> Option<String> {
-    let python_cmd = if cfg!(target_os = "windows") {
-        "python"
-    } else {
-        "python3"
-    };
-
-    Command::new(python_cmd)
-        .arg("--version")
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                Some(String::from_utf8_lossy(&o.stdout).to_string())
-            } else {
-                None
-            }
-        })
-}
-
-/// Execute a Python script file
-pub fn execute_script(script_path: &PathBuf) -> Result<PythonResult> {
-    let python_cmd = if cfg!(target_os = "windows") {
-        "python"
-    } else {
-        "python3"
-    };
-
-    let output = Command::new(python_cmd)
-        .arg(script_path)
-        .output()
-        .context("Failed to execute Python script")?;
-
-    let exit_code = output.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-    Ok(PythonResult {
-        output: stdout,
-        error: if stderr.is_empty() {
-            None
-        } else {
-            Some(stderr)
-        },
-        exit_code,
-    })
+    Some(format!("Monty {MONTY_VERSION} (embedded Python sandbox)"))
 }
 
 /// True when `expression` is a numeric formula only (digits, `+ - * / % ( ) .`,
-/// optional scientific `e`/`E`, whitespace). Rejects identifiers so
-/// `calculate()` cannot interpolate arbitrary Python into `python3 -c`.
+/// optional scientific `e`/`E`, whitespace). Rejects identifiers. The sandbox
+/// is the security boundary; this keeps the calculator a calculator.
 pub fn is_restricted_math_expression(expression: &str) -> bool {
     let trimmed = expression.trim();
     if trimmed.is_empty() {
@@ -187,12 +179,11 @@ pub fn is_restricted_math_expression(expression: &str) -> bool {
     true
 }
 
-/// Calculate expression using Python (`python3 -c`), after restricting the
-/// input to a mathematical expression. The interpolating format string is
-/// not a sandbox; the allowlist is.
+/// Evaluate a mathematical expression in the sandbox after restricting the
+/// input to a numeric formula.
 pub fn calculate(expression: &str) -> Result<String> {
     if !is_restricted_math_expression(expression) {
-        return Err(anyhow::anyhow!(
+        return Err(anyhow!(
             "calculate() accepts a mathematical expression only (digits and + - * / % ( ) . e); got non-math input"
         ));
     }
@@ -204,7 +195,7 @@ pub fn calculate(expression: &str) -> Result<String> {
     let result = execute_python(&code)?;
 
     if result.exit_code != 0 {
-        return Err(anyhow::anyhow!("Calculation error: {:?}", result.error));
+        return Err(anyhow!("Calculation error: {:?}", result.error));
     }
 
     // Parse JSON output
@@ -220,29 +211,23 @@ pub fn calculate(expression: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
-    fn test_is_python_available_consistent_with_version() {
-        let available = is_python_available();
-        if available {
-            assert!(
-                get_python_version().is_some(),
-                "if python is available, version should be Some"
-            );
-        }
+    fn test_is_python_available_always_true_for_embedded_sandbox() {
+        assert!(is_python_available());
+        let version = get_python_version().expect("embedded interpreter has a version");
+        assert!(version.contains("Monty"), "got {version}");
     }
 
     #[test]
-    fn test_get_python_version_format_when_present() {
-        let version = get_python_version();
-        if let Some(v) = version {
-            // Version may be "3.12.0" or "Python 3.12.0" depending on platform
-            assert!(v.contains('.'), "version should contain dot separator: {v}");
-            assert!(
-                v.chars().any(|c| c.is_ascii_digit()),
-                "version should contain digits: {v}"
-            );
-        }
+    fn test_get_python_version_format_contains_dotted_number() {
+        let v = get_python_version().expect("version");
+        assert!(v.contains('.'), "version should contain dot separator: {v}");
+        assert!(
+            v.chars().any(|c| c.is_ascii_digit()),
+            "version should contain digits: {v}"
+        );
     }
 
     #[test]
@@ -255,13 +240,11 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_python_returns_large_stdout_without_deadlocking() {
-        // 2MB exceeds the typical OS pipe buffer. Reading pipes only after
-        // try_wait deadlocks until the 5s kill; draining concurrently must
-        // return Ok well before that budget.
+    fn test_execute_python_returns_large_stdout_in_full() {
+        // 2MB of output sits under the 16 MiB print cap and the 64 MiB heap
+        // budget, so it must come back complete and well inside the budget.
         let started = Instant::now();
-        let result = execute_python("print('x' * 2000000)")
-            .expect("2MB print must not deadlock on the stdout pipe");
+        let result = execute_python("print('x' * 2000000)").expect("2MB print must succeed");
         assert_eq!(result.exit_code, 0, "stderr={:?}", result.error);
         let xs = result.output.matches('x').count();
         assert_eq!(
@@ -273,53 +256,20 @@ mod tests {
         );
         assert!(
             started.elapsed() < Duration::from_secs(3),
-            "large stdout must finish without waiting out the 5s kill, took {:?}",
+            "large output must finish quickly, took {:?}",
             started.elapsed()
         );
     }
 
     #[test]
-    fn test_execute_python_times_out_and_kills_the_child() {
-        // Unique token in python3 -c argv so a concurrent sleep cannot be
-        // mistaken for this child (same reason bash_exec uses a unique duration).
-        let marker = format!(
-            "ion-py-timeout-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
-        let code = format!("import time; time.sleep(30) # {marker}");
-        let started = Instant::now();
-        let err = execute_python_with_timeout(&code, Duration::from_millis(300))
-            .expect_err("sleep must not run to completion");
-        let msg = err.to_string();
-        assert!(msg.contains("timed out"), "got {msg}");
+    fn test_catch_interpreter_panic_returns_err_with_message() {
+        let err = catch_interpreter_panic(|| panic!("boom in monty"))
+            .expect_err("a panic must become Err, not unwind");
+        assert!(err.to_string().contains("boom in monty"), "got {err}");
         assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "kill must be prompt, took {:?}",
-            started.elapsed()
+            err.to_string().contains("python sandbox panicked"),
+            "got {err}"
         );
-        #[cfg(unix)]
-        {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            loop {
-                let check = Command::new("pgrep")
-                    .args(["-f", &marker])
-                    .output()
-                    .expect("pgrep");
-                if check.stdout.is_empty() {
-                    break;
-                }
-                if Instant::now() >= deadline {
-                    panic!(
-                        "python child still alive after timeout: {}",
-                        String::from_utf8_lossy(&check.stdout)
-                    );
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        }
     }
 
     #[test]
@@ -334,6 +284,15 @@ mod tests {
         let result = calculate("(10 + 5) * 2");
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "\"30\"");
+    }
+
+    #[test]
+    fn test_calculate_division_by_zero_returns_err() {
+        let err = calculate("1 / 0").expect_err("division by zero is a calculation error");
+        assert!(
+            err.to_string().contains("ZeroDivisionError"),
+            "error should carry the Python exception, got {err}"
+        );
     }
 
     #[test]
@@ -353,11 +312,165 @@ mod tests {
     #[test]
     fn test_calculate_rejects_python_injection() {
         let err = calculate("__import__('os').system('id')")
-            .expect_err("arbitrary python must not reach python3 -c");
+            .expect_err("arbitrary python must not reach the interpreter");
         let msg = err.to_string();
         assert!(
             msg.contains("mathematical expression only"),
             "error should name the math-only contract, got {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod python_sandbox_tests {
+    //! Boundary tests. The interpreter is the whole sandbox, so every probe
+    //! below must come back as a `PythonResult` carrying a fault and must leave
+    //! no trace on the host.
+    use super::*;
+    use std::time::Instant;
+
+    fn marker_path(tag: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(format!("{tag}.touched"));
+        (dir, path)
+    }
+
+    #[test]
+    fn test_execute_python_import_subprocess_returns_fault_and_runs_nothing() {
+        let (_dir, marker) = marker_path("subprocess");
+        let code = format!(
+            "import subprocess\nsubprocess.run([\"touch\", {:?}])\n",
+            marker.display().to_string()
+        );
+        let result = execute_python(&code).expect("sandbox faults are results, not errors");
+        assert_eq!(
+            result.fault,
+            Some(fault::UNSUPPORTED),
+            "import subprocess must fault as unsupported, got {result:?}"
+        );
+        assert_ne!(result.exit_code, 0);
+        assert!(!marker.exists(), "subprocess.run must not reach the host");
+    }
+
+    #[test]
+    fn test_execute_python_open_etc_passwd_returns_fault_and_reads_nothing() {
+        let result = execute_python("print(open(\"/etc/passwd\").read())\n").expect("result");
+        assert!(result.fault.is_some(), "open() must fault, got {result:?}");
+        assert!(
+            !result.output.contains("root:"),
+            "host file contents leaked: {}",
+            result.output
+        );
+        assert!(result.output.is_empty(), "got output {:?}", result.output);
+    }
+
+    #[test]
+    fn test_execute_python_dunder_import_os_system_returns_fault_and_runs_nothing() {
+        let (_dir, marker) = marker_path("os-system");
+        let code = format!(
+            "__import__(\"os\").system(\"touch {}\")\n",
+            marker.display()
+        );
+        let result = execute_python(&code).expect("result");
+        assert!(
+            result.fault.is_some(),
+            "os.system must fault, got {result:?}"
+        );
+        assert!(!marker.exists(), "os.system must not reach the host");
+    }
+
+    #[test]
+    fn test_execute_python_infinite_loop_returns_timeout_fault_within_budget() {
+        let budget = Duration::from_millis(500);
+        let started = Instant::now();
+        let result = execute_python_with_timeout("while True:\n    pass\n", budget)
+            .expect("a timeout is a result, not an error");
+        let elapsed = started.elapsed();
+        assert_eq!(result.fault, Some(fault::TIMEOUT), "got {result:?}");
+        assert_ne!(result.exit_code, 0);
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "timeout must fire near the budget, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn test_execute_python_large_allocation_returns_memory_fault() {
+        let result =
+            execute_python("x = [0] * (200 * 1024 * 1024)\nprint(len(x))\n").expect("result");
+        assert_eq!(result.fault, Some(fault::MEMORY), "got {result:?}");
+        assert!(
+            result.output.is_empty(),
+            "allocation must fail before print, got {:?}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn test_execute_python_print_returns_output_and_no_error() {
+        let result = execute_python("print(2 + 2)").expect("result");
+        assert_eq!(result.output, "4\n");
+        assert_eq!(result.error, None);
+        assert_eq!(result.fault, None);
+        assert_eq!(result.exit_code, 0);
+    }
+
+    #[test]
+    fn test_execute_python_syntax_error_returns_syntax_fault() {
+        let result = execute_python("def (\n").expect("result");
+        assert_eq!(result.fault, Some(fault::SYNTAX), "got {result:?}");
+        assert_ne!(result.exit_code, 0);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("SyntaxError"),
+            "error should name SyntaxError, got {:?}",
+            result.error
+        );
+    }
+
+    #[test]
+    fn test_execute_python_uncaught_exception_returns_runtime_fault() {
+        let result = execute_python("print('before')\n1 / 0\n").expect("result");
+        assert_eq!(result.fault, Some(fault::RUNTIME), "got {result:?}");
+        assert_ne!(result.exit_code, 0);
+        assert_eq!(result.output, "before\n", "output before the raise is kept");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("ZeroDivisionError"),
+            "error should carry the traceback, got {:?}",
+            result.error
+        );
+    }
+
+    #[test]
+    fn test_execute_python_sleep_cannot_stall_past_the_budget() {
+        let started = Instant::now();
+        let result =
+            execute_python("import time\ntime.sleep(30)\nprint('done')\n").expect("result");
+        assert_eq!(result.fault, None, "got {result:?}");
+        assert_eq!(result.output, "done\n");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "sleep must not block the caller, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn test_execute_python_print_over_output_cap_returns_memory_fault() {
+        // 20 MiB fits the 64 MiB heap but not the 16 MiB print cap.
+        let result = execute_python("print('y' * (20 * 1024 * 1024))\n").expect("result");
+        assert_eq!(result.fault, Some(fault::MEMORY), "got {result:?}");
+        assert!(
+            result.output.len() <= DEFAULT_PYTHON_OUTPUT_LIMIT,
+            "collected {} bytes past the cap",
+            result.output.len()
         );
     }
 }

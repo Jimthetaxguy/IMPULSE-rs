@@ -17,7 +17,7 @@ impl DynamicTool for CalculatorTool {
         ToolDescriptor {
             id: "calculator".into(),
             name: "Calculator".into(),
-            description: "Evaluate a mathematical expression (digits and + - * / % ( ) . e/E, whitespace; no names, sqrt, or abs). Times out after 5s.".into(),
+            description: "Evaluate a mathematical expression (digits and + - * / % ( ) . e/E, whitespace; no names, sqrt, or abs) inside a Monty Python sandbox with no filesystem, network, or process access. Times out after 5s.".into(),
             version: "0.1.0".into(),
             category: ToolCategory::Utility,
             params: vec![ToolParam {
@@ -126,10 +126,10 @@ mod tests {
         let tool = CalculatorTool;
         let ctx = ToolContext::with_all_capabilities();
         let params = serde_json::json!({"expression": "2 + 2"});
-        let result = tool.execute(params, &ctx).await;
-        // May fail if Python not available, but should not panic
-        if let Ok(r) = result {
-            assert!(r.output.get("result").is_some());
-        }
+        let r = tool
+            .execute(params, &ctx)
+            .await
+            .expect("the sandbox is in-process, so evaluation cannot depend on host Python");
+        assert_eq!(r.output["result"], "\"4\"");
     }
 }

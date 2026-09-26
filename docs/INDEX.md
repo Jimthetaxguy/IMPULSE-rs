@@ -2,14 +2,14 @@
 title: Documentation Index
 description: Master navigation hub for Impulse documentation
 version: '1.7'
-updated: 2026-08-17
+updated: 2026-09-26
 type: doc
 category: navigation
 phase: all
 status: active
 audience: everyone
 tags: [index, navigation, discovery]
-last_updated: 2026-08-17
+last_updated: 2026-09-26
 authors:
   - name: Impulse Maintainers
     role: Maintainer
@@ -102,6 +102,7 @@ in `VISION.md` are resolved.
 | [0018](decisions/0018-socket-actor-provenance.md) | Socket actor provenance | Proposed | Connection classes from peer credentials plus a per-run operator capability; only an operator surface can mint `accepted` |
 | [0019](decisions/0019-builder-staged-worktree-world-scope.md) | Builder staged-worktree world scope | Proposed | Declared world scope, a disposable staged Builder worktree, fast-forward-only promotion after acceptance, and the governed Builder loop binding |
 | [0020](decisions/0020-scoped-memory-promotion-and-dismissal.md) | Scoped memory promotion and dismissal | Proposed | Operator-class promote/dismiss, an append-only hash-chained memory log, a separate regenerated GENOME projection, and promoted-only retrieval indexing |
+| [0021](decisions/0021-monty-sandbox-for-calculator-and-python-exec.md) | Monty sandbox for calculator and python_exec | Proposed | In-process Monty interpreter replaces `python3 -c` for the Python tool surfaces; no filesystem, network, or process access; typed fault classes; crash isolation via `monty-pool` deferred |
 
 See [decisions/README.md](decisions/README.md) for full decision log.
 
