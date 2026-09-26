@@ -689,7 +689,7 @@ Config at `.opencode/impulse.json` with equivalent hooks.
 | **Now**    | Tool/model/credential management                                       | Rust        | **Complete** |
 | **Now**    | System utilities (calc, exec, health, system)                          | Rust        | **Complete** |
 | **Next**   | Retrieval + review-first context injection (feature-flagged, additive) | Rust+Python | **Complete** |
-| **Next**   | Monty integration (computed routing, dynamic injection, KDB, SWARM)   | Rust+Python | **Complete** |
+| **Next**   | Monty: `src/monty/` PyO3 module is an unbuilt stub (`monty-support` never built by CI); sandboxed Python for calc/exec lives in `tools/python.rs` (ADR-0021) | Rust | **Partial** |
 | **Later**  | Desktop bundle                                                         | Dioxus Desktop | **Open**  |
 | **Later**  | DataFusion analytics (optional)                                        | Rust        | **Open**     |
 | **Future** | Agent VCS + dashboard                                                  | +Rust       | Vision       |
@@ -711,7 +711,10 @@ Config at `.opencode/impulse.json` with equivalent hooks.
 - Retrieval index (`retrieval.db`) with FTS5 keyword search
 - Feature-flagged semantic path with fallback-safe behavior
 - Review-first context injection on daemon chat and direct orchestration
-- Monty Python interpreter integration (computed routing, dynamic injection, KDB, SWARM)
+- `src/monty/` routing, injection, KDB, and SWARM run as keyword heuristics in plain Rust; the PyO3
+  `monty-support` path is an unbuilt stub, not a completed integration
+- Sandboxed Python for `calc`, `exec`, `calculator`, and `python_exec` uses the in-process `monty`
+  crate with no filesystem, network, or process access (ADR-0021)
 
 **Later (Coordination UX):**
 - Advanced coordination UX and agent dashboarding

@@ -458,7 +458,14 @@ impl DynamicTool for ToolAvailabilityTool {
                 "sccache",
                 build_hygiene::sccache::sccache_status().installed,
             ),
-            ("python", crate::tools::python::is_python_available()),
+            // Host interpreter on PATH, not the embedded sandbox: this list
+            // describes the machine's build toolchain.
+            (
+                "python",
+                which::which("python3")
+                    .or_else(|_| which::which("python"))
+                    .is_ok(),
+            ),
         ]
         .into_iter()
         .map(|(name, installed)| {

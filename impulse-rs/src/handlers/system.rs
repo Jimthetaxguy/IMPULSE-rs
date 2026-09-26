@@ -37,11 +37,6 @@ pub fn handle_system() -> Result<()> {
 pub fn handle_calc(expression: String) -> Result<()> {
     use crate::tools::python;
 
-    if !python::is_python_available() {
-        eprintln!("Error: Python is not available. Please install Python 3.");
-        return Err(anyhow::anyhow!("Python not available"));
-    }
-
     match python::calculate(&expression) {
         Ok(result) => {
             println!("{}", result);
@@ -56,11 +51,6 @@ pub fn handle_calc(expression: String) -> Result<()> {
 
 pub fn handle_exec(code: String) -> Result<()> {
     use crate::tools::python;
-
-    if !python::is_python_available() {
-        eprintln!("Error: Python is not available. Please install Python 3.");
-        return Err(anyhow::anyhow!("Python not available"));
-    }
 
     match python::execute_python(&code) {
         Ok(result) => {

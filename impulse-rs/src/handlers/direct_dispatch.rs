@@ -1578,7 +1578,7 @@ mod tests {
         let _ = result; // Just verify no panic
     }
 
-    // ── Commands::Calc (requires Python on PATH) ─────────────────────────
+    // ── Commands::Calc (in-process Monty sandbox; no host Python needed) ──
 
     #[tokio::test]
     async fn test_dispatch_calc_simple_expression_returns_ok() {
@@ -1590,8 +1590,7 @@ mod tests {
             },
         );
         let result = dispatch(cli).await;
-        // Succeeds when Python is available, errors when it isn't — no panic either way
-        let _ = result;
+        assert!(result.is_ok(), "Calc should return Ok: {result:?}");
     }
 
     #[tokio::test]
@@ -1604,10 +1603,10 @@ mod tests {
             },
         );
         let result = dispatch(cli).await;
-        let _ = result;
+        assert!(result.is_ok(), "Calc should return Ok: {result:?}");
     }
 
-    // ── Commands::Exec (requires Python on PATH) ─────────────────────────
+    // ── Commands::Exec (in-process Monty sandbox; no host Python needed) ──
 
     #[tokio::test]
     async fn test_dispatch_exec_print_statement_returns_ok() {
@@ -1619,7 +1618,7 @@ mod tests {
             },
         );
         let result = dispatch(cli).await;
-        let _ = result;
+        assert!(result.is_ok(), "Exec should return Ok: {result:?}");
     }
 
     // ── Commands::ValidateHooks ──────────────────────────────────────────
