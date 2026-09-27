@@ -13,7 +13,7 @@ exclude = ["impulse-gui"]
 name = "impulse-rs"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.96" # floor set by monty 1.0 (ADR-0021)
 description = "Terminal-native local control plane and harness manager for AI coding agents"
 authors = ["Impulse Maintainers"]
 license = "MIT"
@@ -91,7 +91,7 @@ clap = { version = "4", features = ["derive"] }
 
 # Readline REPL (ion binary, TUI_SPEC.md T6). TUI_SPEC.md floated "15" as a
 # candidate pin; 18 is the current major on crates.io as of this task and
-# resolves/builds cleanly against this workspace's MSRV (1.82), so we pin to
+# resolves/builds cleanly against this workspace's MSRV (then 1.82), so we pin to
 # the current major instead of the stale suggestion.
 rustyline = "18"
 
@@ -107,7 +107,9 @@ pyo3 = { version = "0.29.0", optional = true, features = ["extension-module"] }
 
 # DataFusion for advanced analytics (optional)
 # Enable with --features datafusion-support
-datafusion = { version = "43", optional = true }
+# Nothing imports this crate yet; the requirement only shapes the lockfile. 43's
+# arrow 53 tree capped chrono below 0.4.40, which monty 1.0 needs (ADR-0021).
+datafusion = { version = "55", optional = true }
 
 # Office document handling (optional)
 # Enable with --features office-support
@@ -139,11 +141,18 @@ flate2 = { version = "1", optional = true }
 # them, mirroring the flate2 precedent immediately above.
 weezl = { version = "0.1", optional = true }
 
+# In-process Python sandbox for calculator/python_exec (ADR-0021). No host
+# functions, mounts, or inputs are wired, so the interpreter is the boundary.
+# monty-pool (subprocess workers, crash isolation) is the planned follow-up.
+monty = "1.0.0"
+monty-types = { version = "1.0.0", features = ["tzdb"] }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# Keep Impulse's Rust 1.82 MSRV: security-framework 3.7 requires Rust 1.85.
+# Pinned while the MSRV was 1.82 (security-framework 3.7 requires Rust 1.85). The
+# floor is now 1.96 for the Monty sandbox (ADR-0021), so this pin can be revisited.
 security-framework = "=3.6.0"
 security-framework-sys = "=2.17.0"
 
