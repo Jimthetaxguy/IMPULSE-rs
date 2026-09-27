@@ -392,6 +392,21 @@ fn reap_sync_child_after_kill(
     }
 }
 
+/// Run `command` until it exits or `timeout` passes, whichever comes first,
+/// with bounded output capture and process-group cleanup.
+///
+/// The child is polled every 10 ms. A poll that finds an exit status wins over
+/// a deadline that expired during the sleep before it: a child that finished is
+/// reported as finished.
+///
+/// A **zero** `timeout` is a deadline that has already expired. The child is
+/// spawned, killed and reaped without being polled, so the result is always
+/// `timed_out`. Polling first would leave the outcome to the scheduler: a fast
+/// child can exit between `spawn` and the first poll whenever this thread loses
+/// the CPU there, and the caller would see a completed process for a deadline
+/// that gave it no time to run. Production callers pass the fixed timeouts at
+/// the top of this module; zero is what a test passes to reach the deadline
+/// path without waiting for one.
 fn run_bounded_process(
     command: &mut std::process::Command,
     label: &str,
@@ -427,12 +442,16 @@ fn run_bounded_process(
 
     let started = Instant::now();
     let (status, timed_out) = loop {
-        if let Some(status) = child
-            .try_wait()
-            .with_context(|| format!("failed waiting for {label}"))?
-        {
-            process_group.kill_now();
-            break (Some(status), false);
+        // An already-expired deadline is never polled. That has to be decided
+        // here and not left to timing; see the function comment.
+        if !timeout.is_zero() {
+            if let Some(status) = child
+                .try_wait()
+                .with_context(|| format!("failed waiting for {label}"))?
+            {
+                process_group.kill_now();
+                break (Some(status), false);
+            }
         }
         if started.elapsed() >= timeout {
             process_group.kill_now();
@@ -4077,9 +4096,11 @@ mod tests {
     /// and reaped, so it comes back as simply "not success". Under load that
     /// reported a violation that never happened.
     ///
-    /// A zero deadline makes this deterministic: the bounded runner checks
-    /// `try_wait` once and then the elapsed time, and no spawned process can
-    /// have exited in that window.
+    /// A zero deadline makes this deterministic because the bounded runner
+    /// treats it as already expired: the child is killed and reaped without
+    /// being polled. Until 2026-09-27 the runner polled first and this test
+    /// relied on no child being able to exit between `spawn` and that poll. On
+    /// a loaded CI runner one did, and the probe came back as a success.
     #[test]
     fn test_a_timed_out_ancestry_probe_is_not_reported_as_a_governance_finding() {
         let dir = init_repo();
@@ -4107,6 +4128,72 @@ mod tests {
                 command: "git merge-base --is-ancestor".to_string()
             }),
             "and it must be typed, so a caller can tell 'unknown' from 'violated'"
+        );
+    }
+
+    /// The race the zero-deadline contract removes. `true` exits within a
+    /// millisecond or two of `spawn`, so a runner that polls before it checks
+    /// the deadline returns that exit status whenever its thread loses the CPU
+    /// in between. Repeated, because one pass proves little about a race.
+    #[test]
+    fn test_run_bounded_process_zero_deadline_always_times_out() {
+        for attempt in 0..100 {
+            let mut command = std::process::Command::new("true");
+            let output = run_bounded_process(&mut command, "true", Duration::ZERO)
+                .expect("spawning `true` must succeed");
+            assert!(
+                output.timed_out,
+                "attempt {attempt}: a zero deadline reported a completed child (status {:?})",
+                output.status
+            );
+        }
+    }
+
+    /// Any non-zero deadline keeps the poll-first order: a child that finished
+    /// is reported as finished, with its own exit status.
+    #[test]
+    fn test_run_bounded_process_nonzero_deadline_reports_the_exit_status() {
+        for (program, succeeds) in [("true", true), ("false", false)] {
+            let mut command = std::process::Command::new(program);
+            let output = run_bounded_process(&mut command, program, Duration::from_secs(30))
+                .expect("spawning must succeed");
+            assert!(
+                !output.timed_out,
+                "`{program}` finished well inside its deadline"
+            );
+            let status = output.status.expect("a finished child has a status");
+            assert_eq!(status.success(), succeeds, "`{program}` exit status");
+        }
+    }
+
+    /// A child that outlives a real deadline is killed at it, not waited for.
+    #[test]
+    fn test_run_bounded_process_kills_a_child_that_outlives_its_deadline() {
+        let mut command = std::process::Command::new("sleep");
+        command.arg("30");
+        let started = Instant::now();
+        let output = run_bounded_process(&mut command, "sleep 30", Duration::from_millis(50))
+            .expect("spawning `sleep` must succeed");
+        assert!(output.timed_out);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the runner waited {:?} for a child it should have killed at 50 ms",
+            started.elapsed()
+        );
+    }
+
+    /// Error path: a program that cannot be spawned is an error naming the
+    /// command, neither a timeout nor a status.
+    #[test]
+    fn test_run_bounded_process_spawn_failure_names_the_command() {
+        let mut command =
+            std::process::Command::new("/nonexistent/impulse-test-program-that-does-not-exist");
+        let error = run_bounded_process(&mut command, "missing program", Duration::from_secs(1))
+            .err()
+            .expect("a missing program cannot be spawned");
+        assert!(
+            format!("{error:#}").contains("failed to spawn missing program"),
+            "unexpected error: {error:#}"
         );
     }
 
