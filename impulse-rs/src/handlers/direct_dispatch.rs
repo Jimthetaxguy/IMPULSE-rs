@@ -1621,6 +1621,26 @@ mod tests {
         assert!(result.is_ok(), "Exec should return Ok: {result:?}");
     }
 
+    /// A program that raises did not run, so the command fails and the process
+    /// exits non-zero. It used to print the error and exit 0.
+    #[tokio::test]
+    async fn test_dispatch_exec_faulting_program_returns_err() {
+        let tmp = TempDir::new().unwrap();
+        let cli = cli_with(
+            &tmp,
+            Commands::Exec {
+                code: "1 / 0".to_string(),
+            },
+        );
+        let error = dispatch(cli)
+            .await
+            .expect_err("Exec of a program that raises should return Err");
+        // Dispatch adds its own context, so the fault class is one level down
+        // the chain; `{:#}` prints the whole chain.
+        let chain = format!("{error:#}");
+        assert!(chain.contains("runtime"), "unexpected error: {chain}");
+    }
+
     // ── Commands::ValidateHooks ──────────────────────────────────────────
 
     #[tokio::test]

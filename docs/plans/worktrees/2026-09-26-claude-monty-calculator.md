@@ -74,3 +74,22 @@ tags: [worktree, lane, handoff]
   `agent/grok-calculator-math-only-20260917`, revisit the `security-framework` pin, report monty's loose chrono
   floor upstream, fix the `docs/CLI-COMMANDS.md` claim that `monty-support` gates `calc`/`exec`.
 - Run record: `~/code/_working-files/20260926-003000-claude-impulse-monty-calculator-run.md`.
+
+## Review fixes, 2026-09-27 (PR #70)
+Owner: Claude Code, session a6d4465a. Worktree `.worktrees/monty-review-fixes-20260927`, local branch
+`claude/monty-review-fixes-20260927`, pushed onto the PR branch as a fast-forward.
+
+- Finding P1, `benchmark` timed failing programs. `tooling/builtin/benchmarker.rs` discarded every
+  `execute_python` result, so a program the sandbox could not run was reported with timings. It now runs
+  the program once before timing, refuses one that faults or exits non-zero, and fails the whole
+  benchmark if any timed iteration fails.
+- Finding P2, `exec` exited 0 on a sandbox fault. `handlers/system.rs` returned `Ok` for every
+  `Ok(PythonResult)`. It now returns an error naming the fault class, or the exit code, after printing
+  the program's output and error text. This also covers runtime and syntax failures, which exited 0
+  under the subprocess implementation too; only timeouts had returned an error there.
+- Red first: six new tests failed against the PR head (three per finding), for the reasons above.
+- Tests added: `handlers::system::exec_tests` (9), `tooling::builtin::benchmarker::tests` (6 new, and
+  the old `test_execute`, which passed on `Err`, is now `test_execute_times_a_program_that_runs`),
+  `test_dispatch_exec_faulting_program_returns_err`.
+- Not changed: `python_exec`, which already returns `fault` and `success` in its JSON, and
+  `calculator`, which returns an error for a faulting expression.

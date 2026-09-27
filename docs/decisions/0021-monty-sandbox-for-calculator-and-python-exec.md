@@ -102,6 +102,12 @@ Costs:
 - Monty implements a subset of Python. Programs that used stdlib modules outside that subset now return
   `fault: unsupported` instead of running.
 - The MSRV floor moves to 1.96.
+- A program failure is a result, not an error, so **every caller has to read `fault`**. The `exec`
+  command exits non-zero when a run carries a fault or a non-zero exit code, and the `benchmark` tool
+  refuses to time a program that does not run to completion. Review of PR #70 found both doing
+  neither: `exec` printed the error and exited 0, where the subprocess implementation had returned an
+  error on timeout, and `benchmark` reported timings for a program that failed on every iteration. A
+  new caller of `execute_python` needs the same check.
 
 ## Follow-ups
 

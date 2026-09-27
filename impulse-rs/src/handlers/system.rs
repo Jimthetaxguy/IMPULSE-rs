@@ -54,17 +54,35 @@ pub fn handle_exec(code: String) -> Result<()> {
 
     match python::execute_python(&code) {
         Ok(result) => {
-            if let Some(error) = result.error {
+            if let Some(error) = &result.error {
                 eprintln!("Error:\n{}", error);
             }
             if !result.output.is_empty() {
                 print!("{}", result.output);
             }
+            exec_outcome(&result)
         }
         Err(e) => {
             eprintln!("Execution error: {}", e);
-            return Err(anyhow::anyhow!("Execution failed"));
+            Err(anyhow::anyhow!("Execution failed"))
         }
+    }
+}
+
+/// Whether a sandbox run counts as a successful `exec` command.
+///
+/// The sandbox reports every program failure as a result carrying a fault
+/// class, not as an `Err`, so a caller can tell a timeout from a syntax error.
+/// On the command line that still has to end in a non-zero exit. A script or
+/// an agent that checks only the exit status would otherwise accept a program
+/// that timed out, raised, or never parsed. Output printed before the failure
+/// has already been written by the caller.
+fn exec_outcome(result: &crate::tools::python::PythonResult) -> Result<()> {
+    if let Some(fault) = result.fault {
+        anyhow::bail!("Execution failed ({fault})");
+    }
+    if result.exit_code != 0 {
+        anyhow::bail!("Execution failed (exit code {})", result.exit_code);
     }
     Ok(())
 }
@@ -510,5 +528,95 @@ mod chat_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod exec_tests {
+    use super::*;
+
+    #[test]
+    fn test_handle_exec_completed_program_returns_ok() {
+        assert!(handle_exec("print('hello')".to_string()).is_ok());
+    }
+
+    #[test]
+    fn test_handle_exec_runtime_fault_returns_err_naming_the_fault() {
+        let error = handle_exec("1 / 0".to_string())
+            .expect_err("a program that raised did not run to completion");
+        assert!(
+            format!("{error}").contains("runtime"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_handle_exec_syntax_fault_returns_err_naming_the_fault() {
+        let error = handle_exec("def (".to_string())
+            .expect_err("a program that does not parse did not run to completion");
+        assert!(
+            format!("{error}").contains("syntax"),
+            "unexpected error: {error}"
+        );
+    }
+
+    fn sandbox_result(
+        fault: Option<&'static str>,
+        exit_code: i32,
+    ) -> crate::tools::python::PythonResult {
+        crate::tools::python::PythonResult {
+            output: String::new(),
+            error: fault.map(|class| format!("{class} happened")),
+            exit_code,
+            fault,
+        }
+    }
+
+    #[test]
+    fn test_exec_outcome_completed_run_returns_ok() {
+        assert!(exec_outcome(&sandbox_result(None, 0)).is_ok());
+    }
+
+    /// The case from the review: a program that never terminates comes back
+    /// as a timeout fault, which used to exit 0. Built by hand so the test does
+    /// not spend the five-second wall-clock budget.
+    #[test]
+    fn test_exec_outcome_timeout_fault_returns_err_naming_the_fault() {
+        let timed_out = sandbox_result(Some(crate::tools::python::fault::TIMEOUT), 1);
+        let error = exec_outcome(&timed_out).expect_err("a timeout is a failed run");
+        assert!(
+            format!("{error}").contains("timeout"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_exec_outcome_memory_fault_returns_err_naming_the_fault() {
+        let out_of_memory = sandbox_result(Some(crate::tools::python::fault::MEMORY), 1);
+        let error = exec_outcome(&out_of_memory).expect_err("a memory fault is a failed run");
+        assert!(
+            format!("{error}").contains("memory"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_exec_outcome_nonzero_exit_without_a_fault_returns_err() {
+        let error = exec_outcome(&sandbox_result(None, 3))
+            .expect_err("a non-zero exit code is a failed run");
+        assert!(
+            format!("{error}").contains("exit code 3"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_handle_exec_unsupported_fault_returns_err_naming_the_fault() {
+        let error = handle_exec("import subprocess".to_string())
+            .expect_err("a program the sandbox cannot run did not run to completion");
+        assert!(
+            format!("{error}").contains("unsupported"),
+            "unexpected error: {error}"
+        );
     }
 }
