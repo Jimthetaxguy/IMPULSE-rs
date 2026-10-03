@@ -48,6 +48,20 @@ tags: [worktree, lane, handoff]
   `config.json` `model_endpoints` section on `Config`, photon resolves its endpoint per run.
   Stage 2 (Ion's own provider path through `min-agent` adapters) waits for James to review the ADR.
 
+- 2026-10-03: James's PRD (`docs/spec/2026-10-03-impulse-ion-photon-prd.md`) is the target.
+  James said "go in a loop with recommended", so these recommended calls are taken:
+  1. **Session record:** the governed-task ledger (`GOVERNED_TASKS.json`, ADR-0011) stays the
+     authority. The daemon also writes one readable directory per session (`session.json`,
+     `claim.jsonl`, `verify.jsonl`, `accept.jsonl`, `note.md`) as a projection of it.
+  2. **Photon implementation:** keep `min-agent` as a pinned dependency rather than copying its
+     reader. "Impulse copies the limits" is met by using `min-agent`'s own limits.
+  3. **`trace` reason:** the Photon call record is in memory, part of Ion's loop evidence; `trace`
+     means that record could not be produced. Photon writes nothing on disk.
+  4. **Model client:** cards resolve their endpoint through ADR-0022's photon role; unassigned, it
+     falls back to Anthropic at Ion's origin, which is the client Ion has by default.
+  Order (PRD section 12): session directory -> `explain_error` (Spec A, one tool per card; the
+  free-form `photon` tool is retired) -> card catalog + `find_symbol`.
+
 ## Handoff Notes
 - Gate after ADR-0022 stage 1 (2026-10-03, isolated `CARGO_TARGET_DIR`): `cargo test --workspace`
   3143 passed, 0 failed, 10 ignored across 35 suites; clippy `-D warnings` clean with default
