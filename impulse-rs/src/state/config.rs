@@ -205,6 +205,14 @@ pub struct Config {
     /// Guardrail configuration
     #[serde(default)]
     pub guardrails: crate::guardrail::GuardConfig,
+
+    // ── Section: Model Endpoints ──────────────────────────────────────────
+    //
+    // Named typed endpoints and per-role selection (ADR-0022). Kept on
+    // `Config` so persisting any other key round-trips this section intact.
+    /// Named model endpoints and role assignments
+    #[serde(default)]
+    pub model_endpoints: crate::model_endpoint::ModelEndpointConfig,
 }
 
 // ── Default impl ──────────────────────────────────────────────────────────
@@ -305,6 +313,7 @@ impl Default for Config {
             // Supervisor & Guardrails
             impulse_agent_permissions: impulse_ops::SupervisorPermissionPolicy::default(),
             guardrails: crate::guardrail::GuardConfig::default(),
+            model_endpoints: crate::model_endpoint::ModelEndpointConfig::default(),
         }
     }
 }

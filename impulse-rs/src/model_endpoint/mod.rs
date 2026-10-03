@@ -1,0 +1,471 @@
+//! Typed model endpoints (ADR-0022): a protocol, not a vendor.
+//!
+//! A [`ModelEndpoint`] says how to reach one model: the wire protocol, the API
+//! base URL the protocol path is appended to, how to authenticate (an
+//! environment variable *name*, never a secret), the model id, and an optional
+//! output-token limit. Named endpoints live in `config.json` under
+//! `model_endpoints.profiles`; `model_endpoints.roles` maps a harness role
+//! (Ion, photon) to a profile name.
+//!
+//! Everything here is pure data plus validation. Only [`min_agent_bridge`]
+//! knows another crate's config shapes.
+
+#[cfg(feature = "photon-subagent")]
+pub mod min_agent_bridge;
+
+use std::collections::BTreeMap;
+use std::fmt;
+use std::net::IpAddr;
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+/// Longest accepted profile, env-var, or header name.
+const MAX_NAME_LEN: usize = 64;
+
+/// The request format an endpoint speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireProtocol {
+    /// `{base_url}/messages` (Anthropic Messages API).
+    AnthropicMessages,
+    /// `{base_url}/chat/completions` (OpenAI Chat Completions and compatible
+    /// servers: OpenRouter, LiteLLM, Ollama, vLLM, ...).
+    OpenaiChat,
+    /// `{base_url}/responses` (OpenAI Responses API).
+    OpenaiResponses,
+}
+
+impl fmt::Display for WireProtocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::AnthropicMessages => "anthropic_messages",
+            Self::OpenaiChat => "openai_chat",
+            Self::OpenaiResponses => "openai_responses",
+        })
+    }
+}
+
+/// How an endpoint authenticates. Only environment-variable names are stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum EndpointAuth {
+    /// No credential (for example a local Ollama server).
+    None,
+    /// `Authorization: Bearer <value of env>`.
+    BearerEnv { env: String },
+    /// `<header>: <value of env>`, for example Anthropic's `x-api-key`.
+    HeaderEnv { header: String, env: String },
+}
+
+/// One reachable model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelEndpoint {
+    pub protocol: WireProtocol,
+    /// API base including its path prefix, e.g. `https://api.openai.com/v1`
+    /// or `https://openrouter.ai/api/v1`; the protocol path is appended.
+    pub base_url: String,
+    pub auth: EndpointAuth,
+    pub model: String,
+    /// Output-token ceiling per turn. Required for `anthropic_messages`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+}
+
+/// Harness roles that select an endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointRole {
+    Ion,
+    Photon,
+}
+
+impl fmt::Display for EndpointRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Ion => "ion",
+            Self::Photon => "photon",
+        })
+    }
+}
+
+/// Role → profile name assignments.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointRoles {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ion: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub photon: Option<String>,
+}
+
+/// The `model_endpoints` section of `config.json`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelEndpointConfig {
+    #[serde(default)]
+    pub profiles: BTreeMap<String, ModelEndpoint>,
+    #[serde(default)]
+    pub roles: EndpointRoles,
+}
+
+/// Why an endpoint or its configuration was refused.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum EndpointError {
+    #[error("model id must not be blank")]
+    BlankModel,
+    #[error("base_url '{url}' is not a valid URL: {reason}")]
+    InvalidBaseUrl { url: String, reason: String },
+    #[error("base_url '{url}' must use https, or http to a numeric loopback address")]
+    InsecureBaseUrl { url: String },
+    #[error("base_url must not carry credentials, a query, or a fragment")]
+    BaseUrlCarriesExtras,
+    #[error("'{name}' is not a valid environment variable name")]
+    InvalidEnvName { name: String },
+    #[error("'{name}' is not a valid HTTP header name")]
+    InvalidHeaderName { name: String },
+    #[error("{protocol} endpoints require max_output_tokens")]
+    MissingOutputLimit { protocol: WireProtocol },
+    #[error("max_output_tokens must be positive")]
+    ZeroOutputLimit,
+    #[error("'{name}' is not a valid profile name (1-64 of A-Z a-z 0-9 _ -)")]
+    InvalidProfileName { name: String },
+    #[error("profile '{name}' is invalid: {reason}")]
+    InvalidProfile { name: String, reason: String },
+    #[error(
+        "role '{role}' names profile '{profile}', which is not defined in model_endpoints.profiles"
+    )]
+    UnknownProfile { role: String, profile: String },
+}
+
+fn valid_name(name: &str, extra: impl Fn(u8) -> bool) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_NAME_LEN
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || extra(b))
+}
+
+fn validate_env_name(name: &str) -> Result<(), EndpointError> {
+    let ok = valid_name(name, |b| b == b'_') && !name.as_bytes()[0].is_ascii_digit();
+    ok.then_some(())
+        .ok_or_else(|| EndpointError::InvalidEnvName {
+            name: name.to_string(),
+        })
+}
+
+impl EndpointAuth {
+    /// Checks the env-var and header names.
+    pub fn validate(&self) -> Result<(), EndpointError> {
+        match self {
+            Self::None => Ok(()),
+            Self::BearerEnv { env } => validate_env_name(env),
+            Self::HeaderEnv { header, env } => {
+                if !valid_name(header, |b| b == b'-' || b == b'_') {
+                    return Err(EndpointError::InvalidHeaderName {
+                        name: header.clone(),
+                    });
+                }
+                validate_env_name(env)
+            }
+        }
+    }
+}
+
+impl ModelEndpoint {
+    /// An Anthropic Messages endpoint at `origin` (scheme, host, optional
+    /// port) authenticated by `ANTHROPIC_API_KEY`.
+    pub fn anthropic_messages(origin: &str, model: &str, max_output_tokens: u32) -> Self {
+        Self {
+            protocol: WireProtocol::AnthropicMessages,
+            base_url: format!("{}/v1", origin.trim_end_matches('/')),
+            auth: EndpointAuth::HeaderEnv {
+                header: "x-api-key".into(),
+                env: "ANTHROPIC_API_KEY".into(),
+            },
+            model: model.to_string(),
+            max_output_tokens: Some(max_output_tokens),
+        }
+    }
+
+    /// Validates every field. Plain HTTP is accepted only to a numeric
+    /// loopback address, so a typo cannot send a prompt in cleartext.
+    pub fn validate(&self) -> Result<(), EndpointError> {
+        if self.model.trim().is_empty() {
+            return Err(EndpointError::BlankModel);
+        }
+        let url =
+            reqwest::Url::parse(&self.base_url).map_err(|e| EndpointError::InvalidBaseUrl {
+                url: self.base_url.clone(),
+                reason: e.to_string(),
+            })?;
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(EndpointError::BaseUrlCarriesExtras);
+        }
+        // Numeric loopback only: a hostname such as `localhost` can resolve
+        // anywhere, so it does not qualify for plain HTTP.
+        let loopback = url
+            .host_str()
+            .map(|h| h.trim_start_matches('[').trim_end_matches(']'))
+            .and_then(|h| h.parse::<IpAddr>().ok())
+            .is_some_and(|ip| ip.is_loopback());
+        match url.scheme() {
+            "https" => {}
+            "http" if loopback => {}
+            _ => {
+                return Err(EndpointError::InsecureBaseUrl {
+                    url: self.base_url.clone(),
+                })
+            }
+        }
+        self.auth.validate()?;
+        match self.max_output_tokens {
+            Some(0) => Err(EndpointError::ZeroOutputLimit),
+            None if self.protocol == WireProtocol::AnthropicMessages => {
+                Err(EndpointError::MissingOutputLimit {
+                    protocol: self.protocol,
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+impl ModelEndpointConfig {
+    /// Validates every profile name, every profile, and every role reference.
+    pub fn validate(&self) -> Result<(), EndpointError> {
+        for (name, endpoint) in &self.profiles {
+            if !valid_name(name, |b| b == b'_' || b == b'-') {
+                return Err(EndpointError::InvalidProfileName { name: name.clone() });
+            }
+            endpoint
+                .validate()
+                .map_err(|e| EndpointError::InvalidProfile {
+                    name: name.clone(),
+                    reason: e.to_string(),
+                })?;
+        }
+        for role in [EndpointRole::Ion, EndpointRole::Photon] {
+            self.endpoint_for(role)?;
+        }
+        Ok(())
+    }
+
+    /// The profile assigned to `role`, or `None` when the role is unassigned.
+    /// A role that names a missing profile is an error, never a fallback.
+    pub fn endpoint_for(
+        &self,
+        role: EndpointRole,
+    ) -> Result<Option<&ModelEndpoint>, EndpointError> {
+        let assigned = match role {
+            EndpointRole::Ion => self.roles.ion.as_deref(),
+            EndpointRole::Photon => self.roles.photon.as_deref(),
+        };
+        let Some(name) = assigned.map(str::trim).filter(|n| !n.is_empty()) else {
+            return Ok(None);
+        };
+        self.profiles
+            .get(name)
+            .map(Some)
+            .ok_or_else(|| EndpointError::UnknownProfile {
+                role: role.to_string(),
+                profile: name.to_string(),
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn openrouter() -> ModelEndpoint {
+        ModelEndpoint {
+            protocol: WireProtocol::OpenaiChat,
+            base_url: "https://openrouter.ai/api/v1".into(),
+            auth: EndpointAuth::BearerEnv {
+                env: "OPENROUTER_API_KEY".into(),
+            },
+            model: "qwen/qwen3-coder".into(),
+            max_output_tokens: None,
+        }
+    }
+
+    fn config_with(endpoint: ModelEndpoint, photon: Option<&str>) -> ModelEndpointConfig {
+        ModelEndpointConfig {
+            profiles: BTreeMap::from([("router".to_string(), endpoint)]),
+            roles: EndpointRoles {
+                ion: None,
+                photon: photon.map(str::to_string),
+            },
+        }
+    }
+
+    #[test]
+    fn test_model_endpoint_config_round_trips_through_json() {
+        let original = config_with(openrouter(), Some("router"));
+        let json = serde_json::to_string(&original).unwrap();
+        let recovered: ModelEndpointConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, recovered);
+        let anthropic = ModelEndpoint::anthropic_messages("https://api.anthropic.com", "m", 10);
+        let recovered: ModelEndpoint =
+            serde_json::from_str(&serde_json::to_string(&anthropic).unwrap()).unwrap();
+        assert_eq!(anthropic, recovered);
+    }
+
+    #[test]
+    fn test_model_endpoint_config_parses_documented_shape() {
+        let parsed: ModelEndpointConfig = serde_json::from_value(json!({
+            "profiles": {
+                "local-qwen": {
+                    "protocol": "openai_chat",
+                    "base_url": "http://127.0.0.1:11434/v1",
+                    "auth": {"kind": "none"},
+                    "model": "qwen2.5-coder:7b"
+                }
+            },
+            "roles": {"photon": "local-qwen"}
+        }))
+        .unwrap();
+        assert!(parsed.validate().is_ok());
+        let endpoint = parsed.endpoint_for(EndpointRole::Photon).unwrap().unwrap();
+        assert_eq!(endpoint.protocol, WireProtocol::OpenaiChat);
+        assert_eq!(endpoint.auth, EndpointAuth::None);
+    }
+
+    #[test]
+    fn test_model_endpoint_config_rejects_unknown_fields() {
+        let err = serde_json::from_value::<ModelEndpointConfig>(json!({"profile": {}}));
+        assert!(err.is_err());
+        let err = serde_json::from_value::<ModelEndpoint>(json!({
+            "protocol": "openai_chat", "base_url": "https://x.test/v1",
+            "auth": {"kind": "none"}, "model": "m", "api_key": "sk-nope"
+        }));
+        assert!(err.is_err(), "a secret field must not deserialize");
+        let err = serde_json::from_value::<WireProtocol>(json!("grpc"));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_validate_accepts_https_and_loopback_http() {
+        assert!(openrouter().validate().is_ok());
+        let mut local = openrouter();
+        local.base_url = "http://[::1]:8080/v1".into();
+        assert!(local.validate().is_ok());
+        assert!(
+            ModelEndpoint::anthropic_messages("http://127.0.0.1:4010", "m", 1)
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_insecure_and_malformed_urls() {
+        let mut e = openrouter();
+        e.base_url = "http://openrouter.ai/api/v1".into();
+        assert!(matches!(
+            e.validate(),
+            Err(EndpointError::InsecureBaseUrl { .. })
+        ));
+        e.base_url = "http://localhost:11434/v1".into();
+        assert!(matches!(
+            e.validate(),
+            Err(EndpointError::InsecureBaseUrl { .. })
+        ));
+        e.base_url = "not a url".into();
+        assert!(matches!(
+            e.validate(),
+            Err(EndpointError::InvalidBaseUrl { .. })
+        ));
+        e.base_url = "https://user:pw@openrouter.ai/v1".into();
+        assert_eq!(e.validate(), Err(EndpointError::BaseUrlCarriesExtras));
+        e.base_url = "https://openrouter.ai/v1?key=x".into();
+        assert_eq!(e.validate(), Err(EndpointError::BaseUrlCarriesExtras));
+        e.base_url = "ftp://openrouter.ai/v1".into();
+        assert!(matches!(
+            e.validate(),
+            Err(EndpointError::InsecureBaseUrl { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_rejects_blank_model_bad_auth_and_output_limits() {
+        let mut e = openrouter();
+        e.model = "  ".into();
+        assert_eq!(e.validate(), Err(EndpointError::BlankModel));
+        let mut e = openrouter();
+        e.auth = EndpointAuth::BearerEnv { env: "1BAD".into() };
+        assert!(matches!(
+            e.validate(),
+            Err(EndpointError::InvalidEnvName { .. })
+        ));
+        e.auth = EndpointAuth::HeaderEnv {
+            header: "x api key".into(),
+            env: "KEY".into(),
+        };
+        assert!(matches!(
+            e.validate(),
+            Err(EndpointError::InvalidHeaderName { .. })
+        ));
+        let mut a = ModelEndpoint::anthropic_messages("https://api.anthropic.com", "m", 1);
+        a.max_output_tokens = None;
+        assert_eq!(
+            a.validate(),
+            Err(EndpointError::MissingOutputLimit {
+                protocol: WireProtocol::AnthropicMessages
+            })
+        );
+        a.max_output_tokens = Some(0);
+        assert_eq!(a.validate(), Err(EndpointError::ZeroOutputLimit));
+    }
+
+    #[test]
+    fn test_endpoint_for_unassigned_role_is_none_and_missing_profile_is_error() {
+        let config = config_with(openrouter(), None);
+        assert_eq!(config.endpoint_for(EndpointRole::Photon), Ok(None));
+        let config = config_with(openrouter(), Some("  "));
+        assert_eq!(config.endpoint_for(EndpointRole::Photon), Ok(None));
+        let config = config_with(openrouter(), Some("ghost"));
+        let err = config.endpoint_for(EndpointRole::Photon).unwrap_err();
+        assert_eq!(
+            err,
+            EndpointError::UnknownProfile {
+                role: "photon".into(),
+                profile: "ghost".into()
+            }
+        );
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validate_names_the_invalid_profile() {
+        let mut bad = openrouter();
+        bad.base_url = "http://evil.test/v1".into();
+        let err = config_with(bad, None).validate().unwrap_err();
+        assert!(matches!(&err, EndpointError::InvalidProfile { name, .. } if name == "router"));
+        let mut config = config_with(openrouter(), None);
+        config.profiles.insert("bad name".into(), openrouter());
+        assert!(matches!(
+            config.validate(),
+            Err(EndpointError::InvalidProfileName { .. })
+        ));
+    }
+
+    #[test]
+    fn test_endpoint_error_display_carries_context() {
+        let err = EndpointError::UnknownProfile {
+            role: "ion".into(),
+            profile: "p".into(),
+        };
+        assert!(err.to_string().contains("role 'ion' names profile 'p'"));
+        let err = EndpointError::MissingOutputLimit {
+            protocol: WireProtocol::AnthropicMessages,
+        };
+        assert!(err.to_string().contains("anthropic_messages"));
+        assert!(EndpointError::InsecureBaseUrl { url: "u".into() }
+            .to_string()
+            .contains("https"));
+    }
+}

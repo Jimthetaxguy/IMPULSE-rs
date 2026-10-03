@@ -14,14 +14,13 @@
 //! answer is model text derived from file contents and reaches the parent
 //! model through the same untrusted tool-output envelope as every tool result.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::{bail, ensure, Context, Result};
 use async_trait::async_trait;
 use min_agent::agent::{run, Budget, RunOptions, RunReport};
-use min_agent::config::{Auth, Connection, ModelProfile, Protocol};
 use min_agent::model::{HttpModelClient, ModelClient};
 use min_agent::tools::Workspace;
 use min_agent::trace::Trace;
@@ -30,6 +29,7 @@ use serde_json::{json, Value};
 use super::tools::{ReplTool, ToolOutcome};
 use super::ReplContext;
 use crate::loop_contract::ION_DEFAULT_WALL_CLOCK;
+use crate::model_endpoint::{min_agent_bridge, EndpointRole, ModelEndpoint, ModelEndpointConfig};
 
 /// Photon runs one registry (one REPL session) may start.
 pub const PHOTON_SESSION_LIMIT: usize = 5;
@@ -37,16 +37,23 @@ pub const PHOTON_SESSION_LIMIT: usize = 5;
 pub const PHOTON_DEFAULT_MODEL: &str = "claude-haiku-4-5-20251001";
 /// Environment variable that overrides the photon model.
 pub const PHOTON_MODEL_ENV: &str = "ION_PHOTON_MODEL";
-/// Credential variable the photon connection reads by name.
-pub const PHOTON_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 /// Output-token ceiling per photon turn (Anthropic Messages requires one).
 pub const PHOTON_MAX_OUTPUT_TOKENS: u32 = 4096;
 /// Longest question accepted, in bytes.
 pub const PHOTON_MAX_QUESTION_BYTES: usize = 8192;
 
-/// Builds a fresh model client for one photon run. Called on the blocking
-/// worker thread, once per run, so no client state is shared between runs.
-pub type PhotonClientFactory = Arc<dyn Fn() -> Result<Box<dyn ModelClient>> + Send + Sync>;
+/// Builds a fresh model client for one photon run against `endpoint`.
+/// Called on the blocking worker thread, once per run, so no client state is
+/// shared between runs.
+pub type PhotonClientFactory =
+    Arc<dyn Fn(&ModelEndpoint) -> Result<Box<dyn ModelClient>> + Send + Sync>;
+
+/// Chooses the endpoint for one photon run from the session context.
+pub type PhotonEndpointResolver = Arc<dyn Fn(&ReplContext) -> Result<ModelEndpoint> + Send + Sync>;
+
+/// Environment variable naming Ion's provider; consulted only to refuse a
+/// silent cross-vendor default (ADR-0022 rule 6).
+const PROVIDER_ENV: &str = "IMPULSE_PROVIDER";
 
 /// The photon's budget: `min-agent`'s defaults with the wall clock halved
 /// relative to Ion's own tool-loop budget, so one photon cannot consume the
@@ -61,33 +68,61 @@ pub fn photon_budget() -> Budget {
     }
 }
 
-/// Anthropic Messages connection at `origin` (scheme + host + optional port,
-/// as `llm_backends::anthropic::anthropic_api_origin` returns it).
-pub fn photon_connection(origin: &str) -> Connection {
-    Connection {
-        protocol: Protocol::AnthropicMessages,
-        base_url: format!("{}/v1", origin.trim_end_matches('/')),
-        auth: Auth::HeaderEnv {
-            header: "x-api-key".into(),
-            env: PHOTON_API_KEY_ENV.into(),
-        },
-        proxy: None,
+/// The endpoint for one photon run (ADR-0022 rule 6): the `roles.photon`
+/// profile when assigned; otherwise Anthropic Messages at `anthropic_origin`
+/// with the `ION_PHOTON_MODEL` override or the default model. When Ion runs on
+/// another provider and no photon profile exists, this refuses instead of
+/// guessing a model on a vendor the user did not choose.
+pub fn resolve_photon_endpoint(
+    config: &ModelEndpointConfig,
+    env: &dyn Fn(&str) -> Option<String>,
+    anthropic_origin: &str,
+) -> Result<ModelEndpoint> {
+    if let Some(endpoint) = config.endpoint_for(EndpointRole::Photon)? {
+        endpoint
+            .validate()
+            .context("photon: the configured photon profile is invalid")?;
+        return Ok(endpoint.clone());
     }
+    let provider = env(PROVIDER_ENV)
+        .map(|p| p.trim().to_ascii_lowercase())
+        .filter(|p| !p.is_empty());
+    if let Some(provider) = provider.filter(|p| p != "anthropic" && p != "claude") {
+        bail!(
+            "photon: {PROVIDER_ENV} is '{provider}' and no photon endpoint is configured; \
+             add a profile under model_endpoints.profiles in .impulse/config.json and set \
+             model_endpoints.roles.photon to its name"
+        );
+    }
+    let model = env(PHOTON_MODEL_ENV)
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| PHOTON_DEFAULT_MODEL.to_string());
+    Ok(ModelEndpoint::anthropic_messages(
+        anthropic_origin,
+        &model,
+        PHOTON_MAX_OUTPUT_TOKENS,
+    ))
 }
 
-/// Model profile for a photon run; a blank override falls back to the default.
-pub fn photon_profile(model_override: Option<&str>) -> ModelProfile {
-    let model = model_override
-        .map(str::trim)
-        .filter(|m| !m.is_empty())
-        .unwrap_or(PHOTON_DEFAULT_MODEL);
-    ModelProfile {
-        connection: "ion-photon".into(),
-        model: model.into(),
-        native_tools: true,
-        max_output_tokens: Some(PHOTON_MAX_OUTPUT_TOKENS),
-        output_limit_parameter: None,
+/// Reads the `model_endpoints` section of `<impulse_dir>/config.json`. A
+/// missing file is the empty default; an unreadable or malformed one is an
+/// error, so a typo never silently falls back to another endpoint.
+pub fn load_endpoint_config(impulse_dir: &Path) -> Result<ModelEndpointConfig> {
+    #[derive(serde::Deserialize, Default)]
+    struct Section {
+        #[serde(default)]
+        model_endpoints: ModelEndpointConfig,
     }
+    let path = impulse_dir.join("config.json");
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(e) => return Err(e).with_context(|| format!("photon: cannot read {}", path.display())),
+    };
+    let section: Section = serde_json::from_str(&raw)
+        .with_context(|| format!("photon: cannot parse model_endpoints in {}", path.display()))?;
+    Ok(section.model_endpoints)
 }
 
 /// Validated `photon` arguments.
@@ -156,8 +191,13 @@ pub fn resolve_photon_root(raw: Option<&str>, ctx: &ReplContext) -> Result<PathB
 /// Turns a finished run into the parent's tool outcome. Only a completed run
 /// is `ok`; any other stop is reported with its partial text labeled as not
 /// an answer.
-pub fn outcome_from_report(report: &RunReport) -> Result<ToolOutcome> {
-    let payload = serde_json::to_value(report).context("photon: cannot serialize run report")?;
+pub fn outcome_from_report(report: &RunReport, endpoint: &ModelEndpoint) -> Result<ToolOutcome> {
+    let mut payload =
+        serde_json::to_value(report).context("photon: cannot serialize run report")?;
+    payload["endpoint"] = json!({
+        "protocol": endpoint.protocol.to_string(),
+        "model": endpoint.model,
+    });
     let reads: Vec<String> = report
         .calls
         .iter()
@@ -167,7 +207,9 @@ pub fn outcome_from_report(report: &RunReport) -> Result<ToolOutcome> {
         })
         .collect();
     let evidence = format!(
-        "[photon: {} rounds, {} tool calls{}]",
+        "[photon ({} via {}): {} rounds, {} tool calls{}]",
+        endpoint.model,
+        endpoint.protocol,
         report.rounds,
         report.tool_calls,
         if reads.is_empty() {
@@ -197,36 +239,48 @@ pub fn outcome_from_report(report: &RunReport) -> Result<ToolOutcome> {
 
 /// Ion's disposable read-only subagent tool.
 pub struct PhotonTool {
+    resolver: PhotonEndpointResolver,
     factory: PhotonClientFactory,
     session_limit: usize,
     used: AtomicUsize,
 }
 
 impl PhotonTool {
-    /// A photon with an injected client factory and run cap.
-    pub fn new(factory: PhotonClientFactory, session_limit: usize) -> Self {
+    /// A photon with an injected endpoint resolver, client factory, and run cap.
+    pub fn new(
+        resolver: PhotonEndpointResolver,
+        factory: PhotonClientFactory,
+        session_limit: usize,
+    ) -> Self {
         Self {
+            resolver,
             factory,
             session_limit,
             used: AtomicUsize::new(0),
         }
     }
 
-    /// The production photon: Anthropic Messages at Ion's own API origin,
-    /// credential read by name from `ANTHROPIC_API_KEY` when a run starts, so
-    /// a missing key fails that run rather than the REPL launch.
+    /// The production photon. The endpoint is resolved per run from the
+    /// project's `config.json` (`model_endpoints`) and the environment
+    /// (ADR-0022); the credential is read by env-var name when the client is
+    /// built, so a missing key fails that run rather than the REPL launch.
     pub fn from_env() -> Self {
-        let factory: PhotonClientFactory = Arc::new(|| {
-            let origin = crate::llm_backends::anthropic::anthropic_api_origin();
-            let model = std::env::var(PHOTON_MODEL_ENV).ok();
-            let client = HttpModelClient::new(
-                &photon_connection(&origin),
-                &photon_profile(model.as_deref()),
+        let resolver: PhotonEndpointResolver = Arc::new(|ctx: &ReplContext| {
+            let config = load_endpoint_config(&ctx.sandbox_tool_context().impulse_dir)?;
+            resolve_photon_endpoint(
+                &config,
+                &|key| std::env::var(key).ok(),
+                &crate::llm_backends::anthropic::anthropic_api_origin(),
             )
-            .context("photon: cannot build the model client")?;
+        });
+        let factory: PhotonClientFactory = Arc::new(|endpoint: &ModelEndpoint| {
+            let (connection, profile) = min_agent_bridge::to_min_agent(endpoint)
+                .context("photon: invalid model endpoint")?;
+            let client = HttpModelClient::new(&connection, &profile)
+                .context("photon: cannot build the model client")?;
             Ok(Box::new(client) as Box<dyn ModelClient>)
         });
-        Self::new(factory, PHOTON_SESSION_LIMIT)
+        Self::new(resolver, factory, PHOTON_SESSION_LIMIT)
     }
 
     /// Claims one run slot, refusing once the session cap is reached.
@@ -285,10 +339,12 @@ impl ReplTool for PhotonTool {
     async fn run(&self, args: Value, ctx: &ReplContext) -> Result<ToolOutcome> {
         let request = parse_photon_args(&args)?;
         let root = resolve_photon_root(request.path.as_deref(), ctx)?;
+        let endpoint = (self.resolver)(ctx)?;
         self.reserve_slot()?;
         let factory = Arc::clone(&self.factory);
+        let run_endpoint = endpoint.clone();
         let report = tokio::task::spawn_blocking(move || -> Result<RunReport> {
-            let client = factory()?;
+            let client = factory(&run_endpoint)?;
             let workspace = Workspace::open(&root).context("photon: cannot open workspace")?;
             let options = RunOptions {
                 text_only: false,
@@ -305,13 +361,14 @@ impl ReplTool for PhotonTool {
         })
         .await
         .context("photon: worker thread failed")??;
-        outcome_from_report(&report)
+        outcome_from_report(&report, &endpoint)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_endpoint::WireProtocol;
     use min_agent::model::{Item, ModelError, ModelTurn, RequestLimits, ToolCall, ToolSpec};
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicBool;
@@ -361,9 +418,20 @@ mod tests {
         }
     }
 
+    /// Always resolves the same Anthropic endpoint; the client is scripted.
+    fn fixed_resolver() -> PhotonEndpointResolver {
+        Arc::new(|_: &ReplContext| {
+            Ok(ModelEndpoint::anthropic_messages(
+                "https://api.anthropic.com",
+                "test-model",
+                256,
+            ))
+        })
+    }
+
     /// Reads NOTES.md, then answers with the planted fact.
     fn reading_factory() -> PhotonClientFactory {
-        Arc::new(|| {
+        Arc::new(|_: &ModelEndpoint| {
             Ok(Box::new(ScriptedClient {
                 turns: Mutex::new(VecDeque::from([
                     call_turn("c1", "read_file", json!({"path": "NOTES.md"})),
@@ -375,7 +443,7 @@ mod tests {
 
     /// Lists the root forever with fresh call ids, tripping the repeated-batch breaker.
     fn looping_factory() -> PhotonClientFactory {
-        Arc::new(|| {
+        Arc::new(|_: &ModelEndpoint| {
             let turns = (0..20)
                 .map(|i| call_turn(&format!("c{i}"), "list_files", json!({"path": "."})))
                 .collect();
@@ -387,7 +455,7 @@ mod tests {
 
     /// Records whether it was ever called, then fails.
     fn tripwire_factory(called: Arc<AtomicBool>) -> PhotonClientFactory {
-        Arc::new(move || {
+        Arc::new(move |_: &ModelEndpoint| {
             called.store(true, Ordering::SeqCst);
             bail!("tripwire factory should not run")
         })
@@ -407,7 +475,7 @@ mod tests {
     #[tokio::test]
     async fn test_photon_run_reads_file_and_returns_completed_answer() {
         let (_dir, ctx) = repo_with_notes();
-        let tool = PhotonTool::new(reading_factory(), 5);
+        let tool = PhotonTool::new(fixed_resolver(), reading_factory(), 5);
         let outcome = tool
             .run(json!({"question": "What is the planted fact?"}), &ctx)
             .await
@@ -427,7 +495,7 @@ mod tests {
     #[tokio::test]
     async fn test_photon_run_budget_stop_is_not_success() {
         let (_dir, ctx) = repo_with_notes();
-        let tool = PhotonTool::new(looping_factory(), 5);
+        let tool = PhotonTool::new(fixed_resolver(), looping_factory(), 5);
         let outcome = tool
             .run(json!({"question": "Loop forever"}), &ctx)
             .await
@@ -443,7 +511,7 @@ mod tests {
         let (_dir, ctx) = repo_with_notes();
         let outside = tempfile::tempdir().unwrap();
         let called = Arc::new(AtomicBool::new(false));
-        let tool = PhotonTool::new(tripwire_factory(Arc::clone(&called)), 1);
+        let tool = PhotonTool::new(fixed_resolver(), tripwire_factory(Arc::clone(&called)), 1);
         let escape = outside.path().display().to_string();
         let err = tool
             .run(json!({"question": "q", "path": escape}), &ctx)
@@ -465,7 +533,7 @@ mod tests {
         let granted = tempfile::tempdir().unwrap();
         std::fs::write(granted.path().join("NOTES.md"), "planted fact: 42\n").unwrap();
         ctx.allowed_read_roots.push(granted.path().to_path_buf());
-        let tool = PhotonTool::new(reading_factory(), 5);
+        let tool = PhotonTool::new(fixed_resolver(), reading_factory(), 5);
         let path = granted.path().display().to_string();
         let outcome = tool
             .run(json!({"question": "fact?", "path": path}), &ctx)
@@ -477,7 +545,7 @@ mod tests {
     #[tokio::test]
     async fn test_photon_run_session_limit_refuses_after_cap() {
         let (_dir, ctx) = repo_with_notes();
-        let tool = PhotonTool::new(reading_factory(), 2);
+        let tool = PhotonTool::new(fixed_resolver(), reading_factory(), 2);
         for _ in 0..2 {
             let outcome = tool.run(json!({"question": "fact?"}), &ctx).await.unwrap();
             assert!(outcome.ok);
@@ -493,7 +561,7 @@ mod tests {
     async fn test_photon_run_factory_error_propagates() {
         let (_dir, ctx) = repo_with_notes();
         let called = Arc::new(AtomicBool::new(false));
-        let tool = PhotonTool::new(tripwire_factory(Arc::clone(&called)), 1);
+        let tool = PhotonTool::new(fixed_resolver(), tripwire_factory(Arc::clone(&called)), 1);
         let err = tool
             .run(json!({"question": "fact?"}), &ctx)
             .await
@@ -556,31 +624,141 @@ mod tests {
         assert!(budget.request_timeout <= budget.wall_clock);
     }
 
-    #[test]
-    fn test_photon_connection_uses_anthropic_messages_and_named_key() {
-        let conn = photon_connection("https://api.anthropic.com/");
-        assert!(conn.validate().is_ok());
-        assert_eq!(
-            conn.endpoint().unwrap().as_str(),
-            "https://api.anthropic.com/v1/messages"
-        );
-        assert!(matches!(
-            &conn.auth,
-            Auth::HeaderEnv { header, env } if header == "x-api-key" && env == PHOTON_API_KEY_ENV
-        ));
-        assert!(photon_connection("http://127.0.0.1:4010")
-            .validate()
-            .is_ok());
+    fn env_of(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |key| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        }
     }
 
     #[test]
-    fn test_photon_profile_override_and_blank_fallback() {
-        assert_eq!(photon_profile(None).model, PHOTON_DEFAULT_MODEL);
-        assert_eq!(photon_profile(Some("  ")).model, PHOTON_DEFAULT_MODEL);
-        let profile = photon_profile(Some("claude-sonnet-5-5"));
-        assert_eq!(profile.model, "claude-sonnet-5-5");
-        assert_eq!(profile.max_output_tokens, Some(PHOTON_MAX_OUTPUT_TOKENS));
-        assert!(profile.native_tools);
+    fn test_resolve_photon_endpoint_defaults_to_anthropic_with_model_override() {
+        let config = ModelEndpointConfig::default();
+        let endpoint =
+            resolve_photon_endpoint(&config, &env_of(&[]), "https://api.anthropic.com").unwrap();
+        assert_eq!(endpoint.protocol, WireProtocol::AnthropicMessages);
+        assert_eq!(endpoint.base_url, "https://api.anthropic.com/v1");
+        assert_eq!(endpoint.model, PHOTON_DEFAULT_MODEL);
+        assert_eq!(endpoint.max_output_tokens, Some(PHOTON_MAX_OUTPUT_TOKENS));
+        let endpoint = resolve_photon_endpoint(
+            &config,
+            &env_of(&[
+                (PHOTON_MODEL_ENV, " claude-sonnet-5-5 "),
+                (PROVIDER_ENV, "Claude"),
+            ]),
+            "http://127.0.0.1:4010",
+        )
+        .unwrap();
+        assert_eq!(endpoint.model, "claude-sonnet-5-5");
+        assert_eq!(endpoint.base_url, "http://127.0.0.1:4010/v1");
+        let endpoint = resolve_photon_endpoint(
+            &config,
+            &env_of(&[(PHOTON_MODEL_ENV, "  ")]),
+            "https://a.test",
+        )
+        .unwrap();
+        assert_eq!(endpoint.model, PHOTON_DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn test_resolve_photon_endpoint_uses_assigned_profile_over_env() {
+        let config: ModelEndpointConfig = serde_json::from_value(json!({
+            "profiles": {"local": {
+                "protocol": "openai_chat",
+                "base_url": "http://127.0.0.1:11434/v1",
+                "auth": {"kind": "none"},
+                "model": "qwen2.5-coder:7b"
+            }},
+            "roles": {"photon": "local"}
+        }))
+        .unwrap();
+        let endpoint = resolve_photon_endpoint(
+            &config,
+            &env_of(&[(PHOTON_MODEL_ENV, "ignored"), (PROVIDER_ENV, "openai")]),
+            "https://api.anthropic.com",
+        )
+        .unwrap();
+        assert_eq!(endpoint.protocol, WireProtocol::OpenaiChat);
+        assert_eq!(endpoint.model, "qwen2.5-coder:7b");
+    }
+
+    #[test]
+    fn test_resolve_photon_endpoint_refuses_cross_vendor_default_and_bad_profiles() {
+        let config = ModelEndpointConfig::default();
+        let err = resolve_photon_endpoint(
+            &config,
+            &env_of(&[(PROVIDER_ENV, "minimax")]),
+            "https://api.anthropic.com",
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("IMPULSE_PROVIDER is 'minimax'"));
+        let missing: ModelEndpointConfig =
+            serde_json::from_value(json!({"roles": {"photon": "ghost"}})).unwrap();
+        let err = resolve_photon_endpoint(&missing, &env_of(&[]), "https://api.anthropic.com")
+            .unwrap_err();
+        assert!(format!("{err}").contains("'ghost'"));
+        let insecure: ModelEndpointConfig = serde_json::from_value(json!({
+            "profiles": {"p": {
+                "protocol": "openai_chat", "base_url": "http://remote.test/v1",
+                "auth": {"kind": "none"}, "model": "m"
+            }},
+            "roles": {"photon": "p"}
+        }))
+        .unwrap();
+        let err = resolve_photon_endpoint(&insecure, &env_of(&[]), "https://api.anthropic.com")
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("must use https"));
+    }
+
+    #[test]
+    fn test_load_endpoint_config_missing_file_is_default_and_malformed_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            load_endpoint_config(dir.path()).unwrap(),
+            ModelEndpointConfig::default()
+        );
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"log_level": "info", "model_endpoints": {"roles": {"photon": "p"}}}"#,
+        )
+        .unwrap();
+        let loaded = load_endpoint_config(dir.path()).unwrap();
+        assert_eq!(loaded.roles.photon.as_deref(), Some("p"));
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_endpoints": {"rolez": {}}}"#,
+        )
+        .unwrap();
+        let err = load_endpoint_config(dir.path()).unwrap_err();
+        assert!(format!("{err}").contains("cannot parse model_endpoints"));
+    }
+
+    #[tokio::test]
+    async fn test_photon_run_resolver_error_does_not_consume_slot() {
+        let (_dir, ctx) = repo_with_notes();
+        let resolver: PhotonEndpointResolver =
+            Arc::new(|_: &ReplContext| bail!("no endpoint configured"));
+        let tool = PhotonTool::new(resolver, reading_factory(), 1);
+        let err = tool.run(json!({"question": "q"}), &ctx).await.unwrap_err();
+        assert!(format!("{err}").contains("no endpoint configured"));
+        assert_eq!(tool.used.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_photon_run_reports_resolved_endpoint() {
+        let (_dir, ctx) = repo_with_notes();
+        let tool = PhotonTool::new(fixed_resolver(), reading_factory(), 5);
+        let outcome = tool.run(json!({"question": "fact?"}), &ctx).await.unwrap();
+        assert_eq!(outcome.payload["endpoint"]["model"], "test-model");
+        assert_eq!(
+            outcome.payload["endpoint"]["protocol"],
+            "anthropic_messages"
+        );
+        assert!(outcome
+            .rendered
+            .contains("test-model via anthropic_messages"));
     }
 
     /// Live graduation check against the real provider. Opt-in:
@@ -604,7 +782,7 @@ mod tests {
 
     #[test]
     fn test_photon_schema_name_matches_tool_name_and_requires_question() {
-        let tool = PhotonTool::new(reading_factory(), 1);
+        let tool = PhotonTool::new(fixed_resolver(), reading_factory(), 1);
         let schema = tool.json_schema();
         assert_eq!(schema["name"], tool.name());
         assert_eq!(schema["input_schema"]["required"], json!(["question"]));

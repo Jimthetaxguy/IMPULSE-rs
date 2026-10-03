@@ -34,6 +34,7 @@ pub mod llm_backends;
 pub mod loop_contract;
 pub mod mcp;
 pub mod memory;
+pub mod model_endpoint;
 pub mod monty;
 pub mod notification;
 pub mod office;

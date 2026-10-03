@@ -1,7 +1,7 @@
 ---
 title: Ion photon — a disposable read-only subagent tool
 description: Package the min-agent read-only coding agent as an Ion ReplTool that answers one question about a workspace subtree and is then thrown away
-updated: 2026-10-02
+updated: 2026-10-03
 type: specification
 category: architecture
 phase: all
@@ -60,9 +60,13 @@ the connection, the budget, and the root.
 3. **Budget fits inside the parent.** The photon's wall clock is half of Ion's tool-loop budget
    (`ION_DEFAULT_WALL_CLOCK / 2`), so one photon cannot consume the whole parent exchange. A photon
    is one tool call to the parent loop.
-4. **Host-owned model choice** (ADR-0015). Anthropic Messages at the same origin Ion uses
-   (`ANTHROPIC_BASE_URL` or the canonical default), credential from `ANTHROPIC_API_KEY` by name,
-   model from `ION_PHOTON_MODEL` or a small default. Nothing in the tool schema selects a model.
+4. **Host-owned model choice** (ADR-0015, ADR-0022). The endpoint is a typed
+   `model_endpoint::ModelEndpoint` resolved per run: the `model_endpoints.roles.photon` profile in
+   `.impulse/config.json` when assigned (any of `anthropic_messages`, `openai_chat`,
+   `openai_responses`); otherwise Anthropic Messages at Ion's own origin with
+   `ANTHROPIC_API_KEY` and `ION_PHOTON_MODEL` or the default. If `IMPULSE_PROVIDER` names another
+   vendor and no photon profile exists, the run is refused rather than guessing a model. Nothing in
+   the tool schema selects a model or endpoint. A resolution failure does not consume a run slot.
 5. **Untrusted output.** The answer is model text derived from file contents. It goes through the
    existing untrusted tool-output envelope and `GuardTarget::ToolCall` scan like every tool
    result, so a hostile file cannot approve a later gated call.
@@ -78,8 +82,24 @@ the connection, the budget, and the root.
   `photon-subagent` feature. Turning the feature off removes the tool and the dependency.
 - `min_agent::agent::run` is blocking; the tool runs it on `tokio::task::spawn_blocking`.
   The run cannot be cancelled mid-flight; its own wall-clock deadline is the backstop.
-- The model-client factory is injected, so tests drive the real loop with a scripted
-  `ModelClient` and production uses `HttpModelClient`.
+- The endpoint resolver and model-client factory are injected, so tests drive the real loop with
+  a scripted `ModelClient` and production uses `HttpModelClient` built through
+  `model_endpoint::min_agent_bridge`, the only module that knows `min-agent`'s config shapes.
+- Example profile for a local model:
+
+  ```json
+  "model_endpoints": {
+    "profiles": {
+      "local-qwen": {
+        "protocol": "openai_chat",
+        "base_url": "http://127.0.0.1:11434/v1",
+        "auth": {"kind": "none"},
+        "model": "qwen2.5-coder:7b"
+      }
+    },
+    "roles": {"photon": "local-qwen"}
+  }
+  ```
 
 ## Out of scope
 
