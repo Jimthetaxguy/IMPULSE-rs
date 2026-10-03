@@ -841,7 +841,13 @@ fn is_untracked_impulse_runtime_artifact(path: &[u8]) -> bool {
             // promotion, which is only reachable *after* an approval, failed on
             // a tree the daemon had dirtied itself.
             | b".impulse/MEMORY_CANDIDATES.json"
+            // ADR-0023's blackboard. Ion opens it inside whatever worktree it
+            // runs in, including a staged Builder worktree, the moment a tool
+            // result spills; an ungitignored `.impulse` would then report the
+            // very tree the Builder is about to claim as dirty.
+            | b".impulse/blackboard.db"
     ) || path.starts_with(b".impulse/GOVERNED_TASKS.tmp.")
+        || path.starts_with(b".impulse/blackboard.db-")
         || path.starts_with(b".impulse/DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.tmp-")
         || path.starts_with(b".impulse/PRODUCER_RESERVATIONS.tmp.")
         || path.starts_with(b".impulse/MEMORY_CANDIDATES.tmp.")
@@ -2816,6 +2822,41 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("dirty"));
+    }
+
+    /// ADR-0023: a real blackboard (database plus its WAL and shared-memory
+    /// sidecars) in an ungitignored `.impulse` leaves the subject clean.
+    #[test]
+    fn clean_git_subject_exempts_the_blackboard_database_and_sidecars() {
+        let repo = init_repo();
+        let initial = observe_clean_git_subject(repo.path(), None).unwrap();
+        let impulse = repo.path().join(".impulse");
+        let board = crate::blackboard::Blackboard::open(&impulse).unwrap();
+        board
+            .put(crate::blackboard::NewEntry {
+                task_id: "spill:bash_exec:1",
+                payload: b"output",
+                content_type: "text/plain",
+                ttl_seconds: None,
+                metadata: serde_json::Value::Null,
+            })
+            .unwrap();
+        // Keep the connection open so the WAL sidecars exist during the check.
+        assert!(impulse.join("blackboard.db").exists());
+        assert_eq!(
+            observe_clean_git_subject(repo.path(), Some(&initial)).unwrap(),
+            initial
+        );
+        assert!(is_untracked_impulse_runtime_artifact(
+            b".impulse/blackboard.db-wal"
+        ));
+        assert!(is_untracked_impulse_runtime_artifact(
+            b".impulse/blackboard.db-shm"
+        ));
+        assert!(!is_untracked_impulse_runtime_artifact(
+            b".impulse/blackboard.dbx"
+        ));
+        drop(board);
     }
 
     /// ADR-0020 rule 3a. `.impulse/MEMORY.jsonl` and `.impulse/GENOME_PROJECTION.md`

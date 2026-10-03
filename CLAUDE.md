@@ -144,6 +144,7 @@ ADR-0020's state and request-type contracts implement candidate decisions, `MEMO
 - `PRODUCER_RESERVATIONS.json` — durable producer intent, receipt references, and interrupted-attempt recovery
 - `DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.json` — bounded ambiguous launch/exit mutations awaiting daemon reconciliation
 - `retrieval.db` — search index (rebuildable)
+- `blackboard.db` — off-context agent results and spilled tool output, TTL-purged (ADR-0023)
 
 ---
 

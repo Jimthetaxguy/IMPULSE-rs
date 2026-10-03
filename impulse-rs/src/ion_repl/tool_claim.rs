@@ -1,6 +1,7 @@
 //! Native Ion bridge for daemon-owned governed completion claims.
 //!
-//! The model supplies only a bounded summary and optional artifact ids. Task
+//! The model supplies only a summary and optional artifact ids; a summary
+//! over the claim limit is spilled to the blackboard (ADR-0023). Task
 //! routing comes from the launch environment; current revision, actor, Git
 //! subject, and diff truth are resolved by the daemon.
 
@@ -48,7 +49,7 @@ impl ReplTool for GovernedSubmitClaimTool {
         })
     }
 
-    async fn run(&self, args: Value, _ctx: &ReplContext) -> Result<ToolOutcome> {
+    async fn run(&self, args: Value, ctx: &ReplContext) -> Result<ToolOutcome> {
         let socket_path = required_launch_env("IMPULSE_SOCKET_PATH")?;
         let project_id = required_launch_env("IMPULSE_PROJECT_ID")?;
         let task_id = impulse_ops::governed_task::GovernedTaskId::try_new(required_launch_env(
@@ -77,52 +78,94 @@ impl ReplTool for GovernedSubmitClaimTool {
             .transpose()?
             .unwrap_or_default();
 
+        let blackboard_dir =
+            super::tool_blackboard::claim_blackboard_dir(std::path::Path::new(&socket_path), ctx);
         let client = crate::client::DaemonClient::new(PathBuf::from(socket_path));
         let current = client
             .get_governed_task(project_id.clone(), task_id.clone())
             .await?
             .context("governed task was not found by the project daemon")?;
-        let request = impulse_ops::governed_task::GovernedClaimRequest {
-            request_id: impulse_ops::governed_task::GovernedRequestId::try_new(format!(
-                "ion-claim-{}",
-                uuid::Uuid::new_v4()
-            ))?,
-            project_id,
-            task_id,
-            expected_revision: current.revision,
+        // ADR-0023: a summary over the claim limit is kept whole in the
+        // canonical project's blackboard and submitted as a preview plus a
+        // `blackboard:` artifact reference, instead of being refused by the
+        // daemon's size check. Done after the daemon lookup, and undone below
+        // unless the daemon records the claim, so no failed or refused
+        // submission leaves a non-expiring entry behind.
+        let spilled = super::tool_blackboard::spill_claim_summary(
+            ctx.blackboard.as_ref(),
+            &blackboard_dir,
+            task_id.as_str(),
             summary,
             artifact_ids,
-        };
-        request.validate()?;
-        match client.submit_governed_claim(request).await? {
-            crate::client::GovernedProducerOutcome::Recorded(acknowledged) => {
-                let payload = serde_json::to_value(&acknowledged)
-                    .context("failed to serialize governed claim acknowledgment")?;
-                Ok(ToolOutcome {
-                    rendered: format!(
-                        "Governed completion claim acknowledged at task revision {}.",
-                        acknowledged.revision
-                    ),
-                    payload,
-                    ok: true,
-                })
+        )?;
+        let stored_key = spilled.stored_key.clone();
+        let result = submit_claim(
+            &client,
+            project_id,
+            task_id,
+            current.revision,
+            spilled.summary,
+            spilled.artifact_ids,
+        )
+        .await;
+        let recorded = matches!(&result, Ok(outcome) if outcome.ok);
+        if let (false, Some(key)) = (recorded, stored_key) {
+            if let Err(err) = super::tool_blackboard::undo_claim_spill(&blackboard_dir, &key) {
+                tracing::warn!("could not remove unrecorded claim summary {key}: {err:#}");
             }
-            // ADR-0019 rule 13: the daemon refused to run Git in this staged
-            // worktree. Nothing was recorded and retrying changes nothing, so
-            // the Builder is told the reason and the remedy rather than a
-            // failure it might loop on.
-            crate::client::GovernedProducerOutcome::StagedConfigRefused(refusal) => {
-                let payload = serde_json::to_value(&refusal)
-                    .context("failed to serialize governed claim refusal")?;
-                Ok(ToolOutcome {
-                    rendered: format!(
-                        "Governed completion claim refused: {}. {}.",
-                        refusal.reason, refusal.remedy
-                    ),
-                    payload,
-                    ok: false,
-                })
-            }
+        }
+        result
+    }
+}
+
+async fn submit_claim(
+    client: &crate::client::DaemonClient,
+    project_id: String,
+    task_id: impulse_ops::governed_task::GovernedTaskId,
+    expected_revision: u64,
+    summary: String,
+    artifact_ids: Vec<String>,
+) -> Result<ToolOutcome> {
+    let request = impulse_ops::governed_task::GovernedClaimRequest {
+        request_id: impulse_ops::governed_task::GovernedRequestId::try_new(format!(
+            "ion-claim-{}",
+            uuid::Uuid::new_v4()
+        ))?,
+        project_id,
+        task_id,
+        expected_revision,
+        summary,
+        artifact_ids,
+    };
+    request.validate()?;
+    match client.submit_governed_claim(request).await? {
+        crate::client::GovernedProducerOutcome::Recorded(acknowledged) => {
+            let payload = serde_json::to_value(&acknowledged)
+                .context("failed to serialize governed claim acknowledgment")?;
+            Ok(ToolOutcome {
+                rendered: format!(
+                    "Governed completion claim acknowledged at task revision {}.",
+                    acknowledged.revision
+                ),
+                payload,
+                ok: true,
+            })
+        }
+        // ADR-0019 rule 13: the daemon refused to run Git in this staged
+        // worktree. Nothing was recorded and retrying changes nothing, so
+        // the Builder is told the reason and the remedy rather than a
+        // failure it might loop on.
+        crate::client::GovernedProducerOutcome::StagedConfigRefused(refusal) => {
+            let payload = serde_json::to_value(&refusal)
+                .context("failed to serialize governed claim refusal")?;
+            Ok(ToolOutcome {
+                rendered: format!(
+                    "Governed completion claim refused: {}. {}.",
+                    refusal.reason, refusal.remedy
+                ),
+                payload,
+                ok: false,
+            })
         }
     }
 }

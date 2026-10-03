@@ -311,6 +311,23 @@ impl Daemon {
 
         println!("Daemon listening on {}", self.config.socket_path.display());
 
+        let blackboard_section = self
+            .config
+            .state
+            .config_snapshot()
+            .unwrap_or_default()
+            .blackboard;
+        let purge_interval = crate::blackboard::BlackboardConfig::from_section(&blackboard_section)
+            .unwrap_or_else(|reason| {
+                tracing::warn!("{reason}; using the default blackboard purge interval");
+                crate::blackboard::BlackboardConfig::default()
+            })
+            .purge_interval_secs;
+        let blackboard_maintenance = spawn_blackboard_maintenance(
+            self.config.state.storage().base_path().to_path_buf(),
+            std::time::Duration::from_secs(purge_interval),
+        );
+
         loop {
             tokio::select! {
                 result = listener.accept() => {
@@ -373,9 +390,47 @@ impl Daemon {
         // A signal handler that reaches this path is follow-up work, not a
         // correctness gap.
         actor_provenance::remove_capability_file(&capability_path);
+        blackboard_maintenance.abort();
 
         Ok(())
     }
+}
+
+/// ADR-0023 blackboard upkeep. The first pass runs at startup: it purges
+/// rows that expired while the daemon was down and logs how many live
+/// entries a restarted daemon is resuming with. Later passes purge on
+/// `interval`. Each pass runs on the blocking pool, because a busy database
+/// can hold a SQLite call for up to its busy timeout. A project with no
+/// blackboard file is left alone; the daemon never creates one.
+fn spawn_blackboard_maintenance(
+    impulse_dir: PathBuf,
+    interval: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut first = true;
+        loop {
+            ticker.tick().await;
+            let dir = impulse_dir.clone();
+            match tokio::task::spawn_blocking(move || crate::blackboard::maintain(&dir)).await {
+                Ok(Ok(Some(report))) if first => tracing::info!(
+                    purged = report.purged,
+                    live = report.live,
+                    "blackboard: resuming with live entries"
+                ),
+                Ok(Ok(Some(report))) if report.purged > 0 => tracing::info!(
+                    purged = report.purged,
+                    live = report.live,
+                    "blackboard: purged expired entries"
+                ),
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => tracing::warn!("blackboard maintenance failed: {err}"),
+                Err(err) => tracing::warn!("blackboard maintenance task failed: {err}"),
+            }
+            first = false;
+        }
+    })
 }
 
 struct ConnectionContext {

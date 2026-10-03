@@ -19,14 +19,31 @@ use std::sync::Arc;
 
 use crate::tooling::ToolRegistry;
 
+use super::tool_blackboard::{BlackboardFetchTool, BlackboardStoreTool};
 use super::tool_bridge::DynamicToolBridge;
 use super::tool_claim::GovernedSubmitClaimTool;
 #[cfg(feature = "office-support")]
 use super::tool_document::DocumentReadTool;
 #[cfg(feature = "photon-subagent")]
 use super::tool_photon::PhotonTool;
+use super::tool_search::{SearchToolsTool, ToolDescriptor};
 use super::tool_verify::IonVerifyTool;
 use super::tools::ReplTool;
+
+/// The orchestrator's whole advertised tool surface (ADR-0023): discover
+/// tools, park and page results off-context, hand work to a worker, and pass
+/// an approval gate. Everything else is reached through `search_tools`.
+/// `search_tools`, `blackboard_store` and `blackboard_fetch` are registered
+/// in [`ReplToolRegistry::with_defaults`]; `delegate_task` and
+/// `approve_gate` are reserved names for the orchestrator role, which is not
+/// built yet.
+pub const ORCHESTRATOR_TOOL_SURFACE: [&str; 5] = [
+    "search_tools",
+    "blackboard_store",
+    "blackboard_fetch",
+    "delegate_task",
+    "approve_gate",
+];
 
 /// Ordered (by name) collection of registered `ReplTool`s.
 pub struct ReplToolRegistry {
@@ -75,7 +92,9 @@ impl ReplToolRegistry {
     /// `governed_submit_claim`, the read-only `document_read` (only with the
     /// default `office-support` feature, matching `src/tooling::document`),
     /// plus `file_read`, `file_write`, `bash_exec`, `memory_search`, and
-    /// `genome_read` bridged from `src/tooling::ToolRegistry::with_defaults()`.
+    /// `genome_read` bridged from `src/tooling::ToolRegistry::with_defaults()`,
+    /// then ADR-0023's `blackboard_store` and `blackboard_fetch`, and last
+    /// `search_tools`, whose catalog is a snapshot of everything before it.
     ///
     /// `memory_search`/`genome_read` are read-only (`Capability::FileSystemRead`
     /// only) and stay outside `CONFIRMATION_REQUIRED_TOOLS` like `file_read`
@@ -159,6 +178,22 @@ impl ReplToolRegistry {
              and preferences from GENOME.md",
             )))
             .expect("default genome_read");
+        registry
+            .register(Box::new(BlackboardStoreTool))
+            .expect("default blackboard_store");
+        registry
+            .register(Box::new(BlackboardFetchTool))
+            .expect("default blackboard_fetch");
+
+        // Last, so its catalog snapshot covers every tool registered above.
+        let catalog = registry
+            .list()
+            .into_iter()
+            .map(ToolDescriptor::of)
+            .collect();
+        registry
+            .register(Box::new(SearchToolsTool::new(catalog)))
+            .expect("default search_tools");
 
         registry
     }
@@ -214,6 +249,9 @@ mod tests {
         assert!(registry.get("governed_submit_claim").is_some());
         assert!(registry.get("memory_search").is_some());
         assert!(registry.get("genome_read").is_some());
+        assert!(registry.get("blackboard_store").is_some());
+        assert!(registry.get("blackboard_fetch").is_some());
+        assert!(registry.get("search_tools").is_some());
         assert_eq!(
             registry.get("document_read").is_some(),
             cfg!(feature = "office-support")
@@ -222,7 +260,7 @@ mod tests {
             registry.get("photon").is_some(),
             cfg!(feature = "photon-subagent")
         );
-        let expected = 7
+        let expected = 10
             + usize::from(cfg!(feature = "office-support"))
             + usize::from(cfg!(feature = "photon-subagent"));
         assert_eq!(registry.len(), expected);
@@ -255,6 +293,45 @@ mod tests {
                 schema_name,
                 Some(tool.name()),
                 "dispatch name and schema name must be the same identity"
+            );
+        }
+    }
+
+    #[test]
+    fn test_orchestrator_surface_stays_at_five_tools() {
+        assert_eq!(ORCHESTRATOR_TOOL_SURFACE.len(), 5);
+        let unique: std::collections::BTreeSet<&str> =
+            ORCHESTRATOR_TOOL_SURFACE.iter().copied().collect();
+        assert_eq!(unique.len(), 5, "no duplicate names");
+        let registry = ReplToolRegistry::with_defaults();
+        for name in ["search_tools", "blackboard_store", "blackboard_fetch"] {
+            assert!(ORCHESTRATOR_TOOL_SURFACE.contains(&name));
+            assert!(registry.get(name).is_some(), "{name} is registered");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_search_tools_catalog_covers_every_default_tool() {
+        let registry = ReplToolRegistry::with_defaults();
+        let search = registry.get("search_tools").expect("search_tools");
+        let outcome = search
+            .run(
+                serde_json::json!({"query": "", "limit": 20}),
+                &ReplContext::default(),
+            )
+            .await
+            .expect("list all");
+        let found: Vec<&str> = outcome.payload["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .filter_map(|entry| entry["name"].as_str())
+            .collect();
+        for tool in registry.list() {
+            assert!(
+                found.contains(&tool.name()),
+                "{} is searchable",
+                tool.name()
             );
         }
     }

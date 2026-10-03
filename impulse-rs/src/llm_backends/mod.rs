@@ -199,6 +199,15 @@ pub trait ToolExecutor: Send + Sync {
     fn wrap_compaction_stub(&self, stub: &str) -> String {
         stub.to_string()
     }
+
+    /// Text to append to the compaction stub that replaces `original`, so
+    /// the executor can keep a pointer to anything it stored elsewhere (the
+    /// ion REPL keeps a spilled result's blackboard key). Appended before
+    /// [`ToolExecutor::wrap_compaction_stub`] frames the stub. The default
+    /// keeps nothing.
+    fn compaction_note(&self, _original: &str) -> Option<String> {
+        None
+    }
 }
 
 /// Outcome of one [`ToolExecutor::execute`] call, ready to fold into a
@@ -756,10 +765,12 @@ fn enforce_context_budget(
                 continue;
             }
             let original = result.content.chars().count();
-            let stub = executor.wrap_compaction_stub(&compaction_stub(
-                original,
-                names.get(&result.tool_use_id).map(String::as_str),
-            ));
+            let mut raw_stub =
+                compaction_stub(original, names.get(&result.tool_use_id).map(String::as_str));
+            if let Some(note) = executor.compaction_note(&result.content) {
+                raw_stub.push_str(&note);
+            }
+            let stub = executor.wrap_compaction_stub(&raw_stub);
             let stub_chars = stub.chars().count();
             if stub_chars >= original {
                 continue;
