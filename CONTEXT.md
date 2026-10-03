@@ -521,6 +521,17 @@ not isolated (ADR-0021 follow-up: `monty-pool`). Distinct from `src/monty/`, the
 - **Source of truth:** `src/tools/python.rs` (`execute_python`, `execute_python_with_timeout`,
   `PythonResult`, `fault`) and ADR-0021.
 
+### scout — `[code]`
+Ion's disposable read-only subagent tool. The model passes one question and an optional directory;
+a fresh `min-agent` run (`list_files`, `read_file`, `search_text` under a `cap-std` capability)
+answers it and is dropped, keeping no transcript, trace, memory, or session. The host picks the
+model (`ION_SCOUT_MODEL`, default Haiku), the Anthropic connection at Ion's own origin, and a budget
+of half Ion's tool-loop wall clock. The root must resolve inside the session's read sandbox. It
+stays outside confirmation; spend is capped at five runs per REPL session, and only a `Completed`
+stop is success. Default feature `scout-subagent`; `min-agent` is pinned by git commit.
+- **Source of truth:** `src/ion_repl/tool_scout.rs` and
+  `docs/superpowers/specs/2026-10-02-ion-scout-subagent-design.md`.
+
 ### supervisor policy — `[code]`
 The concrete permission and confirmation policy for supervisor actions such as monitoring, memory
 search, focus, input, context operations, and permission changes. It is the first role-specific

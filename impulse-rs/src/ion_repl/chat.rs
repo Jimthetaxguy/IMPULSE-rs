@@ -1614,6 +1614,24 @@ mod tests {
             "memory_search must stay outside CONFIRMATION_REQUIRED_TOOLS: {:?}",
             asked.lock().unwrap()
         );
+
+        // scout is read-only; its spend is bounded by a per-session cap, not
+        // a prompt. A blank question fails validation before any model client
+        // is built, so this never reaches the network.
+        #[cfg(feature = "scout-subagent")]
+        {
+            asked.lock().unwrap().clear();
+            let scout = executor
+                .execute("scout", serde_json::json!({"question": "  "}))
+                .await;
+            assert!(scout.is_error);
+            assert!(!scout.content.contains("declined"));
+            assert!(
+                asked.lock().unwrap().is_empty(),
+                "scout must stay outside CONFIRMATION_REQUIRED_TOOLS: {:?}",
+                asked.lock().unwrap()
+            );
+        }
     }
 
     #[tokio::test]

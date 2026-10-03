@@ -23,6 +23,8 @@ use super::tool_bridge::DynamicToolBridge;
 use super::tool_claim::GovernedSubmitClaimTool;
 #[cfg(feature = "office-support")]
 use super::tool_document::DocumentReadTool;
+#[cfg(feature = "scout-subagent")]
+use super::tool_scout::ScoutTool;
 use super::tool_verify::IonVerifyTool;
 use super::tools::ReplTool;
 
@@ -111,6 +113,10 @@ impl ReplToolRegistry {
         registry
             .register(Box::new(DocumentReadTool))
             .expect("default document_read");
+        #[cfg(feature = "scout-subagent")]
+        registry
+            .register(Box::new(ScoutTool::from_env()))
+            .expect("default scout");
 
         let dynamic = Arc::new(ToolRegistry::with_defaults());
         registry
@@ -208,16 +214,18 @@ mod tests {
         assert!(registry.get("governed_submit_claim").is_some());
         assert!(registry.get("memory_search").is_some());
         assert!(registry.get("genome_read").is_some());
-        #[cfg(feature = "office-support")]
-        {
-            assert!(registry.get("document_read").is_some());
-            assert_eq!(registry.len(), 8);
-        }
-        #[cfg(not(feature = "office-support"))]
-        {
-            assert!(registry.get("document_read").is_none());
-            assert_eq!(registry.len(), 7);
-        }
+        assert_eq!(
+            registry.get("document_read").is_some(),
+            cfg!(feature = "office-support")
+        );
+        assert_eq!(
+            registry.get("scout").is_some(),
+            cfg!(feature = "scout-subagent")
+        );
+        let expected = 7
+            + usize::from(cfg!(feature = "office-support"))
+            + usize::from(cfg!(feature = "scout-subagent"));
+        assert_eq!(registry.len(), expected);
     }
 
     #[test]

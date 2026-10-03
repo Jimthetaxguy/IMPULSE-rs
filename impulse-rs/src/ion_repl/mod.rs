@@ -21,6 +21,8 @@ pub mod tool_bridge;
 pub mod tool_claim;
 #[cfg(feature = "office-support")]
 pub mod tool_document;
+#[cfg(feature = "scout-subagent")]
+pub mod tool_scout;
 pub mod tool_verify;
 pub mod tools;
 
