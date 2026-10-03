@@ -14,6 +14,7 @@ pub mod token_tracker;
 pub mod agent;
 pub mod agent_discovery;
 pub mod basis;
+pub mod blackboard;
 pub mod branding;
 pub mod build_hygiene;
 pub mod client;

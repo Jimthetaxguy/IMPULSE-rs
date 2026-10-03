@@ -111,6 +111,9 @@ const REPO_RUNTIME_GITIGNORE_ENTRIES: &[&str] = &[
     ".impulse/DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.json",
     ".impulse/DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.lock",
     ".impulse/DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.tmp-*",
+    // ADR-0023's off-context blackboard and its SQLite sidecars.
+    ".impulse/blackboard.db",
+    ".impulse/blackboard.db-*",
 ];
 
 /// The runtime ignore entries `impulse init` writes, exposed so tests that

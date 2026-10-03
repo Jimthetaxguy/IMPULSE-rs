@@ -542,6 +542,19 @@ error, never a fallback. Photon resolves endpoints today; Ion's own provider pat
 ADR-0022 stage 2.
 - **Source of truth:** `src/model_endpoint/` and ADR-0022.
 
+### blackboard — `[code]`
+The project's durable off-context store, `.impulse/blackboard.db` (SQLite). One row per `task_id`:
+payload, content type, creation time, optional TTL, JSON metadata. Live keys are insert-only;
+expired rows read as absent and are purged on open, at daemon start, and on the daemon's purge
+interval. Ion **spills** any tool result over `blackboard.spill_threshold_bytes` (default 4 KiB)
+into it and sends the model a **reference** (preview, `task_id`, size, SHA-256) instead; the model
+**pages** the rest in with `blackboard_fetch` (8 KiB windows, optional JSON pointer). A governed claim
+summary over the 4 KiB claim limit spills the same way and travels as a `blackboard:<key>` artifact
+id. The **orchestrator surface** is the five tools an orchestrator advertises (`search_tools`,
+`blackboard_store`, `blackboard_fetch`, `delegate_task`, `approve_gate`); the last two are reserved.
+- **Source of truth:** `src/blackboard/`, `src/ion_repl/tool_blackboard.rs`,
+  `src/ion_repl/tool_search.rs`, and ADR-0023.
+
 ### supervisor policy — `[code]`
 The concrete permission and confirmation policy for supervisor actions such as monitoring, memory
 search, focus, input, context operations, and permission changes. It is the first role-specific

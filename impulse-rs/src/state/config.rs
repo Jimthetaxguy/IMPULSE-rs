@@ -213,6 +213,19 @@ pub struct Config {
     /// Named model endpoints and role assignments
     #[serde(default)]
     pub model_endpoints: crate::model_endpoint::ModelEndpointConfig,
+
+    // ── Section: Blackboard ───────────────────────────────────────────────
+    //
+    // Off-context result store (ADR-0023): spill threshold, spill TTL, and
+    // the daemon's purge cadence. On `Config` for the same reason as
+    // `model_endpoints`: persisting any other key keeps this section.
+    /// Blackboard spill and purge settings, kept as raw JSON. Parsed and
+    /// validated only by blackboard consumers
+    /// (`BlackboardConfig::from_section`), so a typo there cannot stop the
+    /// rest of the configuration -- and the daemon -- from loading, and
+    /// saving another key writes the section back exactly as it was.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub blackboard: serde_json::Value,
 }
 
 // ── Default impl ──────────────────────────────────────────────────────────
@@ -314,6 +327,7 @@ impl Default for Config {
             impulse_agent_permissions: impulse_ops::SupervisorPermissionPolicy::default(),
             guardrails: crate::guardrail::GuardConfig::default(),
             model_endpoints: crate::model_endpoint::ModelEndpointConfig::default(),
+            blackboard: serde_json::Value::Null,
         }
     }
 }

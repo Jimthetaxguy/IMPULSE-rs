@@ -298,6 +298,7 @@ mod tests {
         let ctx = ReplContext {
             repo_root: repo.path().to_path_buf(),
             allowed_read_roots: vec![granted.path().to_path_buf()],
+            blackboard: None,
         };
         let outcome = IonVerifyTool
             .run(

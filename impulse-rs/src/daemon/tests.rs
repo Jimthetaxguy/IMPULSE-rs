@@ -1844,4 +1844,60 @@ mod tests {
         assert!(json.is_array());
         assert_eq!(json.as_array().unwrap().len(), 0);
     }
+
+    /// ADR-0023: the maintenance task's first pass runs immediately, so a
+    /// restarted daemon purges rows that expired while it was down, and a
+    /// project with no blackboard is never given one.
+    #[tokio::test]
+    async fn test_blackboard_maintenance_purges_on_startup_and_creates_nothing() {
+        let with_board = tempfile::TempDir::new().unwrap();
+        {
+            let board = crate::blackboard::Blackboard::open(with_board.path()).unwrap();
+            let entry = |task_id, ttl_seconds| crate::blackboard::NewEntry {
+                task_id,
+                payload: b"x",
+                content_type: "text/plain",
+                ttl_seconds,
+                metadata: serde_json::Value::Null,
+            };
+            board.put(entry("kept", None)).unwrap();
+            // Written with a creation time long past: a row that expired
+            // while the daemon was down.
+            board.put_at(entry("stale", Some(1)), 1_000).unwrap();
+        }
+        let raw_rows = |dir: &std::path::Path| -> i64 {
+            rusqlite::Connection::open(crate::blackboard::db_path(dir))
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM blackboard", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(raw_rows(with_board.path()), 2, "stale row is on disk");
+        let empty = tempfile::TempDir::new().unwrap();
+
+        let tasks = [
+            super::super::spawn_blackboard_maintenance(
+                with_board.path().to_path_buf(),
+                std::time::Duration::from_millis(20),
+            ),
+            super::super::spawn_blackboard_maintenance(
+                empty.path().to_path_buf(),
+                std::time::Duration::from_millis(20),
+            ),
+        ];
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        for task in &tasks {
+            assert!(!task.is_finished(), "maintenance keeps running");
+            task.abort();
+        }
+
+        assert_eq!(
+            raw_rows(with_board.path()),
+            1,
+            "the startup pass deleted the expired row"
+        );
+        assert!(
+            !crate::blackboard::db_path(empty.path()).exists(),
+            "the daemon must not create a blackboard in a project without one"
+        );
+    }
 }

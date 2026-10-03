@@ -468,6 +468,7 @@ mod tests {
         let ctx = ReplContext {
             repo_root: dir.path().to_path_buf(),
             allowed_read_roots: Vec::new(),
+            blackboard: None,
         };
         (dir, ctx)
     }
