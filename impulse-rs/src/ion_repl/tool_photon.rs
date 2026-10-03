@@ -1,5 +1,5 @@
-//! `scout`: a disposable read-only subagent
-//! (`docs/superpowers/specs/2026-10-02-ion-scout-subagent-design.md`).
+//! `photon`: a disposable read-only subagent
+//! (`docs/superpowers/specs/2026-10-02-ion-photon-subagent-design.md`).
 //!
 //! Ion's model hands one question about a workspace subtree to a fresh
 //! `min-agent` run, which answers it with three read-only tools (`list_files`,
@@ -10,7 +10,7 @@
 //! The host, never the model, picks the model, connection, budget, and root
 //! (ADR-0015). The tool has no side effects, so it stays outside
 //! `chat::CONFIRMATION_REQUIRED_TOOLS`; it does spend tokens, so each registry
-//! (one per REPL session) allows at most [`SCOUT_SESSION_LIMIT`] runs. Its
+//! (one per REPL session) allows at most [`PHOTON_SESSION_LIMIT`] runs. Its
 //! answer is model text derived from file contents and reaches the parent
 //! model through the same untrusted tool-output envelope as every tool result.
 
@@ -31,27 +31,27 @@ use super::tools::{ReplTool, ToolOutcome};
 use super::ReplContext;
 use crate::loop_contract::ION_DEFAULT_WALL_CLOCK;
 
-/// Scout runs one registry (one REPL session) may start.
-pub const SCOUT_SESSION_LIMIT: usize = 5;
-/// Model used when `ION_SCOUT_MODEL` is unset or blank.
-pub const SCOUT_DEFAULT_MODEL: &str = "claude-haiku-4-5-20251001";
-/// Environment variable that overrides the scout model.
-pub const SCOUT_MODEL_ENV: &str = "ION_SCOUT_MODEL";
-/// Credential variable the scout connection reads by name.
-pub const SCOUT_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
-/// Output-token ceiling per scout turn (Anthropic Messages requires one).
-pub const SCOUT_MAX_OUTPUT_TOKENS: u32 = 4096;
+/// Photon runs one registry (one REPL session) may start.
+pub const PHOTON_SESSION_LIMIT: usize = 5;
+/// Model used when `ION_PHOTON_MODEL` is unset or blank.
+pub const PHOTON_DEFAULT_MODEL: &str = "claude-haiku-4-5-20251001";
+/// Environment variable that overrides the photon model.
+pub const PHOTON_MODEL_ENV: &str = "ION_PHOTON_MODEL";
+/// Credential variable the photon connection reads by name.
+pub const PHOTON_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
+/// Output-token ceiling per photon turn (Anthropic Messages requires one).
+pub const PHOTON_MAX_OUTPUT_TOKENS: u32 = 4096;
 /// Longest question accepted, in bytes.
-pub const SCOUT_MAX_QUESTION_BYTES: usize = 8192;
+pub const PHOTON_MAX_QUESTION_BYTES: usize = 8192;
 
-/// Builds a fresh model client for one scout run. Called on the blocking
+/// Builds a fresh model client for one photon run. Called on the blocking
 /// worker thread, once per run, so no client state is shared between runs.
-pub type ScoutClientFactory = Arc<dyn Fn() -> Result<Box<dyn ModelClient>> + Send + Sync>;
+pub type PhotonClientFactory = Arc<dyn Fn() -> Result<Box<dyn ModelClient>> + Send + Sync>;
 
-/// The scout's budget: `min-agent`'s defaults with the wall clock halved
-/// relative to Ion's own tool-loop budget, so one scout cannot consume the
+/// The photon's budget: `min-agent`'s defaults with the wall clock halved
+/// relative to Ion's own tool-loop budget, so one photon cannot consume the
 /// whole parent exchange. Per-request time is capped to fit inside it.
-pub fn scout_budget() -> Budget {
+pub fn photon_budget() -> Budget {
     let wall_clock = ION_DEFAULT_WALL_CLOCK / 2;
     let defaults = Budget::default();
     Budget {
@@ -63,42 +63,42 @@ pub fn scout_budget() -> Budget {
 
 /// Anthropic Messages connection at `origin` (scheme + host + optional port,
 /// as `llm_backends::anthropic::anthropic_api_origin` returns it).
-pub fn scout_connection(origin: &str) -> Connection {
+pub fn photon_connection(origin: &str) -> Connection {
     Connection {
         protocol: Protocol::AnthropicMessages,
         base_url: format!("{}/v1", origin.trim_end_matches('/')),
         auth: Auth::HeaderEnv {
             header: "x-api-key".into(),
-            env: SCOUT_API_KEY_ENV.into(),
+            env: PHOTON_API_KEY_ENV.into(),
         },
         proxy: None,
     }
 }
 
-/// Model profile for a scout run; a blank override falls back to the default.
-pub fn scout_profile(model_override: Option<&str>) -> ModelProfile {
+/// Model profile for a photon run; a blank override falls back to the default.
+pub fn photon_profile(model_override: Option<&str>) -> ModelProfile {
     let model = model_override
         .map(str::trim)
         .filter(|m| !m.is_empty())
-        .unwrap_or(SCOUT_DEFAULT_MODEL);
+        .unwrap_or(PHOTON_DEFAULT_MODEL);
     ModelProfile {
-        connection: "ion-scout".into(),
+        connection: "ion-photon".into(),
         model: model.into(),
         native_tools: true,
-        max_output_tokens: Some(SCOUT_MAX_OUTPUT_TOKENS),
+        max_output_tokens: Some(PHOTON_MAX_OUTPUT_TOKENS),
         output_limit_parameter: None,
     }
 }
 
-/// Validated `scout` arguments.
+/// Validated `photon` arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScoutRequest {
+pub struct PhotonRequest {
     pub question: String,
     pub path: Option<String>,
 }
 
 /// Parses `{question, path?}`; the question must be non-blank and bounded.
-pub fn parse_scout_args(args: &Value) -> Result<ScoutRequest> {
+pub fn parse_photon_args(args: &Value) -> Result<PhotonRequest> {
     let question = args
         .get("question")
         .and_then(Value::as_str)
@@ -106,30 +106,30 @@ pub fn parse_scout_args(args: &Value) -> Result<ScoutRequest> {
         .unwrap_or("");
     ensure!(
         !question.is_empty(),
-        "scout: 'question' must be a non-empty string"
+        "photon: 'question' must be a non-empty string"
     );
     ensure!(
-        question.len() <= SCOUT_MAX_QUESTION_BYTES,
-        "scout: 'question' is {} bytes; the limit is {SCOUT_MAX_QUESTION_BYTES}",
+        question.len() <= PHOTON_MAX_QUESTION_BYTES,
+        "photon: 'question' is {} bytes; the limit is {PHOTON_MAX_QUESTION_BYTES}",
         question.len()
     );
     let path = match args.get("path") {
         None | Some(Value::Null) => None,
         Some(Value::String(p)) if p.trim().is_empty() => None,
         Some(Value::String(p)) => Some(p.trim().to_string()),
-        Some(_) => bail!("scout: 'path' must be a string"),
+        Some(_) => bail!("photon: 'path' must be a string"),
     };
-    Ok(ScoutRequest {
+    Ok(PhotonRequest {
         question: question.to_string(),
         path,
     })
 }
 
-/// Resolves the scout root: `repo_root` by default, otherwise `raw` relative
+/// Resolves the photon root: `repo_root` by default, otherwise `raw` relative
 /// to it. The canonical directory must lie inside the session's read
 /// sandbox; symlinks are resolved before the check, and that same canonical
 /// path is the one handed to `Workspace::open`.
-pub fn resolve_scout_root(raw: Option<&str>, ctx: &ReplContext) -> Result<PathBuf> {
+pub fn resolve_photon_root(raw: Option<&str>, ctx: &ReplContext) -> Result<PathBuf> {
     let repo_root = ctx.effective_repo_root();
     let label = raw.unwrap_or(".");
     let joined = match raw {
@@ -139,17 +139,17 @@ pub fn resolve_scout_root(raw: Option<&str>, ctx: &ReplContext) -> Result<PathBu
     };
     let canonical = joined
         .canonicalize()
-        .with_context(|| format!("scout: cannot resolve path '{label}'"))?;
+        .with_context(|| format!("photon: cannot resolve path '{label}'"))?;
     if !ctx
         .sandbox_tool_context()
         .is_path_allowed(&canonical, false)
     {
         bail!(
-            "scout: '{label}' resolves outside the session's read sandbox \
+            "photon: '{label}' resolves outside the session's read sandbox \
              (repo root plus any /allow grants); use /allow to grant access first"
         );
     }
-    ensure!(canonical.is_dir(), "scout: '{label}' is not a directory");
+    ensure!(canonical.is_dir(), "photon: '{label}' is not a directory");
     Ok(canonical)
 }
 
@@ -157,7 +157,7 @@ pub fn resolve_scout_root(raw: Option<&str>, ctx: &ReplContext) -> Result<PathBu
 /// is `ok`; any other stop is reported with its partial text labeled as not
 /// an answer.
 pub fn outcome_from_report(report: &RunReport) -> Result<ToolOutcome> {
-    let payload = serde_json::to_value(report).context("scout: cannot serialize run report")?;
+    let payload = serde_json::to_value(report).context("photon: cannot serialize run report")?;
     let reads: Vec<String> = report
         .calls
         .iter()
@@ -167,7 +167,7 @@ pub fn outcome_from_report(report: &RunReport) -> Result<ToolOutcome> {
         })
         .collect();
     let evidence = format!(
-        "[scout: {} rounds, {} tool calls{}]",
+        "[photon: {} rounds, {} tool calls{}]",
         report.rounds,
         report.tool_calls,
         if reads.is_empty() {
@@ -185,7 +185,7 @@ pub fn outcome_from_report(report: &RunReport) -> Result<ToolOutcome> {
                 .as_deref()
                 .map(|t| format!("\nPartial text (not an answer): {t}"))
                 .unwrap_or_default();
-            format!("scout stopped: {}{partial}\n\n{evidence}", report.stop)
+            format!("photon stopped: {}{partial}\n\n{evidence}", report.stop)
         }
     };
     Ok(ToolOutcome {
@@ -196,15 +196,15 @@ pub fn outcome_from_report(report: &RunReport) -> Result<ToolOutcome> {
 }
 
 /// Ion's disposable read-only subagent tool.
-pub struct ScoutTool {
-    factory: ScoutClientFactory,
+pub struct PhotonTool {
+    factory: PhotonClientFactory,
     session_limit: usize,
     used: AtomicUsize,
 }
 
-impl ScoutTool {
-    /// A scout with an injected client factory and run cap.
-    pub fn new(factory: ScoutClientFactory, session_limit: usize) -> Self {
+impl PhotonTool {
+    /// A photon with an injected client factory and run cap.
+    pub fn new(factory: PhotonClientFactory, session_limit: usize) -> Self {
         Self {
             factory,
             session_limit,
@@ -212,19 +212,21 @@ impl ScoutTool {
         }
     }
 
-    /// The production scout: Anthropic Messages at Ion's own API origin,
+    /// The production photon: Anthropic Messages at Ion's own API origin,
     /// credential read by name from `ANTHROPIC_API_KEY` when a run starts, so
     /// a missing key fails that run rather than the REPL launch.
     pub fn from_env() -> Self {
-        let factory: ScoutClientFactory = Arc::new(|| {
+        let factory: PhotonClientFactory = Arc::new(|| {
             let origin = crate::llm_backends::anthropic::anthropic_api_origin();
-            let model = std::env::var(SCOUT_MODEL_ENV).ok();
-            let client =
-                HttpModelClient::new(&scout_connection(&origin), &scout_profile(model.as_deref()))
-                    .context("scout: cannot build the model client")?;
+            let model = std::env::var(PHOTON_MODEL_ENV).ok();
+            let client = HttpModelClient::new(
+                &photon_connection(&origin),
+                &photon_profile(model.as_deref()),
+            )
+            .context("photon: cannot build the model client")?;
             Ok(Box::new(client) as Box<dyn ModelClient>)
         });
-        Self::new(factory, SCOUT_SESSION_LIMIT)
+        Self::new(factory, PHOTON_SESSION_LIMIT)
     }
 
     /// Claims one run slot, refusing once the session cap is reached.
@@ -237,7 +239,7 @@ impl ScoutTool {
             .map(|_| ())
             .map_err(|_| {
                 anyhow::anyhow!(
-                    "scout: this session already used its {limit} scout runs; \
+                    "photon: this session already used its {limit} photon runs; \
                      answer from what you have or use file_read"
                 )
             })
@@ -245,19 +247,19 @@ impl ScoutTool {
 }
 
 #[async_trait]
-impl ReplTool for ScoutTool {
+impl ReplTool for PhotonTool {
     fn name(&self) -> &'static str {
-        "scout"
+        "photon"
     }
 
     fn usage(&self) -> &'static str {
-        "scout {\"question\": \"...\", \"path\": \"...\"} -- ask a disposable read-only \
+        "photon {\"question\": \"...\", \"path\": \"...\"} -- ask a disposable read-only \
          subagent one question about the repo (or a subdirectory)"
     }
 
     fn json_schema(&self) -> Value {
         json!({
-            "name": "scout",
+            "name": "photon",
             "description": "Delegate one question about the repository to a disposable, \
                 read-only subagent that can list, read, and search files under the chosen \
                 directory, then is discarded. Use it for broad lookups that would take many \
@@ -268,11 +270,11 @@ impl ReplTool for ScoutTool {
                 "properties": {
                     "question": {
                         "type": "string",
-                        "description": "The single question the scout should answer"
+                        "description": "The single question the photon should answer"
                     },
                     "path": {
                         "type": "string",
-                        "description": "Directory to scope the scout to (defaults to the repo root)"
+                        "description": "Directory to scope the photon to (defaults to the repo root)"
                     }
                 },
                 "required": ["question"]
@@ -281,17 +283,17 @@ impl ReplTool for ScoutTool {
     }
 
     async fn run(&self, args: Value, ctx: &ReplContext) -> Result<ToolOutcome> {
-        let request = parse_scout_args(&args)?;
-        let root = resolve_scout_root(request.path.as_deref(), ctx)?;
+        let request = parse_photon_args(&args)?;
+        let root = resolve_photon_root(request.path.as_deref(), ctx)?;
         self.reserve_slot()?;
         let factory = Arc::clone(&self.factory);
         let report = tokio::task::spawn_blocking(move || -> Result<RunReport> {
             let client = factory()?;
-            let workspace = Workspace::open(&root).context("scout: cannot open workspace")?;
+            let workspace = Workspace::open(&root).context("photon: cannot open workspace")?;
             let options = RunOptions {
                 text_only: false,
-                budget: scout_budget(),
-                meta: json!({"host": "ion", "tool": "scout"}),
+                budget: photon_budget(),
+                meta: json!({"host": "ion", "tool": "photon"}),
             };
             run(
                 client.as_ref(),
@@ -302,7 +304,7 @@ impl ReplTool for ScoutTool {
             )
         })
         .await
-        .context("scout: worker thread failed")??;
+        .context("photon: worker thread failed")??;
         outcome_from_report(&report)
     }
 }
@@ -360,7 +362,7 @@ mod tests {
     }
 
     /// Reads NOTES.md, then answers with the planted fact.
-    fn reading_factory() -> ScoutClientFactory {
+    fn reading_factory() -> PhotonClientFactory {
         Arc::new(|| {
             Ok(Box::new(ScriptedClient {
                 turns: Mutex::new(VecDeque::from([
@@ -372,7 +374,7 @@ mod tests {
     }
 
     /// Lists the root forever with fresh call ids, tripping the repeated-batch breaker.
-    fn looping_factory() -> ScoutClientFactory {
+    fn looping_factory() -> PhotonClientFactory {
         Arc::new(|| {
             let turns = (0..20)
                 .map(|i| call_turn(&format!("c{i}"), "list_files", json!({"path": "."})))
@@ -384,7 +386,7 @@ mod tests {
     }
 
     /// Records whether it was ever called, then fails.
-    fn tripwire_factory(called: Arc<AtomicBool>) -> ScoutClientFactory {
+    fn tripwire_factory(called: Arc<AtomicBool>) -> PhotonClientFactory {
         Arc::new(move || {
             called.store(true, Ordering::SeqCst);
             bail!("tripwire factory should not run")
@@ -403,9 +405,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scout_run_reads_file_and_returns_completed_answer() {
+    async fn test_photon_run_reads_file_and_returns_completed_answer() {
         let (_dir, ctx) = repo_with_notes();
-        let tool = ScoutTool::new(reading_factory(), 5);
+        let tool = PhotonTool::new(reading_factory(), 5);
         let outcome = tool
             .run(json!({"question": "What is the planted fact?"}), &ctx)
             .await
@@ -418,14 +420,14 @@ mod tests {
         assert_eq!(outcome.payload["calls"][0]["tool"], "read_file");
         assert!(
             outcome.payload.get("transcript").is_none(),
-            "the transcript must not leave the scout"
+            "the transcript must not leave the photon"
         );
     }
 
     #[tokio::test]
-    async fn test_scout_run_budget_stop_is_not_success() {
+    async fn test_photon_run_budget_stop_is_not_success() {
         let (_dir, ctx) = repo_with_notes();
-        let tool = ScoutTool::new(looping_factory(), 5);
+        let tool = PhotonTool::new(looping_factory(), 5);
         let outcome = tool
             .run(json!({"question": "Loop forever"}), &ctx)
             .await
@@ -433,15 +435,15 @@ mod tests {
         assert!(!outcome.ok);
         assert!(outcome.payload["answer"].is_null());
         assert_eq!(outcome.payload["stop"]["kind"], "budget_exceeded");
-        assert!(outcome.rendered.starts_with("scout stopped:"));
+        assert!(outcome.rendered.starts_with("photon stopped:"));
     }
 
     #[tokio::test]
-    async fn test_scout_run_sandbox_escape_refused_without_consuming_slot() {
+    async fn test_photon_run_sandbox_escape_refused_without_consuming_slot() {
         let (_dir, ctx) = repo_with_notes();
         let outside = tempfile::tempdir().unwrap();
         let called = Arc::new(AtomicBool::new(false));
-        let tool = ScoutTool::new(tripwire_factory(Arc::clone(&called)), 1);
+        let tool = PhotonTool::new(tripwire_factory(Arc::clone(&called)), 1);
         let escape = outside.path().display().to_string();
         let err = tool
             .run(json!({"question": "q", "path": escape}), &ctx)
@@ -458,12 +460,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scout_run_allows_granted_read_root() {
+    async fn test_photon_run_allows_granted_read_root() {
         let (_dir, mut ctx) = repo_with_notes();
         let granted = tempfile::tempdir().unwrap();
         std::fs::write(granted.path().join("NOTES.md"), "planted fact: 42\n").unwrap();
         ctx.allowed_read_roots.push(granted.path().to_path_buf());
-        let tool = ScoutTool::new(reading_factory(), 5);
+        let tool = PhotonTool::new(reading_factory(), 5);
         let path = granted.path().display().to_string();
         let outcome = tool
             .run(json!({"question": "fact?", "path": path}), &ctx)
@@ -473,9 +475,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scout_run_session_limit_refuses_after_cap() {
+    async fn test_photon_run_session_limit_refuses_after_cap() {
         let (_dir, ctx) = repo_with_notes();
-        let tool = ScoutTool::new(reading_factory(), 2);
+        let tool = PhotonTool::new(reading_factory(), 2);
         for _ in 0..2 {
             let outcome = tool.run(json!({"question": "fact?"}), &ctx).await.unwrap();
             assert!(outcome.ok);
@@ -484,14 +486,14 @@ mod tests {
             .run(json!({"question": "fact?"}), &ctx)
             .await
             .unwrap_err();
-        assert!(format!("{err}").contains("already used its 2 scout runs"));
+        assert!(format!("{err}").contains("already used its 2 photon runs"));
     }
 
     #[tokio::test]
-    async fn test_scout_run_factory_error_propagates() {
+    async fn test_photon_run_factory_error_propagates() {
         let (_dir, ctx) = repo_with_notes();
         let called = Arc::new(AtomicBool::new(false));
-        let tool = ScoutTool::new(tripwire_factory(Arc::clone(&called)), 1);
+        let tool = PhotonTool::new(tripwire_factory(Arc::clone(&called)), 1);
         let err = tool
             .run(json!({"question": "fact?"}), &ctx)
             .await
@@ -501,62 +503,62 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_scout_args_valid_trims_and_defaults_path() {
-        let parsed = parse_scout_args(&json!({"question": "  where?  ", "path": " "})).unwrap();
+    fn test_parse_photon_args_valid_trims_and_defaults_path() {
+        let parsed = parse_photon_args(&json!({"question": "  where?  ", "path": " "})).unwrap();
         assert_eq!(
             parsed,
-            ScoutRequest {
+            PhotonRequest {
                 question: "where?".into(),
                 path: None
             }
         );
-        let parsed = parse_scout_args(&json!({"question": "q", "path": "src"})).unwrap();
+        let parsed = parse_photon_args(&json!({"question": "q", "path": "src"})).unwrap();
         assert_eq!(parsed.path.as_deref(), Some("src"));
     }
 
     #[test]
-    fn test_parse_scout_args_rejects_blank_missing_oversize_and_bad_path() {
-        assert!(parse_scout_args(&json!({})).is_err());
-        assert!(parse_scout_args(&json!({"question": "   "})).is_err());
-        assert!(parse_scout_args(&json!({"question": 7})).is_err());
-        let big = "x".repeat(SCOUT_MAX_QUESTION_BYTES + 1);
-        assert!(parse_scout_args(&json!({ "question": big })).is_err());
-        let err = parse_scout_args(&json!({"question": "q", "path": 3})).unwrap_err();
+    fn test_parse_photon_args_rejects_blank_missing_oversize_and_bad_path() {
+        assert!(parse_photon_args(&json!({})).is_err());
+        assert!(parse_photon_args(&json!({"question": "   "})).is_err());
+        assert!(parse_photon_args(&json!({"question": 7})).is_err());
+        let big = "x".repeat(PHOTON_MAX_QUESTION_BYTES + 1);
+        assert!(parse_photon_args(&json!({ "question": big })).is_err());
+        let err = parse_photon_args(&json!({"question": "q", "path": 3})).unwrap_err();
         assert!(format!("{err}").contains("'path' must be a string"));
     }
 
     #[test]
-    fn test_resolve_scout_root_rejects_file_and_missing_paths() {
+    fn test_resolve_photon_root_rejects_file_and_missing_paths() {
         let (_dir, ctx) = repo_with_notes();
-        let err = resolve_scout_root(Some("NOTES.md"), &ctx).unwrap_err();
+        let err = resolve_photon_root(Some("NOTES.md"), &ctx).unwrap_err();
         assert!(format!("{err}").contains("is not a directory"));
-        let err = resolve_scout_root(Some("missing"), &ctx).unwrap_err();
+        let err = resolve_photon_root(Some("missing"), &ctx).unwrap_err();
         assert!(format!("{err}").contains("cannot resolve path 'missing'"));
-        let root = resolve_scout_root(Some("sub"), &ctx).unwrap();
+        let root = resolve_photon_root(Some("sub"), &ctx).unwrap();
         assert!(root.ends_with("sub"));
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_resolve_scout_root_rejects_symlink_out_of_sandbox() {
+    fn test_resolve_photon_root_rejects_symlink_out_of_sandbox() {
         let (dir, ctx) = repo_with_notes();
         let outside = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
-        let err = resolve_scout_root(Some("link"), &ctx).unwrap_err();
+        let err = resolve_photon_root(Some("link"), &ctx).unwrap_err();
         assert!(format!("{err}").contains("outside the session's read sandbox"));
     }
 
     #[test]
-    fn test_scout_budget_fits_inside_parent_loop_and_validates() {
-        let budget = scout_budget();
+    fn test_photon_budget_fits_inside_parent_loop_and_validates() {
+        let budget = photon_budget();
         assert!(budget.validate().is_ok());
         assert!(budget.wall_clock < ION_DEFAULT_WALL_CLOCK);
         assert!(budget.request_timeout <= budget.wall_clock);
     }
 
     #[test]
-    fn test_scout_connection_uses_anthropic_messages_and_named_key() {
-        let conn = scout_connection("https://api.anthropic.com/");
+    fn test_photon_connection_uses_anthropic_messages_and_named_key() {
+        let conn = photon_connection("https://api.anthropic.com/");
         assert!(conn.validate().is_ok());
         assert_eq!(
             conn.endpoint().unwrap().as_str(),
@@ -564,29 +566,31 @@ mod tests {
         );
         assert!(matches!(
             &conn.auth,
-            Auth::HeaderEnv { header, env } if header == "x-api-key" && env == SCOUT_API_KEY_ENV
+            Auth::HeaderEnv { header, env } if header == "x-api-key" && env == PHOTON_API_KEY_ENV
         ));
-        assert!(scout_connection("http://127.0.0.1:4010").validate().is_ok());
+        assert!(photon_connection("http://127.0.0.1:4010")
+            .validate()
+            .is_ok());
     }
 
     #[test]
-    fn test_scout_profile_override_and_blank_fallback() {
-        assert_eq!(scout_profile(None).model, SCOUT_DEFAULT_MODEL);
-        assert_eq!(scout_profile(Some("  ")).model, SCOUT_DEFAULT_MODEL);
-        let profile = scout_profile(Some("claude-sonnet-5-5"));
+    fn test_photon_profile_override_and_blank_fallback() {
+        assert_eq!(photon_profile(None).model, PHOTON_DEFAULT_MODEL);
+        assert_eq!(photon_profile(Some("  ")).model, PHOTON_DEFAULT_MODEL);
+        let profile = photon_profile(Some("claude-sonnet-5-5"));
         assert_eq!(profile.model, "claude-sonnet-5-5");
-        assert_eq!(profile.max_output_tokens, Some(SCOUT_MAX_OUTPUT_TOKENS));
+        assert_eq!(profile.max_output_tokens, Some(PHOTON_MAX_OUTPUT_TOKENS));
         assert!(profile.native_tools);
     }
 
     /// Live graduation check against the real provider. Opt-in:
-    /// `ANTHROPIC_API_KEY=... cargo test --lib tool_scout -- --ignored`.
+    /// `ANTHROPIC_API_KEY=... cargo test --lib tool_photon -- --ignored`.
     /// Sends only a synthetic temp workspace.
     #[tokio::test]
     #[ignore = "live provider call; requires ANTHROPIC_API_KEY"]
-    async fn test_scout_from_env_live_round_trip_finds_planted_fact() {
+    async fn test_photon_from_env_live_round_trip_finds_planted_fact() {
         let (_dir, ctx) = repo_with_notes();
-        let tool = ScoutTool::from_env();
+        let tool = PhotonTool::from_env();
         let outcome = tool
             .run(
                 json!({"question": "Read NOTES.md and state the planted fact number."}),
@@ -594,13 +598,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(outcome.ok, "scout did not complete: {}", outcome.rendered);
+        assert!(outcome.ok, "photon did not complete: {}", outcome.rendered);
         assert!(outcome.rendered.contains("42"), "{}", outcome.rendered);
     }
 
     #[test]
-    fn test_scout_schema_name_matches_tool_name_and_requires_question() {
-        let tool = ScoutTool::new(reading_factory(), 1);
+    fn test_photon_schema_name_matches_tool_name_and_requires_question() {
+        let tool = PhotonTool::new(reading_factory(), 1);
         let schema = tool.json_schema();
         assert_eq!(schema["name"], tool.name());
         assert_eq!(schema["input_schema"]["required"], json!(["question"]));

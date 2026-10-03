@@ -65,8 +65,9 @@ fn select_base_url(explicit: Option<&str>, from_env: Option<&str>, default: &str
 
 /// The Anthropic API origin Ion's own provider resolves when no explicit base
 /// URL is configured: `ANTHROPIC_BASE_URL` if it carries an `http(s)` scheme,
-/// otherwise the canonical default. Shared with the `scout` subagent so a
-/// local proxy or eval harness intercepts both the parent and its scouts.
+/// otherwise the canonical default. Shared with the `photon` subagent so a
+/// local proxy or eval harness intercepts both the parent and its photons.
+#[cfg(feature = "photon-subagent")]
 pub(crate) fn anthropic_api_origin() -> String {
     let from_env = std::env::var(ANTHROPIC_BASE_URL_ENV).ok();
     select_base_url(None, from_env.as_deref(), ANTHROPIC_DEFAULT_BASE_URL)
@@ -1819,6 +1820,7 @@ mod tests {
         assert_eq!(url, "http://explicit.test/v1/messages");
     }
 
+    #[cfg(feature = "photon-subagent")]
     #[test]
     fn test_anthropic_api_origin_follows_env_and_rejects_schemeless_override() {
         let _guard = env_guard();

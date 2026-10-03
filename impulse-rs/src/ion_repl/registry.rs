@@ -23,8 +23,8 @@ use super::tool_bridge::DynamicToolBridge;
 use super::tool_claim::GovernedSubmitClaimTool;
 #[cfg(feature = "office-support")]
 use super::tool_document::DocumentReadTool;
-#[cfg(feature = "scout-subagent")]
-use super::tool_scout::ScoutTool;
+#[cfg(feature = "photon-subagent")]
+use super::tool_photon::PhotonTool;
 use super::tool_verify::IonVerifyTool;
 use super::tools::ReplTool;
 
@@ -113,10 +113,10 @@ impl ReplToolRegistry {
         registry
             .register(Box::new(DocumentReadTool))
             .expect("default document_read");
-        #[cfg(feature = "scout-subagent")]
+        #[cfg(feature = "photon-subagent")]
         registry
-            .register(Box::new(ScoutTool::from_env()))
-            .expect("default scout");
+            .register(Box::new(PhotonTool::from_env()))
+            .expect("default photon");
 
         let dynamic = Arc::new(ToolRegistry::with_defaults());
         registry
@@ -219,12 +219,12 @@ mod tests {
             cfg!(feature = "office-support")
         );
         assert_eq!(
-            registry.get("scout").is_some(),
-            cfg!(feature = "scout-subagent")
+            registry.get("photon").is_some(),
+            cfg!(feature = "photon-subagent")
         );
         let expected = 7
             + usize::from(cfg!(feature = "office-support"))
-            + usize::from(cfg!(feature = "scout-subagent"));
+            + usize::from(cfg!(feature = "photon-subagent"));
         assert_eq!(registry.len(), expected);
     }
 

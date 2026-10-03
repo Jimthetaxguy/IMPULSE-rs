@@ -1615,20 +1615,20 @@ mod tests {
             asked.lock().unwrap()
         );
 
-        // scout is read-only; its spend is bounded by a per-session cap, not
+        // photon is read-only; its spend is bounded by a per-session cap, not
         // a prompt. A blank question fails validation before any model client
         // is built, so this never reaches the network.
-        #[cfg(feature = "scout-subagent")]
+        #[cfg(feature = "photon-subagent")]
         {
             asked.lock().unwrap().clear();
-            let scout = executor
-                .execute("scout", serde_json::json!({"question": "  "}))
+            let photon = executor
+                .execute("photon", serde_json::json!({"question": "  "}))
                 .await;
-            assert!(scout.is_error);
-            assert!(!scout.content.contains("declined"));
+            assert!(photon.is_error);
+            assert!(!photon.content.contains("declined"));
             assert!(
                 asked.lock().unwrap().is_empty(),
-                "scout must stay outside CONFIRMATION_REQUIRED_TOOLS: {:?}",
+                "photon must stay outside CONFIRMATION_REQUIRED_TOOLS: {:?}",
                 asked.lock().unwrap()
             );
         }
