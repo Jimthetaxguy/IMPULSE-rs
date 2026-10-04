@@ -3,7 +3,7 @@ title: "ADR-0021: Monty Sandbox for calculator and python_exec"
 description: The calculator and python_exec tools run Python inside the in-process Monty interpreter instead of spawning system python3 -c with the daemon's authority
 status: review
 created: 2026-09-26
-updated: 2026-09-26
+updated: 2026-10-04
 type: decision
 category: architecture
 phase: all
@@ -43,7 +43,8 @@ boundary.
    No host functions, no mounts, no inputs. Code goes in; collected print output and a typed result
    come out.
 2. Limits: `max_memory` 64 MiB, `max_feed_duration` 5 s (callers may pass a shorter budget), and
-   collected print output capped at 16 MiB. `time.sleep` returns at once (`SleepMode::Zero`), so a sleep
+   collected print output capped at 16 MiB. `max_memory` bounds single allocations only; see
+   "Memory is only partly bounded" under Consequences. `time.sleep` returns at once (`SleepMode::Zero`), so a sleep
    cannot hold the daemon inside the wall-clock budget.
 3. Every failure returns a `PythonResult` to the caller. There is no panic path and no fallback to
    CPython. `PythonResult` keeps `output`, `error`, and `exit_code`, and gains
@@ -64,7 +65,7 @@ boundary.
 | `unsupported` | `NotImplementedError`, `ModuleNotFoundError` | The code parsed but asks for a Python feature or module the sandbox does not have. `import subprocess` and `import socket` land here (`ModuleNotFoundError`). So do `open()` and `os.getenv()`: with no host handler wired, Monty answers `NotImplementedError: OS function 'open' not implemented with standard execution`. |
 | `runtime` | any other exception | An ordinary uncaught exception; the traceback is in `error`. `__import__` is not a defined name in Monty, so `__import__("os")` is a `NameError` here. |
 | `timeout` | `TimeoutError` raised by `max_feed_duration` | The wall-clock budget was exhausted. |
-| `memory` | `MemoryError` raised by `max_memory` or by the print cap | The memory budget was exhausted. Monty accounts before it allocates: `[0] * (200 * 1024 * 1024)` fails with `memory limit exceeded: 3355443200 bytes > 67108864 bytes` without touching the heap. |
+| `memory` | `MemoryError` raised by `max_memory` or by the print cap | One allocation Monty sizes up front would exceed the budget, or the print cap was reached. `[0] * (200 * 1024 * 1024)` fails with `memory limit exceeded: 3355443200 bytes > 67108864 bytes` without touching the heap. Growth through many smaller allocations does not raise it (see Consequences). |
 
 `exit_code` is 0 on success and 1 on any fault, which is what `python3 -c` reported for an uncaught
 exception, so existing callers keep working.
@@ -90,7 +91,8 @@ reports `(3, 14)`.
 ## Consequences
 
 Model-authored code can no longer read files, open sockets, spawn processes, or read the daemon's
-environment. Time and memory limits are enforced by the interpreter instead of by killing a child.
+environment. The time limit is enforced by the interpreter instead of by killing a child; the memory
+limit only partly (below).
 System Python is no longer needed at runtime for these tools.
 
 Costs:
@@ -99,6 +101,15 @@ Costs:
   crash-proof against a stack-overflow abort or an allocator abort; such a crash takes the whole process
   down. `monty-pool` runs the interpreter in worker subprocesses and turns those crashes into
   `PoolError::Crashed` while the parent stays up. It is the follow-up, not part of this slice.
+- **Memory is only partly bounded** (found in review, 2026-10-04). Monty measures live heap through a
+  counter that its `monty-alloc` global allocator maintains, and its docs say a configured
+  `max_memory` "is silently not enforced" without that allocator. Impulse does not install it, so
+  `max_memory` only refuses a single allocation whose size is known before it happens, such as
+  `[0] * N`. A program that grows a list of 1 MB strings in a loop runs past 64 MiB to completion
+  (100 MB in `test_incremental_growth_is_not_bounded_by_max_memory`); the 5 s budget limits how long
+  it grows, not how far. Closing the gap needs `monty-alloc` as the global allocator, which is
+  process-wide (concurrent runs would share one counter), or `monty-pool` workers under an OS memory
+  limit (follow-up 1).
 - Monty implements a subset of Python. Programs that used stdlib modules outside that subset now return
   `fault: unsupported` instead of running.
 - The MSRV floor moves to 1.96.
@@ -111,7 +122,8 @@ Costs:
 
 ## Follow-ups
 
-1. Move to `monty-pool` with subprocess workers for crash isolation and a parent-side hard timeout.
+1. Move to `monty-pool` with subprocess workers for crash isolation, a parent-side hard timeout, and
+   an OS memory limit per worker (the in-process `max_memory` does not bound gradual growth).
 2. Remove the `impulse-rs/src/monty/` PyO3 stub and the `monty-support` feature, or build them for
    real. They are unbuilt and were wrongly marked Complete in `HANDBOOK.md` (corrected by this lane).
 3. Close `agent/grok-calculator-math-only-20260917`; Monty makes that fence unnecessary. PR #64's

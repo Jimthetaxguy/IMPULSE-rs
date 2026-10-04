@@ -3,8 +3,9 @@
 //! Code runs inside Monty, pydantic's Python interpreter written in Rust, in
 //! this process. No host functions, filesystem mounts, or inputs are wired,
 //! so the interpreter is the whole boundary: programs have no filesystem,
-//! network, process, or environment access. Time and memory budgets are
-//! enforced by the interpreter and come back as typed faults on
+//! network, process, or environment access. The time budget is enforced by
+//! the interpreter; the memory budget only partly (see
+//! [`DEFAULT_PYTHON_MEMORY_LIMIT`]). Both come back as typed faults on
 //! [`PythonResult`]. Nothing here falls back to system CPython.
 //!
 //! Crash isolation is not provided: a stack-overflow or allocator abort inside
@@ -22,7 +23,11 @@ use std::time::Duration;
 
 /// Default wall-clock budget for one program (calculator and python_exec).
 pub const DEFAULT_PYTHON_TIMEOUT: Duration = Duration::from_secs(5);
-/// Heap budget for one program, enforced by Monty's allocation accounting.
+/// Memory budget for one program. Monty checks it against an allocation it
+/// sizes up front (`[0] * N`), but measuring live heap needs `monty-alloc` as
+/// the global allocator, which is not installed, so growth through many
+/// smaller allocations is not stopped by it; only the time budget ends that.
+/// See ADR-0021.
 pub const DEFAULT_PYTHON_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
 /// Cap on collected `print` output. Exceeding it is a [`fault::MEMORY`] fault.
 pub const DEFAULT_PYTHON_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
@@ -392,6 +397,20 @@ mod python_sandbox_tests {
             elapsed < Duration::from_secs(3),
             "timeout must fire near the budget, took {elapsed:?}"
         );
+    }
+
+    /// Pins the gap ADR-0021 records: without `monty-alloc`, live heap is
+    /// not measured, so 100 MB built from 1 MB strings runs to completion
+    /// under the 64 MiB budget. If this fails, the budget is now enforced;
+    /// update ADR-0021 and the python_exec description to match.
+    #[test]
+    fn test_incremental_growth_is_not_bounded_by_max_memory() {
+        let result = execute_python(
+            "x = []\nfor i in range(100):\n    x.append('a' * 1000000 + str(i))\nprint(len(x))\n",
+        )
+        .expect("result");
+        assert_eq!(result.fault, None, "got {result:?}");
+        assert_eq!(result.output, "100\n");
     }
 
     #[test]
