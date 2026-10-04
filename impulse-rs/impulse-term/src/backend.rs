@@ -463,6 +463,10 @@ const INJECTION_QUIET_MS: u64 = 500;
 /// All code paths that write to the PTY must go through this queue.
 /// `write_user_input()` always succeeds and records a timestamp.
 /// `write_injection()` is skipped if user input occurred recently.
+///
+/// Cloning shares the same writer and timestamp, so a caller can take a
+/// handle out from under a lock and write after releasing it.
+#[derive(Clone)]
 pub struct WriteQueue {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     /// Epoch millis of the last user input write.

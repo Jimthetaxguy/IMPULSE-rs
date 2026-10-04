@@ -1230,15 +1230,22 @@ impl DesktopRuntime {
     }
 
     pub fn write_agent(&self, request: AgentWriteRequest) -> Result<(), DesktopBridgeError> {
-        let state = self.lock_state();
-        let record = state.agents.get(&request.agent_id).ok_or_else(|| {
-            DesktopBridgeError::MissingTerminalSession {
-                session_id: request.agent_id.clone(),
-            }
-        })?;
-        record
-            .backend
-            .write_queue()
+        // Take the pane's writer out and release the runtime state before
+        // writing. The PTY write blocks once the child's input queue is full
+        // (a large paste), and every pane's output reader needs this same
+        // state lock before it reads again; holding it here stopped all
+        // output, so a child blocked writing its echo never read its input,
+        // and `close_agent` could not take the lock to kill it.
+        let write_queue = {
+            let state = self.lock_state();
+            let record = state.agents.get(&request.agent_id).ok_or_else(|| {
+                DesktopBridgeError::MissingTerminalSession {
+                    session_id: request.agent_id.clone(),
+                }
+            })?;
+            record.backend.write_queue().clone()
+        };
+        write_queue
             .write_user_input(&request.data)
             .map_err(|error| DesktopBridgeError::TerminalWriteFailed {
                 message: error.to_string(),
@@ -4447,6 +4454,46 @@ mod tests {
             runtime_weak.upgrade().is_none(),
             "PTY callbacks must not retain DesktopRuntimeInner"
         );
+    }
+
+    /// Review P1: `write_agent` held the runtime state lock across a blocking
+    /// PTY write, so a large paste into a pane whose child was not reading
+    /// froze every other runtime call, including the close that would end it.
+    #[cfg(unix)]
+    #[test]
+    fn test_blocked_write_does_not_hold_the_runtime_lock() {
+        let runtime = DesktopRuntime::default();
+        let mut request = spawn_request(24, 80, Some("sh"));
+        request.args = vec!["-c".to_string(), "sleep 60".to_string()];
+        runtime
+            .spawn_agent(request)
+            .expect("spawn a child that never reads");
+
+        let writer = runtime.clone();
+        std::thread::spawn(move || {
+            // Far beyond any tty input queue: this write blocks.
+            let _ = writer.write_agent(AgentWriteRequest {
+                agent_id: "agent-1".to_string(),
+                data: b"line\n".repeat(100_000),
+            });
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let (done, finished) = std::sync::mpsc::channel();
+        let other = runtime.clone();
+        std::thread::spawn(move || {
+            let count = other.snapshot_agents().len();
+            other
+                .close_agent(TerminalCloseRequest {
+                    session_id: "agent-1".to_string(),
+                })
+                .expect("close the blocked pane");
+            let _ = done.send(count);
+        });
+        let count = finished
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("snapshot and close must not wait on the blocked write");
+        assert_eq!(count, 1);
     }
 
     #[test]
