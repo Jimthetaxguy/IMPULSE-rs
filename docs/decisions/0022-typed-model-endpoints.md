@@ -3,7 +3,7 @@ title: "ADR-0022: Typed Model Endpoints (Protocol, Not Vendor)"
 description: Model endpoints are typed values (protocol, base URL, auth by env name, model, output limit) in named config profiles selected per role, so Ion and photon can use any model
 status: review
 created: 2026-10-03
-updated: 2026-10-03
+updated: 2026-10-04
 type: decision
 category: architecture
 phase: all
@@ -46,12 +46,20 @@ modular.
 2. **Validation happens once, at the boundary.** A typed `EndpointError` rejects blank models,
    unparsable or credential-bearing URLs, plain HTTP to anything other than numeric loopback, invalid
    env or header names, and an Anthropic Messages endpoint without an output-token limit.
-3. **Credentials are referenced, never stored.** Auth names an environment variable. Config never
-   holds a secret, and because rule 2 rejects credential-bearing URLs, an endpoint value is safe to
-   log.
+3. **Credentials are referenced, never stored, and go only where the user allows.** Auth names an
+   environment variable. Config never holds a secret, and because rule 2 rejects credential-bearing
+   URLs, an endpoint value is safe to log (validation errors do not echo a URL that fails to parse).
+   `config.json` is project data that a cloned repository controls, so a profile from it may send its
+   credential only to the protocol's vendor host (`api.anthropic.com`, `api.openai.com`), a numeric
+   loopback address, or a host the user lists in `IMPULSE_TRUSTED_MODEL_HOSTS` in their own
+   environment. Anything else is refused with a message naming that variable
+   (`EndpointError::UntrustedCredentialHost`). Endpoints Ion builds from the user's environment
+   (`ANTHROPIC_BASE_URL`) are not subject to this rule.
 4. **Named profiles, selected per role.** `config.json` gains `model_endpoints: { profiles: {name:
    ModelEndpoint}, roles: { ion?, photon? } }`. A role names a profile; a missing profile is an error,
-   never a silent fallback. The section is part of `Config`, so `config set` round-trips it.
+   never a silent fallback. `Config` keeps the section as raw JSON, so `config set` round-trips it and
+   a malformed section never stops the rest of the configuration (and every command) from loading;
+   its consumers parse it and report errors when they use it.
 5. **Host-owned selection (ADR-0015 unchanged).** The harness resolves the endpoint. No tool schema
    exposes a model or endpoint choice. `decide_step_model` still chooses only the model id for a
    step, within the resolved endpoint.

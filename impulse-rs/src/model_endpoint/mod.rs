@@ -23,6 +23,10 @@ use thiserror::Error;
 /// Longest accepted profile, env-var, or header name.
 const MAX_NAME_LEN: usize = 64;
 
+/// Environment variable listing extra hosts (comma-separated) that a
+/// configured profile may send a credential to.
+pub const TRUSTED_MODEL_HOSTS_ENV: &str = "IMPULSE_TRUSTED_MODEL_HOSTS";
+
 /// The request format an endpoint speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -114,8 +118,10 @@ pub struct ModelEndpointConfig {
 pub enum EndpointError {
     #[error("model id must not be blank")]
     BlankModel,
-    #[error("base_url '{url}' is not a valid URL: {reason}")]
-    InvalidBaseUrl { url: String, reason: String },
+    /// The URL itself is not echoed: one that fails to parse may still carry
+    /// userinfo, and endpoint errors reach logs and the model.
+    #[error("base_url is not a valid URL: {reason}")]
+    InvalidBaseUrl { reason: String },
     #[error("base_url '{url}' must use https, or http to a numeric loopback address")]
     InsecureBaseUrl { url: String },
     #[error("base_url must not carry credentials, a query, or a fragment")]
@@ -136,6 +142,59 @@ pub enum EndpointError {
         "role '{role}' names profile '{profile}', which is not defined in model_endpoints.profiles"
     )]
     UnknownProfile { role: String, profile: String },
+    #[error(
+        "this profile would send {env} to '{host}', which is neither the {protocol} vendor host \
+         ({vendor}) nor a numeric loopback address; if you trust it, add it to \
+         IMPULSE_TRUSTED_MODEL_HOSTS in your environment (config.json cannot grant this)"
+    )]
+    UntrustedCredentialHost {
+        host: String,
+        env: String,
+        protocol: WireProtocol,
+        vendor: &'static str,
+    },
+}
+
+/// Hosts a configured profile may send a credential to (ADR-0022, credential
+/// destinations). `config.json` is project data that a cloned repository
+/// controls, so it may choose endpoints but not where a secret goes: beyond
+/// each protocol's vendor host and numeric loopback, only hosts the user
+/// lists in [`TRUSTED_MODEL_HOSTS_ENV`] qualify.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrustedModelHosts {
+    extra: Vec<String>,
+}
+
+impl TrustedModelHosts {
+    /// Parses a comma-separated host list, ignoring blanks and case.
+    pub fn from_list(value: Option<&str>) -> Self {
+        let extra = value
+            .unwrap_or("")
+            .split(',')
+            .map(|host| host.trim().trim_end_matches('.').to_ascii_lowercase())
+            .filter(|host| !host.is_empty())
+            .collect();
+        Self { extra }
+    }
+
+    /// The list from [`TRUSTED_MODEL_HOSTS_ENV`].
+    pub fn from_env() -> Self {
+        Self::from_list(std::env::var(TRUSTED_MODEL_HOSTS_ENV).ok().as_deref())
+    }
+
+    fn allows(&self, host: &str) -> bool {
+        self.extra.iter().any(|trusted| trusted == host)
+    }
+}
+
+impl WireProtocol {
+    /// The vendor's own API host, which may always receive the credential.
+    pub fn vendor_host(self) -> &'static str {
+        match self {
+            Self::AnthropicMessages => "api.anthropic.com",
+            Self::OpenaiChat | Self::OpenaiResponses => "api.openai.com",
+        }
+    }
 }
 
 fn valid_name(name: &str, extra: impl Fn(u8) -> bool) -> bool {
@@ -194,7 +253,6 @@ impl ModelEndpoint {
         }
         let url =
             reqwest::Url::parse(&self.base_url).map_err(|e| EndpointError::InvalidBaseUrl {
-                url: self.base_url.clone(),
                 reason: e.to_string(),
             })?;
         if !url.username().is_empty()
@@ -233,15 +291,62 @@ impl ModelEndpoint {
     }
 }
 
+impl ModelEndpoint {
+    /// Refuses a credential-bearing endpoint whose host neither belongs to
+    /// the protocol's vendor, nor is a numeric loopback address, nor is listed
+    /// in `trusted`. Endpoints built from the user's own environment (Ion's
+    /// `ANTHROPIC_BASE_URL` default) are not subject to this; it guards
+    /// profiles read from `config.json`.
+    pub fn check_credential_destination(
+        &self,
+        trusted: &TrustedModelHosts,
+    ) -> Result<(), EndpointError> {
+        let env = match &self.auth {
+            EndpointAuth::None => return Ok(()),
+            EndpointAuth::BearerEnv { env } | EndpointAuth::HeaderEnv { env, .. } => env,
+        };
+        let url =
+            reqwest::Url::parse(&self.base_url).map_err(|e| EndpointError::InvalidBaseUrl {
+                reason: e.to_string(),
+            })?;
+        let host = url
+            .host_str()
+            .unwrap_or("")
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        let loopback = host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback());
+        let vendor = self.protocol.vendor_host();
+        if loopback || host == vendor || trusted.allows(&host) {
+            return Ok(());
+        }
+        Err(EndpointError::UntrustedCredentialHost {
+            host,
+            env: env.clone(),
+            protocol: self.protocol,
+            vendor,
+        })
+    }
+}
+
 impl ModelEndpointConfig {
-    /// Validates every profile name, every profile, and every role reference.
+    /// Validates every profile name, every profile, and every role reference,
+    /// with credential destinations checked against
+    /// [`TrustedModelHosts::from_env`].
     pub fn validate(&self) -> Result<(), EndpointError> {
+        self.validate_with(&TrustedModelHosts::from_env())
+    }
+
+    /// [`Self::validate`] against an explicit trusted-host list.
+    pub fn validate_with(&self, trusted: &TrustedModelHosts) -> Result<(), EndpointError> {
         for (name, endpoint) in &self.profiles {
             if !valid_name(name, |b| b == b'_' || b == b'-') {
                 return Err(EndpointError::InvalidProfileName { name: name.clone() });
             }
             endpoint
                 .validate()
+                .and_then(|()| endpoint.check_credential_destination(trusted))
                 .map_err(|e| EndpointError::InvalidProfile {
                     name: name.clone(),
                     reason: e.to_string(),
@@ -453,6 +558,65 @@ mod tests {
         ));
     }
 
+    /// Review P1: `config.json` is repository data, so a cloned repo could
+    /// otherwise point a credential-bearing profile at its own host and
+    /// receive the user's key.
+    #[test]
+    fn test_credential_destination_allows_vendor_loopback_and_user_trusted_hosts() {
+        let none = TrustedModelHosts::default();
+        assert_eq!(
+            openrouter().check_credential_destination(&none),
+            Err(EndpointError::UntrustedCredentialHost {
+                host: "openrouter.ai".into(),
+                env: "OPENROUTER_API_KEY".into(),
+                protocol: WireProtocol::OpenaiChat,
+                vendor: "api.openai.com",
+            })
+        );
+        let trusted = TrustedModelHosts::from_list(Some(" OpenRouter.ai. , ,other.test"));
+        assert_eq!(openrouter().check_credential_destination(&trusted), Ok(()));
+
+        let vendor = ModelEndpoint::anthropic_messages("https://api.anthropic.com", "m", 1);
+        assert_eq!(vendor.check_credential_destination(&none), Ok(()));
+        let collector = ModelEndpoint::anthropic_messages("https://collector.example", "m", 1);
+        assert!(matches!(
+            collector.check_credential_destination(&none),
+            Err(EndpointError::UntrustedCredentialHost { .. })
+        ));
+        let local = ModelEndpoint::anthropic_messages("http://127.0.0.1:4010", "m", 1);
+        assert_eq!(local.check_credential_destination(&none), Ok(()));
+        let mut anonymous = openrouter();
+        anonymous.auth = EndpointAuth::None;
+        assert_eq!(anonymous.check_credential_destination(&none), Ok(()));
+    }
+
+    #[test]
+    fn test_config_validate_with_refuses_an_untrusted_credential_host() {
+        let config = config_with(openrouter(), Some("router"));
+        let err = config
+            .validate_with(&TrustedModelHosts::default())
+            .unwrap_err();
+        assert!(
+            matches!(&err, EndpointError::InvalidProfile { name, reason }
+                if name == "router" && reason.contains(TRUSTED_MODEL_HOSTS_ENV)),
+            "{err}"
+        );
+        assert_eq!(
+            config.validate_with(&TrustedModelHosts::from_list(Some("openrouter.ai"))),
+            Ok(())
+        );
+    }
+
+    /// Review P3: a URL that fails to parse can still carry userinfo.
+    #[test]
+    fn test_invalid_base_url_error_does_not_echo_the_url() {
+        let mut e = openrouter();
+        e.base_url = "https://user:secret@host:notaport/v1".into();
+        let message = e.validate().unwrap_err().to_string();
+        assert!(message.contains("not a valid URL"), "{message}");
+        assert!(!message.contains("secret"), "{message}");
+    }
+
     #[test]
     fn test_endpoint_error_display_carries_context() {
         let err = EndpointError::UnknownProfile {
@@ -467,5 +631,19 @@ mod tests {
         assert!(EndpointError::InsecureBaseUrl { url: "u".into() }
             .to_string()
             .contains("https"));
+        let err = EndpointError::UntrustedCredentialHost {
+            host: "collector.example".into(),
+            env: "ANTHROPIC_API_KEY".into(),
+            protocol: WireProtocol::AnthropicMessages,
+            vendor: "api.anthropic.com",
+        }
+        .to_string();
+        for part in [
+            "ANTHROPIC_API_KEY",
+            "collector.example",
+            TRUSTED_MODEL_HOSTS_ENV,
+        ] {
+            assert!(err.contains(part), "{err}");
+        }
     }
 }

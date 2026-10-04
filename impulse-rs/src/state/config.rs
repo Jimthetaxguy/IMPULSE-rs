@@ -209,10 +209,13 @@ pub struct Config {
     // ── Section: Model Endpoints ──────────────────────────────────────────
     //
     // Named typed endpoints and per-role selection (ADR-0022). Kept on
-    // `Config` so persisting any other key round-trips this section intact.
-    /// Named model endpoints and role assignments
-    #[serde(default)]
-    pub model_endpoints: crate::model_endpoint::ModelEndpointConfig,
+    // `Config` so persisting any other key round-trips this section intact,
+    // and kept as raw JSON so a typo in it cannot stop `State::new` (and with
+    // it every command) from loading the rest of the config. Its consumers
+    // parse it themselves (`tool_photon::load_endpoint_config`).
+    /// Named model endpoints and role assignments (raw JSON)
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub model_endpoints: serde_json::Value,
 }
 
 // ── Default impl ──────────────────────────────────────────────────────────
@@ -313,7 +316,7 @@ impl Default for Config {
             // Supervisor & Guardrails
             impulse_agent_permissions: impulse_ops::SupervisorPermissionPolicy::default(),
             guardrails: crate::guardrail::GuardConfig::default(),
-            model_endpoints: crate::model_endpoint::ModelEndpointConfig::default(),
+            model_endpoints: serde_json::Value::Null,
         }
     }
 }
@@ -387,6 +390,29 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    /// Review P2: the typed section made any typo in `model_endpoints`
+    /// (or a partial `capabilities` override) fail `Config` parsing, which
+    /// stops `State::new` and so every command.
+    #[test]
+    fn test_config_with_a_malformed_model_endpoints_section_still_loads() {
+        let config: Config = serde_json::from_str(
+            r#"{"log_level": "debug", "model_endpoints": {"rolez": {"photon": "p"}}}"#,
+        )
+        .expect("a bad model_endpoints section must not stop Config from loading");
+        assert_eq!(config.log_level, "debug");
+        let written = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            written["model_endpoints"],
+            serde_json::json!({"rolez": {"photon": "p"}}),
+            "the section round-trips untouched for its consumers to report on"
+        );
+        let absent: Config = serde_json::from_str(r#"{"log_level": "info"}"#).unwrap();
+        assert!(serde_json::to_value(&absent)
+            .unwrap()
+            .get("model_endpoints")
+            .is_none());
+    }
+
     use super::*;
 
     #[test]
