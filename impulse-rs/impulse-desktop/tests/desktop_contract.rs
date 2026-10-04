@@ -35,6 +35,37 @@ use impulse_ops::{
 };
 use serde_json::json;
 
+/// SSR output with HTML entities decoded, so assertions name the text a
+/// user sees rather than one renderer's escaping style. Dioxus 0.6 emits
+/// named entities (`&quot;`, `&lt;`) and 0.7 numeric ones (`&#34;`, `&#60;`);
+/// asserting on either form ties the test to a dependency version.
+fn decoded_html(html: &str) -> String {
+    [
+        ("&quot;", "\""),
+        ("&#34;", "\""),
+        ("&#39;", "'"),
+        ("&apos;", "'"),
+        ("&lt;", "<"),
+        ("&#60;", "<"),
+        ("&gt;", ">"),
+        ("&#62;", ">"),
+        // Last, so an escaped entity like `&amp;lt;` decodes one level only.
+        ("&amp;", "&"),
+        ("&#38;", "&"),
+    ]
+    .iter()
+    .fold(html.to_string(), |text, (entity, plain)| {
+        text.replace(entity, plain)
+    })
+}
+
+#[test]
+fn test_decoded_html_reads_named_and_numeric_entities_alike() {
+    assert_eq!(decoded_html("&quot;a&quot; &#34;b&#34;"), "\"a\" \"b\"");
+    assert_eq!(decoded_html("&lt;x&gt; &#60;y&#62;"), "<x> <y>");
+    assert_eq!(decoded_html("&amp;lt;"), "&lt;");
+}
+
 fn platform_id(value: &str) -> AgentPlatformId {
     AgentPlatformId::try_new(value).expect("valid test platform id")
 }
@@ -536,7 +567,12 @@ fn test_dioxus_desktop_launch_binary_is_feature_gated() {
     assert!(manifest_text.contains("name = \"impulse-desktop\""));
     assert!(manifest_text.contains("required-features = [\"desktop-app\"]"));
     assert!(manifest_text.contains("desktop-app = [\"dep:dioxus-desktop\", \"dioxus/desktop\"]"));
-    assert!(manifest_text.contains("dioxus-desktop = { version = \"0.6.3\", optional = true }"));
+    // The desktop host is an optional dependency, whatever its version: the
+    // feature gate is the contract, not the pin.
+    assert!(manifest_text.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with("dioxus-desktop = {") && line.contains("optional = true")
+    }));
     assert!(launcher_text.contains("use impulse_desktop::desktop_host::desktop_config;"));
     assert!(launcher_text.contains("dioxus::LaunchBuilder::desktop()"));
     assert!(launcher_text.contains(".with_cfg(desktop_config())"));
@@ -2610,7 +2646,7 @@ fn test_shell_supervisor_route_renders_authoritative_governed_evidence_and_contr
     assert!(html.contains("data-review-state=\"awaiting supervisor\""));
     assert!(html.contains("Implemented the daemon-owned task lifecycle"));
     assert!(html.contains("redacted argv"));
-    assert!(html.contains("&lt;redacted&gt;"));
+    assert!(decoded_html(&html).contains("<redacted>"));
     assert!(html.contains("output truncated"));
     assert!(html.contains("Recommend accept"));
     assert!(html.contains("Request changes"));
@@ -2684,9 +2720,9 @@ fn test_profiled_governed_tasks_label_rust_only_and_route_all_producers_via_daem
         "the launcher and all three profiled task cards must identify the Rust-only profile"
     );
     assert_eq!(html.matches("class=\"governed-task-profile\"").count(), 3);
-    assert!(html.contains("&quot;$IMPULSE_CONTROL_CLI&quot; --daemon governed-claim"));
-    assert!(html.contains("&quot;$IMPULSE_CONTROL_CLI&quot; --daemon governed-verify"));
-    assert!(html.contains("&quot;$IMPULSE_CONTROL_CLI&quot; --daemon governed-review"));
+    assert!(decoded_html(&html).contains("\"$IMPULSE_CONTROL_CLI\" --daemon governed-claim"));
+    assert!(decoded_html(&html).contains("\"$IMPULSE_CONTROL_CLI\" --daemon governed-verify"));
+    assert!(decoded_html(&html).contains("\"$IMPULSE_CONTROL_CLI\" --daemon governed-review"));
     assert!(!html.contains("$IMPULSE_CONTROL_CLI governed-"));
 }
 
