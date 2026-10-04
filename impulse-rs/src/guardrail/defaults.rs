@@ -33,16 +33,24 @@ pub fn builtin_rules() -> Vec<GuardRule> {
         // ==================================================================
         GuardRule {
             id: "block-force-push-main".to_string(),
-            // Match a force flag and the `main` ref in EITHER order, so
-            // `git push origin main --force` (flag after the branch) can't
-            // bypass the block. Rust's regex engine is linear-time, so the
-            // `.*` alternation has no catastrophic-backtracking risk.
-            pattern: r"git\s+push\b.*(?:\s(?:-f|--force)\b.*\bmain\b|\bmain\b.*\s(?:-f|--force)\b)"
-                .to_string(),
+            // A force flag and the `main` (or `master`) ref in either order, or
+            // a `+` refspec onto it. `[^;&|\n]` keeps the whole match inside
+            // one command, so a force flag in a later command cannot trip it,
+            // and git's global options (`git -C dir`, `-c k=v`) may come
+            // before `push`. `-[a-zA-Z]*f` covers clustered short flags
+            // (`-fu`). Rust's regex engine is linear-time, so the
+            // alternation has no catastrophic-backtracking risk.
+            pattern: concat!(
+                r"\bgit\b[^;&|\n]*\spush\b[^;&|\n]*",
+                r"(?:\s(?:-[a-zA-Z]*f[a-zA-Z]*|--force)\b[^;&|\n]*\b(?:main|master)\b",
+                r"|\b(?:main|master)\b[^;&|\n]*\s(?:-[a-zA-Z]*f[a-zA-Z]*|--force)\b",
+                r"|\s\+(?:\S*:)?(?:refs/heads/)?(?:main|master)\b)"
+            )
+            .to_string(),
             action: GuardAction::Block,
             target: GuardTarget::Bash,
-            reason: "Force-pushing to main rewrites shared history and can cause data loss \
-                     for all collaborators."
+            reason: "Force-pushing to main or master rewrites shared history and can cause \
+                     data loss for all collaborators."
                 .to_string(),
             suggestion: Some(
                 "Push to a feature branch and open a pull request instead.".to_string(),
@@ -52,7 +60,11 @@ pub fn builtin_rules() -> Vec<GuardRule> {
         },
         GuardRule {
             id: "block-bulk-git-add".to_string(),
-            pattern: r"git\s+add\s+(-A|--all|\.\s*$)".to_string(),
+            // `git add .` anywhere in a command, not only at the very end of
+            // the input (`git add . && git commit` used to pass), with git's
+            // global options allowed before `add`.
+            pattern: r"\bgit\b[^;&|\n]*\sadd\b[^;&|\n]*\s(?:-A\b|--all\b|\.(?:\s|$|[;&|]))"
+                .to_string(),
             action: GuardAction::Block,
             target: GuardTarget::Bash,
             reason: "Bulk git add stages everything including secrets, binaries, and \
@@ -66,7 +78,14 @@ pub fn builtin_rules() -> Vec<GuardRule> {
         },
         GuardRule {
             id: "block-rm-rf-root".to_string(),
-            pattern: r"rm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+)?-?[a-zA-Z]*r[a-zA-Z]*\s+[/~]".to_string(),
+            // A recursive flag anywhere among `rm`'s options (`-rf`, `-r -f`,
+            // `--recursive --force`, after `--`), then a target at `/`, `~`, or
+            // `$HOME`, optionally quoted.
+            pattern: concat!(
+                r"\brm\s+(?:(?:-[a-zA-Z]+|--[a-z-]*)\s+)*?(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)\s+",
+                r#"(?:(?:-[a-zA-Z]+|--[a-z-]*)\s+)*["']?(?:/|~|\$\{?HOME\}?)"#
+            )
+            .to_string(),
             action: GuardAction::Block,
             target: GuardTarget::Bash,
             reason: "Recursive forced deletion of root or home directory is catastrophic \
@@ -351,6 +370,49 @@ mod tests {
             !GuardEngine::has_blocking(&results),
             "Should allow force push to a 'maintenance' branch"
         );
+    }
+
+    /// Review P2: ordinary command shapes defeated the Block rules.
+    #[test]
+    fn test_block_rules_cover_common_command_shapes() {
+        let engine = GuardEngine::new(&builtin_rules()).unwrap();
+        let blocked = |command: &str| {
+            GuardEngine::has_blocking(&engine.evaluate(command, &GuardTarget::Bash))
+        };
+        for command in [
+            "git -C ../wt push --force origin main",
+            "git -c core.x=1 push --force origin main",
+            "git push -fu origin main",
+            "git push origin +main",
+            "git push origin +HEAD:main",
+            "git push --force origin master",
+            "git add . && git commit -m wip",
+            "git add .; git status",
+            "git add .\ngit status",
+            "git -C sub add -A",
+            "git add -- .",
+            "rm -r -f /",
+            "rm -f -r /",
+            "rm --recursive --force /",
+            "rm -rf -- /",
+            "rm -rf \"/\"",
+            "rm -rf \"$HOME\"",
+            "rm -rf ${HOME}/",
+        ] {
+            assert!(blocked(command), "should block: {command}");
+        }
+        for command in [
+            "git push --force origin maintenance",
+            "git push origin feature && echo --force main",
+            "git add ./src/main.rs",
+            "git add .gitignore",
+            "git add src/lib.rs",
+            "rm -rf ./build",
+            "rm -rf target/",
+            "rm -i notes.txt",
+        ] {
+            assert!(!blocked(command), "should allow: {command}");
+        }
     }
 
     #[test]
