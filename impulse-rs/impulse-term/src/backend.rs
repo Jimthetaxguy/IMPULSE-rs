@@ -157,6 +157,19 @@ impl TerminalBackend {
         exit_callback: Option<ExitCallback>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let scrollback = scrollback.unwrap_or(DEFAULT_SCROLLBACK_LINES);
+        // portable-pty starts the child in `$HOME` when the requested
+        // directory is not an existing directory, with no error, while this
+        // backend would keep reporting the requested path. An agent launched
+        // for a deleted or unmounted workspace must not run somewhere else.
+        if let Some(dir) = working_dir {
+            if !dir.is_dir() {
+                return Err(format!(
+                    "working directory {} does not exist or is not a directory",
+                    dir.display()
+                )
+                .into());
+            }
+        }
 
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {

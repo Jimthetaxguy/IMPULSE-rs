@@ -351,3 +351,13 @@ fn test_spawn_invalid_command_returns_error() {
         "spawning a nonexistent command should return an Err"
     );
 }
+
+/// Review P2: portable-pty silently fell back to `$HOME` for a missing
+/// working directory, so the agent ran outside its workspace.
+#[test]
+fn test_spawn_refuses_a_missing_working_directory() {
+    let missing = std::path::Path::new("/definitely/not/a/real/impulse/dir");
+    let result = impulse_term::TerminalBackend::spawn("pwd", &[], Some(missing), &[], 24, 80, None);
+    let error = result.err().expect("a missing directory must be refused");
+    assert!(error.to_string().contains("does not exist"), "{error}");
+}
