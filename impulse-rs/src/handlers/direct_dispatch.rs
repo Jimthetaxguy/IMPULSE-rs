@@ -1768,6 +1768,29 @@ mod tests {
         assert!(result.is_ok(), "SessionStart should return Ok");
     }
 
+    /// Review P2: an unparseable mode used to become Apply (and an absent one
+    /// always was Apply, whatever `context_injection_mode` said).
+    #[tokio::test]
+    async fn test_dispatch_session_start_rejects_an_invalid_inject_mode() {
+        let tmp = TempDir::new().unwrap();
+        let cli = cli_with(
+            &tmp,
+            Commands::SessionStart {
+                name: Some("typo".to_string()),
+                platform: None,
+                inject_mode: Some("of".to_string()),
+                inject_explain: false,
+            },
+        );
+        let err = dispatch(cli).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Invalid inject mode"),
+            "{err:#}"
+        );
+        let state = state::State::new(tmp.path().to_path_buf()).unwrap();
+        assert!(state.list_sessions().await.unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn test_dispatch_session_start_with_platform_returns_ok() {
         let tmp = TempDir::new().unwrap();

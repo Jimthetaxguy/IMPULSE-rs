@@ -207,7 +207,7 @@ fi
 
 IMPULSE_HOOK_EVIDENCE=1 \
 IMPULSE_HOOK_SENTINEL=1 \
-impulse-rs -c "$ROOT/.impulse" session-start -n "${CLAUDE_PROJECT_NAME:-hook-validation}" -p claude-code < "$PAYLOAD_PATH"
+impulse-rs -c "$ROOT/.impulse" session-start -n "${CLAUDE_PROJECT_NAME:-hook-validation}" -p claude-code --inject-mode apply < "$PAYLOAD_PATH"
 "#;
 
             let session_end = r#"#!/bin/bash
