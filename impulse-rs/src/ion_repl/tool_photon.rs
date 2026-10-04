@@ -96,6 +96,23 @@ pub fn resolve_photon_endpoint(
             .context("photon: the configured photon profile is refused")?;
         return Ok(endpoint.clone());
     }
+    // Without its own profile photon would default to Anthropic's cloud.
+    // Refuse when the configuration says otherwise: a photon fallback list
+    // with no primary, or Ion moved onto typed endpoints (for example a local
+    // model), where a silent default would send the question and file
+    // excerpts to a vendor the user did not choose.
+    if config.role_is_configured(EndpointRole::Photon) {
+        bail!(
+            "photon: model_endpoints.fallbacks.photon is set but model_endpoints.roles.photon \
+             is not; name photon's primary profile in model_endpoints.roles.photon"
+        );
+    }
+    if config.role_is_configured(EndpointRole::Ion) {
+        bail!(
+            "photon: Ion uses model_endpoints, so photon needs its own assignment; set \
+             model_endpoints.roles.photon (it may name the same profile as Ion)"
+        );
+    }
     let provider = env(PROVIDER_ENV)
         .map(|p| p.trim().to_ascii_lowercase())
         .filter(|p| !p.is_empty());
@@ -827,6 +844,42 @@ mod tests {
         let err = resolve_photon_endpoint(&insecure, &env_of(&[]), "https://api.anthropic.com")
             .unwrap_err();
         assert!(format!("{err:#}").contains("must use https"));
+    }
+
+    /// Review P2: with only `fallbacks.photon`, or with Ion on a typed
+    /// endpoint, photon used to default to Anthropic's cloud anyway.
+    #[test]
+    fn test_resolve_photon_endpoint_refuses_the_cloud_default_when_config_says_otherwise() {
+        let local = json!({
+            "protocol": "openai_chat",
+            "base_url": "http://127.0.0.1:11434/v1",
+            "auth": {"kind": "none"},
+            "model": "qwen3:8b"
+        });
+        let fallback_only: ModelEndpointConfig = serde_json::from_value(json!({
+            "profiles": {"local": local.clone()},
+            "fallbacks": {"photon": ["local"]}
+        }))
+        .unwrap();
+        let err =
+            resolve_photon_endpoint(&fallback_only, &env_of(&[]), "https://api.anthropic.com")
+                .unwrap_err();
+        assert!(
+            format!("{err}").contains("model_endpoints.roles.photon"),
+            "{err}"
+        );
+
+        let ion_typed: ModelEndpointConfig = serde_json::from_value(json!({
+            "profiles": {"local": local},
+            "roles": {"ion": "local"}
+        }))
+        .unwrap();
+        let err = resolve_photon_endpoint(&ion_typed, &env_of(&[]), "https://api.anthropic.com")
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("model_endpoints.roles.photon"),
+            "{err}"
+        );
     }
 
     /// Review P1: a cloned repository's `.impulse/config.json` must not be

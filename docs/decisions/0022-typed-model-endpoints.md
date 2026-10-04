@@ -151,6 +151,13 @@ through `min-agent`, whose client is blocking. Photon keeps using `min-agent`.
     `ToolUse` even when a server reports `stop`, and a malformed tool call fails the turn. The
     endpoint names the model, so the step-model hook's per-step model id is not applied on this
     path yet.
+17. **Credential destinations hold for every role, and photon follows the configuration.** Rule
+    3's vendor-host, loopback, or `IMPULSE_TRUSTED_MODEL_HOSTS` check runs inside `validate_role`,
+    so Ion's own profiles and fallbacks obey it, not only `validate`. When Ion is on typed
+    endpoints, or photon has fallbacks but no `roles.photon`, photon refuses rule 6's Anthropic
+    default and asks for `model_endpoints.roles.photon` instead of sending the question and file
+    excerpts to a vendor the user did not choose. A `model_endpoints` section that does not parse
+    and does not name Ion leaves Ion on the legacy path with a printed note.
 
 **Review.** An adversarial pass (2026-10-04, reproductions in a scratch copy) found three P1s, a
 tool call dropped on `finish_reason: "stop"`, a local 400 that stopped the fallback chain, and an

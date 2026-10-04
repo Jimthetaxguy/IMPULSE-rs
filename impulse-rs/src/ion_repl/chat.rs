@@ -450,6 +450,12 @@ fn endpoint_provider(impulse_dir: &std::path::Path) -> Result<Option<EndpointPro
                     path.display()
                 ));
             }
+            // Same visibility as the other ignore paths: the section is
+            // broken, and photon will report it when it runs.
+            eprintln!(
+                "Note: Ion ignores model_endpoints; cannot parse it in {} ({err})",
+                path.display()
+            );
             return Ok(None);
         }
     };
