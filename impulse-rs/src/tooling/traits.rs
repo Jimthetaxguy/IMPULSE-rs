@@ -51,6 +51,20 @@ pub(crate) fn secure_resolve(path: &Path) -> PathBuf {
     normalize_lexical(path)
 }
 
+/// The physical path a write to `path` will touch, for both the sandbox check
+/// and the write itself.
+///
+/// `..` is collapsed over the whole path first, then symlinks in the existing
+/// prefix are resolved. Checking one form of the path and writing to another
+/// let `fresh/../link/../x` (with `fresh` missing and `link` a symlink out of
+/// the root) pass the check as `<root>/x` and then, once `create_dir_all`
+/// made `fresh` real, land outside the root through `link`. A writer must
+/// check and use only this path; when the target is a symlink inside the
+/// root, it names the link's target, so the link itself is kept.
+pub(crate) fn resolve_for_write(path: &Path) -> PathBuf {
+    secure_resolve(&normalize_lexical(path))
+}
+
 /// Capability a tool may require — deny-by-default security model
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Capability {

@@ -88,7 +88,8 @@ impl DynamicTool for FileWriteTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
-        let path = ctx.resolve_path(path_str);
+        // Check and write the same physical path; see `resolve_for_write`.
+        let path = resolve_for_write(&ctx.resolve_path(path_str));
 
         if !ctx.is_path_allowed(&path, true) {
             return Err(ToolError::PathNotAllowed(path.display().to_string()));
@@ -124,8 +125,25 @@ impl DynamicTool for FileWriteTool {
         );
         let temp_path = parent.join(temp_name);
 
-        std::fs::write(&temp_path, content)
-            .map_err(|e| ToolError::ExecutionFailed(format!("failed to write temp file: {e}")))?;
+        if let Err(e) = std::fs::write(&temp_path, content) {
+            // A partial temp file (disk full, I/O error) must not be left
+            // behind in the user's tree.
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(ToolError::ExecutionFailed(format!(
+                "failed to write temp file: {e}"
+            )));
+        }
+
+        // Rename replaces the inode, so carry an existing file's mode over
+        // (an executable script stays executable, a 0600 file stays private).
+        if let Ok(existing) = std::fs::metadata(&path) {
+            if let Err(e) = std::fs::set_permissions(&temp_path, existing.permissions()) {
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(ToolError::ExecutionFailed(format!(
+                    "failed to keep the existing file's permissions: {e}"
+                )));
+            }
+        }
 
         if let Err(e) = std::fs::rename(&temp_path, &path) {
             let _ = std::fs::remove_file(&temp_path);
@@ -220,6 +238,82 @@ mod tests {
         .expect("overwrite should succeed");
 
         assert_eq!(std::fs::read_to_string(&target).expect("read back"), "new");
+    }
+
+    /// Review P2: the check judged `<root>/pwned.txt` while the write went
+    /// through `fresh/..` and the `link` symlink to the outside directory.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_execute_dotdot_through_a_symlink_cannot_escape_the_root() {
+        let tool = FileWriteTool;
+        let root = tempfile::tempdir().expect("root");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::create_dir(outside.path().join("sub")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("sub"), root.path().join("link")).unwrap();
+        let ctx = ToolContext {
+            allowed_write_roots: vec![root.path().to_path_buf()],
+            ..ToolContext::with_all_capabilities()
+        };
+
+        for raw in ["fresh/../link/../pwned.txt", "fresh/../link/pwned.txt"] {
+            let target = root.path().join(raw);
+            let result = tool
+                .execute(
+                    serde_json::json!({"path": target.display().to_string(), "content": "x"}),
+                    &ctx,
+                )
+                .await;
+            assert!(
+                !outside.path().join("pwned.txt").exists()
+                    && !outside.path().join("sub").join("pwned.txt").exists(),
+                "{raw} escaped the write root: {result:?}"
+            );
+            match result {
+                // Collapsing `..` first makes the first path `<root>/pwned.txt`.
+                Ok(written) => assert_eq!(
+                    std::path::PathBuf::from(written.output["path"].as_str().unwrap()),
+                    root.path().canonicalize().unwrap().join("pwned.txt")
+                ),
+                // The second resolves through `link`, outside the root.
+                Err(ToolError::PathNotAllowed(_)) => {}
+                Err(other) => panic!("{raw}: unexpected error {other}"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_execute_keeps_mode_and_writes_through_an_in_root_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let tool = FileWriteTool;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("release.sh");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&script, dir.path().join("alias.sh")).unwrap();
+        let ctx = ToolContext {
+            allowed_write_roots: vec![dir.path().to_path_buf()],
+            ..ToolContext::with_all_capabilities()
+        };
+
+        tool.execute(
+            serde_json::json!({
+                "path": dir.path().join("alias.sh").display().to_string(),
+                "content": "#!/bin/sh\necho new\n",
+            }),
+            &ctx,
+        )
+        .await
+        .expect("write through the link");
+
+        let alias = std::fs::symlink_metadata(dir.path().join("alias.sh")).unwrap();
+        assert!(alias.file_type().is_symlink(), "the link must survive");
+        assert_eq!(
+            std::fs::read_to_string(&script).unwrap(),
+            "#!/bin/sh\necho new\n"
+        );
+        let mode = std::fs::metadata(&script).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "the executable bit must survive");
     }
 
     #[tokio::test]
