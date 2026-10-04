@@ -511,9 +511,15 @@ pub(crate) fn digest(text: &str) -> String {
 }
 
 #[cfg(test)]
+// Tests hold `impulse_home_unset()` (a `std::sync::Mutex` guard) across
+// `.await` on purpose: the blackboard path is derived from `IMPULSE_HOME`
+// on every call, so the variable must stay unset for the whole test, not
+// only while it is read. Test-only; production never takes this lock.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use crate::blackboard::db_path;
+    use crate::test_support::impulse_home_unset;
 
     fn ctx_in(dir: &std::path::Path) -> ReplContext {
         ReplContext {
@@ -525,6 +531,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_then_fetch_round_trips_a_value() {
+        let _home = impulse_home_unset();
         let dir = tempfile::TempDir::new().expect("tempdir");
         let ctx = ctx_in(dir.path());
         let stored = BlackboardStoreTool
@@ -547,6 +554,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_non_string_value_is_stored_as_json() {
+        let _home = impulse_home_unset();
         let dir = tempfile::TempDir::new().expect("tempdir");
         let ctx = ctx_in(dir.path());
         BlackboardStoreTool
@@ -569,6 +577,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_refuses_a_live_key() {
+        let _home = impulse_home_unset();
         let dir = tempfile::TempDir::new().expect("tempdir");
         let ctx = ctx_in(dir.path());
         BlackboardStoreTool
@@ -584,6 +593,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_rejects_bad_arguments() {
+        let _home = impulse_home_unset();
         let dir = tempfile::TempDir::new().expect("tempdir");
         let ctx = ctx_in(dir.path());
         for args in [
@@ -607,6 +617,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_missing_key_is_not_ok() {
+        let _home = impulse_home_unset();
         let dir = tempfile::TempDir::new().expect("tempdir");
         let ctx = ctx_in(dir.path());
         let outcome = BlackboardFetchTool
@@ -619,6 +630,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_rejects_unknown_projection_fields() {
+        let _home = impulse_home_unset();
         let dir = tempfile::TempDir::new().expect("tempdir");
         let ctx = ctx_in(dir.path());
         let err = BlackboardFetchTool
@@ -630,6 +642,7 @@ mod tests {
 
     #[test]
     fn test_spill_under_threshold_is_inline() {
+        let _home = impulse_home_unset();
         let dir = tempfile::TempDir::new().expect("tempdir");
         let ctx = ctx_in(dir.path());
         assert_eq!(
@@ -644,6 +657,7 @@ mod tests {
 
     #[test]
     fn test_spill_disabled_when_context_has_no_config() {
+        let _home = impulse_home_unset();
         let dir = tempfile::TempDir::new().expect("tempdir");
         let ctx = ReplContext {
             repo_root: dir.path().to_path_buf(),
@@ -658,6 +672,7 @@ mod tests {
 
     #[test]
     fn test_spill_exempt_tools_stay_inline() {
+        let _home = impulse_home_unset();
         let dir = tempfile::TempDir::new().expect("tempdir");
         let ctx = ctx_in(dir.path());
         let big = "x".repeat(10_000);
@@ -671,6 +686,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_spill_over_threshold_stores_full_output_and_pages_back() {
+        let _home = impulse_home_unset();
         let dir = tempfile::TempDir::new().expect("tempdir");
         let ctx = ctx_in(dir.path());
         let big: String = (0..2_000).map(|n| format!("line {n}\n")).collect();
@@ -707,6 +723,7 @@ mod tests {
 
     #[test]
     fn test_spill_reports_failure_instead_of_dropping_output() {
+        let _home = impulse_home_unset();
         let dir = tempfile::TempDir::new().expect("tempdir");
         // A regular file where the .impulse directory should be makes the
         // open fail.
@@ -745,6 +762,7 @@ mod tests {
 
     #[test]
     fn test_claim_summary_under_limit_is_unchanged() {
+        let _home = impulse_home_unset();
         let dir = tempfile::TempDir::new().expect("tempdir");
         let spilled = spill(dir.path(), "done".to_string(), vec![]).expect("fits");
         assert_eq!(spilled.summary, "done");
@@ -755,6 +773,7 @@ mod tests {
 
     #[test]
     fn test_claim_summary_spill_disabled_without_config() {
+        let _home = impulse_home_unset();
         let dir = tempfile::TempDir::new().expect("tempdir");
         let long = "x".repeat(10_000);
         let spilled =
@@ -764,6 +783,7 @@ mod tests {
 
     #[test]
     fn test_claim_summary_over_limit_spills_and_adds_artifact_reference() {
+        let _home = impulse_home_unset();
         let dir = tempfile::TempDir::new().expect("tempdir");
         let long = "Implemented the feature. ".repeat(400);
         let spilled = spill(dir.path(), long.clone(), vec!["existing".to_string()]).expect("spill");
@@ -789,6 +809,7 @@ mod tests {
     /// submitted preview.
     #[test]
     fn test_claim_summary_with_leading_whitespace_keeps_a_text_preview() {
+        let _home = impulse_home_unset();
         let dir = tempfile::TempDir::new().expect("tempdir");
         let summary = format!(
             "{}Real summary text. {}",
@@ -803,6 +824,7 @@ mod tests {
     /// Review P3: the spill must not accept what the daemon would refuse.
     #[test]
     fn test_claim_summary_blank_or_nul_is_refused_before_storing() {
+        let _home = impulse_home_unset();
         let dir = tempfile::TempDir::new().expect("tempdir");
         assert!(spill(dir.path(), "\n".repeat(6_000), vec![]).is_err());
         let with_nul = format!("{}\0tail", "text ".repeat(1_000));
@@ -815,6 +837,7 @@ mod tests {
 
     #[test]
     fn test_undo_claim_spill_removes_the_entry() {
+        let _home = impulse_home_unset();
         let dir = tempfile::TempDir::new().expect("tempdir");
         let spilled = spill(dir.path(), "word ".repeat(2_000), vec![]).expect("spill");
         let key = spilled.stored_key.expect("stored");
@@ -825,6 +848,7 @@ mod tests {
 
     #[test]
     fn test_claim_summary_with_full_artifact_list_is_refused() {
+        let _home = impulse_home_unset();
         let dir = tempfile::TempDir::new().expect("tempdir");
         let full = (0..impulse_ops::governed_task::MAX_GOVERNED_REFERENCES)
             .map(|n| format!("a{n}"))
@@ -835,6 +859,7 @@ mod tests {
 
     #[test]
     fn test_claim_blackboard_dir_is_the_sockets_parent() {
+        let _home = impulse_home_unset();
         let ctx = ReplContext {
             repo_root: PathBuf::from("/tmp/staged-worktree"),
             ..ReplContext::default()
@@ -852,6 +877,7 @@ mod tests {
 
     #[test]
     fn test_entry_text_for_scan_reads_the_whole_entry() {
+        let _home = impulse_home_unset();
         let dir = tempfile::TempDir::new().expect("tempdir");
         let ctx = ctx_in(dir.path());
         let big = "y".repeat(20_000);
@@ -866,6 +892,7 @@ mod tests {
 
     #[test]
     fn test_compaction_note_keeps_only_a_valid_spill_key() {
+        let _home = impulse_home_unset();
         let dir = tempfile::TempDir::new().expect("tempdir");
         let ctx = ctx_in(dir.path());
         let SpillOutcome::Spilled { reference, entry } =
@@ -887,6 +914,7 @@ mod tests {
     /// envelope, is still smaller than what it replaces.
     #[test]
     fn test_reference_is_smaller_than_the_minimum_threshold() {
+        let _home = impulse_home_unset();
         let dir = tempfile::TempDir::new().expect("tempdir");
         let ctx = ReplContext {
             repo_root: dir.path().to_path_buf(),
@@ -913,6 +941,7 @@ mod tests {
 
     #[test]
     fn test_key_segment_maps_onto_key_charset() {
+        let _home = impulse_home_unset();
         assert_eq!(key_segment("bash_exec"), "bash_exec");
         assert_eq!(key_segment("a/b c"), "a_b_c");
         assert_eq!(key_segment(""), "x");

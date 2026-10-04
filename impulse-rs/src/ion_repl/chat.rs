@@ -2870,7 +2870,10 @@ mod tests {
     }
 
     #[tokio::test]
+    // Holds the IMPULSE_HOME lock across awaits; see `test_support::impulse_home_unset`.
+    #[allow(clippy::await_holding_lock)]
     async fn test_oversized_tool_result_is_replaced_by_a_blackboard_reference() {
+        let _home = crate::test_support::impulse_home_unset();
         let dir = tempfile::TempDir::new().expect("tempdir");
         let mut tools = ReplToolRegistry::new();
         tools
@@ -2919,7 +2922,10 @@ mod tests {
     /// entry this session never spilled (another agent wrote it) must still
     /// set the untrusted flag when any page of it is fetched.
     #[tokio::test]
+    // Holds the IMPULSE_HOME lock across awaits; see `test_support::impulse_home_unset`.
+    #[allow(clippy::await_holding_lock)]
     async fn test_fetch_scans_the_whole_entry_not_just_the_page() {
+        let _home = crate::test_support::impulse_home_unset();
         let dir = tempfile::TempDir::new().expect("tempdir");
         let ctx = ReplContext {
             repo_root: dir.path().to_path_buf(),
@@ -2970,7 +2976,10 @@ mod tests {
     }
 
     #[tokio::test]
+    // Holds the IMPULSE_HOME lock across awaits; see `test_support::impulse_home_unset`.
+    #[allow(clippy::await_holding_lock)]
     async fn test_oversized_tool_result_stays_inline_when_spill_is_disabled() {
+        let _home = crate::test_support::impulse_home_unset();
         let mut tools = ReplToolRegistry::new();
         tools
             .register(Box::new(LargeOutputTool))
