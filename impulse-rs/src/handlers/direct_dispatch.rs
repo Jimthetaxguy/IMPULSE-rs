@@ -2217,7 +2217,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dispatch_agent_configure_invalid_provider_returns_ok() {
+    async fn test_dispatch_agent_configure_invalid_provider_is_an_error() {
         let tmp = TempDir::new().unwrap();
         let cli = cli_with(
             &tmp,
@@ -2232,8 +2232,8 @@ mod tests {
         );
         let result = dispatch(cli).await;
         assert!(
-            result.is_ok(),
-            "AgentConfigure with invalid provider should return Ok (prints error, doesn't fail)"
+            result.is_err(),
+            "an invalid provider must exit non-zero, not print and succeed"
         );
     }
 
@@ -2420,7 +2420,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dispatch_steward_unknown_subcommand_returns_ok() {
+    async fn test_dispatch_steward_unknown_subcommand_is_an_error() {
         let tmp = TempDir::new().unwrap();
         let cli = cli_with(
             &tmp,
@@ -2432,9 +2432,11 @@ mod tests {
                 json: false,
             },
         );
-        let result = dispatch(cli).await;
-        // Unknown subcommand prints message but may return Ok
-        let _ = result;
+        let err = dispatch(cli).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Unknown steward subcommand"),
+            "{err:#}"
+        );
     }
 
     // ── Commands::ToolingList with category filter ───────────────────────

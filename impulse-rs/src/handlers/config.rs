@@ -378,9 +378,7 @@ pub fn handle_credentials(
                         }
                     }
                 }
-                Err(e) => {
-                    eprintln!("Error listing secrets: {}", e);
-                }
+                Err(e) => anyhow::bail!("Error listing secrets: {e}"),
             }
         }
         "get" => {
@@ -391,9 +389,7 @@ pub fn handle_credentials(
                 Ok(val) => {
                     println!("{}", val);
                 }
-                Err(e) => {
-                    eprintln!("Error getting secret: {}", e);
-                }
+                Err(e) => anyhow::bail!("Error getting secret: {e}"),
             }
         }
         "set" => {
@@ -407,9 +403,7 @@ pub fn handle_credentials(
                 Ok(_) => {
                     println!("Secret '{}' stored successfully.", key);
                 }
-                Err(e) => {
-                    eprintln!("Error setting secret: {}", e);
-                }
+                Err(e) => anyhow::bail!("Error setting secret: {e}"),
             }
         }
         "delete" | "rm" => {
@@ -420,9 +414,7 @@ pub fn handle_credentials(
                 Ok(_) => {
                     println!("Secret '{}' deleted.", key);
                 }
-                Err(e) => {
-                    eprintln!("Error deleting secret: {}", e);
-                }
+                Err(e) => anyhow::bail!("Error deleting secret: {e}"),
             }
         }
         "status" => {

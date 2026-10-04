@@ -69,7 +69,7 @@ locally. `—` means the dispatcher prints a direct-mode instruction instead of 
 | `tooling-validate` | Yes | — | Validate manifest-defined tools (`--json`) |
 | `tooling-reload` | Yes | — | Reload runtime tooling (`--json`) |
 | `mcp serve` | Yes | — | Serve registry-backed MCP interface (`--transport`, `--port`) |
-| `agent-configure` | Yes | — | Configure Impulse Agent (`--provider`, `--api-key`, `--harness`) |
+| `agent-configure` | Yes | — | Configure Impulse Agent (`--provider`, `--model`, `--harness`); the API key comes from the environment (`--api-key` is refused because config.json never stores it) |
 | `agent-status` | Yes | — | Show agent status (`--json`) |
 | `agent-query` | Yes | — | Query the agent (`--prompt`, `--json`) |
 | `guard` | Yes | — | Evaluate guardrail rules (`--action`, `--target`, `--list`, `--enable`) |

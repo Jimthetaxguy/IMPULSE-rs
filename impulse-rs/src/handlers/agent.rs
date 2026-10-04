@@ -21,12 +21,17 @@ pub fn handle_agent_configure(
         if state.set_config("impulse_agent_provider", p)? {
             println!("Set impulse_agent_provider = {}", p);
         } else {
-            eprintln!("Invalid provider: {} (use: anthropic, openai, minimax)", p);
+            anyhow::bail!("Invalid provider: {p} (use: anthropic, openai, minimax)");
         }
     }
-    if let Some(ref key) = api_key {
-        let _ = state.set_config("impulse_agent_api_key", key)?;
-        println!("Set impulse_agent_api_key = ***");
+    if api_key.is_some() {
+        // `impulse_agent_api_key` is never written to config.json (it is
+        // `skip_serializing`), so this used to report success for a key that
+        // was gone when the command exited.
+        anyhow::bail!(
+            "--api-key is not stored; set the provider's key in the environment \
+             (for example ANTHROPIC_API_KEY) or keep it with `impulse-rs credentials set`"
+        );
     }
     if let Some(ref m) = model {
         let _ = state.set_config("impulse_agent_model", m)?;
@@ -36,7 +41,7 @@ pub fn handle_agent_configure(
         if state.set_config("impulse_agent_harness", h)? {
             println!("Set impulse_agent_harness = {}", h);
         } else {
-            eprintln!("Invalid harness: {} (use: claude-code, opencode)", h);
+            anyhow::bail!("Invalid harness: {h} (use: claude-code, opencode)");
         }
     }
     if auto_review {
@@ -87,7 +92,7 @@ pub fn handle_agent_status(state: &Arc<state::State>, json: bool) -> Result<()> 
             None => {
                 println!("  Status: not configured");
                 println!("\n  Configure with:");
-                println!("    impulse-rs agent-configure --provider anthropic --api-key YOUR_KEY");
+                println!("    export ANTHROPIC_API_KEY=...; impulse-rs agent-configure --provider anthropic");
                 println!("    impulse-rs agent-configure --harness claude-code");
             }
         }
@@ -111,7 +116,7 @@ pub async fn handle_agent_query(
 ) -> Result<()> {
     let mut agent = resolve_configured_agent(state).ok_or_else(|| {
         anyhow::anyhow!(
-            "Impulse Agent not configured. Run: impulse-rs agent-configure --provider anthropic --api-key YOUR_KEY"
+            "Impulse Agent not configured. Set ANTHROPIC_API_KEY, then run: impulse-rs agent-configure --provider anthropic"
         )
     })?;
 
@@ -223,7 +228,7 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_agent_configure_invalid_provider_does_not_set() {
+    fn test_handle_agent_configure_invalid_provider_is_an_error_and_does_not_set() {
         let (_tmp, st) = test_state();
         let result = handle_agent_configure(
             &st,
@@ -234,7 +239,8 @@ mod tests {
             false,
             false,
         );
-        assert!(result.is_ok());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("Invalid provider"), "{err}");
         let config = st.config_snapshot().unwrap();
         // Invalid provider should not be stored
         assert!(config.impulse_agent_provider.is_none());
@@ -283,13 +289,32 @@ mod tests {
         assert!(config.impulse_agent_auto_coordinate);
     }
 
+    /// Review P2: `impulse_agent_api_key` is never written to config.json,
+    /// so `--api-key` reported success for a key that vanished on exit.
+    #[test]
+    fn test_handle_agent_configure_api_key_is_refused_with_guidance() {
+        let (_tmp, st) = test_state();
+        let err = handle_agent_configure(
+            &st,
+            None,
+            Some("test-api-key-not-real".to_string()),
+            None,
+            None,
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not stored"), "{err}");
+        assert!(!err.to_string().contains("test-api-key-not-real"), "{err}");
+    }
+
     #[test]
     fn test_handle_agent_configure_multiple_fields_at_once() {
         let (_tmp, st) = test_state();
         let result = handle_agent_configure(
             &st,
             Some("anthropic".to_string()),
-            Some("test-api-key-not-real".to_string()),
+            None,
             Some("claude-3-opus".to_string()),
             None,
             true,

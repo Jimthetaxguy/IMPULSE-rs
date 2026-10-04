@@ -2040,7 +2040,7 @@ pub(crate) async fn handle_agent_request(
         None => {
             return DaemonResponse::AgentAssistResult {
                 success: false,
-                response: "Impulse Agent not configured. Run: impulse-rs agent-configure --provider anthropic --api-key YOUR_KEY".to_string(),
+                response: "Impulse Agent not configured. Set ANTHROPIC_API_KEY, then run: impulse-rs agent-configure --provider anthropic".to_string(),
                 recommendations: Vec::new(),
                 pane_summaries: Vec::new(),
             }
@@ -2117,7 +2117,7 @@ pub(crate) async fn handle_agent_specialized_request(
         Some(agent) => agent,
         None => {
             return respond_err(
-                "Impulse Agent not configured. Run: impulse-rs agent-configure --provider anthropic --api-key YOUR_KEY",
+                "Impulse Agent not configured. Set ANTHROPIC_API_KEY, then run: impulse-rs agent-configure --provider anthropic",
             )
         }
     };

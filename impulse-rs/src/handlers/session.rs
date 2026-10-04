@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::sync::Arc;
 
 use crate::envelope::{write_envelope, EnvelopeBuilder, OutputFormat};
@@ -235,7 +235,9 @@ pub async fn handle_session_end(
                 println!("Session not found: {}", session_id)
             }
         }
-        Err(e) => eprintln!("Error: {}", e),
+        // An unknown session fails open above (hooks must not break the
+        // agent), but a state write that failed is a real error.
+        Err(e) => return Err(e).context("Failed to end session"),
     }
     Ok(())
 }

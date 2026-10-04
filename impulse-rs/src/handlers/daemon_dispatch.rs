@@ -744,13 +744,7 @@ async fn handle_chat(
     inject_mode: Option<String>,
     inject_explain: bool,
 ) -> Result<()> {
-    let inject_mode = match parse_injection_mode(inject_mode.as_deref()) {
-        Ok(mode) => mode.map(|m| m.as_str().to_string()),
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            return Ok(());
-        }
-    };
+    let inject_mode = parse_injection_mode(inject_mode.as_deref())?.map(|m| m.as_str().to_string());
     match client
         .chat(session_id.clone(), message, inject_mode, inject_explain)
         .await

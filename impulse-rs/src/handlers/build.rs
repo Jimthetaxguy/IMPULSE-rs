@@ -56,9 +56,7 @@ pub fn handle_clean_all(state: &Arc<state::State>, dry_run: Option<bool>) -> Res
                 }
             }
         }
-        Err(e) => {
-            eprintln!("Clean-all failed: {}", e);
-        }
+        Err(e) => anyhow::bail!("Clean-all failed: {e}"),
     }
     Ok(())
 }
@@ -217,10 +215,9 @@ pub fn handle_sweep(
                 }
             }
         }
-        Err(e) => {
-            eprintln!("Sweep failed: {}", e);
-            eprintln!("\nHint: Check filesystem permissions and scan path configuration.");
-        }
+        Err(e) => anyhow::bail!(
+            "Sweep failed: {e}\nHint: Check filesystem permissions and scan path configuration."
+        ),
     }
     Ok(())
 }
@@ -274,10 +271,9 @@ pub fn handle_wipe(
                 }
             }
         }
-        Err(e) => {
-            eprintln!("Wipe failed: {}", e);
-            eprintln!("\nHint: Check filesystem permissions and scan path configuration.");
-        }
+        Err(e) => anyhow::bail!(
+            "Wipe failed: {e}\nHint: Check filesystem permissions and scan path configuration."
+        ),
     }
     Ok(())
 }
