@@ -9,7 +9,9 @@ use crate::injection::types::{
     InjectionBundle, InjectionExplain, InjectionMode, InjectionRunResult, InjectionScope,
     InjectionSnippet, InjectionSurface,
 };
-use crate::retrieval::types::{FallbackCode, RetrievalMode, SearchBackend, SearchResult};
+use crate::retrieval::types::{
+    FallbackCode, RetrievalMode, SearchBackend, SearchResponse, SearchResult,
+};
 use crate::state::Config;
 
 fn tokenize_terms(input: &str) -> Vec<String> {
@@ -121,6 +123,21 @@ fn render_injected_block(bundle: &InjectionBundle) -> String {
         ));
     }
     out
+}
+
+/// `context_injection_min_score` is a similarity threshold (0..1), so it
+/// applies only to results that came from vectors. Keyword scores (negated
+/// bm25) are on another scale, and a semantic search that fell back to
+/// keyword returns keyword scores.
+fn similarity_floor(resp: &SearchResponse, min_score: f64) -> Option<f64> {
+    (resp.mode == "semantic" && !resp.used_fallback).then_some(min_score)
+}
+
+fn above_floor(snippets: Vec<InjectionSnippet>, floor: Option<f64>) -> Vec<InjectionSnippet> {
+    match floor {
+        Some(floor) => snippets.into_iter().filter(|s| s.score >= floor).collect(),
+        None => snippets,
+    }
 }
 
 fn to_snippets(results: Vec<SearchResult>) -> Vec<InjectionSnippet> {
@@ -280,8 +297,9 @@ pub fn run_injection(
                 fallback_code = resp.fallback_code;
             }
             backend_set.insert(resp.backend_used.clone());
+            let floor = similarity_floor(&resp, min_score);
             explain.engine_notes.extend(resp.engine_notes);
-            snippets.extend(to_snippets(resp.results));
+            snippets.extend(above_floor(to_snippets(resp.results), floor));
         }
         Err(err) => {
             explain.engine_notes.push(format!(
@@ -300,8 +318,9 @@ pub fn run_injection(
                 fallback_code = resp.fallback_code;
             }
             backend_set.insert(resp.backend_used.clone());
+            let floor = similarity_floor(&resp, min_score);
             explain.engine_notes.extend(resp.engine_notes);
-            snippets.extend(to_snippets(resp.results));
+            snippets.extend(above_floor(to_snippets(resp.results), floor));
         }
         Err(err) => {
             explain
@@ -327,10 +346,7 @@ pub fn run_injection(
     let mut dedup = HashSet::new();
     let mut filtered = snippets
         .into_iter()
-        .filter(|snippet| {
-            (snippet.score <= 0.0 || snippet.score >= min_score)
-                && dedup.insert((snippet.source.clone(), snippet.id.clone()))
-        })
+        .filter(|snippet| dedup.insert((snippet.source.clone(), snippet.id.clone())))
         .collect::<Vec<_>>();
     filtered.sort_by(score_compare);
 

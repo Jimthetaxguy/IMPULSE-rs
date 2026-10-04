@@ -876,12 +876,26 @@ ON CONFLICT(decision_id) DO UPDATE SET
         Ok(())
     }
 
+    /// An FTS5 MATCH expression requiring every word of `query`. Each word is
+    /// quoted (so FTS5 operators in user text stay literal) and the words are
+    /// joined by FTS5's implicit AND. Quoting the whole input instead made it
+    /// one phrase, so `auth bug` matched only those words adjacent and in
+    /// order, not "fixed bug in auth module" (ADR-0003 promises tokenized
+    /// keyword matching).
     fn sanitize_fts_query(query: &str) -> String {
-        let q = query.trim();
-        if q.is_empty() {
-            return String::new();
-        }
-        format!("\"{}\"", q.replace('"', "\"\""))
+        query
+            .split_whitespace()
+            .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// FTS5's `bm25()` is lower-is-better (more negative means a stronger
+    /// match). Every `SearchResult::score` is higher-is-better, like the
+    /// semantic backends' similarity, so callers that sort descending keep
+    /// the strongest matches; the raw value used to put the weakest first.
+    fn bm25_score(raw: f64) -> f64 {
+        -raw
     }
 
     pub fn search_history_keyword(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
@@ -910,7 +924,7 @@ LIMIT ?2
                 id: row.get(0)?,
                 title: row.get(1)?,
                 snippet: row.get(2)?,
-                score: row.get::<_, f64>(3)?,
+                score: Self::bm25_score(row.get::<_, f64>(3)?),
             })
         });
 
@@ -986,7 +1000,7 @@ LIMIT ?2
                 id: row.get(0)?,
                 title: row.get(1)?,
                 snippet: row.get(2)?,
-                score: row.get::<_, f64>(3)?,
+                score: Self::bm25_score(row.get::<_, f64>(3)?),
             })
         });
 
@@ -1150,7 +1164,7 @@ LIMIT ?2
                 id: row.get(0)?,
                 title: row.get(1)?,
                 snippet: row.get(2)?,
-                score: row.get::<_, f64>(3)?,
+                score: Self::bm25_score(row.get::<_, f64>(3)?),
             })
         });
         match rows {
@@ -1555,6 +1569,61 @@ mod tests {
         let results = store.search_history_keyword("retrieval", 10).unwrap();
         assert_eq!(results.len(), 3);
         assert!(results.iter().all(|r| r.source == "history"));
+    }
+
+    /// Review P2: raw bm25 made `memory_search` and injection, which sort
+    /// descending, keep the weakest matches.
+    #[test]
+    fn test_keyword_scores_are_higher_for_stronger_matches() {
+        let (_tmp, store) = open_test_store();
+        store
+            .upsert_history(HistoryUpsert {
+                search_text: "auth auth auth auth auth token refresh",
+                ..test_history_row("strong", "Strong")
+            })
+            .unwrap();
+        store
+            .upsert_history(HistoryUpsert {
+                search_text: "auth mentioned once among many other unrelated words here",
+                ..test_history_row("weak", "Weak")
+            })
+            .unwrap();
+        store
+            .upsert_history(HistoryUpsert {
+                search_text: "nothing relevant",
+                ..test_history_row("none", "None")
+            })
+            .unwrap();
+        store.refresh_fts().unwrap();
+
+        let results = store.search_history_keyword("auth", 10).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].id, "strong");
+        assert!(
+            results[0].score > results[1].score,
+            "stronger match must score higher: {results:?}"
+        );
+    }
+
+    /// Review P2: the whole query used to be one FTS5 phrase.
+    #[test]
+    fn test_keyword_search_matches_words_in_any_order() {
+        let (_tmp, store) = open_test_store();
+        store
+            .upsert_history(HistoryUpsert {
+                search_text: "fixed bug in auth module",
+                ..test_history_row("s1", "Session")
+            })
+            .unwrap();
+        store.refresh_fts().unwrap();
+        let results = store.search_history_keyword("auth bug", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(store
+            .search_history_keyword("auth missing", 10)
+            .unwrap()
+            .is_empty());
+        // FTS5 syntax in user text stays literal instead of erroring.
+        assert!(store.search_history_keyword("auth OR \"bug", 10).is_ok());
     }
 
     #[test]
