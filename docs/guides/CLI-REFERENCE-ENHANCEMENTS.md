@@ -114,34 +114,26 @@ impulse-rs orchestrate --task "add feature" --auto-handoff
 
 ### Claude Code Hooks (Generated)
 
+`impulse-rs hooks --platform claude-code` writes a template and prints the guard entry to add to
+`.claude/settings.local.json` (Claude Code does not load `.claude/hooks/hooks.json`):
+
 ```json
 {
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Write|Edit",
+        "matcher": "Bash|Write|Edit|MultiEdit",
         "hooks": [
-          {
-            "type": "command",
-            "command": "impulse-rs guard --action \"$INPUT\" --target file --check-conflicts --block"
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "Write|Edit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "impulse-rs track-write --file \"$INPUT\" --session-id $IMPULSE_SESSION_ID"
-          }
+          { "type": "command", "command": "impulse-rs guard --hook" }
         ]
       }
     ]
   }
 }
 ```
+
+Claude Code sends each call as JSON on stdin and blocks it only when the hook exits 2. See the
+ADR-0006 amendment (2026-10-04).
 
 ---
 
@@ -160,8 +152,8 @@ impulse-rs orchestrate --task "add feature" --auto-handoff
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
-| 1 | Blocked by guardrail |
-| 2 | Configuration error |
+| 1 | Blocked by guardrail (`guard --action`) |
+| 2 | Configuration error; for `guard --hook`, blocked (Claude Code's only blocking code) |
 | 3 | Storage error |
 
 ---

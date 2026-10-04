@@ -33,6 +33,11 @@ where
     let impulse_dir = cli.impulse_dir.clone();
     let verbose = cli.verbose;
     let format = cli.format;
+    // Before `State::new`, whose failure would exit 1, which Claude Code
+    // treats as "allow" (see `handlers::guard::run_guard_hook`).
+    if let Commands::Guard { hook: true, .. } = &cli.command {
+        handlers::guard::run_guard_hook(&impulse_dir);
+    }
     let state = Arc::new(
         state::State::new(impulse_dir.clone()).context("Failed to initialize impulse state")?,
     );
@@ -545,6 +550,9 @@ where
             handlers::semantic_diff_handlers::handle_sem_status(json)
                 .context("Failed to handle sem-status command")?;
         }
+        Commands::Guard { hook: true, .. } => {
+            handlers::guard::run_guard_hook(&impulse_dir);
+        }
         Commands::Guard {
             action,
             target,
@@ -552,6 +560,7 @@ where
             enable,
             disable,
             json,
+            hook: false,
         } => {
             handlers::guard::handle_guard(&state, action, target, list, enable, disable, json)
                 .context("Failed to handle guard command")?;
@@ -942,6 +951,7 @@ mod tests {
                 enable: None,
                 disable: None,
                 json: false,
+                hook: false,
             },
         );
         let result = dispatch(cli).await;
@@ -960,6 +970,7 @@ mod tests {
                 enable: None,
                 disable: None,
                 json: true,
+                hook: false,
             },
         );
         let result = dispatch(cli).await;
@@ -1217,17 +1228,24 @@ mod tests {
 
     // ── Commands::Hooks ───────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn test_dispatch_hooks_all_returns_ok() {
+    // These call the installer with an explicit root: going through
+    // `dispatch` wrote `.claude/hooks/hooks.json` and `.opencode/impulse.json`
+    // into the source tree the tests ran in.
+    #[test]
+    fn test_hooks_all_writes_both_templates_under_the_project_root() {
         let tmp = TempDir::new().unwrap();
-        let cli = cli_with(
-            &tmp,
-            Commands::Hooks {
-                platform: "all".to_string(),
-            },
-        );
-        let result = dispatch(cli).await;
-        assert!(result.is_ok(), "Hooks --platform all should return Ok");
+        handlers::system::install_hook_templates(tmp.path(), "all").unwrap();
+        let claude = std::fs::read_to_string(tmp.path().join(".claude/hooks/hooks.json")).unwrap();
+        assert!(claude.contains("impulse-rs guard --hook"), "{claude}");
+        assert!(tmp.path().join(".opencode/impulse.json").exists());
+    }
+
+    #[test]
+    fn test_hooks_unknown_platform_is_an_error() {
+        let tmp = TempDir::new().unwrap();
+        let err = handlers::system::install_hook_templates(tmp.path(), "vscode").unwrap_err();
+        assert!(err.to_string().contains("unknown hooks platform"), "{err}");
+        assert!(!tmp.path().join(".claude").exists());
     }
 
     // ── Commands::SessionConflicts ────────────────────────────────────────
@@ -2252,6 +2270,7 @@ mod tests {
                 enable: None,
                 disable: None,
                 json: false,
+                hook: false,
             },
         );
         let result = dispatch(cli).await;
@@ -2342,36 +2361,20 @@ mod tests {
 
     // ── Commands::Hooks with specific platforms ──────────────────────────
 
-    #[tokio::test]
-    async fn test_dispatch_hooks_claude_code_returns_ok() {
+    #[test]
+    fn test_hooks_claude_code_writes_only_the_claude_template() {
         let tmp = TempDir::new().unwrap();
-        let cli = cli_with(
-            &tmp,
-            Commands::Hooks {
-                platform: "claude-code".to_string(),
-            },
-        );
-        let result = dispatch(cli).await;
-        assert!(
-            result.is_ok(),
-            "Hooks for claude-code platform should return Ok"
-        );
+        handlers::system::install_hook_templates(tmp.path(), "claude-code").unwrap();
+        assert!(tmp.path().join(".claude/hooks/hooks.json").exists());
+        assert!(!tmp.path().join(".opencode").exists());
     }
 
-    #[tokio::test]
-    async fn test_dispatch_hooks_opencode_returns_ok() {
+    #[test]
+    fn test_hooks_opencode_writes_only_the_opencode_template() {
         let tmp = TempDir::new().unwrap();
-        let cli = cli_with(
-            &tmp,
-            Commands::Hooks {
-                platform: "opencode".to_string(),
-            },
-        );
-        let result = dispatch(cli).await;
-        assert!(
-            result.is_ok(),
-            "Hooks for opencode platform should return Ok"
-        );
+        handlers::system::install_hook_templates(tmp.path(), "opencode").unwrap();
+        assert!(tmp.path().join(".opencode/impulse.json").exists());
+        assert!(!tmp.path().join(".claude").exists());
     }
 
     // ── Commands::Steward (list subcommand) ──────────────────────────────

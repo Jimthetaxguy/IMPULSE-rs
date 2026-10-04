@@ -146,6 +146,27 @@ fn check_file_conflicts(file: &str, state: &State) -> Option<Conflict> {
 }
 ```
 
+## Amendment (2026-10-04): the PreToolUse hook exits 2 and reads stdin
+
+The guard never blocked a Claude Code tool call. Claude Code blocks a PreToolUse call only when
+the hook exits 2 (its stderr then goes to the model); exit 1 is a non-blocking error and the call
+proceeds. The generated hook also ran `guard --action "$INPUT"`, but Claude Code sets no `$INPUT`
+and sends the call as JSON on stdin, so every call was evaluated as an empty string. And
+`impulse-rs hooks` wrote `.claude/hooks/hooks.json`, which Claude Code does not load. The
+consequence above, "blocking provides real protection", did not hold.
+
+- `impulse-rs guard --hook` reads the PreToolUse payload from stdin, checks Bash commands against
+  `bash` rules and Write, Edit, and MultiEdit content against `file-write` rules, and exits 2 on a
+  Block-tier match with the rule's reason on stderr. Warn-tier matches print and exit 0.
+- It fails closed: a payload it cannot read, or a `config.json` it cannot load, exits 2. It runs
+  before the daemon client and before `State::new`, so neither can turn into an "allow" exit.
+- `impulse-rs guard --action ...` keeps exit 1 for scripts.
+- The generated PreToolUse entry is `impulse-rs guard --hook` with matcher
+  `Bash|Write|Edit|MultiEdit`. `impulse-rs hooks` still writes the template to
+  `.claude/hooks/hooks.json` and prints the entry to add to `.claude/settings.local.json`; the
+  template's session-tracking hooks are not installed, because they also rely on variables Claude
+  Code does not set.
+
 ## Related ADRs
 
 - ADR 0002: File-first memory — Uses `.impulse/` directory

@@ -42,29 +42,11 @@ pub(crate) fn build_claude_hook_config() -> serde_json::Value {
         "hooks": {
             "PreToolUse": [
                 {
-                    "matcher": "Bash",
+                    "matcher": "Bash|Write|Edit|MultiEdit",
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "impulse-rs guard --action \"$INPUT\" --target bash"
-                        }
-                    ]
-                },
-                {
-                    "matcher": "Write",
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": "impulse-rs guard --action \"$INPUT\" --target file"
-                        }
-                    ]
-                },
-                {
-                    "matcher": "Edit",
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": "impulse-rs guard --action \"$INPUT\" --target file"
+                            "command": "impulse-rs guard --hook"
                         }
                     ]
                 }
@@ -353,17 +335,29 @@ mod hook_config_tests {
             "PreToolUse must have at least one entry"
         );
 
-        let bash_guard = pre_arr
+        let guard = pre_arr
             .iter()
-            .find(|entry| entry.get("matcher").and_then(|m| m.as_str()) == Some("Bash"))
-            .expect("PreToolUse must have a Bash matcher");
-        let bash_hooks = bash_guard["hooks"].as_array().unwrap();
-        let bash_cmd = bash_hooks[0]["command"].as_str().unwrap();
-        assert!(
-            bash_cmd.contains("impulse-rs guard"),
-            "Bash PreToolUse hook must invoke 'impulse-rs guard', got: {}",
-            bash_cmd
-        );
+            .find(|entry| {
+                entry["matcher"]
+                    .as_str()
+                    .is_some_and(|m| m.split('|').any(|tool| tool == "Bash"))
+            })
+            .expect("PreToolUse must match Bash");
+        let matcher = guard["matcher"].as_str().unwrap();
+        for tool in ["Write", "Edit", "MultiEdit"] {
+            assert!(
+                matcher.split('|').any(|t| t == tool),
+                "{matcher} misses {tool}"
+            );
+        }
+        // Claude Code passes the call as JSON on stdin and blocks only on exit
+        // 2; `$INPUT` is not a variable it defines (the old command always
+        // evaluated an empty string).
+        let guard_cmd = guard["hooks"][0]["command"].as_str().unwrap();
+        assert_eq!(guard_cmd, "impulse-rs guard --hook");
+        assert!(!serde_json::to_string(pre_tool_use)
+            .unwrap()
+            .contains("$INPUT"));
 
         let post_tool_use = hooks
             .get("PostToolUse")

@@ -279,6 +279,7 @@ cargo run -- config <key> --value <val>  # Set value
 # Guardrails
 cargo run -- guard --action "git push --force" --target bash --json
 cargo run -- guard --list
+cargo run -- guard --hook < pre-tool-use.json   # Claude Code PreToolUse hook: exit 2 blocks
 cargo run -- guard --enable <rule-id>
 cargo run -- guard --disable <rule-id>
 

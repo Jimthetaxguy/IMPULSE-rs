@@ -33,29 +33,11 @@
       {
         "hooks": [
           {
-            "command": "impulse-rs guard --action \"$INPUT\" --target bash",
+            "command": "impulse-rs guard --hook",
             "type": "command"
           }
         ],
-        "matcher": "Bash"
-      },
-      {
-        "hooks": [
-          {
-            "command": "impulse-rs guard --action \"$INPUT\" --target file",
-            "type": "command"
-          }
-        ],
-        "matcher": "Write"
-      },
-      {
-        "hooks": [
-          {
-            "command": "impulse-rs guard --action \"$INPUT\" --target file",
-            "type": "command"
-          }
-        ],
-        "matcher": "Edit"
+        "matcher": "Bash|Write|Edit|MultiEdit"
       }
     ],
     "SessionEnd": [

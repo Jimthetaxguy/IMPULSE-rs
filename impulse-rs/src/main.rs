@@ -18,6 +18,12 @@ use impulse_rs::{cli, client, handlers, resolve_impulse_dir};
 async fn main() -> Result<()> {
     let mut cli = cli::Cli::parse();
     cli.impulse_dir = resolve_impulse_dir(cli.impulse_dir);
+    // The PreToolUse guard runs before either dispatcher: it must not depend
+    // on the daemon or on loading the full state, whose failures would exit
+    // with a code Claude Code treats as "allow".
+    if let cli::Commands::Guard { hook: true, .. } = &cli.command {
+        handlers::guard::run_guard_hook(&cli.impulse_dir);
+    }
     if cli.daemon {
         let socket_path = cli
             .socket

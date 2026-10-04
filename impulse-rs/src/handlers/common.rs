@@ -71,7 +71,7 @@ pub(crate) fn read_hook_stdin_payload() -> Option<String> {
 /// Reads `reader` to its end on a helper thread, keeping at most `max_bytes`,
 /// and gives up after `timeout`. A reader that never reaches EOF leaves its
 /// thread blocked until the process exits; the caller is not held.
-fn read_payload_with_deadline<R>(
+pub(crate) fn read_payload_with_deadline<R>(
     reader: R,
     timeout: std::time::Duration,
     max_bytes: u64,

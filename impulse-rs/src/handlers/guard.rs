@@ -1,7 +1,143 @@
 use anyhow::Result;
+use std::io::IsTerminal;
+use std::path::Path;
 use std::sync::Arc;
 
-use crate::{guardrail, state};
+use crate::{guardrail, state, storage};
+
+/// Largest PreToolUse payload the hook reads. Write payloads carry the whole
+/// file, so this is generous; a larger payload blocks the call.
+const MAX_HOOK_PAYLOAD_BYTES: u64 = 32 * 1024 * 1024;
+
+/// How long the hook waits for Claude Code to finish writing stdin.
+const HOOK_PAYLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Claude Code blocks a PreToolUse call only on exit code 2 (stderr goes to
+/// the model); any other non-zero code is a non-blocking error.
+const HOOK_BLOCK: i32 = 2;
+
+/// The outcome of guarding one Claude Code tool call.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct HookDecision {
+    /// 0 lets the call run; [`HOOK_BLOCK`] stops it.
+    pub exit_code: i32,
+    /// Written to stderr: the reason when blocking, a note when warning.
+    pub message: Option<String>,
+}
+
+impl HookDecision {
+    fn allow(message: Option<String>) -> Self {
+        Self {
+            exit_code: 0,
+            message,
+        }
+    }
+
+    fn block(message: String) -> Self {
+        Self {
+            exit_code: HOOK_BLOCK,
+            message: Some(message),
+        }
+    }
+}
+
+/// Decides one PreToolUse call from Claude Code's stdin payload
+/// (`{"tool_name": ..., "tool_input": {...}}`). Bash commands are checked
+/// against `bash` rules; Write, Edit, and MultiEdit content against
+/// `file-write` rules. Other tools pass. The guard fails closed: a payload
+/// it cannot read, or rules it cannot evaluate, block the call.
+pub(crate) fn decide_pre_tool_use(payload: &str, guards: &guardrail::GuardConfig) -> HookDecision {
+    let call: serde_json::Value = match serde_json::from_str(payload) {
+        Ok(call) => call,
+        Err(error) => {
+            return HookDecision::block(format!(
+                "Impulse guard could not read the PreToolUse payload ({error}); the call is blocked"
+            ))
+        }
+    };
+    let input = &call["tool_input"];
+    let text = |field: &str| input[field].as_str().unwrap_or_default().to_string();
+    let (target, action) = match call["tool_name"].as_str().unwrap_or_default() {
+        "Bash" => ("bash", text("command")),
+        "Write" => ("file", text("content")),
+        "Edit" => ("file", text("new_string")),
+        "MultiEdit" => (
+            "file",
+            input["edits"]
+                .as_array()
+                .map(|edits| {
+                    edits
+                        .iter()
+                        .filter_map(|edit| edit["new_string"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default(),
+        ),
+        _ => return HookDecision::allow(None),
+    };
+    match guardrail::evaluate_action(&action, target, guards) {
+        Err(error) => HookDecision::block(format!(
+            "Impulse guard could not evaluate its rules ({error}); the call is blocked"
+        )),
+        Ok(results) if results.is_empty() => HookDecision::allow(None),
+        Ok(results) => {
+            let report = results
+                .iter()
+                .map(|result| result.format_human())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if guardrail::GuardEngine::has_blocking(&results) {
+                HookDecision::block(format!("Blocked by the Impulse guard:\n{report}"))
+            } else {
+                HookDecision::allow(Some(report))
+            }
+        }
+    }
+}
+
+/// Runs `impulse-rs guard --hook` and exits. It reads only `config.json`'s
+/// guardrail section (not the governed ledgers `State::new` loads), so an
+/// unrelated state problem cannot turn into an exit code Claude Code treats
+/// as "allow".
+pub fn run_guard_hook(impulse_dir: &Path) -> ! {
+    let decision = guard_hook_decision(impulse_dir);
+    if let Some(message) = &decision.message {
+        eprintln!("{message}");
+    }
+    std::process::exit(decision.exit_code)
+}
+
+fn guard_hook_decision(impulse_dir: &Path) -> HookDecision {
+    let config = match storage::Storage::new(impulse_dir.to_path_buf())
+        .read_json::<state::Config>("config.json")
+    {
+        Ok(config) => config,
+        Err(error) => {
+            return HookDecision::block(format!(
+                "Impulse guard could not load {}/config.json ({error:#}); the call is blocked",
+                impulse_dir.display()
+            ))
+        }
+    };
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        return HookDecision::block(
+            "impulse-rs guard --hook reads a Claude Code PreToolUse payload from stdin".to_string(),
+        );
+    }
+    match super::common::read_payload_with_deadline(
+        stdin,
+        HOOK_PAYLOAD_TIMEOUT,
+        MAX_HOOK_PAYLOAD_BYTES,
+    ) {
+        Some(payload) => decide_pre_tool_use(&payload, &config.guardrails),
+        None => HookDecision::block(
+            "Impulse guard received no PreToolUse payload on stdin; the call is blocked"
+                .to_string(),
+        ),
+    }
+}
 
 /// Load the current guardrail config and confirm `rule_id` is known (either
 /// a builtin rule or an already-configured rule). Exits the process with
@@ -19,6 +155,36 @@ fn resolve_known_rule_id(state: &Arc<state::State>, rule_id: &str) -> Result<sta
         std::process::exit(1);
     }
     Ok(config)
+}
+
+/// Enables or disables `rule_id` in the configured rules. A built-in rule is
+/// disabled by a configured override entry with its id and removed again to
+/// enable it. A user-defined rule is toggled in place: replacing it with an
+/// override entry used to discard its pattern, so disabling and then
+/// enabling it deleted the rule.
+fn set_rule_enabled(rules: &mut Vec<guardrail::GuardRule>, rule_id: &str, enabled: bool) {
+    let builtin = guardrail::defaults::builtin_rules()
+        .iter()
+        .any(|rule| rule.id == rule_id);
+    if !builtin {
+        for rule in rules.iter_mut().filter(|rule| rule.id == rule_id) {
+            rule.enabled = enabled;
+        }
+        return;
+    }
+    rules.retain(|rule| rule.id != rule_id);
+    if !enabled {
+        rules.push(guardrail::GuardRule {
+            id: rule_id.to_string(),
+            pattern: String::new(),
+            action: guardrail::GuardAction::Log,
+            target: guardrail::GuardTarget::Any,
+            reason: "Disabled by user".to_string(),
+            suggestion: None,
+            enabled: false,
+            builtin: false,
+        });
+    }
 }
 
 /// Handle the `guard` command.
@@ -55,25 +221,12 @@ pub fn handle_guard(
         }
     } else if let Some(ref rule_id) = enable {
         let mut config = resolve_known_rule_id(state, rule_id)?;
-        config
-            .guardrails
-            .rules
-            .retain(|r| r.id != *rule_id || r.enabled);
+        set_rule_enabled(&mut config.guardrails.rules, rule_id, true);
         state.update_guardrail_rules(config.guardrails.rules.clone())?;
         println!("Enabled rule: {}", rule_id);
     } else if let Some(ref rule_id) = disable {
         let mut config = resolve_known_rule_id(state, rule_id)?;
-        config.guardrails.rules.retain(|r| r.id != *rule_id);
-        config.guardrails.rules.push(guardrail::GuardRule {
-            id: rule_id.clone(),
-            pattern: String::new(),
-            action: guardrail::GuardAction::Log,
-            target: guardrail::GuardTarget::Any,
-            reason: "Disabled by user".to_string(),
-            suggestion: None,
-            enabled: false,
-            builtin: false,
-        });
+        set_rule_enabled(&mut config.guardrails.rules, rule_id, false);
         state.update_guardrail_rules(config.guardrails.rules.clone())?;
         println!("Disabled rule: {}", rule_id);
     } else if let Some(ref action_str) = action {
@@ -218,6 +371,126 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    // ── enable / disable ──────────────────────────────────────────────────
+
+    fn custom_rule() -> guardrail::GuardRule {
+        guardrail::GuardRule {
+            id: "no-sudo".to_string(),
+            pattern: r"\bsudo\b".to_string(),
+            action: guardrail::GuardAction::Block,
+            target: guardrail::GuardTarget::Bash,
+            reason: "no sudo here".to_string(),
+            suggestion: None,
+            enabled: true,
+            builtin: false,
+        }
+    }
+
+    fn blocks(rules: &[guardrail::GuardRule], action: &str) -> bool {
+        let config = guardrail::GuardConfig {
+            rules: rules.to_vec(),
+            ..guardrail::GuardConfig::default()
+        };
+        guardrail::GuardEngine::has_blocking(
+            &guardrail::evaluate_action(action, "bash", &config).unwrap(),
+        )
+    }
+
+    /// Review P2: disabling and re-enabling a user rule deleted it.
+    #[test]
+    fn test_disable_then_enable_keeps_a_custom_rule() {
+        let mut rules = vec![custom_rule()];
+        set_rule_enabled(&mut rules, "no-sudo", false);
+        assert!(!blocks(&rules, "sudo rm x"));
+        set_rule_enabled(&mut rules, "no-sudo", true);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].pattern, custom_rule().pattern);
+        assert!(blocks(&rules, "sudo rm x"));
+    }
+
+    #[test]
+    fn test_disable_then_enable_a_builtin_rule() {
+        let force_push = "git push --force origin main";
+        let mut rules = Vec::new();
+        assert!(blocks(&rules, force_push));
+        set_rule_enabled(&mut rules, "block-force-push-main", false);
+        assert!(!blocks(&rules, force_push));
+        set_rule_enabled(&mut rules, "block-force-push-main", true);
+        assert!(rules.is_empty());
+        assert!(blocks(&rules, force_push));
+    }
+
+    // ── PreToolUse hook decisions ─────────────────────────────────────────
+
+    fn hook(payload: serde_json::Value) -> HookDecision {
+        decide_pre_tool_use(&payload.to_string(), &guardrail::GuardConfig::default())
+    }
+
+    /// Review P1: a Block used to exit 1, which Claude Code treats as a
+    /// non-blocking error, so the guard never stopped a call.
+    #[test]
+    fn test_hook_blocks_a_force_push_with_exit_two() {
+        let decision = hook(serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "git push --force origin main"}
+        }));
+        assert_eq!(decision.exit_code, 2);
+        assert!(decision
+            .message
+            .unwrap()
+            .contains("Blocked by the Impulse guard"));
+    }
+
+    #[test]
+    fn test_hook_allows_a_benign_command_silently() {
+        let decision = hook(serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "cargo test --workspace"}
+        }));
+        assert_eq!(decision, HookDecision::allow(None));
+    }
+
+    #[test]
+    fn test_hook_warns_without_blocking() {
+        let decision = hook(serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "git add .env"}
+        }));
+        assert_eq!(decision.exit_code, 0);
+        assert!(decision.message.is_some());
+    }
+
+    #[test]
+    fn test_hook_checks_written_and_edited_content() {
+        let secret = "api_key = 'sk_live_0123456789abcdefghij'";
+        for payload in [
+            serde_json::json!({"tool_name": "Write", "tool_input": {"file_path": "a.rs", "content": secret}}),
+            serde_json::json!({"tool_name": "Edit", "tool_input": {"file_path": "a.rs", "old_string": "x", "new_string": secret}}),
+            serde_json::json!({"tool_name": "MultiEdit", "tool_input": {"file_path": "a.rs", "edits": [
+                {"old_string": "a", "new_string": "fine"},
+                {"old_string": "b", "new_string": secret}
+            ]}}),
+        ] {
+            assert_eq!(hook(payload.clone()).exit_code, 2, "{payload}");
+        }
+    }
+
+    #[test]
+    fn test_hook_passes_tools_it_does_not_guard() {
+        let decision = hook(serde_json::json!({
+            "tool_name": "Read",
+            "tool_input": {"file_path": "README.md"}
+        }));
+        assert_eq!(decision, HookDecision::allow(None));
+    }
+
+    #[test]
+    fn test_hook_fails_closed_on_an_unreadable_payload() {
+        let decision = decide_pre_tool_use("not json", &guardrail::GuardConfig::default());
+        assert_eq!(decision.exit_code, 2);
+        assert!(decision.message.unwrap().contains("could not read"));
+    }
 
     fn test_state() -> (TempDir, Arc<state::State>) {
         let tmp = TempDir::new().unwrap();

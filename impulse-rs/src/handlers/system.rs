@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -152,54 +152,58 @@ pub fn handle_swarm(agent_a: String, agent_b: String, threshold: f64, json: bool
 }
 
 pub fn handle_hooks(state: &Arc<state::State>, platform: String) -> Result<()> {
-    let impulse_path = state.storage().base_path().display().to_string();
+    install_hook_templates(Path::new("."), &platform)?;
+    println!("\nImpulse path: {}", state.storage().base_path().display());
+    Ok(())
+}
 
-    if platform == "claude-code" || platform == "all" {
+/// Writes the hook templates under `project_root` (`.claude/hooks/hooks.json`,
+/// `.opencode/impulse.json`) for `platform`. Taking the root explicitly keeps
+/// tests out of the source tree they run in.
+pub(crate) fn install_hook_templates(project_root: &Path, platform: &str) -> Result<()> {
+    let claude = platform == "claude-code" || platform == "all";
+    let opencode = platform == "opencode" || platform == "all";
+    if !claude && !opencode {
+        anyhow::bail!("unknown hooks platform '{platform}' (use claude-code, opencode, or all)");
+    }
+
+    if claude {
         println!("Setting up Claude Code hooks...");
-        let hooks_dir = std::path::Path::new(".claude/hooks");
-        if let Err(e) = std::fs::create_dir_all(hooks_dir) {
-            eprintln!("Error creating .claude/hooks: {}", e);
-        } else {
-            let hook_config = build_claude_hook_config();
-            let hook_json = serde_json::to_string_pretty(&hook_config).unwrap_or_else(|e| {
-                eprintln!("Error serializing hook config: {}", e);
-                String::from("{}")
-            });
-            let hook_path = std::path::Path::new(".claude/hooks/hooks.json");
-            if let Err(e) = stewardship::atomic_write_file(hook_path, hook_json.as_bytes()) {
-                eprintln!("Error writing hooks: {}", e);
-            } else {
-                println!("  \u{2713} Created .claude/hooks/hooks.json");
-            }
-        }
+        let hooks_dir = project_root.join(".claude").join("hooks");
+        std::fs::create_dir_all(&hooks_dir).context("Failed to create .claude/hooks")?;
+        let hook_config = build_claude_hook_config();
+        let hook_json = serde_json::to_string_pretty(&hook_config)
+            .context("Failed to serialize the Claude hook template")?;
+        let hook_path = hooks_dir.join("hooks.json");
+        stewardship::atomic_write_file(&hook_path, hook_json.as_bytes())
+            .context("Failed to write .claude/hooks/hooks.json")?;
+        println!("  \u{2713} Wrote the hook template to .claude/hooks/hooks.json");
+        // Claude Code reads hooks from its settings files, not this path, so
+        // say exactly what makes the guard enforce anything.
+        let guard_entry =
+            serde_json::json!({ "hooks": { "PreToolUse": hook_config["hooks"]["PreToolUse"] } });
+        println!(
+            "\nClaude Code does not load .claude/hooks/hooks.json; it is a template. To enforce \
+             the Impulse guard, add this to .claude/settings.local.json (merge with any hooks \
+             already there):\n{}\nThe template's session-tracking entries need your session wiring; \
+             see `impulse-rs validate-hooks claude-code`.",
+            serde_json::to_string_pretty(&guard_entry)
+                .context("Failed to serialize the guard hook entry")?
+        );
     }
 
-    if platform == "opencode" || platform == "all" {
+    if opencode {
         println!("\nSetting up OpenCode integration...");
-        let opencode_dir = std::path::Path::new(".opencode");
-        if let Err(e) = std::fs::create_dir_all(opencode_dir) {
-            eprintln!("Error creating .opencode: {}", e);
-        } else {
-            let opencode_config = build_opencode_hook_config();
-            let opencode_json =
-                serde_json::to_string_pretty(&opencode_config).unwrap_or_else(|e| {
-                    eprintln!("Error serializing OpenCode config: {}", e);
-                    String::from("{}")
-                });
-            let opencode_path = std::path::Path::new(".opencode/impulse.json");
-            if let Err(e) = stewardship::atomic_write_file(opencode_path, opencode_json.as_bytes())
-            {
-                eprintln!("Error writing OpenCode config: {}", e);
-            } else {
-                println!("  \u{2713} Created .opencode/impulse.json");
-            }
-        }
+        let opencode_dir = project_root.join(".opencode");
+        std::fs::create_dir_all(&opencode_dir).context("Failed to create .opencode")?;
+        let opencode_config = build_opencode_hook_config();
+        let opencode_json = serde_json::to_string_pretty(&opencode_config)
+            .context("Failed to serialize the OpenCode config")?;
+        let opencode_path = opencode_dir.join("impulse.json");
+        stewardship::atomic_write_file(&opencode_path, opencode_json.as_bytes())
+            .context("Failed to write .opencode/impulse.json")?;
+        println!("  \u{2713} Created .opencode/impulse.json");
     }
-
-    println!(
-        "\nHooks setup complete!\nImpulse path: {}\nEdit .claude/hooks/hooks.json to customize.",
-        impulse_path
-    );
     Ok(())
 }
 

@@ -568,6 +568,10 @@ pub enum Commands {
         /// Output results as JSON (matches daemon IPC format)
         #[arg(long)]
         json: bool,
+        /// Run as a Claude Code PreToolUse hook: read the tool call from
+        /// stdin and exit 2 to block it (Claude Code's only blocking code)
+        #[arg(long)]
+        hook: bool,
     },
     /// Semantic diff between two Git refs using the `sem` tool
     SemDiff {
