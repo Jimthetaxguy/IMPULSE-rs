@@ -71,16 +71,39 @@ impl Storage {
         Self::atomic_write_private_path(&path, json.as_bytes())
     }
 
+    /// Appends one JSON record as one line.
+    ///
+    /// The record and its newline go out in a single `write_all` on an
+    /// `O_APPEND` file, so concurrent appenders (the daemon and hook
+    /// processes) cannot interleave inside a line; `writeln!` used to issue
+    /// them as separate writes. If the file ends without a newline (a write
+    /// torn by a crash or a full disk), the record starts on a new line
+    /// instead of being glued to the fragment and lost with it, and a failed
+    /// write is truncated back so it leaves no fragment of its own.
     pub fn append_jsonl(&self, filename: &str, record: &impl Serialize) -> Result<()> {
         self.ensure_dir()?;
         let path = self.path(filename);
         let mut file = OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(&path)
             .context("Failed to open file for append")?;
         let json = serde_json::to_string(record).context("Failed to serialize JSONL record")?;
-        writeln!(file, "{}", json).context("Failed to write JSONL record")?;
+        let previous_len = file
+            .metadata()
+            .context("Failed to read JSONL file metadata")?
+            .len();
+        let mut line = Vec::with_capacity(json.len() + 2);
+        if previous_len > 0 && !ends_with_newline(&mut file, previous_len)? {
+            line.push(b'\n');
+        }
+        line.extend_from_slice(json.as_bytes());
+        line.push(b'\n');
+        if let Err(error) = file.write_all(&line) {
+            let _ = file.set_len(previous_len);
+            return Err(error).context("Failed to write JSONL record");
+        }
         file.sync_all().context("Failed to sync JSONL")?;
         Ok(())
     }
@@ -93,15 +116,18 @@ impl Storage {
         let file = File::open(&path).context("Failed to open JSONL file")?;
         let reader = BufReader::new(file);
         let mut results = Vec::new();
-        for (idx, line) in reader.lines().enumerate() {
+        // Lines are read as bytes: a torn line cut inside a multi-byte
+        // character is invalid UTF-8, and `lines()` turned that into an error
+        // that aborted the whole read instead of skipping the one record.
+        for (idx, line) in reader.split(b'\n').enumerate() {
             let line = line.context("Failed to read line")?;
-            if line.trim().is_empty() {
+            if line.trim_ascii().is_empty() {
                 continue;
             }
-            // Skip (don't fail on) a malformed record. These are append-only
-            // logs written non-atomically, so a crash can leave a torn trailing
-            // line — one bad line must not make the whole log unreadable.
-            match serde_json::from_str::<T>(&line) {
+            // Skip (don't fail on) a malformed record. A crash can still leave
+            // a torn trailing line; one bad line must not make the whole log
+            // unreadable.
+            match serde_json::from_slice::<T>(&line) {
                 Ok(record) => results.push(record),
                 Err(err) => tracing::warn!(
                     "skipping malformed JSONL record in {:?} (line {}): {}",
@@ -127,14 +153,14 @@ impl Storage {
         let file = File::open(&path).context("Failed to open JSONL file")?;
         let reader = BufReader::new(file);
         let mut count = 0usize;
-        for (idx, line) in reader.lines().enumerate() {
+        for (idx, line) in reader.split(b'\n').enumerate() {
             let line = line.context("Failed to read line")?;
-            if line.trim().is_empty() {
+            if line.trim_ascii().is_empty() {
                 continue;
             }
             // Skip malformed records (e.g. a crash-torn trailing line) rather
             // than aborting the whole stream — see read_jsonl.
-            let record: T = match serde_json::from_str(&line) {
+            let record: T = match serde_json::from_slice(&line) {
                 Ok(record) => record,
                 Err(err) => {
                     tracing::warn!(
@@ -248,6 +274,17 @@ pub fn get_working_dir_name() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// Whether the file's last byte (at `len - 1`) is a newline.
+fn ends_with_newline(file: &mut File, len: u64) -> Result<bool> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    file.seek(SeekFrom::Start(len - 1))
+        .context("Failed to seek to the end of the JSONL file")?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)
+        .context("Failed to read the end of the JSONL file")?;
+    Ok(last[0] == b'\n')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,6 +379,97 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].name, "first");
         assert_eq!(records[1].name, "second");
+    }
+
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    struct Numbered {
+        id: i32,
+    }
+
+    /// Review P2: a torn tail with no newline swallowed the next record
+    /// (both landed on one unparsable line). The old test wrote its torn line
+    /// with `writeln!`, so it could not see this.
+    #[test]
+    fn test_append_after_a_torn_tail_keeps_the_new_record() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = Storage::new(temp_dir.path().to_path_buf());
+        storage
+            .append_jsonl("log.jsonl", &Numbered { id: 1 })
+            .unwrap();
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(storage.path("log.jsonl"))
+            .unwrap();
+        f.write_all(b"{\"id\":").unwrap(); // no newline
+        drop(f);
+        storage
+            .append_jsonl("log.jsonl", &Numbered { id: 2 })
+            .unwrap();
+
+        let records: Vec<Numbered> = storage.read_jsonl("log.jsonl").unwrap();
+        assert_eq!(records, vec![Numbered { id: 1 }, Numbered { id: 2 }]);
+    }
+
+    /// Review P2: `lines()` failed the whole read on invalid UTF-8 (a line
+    /// cut inside a multi-byte character).
+    #[test]
+    fn test_read_jsonl_skips_a_line_with_invalid_utf8() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = Storage::new(temp_dir.path().to_path_buf());
+        storage
+            .append_jsonl("log.jsonl", &Numbered { id: 1 })
+            .unwrap();
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(storage.path("log.jsonl"))
+            .unwrap();
+        f.write_all(b"{\"id\": \xe2\x82\n").unwrap();
+        drop(f);
+        storage
+            .append_jsonl("log.jsonl", &Numbered { id: 3 })
+            .unwrap();
+
+        let records: Vec<Numbered> = storage.read_jsonl("log.jsonl").unwrap();
+        assert_eq!(records, vec![Numbered { id: 1 }, Numbered { id: 3 }]);
+        let mut streamed = Vec::new();
+        storage
+            .read_jsonl_stream("log.jsonl", |record: Numbered| {
+                streamed.push(record);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(streamed.len(), 2);
+    }
+
+    #[test]
+    fn test_concurrent_appends_never_interleave_within_a_line() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = std::sync::Arc::new(Storage::new(temp_dir.path().to_path_buf()));
+        let handles: Vec<_> = (0..16)
+            .map(|thread| {
+                let storage = std::sync::Arc::clone(&storage);
+                std::thread::spawn(move || {
+                    for i in 0..25 {
+                        storage
+                            .append_jsonl(
+                                "log.jsonl",
+                                &Numbered {
+                                    id: thread * 100 + i,
+                                },
+                            )
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let raw = std::fs::read_to_string(storage.path("log.jsonl")).unwrap();
+        assert_eq!(raw.lines().count(), 400);
+        assert!(raw
+            .lines()
+            .all(|line| serde_json::from_str::<Numbered>(line).is_ok()));
     }
 
     #[test]
