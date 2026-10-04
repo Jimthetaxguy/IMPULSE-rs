@@ -296,7 +296,7 @@ pub fn index_memory(
         .context("Failed to initialize retrieval schema")?;
     if rebuild {
         store
-            .clear_all()
+            .clear_scope(scope)
             .context("Failed to clear retrieval store for rebuild")?;
     }
 
@@ -524,7 +524,7 @@ pub fn index_memory_from_storage(
         .context("Failed to initialize retrieval schema")?;
     if rebuild {
         store
-            .clear_all()
+            .clear_scope(scope)
             .context("Failed to clear retrieval store for rebuild")?;
     }
 

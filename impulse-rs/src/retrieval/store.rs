@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::retrieval::types::SearchResult;
+use crate::retrieval::types::{IndexScope, SearchResult};
 
 /// Percent-encodes `path` for embedding in a SQLite `file:` URI (review
 /// round 6, MEDIUM REFUTED -- used by [`RetrievalStore::open_read_only`]'s
@@ -508,31 +508,43 @@ CREATE TABLE IF NOT EXISTS genome_vec (
         Ok(())
     }
 
+    /// Clears the history and genome tables.
     pub fn clear_all(&self) -> Result<()> {
+        self.clear_scope(IndexScope::All)
+    }
+
+    /// Clears the tables a rebuild of `scope` re-indexes, and nothing else.
+    /// Promoted memory records (`memory_records`, `memory_fts`) are never
+    /// cleared here: they are indexed separately from the memory projection
+    /// (`index_promoted_memory_records`, with its own dirty marker), which a
+    /// history or genome rebuild never re-runs. Clearing everything for any
+    /// scope used to leave `--scope genome --rebuild` with an empty history
+    /// index and wiped promoted records the marker still called current.
+    pub fn clear_scope(&self, scope: IndexScope) -> Result<()> {
         let tx = self
             .conn
             .unchecked_transaction()
-            .context("Failed to begin clear_all transaction")?;
-        tx.execute("DELETE FROM history_entries", [])
-            .context("Failed to delete from history_entries")?;
-        tx.execute("DELETE FROM genome_decisions", [])
-            .context("Failed to delete from genome_decisions")?;
-        tx.execute("DELETE FROM history_fts", [])
-            .context("Failed to delete from history_fts")?;
-        tx.execute("DELETE FROM genome_fts", [])
-            .context("Failed to delete from genome_fts")?;
-        tx.execute("DELETE FROM history_vec", [])
-            .context("Failed to delete from history_vec")?;
-        tx.execute("DELETE FROM genome_vec", [])
-            .context("Failed to delete from genome_vec")?;
-        tx.execute("DELETE FROM memory_records", [])
-            .context("Failed to delete from memory_records")?;
-        tx.execute("DELETE FROM memory_fts", [])
-            .context("Failed to delete from memory_fts")?;
-        let _ = tx.execute("DELETE FROM history_vec0", []);
-        let _ = tx.execute("DELETE FROM genome_vec0", []);
+            .context("Failed to begin index clear transaction")?;
+        let mut tables: Vec<&str> = Vec::new();
+        if matches!(scope, IndexScope::History | IndexScope::All) {
+            tables.extend(["history_entries", "history_fts", "history_vec"]);
+        }
+        if matches!(scope, IndexScope::Genome | IndexScope::All) {
+            tables.extend(["genome_decisions", "genome_fts", "genome_vec"]);
+        }
+        for table in tables {
+            tx.execute(&format!("DELETE FROM {table}"), [])
+                .with_context(|| format!("Failed to delete from {table}"))?;
+        }
+        // The vec0 tables exist only when sqlite-vec is loaded.
+        if matches!(scope, IndexScope::History | IndexScope::All) {
+            let _ = tx.execute("DELETE FROM history_vec0", []);
+        }
+        if matches!(scope, IndexScope::Genome | IndexScope::All) {
+            let _ = tx.execute("DELETE FROM genome_vec0", []);
+        }
         tx.commit()
-            .context("Failed to commit clear_all transaction")?;
+            .context("Failed to commit index clear transaction")?;
         Ok(())
     }
 
@@ -688,10 +700,9 @@ ON CONFLICT(decision_id) DO UPDATE SET
                 .context("Failed to delete all from history_entries")?;
             tx.execute("DELETE FROM history_vec", [])
                 .context("Failed to delete all from history_vec")?;
-            tx.execute("DELETE FROM memory_records", [])
-                .context("Failed to delete from memory_records")?;
-            tx.execute("DELETE FROM memory_fts", [])
-                .context("Failed to delete from memory_fts")?;
+            // History only: promoted memory records belong to the memory
+            // projection's indexer. Deleting them here wiped every promoted
+            // record whenever HISTORY.jsonl was empty.
             let _ = tx.execute("DELETE FROM history_vec0", []);
             tx.commit()
                 .context("Failed to commit delete_history_except transaction")?;
@@ -1624,6 +1635,66 @@ mod tests {
             .is_empty());
         // FTS5 syntax in user text stays literal instead of erroring.
         assert!(store.search_history_keyword("auth OR \"bug", 10).is_ok());
+    }
+
+    fn index_one_memory_record(store: &RetrievalStore) {
+        store
+            .upsert_memory_record(MemoryRecordUpsert {
+                record_id: "rec-1",
+                project_id: "p",
+                scope: "project",
+                kind: "decision",
+                valid_from: "2026-09-12",
+                title: "promoted",
+                body: "kept",
+                source_json: "{}",
+                search_text: "promoted kept",
+                content_hash: "h",
+            })
+            .unwrap();
+    }
+
+    /// Review P2: an empty history wiped the promoted memory records too.
+    #[test]
+    fn test_delete_history_except_empty_keeps_memory_records() {
+        let (_tmp, store) = open_test_store();
+        index_one_memory_record(&store);
+        store.delete_history_except(&HashSet::new()).unwrap();
+        assert_eq!(store.count_memory_records().unwrap(), 1);
+    }
+
+    /// Review P2: a genome-only rebuild cleared the history index (and the
+    /// promoted records) with nothing to re-index them.
+    #[test]
+    fn test_clear_scope_clears_only_that_scope() {
+        let (_tmp, store) = open_test_store();
+        store
+            .upsert_history(HistoryUpsert {
+                search_text: "history text",
+                ..test_history_row("s1", "Session")
+            })
+            .unwrap();
+        store
+            .upsert_genome(GenomeUpsert {
+                search_text: "genome text",
+                ..test_genome_row("d1", "Decision")
+            })
+            .unwrap();
+        index_one_memory_record(&store);
+        store.refresh_fts().unwrap();
+
+        store.clear_scope(IndexScope::Genome).unwrap();
+        assert!(store.get_genome_by_id("d1").unwrap().is_none());
+        assert!(store.get_history_by_id("s1").unwrap().is_some());
+        assert_eq!(
+            store.search_history_keyword("history", 10).unwrap().len(),
+            1
+        );
+        assert_eq!(store.count_memory_records().unwrap(), 1);
+
+        store.clear_scope(IndexScope::All).unwrap();
+        assert!(store.get_history_by_id("s1").unwrap().is_none());
+        assert_eq!(store.count_memory_records().unwrap(), 1);
     }
 
     #[test]
