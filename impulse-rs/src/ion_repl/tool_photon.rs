@@ -121,20 +121,7 @@ pub fn resolve_photon_endpoint(
 /// missing file is the empty default; an unreadable or malformed one is an
 /// error, so a typo never silently falls back to another endpoint.
 pub fn load_endpoint_config(impulse_dir: &Path) -> Result<ModelEndpointConfig> {
-    #[derive(serde::Deserialize, Default)]
-    struct Section {
-        #[serde(default)]
-        model_endpoints: ModelEndpointConfig,
-    }
-    let path = impulse_dir.join("config.json");
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
-        Err(e) => return Err(e).with_context(|| format!("photon: cannot read {}", path.display())),
-    };
-    let section: Section = serde_json::from_str(&raw)
-        .with_context(|| format!("photon: cannot parse model_endpoints in {}", path.display()))?;
-    Ok(section.model_endpoints)
+    crate::model_endpoint::load_config(impulse_dir)
 }
 
 /// Validated `photon` arguments.

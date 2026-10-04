@@ -17,8 +17,9 @@ tags: [adr, llm, providers, ion, photon, configuration]
 ## Status
 
 Proposed on lane `claude/ion-scout-subagent-20261002`. Stage 1 (types, config schema, photon
-resolution) is implemented there. Stage 2 (Ion's own provider path) waits for operator review of
-this ADR.
+resolution) is implemented there. Stage 2 (a provider trait and Ion on typed endpoints) is
+implemented on `claude/model-provider-20261004`; see [Stage 2 amendment](#stage-2-amendment-2026-10-04).
+It replaces the min-agent route that rule 7 originally named.
 
 ## Context
 
@@ -92,3 +93,80 @@ modular.
   adapters and leaves two wire layers to maintain.
 - **Delegate selection to a gateway (LiteLLM, OpenRouter).** Rejected by ADR-0015: per-step model
   choice stays harness-owned. A gateway remains usable as one endpoint.
+
+## Stage 2 amendment (2026-10-04)
+
+James directed stage 2 to a native provider trait, informed by a study of LangChain's provider
+abstraction (`langchain-provider-abstraction-research.md`): adopt its small provider contract,
+unified tool-call types, and capability metadata; drop its Runnable layer, model-name inference,
+`with_structured_output`, and separate sync/async paths; and merge its three retry, fallback, and
+routing mechanisms into one. This supersedes rule 7's plan to reach non-Anthropic protocols
+through `min-agent`, whose client is blocking. Photon keeps using `min-agent`.
+
+8. **One small trait.** `model_provider::ModelProvider` has `capabilities()`, `generate()`, and
+   `stream()`. `stream()` has a default that replays `generate()`, so every provider can stream.
+   Providers are `Arc`-shareable and hold no conversation state.
+9. **Capabilities are data.** `ModelCapabilities` (tool calling, vision, streaming, structured
+   output, context window) defaults from the wire protocol and is narrowed per profile with
+   `capabilities` in `config.json`. A request needing tools or images is refused before any network
+   call by an endpoint that does not declare them. Nothing is inferred from a model id.
+10. **One neutral message model.** `ContentBlock::{Text, Image, ToolCall, ToolResult}` normalizes
+    Anthropic `tool_use` blocks with object `input` and OpenAI `tool_calls` with string
+    `arguments` (and Ollama's occasional object). Arguments that are not a JSON object become an
+    `InvalidToolCall`, never an error and never a guessed value. One `StreamAccumulator` merges
+    stream fragments for every provider.
+11. **Two wire providers.** `AnthropicProvider` (Messages) and `OpenAiChatProvider` (Chat
+    Completions: OpenAI, Ollama, OpenRouter, vLLM, LiteLLM), each with non-streaming and SSE paths.
+    `openai_responses` is refused by name at build time until it has a native provider; photon
+    still reaches it through `min-agent`. Structured output is validated by the harness, not
+    offered as a model method. `provider_params` passes vendor fields through unmodeled but can
+    never replace the keys the harness owns (`model`, `messages`, `system`, `tools`, `stream`,
+    `stream_options`, `max_tokens`). Redirects are refused, so a credential header is never sent
+    to another host, and a stream that is silent for 120 seconds fails with a timeout.
+12. **One endpoint policy.** `model_endpoints.policy` (`routing`: `local_first` by default or
+    `in_order`; `retry`: attempts and capped exponential backoff) drives `PolicyProvider`, which is
+    itself a `ModelProvider`. One error classification decides everything: transport, timeout,
+    408, 429, and 5xx retry the same endpoint; a `Retry-After` longer than the backoff cap moves on
+    instead of retrying early. Every other failure moves to the next endpoint, including 400 and
+    422: a local model's "does not support tools" or "context too long" is a 400 that a different
+    model behind the next endpoint may not return. A body that is not JSON is `InvalidResponse`
+    and moves on. A stream falls back only before its first event.
+13. **Local first.** An endpoint on a numeric loopback address (the same test rule 2 uses for plain
+    HTTP) is tried before remote ones, keeping configured order within each group.
+14. **Roles.** `orchestrator` joins `ion` and `photon`. `model_endpoints.fallbacks.<role>` lists
+    further profiles; an unknown fallback is a validation error, consistent with rule 4. The router
+    maps a role to a `PolicyProvider` over its own profile plus fallbacks. Which model a role runs
+    is configuration, never a built-in quality tier.
+15. **Composition through tower.** `ProviderService` makes any provider a
+    `tower::Service<ModelRequest>`, so timeouts and concurrency limits come from tower layers
+    instead of a bespoke chain abstraction.
+16. **Ion on endpoints.** When `model_endpoints` assigns Ion a profile or fallbacks, `ion` builds
+    its provider from the router (`ChatState::from_config_or_env`) and runs its unchanged tool loop
+    on it through `ion_bridge::ModelProviderLlm`. Only Ion's own profiles, fallbacks, and the
+    policy are validated for Ion; a broken Ion section fails closed at the first turn
+    (`ProviderSelectionError::InvalidEndpointConfig`). Without an Ion assignment, including when
+    `config.json` is unreadable or another role's profile is broken, Ion's provider is exactly the
+    legacy `IMPULSE_PROVIDER` one. On this path the endpoint governs the output limit and sampling
+    (Ion's built-in 4,096-token and 0.7 defaults are not sent), tool calls reach the loop as
+    `ToolUse` even when a server reports `stop`, and a malformed tool call fails the turn. The
+    endpoint names the model, so the step-model hook's per-step model id is not applied on this
+    path yet.
+
+**Review.** An adversarial pass (2026-10-04, reproductions in a scratch copy) found three P1s, a
+tool call dropped on `finish_reason: "stop"`, a local 400 that stopped the fallback chain, and an
+unrelated broken profile that disabled Ion, plus P2s and P3s on output limits, stream stalls,
+unindexed tool-call deltas, retry classification, and `provider_params`. All are fixed with
+regression tests; the rules above describe the fixed behavior.
+
+**Evidence.** Unit tests cover wire mapping in both directions, SSE parsing, accumulation,
+every policy branch (under paused time), routing order, config validation, and the Ion bridge.
+Loopback HTTP tests run both providers through `reqwest` and the SSE reader against recorded
+response bytes, including 429 `Retry-After`, 401, and fallback from a dead local port. Opt-in
+real-system tests (`IMPULSE_OLLAMA_IT=1`, `--ignored`) passed against a local Ollama with
+`qwen3:8b` and `llama3.1:8b` on 2026-10-04: generate, stream, a `file_read` tool call, and one Ion
+turn driven through `ChatState::from_config_or_env`.
+
+**Not in stage 2.** A native `openai_responses` provider; per-step model choice across endpoints;
+cost tracking and token budgets; latency- or quality-threshold routing; and moving photon off
+`min-agent`.
+

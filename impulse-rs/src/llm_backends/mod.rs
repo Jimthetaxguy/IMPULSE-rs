@@ -254,6 +254,11 @@ pub enum ProviderSelectionError {
         "{PROVIDER_ENV}='{value}' names no known provider (expected one of: anthropic, openai, minimax)"
     )]
     UnknownProvider { value: String },
+    /// `model_endpoints` in `config.json` assigns Ion an endpoint that cannot
+    /// be used. Ion refuses to start a turn rather than fall back to another
+    /// provider (ADR-0022 rule 4).
+    #[error("model_endpoints configuration for ion is invalid: {reason}")]
+    InvalidEndpointConfig { reason: String },
 }
 
 /// Resolves the provider named by [`PROVIDER_ENV`], or Anthropic when it is

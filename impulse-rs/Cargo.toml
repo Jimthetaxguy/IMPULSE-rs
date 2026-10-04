@@ -47,12 +47,16 @@ ratatui = "0.28"
 crossterm = "0.28"
 
 # HTTP/API calls
-reqwest = { version = "0.12", features = ["json", "blocking"] }
+reqwest = { version = "0.12", features = ["json", "blocking", "stream"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+# Model provider streams and middleware (ADR-0022 stage 2). Both were already
+# in the lockfile through other dependencies.
+futures = "0.3"
+tower = { version = "0.5", features = ["limit", "util"] }
 rusqlite = { version = "0.32", features = ["bundled", "load_extension"] }
 sha2 = "0.10"
 impulse-ops = { path = "impulse-ops" }

@@ -5,7 +5,10 @@
 //! environment variable *name*, never a secret), the model id, and an optional
 //! output-token limit. Named endpoints live in `config.json` under
 //! `model_endpoints.profiles`; `model_endpoints.roles` maps a harness role
-//! (Ion, photon) to a profile name.
+//! (ion, photon, orchestrator) to a profile name, and
+//! `model_endpoints.fallbacks` lists further profiles per role that the
+//! stage-2 endpoint policy (`model_provider::policy`) may try, under
+//! `model_endpoints.policy`.
 //!
 //! Everything here is pure data plus validation. Only [`min_agent_bridge`]
 //! knows another crate's config shapes.
@@ -75,6 +78,11 @@ pub struct ModelEndpoint {
     /// Output-token ceiling per turn. Required for `anthropic_messages`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
+    /// What this endpoint's model can do. Defaults to what the protocol
+    /// supports; set it to narrow a model, for example a small local model
+    /// without tool calling. Never inferred from the model id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<crate::model_provider::ModelCapabilities>,
 }
 
 /// Harness roles that select an endpoint.
@@ -82,6 +90,11 @@ pub struct ModelEndpoint {
 pub enum EndpointRole {
     Ion,
     Photon,
+    Orchestrator,
+}
+
+impl EndpointRole {
+    pub const ALL: [Self; 3] = [Self::Ion, Self::Photon, Self::Orchestrator];
 }
 
 impl fmt::Display for EndpointRole {
@@ -89,6 +102,7 @@ impl fmt::Display for EndpointRole {
         f.write_str(match self {
             Self::Ion => "ion",
             Self::Photon => "photon",
+            Self::Orchestrator => "orchestrator",
         })
     }
 }
@@ -101,6 +115,31 @@ pub struct EndpointRoles {
     pub ion: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub photon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator: Option<String>,
+}
+
+/// Role → further profiles the endpoint policy may try after the role's own
+/// profile, in configured order (local-first routing may reorder them).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointFallbacks {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ion: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub photon: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub orchestrator: Vec<String>,
+}
+
+impl EndpointFallbacks {
+    pub fn for_role(&self, role: EndpointRole) -> &[String] {
+        match role {
+            EndpointRole::Ion => &self.ion,
+            EndpointRole::Photon => &self.photon,
+            EndpointRole::Orchestrator => &self.orchestrator,
+        }
+    }
 }
 
 /// The `model_endpoints` section of `config.json`.
@@ -111,6 +150,10 @@ pub struct ModelEndpointConfig {
     pub profiles: BTreeMap<String, ModelEndpoint>,
     #[serde(default)]
     pub roles: EndpointRoles,
+    #[serde(default)]
+    pub fallbacks: EndpointFallbacks,
+    #[serde(default)]
+    pub policy: crate::model_provider::policy::EndpointPolicy,
 }
 
 /// Why an endpoint or its configuration was refused.
@@ -153,6 +196,10 @@ pub enum EndpointError {
         protocol: WireProtocol,
         vendor: &'static str,
     },
+    #[error("fallback for role '{role}' names profile '{profile}', which is not defined")]
+    UnknownFallback { role: String, profile: String },
+    #[error("invalid model_endpoints.policy: {reason}")]
+    InvalidPolicy { reason: String },
 }
 
 /// Hosts a configured profile may send a credential to (ADR-0022, credential
@@ -242,6 +289,7 @@ impl ModelEndpoint {
             },
             model: model.to_string(),
             max_output_tokens: Some(max_output_tokens),
+            capabilities: None,
         }
     }
 
@@ -352,10 +400,80 @@ impl ModelEndpointConfig {
                     reason: e.to_string(),
                 })?;
         }
-        for role in [EndpointRole::Ion, EndpointRole::Photon] {
+        for role in EndpointRole::ALL {
             self.endpoint_for(role)?;
+            for profile in self.fallbacks.for_role(role) {
+                if !self.profiles.contains_key(profile.trim()) {
+                    return Err(EndpointError::UnknownFallback {
+                        role: role.to_string(),
+                        profile: profile.clone(),
+                    });
+                }
+            }
         }
-        Ok(())
+        self.policy
+            .validate()
+            .map_err(|reason| EndpointError::InvalidPolicy { reason })
+    }
+
+    /// Validates only what `role` uses: its own profile, its fallbacks, and
+    /// the policy. A broken profile assigned to another role does not stop
+    /// this one from running. Credential destinations are checked against
+    /// [`TrustedModelHosts::from_env`].
+    pub fn validate_role(&self, role: EndpointRole) -> Result<(), EndpointError> {
+        self.validate_role_with(role, &TrustedModelHosts::from_env())
+    }
+
+    /// [`Self::validate_role`] against an explicit trusted-host list.
+    pub fn validate_role_with(
+        &self,
+        role: EndpointRole,
+        trusted: &TrustedModelHosts,
+    ) -> Result<(), EndpointError> {
+        let own = self.endpoint_for(role)?.map(|_| ());
+        let mut names: Vec<&str> = Vec::new();
+        if own.is_some() {
+            if let Some(name) = match role {
+                EndpointRole::Ion => self.roles.ion.as_deref(),
+                EndpointRole::Photon => self.roles.photon.as_deref(),
+                EndpointRole::Orchestrator => self.roles.orchestrator.as_deref(),
+            } {
+                names.push(name.trim());
+            }
+        }
+        for fallback in self.fallbacks.for_role(role) {
+            if !self.profiles.contains_key(fallback.trim()) {
+                return Err(EndpointError::UnknownFallback {
+                    role: role.to_string(),
+                    profile: fallback.clone(),
+                });
+            }
+            names.push(fallback.trim());
+        }
+        for name in names {
+            if let Some(endpoint) = self.profiles.get(name) {
+                endpoint
+                    .validate()
+                    .and_then(|()| endpoint.check_credential_destination(trusted))
+                    .map_err(|e| EndpointError::InvalidProfile {
+                        name: name.to_string(),
+                        reason: e.to_string(),
+                    })?;
+            }
+        }
+        self.policy
+            .validate()
+            .map_err(|reason| EndpointError::InvalidPolicy { reason })
+    }
+
+    /// Whether `role` has an own profile or any fallback configured.
+    pub fn role_is_configured(&self, role: EndpointRole) -> bool {
+        let own = match role {
+            EndpointRole::Ion => self.roles.ion.as_deref(),
+            EndpointRole::Photon => self.roles.photon.as_deref(),
+            EndpointRole::Orchestrator => self.roles.orchestrator.as_deref(),
+        };
+        own.is_some_and(|name| !name.trim().is_empty()) || !self.fallbacks.for_role(role).is_empty()
     }
 
     /// The profile assigned to `role`, or `None` when the role is unassigned.
@@ -367,6 +485,7 @@ impl ModelEndpointConfig {
         let assigned = match role {
             EndpointRole::Ion => self.roles.ion.as_deref(),
             EndpointRole::Photon => self.roles.photon.as_deref(),
+            EndpointRole::Orchestrator => self.roles.orchestrator.as_deref(),
         };
         let Some(name) = assigned.map(str::trim).filter(|n| !n.is_empty()) else {
             return Ok(None);
@@ -379,6 +498,27 @@ impl ModelEndpointConfig {
                 profile: name.to_string(),
             })
     }
+}
+
+/// Reads the `model_endpoints` section of `<impulse_dir>/config.json`. A
+/// missing file or section is the empty default; an unreadable or malformed
+/// one is an error, so a typo never silently falls back to another endpoint.
+pub fn load_config(impulse_dir: &std::path::Path) -> anyhow::Result<ModelEndpointConfig> {
+    use anyhow::Context as _;
+    #[derive(Deserialize, Default)]
+    struct Section {
+        #[serde(default)]
+        model_endpoints: ModelEndpointConfig,
+    }
+    let path = impulse_dir.join("config.json");
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(err) => return Err(err).with_context(|| format!("cannot read {}", path.display())),
+    };
+    let section: Section = serde_json::from_str(&raw)
+        .with_context(|| format!("cannot parse model_endpoints in {}", path.display()))?;
+    Ok(section.model_endpoints)
 }
 
 #[cfg(test)]
@@ -395,6 +535,7 @@ mod tests {
             },
             model: "qwen/qwen3-coder".into(),
             max_output_tokens: None,
+            capabilities: None,
         }
     }
 
@@ -404,7 +545,9 @@ mod tests {
             roles: EndpointRoles {
                 ion: None,
                 photon: photon.map(str::to_string),
+                orchestrator: None,
             },
+            ..ModelEndpointConfig::default()
         }
     }
 
@@ -603,6 +746,30 @@ mod tests {
         );
         assert_eq!(
             config.validate_with(&TrustedModelHosts::from_list(Some("openrouter.ai"))),
+            Ok(())
+        );
+    }
+
+    /// Review P1 (stage 2): Ion resolves its endpoint through
+    /// `validate_role`, so the credential-destination rule must hold there
+    /// too, not only in `validate`.
+    #[test]
+    fn test_validate_role_refuses_an_untrusted_credential_host_for_ion() {
+        let mut config = config_with(openrouter(), None);
+        config.roles.ion = Some("router".into());
+        let err = config
+            .validate_role_with(EndpointRole::Ion, &TrustedModelHosts::default())
+            .unwrap_err();
+        assert!(
+            matches!(&err, EndpointError::InvalidProfile { reason, .. }
+                if reason.contains(TRUSTED_MODEL_HOSTS_ENV)),
+            "{err}"
+        );
+        assert_eq!(
+            config.validate_role_with(
+                EndpointRole::Ion,
+                &TrustedModelHosts::from_list(Some("openrouter.ai"))
+            ),
             Ok(())
         );
     }

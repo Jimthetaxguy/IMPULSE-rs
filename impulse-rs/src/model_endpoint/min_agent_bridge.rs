@@ -57,6 +57,7 @@ mod tests {
             auth,
             model: " model-x ".into(),
             max_output_tokens: Some(512),
+            capabilities: None,
         }
     }
 

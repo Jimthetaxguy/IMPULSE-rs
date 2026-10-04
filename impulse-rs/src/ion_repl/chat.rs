@@ -253,6 +253,25 @@ impl ChatState {
         Ok(Self::with_provider(provider, model))
     }
 
+    /// Ion's provider from typed endpoints when `model_endpoints.roles.ion`
+    /// or `model_endpoints.fallbacks.ion` is configured in
+    /// `<impulse_dir>/config.json` (ADR-0022 stage 2), else the legacy
+    /// `IMPULSE_PROVIDER` path. The endpoint path runs under the configured
+    /// endpoint policy: local-first routing, retry, and fallback. A broken
+    /// section fails closed at the first turn, never falling back silently.
+    pub fn from_config_or_env(impulse_dir: &std::path::Path) -> Self {
+        match endpoint_provider(impulse_dir) {
+            Ok(Some((provider, model))) => Self::with_provider(provider, model),
+            Ok(None) => Self::from_env(),
+            Err(reason) => Self::with_provider(
+                Box::new(UnconfiguredProvider::new(
+                    ProviderSelectionError::InvalidEndpointConfig { reason },
+                )),
+                DEFAULT_MODEL.to_string(),
+            ),
+        }
+    }
+
     /// Test/DI seam: build chat state with an arbitrary provider (e.g. a
     /// fake `LlmProvider` from [`test_support`]) instead of the real
     /// Anthropic backend. Also usable by future providers (OpenAI, Minimax).
@@ -379,6 +398,82 @@ impl ChatState {
         self.untrusted_seen
             .load(std::sync::atomic::Ordering::Relaxed)
     }
+}
+
+/// An endpoint-backed provider and the model id Ion displays for it.
+type EndpointProvider = (Box<dyn LlmProvider>, String);
+
+/// The endpoint-backed provider for Ion, if `model_endpoints` assigns one.
+fn endpoint_provider(impulse_dir: &std::path::Path) -> Result<Option<EndpointProvider>, String> {
+    use crate::model_endpoint::{EndpointRole, ModelEndpointConfig};
+    use crate::model_provider::{ion_bridge::ModelProviderLlm, router::ModelRouter};
+    // Ion read nothing from config.json before stage 2, so only an Ion
+    // assignment may change its behavior: an unreadable file, or a broken
+    // profile that only photon or the orchestrator uses, leaves Ion on the
+    // legacy path. Once Ion is assigned, its own section is strict.
+    let path = impulse_dir.join("config.json");
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            eprintln!(
+                "Note: Ion ignores model_endpoints; cannot read {} ({err})",
+                path.display()
+            );
+            return Ok(None);
+        }
+    };
+    let section = match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(value) => value.get("model_endpoints").cloned(),
+        Err(err) => {
+            eprintln!(
+                "Note: Ion ignores model_endpoints; {} is not valid JSON ({err})",
+                path.display()
+            );
+            return Ok(None);
+        }
+    };
+    let Some(section) = section else {
+        return Ok(None);
+    };
+    let config: ModelEndpointConfig = match serde_json::from_value(section.clone()) {
+        Ok(config) => config,
+        Err(err) => {
+            let ion_named = section.pointer("/roles/ion").is_some_and(|v| !v.is_null())
+                || section
+                    .pointer("/fallbacks/ion")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|list| !list.is_empty());
+            if ion_named {
+                return Err(format!(
+                    "cannot parse model_endpoints in {}: {err}",
+                    path.display()
+                ));
+            }
+            return Ok(None);
+        }
+    };
+    if !config.role_is_configured(EndpointRole::Ion) {
+        return Ok(None);
+    }
+    let router = ModelRouter::for_role(config, EndpointRole::Ion).map_err(|err| err.to_string())?;
+    let Some(policy) = router
+        .provider_for(EndpointRole::Ion)
+        .map_err(|err| err.to_string())?
+    else {
+        return Ok(None);
+    };
+    let model = router
+        .primary_model(EndpointRole::Ion)
+        .map_err(|err| err.to_string())?
+        .unwrap_or_else(|| policy.order().join(","));
+    Ok(Some((
+        Box::new(ModelProviderLlm::new(
+            std::sync::Arc::new(policy),
+            model.clone(),
+        )),
+        model,
+    )))
 }
 
 /// Builds Anthropic tool-use schemas from every tool in `registry`
@@ -2835,6 +2930,91 @@ mod tests {
             second.content
         );
         assert!(second.content.contains("declined"));
+    }
+
+    /// ADR-0022 stage 2, real system: Ion's own chat loop on a typed
+    /// endpoint from `config.json`, against a local Ollama. Opt in with
+    /// `IMPULSE_OLLAMA_IT=1` (model: `IMPULSE_OLLAMA_MODEL`, default `qwen3`).
+    #[tokio::test]
+    #[ignore = "needs a running local Ollama; set IMPULSE_OLLAMA_IT=1 and run with --ignored"]
+    async fn test_ion_turn_runs_on_a_local_ollama_endpoint_from_config() {
+        if std::env::var("IMPULSE_OLLAMA_IT").as_deref() != Ok("1") {
+            return;
+        }
+        let model = std::env::var("IMPULSE_OLLAMA_MODEL").unwrap_or_else(|_| "qwen3".into());
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::json!({"model_endpoints": {
+                "profiles": {"local": {
+                    "protocol": "openai_chat",
+                    "base_url": "http://127.0.0.1:11434/v1",
+                    "auth": {"kind": "none"},
+                    "model": model,
+                    "max_output_tokens": 512
+                }},
+                "roles": {"ion": "local"}
+            }})
+            .to_string(),
+        )
+        .expect("write config");
+        let mut chat = ChatState::from_config_or_env(dir.path());
+        let reply = chat
+            .turn(
+                "Reply with the single word: ready",
+                &ReplToolRegistry::new(),
+                &ReplContext::default(),
+            )
+            .await
+            .expect("Ion turn on the local endpoint");
+        assert!(!reply.trim().is_empty(), "empty reply");
+    }
+
+    #[tokio::test]
+    async fn test_from_config_or_env_fails_closed_on_a_broken_endpoint_section() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_endpoints": {"roles": {"ion": "missing"}}}"#,
+        )
+        .expect("write config");
+        let mut chat = ChatState::from_config_or_env(dir.path());
+        assert_eq!(chat.agent.provider.name(), "unconfigured");
+        let err = chat
+            .turn("hi", &ReplToolRegistry::new(), &ReplContext::default())
+            .await
+            .expect_err("no silent fallback to another provider");
+        assert!(err.to_string().contains("missing"), "{err}");
+    }
+
+    /// Review P1/P3: without an Ion assignment, Ion's provider is exactly the
+    /// legacy `IMPULSE_PROVIDER` one, even when config.json is invalid JSON
+    /// or another role's profile is broken.
+    #[test]
+    fn test_from_config_or_env_without_an_ion_endpoint_keeps_the_legacy_path() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        for config in [
+            None,
+            Some("{not json"),
+            Some(
+                r#"{"model_endpoints": {"profiles": {"p": {"protocol": "openai_chat",
+                    "base_url": "http://example.com/v1", "auth": {"kind": "none"},
+                    "model": "m"}}, "roles": {"photon": "p"}}}"#,
+            ),
+            Some(r#"{"model_endpoints": {"rolez": {}}}"#),
+        ] {
+            if let Some(config) = config {
+                std::fs::write(dir.path().join("config.json"), config).expect("write");
+            }
+            let name = with_provider_env(None, || {
+                ChatState::from_config_or_env(dir.path())
+                    .agent
+                    .provider
+                    .name()
+                    .to_string()
+            });
+            assert_eq!(name, "anthropic", "config: {config:?}");
+        }
     }
 
     // ------------------------------------------------------------------

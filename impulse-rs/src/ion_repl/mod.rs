@@ -354,12 +354,13 @@ impl ReplSession {
                 crate::blackboard::BlackboardConfig::default()
             });
         context.blackboard = Some(blackboard);
+        let impulse_dir = context.sandbox_tool_context().impulse_dir;
         Ok(Self {
             editor,
             history_path,
             context,
             tools: ReplToolRegistry::with_defaults(),
-            chat: ChatState::from_env(),
+            chat: ChatState::from_config_or_env(&impulse_dir),
         })
     }
 

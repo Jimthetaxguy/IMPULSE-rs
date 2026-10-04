@@ -535,25 +535,22 @@ at five runs per REPL session, and only a `Completed` stop is success. Default f
 ### model endpoint — `[code]`
 A typed way to reach one model: wire protocol (`anthropic_messages`, `openai_chat`,
 `openai_responses`), API base URL including its path, auth by environment-variable name (never a
-secret), model id, and optional output-token limit. HTTPS only, except plain HTTP to a numeric
-loopback address. Named endpoints live in `config.json` under `model_endpoints.profiles`, and
-`model_endpoints.roles` assigns them to `ion` and `photon`; a role naming a missing profile is an
-error, never a fallback. Photon resolves endpoints today; Ion's own provider path moves onto them in
-ADR-0022 stage 2.
+secret), model id, optional output-token limit, and optional declared `capabilities`. HTTPS only,
+except plain HTTP to a numeric loopback address. Named endpoints live in `config.json` under
+`model_endpoints.profiles`; `model_endpoints.roles` assigns them to `ion`, `photon`, and
+`orchestrator`, and `model_endpoints.fallbacks` lists further profiles per role. A role or fallback
+naming a missing profile is an error, never a fallback.
 - **Source of truth:** `src/model_endpoint/` and ADR-0022.
 
-### blackboard — `[code]`
-The project's durable off-context store, `.impulse/blackboard.db` (SQLite). One row per `task_id`:
-payload, content type, creation time, optional TTL, JSON metadata. Live keys are insert-only;
-expired rows read as absent and are purged on open, at daemon start, and on the daemon's purge
-interval. Ion **spills** any tool result over `blackboard.spill_threshold_bytes` (default 4 KiB)
-into it and sends the model a **reference** (preview, `task_id`, size, SHA-256) instead; the model
-**pages** the rest in with `blackboard_fetch` (8 KiB windows, optional JSON pointer). A governed claim
-summary over the 4 KiB claim limit spills the same way and travels as a `blackboard:<key>` artifact
-id. The **orchestrator surface** is the five tools an orchestrator advertises (`search_tools`,
-`blackboard_store`, `blackboard_fetch`, `delegate_task`, `approve_gate`); the last two are reserved.
-- **Source of truth:** `src/blackboard/`, `src/ion_repl/tool_blackboard.rs`,
-  `src/ion_repl/tool_search.rs`, and ADR-0023.
+### model provider — `[code]`
+One model behind one wire protocol, as the `ModelProvider` trait: `capabilities()`, `generate()`,
+and `stream()`. **Capabilities** are declared data, checked before a request is sent. Messages and
+tool calls use one neutral form (`ContentBlock`), and malformed tool arguments become an
+`InvalidToolCall`. The **endpoint policy** (`model_endpoints.policy`) is the single mechanism for
+**local-first routing**, retry, and fallback, applied by `PolicyProvider`, which is itself a
+provider. The router turns a role into a policy over its endpoints, and Ion runs on it when
+`model_endpoints` assigns Ion a profile.
+- **Source of truth:** `src/model_provider/` and ADR-0022 (stage 2 amendment).
 
 ### supervisor policy — `[code]`
 The concrete permission and confirmation policy for supervisor actions such as monitoring, memory
