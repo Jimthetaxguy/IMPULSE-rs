@@ -706,6 +706,13 @@ impl ImpulseAgent {
         let harness_command_display = harness_command.display().to_string();
         let mut cmd = tokio::process::Command::new(&harness_command);
         cmd.args(harness_kind.invocation_args()).arg(&print_arg);
+        // `wait_with_output` below only captures handles that were piped;
+        // inherited ones would send the reply to this process's own stdout
+        // and leave `output.stdout` empty. Stdin is closed so a harness can
+        // never sit waiting on it.
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
 
         // Set env var pointing to the structured request file
         cmd.env(
@@ -1786,6 +1793,69 @@ mod tests {
             std::fs::set_permissions(&script_path, perms).expect("chmod fake harness script");
         }
         (dir, script_path, pid_file)
+    }
+
+    /// Writes an executable fake harness named `claude` running `body`.
+    #[cfg(unix)]
+    fn write_fake_harness(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script_path = dir.path().join("claude");
+        std::fs::write(&script_path, format!("#!/bin/sh\n{body}\n"))
+            .expect("write fake harness script");
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat fake harness script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod fake harness script");
+        (dir, script_path)
+    }
+
+    /// Regression: after `output()` became `spawn()` + `wait_with_output()`
+    /// the child's stdout was inherited instead of piped, so every successful
+    /// harness reply came back empty.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_harness_query_returns_the_harness_reply() {
+        let (_dir, script_path) =
+            write_fake_harness(r#"printf '{"content":"hello from harness"}'"#);
+        let agent = ImpulseAgent::new(ImpulseAgentConfig::harness(ImpulseHarness::ClaudeCode))
+            .expect("harness agent should construct")
+            .with_test_harness_command(script_path);
+        let response = agent
+            .harness_query_structured_with_timeout(
+                "system",
+                "hello",
+                &[],
+                None,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("harness query should succeed");
+        assert_eq!(response.content, "hello from harness");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_harness_query_failure_reports_the_harness_stderr() {
+        let (_dir, script_path) = write_fake_harness("echo 'boom: bad credentials' >&2\nexit 3");
+        let agent = ImpulseAgent::new(ImpulseAgentConfig::harness(ImpulseHarness::ClaudeCode))
+            .expect("harness agent should construct")
+            .with_test_harness_command(script_path);
+        let error = agent
+            .harness_query_structured_with_timeout(
+                "system",
+                "hello",
+                &[],
+                None,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect_err("a failing harness must be an error");
+        assert!(
+            error.to_string().contains("boom: bad credentials"),
+            "{error}"
+        );
     }
 
     /// Polls until the fake harness has published both pids. The bound is a

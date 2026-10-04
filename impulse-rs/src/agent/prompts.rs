@@ -203,22 +203,56 @@ pub fn build_context_prompt(insights: &[ExtractedInsight]) -> String {
     out
 }
 
+/// How much of a pane's most recent output goes into a summary request.
+const SUMMARY_TAIL_BYTES: usize = 4000;
+
 /// Build a user message for task summarization.
 pub fn build_summary_prompt(pane_name: &str, raw_output: &str) -> String {
-    let truncated = if raw_output.len() > 4000 {
-        &raw_output[raw_output.len() - 4000..]
-    } else {
-        raw_output
-    };
+    let truncated = tail_on_char_boundary(raw_output, SUMMARY_TAIL_BYTES);
     format!(
         "Summarize the recent activity from pane '{}':\n\n```\n{}\n```",
         pane_name, truncated
     )
 }
 
+/// The last `max_bytes` of `text` or fewer, starting on a char boundary so
+/// terminal output with box drawing or emoji never splits a character.
+fn tail_on_char_boundary(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut start = text.len() - max_bytes;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: the old byte slice panicked when the cut landed inside a
+    /// multi-byte character, killing the daemon's `AgentSummarizePane` task.
+    #[test]
+    fn test_build_summary_prompt_multibyte_output_does_not_split_a_char() {
+        let output = "\u{2713}".repeat(1400); // 4200 bytes, 3 bytes per char
+        let prompt = build_summary_prompt("pane", &output);
+        let body = prompt.split("```\n").nth(1).expect("fenced body");
+        assert!(body
+            .chars()
+            .all(|c| c == '\u{2713}' || c == '\n' || c == '`'));
+        assert!(body.trim_end_matches(['\n', '`']).len() <= SUMMARY_TAIL_BYTES);
+    }
+
+    #[test]
+    fn test_tail_on_char_boundary_keeps_short_text_whole() {
+        assert_eq!(tail_on_char_boundary("short", 10), "short");
+        // "ééé" is 6 bytes: a 4-byte tail starts on a boundary, a 3-byte
+        // tail would start mid-character and moves forward to the next one.
+        assert_eq!(tail_on_char_boundary("ééé", 4), "éé");
+        assert_eq!(tail_on_char_boundary("ééé", 3), "é");
+    }
 
     #[test]
     fn test_build_review_prompt() {
