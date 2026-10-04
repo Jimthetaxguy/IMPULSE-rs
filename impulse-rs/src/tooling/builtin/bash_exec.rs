@@ -32,16 +32,37 @@
 //! guard applied defensively to the allowlist itself (belt-and-suspenders
 //! — none of the allowlisted names should ever match it, and a test in
 //! `env_scrub` proves that).
+//!
+//! **Bounded output and time.** Output is read through `tooling::capture`,
+//! which keeps the first `MAX_OUTPUT_BYTES` of each stream and reads past
+//! the rest, so a command that prints without bound cannot grow this
+//! process's memory. `timeout_secs` cannot outlast the executor, which
+//! cancels every tool call at `ToolContext::timeout_ms`; a request past that
+//! limit is capped, and the timeout error says so.
 
 use async_trait::async_trait;
 use tokio::time::Duration;
 
+use crate::tooling::capture::wait_with_capped_output;
 use crate::tooling::env_scrub::scrub_and_allowlist_env;
 use crate::tooling::error::ToolError;
 use crate::tooling::traits::*;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+/// How far inside the executor's deadline (`ToolContext::timeout_ms`) this
+/// tool's own deadline sits, so a capped request ends here, with an error
+/// that names the cap, rather than at the executor's bare `Timeout`.
+const TIME_LIMIT_MARGIN_MS: u64 = 250;
+
+/// `ms` as whole seconds (`30s`) when it is one, otherwise in milliseconds.
+fn format_limit(ms: u64) -> String {
+    if ms.is_multiple_of(1000) {
+        format!("{}s", ms / 1000)
+    } else {
+        format!("{ms}ms")
+    }
+}
 
 /// Truncate `s` to at most `max_bytes` bytes without panicking when
 /// `max_bytes` falls in the middle of a multi-byte UTF-8 character.
@@ -94,7 +115,9 @@ impl DynamicTool for BashExecTool {
                 },
                 ToolParam {
                     name: "timeout_secs".into(),
-                    description: "Timeout in seconds (default: 30)".into(),
+                    description: "Timeout in seconds (default: 30; capped at the session's \
+                                  tool time limit, 30 seconds unless configured)"
+                        .into(),
                     param_type: ParamType::Integer,
                     required: false,
                     default: Some(serde_json::json!(DEFAULT_TIMEOUT_SECS)),
@@ -117,6 +140,10 @@ impl DynamicTool for BashExecTool {
         params: serde_json::Value,
         ctx: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
+        // Taken first, so this tool's deadline is measured from almost the
+        // same instant as the executor's, which starts just before this
+        // future is first polled.
+        let started = tokio::time::Instant::now();
         let command = params
             .get("command")
             .and_then(|v| v.as_str())
@@ -126,6 +153,20 @@ impl DynamicTool for BashExecTool {
             .and_then(|v| v.as_u64())
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .max(1);
+        let limit_ms = ctx.timeout_ms.max(1);
+        let requested_ms = timeout_secs.saturating_mul(1000);
+        let budget_ms = requested_ms
+            .min(limit_ms.saturating_sub(TIME_LIMIT_MARGIN_MS))
+            .max(1);
+        let timeout_message = if requested_ms > limit_ms {
+            format!(
+                "command timed out at this session's {} tool time limit \
+                 (timeout_secs {timeout_secs} is capped to it): {command}",
+                format_limit(limit_ms)
+            )
+        } else {
+            format!("command timed out after {timeout_secs}s: {command}")
+        };
         let cwd = params
             .get("cwd")
             .and_then(|v| v.as_str())
@@ -150,9 +191,8 @@ impl DynamicTool for BashExecTool {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
         cmd.stdin(std::process::Stdio::null());
-        // On timeout, the `wait_with_output` future below is dropped along with
-        // the `Child` it owns; `kill_on_drop` ensures that drop sends SIGKILL
-        // instead of leaving an orphaned/zombie process behind.
+        // On timeout, returning drops `child`; `kill_on_drop` makes that drop
+        // send SIGKILL instead of leaving an orphaned/zombie process behind.
         cmd.kill_on_drop(true);
 
         // `kill_on_drop`/SIGKILL only reaches the *direct* `sh` child, not
@@ -178,39 +218,44 @@ impl DynamicTool for BashExecTool {
             cmd.process_group(0);
         }
 
-        let child = cmd
+        let mut child = cmd
             .spawn()
             .map_err(|e| ToolError::ExecutionFailed(format!("failed to spawn shell: {e}")))?;
         // Synchronous Drop cleanup covers explicit timeout and arbitrary
         // task cancellation; `kill_on_drop` alone reaches only direct `sh`.
         let mut process_group_guard = crate::process_group::ProcessGroupGuard::new(child.id());
 
-        let output =
-            match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
-                .await
-            {
-                Ok(result) => {
-                    let output = result.map_err(|e| {
-                        ToolError::ExecutionFailed(format!("failed to wait on child: {e}"))
-                    })?;
-                    process_group_guard.disarm();
-                    output
-                }
-                Err(_elapsed) => {
-                    // Returning drops the still-armed group guard after the
-                    // Child future is dropped, killing backgrounded work too.
-                    return Err(ToolError::ExecutionFailed(format!(
-                        "command timed out after {timeout_secs}s: {command}"
-                    )));
-                }
-            };
+        let deadline = started + Duration::from_millis(budget_ms);
+        let output = match tokio::time::timeout_at(
+            deadline,
+            wait_with_capped_output(&mut child, MAX_OUTPUT_BYTES, MAX_OUTPUT_BYTES),
+        )
+        .await
+        {
+            Ok(result) => {
+                let output = result.map_err(|e| {
+                    ToolError::ExecutionFailed(format!("failed to wait on child: {e}"))
+                })?;
+                process_group_guard.disarm();
+                output
+            }
+            Err(_elapsed) => {
+                // Returning drops the still-armed group guard, killing
+                // backgrounded work too, and then `child` itself.
+                return Err(ToolError::ExecutionFailed(timeout_message));
+            }
+        };
 
-        let stdout_full = String::from_utf8_lossy(&output.stdout).into_owned();
-        let stderr_full = String::from_utf8_lossy(&output.stderr).into_owned();
-        let stdout_truncated = stdout_full.len() > MAX_OUTPUT_BYTES;
-        let stderr_truncated = stderr_full.len() > MAX_OUTPUT_BYTES;
-        let stdout = truncate_at_char_boundary(&stdout_full, MAX_OUTPUT_BYTES);
-        let stderr = truncate_at_char_boundary(&stderr_full, MAX_OUTPUT_BYTES);
+        // The kept bytes are already within `MAX_OUTPUT_BYTES`; a cut inside
+        // a multi-byte character becomes U+FFFD, which this trims back off.
+        let stdout = truncate_at_char_boundary(
+            &String::from_utf8_lossy(&output.stdout.bytes),
+            MAX_OUTPUT_BYTES,
+        );
+        let stderr = truncate_at_char_boundary(
+            &String::from_utf8_lossy(&output.stderr.bytes),
+            MAX_OUTPUT_BYTES,
+        );
 
         Ok(ToolResult::json(serde_json::json!({
             "command": command,
@@ -218,8 +263,8 @@ impl DynamicTool for BashExecTool {
             "success": output.status.success(),
             "stdout": stdout,
             "stderr": stderr,
-            "stdout_truncated": stdout_truncated,
-            "stderr_truncated": stderr_truncated,
+            "stdout_truncated": output.stdout.truncated(),
+            "stderr_truncated": output.stderr.truncated(),
         })))
     }
 
@@ -373,6 +418,33 @@ mod tests {
         assert_eq!(result.output["exit_code"], 0);
         assert_eq!(result.output["success"], true);
         assert_eq!(result.output["stdout"], "hello\n");
+        assert_eq!(result.output["stdout_truncated"], false);
+    }
+
+    /// Review P2-15: output was buffered whole and only then cut to
+    /// `MAX_OUTPUT_BYTES`; it is now cut as it is read.
+    #[tokio::test]
+    async fn test_execute_returns_a_bounded_prefix_of_large_output() {
+        let tool = BashExecTool;
+        let ctx = ToolContext::with_all_capabilities();
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "command": "yes a | head -c 1000000; yes b | head -c 300000 >&2"
+                }),
+                &ctx,
+            )
+            .await
+            .expect("command should run");
+        let stdout = result.output["stdout"].as_str().unwrap();
+        let stderr = result.output["stderr"].as_str().unwrap();
+        assert_eq!(stdout.len(), MAX_OUTPUT_BYTES);
+        assert!(stdout.starts_with("a\na\n"));
+        assert_eq!(result.output["stdout_truncated"], true);
+        assert_eq!(stderr.len(), MAX_OUTPUT_BYTES);
+        assert!(stderr.starts_with("b\nb\n"));
+        assert_eq!(result.output["stderr_truncated"], true);
+        assert_eq!(result.output["exit_code"], 0);
     }
 
     #[tokio::test]
@@ -397,7 +469,67 @@ mod tests {
                 &ctx,
             )
             .await;
-        assert!(matches!(result, Err(ToolError::ExecutionFailed(_))));
+        assert!(
+            matches!(&result, Err(ToolError::ExecutionFailed(message))
+                if message.starts_with("command timed out after 1s")),
+            "{result:?}"
+        );
+    }
+
+    /// Review P2-17: a `timeout_secs` past the session's limit was cut off
+    /// by the executor with no sign that the request had been capped.
+    #[tokio::test]
+    async fn test_execute_caps_timeout_secs_at_the_session_limit() {
+        let tool = BashExecTool;
+        let ctx = ToolContext {
+            timeout_ms: 1500,
+            ..ToolContext::with_all_capabilities()
+        };
+        let started = std::time::Instant::now();
+        let result = tool
+            .execute(
+                serde_json::json!({"command": "sleep 10", "timeout_secs": 60}),
+                &ctx,
+            )
+            .await;
+        assert!(started.elapsed() < Duration::from_secs(5));
+        match result {
+            Err(ToolError::ExecutionFailed(message)) => {
+                assert!(message.contains("1500ms tool time limit"), "{message}");
+                assert!(message.contains("timeout_secs 60 is capped"), "{message}");
+            }
+            other => panic!("expected a capped timeout, got {other:?}"),
+        }
+    }
+
+    /// The executor cancels every call at the same limit. This tool's own
+    /// deadline sits just inside it, so the caller gets the message that
+    /// names the cap rather than the executor's bare `Timeout`.
+    #[tokio::test]
+    async fn test_capped_timeout_message_reaches_the_caller_through_the_executor() {
+        let registry = crate::tooling::ToolRegistry::with_defaults();
+        let ctx = ToolContext {
+            timeout_ms: 1500,
+            ..ToolContext::with_all_capabilities()
+        };
+        let result = registry
+            .execute(
+                "bash_exec",
+                serde_json::json!({"command": "sleep 10", "timeout_secs": 60}),
+                &ctx,
+            )
+            .await;
+        assert!(
+            matches!(&result, Err(ToolError::ExecutionFailed(message))
+                if message.contains("tool time limit")),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn test_format_limit_uses_seconds_only_when_whole() {
+        assert_eq!(format_limit(30_000), "30s");
+        assert_eq!(format_limit(1500), "1500ms");
     }
 
     #[test]
