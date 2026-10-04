@@ -90,6 +90,21 @@ pub fn handle_add_decision(
     Ok(())
 }
 
+/// How many results a search fetches at most. Paging (`--offset`,
+/// `--page`) and `--total` work within this window.
+const MAX_SEARCH_WINDOW: usize = 1000;
+
+/// The retrieval call a search command runs: `retrieval::search_history`
+/// or `retrieval::search_genome`.
+type SearchFn = fn(
+    &std::path::Path,
+    &state::Config,
+    &str,
+    Option<retrieval::types::RetrievalMode>,
+    Option<retrieval::types::SearchBackend>,
+    Option<usize>,
+) -> Result<retrieval::types::SearchResponse>;
+
 /// Handle the `search-history` command.
 ///
 /// Performs keyword or semantic search across session history entries,
@@ -98,96 +113,7 @@ pub fn handle_search_history(
     state: &Arc<state::State>,
     options: SearchMemoryOptions,
 ) -> Result<()> {
-    let SearchMemoryOptions {
-        query,
-        mode,
-        backend,
-        limit,
-        offset,
-        page,
-        total,
-        explain,
-        json,
-    } = options;
-
-    let mode = if let Some(m) = mode.as_deref() {
-        Some(
-            retrieval::types::RetrievalMode::parse(m)
-                .ok_or_else(|| anyhow::anyhow!("Invalid mode. Use keyword|semantic"))?,
-        )
-    } else {
-        None
-    };
-    let backend = if let Some(b) = backend.as_deref() {
-        Some(retrieval::types::SearchBackend::parse(b).ok_or_else(|| {
-            anyhow::anyhow!("Invalid backend. Use auto|sqlite-vec|rust-cosine|keyword")
-        })?)
-    } else {
-        None
-    };
-    let page_limit = limit.unwrap_or(10);
-    let page_offset = offset.unwrap_or(0)
-        + page
-            .map(|p| (p.saturating_sub(1)) * page_limit)
-            .unwrap_or(0);
-    let config = state.config_snapshot()?;
-    let resp = retrieval::search_history(
-        state.storage().base_path(),
-        &config,
-        &query,
-        mode,
-        backend,
-        limit,
-        Some(page_offset),
-    )?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&resp)?);
-    } else {
-        if total {
-            if let Some(tc) = resp.total_count {
-                println!("Total matches: {}", tc);
-            }
-        }
-        if resp.used_fallback {
-            println!(
-                "Mode: {} (fallback) [{}] - {}",
-                resp.mode,
-                resp.backend_used,
-                resp.fallback_reason
-                    .unwrap_or_else(|| "unknown reason".to_string())
-            );
-        } else {
-            println!("Mode: {} [{}]", resp.mode, resp.backend_used);
-        }
-        if resp.results.is_empty() {
-            println!("No results");
-        } else {
-            for (idx, item) in resp.results.iter().enumerate() {
-                println!(
-                    "{}. [{}] {} ({})\n   {}",
-                    idx + 1,
-                    item.source,
-                    item.title,
-                    item.id,
-                    item.snippet
-                );
-            }
-        }
-        if explain {
-            println!(
-                "\nExplain: timing={}ms candidates={} fallback_code={}",
-                resp.timing_ms,
-                resp.candidate_count,
-                resp.fallback_code
-                    .map(|c| c.as_str().to_string())
-                    .unwrap_or_else(|| "none".to_string())
-            );
-            for note in resp.engine_notes {
-                println!("  - {}", note);
-            }
-        }
-    }
-    Ok(())
+    handle_search(state, &options, retrieval::search_history)
 }
 
 /// Handle the `search-genome` command.
@@ -195,19 +121,43 @@ pub fn handle_search_history(
 /// Performs keyword or semantic search across decisions in `GENOME.md`,
 /// with pagination, backend selection, and optional scoring explanation.
 pub fn handle_search_genome(state: &Arc<state::State>, options: SearchMemoryOptions) -> Result<()> {
-    let SearchMemoryOptions {
-        query,
-        mode,
-        backend,
-        limit,
-        offset,
-        page,
-        total,
-        explain,
-        json,
-    } = options;
+    handle_search(state, &options, retrieval::search_genome)
+}
 
-    let mode = if let Some(m) = mode.as_deref() {
+/// Index of a page's first result: `--offset` plus `--page`'s earlier
+/// pages. Pages count from 1; page 0 is page 1.
+fn page_start(offset: Option<usize>, page: Option<usize>, page_limit: usize) -> usize {
+    let earlier_pages = page
+        .map(|p| p.saturating_sub(1).saturating_mul(page_limit))
+        .unwrap_or(0);
+    offset.unwrap_or(0).saturating_add(earlier_pages)
+}
+
+/// Keeps `limit` results from index `start`; returns how many results the
+/// search matched before paging.
+fn take_page(resp: &mut retrieval::types::SearchResponse, start: usize, limit: usize) -> usize {
+    let matched = resp.results.len();
+    resp.results = std::mem::take(&mut resp.results)
+        .into_iter()
+        .skip(start)
+        .take(limit)
+        .collect();
+    matched
+}
+
+/// Runs a search and keeps one page of it, returning the page and the
+/// index of its first result.
+///
+/// Every backend ranks its matches and returns the top N, so a page is the
+/// top `start + limit` with the first `start` skipped, and `--total`
+/// fetches the whole window and counts it. The offset used to be passed
+/// down and ignored, so every page was the first page.
+fn search_page(
+    state: &Arc<state::State>,
+    options: &SearchMemoryOptions,
+    search: SearchFn,
+) -> Result<(retrieval::types::SearchResponse, usize)> {
+    let mode = if let Some(m) = options.mode.as_deref() {
         Some(
             retrieval::types::RetrievalMode::parse(m)
                 .ok_or_else(|| anyhow::anyhow!("Invalid mode. Use keyword|semantic"))?,
@@ -215,73 +165,99 @@ pub fn handle_search_genome(state: &Arc<state::State>, options: SearchMemoryOpti
     } else {
         None
     };
-    let backend = if let Some(b) = backend.as_deref() {
+    let backend = if let Some(b) = options.backend.as_deref() {
         Some(retrieval::types::SearchBackend::parse(b).ok_or_else(|| {
             anyhow::anyhow!("Invalid backend. Use auto|sqlite-vec|rust-cosine|keyword")
         })?)
     } else {
         None
     };
-    let page_limit = limit.unwrap_or(10);
-    let page_offset = offset.unwrap_or(0)
-        + page
-            .map(|p| (p.saturating_sub(1)) * page_limit)
-            .unwrap_or(0);
     let config = state.config_snapshot()?;
-    let resp = retrieval::search_genome(
+    let page_limit = options
+        .limit
+        .unwrap_or(config.retrieval_default_limit)
+        .max(1);
+    let start = page_start(options.offset, options.page, page_limit);
+    if start >= MAX_SEARCH_WINDOW {
+        anyhow::bail!(
+            "--offset/--page start at result {}, past the first {MAX_SEARCH_WINDOW} results \
+             that search pages through",
+            start.saturating_add(1)
+        );
+    }
+    let window = if options.total {
+        MAX_SEARCH_WINDOW
+    } else {
+        start.saturating_add(page_limit).min(MAX_SEARCH_WINDOW)
+    };
+    let mut resp = search(
         state.storage().base_path(),
         &config,
-        &query,
+        &options.query,
         mode,
         backend,
-        limit,
-        Some(page_offset),
+        Some(window),
     )?;
-    if json {
+    let matched = take_page(&mut resp, start, page_limit);
+    if options.total {
+        resp.total_count = Some(matched);
+        if matched >= MAX_SEARCH_WINDOW {
+            resp.engine_notes
+                .push(format!("total counts at most {MAX_SEARCH_WINDOW} matches"));
+        }
+    }
+    Ok((resp, start))
+}
+
+fn handle_search(
+    state: &Arc<state::State>,
+    options: &SearchMemoryOptions,
+    search: SearchFn,
+) -> Result<()> {
+    let (resp, start) = search_page(state, options, search)?;
+    if options.json {
         println!("{}", serde_json::to_string_pretty(&resp)?);
+        return Ok(());
+    }
+    if let Some(total) = resp.total_count {
+        let capped = if total >= MAX_SEARCH_WINDOW { "+" } else { "" };
+        println!("Total matches: {total}{capped}");
+    }
+    if resp.used_fallback {
+        println!(
+            "Mode: {} (fallback) [{}] - {}",
+            resp.mode,
+            resp.backend_used,
+            resp.fallback_reason.as_deref().unwrap_or("unknown reason")
+        );
     } else {
-        if total {
-            if let Some(tc) = resp.total_count {
-                println!("Total matches: {}", tc);
-            }
-        }
-        if resp.used_fallback {
+        println!("Mode: {} [{}]", resp.mode, resp.backend_used);
+    }
+    if resp.results.is_empty() {
+        println!("No results");
+    } else {
+        for (idx, item) in resp.results.iter().enumerate() {
             println!(
-                "Mode: {} (fallback) [{}] - {}",
-                resp.mode,
-                resp.backend_used,
-                resp.fallback_reason
-                    .unwrap_or_else(|| "unknown reason".to_string())
+                "{}. [{}] {} ({})\n   {}",
+                start + idx + 1,
+                item.source,
+                item.title,
+                item.id,
+                item.snippet
             );
-        } else {
-            println!("Mode: {} [{}]", resp.mode, resp.backend_used);
         }
-        if resp.results.is_empty() {
-            println!("No results");
-        } else {
-            for (idx, item) in resp.results.iter().enumerate() {
-                println!(
-                    "{}. [{}] {} ({})\n   {}",
-                    idx + 1,
-                    item.source,
-                    item.title,
-                    item.id,
-                    item.snippet
-                );
-            }
-        }
-        if explain {
-            println!(
-                "\nExplain: timing={}ms candidates={} fallback_code={}",
-                resp.timing_ms,
-                resp.candidate_count,
-                resp.fallback_code
-                    .map(|c| c.as_str().to_string())
-                    .unwrap_or_else(|| "none".to_string())
-            );
-            for note in resp.engine_notes {
-                println!("  - {}", note);
-            }
+    }
+    if options.explain {
+        println!(
+            "\nExplain: timing={}ms candidates={} fallback_code={}",
+            resp.timing_ms,
+            resp.candidate_count,
+            resp.fallback_code
+                .map(|c| c.as_str().to_string())
+                .unwrap_or_else(|| "none".to_string())
+        );
+        for note in &resp.engine_notes {
+            println!("  - {}", note);
         }
     }
     Ok(())
@@ -443,6 +419,149 @@ mod tests {
         let (_tmp, st) = test_state();
         let result = handle_history(&st, Some(OutputFormat::Json));
         assert!(result.is_ok());
+    }
+
+    // ── search paging (review P2-24) ────────────────────────────────────
+
+    fn search_options(query: &str) -> SearchMemoryOptions {
+        SearchMemoryOptions {
+            query: query.to_string(),
+            mode: Some("keyword".to_string()),
+            backend: None,
+            limit: None,
+            offset: None,
+            page: None,
+            total: false,
+            explain: false,
+            json: false,
+        }
+    }
+
+    fn index_history(st: &Arc<state::State>, summaries: &[&str]) {
+        let entries = summaries
+            .iter()
+            .enumerate()
+            .map(|(i, summary)| state::HistoryEntry {
+                session_id: format!("s{i}"),
+                session_name: format!("Session {i}"),
+                platform: None,
+                started_at: chrono::Utc::now(),
+                ended_at: chrono::Utc::now(),
+                summary: summary.to_string(),
+                files_touched: Vec::new(),
+                tools_used: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        retrieval::index(
+            st.storage().base_path(),
+            &entries,
+            &memory::Genome::default(),
+            &st.config_snapshot().unwrap(),
+            retrieval::types::IndexScope::History,
+            true,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_page_start_combines_offset_and_page() {
+        assert_eq!(page_start(None, None, 10), 0);
+        assert_eq!(page_start(None, Some(3), 10), 20);
+        assert_eq!(page_start(Some(5), Some(2), 10), 15);
+        assert_eq!(page_start(None, Some(0), 10), 0);
+        assert_eq!(
+            page_start(Some(usize::MAX), Some(usize::MAX), 10),
+            usize::MAX
+        );
+    }
+
+    #[test]
+    fn test_take_page_skips_and_counts() {
+        let mut resp = retrieval::types::SearchResponse {
+            results: (0..5)
+                .map(|i| retrieval::types::SearchResult {
+                    source: "history".to_string(),
+                    id: format!("r{i}"),
+                    title: String::new(),
+                    snippet: String::new(),
+                    score: 0.0,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(take_page(&mut resp, 2, 2), 5);
+        let ids = resp
+            .results
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["r2", "r3"]);
+    }
+
+    #[test]
+    fn test_search_pages_through_matches_and_counts_the_total() {
+        let (_tmp, st) = test_state();
+        index_history(
+            &st,
+            &[
+                "alpha migration",
+                "alpha rollout",
+                "alpha cleanup",
+                "beta only",
+            ],
+        );
+
+        let first = SearchMemoryOptions {
+            limit: Some(1),
+            ..search_options("alpha")
+        };
+        let (page_one, start) = search_page(&st, &first, retrieval::search_history).unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(page_one.results.len(), 1);
+        assert_eq!(page_one.total_count, None);
+
+        let second = SearchMemoryOptions {
+            limit: Some(1),
+            page: Some(2),
+            total: true,
+            ..search_options("alpha")
+        };
+        let (page_two, start) = search_page(&st, &second, retrieval::search_history).unwrap();
+        assert_eq!(start, 1);
+        assert_eq!(page_two.results.len(), 1);
+        assert_ne!(page_two.results[0].id, page_one.results[0].id);
+        assert_eq!(page_two.total_count, Some(3));
+
+        let past_the_end = SearchMemoryOptions {
+            offset: Some(3),
+            ..search_options("alpha")
+        };
+        let (empty, _) = search_page(&st, &past_the_end, retrieval::search_history).unwrap();
+        assert!(empty.results.is_empty());
+    }
+
+    #[test]
+    fn test_search_refuses_a_page_past_the_window() {
+        let (_tmp, st) = test_state();
+        let options = SearchMemoryOptions {
+            offset: Some(MAX_SEARCH_WINDOW),
+            ..search_options("alpha")
+        };
+        let err = search_page(&st, &options, retrieval::search_history).unwrap_err();
+        assert!(
+            err.to_string().contains("past the first 1000 results"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_search_rejects_an_unknown_mode() {
+        let (_tmp, st) = test_state();
+        let options = SearchMemoryOptions {
+            mode: Some("fuzzy".to_string()),
+            ..search_options("alpha")
+        };
+        assert!(search_page(&st, &options, retrieval::search_genome).is_err());
     }
 
     // ── handle_activity ─────────────────────────────────────────────────

@@ -41,8 +41,8 @@ locally. `—` means the dispatcher prints a direct-mode instruction instead of 
 | `sync-context` | Yes | — | Synchronize context across sessions (`--session-id`, `--inject-mode`) |
 | `compute-injection` | Yes | — | Compute dynamic injection selection (`--query`, `--limit`) |
 | `verify` | Yes | Local | Run project verification checks |
-| `search-history` | Yes | — | Search session history (`--query`, `--mode`, `--backend`, `--limit`) |
-| `search-genome` | Yes | — | Search genome decisions (`--query`, `--mode`, `--backend`, `--limit`) |
+| `search-history` | Yes | — | Search session history (`--query`, `--mode`, `--backend`, `--limit`; `--offset`/`--page` page through the first 1000 matches, `--total` counts them; `--explain`, `--json`) |
+| `search-genome` | Yes | — | Search genome decisions (`--query`, `--mode`, `--backend`, `--limit`; `--offset`/`--page` page through the first 1000 matches, `--total` counts them; `--explain`, `--json`) |
 | `index-memory` | Yes | — | Index memory for search (`--scope`, `--rebuild`) |
 | `retrieval-status` | Yes | — | Show retrieval index status (`--check`, `--json`) |
 | `tools` | Yes | — | Manage installed tools (`list`/`init`/`update`/`check`, `--tool`, `--dry-run`) |

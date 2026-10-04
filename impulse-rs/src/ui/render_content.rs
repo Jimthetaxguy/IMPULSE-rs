@@ -446,7 +446,6 @@ pub(crate) fn render_search(
                 None,
                 Some(crate::retrieval::types::SearchBackend::Auto),
                 Some(10),
-                None,
             ) {
                 let explain = format!(
                     "Retrieval: backend={} fallback={} code={} time={}ms candidates={}",

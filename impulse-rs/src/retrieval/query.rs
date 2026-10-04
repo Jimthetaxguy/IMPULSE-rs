@@ -570,12 +570,9 @@ pub fn search_history(
     mode_override: Option<RetrievalMode>,
     backend_override: Option<SearchBackend>,
     limit_override: Option<usize>,
-    offset_override: Option<usize>,
 ) -> Result<SearchResponse> {
     let started = Instant::now();
     let limit = limit_override.unwrap_or(config.retrieval_default_limit.max(1));
-    let offset = offset_override.unwrap_or(0);
-    let _ = offset; // offset parameter reserved for future use
     let mode = resolve_mode(config, mode_override);
 
     if query.trim().is_empty() {
@@ -732,12 +729,9 @@ pub fn search_genome(
     mode_override: Option<RetrievalMode>,
     backend_override: Option<SearchBackend>,
     limit_override: Option<usize>,
-    offset_override: Option<usize>,
 ) -> Result<SearchResponse> {
     let started = Instant::now();
     let limit = limit_override.unwrap_or(config.retrieval_default_limit.max(1));
-    let offset = offset_override.unwrap_or(0);
-    let _ = offset; // offset parameter reserved for future use
     let mode = resolve_mode(config, mode_override);
 
     if query.trim().is_empty() {

@@ -89,9 +89,8 @@ pub fn search_history(
     mode: Option<RetrievalMode>,
     backend: Option<SearchBackend>,
     limit: Option<usize>,
-    offset: Option<usize>,
 ) -> Result<SearchResponse> {
-    query::search_history(base_path, config, query, mode, backend, limit, offset)
+    query::search_history(base_path, config, query, mode, backend, limit)
 }
 
 pub fn search_genome(
@@ -101,9 +100,8 @@ pub fn search_genome(
     mode: Option<RetrievalMode>,
     backend: Option<SearchBackend>,
     limit: Option<usize>,
-    offset: Option<usize>,
 ) -> Result<SearchResponse> {
-    query::search_genome(base_path, config, query, mode, backend, limit, offset)
+    query::search_genome(base_path, config, query, mode, backend, limit)
 }
 
 pub fn status(base_path: &Path, config: &Config, check: bool) -> Result<RetrievalStatus> {
@@ -344,8 +342,7 @@ mod tests {
         .unwrap();
 
         // Search for the entry
-        let result =
-            search_history(tmp.path(), &config, "search", None, None, Some(5), None).unwrap();
+        let result = search_history(tmp.path(), &config, "search", None, None, Some(5)).unwrap();
         assert!(result.candidate_count > 0);
         assert!(!result.results.is_empty());
     }
@@ -372,8 +369,7 @@ mod tests {
         let _idx = index(tmp.path(), &[], &genome, &config, IndexScope::Genome, true).unwrap();
 
         // Search for the entry
-        let result =
-            search_genome(tmp.path(), &config, "sqlite", None, None, Some(5), None).unwrap();
+        let result = search_genome(tmp.path(), &config, "sqlite", None, None, Some(5)).unwrap();
         assert!(result.candidate_count > 0);
         assert!(!result.results.is_empty());
         // Verify we found the SQLite decision

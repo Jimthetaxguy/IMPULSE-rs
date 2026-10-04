@@ -272,7 +272,6 @@ pub fn run_injection(
         Some(retrieval_mode),
         Some(SearchBackend::Auto),
         Some(candidate_limit),
-        None,
     );
     let genome_response = crate::retrieval::search_genome(
         base_path,
@@ -281,7 +280,6 @@ pub fn run_injection(
         Some(retrieval_mode),
         Some(SearchBackend::Auto),
         Some(candidate_limit),
-        None,
     );
 
     let mut snippets = Vec::new();
