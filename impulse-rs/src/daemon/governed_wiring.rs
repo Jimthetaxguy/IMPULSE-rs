@@ -3067,21 +3067,39 @@ mod tests {
     /// state layer enforces. Two copies can drift; this makes drift fail
     /// loudly rather than silently letting the daemon delete a checkout the
     /// ledger would then refuse to record.
+    /// Every pin shape the rules must agree on: none, a current-scheme pin,
+    /// and pins under superseded and future schemes. The matrices used to hold
+    /// only the first two, so the daemon's discard rule could treat a
+    /// superseded-scheme pin differently from the state layer unnoticed.
+    fn matrix_pins() -> Vec<impulse_ops::governed_task::SharedRepositoryConfigPin> {
+        use impulse_ops::governed_task::{
+            SharedRepositoryConfigDigest, SharedRepositoryConfigPin,
+            LEGACY_SHARED_REPOSITORY_CONFIG_SCHEME_VERSION,
+            SHARED_REPOSITORY_CONFIG_SCHEME_VERSION,
+        };
+        let current =
+            SharedRepositoryConfigDigest::current(format!("sha256:{}", "c".repeat(64)), None, None);
+        let at_scheme = |scheme_version| {
+            SharedRepositoryConfigPin::Recorded(SharedRepositoryConfigDigest {
+                scheme_version,
+                ..current.clone()
+            })
+        };
+        vec![
+            SharedRepositoryConfigPin::Unknown,
+            SharedRepositoryConfigPin::Recorded(current.clone()),
+            at_scheme(LEGACY_SHARED_REPOSITORY_CONFIG_SCHEME_VERSION),
+            at_scheme(SHARED_REPOSITORY_CONFIG_SCHEME_VERSION - 1),
+            at_scheme(SHARED_REPOSITORY_CONFIG_SCHEME_VERSION + 1),
+        ]
+    }
+
     #[test]
     fn both_discardability_rules_agree_over_the_whole_state_matrix() {
         use crate::state::staged_worktree_is_discardable as state_layer_rule;
 
         let base = matrix_task;
-        let pins = [
-            impulse_ops::governed_task::SharedRepositoryConfigPin::Unknown,
-            impulse_ops::governed_task::SharedRepositoryConfigPin::Recorded(
-                impulse_ops::governed_task::SharedRepositoryConfigDigest::current(
-                    format!("sha256:{}", "c".repeat(64)),
-                    None,
-                    None,
-                ),
-            ),
-        ];
+        let pins = matrix_pins();
         let promotions = [
             None,
             Some(GovernedPromotionOutcome::Promoted {
@@ -3162,16 +3180,7 @@ mod tests {
         // changing it changes this test.
         let endpoint_admits = |task: &GovernedTaskRun| promote_preflight(task).is_ok();
 
-        let pins = [
-            impulse_ops::governed_task::SharedRepositoryConfigPin::Unknown,
-            impulse_ops::governed_task::SharedRepositoryConfigPin::Recorded(
-                impulse_ops::governed_task::SharedRepositoryConfigDigest::current(
-                    format!("sha256:{}", "c".repeat(64)),
-                    None,
-                    None,
-                ),
-            ),
-        ];
+        let pins = matrix_pins();
         let promotions = [
             None,
             Some(GovernedPromotionOutcome::Promoted {

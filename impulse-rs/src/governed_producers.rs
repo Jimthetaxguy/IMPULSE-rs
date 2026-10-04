@@ -2571,6 +2571,21 @@ pub fn promote_governed_outcome(task: &GovernedTaskRun) -> Result<GovernedPromot
             PromotionBlockedReason::DetachedHead,
         ));
     };
+    // A retry after the branch already advanced -- the swap landed, then the
+    // worktree sync or the receipt failed, or the daemon died before
+    // recording it -- finds the clean canonical branch at the accepted commit.
+    // That is this promotion's own effect, not a concurrent move; reporting it
+    // as `CanonicalHeadMoved` left the run permanently unpromotable.
+    if canonical_head == accepted_revision {
+        return Ok(GovernedPromotionInput {
+            actor: staged_system_actor(),
+            accepted_revision: accepted_revision.clone(),
+            initial_subject_revision: initial,
+            outcome: GovernedPromotionOutcome::Promoted {
+                promoted_revision: accepted_revision,
+            },
+        });
+    }
     if canonical_head != initial {
         return Ok(blocked(
             canonical_head,

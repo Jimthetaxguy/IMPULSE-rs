@@ -260,6 +260,26 @@ fn test_promotion_fast_forwards_the_canonical_branch_when_head_has_not_moved() {
     );
 }
 
+/// Review P2: a promotion retried after its branch swap had landed (the
+/// sync or the receipt then failed, or the daemon died) was recorded as
+/// `CanonicalHeadMoved` and could never become `Promoted`.
+#[test]
+fn test_promotion_retried_after_the_branch_advanced_is_promoted() {
+    let (_dir, repo) = init_repo();
+    let (task, _initial, builder_commit, _root) = staged_with_builder_commit(&repo);
+
+    promote_governed_outcome(&task).expect("first promotion");
+    let retried = promote_governed_outcome(&task).expect("retry");
+
+    assert_eq!(
+        retried.outcome,
+        GovernedPromotionOutcome::Promoted {
+            promoted_revision: builder_commit.clone()
+        }
+    );
+    assert_eq!(head(&repo), builder_commit);
+}
+
 #[test]
 fn test_promotion_blocks_without_touching_the_canonical_branch_when_head_moved() {
     let (_dir, repo) = init_repo();

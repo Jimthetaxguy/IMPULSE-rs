@@ -257,12 +257,17 @@ pub fn staged_worktree_is_discardable(task: &GovernedTaskRun) -> bool {
     {
         return true;
     }
-    // A worktree with no shared-configuration pin can never be promoted, so
-    // discarding it is the only way forward and must always be available.
+    // A worktree whose shared-configuration pin this build cannot compare --
+    // absent, or recorded under a superseded digest scheme -- can never be
+    // promoted, so discarding it is the only way forward and must always be
+    // available. This must match the state layer's rule exactly: checking only
+    // `is_unknown` left a superseded-scheme pin undiscardable here (the daemon
+    // preflight and the cockpit's Discard control) while every other path
+    // told the operator to discard it.
     if task
         .staged_worktree
         .as_ref()
-        .is_some_and(|staged| staged.shared_config_digest.is_unknown())
+        .is_some_and(|staged| !staged.shared_config_digest.is_comparable())
     {
         return true;
     }
