@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::RwLock;
 
 use crate::storage::Storage;
 
@@ -78,7 +78,7 @@ impl std::fmt::Debug for State {
 impl Drop for State {
     fn drop(&mut self) {
         if self.dirty.load(Ordering::Acquire) {
-            if let Ok(state) = self.live_state.try_read() {
+            if let Ok(state) = self.live_state.read() {
                 if let Err(err) = self.storage.write_json(LIVE_STATE_FILE, &*state) {
                     tracing::error!("failed to persist live state on drop: {}", err);
                 }
@@ -161,7 +161,7 @@ impl State {
     }
 
     pub async fn sync_immediate(&self) -> Result<()> {
-        let state = self.live_state.try_read().map(|s| s.clone())?;
+        let state = self.live_state.read().map_err(lock_err)?.clone();
         self.storage
             .write_json(LIVE_STATE_FILE, &state)
             .context("Failed to write live state to disk")?;
@@ -179,7 +179,7 @@ impl State {
         let session = Session::new(name, platform);
 
         {
-            let mut state = self.live_state.try_write().map_err(lock_err)?;
+            let mut state = self.live_state.write().map_err(lock_err)?;
             state.add_session(session.clone());
         }
 
@@ -197,34 +197,34 @@ impl State {
         summary: String,
     ) -> Result<Option<HistoryEntry>> {
         let history_entry = {
-            let mut state = self.live_state.try_write().map_err(lock_err)?;
-
-            if let Some(session) = state.get_session_mut(session_id) {
-                session.set_status(SessionStatus::Completed);
-
-                let entry = HistoryEntry {
-                    session_id: session.id.clone(),
-                    session_name: session.name.clone(),
-                    platform: session.platform,
-                    started_at: session.created_at,
-                    ended_at: Utc::now(),
-                    summary,
-                    files_touched: session.active_files.clone(),
-                    tools_used: session.recent_tools.clone(),
-                };
-
-                state.remove_session(session_id);
-                Some(entry)
-            } else {
-                None
+            let mut state = self.live_state.write().map_err(lock_err)?;
+            match state.get_session(session_id) {
+                Some(session) => {
+                    let entry = HistoryEntry {
+                        session_id: session.id.clone(),
+                        session_name: session.name.clone(),
+                        platform: session.platform,
+                        started_at: session.created_at,
+                        ended_at: Utc::now(),
+                        summary,
+                        files_touched: session.active_files.clone(),
+                        tools_used: session.recent_tools.clone(),
+                    };
+                    // Record the history first and remove the session only
+                    // once that succeeded: removing it first lost both the
+                    // session and its history entry when the append failed
+                    // (disk full, unwritable file), and a retry then said
+                    // "Session not found". The lock is held across the append
+                    // so two concurrent ends cannot both record the session.
+                    self.storage
+                        .append_jsonl(HISTORY_FILE, &entry)
+                        .context("Failed to append session to history log")?;
+                    state.remove_session(session_id);
+                    Some(entry)
+                }
+                None => None,
             }
         };
-
-        if let Some(ref entry) = history_entry {
-            self.storage
-                .append_jsonl(HISTORY_FILE, entry)
-                .context("Failed to append session to history log")?;
-        }
 
         self.mark_dirty();
         self.sync_immediate()
@@ -251,7 +251,7 @@ impl State {
     ) -> Result<Vec<String>> {
         let state = self
             .live_state
-            .try_read()
+            .read()
             .map_err(|_| anyhow::anyhow!("Failed to acquire read lock on live state"))?;
 
         let mut conflicting = Vec::new();
@@ -320,7 +320,7 @@ impl State {
     {
         let mut updated = false;
         {
-            let mut state = self.live_state.try_write().map_err(lock_err)?;
+            let mut state = self.live_state.write().map_err(lock_err)?;
             if let Some(session) = state.get_session_mut(session_id) {
                 f(session);
                 updated = true;
@@ -337,12 +337,12 @@ impl State {
     }
 
     pub async fn get_session(&self, session_id: &str) -> Result<Option<Session>> {
-        let state = self.live_state.try_read().map_err(lock_err)?;
+        let state = self.live_state.read().map_err(lock_err)?;
         Ok(state.get_session(session_id).cloned())
     }
 
     pub async fn list_sessions(&self) -> Result<Vec<Session>> {
-        let state = self.live_state.try_read().map_err(lock_err)?;
+        let state = self.live_state.read().map_err(lock_err)?;
         Ok(state.list_sessions().into_iter().cloned().collect())
     }
 
@@ -356,13 +356,13 @@ impl State {
 
     /// Get a config value by key
     pub fn get_config(&self, key: &str) -> Result<Option<String>> {
-        let config = self.config.try_read().map_err(lock_err)?;
+        let config = self.config.read().map_err(lock_err)?;
         Ok(config.get(key))
     }
 
     /// Set a config value by key
     pub fn set_config(&self, key: &str, value: &str) -> Result<bool> {
-        let mut config = self.config.try_write().map_err(lock_err)?;
+        let mut config = self.config.write().map_err(lock_err)?;
         let result = config.set(key, value);
         if result {
             self.storage
@@ -374,18 +374,18 @@ impl State {
 
     /// List all config values
     pub fn list_config(&self) -> Result<Vec<(String, String)>> {
-        let config = self.config.try_read().map_err(lock_err)?;
+        let config = self.config.read().map_err(lock_err)?;
         Ok(config.list())
     }
 
     pub fn config_snapshot(&self) -> Result<Config> {
-        let config = self.config.try_read().map_err(lock_err)?;
+        let config = self.config.read().map_err(lock_err)?;
         Ok(config.clone())
     }
 
     /// Update guardrail rules in config and persist to disk
     pub fn update_guardrail_rules(&self, rules: Vec<crate::guardrail::GuardRule>) -> Result<()> {
-        let mut config = self.config.try_write().map_err(lock_err)?;
+        let mut config = self.config.write().map_err(lock_err)?;
         config.guardrails.rules = rules;
         self.storage
             .write_json(CONFIG_FILE, &*config)
@@ -397,7 +397,7 @@ impl State {
         &self,
         policy: impulse_ops::SupervisorPermissionPolicy,
     ) -> Result<()> {
-        let mut config = self.config.try_write().map_err(lock_err)?;
+        let mut config = self.config.write().map_err(lock_err)?;
         let mut normalized = policy;
         normalized.normalize();
         config.impulse_agent_permissions = normalized;
@@ -604,6 +604,48 @@ impl ConflictAnalytics {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Review P2: try-locks on the Tokio RwLocks failed any call that
+    /// overlapped another, which the daemon's concurrent connections do.
+    #[test]
+    fn test_reads_and_writes_wait_for_a_held_lock_instead_of_failing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = std::sync::Arc::new(State::new(dir.path().to_path_buf()).unwrap());
+        let held = state.live_state.read().unwrap();
+        let writer = std::sync::Arc::clone(&state);
+        let handle = std::thread::spawn(move || writer.set_config("log_level", "debug"));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(held);
+        assert!(handle.join().unwrap().unwrap());
+        assert_eq!(
+            state.get_config("log_level").unwrap().as_deref(),
+            Some("debug")
+        );
+    }
+
+    /// Review P2: the session was removed before its history was appended,
+    /// so a failed append lost both.
+    #[tokio::test]
+    async fn test_end_session_keeps_the_session_when_history_cannot_be_written() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = State::new(dir.path().to_path_buf()).unwrap();
+        let session = state.create_session("s".to_string(), None).await.unwrap();
+        std::fs::create_dir_all(dir.path().join(HISTORY_FILE)).unwrap();
+
+        assert!(state
+            .end_session(&session.id, "done".to_string())
+            .await
+            .is_err());
+        assert!(state.get_session(&session.id).await.unwrap().is_some());
+
+        std::fs::remove_dir(dir.path().join(HISTORY_FILE)).unwrap();
+        assert!(state
+            .end_session(&session.id, "done".to_string())
+            .await
+            .unwrap()
+            .is_some());
+        assert!(state.get_session(&session.id).await.unwrap().is_none());
+    }
 
     #[test]
     fn test_config_default() {
