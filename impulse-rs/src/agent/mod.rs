@@ -875,6 +875,13 @@ impl ImpulseAgent {
                     AgentError::InvalidRequest("Agent not initialized".to_string())
                 })?;
                 agent.system_prompt = Some(system_prompt.to_string());
+                // Continuity comes from the bounded summary prepended above
+                // (`MAX_SESSION_HISTORY` turns). The inner agent's own history
+                // also re-sent every past turn in full: the daemon caches one
+                // agent for its whole life, so each request grew and the
+                // context was carried twice until requests hit the model's
+                // limit. Harness mode is already stateless per query.
+                agent.clear_history();
                 agent.chat(&enriched_prompt).await
             }
             AgentMode::Harness { .. } => {
@@ -1222,6 +1229,62 @@ mod tests {
 
     struct RecordingStatelessProvider {
         models: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    /// Records how many messages each request carried.
+    struct MessageCountProvider {
+        counts: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for MessageCountProvider {
+        fn name(&self) -> &str {
+            "message-count"
+        }
+        fn default_model(&self) -> &str {
+            "count-default"
+        }
+        async fn chat(
+            &self,
+            request: crate::llm_backends::ChatRequest,
+        ) -> AgentResult<crate::llm_backends::ChatResponse> {
+            self.counts.lock().unwrap().push(request.messages.len());
+            Ok(crate::llm_backends::ChatResponse {
+                content: "ok".to_string(),
+                model: request.model,
+                usage: crate::llm_backends::Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+                stop_reason: crate::llm_backends::StopReason::EndTurn,
+                tool_calls: Vec::new(),
+            })
+        }
+        fn supported_models(&self) -> Vec<&str> {
+            vec!["count-default"]
+        }
+    }
+
+    /// Review P2: the cached API agent re-sent every past turn on each
+    /// query, so requests grew by two messages per turn without bound.
+    #[tokio::test]
+    async fn test_api_query_request_size_stays_bounded() {
+        let counts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = ImpulseAgent::with_test_provider(Box::new(MessageCountProvider {
+            counts: std::sync::Arc::clone(&counts),
+        }));
+        for turn in 0..12 {
+            agent
+                .query("system", &format!("question {turn}"))
+                .await
+                .expect("query");
+        }
+        let counts = counts.lock().unwrap();
+        assert_eq!(counts.len(), 12);
+        assert!(
+            counts.iter().all(|&count| count == counts[0]),
+            "every request must carry the same number of messages: {counts:?}"
+        );
     }
 
     #[async_trait::async_trait]
