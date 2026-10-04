@@ -40,6 +40,32 @@ tags: [worktree, lane, handoff, cleanup, review]
   Git history and `impulse-rs/impulse-ion/TUI_SPEC.md`.
 
 ## Handoff Notes
+- Hook stdin hang (fixed here): `handlers::common::read_hook_stdin_payload` ran an unbounded
+  `read_to_string` on any non-terminal stdin for `session-start`/`session-end` (direct and daemon
+  dispatch), so a caller that left stdin as an open pipe hung forever; a `cargo test` started from
+  such a shell hung in `handlers::session` and `direct_dispatch` tests. The payload's only consumer
+  is hook evidence, so it is now read only when `IMPULSE_HOOK_EVIDENCE` is on, capped at 1 MiB, and
+  abandoned after 2 s.
+- Tests that could not fail (fixed here): six `direct_dispatch` tests ended in `let _ = result`
+  (two named `..._returns_err` for handlers that deliberately fail open); they now assert the
+  fail-open contract and that no session or history was created. The print-helper tests in
+  `handlers/common.rs` now assert on text from new pure formatters; the session-start banner tests
+  no longer race on `IMPULSE_HOOK_SENTINEL`. An ignored verify-dispatch test that asserted nothing
+  was removed. `VerificationReport::success()` no longer reports a pass for zero checks.
+- Worktree audit (2026-10-04): of the 34 worktrees under `.worktrees/`, 16 are clean and belong to
+  merged PRs whose commits all landed (`document-read-hardening-20260902`'s extra commits landed via
+  #49), and `governed-task-run`'s commits are all in `main` too. Nine are pushed but unmerged with
+  no PR (`agent-cache-serialization`, `agent-truth-parity`, `code-wiki-baseline-20260828`,
+  `desktop-daemon-truth-wire`, `dioxus-egui-retirement`, `dioxus-packaged-acceptance-20260830`,
+  `dioxus-release-truth-20260829`, `harness-evolution-adr`, `live-daemon-truth-integration`) and
+  need keep-or-close decisions. Every local-only commit is on `origin` under `backup/*` (new today:
+  `backup/claude-desktop-ux-functional-fixes-local-20261004`, two 2026-07-21 desktop commits that
+  never reached `main`). Five stale worktrees hold uncommitted changes (`base-url-override`,
+  `governed-role-launch`, `legacy-ui-retirement-plan`, `legacy-ui-retirement-rewrite`,
+  `pr51-verification-guide-20260912`); removal waits for James.
+- Pending stack: the blackboard branch now carries the IMPULSE_HOME test-race fix (`b73e22d`);
+  the provider (`d006855`) and VISION (`bca4bd8`) branches were restacked onto it; the provider
+  tree is byte-identical to its gated tip `88843b2`.
 - Restriction-lint audit (`clippy::unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`,
   `dbg_macro`, `undocumented_unsafe_blocks`) over non-test code at `7481457`: 27 sites, all
   `expect`/`unwrap` backed by local invariants (piped stdio, generated IDs, guarded `is_empty`).

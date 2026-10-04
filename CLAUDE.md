@@ -106,7 +106,7 @@ Before implementing, consider alternative approaches. Choose the simplest soluti
 - `impulse-rs/impulse-ops/` — shared control-plane protocol and models: supervisor policy/actions, telemetry, workbench snapshots, artifacts, daemon requests/responses, and the agent-platform registry
 - `impulse-rs/impulse-term/` — PTY/session/context core (PTY + vt100 + WriteQueue + context bridge)
 - `impulse-rs/impulse-desktop/` — Dioxus cockpit, typed host bridge, workspace registry, PTY runtime integration, and desktop MCP surface; it projects backend truth rather than owning it
-- `impulse-rs/impulse-ion/` — Ion harness contract v0 (transport-agnostic `HarnessRequest`/`HarnessResponse` types + `PiAdapter`, the Rust-side caller of harness #2/Pi-on-MiniMax; drives `impulse-rs ion-verify`, see `impulse-ion/TUI_SPEC.md` for the ion-cli agent roadmap, 23 tests)
+- `impulse-rs/impulse-ion/` — Ion harness contract v0 (transport-agnostic `HarnessRequest`/`HarnessResponse` types + `PiAdapter`, the Rust-side caller of harness #2/Pi-on-MiniMax; drives `impulse-rs ion-verify`, see `impulse-ion/TUI_SPEC.md` for the ion-cli agent roadmap)
 
 **Legacy:** `impulse-gui` / egui is frozen. It receives compile-maintenance only until the Dioxus desktop host reaches parity. Tauri-shaped code is also compatibility-only, not a new product scaffold target.
 
