@@ -8,8 +8,10 @@ use super::{load_build_hygiene_config, print_json, print_verification_report};
 
 /// Handle the `verify` command.
 ///
-/// Runs the default verification steps (build, test, clippy, fmt) and prints
-/// a pass/fail report. Bails on failure.
+/// Runs the verification steps detected for the current directory (package
+/// scripts, `cargo check` and `cargo test`, and the retrieval contract check;
+/// see `verify::default_steps`) and prints a pass/fail report. Bails on
+/// failure.
 pub fn handle_verify() -> Result<()> {
     let steps = verify::default_steps(&std::env::current_dir()?);
     let report = verify::run_verification(steps)?;

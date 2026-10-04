@@ -42,20 +42,57 @@ pub(crate) fn is_truthy_env(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Upper bound on a hook's stdin payload. Hook runners send a small JSON
+/// object; anything past this is cut off rather than buffered.
+const MAX_HOOK_STDIN_BYTES: u64 = 1024 * 1024;
+
+/// How long to wait for a hook runner to finish writing stdin and close it.
+const HOOK_STDIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The payload a hook runner piped on stdin, recorded as hook evidence.
+///
+/// Hook evidence is the only consumer, so stdin is read only when
+/// `IMPULSE_HOOK_EVIDENCE` is on, and never from a terminal. A caller that
+/// leaves stdin as an open pipe (a CI job, a background shell, an agent's
+/// tool runner) must not stall `session-start`/`session-end`, so the read is
+/// capped at [`MAX_HOOK_STDIN_BYTES`] and abandoned after
+/// [`HOOK_STDIN_TIMEOUT`].
 pub(crate) fn read_hook_stdin_payload() -> Option<String> {
-    let mut stdin = std::io::stdin();
+    if !is_truthy_env("IMPULSE_HOOK_EVIDENCE") {
+        return None;
+    }
+    let stdin = std::io::stdin();
     if stdin.is_terminal() {
         return None;
     }
+    read_payload_with_deadline(stdin, HOOK_STDIN_TIMEOUT, MAX_HOOK_STDIN_BYTES)
+}
 
-    let mut payload = String::new();
-    if stdin.read_to_string(&mut payload).is_ok() {
-        let trimmed = payload.trim().to_string();
-        if !trimmed.is_empty() {
-            return Some(trimmed);
-        }
-    }
-    None
+/// Reads `reader` to its end on a helper thread, keeping at most `max_bytes`,
+/// and gives up after `timeout`. A reader that never reaches EOF leaves its
+/// thread blocked until the process exits; the caller is not held.
+fn read_payload_with_deadline<R>(
+    reader: R,
+    timeout: std::time::Duration,
+    max_bytes: u64,
+) -> Option<String>
+where
+    R: Read + Send + 'static,
+{
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let read = reader
+            .take(max_bytes)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes);
+        // The receiver is gone once the deadline passed; nothing to report.
+        let _ = sender.send(read);
+    });
+    let bytes = receiver.recv_timeout(timeout).ok()?.ok()?;
+    let payload = String::from_utf8_lossy(&bytes);
+    let trimmed = payload.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 // ============================================================================
@@ -212,7 +249,13 @@ pub(crate) fn persist_claude_env_var_at(
 }
 
 pub(crate) fn hook_session_start_banner() -> Option<String> {
-    if !is_truthy_env("IMPULSE_HOOK_SENTINEL") {
+    session_start_banner(is_truthy_env("IMPULSE_HOOK_SENTINEL"))
+}
+
+/// The SessionStart validation marker, when the sentinel is enabled. Split
+/// from the env read so tests do not race on `IMPULSE_HOOK_SENTINEL`.
+fn session_start_banner(sentinel_enabled: bool) -> Option<String> {
+    if !sentinel_enabled {
         return None;
     }
 
@@ -364,8 +407,12 @@ pub(crate) fn load_build_hygiene_config(state: &state::State) -> build_hygiene::
 // ============================================================================
 
 pub(crate) fn print_injection_explain(result: &injection::types::InjectionRunResult) {
-    println!(
-        "Injection: requested={} effective={} applied={} backend={} fallback_code={} timing={}ms candidates={} status={} artifact={}",
+    print!("{}", format_injection_explain(result));
+}
+
+fn format_injection_explain(result: &injection::types::InjectionRunResult) -> String {
+    let mut out = format!(
+        "Injection: requested={} effective={} applied={} backend={} fallback_code={} timing={}ms candidates={} status={} artifact={}\n",
         result.requested_mode,
         result.effective_mode,
         result.applied,
@@ -384,18 +431,24 @@ pub(crate) fn print_injection_explain(result: &injection::types::InjectionRunRes
             .unwrap_or_else(|| "none".to_string())
     );
     if let Some(reason) = &result.skipped_reason {
-        println!("  skipped_reason={}", reason);
+        out.push_str(&format!("  skipped_reason={reason}\n"));
     }
     if let Some(error) = &result.explain.error {
-        println!("  error={}", error);
+        out.push_str(&format!("  error={error}\n"));
     }
+    out
 }
 
 pub(crate) fn print_config(config: Vec<(String, String)>) {
     branding::print_header("Configuration");
-    for (k, v) in config {
-        println!("  {}: {}", k, v);
-    }
+    print!("{}", format_config_entries(&config));
+}
+
+fn format_config_entries(config: &[(String, String)]) -> String {
+    config
+        .iter()
+        .map(|(k, v)| format!("  {k}: {v}\n"))
+        .collect()
 }
 
 pub(crate) fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
@@ -407,9 +460,15 @@ pub(crate) fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
 
 pub(crate) fn print_verification_report(report: &verify::VerificationReport) {
     branding::print_header("Verification Report");
+    print!("{}", format_verification_report(report));
+}
+
+/// Pass/fail lines, the last 20 output lines of a failed step, and a summary.
+fn format_verification_report(report: &verify::VerificationReport) -> String {
+    let mut out = String::new();
     for result in &report.results {
         let status = if result.success { "PASS" } else { "FAIL" };
-        println!("{} - {}", status, result.step.name);
+        out.push_str(&format!("{} - {}\n", status, result.step.name));
         if !result.success {
             let tail = result
                 .output
@@ -421,17 +480,18 @@ pub(crate) fn print_verification_report(report: &verify::VerificationReport) {
                 .rev()
                 .collect::<Vec<_>>()
                 .join("\n");
-            println!("\nLast output:\n{}\n", tail);
+            out.push_str(&format!("\nLast output:\n{tail}\n\n"));
         }
     }
-    println!(
-        "Summary: {}",
-        if report.success() {
-            "ALL CHECKS PASSED"
-        } else {
-            "BLOCKED - fix failing checks"
-        }
-    );
+    let summary = if report.results.is_empty() {
+        "NO CHECKS RAN"
+    } else if report.success() {
+        "ALL CHECKS PASSED"
+    } else {
+        "BLOCKED - fix failing checks"
+    };
+    out.push_str(&format!("Summary: {summary}\n"));
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -829,28 +889,57 @@ mod tests {
     // ── hook_session_start_banner ─────────────────────────────────────────
 
     #[test]
-    fn test_hook_session_start_banner_respects_sentinel_env() {
-        // Set the sentinel and test that the banner is returned
-        std::env::set_var("IMPULSE_HOOK_SENTINEL", "1");
-        let result = hook_session_start_banner();
-        // Due to env var races, result may be None if another test cleared it
-        if let Some(banner) = result {
-            assert!(
-                banner.contains("IMPULSE_HOOK_SENTINEL"),
-                "Banner should contain sentinel marker"
-            );
-            assert!(
-                banner.contains("SessionStart"),
-                "Banner should mention SessionStart"
-            );
-        }
-        std::env::remove_var("IMPULSE_HOOK_SENTINEL");
+    fn test_session_start_banner_enabled_carries_the_sentinel_marker() {
+        let banner = session_start_banner(true).expect("enabled sentinel emits a banner");
+        assert!(banner.contains("IMPULSE_HOOK_SENTINEL"), "{banner}");
+        assert!(banner.contains("SessionStart"), "{banner}");
     }
 
     #[test]
-    fn test_hook_session_start_banner_does_not_panic() {
-        // Regardless of env state, function should never panic
-        let _result = hook_session_start_banner();
+    fn test_session_start_banner_disabled_emits_nothing() {
+        assert_eq!(session_start_banner(false), None);
+    }
+
+    // ── read_payload_with_deadline ────────────────────────────────────────
+
+    #[test]
+    fn test_read_payload_with_deadline_returns_trimmed_payload() {
+        let reader = std::io::Cursor::new(b"  {\"hook\":\"SessionStart\"}\n".to_vec());
+        let payload = read_payload_with_deadline(reader, std::time::Duration::from_secs(5), 1024);
+        assert_eq!(payload.as_deref(), Some("{\"hook\":\"SessionStart\"}"));
+    }
+
+    #[test]
+    fn test_read_payload_with_deadline_blank_input_is_none() {
+        let reader = std::io::Cursor::new(b" \n\t ".to_vec());
+        assert_eq!(
+            read_payload_with_deadline(reader, std::time::Duration::from_secs(5), 1024),
+            None
+        );
+    }
+
+    #[test]
+    fn test_read_payload_with_deadline_caps_the_payload_size() {
+        let reader = std::io::Cursor::new(vec![b'x'; 4096]);
+        let payload = read_payload_with_deadline(reader, std::time::Duration::from_secs(5), 100)
+            .expect("payload");
+        assert_eq!(payload.len(), 100);
+    }
+
+    /// The hang this guards against: a pipe whose writer never closes.
+    #[cfg(unix)]
+    #[test]
+    fn test_read_payload_with_deadline_gives_up_on_a_pipe_that_never_closes() {
+        let (reader, _writer_kept_open) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let started = std::time::Instant::now();
+        let payload =
+            read_payload_with_deadline(reader, std::time::Duration::from_millis(100), 1024);
+        assert_eq!(payload, None);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the deadline must bound the wait: {:?}",
+            started.elapsed()
+        );
     }
 
     // ── capture_hook_evidence ─────────────────────────────────────────────
@@ -1114,55 +1203,73 @@ mod tests {
     }
 
     #[test]
-    fn test_print_injection_explain_no_panic_basic() {
+    fn test_format_injection_explain_basic_is_one_summary_line() {
         let result = make_test_injection_result(None, None, None);
-        // Should not panic — output goes to stdout
-        print_injection_explain(&result);
+        let text = format_injection_explain(&result);
+        assert_eq!(
+            text,
+            "Injection: requested=apply effective=apply applied=true backend=jsonl \
+             fallback_code=none timing=42ms candidates=5 status=ok artifact=/tmp/artifact.md\n"
+        );
     }
 
     #[test]
-    fn test_print_injection_explain_no_panic_with_skipped_reason() {
+    fn test_format_injection_explain_adds_skipped_reason_line() {
         let result = make_test_injection_result(Some("no candidates".to_string()), None, None);
-        print_injection_explain(&result);
+        let text = format_injection_explain(&result);
+        assert!(
+            text.ends_with("\n  skipped_reason=no candidates\n"),
+            "{text}"
+        );
+        assert!(!text.contains("error="), "{text}");
     }
 
     #[test]
-    fn test_print_injection_explain_no_panic_with_error() {
+    fn test_format_injection_explain_adds_error_line() {
         let result = make_test_injection_result(None, None, Some("retrieval timeout".to_string()));
-        print_injection_explain(&result);
+        let text = format_injection_explain(&result);
+        assert!(text.ends_with("\n  error=retrieval timeout\n"), "{text}");
     }
 
     #[test]
-    fn test_print_injection_explain_no_panic_with_fallback_code() {
+    fn test_format_injection_explain_names_the_fallback_code() {
         let result = make_test_injection_result(
             None,
             Some(crate::retrieval::types::FallbackCode::VectorBackendDisabled),
             None,
         );
-        print_injection_explain(&result);
+        let text = format_injection_explain(&result);
+        assert!(
+            text.contains(" fallback_code=vector_backend_disabled "),
+            "{text}"
+        );
     }
 
     #[test]
-    fn test_print_injection_explain_no_panic_with_no_artifact() {
+    fn test_format_injection_explain_without_artifact_says_none() {
         let mut result = make_test_injection_result(None, None, None);
         result.artifact_path = None;
-        print_injection_explain(&result);
+        let text = format_injection_explain(&result);
+        assert!(text.trim_end().ends_with(" artifact=none"), "{text}");
     }
 
     // ── print_config ─────────────────────────────────────────────────────
 
     #[test]
-    fn test_print_config_no_panic_empty_list() {
-        print_config(vec![]);
+    fn test_format_config_entries_empty_list_is_empty() {
+        assert_eq!(format_config_entries(&[]), "");
     }
 
     #[test]
-    fn test_print_config_no_panic_with_entries() {
+    fn test_format_config_entries_one_indented_line_per_entry() {
         let entries = vec![
             ("key1".to_string(), "value1".to_string()),
             ("key2".to_string(), "value2".to_string()),
         ];
-        print_config(entries);
+        assert_eq!(
+            format_config_entries(&entries),
+            "  key1: value1\n  key2: value2\n"
+        );
     }
 
     // ── print_json ───────────────────────────────────────────────────────
@@ -1186,7 +1293,7 @@ mod tests {
     // ── print_verification_report ────────────────────────────────────────
 
     #[test]
-    fn test_print_verification_report_no_panic_all_pass() {
+    fn test_format_verification_report_all_pass() {
         let report = verify::VerificationReport {
             results: vec![verify::VerificationResult {
                 step: verify::VerificationStep {
@@ -1197,11 +1304,12 @@ mod tests {
                 output: "all tests passed".to_string(),
             }],
         };
-        print_verification_report(&report);
+        let text = format_verification_report(&report);
+        assert_eq!(text, "PASS - cargo test\nSummary: ALL CHECKS PASSED\n");
     }
 
     #[test]
-    fn test_print_verification_report_no_panic_with_failure() {
+    fn test_format_verification_report_failure_shows_output_and_blocks() {
         let report = verify::VerificationReport {
             results: vec![verify::VerificationResult {
                 step: verify::VerificationStep {
@@ -1212,17 +1320,48 @@ mod tests {
                 output: "error: unused variable\n  --> src/main.rs:5:9\n".to_string(),
             }],
         };
-        print_verification_report(&report);
+        let text = format_verification_report(&report);
+        assert!(text.starts_with("FAIL - cargo clippy\n"), "{text}");
+        assert!(
+            text.contains("Last output:\nerror: unused variable\n  --> src/main.rs:5:9\n"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("Summary: BLOCKED - fix failing checks\n"),
+            "{text}"
+        );
     }
 
     #[test]
-    fn test_print_verification_report_no_panic_empty_results() {
+    fn test_format_verification_report_failure_keeps_only_the_last_20_lines() {
+        let output: String = (1..=30).map(|n| format!("line {n}\n")).collect();
+        let report = verify::VerificationReport {
+            results: vec![verify::VerificationResult {
+                step: verify::VerificationStep {
+                    name: "cargo test".to_string(),
+                    command: vec!["cargo".to_string(), "test".to_string()],
+                },
+                success: false,
+                output,
+            }],
+        };
+        let text = format_verification_report(&report);
+        assert!(!text.contains("line 10\n"), "{text}");
+        assert!(text.contains("Last output:\nline 11\n"), "{text}");
+        assert!(text.contains("line 30\n"), "{text}");
+    }
+
+    #[test]
+    fn test_format_verification_report_with_no_results_does_not_claim_a_pass() {
         let report = verify::VerificationReport { results: vec![] };
-        print_verification_report(&report);
+        assert_eq!(
+            format_verification_report(&report),
+            "Summary: NO CHECKS RAN\n"
+        );
     }
 
     #[test]
-    fn test_print_verification_report_no_panic_mixed_results() {
+    fn test_format_verification_report_mixed_results_lists_each_step() {
         let report = verify::VerificationReport {
             results: vec![
                 verify::VerificationResult {
@@ -1243,7 +1382,16 @@ mod tests {
                 },
             ],
         };
-        print_verification_report(&report);
+        let text = format_verification_report(&report);
+        assert!(text.starts_with("PASS - build\nFAIL - test\n"), "{text}");
+        assert!(
+            text.contains("FAILED test_something\nassertion failed"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("Summary: BLOCKED - fix failing checks\n"),
+            "{text}"
+        );
     }
 
     // ── persist_claude_env_var edge cases ─────────────────────────────────

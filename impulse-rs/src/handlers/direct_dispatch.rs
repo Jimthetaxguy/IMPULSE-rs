@@ -1564,7 +1564,7 @@ mod tests {
     // ── Commands::SessionInfo with nonexistent ID ─────────────────────────
 
     #[tokio::test]
-    async fn test_dispatch_session_info_nonexistent_id() {
+    async fn test_dispatch_session_info_nonexistent_id_reports_not_found() {
         let tmp = TempDir::new().unwrap();
         let cli = cli_with(
             &tmp,
@@ -1573,9 +1573,11 @@ mod tests {
             },
         );
         let result = dispatch(cli).await;
-        // SessionInfo for a nonexistent ID should either return Ok (with "not found" message)
-        // or return an error — either way the dispatch shouldn't panic
-        let _ = result; // Just verify no panic
+        // An unknown id is reported as "Session not found", not an error.
+        assert!(
+            result.is_ok(),
+            "session-info for an unknown id should report not-found and succeed: {result:?}"
+        );
     }
 
     // ── Commands::Calc (in-process Monty sandbox; no host Python needed) ──
@@ -1789,7 +1791,7 @@ mod tests {
     // ── Commands::SessionEnd ─────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_dispatch_session_end_nonexistent_session_returns_err() {
+    async fn test_dispatch_session_end_nonexistent_session_fails_open_without_history() {
         let tmp = TempDir::new().unwrap();
         let cli = cli_with(
             &tmp,
@@ -1801,14 +1803,17 @@ mod tests {
             },
         );
         let result = dispatch(cli).await;
-        // Ending a nonexistent session should error or handle gracefully
-        let _ = result;
+        // Hook handlers fail open: ending an unknown session reports
+        // "Session not found" and exits 0, and must not append history.
+        assert!(result.is_ok(), "session-end should fail open: {result:?}");
+        let state = state::State::new(tmp.path().to_path_buf()).unwrap();
+        assert!(state.get_history_sync().unwrap().is_empty());
     }
 
     // ── Commands::TrackWrite (without active session) ────────────────────
 
     #[tokio::test]
-    async fn test_dispatch_track_write_no_session_returns_err_or_ok() {
+    async fn test_dispatch_track_write_without_session_fails_open() {
         let tmp = TempDir::new().unwrap();
         let cli = cli_with(
             &tmp,
@@ -1818,12 +1823,16 @@ mod tests {
             },
         );
         let result = dispatch(cli).await;
-        // Without a session ID or IMPULSE_SESSION_ID env, this may error
-        let _ = result;
+        // Hook handlers fail open: with no usable session (whether or not
+        // IMPULSE_SESSION_ID is set where the tests run) track-write prints an
+        // error, exits 0, and never creates a session.
+        assert!(result.is_ok(), "track-write should fail open: {result:?}");
+        let state = state::State::new(tmp.path().to_path_buf()).unwrap();
+        assert!(state.list_sessions().await.unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn test_dispatch_track_write_nonexistent_session_returns_err() {
+    async fn test_dispatch_track_write_unknown_session_fails_open() {
         let tmp = TempDir::new().unwrap();
         let cli = cli_with(
             &tmp,
@@ -1833,13 +1842,15 @@ mod tests {
             },
         );
         let result = dispatch(cli).await;
-        let _ = result; // May error; no panic
+        assert!(result.is_ok(), "track-write should fail open: {result:?}");
+        let state = state::State::new(tmp.path().to_path_buf()).unwrap();
+        assert!(state.list_sessions().await.unwrap().is_empty());
     }
 
     // ── Commands::TrackTool (without active session) ─────────────────────
 
     #[tokio::test]
-    async fn test_dispatch_track_tool_no_session_returns_err_or_ok() {
+    async fn test_dispatch_track_tool_without_session_fails_open() {
         let tmp = TempDir::new().unwrap();
         let cli = cli_with(
             &tmp,
@@ -1849,7 +1860,9 @@ mod tests {
             },
         );
         let result = dispatch(cli).await;
-        let _ = result;
+        assert!(result.is_ok(), "track-tool should fail open: {result:?}");
+        let state = state::State::new(tmp.path().to_path_buf()).unwrap();
+        assert!(state.list_sessions().await.unwrap().is_empty());
     }
 
     // ── Commands::SemBlame (sem CLI likely absent → returns Ok) ──────────
@@ -2137,18 +2150,6 @@ mod tests {
             result.is_ok(),
             "Analyze for nonexistent session should return Ok (not found message)"
         );
-    }
-
-    // ── Commands::Verify (runs build verification) ───────────────────────
-
-    #[tokio::test]
-    #[ignore = "verify dispatch re-enters cargo test from the repo root and is not safe in-process"]
-    async fn test_dispatch_verify_runs_without_panic() {
-        let tmp = TempDir::new().unwrap();
-        let cli = cli_with(&tmp, Commands::Verify);
-        let result = dispatch(cli).await;
-        // Verify may fail (no Cargo project at temp dir) but should not panic
-        let _ = result;
     }
 
     // ── Commands::AgentConfigure with specific provider ──────────────────

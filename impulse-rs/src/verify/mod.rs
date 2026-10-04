@@ -30,8 +30,12 @@ pub struct VerificationReport {
 }
 
 impl VerificationReport {
+    /// True only when at least one check ran and every check passed. A report
+    /// with no results is not a pass; `run_verification` refuses to produce
+    /// one, and this keeps a hand-built or deserialized report from claiming
+    /// success vacuously.
     pub fn success(&self) -> bool {
-        self.results.iter().all(|r| r.success)
+        !self.results.is_empty() && self.results.iter().all(|r| r.success)
     }
 }
 
@@ -186,6 +190,33 @@ pub fn run_verification(steps: Vec<VerificationStep>) -> Result<VerificationRepo
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_report_success_requires_at_least_one_result() {
+        assert!(!VerificationReport { results: vec![] }.success());
+        let step = VerificationStep {
+            name: "cargo test".to_string(),
+            command: vec!["cargo".to_string(), "test".to_string()],
+        };
+        let passed = VerificationResult {
+            step: step.clone(),
+            success: true,
+            output: String::new(),
+        };
+        let failed = VerificationResult {
+            step,
+            success: false,
+            output: String::new(),
+        };
+        assert!(VerificationReport {
+            results: vec![passed.clone()]
+        }
+        .success());
+        assert!(!VerificationReport {
+            results: vec![passed, failed]
+        }
+        .success());
+    }
 
     #[test]
     fn test_no_steps_errors() {
