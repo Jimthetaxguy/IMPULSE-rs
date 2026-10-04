@@ -63,3 +63,22 @@ jobs:
         run: cargo build --release
       - name: Build (minimal, no default features)
         run: cargo build --no-default-features
+
+  desktop-release:
+    # The Dioxus cockpit is feature-gated (`desktop-app`), so the jobs above
+    # never compile it, and the verification gate builds only debug. Release
+    # builds borrow-check `rsx!` `key:` expansions differently, which once
+    # left main unable to package the app while every other check was green.
+    name: Desktop app (release check, macOS)
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: impulse-rs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: impulse-rs
+      - name: Check impulse-desktop with the desktop host in release mode
+        run: cargo check --release -p impulse-desktop --features desktop-app

@@ -1760,6 +1760,10 @@ fn OperatorBoard(
                                 armed_discard.read().as_deref() == Some(task_key.as_str());
                             let ack_notice = governed_acks.get(&task_key).cloned();
                             let dismiss_key = task_key.clone();
+                            // Computed before `rsx!`: in release builds Dioxus 0.6
+                            // evaluates a formatted `key:` after the props move
+                            // `task`, which fails to borrow-check (E0382).
+                            let card_key = format!("{}:{}", task.id, task.revision);
                             rsx! {
                                 GovernedTaskCard {
                                     // A daemon revision is the authoritative decision epoch.
@@ -1767,7 +1771,7 @@ fn OperatorBoard(
                                     // a later supervisor/operator decision. The discard draft is
                                     // deliberately NOT part of that epoch — see the board's
                                     // `discard_drafts` comment.
-                                    key: "{task.id}:{task.revision}",
+                                    key: "{card_key}",
                                     task,
                                     on_mutation: on_governed_mutation,
                                     on_promote: on_governed_promotion,

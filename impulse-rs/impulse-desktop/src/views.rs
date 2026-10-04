@@ -370,6 +370,10 @@ fn ArtifactCard(artifact: ArtifactEnvelope, on_intent: EventHandler<ShellIntent>
                             let artifact_id = artifact.id.clone();
                             let action_id = action.id.clone();
                             let action_label = action.label.clone();
+                            // Separate copy for `key:`: in release builds Dioxus 0.6
+                            // evaluates it after the onclick closure takes
+                            // `action_id` (E0382).
+                            let button_key = action_id.clone();
                             let class_name = if action.requires_confirmation {
                                 "action-ghost mutating"
                             } else {
@@ -377,7 +381,7 @@ fn ArtifactCard(artifact: ArtifactEnvelope, on_intent: EventHandler<ShellIntent>
                             };
                             rsx! {
                                 button {
-                                    key: "{action_id}",
+                                    key: "{button_key}",
                                     class: "{class_name}",
                                     onclick: move |_| on_intent.call(ShellIntent::ArtifactAction {
                                         artifact_id: artifact_id.clone(),
