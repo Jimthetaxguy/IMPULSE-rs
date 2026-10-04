@@ -122,7 +122,12 @@ impl State {
         // Must follow candidate reconciliation: the log is cross-checked against
         // the reconciled review statuses, not the pre-migration ones.
         state.reconcile_promoted_memory_log()?;
-        state.reconcile_producer_reservations()?;
+        // Producer reservations are deliberately not reconciled here. Every
+        // direct-mode command (including the hooks that fire on each agent
+        // tool call) builds a `State`, and a reservation that is open on disk
+        // may belong to a daemon that is still running its side effect. Only
+        // the daemon reconciles, once it owns the socket; see
+        // `State::reconcile_producer_reservations`.
         Ok(state)
     }
 

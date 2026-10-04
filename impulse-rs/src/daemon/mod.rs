@@ -266,6 +266,13 @@ impl Daemon {
             let _ = tokio::fs::remove_file(&pid_path).await;
         }
 
+        // No other daemon serves this project, so reservations still open on
+        // disk were left by a run that died before writing its receipt.
+        self.config
+            .state
+            .reconcile_producer_reservations()
+            .context("Failed to reconcile interrupted producer reservations")?;
+
         // Publish the capability BEFORE binding, so that "the socket is
         // connectable" implies "the capability is on disk". Publishing after
         // bind leaves a window in which a client that uses socket readiness as

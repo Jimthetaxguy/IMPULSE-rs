@@ -2383,9 +2383,11 @@ mod tests {
         drop(state);
 
         let state: SharedState = Arc::new(
-            crate::state::State::new(repo.path().join(".impulse"))
-                .expect("the daemon reloads and reconciles"),
+            crate::state::State::new(repo.path().join(".impulse")).expect("the daemon reloads"),
         );
+        state
+            .reconcile_producer_reservations()
+            .expect("the restarted daemon reconciles");
         let reloaded = state
             .get_governed_task(&project_id, &claimed.id)
             .unwrap()

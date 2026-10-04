@@ -11,13 +11,15 @@
 //! before running the side effect and releases with a receipt reference once
 //! the side effect *and* its governed-task mutation are durably recorded. A
 //! reservation still open when the process reloads was interrupted before a
-//! receipt existed; [`State::new`] reconciles it to
+//! receipt existed; the daemon reconciles it at startup
+//! ([`State::reconcile_producer_reservations`]) to
 //! [`ReservationOutcome::NeedsRerun`] and records a note on the governed
-//! task's own event chain so the operator surface can show it. Wiring
-//! `RunGovernedVerification`/`RunGovernedSupervisorReview` to call
-//! [`with_reservation`] around the side effect *and* the mutation persist
-//! step is handler-lane follow-up work — see `with_reservation`'s doc comment
-//! for the exact integration contract.
+//! task's own event chain so the operator surface can show it. Other
+//! processes load the journal without repairing it, because an open
+//! reservation there may belong to a daemon that is still running.
+//! `RunGovernedVerification`, `RunGovernedSupervisorReview`, and staged
+//! promotion call [`with_reservation`] around the side effect *and* the
+//! mutation persist step.
 //!
 //! The journal is deliberately independent of `GOVERNED_TASKS.json`: a
 //! corrupted or truncated journal fails closed at load without blocking
@@ -368,7 +370,15 @@ impl State {
     /// through the same idempotent governed-task mutation path keyed by a
     /// deterministic per-reservation request id, so a repeat reconcile does
     /// not duplicate events).
-    pub(super) fn reconcile_producer_reservations(&self) -> Result<()> {
+    /// Closes every reservation still open as `NeedsRerun` and notes the
+    /// interruption on the governed task's event chain.
+    ///
+    /// Only the process that owns reservations may call this: the daemon, at
+    /// startup, after it has confirmed no other daemon serves the project.
+    /// Any other process (a hook's CLI invocation, the TUI) would close a
+    /// running daemon's live reservation and write a stale copy of the
+    /// governed ledger over the daemon's.
+    pub fn reconcile_producer_reservations(&self) -> Result<()> {
         for reservation in self.open_reservations()? {
             let reason = "interrupted before receipt".to_string();
             self.close_reservation_needs_rerun(&reservation.id, reason.clone())?;
@@ -759,6 +769,8 @@ mod tests {
 
         let base = root.path().join("impulse-test").join(".impulse");
         let reloaded = State::new(base).unwrap();
+        // The restarted daemon reconciles once it owns the project.
+        reloaded.reconcile_producer_reservations().unwrap();
 
         // The interrupted reservation is no longer open...
         assert!(reloaded.open_reservations().unwrap().is_empty());
@@ -781,6 +793,59 @@ mod tests {
         assert!(note.detail.contains("interrupted before receipt"));
     }
 
+    /// Regression: `State::new` used to reconcile, so any hook's CLI
+    /// invocation closed the running daemon's open reservation as
+    /// interrupted and wrote its own stale copy of the governed ledger.
+    #[test]
+    fn opening_state_elsewhere_leaves_a_live_reservation_open() {
+        let (root, daemon_state) = state();
+        let task = registered_task(&daemon_state, "live");
+        let request = GovernedRequestId::try_new("verify-live").unwrap();
+        let id = daemon_state
+            .reserve(
+                &task.id,
+                task.revision,
+                &request,
+                ProducerKind::Verification,
+            )
+            .unwrap();
+        let revision_before = daemon_state
+            .get_governed_task("impulse-test", &task.id)
+            .unwrap()
+            .unwrap()
+            .revision;
+
+        // A hook's CLI process opens the same project while the daemon's
+        // side effect is still running.
+        let base = root.path().join("impulse-test").join(".impulse");
+        let hook_state = State::new(base.clone()).unwrap();
+        assert!(hook_state
+            .open_reservations()
+            .unwrap()
+            .iter()
+            .any(|reservation| reservation.id == id));
+        drop(hook_state);
+
+        let on_disk = State::new(base).unwrap();
+        assert!(on_disk
+            .open_reservations()
+            .unwrap()
+            .iter()
+            .any(|reservation| reservation.id == id));
+        let task_after = on_disk
+            .get_governed_task("impulse-test", &task.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(task_after.revision, revision_before);
+        assert!(!task_after.events.iter().any(|event| {
+            event.kind
+                == impulse_ops::governed_task::GovernedTaskEventKind::ProducerReservationInterrupted
+        }));
+
+        // The daemon still releases its own reservation normally.
+        daemon_state.release(&id, "receipt-live").unwrap();
+    }
+
     #[test]
     fn reconcile_is_idempotent_across_repeated_calls() {
         let (root, state) = state();
@@ -797,6 +862,7 @@ mod tests {
 
         let base = root.path().join("impulse-test").join(".impulse");
         let first_reload = State::new(base.clone()).unwrap();
+        first_reload.reconcile_producer_reservations().unwrap();
         let first_task = first_reload
             .get_governed_task("impulse-test", &task.id)
             .unwrap()
@@ -806,6 +872,7 @@ mod tests {
         // A second reload (nothing new got interrupted) must not append a
         // second interruption note or bump the task revision again.
         let second_reload = State::new(base).unwrap();
+        second_reload.reconcile_producer_reservations().unwrap();
         let second_task = second_reload
             .get_governed_task("impulse-test", &task.id)
             .unwrap()
@@ -838,6 +905,7 @@ mod tests {
 
         let base = root.path().join("impulse-test").join(".impulse");
         let reloaded = State::new(base).unwrap();
+        reloaded.reconcile_producer_reservations().unwrap();
 
         // The same request id now carries a recorded needs-rerun reason:
         // a caller replaying it can tell this apart from a first attempt.
