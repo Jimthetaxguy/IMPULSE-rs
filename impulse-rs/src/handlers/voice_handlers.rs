@@ -9,7 +9,7 @@ use crate::voice::{
     default_voice_provider, elevenlabs_client_tool_schemas, ensure_elevenlabs_env,
     invoke_elevenlabs_client_tool, parse_webhook_tool_request, voice_engine_docs,
     ElevenLabsClientToolRequest, SecretSource, VoiceServer, VoiceToolBridge, VoiceTransport,
-    DEFAULT_VOICE_EXPOSED_TOOLS,
+    WebhookAuth, DEFAULT_VOICE_EXPOSED_TOOLS, WEBHOOK_SECRET_ENV,
 };
 
 /// Dispatch `impulse-rs voice …` subcommands.
@@ -183,16 +183,64 @@ pub async fn handle_voice(_impulse_dir: &Path, subcommand: VoiceCommands) -> Res
             println!("{}", serde_json::to_string_pretty(&schemas)?);
             Ok(())
         }
-        VoiceCommands::Serve { transport, port } => {
-            let server = VoiceServer::with_defaults();
+        VoiceCommands::Serve {
+            transport,
+            port,
+            allow_unauthenticated,
+        } => {
             let t = match transport.to_ascii_lowercase().as_str() {
                 "stdio" => VoiceTransport::Stdio,
                 "tcp" => VoiceTransport::Tcp(port),
                 "webhook" | "http" => VoiceTransport::Webhook(port),
                 other => bail!("unknown voice transport `{other}` (use stdio, tcp, or webhook)"),
             };
+            let auth = webhook_auth(
+                std::env::var(WEBHOOK_SECRET_ENV).ok().as_deref(),
+                allow_unauthenticated,
+            );
+            if matches!(t, VoiceTransport::Webhook(_)) {
+                if let Err(message) = &auth {
+                    bail!("{message}");
+                }
+            }
+            let server = VoiceServer::with_defaults()
+                .with_webhook_auth(auth.unwrap_or(WebhookAuth::Unauthenticated));
             server.serve(t).await.context("voice serve failed")?;
             Ok(())
         }
+    }
+}
+
+/// The webhook's authentication: the shared secret when set, otherwise only
+/// an explicit `--allow-unauthenticated` (the documented setup exposes the
+/// webhook through a public tunnel).
+fn webhook_auth(secret: Option<&str>, allow_unauthenticated: bool) -> Result<WebhookAuth, String> {
+    match secret.map(str::trim).filter(|secret| !secret.is_empty()) {
+        Some(secret) => Ok(WebhookAuth::Bearer(secret.to_string())),
+        None if allow_unauthenticated => Ok(WebhookAuth::Unauthenticated),
+        None => Err(format!(
+            "the voice webhook needs {WEBHOOK_SECRET_ENV}: set it and send it as \
+             `Authorization: Bearer <secret>` from the ElevenLabs tool, or pass \
+             --allow-unauthenticated for local testing"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_webhook_auth_requires_a_secret_or_an_explicit_opt_out() {
+        assert!(matches!(
+            webhook_auth(Some(" s3cret "), false),
+            Ok(WebhookAuth::Bearer(secret)) if secret == "s3cret"
+        ));
+        assert!(matches!(
+            webhook_auth(Some("  "), true),
+            Ok(WebhookAuth::Unauthenticated)
+        ));
+        let refusal = webhook_auth(None, false).unwrap_err();
+        assert!(refusal.contains(WEBHOOK_SECRET_ENV), "{refusal}");
     }
 }

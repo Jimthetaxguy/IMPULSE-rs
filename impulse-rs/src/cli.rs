@@ -95,6 +95,10 @@ pub enum VoiceCommands {
         /// Port for tcp / webhook (default: 8787)
         #[arg(long, default_value_t = 8787)]
         port: u16,
+        /// Serve the webhook without IMPULSE_VOICE_WEBHOOK_SECRET; anyone who
+        /// can reach the port can call its tools. For local testing only.
+        #[arg(long)]
+        allow_unauthenticated: bool,
     },
 }
 

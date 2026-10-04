@@ -34,22 +34,103 @@ pub enum VoiceTransport {
     Webhook(u16),
 }
 
+/// Environment variable holding the webhook's shared secret.
+pub const WEBHOOK_SECRET_ENV: &str = "IMPULSE_VOICE_WEBHOOK_SECRET";
+
+/// Largest HTTP header block the webhook reads before refusing the request.
+const MAX_WEBHOOK_HEADER_BYTES: usize = 64 * 1024;
+
+/// How long one webhook connection may take to send its request.
+const WEBHOOK_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How the webhook authenticates callers. It is reachable through a public
+/// tunnel in the documented setup, and even read-only tools (`file_read`,
+/// `config_get`) disclose project files, so every route except the health
+/// check requires the shared secret unless the operator explicitly opted out.
+#[derive(Clone)]
+pub enum WebhookAuth {
+    /// `Authorization: Bearer <secret>` is required.
+    Bearer(String),
+    /// No authentication (`voice serve --allow-unauthenticated`).
+    Unauthenticated,
+}
+
+impl std::fmt::Debug for WebhookAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Bearer(_) => "WebhookAuth::Bearer(<redacted>)",
+            Self::Unauthenticated => "WebhookAuth::Unauthenticated",
+        })
+    }
+}
+
+impl WebhookAuth {
+    fn admits(&self, headers: &str) -> bool {
+        let Self::Bearer(secret) = self else {
+            return true;
+        };
+        headers.lines().any(|line| {
+            let Some((name, value)) = line.split_once(':') else {
+                return false;
+            };
+            name.trim().eq_ignore_ascii_case("authorization")
+                && value
+                    .trim()
+                    .strip_prefix("Bearer ")
+                    .is_some_and(|presented| constant_time_eq(secret, presented.trim()))
+        })
+    }
+}
+
+/// Compares in time independent of how many leading bytes match.
+fn constant_time_eq(expected: &str, presented: &str) -> bool {
+    let (expected, presented) = (expected.as_bytes(), presented.as_bytes());
+    if expected.len() != presented.len() {
+        return false;
+    }
+    expected
+        .iter()
+        .zip(presented)
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+        == 0
+}
+
+/// Whether a JSON-line transport's peer may confirm a mutating tool call.
+/// Only stdio qualifies: its peer is the process that launched the server.
+/// Any local process (or a browser page sending a cross-protocol request)
+/// can reach the TCP port, so a `confirmed: true` arriving there is ignored,
+/// the same rule the webhook applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmationTrust {
+    TrustedPeer,
+    Untrusted,
+}
+
 /// Registry-backed voice server (MCP twin for ElevenLabs tool calling).
 pub struct VoiceServer {
     bridge: Arc<VoiceToolBridge>,
+    webhook_auth: WebhookAuth,
 }
 
 impl VoiceServer {
     pub fn new(registry: Arc<ToolRegistry>, ctx: ToolContext, policy: VoicePolicy) -> Self {
         Self {
             bridge: Arc::new(VoiceToolBridge::new(registry, ctx, policy)),
+            webhook_auth: WebhookAuth::Unauthenticated,
         }
     }
 
     pub fn with_defaults() -> Self {
         Self {
             bridge: Arc::new(VoiceToolBridge::with_defaults()),
+            webhook_auth: WebhookAuth::Unauthenticated,
         }
+    }
+
+    /// Sets how the webhook transport authenticates callers.
+    pub fn with_webhook_auth(mut self, auth: WebhookAuth) -> Self {
+        self.webhook_auth = auth;
+        self
     }
 
     pub fn bridge(&self) -> &VoiceToolBridge {
@@ -95,7 +176,9 @@ impl VoiceServer {
                 }
                 BoundedLine::Line(line) => line,
             };
-            let response = self.process_request(&line).await;
+            let response = self
+                .process_request_with_trust(&line, ConfirmationTrust::TrustedPeer)
+                .await;
             writer
                 .write_all(serde_json::to_string(&response)?.as_bytes())
                 .await?;
@@ -110,13 +193,28 @@ impl VoiceServer {
         let listener = TcpListener::bind(&addr)
             .await
             .with_context(|| format!("bind voice tcp {addr}"))?;
-        eprintln!("Voice JSON-line server listening on {addr} (tools/list, tools/call)");
+        eprintln!(
+            "Voice JSON-line server listening on {addr} (tools/list, tools/call); \
+             mutating tools are never confirmed over TCP"
+        );
 
         loop {
-            let (socket, _) = listener.accept().await?;
+            let socket = match listener.accept().await {
+                Ok((socket, _)) => socket,
+                Err(error) => {
+                    // A transient accept failure (EMFILE, ECONNABORTED) must
+                    // not end the server; pausing keeps EMFILE from spinning.
+                    tracing::warn!(%error, "voice tcp accept failed");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
             let bridge = Arc::clone(&self.bridge);
             tokio::spawn(async move {
-                let server = VoiceServer { bridge };
+                let server = VoiceServer {
+                    bridge,
+                    webhook_auth: WebhookAuth::Unauthenticated,
+                };
                 let (reader, mut writer) = socket.into_split();
                 let mut reader = BufReader::new(reader);
                 loop {
@@ -138,7 +236,9 @@ impl VoiceServer {
                         Ok(BoundedLine::Line(line)) => line,
                         Err(_) => break,
                     };
-                    let response = server.process_request(&line).await;
+                    let response = server
+                        .process_request_with_trust(&line, ConfirmationTrust::Untrusted)
+                        .await;
                     if writer
                         .write_all(
                             serde_json::to_string(&response)
@@ -171,20 +271,59 @@ impl VoiceServer {
         eprintln!(
             "Voice webhook server listening on http://{addr}/voice/tools (ElevenLabs server tools)"
         );
+        if matches!(self.webhook_auth, WebhookAuth::Unauthenticated) {
+            eprintln!(
+                "WARNING: the voice webhook is unauthenticated; anyone who can reach this port \
+                 (including through a tunnel) can call its tools. Set {WEBHOOK_SECRET_ENV} instead."
+            );
+        }
+        self.serve_webhook_on(listener).await
+    }
 
+    /// The webhook accept loop on an already-bound listener (tests bind port 0).
+    async fn serve_webhook_on(&self, listener: TcpListener) -> Result<()> {
         loop {
-            let (stream, _) = listener.accept().await?;
+            let stream = match listener.accept().await {
+                Ok((stream, _)) => stream,
+                Err(error) => {
+                    tracing::warn!(%error, "voice webhook accept failed");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
             let bridge = Arc::clone(&self.bridge);
+            let auth = self.webhook_auth.clone();
             tokio::spawn(async move {
-                if let Err(err) = handle_http_connection(stream, bridge).await {
-                    tracing::debug!(error = %err, "voice webhook connection closed");
+                let handled = tokio::time::timeout(
+                    WEBHOOK_REQUEST_TIMEOUT,
+                    handle_http_connection(stream, bridge, auth),
+                )
+                .await;
+                match handled {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        tracing::debug!(error = %err, "voice webhook connection closed")
+                    }
+                    Err(_) => tracing::debug!("voice webhook connection timed out"),
                 }
             });
         }
     }
 
-    /// Process one JSON-line request (MCP-compatible method names).
+    /// Process one JSON-line request from a trusted peer (stdio). See
+    /// [`Self::process_request_with_trust`].
     pub async fn process_request(&self, request_str: &str) -> serde_json::Value {
+        self.process_request_with_trust(request_str, ConfirmationTrust::TrustedPeer)
+            .await
+    }
+
+    /// Process one JSON-line request (MCP-compatible method names). A
+    /// `confirmed` flag is honored only from a [`ConfirmationTrust::TrustedPeer`].
+    pub async fn process_request_with_trust(
+        &self,
+        request_str: &str,
+        trust: ConfirmationTrust,
+    ) -> serde_json::Value {
         let request: serde_json::Value = match serde_json::from_str(request_str) {
             Ok(value) => value,
             Err(err) => {
@@ -217,10 +356,11 @@ impl VoiceServer {
                     .or_else(|| params.get("params"))
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!({}));
-                let confirmed = params
-                    .get("confirmed")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
+                let confirmed = trust == ConfirmationTrust::TrustedPeer
+                    && params
+                        .get("confirmed")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                 let tool_call_id = params
                     .get("tool_call_id")
                     .or_else(|| params.get("id"))
@@ -250,17 +390,33 @@ impl VoiceServer {
     }
 }
 
-async fn handle_http_connection(mut stream: TcpStream, bridge: Arc<VoiceToolBridge>) -> Result<()> {
-    let mut buf = vec![0u8; 64 * 1024];
-    let n = stream.read(&mut buf).await?;
-    if n == 0 {
-        return Ok(());
-    }
-    let raw = &buf[..n];
-    let header_end = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .context("incomplete HTTP headers")?;
+async fn handle_http_connection(
+    mut stream: TcpStream,
+    bridge: Arc<VoiceToolBridge>,
+    auth: WebhookAuth,
+) -> Result<()> {
+    // Read until the end of the header block, which may arrive in pieces.
+    let mut raw = Vec::with_capacity(8 * 1024);
+    let mut chunk = vec![0u8; 8 * 1024];
+    let header_end = loop {
+        if let Some(position) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+            break position;
+        }
+        if raw.len() > MAX_WEBHOOK_HEADER_BYTES {
+            return write_http_response(
+                &mut stream,
+                431,
+                "application/json",
+                br#"{"error":"request headers too large"}"#,
+            )
+            .await;
+        }
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        raw.extend_from_slice(&chunk[..n]);
+    };
     let header_text = std::str::from_utf8(&raw[..header_end]).unwrap_or("");
     let body = &raw[header_end + 4..];
 
@@ -269,6 +425,17 @@ async fn handle_http_connection(mut stream: TcpStream, bridge: Arc<VoiceToolBrid
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("/");
+
+    let is_health = method == "GET" && matches!(path, "/healthz" | "/health");
+    if !is_health && !auth.admits(header_text) {
+        return write_http_response(
+            &mut stream,
+            401,
+            "application/json",
+            br#"{"error":"missing or wrong Authorization bearer secret"}"#,
+        )
+        .await;
+    }
 
     let content_length = header_text
         .lines()
@@ -279,15 +446,24 @@ async fn handle_http_connection(mut stream: TcpStream, bridge: Arc<VoiceToolBrid
                 .map(|v| v.trim().parse::<usize>().unwrap_or(0))
         })
         .unwrap_or(body.len());
+    // Refuse before allocating: a caller-chosen length is never trusted.
+    if content_length > MAX_REQUEST_SIZE {
+        return write_http_response(
+            &mut stream,
+            413,
+            "application/json",
+            br#"{"error":"request body too large"}"#,
+        )
+        .await;
+    }
 
     let mut body_owned = body.to_vec();
     while body_owned.len() < content_length {
-        let mut more = vec![0u8; content_length - body_owned.len()];
-        let m = stream.read(&mut more).await?;
+        let m = stream.read(&mut chunk).await?;
         if m == 0 {
             break;
         }
-        body_owned.extend_from_slice(&more[..m]);
+        body_owned.extend_from_slice(&chunk[..m]);
     }
     body_owned.truncate(content_length);
 
@@ -326,19 +502,35 @@ async fn handle_http_connection(mut stream: TcpStream, bridge: Arc<VoiceToolBrid
         ),
     };
 
+    write_http_response(&mut stream, status, content_type, &payload).await
+}
+
+async fn write_http_response(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    payload: &[u8],
+) -> Result<()> {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
+        413 => "Payload Too Large",
+        431 => "Request Header Fields Too Large",
         _ => "Error",
     };
-    let response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+    let mut response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n",
         payload.len()
     );
+    if status == 401 {
+        response.push_str("WWW-Authenticate: Bearer\r\n");
+    }
+    response.push_str("\r\n");
     stream.write_all(response.as_bytes()).await?;
-    stream.write_all(&payload).await?;
+    stream.write_all(payload).await?;
     stream.flush().await?;
     Ok(())
 }
@@ -370,6 +562,108 @@ mod tests {
         assert_eq!(resp["status"], "ok");
         assert_eq!(resp["tool"], "system_info");
         assert!(resp["result"]["output"]["os"].is_string());
+    }
+
+    /// Review P1: any local process can reach the TCP transport, so a
+    /// client-supplied `confirmed: true` there must not unlock a mutating tool.
+    #[tokio::test]
+    async fn tcp_requests_cannot_confirm_a_mutating_tool() {
+        let server = VoiceServer::with_defaults();
+        let resp = server
+            .process_request_with_trust(
+                r#"{"method":"tools/call","params":{"name":"bash_exec","arguments":{"command":"echo no"},"confirmed":true}}"#,
+                ConfirmationTrust::Untrusted,
+            )
+            .await;
+        assert_eq!(resp["status"], "denied", "{resp}");
+    }
+
+    async fn spawn_webhook(auth: WebhookAuth) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = VoiceServer::with_defaults().with_webhook_auth(auth);
+        tokio::spawn(async move {
+            let _ = server.serve_webhook_on(listener).await;
+        });
+        addr
+    }
+
+    async fn send_raw(addr: std::net::SocketAddr, parts: &[&[u8]]) -> String {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        for part in parts {
+            stream.write_all(part).await.unwrap();
+            stream.flush().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let mut response = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            stream.read_to_string(&mut response),
+        )
+        .await
+        .expect("response within 10s")
+        .unwrap();
+        response
+    }
+
+    /// Review P1: the old handler allocated `vec![0; Content-Length]` from
+    /// the caller's header, so one request could abort the process.
+    #[tokio::test]
+    async fn webhook_refuses_an_oversized_content_length_before_allocating() {
+        let addr = spawn_webhook(WebhookAuth::Unauthenticated).await;
+        let response = send_raw(
+            addr,
+            &[b"POST /voice/tools HTTP/1.1\r\nContent-Length: 9223372036854775807\r\n\r\n"],
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 413"), "{response}");
+        let health = send_raw(addr, &[b"GET /healthz HTTP/1.1\r\n\r\n"]).await;
+        assert!(health.starts_with("HTTP/1.1 200"), "{health}");
+    }
+
+    #[tokio::test]
+    async fn webhook_requires_the_bearer_secret_except_for_health() {
+        let addr = spawn_webhook(WebhookAuth::Bearer("s3cret".into())).await;
+        let body = br#"{"tool_name":"system_info","parameters":{"include_env":false}}"#;
+        let request = |auth: &str| {
+            format!(
+                "POST /voice/tools HTTP/1.1\r\n{auth}Content-Length: {}\r\n\r\n{}",
+                body.len(),
+                std::str::from_utf8(body).unwrap()
+            )
+        };
+        let missing = send_raw(addr, &[request("").as_bytes()]).await;
+        assert!(missing.starts_with("HTTP/1.1 401"), "{missing}");
+        let wrong = send_raw(
+            addr,
+            &[request("Authorization: Bearer nope\r\n").as_bytes()],
+        )
+        .await;
+        assert!(wrong.starts_with("HTTP/1.1 401"), "{wrong}");
+        let schema = send_raw(addr, &[b"GET /voice/schema HTTP/1.1\r\n\r\n"]).await;
+        assert!(schema.starts_with("HTTP/1.1 401"), "{schema}");
+        let ok = send_raw(
+            addr,
+            &[request("authorization: Bearer s3cret\r\n").as_bytes()],
+        )
+        .await;
+        assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+        let health = send_raw(addr, &[b"GET /healthz HTTP/1.1\r\n\r\n"]).await;
+        assert!(health.starts_with("HTTP/1.1 200"), "{health}");
+    }
+
+    /// Headers may arrive in several reads; the old handler did one read.
+    #[tokio::test]
+    async fn webhook_reads_headers_split_across_writes() {
+        let addr = spawn_webhook(WebhookAuth::Unauthenticated).await;
+        let response = send_raw(addr, &[b"GET /hea", b"lthz HTTP/1.1\r\n", b"\r\n"]).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    }
+
+    #[test]
+    fn webhook_auth_debug_never_prints_the_secret() {
+        let shown = format!("{:?}", WebhookAuth::Bearer("s3cret".into()));
+        assert!(!shown.contains("s3cret"), "{shown}");
     }
 
     #[tokio::test]

@@ -41,7 +41,7 @@ transport for ElevenLabs server tools.
 impulse-rs voice status --json
 impulse-rs voice list-tools --json
 impulse-rs voice schema --json          # register as EL client tools
-impulse-rs voice serve --transport webhook --port 8787
+IMPULSE_VOICE_WEBHOOK_SECRET=... impulse-rs voice serve --transport webhook --port 8787
 impulse-rs voice serve --transport stdio   # JSON-line tools/list|tools/call
 impulse-rs voice tool-call --name system_info --params '{"include_env":false}' --json
 impulse-rs voice tool-call --name bash_exec --params '{"command":"echo hi"}' --json
@@ -57,6 +57,11 @@ impulse-rs voice docs
 | Infisical `ElevenLabs_API_Key` (`~/code` project, env `dev`) | Loaded automatically by `voice status` / `ensure_elevenlabs_env()` |
 | `IMPULSE_ELEVENLABS_AGENT_ID` | Optional; live agent is `agent_7001kxmm5n58erer2v0yh73eqepw` |
 | `IMPULSE_VOICE_PROVIDER` | Defaults to ElevenLabs Agent |
+| `IMPULSE_VOICE_WEBHOOK_SECRET` | Required by `voice serve --transport webhook`: every route except `GET /healthz` needs `Authorization: Bearer <secret>`, so configure that header on the ElevenLabs server tool. `--allow-unauthenticated` serves without it, for local testing only |
+
+The webhook refuses a body over 10 MiB (413) before reading it, and a header block over 64 KiB
+(431). Mutating tools are never confirmed over the webhook or the TCP JSON-line transport; only
+the stdio transport's parent process can send `confirmed: true`.
 
 ```bash
 # Helper (never prints key material)

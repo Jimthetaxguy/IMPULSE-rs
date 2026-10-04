@@ -21,7 +21,10 @@ pub enum VoicePolicyDecision {
 /// Policy applied before any side-effecting tool runs on the voice path.
 #[derive(Debug, Clone)]
 pub struct VoicePolicy {
-    /// When false (default), mutating tools are always denied without confirm.
+    /// When true (the default), a mutating tool may run if its call is
+    /// confirmed; when false, mutating tools are always denied. Only a
+    /// trusted transport can confirm: the stdio peer that launched the
+    /// server. Webhook and TCP calls always arrive unconfirmed.
     pub allow_confirmed_mutations: bool,
     /// Optional allowlist of tool ids; empty means all registered tools may be
     /// *considered*, subject to risk class.

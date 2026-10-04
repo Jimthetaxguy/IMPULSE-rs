@@ -33,7 +33,7 @@ pub use policy::{
 pub use provider::{default_voice_provider, VoiceProvider};
 pub use schema::{elevenlabs_client_tool_schemas, ElevenLabsClientToolSchema};
 pub use secrets::{ensure_elevenlabs_env, load_elevenlabs_api_key, SecretSource};
-pub use server::{VoiceServer, VoiceTransport};
+pub use server::{ConfirmationTrust, VoiceServer, VoiceTransport, WebhookAuth, WEBHOOK_SECRET_ENV};
 pub use webhook::{parse_webhook_tool_request, WebhookToolRequest};
 
 /// Module-level docs for operators / agent config (also returned by CLI).
@@ -52,10 +52,15 @@ Implemented like `McpServer`:
 - Case-sensitive tool ids (`system_info`, `file_read`, `bash_exec`, …)
 
 ```bash
-impulse-rs voice serve --transport webhook --port 8787
+IMPULSE_VOICE_WEBHOOK_SECRET=... impulse-rs voice serve --transport webhook --port 8787
 # Point ElevenLabs server tool URL at http://127.0.0.1:8787/voice/tools
+# and add the header `Authorization: Bearer <IMPULSE_VOICE_WEBHOOK_SECRET>`
 impulse-rs voice schema --json   # register client tools on the agent
 ```
+
+The webhook refuses calls without the bearer secret (`--allow-unauthenticated`
+is for local testing). Mutating tools are never confirmed over the webhook or
+TCP; only the stdio transport's parent process can confirm them.
 
 ## Default exposed tools (read-oriented)
 - system_info, health_check, config_get, steward_status

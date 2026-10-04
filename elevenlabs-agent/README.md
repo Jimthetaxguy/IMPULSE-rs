@@ -19,7 +19,7 @@ Managed with **ElevenLabs CLI** + **Infisical** (`ElevenLabs_API_Key` from `~/co
 | `config_get` | `tool_0401kxmm3eq3ezgt6jyg52nncn28` |
 | `steward_status` | `tool_1101kxmm3ewyfkstpadw11nsq0v8` |
 
-These are **client tools**: a conversation client (or Impulse `voice tool-call`) must execute them and return results. For cloud **server tools**, point webhooks at `impulse-rs voice serve --transport webhook` (needs a public URL / tunnel).
+These are **client tools**: a conversation client (or Impulse `voice tool-call`) must execute them and return results. For cloud **server tools**, point webhooks at `impulse-rs voice serve --transport webhook` (needs a public URL / tunnel). Set `IMPULSE_VOICE_WEBHOOK_SECRET` before serving and add `Authorization: Bearer <secret>` as a header on each server tool; the webhook refuses unauthenticated calls.
 
 ## Secrets
 
