@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -336,6 +336,32 @@ fn embed_texts_with(
             ),
         })?;
 
+    // Drain stdout and stderr while the child runs. The script prints one
+    // JSON line of floats per text (about 8 KB each), so a real batch is far
+    // larger than a pipe buffer; with nobody reading, the child blocked in
+    // `print`, never exited, and every batch "timed out" after the deadline.
+    let drain = |stream: Option<Box<dyn Read + Send>>| {
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut stream) = stream {
+                let _ = stream.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let stdout_reader = drain(
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    );
+    let stderr_reader = drain(
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    );
+
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(&payload).map_err(|e| EmbeddingError {
             kind: EmbeddingFailureKind::StdinWriteFailed,
@@ -348,9 +374,9 @@ fn embed_texts_with(
 
     let timeout = Duration::from_secs(timeout_secs);
     let deadline = Instant::now() + timeout;
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
@@ -372,12 +398,19 @@ fn embed_texts_with(
                 });
             }
         }
-    }
+    };
 
-    let output = child.wait_with_output().map_err(|e| EmbeddingError {
-        kind: EmbeddingFailureKind::ProcessFailed,
-        message: format!("failed reading embedding subprocess output: {}", e),
-    })?;
+    let joined = |reader: thread::JoinHandle<Vec<u8>>| {
+        reader.join().map_err(|_| EmbeddingError {
+            kind: EmbeddingFailureKind::ProcessFailed,
+            message: "embedding subprocess output reader panicked".to_string(),
+        })
+    };
+    let output = std::process::Output {
+        status,
+        stdout: joined(stdout_reader)?,
+        stderr: joined(stderr_reader)?,
+    };
 
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
@@ -682,5 +715,44 @@ print(json.dumps({"vectors": [[1.0]], "dim": 1}))
             "expected timeout message, got: {}",
             err.message
         );
+    }
+
+    /// Review P2: stdout was not read until the child exited, so a reply
+    /// larger than a pipe buffer blocked the child forever and every real
+    /// batch timed out.
+    #[test]
+    fn test_embed_reads_a_reply_larger_than_a_pipe_buffer() {
+        let _guard = retrieval_embedding_env_lock();
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let script_path = temp.path().join("big_embed.py");
+        fs::write(
+            &script_path,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+texts = json.loads(sys.stdin.read())["texts"]
+dim = 384
+print(json.dumps({"vectors": [[0.125] * dim for _ in texts], "dim": dim}))
+"#,
+        )
+        .unwrap();
+
+        std::env::set_var("IMPULSE_EMBED_SCRIPT", &script_path);
+        let cfg = Config::default();
+        let texts: Vec<String> = (0..64).map(|i| format!("text {i}")).collect();
+        let result = embed_texts(&cfg, &texts, 30);
+        std::env::remove_var("IMPULSE_EMBED_SCRIPT");
+
+        let vectors = result.expect("a large reply must be read, not time out");
+        assert_eq!(vectors.len(), 64);
+        assert!(vectors.iter().all(|v| v.len() == 384));
     }
 }
