@@ -1,7 +1,7 @@
 ---
 title: Vision History
 description: How Impulse's vision changed from February to October 2026, reconstructed from commits, ADRs, branches, and Cargo history
-updated: 2026-10-03
+updated: 2026-10-04
 type: doc
 category: core
 phase: all
@@ -18,7 +18,8 @@ the text says so. Commit dates are author dates; a few commits were authored bef
 committed, and that is noted where it matters.
 
 The repository holds about 630 commits reachable from about 120 local and remote branch refs, two root
-commits, and twenty-two ADRs (0016 exists only on a branch, and 0022 only on the photon lane).
+commits, and twenty-three ADRs (0016 exists only on a branch, 0022 only on the photon lane, and 0023
+only on the blackboard lane).
 
 ## The short version
 
@@ -27,7 +28,7 @@ commits, and twenty-two ADRs (0016 exists only on a branch, and 0022 only on the
 | before 2026-02-25 | A TypeScript/Bun memory tool, then a Rust rewrite | Indirect: notes inside the first commit |
 | 2026-02-25 | "Your AI remembers. Silently." A memory sidecar for coding agents | `1d92ba9`, ADR-0001 to 0005 |
 | 2026-02-25 to 03-31 | A meta-agent that monitors, injects, extracts, refines (MIER), with an egui cockpit | `1d92ba9` session notes, `6814eea`, Ralph Plans 2 to 5 |
-| 2026-04-15 to 06-25 | A search for the desktop shell: egui, then Tauri, then Dioxus | ADR-0007, `3ad15c9`, ADR-0008, ADR-0009 |
+| 2026-04-15 to 06-25 | A search for the desktop shell: egui, then Tauri 2 with Dioxus, then Dioxus alone | ADR-0007, `3ad15c9`, ADR-0008, ADR-0009 |
 | 2026-07-11 | Ion: Impulse's own coding agent | `ae4e87d` to `7cb9e18`, one day |
 | 2026-07-12 | "Local control plane and harness manager"; `VISION.md` is written | `1f5253d` |
 | 2026-07-13 to 07-16 | Governed tasks: claim, verify, review, operator acceptance | ADR-0010 to 0013 |
@@ -42,7 +43,7 @@ at version 1.3 (`docs/spec/RUST-CANONICAL-CONTRACT.md`, dated 2026-02-24), five 
 `.impulse/GENOME.md` stamped 2026-02-23, and a 764-line `HANDBOOK.md`. Three notes inside it
 describe what came before:
 
-- `docs/HONEST-ROADMAP.md` (updated 2026-02-21) calls itself the output of "Session 5 critique
+- `docs/HONEST-ROADMAP.md` (created 2026-02-21, updated 2026-02-24) calls itself the output of "Session 5 critique
   (21 iterations of adversarial analysis)" and says it "was originally written during the
   TypeScript/Bun era (Session 5, pre-Rust pivot)". It complements a `PRODUCT-SPEC-v2.md` that is
   not in this repository.
@@ -56,9 +57,11 @@ There was also an earlier name. Commit `1b52769` (2026-03-07) adds `.impulse/` t
 rename"; `1ea01b9` (2026-03-27) later removes "Cockpit legacy". The first commit's docs index links
 `archive/research/cockpit-feature-plan.md`.
 
-So the prehistory is: a TypeScript/Bun memory tool, adversarially critiqued over several sessions,
-rewritten in Rust for single-binary distribution, with a working name of Cockpit. None of that code
-is in this repository.
+So the prehistory is: a TypeScript/Bun memory tool, critiqued adversarially (the roadmap records a
+fifth session of 21 iterations), rewritten in Rust for single-binary distribution, with a working
+name of Cockpit. Part of that code survives: `1b52769` (2026-03-07) added the pre-pivot harness under
+`archive/harness/` (`@cockpit/harness`, run with `bun src/index.ts`), and it is still on `main`. The
+old `impulse/` TypeScript project is not in this repository.
 
 ## February: a memory sidecar
 
@@ -71,16 +74,17 @@ The first five ADRs all serve that problem:
 
 - **ADR-0001**: Claude Code is the primary integration target; OpenCode is a later thin adapter.
 - **ADR-0002**: knowledge lives in three plain-text files in `.impulse/` (`GENOME.md`,
-  `HISTORY.jsonl`, `LIVE_STATE.json`), with "no database, no embeddings, no vector store in
-  Phase 1".
+  `HISTORY_INDEX.md`, `LIVE_STATE.json`), with "no database, no embeddings, no vector store in
+  Phase 1". The code used `HISTORY.jsonl` from the first commit.
 - **ADR-0003 to 0005**: progressive search, decision extraction at session end, distribution.
 
 The code already went further than the ADRs. Day-one `Cargo.toml` pulls in `ratatui`,
-`portable-pty`, `vt100`, `rusqlite` (with FTS5 retrieval in `retrieval.db`), an optional `tauri`,
-`pyo3` behind a `monty-support` flag, `calamine`, and `datafusion`. A second commit the same day
-(`dd89278`) adds the `impulse-term` and egui `impulse-gui` crates.
+`portable-pty`, `vt100`, `rusqlite` (with FTS5 retrieval in `retrieval.db`), `pyo3` behind a
+`monty-support` flag, `calamine`, and `datafusion`. The first commit also carried a separate Tauri 2
+app crate (`impulse-rs/src-tauri`). A second commit the same day (`dd89278`) deleted it and added the
+`impulse-term` and egui `impulse-gui` crates.
 
-The same commit carries the first pivot inside the memory product. Its
+The first commit (`1d92ba9`) also carries the first pivot inside the memory product. Its
 `SESSION-2026-02-25-META-AGENT.md` describes "transforming Impulse from a terminal multiplexer into
 a **meta-agent** that manages the cognitive state of AI coding agents", built on MIER: Monitor,
 Inject, Extract, Refine. Memory stopped being a passive file and became something Impulse pushed
@@ -107,9 +111,10 @@ March is mostly the egui cockpit and code quality, driven by Ralph loops (Ralph 
 - Ralph Plan 3 marks the "agent harness COMPLETE" (`b55f8de`, 2026-03-31), the IPC protocol is
   rewritten to version 2 (`e612548`), and the contract's IPC section first uses the words
   "Supervisor (EGUI control plane)" (`312a6a5`).
-- The same day, `b3b57b2` "assess and clean obsolete vision docs" deletes the `docs/vision/`
-  directory the first commit had shipped (real-time injection, intent detection, dynamic CLI,
-  dashboard design).
+- The same day, `b3b57b2` "assess and clean obsolete vision docs" deletes the dashboard-design doc
+  from `docs/vision/` and archives the TUI augmentation vision. The other vision docs the first
+  commit shipped (real-time injection, intent detection, dynamic CLI, and others) are still on
+  `main`.
 
 Early April is cockpit polish: themes, a command palette, a PTY write queue, a README rewritten "for
 post-redesign state" (`ee6e2cd`) that still leads with "Your AI remembers. Silently."
@@ -117,7 +122,8 @@ post-redesign state" (`ee6e2cd`) that still leads with "Your AI remembers. Silen
 ## April to June: finding the desktop shell
 
 The product kept its memory pitch while the question underneath changed to "what window do the
-agents live in?" The answer changed three times.
+agents live in?" The answer changed several times. The very first commit carried a Tauri 2 stub,
+removed the same day in favor of egui.
 
 1. **egui** was the cockpit through March.
 2. **Tauri 2 + Dioxus + xterm.js** (ADR-0007, `46dae08`, 2026-04-15). The same day `55f1499` marks
@@ -126,7 +132,8 @@ agents live in?" The answer changed three times.
    tree, outside the workspace.
 3. **Dioxus Desktop native host** (ADR-0008; `88985d8` "Tauri -> Dioxus native host migration",
    2026-06-14). ADR-0007 is marked superseded. The `impulse-desktop` crate (first `dioxus`
-   dependency, `d1ed8e0`, 2026-05-30) becomes the cockpit, and the unified Dioxus shell lands as
+   dependency on `main`, `d1ed8e0`, 2026-05-30; the second-root branch below had one earlier)
+   becomes the cockpit, and the unified Dioxus shell lands as
    PR #9 (2026-06-13).
 
 Two parallel attempts in this period never reached `main`:
@@ -157,7 +164,8 @@ Ion appeared in a single day. On 2026-07-11:
   (`HarnessRequest`/`HarnessResponse`, "spec-a") kept outside the repo under `~/.ai-memory/`.
 - `28b847a` and `f5b46ce` add a Rust adapter for a TypeScript Pi agent on MiniMax as a verification
   gate, and the `ion-verify` command.
-- `35117f4` splits the crate into lib and bin so a second binary, `ion`, can exist.
+- `35117f4` splits the main `impulse-rs` crate into lib and bin so a second binary, `ion`, can
+  exist.
 - `2807bf8`, `bf38b06`, `6166004`, `7cb9e18` build the REPL (T6), tools (T7), chat (T8), and
   tool-calling with a confirmation gate (T9).
 
@@ -179,13 +187,14 @@ control plane boundaries") creates `VISION.md`:
 > Impulse is a terminal-native local control plane and harness manager for AI
 > software-engineering agents.
 
-The README subtitle becomes "One governed cockpit for many coding agents" (`2f95f45`).
-`ARCHITECTURE-CLARIFICATION.md` is rewritten and now says that "its memory-sidecar framing is no
-longer the product contract". Memory survives as "a governed platform service with provenance, not
-an indiscriminate transcript dump". The problem statement moves from forgetting to fragmentation and
-trust: "terminal sprawl, duplicated work, context bleed, silent conflicts, and unverified claims".
+The same commit makes the README subtitle "One governed cockpit for many coding agents" (it reached
+`main` through `3df9d9f`, PR #13). `ARCHITECTURE-CLARIFICATION.md` is rewritten and now says that
+"its memory-sidecar framing is no longer the product contract". In `VISION.md`, memory survives as
+"a governed platform service with provenance, not an indiscriminate transcript dump", and the
+problem statement moves from forgetting to fragmentation and trust: "terminal sprawl, duplicated
+work, context bleed, silent conflicts, and unverified claims".
 
-Four ADRs in four days turned "governed" into code:
+Four ADRs in three days turned "governed" into code:
 
 - **ADR-0010** (2026-07-13): product role launch contract; Builder launches require a task.
 - **ADR-0011** (2026-07-13): the daemon-owned governed task lifecycle.
@@ -193,8 +202,10 @@ Four ADRs in four days turned "governed" into code:
 - **ADR-0013** (2026-07-15): accepted runs produce deterministic memory candidates for review.
 
 ADR-0013 is where the February product comes back. Memory is no longer captured silently; it is
-proposed from accepted, verified work and waits for an operator. The governed Dioxus cockpit
-shipped on 2026-07-16 (`2626698`), and an ElevenLabs voice bridge landed as PR #22 the same week.
+proposed from accepted, verified work and waits for an operator. Governed controls reached the
+Dioxus cockpit on `main` through PRs #14 and #18 to #20 (2026-07-14 and 15); a fuller cockpit
+commit on another lane (`2626698`, 2026-07-16) was never merged. An ElevenLabs voice bridge landed
+as PR #22 the same week.
 
 ## August: research, the kernel, and the step model
 
@@ -215,8 +226,10 @@ August looked outward and inward at once.
 
 ## September: hardening the governed slice
 
-September turned the July contracts into something an adversary could not easily break. Most lanes
-went through review rounds recorded in the commit log ("review round 1", "round 2", "round 3").
+September turned the July contracts into something an adversary could not easily break. The
+early-September governed-slice lanes went through numbered review rounds recorded in the commit log
+("review round 1", "round 2", "round 3"): 12 of the month's 31 merged PRs show them, and three more
+mention an adversarial review.
 
 - **ADR-0017** (`5286597`): a canonical loop contract with typed budgets and termination evidence.
 - **Ion's tool floor** (PR #46): sandbox roots, an untrusted-output envelope, and loop evidence.
@@ -227,7 +240,7 @@ went through review rounds recorded in the commit log ("review round 1", "round 
   worktree, with operator Promote and Discard in the cockpit (PR #58) and protocol v9 (PR #52).
 - **ADR-0020** (PR #56): scoped memory promotion and dismissal, the decision half of ADR-0013.
 - **Property-based and fuzz harnesses** over "the parsers reviews kept breaking" (PR #59), the
-  first `proptest` dependency.
+  first `proptest` dependency on `main`.
 - **ADR-0021** (2026-09-26): `calculator` and `python_exec` run in the in-process Monty
   interpreter. The `monty-support` flag had sat in `Cargo.toml` since the first commit; seven months
   later Monty arrived as a sandbox rather than as the computed-routing engine the February handbook
@@ -263,10 +276,10 @@ produces should outlive the agent's context.
 |---|---|---|---|
 | TypeScript/Bun implementation | before 2026-02-21 | Rewritten in Rust for binary distribution | `HANDBOOK.md`, `HONEST-ROADMAP.md` in `1d92ba9` |
 | The name Cockpit | before 2026-03-07 | Renamed to Impulse; legacy removed 2026-03-27 | `1b52769`, `1ea01b9` |
-| Zellij WASM plugin dashboard | planned Phase 3 | Never built; Impulse grew its own TUI and GUI | ADR-0002, `HONEST-ROADMAP.md` |
-| Early vision docs (injection, intent, dynamic CLI) | 2026-02-25 | Deleted as obsolete | `b3b57b2` |
+| Zellij WASM plugin dashboard | planned Phase 3 | Only a stub status-bar plugin was committed (`zellij-plugins/memory-status-bar`); Impulse grew its own TUI and GUI | ADR-0002, `HONEST-ROADMAP.md`, `1d92ba9` |
+| Early vision docs | 2026-02-25 | Dashboard design deleted and TUI augmentation archived; the rest remain | `b3b57b2` |
 | egui GUI | 2026-02 to 2026-04 | Removed from the workspace; source kept frozen | `3ad15c9`, ADR-0007 |
-| Tauri desktop shell | 2026-04-15 | Superseded by the Dioxus native host | ADR-0007, ADR-0008, `88985d8` |
+| Tauri desktop shell | 2026-02-25 (stub, removed the same day); 2026-04-15 (ADR-0007) | Superseded by the Dioxus native host | `1d92ba9`, `dd89278`, ADR-0007, ADR-0008, `88985d8` |
 | Second-root supervisor and command blocks | 2026-04-22 to 04-23 | Unmerged branch | `origin/cleanup/loop-103-onward` |
 | Contracts-first 5-crate rewrite | 2026-06-18 | Archived; concepts mapped onto the active tree | `origin/clean/dioxus-pty-orchestrator`, ADR-0009 |
 | "No database" memory | ADR-0002 | Eroded: `retrieval.db` from day one, now the blackboard | ADR-0002, ADR-0023 |
@@ -274,7 +287,8 @@ produces should outlive the agent's context.
 
 Many other branches that look unmerged are not abandoned. Lanes in this repository are usually
 squash-merged or relanded through a PR, and the branch is kept as a backup (`backup/...`,
-`archive/...`). Their content is on `main`.
+`archive/...`), so their content is usually on `main`. Not always: `codex/dioxus-egui-retirement`
+(`2626698`) is one that never landed.
 
 ## The through-line
 
@@ -294,14 +308,14 @@ in VISION's words, "the full-time dispatcher, historian, permission clerk, and c
 Some things have not changed since the first commit:
 
 - **Rust, terminal-native, local.** Fixed by the pre-history rewrite and never revisited.
-- **The `.impulse/` directory**, with `GENOME.md`, `HISTORY.jsonl`, and `LIVE_STATE.json` in the
-  places ADR-0002 put them.
+- **The `.impulse/` directory**, with `GENOME.md` and `LIVE_STATE.json` where ADR-0002 put them,
+  and `HISTORY.jsonl` in place of ADR-0002's `HISTORY_INDEX.md`.
 - **Review before apply.** Principle 6 in February, operator-required acceptance in July, memory
   candidates that wait for a decision in July and September.
 - **The guardrail engine.** Written for Claude Code hooks in February, scanning Ion's tool calls in
   July.
 - **Adversarial review as a working method.** The "Session 5 critique" before the first commit,
-  Ralph loops in March, and numbered review rounds on almost every September lane.
+  Ralph loops in March, and numbered review rounds on most early-September governed-slice lanes.
 
 The biggest shift is in what counts as the product. In February it was memory. Since July it has
 been the boundary around the agents: who launched them, what they may touch, what they claim, what
