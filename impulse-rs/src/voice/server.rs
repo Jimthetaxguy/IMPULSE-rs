@@ -55,6 +55,11 @@ const WEBHOOK_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// again.
 const WEBHOOK_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long an authenticated client has to finish its body, within
+/// `WEBHOOK_REQUEST_TIMEOUT`. With only the request budget, a client that
+/// stopped partway through its body held a connection slot for 30 s.
+const WEBHOOK_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// How the webhook authenticates callers. It is reachable through a public
 /// tunnel in the documented setup, and even read-only tools (`file_read`,
 /// `config_get`) disclose project files, so every route except the health
@@ -298,8 +303,13 @@ impl VoiceServer {
 
     /// The webhook accept loop on an already-bound listener (tests bind port 0).
     async fn serve_webhook_on(&self, listener: TcpListener) -> Result<()> {
-        self.serve_webhook_with_limit(listener, MAX_WEBHOOK_CONNECTIONS, WEBHOOK_HEADER_TIMEOUT)
-            .await
+        self.serve_webhook_with_limit(
+            listener,
+            MAX_WEBHOOK_CONNECTIONS,
+            WEBHOOK_HEADER_TIMEOUT,
+            WEBHOOK_BODY_TIMEOUT,
+        )
+        .await
     }
 
     /// [`Self::serve_webhook_on`] with the connection cap passed in. A
@@ -310,6 +320,7 @@ impl VoiceServer {
         listener: TcpListener,
         max_connections: usize,
         header_timeout: std::time::Duration,
+        body_timeout: std::time::Duration,
     ) -> Result<()> {
         let slots = Arc::new(tokio::sync::Semaphore::new(max_connections));
         loop {
@@ -333,7 +344,7 @@ impl VoiceServer {
                 let _slot = slot;
                 let handled = tokio::time::timeout(
                     WEBHOOK_REQUEST_TIMEOUT,
-                    handle_http_connection(stream, bridge, auth, header_timeout),
+                    handle_http_connection(stream, bridge, auth, header_timeout, body_timeout),
                 )
                 .await;
                 match handled {
@@ -461,6 +472,7 @@ async fn handle_http_connection(
     bridge: Arc<VoiceToolBridge>,
     auth: WebhookAuth,
     header_timeout: std::time::Duration,
+    body_timeout: std::time::Duration,
 ) -> Result<()> {
     let mut raw = Vec::with_capacity(8 * 1024);
     let header_end = match tokio::time::timeout(
@@ -505,64 +517,27 @@ async fn handle_http_connection(
         .await;
     }
 
-    // A health check needs no body, and it is unauthenticated, so reading
-    // a declared one let any client make the server buffer up to the limit.
-    let body_owned = if is_health {
-        Vec::new()
-    } else if is_chunked(header_text) {
-        // Transfer-Encoding overrides any Content-Length (RFC 9112, 6.3).
-        match read_chunked_body(&mut stream, body).await? {
-            ChunkedBody::Complete(decoded) => decoded,
-            ChunkedBody::TooLarge => {
-                return reply_and_close(
-                    &mut stream,
-                    413,
-                    "application/json",
-                    br#"{"error":"request body too large"}"#,
-                )
-                .await
+    let body_owned = match tokio::time::timeout(
+        body_timeout,
+        read_body(&mut stream, header_text, body, is_health),
+    )
+    .await
+    {
+        Ok(read) => match read? {
+            BodyRead::Complete(bytes) => bytes,
+            BodyRead::Refused(status, payload) => {
+                return reply_and_close(&mut stream, status, "application/json", payload).await
             }
-            ChunkedBody::Malformed => {
-                return reply_and_close(
-                    &mut stream,
-                    400,
-                    "application/json",
-                    br#"{"error":"malformed chunked request body"}"#,
-                )
-                .await
-            }
-        }
-    } else {
-        let content_length = header_text
-            .lines()
-            .find_map(|l| {
-                let lower = l.to_ascii_lowercase();
-                lower
-                    .strip_prefix("content-length:")
-                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
-            })
-            .unwrap_or(body.len());
-        // Refuse before allocating: a caller-chosen length is never trusted.
-        if content_length > MAX_REQUEST_SIZE {
+        },
+        Err(_) => {
             return reply_and_close(
                 &mut stream,
-                413,
+                408,
                 "application/json",
-                br#"{"error":"request body too large"}"#,
+                br#"{"error":"request body not received in time"}"#,
             )
-            .await;
+            .await
         }
-        let mut body_owned = body.to_vec();
-        let mut chunk = vec![0u8; 8 * 1024];
-        while body_owned.len() < content_length {
-            let m = stream.read(&mut chunk).await?;
-            if m == 0 {
-                break;
-            }
-            body_owned.extend_from_slice(&chunk[..m]);
-        }
-        body_owned.truncate(content_length);
-        body_owned
     };
 
     let (status, content_type, payload) = match (method, path) {
@@ -620,13 +595,115 @@ enum ChunkedBody {
     Malformed,
 }
 
-/// Whether the headers declare `Transfer-Encoding: chunked`.
-fn is_chunked(header_text: &str) -> bool {
-    header_text.lines().any(|line| {
-        line.to_ascii_lowercase()
-            .strip_prefix("transfer-encoding:")
-            .is_some_and(|codings| codings.split(',').any(|coding| coding.trim() == "chunked"))
-    })
+/// How a request frames its body.
+enum BodyFraming {
+    /// No `Transfer-Encoding`: `Content-Length` bytes, or what came with the
+    /// headers.
+    Length,
+    Chunked,
+    /// Refused with this status and JSON body.
+    Refused(u16, &'static [u8]),
+}
+
+/// RFC 9112 section 6: a request with both `Transfer-Encoding` and
+/// `Content-Length` is refused rather than guessed at, and so is any coding
+/// but `chunked`, which this server cannot undo (`gzip, chunked` was
+/// de-chunked and handed on still compressed).
+fn body_framing(header_text: &str) -> BodyFraming {
+    let mut has_encoding = false;
+    let mut has_length = false;
+    let mut codings = Vec::new();
+    for line in header_text.lines().skip(1) {
+        let lower = line.to_ascii_lowercase();
+        if let Some(value) = lower.strip_prefix("transfer-encoding:") {
+            has_encoding = true;
+            codings.extend(
+                value
+                    .split(',')
+                    .map(|coding| coding.trim().to_string())
+                    .filter(|coding| !coding.is_empty()),
+            );
+        } else if lower.starts_with("content-length:") {
+            has_length = true;
+        }
+    }
+    if !has_encoding {
+        BodyFraming::Length
+    } else if has_length {
+        BodyFraming::Refused(
+            400,
+            br#"{"error":"Transfer-Encoding and Content-Length together"}"#,
+        )
+    } else if codings == ["chunked"] {
+        BodyFraming::Chunked
+    } else {
+        BodyFraming::Refused(
+            501,
+            br#"{"error":"only the chunked transfer coding is supported"}"#,
+        )
+    }
+}
+
+/// What reading a request body came to.
+enum BodyRead {
+    Complete(Vec<u8>),
+    /// Refused with this status and JSON body; nothing more is read.
+    Refused(u16, &'static [u8]),
+}
+
+/// Reads the body after the headers; `buffered` is what arrived with them.
+async fn read_body(
+    stream: &mut TcpStream,
+    header_text: &str,
+    buffered: &[u8],
+    is_health: bool,
+) -> Result<BodyRead> {
+    // A health check needs no body, and it is unauthenticated, so reading a
+    // declared one let any client make the server buffer up to the limit.
+    if is_health {
+        return Ok(BodyRead::Complete(Vec::new()));
+    }
+    match body_framing(header_text) {
+        BodyFraming::Refused(status, payload) => Ok(BodyRead::Refused(status, payload)),
+        BodyFraming::Chunked => Ok(match read_chunked_body(stream, buffered).await? {
+            ChunkedBody::Complete(decoded) => BodyRead::Complete(decoded),
+            ChunkedBody::TooLarge => {
+                BodyRead::Refused(413, br#"{"error":"request body too large"}"#)
+            }
+            ChunkedBody::Malformed => {
+                BodyRead::Refused(400, br#"{"error":"malformed chunked request body"}"#)
+            }
+        }),
+        BodyFraming::Length => {
+            let content_length = header_text
+                .lines()
+                .find_map(|line| {
+                    let lower = line.to_ascii_lowercase();
+                    lower
+                        .strip_prefix("content-length:")
+                        .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                })
+                .unwrap_or(buffered.len());
+            // Refuse before allocating: a caller-chosen length is never trusted.
+            if content_length > MAX_REQUEST_SIZE {
+                return Ok(BodyRead::Refused(
+                    413,
+                    br#"{"error":"request body too large"}"#,
+                ));
+            }
+            let mut body = buffered.to_vec();
+            let mut chunk = vec![0u8; 8 * 1024];
+            while body.len() < content_length {
+                let n = stream.read(&mut chunk).await?;
+                if n == 0 {
+                    break;
+                }
+                body.extend_from_slice(&chunk[..n]);
+            }
+            body.truncate(content_length);
+            Ok(BodyRead::Complete(body))
+        }
+    }
 }
 
 /// Reads a chunked request body (RFC 9112, section 7.1). `buffered` is what
@@ -725,8 +802,10 @@ async fn reply_and_close(
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
+        408 => "Request Timeout",
         413 => "Payload Too Large",
         431 => "Request Header Fields Too Large",
+        501 => "Not Implemented",
         _ => "Error",
     };
     let mut response = format!(
@@ -948,7 +1027,12 @@ mod tests {
         let server = VoiceServer::with_defaults();
         tokio::spawn(async move {
             let _ = server
-                .serve_webhook_with_limit(listener, 1, std::time::Duration::from_millis(200))
+                .serve_webhook_with_limit(
+                    listener,
+                    1,
+                    std::time::Duration::from_millis(200),
+                    WEBHOOK_BODY_TIMEOUT,
+                )
                 .await;
         });
 
@@ -968,6 +1052,58 @@ mod tests {
         // The slot is free again for the next client.
         let served = send_raw(addr, &[b"GET /healthz HTTP/1.1\r\n\r\n"]).await;
         assert!(served.starts_with("HTTP/1.1 200"), "{served}");
+    }
+
+    /// Round 4 (reviewer B): only the header read had its own deadline, so a
+    /// client that stopped partway through its body held a slot for 30 s.
+    #[tokio::test]
+    async fn webhook_answers_408_when_the_body_stops_arriving() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = VoiceServer::with_defaults().with_webhook_auth(WebhookAuth::Unauthenticated);
+        tokio::spawn(async move {
+            let _ = server
+                .serve_webhook_with_limit(
+                    listener,
+                    1,
+                    WEBHOOK_HEADER_TIMEOUT,
+                    std::time::Duration::from_millis(200),
+                )
+                .await;
+        });
+        let mut stalled = TcpStream::connect(addr).await.unwrap();
+        stalled
+            .write_all(b"POST /voice/tools HTTP/1.1\r\nContent-Length: 100\r\n\r\n{\"tool")
+            .await
+            .unwrap();
+        let mut reply = Vec::new();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stalled.read_to_end(&mut reply),
+        )
+        .await
+        .expect("answered before the 30 s request timeout");
+        let reply = String::from_utf8_lossy(&reply);
+        assert!(reply.starts_with("HTTP/1.1 408"), "{read:?} {reply}");
+    }
+
+    /// Round 4 (reviewer B): Transfer-Encoding with Content-Length was
+    /// accepted, and `gzip, chunked` was de-chunked and handed on compressed.
+    #[tokio::test]
+    async fn webhook_refuses_ambiguous_or_unsupported_body_framing() {
+        let addr = spawn_webhook(WebhookAuth::Unauthenticated).await;
+        let both = send_raw(
+            addr,
+            &[b"POST /voice/tools HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n0\r\n\r\n"],
+        )
+        .await;
+        assert!(both.starts_with("HTTP/1.1 400"), "{both}");
+        let gzip = send_raw(
+            addr,
+            &[b"POST /voice/tools HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n"],
+        )
+        .await;
+        assert!(gzip.starts_with("HTTP/1.1 501"), "{gzip}");
     }
 
     /// Recorded review item: a chunked body, which carries no
@@ -1013,7 +1149,7 @@ mod tests {
         let server = VoiceServer::with_defaults().with_webhook_auth(WebhookAuth::Unauthenticated);
         tokio::spawn(async move {
             let _ = server
-                .serve_webhook_with_limit(listener, 1, WEBHOOK_HEADER_TIMEOUT)
+                .serve_webhook_with_limit(listener, 1, WEBHOOK_HEADER_TIMEOUT, WEBHOOK_BODY_TIMEOUT)
                 .await;
         });
 
