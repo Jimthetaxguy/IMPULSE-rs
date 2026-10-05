@@ -26,13 +26,24 @@ use super::types::{GuardAction, GuardRule, GuardTarget};
 /// defense: content read INTO context should never be able to silently
 /// approve its own follow-up actions). All rules are enabled by default and
 /// marked as builtin.
+/// One shell word, which may hold quoted parts and escaped spaces:
+/// `"my repo"`, `user.name="Jane Doe"`, `~/My\ Repo`.
+const SHELL_WORD: &str = r#"(?:"[^"]*"|'[^']*'|\\.|[^\s\\"'])+"#;
+
 /// A git invocation whose subcommand is `subcommand`. Global options such as
-/// `-C dir`, `-c k=v`, or `--git-dir=x` may come between, and both words
-/// match in any case (macOS resolves `GIT` to git). Requiring the subcommand
-/// position keeps a commit message that mentions the word from matching.
+/// `-C dir`, `-c k=v`, `--git-dir=x`, or `--config-env name=var` may come
+/// between, with quoted or escaped values, and both words match in any case
+/// (macOS resolves `GIT` to git). Requiring the subcommand position keeps a
+/// commit message that mentions the word from matching.
 fn git_subcommand(subcommand: &str) -> String {
     format!(
-        r"(?i:\bgit)(?:\s+(?:-[cC]\s+\S+|--(?:git-dir|work-tree|namespace)\s+\S+|--?[\w-]+(?:=\S+)?))*\s+(?i:{subcommand})\b"
+        concat!(
+            r"(?i:\bgit)(?:\s+(?:-[cC]\s+{word}",
+            r"|--(?:git-dir|work-tree|namespace|config-env|super-prefix|attr-source|exec-path)(?:=|\s+){word}",
+            r"|--?[\w-]+(?:={word})?))*\s+(?i:{subcommand})\b"
+        ),
+        word = SHELL_WORD,
+        subcommand = subcommand,
     )
 }
 
@@ -49,7 +60,7 @@ fn force_push_pattern() -> String {
         concat!(
             "{push}{same}(?:",
             r"\s{force}{same}{branch}",
-            r"|{branch}{same}\s{force}(?:\s|$)",
+            r"|{branch}{same}\s{force}(?:$|[\s;|&)`>])",
             r#"|\s["']?\+(?:[^\s:;|&"']*:)?(?:refs/heads/)?(?:(?i:main|master)\b|\*)"#,
             r"|\s--mirror\b",
             ")"
@@ -413,7 +424,7 @@ mod tests {
         let blocked = |command: &str| {
             GuardEngine::has_blocking(&engine.evaluate(command, &GuardTarget::Bash))
         };
-        // Two review rounds of shapes: global options and clusters, quoted
+        // Three review rounds of shapes: global options (quoted values too) and clusters, quoted
         // and wildcard refspecs, --mirror, redirections, subshells, any case.
         for command in [
             "git -C ../wt push --force origin main",
@@ -452,6 +463,16 @@ mod tests {
             "GIT_DIR=x git push -f origin main",
             "command git push -f origin main",
             "git push --force-with-lease origin main",
+            "git -C \"my repo\" push --force origin main",
+            "git -c \"user.name=Jane Doe\" push -f origin main",
+            "git -c http.extraheader=\"Authorization: basic abc\" push -f origin main",
+            "git -C ~/My\\ Repo push -f origin main",
+            "git --config-env http.extraheader=TOKEN push -f origin main",
+            "git -C \"my repo\" add .",
+            "git push origin main -f;git status",
+            "`git push origin main -f`",
+            "git push origin main -f>/dev/null",
+            "git push origin main -f&&echo ok",
             "git push origin HEAD:main -f",
             "sudo rm -rf /",
             "rm -rf /*",
@@ -483,6 +504,7 @@ mod tests {
             "rmdir -p /tmp/x",
             "git add *.rs",
             "git log --grep='push -f main'",
+            "git -C \"my repo\" push origin feature",
         ] {
             assert!(!blocked(command), "should allow: {command}");
         }
