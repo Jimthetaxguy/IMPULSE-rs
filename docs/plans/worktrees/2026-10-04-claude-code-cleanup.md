@@ -32,10 +32,11 @@ tags: [worktree, lane, handoff, cleanup, review]
   `cargo clippy --workspace --all-targets -- -D warnings` (default and `--no-default-features`),
   `cargo fmt --all -- --check`, `python3 docs/validate_docs.py`
 - Latest status:
-  - review pass, adversarial refutation round, and six verification rounds complete;
+  - review pass, adversarial refutation round, and seven verification rounds complete, the
+    seventh the first with no P2;
   - each round found and fixed regressions in the previous round's fixes; the fourth found two
-    P2s, the fifth one pre-existing P2 and only P3 regressions, and the sixth one P2 in a
-    round-5 fix, all fixed;
+    P2s, the fifth one pre-existing P2 and only P3 regressions, the sixth one P2 in a round-5
+    fix, and the seventh only P3s, all fixed;
   - behavior changes carry regression tests, nearly all checked by reverting the fix and watching
     the test fail;
   - gate evidence goes in the PR description;
@@ -235,6 +236,19 @@ Sixth verification round (against `7312ca7`):
   - `4c711ed`: control characters and non-token field names are refused, a non-UTF-8 header block
     gets 400 instead of a misleading 401, and the request line must be exact.
 
+Seventh verification round (against `fb48db2`), the first with no P2. Every round-6 fix held. P3s
+fixed:
+- `a0ea7c1`:
+  - a bare line feed in the request head is refused, which also gives LF-only clients a prompt 400;
+  - only HTTP/1.0 and 1.1 are served;
+  - the header reader scans only new bytes;
+  - a query string no longer keeps a request from its route.
+- `c262276`: `.git` is opened non-blocking and checked through the handle, closing a race between
+  the type check and the open.
+- `d4bbe46`:
+  - a symlinked `CACHEDIR.TAG` no longer counts;
+  - the clean-all descriptions no longer say it runs `cargo clean`.
+
 Still recorded, not fixed:
 - `file_write`'s check-then-write race against a concurrent same-user process swapping symlinks
   (needs directory-fd opens).
@@ -272,6 +286,9 @@ Still recorded, not fixed:
   path instead of the native code. The tools bypass the link, `CACHEDIR.TAG` and root checks, and
   cargo-sweep may find a shared global build directory through `cargo metadata` (suspected; neither
   tool is installed here). Whether to prefer the native code is a decision for James.
+- Between `projects_to_clean`'s checks and the removal, a concurrent same-user change can replace a
+  project directory with a link. The removal then deletes the linked `target/` outside the root.
+  A race-free fix needs the same directory-handle removal as `file_write`'s recorded race.
 - The sqlite-vec search pool still follows the page window. Its order is the same for any pool
   size except between results at exactly the same distance.
 
