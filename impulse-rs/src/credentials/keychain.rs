@@ -1,6 +1,4 @@
 #[cfg(target_os = "macos")]
-use std::process::Command;
-#[cfg(target_os = "macos")]
 use std::sync::Mutex;
 
 #[cfg(target_os = "macos")]
@@ -36,6 +34,24 @@ struct InternetPasswordIdentity<'a> {
     port: Option<u16>,
     protocol: SecProtocolType,
     authentication_type: SecAuthenticationType,
+}
+
+/// The accounts of the internet-password items stored for `server`, in
+/// order and without repeats. `set` stores each secret with the provider's
+/// service name as the server and the key as the account.
+#[cfg(any(target_os = "macos", test))]
+fn accounts_for_server(
+    items: &[std::collections::HashMap<String, String>],
+    server: &str,
+) -> Vec<String> {
+    let mut accounts: Vec<String> = items
+        .iter()
+        .filter(|item| item.get("srvr").map(String::as_str) == Some(server))
+        .filter_map(|item| item.get("acct").cloned())
+        .collect();
+    accounts.sort();
+    accounts.dedup();
+    accounts
 }
 
 #[cfg(target_os = "macos")]
@@ -222,29 +238,35 @@ impl crate::credentials::CredentialProvider for KeychainProvider {
     fn list(&self) -> Result<Vec<SecretEntry>, CredentialError> {
         #[cfg(target_os = "macos")]
         {
-            let output = Command::new("security")
-                .args(["find-internet-password", "-s", &self.service_name])
-                .output()?;
-
-            if !output.status.success() {
-                return Ok(Vec::new());
-            }
-
-            let output_str = String::from_utf8_lossy(&output.stdout);
-            let mut secrets = Vec::new();
-
-            for line in output_str.lines() {
-                if let Some(account) = line.strip_prefix("account: ") {
-                    secrets.push(SecretEntry {
-                        key: account.to_string(),
-                        provider: "keychain".to_string(),
-                        created_at: chrono::Utc::now(),
-                        last_accessed: None,
-                    });
-                }
-            }
-
-            Ok(secrets)
+            use security_framework::item::{ItemClass, ItemSearchOptions, Limit};
+            // Attributes only, no secret data, so listing never prompts. This
+            // used to run `security find-internet-password -s <service>`,
+            // which returns only the first match and prints the account as
+            // `"acct"<blob>="..."`, not the `account: ` line it looked for, so
+            // `credentials list` and the status count were always empty.
+            let items = match ItemSearchOptions::new()
+                .class(ItemClass::internet_password())
+                .load_attributes(true)
+                .limit(Limit::All)
+                .search()
+            {
+                Ok(items) => items,
+                Err(error) if error.code() == errSecItemNotFound => Vec::new(),
+                Err(error) => return Err(native_command_error(error)),
+            };
+            let attributes: Vec<_> = items
+                .iter()
+                .filter_map(|item| item.simplify_dict())
+                .collect();
+            Ok(accounts_for_server(&attributes, &self.service_name)
+                .into_iter()
+                .map(|key| SecretEntry {
+                    key,
+                    provider: "keychain".to_string(),
+                    created_at: chrono::Utc::now(),
+                    last_accessed: None,
+                })
+                .collect())
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -272,6 +294,30 @@ impl crate::credentials::CredentialProvider for KeychainProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Recorded review P3: `list` never parsed real `security` output, so it
+    /// was always empty.
+    #[test]
+    fn test_accounts_for_server_keeps_only_this_services_accounts() {
+        let item = |server: &str, account: &str| {
+            std::collections::HashMap::from([
+                ("srvr".to_string(), server.to_string()),
+                ("acct".to_string(), account.to_string()),
+            ])
+        };
+        let items = [
+            item("impulse", "OPENAI_API_KEY"),
+            item("other-app", "TOKEN"),
+            item("impulse", "ANTHROPIC_API_KEY"),
+            item("impulse", "ANTHROPIC_API_KEY"),
+            std::collections::HashMap::from([("srvr".to_string(), "impulse".to_string())]),
+        ];
+        assert_eq!(
+            accounts_for_server(&items, "impulse"),
+            ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]
+        );
+        assert!(accounts_for_server(&items, "absent").is_empty());
+    }
     use crate::credentials::CredentialProvider;
 
     #[cfg(target_os = "macos")]
