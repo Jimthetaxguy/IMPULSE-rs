@@ -178,6 +178,14 @@ Recorded items fixed after round 3:
   encoded bytes and each line, instead of answering 400.
 - `c245765`: the harness CLI's output is captured with caps (8 MiB of reply, 64 KiB of stderr), and a
   reply over the cap is an error instead of being kept.
+- `b39dbdd`: each benchmark run gets only the time left before the deadline, so a run that starts
+  just before it no longer overshoots by up to the sandbox's 5 s budget.
+- `3e5f00f`: `end_session` claims the session under the state lock and writes its history after
+  releasing it, instead of holding the lock across the append's fsync; a failed append puts the
+  session back.
+- `4daabf5`: every build-hygiene tool (`build_health`, sweep, wipe, clean-all, the sccache tools,
+  `tool_availability`) runs its walks and `cargo`/`sccache` subprocesses off the async runtime.
+- `5eff5de`: `python_exec`, `calculator` and the benchmark run the sandbox off the async runtime.
 - The docs contract check passes. `7cfad38` closed out the two stale May lane cards. The next
   commit reviewed the collaborative coding guide against current practice:
   - its gate matches `CLAUDE.md`;
@@ -192,7 +200,6 @@ Still recorded, not fixed:
   purpose. Allowing it means choosing between a temp file outside the root and a non-atomic in-place
   write. No default root is a single file.
 - A manifest tool that reads the terminal is stopped by the OS and ends at its timeout.
-- `end_session` holds the state lock across an fsync.
 - A bare `git push --force` while on main is not caught (the rule cannot see the current branch).
 - The recursive-delete Block rule stays broad (any absolute or home path) because narrowing it is
   a policy choice.
@@ -201,11 +208,9 @@ Still recorded, not fixed:
 - The Keychain `list` matches on the server alone, while `get` and `delete` also require the
   default authentication type. Matching that too needs the approval-gated round-trip test
   (`#[ignore]`, it writes to the login keychain) to confirm how the attribute reads back.
-- Other tool bodies that never await, such as the office tools, still keep a webhook slot and a
-  runtime worker past the request timeout. Each needs its own `spawn_blocking`: a blanket wrapper
-  would break the kill-on-drop cancellation that process tools rely on.
-- A benchmark run that starts just before the deadline still finishes, so the overshoot is up to
-  one run (at most Monty's 5 s budget).
+- The office tools still parse synchronously on the runtime thread when called over MCP or the
+  daemon; they are not exposed over the webhook. They need their own `spawn_blocking`: a blanket
+  wrapper would break the kill-on-drop cancellation that process tools rely on.
 - The sqlite-vec search pool still follows the page window. Its order is the same for any pool
   size except between results at exactly the same distance.
 
