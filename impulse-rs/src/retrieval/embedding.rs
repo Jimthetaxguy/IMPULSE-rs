@@ -362,15 +362,15 @@ fn embed_texts_with(
             .map(|s| Box::new(s) as Box<dyn Read + Send>),
     );
 
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(&payload).map_err(|e| EmbeddingError {
-            kind: EmbeddingFailureKind::StdinWriteFailed,
-            message: format!(
-                "failed to write embedding request to subprocess stdin: {}",
-                e
-            ),
-        })?;
-    }
+    // Written on its own thread so the deadline below also covers a child
+    // that never reads its input: written inline, a request larger than a
+    // pipe buffer blocked here with no timeout. A failed write used to
+    // return at once, leaving the child unreaped and its stderr unread; its
+    // result is now checked after the child exits.
+    let stdin_writer = child
+        .stdin
+        .take()
+        .map(|mut stdin| thread::spawn(move || stdin.write_all(&payload)));
 
     let timeout = Duration::from_secs(timeout_secs);
     let deadline = Instant::now() + timeout;
@@ -417,6 +417,15 @@ fn embed_texts_with(
         return Err(EmbeddingError {
             kind: EmbeddingFailureKind::ProcessFailed,
             message: format!("embedding subprocess failed: {}", err.trim()),
+        });
+    }
+    if let Some(Ok(Err(error))) = stdin_writer.map(|writer| writer.join()) {
+        return Err(EmbeddingError {
+            kind: EmbeddingFailureKind::StdinWriteFailed,
+            message: format!(
+                "failed to write embedding request to subprocess stdin: {error}; stderr: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
         });
     }
 
@@ -715,6 +724,38 @@ print(json.dumps({"vectors": [[1.0]], "dim": 1}))
             "expected timeout message, got: {}",
             err.message
         );
+    }
+
+    /// Refutation review of e1698f8: the request was written before the
+    /// deadline started, so a child that does not read its input held the
+    /// call past the timeout.
+    #[test]
+    fn test_embed_timeout_covers_a_child_that_does_not_read_its_input() {
+        let _guard = retrieval_embedding_env_lock();
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let script_path = temp.path().join("deaf_embed.py");
+        fs::write(
+            &script_path,
+            "import sys, time\ntime.sleep(5)\nsys.stdin.read()\nprint('{\"vectors\": [[1.0]], \"dim\": 1}')\n",
+        )
+        .unwrap();
+
+        std::env::set_var("IMPULSE_EMBED_SCRIPT", &script_path);
+        let cfg = Config::default();
+        let started = std::time::Instant::now();
+        // Far larger than a pipe buffer, so writing it blocks until read.
+        let result = embed_texts(&cfg, &["x".repeat(400_000)], 1);
+        std::env::remove_var("IMPULSE_EMBED_SCRIPT");
+
+        assert_eq!(result.unwrap_err().kind, EmbeddingFailureKind::Timeout);
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
     }
 
     /// Review P2: stdout was not read until the child exited, so a reply

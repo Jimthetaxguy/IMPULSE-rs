@@ -894,11 +894,19 @@ ON CONFLICT(decision_id) DO UPDATE SET
     /// order, not "fixed bug in auth module" (ADR-0003 promises tokenized
     /// keyword matching).
     fn sanitize_fts_query(query: &str) -> String {
+        Self::quoted_words(query).join(" ")
+    }
+
+    /// The same quoted words joined by `OR`: an entry matching any of them.
+    fn any_word_fts_query(query: &str) -> String {
+        Self::quoted_words(query).join(" OR ")
+    }
+
+    fn quoted_words(query: &str) -> Vec<String> {
         query
             .split_whitespace()
             .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
-            .collect::<Vec<_>>()
-            .join(" ")
+            .collect()
     }
 
     /// FTS5's `bm25()` is lower-is-better (more negative means a stronger
@@ -910,7 +918,26 @@ ON CONFLICT(decision_id) DO UPDATE SET
     }
 
     pub fn search_history_keyword(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
-        let fts_query = Self::sanitize_fts_query(query);
+        self.history_fts(Self::sanitize_fts_query(query), query, limit)
+    }
+
+    /// Candidates for semantic search: entries matching any word of
+    /// `query`, strongest first. Requiring every word, as keyword search
+    /// does, dropped semantically close entries that miss one of them.
+    pub fn history_keyword_candidates(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
+        self.history_fts(Self::any_word_fts_query(query), query, limit)
+    }
+
+    fn history_fts(
+        &self,
+        fts_query: String,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
         if fts_query.is_empty() {
             return Ok(Vec::new());
         }
@@ -986,7 +1013,25 @@ LIMIT ?2
     }
 
     pub fn search_genome_keyword(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
-        let fts_query = Self::sanitize_fts_query(query);
+        self.genome_fts(Self::sanitize_fts_query(query), query, limit)
+    }
+
+    /// Candidates for semantic search over decisions; see
+    /// [`Self::history_keyword_candidates`].
+    pub fn genome_keyword_candidates(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
+        self.genome_fts(Self::any_word_fts_query(query), query, limit)
+    }
+
+    fn genome_fts(
+        &self,
+        fts_query: String,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
         if fts_query.is_empty() {
             return Ok(Vec::new());
         }
@@ -1138,6 +1183,24 @@ ON CONFLICT(record_id) DO UPDATE SET
                 .context("Failed to delete stale memory_fts row")?;
         }
         Ok(())
+    }
+
+    pub fn count_history_entries(&self) -> Result<usize> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM history_entries", [], |row| row.get(0))
+            .context("Failed to count history entries")?;
+        Ok(count.max(0) as usize)
+    }
+
+    pub fn count_genome_decisions(&self) -> Result<usize> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM genome_decisions", [], |row| {
+                row.get(0)
+            })
+            .context("Failed to count genome decisions")?;
+        Ok(count.max(0) as usize)
     }
 
     pub fn count_memory_records(&self) -> Result<usize> {

@@ -224,9 +224,12 @@ fn semantic_history_rust(
         }
     };
 
-    let candidate_limit = config.retrieval_candidate_pool.max(10);
+    // At least the requested window, or paging past the pool size came back
+    // empty; matched by any word, so the keyword filter does not decide
+    // semantic recall.
+    let candidate_limit = config.retrieval_candidate_pool.max(limit).max(10);
     let keyword_candidates = store
-        .search_history_keyword(query, candidate_limit)
+        .history_keyword_candidates(query, candidate_limit)
         .unwrap_or_default();
     let candidate_ids: Option<HashSet<String>> = if keyword_candidates.is_empty() {
         None
@@ -419,9 +422,9 @@ fn semantic_genome_rust(
         }
     };
 
-    let candidate_limit = config.retrieval_candidate_pool.max(10);
+    let candidate_limit = config.retrieval_candidate_pool.max(limit).max(10);
     let keyword_candidates = store
-        .search_genome_keyword(query, candidate_limit)
+        .genome_keyword_candidates(query, candidate_limit)
         .unwrap_or_default();
     let candidate_ids: Option<HashSet<String>> = if keyword_candidates.is_empty() {
         None

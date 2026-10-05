@@ -467,6 +467,14 @@ pub fn index_memory(
         backend_health.push("vector_backend_disabled=true".to_string());
     }
 
+    // A single-scope run leaves the other scope's rows in place; record
+    // what the store holds for it rather than 0.
+    if !matches!(scope, IndexScope::History | IndexScope::All) {
+        history_count = store.count_history_entries()?;
+    }
+    if !matches!(scope, IndexScope::Genome | IndexScope::All) {
+        genome_count = store.count_genome_decisions()?;
+    }
     let duration_ms = started.elapsed().as_millis() as u64;
     let state = IndexState {
         version: "1".to_string(),
@@ -701,6 +709,14 @@ pub fn index_memory_from_storage(
         backend_health.push("vector_backend_disabled=true".to_string());
     }
 
+    // A single-scope run leaves the other scope's rows in place; record
+    // what the store holds for it rather than 0.
+    if !matches!(scope, IndexScope::History | IndexScope::All) {
+        history_count = store.count_history_entries()?;
+    }
+    if !matches!(scope, IndexScope::Genome | IndexScope::All) {
+        genome_count = store.count_genome_decisions()?;
+    }
     let duration_ms = started.elapsed().as_millis() as u64;
     let state = IndexState {
         version: "1".to_string(),
@@ -813,6 +829,74 @@ mod tests {
             "vector must be removed when changed row re-embed fails"
         );
         std::env::remove_var("IMPULSE_EMBED_ALLOW_FAKE");
+    }
+
+    /// Refutation review of 6a060c7: semantic candidates came from the
+    /// all-words keyword search, so an entry missing one query word was
+    /// never scored. Candidates now match any word.
+    #[test]
+    fn test_semantic_candidates_match_any_query_word() {
+        let _guard = retrieval_embedding_env_lock();
+        let temp = TempDir::new().unwrap();
+        let cfg = Config {
+            retrieval_vector_enabled: false,
+            retrieval_backend: "fts".to_string(),
+            ..Config::default()
+        };
+        let mut history = vec![
+            sample_history("token refresh flow"),
+            sample_history("refresh the token later"),
+            sample_history("token renewal path"),
+        ];
+        for (i, entry) in history.iter_mut().enumerate() {
+            entry.session_id = format!("s{i}");
+        }
+        index_memory(
+            temp.path(),
+            &history,
+            &Genome::default(),
+            &cfg,
+            IndexScope::All,
+            true,
+        )
+        .unwrap();
+        let store = crate::retrieval::store::RetrievalStore::open(temp.path()).unwrap();
+        assert_eq!(
+            store
+                .search_history_keyword("token refresh", 10)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            store
+                .history_keyword_candidates("token refresh", 10)
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    /// Refutation review of e5c5dc3: a genome-only rebuild kept the history
+    /// index but recorded history_count = 0.
+    #[test]
+    fn test_a_single_scope_rebuild_reports_the_other_scope_it_kept() {
+        let _guard = retrieval_embedding_env_lock();
+        let temp = TempDir::new().unwrap();
+        let cfg = Config {
+            retrieval_vector_enabled: false,
+            retrieval_backend: "fts".to_string(),
+            ..Config::default()
+        };
+        let history = vec![sample_history("kept across a genome rebuild")];
+        let mut genome = Genome::default();
+        genome.add_decision("Keep counts honest".to_string(), None, Vec::new());
+
+        index_memory(temp.path(), &history, &genome, &cfg, IndexScope::All, true).unwrap();
+        let state =
+            index_memory(temp.path(), &[], &genome, &cfg, IndexScope::Genome, true).unwrap();
+        assert_eq!(state.history_count, 1);
+        assert_eq!(state.genome_count, 1);
     }
 
     #[test]
