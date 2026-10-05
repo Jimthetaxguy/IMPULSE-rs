@@ -351,6 +351,18 @@ impl State {
         let mut updated = false;
         {
             let mut state = self.live_state.write().map_err(lock_err)?;
+            // An ending session's history entry is already built; an update
+            // now would report success and then vanish with the session.
+            // Checked under the write lock, which excludes the claim in
+            // `end_session`.
+            if self
+                .ending_sessions
+                .lock()
+                .map_err(lock_err)?
+                .contains(session_id)
+            {
+                anyhow::bail!("Session {session_id} is being ended");
+            }
             if let Some(session) = state.get_session_mut(session_id) {
                 f(session);
                 updated = true;
@@ -680,6 +692,8 @@ mod tests {
             .end_session(&ending_id, "again".to_string())
             .await
             .is_err();
+        // Round 5 (reviewer A): tracking then reported success and was lost.
+        let tracking_refused = state.track_file(&ending_id, "late.rs").await.is_err();
 
         // Read another session from a plain thread: a held std lock would
         // block it, and a runtime thread blocked that way could not time out.
@@ -726,6 +740,7 @@ mod tests {
         );
         assert!(saved, "a save during the end dropped the session");
         assert!(second_end_refused, "a second end was not refused");
+        assert!(tracking_refused, "tracking an ending session was accepted");
     }
 
     /// Review P2: the session was removed before its history was appended,
