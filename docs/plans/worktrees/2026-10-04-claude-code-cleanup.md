@@ -172,6 +172,11 @@ Two recorded items fixed after round 3:
   no longer multiplies the walk, and `build_health` walks under `spawn_blocking`.
 - `ce98af3`: a triple quote inside a one-line string or comment no longer hides a configured
   sccache wrapper from the status check.
+- The docs contract check passes. `7cfad38` closed out the two stale May lane cards. The next
+  commit reviewed the collaborative coding guide against current practice:
+  - its gate matches `CLAUDE.md`;
+  - it covers per-lane target dirs and regression tests shown to fail with the fix reverted;
+  - it adds a review-before-ready section.
 
 Still recorded, not fixed:
 - `file_write`'s check-then-write race against a concurrent same-user process swapping symlinks
@@ -222,10 +227,6 @@ Still recorded, not fixed:
   CLI under a 120 s timeout, so lower risk than tool output.
 - **Multi-process `State`** never reloads and rewrites whole files without a lock (accepted for
   hooks in SECURITY-REVIEW Issue 3); the legacy TUI still auto-types context into PTYs.
-- **Docs contract check** fails only on `COLLABORATIVE-AGENTIC-CODING.md`, past the 120-day
-  staleness threshold; the living guide needs a content review against current practice, not a date
-  bump. The two May lane cards were reviewed on 2026-10-04: Loop 6's boundary map is superseded by
-  the canonical contract, and the docs lane card's status now matches its own record (`complete`).
 
 ## Decisions
 - 2026-10-04: review `main` module by module with read-only reviewers, verify every finding against
