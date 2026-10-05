@@ -48,19 +48,25 @@ fn git_subcommand(subcommand: &str) -> String {
 }
 
 /// The rest of one shell command: stops at `;`, `|`, `&`, or a newline, but
-/// steps over redirections such as `2>&1`, so a flag in a later command never
-/// counts and one after a redirection still does.
-const SAME_COMMAND: &str = r"(?:[^;|&\n]|&>|>&|<&)*";
+/// steps over redirections such as `2>&1` and line continuations (a `\` that
+/// ends a line), so a flag in a later command never counts and one after a
+/// redirection or a continuation still does.
+const SAME_COMMAND: &str = r"(?:[^;|&\n]|\\\r?\n|&>|>&|<&)*";
 
-/// A ref naming main or master as a whole: it starts after whitespace, a
-/// quote, a refspec's `:`, or a `+`, optionally as `refs/heads/`. A word
-/// boundary alone also matched `feature/main-menu`, `main-menu`, and `main~1`.
-const MAIN_REF: &str = r#"[\s"':+](?:refs/heads/)?(?i:main|master)"#;
+/// The gap between two words of one command: a space, a tab, or a line
+/// continuation. A newline alone starts another command.
+const WORD_GAP: &str = r"(?:[ \t]|\\\r?\n)";
 
-/// What may follow a whole ref: the end, whitespace, a quote, or a shell
-/// separator. The regex crate has no lookahead, so this consumes the
-/// character and can only end a pattern.
-const REF_END: &str = r#"(?:$|[\s"';|&)`>])"#;
+/// A ref naming main or master as a whole: it starts after a word gap, a
+/// quote, a refspec's `:`, a `+`, or brace expansion's `{` or `,`,
+/// optionally as `refs/heads/`. A word boundary alone also matched
+/// `feature/main-menu`, `main-menu`, and `main~1`.
+const MAIN_REF: &str = r#"(?:[ \t"':+{,]|\\\r?\n)(?:refs/heads/)?(?i:main|master)"#;
+
+/// What may follow a whole ref: the end, whitespace, a quote, a shell
+/// separator, or brace expansion's `,` or `}`. The regex crate has no
+/// lookahead, so this consumes the character and can only end a pattern.
+const REF_END: &str = r#"(?:$|[\s"';|&)`>,}])"#;
 
 /// A force-push of main or master: a force flag and the branch in either
 /// order, a `+` refspec onto it (quoted or not, or a `*` wildcard),
@@ -70,15 +76,16 @@ fn force_push_pattern() -> String {
     format!(
         concat!(
             "{push}{same}(?:",
-            r"\s{force}{same}{main}{end}",
-            r#"|{main}["']?\s(?:{same}\s)?{force}(?:$|[\s;|&)`>])"#,
-            r#"|\s["']?\+(?:[^\s:;|&"']*:)?(?:refs/heads/)?(?:(?i:main|master){end}|\*)"#,
-            r"|\s--mirror\b",
-            r"|\s{force}{same}\s--all\b|\s--all\b{same}\s{force}(?:$|[\s;|&)`>])",
+            r"{gap}{force}{same}{main}{end}",
+            r#"|{main}["']?(?:(?:{gap}|[,}}<>]|&>){same})?{gap}{force}(?:$|[\s;|&)`>])"#,
+            r#"|{gap}["']?\+(?:[^\s:;|&"']*:)?(?:refs/heads/)?(?:(?i:main|master){end}|\*)"#,
+            r"|{gap}--mirror\b",
+            r"|{gap}{force}{same}{gap}--all\b|{gap}--all\b{same}{gap}{force}(?:$|[\s;|&)`>])",
             ")"
         ),
         push = git_subcommand("push"),
         same = SAME_COMMAND,
+        gap = WORD_GAP,
         force = r"(?:-[a-zA-Z]*f[a-zA-Z]*|--force\S*)",
         main = MAIN_REF,
         end = REF_END,
@@ -496,6 +503,13 @@ mod tests {
             "git push -f origin refs/heads/main",
             "git push -f origin HEAD:refs/heads/master",
             "git push -f origin main~1:main",
+            "git push origin main>log -f",
+            "git push origin \"main\">/dev/null -f",
+            "git push -f origin {main,release}",
+            "git push origin {main,release} -f",
+            "git push --force \\\norigin main",
+            "git push --force \\\nmain",
+            "git push origin main \\\n-f",
             "git push --all --force origin",
             "git push -f --all",
             "rm -rf /*",
@@ -518,6 +532,12 @@ mod tests {
             "git push origin +main-menu",
             "git push origin feature/main -f",
             "git push --all origin",
+            "git push origin main\ntail -f build.log",
+            "git push origin main\ncurl -fsSL https://example.com/install.sh -o install.sh",
+            "git push origin HEAD:main\nrm -rf build",
+            "git push origin main\nln -sf ../shared config",
+            "git push origin main\ngit push -f origin feature",
+            "git push -f origin feature\nmain",
             "git push origin feature && echo --force main",
             "git add ./src/main.rs",
             "git add .gitignore",
