@@ -19,7 +19,10 @@ tags: [worktree, lane, handoff, cleanup, review]
 - Worktree: `../IMPULSE-rs.wt-cleanup`
 - Owned paths: this card; fixes for review findings in modules the pending branch stack does not
   touch (see Blocked paths)
-- Shared paths edited: `CLAUDE.md` (Architecture section only)
+- Shared paths edited: `CLAUDE.md` (Architecture section only), and
+  `impulse-rs/src/handlers/config.rs` (`6159ab7`, `99e858a`) although it is listed as blocked below.
+  `git merge-tree` trial merges of this branch with all nine pending branches were clean on
+  2026-10-04.
 - Blocked paths (edited by the unmerged stack: photon, blackboard, model provider, Dioxus 0.7):
   `impulse-rs/src/ion_repl/**`, `impulse-rs/src/llm_backends/**`, `impulse-rs/src/model_endpoint/**`,
   `impulse-rs/src/state/config.rs`, `impulse-rs/src/handlers/config.rs`, `impulse-rs/src/test_support.rs`,
@@ -28,11 +31,12 @@ tags: [worktree, lane, handoff, cleanup, review]
 - Verification: `cargo build --workspace`, `cargo test --workspace`,
   `cargo clippy --workspace --all-targets -- -D warnings` (default and `--no-default-features`),
   `cargo fmt --all -- --check`, `python3 docs/validate_docs.py`
-- Latest status: review pass, adversarial refutation round, and verification round complete.
-  29 fixes and 3 documentation corrections, 11 commits fixing what the refutation round
-  confirmed, and 8 more from the verification round and the recorded items. Behavior changes
-  carry regression tests, nearly all checked by reverting the fix and watching the test fail.
-  Gate evidence goes in the PR description. Not merged; needs a PR and review.
+- Latest status: review pass, adversarial refutation round, and two verification rounds
+  complete. 29 fixes and 3 documentation corrections, 11 commits fixing what the refutation round
+  confirmed, 8 from the first verification round and the recorded items, and 6 from the second
+  round and two more recorded items. Behavior changes carry regression tests, nearly all checked
+  by reverting the fix and watching the test fail. Gate evidence goes in the PR description. Not
+  merged; needs a PR and review.
 
 ## Fixed on this branch
 | Area | Commits |
@@ -94,19 +98,51 @@ Also from the recorded items:
 - `b8cee15`: bounded benchmark work; the unused, unsound path validator is deleted.
 - `1fc1e7d`: tools default to the session's impulse dir.
 
+Second verification round: the reviewers reran everything against `c5846b7`. Every earlier item
+held. In the latest fixes they confirmed four issues and suspected five more; all nine are fixed:
+
+| Issue | Commit |
+|---|---|
+| One pane write over the 16 MiB cap was refused even with nothing queued | `84493f1` |
+| The semantic candidate pool grew with the page window, so later pages could rank another set | `84493f1` |
+| Right-to-left and Arabic letter marks were refused as bidi controls | `d2789af` |
+| In a project without `.impulse`, the guard hook blocked every call, `impulse-rs init` included | `d2789af` |
+| The daemon refused to start where `flock` is unsupported | `d2789af` |
+| An unreadable log length let the memory-log cut-back erase the log | `d2789af` |
+| The benchmark trusted one run's time; the timing loop now stops at a deadline | `59b4e4b` |
+| An escaped quote inside a quoted `-c` value hid a force push from the guard | `59b4e4b` |
+| A Ctrl-C handler install error read as an interruption in `tooling-run` | `59b4e4b` |
+
+`3c0ba8d` fixes guard mismatches from the same probe that no commit had claimed:
+- a force push to a branch whose name contains `main` (`feature/main-menu`) was blocked;
+- `--all` with a force flag was not blocked;
+- `rm` with `\/` or `--rec` was not blocked.
+
+Five of the nine fixes have tests that fail against the previous code. The other four have no
+test:
+- the candidate pool no longer takes the page as an input, so there is nothing to vary;
+- the lock fallback, the cut-back guard and the Ctrl-C install error depend on OS failures a test
+  cannot provoke.
+
+Two more recorded items are fixed:
+- `d718b92`: the Keychain provider lists this service's secrets natively; `list` never parsed
+  `security` output.
+- `ba9c873`: the voice webhook handles at most 64 connections at once and closes the rest.
+
 Still recorded, not fixed:
 - `file_write`'s check-then-write race against a concurrent same-user process swapping symlinks
   (needs directory-fd opens).
 - A write root naming a single file is refused (suspected; every default root is a directory).
-- The voice webhook has no connection cap, answers chunked bodies with 400, and resets after
-  401/413.
+- The voice webhook answers chunked bodies with 400 and resets the connection after a 401 or 413.
 - A manifest tool that reads the terminal is stopped by the OS and ends at its timeout.
 - `end_session` holds the state lock across an fsync.
-- The Keychain provider's `list` never parses `security` output, so `credentials list` and its
-  count are always empty.
 - A bare `git push --force` while on main is not caught (the rule cannot see the current branch).
 - The recursive-delete Block rule stays broad (any absolute or home path) because narrowing it is
   a policy choice.
+- sccache setup refuses a config with any multi-line value, including a `[build]` table that
+  `25bf884` used to edit (by design since `b283c3f`).
+- `wrapper_state` still runs the old `"""` scanner first, so `X = '"""'` before a configured
+  wrapper reads as unset and setup asks for a key that is already there (unusual input).
 
 ## Recorded, not fixed (each needs a decision or its own lane)
 - **Office tools are unbounded** (`excel_read`, `word_read`, `document_parse`, the `office` CLI,
