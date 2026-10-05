@@ -144,19 +144,49 @@ fn acquire_daemon_lock(path: &std::path::Path) -> Result<Option<std::fs::File>> 
     // valid; flock only takes an advisory lock on it and touches no memory.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
-            anyhow::bail!(
+        match classify_lock_failure(error.raw_os_error()) {
+            LockFailure::Held => anyhow::bail!(
                 "Another daemon is already running (lock held: {})",
                 path.display()
-            );
+            ),
+            LockFailure::Unsupported => {
+                tracing::warn!(
+                    "daemon lock unavailable on {} ({error}); continuing without it",
+                    path.display()
+                );
+                return Ok(None);
+            }
+            LockFailure::Other => {
+                return Err(error).with_context(|| format!("Failed to lock {}", path.display()))
+            }
         }
-        tracing::warn!(
-            "daemon lock unavailable on {} ({error}); continuing without it",
-            path.display()
-        );
-        return Ok(None);
     }
     Ok(Some(file))
+}
+
+/// What a failed non-blocking `flock` means for starting the daemon.
+#[derive(Debug, PartialEq, Eq)]
+enum LockFailure {
+    /// Another process holds the lock.
+    Held,
+    /// This filesystem cannot lock; the daemon runs unlocked.
+    Unsupported,
+    /// Anything else, which refuses to start.
+    Other,
+}
+
+fn classify_lock_failure(code: Option<i32>) -> LockFailure {
+    match code {
+        // EWOULDBLOCK is flock's answer when another process holds the lock;
+        // lock emulation on some network filesystems (CIFS) answers EACCES.
+        Some(code) if code == libc::EWOULDBLOCK || code == libc::EACCES => LockFailure::Held,
+        Some(code)
+            if [libc::ENOTSUP, libc::EOPNOTSUPP, libc::ENOLCK, libc::EINVAL].contains(&code) =>
+        {
+            LockFailure::Unsupported
+        }
+        _ => LockFailure::Other,
+    }
 }
 
 pub struct DaemonConfig {

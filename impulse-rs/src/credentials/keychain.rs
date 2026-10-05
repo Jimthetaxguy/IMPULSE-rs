@@ -239,17 +239,21 @@ impl crate::credentials::CredentialProvider for KeychainProvider {
         #[cfg(target_os = "macos")]
         {
             use security_framework::item::{ItemClass, ItemSearchOptions, Limit};
-            // Attributes only, no secret data, so listing never prompts. This
-            // used to run `security find-internet-password -s <service>`,
-            // which returns only the first match and prints the account as
+            // Attributes only, no secret data, and like `get`, `set` and
+            // `delete` with user interaction off, so listing a locked
+            // keychain fails instead of prompting. This used to run
+            // `security find-internet-password -s <service>`, which returns
+            // only the first match and prints the account as
             // `"acct"<blob>="..."`, not the `account: ` line it looked for, so
             // `credentials list` and the status count were always empty.
-            let items = match ItemSearchOptions::new()
-                .class(ItemClass::internet_password())
-                .load_attributes(true)
-                .limit(Limit::All)
-                .search()
-            {
+            let searched = with_noninteractive_keychain(|| {
+                ItemSearchOptions::new()
+                    .class(ItemClass::internet_password())
+                    .load_attributes(true)
+                    .limit(Limit::All)
+                    .search()
+            });
+            let items = match searched {
                 Ok(items) => items,
                 Err(error) if error.code() == errSecItemNotFound => Vec::new(),
                 Err(error) => return Err(native_command_error(error)),

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use std::io::IsTerminal;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::{guardrail, state, storage};
@@ -118,18 +118,48 @@ pub(crate) fn decide_pre_tool_use(payload: &str, guards: &guardrail::GuardConfig
     }
 }
 
-/// The installed hook names `$CLAUDE_PROJECT_DIR/.impulse`. With that
-/// variable unset it names `/.impulse`: the hook cannot tell which project it
-/// guards, and a missing config used to mean "defaults", dropping the
-/// project's own rules, so it blocks. A set variable whose project simply has
-/// no `.impulse` yet gets the built-in rules, so `impulse-rs init` can run.
-fn missing_project_block(impulse_dir: &Path, project_dir: Option<&str>) -> Option<HookDecision> {
-    if impulse_dir.is_dir() || project_dir.is_some_and(|dir| !dir.trim().is_empty()) {
-        return None;
+/// The `.impulse` directory whose rules the hook applies, or the decision to
+/// block when the hook cannot tell which project it guards.
+///
+/// The installed hook names `$CLAUDE_PROJECT_DIR/.impulse`. Claude Code
+/// started in a subdirectory names one that does not exist while the
+/// project's own sits higher up, and the built-in rules alone would skip the
+/// project's custom Block rules, so the nearest enclosing one counts, up to
+/// the repository root (the nearest directory holding `.git`). An `.impulse`
+/// above the repository, such as a user-level one, never counts; outside a
+/// repository only the named directory does.
+///
+/// With none found, a set `CLAUDE_PROJECT_DIR` means the project has no rules
+/// of its own yet: the built-in rules apply, so `impulse-rs init` can run.
+/// Unset or blank, the hook names `/.impulse` and blocks.
+fn guard_impulse_dir(
+    impulse_dir: &Path,
+    project_dir: Option<&str>,
+) -> std::result::Result<PathBuf, HookDecision> {
+    if impulse_dir.is_dir() {
+        return Ok(impulse_dir.to_path_buf());
     }
-    Some(HookDecision::block(format!(
-        "Impulse guard cannot tell which project it guards: CLAUDE_PROJECT_DIR is not set and \
-         {} does not exist; the call is blocked",
+    let named = std::path::absolute(impulse_dir).unwrap_or_else(|_| impulse_dir.to_path_buf());
+    let enclosing = named
+        .file_name()
+        .zip(named.parent())
+        .and_then(|(name, start)| {
+            let root = start.ancestors().find(|dir| dir.join(".git").exists())?;
+            start
+                .ancestors()
+                .take_while(|dir| dir.starts_with(root))
+                .map(|dir| dir.join(name))
+                .find(|candidate| candidate.is_dir())
+        });
+    if let Some(found) = enclosing {
+        return Ok(found);
+    }
+    if project_dir.is_some_and(|dir| !dir.trim().is_empty()) {
+        return Ok(named);
+    }
+    Err(HookDecision::block(format!(
+        "Impulse guard cannot tell which project it guards: CLAUDE_PROJECT_DIR is unset or empty \
+         and {} does not exist; the call is blocked",
         impulse_dir.display()
     )))
 }
@@ -148,10 +178,11 @@ pub fn run_guard_hook(impulse_dir: &Path) -> ! {
 
 fn guard_hook_decision(impulse_dir: &Path) -> HookDecision {
     let project_dir = std::env::var("CLAUDE_PROJECT_DIR").ok();
-    if let Some(blocked) = missing_project_block(impulse_dir, project_dir.as_deref()) {
-        return blocked;
-    }
-    let config = match storage::Storage::new(impulse_dir.to_path_buf())
+    let impulse_dir = match guard_impulse_dir(impulse_dir, project_dir.as_deref()) {
+        Ok(dir) => dir,
+        Err(blocked) => return blocked,
+    };
+    let config = match storage::Storage::new(impulse_dir.clone())
         .read_json::<state::Config>("config.json")
     {
         Ok(config) => config,
@@ -514,15 +545,81 @@ mod tests {
             );
         }
         let missing = std::path::Path::new("/definitely/not/a/project/.impulse");
-        assert_eq!(
-            missing_project_block(missing, None).map(|d| d.exit_code),
-            Some(2)
-        );
+        for project_dir in [None, Some(""), Some("  ")] {
+            assert_eq!(
+                guard_impulse_dir(missing, project_dir)
+                    .err()
+                    .map(|d| d.exit_code),
+                Some(2),
+                "CLAUDE_PROJECT_DIR = {project_dir:?}"
+            );
+        }
         // A project without `.impulse` yet still runs on the built-in rules,
         // so `impulse-rs init` is not blocked.
-        assert!(missing_project_block(missing, Some("/definitely/not/a/project")).is_none());
+        assert_eq!(
+            guard_impulse_dir(missing, Some("/definitely/not/a/project")).ok(),
+            Some(missing.to_path_buf())
+        );
         let existing = tempfile::TempDir::new().unwrap();
-        assert!(missing_project_block(existing.path(), None).is_none());
+        assert_eq!(
+            guard_impulse_dir(existing.path(), None).ok(),
+            Some(existing.path().to_path_buf())
+        );
+    }
+
+    /// Round 3 on d2789af: with Claude Code started in a subdirectory, the
+    /// hook named `src/.impulse`, which does not exist, and ran on the
+    /// built-in rules, skipping the project's custom Block rules.
+    #[test]
+    fn test_guard_impulse_dir_finds_the_projects_own_from_a_subdirectory() {
+        let project = TempDir::new().unwrap();
+        std::fs::create_dir(project.path().join(".git")).unwrap();
+        std::fs::create_dir(project.path().join(".impulse")).unwrap();
+        let deep = project.path().join("src").join("deep");
+        std::fs::create_dir_all(&deep).unwrap();
+        let named = deep.join(".impulse");
+        let own = project.path().join(".impulse");
+        assert_eq!(
+            guard_impulse_dir(&named, deep.to_str()).ok(),
+            Some(own.clone())
+        );
+        // Without CLAUDE_PROJECT_DIR the repository still tells the project.
+        assert_eq!(guard_impulse_dir(&named, None).ok(), Some(own));
+    }
+
+    #[test]
+    fn test_guard_impulse_dir_never_looks_past_the_repository_root() {
+        // An `.impulse` above the repository, such as a user-level one, is
+        // not this project's.
+        let outer = TempDir::new().unwrap();
+        std::fs::create_dir(outer.path().join(".impulse")).unwrap();
+        let repo = outer.path().join("repo");
+        let src = repo.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir(repo.join(".git")).unwrap();
+        let named = src.join(".impulse");
+        assert_eq!(
+            guard_impulse_dir(&named, src.to_str()).ok(),
+            Some(named.clone())
+        );
+        // Outside any repository only the named directory counts. A temp dir
+        // inside a repository would make this half meaningless, so it checks.
+        let loose = outer.path().join("loose");
+        std::fs::create_dir(&loose).unwrap();
+        assert!(
+            !loose.ancestors().any(|dir| dir.join(".git").exists()),
+            "the temp dir {} is inside a git repository",
+            loose.display()
+        );
+        let named = loose.join(".impulse");
+        assert_eq!(
+            guard_impulse_dir(&named, loose.to_str()).ok(),
+            Some(named.clone())
+        );
+        assert_eq!(
+            guard_impulse_dir(&named, None).err().map(|d| d.exit_code),
+            Some(2)
+        );
     }
 
     #[test]

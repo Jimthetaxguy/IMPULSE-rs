@@ -1405,6 +1405,29 @@ mod tests {
         );
     }
 
+    /// Round 3 on d2789af: lock emulation on some network filesystems
+    /// reports a held lock as EACCES, which read as "flock unsupported" and
+    /// started a second daemon unlocked. Unknown errors refuse to start.
+    #[test]
+    fn test_classify_lock_failure_holds_eacces_and_refuses_the_unknown() {
+        use super::super::{classify_lock_failure, LockFailure};
+        assert_eq!(
+            classify_lock_failure(Some(libc::EWOULDBLOCK)),
+            LockFailure::Held
+        );
+        assert_eq!(classify_lock_failure(Some(libc::EACCES)), LockFailure::Held);
+        assert_eq!(
+            classify_lock_failure(Some(libc::ENOTSUP)),
+            LockFailure::Unsupported
+        );
+        assert_eq!(
+            classify_lock_failure(Some(libc::ENOLCK)),
+            LockFailure::Unsupported
+        );
+        assert_eq!(classify_lock_failure(Some(libc::EIO)), LockFailure::Other);
+        assert_eq!(classify_lock_failure(None), LockFailure::Other);
+    }
+
     /// Refutation review of dddee6d (suspected): ownership rested on a
     /// connect() check alone. A held lock now stops a second daemon before it
     /// touches the socket or reconciles anything.
