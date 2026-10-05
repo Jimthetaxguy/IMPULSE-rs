@@ -473,7 +473,7 @@ async fn handle_http_connection(
             HeaderBlock::End(position) => position,
             HeaderBlock::Closed => return Ok(()),
             HeaderBlock::TooLarge => {
-                return write_http_response(
+                return reply_and_close(
                     &mut stream,
                     431,
                     "application/json",
@@ -496,7 +496,7 @@ async fn handle_http_connection(
 
     let is_health = method == "GET" && matches!(path, "/healthz" | "/health");
     if !is_health && !auth.admits(header_text) {
-        return write_http_response(
+        return reply_and_close(
             &mut stream,
             401,
             "application/json",
@@ -516,7 +516,7 @@ async fn handle_http_connection(
         .unwrap_or(body.len());
     // Refuse before allocating: a caller-chosen length is never trusted.
     if content_length > MAX_REQUEST_SIZE {
-        return write_http_response(
+        return reply_and_close(
             &mut stream,
             413,
             "application/json",
@@ -574,10 +574,21 @@ async fn handle_http_connection(
         ),
     };
 
-    write_http_response(&mut stream, status, content_type, &payload).await
+    reply_and_close(&mut stream, status, content_type, &payload).await
 }
 
-async fn write_http_response(
+/// How long a closing connection may keep sending, and how much of it is
+/// read and dropped meanwhile; see [`reply_and_close`].
+const WEBHOOK_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const WEBHOOK_DRAIN_BYTES: usize = 1024 * 1024;
+
+/// Writes the reply and closes the connection. A request whose body was not
+/// read (a 401, a 413, a health check that declared one) leaves bytes
+/// unread, and closing with unread bytes makes the kernel send a reset,
+/// which can discard the reply before the client reads it. So the write
+/// side is shut first, and what the client still sends is read and dropped,
+/// within `WEBHOOK_DRAIN_TIMEOUT` and `WEBHOOK_DRAIN_BYTES`.
+async fn reply_and_close(
     stream: &mut TcpStream,
     status: u16,
     content_type: &str,
@@ -604,6 +615,18 @@ async fn write_http_response(
     stream.write_all(response.as_bytes()).await?;
     stream.write_all(payload).await?;
     stream.flush().await?;
+    let _ = stream.shutdown().await;
+    let mut sink = [0u8; 8 * 1024];
+    let mut drained = 0;
+    let _ = tokio::time::timeout(WEBHOOK_DRAIN_TIMEOUT, async {
+        while drained < WEBHOOK_DRAIN_BYTES {
+            match stream.read(&mut sink).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => drained += n,
+            }
+        }
+    })
+    .await;
     Ok(())
 }
 
@@ -745,6 +768,36 @@ mod tests {
             let response = send_raw(addr, &[request.as_bytes()]).await;
             assert!(response.starts_with("HTTP/1.1 200"), "{auth}: {response}");
         }
+    }
+
+    /// Recorded review item: a refused request's body was left unread, and
+    /// closing with unread bytes made the kernel send a reset, which could
+    /// discard the 401 before the client read it.
+    #[tokio::test]
+    async fn webhook_refusal_closes_cleanly_while_the_body_is_unread() {
+        let addr = spawn_webhook(WebhookAuth::Bearer("s3cret".into())).await;
+        let body = vec![b'x'; 64 * 1024];
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let head = format!(
+            "POST /voice/tool HTTP/1.1\r\nAuthorization: Bearer wrong\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).await.unwrap();
+        stream.write_all(&body).await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut reply = Vec::new();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            stream.read_to_end(&mut reply),
+        )
+        .await
+        .expect("a reply within 10 s");
+        let reply = String::from_utf8_lossy(&reply);
+        assert!(
+            read.is_ok(),
+            "the connection was reset: {read:?}, after {reply:?}"
+        );
+        assert!(reply.starts_with("HTTP/1.1 401"), "{reply}");
     }
 
     /// Refutation review of fbba874: an unauthenticated health check that
