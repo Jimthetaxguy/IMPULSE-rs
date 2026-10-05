@@ -12,7 +12,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-use crate::process_util::run_with_timeout;
+use crate::process_util::{run_with_limits, run_with_timeout, MAX_STDERR_BYTES};
 use crate::storage::sanitize_filename;
 
 use super::types::*;
@@ -23,6 +23,12 @@ const SEM_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `sem --version` answers at once; waiting longer only stalls `sem-status`.
 const SEM_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Most output `sem diff` may print. Its JSON carries every changed entity's
+/// full source on both sides, and a nested entity repeats its parent's text,
+/// so a session that adds a large generated file can pass the default cap
+/// with a complete answer. The parser skips that text.
+const SEM_DIFF_MAX_OUTPUT_BYTES: usize = 128 * 1024 * 1024;
 
 #[cfg(test)]
 thread_local! {
@@ -50,18 +56,33 @@ fn sem_timeout(default: Duration) -> Duration {
 }
 
 /// Runs `f` with `program` standing in for `sem`, and `timeout` for every
-/// sem timeout, on this thread only.
+/// sem timeout, on this thread only. A nested call restores the outer
+/// setting when it returns.
 #[cfg(test)]
 pub(crate) fn with_test_sem<T>(program: &Path, timeout: Duration, f: impl FnOnce() -> T) -> T {
-    struct Reset;
-    impl Drop for Reset {
+    type Setting = Option<(std::path::PathBuf, Duration)>;
+    struct Restore(Setting);
+    impl Drop for Restore {
         fn drop(&mut self) {
-            TEST_SEM.with(|sem| *sem.borrow_mut() = None);
+            let outer = self.0.take();
+            TEST_SEM.with(|sem| *sem.borrow_mut() = outer);
         }
     }
-    TEST_SEM.with(|sem| *sem.borrow_mut() = Some((program.to_path_buf(), timeout)));
-    let _reset = Reset;
+    let outer = TEST_SEM.with(|sem| sem.replace(Some((program.to_path_buf(), timeout))));
+    let _restore = Restore(outer);
     f()
+}
+
+/// A `sem` command that answers from this machine only.
+///
+/// With a sem cloud login and consent, `sem diff` prints its answer and then
+/// goes on to a relations pass of minutes before exiting, which the timeout
+/// would end, throwing the complete answer away. `SEM_LOCAL=1` is sem's own
+/// switch for keeping a run local.
+fn sem_command() -> Command {
+    let mut cmd = Command::new(sem_program());
+    cmd.env("SEM_LOCAL", "1");
+    cmd
 }
 
 /// Check whether the `sem` CLI is available on PATH.
@@ -79,7 +100,7 @@ fn require_sem() -> Result<()> {
 /// The version `sem --version` reports.
 pub fn sem_version() -> Result<String> {
     require_sem()?;
-    let mut cmd = Command::new(sem_program());
+    let mut cmd = sem_command();
     cmd.arg("--version");
     let output = run_with_timeout(cmd, sem_timeout(SEM_VERSION_TIMEOUT))
         .context("failed to run `sem --version`")?;
@@ -125,14 +146,19 @@ pub fn run_semantic_diff(
     require_sem()?;
     let range = diff_range(base_ref, head_ref)?;
 
-    let mut cmd = Command::new(sem_program());
+    let mut cmd = sem_command();
     cmd.arg("diff")
         .arg(&range)
         .arg("--format")
         .arg("json")
         .current_dir(repo_path);
-    let output =
-        run_with_timeout(cmd, sem_timeout(SEM_TIMEOUT)).context("failed to run `sem diff`")?;
+    let output = run_with_limits(
+        cmd,
+        sem_timeout(SEM_TIMEOUT),
+        SEM_DIFF_MAX_OUTPUT_BYTES,
+        MAX_STDERR_BYTES,
+    )
+    .context("failed to run `sem diff`")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -156,7 +182,7 @@ pub fn run_semantic_blame(repo_path: &Path, file_path: &str) -> Result<Vec<Seman
     require_sem()?;
 
     // `--` ends sem's options, so a file name starting with `-` stays a file.
-    let mut cmd = Command::new(sem_program());
+    let mut cmd = sem_command();
     cmd.arg("blame")
         .arg("--format")
         .arg("json")
@@ -178,9 +204,7 @@ pub fn run_semantic_blame(repo_path: &Path, file_path: &str) -> Result<Vec<Seman
         return Ok(Vec::new());
     }
 
-    let entries: Vec<SemanticBlameEntry> =
-        serde_json::from_str(&stdout).context("failed to parse sem blame JSON output")?;
-    Ok(entries)
+    parse_sem_blame_output(&stdout, file_path)
 }
 
 /// Run `sem impact` for a given entity and return its blast radius.
@@ -188,7 +212,7 @@ pub fn run_semantic_impact(repo_path: &Path, entity_name: &str) -> Result<Impact
     require_sem()?;
 
     // `--` ends sem's options, so the entity name is never read as one.
-    let mut cmd = Command::new(sem_program());
+    let mut cmd = sem_command();
     cmd.arg("impact")
         .arg("--format")
         .arg("json")
@@ -205,10 +229,7 @@ pub fn run_semantic_impact(repo_path: &Path, entity_name: &str) -> Result<Impact
         );
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let result: ImpactResult =
-        serde_json::from_str(&stdout).context("failed to parse sem impact JSON output")?;
-    Ok(result)
+    parse_sem_impact_output(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// Capture semantic diff at session end and store it.
@@ -469,8 +490,14 @@ impl RawChange {
 
 impl RawEntity {
     fn into_info(self) -> Result<EntityInfo> {
+        // A name may be empty: sem names a JSON entity by its key, and an npm
+        // lockfile's root package is keyed "" (an empty Markdown heading is
+        // another). It must still be there.
+        let Some(name) = self.name else {
+            bail!("it has no entity name");
+        };
         Ok(EntityInfo {
-            name: required(self.name, "entity name")?,
+            name,
             entity_type: required(self.entity_type, "entity type")?,
             file_path: required(self.file_path, "file path")?,
             start_line: self.start_line,
@@ -503,8 +530,189 @@ fn parse_change_kind(value: Option<&str>) -> Result<ChangeKind> {
     })
 }
 
+/// One entity as `sem blame` and `sem impact` print it.
+#[derive(Deserialize)]
+struct RawSemEntity {
+    name: String,
+    #[serde(rename = "type")]
+    entity_type: String,
+    /// `sem impact` names each entity's file; `sem blame` entries are all in
+    /// the blamed file.
+    #[serde(default)]
+    file: Option<String>,
+    /// `[start, end]`.
+    #[serde(default)]
+    lines: Option<[u32; 2]>,
+}
+
+impl RawSemEntity {
+    fn into_info(self, blamed_file: Option<&str>) -> Result<EntityInfo> {
+        let file_path = self.file.or_else(|| blamed_file.map(str::to_string));
+        Ok(EntityInfo {
+            name: self.name,
+            entity_type: required(Some(self.entity_type), "entity type")?,
+            file_path: required(file_path, "file path")?,
+            start_line: self.lines.map(|[start, _]| start),
+            end_line: self.lines.map(|[_, end]| end),
+            parent: None,
+        })
+    }
+}
+
+/// One `sem blame --format json` entry: an entity with its fields flat
+/// beside the blame, and `commit` null for lines not yet committed.
+#[derive(Deserialize)]
+struct RawBlameEntry {
+    name: String,
+    #[serde(rename = "type")]
+    entity_type: String,
+    #[serde(default)]
+    lines: Option<[u32; 2]>,
+    author: String,
+    date: String,
+    commit: Option<String>,
+    #[serde(default)]
+    summary: Option<String>,
+}
+
+/// Parse the list `sem blame --format json` prints for `file_path`.
+fn parse_sem_blame_output(json_str: &str, file_path: &str) -> Result<Vec<SemanticBlameEntry>> {
+    let entries: Vec<RawBlameEntry> =
+        serde_json::from_str(json_str).context("failed to parse sem blame JSON output")?;
+    entries
+        .into_iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let entity = RawSemEntity {
+                name: entry.name,
+                entity_type: entry.entity_type,
+                file: None,
+                lines: entry.lines,
+            }
+            .into_info(Some(file_path))
+            .with_context(|| format!("sem blame entry #{} is incomplete", index + 1))?;
+            Ok(SemanticBlameEntry {
+                entity,
+                author: entry.author,
+                commit: entry.commit,
+                date: entry.date,
+                message: entry.summary,
+            })
+        })
+        .collect()
+}
+
+/// The parts of `sem impact --format json` the report uses: the entity, its
+/// direct dependents, and how many entities the change reaches in all.
+#[derive(Deserialize)]
+struct RawImpact {
+    entity: RawSemEntity,
+    dependents: Vec<RawSemEntity>,
+    #[serde(default)]
+    impact: Option<RawImpactReach>,
+}
+
+#[derive(Deserialize)]
+struct RawImpactReach {
+    total: usize,
+}
+
+/// Parse what `sem impact --format json` prints for one entity.
+fn parse_sem_impact_output(json_str: &str) -> Result<ImpactResult> {
+    let impact: RawImpact =
+        serde_json::from_str(json_str).context("failed to parse sem impact JSON output")?;
+    let target = impact
+        .entity
+        .into_info(None)
+        .context("sem impact's entity is incomplete")?;
+    let dependents = impact
+        .dependents
+        .into_iter()
+        .map(|entity| entity.into_info(None))
+        .collect::<Result<Vec<_>>>()
+        .context("a dependent in sem impact's output is incomplete")?;
+    let blast_radius = impact.impact.map_or(dependents.len(), |reach| reach.total);
+    Ok(ImpactResult {
+        target,
+        dependents,
+        blast_radius,
+    })
+}
+
+/// Fake `sem` scripts for tests here and in the sem command handlers.
+#[cfg(test)]
+pub(crate) mod fake_sem {
+    use std::path::{Path, PathBuf};
+
+    /// A shell script standing in for `sem`. Each run appends its arguments,
+    /// one per line followed by a `--end--` line, to the returned log, and
+    /// the `SEM_LOCAL` it saw to `env.log` beside it; then it runs `body`.
+    pub(crate) fn fake_sem(body: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let log = dir.path().join("argv.log");
+        let env_log = dir.path().join("env.log");
+        let script = dir.path().join("sem");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 [ \"$1\" = --impulse-test-warm-up ] && exit 0\n\
+                 printf '%s\\n' \"$@\" --end-- >> '{}'\n\
+                 echo \"SEM_LOCAL=$SEM_LOCAL\" >> '{}'\n\
+                 {body}\n",
+                log.display(),
+                env_log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // On Linux a process another test forks while the script is open for
+        // writing keeps that descriptor until it execs, and running the
+        // script fails with ETXTBSY until then. Wait that out here, once.
+        for _ in 0..200 {
+            match std::process::Command::new(&script)
+                .arg("--impulse-test-warm-up")
+                .status()
+            {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                _ => break,
+            }
+        }
+        (dir, script, log)
+    }
+
+    /// Each sem run's arguments, from a [`fake_sem`] log.
+    pub(crate) fn logged_runs(log: &Path) -> Vec<Vec<String>> {
+        let text = std::fs::read_to_string(log).unwrap_or_default();
+        let mut runs = Vec::new();
+        let mut current = Vec::new();
+        for line in text.lines() {
+            if line == "--end--" {
+                runs.push(std::mem::take(&mut current));
+            } else {
+                current.push(line.to_string());
+            }
+        }
+        runs
+    }
+
+    /// The `SEM_LOCAL=...` line each run logged, from a [`fake_sem`] log.
+    pub(crate) fn logged_sem_local(log: &Path) -> Vec<String> {
+        let env_log = log.with_file_name("env.log");
+        std::fs::read_to_string(env_log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::fake_sem::{fake_sem, logged_runs, logged_sem_local};
     use super::*;
 
     #[test]
@@ -807,41 +1015,6 @@ mod tests {
         assert!(diff_range("main", "-p").is_err());
     }
 
-    /// A shell script standing in for `sem`. It appends its arguments, one
-    /// per line followed by a `--end--` line, to the returned log, then runs
-    /// `body`.
-    fn fake_sem(body: &str) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::TempDir::new().unwrap();
-        let log = dir.path().join("argv.log");
-        let script = dir.path().join("sem");
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" --end-- >> '{}'\n{body}\n",
-                log.display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        (dir, script, log)
-    }
-
-    /// Each sem run's arguments, from a [`fake_sem`] log.
-    fn logged_runs(log: &Path) -> Vec<Vec<String>> {
-        let text = std::fs::read_to_string(log).unwrap_or_default();
-        let mut runs = Vec::new();
-        let mut current = Vec::new();
-        for line in text.lines() {
-            if line == "--end--" {
-                runs.push(std::mem::take(&mut current));
-            } else {
-                current.push(line.to_string());
-            }
-        }
-        runs
-    }
-
     #[test]
     fn test_run_semantic_diff_passes_one_range_and_reads_current_output() {
         let (_dir, sem, log) = fake_sem(&format!("cat <<'JSON'\n{CURRENT_SEM_OUTPUT}\nJSON"));
@@ -880,11 +1053,9 @@ mod tests {
     /// starting with `-` was read as an option.
     #[test]
     fn test_run_semantic_blame_and_impact_end_options_before_the_name() {
-        let (_dir, sem, log) = fake_sem(
-            "if [ \"$1\" = blame ]; then echo '[]'; else \
-             echo '{\"target\":{\"name\":\"x\",\"entity_type\":\"f\",\"file_path\":\"a\"},\
-             \"dependents\":[],\"blast_radius\":0}'; fi",
-        );
+        let (_dir, sem, log) = fake_sem(&format!(
+            "if [ \"$1\" = blame ]; then echo '[]'; else cat <<'JSON'\n{SEM_IMPACT_OUTPUT}\nJSON\nfi"
+        ));
         let repo = tempfile::TempDir::new().unwrap();
         with_test_sem(&sem, Duration::from_secs(10), || {
             run_semantic_blame(repo.path(), "-weird.rs").unwrap();
@@ -948,5 +1119,150 @@ mod tests {
         crate::process_util::test_sleep::stop(&marker);
         assert!(result.is_err(), "{result:?}");
         assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+    }
+
+    /// `sem impact --format json` output in the shape sem's `impact.rs`
+    /// prints (full mode, no `--deps`/`--dependents`/`--tests`).
+    const SEM_IMPACT_OUTPUT: &str = r#"{
+        "entity": {"entityId": "src/config.ts::function::parseConfig", "name": "parseConfig",
+                   "type": "function", "file": "src/config.ts", "lines": [3, 9]},
+        "dependencies": [],
+        "dependents": [
+            {"entityId": "src/load.ts::function::load", "name": "load", "type": "function",
+             "file": "src/load.ts", "lines": [1, 4]}
+        ],
+        "impact": {"depth": 2, "total": 3, "entities": []},
+        "tests": [],
+        "noTestReaches": true
+    }"#;
+
+    /// Verification finding: sem names a JSON entity by its key, and an npm
+    /// lockfile's root package is keyed "", so adding a lockfile failed the
+    /// whole diff.
+    #[test]
+    fn test_parse_sem_diff_keeps_an_entity_with_an_empty_name() {
+        let changes = parse_sem_diff_output(
+            r#"{"changes": [{"changeType": "added", "entityName": "", "entityType": "object",
+                             "filePath": "package-lock.json"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].entity.name, "");
+        assert_eq!(changes[0].entity.file_path, "package-lock.json");
+    }
+
+    /// Verification finding: sem's blame entries are flat (`name`, `type`,
+    /// `lines`, a nullable `commit`), so every non-empty blame failed to
+    /// parse.
+    #[test]
+    fn test_parse_sem_blame_output_reads_sem_entries() {
+        let entries = parse_sem_blame_output(
+            r#"[
+                {"name": "parse", "type": "function", "lines": [3, 9], "author": "Ada",
+                 "date": "2026-10-01", "commit": "abc1234", "summary": "fix parse"},
+                {"name": "draft", "type": "function", "lines": [11, 12], "author": "unknown",
+                 "date": "", "commit": null, "summary": ""}
+            ]"#,
+            "src/config.ts",
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].entity.name, "parse");
+        assert_eq!(entries[0].entity.entity_type, "function");
+        assert_eq!(entries[0].entity.file_path, "src/config.ts");
+        assert_eq!(entries[0].entity.start_line, Some(3));
+        assert_eq!(entries[0].entity.end_line, Some(9));
+        assert_eq!(entries[0].commit.as_deref(), Some("abc1234"));
+        assert_eq!(entries[0].message.as_deref(), Some("fix parse"));
+        assert_eq!(entries[1].commit, None);
+
+        assert!(parse_sem_blame_output(r#"[{"name": "x"}]"#, "a.rs").is_err());
+    }
+
+    /// Verification finding: sem's impact output has an `entity` object and
+    /// an `impact.total`, not `target` and `blast_radius`, so every impact
+    /// failed to parse.
+    #[test]
+    fn test_parse_sem_impact_output_reads_sem_output() {
+        let result = parse_sem_impact_output(SEM_IMPACT_OUTPUT).unwrap();
+        assert_eq!(result.target.name, "parseConfig");
+        assert_eq!(result.target.file_path, "src/config.ts");
+        assert_eq!(result.target.start_line, Some(3));
+        assert_eq!(result.dependents.len(), 1);
+        assert_eq!(result.dependents[0].file_path, "src/load.ts");
+        assert_eq!(result.blast_radius, 3);
+
+        let without_reach = parse_sem_impact_output(
+            r#"{"entity": {"name": "f", "type": "function", "file": "a.rs"},
+                "dependents": [{"name": "g", "type": "function", "file": "b.rs"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(without_reach.blast_radius, 1);
+
+        assert!(parse_sem_impact_output(r#"{"target": {}, "blast_radius": 0}"#).is_err());
+        assert!(parse_sem_impact_output(
+            r#"{"entity": {"name": "f", "type": "function"}, "dependents": []}"#
+        )
+        .is_err());
+    }
+
+    /// Verification finding: with a sem cloud login, `sem diff` runs on for
+    /// minutes after printing its answer, past the timeout. Every sem command
+    /// now runs with `SEM_LOCAL=1`.
+    #[test]
+    fn test_sem_commands_run_with_sem_local_set() {
+        let (_dir, sem, log) = fake_sem(&format!(
+            "case \"$1\" in \
+               diff) echo '{{\"changes\": []}}' ;; \
+               blame) echo '[]' ;; \
+               impact) cat <<'JSON'\n{SEM_IMPACT_OUTPUT}\nJSON\n;; \
+               *) echo 'sem 9.9.9' ;; \
+             esac"
+        ));
+        let repo = tempfile::TempDir::new().unwrap();
+        with_test_sem(&sem, Duration::from_secs(10), || {
+            run_semantic_diff(repo.path(), "abc", "HEAD").unwrap();
+            run_semantic_blame(repo.path(), "a.rs").unwrap();
+            run_semantic_impact(repo.path(), "f").unwrap();
+            sem_version().unwrap();
+        });
+        assert_eq!(logged_sem_local(&log), ["SEM_LOCAL=1"; 4]);
+    }
+
+    /// Verification finding: sem's JSON carries each change's full source,
+    /// so a complete answer can pass the 32 MiB default cap; `sem diff`
+    /// gets a larger one.
+    #[test]
+    fn test_run_semantic_diff_reads_an_answer_larger_than_the_default_cap() {
+        let source_bytes = crate::process_util::MAX_STDOUT_BYTES + 1024 * 1024;
+        let (_dir, sem, _log) = fake_sem(&format!(
+            "printf '{{\"changes\": [{{\"changeType\": \"added\", \"entityName\": \"f\", \
+             \"entityType\": \"function\", \"filePath\": \"gen.rs\", \"afterContent\": \"'\n\
+             head -c {source_bytes} /dev/zero | tr '\\0' a\n\
+             printf '\"}}]}}'"
+        ));
+        let repo = tempfile::TempDir::new().unwrap();
+        let changes = with_test_sem(&sem, Duration::from_secs(30), || {
+            run_semantic_diff(repo.path(), "abc", "HEAD")
+        })
+        .unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].entity.file_path, "gen.rs");
+    }
+
+    /// Verification finding: a nested `with_test_sem` reset the outer
+    /// setting to none, so the next call ran the real `sem`.
+    #[test]
+    fn test_nested_test_sem_restores_the_outer_program() {
+        let outer = Path::new("/outer/sem");
+        let inner = Path::new("/inner/sem");
+        with_test_sem(outer, Duration::from_secs(1), || {
+            with_test_sem(inner, Duration::from_secs(2), || {
+                assert_eq!(sem_program(), inner.as_os_str());
+            });
+            assert_eq!(sem_program(), outer.as_os_str());
+            assert_eq!(sem_timeout(SEM_TIMEOUT), Duration::from_secs(1));
+        });
+        assert_eq!(sem_program(), "sem");
     }
 }

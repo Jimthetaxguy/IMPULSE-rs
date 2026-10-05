@@ -96,7 +96,11 @@ pub fn handle_sem_blame(file: String, json: bool) -> Result<()> {
                 .unwrap_or("");
             println!(
                 "  {} ({}) — {} by {} [{}]",
-                entry.entity.name, entry.entity.entity_type, entry.commit, entry.author, msg
+                entry.entity.name,
+                entry.entity.entity_type,
+                entry.commit.as_deref().unwrap_or("uncommitted"),
+                entry.author,
+                msg
             );
         }
     }
@@ -167,7 +171,7 @@ pub fn handle_sem_status(json: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use crate::semantic_diff::fake_sem::{fake_sem, logged_runs};
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
@@ -175,21 +179,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let st = state::State::new(tmp.path().to_path_buf()).unwrap();
         (tmp, Arc::new(st))
-    }
-
-    /// A shell script standing in for `sem` that appends one line per run
-    /// to the returned log, then runs `body`.
-    fn fake_sem(body: &str) -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
-        let dir = TempDir::new().unwrap();
-        let log = dir.path().join("runs.log");
-        let script = dir.path().join("sem");
-        std::fs::write(
-            &script,
-            format!("#!/bin/sh\necho \"$*\" >> '{}'\n{body}\n", log.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        (dir, script, log)
     }
 
     /// Review finding: with a session id, `sem-diff` ran `sem diff` once,
@@ -208,8 +197,8 @@ mod tests {
             )
         })
         .unwrap();
-        let runs = std::fs::read_to_string(&log).unwrap();
-        assert_eq!(runs.lines().count(), 1, "sem ran: {runs:?}");
+        let runs = logged_runs(&log);
+        assert_eq!(runs.len(), 1, "sem ran: {runs:?}");
         assert!(state
             .storage()
             .base_path()
@@ -222,7 +211,7 @@ mod tests {
     #[test]
     fn test_handle_sem_status_returns_by_the_timeout_when_the_version_hangs() {
         let marker = crate::process_util::test_sleep::unique_duration(5);
-        let (_dir, sem, _log) = fake_sem(&format!("sleep {marker}"));
+        let (_dir, sem, log) = fake_sem(&format!("sleep {marker}"));
         let start = Instant::now();
         let result = semantic_diff::with_test_sem(&sem, Duration::from_millis(300), || {
             handle_sem_status(false)
@@ -230,6 +219,9 @@ mod tests {
         let elapsed = start.elapsed();
         crate::process_util::test_sleep::stop(&marker);
         result.unwrap();
+        // The fake sem really ran: an unbounded `sem --version` that never
+        // used it would also return at once, finding no `sem` on PATH.
+        assert_eq!(logged_runs(&log), [["--version"]]);
         assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
     }
 }

@@ -26,12 +26,12 @@
 mod runner;
 mod types;
 
-#[cfg(test)]
-pub(crate) use runner::with_test_sem;
 pub use runner::{
     capture_semantic_diff, run_semantic_blame, run_semantic_diff, run_semantic_impact,
     sem_available, sem_version,
 };
+#[cfg(test)]
+pub(crate) use runner::{fake_sem, with_test_sem};
 pub use types::{
     ChangeKind, EntityChange, EntityInfo, ImpactResult, SemanticBlameEntry, SemanticDiffReport,
     SemanticDiffSummary,

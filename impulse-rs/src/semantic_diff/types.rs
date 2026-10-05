@@ -227,7 +227,10 @@ impl SemanticDiffReport {
 pub struct SemanticBlameEntry {
     pub entity: EntityInfo,
     pub author: String,
-    pub commit: String,
+    /// The last commit to change the entity; `None` when its current lines
+    /// are not committed yet.
+    #[serde(default)]
+    pub commit: Option<String>,
     pub date: String,
     #[serde(default)]
     pub message: Option<String>,
@@ -247,6 +250,30 @@ pub struct ImpactResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_semantic_blame_entry_round_trips() {
+        for commit in [Some("abc1234".to_string()), None] {
+            let entry = SemanticBlameEntry {
+                entity: EntityInfo {
+                    name: "parse".to_string(),
+                    entity_type: "function".to_string(),
+                    file_path: "src/config.ts".to_string(),
+                    start_line: Some(3),
+                    end_line: Some(9),
+                    parent: None,
+                },
+                author: "Ada".to_string(),
+                commit,
+                date: "2026-10-01".to_string(),
+                message: Some("fix parse".to_string()),
+            };
+            let json = serde_json::to_string(&entry).unwrap();
+            let recovered: SemanticBlameEntry = serde_json::from_str(&json).unwrap();
+            assert_eq!(serde_json::to_string(&recovered).unwrap(), json);
+            assert_eq!(recovered.commit, entry.commit);
+        }
+    }
 
     #[test]
     fn test_change_kind_display() {

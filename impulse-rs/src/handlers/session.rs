@@ -176,7 +176,7 @@ pub async fn handle_session_end(
                         eprintln!("Semantic diff: {}", report.summary);
                     }
                 }
-                Err(e) => eprintln!("Warning: semantic diff failed: {}", e),
+                Err(e) => eprintln!("Warning: semantic diff failed: {e:#}"),
             }
         }
     }
