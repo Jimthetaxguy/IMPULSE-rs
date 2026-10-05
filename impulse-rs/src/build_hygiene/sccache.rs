@@ -148,10 +148,11 @@ enum WrapperState {
 }
 
 /// Plans the edit without a TOML parser. Only the shapes cargo configs use in
-/// practice are recognized: `[build]` headers (with optional whitespace and a
-/// trailing comment), `rustc-wrapper` keys inside that table, and the dotted
-/// `build.rustc-wrapper` or an inline `build = { ... }` at the top level.
-/// Comment lines never count.
+/// practice are recognized: `[build]` headers (quoted or not, with optional
+/// whitespace and a trailing comment), `rustc-wrapper` keys inside that table,
+/// top-level dotted `build.*` keys, and an inline `build = { ... }`. Comment
+/// lines, a leading byte-order mark, and the inside of multi-line strings
+/// never count.
 fn plan_wrapper_edit(existing: &str) -> Result<WrapperEdit> {
     match wrapper_state(existing) {
         WrapperState::Sccache => return Ok(WrapperEdit::AlreadyConfigured),
@@ -164,15 +165,39 @@ fn plan_wrapper_edit(existing: &str) -> Result<WrapperEdit> {
         WrapperState::Unset => {}
     }
 
+    let lines = scan_lines(existing);
+    // The key goes under a `[build]` header if there is one. Otherwise, when
+    // the top level already sets `build.*` with dotted keys, a `[build]`
+    // table would define `build` twice and cargo would refuse the whole
+    // file, so the key goes beside them in the same dotted form.
+    let has_build_header = lines
+        .iter()
+        .any(|line| line.structural && table_header(line.text).as_deref() == Some("build"));
     let mut out = String::with_capacity(existing.len() + CARGO_CONFIG_ENTRY.len());
+    let mut table = String::new();
     let mut inserted = false;
-    for line in existing.split_inclusive('\n') {
-        out.push_str(line);
-        if !inserted && table_header(line) == Some("build") {
-            if !line.ends_with('\n') {
+    for line in &lines {
+        out.push_str(line.text);
+        if inserted || !line.structural {
+            continue;
+        }
+        let trimmed = content_of(line.text);
+        let insertion = if trimmed.starts_with('[') {
+            table = table_header(line.text).unwrap_or_else(|| "[[array]]".to_string());
+            (table == "build").then_some("rustc-wrapper = \"sccache\"\n")
+        } else if !has_build_header && table.is_empty() && line.ends_structural {
+            trimmed
+                .split_once('=')
+                .filter(|(key, _)| normalize_key(key).starts_with("build."))
+                .map(|_| "build.rustc-wrapper = \"sccache\"\n")
+        } else {
+            None
+        };
+        if let Some(entry) = insertion {
+            if !out.ends_with('\n') {
                 out.push('\n');
             }
-            out.push_str("rustc-wrapper = \"sccache\"\n");
+            out.push_str(entry);
             inserted = true;
         }
     }
@@ -185,56 +210,148 @@ fn plan_wrapper_edit(existing: &str) -> Result<WrapperEdit> {
     Ok(WrapperEdit::Write(out))
 }
 
+/// One line of a config, newline included, and whether it is TOML
+/// structure: a line that starts inside a multi-line string (`"""` or
+/// `'''`) is string content, and one that ends inside one cannot take an
+/// insertion after it.
+struct ScannedLine<'a> {
+    text: &'a str,
+    structural: bool,
+    ends_structural: bool,
+}
+
+fn scan_lines(config: &str) -> Vec<ScannedLine<'_>> {
+    let mut open: Option<&str> = None;
+    config
+        .split_inclusive('\n')
+        .map(|text| {
+            let structural = open.is_none();
+            if !(structural && content_of(text).starts_with('#')) {
+                let mut rest = text;
+                loop {
+                    let next = match open {
+                        Some(delimiter) => rest.find(delimiter).map(|at| (at, delimiter)),
+                        None => [r#"""""#, "'''"]
+                            .into_iter()
+                            .filter_map(|delimiter| rest.find(delimiter).map(|at| (at, delimiter)))
+                            .min_by_key(|(at, _)| *at),
+                    };
+                    let Some((at, delimiter)) = next else { break };
+                    rest = &rest[at + delimiter.len()..];
+                    open = if open.is_some() {
+                        None
+                    } else {
+                        Some(delimiter)
+                    };
+                }
+            }
+            ScannedLine {
+                text,
+                structural,
+                ends_structural: open.is_none(),
+            }
+        })
+        .collect()
+}
+
+/// A line's text without surrounding whitespace or a byte-order mark.
+fn content_of(line: &str) -> &str {
+    line.trim().trim_start_matches('\u{feff}').trim()
+}
+
 fn wrapper_state(config: &str) -> WrapperState {
     // The table the current line belongs to; "" is the top level. An
     // array-of-tables header (`[[...]]`) never names `build`.
-    let mut table = "";
-    for line in config.lines() {
-        let trimmed = line.trim();
+    let mut table = String::new();
+    for line in scan_lines(config) {
+        if !line.structural {
+            continue;
+        }
+        let trimmed = content_of(line.text);
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
         if trimmed.starts_with('[') {
-            table = table_header(line).unwrap_or("[[array]]");
+            table = table_header(line.text).unwrap_or_else(|| "[[array]]".to_string());
             continue;
         }
         let Some((key, value)) = trimmed.split_once('=') else {
             continue;
         };
-        let key = normalize_key(key);
-        let value = value.trim();
-        let wrapper_value = match (table, key.as_str()) {
-            ("build", "rustc-wrapper") | ("", "build.rustc-wrapper") => Some(value),
-            ("", "build") => {
-                return if value.contains("sccache") {
-                    WrapperState::Sccache
-                } else {
-                    WrapperState::InlineBuildTable
-                };
+        match (table.as_str(), normalize_key(key).as_str()) {
+            ("build", "rustc-wrapper") | ("", "build.rustc-wrapper") => {
+                return wrapper_value_state(value)
             }
-            _ => None,
-        };
-        if let Some(value) = wrapper_value {
-            return if value.contains("sccache") {
-                WrapperState::Sccache
-            } else {
-                WrapperState::Other(value.to_string())
-            };
+            ("", "build") => return inline_build_state(value),
+            _ => {}
         }
     }
     WrapperState::Unset
 }
 
-/// The name of a `[name]` table header line, ignoring whitespace and a
-/// trailing comment. Array-of-tables headers (`[[name]]`) return `None`.
-fn table_header(line: &str) -> Option<&str> {
-    let rest = line.trim().strip_prefix('[')?;
+fn wrapper_value_state(value: &str) -> WrapperState {
+    if names_sccache(wrapper_program(value)) {
+        WrapperState::Sccache
+    } else {
+        WrapperState::Other(value.trim().to_string())
+    }
+}
+
+/// `build = { ... }`: configured only if it sets `rustc-wrapper` to sccache.
+fn inline_build_state(value: &str) -> WrapperState {
+    let body = value
+        .trim()
+        .trim_start_matches('{')
+        .split('}')
+        .next()
+        .unwrap_or_default();
+    for pair in body.split(',') {
+        if let Some((key, value)) = pair.split_once('=') {
+            if normalize_key(key) == "rustc-wrapper" {
+                return match wrapper_value_state(value) {
+                    WrapperState::Sccache => WrapperState::Sccache,
+                    _ => WrapperState::InlineBuildTable,
+                };
+            }
+        }
+    }
+    WrapperState::InlineBuildTable
+}
+
+/// The program a `rustc-wrapper` value names, unquoted and without a
+/// trailing comment: `"/opt/bin/sccache" # note` gives `/opt/bin/sccache`.
+fn wrapper_program(value: &str) -> &str {
+    let value = value.trim();
+    if let Some(rest) = value.strip_prefix('"') {
+        return rest.split('"').next().unwrap_or_default();
+    }
+    if let Some(rest) = value.strip_prefix('\'') {
+        return rest.split('\'').next().unwrap_or_default();
+    }
+    value
+        .split(|c: char| c.is_whitespace() || c == '#')
+        .next()
+        .unwrap_or_default()
+}
+
+/// Whether a program path's file name is sccache. A substring test also
+/// accepted `/opt/no-sccache/wrap` and any value whose comment said sccache.
+fn names_sccache(program: &str) -> bool {
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    name == "sccache" || name == "sccache.exe"
+}
+
+/// The normalized name of a `[name]` table header line, ignoring whitespace,
+/// quotes, a byte-order mark, and a trailing comment, so `[ "build" ]` is
+/// `build`. Array-of-tables headers (`[[name]]`) return `None`.
+fn table_header(line: &str) -> Option<String> {
+    let rest = content_of(line).strip_prefix('[')?;
     if rest.starts_with('[') {
         return None;
     }
     let (name, after) = rest.split_once(']')?;
     let after = after.trim();
-    (after.is_empty() || after.starts_with('#')).then(|| name.trim())
+    (after.is_empty() || after.starts_with('#')).then(|| normalize_key(name))
 }
 
 /// A bare or dotted key with whitespace and quotes removed, so
@@ -436,6 +553,59 @@ mod tests {
                 "{existing}"
             );
         }
+    }
+
+    /// Refutation review of a42c5d4: each of these became a config cargo
+    /// refuses ("duplicate key"), or the key landed inside a string.
+    #[test]
+    fn test_plan_keeps_the_config_one_valid_build_table() {
+        for (existing, expected) in [
+            (
+                "build.jobs = 4\n[net]\nretry = 3\n",
+                "build.jobs = 4\nbuild.rustc-wrapper = \"sccache\"\n[net]\nretry = 3\n",
+            ),
+            (
+                "[\"build\"]\njobs = 4\n",
+                "[\"build\"]\nrustc-wrapper = \"sccache\"\njobs = 4\n",
+            ),
+            (
+                "\u{feff}[build]\njobs = 4\n",
+                "\u{feff}[build]\nrustc-wrapper = \"sccache\"\njobs = 4\n",
+            ),
+            (
+                "note = \"\"\"\n[build]\n\"\"\"\n",
+                "note = \"\"\"\n[build]\n\"\"\"\n[build]\nrustc-wrapper = \"sccache\"\n",
+            ),
+        ] {
+            let WrapperEdit::Write(text) = plan_wrapper_edit(existing).unwrap() else {
+                panic!("expected an edit for {existing:?}");
+            };
+            assert_eq!(text, expected, "{existing:?}");
+        }
+    }
+
+    /// Refutation review of a42c5d4: any value or comment containing
+    /// "sccache" counted as configured.
+    #[test]
+    fn test_only_an_sccache_program_counts_as_configured() {
+        for existing in [
+            "[build]\nrustc-wrapper = \"/usr/local/bin/other\" # TODO switch to sccache\n",
+            "[build]\nrustc-wrapper = \"/opt/no-sccache/wrap\"\n",
+        ] {
+            assert!(
+                matches!(wrapper_state(existing), WrapperState::Other(_)),
+                "{existing}"
+            );
+            assert!(plan_wrapper_edit(existing).is_err(), "{existing}");
+        }
+        assert_eq!(
+            wrapper_state("build = { rustc-wrapper = \"sccache\" }\n"),
+            WrapperState::Sccache
+        );
+        assert_eq!(
+            wrapper_state("build = { rustc-wrapper = \"other\" }\n"),
+            WrapperState::InlineBuildTable
+        );
     }
 
     #[test]
