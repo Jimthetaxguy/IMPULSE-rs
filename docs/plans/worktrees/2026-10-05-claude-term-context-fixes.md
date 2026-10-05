@@ -107,8 +107,14 @@ the one-screen reads, which no longer panic or count pages twice.
   `{stream: true}` in `impulse-desktop/src/ui.rs`), garbling multibyte text at chunk boundaries.
   `ui.rs` is blocked here.
 - The legacy egui `ContextBridge` estimate counts visible characters only (egui is frozen).
-- vt100 0.15 limits history reads to one screen and panics on some screen states; a newer vt100
-  may lift both, which needs a `Cargo.toml` change.
+- vt100 0.15 limits history reads to one screen and panics on some screen states. The latest is
+  0.16.2. Its changelog fixes scrollback offsets in `Grid::visible_rows` (0.16.0, #11), likely
+  the underflow behind the one-screen limit, and a cursor out of bounds after a resize (0.16.2);
+  the wide-character panic is not mentioned. The upgrade moves `set_size` and `set_scrollback`
+  from `Parser` to `Screen` (through `screen_mut()`), removes the title and bell accessors (unused
+  here), and makes `Cell::contents` return `&str`: about 20 call sites in `impulse-term` and
+  `src/ui`. It needs `Cargo.toml` and `Cargo.lock`, which other branches also edit, so it belongs
+  in a dependency lane.
 - The TUI writes each injection with a blocking `write_input` on its own thread. A pane that is
   not reading its input stalls the whole tick once the message overfills the tty's input queue:
   a test pane running `sleep 30` held one tick for 30 s. Writing through the per-pane write queue,
