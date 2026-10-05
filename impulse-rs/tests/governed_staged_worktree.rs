@@ -280,6 +280,30 @@ fn test_promotion_retried_after_the_branch_advanced_is_promoted() {
     assert_eq!(head(&repo), builder_commit);
 }
 
+/// Refutation review of 5d60aa0: a branch checked out at the accepted
+/// commit (to inspect it) looked like a promotion that had already landed,
+/// so `main` was never advanced but the run was recorded as promoted.
+#[test]
+fn test_another_branch_at_the_accepted_commit_is_not_taken_for_a_promotion() {
+    let (_dir, repo) = init_repo();
+    let (task, initial, builder_commit, _root) = staged_with_builder_commit(&repo);
+
+    git(
+        &repo,
+        &["switch", "--quiet", "-c", "inspect", &builder_commit],
+    );
+    let promotion = promote_governed_outcome(&task).expect("a blocked promotion is not an error");
+
+    assert_eq!(
+        promotion.outcome,
+        GovernedPromotionOutcome::PromotionBlocked {
+            canonical_head: builder_commit,
+            reason: PromotionBlockedReason::CanonicalHeadMoved,
+        }
+    );
+    assert_eq!(git(&repo, &["rev-parse", "refs/heads/main"]), initial);
+}
+
 #[test]
 fn test_promotion_blocks_without_touching_the_canonical_branch_when_head_moved() {
     let (_dir, repo) = init_repo();
