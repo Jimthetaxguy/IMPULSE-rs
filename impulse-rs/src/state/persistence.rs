@@ -59,6 +59,10 @@ pub struct State {
         HashMap<impulse_ops::governed_task::GovernedTaskId, Arc<tokio::sync::Mutex<()>>>,
     >,
     live_state: RwLock<LiveState>,
+    /// Sessions whose history `end_session` is writing. They stay in
+    /// `live_state` until it is written; the mark lets only one end record a
+    /// session.
+    ending_sessions: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Set on every mutation, cleared after a sync. A lock-free `AtomicBool`
     /// so `mark_dirty` (sync, called from async mutators) and the `Drop` flush
     /// can never silently fail to set/read it under lock contention — a dropped
@@ -115,6 +119,7 @@ impl State {
             producer_reservations,
             governed_producer_locks: tokio::sync::Mutex::new(HashMap::new()),
             live_state: RwLock::new(live_state),
+            ending_sessions: std::sync::Mutex::new(std::collections::HashSet::new()),
             dirty: AtomicBool::new(false),
             config: RwLock::new(config),
         };
@@ -196,37 +201,56 @@ impl State {
         session_id: &str,
         summary: String,
     ) -> Result<Option<HistoryEntry>> {
-        // Claim the session under the lock, then write its history without
-        // it: the append syncs to disk, and holding the state's write lock
-        // across that made every state reader wait on the disk. Taking the
-        // session out first still lets only one of two concurrent ends
-        // record it, and a failed append (disk full, unwritable file) puts
-        // it back, so neither the session nor its history is lost and a
-        // retry works.
-        let claimed = self
-            .live_state
-            .write()
-            .map_err(lock_err)?
-            .remove_session(session_id);
+        // Mark the session as ending under the lock, then write its history
+        // without the lock: the append syncs to disk, and holding the state's
+        // write lock across that made every state reader wait on the disk.
+        // The session stays in place until its history is written, so a save
+        // meanwhile still includes it and a failed append (disk full,
+        // unwritable file) loses nothing; taking it out early lost it when
+        // another session's save landed before the failure put it back. The
+        // mark lets only one of two concurrent ends record it.
+        let claimed = {
+            let state = self.live_state.read().map_err(lock_err)?;
+            match state.get_session(session_id) {
+                Some(session) => {
+                    if !self
+                        .ending_sessions
+                        .lock()
+                        .map_err(lock_err)?
+                        .insert(session_id.to_string())
+                    {
+                        anyhow::bail!("Session {session_id} is already being ended");
+                    }
+                    Some(HistoryEntry {
+                        session_id: session.id.clone(),
+                        session_name: session.name.clone(),
+                        platform: session.platform,
+                        started_at: session.created_at,
+                        ended_at: Utc::now(),
+                        summary,
+                        files_touched: session.active_files.clone(),
+                        tools_used: session.recent_tools.clone(),
+                    })
+                }
+                None => None,
+            }
+        };
         let history_entry = match claimed {
-            Some(session) => {
-                let entry = HistoryEntry {
-                    session_id: session.id.clone(),
-                    session_name: session.name.clone(),
-                    platform: session.platform,
-                    started_at: session.created_at,
-                    ended_at: Utc::now(),
-                    summary,
-                    files_touched: session.active_files.clone(),
-                    tools_used: session.recent_tools.clone(),
-                };
-                if let Err(error) = self.storage.append_jsonl(HISTORY_FILE, &entry) {
+            Some(entry) => {
+                let appended = self.storage.append_jsonl(HISTORY_FILE, &entry);
+                // Remove the session before clearing the mark, so a concurrent
+                // end never finds it unmarked after its history was written.
+                if appended.is_ok() {
                     self.live_state
                         .write()
                         .map_err(lock_err)?
-                        .add_session(session);
-                    return Err(error).context("Failed to append session to history log");
+                        .remove_session(session_id);
                 }
+                self.ending_sessions
+                    .lock()
+                    .map_err(lock_err)?
+                    .remove(session_id);
+                appended.context("Failed to append session to history log")?;
                 Some(entry)
             }
             None => None,
@@ -638,10 +662,24 @@ mod tests {
         assert!(made.success(), "mkfifo failed");
 
         let ender = Arc::clone(&state);
+        let ending_id = ending.id.clone();
         let summary = "x".repeat(1024 * 1024);
         let end = tokio::spawn(async move { ender.end_session(&ending.id, summary).await });
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(!end.is_finished(), "the append did not wait on the FIFO");
+
+        // Round 4 (reviewer A): the session was taken out while its history
+        // was written, so a save meanwhile dropped it, and a failed append
+        // then lost it for good. It stays saved, and a second end is refused.
+        // Checked after the FIFO is drained: a failed assertion here would
+        // leave the writer blocked and the test hanging.
+        let saved = state.sync_immediate().await.is_ok()
+            && std::fs::read_to_string(dir.path().join(LIVE_STATE_FILE))
+                .is_ok_and(|saved| saved.contains(&ending_id));
+        let second_end_refused = state
+            .end_session(&ending_id, "again".to_string())
+            .await
+            .is_err();
 
         // Read another session from a plain thread: a held std lock would
         // block it, and a runtime thread blocked that way could not time out.
@@ -686,6 +724,8 @@ mod tests {
             Ok(Some(true)),
             "state blocked while history was written"
         );
+        assert!(saved, "a save during the end dropped the session");
+        assert!(second_end_refused, "a second end was not refused");
     }
 
     /// Review P2: the session was removed before its history was appended,
