@@ -469,7 +469,7 @@ impl Drop for DispatchReset<'_> {
 const PANE_INPUT_QUEUE: usize = 256;
 /// How many bytes a pane may have queued; with only a count, a caller
 /// writing large pastes to a pane that is not reading could queue without
-/// bound.
+/// bound. One write of any size still goes through when nothing is queued.
 const PANE_INPUT_BYTES: usize = 16 * 1024 * 1024;
 
 /// A pane's input path: a bounded queue drained by one writer thread, so the
@@ -525,7 +525,7 @@ impl PaneInput {
         let queued = self
             .queued_bytes
             .fetch_add(len, std::sync::atomic::Ordering::SeqCst);
-        if queued.saturating_add(len) > PANE_INPUT_BYTES {
+        if queued != 0 && queued.saturating_add(len) > PANE_INPUT_BYTES {
             self.queued_bytes
                 .fetch_sub(len, std::sync::atomic::Ordering::SeqCst);
             return Err(DesktopBridgeError::TerminalWriteFailed {
@@ -4663,6 +4663,26 @@ mod tests {
                 session_id: "agent-1".to_string(),
             })
             .expect("close the busy pane");
+    }
+
+    /// Verification round on af63095: a single write over the byte cap was
+    /// refused even with nothing queued, blaming a pane that was reading.
+    #[test]
+    fn test_one_large_write_goes_through_when_nothing_is_queued() {
+        let runtime = DesktopRuntime::default();
+        let mut request = spawn_request(24, 80, Some("sh"));
+        request.args = vec!["-c".to_string(), "cat > /dev/null".to_string()];
+        runtime.spawn_agent(request).expect("spawn a reading pane");
+        let result = runtime.write_agent(AgentWriteRequest {
+            agent_id: "agent-1".to_string(),
+            data: vec![b'x'; PANE_INPUT_BYTES + 1024 * 1024],
+        });
+        assert!(result.is_ok(), "{result:?}");
+        runtime
+            .close_agent(TerminalCloseRequest {
+                session_id: "agent-1".to_string(),
+            })
+            .expect("close the pane");
     }
 
     #[test]

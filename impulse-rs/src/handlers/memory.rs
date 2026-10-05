@@ -92,7 +92,7 @@ pub fn handle_add_decision(
 
 /// How many results a search fetches at most. Paging (`--offset`,
 /// `--page`) and `--total` work within this window.
-const MAX_SEARCH_WINDOW: usize = 1000;
+const MAX_SEARCH_WINDOW: usize = retrieval::query::MAX_RESULT_WINDOW;
 
 /// The retrieval call a search command runs: `retrieval::search_history`
 /// or `retrieval::search_genome`.

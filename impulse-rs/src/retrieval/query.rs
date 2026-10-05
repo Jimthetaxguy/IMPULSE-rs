@@ -173,6 +173,12 @@ fn file_fallback_genome(base_path: &Path, query: &str, limit: usize) -> Vec<Sear
         .collect()
 }
 
+/// The most results a search returns across all its pages. The keyword
+/// candidate pool is at least this large and does not depend on the page
+/// asked for, so every page of one search ranks the same candidates; a pool
+/// sized by the page window ranked a different set for later pages.
+pub const MAX_RESULT_WINDOW: usize = 1000;
+
 /// The entries semantic search scores, or `None` for all of them. The
 /// keyword prefilter exists to bound scoring on a large corpus, so it applies
 /// only when its candidates fill the pool; with fewer, every vector is
@@ -235,10 +241,10 @@ fn semantic_history_rust(
         }
     };
 
-    // At least the requested window, or paging past the pool size came back
-    // empty; matched by any word, so the keyword filter does not decide
+    // The same pool for every page, and large enough for the last one.
+    // Candidates match any query word, so the keyword filter does not decide
     // semantic recall.
-    let candidate_limit = config.retrieval_candidate_pool.max(limit).max(10);
+    let candidate_limit = config.retrieval_candidate_pool.max(MAX_RESULT_WINDOW);
     let keyword_candidates = store
         .history_keyword_candidates(query, candidate_limit)
         .unwrap_or_default();
@@ -429,7 +435,7 @@ fn semantic_genome_rust(
         }
     };
 
-    let candidate_limit = config.retrieval_candidate_pool.max(limit).max(10);
+    let candidate_limit = config.retrieval_candidate_pool.max(MAX_RESULT_WINDOW);
     let keyword_candidates = store
         .genome_keyword_candidates(query, candidate_limit)
         .unwrap_or_default();
