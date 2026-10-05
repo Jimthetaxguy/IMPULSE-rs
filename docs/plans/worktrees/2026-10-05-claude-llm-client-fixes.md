@@ -31,7 +31,7 @@ tags: [worktree, lane, handoff, llm-backends, daemon-client, review]
 - Verification: `cargo build --workspace`, `cargo test --workspace`,
   `cargo clippy --workspace --all-targets -- -D warnings` (default and `--no-default-features`),
   `cargo fmt --all -- --check`, `python3 docs/validate_docs.py`
-- Latest status: implemented, gated and pushed; not merged; needs a verification round and a PR.
+- Latest status: implemented, verification round fixed, gated and pushed; not merged; needs a PR.
 
 ## Findings fixed
 - P2, secret leak: the providers followed redirects, and reqwest drops `Authorization` on a hop to
@@ -73,6 +73,36 @@ tags: [worktree, lane, handoff, llm-backends, daemon-client, review]
   "invalid response: error decoding response body"; transport errors now say what happened (a
   timeout, with which limit, or the cause chain).
 
+## Verification round
+A read-only reviewer probed both commits (29 probes, loopback only) and confirmed one P1 that this
+lane introduced: an override the stricter parser refused fell back to the provider's public API,
+with the key and the whole prompt. That hit common values that had worked or failed safely before:
+OpenRouter's `https://openrouter.ai/api`, Cloudflare gateway paths, Ollama's
+`http://localhost:11434/v1`, credentials in the URL, IPv6 zone ids. The only signal was a tracing
+warning most entry points never show. Fixed: an override that is set but can't be used fails every
+request with an error naming the variable, never falling back; a path prefix and credentials are
+kept again (credentials and paths are never logged); only a missing scheme or host, a query or a
+fragment are refused. CLAUDE.md no longer says a typo degrades to the real API.
+
+Also fixed from the round:
+- A malformed 200 body was quoted whole in the error (serde quotes an unexpected value in full);
+  it is cut to 2,000 characters.
+- Rejecting a call id used in an earlier turn wedged a session with servers that reuse one id per
+  response (every later tool turn failed). Within one response a shared id is still refused; an
+  id repeated from an earlier turn is renamed `{id}-{n}`, in the history and in its result.
+- `model_context_window_exceeded` (output cut off at the context window) counts as a token-limit
+  stop, so its tool blocks are not run.
+- `ImpulseAgent::with_test_provider` still sent the old sampling; and honouring the config's
+  2048-token default halved the API agent's replies (harness and governed requests had always
+  used the setting). The default is 4096, the API agent's previous cap.
+- `base_resp` and `error` are read loosely: a numeric-string status code counts, and `error`
+  values of null, `false`, `""` or `{}` are no error.
+- `localhost.` and IPv4-mapped loopback (`[::ffff:127.0.0.1]`) count as loopback.
+
+Recorded: `impulse-desktop/src/daemon_ops.rs` has its own daemon client with the same gaps
+(unbounded reply reads, no size check before writing, retries after a read timeout); and a reply
+cut off at the token limit without tool calls still returns as complete (in harness mode too).
+
 ## Not fixed
 - F11 (`daemon --stop` only pings): fixed on `claude/code-cleanup-20261004` by `278942b`.
 - F13's daemon side: `RegisterGovernedTask` takes no per-task lock, so two concurrent
@@ -92,6 +122,10 @@ tags: [worktree, lane, handoff, llm-backends, daemon-client, review]
 - Gate (`CARGO_TARGET_DIR` isolated per lane, `*_BASE_URL` unset): build clean;
   `cargo test --workspace` 3132 passed, 0 failed, 9 ignored; clippy clean with and without
   default features; fmt clean; `python3 docs/validate_docs.py` 189/189.
+- Verification round: 9 more revert proofs, all failing against their reverts; none can reach the
+  network (the unusable-override test checks `endpoint()`, since a test calling `chat` would reach
+  the real API if the fail-closed rule regressed). Gate after the round: `cargo test --workspace`
+  3138 passed, 0 failed, 9 ignored; clippy clean with and without default features; fmt clean.
 
 ## Handoff
 - Open a PR when James approves; run a verification round first.
