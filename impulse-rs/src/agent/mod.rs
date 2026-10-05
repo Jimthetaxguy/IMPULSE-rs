@@ -52,6 +52,12 @@ fn governed_api_actor_id(provider: ImpulseProvider, resolved_model: &str) -> Str
 /// shell command. 120s was chosen as a middle ground between `bash_exec`'s
 /// 30s and the REPL tool loop's 180s wall-clock budget.
 pub const DEFAULT_HARNESS_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The most of a harness CLI's stdout (its reply) and stderr that is kept.
+/// `wait_with_output` kept everything the CLI wrote, so a runaway harness
+/// grew this process's memory until the timeout.
+const MAX_HARNESS_STDOUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_HARNESS_STDERR_BYTES: usize = 64 * 1024;
 use coordinator::Recommendation;
 
 /// The LLM provider to use for the Impulse Agent.
@@ -706,7 +712,7 @@ impl ImpulseAgent {
         let harness_command_display = harness_command.display().to_string();
         let mut cmd = tokio::process::Command::new(&harness_command);
         cmd.args(harness_kind.invocation_args()).arg(&print_arg);
-        // `wait_with_output` below only captures handles that were piped;
+        // The capture below only reads handles that were piped;
         // inherited ones would send the reply to this process's own stdout
         // and leave `output.stdout` empty. Stdin is closed so a harness can
         // never sit waiting on it.
@@ -757,7 +763,7 @@ impl ImpulseAgent {
         // how long a wedged turn can retain that async guard before retries
         // may proceed. `tokio::time::timeout` returns a typed
         // `AgentError::HarnessTimedOut` instead of hanging indefinitely.
-        let child = cmd.spawn().map_err(|e| {
+        let mut child = cmd.spawn().map_err(|e| {
             AgentError::ApiRequest(format!("Failed to spawn {harness_command_display}: {e}"))
         })?;
         // Unlike `kill_on_drop`, this guard targets the whole isolated group
@@ -765,7 +771,16 @@ impl ImpulseAgent {
         // as well as the explicit timeout branch below.
         let mut process_group_guard = crate::process_group::ProcessGroupGuard::new(child.id());
 
-        let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        let output = match tokio::time::timeout(
+            timeout,
+            crate::tooling::capture::wait_with_capped_output(
+                &mut child,
+                MAX_HARNESS_STDOUT_BYTES,
+                MAX_HARNESS_STDERR_BYTES,
+            ),
+        )
+        .await
+        {
             Ok(result) => {
                 let output = result.map_err(|e| {
                     AgentError::ApiRequest(format!(
@@ -777,9 +792,9 @@ impl ImpulseAgent {
                 output
             }
             Err(_elapsed) => {
-                // Returning drops the still-armed process-group guard after
-                // `wait_with_output` drops its Child, killing wrapper
-                // grandchildren before the caller observes the timeout.
+                // Returning drops the still-armed process-group guard, then
+                // the Child (`kill_on_drop`), killing wrapper grandchildren
+                // before the caller observes the timeout.
                 return Err(AgentError::HarnessTimedOut {
                     command: harness_command_display,
                     seconds: timeout.as_secs(),
@@ -788,10 +803,17 @@ impl ImpulseAgent {
         };
 
         if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            if output.stdout.truncated() {
+                return Err(AgentError::ApiResponse(format!(
+                    "{harness_command_display} wrote {} bytes, more than the \
+                     {MAX_HARNESS_STDOUT_BYTES}-byte reply limit",
+                    output.stdout.total
+                )));
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout.bytes).to_string();
             Ok(harness::HarnessResponse::parse_or_plain(&stdout))
         } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = String::from_utf8_lossy(&output.stderr.bytes);
             Err(AgentError::ApiResponse(format!(
                 "{} exited with {}: {}",
                 harness_command_display, output.status, stderr
@@ -1891,6 +1913,41 @@ mod tests {
     // ── Harness subprocess timeout / kill_on_drop regression tests
     //    (same-day Opus sweep: `harness_query_structured`'s `.output().await`
     //    previously had no timeout and no `kill_on_drop`) ──────────────────
+
+    /// Recorded review item: harness output was collected with
+    /// `wait_with_output`, which keeps everything the CLI writes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_harness_reply_over_the_cap_is_refused_not_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let harness = dir.path().join("claude");
+        std::fs::write(
+            &harness,
+            format!(
+                "#!/bin/sh\nhead -c {} /dev/zero\n",
+                MAX_HARNESS_STDOUT_BYTES + 1
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&harness).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&harness, permissions).unwrap();
+        let agent = ImpulseAgent::new(ImpulseAgentConfig::harness(ImpulseHarness::ClaudeCode))
+            .unwrap()
+            .with_test_harness_command(harness);
+        let error = agent
+            .harness_query_structured_with_timeout(
+                "system",
+                "hello",
+                &[],
+                None,
+                Duration::from_secs(60),
+            )
+            .await
+            .expect_err("a reply over the cap is refused");
+        assert!(error.to_string().contains("reply limit"), "{error}");
+    }
 
     /// Writes an executable shell script into a fresh temp directory that
     /// just sleeps, standing in for a hung harness CLI
