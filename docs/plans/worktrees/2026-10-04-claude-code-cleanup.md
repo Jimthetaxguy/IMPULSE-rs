@@ -167,11 +167,17 @@ Third verification round (against `3c0ba8d`):
     30 s request budget, and could reconnect to keep it. The header read now has a 5 s deadline
     (`a5b940e`).
 
-Two recorded items fixed after round 3:
+Recorded items fixed after round 3:
 - `c6b7a07`: `dir_size` counts links instead of following them, so a link back up a target tree
   no longer multiplies the walk, and `build_health` walks under `spawn_blocking`.
 - `ce98af3`: a triple quote inside a one-line string or comment no longer hides a configured
   sccache wrapper from the status check.
+- `9cc82f2`: webhook replies close cleanly. A 401 or 413 left the request body unread, and
+  closing with unread bytes reset the connection, often before the client read the reply.
+- `0e758d1`: the webhook decodes chunked request bodies, with caps on the decoded body, the
+  encoded bytes and each line, instead of answering 400.
+- `c245765`: the harness CLI's output is captured with caps (8 MiB of reply, 64 KiB of stderr), and a
+  reply over the cap is an error instead of being kept.
 - The docs contract check passes. `7cfad38` closed out the two stale May lane cards. The next
   commit reviewed the collaborative coding guide against current practice:
   - its gate matches `CLAUDE.md`;
@@ -181,8 +187,10 @@ Two recorded items fixed after round 3:
 Still recorded, not fixed:
 - `file_write`'s check-then-write race against a concurrent same-user process swapping symlinks
   (needs directory-fd opens).
-- A write root naming a single file is refused (suspected; every default root is a directory).
-- The voice webhook answers chunked bodies with 400 and resets the connection after a 401 or 413.
+- A write root naming a single file is refused. Confirmed by reading: the atomic write puts its temp
+  file in the parent directory, which lies outside such a root, and `file_write` refuses that on
+  purpose. Allowing it means choosing between a temp file outside the root and a non-atomic in-place
+  write. No default root is a single file.
 - A manifest tool that reads the terminal is stopped by the OS and ends at its timeout.
 - `end_session` holds the state lock across an fsync.
 - A bare `git push --force` while on main is not caught (the rule cannot see the current branch).
@@ -223,8 +231,6 @@ Still recorded, not fixed:
   verdict through it.
 - **Promotion `reset --hard`** would destroy exempt tracked memory files once the ADR-0020 decision
   endpoint ships; latent today.
-- **Agent harness output** is still collected with `wait_with_output`; it is the user's configured
-  CLI under a 120 s timeout, so lower risk than tool output.
 - **Multi-process `State`** never reloads and rewrites whole files without a lock (accepted for
   hooks in SECURITY-REVIEW Issue 3); the legacy TUI still auto-types context into PTYs.
 
