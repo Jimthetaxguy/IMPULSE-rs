@@ -54,7 +54,13 @@ impl DynamicTool for CalculatorTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidParams("missing 'expression'".into()))?;
 
-        match crate::tools::python::calculate(expression) {
+        // The sandbox runs synchronously; see `PythonExecTool::execute`.
+        let owned = expression.to_string();
+        let calculated =
+            tokio::task::spawn_blocking(move || crate::tools::python::calculate(&owned))
+                .await
+                .map_err(|e| ToolError::ExecutionFailed(format!("Calculation failed: {e}")))?;
+        match calculated {
             Ok(result) => Ok(ToolResult::json(serde_json::json!({
                 "expression": expression,
                 "result": result,

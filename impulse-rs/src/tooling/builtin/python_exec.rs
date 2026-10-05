@@ -75,7 +75,15 @@ impl DynamicTool for PythonExecTool {
             .unwrap_or(crate::tools::python::DEFAULT_PYTHON_TIMEOUT)
             .min(crate::tools::python::DEFAULT_PYTHON_TIMEOUT);
 
-        match crate::tools::python::execute_python_with_timeout(code, timeout) {
+        // The sandbox runs synchronously, for up to its timeout; off the
+        // runtime, the runtime's threads stay free meanwhile.
+        let code = code.to_string();
+        let run = tokio::task::spawn_blocking(move || {
+            crate::tools::python::execute_python_with_timeout(&code, timeout)
+        })
+        .await
+        .map_err(|e| ToolError::ExecutionFailed(format!("Python execution failed: {e}")))?;
+        match run {
             Ok(result) => {
                 let success = result.exit_code == 0;
                 Ok(ToolResult::json(serde_json::json!({
@@ -101,6 +109,29 @@ impl DynamicTool for PythonExecTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Round 3 follow-up: the sandbox ran on the runtime's own thread, so a
+    /// program running for its whole budget held that thread. On a
+    /// single-threaded runtime the quick task would finish after it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_execute_leaves_the_runtime_free_while_the_program_runs() {
+        let ctx = ToolContext::with_all_capabilities();
+        let code = "import time\nstart = time.time()\nwhile time.time() - start < 0.3:\n    pass\n";
+        let started = std::time::Instant::now();
+        let run = PythonExecTool.execute(serde_json::json!({"code": code}), &ctx);
+        let quick = async {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            started.elapsed()
+        };
+        let (run, quick_elapsed) = tokio::join!(run, quick);
+        let run = run.expect("the program runs");
+        assert_eq!(run.output["exit_code"], 0, "{:?}", run.output);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(300));
+        assert!(
+            quick_elapsed < std::time::Duration::from_millis(250),
+            "the quick task waited {quick_elapsed:?}"
+        );
+    }
 
     #[test]
     fn test_descriptor() {

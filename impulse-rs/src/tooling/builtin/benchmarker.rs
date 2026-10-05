@@ -83,77 +83,89 @@ impl DynamicTool for BenchmarkerTool {
         }
         let iterations = iterations as u32;
 
-        // A program that does not run to completion would be timed all the
-        // same, and the numbers would describe the sandbox's failure path, not
-        // the workload. Run it once before timing anything and refuse a
-        // program that faults. A slow failure such as a timeout is then paid
-        // for once, not once per iteration.
-        let preflight_started = std::time::Instant::now();
-        let preflight = crate::tools::python::execute_python(&code)
-            .map_err(|e| ToolError::ExecutionFailed(format!("sandbox failed: {e}")))?;
-        if let Some(reason) = benchmark_refusal(&preflight) {
-            return Err(ToolError::ExecutionFailed(reason));
-        }
-        // One run's time stands in for the rest: refuse work that would run
-        // past the session's tool time limit, which could not stop it.
-        let one_run = preflight_started.elapsed();
-        let estimate = one_run.saturating_mul(iterations);
         let limit = std::time::Duration::from_millis(ctx.timeout_ms.max(1));
-        if estimate > limit {
-            return Err(ToolError::InvalidParams(format!(
-                "{iterations} iterations of a {} ms program would take about {} s, past this \
-                 session's {} s tool time limit; use fewer iterations",
-                one_run.as_millis(),
-                estimate.as_secs(),
-                limit.as_secs()
-            )));
-        }
-
-        // The estimate trusts one run; a program slower after its first run
-        // would still outlast the limit, so the loop also stops at it, and
-        // each run gets only the time left before it.
-        let deadline = std::time::Instant::now() + limit.saturating_sub(one_run);
-        let runs = time_runs(iterations, deadline, |remaining| {
-            let budget = remaining.min(crate::tools::python::DEFAULT_PYTHON_TIMEOUT);
-            match crate::tools::python::execute_python_with_timeout(&code, budget) {
-                Ok(run)
-                    if run.fault == Some(crate::tools::python::fault::TIMEOUT)
-                        && budget < crate::tools::python::DEFAULT_PYTHON_TIMEOUT =>
-                {
-                    RunOutcome::OutOfTime
-                }
-                Ok(run) => {
-                    benchmark_refusal(&run).map_or(RunOutcome::Completed, RunOutcome::Refused)
-                }
-                Err(e) => RunOutcome::Refused(format!("sandbox failed: {e}")),
-            }
-        });
-        if let Some(reason) = runs.first_failure {
-            return Err(ToolError::ExecutionFailed(reason));
-        }
-        if runs.past_deadline {
-            return Err(ToolError::ExecutionFailed(format!(
-                "stopped at this session's {} s tool time limit before {iterations} iterations \
-                 finished; the program ran slower than its first run",
-                limit.as_secs()
-            )));
-        }
-        let result = runs.result;
-
-        Ok(ToolResult::json(serde_json::json!({
-            "name": result.name,
-            "iterations": result.iterations,
-            "total_ms": result.duration_ms,
-            "avg_ms": result.avg_ms,
-            "min_ms": result.min_ms,
-            "max_ms": result.max_ms,
-            "summary": crate::tools::benchmark::format_benchmark(&result),
-        })))
+        tokio::task::spawn_blocking(move || run_timed_benchmark(&code, iterations, limit))
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("benchmark task failed: {e}")))?
     }
 
     fn required_capabilities(&self) -> Vec<Capability> {
         vec![Capability::PythonExec]
     }
+}
+
+/// The preflight run, the time estimate and the timing loop. The sandbox
+/// runs synchronously, so [`BenchmarkerTool::execute`] runs this off the
+/// async runtime; on the runtime's own thread a benchmark held that thread
+/// for up to the session's whole tool time limit.
+fn run_timed_benchmark(
+    code: &str,
+    iterations: u32,
+    limit: std::time::Duration,
+) -> Result<ToolResult, ToolError> {
+    // A program that does not run to completion would be timed all the
+    // same, and the numbers would describe the sandbox's failure path, not
+    // the workload. Run it once before timing anything and refuse a
+    // program that faults. A slow failure such as a timeout is then paid
+    // for once, not once per iteration.
+    let preflight_started = std::time::Instant::now();
+    let preflight = crate::tools::python::execute_python(code)
+        .map_err(|e| ToolError::ExecutionFailed(format!("sandbox failed: {e}")))?;
+    if let Some(reason) = benchmark_refusal(&preflight) {
+        return Err(ToolError::ExecutionFailed(reason));
+    }
+    // One run's time stands in for the rest: refuse work that would run
+    // past the session's tool time limit, which could not stop it.
+    let one_run = preflight_started.elapsed();
+    let estimate = one_run.saturating_mul(iterations);
+    if estimate > limit {
+        return Err(ToolError::InvalidParams(format!(
+            "{iterations} iterations of a {} ms program would take about {} s, past this \
+             session's {} s tool time limit; use fewer iterations",
+            one_run.as_millis(),
+            estimate.as_secs(),
+            limit.as_secs()
+        )));
+    }
+
+    // The estimate trusts one run; a program slower after its first run
+    // would still outlast the limit, so the loop also stops at it, and
+    // each run gets only the time left before it.
+    let deadline = std::time::Instant::now() + limit.saturating_sub(one_run);
+    let runs = time_runs(iterations, deadline, |remaining| {
+        let budget = remaining.min(crate::tools::python::DEFAULT_PYTHON_TIMEOUT);
+        match crate::tools::python::execute_python_with_timeout(code, budget) {
+            Ok(run)
+                if run.fault == Some(crate::tools::python::fault::TIMEOUT)
+                    && budget < crate::tools::python::DEFAULT_PYTHON_TIMEOUT =>
+            {
+                RunOutcome::OutOfTime
+            }
+            Ok(run) => benchmark_refusal(&run).map_or(RunOutcome::Completed, RunOutcome::Refused),
+            Err(e) => RunOutcome::Refused(format!("sandbox failed: {e}")),
+        }
+    });
+    if let Some(reason) = runs.first_failure {
+        return Err(ToolError::ExecutionFailed(reason));
+    }
+    if runs.past_deadline {
+        return Err(ToolError::ExecutionFailed(format!(
+            "stopped at this session's {} s tool time limit before {iterations} iterations \
+             finished; the program ran slower than its first run",
+            limit.as_secs()
+        )));
+    }
+    let result = runs.result;
+
+    Ok(ToolResult::json(serde_json::json!({
+        "name": result.name,
+        "iterations": result.iterations,
+        "total_ms": result.duration_ms,
+        "avg_ms": result.avg_ms,
+        "min_ms": result.min_ms,
+        "max_ms": result.max_ms,
+        "summary": crate::tools::benchmark::format_benchmark(&result),
+    })))
 }
 
 /// How [`time_runs`] ended.
