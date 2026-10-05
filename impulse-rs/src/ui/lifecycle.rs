@@ -475,9 +475,18 @@ fn pane_scan_text(pane: &super::terminal_pane::TerminalPane) -> String {
         return current;
     }
     let above = pane.screen_snapshot_at_offset(history);
-    let mut lines: Vec<String> = above.rows(0, cols).take(history).collect();
-    lines.push(current);
-    lines.join("\n")
+    let mut text = String::new();
+    for (row, line) in above.rows(0, cols).take(history).enumerate() {
+        text.push_str(&line);
+        // A wrapped row continues on the next one, as `contents()` joins
+        // it; split, a long line reached the parser in pieces and was missed.
+        let wrapped = u16::try_from(row).is_ok_and(|row| above.row_wrapped(row));
+        if !wrapped {
+            text.push('\n');
+        }
+    }
+    text.push_str(&current);
+    text
 }
 
 /// The newest insights from every pane but `pane_id`, newest first, as many
@@ -692,6 +701,36 @@ mod tests {
             .count();
         kill_all(&state);
         assert_eq!(unresolved, 0);
+    }
+
+    /// Verification finding: a line that wrapped in the history above the
+    /// screen reached the parser split at the row edge, so a long `Write(`
+    /// there gave no insight.
+    #[test]
+    fn test_tick_reads_a_wrapped_line_in_the_history_whole() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (_dir, mut state) = tui_state(false);
+        let file = format!("src/{}.rs", "x".repeat(90));
+        let script = format!("printf 'Write({file})\\n'; seq 1 30; echo done-marker; sleep 30");
+        let id = add_pane(
+            &mut state,
+            "claude-1",
+            &script,
+            (24, 80),
+            AgentKind::ClaudeCode,
+        );
+        wait_for(&state, id, "done-marker");
+
+        context_lifecycle_tick(&mut state);
+        let modified: Vec<String> = state.context_monitor.pane_states[&id]
+            .extracted_insights
+            .iter()
+            .filter(|insight| insight.insight_type == InsightType::FileModified)
+            .map(|insight| insight.content.clone())
+            .collect();
+        kill_all(&state);
+        assert_eq!(modified, [file]);
     }
 
     /// Verification findings: with more conflicts than the 20-entry list
