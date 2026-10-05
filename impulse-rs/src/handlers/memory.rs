@@ -76,15 +76,23 @@ pub fn handle_history(state: &Arc<state::State>, format: Option<OutputFormat>) -
 
 /// Handle the `add-decision` command.
 ///
-/// Appends a new decision to `GENOME.md` with an optional rationale.
-/// Duplicate descriptions are silently deduplicated by the Genome layer.
+/// Appends a new decision to `GENOME.md` with an optional rationale. A
+/// decision that repeats the last one is not added, and the output says so.
+///
+/// The read, change and write happen under `GENOME.md`'s lock: without it,
+/// two processes adding at once each wrote back their own copy, and one
+/// decision was lost though both were reported as added.
 pub fn handle_add_decision(
     state: &Arc<state::State>,
     description: String,
     rationale: Option<String>,
 ) -> Result<()> {
+    let _lock = state.storage().lock_exclusive("GENOME.md")?;
     let mut genome: memory::Genome = state.storage().read_json("GENOME.md")?;
-    genome.add_decision(description, rationale, Vec::new());
+    if !genome.add_decision(description, rationale, Vec::new()) {
+        println!("Not added: it repeats the last decision in GENOME");
+        return Ok(());
+    }
     state.storage().write_json("GENOME.md", &genome)?;
     println!("Added decision to GENOME");
     Ok(())
@@ -585,5 +593,31 @@ mod tests {
 
         let result = handle_activity(&st, 5).await;
         assert!(result.is_ok());
+    }
+
+    /// Review finding: concurrent `add-decision` calls each read GENOME.md,
+    /// added theirs and wrote back their own copy, so decisions reported as
+    /// added were lost (about half, with two writers).
+    #[test]
+    fn add_decision_keeps_every_concurrent_decision() {
+        let (_tmp, st) = test_state();
+        st.storage()
+            .write_json("GENOME.md", &memory::Genome::new())
+            .unwrap();
+        let handles: Vec<_> = (0..2)
+            .map(|writer| {
+                let st = Arc::clone(&st);
+                std::thread::spawn(move || {
+                    for i in 0..25 {
+                        handle_add_decision(&st, format!("decision {writer}-{i}"), None).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let genome: memory::Genome = st.storage().read_json("GENOME.md").unwrap();
+        assert_eq!(genome.decisions.len(), 50);
     }
 }

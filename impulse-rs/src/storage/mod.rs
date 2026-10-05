@@ -1,8 +1,10 @@
 //! Atomic file I/O layer and `.impulse/` directory management.
 //!
 //! All writes use temp file + rename for crash safety. Temp file names
-//! include PID + timestamp to avoid collisions. Provides JSON, JSONL,
-//! and plain-text read/write helpers via the [`Storage`] struct.
+//! include the PID, a per-process counter and a timestamp to avoid
+//! collisions. Provides JSON, JSONL, and plain-text read/write helpers via
+//! the [`Storage`] struct, and an exclusive lock for read-modify-write
+//! updates ([`Storage::lock_exclusive`]).
 //!
 //! JSONL reads tolerate a malformed record (skipping it with a warning) so a
 //! crash-torn trailing line in an append-only log can't make the whole log
@@ -20,6 +22,18 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 pub struct Storage {
     base_path: PathBuf,
+}
+
+/// Distinguishes temp files this process creates in the same instant. The
+/// clock alone can't: on macOS `SystemTime` nanoseconds are whole
+/// microseconds, so two writes within one microsecond got the same name and
+/// the second failed with "File exists".
+static TEMP_FILE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// An exclusive advisory lock on a `.lock` file beside some data, released
+/// when dropped. See [`Storage::lock_exclusive`].
+pub struct FileLock {
+    _file: Option<File>,
 }
 
 impl Storage {
@@ -211,8 +225,9 @@ impl Storage {
         unix_mode: Option<u32>,
     ) -> Result<()> {
         let unique_suffix = format!(
-            "tmp.{}.{}",
+            "tmp.{}.{}.{}",
             std::process::id(),
+            TEMP_FILE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -275,6 +290,55 @@ impl Storage {
             }
         }
         Ok(())
+    }
+
+    /// Takes an exclusive lock on `<filename>.lock` in the storage
+    /// directory, waiting for any other holder, for one read-modify-write
+    /// of `filename`.
+    ///
+    /// Without it, two processes that each read a file, change it and write
+    /// it back keep only one change: the second rename replaces the first.
+    /// Every writer that updates the file this way must hold the lock. On a
+    /// filesystem without `flock` (some network mounts) the update runs
+    /// unlocked with a warning, as before the lock existed.
+    pub fn lock_exclusive(&self, filename: &str) -> Result<FileLock> {
+        let path = self.path(&format!("{filename}.lock"));
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("Failed to open lock file {}", path.display()))?;
+        #[cfg(unix)]
+        loop {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: `file` is open for the whole call, so the descriptor
+            // is valid; `flock` only takes an advisory lock on it and reads
+            // no memory.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(code)
+                    if code == libc::ENOTSUP
+                        || code == libc::EOPNOTSUPP
+                        || code == libc::ENOLCK =>
+                {
+                    tracing::warn!(
+                        "{} can't be locked ({error}); updating it unlocked",
+                        path.display()
+                    );
+                    return Ok(FileLock { _file: None });
+                }
+                _ => {
+                    return Err(error)
+                        .with_context(|| format!("Failed to lock {}", path.display()));
+                }
+            }
+        }
+        Ok(FileLock { _file: Some(file) })
     }
 
     #[cfg(test)]
@@ -674,5 +738,70 @@ mod tests {
         let name = get_working_dir_name();
         assert!(!name.is_empty());
         assert_ne!(name, "unknown");
+    }
+
+    /// Review finding: temp names were pid plus sub-second nanoseconds,
+    /// which on macOS are whole microseconds, so two writes in one process
+    /// within a microsecond collided and the second failed ("File exists").
+    #[test]
+    fn test_concurrent_atomic_writes_in_one_process_all_succeed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = std::sync::Arc::new(dir.path().join("shared.json"));
+        let threads = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(threads));
+        let handles: Vec<_> = (0..threads)
+            .map(|n| {
+                let path = std::sync::Arc::clone(&path);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (0..50)
+                        .filter_map(|i| {
+                            Storage::atomic_write_path(&path, format!("{n}-{i}").as_bytes()).err()
+                        })
+                        .map(|e| format!("{e:#}"))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let failures: Vec<String> = handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap())
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "{} failed: {:?}",
+            failures.len(),
+            failures.first()
+        );
+    }
+
+    #[test]
+    fn test_lock_exclusive_serializes_holders() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = std::sync::Arc::new(Storage::new(dir.path().to_path_buf()));
+        let inside = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let overlapped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let storage = std::sync::Arc::clone(&storage);
+                let inside = std::sync::Arc::clone(&inside);
+                let overlapped = std::sync::Arc::clone(&overlapped);
+                std::thread::spawn(move || {
+                    for _ in 0..20 {
+                        let _lock = storage.lock_exclusive("data.json").unwrap();
+                        if inside.fetch_add(1, std::sync::atomic::Ordering::SeqCst) != 0 {
+                            overlapped.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        std::thread::sleep(std::time::Duration::from_micros(200));
+                        inside.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert!(!overlapped.load(std::sync::atomic::Ordering::SeqCst));
     }
 }
