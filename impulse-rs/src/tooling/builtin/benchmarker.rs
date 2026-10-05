@@ -110,16 +110,24 @@ impl DynamicTool for BenchmarkerTool {
         }
 
         // The estimate trusts one run; a program slower after its first run
-        // would still outlast the limit, so the loop also stops at it.
+        // would still outlast the limit, so the loop also stops at it, and
+        // each run gets only the time left before it.
         let deadline = std::time::Instant::now() + limit.saturating_sub(one_run);
-        let runs = time_runs(
-            iterations,
-            deadline,
-            || match crate::tools::python::execute_python(&code) {
-                Ok(run) => benchmark_refusal(&run),
-                Err(e) => Some(format!("sandbox failed: {e}")),
-            },
-        );
+        let runs = time_runs(iterations, deadline, |remaining| {
+            let budget = remaining.min(crate::tools::python::DEFAULT_PYTHON_TIMEOUT);
+            match crate::tools::python::execute_python_with_timeout(&code, budget) {
+                Ok(run)
+                    if run.fault == Some(crate::tools::python::fault::TIMEOUT)
+                        && budget < crate::tools::python::DEFAULT_PYTHON_TIMEOUT =>
+                {
+                    RunOutcome::OutOfTime
+                }
+                Ok(run) => {
+                    benchmark_refusal(&run).map_or(RunOutcome::Completed, RunOutcome::Refused)
+                }
+                Err(e) => RunOutcome::Refused(format!("sandbox failed: {e}")),
+            }
+        });
         if let Some(reason) = runs.first_failure {
             return Err(ToolError::ExecutionFailed(reason));
         }
@@ -158,25 +166,39 @@ struct TimedRuns {
     past_deadline: bool,
 }
 
-/// Times `iterations` calls of `run_once`, which returns why its run cannot
-/// be timed, or `None`. The loop has no await, so the executor's timeout
-/// cannot stop it; once `deadline` passes the remaining iterations do
-/// nothing instead.
+/// How one timed run ended.
+enum RunOutcome {
+    Completed,
+    /// The run cannot be timed: why.
+    Refused(String),
+    /// The run hit the time it was given, which was all that was left.
+    OutOfTime,
+}
+
+/// Times `iterations` calls of `run_once`, which is given the time left
+/// before `deadline`. The loop has no await, so the executor's timeout
+/// cannot stop it; a run that starts just before the deadline used to run
+/// its full sandbox budget past it, and once the deadline passes the
+/// remaining iterations do nothing.
 fn time_runs(
     iterations: u32,
     deadline: std::time::Instant,
-    mut run_once: impl FnMut() -> Option<String>,
+    mut run_once: impl FnMut(std::time::Duration) -> RunOutcome,
 ) -> TimedRuns {
     let mut first_failure: Option<String> = None;
     let mut past_deadline = false;
     let result = crate::tools::benchmark::run_benchmark("python_benchmark", iterations, || {
-        if past_deadline || std::time::Instant::now() >= deadline {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if past_deadline || remaining.is_zero() {
             past_deadline = true;
             return;
         }
-        let failure = run_once();
-        if first_failure.is_none() {
-            first_failure = failure;
+        match run_once(remaining) {
+            RunOutcome::Completed => {}
+            RunOutcome::Refused(reason) => {
+                first_failure.get_or_insert(reason);
+            }
+            RunOutcome::OutOfTime => past_deadline = true,
         }
     });
     TimedRuns {
@@ -226,10 +248,10 @@ mod tests {
     fn test_time_runs_stops_at_the_deadline() {
         let mut calls = 0;
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
-        let runs = time_runs(1_000, deadline, || {
+        let runs = time_runs(1_000, deadline, |_| {
             calls += 1;
             std::thread::sleep(std::time::Duration::from_millis(10));
-            None
+            RunOutcome::Completed
         });
         assert!(runs.past_deadline);
         // Each call takes at least 10 ms, so at most five start before 50 ms.
@@ -241,18 +263,42 @@ mod tests {
     fn test_time_runs_keeps_the_first_failure_and_runs_every_iteration() {
         let mut calls = 0;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
-        let runs = time_runs(5, deadline, || {
+        let runs = time_runs(5, deadline, |_| {
             calls += 1;
             match calls {
-                2 => Some("second run failed".to_string()),
-                3 => Some("third run failed".to_string()),
-                _ => None,
+                2 => RunOutcome::Refused("second run failed".to_string()),
+                3 => RunOutcome::Refused("third run failed".to_string()),
+                _ => RunOutcome::Completed,
             }
         });
         assert!(!runs.past_deadline);
         assert_eq!(calls, 5);
         assert_eq!(runs.result.iterations, 5);
         assert_eq!(runs.first_failure.as_deref(), Some("second run failed"));
+    }
+
+    /// Round 3 (reviewer B): a run that started just before the deadline
+    /// ran its whole sandbox budget past it (4.64 s under a 2 s limit).
+    #[test]
+    fn test_time_runs_gives_each_run_only_the_time_left() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        let mut given = Vec::new();
+        let runs = time_runs(1_000, deadline, |remaining| {
+            given.push(remaining);
+            if given.len() == 3 {
+                // The sandbox stopped this run at the time it was given.
+                return RunOutcome::OutOfTime;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            RunOutcome::Completed
+        });
+        assert!(runs.past_deadline);
+        assert_eq!(given.len(), 3, "no run starts after one runs out of time");
+        assert!(given
+            .iter()
+            .all(|g| *g <= std::time::Duration::from_millis(200)));
+        assert!(given.windows(2).all(|pair| pair[1] < pair[0]), "{given:?}");
+        assert_eq!(runs.first_failure, None);
     }
 
     #[test]
