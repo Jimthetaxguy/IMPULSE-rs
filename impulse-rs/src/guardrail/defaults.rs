@@ -26,6 +26,52 @@ use super::types::{GuardAction, GuardRule, GuardTarget};
 /// defense: content read INTO context should never be able to silently
 /// approve its own follow-up actions). All rules are enabled by default and
 /// marked as builtin.
+/// A git invocation whose subcommand is `subcommand`. Global options such as
+/// `-C dir`, `-c k=v`, or `--git-dir=x` may come between, and both words
+/// match in any case (macOS resolves `GIT` to git). Requiring the subcommand
+/// position keeps a commit message that mentions the word from matching.
+fn git_subcommand(subcommand: &str) -> String {
+    format!(
+        r"(?i:\bgit)(?:\s+(?:-[cC]\s+\S+|--(?:git-dir|work-tree|namespace)\s+\S+|--?[\w-]+(?:=\S+)?))*\s+(?i:{subcommand})\b"
+    )
+}
+
+/// The rest of one shell command: stops at `;`, `|`, `&`, or a newline, but
+/// steps over redirections such as `2>&1`, so a flag in a later command never
+/// counts and one after a redirection still does.
+const SAME_COMMAND: &str = r"(?:[^;|&\n]|&>|>&|<&)*";
+
+/// A force-push of main or master: a force flag and the branch in either
+/// order, a `+` refspec onto it (quoted or not, or a `*` wildcard), or
+/// `--mirror`, which force-updates every ref.
+fn force_push_pattern() -> String {
+    format!(
+        concat!(
+            "{push}{same}(?:",
+            r"\s{force}{same}{branch}",
+            r"|{branch}{same}\s{force}(?:\s|$)",
+            r#"|\s["']?\+(?:[^\s:;|&"']*:)?(?:refs/heads/)?(?:(?i:main|master)\b|\*)"#,
+            r"|\s--mirror\b",
+            ")"
+        ),
+        push = git_subcommand("push"),
+        same = SAME_COMMAND,
+        force = r"(?:-[a-zA-Z]*f[a-zA-Z]*|--force\S*)",
+        branch = r"\b(?i:main|master)\b",
+    )
+}
+
+/// `git add` of everything: `-A` (alone or in a cluster such as `-vA`),
+/// `--all`, or a whole-tree pathspec (`.`, `./`, `:/`, `*`, quoted or not)
+/// that ends its token, so `./src/main.rs` and `.gitignore` pass.
+fn bulk_git_add_pattern() -> String {
+    format!(
+        r#"{add}{same}\s(?:-[a-zA-Z]*A[a-zA-Z]*|--all|["']?(?:\.|\./|:/|\*)["']?)(?:$|[\s;|&)`>])"#,
+        add = git_subcommand("add"),
+        same = SAME_COMMAND,
+    )
+}
+
 pub fn builtin_rules() -> Vec<GuardRule> {
     vec![
         // ==================================================================
@@ -33,24 +79,13 @@ pub fn builtin_rules() -> Vec<GuardRule> {
         // ==================================================================
         GuardRule {
             id: "block-force-push-main".to_string(),
-            // A force flag and the `main` (or `master`) ref in either order, or
-            // a `+` refspec onto it. `[^;&|\n]` keeps the whole match inside
-            // one command, so a force flag in a later command cannot trip it,
-            // and git's global options (`git -C dir`, `-c k=v`) may come
-            // before `push`. `-[a-zA-Z]*f` covers clustered short flags
-            // (`-fu`). Rust's regex engine is linear-time, so the
-            // alternation has no catastrophic-backtracking risk.
-            pattern: concat!(
-                r"\bgit\b[^;&|\n]*\spush\b[^;&|\n]*",
-                r"(?:\s(?:-[a-zA-Z]*f[a-zA-Z]*|--force)\b[^;&|\n]*\b(?:main|master)\b",
-                r"|\b(?:main|master)\b[^;&|\n]*\s(?:-[a-zA-Z]*f[a-zA-Z]*|--force)\b",
-                r"|\s\+(?:\S*:)?(?:refs/heads/)?(?:main|master)\b)"
-            )
-            .to_string(),
+            // See `force_push_pattern`. Rust's regex engine is linear-time, so
+            // the alternation has no catastrophic-backtracking risk.
+            pattern: force_push_pattern(),
             action: GuardAction::Block,
             target: GuardTarget::Bash,
-            reason: "Force-pushing to main or master rewrites shared history and can cause \
-                     data loss for all collaborators."
+            reason: "Force-pushing (or mirroring) to main or master rewrites shared history \
+                     and can cause data loss for all collaborators."
                 .to_string(),
             suggestion: Some(
                 "Push to a feature branch and open a pull request instead.".to_string(),
@@ -60,11 +95,8 @@ pub fn builtin_rules() -> Vec<GuardRule> {
         },
         GuardRule {
             id: "block-bulk-git-add".to_string(),
-            // `git add .` anywhere in a command, not only at the very end of
-            // the input (`git add . && git commit` used to pass), with git's
-            // global options allowed before `add`.
-            pattern: r"\bgit\b[^;&|\n]*\sadd\b[^;&|\n]*\s(?:-A\b|--all\b|\.(?:\s|$|[;&|]))"
-                .to_string(),
+            // See `bulk_git_add_pattern`.
+            pattern: bulk_git_add_pattern(),
             action: GuardAction::Block,
             target: GuardTarget::Bash,
             reason: "Bulk git add stages everything including secrets, binaries, and \
@@ -79,17 +111,19 @@ pub fn builtin_rules() -> Vec<GuardRule> {
         GuardRule {
             id: "block-rm-rf-root".to_string(),
             // A recursive flag anywhere among `rm`'s options (`-rf`, `-r -f`,
-            // `--recursive --force`, after `--`), then a target at `/`, `~`, or
-            // `$HOME`, optionally quoted.
+            // `--recursive --force`, after `--`), then a target that starts at
+            // `/`, `~`, or `$HOME`, optionally quoted. Deliberately broad, as the
+            // original rule was: any absolute or home path, not only `/` itself.
+            // `rm` matches in any case (macOS resolves `RM`).
             pattern: concat!(
-                r"\brm\s+(?:(?:-[a-zA-Z]+|--[a-z-]*)\s+)*?(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)\s+",
+                r"(?i:\brm)\s+(?:(?:-[a-zA-Z]+|--[a-z-]*)\s+)*?(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)\s+",
                 r#"(?:(?:-[a-zA-Z]+|--[a-z-]*)\s+)*["']?(?:/|~|\$\{?HOME\}?)"#
             )
             .to_string(),
             action: GuardAction::Block,
             target: GuardTarget::Bash,
-            reason: "Recursive forced deletion of root or home directory is catastrophic \
-                     and irreversible."
+            reason: "Recursive forced deletion of an absolute or home path can destroy \
+                     system or user files irreversibly."
                 .to_string(),
             suggestion: Some(
                 "Target a specific subdirectory: rm -rf ./build/ or rm -rf target/".to_string(),
@@ -379,6 +413,8 @@ mod tests {
         let blocked = |command: &str| {
             GuardEngine::has_blocking(&engine.evaluate(command, &GuardTarget::Bash))
         };
+        // Two review rounds of shapes: global options and clusters, quoted
+        // and wildcard refspecs, --mirror, redirections, subshells, any case.
         for command in [
             "git -C ../wt push --force origin main",
             "git -c core.x=1 push --force origin main",
@@ -398,9 +434,37 @@ mod tests {
             "rm -rf \"/\"",
             "rm -rf \"$HOME\"",
             "rm -rf ${HOME}/",
+            "git push origin \"+main\"",
+            "git push origin '+HEAD:main'",
+            "git push --mirror origin",
+            "git push origin '+refs/heads/*:refs/heads/*'",
+            "git push 2>&1 -f origin main",
+            "git add ./",
+            "git add \".\"",
+            "git add :/",
+            "git add -vA",
+            "git add -Av",
+            "(git add .)",
+            "`git add .`",
+            "git add .>/dev/null",
+            "GIT push -f origin main",
+            "RM -rf /",
+            "GIT_DIR=x git push -f origin main",
+            "command git push -f origin main",
+            "git push --force-with-lease origin main",
+            "git push origin HEAD:main -f",
+            "sudo rm -rf /",
+            "rm -rf /*",
+            "rm -rf '/'",
+            "rm -rf ~/",
+            "rm -rf $HOME/..",
+            "rm -rf ~/*",
+            "git add *",
         ] {
             assert!(blocked(command), "should block: {command}");
         }
+        // A commit message or `git log` that mentions a force-push, a feature
+        // branch, single files, and a feature `+` refspec all pass.
         for command in [
             "git push --force origin maintenance",
             "git push origin feature && echo --force main",
@@ -410,6 +474,15 @@ mod tests {
             "rm -rf ./build",
             "rm -rf target/",
             "rm -i notes.txt",
+            "git commit -m \"will push -f to main later\"",
+            "git log main --format=%H",
+            "grep -rf patterns.txt main.rs",
+            "git push origin feature -u",
+            "git push -f origin feature",
+            "git push origin +feature",
+            "rmdir -p /tmp/x",
+            "git add *.rs",
+            "git log --grep='push -f main'",
         ] {
             assert!(!blocked(command), "should allow: {command}");
         }
