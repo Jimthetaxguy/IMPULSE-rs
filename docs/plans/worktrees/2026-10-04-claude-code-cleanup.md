@@ -31,13 +31,14 @@ tags: [worktree, lane, handoff, cleanup, review]
 - Verification: `cargo build --workspace`, `cargo test --workspace`,
   `cargo clippy --workspace --all-targets -- -D warnings` (default and `--no-default-features`),
   `cargo fmt --all -- --check`, `python3 docs/validate_docs.py`
-- Latest status: review pass, adversarial refutation round, and two verification rounds
-  complete, and a third on the second round's fixes. 29 fixes and 3 documentation corrections,
-  11 commits fixing what the refutation round confirmed, 8 from the first verification round and
-  the recorded items, 6 from the second round and two more recorded items, and the third round's
-  fixes below. Behavior changes carry regression tests, nearly all checked
-  by reverting the fix and watching the test fail. Gate evidence goes in the PR description. Not
-  merged; needs a PR and review.
+- Latest status:
+  - review pass, adversarial refutation round, and four verification rounds complete;
+  - each round found and fixed regressions in the previous round's fixes, and the fourth found
+    two P2s, both fixed;
+  - behavior changes carry regression tests, nearly all checked by reverting the fix and watching
+    the test fail;
+  - gate evidence goes in the PR description;
+  - not merged; needs a PR and review.
 
 ## Fixed on this branch
 | Area | Commits |
@@ -192,6 +193,21 @@ Recorded items fixed after round 3:
   - it covers per-lane target dirs and regression tests shown to fail with the fix reverted;
   - it adds a review-before-ready section.
 
+Fourth verification round (against `5eff5de`), over the 13 code commits since `3c0ba8d`:
+- Every claimed fix held except the two below.
+- Two P2s:
+  - `efa9c7b` fixes a regression in `3e5f00f`. `end_session` took the session out while writing
+    its history, so another session's save dropped it, and a failed append lost it (14 of 20
+    trials). It now stays in place, marked as ending, until its history is written.
+  - `47b8ed8` fixes a pre-existing bug. Project discovery followed directory links out of the
+    search root, listing one outside project 31 times. `clean-all`'s fallback would have run
+    `cargo clean` there each time. Discovery now visits each real path once, inside the root.
+- P3s fixed:
+  - `47b8ed8`: `dir_size` counted every hard link.
+  - `11ec722`: a body that stops arriving now gets a 10 s deadline and a 408; Transfer-Encoding
+    with Content-Length gets 400; any coding but `chunked` gets 501.
+  - `226f404`: an empty `.git` file no longer ends the guard's `.impulse` search.
+
 Still recorded, not fixed:
 - `file_write`'s check-then-write race against a concurrent same-user process swapping symlinks
   (needs directory-fd opens).
@@ -211,6 +227,16 @@ Still recorded, not fixed:
 - The office tools still parse synchronously on the runtime thread when called over MCP or the
   daemon; they are not exposed over the webhook. They need their own `spawn_blocking`: a blanket
   wrapper would break the kill-on-drop cancellation that process tools rely on.
+- A webhook client that reconnects as soon as it is cut still keeps every slot: the header and
+  body deadlines only shorten each hold, and the 2 s drain after a refusal holds one too. This
+  needs per-source or accept-rate limits.
+- `sweep`, `wipe` and `clean_all` work run under `spawn_blocking` keeps going after the request
+  that started it is cancelled (it used to block the runtime instead). Stopping it needs a stop
+  flag through the deletion loops.
+- In the guard's `.impulse` search the nearest one wins, so a nested `.impulse` with guardrails off
+  shadows the root's rules for a session started under it; a nested worktree's `.git` file ends
+  the search. Outside a git repository a session started in a subdirectory gets the built-in
+  rules.
 - The sqlite-vec search pool still follows the page window. Its order is the same for any pool
   size except between results at exactly the same distance.
 
