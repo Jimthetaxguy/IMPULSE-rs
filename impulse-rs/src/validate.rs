@@ -4,8 +4,6 @@
 //! as filesystem paths, SQL components, IDs, or URL segments. This is the
 //! single enforcement point for the "treat agent inputs as adversarial" rule.
 
-use std::path::{Component, Path, PathBuf};
-
 /// Validation error with machine-readable `kind` for envelope error payloads.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ValidationError {
@@ -117,33 +115,6 @@ pub fn validate_resource_name(name: &str, field: &'static str) -> Result<(), Val
     Ok(())
 }
 
-/// Validate a path is sandboxed under `root` — no traversal, no absolute escape.
-pub fn validate_path_sandboxed(path: &str, root: &Path) -> Result<PathBuf, ValidationError> {
-    let p = Path::new(path);
-
-    // Reject absolute paths that don't start with root
-    if p.is_absolute() {
-        let canonical = p.to_path_buf();
-        if !canonical.starts_with(root) {
-            return Err(ValidationError::PathTraversal {
-                path: path.to_string(),
-            });
-        }
-        return Ok(canonical);
-    }
-
-    // Reject component-level traversal
-    for component in p.components() {
-        if matches!(component, Component::ParentDir) {
-            return Err(ValidationError::PathTraversal {
-                path: path.to_string(),
-            });
-        }
-    }
-
-    Ok(root.join(p))
-}
-
 /// Reject inputs longer than `max` bytes.
 pub fn validate_length(
     input: &str,
@@ -222,15 +193,6 @@ mod tests {
         assert!(validate_resource_name("id#section", "test").is_err());
         assert!(validate_resource_name("id\0null", "test").is_err());
         assert!(validate_resource_name("valid-id-123", "test").is_ok());
-    }
-
-    #[test]
-    fn path_traversal_blocked() {
-        let root = Path::new("/home/user/project");
-        assert!(validate_path_sandboxed("../../etc/passwd", root).is_err());
-        assert!(validate_path_sandboxed("src/../../../etc/passwd", root).is_err());
-        assert!(validate_path_sandboxed("src/main.rs", root).is_ok());
-        assert!(validate_path_sandboxed("/etc/passwd", root).is_err());
     }
 
     #[test]

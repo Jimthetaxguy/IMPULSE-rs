@@ -7,6 +7,9 @@ use async_trait::async_trait;
 use crate::tooling::error::ToolError;
 use crate::tooling::traits::*;
 
+/// Most iterations one call may request.
+const MAX_BENCHMARK_ITERATIONS: u64 = 10_000;
+
 /// Run a micro-benchmark on a Python expression.
 ///
 /// Useful for agents to measure performance of operations before recommending
@@ -36,7 +39,9 @@ impl DynamicTool for BenchmarkerTool {
                 },
                 ToolParam {
                     name: "iterations".into(),
-                    description: "Number of iterations (default: 100)".into(),
+                    description: "Number of iterations (default: 100, at most 10000; the \
+                                  estimated total must fit the session's tool time limit)"
+                        .into(),
                     param_type: ParamType::Integer,
                     required: false,
                     default: Some(serde_json::json!(100)),
@@ -57,27 +62,51 @@ impl DynamicTool for BenchmarkerTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
         let code = params
             .get("code")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidParams("missing 'code'".into()))?
             .to_string();
+        // `as u32` used to truncate a large count (2^32 + 5 ran 5 times), and
+        // nothing bounded it: the timing loop runs without an await, so the
+        // executor's timeout cannot stop it once it starts.
         let iterations = params
             .get("iterations")
             .and_then(|v| v.as_u64())
-            .unwrap_or(100) as u32;
+            .unwrap_or(100);
+        if !(1..=MAX_BENCHMARK_ITERATIONS).contains(&iterations) {
+            return Err(ToolError::InvalidParams(format!(
+                "iterations must be between 1 and {MAX_BENCHMARK_ITERATIONS}, got {iterations}"
+            )));
+        }
+        let iterations = iterations as u32;
 
         // A program that does not run to completion would be timed all the
         // same, and the numbers would describe the sandbox's failure path, not
         // the workload. Run it once before timing anything and refuse a
         // program that faults. A slow failure such as a timeout is then paid
         // for once, not once per iteration.
+        let preflight_started = std::time::Instant::now();
         let preflight = crate::tools::python::execute_python(&code)
             .map_err(|e| ToolError::ExecutionFailed(format!("sandbox failed: {e}")))?;
         if let Some(reason) = benchmark_refusal(&preflight) {
             return Err(ToolError::ExecutionFailed(reason));
+        }
+        // One run's time stands in for the rest: refuse work that would run
+        // past the session's tool time limit, which could not stop it.
+        let one_run = preflight_started.elapsed();
+        let estimate = one_run.saturating_mul(iterations);
+        let limit = std::time::Duration::from_millis(ctx.timeout_ms.max(1));
+        if estimate > limit {
+            return Err(ToolError::InvalidParams(format!(
+                "{iterations} iterations of a {} ms program would take about {} s, past this \
+                 session's {} s tool time limit; use fewer iterations",
+                one_run.as_millis(),
+                estimate.as_secs(),
+                limit.as_secs()
+            )));
         }
 
         // Use the existing benchmark module to time Python execution. The
@@ -221,6 +250,41 @@ mod tests {
             Err(other) => panic!("expected ExecutionFailed, got {other:?}"),
             Ok(timed) => panic!("a failing program was timed: {}", timed.output),
         }
+    }
+
+    #[tokio::test]
+    async fn test_execute_refuses_an_iteration_count_out_of_range() {
+        let ctx = ToolContext::with_all_capabilities();
+        for iterations in [0u64, MAX_BENCHMARK_ITERATIONS + 1, (1u64 << 32) + 5] {
+            let result = BenchmarkerTool
+                .execute(
+                    serde_json::json!({"code": "x = 1", "iterations": iterations}),
+                    &ctx,
+                )
+                .await;
+            assert!(
+                matches!(result, Err(ToolError::InvalidParams(_))),
+                "{iterations}: {result:?}"
+            );
+        }
+    }
+
+    /// Recorded review P3: the loop cannot be interrupted, so a request whose
+    /// estimate passes the session's time limit is refused before it starts.
+    #[tokio::test]
+    async fn test_execute_refuses_work_past_the_time_limit() {
+        let ctx = ToolContext {
+            timeout_ms: 1_000,
+            ..ToolContext::with_all_capabilities()
+        };
+        let slow = "total = 0\nfor i in range(200000):\n    total += i\n";
+        let result = BenchmarkerTool
+            .execute(serde_json::json!({"code": slow, "iterations": 10000}), &ctx)
+            .await;
+        assert!(
+            matches!(&result, Err(ToolError::InvalidParams(message)) if message.contains("tool time limit")),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]
