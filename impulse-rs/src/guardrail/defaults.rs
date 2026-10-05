@@ -52,23 +52,36 @@ fn git_subcommand(subcommand: &str) -> String {
 /// counts and one after a redirection still does.
 const SAME_COMMAND: &str = r"(?:[^;|&\n]|&>|>&|<&)*";
 
+/// A ref naming main or master as a whole: it starts after whitespace, a
+/// quote, a refspec's `:`, or a `+`, optionally as `refs/heads/`. A word
+/// boundary alone also matched `feature/main-menu`, `main-menu`, and `main~1`.
+const MAIN_REF: &str = r#"[\s"':+](?:refs/heads/)?(?i:main|master)"#;
+
+/// What may follow a whole ref: the end, whitespace, a quote, or a shell
+/// separator. The regex crate has no lookahead, so this consumes the
+/// character and can only end a pattern.
+const REF_END: &str = r#"(?:$|[\s"';|&)`>])"#;
+
 /// A force-push of main or master: a force flag and the branch in either
-/// order, a `+` refspec onto it (quoted or not, or a `*` wildcard), or
-/// `--mirror`, which force-updates every ref.
+/// order, a `+` refspec onto it (quoted or not, or a `*` wildcard),
+/// `--mirror`, which force-updates every ref, or `--all` with a force flag,
+/// which force-updates every branch.
 fn force_push_pattern() -> String {
     format!(
         concat!(
             "{push}{same}(?:",
-            r"\s{force}{same}{branch}",
-            r"|{branch}{same}\s{force}(?:$|[\s;|&)`>])",
-            r#"|\s["']?\+(?:[^\s:;|&"']*:)?(?:refs/heads/)?(?:(?i:main|master)\b|\*)"#,
+            r"\s{force}{same}{main}{end}",
+            r#"|{main}["']?\s(?:{same}\s)?{force}(?:$|[\s;|&)`>])"#,
+            r#"|\s["']?\+(?:[^\s:;|&"']*:)?(?:refs/heads/)?(?:(?i:main|master){end}|\*)"#,
             r"|\s--mirror\b",
+            r"|\s{force}{same}\s--all\b|\s--all\b{same}\s{force}(?:$|[\s;|&)`>])",
             ")"
         ),
         push = git_subcommand("push"),
         same = SAME_COMMAND,
         force = r"(?:-[a-zA-Z]*f[a-zA-Z]*|--force\S*)",
-        branch = r"\b(?i:main|master)\b",
+        main = MAIN_REF,
+        end = REF_END,
     )
 }
 
@@ -122,13 +135,15 @@ pub fn builtin_rules() -> Vec<GuardRule> {
         GuardRule {
             id: "block-rm-rf-root".to_string(),
             // A recursive flag anywhere among `rm`'s options (`-rf`, `-r -f`,
-            // `--recursive --force`, after `--`), then a target that starts at
-            // `/`, `~`, or `$HOME`, optionally quoted. Deliberately broad, as the
-            // original rule was: any absolute or home path, not only `/` itself.
-            // `rm` matches in any case (macOS resolves `RM`).
+            // `--recursive --force`, GNU's abbreviations such as `--rec`, after
+            // `--`), then a target that starts at `/` (also escaped, `\/`), `~`,
+            // or `$HOME`, optionally quoted. Deliberately broad, as the original
+            // rule was: any absolute or home path, not only `/` itself. `rm`
+            // matches in any case (macOS resolves `RM`).
             pattern: concat!(
-                r"(?i:\brm)\s+(?:(?:-[a-zA-Z]+|--[a-z-]*)\s+)*?(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)\s+",
-                r#"(?:(?:-[a-zA-Z]+|--[a-z-]*)\s+)*["']?(?:/|~|\$\{?HOME\}?)"#
+                r"(?i:\brm)\s+(?:(?:-[a-zA-Z]+|--[a-z-]*)\s+)*?",
+                r"(?:-[a-zA-Z]*[rR][a-zA-Z]*|--r(?:e(?:c(?:u(?:r(?:s(?:i(?:v(?:e)?)?)?)?)?)?)?)?)\s+",
+                r#"(?:(?:-[a-zA-Z]+|--[a-z-]*)\s+)*["']?(?:\\?/|~|\$\{?HOME\}?)"#
             )
             .to_string(),
             action: GuardAction::Block,
@@ -476,6 +491,13 @@ mod tests {
             "git push origin main -f&&echo ok",
             "git push origin HEAD:main -f",
             "sudo rm -rf /",
+            "rm -rf \\/",
+            "rm --rec -f /",
+            "git push -f origin refs/heads/main",
+            "git push -f origin HEAD:refs/heads/master",
+            "git push -f origin main~1:main",
+            "git push --all --force origin",
+            "git push -f --all",
             "rm -rf /*",
             "rm -rf '/'",
             "rm -rf ~/",
@@ -486,9 +508,16 @@ mod tests {
             assert!(blocked(command), "should block: {command}");
         }
         // A commit message or `git log` that mentions a force-push, a feature
-        // branch, single files, and a feature `+` refspec all pass.
+        // branch (also one whose name contains `main`), single files, and a
+        // feature `+` refspec all pass.
         for command in [
             "git push --force origin maintenance",
+            "git push -f origin feature/main-menu",
+            "git push --force origin main-menu",
+            "git push -f origin main~1:release",
+            "git push origin +main-menu",
+            "git push origin feature/main -f",
+            "git push --all origin",
             "git push origin feature && echo --force main",
             "git add ./src/main.rs",
             "git add .gitignore",
