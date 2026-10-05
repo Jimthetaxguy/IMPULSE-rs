@@ -446,19 +446,39 @@ enum HeaderBlock {
     Closed,
     /// More than `MAX_WEBHOOK_HEADER_BYTES` arrived without an end.
     TooLarge,
+    /// A line feed without a carriage return before it. Split there, a line
+    /// hid a header from a proxy that requires CRLF; a client sending only
+    /// LF used to wait out the header deadline with no reply.
+    BareLineFeed,
 }
 
 /// Reads into `raw` until the end of the header block, which may arrive in
-/// pieces.
+/// pieces. Each pass looks only at what arrived since the last one (from a
+/// few bytes back, so a terminator split across reads is still found);
+/// searching the whole buffer every time cost quadratic time in the size of
+/// a header block sent in small pieces.
 async fn read_header_block(stream: &mut TcpStream, raw: &mut Vec<u8>) -> Result<HeaderBlock> {
     let mut chunk = vec![0u8; 8 * 1024];
+    let mut scanned: usize = 0;
     loop {
-        if let Some(position) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
-            return Ok(HeaderBlock::End(position));
+        let from = scanned.saturating_sub(3);
+        let end = raw[from..]
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|position| from + position);
+        let head = end.unwrap_or(raw.len());
+        let bare_line_feed = (scanned.saturating_sub(1)..head)
+            .any(|i| raw[i] == b'\n' && (i == 0 || raw[i - 1] != b'\r'));
+        if bare_line_feed {
+            return Ok(HeaderBlock::BareLineFeed);
+        }
+        if let Some(end) = end {
+            return Ok(HeaderBlock::End(end));
         }
         if raw.len() > MAX_WEBHOOK_HEADER_BYTES {
             return Ok(HeaderBlock::TooLarge);
         }
+        scanned = raw.len();
         let n = stream.read(&mut chunk).await?;
         if n == 0 {
             return Ok(HeaderBlock::Closed);
@@ -493,6 +513,15 @@ async fn handle_http_connection(
                 )
                 .await
             }
+            HeaderBlock::BareLineFeed => {
+                return reply_and_close(
+                    &mut stream,
+                    400,
+                    "application/json",
+                    br#"{"error":"a bare line feed in the request head; lines end with CRLF"}"#,
+                )
+                .await
+            }
         },
         // Nothing is answered: the client has not authenticated yet.
         Err(_) => return Ok(()),
@@ -509,8 +538,8 @@ async fn handle_http_connection(
         )
         .await;
     };
-    if let Some(problem) = malformed_header(header_text) {
-        return reply_and_close(&mut stream, 400, "application/json", problem).await;
+    if let Some((status, problem)) = malformed_header(header_text) {
+        return reply_and_close(&mut stream, status, "application/json", problem).await;
     }
     let body = &raw[header_end + 4..];
 
@@ -518,7 +547,10 @@ async fn handle_http_connection(
     let request_line = lines.next().unwrap_or("");
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
-    let path = parts.next().unwrap_or("/");
+    // Routes match the path alone: a provider or probe adding a query
+    // string (`/healthz?probe=1`) was refused or sent to the wrong route.
+    let target = parts.next().unwrap_or("/");
+    let path = target.split_once('?').map_or(target, |(path, _)| path);
 
     let is_health = method == "GET" && matches!(path, "/healthz" | "/health");
     if !is_health && !auth.admits(header_text) {
@@ -619,7 +651,7 @@ enum ChunkedBody {
 /// different value. They used to be skipped or read leniently. No request
 /// could be smuggled through this server, since every connection closes
 /// after one reply, so this is defense in depth.
-fn malformed_header(header_text: &str) -> Option<&'static [u8]> {
+fn malformed_header(header_text: &str) -> Option<(u16, &'static [u8])> {
     let mut lines = header_text.lines();
     let request_line = lines.next().unwrap_or("");
     let parts: Vec<&str> = request_line.split(' ').collect();
@@ -627,32 +659,43 @@ fn malformed_header(header_text: &str) -> Option<&'static [u8]> {
         || parts.iter().any(|part| part.is_empty())
         || !parts[2].starts_with("HTTP/")
     {
-        return Some(br#"{"error":"malformed request line"}"#);
+        return Some((400, br#"{"error":"malformed request line"}"#));
+    }
+    // Only HTTP/1.0 and HTTP/1.1 are served; `HTTP/9.9` used to be read as
+    // either.
+    if !matches!(parts[2], "HTTP/1.0" | "HTTP/1.1") {
+        return Some((
+            505,
+            br#"{"error":"only HTTP/1.0 and HTTP/1.1 are supported"}"#,
+        ));
     }
     if header_text
         .lines()
         .any(|line| line.chars().any(|c| c.is_ascii_control() && c != '\t'))
     {
-        return Some(br#"{"error":"control characters in the request head"}"#);
+        return Some((
+            400,
+            br#"{"error":"control characters in the request head"}"#,
+        ));
     }
     let mut length: Option<&str> = None;
     for line in lines {
         if line.starts_with([' ', '\t']) {
-            return Some(br#"{"error":"folded header lines are not accepted"}"#);
+            return Some((400, br#"{"error":"folded header lines are not accepted"}"#));
         }
         let Some((name, value)) = line.split_once(':') else {
-            return Some(br#"{"error":"header line without a colon"}"#);
+            return Some((400, br#"{"error":"header line without a colon"}"#));
         };
         if name.is_empty() || !name.chars().all(is_token_char) {
-            return Some(br#"{"error":"malformed header field name"}"#);
+            return Some((400, br#"{"error":"malformed header field name"}"#));
         }
         if name.eq_ignore_ascii_case("content-length") {
             let value = value.trim();
             if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-                return Some(br#"{"error":"Content-Length must be digits"}"#);
+                return Some((400, br#"{"error":"Content-Length must be digits"}"#));
             }
             if length.is_some_and(|earlier| earlier != value) {
-                return Some(br#"{"error":"conflicting Content-Length values"}"#);
+                return Some((400, br#"{"error":"conflicting Content-Length values"}"#));
             }
             length = Some(value);
         }
@@ -876,6 +919,7 @@ async fn reply_and_close(
         413 => "Payload Too Large",
         431 => "Request Header Fields Too Large",
         501 => "Not Implemented",
+        505 => "HTTP Version Not Supported",
         _ => "Error",
     };
     let mut response = format!(
@@ -1204,6 +1248,14 @@ mod tests {
                 "{headers:?}: {response}"
             );
         }
+        // Round 7 (reviewer B): a bare line feed split a line where a proxy
+        // requiring CRLF would not.
+        let request = format!(
+            "POST /voice/tools HTTP/1.1\r\nX-A: b\nX-B: c\r\nContent-Length: {n}\r\n\r\n{body}"
+        );
+        let response = send_raw(addr, &[request.as_bytes()]).await;
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+
         // Round 6 (reviewer B): a loose request line, and a header block
         // that is not UTF-8, which skipped every check.
         for request_line in [
@@ -1230,6 +1282,24 @@ mod tests {
         );
         let response = send_raw(addr, &[repeated.as_bytes()]).await;
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    }
+
+    /// Round 7 (reviewer B): a client sending only line feeds waited out
+    /// the header deadline with no reply; `HTTP/9.9` was served; a query
+    /// string kept a request from its route.
+    #[tokio::test]
+    async fn webhook_answers_lf_only_requests_versions_and_query_strings() {
+        let addr = spawn_webhook(WebhookAuth::Bearer("s3cret".into())).await;
+        let started = std::time::Instant::now();
+        let lf_only = send_raw(addr, &[b"GET /healthz HTTP/1.1\n\n"]).await;
+        assert!(lf_only.starts_with("HTTP/1.1 400"), "{lf_only}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
+
+        let version = send_raw(addr, &[b"GET /healthz HTTP/9.9\r\n\r\n"]).await;
+        assert!(version.starts_with("HTTP/1.1 505"), "{version}");
+
+        let probe = send_raw(addr, &[b"GET /healthz?probe=1 HTTP/1.1\r\n\r\n"]).await;
+        assert!(probe.starts_with("HTTP/1.1 200"), "{probe}");
     }
 
     /// Recorded review item: a chunked body, which carries no
