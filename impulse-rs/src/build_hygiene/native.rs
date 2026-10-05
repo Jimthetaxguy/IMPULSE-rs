@@ -558,6 +558,7 @@ mod tests {
         fs::create_dir_all(proj.join("target")).unwrap();
         fs::write(proj.join("Cargo.toml"), "[package]\nname = \"test\"\n").unwrap();
         fs::write(proj.join("target/artifact"), "data").unwrap();
+        tag(&proj.join("target"));
 
         let result = native_wipe(&[tmp.path().to_path_buf()], true).unwrap();
 
@@ -575,6 +576,7 @@ mod tests {
         fs::create_dir_all(proj.join("target")).unwrap();
         fs::write(proj.join("Cargo.toml"), "[package]\nname = \"test\"\n").unwrap();
         fs::write(proj.join("target/artifact"), "data").unwrap();
+        tag(&proj.join("target"));
 
         let result = native_wipe(&[tmp.path().to_path_buf()], false).unwrap();
 
@@ -585,6 +587,36 @@ mod tests {
         assert!(!proj.join("target").exists());
         // Cargo.toml should still exist
         assert!(proj.join("Cargo.toml").exists());
+    }
+
+    fn tag(target: &Path) {
+        fs::write(
+            target.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
+    }
+
+    /// Round 6 (reviewer C): like `cargo clean`, sweep and wipe leave a
+    /// `target` without cargo's `CACHEDIR.TAG` alone.
+    #[test]
+    fn test_native_sweep_and_wipe_skip_an_untagged_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("plain");
+        fs::create_dir_all(proj.join("target")).unwrap();
+        fs::write(proj.join("Cargo.toml"), "[package]\nname = \"test\"\n").unwrap();
+        fs::write(proj.join("target/notes.txt"), "not a build output").unwrap();
+
+        let swept = native_sweep_paths(&[tmp.path().to_path_buf()], 0, false).unwrap();
+        let wiped = native_wipe(&[tmp.path().to_path_buf()], false).unwrap();
+        assert!(proj.join("target/notes.txt").exists());
+        assert_eq!(wiped.projects_cleaned, 0);
+        for errors in [&swept.errors, &wiped.errors] {
+            assert!(
+                errors.iter().any(|e| e.contains("CACHEDIR.TAG")),
+                "{errors:?}"
+            );
+        }
     }
 
     #[test]
@@ -603,6 +635,7 @@ mod tests {
             fs::create_dir_all(proj.join("target")).unwrap();
             fs::write(proj.join("Cargo.toml"), "[package]").unwrap();
             fs::write(proj.join("target/bin"), "binary").unwrap();
+            tag(&proj.join("target"));
         }
 
         let result = native_wipe(&[tmp.path().to_path_buf()], false).unwrap();
@@ -645,6 +678,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let proj = tmp.path().join("test-proj");
         fs::create_dir_all(proj.join("target/debug")).unwrap();
+        tag(&proj.join("target"));
         fs::write(proj.join("Cargo.toml"), "[package]\nname = \"test\"\n").unwrap();
 
         create_file_with_mtime(&proj.join("target/debug/old.o"), "old", 60);
@@ -699,12 +733,14 @@ mod tests {
         // Project A: valid, with a stale file
         let proj_a = tmp.path().join("proj-a");
         fs::create_dir_all(proj_a.join("target")).unwrap();
+        tag(&proj_a.join("target"));
         fs::write(proj_a.join("Cargo.toml"), "[package]\nname = \"a\"\n").unwrap();
         create_file_with_mtime(&proj_a.join("target/old.o"), "stale", 60);
 
         // Project B: valid, with a stale file
         let proj_b = tmp.path().join("proj-b");
         fs::create_dir_all(proj_b.join("target")).unwrap();
+        tag(&proj_b.join("target"));
         fs::write(proj_b.join("Cargo.toml"), "[package]\nname = \"b\"\n").unwrap();
         create_file_with_mtime(&proj_b.join("target/old.o"), "stale", 60);
 

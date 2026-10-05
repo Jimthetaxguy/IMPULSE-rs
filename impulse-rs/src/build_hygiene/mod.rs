@@ -16,7 +16,7 @@ mod tests;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // Re-export key types
 pub use clean_all::clean_all_projects;
@@ -133,24 +133,48 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// The signature that starts a `CACHEDIR.TAG` file, which cargo writes into
+/// each build directory it creates.
+const CACHEDIR_TAG_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+
+/// Whether `target` carries cargo's `CACHEDIR.TAG`. Cargo itself refuses to
+/// clean a directory without one, to avoid deleting unrelated files. Only a
+/// regular file is read, so a FIFO in its place cannot block the caller.
+fn is_cargo_build_dir(target: &Path) -> bool {
+    let tag = target.join("CACHEDIR.TAG");
+    if !std::fs::metadata(&tag).is_ok_and(|meta| meta.is_file()) {
+        return false;
+    }
+    let mut start = [0u8; CACHEDIR_TAG_SIGNATURE.len()];
+    std::fs::File::open(&tag)
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut start))
+        .is_ok_and(|()| start.as_slice() == CACHEDIR_TAG_SIGNATURE)
+}
+
 /// Projects under `paths` that a destructive operation may act on, and a
-/// note for each one skipped. A project whose `target` is a symbolic link is
-/// left alone: sweeping, wiping or cleaning through the link changed files
-/// outside the scanned roots, possibly a directory other projects share.
+/// note for each one skipped. A project is left alone when its `target` is a
+/// symbolic link, since acting through the link changed files outside the
+/// scanned roots, possibly a directory other projects share; or when its
+/// `target` lacks cargo's `CACHEDIR.TAG`, as cargo would refuse it too.
 pub fn projects_to_clean(paths: &[PathBuf]) -> (Vec<RustProject>, Vec<String>) {
     let mut skipped = Vec::new();
     let projects = discover_rust_projects(paths)
         .into_iter()
         .filter(|project| {
-            let linked = std::fs::symlink_metadata(project.path.join("target"))
-                .is_ok_and(|meta| meta.file_type().is_symlink());
-            if linked {
-                skipped.push(format!(
-                    "{}: target is a symbolic link; skipped",
-                    project.path.display()
-                ));
+            let target = project.path.join("target");
+            let reason = if std::fs::symlink_metadata(&target)
+                .is_ok_and(|meta| meta.file_type().is_symlink())
+            {
+                Some("target is a symbolic link")
+            } else if !is_cargo_build_dir(&target) {
+                Some("target has no CACHEDIR.TAG, so it is not treated as a cargo build directory")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                skipped.push(format!("{}: {reason}; skipped", project.path.display()));
             }
-            !linked
+            reason.is_none()
         })
         .collect();
     (projects, skipped)
