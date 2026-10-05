@@ -24,16 +24,29 @@ pub struct Storage {
     base_path: PathBuf,
 }
 
-/// Distinguishes temp files this process creates in the same instant. The
-/// clock alone can't: on macOS `SystemTime` nanoseconds are whole
-/// microseconds, so two writes within one microsecond got the same name and
-/// the second failed with "File exists".
 static TEMP_FILE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// An exclusive advisory lock on a `.lock` file beside some data, released
-/// when dropped. See [`Storage::lock_exclusive`].
-pub struct FileLock {
-    _file: Option<File>,
+/// Makes a temp file's name unique: the process id, a per-process sequence
+/// number and the clock's sub-second nanoseconds. The clock alone can't: on
+/// macOS `SystemTime` nanoseconds are whole microseconds, so two writes in
+/// one microsecond got the same name, and the second failed with "File
+/// exists" or wrote over the first one's temp file.
+pub(crate) fn unique_temp_token() -> String {
+    format!(
+        "{}.{}.{}",
+        std::process::id(),
+        TEMP_FILE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos()
+    )
+}
+
+/// An exclusive advisory lock on a storage directory, released when
+/// dropped. See [`Storage::lock_exclusive`].
+pub struct StorageLock {
+    _dir: Option<File>,
 }
 
 impl Storage {
@@ -224,16 +237,7 @@ impl Storage {
         content: &[u8],
         unix_mode: Option<u32>,
     ) -> Result<()> {
-        let unique_suffix = format!(
-            "tmp.{}.{}.{}",
-            std::process::id(),
-            TEMP_FILE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .subsec_nanos()
-        );
-        let temp_path = path.with_extension(unique_suffix);
+        let temp_path = path.with_extension(format!("tmp.{}", unique_temp_token()));
         let mut options = OpenOptions::new();
         options.create_new(true).write(true);
         #[cfg(unix)]
@@ -292,53 +296,67 @@ impl Storage {
         Ok(())
     }
 
-    /// Takes an exclusive lock on `<filename>.lock` in the storage
-    /// directory, waiting for any other holder, for one read-modify-write
-    /// of `filename`.
+    /// Takes an exclusive lock on the storage directory, creating it if
+    /// needed and waiting for any other holder, for one read-modify-write of
+    /// a file in it.
     ///
     /// Without it, two processes that each read a file, change it and write
     /// it back keep only one change: the second rename replaces the first.
-    /// Every writer that updates the file this way must hold the lock. On a
-    /// filesystem without `flock` (some network mounts) the update runs
+    /// Every writer that updates a file this way must hold the lock.
+    ///
+    /// The lock is on the directory itself rather than on a lock file, so it
+    /// leaves nothing behind: a file it created would sit untracked in a
+    /// project's `.impulse/` and make a governed workspace dirty. (Locking
+    /// the data file wouldn't work either, because the atomic write renames a
+    /// new file over it; the directory stays the same file throughout.) It
+    /// covers every file in the directory, and it is not re-entrant: taking
+    /// it again on a thread that holds it waits forever. Where a directory
+    /// can't be locked (some network mounts, NFS among them) the update runs
     /// unlocked with a warning, as before the lock existed.
-    pub fn lock_exclusive(&self, filename: &str) -> Result<FileLock> {
-        let path = self.path(&format!("{filename}.lock"));
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)
-            .with_context(|| format!("Failed to open lock file {}", path.display()))?;
+    pub fn lock_exclusive(&self) -> Result<StorageLock> {
+        self.ensure_dir()?;
         #[cfg(unix)]
-        loop {
+        {
             use std::os::unix::io::AsRawFd;
-            // SAFETY: `file` is open for the whole call, so the descriptor
-            // is valid; `flock` only takes an advisory lock on it and reads
-            // no memory.
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
-                break;
-            }
-            let error = std::io::Error::last_os_error();
-            match error.raw_os_error() {
-                Some(libc::EINTR) => continue,
-                Some(code)
-                    if code == libc::ENOTSUP
-                        || code == libc::EOPNOTSUPP
-                        || code == libc::ENOLCK =>
-                {
-                    tracing::warn!(
-                        "{} can't be locked ({error}); updating it unlocked",
-                        path.display()
-                    );
-                    return Ok(FileLock { _file: None });
+            let dir = File::open(&self.base_path).with_context(|| {
+                format!("Failed to open {} to lock it", self.base_path.display())
+            })?;
+            loop {
+                // SAFETY: `dir` is open for the whole call, so the
+                // descriptor is valid; `flock` only takes an advisory lock
+                // on it and reads no memory.
+                if unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                    return Ok(StorageLock { _dir: Some(dir) });
                 }
-                _ => {
-                    return Err(error)
-                        .with_context(|| format!("Failed to lock {}", path.display()));
+                let error = std::io::Error::last_os_error();
+                match error.raw_os_error() {
+                    Some(libc::EINTR) => continue,
+                    // EBADF: NFS emulates `flock` with byte-range locks, and
+                    // an exclusive one needs a descriptor open for writing,
+                    // which a directory can't be. The descriptor itself is
+                    // valid, since it was opened just above.
+                    Some(code)
+                        if code == libc::ENOTSUP
+                            || code == libc::EOPNOTSUPP
+                            || code == libc::ENOLCK
+                            || code == libc::EBADF =>
+                    {
+                        tracing::warn!(
+                            "{} can't be locked ({error}); updating it unlocked",
+                            self.base_path.display()
+                        );
+                        return Ok(StorageLock { _dir: None });
+                    }
+                    _ => {
+                        return Err(error).with_context(|| {
+                            format!("Failed to lock {}", self.base_path.display())
+                        });
+                    }
                 }
             }
         }
-        Ok(FileLock { _file: Some(file) })
+        #[cfg(not(unix))]
+        Ok(StorageLock { _dir: None })
     }
 
     #[cfg(test)]
@@ -777,6 +795,21 @@ mod tests {
     }
 
     #[test]
+    fn test_unique_temp_token_never_repeats_across_threads() {
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(|| (0..2_000).map(|_| unique_temp_token()).collect::<Vec<_>>())
+            })
+            .collect();
+        let tokens: Vec<String> = handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap())
+            .collect();
+        let distinct: std::collections::HashSet<&String> = tokens.iter().collect();
+        assert_eq!(distinct.len(), tokens.len());
+    }
+
+    #[test]
     fn test_lock_exclusive_serializes_holders() {
         let dir = tempfile::TempDir::new().unwrap();
         let storage = std::sync::Arc::new(Storage::new(dir.path().to_path_buf()));
@@ -789,7 +822,7 @@ mod tests {
                 let overlapped = std::sync::Arc::clone(&overlapped);
                 std::thread::spawn(move || {
                     for _ in 0..20 {
-                        let _lock = storage.lock_exclusive("data.json").unwrap();
+                        let _lock = storage.lock_exclusive().unwrap();
                         if inside.fetch_add(1, std::sync::atomic::Ordering::SeqCst) != 0 {
                             overlapped.store(true, std::sync::atomic::Ordering::SeqCst);
                         }
@@ -803,5 +836,38 @@ mod tests {
             handle.join().unwrap();
         }
         assert!(!overlapped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_lock_exclusive_leaves_no_file_in_the_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(dir.path().to_path_buf());
+        {
+            let _lock = storage.lock_exclusive().unwrap();
+            storage.write_json("GENOME.md", &vec!["one"]).unwrap();
+        }
+        let names: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["GENOME.md".to_string()]);
+    }
+
+    #[test]
+    fn test_lock_exclusive_creates_a_missing_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path().join(".impulse");
+        let storage = Storage::new(base.clone());
+        let _lock = storage.lock_exclusive().unwrap();
+        assert!(base.is_dir());
+    }
+
+    #[test]
+    fn test_lock_exclusive_fails_when_the_path_is_a_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path().join("not-a-dir");
+        fs::write(&base, "x").unwrap();
+        let storage = Storage::new(base);
+        assert!(storage.lock_exclusive().is_err());
     }
 }

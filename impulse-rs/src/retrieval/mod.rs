@@ -29,14 +29,7 @@ use crate::state::{Config, HistoryEntry};
 use crate::storage::Storage;
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let temp_path = path.with_extension(format!(
-        "tmp.{}.{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
+    let temp_path = path.with_extension(format!("tmp.{}", crate::storage::unique_temp_token()));
     let mut file = File::create(&temp_path)?;
     file.write_all(bytes)?;
     file.sync_all()?;

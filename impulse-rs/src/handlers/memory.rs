@@ -79,15 +79,15 @@ pub fn handle_history(state: &Arc<state::State>, format: Option<OutputFormat>) -
 /// Appends a new decision to `GENOME.md` with an optional rationale. A
 /// decision that repeats the last one is not added, and the output says so.
 ///
-/// The read, change and write happen under `GENOME.md`'s lock: without it,
-/// two processes adding at once each wrote back their own copy, and one
-/// decision was lost though both were reported as added.
+/// The read, change and write happen under the storage directory's lock:
+/// without it, two processes adding at once each wrote back their own copy,
+/// and one decision was lost though both were reported as added.
 pub fn handle_add_decision(
     state: &Arc<state::State>,
     description: String,
     rationale: Option<String>,
 ) -> Result<()> {
-    let _lock = state.storage().lock_exclusive("GENOME.md")?;
+    let _lock = state.storage().lock_exclusive()?;
     let mut genome: memory::Genome = state.storage().read_json("GENOME.md")?;
     if !genome.add_decision(description, rationale, Vec::new()) {
         println!("Not added: it repeats the last decision in GENOME");

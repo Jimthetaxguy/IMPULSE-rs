@@ -529,14 +529,8 @@ impl NotificationStore {
             let trimmed = to_keep.into_iter().rev().collect::<Vec<_>>().join("\n");
 
             // Atomic write: temp file + rename
-            let tmp_path = path.with_extension(format!(
-                "tmp.{}.{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-            ));
+            let tmp_path =
+                path.with_extension(format!("tmp.{}", crate::storage::unique_temp_token()));
             std::fs::write(&tmp_path, &trimmed)?;
             std::fs::rename(&tmp_path, &path)?;
         }

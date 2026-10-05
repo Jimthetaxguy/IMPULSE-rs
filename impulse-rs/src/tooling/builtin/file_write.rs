@@ -122,18 +122,14 @@ impl DynamicTool for FileWriteTool {
             )));
         }
 
-        // Atomic write: temp file (PID + timestamp qualified, same
-        // directory as the target so rename() is same-filesystem) + rename.
+        // Atomic write: a uniquely named temp file in the target's own
+        // directory (so rename() is same-filesystem), then rename.
         let temp_name = format!(
-            ".{}.tmp.{}.{}",
+            ".{}.tmp.{}",
             path.file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("file_write"),
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
+            crate::storage::unique_temp_token()
         );
         let temp_path = parent.join(temp_name);
 

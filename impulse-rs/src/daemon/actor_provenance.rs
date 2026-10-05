@@ -357,8 +357,9 @@ pub fn mutation_authorization_needs_profile(mutation: &GovernedTaskMutation) -> 
 
 /// Write `capability` to `path` atomically with owner-only permissions.
 ///
-/// Temp file name carries the PID plus nanoseconds so two daemons racing on the
-/// same directory cannot collide, matching `storage::atomic_write_path`.
+/// The temp file's name carries `storage::unique_temp_token`, as
+/// `storage::atomic_write_path`'s does, so two daemons racing on the same
+/// directory, or two writes in one process, cannot collide.
 pub fn write_capability_file(path: &Path, capability: &OperatorCapability) -> anyhow::Result<()> {
     use anyhow::Context as _;
     use std::io::Write as _;
@@ -373,17 +374,12 @@ pub fn write_capability_file(path: &Path, capability: &OperatorCapability) -> an
             parent.display()
         )
     })?;
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.subsec_nanos())
-        .unwrap_or_default();
     let temp = parent.join(format!(
-        ".{}.{}.{}.tmp",
+        ".{}.{}.tmp",
         path.file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("operator-cap"),
-        std::process::id(),
-        nanos
+        crate::storage::unique_temp_token()
     ));
     // A leftover temp file from a crashed run could have any owner-visible
     // mode, and `OpenOptions::mode` only applies to a file this call creates.
