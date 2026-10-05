@@ -167,6 +167,12 @@ Third verification round (against `3c0ba8d`):
     30 s request budget, and could reconnect to keep it. The header read now has a 5 s deadline
     (`a5b940e`).
 
+Two recorded items fixed after round 3:
+- `c6b7a07`: `dir_size` counts links instead of following them, so a link back up a target tree
+  no longer multiplies the walk, and `build_health` walks under `spawn_blocking`.
+- `ce98af3`: a triple quote inside a one-line string or comment no longer hides a configured
+  sccache wrapper from the status check.
+
 Still recorded, not fixed:
 - `file_write`'s check-then-write race against a concurrent same-user process swapping symlinks
   (needs directory-fd opens).
@@ -182,15 +188,13 @@ Still recorded, not fixed:
 - The Keychain `list` matches on the server alone, while `get` and `delete` also require the
   default authentication type. Matching that too needs the approval-gated round-trip test
   (`#[ignore]`, it writes to the login keychain) to confirm how the attribute reads back.
-- A webhook tool body that never awaits keeps its connection slot and a runtime worker past the
-  request timeout. One example is a long `build_health` walk, whose `dir_size` follows symlinks.
-  Tool bodies need `spawn_blocking`, and the walk needs bounds.
+- Other tool bodies that never await, such as the office tools, still keep a webhook slot and a
+  runtime worker past the request timeout. Each needs its own `spawn_blocking`: a blanket wrapper
+  would break the kill-on-drop cancellation that process tools rely on.
 - A benchmark run that starts just before the deadline still finishes, so the overshoot is up to
   one run (at most Monty's 5 s budget).
 - The sqlite-vec search pool still follows the page window. Its order is the same for any pool
   size except between results at exactly the same distance.
-- `wrapper_state` still runs the old `"""` scanner first, so `X = '"""'` before a configured
-  wrapper reads as unset and setup asks for a key that is already there (unusual input).
 
 ## Recorded, not fixed (each needs a decision or its own lane)
 - **Office tools are unbounded** (`excel_read`, `word_read`, `document_parse`, the `office` CLI,
@@ -218,9 +222,10 @@ Still recorded, not fixed:
   CLI under a 120 s timeout, so lower risk than tool output.
 - **Multi-process `State`** never reloads and rewrites whole files without a lock (accepted for
   hooks in SECURITY-REVIEW Issue 3); the legacy TUI still auto-types context into PTYs.
-- **Docs contract check** fails on three documents past the 120-day staleness threshold
-  (`COLLABORATIVE-AGENTIC-CODING.md` and two May lane cards); they need a real review, not a date
-  bump.
+- **Docs contract check** fails only on `COLLABORATIVE-AGENTIC-CODING.md`, past the 120-day
+  staleness threshold; the living guide needs a content review against current practice, not a date
+  bump. The two May lane cards were reviewed on 2026-10-04: Loop 6's boundary map is superseded by
+  the canonical contract, and the docs lane card's status now matches its own record (`complete`).
 
 ## Decisions
 - 2026-10-04: review `main` module by module with read-only reviewers, verify every finding against

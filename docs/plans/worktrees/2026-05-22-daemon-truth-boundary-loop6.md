@@ -1,16 +1,20 @@
 ---
 title: Daemon Truth Boundary Loop 6
 description: Boundary artifact for Ralph Plan 6 Loop 6 daemon/workbench truth ownership.
-updated: 2026-05-22
+updated: 2026-10-04
 type: doc
 category: planning
 phase: all
-status: active
+status: superseded
 audience: builders
 tags: [worktree, daemon, desktop, ops, artifacts, supervisor, telemetry]
 ---
 
 # Daemon Truth Boundary Loop 6
+
+> Superseded 2026-10-04: Ralph Plan 6 is archived, and daemon workbench truth ownership is now
+> stated in `docs/spec/RUST-CANONICAL-CONTRACT.md`. This boundary map is kept as historical Loop 6
+> context.
 
 ## Lane Facts
 
