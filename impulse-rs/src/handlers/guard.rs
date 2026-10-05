@@ -354,10 +354,7 @@ pub fn handle_analytics(
             }
         }
     } else {
-        println!(
-            "Unknown analytics type: {}. Available: conflicts",
-            subcommand
-        );
+        anyhow::bail!("Unknown analytics type: {subcommand}. Available: conflicts");
     }
     Ok(())
 }
@@ -654,38 +651,43 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_analytics_unknown_subcommand_returns_ok() {
+    fn test_handle_analytics_unknown_subcommand_is_an_error() {
         let (_tmp, st) = test_state();
-        // Unknown subcommand prints a message but returns Ok
         let result = handle_analytics(&st, "unknown".to_string(), false, "day".to_string());
-        assert!(result.is_ok());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Unknown analytics type"));
     }
 
     // ── handle_analytics with recorded conflicts ───────────────────────
 
-    #[test]
-    fn test_handle_analytics_with_recorded_conflicts() {
+    /// Review P3-3: analytics read a file only tests wrote, so conflicts
+    /// that detection recorded never showed up.
+    #[tokio::test]
+    async fn test_analytics_counts_conflicts_that_detection_recorded() {
         let (_tmp, st) = test_state();
-        st.record_conflict(
-            "src/main.rs",
-            vec!["session-a".to_string(), "session-b".to_string()],
-        )
-        .unwrap();
-        st.record_conflict_resolution("src/main.rs", "manual-merge")
-            .unwrap();
+        let a = st.create_session("a".to_string(), None).await.unwrap();
+        let b = st.create_session("b".to_string(), None).await.unwrap();
+        st.track_file(&a.id, "src/main.rs").await.unwrap();
+        st.track_file(&b.id, "src/main.rs").await.unwrap();
+        assert_eq!(
+            st.check_file_conflict(&b.id, "src/main.rs").await.unwrap(),
+            ["a"]
+        );
 
-        let result = handle_analytics(&st, "conflicts".to_string(), false, "day".to_string());
-        assert!(result.is_ok());
-    }
+        let analytics = st.get_conflict_analytics().unwrap().get_analytics();
+        assert_eq!(analytics.total_conflicts, 1);
+        assert_eq!(analytics.unresolved_count, 1);
+        assert_eq!(
+            analytics.most_common_files,
+            [("src/main.rs".to_string(), 1)]
+        );
 
-    #[test]
-    fn test_handle_analytics_with_conflicts_json_output() {
-        let (_tmp, st) = test_state();
-        st.record_conflict("src/lib.rs", vec!["s1".to_string()])
-            .unwrap();
-
-        let result = handle_analytics(&st, "conflicts".to_string(), true, "day".to_string());
-        assert!(result.is_ok());
+        for json in [false, true] {
+            let result = handle_analytics(&st, "conflicts".to_string(), json, "day".to_string());
+            assert!(result.is_ok());
+        }
     }
 
     // ── handle_guard: list confirms rules are returned ─────────────────

@@ -1014,7 +1014,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dispatch_analytics_unknown_subcommand_returns_ok() {
+    async fn test_dispatch_analytics_unknown_subcommand_is_an_error() {
         let tmp = TempDir::new().unwrap();
         let cli = cli_with(
             &tmp,
@@ -1024,10 +1024,10 @@ mod tests {
                 period: "all".to_string(),
             },
         );
-        let result = dispatch(cli).await;
+        let err = dispatch(cli).await.unwrap_err();
         assert!(
-            result.is_ok(),
-            "Analytics with unknown subcommand prints message but returns Ok"
+            format!("{err:#}").contains("Unknown analytics type"),
+            "{err:#}"
         );
     }
 

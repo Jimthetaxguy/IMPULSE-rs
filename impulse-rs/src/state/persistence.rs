@@ -407,34 +407,12 @@ impl State {
         Ok(())
     }
 
+    /// Conflict analytics, built from the audit trail conflict detection
+    /// appends to (`CONFLICTS.jsonl`). This used to read a separate
+    /// `CONFLICTS.json` that only test code wrote, so `analytics conflicts`
+    /// always reported none.
     pub fn get_conflict_analytics(&self) -> Result<ConflictHistory> {
-        self.storage
-            .read_json("CONFLICTS.json")
-            .context("Failed to read conflict analytics from disk")
-    }
-
-    pub fn record_conflict(&self, file_path: &str, sessions: Vec<String>) -> Result<()> {
-        let mut history: ConflictHistory = self
-            .storage
-            .read_json("CONFLICTS.json")
-            .context("Failed to read conflict history from disk")?;
-        history.record_conflict(file_path, sessions);
-        self.storage
-            .write_json("CONFLICTS.json", &history)
-            .context("Failed to persist conflict history to disk")?;
-        Ok(())
-    }
-
-    pub fn record_conflict_resolution(&self, file_path: &str, resolution: &str) -> Result<()> {
-        let mut history: ConflictHistory = self
-            .storage
-            .read_json("CONFLICTS.json")
-            .context("Failed to read conflict history for resolution update")?;
-        history.record_resolution(file_path, resolution);
-        self.storage
-            .write_json("CONFLICTS.json", &history)
-            .context("Failed to persist conflict resolution to disk")?;
-        Ok(())
+        Ok(ConflictHistory::from_events(&self.get_conflict_history()?))
     }
 }
 
@@ -453,26 +431,46 @@ impl ConflictHistory {
         }
     }
 
-    pub fn record_conflict(&mut self, file_path: &str, detected_sessions: Vec<String>) {
-        if let Some(entry) = self
-            .conflict_history
-            .iter_mut()
-            .find(|e| e.file_path == file_path)
-        {
-            entry.detection_count += 1;
-            entry.last_detected = Utc::now();
-            entry.involved_sessions = detected_sessions;
-        } else {
-            self.conflict_history.push(ConflictEntry {
-                file_path: file_path.to_string(),
-                detection_count: 1,
-                first_detected: Utc::now(),
-                last_detected: Utc::now(),
-                involved_sessions: detected_sessions,
-                resolution: None,
-                resolved_at: None,
-            });
+    /// One entry per file from detection events: how often it was
+    /// detected, when first and last, and the sessions involved (the one
+    /// that hit the conflict and those it conflicted with). Nothing records
+    /// resolutions yet, so every entry starts unresolved.
+    pub fn from_events(events: &[ConflictEvent]) -> Self {
+        let mut history = Self::new();
+        for event in events {
+            let index = match history
+                .conflict_history
+                .iter()
+                .position(|e| e.file_path == event.file_path)
+            {
+                Some(index) => {
+                    let entry = &mut history.conflict_history[index];
+                    entry.detection_count += 1;
+                    entry.first_detected = entry.first_detected.min(event.detected_at);
+                    entry.last_detected = entry.last_detected.max(event.detected_at);
+                    index
+                }
+                None => {
+                    history.conflict_history.push(ConflictEntry {
+                        file_path: event.file_path.clone(),
+                        detection_count: 1,
+                        first_detected: event.detected_at,
+                        last_detected: event.detected_at,
+                        involved_sessions: Vec::new(),
+                        resolution: None,
+                        resolved_at: None,
+                    });
+                    history.conflict_history.len() - 1
+                }
+            };
+            let involved = &mut history.conflict_history[index].involved_sessions;
+            for session in std::iter::once(&event.session_id).chain(&event.conflicting_sessions) {
+                if !involved.contains(session) {
+                    involved.push(session.clone());
+                }
+            }
         }
+        history
     }
 
     pub fn record_resolution(&mut self, file_path: &str, resolution: &str) {
@@ -1064,34 +1062,52 @@ mod tests {
         assert!(history.conflict_history.is_empty());
     }
 
-    #[test]
-    fn test_conflict_history_record_conflict() {
-        let mut history = ConflictHistory::new();
-        history.record_conflict(
-            "src/main.rs",
-            vec!["session1".to_string(), "session2".to_string()],
-        );
-
-        assert_eq!(history.conflict_history.len(), 1);
-        assert_eq!(history.conflict_history[0].file_path, "src/main.rs");
-        assert_eq!(history.conflict_history[0].detection_count, 1);
-        assert_eq!(history.conflict_history[0].involved_sessions.len(), 2);
+    fn conflict_event(file_path: &str, session_id: &str, at: &str) -> ConflictEvent {
+        ConflictEvent {
+            file_path: file_path.to_string(),
+            session_id: session_id.to_string(),
+            conflicting_sessions: vec!["other".to_string()],
+            detected_at: DateTime::parse_from_rfc3339(at)
+                .unwrap()
+                .with_timezone(&Utc),
+        }
     }
 
     #[test]
-    fn test_conflict_history_record_conflict_increments_count() {
-        let mut history = ConflictHistory::new();
-        history.record_conflict("src/main.rs", vec!["session1".to_string()]);
-        history.record_conflict("src/main.rs", vec!["session2".to_string()]);
+    fn test_conflict_history_from_events_groups_by_file() {
+        let history = ConflictHistory::from_events(&[
+            conflict_event("src/main.rs", "s2", "2026-10-02T10:00:00Z"),
+            conflict_event("src/lib.rs", "s1", "2026-10-03T10:00:00Z"),
+            conflict_event("src/main.rs", "s1", "2026-10-01T10:00:00Z"),
+        ]);
 
-        assert_eq!(history.conflict_history.len(), 1);
-        assert_eq!(history.conflict_history[0].detection_count, 2);
+        assert_eq!(history.conflict_history.len(), 2);
+        let main = &history.conflict_history[0];
+        assert_eq!(main.file_path, "src/main.rs");
+        assert_eq!(main.detection_count, 2);
+        assert_eq!(
+            main.first_detected.to_rfc3339(),
+            "2026-10-01T10:00:00+00:00"
+        );
+        assert_eq!(main.last_detected.to_rfc3339(), "2026-10-02T10:00:00+00:00");
+        assert_eq!(main.involved_sessions, ["s2", "other", "s1"]);
+        assert!(main.resolution.is_none());
+    }
+
+    #[test]
+    fn test_conflict_history_from_no_events_is_empty() {
+        assert!(ConflictHistory::from_events(&[])
+            .conflict_history
+            .is_empty());
     }
 
     #[test]
     fn test_conflict_history_record_resolution() {
-        let mut history = ConflictHistory::new();
-        history.record_conflict("src/main.rs", vec!["session1".to_string()]);
+        let mut history = ConflictHistory::from_events(&[conflict_event(
+            "src/main.rs",
+            "session1",
+            "2026-10-01T10:00:00Z",
+        )]);
         history.record_resolution("src/main.rs", "merge");
 
         assert_eq!(
