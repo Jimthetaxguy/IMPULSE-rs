@@ -726,10 +726,13 @@ impl McpTool for SearchMemoryTool {
         let history_path = ctx.memory_root().join("HISTORY.jsonl");
         let mut matches = Vec::new();
         if history_path.is_file() {
-            if let Ok(contents) = std::fs::read_to_string(&history_path) {
-                for line in contents.lines() {
+            // Bytes, not `read_to_string`: one invalid UTF-8 byte (a torn
+            // record) made the whole history unreadable and every search empty.
+            if let Ok(contents) = std::fs::read(&history_path) {
+                for line in contents.split(|byte| *byte == b'\n') {
+                    let line = String::from_utf8_lossy(line);
                     if line.to_ascii_lowercase().contains(&query) {
-                        matches.push(line.to_string());
+                        matches.push(line.into_owned());
                         if matches.len() >= limit {
                             break;
                         }

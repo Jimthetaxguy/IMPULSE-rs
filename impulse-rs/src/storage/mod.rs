@@ -71,39 +71,45 @@ impl Storage {
         Self::atomic_write_private_path(&path, json.as_bytes())
     }
 
-    /// Appends one JSON record as one line.
+    /// Appends one JSON record as one line (see [`Self::append_jsonl_path`]).
+    pub fn append_jsonl(&self, filename: &str, record: &impl Serialize) -> Result<()> {
+        self.ensure_dir()?;
+        Self::append_jsonl_path(&self.path(filename), record)
+    }
+
+    /// Appends one JSON record as one line to the file at `path`.
     ///
     /// The record and its newline go out in a single `write_all` on an
     /// `O_APPEND` file, so concurrent appenders (the daemon and hook
     /// processes) cannot interleave inside a line; `writeln!` used to issue
     /// them as separate writes. If the file ends without a newline (a write
     /// torn by a crash or a full disk), the record starts on a new line
-    /// instead of being glued to the fragment and lost with it, and a failed
-    /// write is truncated back so it leaves no fragment of its own.
-    pub fn append_jsonl(&self, filename: &str, record: &impl Serialize) -> Result<()> {
-        self.ensure_dir()?;
-        let path = self.path(filename);
+    /// instead of being glued to the fragment and lost with it, and readers
+    /// skip the fragment. A failed write is left as it is: truncating the
+    /// file back to the length seen before writing also removed records
+    /// other processes had appended and synced in the meantime.
+    pub fn append_jsonl_path(path: &Path, record: &impl Serialize) -> Result<()> {
         let mut file = OpenOptions::new()
             .create(true)
             .read(true)
             .append(true)
-            .open(&path)
+            .open(path)
             .context("Failed to open file for append")?;
         let json = serde_json::to_string(record).context("Failed to serialize JSONL record")?;
-        let previous_len = file
+        // Appends only ever grow the file, so the byte at `len - 1` stays
+        // what it was even if another process appends in between.
+        let len = file
             .metadata()
             .context("Failed to read JSONL file metadata")?
             .len();
         let mut line = Vec::with_capacity(json.len() + 2);
-        if previous_len > 0 && !ends_with_newline(&mut file, previous_len)? {
+        if len > 0 && !ends_with_newline(&mut file, len)? {
             line.push(b'\n');
         }
         line.extend_from_slice(json.as_bytes());
         line.push(b'\n');
-        if let Err(error) = file.write_all(&line) {
-            let _ = file.set_len(previous_len);
-            return Err(error).context("Failed to write JSONL record");
-        }
+        file.write_all(&line)
+            .context("Failed to write JSONL record")?;
         file.sync_all().context("Failed to sync JSONL")?;
         Ok(())
     }

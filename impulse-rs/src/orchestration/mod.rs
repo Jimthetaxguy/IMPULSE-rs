@@ -146,13 +146,7 @@ pub fn write_handoff(
         task: task.to_string(),
         session_id: session.map(|s| s.id.clone()),
     };
-    let line = serde_json::to_string(&log_entry)?;
-    let mut log = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(root.join("routing-log.jsonl"))?;
-    use std::io::Write as _;
-    writeln!(log, "{}", line)?;
+    crate::storage::Storage::append_jsonl_path(&root.join("routing-log.jsonl"), &log_entry)?;
 
     Ok(handoff_path)
 }
