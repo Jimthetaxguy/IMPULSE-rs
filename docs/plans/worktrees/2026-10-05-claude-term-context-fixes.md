@@ -30,8 +30,8 @@ tags: [worktree, lane, handoff, terminal, context, review]
 - Verification: `cargo build --workspace`, `cargo test --workspace`,
   `cargo clippy --workspace --all-targets -- -D warnings` (default and `--no-default-features`),
   `cargo fmt --all -- --check`, `python3 docs/validate_docs.py`
-- Latest status: implemented in `8a4c4b7`, `cfe8645`, `e9aff9f`, `7db19bf` and `a14eeb6` (the
-  last from the verification round); final gate clean; pushed. Not merged; needs a PR and
+- Latest status: implemented in `8a4c4b7`, `cfe8645`, `e9aff9f`, `7db19bf`, `a14eeb6` (the
+  verification round) and `660a763` (the final round); pushed. Not merged; needs a PR and
   review.
 
 ## Findings fixed
@@ -79,6 +79,12 @@ The same reviewer reran its reproductions against the fixes and probed them. Fix
 - Conflict announcements were de-duplicated against the 20-entry display list: past 20 conflicts
   the dropped ones were announced every tick, and a new pair of panes on the same file was never
   announced. Announcements now have their own set, keyed by kind, description and panes.
+The final round (`660a763`) found one more: the history above the screen was read one row at a
+time while the screen was read with wrapped rows joined, so a long line that wrapped in the
+history reached the parser in pieces (a `Write(` with a 90-character path, 30 lines up, gave no
+insight). Wrapped history rows are now joined. Nothing else was confirmed; the tick took 36.7 ms
+per pane with 10k lines of scrollback, down from 267 ms.
+
 Held up under the round: a fuzz run at small sizes with resizes (six parser panics recovered, no
 other panics, the final output rendered, `kill()` returned, one exit callback), the quoting, and
 the one-screen reads, which no longer panic or count pages twice.
@@ -111,7 +117,7 @@ the one-screen reads, which no longer panic or count pages twice.
   and the injection's trailing `\n` may not submit in raw-mode TUIs.
 
 ## Evidence
-- Red: each fix was reverted on its own and its tests run, 24 reverts in all; 23 failed as
+- Red: each fix was reverted on its own and its tests run, 25 reverts in all; 24 failed as
   intended. The compaction-cooldown test at first passed reverted (its pane never read input, so
   the reverted injection blocked and failed); its pane now drains input and the test fails
   reverted. Two round-2 reverts first missed the original bug and were redone faithfully. The
@@ -122,8 +128,12 @@ the one-screen reads, which no longer panic or count pages twice.
   `claude/code-cleanup-20261004`): build clean; `cargo test --workspace` 3131 passed, 0 failed,
   9 ignored (impulse-rs unit tests 2397, `backend_resilience` 5, `backend_tests` 19); clippy clean
   with default features and with `--no-default-features`; fmt clean.
-- Final gate on `a14eeb6`: build clean; `cargo test --workspace` 3134 passed, 0 failed, 9 ignored
+- Gate on `a14eeb6`: build clean; `cargo test --workspace` 3134 passed, 0 failed, 9 ignored
   (impulse-rs unit tests 2398 passed and 5 ignored, `backend_resilience` 6, `backend_tests` 19,
+  `panel_scrollback` 1); clippy clean with default features and with `--no-default-features`;
+  fmt clean.
+- Final gate on `660a763`: build clean; `cargo test --workspace` 3135 passed, 0 failed, 9 ignored
+  (impulse-rs unit tests 2399 passed and 5 ignored, `backend_resilience` 6, `backend_tests` 19,
   `panel_scrollback` 1); clippy clean with default features and with `--no-default-features`;
   fmt clean.
 - Trial merges: clean with every active branch, including `claude/code-cleanup-20261004` after
