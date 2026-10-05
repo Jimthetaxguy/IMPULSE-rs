@@ -183,16 +183,25 @@ fn holds_git_repository(dir: &Path) -> bool {
             && marker.join("objects").is_dir()
             && marker.join("refs").is_dir();
     }
-    // Only a regular file is read: opening a FIFO named `.git` blocked the
-    // hook until Claude Code's timeout, after which the call ran unguarded.
-    if !meta.is_file() {
+    // Opened without blocking and checked through the open handle: a FIFO
+    // named `.git` blocked the hook in `open()` until Claude Code's timeout,
+    // after which the call ran unguarded, and checking the type before the
+    // open left a window to swap one in.
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let Ok(file) = options.open(&marker) else {
+        return false;
+    };
+    if !file.metadata().is_ok_and(|meta| meta.is_file()) {
         return false;
     }
     let mut content = String::new();
-    let read = std::fs::File::open(&marker).and_then(|file| {
-        std::io::Read::read_to_string(&mut std::io::Read::take(file, 4096), &mut content)
-    });
-    if read.is_err() {
+    if std::io::Read::read_to_string(&mut std::io::Read::take(file, 4096), &mut content).is_err() {
         return false;
     }
     // Git's own format: exactly `gitdir: `, then the path to the end of the
