@@ -28,9 +28,10 @@ tags: [worktree, lane, handoff, cleanup, review]
 - Verification: `cargo build --workspace`, `cargo test --workspace`,
   `cargo clippy --workspace --all-targets -- -D warnings` (default and `--no-default-features`),
   `cargo fmt --all -- --check`, `python3 docs/validate_docs.py`
-- Latest status: review pass complete. 32 commits: 29 fixes and 3 documentation corrections.
-  Behavior changes carry regression tests, and most were checked by reverting the fix and watching
-  the test fail. Gate evidence goes in the PR description. Not merged; needs a PR and review.
+- Latest status: review pass and one adversarial refutation round complete. 29 fixes and 3
+  documentation corrections, then 11 commits fixing what the refutation round confirmed. Behavior
+  changes carry regression tests, nearly all checked by reverting the fix and watching the test
+  fail. Gate evidence goes in the PR description. Not merged; needs a PR and review.
 
 ## Fixed on this branch
 | Area | Commits |
@@ -45,6 +46,34 @@ tags: [worktree, lane, handoff, cleanup, review]
 | Governed tasks | `5d60aa0` a retried promotion lands, superseded pins are discardable, decided memory candidates still match |
 | Desktop and terminal | `6b9e3de` PTY writes no longer hold the runtime lock; `f978ba7` a missing working directory is refused instead of spawning in `$HOME` |
 | Other | `a42c5d4` sccache setup edits cargo config without duplicating keys; `c19a1dd` session-start honors the configured injection mode; `5e28d78` workbench snapshots keep reviewed artifacts; `0e98643` steward parses real transcripts; `e63942c`, `2caece0` CLAUDE.md current |
+
+## Refutation round (2026-10-04)
+Three read-only reviewers, each with its own source export and build cache, tried to refute every
+commit above with reproductions. They confirmed 2 P1, 6 P2 and about 20 P3 findings, several of
+them regressions in this branch's own fixes. Fixed in 11 commits (`f805419`..`88fef92`), each
+behavior change with a test that fails against the previous code:
+
+- P1 `f805419`: a failed JSONL append truncated records other processes had appended and synced
+  (58400bb's repair; reproduced across processes: 52-59 lost, now 0).
+- P1 `0abe1a1`: a blocked PTY write still held the cockpit's one-at-a-time command queue, so
+  `close` waited behind it; pane input now goes through a per-pane writer thread.
+- P2 `6bdd921`: a retried promotion took any branch at the accepted commit for its own swap (now
+  requires its reflog entry); a live Builder's worktree with an incomparable pin is stopped first.
+- P2 `d033932`: CLI-run manifest tools stay in the CLI's process group (Ctrl-C, terminal reads).
+- P2 `45bcbac`: guard Block rules match git's subcommand position, quoted and wildcard refspecs,
+  `--mirror`, redirections, any case; no longer block a commit message that mentions force-push.
+- P2 `385b4ea`: the guard hook is anchored on `$CLAUDE_PROJECT_DIR/.impulse`, blocks payloads it
+  cannot read, checks NotebookEdit, and keeps a user's override of a built-in rule.
+- P2 `25bf884`: sccache setup keeps cargo config valid with dotted `build.*` keys, quoted headers,
+  a BOM, and multi-line strings; only an sccache program counts as configured.
+- P3 batches `aebc335`, `19d41f4`, `388967e`, `88fef92`: CLI/daemon/state, tools/voice/MCP/Monty
+  docs, retrieval, and the agent's turn history (details in each commit message).
+
+Recorded from the round, not fixed: file_write's check-then-write race against a concurrent
+same-user process swapping symlinks (needs directory-fd opens); no connection cap on the voice
+webhook; daemon ownership rests on a `connect()` check rather than a lock (two daemons starting
+together both reconcile); `end_session` holds the state lock across an fsync; the recursive-delete
+Block rule stays broad (any absolute or home path) because narrowing it is a policy choice.
 
 ## Recorded, not fixed (each needs a decision or its own lane)
 - **Office tools are unbounded** (`excel_read`, `word_read`, `document_parse`, the `office` CLI,
