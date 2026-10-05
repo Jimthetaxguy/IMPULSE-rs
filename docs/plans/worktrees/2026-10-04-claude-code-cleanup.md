@@ -32,9 +32,9 @@ tags: [worktree, lane, handoff, cleanup, review]
   `cargo clippy --workspace --all-targets -- -D warnings` (default and `--no-default-features`),
   `cargo fmt --all -- --check`, `python3 docs/validate_docs.py`
 - Latest status:
-  - review pass, adversarial refutation round, and four verification rounds complete;
-  - each round found and fixed regressions in the previous round's fixes, and the fourth found
-    two P2s, both fixed;
+  - review pass, adversarial refutation round, and five verification rounds complete;
+  - each round found and fixed regressions in the previous round's fixes; the fourth found two
+    P2s, and the fifth one pre-existing P2 and only P3 regressions, all fixed;
   - behavior changes carry regression tests, nearly all checked by reverting the fix and watching
     the test fail;
   - gate evidence goes in the PR description;
@@ -208,6 +208,20 @@ Fourth verification round (against `5eff5de`), over the 13 code commits since `3
     with Content-Length gets 400; any coding but `chunked` gets 501.
   - `226f404`: an empty `.git` file no longer ends the guard's `.impulse` search.
 
+Fifth verification round (against `226f404`):
+- Every round-4 fix held. Reviewer A's race probe lost an ending session 0 of 20 times (was 14),
+  and a 64-session stress run showed no deadlock, duplicate or stranded mark.
+- One P2, pre-existing, fixed in `bd65e39`. Without cargo-clean-all, `clean-all` ran a bare
+  `cargo clean` per project. That cleans the configured build directory, which with this machine's
+  global `build.target-dir` is shared. It now passes `--target-dir <project>/target`.
+- P3s fixed:
+  - `bd65e39`: sweep, wipe and clean-all skip a project whose `target` links out of the root;
+    a native sweep had deleted files through such a link.
+  - `926657b`: a regression in `47b8ed8`, where overlapping search roots dropped deep projects.
+  - `c84ca88`: tracking an ending session is refused instead of being silently lost.
+  - `23c8562`: the guard's repository check follows git's own rules.
+  - `7312ca7`: malformed header lines get 400.
+
 Still recorded, not fixed:
 - `file_write`'s check-then-write race against a concurrent same-user process swapping symlinks
   (needs directory-fd opens).
@@ -237,6 +251,10 @@ Still recorded, not fixed:
   shadows the root's rules for a session started under it; a nested worktree's `.git` file ends
   the search. Outside a git repository a session started in a subdirectory gets the built-in
   rules.
+- Discovery canonicalizes every directory to stay inside its root, about 2.2 times the old
+  walk time (15 µs per directory); small next to sizing build directories.
+- A webhook connection can hold its slot for about 17 s before a 408: up to 5 s of headers, 10 s
+  of body and the 2 s drain, all within the 30 s request timeout.
 - The sqlite-vec search pool still follows the page window. Its order is the same for any pool
   size except between results at exactly the same distance.
 
