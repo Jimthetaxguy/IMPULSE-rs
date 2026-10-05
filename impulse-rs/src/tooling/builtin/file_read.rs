@@ -251,4 +251,32 @@ mod tests {
             "expected PathNotAllowed, got: {result:?}"
         );
     }
+
+    #[tokio::test]
+    async fn test_execute_refuses_the_daemon_operator_capability_file() {
+        // Regression: the default read roots include `.impulse`, so a voice
+        // or MCP caller could read the daemon's operator token through this
+        // tool and present it on the socket as an operator.
+        let tool = FileReadTool;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let sockets = root.join(".impulse/sockets");
+        std::fs::create_dir_all(&sockets).unwrap();
+        let cap = impulse_ops::operator_capability::path_for_socket(&sockets.join("impulse.sock"));
+        let token = "ab".repeat(32);
+        std::fs::write(&cap, &token).unwrap();
+
+        let ctx = ToolContext {
+            allowed_read_roots: vec![root.clone(), root.join(".impulse")],
+            ..ToolContext::with_all_capabilities()
+        };
+        let result = tool
+            .execute(serde_json::json!({"path": cap.display().to_string()}), &ctx)
+            .await;
+
+        assert!(
+            matches!(result, Err(ToolError::PathNotAllowed(_))),
+            "expected PathNotAllowed, got: {result:?}"
+        );
+    }
 }

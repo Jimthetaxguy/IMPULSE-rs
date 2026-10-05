@@ -65,6 +65,21 @@ pub(crate) fn resolve_for_write(path: &Path) -> PathBuf {
     secure_resolve(&normalize_lexical(path))
 }
 
+/// Whether `path` names a daemon's operator-capability file. The token in it
+/// is what makes a daemon connection an operator (ADR-0018), so no tool may
+/// read or write it, whatever its roots: the tools also run for callers, such
+/// as a voice or MCP client, that must never hold that token. The extension
+/// is compared without case because macOS paths usually ignore case.
+fn is_operator_capability_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case(
+                impulse_ops::operator_capability::OPERATOR_CAPABILITY_EXTENSION,
+            )
+        })
+}
+
 /// Capability a tool may require — deny-by-default security model
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Capability {
@@ -361,7 +376,20 @@ impl ToolContext {
     }
 
     /// Check whether a path is allowed for the requested access mode.
+    ///
+    /// A daemon's operator-capability file is never allowed, even with no
+    /// roots configured; see [`is_operator_capability_file`].
     pub fn is_path_allowed(&self, path: &std::path::Path, write: bool) -> bool {
+        // Resolve to a traversal-free path. The previous implementation fell
+        // back to the RAW path when canonicalize failed (the common case for a
+        // not-yet-created write target), which let `<root>/../../etc/x` slip
+        // through the component-based `starts_with` check. Resolving also
+        // follows a symlink to the capability file before the check below.
+        let candidate = secure_resolve(path);
+        if is_operator_capability_file(&candidate) {
+            return false;
+        }
+
         let roots = if write {
             &self.allowed_write_roots
         } else {
@@ -371,12 +399,6 @@ impl ToolContext {
         if roots.is_empty() {
             return true;
         }
-
-        // Resolve to a traversal-free path. The previous implementation fell
-        // back to the RAW path when canonicalize failed (the common case for a
-        // not-yet-created write target), which let `<root>/../../etc/x` slip
-        // through the component-based `starts_with` check.
-        let candidate = secure_resolve(path);
 
         roots.iter().any(|root| {
             let root = secure_resolve(root);
@@ -469,6 +491,50 @@ mod tests {
             !ctx.is_path_allowed(&escape, true),
             "traversal to a non-existent target outside the root must be denied"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_is_path_allowed_refuses_the_operator_capability_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let sockets = root.join(".impulse/sockets");
+        std::fs::create_dir_all(&sockets).unwrap();
+        let cap = impulse_ops::operator_capability::path_for_socket(&sockets.join("impulse.sock"));
+        std::fs::write(&cap, "token").unwrap();
+        let pid = sockets.join("impulse.pid");
+        std::fs::write(&pid, "1").unwrap();
+        let link = root.join("notes.txt");
+        std::os::unix::fs::symlink(&cap, &link).unwrap();
+        let shouted = sockets.join("IMPULSE.OPERATOR-CAP");
+
+        // The default roots (the project plus `.impulse`) and no roots at all.
+        let rooted = ToolContext {
+            allowed_read_roots: vec![root.clone(), root.join(".impulse")],
+            allowed_write_roots: vec![root.clone()],
+            ..ToolContext::default()
+        };
+        let unrestricted = ToolContext::with_all_capabilities();
+        for ctx in [&rooted, &unrestricted] {
+            for write in [false, true] {
+                assert!(!ctx.is_path_allowed(&cap, write), "{cap:?} write={write}");
+                assert!(!ctx.is_path_allowed(&link, write), "{link:?} write={write}");
+                assert!(
+                    !ctx.is_path_allowed(&shouted, write),
+                    "{shouted:?} write={write}"
+                );
+            }
+            assert!(
+                ctx.is_path_allowed(&pid, false),
+                "the denial is only the capability"
+            );
+        }
+        // macOS resolves the shouted name to the real file anyway; a
+        // case-sensitive filesystem leaves it as written.
+        assert!(is_operator_capability_file(Path::new(
+            "/x/impulse.OPERATOR-CAP"
+        )));
+        assert!(!is_operator_capability_file(Path::new("/x/impulse.pid")));
     }
 
     #[test]
