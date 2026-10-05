@@ -32,9 +32,10 @@ tags: [worktree, lane, handoff, cleanup, review]
   `cargo clippy --workspace --all-targets -- -D warnings` (default and `--no-default-features`),
   `cargo fmt --all -- --check`, `python3 docs/validate_docs.py`
 - Latest status:
-  - review pass, adversarial refutation round, and five verification rounds complete;
+  - review pass, adversarial refutation round, and six verification rounds complete;
   - each round found and fixed regressions in the previous round's fixes; the fourth found two
-    P2s, and the fifth one pre-existing P2 and only P3 regressions, all fixed;
+    P2s, the fifth one pre-existing P2 and only P3 regressions, and the sixth one P2 in a
+    round-5 fix, all fixed;
   - behavior changes carry regression tests, nearly all checked by reverting the fix and watching
     the test fail;
   - gate evidence goes in the PR description;
@@ -222,6 +223,18 @@ Fifth verification round (against `226f404`):
   - `23c8562`: the guard's repository check follows git's own rules.
   - `7312ca7`: malformed header lines get 400.
 
+Sixth verification round (against `7312ca7`):
+- Every round-5 fix held, with no false positives on realistic webhook traffic.
+- One P2, fixed in `fb48db2`: `cargo clean --target-dir X` also removes cargo's configured
+  `build.build-dir`, so `bd65e39` could still delete a shared directory. A relative scan path also
+  made it clean nothing. The fallback now removes the project's own `target/` itself.
+  `projects_to_clean` also skips any `target/` without cargo's `CACHEDIR.TAG`, as cargo does.
+- P3s fixed:
+  - `db9644d`: a FIFO named `.git` hung the guard hook, a regression in `226f404`. Gitfiles are now
+    read with git's exact format.
+  - `4c711ed`: control characters and non-token field names are refused, a non-UTF-8 header block
+    gets 400 instead of a misleading 401, and the request line must be exact.
+
 Still recorded, not fixed:
 - `file_write`'s check-then-write race against a concurrent same-user process swapping symlinks
   (needs directory-fd opens).
@@ -255,6 +268,10 @@ Still recorded, not fixed:
   walk time (15 µs per directory); small next to sizing build directories.
 - A webhook connection can hold its slot for about 17 s before a 408: up to 5 s of headers, 10 s
   of body and the 2 s drain, all within the 30 s request timeout.
+- With cargo-clean-all or cargo-sweep installed, `clean-all` and `sweep` run those tools per search
+  path instead of the native code. The tools bypass the link, `CACHEDIR.TAG` and root checks, and
+  cargo-sweep may find a shared global build directory through `cargo metadata` (suspected; neither
+  tool is installed here). Whether to prefer the native code is a decision for James.
 - The sqlite-vec search pool still follows the page window. Its order is the same for any pool
   size except between results at exactly the same distance.
 
