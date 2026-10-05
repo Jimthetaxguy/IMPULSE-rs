@@ -284,11 +284,10 @@ fn scan_lines(config: &str) -> Vec<ScannedLine<'_>> {
                 let mut rest = text;
                 loop {
                     let next = match open {
-                        Some(delimiter) => rest.find(delimiter).map(|at| (at, delimiter)),
-                        None => [r#"""""#, "'''"]
-                            .into_iter()
-                            .filter_map(|delimiter| rest.find(delimiter).map(|at| (at, delimiter)))
-                            .min_by_key(|(at, _)| *at),
+                        Some(delimiter) => {
+                            closing_delimiter(rest, delimiter).map(|at| (at, delimiter))
+                        }
+                        None => opening_delimiter(rest),
                     };
                     let Some((at, delimiter)) = next else { break };
                     rest = &rest[at + delimiter.len()..];
@@ -306,6 +305,58 @@ fn scan_lines(config: &str) -> Vec<ScannedLine<'_>> {
             }
         })
         .collect()
+}
+
+/// Where a multi-line string opens in `rest`, outside a string: a `"""` or
+/// `'''` inside a one-line `"..."` or `'...'`, or after a `#`, opens none.
+/// Matching anywhere on the line hid everything after `X = '"""'` from the
+/// wrapper check, which then reported a configured wrapper as unset.
+fn opening_delimiter(rest: &str) -> Option<(usize, &'static str)> {
+    let bytes = rest.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        for delimiter in [r#"""""#, "'''"] {
+            if bytes[at..].starts_with(delimiter.as_bytes()) {
+                return Some((at, delimiter));
+            }
+        }
+        match bytes[at] {
+            b'#' => return None,
+            b'"' => {
+                at += 1;
+                while at < bytes.len() && bytes[at] != b'"' {
+                    at += if bytes[at] == b'\\' { 2 } else { 1 };
+                }
+            }
+            b'\'' => {
+                at += 1;
+                while at < bytes.len() && bytes[at] != b'\'' {
+                    at += 1;
+                }
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+    None
+}
+
+/// Where the open multi-line string `delimiter` closes in `rest`. A basic
+/// string (`"""`) may escape a quote with a backslash.
+fn closing_delimiter(rest: &str, delimiter: &str) -> Option<usize> {
+    let bytes = rest.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        if delimiter == r#"""""# && bytes[at] == b'\\' {
+            at += 2;
+            continue;
+        }
+        if bytes[at..].starts_with(delimiter.as_bytes()) {
+            return Some(at);
+        }
+        at += 1;
+    }
+    None
 }
 
 /// A line's text without surrounding whitespace or a byte-order mark.
@@ -508,6 +559,26 @@ fn extract_number(line: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Round 2 (reviewer C): a `"""` inside a one-line literal or a comment
+    /// opened a multi-line string in the scanner, so the status check
+    /// reported a configured wrapper as unset.
+    #[test]
+    fn test_wrapper_state_ignores_triple_quotes_in_one_line_strings_and_comments() {
+        let wrapper = "[build]\nrustc-wrapper = \"sccache\"\n";
+        for first in [
+            "X = '\"\"\"'\n",
+            "X = 1 # \"\"\"\n",
+            "X = \"a \\\" \\\"\\\"\\\" b\"\n",
+            "X = '''\nliteral '\n'''\n",
+        ] {
+            let config = format!("{first}{wrapper}");
+            assert_eq!(wrapper_state(&config), WrapperState::Sccache, "{config}");
+        }
+        // A real multi-line string still hides what is inside it.
+        let inside = format!("X = \"\"\"\n{wrapper}\"\"\"\n");
+        assert_eq!(wrapper_state(&inside), WrapperState::Unset, "{inside}");
+    }
 
     #[test]
     fn test_cargo_config_path_prefers_cargo_home() {
