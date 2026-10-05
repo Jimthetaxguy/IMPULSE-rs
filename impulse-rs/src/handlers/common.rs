@@ -248,6 +248,14 @@ pub(crate) fn persist_claude_env_var_at(
     Ok(())
 }
 
+/// Why `daemon --stop` fails. The daemon protocol has no stop request and
+/// the daemon installs no signal handler (see `daemon::mod`), so the flag
+/// cannot stop anything; it used to print "Daemon stopped" after a ping in
+/// daemon mode, and to start a new daemon in direct mode.
+pub(crate) const DAEMON_STOP_UNSUPPORTED: &str =
+    "impulse-rs cannot stop a running daemon: the daemon protocol has no stop request. \
+     End the daemon process itself (Ctrl-C in its terminal, or kill its process).";
+
 pub(crate) fn hook_session_start_banner() -> Option<String> {
     session_start_banner(is_truthy_env("IMPULSE_HOOK_SENTINEL"))
 }

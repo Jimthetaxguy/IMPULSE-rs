@@ -12,7 +12,7 @@ use crate::{envelope, plugin, semantic_diff, verify, Commands};
 
 use super::{
     capture_hook_evidence, default_session_name, get_session_id, parse_injection_mode, print_json,
-    print_verification_report, read_hook_stdin_payload, HookEvidenceInput,
+    print_verification_report, read_hook_stdin_payload, HookEvidenceInput, DAEMON_STOP_UNSUPPORTED,
 };
 
 /// Run a CLI command in daemon mode (forwarding over IPC).
@@ -575,9 +575,7 @@ mod governed_message_tests {
 
 async fn handle_daemon(client: &DaemonClient, stop: bool) -> Result<()> {
     if stop {
-        println!("Stopping daemon...");
-        let _ = client.ping().await;
-        println!("Daemon stopped");
+        anyhow::bail!(DAEMON_STOP_UNSUPPORTED);
     } else {
         println!("Daemon running");
         let status = client
@@ -908,6 +906,16 @@ fn format_session_line(session: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review P3-5: `--stop` printed "Daemon stopped" after a ping and left
+    /// the daemon running. It fails before touching the socket now.
+    #[tokio::test]
+    async fn test_daemon_stop_fails_instead_of_claiming_success() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let client = DaemonClient::new(tmp.path().join("no-daemon.sock"));
+        let err = handle_daemon(&client, true).await.unwrap_err();
+        assert!(err.to_string().contains("no stop request"), "{err}");
+    }
 
     /// Parse plugin options string: valid JSON passes through, invalid wraps as `{"raw": ...}`.
     /// Delegates to the shared `parse_json_or_raw` helper.

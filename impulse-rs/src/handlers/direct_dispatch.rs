@@ -43,7 +43,8 @@ where
     );
 
     match cli.command {
-        Commands::Daemon { .. } => {
+        Commands::Daemon { stop: true } => anyhow::bail!(handlers::DAEMON_STOP_UNSUPPORTED),
+        Commands::Daemon { stop: false } => {
             daemon::Daemon::new(state.clone())
                 .start()
                 .await
@@ -649,6 +650,24 @@ mod tests {
             socket: None,
             format: None,
         }
+    }
+
+    // ── Commands::Daemon --stop (review P3-5) ─────────────────────────────
+
+    /// `daemon --stop` used to ignore the flag and start a daemon, which
+    /// never returns; the timeout turns that into a failure here.
+    #[tokio::test]
+    async fn test_dispatch_daemon_stop_refuses_instead_of_starting_a_daemon() {
+        let tmp = TempDir::new().unwrap();
+        let cli = cli_with(&tmp, Commands::Daemon { stop: true });
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), dispatch(cli))
+            .await
+            .expect("daemon --stop must return, not run a daemon");
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("cannot stop a running daemon"),
+            "{err:#}"
+        );
     }
 
     // ── Commands::Run (launches the ratatui runner) ───────────────────────

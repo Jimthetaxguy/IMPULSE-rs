@@ -12,7 +12,7 @@ locally. `—` means the dispatcher prints a direct-mode instruction instead of 
 
 | Command | Direct | With `--daemon` | Description |
 |---------|--------|--------|-------------|
-| `daemon` | Yes | IPC status only | Run the foreground daemon listener; `--daemon daemon --stop` does not terminate it |
+| `daemon` | Yes | IPC status only | Run the foreground daemon listener. `daemon --stop` fails with an explanation: the protocol has no stop request, so end the daemon process itself |
 | `run` | Yes | — | Launch the 10-tab ratatui workbench |
 | `session-start` | Yes | IPC | Begin a new session (`--name`, `--platform`, `--inject-mode`) |
 | `session-end` | Yes | IPC | End session (`--session-id`, `--summary`, `--verify`, `--sem-diff-base`) |
