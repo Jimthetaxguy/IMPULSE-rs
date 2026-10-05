@@ -115,12 +115,12 @@ pub fn native_sweep_paths(
     max_age_days: u32,
     dry_run: bool,
 ) -> Result<CleanResult> {
-    let projects = crate::build_hygiene::discover_rust_projects(paths);
+    let (projects, skipped) = crate::build_hygiene::projects_to_clean(paths);
 
     let mut total_freed: u64 = 0;
     let mut total_removed: u32 = 0;
     let mut total_projects: u32 = 0;
-    let mut all_errors: Vec<String> = Vec::new();
+    let mut all_errors: Vec<String> = skipped;
 
     for project in &projects {
         let target_dir = project.path.join("target");
@@ -171,14 +171,14 @@ pub fn native_sweep_paths(
 ///
 /// This replaces `cargo-wipe` for systems where it isn't installed.
 pub fn native_wipe(paths: &[PathBuf], dry_run: bool) -> Result<CleanResult> {
-    let projects = crate::build_hygiene::discover_rust_projects(paths);
+    let (projects, skipped) = crate::build_hygiene::projects_to_clean(paths);
 
     if projects.is_empty() {
         return Ok(CleanResult {
             bytes_freed: 0,
             files_removed: 0,
             projects_cleaned: 0,
-            errors: vec![],
+            errors: skipped,
             was_dry_run: dry_run,
             summary: "No Rust projects with target/ directories found.".to_string(),
         });
@@ -190,7 +190,7 @@ pub fn native_wipe(paths: &[PathBuf], dry_run: bool) -> Result<CleanResult> {
             bytes_freed: total_bytes,
             files_removed: 0,
             projects_cleaned: projects.len() as u32,
-            errors: vec![],
+            errors: skipped,
             was_dry_run: true,
             summary: format!(
                 "[DRY RUN] Would remove target/ from {} projects, freeing ~{}",
@@ -202,7 +202,7 @@ pub fn native_wipe(paths: &[PathBuf], dry_run: bool) -> Result<CleanResult> {
 
     let mut total_freed: u64 = 0;
     let mut cleaned: u32 = 0;
-    let mut errors: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = skipped;
 
     for project in &projects {
         let target_dir = project.path.join("target");
@@ -377,6 +377,43 @@ fn remove_empty_dirs_recursive(dir: &Path, root: &Path, errors: &mut Vec<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Round 5 (reviewer C): sweep and wipe acted through a `target` that
+    /// links outside the root; a real sweep would delete the files there.
+    #[cfg(unix)]
+    #[test]
+    fn test_native_sweep_and_wipe_skip_a_target_that_is_a_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let outside = tmp.path().join("outside-target");
+        std::fs::create_dir_all(root.join("p")).unwrap();
+        std::fs::create_dir_all(outside.join("debug")).unwrap();
+        std::fs::write(outside.join("debug/stale.bin"), b"stale").unwrap();
+        std::fs::write(root.join("p/Cargo.toml"), "[package]\nname = \"p\"\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("p/target")).unwrap();
+
+        let swept = native_sweep_paths(std::slice::from_ref(&root), 0, false).unwrap();
+        assert!(
+            outside.join("debug/stale.bin").exists(),
+            "sweep deleted through the link"
+        );
+        assert!(
+            swept.errors.iter().any(|e| e.contains("symbolic link")),
+            "{:?}",
+            swept.errors
+        );
+
+        let wiped = native_wipe(std::slice::from_ref(&root), false).unwrap();
+        assert!(
+            outside.join("debug/stale.bin").exists(),
+            "wipe deleted through the link"
+        );
+        assert!(
+            root.join("p/target").symlink_metadata().is_ok(),
+            "wipe removed the link"
+        );
+        assert_eq!(wiped.projects_cleaned, 0);
+    }
     use std::fs;
 
     fn create_file_with_mtime(path: &Path, content: &str, age_days: u64) {

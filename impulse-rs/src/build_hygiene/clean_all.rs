@@ -4,11 +4,10 @@
 // More aggressive than sweep — it removes ALL build artifacts, not just stale ones.
 
 use anyhow::Result;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::build_hygiene::discovery::discover_rust_projects;
-use crate::build_hygiene::{format_bytes, CleanResult};
+use crate::build_hygiene::{format_bytes, projects_to_clean, CleanResult};
 
 /// Run cargo-clean-all or equivalent across discovered projects.
 ///
@@ -96,14 +95,14 @@ fn clean_all_with_tool(paths: &[PathBuf], dry_run: bool) -> Result<CleanResult> 
 
 /// Fallback: discover projects manually and run cargo clean in each
 fn clean_all_manual(paths: &[PathBuf], dry_run: bool) -> Result<CleanResult> {
-    let projects = discover_rust_projects(paths);
+    let (projects, skipped) = projects_to_clean(paths);
 
     if projects.is_empty() {
         return Ok(CleanResult {
             bytes_freed: 0,
             files_removed: 0,
             projects_cleaned: 0,
-            errors: vec![],
+            errors: skipped,
             was_dry_run: dry_run,
             summary: "No Rust projects found to clean.".to_string(),
         });
@@ -119,15 +118,12 @@ fn clean_all_manual(paths: &[PathBuf], dry_run: bool) -> Result<CleanResult> {
 
     let mut total_freed: u64 = 0;
     let mut cleaned: u32 = 0;
-    let mut errors: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = skipped;
 
     for project in &projects {
         let before_size = project.target_size_bytes;
 
-        let output = Command::new("cargo")
-            .arg("clean")
-            .current_dir(&project.path)
-            .output();
+        let output = cargo_clean_command(&project.path).output();
 
         match output {
             Ok(o) if o.status.success() => {
@@ -169,6 +165,21 @@ fn clean_all_manual(paths: &[PathBuf], dry_run: bool) -> Result<CleanResult> {
     })
 }
 
+/// `cargo clean` for one project's own `target/`. A bare `cargo clean`
+/// cleans whatever directory cargo is configured to build into; with a
+/// global `build.target-dir`, or a `CARGO_TARGET_DIR` this process
+/// inherited, that is a directory every project shares, not the `target/`
+/// discovery measured, and it was deleted once per project.
+fn cargo_clean_command(project: &Path) -> Command {
+    let mut command = Command::new("cargo");
+    command
+        .arg("clean")
+        .arg("--target-dir")
+        .arg(project.join("target"))
+        .current_dir(project);
+    command
+}
+
 fn parse_clean_all_output(output: &str) -> (u64, u32) {
     let mut total_bytes: u64 = 0;
     let mut project_count: u32 = 0;
@@ -205,6 +216,48 @@ fn parse_clean_all_output(output: &str) -> (u64, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Round 5 (reviewer C): the fallback ran a bare `cargo clean`, which
+    /// cleans the configured build directory, shared on this machine.
+    #[test]
+    fn test_cargo_clean_command_names_the_projects_own_target() {
+        let project = Path::new("/tmp/some-project");
+        let command = cargo_clean_command(project);
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(
+            args,
+            [
+                std::ffi::OsStr::new("clean"),
+                std::ffi::OsStr::new("--target-dir"),
+                project.join("target").as_os_str(),
+            ]
+        );
+        assert_eq!(command.get_current_dir(), Some(project));
+    }
+
+    /// Round 5 (reviewer C): a `target` that links outside the root was
+    /// cleaned through the link.
+    #[cfg(unix)]
+    #[test]
+    fn test_clean_all_manual_skips_a_project_whose_target_is_a_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let outside = tmp.path().join("outside-target");
+        std::fs::create_dir_all(root.join("p")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep.bin"), b"keep").unwrap();
+        std::fs::write(root.join("p/Cargo.toml"), "[package]\nname = \"p\"\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("p/target")).unwrap();
+
+        let result = clean_all_manual(std::slice::from_ref(&root), false).unwrap();
+        assert!(outside.join("keep.bin").exists());
+        assert_eq!(result.projects_cleaned, 0);
+        assert!(
+            result.errors.iter().any(|e| e.contains("symbolic link")),
+            "{:?}",
+            result.errors
+        );
+    }
     use std::fs;
 
     #[test]

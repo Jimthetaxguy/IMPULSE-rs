@@ -133,6 +133,29 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// Projects under `paths` that a destructive operation may act on, and a
+/// note for each one skipped. A project whose `target` is a symbolic link is
+/// left alone: sweeping, wiping or cleaning through the link changed files
+/// outside the scanned roots, possibly a directory other projects share.
+pub fn projects_to_clean(paths: &[PathBuf]) -> (Vec<RustProject>, Vec<String>) {
+    let mut skipped = Vec::new();
+    let projects = discover_rust_projects(paths)
+        .into_iter()
+        .filter(|project| {
+            let linked = std::fs::symlink_metadata(project.path.join("target"))
+                .is_ok_and(|meta| meta.file_type().is_symlink());
+            if linked {
+                skipped.push(format!(
+                    "{}: target is a symbolic link; skipped",
+                    project.path.display()
+                ));
+            }
+            !linked
+        })
+        .collect();
+    (projects, skipped)
+}
+
 /// Check if a cargo tool is installed
 pub fn is_cargo_tool_installed(tool_name: &str) -> bool {
     std::process::Command::new("cargo")
