@@ -393,6 +393,26 @@ impl MemoryLog {
         storage: &Storage,
         record: MemoryRecord,
     ) -> Result<MemoryLogEntry> {
+        self.append_with(storage, record, |entry| {
+            storage.append_jsonl(MEMORY_LOG_FILE, entry)
+        })
+    }
+
+    /// [`Self::append`] with the write step passed in, so a test can make it
+    /// fail partway through.
+    ///
+    /// On a failed write the file is cut back to the length it had before:
+    /// a partial line here would make every later load fail closed (this log
+    /// rejects malformed entries by design). Unlike the shared JSONL logs,
+    /// which other processes append to, this one has a single writer under
+    /// the ledger lock (its hash chain could not survive two), so the cut can
+    /// only remove this append's own bytes.
+    fn append_with(
+        &mut self,
+        storage: &Storage,
+        record: MemoryRecord,
+        write: impl FnOnce(&MemoryLogEntry) -> Result<()>,
+    ) -> Result<MemoryLogEntry> {
         let seq = self.next_seq();
         let previous_digest = self.next_previous_digest();
         let entry_digest = seal_digest(seq, &previous_digest, &record)?;
@@ -402,9 +422,14 @@ impl MemoryLog {
             record,
             entry_digest,
         };
-        storage
-            .append_jsonl(MEMORY_LOG_FILE, &entry)
-            .context("Failed to append to the promoted memory log")?;
+        let path = storage.path(MEMORY_LOG_FILE);
+        let length_before = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        if let Err(error) = write(&entry) {
+            if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) {
+                let _ = file.set_len(length_before);
+            }
+            return Err(error).context("Failed to append to the promoted memory log");
+        }
         self.uncommitted_tail.push(entry.clone());
         Ok(entry)
     }
@@ -802,6 +827,37 @@ mod tests {
         assert!(log.head().is_none());
         assert_eq!(log.next_seq(), 0);
         assert_eq!(log.next_previous_digest(), MEMORY_LOG_GENESIS_DIGEST);
+    }
+
+    /// Verification round on f805419: with the shared append no longer
+    /// cutting back a failed write, a short write left a partial line that
+    /// made every later load (and so every State::new) fail.
+    #[test]
+    fn test_a_failed_append_leaves_the_log_loadable() {
+        let (_dir, storage) = storage();
+        let mut log = MemoryLog::load(&storage, None, LedgerOrigin::Local).unwrap();
+        let first =
+            derive_promoted_record(&candidate(), &request("r-1"), 3, "2026-09-12T10:00:00Z")
+                .unwrap();
+        log.append(&storage, first).unwrap();
+        log.commit_tail();
+        let head = log.head().unwrap();
+        let path = storage.path(MEMORY_LOG_FILE);
+        let length = std::fs::metadata(&path).unwrap().len();
+
+        let second =
+            derive_promoted_record(&candidate(), &request("r-2"), 4, "2026-09-12T11:00:00Z")
+                .unwrap();
+        let result = log.append_with(&storage, second, |_| {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
+            file.write_all(b"{\"seq\":1,\"previous_dig")?;
+            anyhow::bail!("disk full")
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), length);
+        let reloaded = MemoryLog::load(&storage, Some(&head), LedgerOrigin::Local).unwrap();
+        assert_eq!(reloaded.committed().len(), 1);
     }
 
     #[test]
