@@ -175,10 +175,18 @@ fn guard_impulse_dir(
 /// search short of the project's own `.impulse`.
 fn holds_git_repository(dir: &Path) -> bool {
     let marker = dir.join(".git");
-    if marker.is_dir() {
+    let Ok(meta) = std::fs::metadata(&marker) else {
+        return false;
+    };
+    if meta.is_dir() {
         return marker.join("HEAD").is_file()
             && marker.join("objects").is_dir()
             && marker.join("refs").is_dir();
+    }
+    // Only a regular file is read: opening a FIFO named `.git` blocked the
+    // hook until Claude Code's timeout, after which the call ran unguarded.
+    if !meta.is_file() {
+        return false;
     }
     let mut content = String::new();
     let read = std::fs::File::open(&marker).and_then(|file| {
@@ -187,10 +195,12 @@ fn holds_git_repository(dir: &Path) -> bool {
     if read.is_err() {
         return false;
     }
-    // A relative `gitdir:` is relative to `dir`; `join` keeps an absolute one.
+    // Git's own format: exactly `gitdir: `, then the path to the end of the
+    // line, with only the line ending removed. A relative path is relative
+    // to `dir`; `join` keeps an absolute one.
     content
-        .strip_prefix("gitdir:")
-        .map(str::trim)
+        .strip_prefix("gitdir: ")
+        .map(|target| target.trim_end_matches(['\r', '\n']))
         .is_some_and(|target| !target.is_empty() && dir.join(target).join("HEAD").is_file())
 }
 
@@ -658,6 +668,55 @@ mod tests {
         )
         .unwrap();
         assert!(holds_git_repository(&project.path().join("c")));
+        std::fs::write(
+            project.path().join("c/.git"),
+            "gitdir: ../.git/worktrees/c\r\n",
+        )
+        .unwrap();
+        assert!(holds_git_repository(&project.path().join("c")));
+        // Round 6 (reviewer A): git rejects a gitfile without the space after
+        // the colon, or with trailing spaces after the path.
+        for content in [
+            "gitdir:../.git/worktrees/c\n",
+            "gitdir: ../.git/worktrees/c   \n",
+        ] {
+            std::fs::write(project.path().join("c/.git"), content).unwrap();
+            assert!(
+                !holds_git_repository(&project.path().join("c")),
+                "{content:?}"
+            );
+        }
+    }
+
+    /// Round 6 (reviewer A): a FIFO named `.git` blocked the hook in
+    /// `open()`; Claude Code's timeout then let the call run unguarded. The
+    /// check runs on its own thread, and the test opens the FIFO's write side
+    /// if it blocks, so a regression fails instead of hanging.
+    #[cfg(unix)]
+    #[test]
+    fn test_holds_git_repository_does_not_open_a_fifo() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = TempDir::new().unwrap();
+        let fifo = dir.path().join(".git");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success(), "mkfifo failed");
+        let (sent, received) = std::sync::mpsc::channel();
+        let checked = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            let _ = sent.send(holds_git_repository(&checked));
+        });
+        let answer = received.recv_timeout(std::time::Duration::from_secs(2));
+        if answer.is_err() {
+            // Release a reader blocked in open(), so the thread can finish.
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo);
+        }
+        assert_eq!(answer, Ok(false), "the check blocked on a FIFO");
     }
 
     /// A `.git` directory as git requires it: `HEAD`, `objects`, `refs`.
