@@ -1415,7 +1415,9 @@ mod tests {
         let daemon = Daemon::new(state_in_project(&tmp));
         let lock_path = daemon.socket_path().parent().unwrap().join("daemon.lock");
         std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
-        let held = acquire_daemon_lock(&lock_path).expect("the first holder gets the lock");
+        let held = acquire_daemon_lock(&lock_path)
+            .expect("the first holder gets the lock")
+            .expect("flock is supported here");
 
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), daemon.start())
             .await
@@ -1428,9 +1430,20 @@ mod tests {
         );
 
         drop(held);
+        // A child another test forks in this process holds a copy of the
+        // descriptor until it execs (files are close-on-exec), so the release
+        // can lag the drop by a moment.
+        let mut again = acquire_daemon_lock(&lock_path);
+        for _ in 0..100 {
+            if matches!(again, Ok(Some(_))) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            again = acquire_daemon_lock(&lock_path);
+        }
         assert!(
-            acquire_daemon_lock(&lock_path).is_ok(),
-            "released with its holder"
+            matches!(again, Ok(Some(_))),
+            "released with its holder: {again:?}"
         );
     }
 

@@ -423,10 +423,19 @@ impl MemoryLog {
             entry_digest,
         };
         let path = storage.path(MEMORY_LOG_FILE);
-        let length_before = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        // 0 when the file does not exist yet; unknown (no cut) when its
+        // length cannot be read, so an unreadable length never becomes 0 and
+        // erases the log.
+        let length_before = match std::fs::metadata(&path) {
+            Ok(meta) => Some(meta.len()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(0),
+            Err(_) => None,
+        };
         if let Err(error) = write(&entry) {
-            if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) {
-                let _ = file.set_len(length_before);
+            if let Some(length) = length_before {
+                if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) {
+                    let _ = file.set_len(length);
+                }
             }
             return Err(error).context("Failed to append to the promoted memory log");
         }

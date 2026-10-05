@@ -65,7 +65,10 @@ pub fn reject_control_chars(input: &str, field: &'static str) -> Result<(), Vali
 /// Unicode bidirectional controls, which reorder how text displays
 /// ("Trojan Source"): a path or name can read differently from what it is.
 fn is_bidi_control(ch: char) -> bool {
-    matches!(ch, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+    // Embeddings, overrides and isolates reorder a run of text. The plain
+    // direction marks (U+200E, U+200F, U+061C) do not, and are ordinary in
+    // Hebrew and Arabic text, so they stay allowed.
+    matches!(ch, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
 
 /// Reject any control character, line breaks and tabs included, and bidi
@@ -159,6 +162,18 @@ pub fn validate_file_arg(path: &str) -> Result<(), ValidationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Verification round on 986ba23: the right-to-left and Arabic letter
+    /// marks are ordinary text, unlike overrides and isolates.
+    #[test]
+    fn bidi_overrides_are_refused_but_direction_marks_are_text() {
+        assert!(
+            reject_control_chars("\u{05E9}\u{05DC}\u{05D5}\u{05DD}\u{200F}", "summary").is_ok()
+        );
+        assert!(reject_control_chars("\u{0627}\u{061C}\u{0628}", "name").is_ok());
+        assert!(reject_control_chars("abc\u{202E}fed", "name").is_err());
+        assert!(validate_single_line_text("a\u{2066}b\u{2069}", "tool").is_err());
+    }
 
     #[test]
     fn control_chars_rejected() {

@@ -128,8 +128,11 @@ fn build_remote_tool_context(
 }
 
 /// Takes the per-project daemon lock, failing at once if another process
-/// holds it. The returned file holds the lock until it is dropped.
-fn acquire_daemon_lock(path: &std::path::Path) -> Result<std::fs::File> {
+/// holds it. The returned file holds the lock until it is dropped. On a
+/// filesystem that does not support `flock` (some network mounts) the
+/// daemon runs unlocked, as before the lock existed, with a warning; the
+/// liveness check still applies.
+fn acquire_daemon_lock(path: &std::path::Path) -> Result<Option<std::fs::File>> {
     use std::os::unix::io::AsRawFd;
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -147,9 +150,13 @@ fn acquire_daemon_lock(path: &std::path::Path) -> Result<std::fs::File> {
                 path.display()
             );
         }
-        return Err(error).with_context(|| format!("Failed to lock {}", path.display()));
+        tracing::warn!(
+            "daemon lock unavailable on {} ({error}); continuing without it",
+            path.display()
+        );
+        return Ok(None);
     }
-    Ok(file)
+    Ok(Some(file))
 }
 
 pub struct DaemonConfig {

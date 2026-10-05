@@ -118,6 +118,22 @@ pub(crate) fn decide_pre_tool_use(payload: &str, guards: &guardrail::GuardConfig
     }
 }
 
+/// The installed hook names `$CLAUDE_PROJECT_DIR/.impulse`. With that
+/// variable unset it names `/.impulse`: the hook cannot tell which project it
+/// guards, and a missing config used to mean "defaults", dropping the
+/// project's own rules, so it blocks. A set variable whose project simply has
+/// no `.impulse` yet gets the built-in rules, so `impulse-rs init` can run.
+fn missing_project_block(impulse_dir: &Path, project_dir: Option<&str>) -> Option<HookDecision> {
+    if impulse_dir.is_dir() || project_dir.is_some_and(|dir| !dir.trim().is_empty()) {
+        return None;
+    }
+    Some(HookDecision::block(format!(
+        "Impulse guard cannot tell which project it guards: CLAUDE_PROJECT_DIR is not set and \
+         {} does not exist; the call is blocked",
+        impulse_dir.display()
+    )))
+}
+
 /// Runs `impulse-rs guard --hook` and exits. It reads only `config.json`'s
 /// guardrail section (not the governed ledgers `State::new` loads), so an
 /// unrelated state problem cannot turn into an exit code Claude Code treats
@@ -131,15 +147,9 @@ pub fn run_guard_hook(impulse_dir: &Path) -> ! {
 }
 
 fn guard_hook_decision(impulse_dir: &Path) -> HookDecision {
-    // The installed hook names `$CLAUDE_PROJECT_DIR/.impulse`; with that
-    // variable unset it names `/.impulse`, which has no config, and a missing
-    // config used to mean "defaults", dropping the project's own rules.
-    if !impulse_dir.is_dir() {
-        return HookDecision::block(format!(
-            "Impulse guard found no {} (is CLAUDE_PROJECT_DIR set, and has `impulse-rs init` \
-             run?); the call is blocked",
-            impulse_dir.display()
-        ));
+    let project_dir = std::env::var("CLAUDE_PROJECT_DIR").ok();
+    if let Some(blocked) = missing_project_block(impulse_dir, project_dir.as_deref()) {
+        return blocked;
     }
     let config = match storage::Storage::new(impulse_dir.to_path_buf())
         .read_json::<state::Config>("config.json")
@@ -504,7 +514,15 @@ mod tests {
             );
         }
         let missing = std::path::Path::new("/definitely/not/a/project/.impulse");
-        assert_eq!(guard_hook_decision(missing).exit_code, 2);
+        assert_eq!(
+            missing_project_block(missing, None).map(|d| d.exit_code),
+            Some(2)
+        );
+        // A project without `.impulse` yet still runs on the built-in rules,
+        // so `impulse-rs init` is not blocked.
+        assert!(missing_project_block(missing, Some("/definitely/not/a/project")).is_none());
+        let existing = tempfile::TempDir::new().unwrap();
+        assert!(missing_project_block(existing.path(), None).is_none());
     }
 
     #[test]
