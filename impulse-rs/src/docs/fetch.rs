@@ -2,24 +2,27 @@
 // Uses provider APIs to get current model lists
 
 use super::{known_providers, ModelInfo};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::Deserialize;
 
 /// Fetch models from OpenAI API
 pub async fn fetch_openai_models(api_key: &str) -> Result<Vec<ModelInfo>> {
     // Bounded timeouts so a slow/hung provider endpoint can't stall the fetch.
+    // A client that fails to build is an error: `Client::new()` would panic
+    // in that case, and has no timeouts.
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()
-        .unwrap_or_else(|_| Client::new());
+        .context("Failed to build the HTTP client")?;
 
     let response = client
         .get("https://api.openai.com/v1/models")
         .header("Authorization", format!("Bearer {}", api_key))
         .send()
-        .await?;
+        .await
+        .context("Failed to reach the OpenAI models API")?;
 
     if !response.status().is_success() {
         return Err(anyhow::anyhow!("OpenAI API error: {}", response.status()));
@@ -41,7 +44,10 @@ pub async fn fetch_openai_models(api_key: &str) -> Result<Vec<ModelInfo>> {
         owned_by: String,
     }
 
-    let resp: OpenAiModelsResponse = response.json().await?;
+    let resp: OpenAiModelsResponse = response
+        .json()
+        .await
+        .context("Failed to read the OpenAI models list")?;
 
     let models: Vec<ModelInfo> = resp
         .data
@@ -263,11 +269,14 @@ pub async fn fetch_all_models(openai_api_key: Option<&str>) -> Result<Vec<ModelI
     // Mistral models (static list)
     all_models.extend(fetch_mistral_models());
 
-    // OpenAI models (API call if key provided)
+    // OpenAI models (API call if key provided). A failed call is an error:
+    // dropping it reported success, and the caller then cached a list with
+    // every OpenAI model gone, marked fresh from the API.
     if let Some(key) = openai_api_key {
-        if let Ok(models) = fetch_openai_models(key).await {
-            all_models.extend(models);
-        }
+        let models = fetch_openai_models(key).await.context(
+            "Failed to list OpenAI models (unset OPENAI_API_KEY to use the built-in list)",
+        )?;
+        all_models.extend(models);
     } else {
         // Add known models without API key
         all_models.extend(vec![

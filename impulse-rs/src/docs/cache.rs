@@ -92,15 +92,15 @@ impl DocsCache {
         Ok(metadata)
     }
 
-    /// Check if cache is stale (older than specified duration)
+    /// Check if cache is stale (older than specified duration). A timestamp
+    /// in the future (a clock set back, or a copied cache) counts as stale:
+    /// its age is unknown, and it would otherwise never expire.
     pub fn is_stale(&self, max_age: std::time::Duration) -> bool {
-        if let Ok(metadata) = self.load_metadata() {
-            let age = std::time::SystemTime::now()
+        match self.load_metadata() {
+            Ok(metadata) => std::time::SystemTime::now()
                 .duration_since(metadata.last_updated)
-                .unwrap_or_default();
-            age > max_age
-        } else {
-            true
+                .map_or(true, |age| age > max_age),
+            Err(_) => true,
         }
     }
 
@@ -164,9 +164,10 @@ mod tests {
 
     #[test]
     fn test_is_stale() {
-        let temp_dir = std::env::temp_dir().join("impulse_test_cache");
-        let _ = std::fs::create_dir_all(&temp_dir);
-        let cache = DocsCache::new(temp_dir.clone());
+        // Its own directory: a fixed shared path let concurrent runs (other
+        // worktrees' test suites) seed and delete each other's cache.
+        let temp = tempfile::TempDir::new().unwrap();
+        let cache = DocsCache::new(temp.path().to_path_buf());
 
         // New cache should be stale
         assert!(cache.is_stale(Duration::from_secs(1)));
@@ -188,7 +189,20 @@ mod tests {
 
         // But should be stale for 0 seconds
         assert!(cache.is_stale(Duration::from_secs(0)));
+    }
 
-        let _ = std::fs::remove_dir_all(temp_dir);
+    #[test]
+    fn test_a_timestamp_in_the_future_is_stale() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cache = DocsCache::new(temp.path().to_path_buf());
+        cache
+            .save_metadata(&CacheMetadata {
+                last_updated: SystemTime::now() + Duration::from_secs(3600),
+                model_count: 1,
+                provider_count: 1,
+                source: "test".to_string(),
+            })
+            .unwrap();
+        assert!(cache.is_stale(Duration::from_secs(86400)));
     }
 }

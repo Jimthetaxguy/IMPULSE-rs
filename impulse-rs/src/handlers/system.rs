@@ -398,7 +398,7 @@ pub async fn handle_docs(
             }
         }
         _ => {
-            eprintln!(
+            anyhow::bail!(
                 "Unknown docs subcommand: {}. Use: fetch, list, providers, status",
                 subcommand
             );
@@ -469,16 +469,13 @@ pub fn handle_tools(
             if tools.is_empty() {
                 println!("No tools installed");
             } else {
-                println!("{:<20} {:<15} Status", "Tool", "Version");
-                println!("{:-<20} {:-<-15} ", "", "");
-                for (id, version, up_to_date) in tools {
-                    let status = if up_to_date {
-                        "up to date"
-                    } else {
-                        "update available"
-                    };
-                    println!("{:<20} {:<15} {}", id, version, status);
+                println!("{:<20} Version", "Tool");
+                println!("{:-<20} {:-<15}", "", "");
+                for (id, version) in tools {
+                    println!("{:<20} {}", id, version);
                 }
+                println!();
+                println!("Newer versions are not checked; `tools update` updates each tool.");
             }
         }
         _ => {
@@ -515,23 +512,30 @@ mod chat_tests {
         );
     }
 
+    /// Review finding: an unknown `docs` subcommand printed a message and
+    /// exited 0.
     #[tokio::test]
-    async fn test_chat_valid_modes_accepted() {
-        // "off", "review", "apply" are valid inject modes — they won't fail on mode validation
-        // (they'll fail later at the API call stage, but mode parsing succeeds)
+    async fn test_an_unknown_docs_subcommand_is_an_error() {
         let (_dir, st) = test_state();
-        for mode in &["off", "review", "apply"] {
-            let result = handle_chat(&st, "hello", Some(mode), false).await;
-            // Should NOT fail with inject_mode error — may fail with API key or network
-            if let Err(e) = &result {
-                assert!(
-                    !e.to_string().contains("inject_mode"),
-                    "Valid mode '{}' rejected: {}",
-                    mode,
-                    e
-                );
-            }
+        let err = handle_docs(&st, false, "frobnicate".to_string(), None, false, false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Unknown docs subcommand"), "{err}");
+    }
+
+    /// Checks the mode parser `handle_chat` validates with, not
+    /// `handle_chat` itself: with an API key in the environment, calling it
+    /// sent a real request to api.anthropic.com from the test suite.
+    #[test]
+    fn test_chat_valid_modes_accepted() {
+        use crate::injection::types::InjectionMode;
+        for mode in ["off", "review", "apply"] {
+            assert!(
+                InjectionMode::parse(mode).is_some(),
+                "valid mode '{mode}' rejected"
+            );
         }
+        assert!(InjectionMode::parse("invalid_mode").is_none());
     }
 }
 
