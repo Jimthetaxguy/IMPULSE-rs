@@ -27,11 +27,7 @@ pub(crate) fn handle_conflict_resolution(
     let idx = state.selected_conflict_index % conflict_recommendations.len();
     if let Some(rec) = conflict_recommendations.get(idx) {
         let resolved_key = recommendation_key(rec);
-        let file_path = rec
-            .description
-            .strip_prefix("Multiple agents modifying: ")
-            .unwrap_or(&rec.description)
-            .to_string();
+        let file_path = rec.conflict_file().unwrap_or(&rec.description).to_string();
 
         // Update recommendation to show resolution
         for r in state.mier_recommendations.iter_mut() {
@@ -265,8 +261,9 @@ pub(crate) fn context_lifecycle_tick(state: &mut TuiState) {
                         crate::agent::coordinator::RecommendationType::FileConflict
                     ) {
                         state.last_conflict_notification = Some(std::time::Instant::now());
-                        // Emit conflict notification
-                        let file_path = rec.description.clone();
+                        // Emit conflict notification. The notification and
+                        // webhook name the file, not the description around it.
+                        let file_path = rec.conflict_file().unwrap_or(&rec.description).to_string();
                         let panes = rec.panes_involved.clone();
                         let bus_clone = notification_bus.clone();
                         let state_for_webhook = state_clone.clone();
@@ -701,6 +698,98 @@ mod tests {
             .count();
         kill_all(&state);
         assert_eq!(unresolved, 0);
+    }
+
+    /// Answers one HTTP request on `listener` with 200 and sends its body.
+    fn serve_one_request(listener: std::net::TcpListener) -> std::sync::mpsc::Receiver<String> {
+        use std::io::{BufRead, Read, Write};
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((socket, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = std::io::BufReader::new(socket);
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = value.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            let _ = reader.read_exact(&mut body);
+            let _ = reader
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let _ = tx.send(String::from_utf8_lossy(&body).into_owned());
+        });
+        rx
+    }
+
+    /// Review finding: the conflict notification and webhook carried the
+    /// recommendation's description ("Multiple agents modifying:
+    /// src/main.rs") as their file path.
+    #[test]
+    fn test_tick_reports_a_conflict_with_the_bare_file_path() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (_dir, mut state) = tui_state(true);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/hook", listener.local_addr().unwrap());
+        let webhook_body = serve_one_request(listener);
+        assert!(state
+            .state
+            .set_config("conflict_webhook_url", &url)
+            .unwrap());
+        assert!(state
+            .state
+            .set_config("conflict_webhook_enabled", "true")
+            .unwrap());
+        let script = "printf 'Write(src/main.rs)\\n'; sleep 30";
+        let a = add_pane(
+            &mut state,
+            "claude-1",
+            script,
+            (24, 80),
+            AgentKind::ClaudeCode,
+        );
+        let b = add_pane(&mut state, "codex-2", script, (24, 80), AgentKind::Codex);
+        wait_for(&state, a, "Write(");
+        wait_for(&state, b, "Write(");
+
+        context_lifecycle_tick(&mut state);
+        let body = webhook_body.recv_timeout(Duration::from_secs(10));
+        let bus = state.notification_bus.clone();
+        let detected: Vec<String> = rt.block_on(async {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let paths: Vec<String> = bus
+                    .recent(50)
+                    .await
+                    .into_iter()
+                    .filter_map(|n| match n.event {
+                        crate::notification::NotificationEvent::ConflictDetected {
+                            file_path,
+                            ..
+                        } => Some(file_path),
+                        _ => None,
+                    })
+                    .collect();
+                if !paths.is_empty() || Instant::now() >= deadline {
+                    break paths;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        kill_all(&state);
+
+        assert_eq!(detected, ["src/main.rs"]);
+        let body: serde_json::Value =
+            serde_json::from_str(&body.expect("the webhook should be sent")).unwrap();
+        assert_eq!(body["file_path"], "src/main.rs");
     }
 
     /// Verification finding: a line that wrapped in the history above the

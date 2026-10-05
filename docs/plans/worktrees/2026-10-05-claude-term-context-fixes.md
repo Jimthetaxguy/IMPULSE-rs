@@ -89,6 +89,15 @@ Held up under the round: a fuzz run at small sizes with resizes (six parser pani
 other panics, the final output rendered, `kill()` returned, one exit callback), the quoting, and
 the one-screen reads, which no longer panic or count pages twice.
 
+## Conflict path in notifications (later review)
+A review of `src/notification/` (lane `claude/subprocess-delegation-fixes-20261005`) found that
+the conflict notification and webhook carried the recommendation's description ("Multiple agents
+modifying: src/main.rs") as their `file_path`. This branch owns the tick, so the fix is here:
+`Recommendation::conflict_file` reads the path back next to where the coordinator formats it
+(`FILE_CONFLICT_PREFIX`), and the tick and the resolution handler use it. A tick test with two
+panes on one file and a loopback webhook checks the bus event and the webhook body; with the old
+line the event carried the description.
+
 ## Recorded, not fixed
 - History reads reach one screen (the vt100 0.15 limit), so an error, compaction or `Write(` that
   scrolls further between extraction passes (every 30 s) is missed; before this branch debug

@@ -54,6 +54,21 @@ fn default_priority() -> u8 {
     50
 }
 
+/// How a file-conflict recommendation's description begins; the contested
+/// file's path follows. [`Recommendation::conflict_file`] reads it back.
+pub(crate) const FILE_CONFLICT_PREFIX: &str = "Multiple agents modifying: ";
+
+impl Recommendation {
+    /// The contested file of a file-conflict recommendation, which is only
+    /// carried in its description.
+    pub(crate) fn conflict_file(&self) -> Option<&str> {
+        if self.recommendation_type != RecommendationType::FileConflict {
+            return None;
+        }
+        self.description.strip_prefix(FILE_CONFLICT_PREFIX)
+    }
+}
+
 /// Full coordination result including recommendations and pane summaries.
 /// Used by the daemon to return a richer response than just recommendations.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -153,8 +168,7 @@ impl ConflictResolver {
         for recommendation in &detected {
             if recommendation.recommendation_type == RecommendationType::FileConflict {
                 let file_path = recommendation
-                    .description
-                    .strip_prefix("Multiple agents modifying: ")
+                    .conflict_file()
                     .unwrap_or(&recommendation.description)
                     .to_string();
 
@@ -310,7 +324,7 @@ pub fn detect_file_conflicts(insights: &[ExtractedInsight]) -> Vec<Recommendatio
             Recommendation {
                 recommendation_type: RecommendationType::FileConflict,
                 panes_involved,
-                description: format!("Multiple agents modifying: {}", file),
+                description: format!("{FILE_CONFLICT_PREFIX}{file}"),
                 action,
                 priority: default_priority(),
             }
@@ -564,6 +578,20 @@ mod tests {
         ];
         let conflicts = detect_file_conflicts(&insights);
         assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    fn test_conflict_file_is_the_path_of_a_file_conflict_only() {
+        let insights = vec![
+            make_insight(1, InsightType::FileModified, "src/main.rs"),
+            make_insight(2, InsightType::FileModified, "src/main.rs"),
+        ];
+        let conflicts = detect_file_conflicts(&insights);
+        assert_eq!(conflicts[0].conflict_file(), Some("src/main.rs"));
+
+        let mut other = conflicts[0].clone();
+        other.recommendation_type = RecommendationType::CrossPaneSync;
+        assert_eq!(other.conflict_file(), None);
     }
 
     #[test]
