@@ -45,13 +45,16 @@ impl DynamicTool for StewardStatusTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
+        // Without an explicit `impulse_dir`, the session's own directory: a
+        // relative `.impulse` named whatever directory the process ran from.
         let impulse_dir = params
             .get("impulse_dir")
             .and_then(|v| v.as_str())
-            .unwrap_or(".impulse");
-        let base = std::path::PathBuf::from(impulse_dir);
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| ctx.impulse_dir.clone());
+        let base = impulse_dir;
 
         let stew_config = stewardship::StewardshipConfig::default();
         let proposals = stewardship::approval::list_pending(&base).unwrap_or_default();
