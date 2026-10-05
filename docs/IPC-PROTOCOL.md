@@ -407,28 +407,35 @@ Generates a natural-language summary of pane activity. Returns `AgentSpecialized
 
 ### Delegation System
 
-Tracks sub-agent delegations detected in coordinator output. Each delegation records a frozen context snapshot and depth-limited child agent chains.
+Tracks sub-agent delegations detected in coordinator output, depth-limited like Hermes Agent's child chains.
 
 | Request | Data | Since | Description |
 |---------|------|-------|-------------|
-| `RegisterDelegation` | `{spec, coordinator_pane_id, context_snapshot?}` | v2 | Register a delegation detected in agent output |
-| `CompleteDelegation` | `{delegation_id, summary, tool_trace?, diff_summary?}` | v2 | Mark a delegation as completed |
+| `RegisterDelegation` | `{spec, coordinator_pane_id, context_snapshot?}` | v2 | Register a delegation detected in agent output; returns `{delegation_id}` |
+| `CompleteDelegation` | `{delegation_id, summary, tool_trace?, diff_summary?}` | v2 | Mark a delegation as completed; returns `{completed, handoff_prompt}` |
 | `ListDelegations` | — | v2 | List all tracked delegations |
 
 ```json
 {"type": "RegisterDelegation", "data": {
-  "spec": { "delegation_id": "del-1", "delegated_to": "claude-code", "depth": 1 },
+  "spec": { "task": "Refactor the database layer", "target_files": ["src/db.rs"], "max_depth": 1 },
   "coordinator_pane_id": 0,
   "context_snapshot": "Frozen at delegation time..."
 }}
 {"type": "CompleteDelegation", "data": {
   "delegation_id": "del-1",
   "summary": "Refactored database layer",
-  "tool_trace": [],
-  "diff_summary": { "files_changed": 4, "insertions": 120 }
+  "tool_trace": [{ "kind": "edit", "target": "src/db.rs", "timestamp": null }],
+  "diff_summary": { "files_changed": 4, "lines_added": 120, "lines_removed": 30 }
 }}
 {"type": "ListDelegations"}
 ```
+
+`spec` takes `task` (required), `target_files`, `constraints`, `max_depth` and `restricted_tools`. The tracker is bounded:
+
+- A delegation is completed once. `CompleteDelegation` for a delegation that already completed or failed is an `Error`, and the first result stands.
+- It holds at most 256 delegations. Registering past that drops the oldest finished delegation; when all 256 are still pending or in progress, the registration is an `Error`.
+- It keeps the first 64 KiB of `context_snapshot` (nothing reads the snapshot back yet).
+- A spec's text, and a completion's summary plus tool trace, may each be at most 256 KiB; a larger one is an `Error`.
 
 ### Agent Pool
 

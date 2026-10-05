@@ -2313,11 +2313,8 @@ pub(crate) async fn handle_delegation_request(
             // depth tracking is an in-process concern.
             let mut tracker = delegation_tracker.write().await;
             match tracker.register(spec, coordinator_pane_id, context_snapshot, 0) {
-                Some(id) => respond_ok(&serde_json::json!({ "delegation_id": id })),
-                None => respond_err(format!(
-                    "delegation rejected: max depth ({}) would be exceeded",
-                    crate::delegation::types::MAX_DELEGATION_DEPTH
-                )),
+                Ok(id) => respond_ok(&serde_json::json!({ "delegation_id": id })),
+                Err(e) => respond_err(e.to_string()),
             }
         }
         DaemonRequest::CompleteDelegation {
@@ -2327,14 +2324,15 @@ pub(crate) async fn handle_delegation_request(
             diff_summary,
         } => {
             let mut tracker = delegation_tracker.write().await;
-            if tracker.complete(&delegation_id, summary, tool_trace, diff_summary) {
-                let handoff_prompt = tracker.build_handoff_prompt(&delegation_id);
-                respond_ok(&serde_json::json!({
-                    "completed": true,
-                    "handoff_prompt": handoff_prompt,
-                }))
-            } else {
-                respond_err(format!("delegation not found: {delegation_id}"))
+            match tracker.complete(&delegation_id, summary, tool_trace, diff_summary) {
+                Ok(()) => {
+                    let handoff_prompt = tracker.build_handoff_prompt(&delegation_id);
+                    respond_ok(&serde_json::json!({
+                        "completed": true,
+                        "handoff_prompt": handoff_prompt,
+                    }))
+                }
+                Err(e) => respond_err(e.to_string()),
             }
         }
         DaemonRequest::ListDelegations => {

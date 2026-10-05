@@ -1151,6 +1151,50 @@ mod tests {
         }
     }
 
+    /// Review finding: the daemon accepted a second CompleteDelegation for
+    /// the same id and replaced the first worker's result.
+    #[tokio::test]
+    async fn test_handle_delegation_second_completion_is_refused() {
+        let tracker = delegation_tracker_handle();
+        let spec = crate::delegation::types::DelegationSpec {
+            task: "refactor auth".to_string(),
+            target_files: vec![],
+            constraints: None,
+            max_depth: 2,
+            restricted_tools: vec![],
+        };
+        let id = match handle_delegation_request(
+            DaemonRequest::RegisterDelegation {
+                spec,
+                coordinator_pane_id: 0,
+                context_snapshot: String::new(),
+            },
+            &tracker,
+        )
+        .await
+        {
+            DaemonResponse::Ok { result } => result["delegation_id"].as_str().unwrap().to_string(),
+            other => panic!("expected Ok, got {other:?}"),
+        };
+        let complete = |summary: &str| DaemonRequest::CompleteDelegation {
+            delegation_id: id.clone(),
+            summary: summary.to_string(),
+            tool_trace: vec![],
+            diff_summary: None,
+        };
+
+        let first = handle_delegation_request(complete("worker A"), &tracker).await;
+        assert!(matches!(first, DaemonResponse::Ok { .. }), "{first:?}");
+        match handle_delegation_request(complete("worker B"), &tracker).await {
+            DaemonResponse::Error { message, .. } => {
+                assert!(message.contains("already completed"), "{message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        let prompt = tracker.read().await.build_handoff_prompt(&id).unwrap();
+        assert!(prompt.contains("worker A") && !prompt.contains("worker B"));
+    }
+
     #[tokio::test]
     async fn test_handle_delegation_complete_unknown_id_errors() {
         let tracker = delegation_tracker_handle();
