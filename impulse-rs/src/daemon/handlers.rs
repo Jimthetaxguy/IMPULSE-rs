@@ -715,6 +715,75 @@ pub(crate) struct ProcessRequestContext<'a> {
     pub connection_class: ConnectionClass,
 }
 
+/// Boundary validation for user-supplied request fields, run before
+/// dispatch (CLAUDE.md Principle 3). Identifiers must be well-formed names;
+/// free text that is stored and later printed (`activity`, the TUI, history)
+/// must not carry control characters such as terminal escapes. Newlines and
+/// tabs stay allowed, so multi-line summaries pass.
+pub(crate) fn validate_request_fields(
+    request: &DaemonRequest,
+) -> Result<(), crate::validate::ValidationError> {
+    use crate::validate::{reject_control_chars, validate_session_id, validate_tool_id};
+
+    if let DaemonRequest::EndSession { session_id, .. }
+    | DaemonRequest::GetSession { session_id }
+    | DaemonRequest::TrackFile { session_id, .. }
+    | DaemonRequest::TrackTool { session_id, .. }
+    | DaemonRequest::CheckConflict { session_id, .. }
+    | DaemonRequest::Chat { session_id, .. } = request
+    {
+        validate_session_id(session_id)?;
+    }
+    // These were stored unchecked (review P3-8).
+    if let DaemonRequest::TrackFile { file_path, .. }
+    | DaemonRequest::CheckConflict { file_path, .. } = request
+    {
+        reject_control_chars(file_path, "file_path")?;
+    }
+    if let DaemonRequest::TrackTool { tool_name, .. } = request {
+        reject_control_chars(tool_name, "tool_name")?;
+    }
+    if let DaemonRequest::EndSession { summary, .. } = request {
+        reject_control_chars(summary, "summary")?;
+    }
+    if let DaemonRequest::DescribeTool { name } | DaemonRequest::InvokeTool { name, .. } = request {
+        validate_tool_id(name)?;
+    }
+    if let DaemonRequest::InvokePlugin { name, .. } = request {
+        reject_control_chars(name, "plugin_name")?;
+    }
+    if let DaemonRequest::CreateSession { name, .. } = request {
+        reject_control_chars(name, "name")?;
+    }
+    if let DaemonRequest::GetArtifact { artifact_id }
+    | DaemonRequest::RunArtifactAction { artifact_id, .. } = request
+    {
+        reject_control_chars(artifact_id, "artifact_id")?;
+    }
+    if let DaemonRequest::GetGovernedTask { project_id, .. }
+    | DaemonRequest::ListGovernedTasks { project_id }
+    | DaemonRequest::SubmitGovernedClaim {
+        request: impulse_ops::governed_task::GovernedClaimRequest { project_id, .. },
+    }
+    | DaemonRequest::RunGovernedVerification {
+        request: impulse_ops::governed_task::GovernedVerificationRequest { project_id, .. },
+    }
+    | DaemonRequest::RunGovernedSupervisorReview {
+        request: impulse_ops::governed_task::GovernedSupervisorReviewRequest { project_id, .. },
+    }
+    | DaemonRequest::PromoteGovernedOutcome {
+        request: impulse_ops::governed_wiring::GovernedPromotionRequest { project_id, .. },
+    }
+    | DaemonRequest::DiscardGovernedStagedWorktree {
+        request:
+            impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardRequest { project_id, .. },
+    } = request
+    {
+        reject_control_chars(project_id, "project_id")?;
+    }
+    Ok(())
+}
+
 #[tracing::instrument(skip_all, fields(request_type = request_type_name(&request)))]
 pub(crate) async fn process_request(
     request: DaemonRequest,
@@ -732,69 +801,8 @@ pub(crate) async fn process_request(
         connection_class,
     } = context;
 
-    // ── Boundary validation ─��───────────────────────────────────────────────
-    // Validate user-supplied IDs before dispatch to catch malformed input early.
-    if let DaemonRequest::EndSession { ref session_id, .. }
-    | DaemonRequest::GetSession { ref session_id }
-    | DaemonRequest::TrackFile { ref session_id, .. }
-    | DaemonRequest::TrackTool { ref session_id, .. }
-    | DaemonRequest::CheckConflict { ref session_id, .. }
-    | DaemonRequest::Chat { ref session_id, .. } = request
-    {
-        if let Err(e) = crate::validate::validate_session_id(session_id) {
-            return respond_err(e);
-        }
-    }
-    if let DaemonRequest::DescribeTool { ref name } | DaemonRequest::InvokeTool { ref name, .. } =
-        request
-    {
-        if let Err(e) = crate::validate::validate_tool_id(name) {
-            return respond_err(e);
-        }
-    }
-    if let DaemonRequest::InvokePlugin { ref name, .. } = request {
-        if let Err(e) = crate::validate::reject_control_chars(name, "plugin_name") {
-            return respond_err(e);
-        }
-    }
-    if let DaemonRequest::CreateSession { ref name, .. } = request {
-        if let Err(e) = crate::validate::reject_control_chars(name, "name") {
-            return respond_err(e);
-        }
-    }
-    if let DaemonRequest::GetArtifact { ref artifact_id }
-    | DaemonRequest::RunArtifactAction {
-        ref artifact_id, ..
-    } = request
-    {
-        if let Err(e) = crate::validate::reject_control_chars(artifact_id, "artifact_id") {
-            return respond_err(e);
-        }
-    }
-    if let DaemonRequest::GetGovernedTask { ref project_id, .. }
-    | DaemonRequest::ListGovernedTasks { ref project_id }
-    | DaemonRequest::SubmitGovernedClaim {
-        request: impulse_ops::governed_task::GovernedClaimRequest { ref project_id, .. },
-    }
-    | DaemonRequest::RunGovernedVerification {
-        request: impulse_ops::governed_task::GovernedVerificationRequest { ref project_id, .. },
-    }
-    | DaemonRequest::RunGovernedSupervisorReview {
-        request: impulse_ops::governed_task::GovernedSupervisorReviewRequest { ref project_id, .. },
-    }
-    | DaemonRequest::PromoteGovernedOutcome {
-        request: impulse_ops::governed_wiring::GovernedPromotionRequest { ref project_id, .. },
-    }
-    | DaemonRequest::DiscardGovernedStagedWorktree {
-        request:
-            impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardRequest {
-                ref project_id, ..
-            },
-    } = request
-    {
-        if let Err(error) = crate::validate::reject_control_chars(project_id, "project_id") {
-            return respond_err(error);
-        }
+    if let Err(error) = validate_request_fields(&request) {
+        return respond_err(error);
     }
 
     match request {
@@ -3453,5 +3461,70 @@ mod governed_producer_handler_tests {
         authoritative.staged_worktree = None;
         super::preflight_claim(&authoritative, &request)
             .expect("an authoritative claim does not need a staged worktree");
+    }
+}
+
+#[cfg(test)]
+mod request_validation_tests {
+    use super::validate_request_fields;
+    use crate::daemon::protocol::DaemonRequest;
+
+    const ESCAPE: &str = "\u{1b}[2J";
+
+    /// Review P3-8: these fields were stored and later printed unchecked.
+    #[test]
+    fn test_rejects_control_characters_in_tracked_and_ended_fields() {
+        let requests = [
+            DaemonRequest::TrackFile {
+                session_id: "s1".to_string(),
+                file_path: format!("src/{ESCAPE}main.rs"),
+            },
+            DaemonRequest::CheckConflict {
+                session_id: "s1".to_string(),
+                file_path: format!("src/{ESCAPE}main.rs"),
+            },
+            DaemonRequest::TrackTool {
+                session_id: "s1".to_string(),
+                tool_name: format!("Read{ESCAPE}"),
+            },
+            DaemonRequest::EndSession {
+                session_id: "s1".to_string(),
+                summary: format!("done{ESCAPE}"),
+            },
+        ];
+        for request in requests {
+            let err = validate_request_fields(&request).unwrap_err();
+            assert!(err.to_string().contains("control characters"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_allows_ordinary_fields_and_multi_line_summaries() {
+        let requests = [
+            DaemonRequest::TrackFile {
+                session_id: "s1".to_string(),
+                file_path: "src/main.rs".to_string(),
+            },
+            DaemonRequest::TrackTool {
+                session_id: "s1".to_string(),
+                tool_name: "Read".to_string(),
+            },
+            DaemonRequest::EndSession {
+                session_id: "s1".to_string(),
+                summary: "Fixed the parser.\n\tAdded tests.".to_string(),
+            },
+            DaemonRequest::Ping,
+        ];
+        for request in requests {
+            assert!(validate_request_fields(&request).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_still_rejects_a_malformed_session_id() {
+        let request = DaemonRequest::GetSession {
+            session_id: "../escape".to_string(),
+        };
+        assert!(validate_request_fields(&request).is_err());
     }
 }
