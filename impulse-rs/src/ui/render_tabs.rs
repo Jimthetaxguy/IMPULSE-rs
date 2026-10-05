@@ -203,7 +203,10 @@ pub(crate) fn render_status_bar(
                 platform_str, sid_short, s.status
             )
         } else {
-            format!("Session: {}", &sid[..sid.len().min(8)])
+            format!(
+                "Session: {}",
+                crate::ui::visualization::prefix_on_char_boundary(sid, 8)
+            )
         }
     } else {
         "No session selected".to_string()

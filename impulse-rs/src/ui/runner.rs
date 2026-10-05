@@ -342,7 +342,9 @@ pub(crate) fn run_app(
                             if result.is_ok() {
                                 state.status_message = Some(format!(
                                     "Ended session: {}",
-                                    &sid_clone[..sid_clone.len().min(8)]
+                                    crate::ui::visualization::prefix_on_char_boundary(
+                                        &sid_clone, 8
+                                    )
                                 ));
                                 state.selected_session = None;
                                 if state.current_session_id.as_ref() == Some(&sid_clone) {
@@ -371,8 +373,10 @@ pub(crate) fn run_app(
                         // Show session details
                         if let Some(ref sid) = state.selected_session {
                             state.active_tab = 1; // Switch to sessions tab to see details
-                            state.status_message =
-                                Some(format!("Selected: {}", &sid[..sid.len().min(12)]));
+                            state.status_message = Some(format!(
+                                "Selected: {}",
+                                crate::ui::visualization::prefix_on_char_boundary(sid, 12)
+                            ));
                         }
                     }
                     KeyCode::Char('r') => {

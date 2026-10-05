@@ -62,7 +62,9 @@ pub(crate) fn render_sessions(
             let time = s.last_activity.format("%H:%M").to_string();
 
             Row::new(vec![
-                Cell::from(Span::raw(&s.name[..s.name.len().min(15)])),
+                Cell::from(Span::raw(
+                    crate::ui::visualization::prefix_on_char_boundary(&s.name, 15),
+                )),
                 Cell::from(Span::raw(status)),
                 Cell::from(Span::raw(platform)),
                 Cell::from(Span::raw(files)),
@@ -169,7 +171,7 @@ pub(crate) fn render_timeline(
             content.push(Line::from(vec![
                 Span::styled("● ", Style::default().fg(COLOR_SUCCESS)),
                 Span::styled(
-                    &session.name[..session.name.len().min(18)],
+                    crate::ui::visualization::prefix_on_char_boundary(&session.name, 18),
                     Style::default().fg(COLOR_TEXT_BRIGHT),
                 ),
             ]));
@@ -209,7 +211,7 @@ pub(crate) fn render_timeline(
         content.push(Line::from(vec![
             Span::styled("○ ", Style::default().fg(COLOR_TEXT)),
             Span::styled(
-                &entry.session_name[..entry.session_name.len().min(18)],
+                crate::ui::visualization::prefix_on_char_boundary(&entry.session_name, 18),
                 Style::default().fg(COLOR_TEXT_BRIGHT),
             ),
         ]));
@@ -284,7 +286,7 @@ pub(crate) fn render_history(f: &mut Frame, area: Rect, history: &[crate::state:
             ),
             Span::raw(" "),
             Span::styled(
-                &entry.session_name[..entry.session_name.len().min(15)],
+                crate::ui::visualization::prefix_on_char_boundary(&entry.session_name, 15),
                 Style::default().fg(COLOR_TEXT_BRIGHT),
             ),
         ]));
@@ -351,7 +353,10 @@ pub(crate) fn render_genome(f: &mut Frame, area: Rect, state: &TuiState) {
             content.push(Line::from(vec![
                 Span::styled("● ", Style::default().fg(COLOR_SUCCESS)),
                 Span::styled(format!("{} ", date), Style::default().fg(COLOR_TEXT)),
-                Span::raw(&decision.description[..decision.description.len().min(30)]),
+                Span::raw(crate::ui::visualization::prefix_on_char_boundary(
+                    &decision.description,
+                    30,
+                )),
             ]));
             content.push(Line::from(""));
         }
@@ -370,7 +375,10 @@ pub(crate) fn render_genome(f: &mut Frame, area: Rect, state: &TuiState) {
             content.push(Line::from(vec![
                 Span::styled("◐ ", Style::default().fg(COLOR_WARNING)),
                 Span::raw(format!("[{}] ", pref.category)),
-                Span::raw(&pref.description[..pref.description.len().min(25)]),
+                Span::raw(crate::ui::visualization::prefix_on_char_boundary(
+                    &pref.description,
+                    25,
+                )),
             ]));
             content.push(Line::from(""));
         }
@@ -713,5 +721,45 @@ pub(crate) fn render_config(f: &mut Frame, area: Rect, _state: &TuiState) {
             .style(Style::default().bg(COLOR_PANEL));
 
         f.render_widget(Paragraph::new(content).block(block), area);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    #[test]
+    fn test_render_genome_cuts_multibyte_entries_on_a_char_boundary() {
+        // Byte 30 of the decision and byte 25 of the preference both fall
+        // inside a three-byte character; slicing there used to panic and
+        // take the whole TUI down.
+        let dir = tempfile::TempDir::new().unwrap();
+        let state =
+            std::sync::Arc::new(crate::state::State::new(dir.path().to_path_buf()).unwrap());
+        let mut genome = crate::memory::Genome::new();
+        assert!(genome.add_decision("d".repeat(29) + "日本語の決定", None, Vec::new()));
+        genome.preferences.push(crate::memory::Preference {
+            category: "style".to_string(),
+            description: "p".repeat(24) + "日本語",
+            since: chrono::Utc::now(),
+        });
+        state.storage().write_json("GENOME.md", &genome).unwrap();
+        let tui = TuiState::new(state);
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| render_genome(f, f.area(), &tui)).unwrap();
+
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains(&"d".repeat(29)), "decision prefix shown");
+        assert!(screen.contains(&"p".repeat(24)), "preference prefix shown");
+        assert!(!screen.contains('日'), "the split character is dropped");
     }
 }
