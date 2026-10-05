@@ -109,10 +109,9 @@ const MINIMAX_DEFAULT_BASE_URL: &str = "https://api.minimax.chat";
 /// request, so a request that does not set one still sends this fallback.
 const MINIMAX_DEFAULT_MAX_TOKENS: u32 = 4096;
 
-/// Env vars that redirect a provider at a different origin. The override exists
-/// so an eval harness or local proxy can intercept provider traffic without a
-/// rebuild; it is deliberately origin-only so a redirect cannot rewrite the
-/// request path.
+/// Env vars that point a provider at another base URL, so an eval harness, a
+/// gateway or a local proxy can take its traffic without a rebuild. Each
+/// provider appends its own request path to the base.
 const ANTHROPIC_BASE_URL_ENV: &str = "ANTHROPIC_BASE_URL";
 const OPENAI_BASE_URL_ENV: &str = "OPENAI_BASE_URL";
 const MINIMAX_BASE_URL_ENV: &str = "MINIMAX_BASE_URL";
@@ -152,7 +151,9 @@ fn select_base_url(
 /// own path, so the base may carry a path prefix (a gateway's, such as
 /// OpenRouter's `https://openrouter.ai/api`) and credentials (sent as Basic
 /// auth; never logged), but not a query or fragment, which the provider's
-/// path would land after.
+/// path would land after. Credentials must decode to UTF-8: reqwest leaves
+/// any that don't in the URL instead of sending them, where they would reach
+/// error messages.
 fn parse_base_url(candidate: &str) -> Result<String, &'static str> {
     let url = reqwest::Url::parse(candidate).map_err(|_| "it is not an absolute URL")?;
     if !matches!(url.scheme(), "http" | "https") {
@@ -164,7 +165,36 @@ fn parse_base_url(candidate: &str) -> Result<String, &'static str> {
     if url.query().is_some() || url.fragment().is_some() {
         return Err("it has a query or fragment");
     }
+    let credentials = [url.username(), url.password().unwrap_or("")];
+    if !credentials.iter().all(|part| percent_decodes_to_utf8(part)) {
+        return Err("its credentials are not valid UTF-8");
+    }
     Ok(url.as_str().trim_end_matches('/').to_string())
+}
+
+/// Whether `text`, with its `%XX` escapes decoded, is valid UTF-8.
+fn percent_decodes_to_utf8(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let escaped = (bytes[i] == b'%')
+            .then(|| bytes.get(i + 1..i + 3))
+            .flatten()
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match escaped {
+            Some(byte) => {
+                decoded.push(byte);
+                i += 3;
+            }
+            None => {
+                decoded.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    std::str::from_utf8(&decoded).is_ok()
 }
 
 /// How a resolved origin relates to the provider's canonical default.
@@ -216,12 +246,16 @@ fn classify_base_url(resolved: &str, default: &str) -> BaseUrlKind {
     }
 }
 
-fn log_base_url_override(provider_name: &str, base: &str, kind: BaseUrlKind) {
-    // The origin only: a base may carry credentials, and its path can name
-    // an account.
-    let origin = reqwest::Url::parse(base)
+/// What the override log line shows of a base: its origin, never the
+/// credentials a base can carry or a path that can name an account.
+fn override_log_origin(base: &str) -> String {
+    reqwest::Url::parse(base)
         .map(|url| url.origin().ascii_serialization())
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+fn log_base_url_override(provider_name: &str, base: &str, kind: BaseUrlKind) {
+    let origin = override_log_origin(base);
     let origin = origin.as_str();
     match kind {
         BaseUrlKind::Canonical => {}
@@ -289,16 +323,22 @@ impl BaseProvider {
         self
     }
 
-    /// Full request URL for one provider endpoint, honoring the configured or
-    /// env-supplied origin. `path` must start with `/`.
     /// The request URL for one provider endpoint, from the configured or
-    /// environment base URL, else the canonical one. A set override that
-    /// can't be used (see [`select_base_url`]) fails the request.
+    /// environment base URL, else the canonical one. `path` must start with
+    /// `/`. A set override that can't be used (see [`select_base_url`])
+    /// fails the request.
+    ///
+    /// A base ending in `/v1` has it removed when `path` starts with `/v1/`:
+    /// the OpenAI SDK convention gives a base with `/v1`, which would
+    /// otherwise double into `/v1/v1/...`. `allow_url_credentials` is false
+    /// for providers whose key is the `Authorization` header, since reqwest
+    /// would send URL credentials as a second one.
     pub fn endpoint(
         &self,
         env_var: &str,
         default_base_url: &str,
         path: &str,
+        allow_url_credentials: bool,
     ) -> AgentResult<String> {
         let unusable = |source: &str, reason: &str| {
             AgentError::InvalidRequest(format!(
@@ -306,22 +346,48 @@ impl BaseProvider {
                 self.provider_name
             ))
         };
-        let from_env = match std::env::var(env_var) {
-            Ok(value) => Some(value),
-            Err(std::env::VarError::NotPresent) => None,
-            Err(std::env::VarError::NotUnicode(_)) => {
-                return Err(unusable(env_var, "it is not valid UTF-8"));
+        let configured = self
+            .base_url
+            .as_deref()
+            .filter(|base| !base.trim().is_empty());
+        // The environment only matters when nothing is configured, so a
+        // value it can't use doesn't fail a configured URL it would lose to.
+        let from_env = if configured.is_some() {
+            None
+        } else {
+            match std::env::var(env_var) {
+                Ok(value) => Some(value),
+                Err(std::env::VarError::NotPresent) => None,
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    return Err(unusable(env_var, "it is not valid UTF-8"));
+                }
             }
         };
-        let base = select_base_url(
-            self.base_url.as_deref(),
-            from_env.as_deref(),
-            default_base_url,
-        )
-        .map_err(|(source, reason)| match source {
-            OverrideSource::Configured => unusable("The configured base URL", reason),
-            OverrideSource::Environment => unusable(env_var, reason),
-        })?;
+        let source_name = |source| match source {
+            OverrideSource::Configured => "The configured base URL",
+            OverrideSource::Environment => env_var,
+        };
+        let base = select_base_url(configured, from_env.as_deref(), default_base_url)
+            .map_err(|(source, reason)| unusable(source_name(source), reason))?;
+        if !allow_url_credentials && base.contains('@') {
+            let has_credentials = reqwest::Url::parse(&base)
+                .is_ok_and(|url| !url.username().is_empty() || url.password().is_some());
+            if has_credentials {
+                let source = if configured.is_some() {
+                    OverrideSource::Configured
+                } else {
+                    OverrideSource::Environment
+                };
+                return Err(unusable(
+                    source_name(source),
+                    "it carries credentials, and this provider's key is the Authorization header",
+                ));
+            }
+        }
+        let base = match base.strip_suffix("/v1") {
+            Some(without_version) if path.starts_with("/v1/") => without_version.to_string(),
+            _ => base,
+        };
         log_base_url_override(
             self.provider_name,
             &base,
@@ -414,8 +480,12 @@ impl BaseProvider {
             ));
         }
         // reqwest's own message ("error sending request for url (...)")
-        // leaves out why; its source chain says.
+        // leaves out why; its source chain says. The URL it quotes is cut to
+        // its origin: a base can carry credentials and an account path.
         let mut message = error.to_string();
+        if let Some(url) = error.url() {
+            message = message.replace(url.as_str(), &url.origin().ascii_serialization());
+        }
         let mut source = std::error::Error::source(error);
         while let Some(cause) = source {
             message.push_str(": ");
@@ -743,6 +813,7 @@ impl AnthropicProvider {
             ANTHROPIC_BASE_URL_ENV,
             ANTHROPIC_DEFAULT_BASE_URL,
             "/v1/messages",
+            true,
         )
     }
 }
@@ -982,6 +1053,11 @@ struct OpenAiStyleResponse {
 fn minimax_status(base: &serde_json::Value) -> Option<AgentError> {
     let code = base.get("status_code").and_then(|code| {
         code.as_i64()
+            .or_else(|| {
+                code.as_f64()
+                    .filter(|value| value.fract() == 0.0)
+                    .map(|value| value as i64)
+            })
             .or_else(|| code.as_str().and_then(|text| text.trim().parse().ok()))
     })?;
     if code == 0 {
@@ -1001,19 +1077,34 @@ fn minimax_status(base: &serde_json::Value) -> Option<AgentError> {
 }
 
 /// The message of an `error` a reply carries, if it carries one: a
-/// non-empty string, or a non-empty object (its `message` when that is a
-/// string). Null, `false`, `""` and `{}` are no error.
+/// non-empty string, `true`, a non-empty list, or an object with a
+/// non-empty field (its `message` when that is a non-empty string). Null,
+/// `false`, `""`, `[]`, and objects whose fields are all null or empty are
+/// no error.
 fn reported_error(error: &serde_json::Value) -> Option<String> {
+    let is_empty = |value: &serde_json::Value| match value {
+        serde_json::Value::Null | serde_json::Value::Bool(false) => true,
+        serde_json::Value::String(text) => text.trim().is_empty(),
+        serde_json::Value::Array(items) => items.is_empty(),
+        serde_json::Value::Object(fields) => fields.is_empty(),
+        _ => false,
+    };
     match error {
-        serde_json::Value::String(text) if !text.trim().is_empty() => Some(quote(text, false)),
-        serde_json::Value::Object(fields) if !fields.is_empty() => Some(quote(
-            &fields
+        serde_json::Value::Object(fields) => {
+            if fields.values().all(is_empty) {
+                return None;
+            }
+            let message = fields
                 .get("message")
                 .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-                .unwrap_or_else(|| error.to_string()),
-            false,
-        )),
+                .filter(|message| !message.trim().is_empty());
+            Some(quote(
+                &message.map_or_else(|| error.to_string(), str::to_string),
+                false,
+            ))
+        }
+        serde_json::Value::String(text) if !is_empty(error) => Some(quote(text, false)),
+        other if !is_empty(other) => Some(quote(&other.to_string(), false)),
         _ => None,
     }
 }
@@ -1169,7 +1260,7 @@ fn openai_style_chat_response(
             } else {
                 serde_json::from_str(&call.function.arguments).map_err(|e| {
                     AgentError::ApiResponse(format!(
-                        "tool call '{}' carried arguments that are not valid JSON: {e}",
+                        "tool call '{:.80}' carried arguments that are not valid JSON: {e}",
                         call.function.name
                     ))
                 })?
@@ -1219,6 +1310,7 @@ impl OpenAiProvider {
             OPENAI_BASE_URL_ENV,
             OPENAI_DEFAULT_BASE_URL,
             "/v1/chat/completions",
+            false,
         )
     }
 }
@@ -1284,6 +1376,7 @@ impl MinimaxProvider {
             MINIMAX_BASE_URL_ENV,
             MINIMAX_DEFAULT_BASE_URL,
             "/v1/text/chatcompletion_v2",
+            false,
         )
     }
 }
@@ -2062,7 +2155,7 @@ mod tests {
         std::env::set_var(var, "http://127.0.0.1:9999");
         let provider = BaseProvider::new("test", "api_key".to_string(), "gpt-4");
         let url = provider
-            .endpoint(var, "https://api.example.com", "/v1/messages")
+            .endpoint(var, "https://api.example.com", "/v1/messages", true)
             .unwrap();
         std::env::remove_var(var);
         assert_eq!(url, "http://127.0.0.1:9999/v1/messages");
@@ -2076,7 +2169,7 @@ mod tests {
         let provider = BaseProvider::new("test", "api_key".to_string(), "gpt-4")
             .with_base_url("http://explicit.test");
         let url = provider
-            .endpoint(var, "https://api.example.com", "/v1/messages")
+            .endpoint(var, "https://api.example.com", "/v1/messages", true)
             .unwrap();
         std::env::remove_var(var);
         assert_eq!(url, "http://explicit.test/v1/messages");
@@ -2642,7 +2735,7 @@ mod http_tests {
         let var = "IMPULSE_TEST_UNUSABLE_BASE_URL";
         std::env::set_var(var, "localhost:4010");
         let base = BaseProvider::new("test", FAKE_KEY.to_string(), "m");
-        let result = base.endpoint(var, "https://api.example.com", "/v1/messages");
+        let result = base.endpoint(var, "https://api.example.com", "/v1/messages", true);
         std::env::remove_var(var);
         let err = result.unwrap_err();
         assert!(err.to_string().contains(var), "{err}");
@@ -2728,5 +2821,160 @@ mod http_tests {
         assert_eq!(reply.content, "hi");
         let head = seen.lock().unwrap()[0].head.to_ascii_lowercase();
         assert!(head.contains("x-api-key: test-key"), "{head}");
+    }
+
+    /// Second verification round: the non-UTF-8 branch had no test, and a
+    /// non-UTF-8 environment value also failed a configured URL it should
+    /// lose to.
+    #[test]
+    fn test_a_non_utf8_environment_override_fails_only_when_it_is_used() {
+        use std::os::unix::ffi::OsStrExt;
+        let _guard = super::tests::env_guard();
+        let var = "IMPULSE_TEST_NON_UTF8_BASE_URL";
+        std::env::set_var(var, std::ffi::OsStr::from_bytes(b"http://\xff"));
+        let unset = BaseProvider::new("test", FAKE_KEY.to_string(), "m").endpoint(
+            var,
+            "https://api.example.com",
+            "/v1/messages",
+            true,
+        );
+        let configured = BaseProvider::new("test", FAKE_KEY.to_string(), "m")
+            .with_base_url("http://127.0.0.1:4010")
+            .endpoint(var, "https://api.example.com", "/v1/messages", true);
+        std::env::remove_var(var);
+        let err = unset.unwrap_err();
+        assert!(
+            err.to_string().contains(var) && err.to_string().contains("UTF-8"),
+            "{err}"
+        );
+        assert_eq!(configured.unwrap(), "http://127.0.0.1:4010/v1/messages");
+    }
+
+    /// Second verification round: the origin-only log line had no test.
+    #[test]
+    fn test_the_override_log_shows_only_the_origin() {
+        assert_eq!(
+            override_log_origin("http://user:SECRETPW@127.0.0.1:4010/acct/SECRETPATH"),
+            "http://127.0.0.1:4010"
+        );
+    }
+
+    /// Second verification round: URL credentials became a second
+    /// `Authorization` header beside an OpenAI or MiniMax key, and ones that
+    /// don't decode to UTF-8 stayed in the URL and reached error text.
+    #[test]
+    fn test_url_credentials_are_refused_where_they_cannot_work() {
+        let openai = OpenAiProvider(
+            BaseProvider::new("openai", FAKE_KEY.to_string(), "gpt-4o")
+                .with_base_url("http://user:pw@127.0.0.1:4010"),
+        );
+        let err = openai.endpoint().unwrap_err();
+        assert!(err.to_string().contains("Authorization header"), "{err}");
+        let minimax = MinimaxProvider(
+            BaseProvider::new("minimax", FAKE_KEY.to_string(), "m")
+                .with_base_url("http://user:pw@127.0.0.1:4010"),
+        );
+        assert!(minimax.endpoint().is_err());
+        let anthropic = AnthropicProvider {
+            base: BaseProvider::new("anthropic", FAKE_KEY.to_string(), "m")
+                .with_base_url("http://user:pw@127.0.0.1:4010"),
+            cache_system_and_tools: false,
+        };
+        assert_eq!(
+            anthropic.endpoint().unwrap(),
+            "http://user:pw@127.0.0.1:4010/v1/messages"
+        );
+
+        assert_eq!(
+            parse_base_url("http://%FF:pw@127.0.0.1:4010"),
+            Err("its credentials are not valid UTF-8")
+        );
+        assert!(parse_base_url("http://user:p%40ss@127.0.0.1:4010").is_ok());
+    }
+
+    /// Second verification round: transport errors quoted the whole URL,
+    /// credentials and account path included.
+    #[tokio::test]
+    async fn test_transport_errors_quote_only_the_origin() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = closed.local_addr().unwrap();
+        drop(closed);
+        let provider = AnthropicProvider {
+            base: BaseProvider::new("anthropic", FAKE_KEY.to_string(), "m")
+                .with_base_url(format!("http://user:SECRETPW@{address}/SECRETPATH")),
+            cache_system_and_tools: false,
+        };
+        let endpoint = reqwest::Url::parse(&provider.endpoint().unwrap()).unwrap();
+        assert_eq!(endpoint.host_str(), Some("127.0.0.1"));
+        let err = provider.chat(hello()).await.unwrap_err().to_string();
+        assert!(
+            !err.contains("SECRETPW") && !err.contains("SECRETPATH"),
+            "{err}"
+        );
+        assert!(err.contains(&address.to_string()), "{err}");
+    }
+
+    /// Second verification round: the OpenAI SDK convention gives a base
+    /// ending in `/v1`, which doubled into `/v1/v1/...`.
+    #[test]
+    fn test_a_base_ending_in_v1_is_not_doubled() {
+        let openai = OpenAiProvider(
+            BaseProvider::new("openai", FAKE_KEY.to_string(), "gpt-4o")
+                .with_base_url("http://127.0.0.1:11434/v1"),
+        );
+        assert_eq!(
+            openai.endpoint().unwrap(),
+            "http://127.0.0.1:11434/v1/chat/completions"
+        );
+        let gateway = OpenAiProvider(
+            BaseProvider::new("openai", FAKE_KEY.to_string(), "gpt-4o")
+                .with_base_url("https://openrouter.ai/api/v1/"),
+        );
+        assert_eq!(
+            gateway.endpoint().unwrap(),
+            "https://openrouter.ai/api/v1/chat/completions"
+        );
+    }
+
+    /// Second verification round: loosely read envelopes still misread a
+    /// few shapes.
+    #[test]
+    fn test_envelope_edge_cases() {
+        let good_choice =
+            serde_json::json!([{"message": {"content": "hi"}, "finish_reason": "stop"}]);
+        for no_error in [
+            serde_json::json!({"error": {"message": ""}}),
+            serde_json::json!({"error": {"message": null, "code": null}}),
+            serde_json::json!({"error": []}),
+        ] {
+            let mut raw = no_error.clone();
+            raw["choices"] = good_choice.clone();
+            let resp: OpenAiStyleResponse = serde_json::from_value(raw).unwrap();
+            assert!(
+                openai_style_chat_response(resp, "openai", "m").is_ok(),
+                "{no_error}"
+            );
+        }
+        for an_error in [
+            serde_json::json!({"error": true}),
+            serde_json::json!({"error": ["boom"]}),
+        ] {
+            let mut raw = an_error.clone();
+            raw["choices"] = good_choice.clone();
+            let resp: OpenAiStyleResponse = serde_json::from_value(raw).unwrap();
+            assert!(
+                openai_style_chat_response(resp, "openai", "m").is_err(),
+                "{an_error}"
+            );
+        }
+        let resp: OpenAiStyleResponse = serde_json::from_value(serde_json::json!({
+            "choices": good_choice,
+            "base_resp": {"status_code": 1004.0, "status_msg": "login fail"}
+        }))
+        .unwrap();
+        assert!(matches!(
+            openai_style_chat_response(resp, "minimax", "m"),
+            Err(AgentError::Authentication(_))
+        ));
     }
 }

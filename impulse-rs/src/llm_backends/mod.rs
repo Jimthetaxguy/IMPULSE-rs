@@ -982,7 +982,8 @@ fn rename_repeated_call_ids(calls: &mut [ToolCall], working: &[Message]) {
         .iter()
         .flat_map(|message| message.tool_calls.iter().map(|call| call.id.clone()))
         .collect();
-    let batch: Vec<String> = calls.iter().map(|call| call.id.clone()).collect();
+    let batch: std::collections::HashSet<String> =
+        calls.iter().map(|call| call.id.clone()).collect();
     for call in calls.iter_mut() {
         if used.contains(&call.id) {
             let fresh = (2..)
@@ -1097,9 +1098,8 @@ mod tests {
 
     /// Always asks the model to call `echo_tool`, every round -- used to
     /// prove the round cap actually fires instead of looping forever. Each
-    /// round's call has its own id, as a real provider's does (the loop
-    /// refuses a reused one); the history grows each round, so its length
-    /// numbers the call.
+    /// round's call has its own id, as a real provider's does; the history
+    /// grows each round, so its length numbers the call.
     struct AlwaysToolUseProvider;
 
     #[async_trait]
@@ -3467,5 +3467,39 @@ mod tests {
         let agent = test_agent(FixedReplyProvider { content: "x" });
         assert_eq!(agent.temperature, DEFAULT_TEMPERATURE);
         assert_eq!(agent.max_tokens, Some(DEFAULT_MAX_TOKENS));
+    }
+
+    /// Second verification round: renaming checked each candidate against
+    /// the batch as a list, quadratic in the batch size (8,000 calls took
+    /// 167 ms, and a reply under the 16 MiB cap could hold 200,000).
+    #[test]
+    fn test_renaming_a_large_batch_is_linear() {
+        let history = vec![Message::assistant_tool_use(
+            String::new(),
+            vec![ToolCall {
+                id: "a".to_string(),
+                name: "echo_tool".to_string(),
+                input: serde_json::json!({}),
+            }],
+        )];
+        let mut calls: Vec<ToolCall> = std::iter::once("a".to_string())
+            .chain((2..40_000).map(|n| format!("a-{n}")))
+            .map(|id| ToolCall {
+                id,
+                name: "echo_tool".to_string(),
+                input: serde_json::json!({}),
+            })
+            .collect();
+        let start = std::time::Instant::now();
+        rename_repeated_call_ids(&mut calls, &history);
+        let elapsed = start.elapsed();
+        let unique: std::collections::HashSet<&str> =
+            calls.iter().map(|call| call.id.as_str()).collect();
+        assert_eq!(unique.len(), calls.len());
+        assert!(!unique.contains("a"));
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "took {elapsed:?}"
+        );
     }
 }
