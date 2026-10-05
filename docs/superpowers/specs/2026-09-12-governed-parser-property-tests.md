@@ -1,7 +1,7 @@
 ---
 title: Governed Parser Property Tests
 description: Property-based and fuzz-style test harnesses over the parsers adversarial review kept re-breaking in the two weeks before 2026-09-12, their oracles, and every finding
-updated: 2026-09-12
+updated: 2026-10-05
 type: specification
 category: testing
 phase: all
@@ -127,11 +127,11 @@ specific tests.
 | 4c | `bash_command_escape_candidates` | `ion_repl/chat.rs` | Documented miss (`H=/etc; cat $H/passwd`, variable indirection) stays a miss | direct, see Findings for the OTHER documented-miss claim that did NOT hold |
 | 5a | `wrap_untrusted_tool_output` | `ion_repl/chat.rs` | For arbitrary content (including forged header/footer-shaped text), exactly one real header and one real footer sharing an 8-hex-char nonce, content preserved verbatim between them | direct (structural parse-back) |
 | 5b | `wrap_untrusted_tool_output` | `ion_repl/chat.rs` | Two calls (even with identical content) use different nonces | direct |
-| 6a | `extract_word` | `ion_repl/tool_document.rs` | Never panics on a generated well-formed docx grammar (depth 8 via `w:tbl>w:tr>w:tc>mc:AlternateContent>mc:Choice>w:p>w:r>w:t`); `sum(section.chars) == total_chars`; deleted/instruction text never appears; `mc:Fallback` never appears, `mc:Choice` always does; `w:ins` text always appears; a table row's line has exactly `cells-1` tabs | direct (generator is its own oracle: every visible/hidden marker is asserted present/absent by construction) |
-| 6b | `extract_word` | `ion_repl/tool_document.rs` | A nested `w:tbl` flattens into the containing row's single line rather than producing its own | pinned hand-built regression |
-| 6c | `extract_word` | `ion_repl/tool_document.rs` | Never panics on arbitrary bytes as the `word/document.xml` entry, or as the whole file; always `Result`, never a panic | none |
-| 6d | `WordTextBuilder` | `ion_repl/tool_document.rs` | Never panics; drops whitespace-only lines; a fitting non-blank line becomes exactly one output line with `chars()` growing by `line.chars().count() + 1`; section table capped at `MAX_WORD_SECTIONS`; `check_pending` and `push_line` agree on refusal | direct |
-| 6e | `SheetBodyBuilder` | `ion_repl/tool_document.rs` | Never panics; a dense row-major grid renders as tab-separated rows matching a hand-computed expectation, with `chars` matching the rendered text's own length | direct |
+| 6a | `extract_word` | `office/bounded.rs` (tests in `ion_repl/tool_document.rs`) | Never panics on a generated well-formed docx grammar (depth 8 via `w:tbl>w:tr>w:tc>mc:AlternateContent>mc:Choice>w:p>w:r>w:t`); `sum(section.chars) == total_chars`; deleted/instruction text never appears; `mc:Fallback` never appears, `mc:Choice` always does; `w:ins` text always appears; a table row's line has exactly `cells-1` tabs | direct (generator is its own oracle: every visible/hidden marker is asserted present/absent by construction) |
+| 6b | `extract_word` | `office/bounded.rs` (tests in `ion_repl/tool_document.rs`) | A nested `w:tbl` flattens into the containing row's single line rather than producing its own | pinned hand-built regression |
+| 6c | `extract_word` | `office/bounded.rs` (tests in `ion_repl/tool_document.rs`) | Never panics on arbitrary bytes as the `word/document.xml` entry, or as the whole file; always `Result`, never a panic | none |
+| 6d | `WordTextBuilder` | `office/bounded.rs` | Never panics; drops whitespace-only lines; a fitting non-blank line becomes exactly one output line with `chars()` growing by `line.chars().count() + 1`; section table capped at `MAX_WORD_SECTIONS`; `check_pending` and `push_line` agree on refusal | direct |
+| 6e | `SheetBodyBuilder` | `office/bounded.rs` | Never panics; a dense row-major grid renders as tab-separated rows matching a hand-computed expectation, with `chars` matching the rendered text's own length | direct |
 | 6f | `window` | `ion_repl/tool_document.rs` | Never panics; `returned_chars <= max_chars` and matches content length; `next_offset` is `Some` iff truncated and, when so, `== start + returned` and `< total`; truncation ends on `\n` or is a documented hard-cut; an offset past the end yields an empty complete window | direct |
 | 6g | `fold_case` | `ion_repl/tool_document.rs` | Never panics; idempotent; matches `str::to_lowercase` for plain ASCII letters | direct |
 | 7a | `secure_resolve` / `ToolContext::is_path_allowed` | `tooling/traits.rs` | Never panics on arbitrary path strings, with or without configured roots | none |

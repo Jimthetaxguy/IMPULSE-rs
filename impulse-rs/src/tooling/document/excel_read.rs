@@ -8,8 +8,9 @@ use crate::tooling::traits::*;
 
 /// Read Excel/CSV files and return structured data (sheets, rows, columns).
 ///
-/// Supports: .xlsx, .xls, .csv
-/// Delegates to office::excel::parse_excel for actual parsing.
+/// Supports: .xlsx, .csv (legacy .xls is refused)
+/// Delegates to office::excel::parse_excel, which reads under the bounds in
+/// office::bounded, on the blocking pool.
 pub struct ExcelReadTool;
 
 #[async_trait]
@@ -49,13 +50,18 @@ impl DynamicTool for ExcelReadTool {
             Some(p) if !p.trim().is_empty() => {
                 let path = PathBuf::from(p);
                 let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                if !matches!(ext.to_lowercase().as_str(), "xlsx" | "xls" | "csv") {
-                    return Err(ToolError::InvalidParams(format!(
-                        "Unsupported format: .{} (expected .xlsx, .xls, or .csv)",
+                match ext.to_lowercase().as_str() {
+                    "xlsx" | "csv" => Ok(()),
+                    "xls" => Err(ToolError::InvalidParams(
+                        "legacy .xls workbooks are not read: their binary format cannot be \
+                         bounded before parsing; convert to .xlsx"
+                            .into(),
+                    )),
+                    _ => Err(ToolError::InvalidParams(format!(
+                        "Unsupported format: .{} (expected .xlsx or .csv)",
                         ext
-                    )));
+                    ))),
                 }
-                Ok(())
             }
             _ => Err(ToolError::InvalidParams(
                 "missing or empty 'path' string".into(),
@@ -73,7 +79,14 @@ impl DynamicTool for ExcelReadTool {
             .ok_or_else(|| ToolError::InvalidParams("missing 'path' string parameter".into()))?;
         let path = PathBuf::from(path_str);
 
-        match crate::office::excel::parse_excel(&path) {
+        // Parsing is synchronous, so it runs on the blocking pool; the office
+        // bounds cap how long it can take.
+        let parsed = tokio::task::spawn_blocking(move || crate::office::excel::parse_excel(&path))
+            .await
+            .map_err(|e| {
+                ToolError::ExecutionFailed(format!("excel_read parse task failed: {e}"))
+            })?;
+        match parsed {
             Ok(result) => {
                 let mut metadata = std::collections::HashMap::new();
                 metadata.insert("format".to_string(), result.metadata.format.clone());
@@ -144,6 +157,34 @@ mod tests {
         let tool = ExcelReadTool;
         let params = serde_json::json!({"path": "file.pdf"});
         assert!(tool.validate_params(&params).is_err());
+    }
+
+    #[test]
+    fn test_validate_refuses_legacy_xls() {
+        let tool = ExcelReadTool;
+        let params = serde_json::json!({"path": "old.XLS"});
+        match tool.validate_params(&params) {
+            Err(ToolError::InvalidParams(message)) => {
+                assert!(message.contains("legacy .xls"), "{message}")
+            }
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+    }
+
+    /// The parse runs on the blocking pool, so the async runtime keeps
+    /// serving other tasks while a workbook is read.
+    #[tokio::test]
+    async fn test_execute_parses_off_the_async_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rows.csv");
+        std::fs::write(&path, "a,b\n1,2\n").unwrap();
+        let (result, turns) = super::super::test_support::turns_while_executing(
+            &ExcelReadTool,
+            serde_json::json!({"path": path}),
+        )
+        .await;
+        assert_eq!(result.unwrap().output["content"], "a,b\n1,2\n");
+        assert!(turns > 0, "the parse ran on the async runtime thread");
     }
 
     #[tokio::test]

@@ -2,9 +2,16 @@
 //!
 //! Provides parsing, extraction, and generation for `.xlsx` and `.docx` files.
 //! Used by the context pipeline to ingest Office documents as structured data.
+//! Every read goes through the bounded readers in `office::bounded`, which
+//! Ion's `document_read` shares: a file-size cap, a container inflation cap,
+//! and streaming workbook and Word readers. Legacy `.xls` is refused.
 
+#[cfg(feature = "office-support")]
+pub mod bounded;
 pub mod excel;
 pub mod extraction;
+#[cfg(all(test, feature = "office-support"))]
+pub(crate) mod test_fixtures;
 pub mod word;
 
 use serde::{Deserialize, Serialize};
@@ -67,11 +74,13 @@ impl OfficeFormat {
         }
     }
 
-    /// Check if format is supported for reading
+    /// Check if format is supported for reading. Legacy `.xls` is not: its
+    /// binary format has no streaming reader, so it cannot be read under the
+    /// office bounds.
     pub fn is_readable(&self) -> bool {
         matches!(
             self,
-            OfficeFormat::Xlsx | OfficeFormat::Xls | OfficeFormat::Csv | OfficeFormat::Docx
+            OfficeFormat::Xlsx | OfficeFormat::Csv | OfficeFormat::Docx
         )
     }
 
@@ -124,39 +133,90 @@ pub struct ContentChunk {
 
 /// Parse an Office document and return extracted content
 ///
-/// This is the main entry point for document parsing.
-/// Uses feature flags to determine which parsers are available.
+/// This is the main entry point for document parsing. Every format is read
+/// under the bounds in `office::bounded`; legacy `.xls` is refused with the
+/// reason.
 pub fn parse_document(path: &std::path::Path) -> Result<ExtractionResult, String> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .ok_or("No file extension")?;
 
-    let format = OfficeFormat::from_extension(ext);
-
-    if !format.is_readable() {
-        return Err(format!("Unsupported format: {}", ext));
+    match OfficeFormat::from_extension(ext) {
+        OfficeFormat::Xlsx | OfficeFormat::Xls | OfficeFormat::Csv => excel::parse_excel(path),
+        OfficeFormat::Docx => word::parse_word(path),
+        OfficeFormat::Doc | OfficeFormat::Unknown => Err(format!("Unsupported format: {}", ext)),
     }
+}
 
-    // Verify file exists and is readable
-    let _metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
+/// Reads `path` under the bounds in [`bounded`] and adapts the result for
+/// the office callers.
+#[cfg(feature = "office-support")]
+fn read_bounded(path: &std::path::Path) -> Result<ExtractionResult, String> {
+    let parsed = bounded::read_document(
+        path,
+        &bounded::path_label(path),
+        bounded::ExtractBudget::DEFAULT,
+    )
+    .map_err(|e| format!("{e:#}"))?;
+    Ok(extraction_result(path, parsed))
+}
 
-    let result = match format {
-        OfficeFormat::Xlsx | OfficeFormat::Xls | OfficeFormat::Csv => excel::parse_excel(path)?,
-        OfficeFormat::Docx => word::parse_word(path)?,
-        OfficeFormat::Unknown | OfficeFormat::Doc => {
-            return Err(format!("Format {} not supported", ext));
-        }
-    };
+/// Adapts a bounded read to an [`ExtractionResult`]. Each chunk is the exact
+/// span of `content` one section covers: a sheet's body, the whole of a CSV
+/// file, or a run of Word lines.
+#[cfg(feature = "office-support")]
+fn extraction_result(path: &std::path::Path, parsed: bounded::ParsedDocument) -> ExtractionResult {
+    let mut chunks = Vec::with_capacity(parsed.sections.len());
+    // Sections arrive in text order and do not overlap, so one pass over the
+    // text finds every span.
+    let mut rest = parsed.text.as_str();
+    let mut consumed = 0usize;
+    for section in &parsed.sections {
+        let Some(skip) = section
+            .offset
+            .and_then(|offset| offset.checked_sub(consumed))
+        else {
+            continue;
+        };
+        let (_, from_offset) = split_after_chars(rest, skip);
+        let (span, after) = split_after_chars(from_offset, section.chars);
+        chunks.push(ContentChunk {
+            content: span.to_string(),
+            chunk_type: section.kind.clone(),
+            index: section.index,
+        });
+        rest = after;
+        consumed += skip + section.chars;
+    }
+    ExtractionResult {
+        document_type: parsed.document_type,
+        content: parsed.text,
+        metadata: ExtractionMetadata {
+            source_path: path.to_string_lossy().to_string(),
+            format: parsed.format,
+            size_bytes: parsed.size_bytes,
+            extracted_at: chrono::Utc::now().to_rfc3339(),
+        },
+        chunks,
+    }
+}
 
-    Ok(result)
+/// Splits `s` after its first `chars` characters, or at its end.
+#[cfg(feature = "office-support")]
+fn split_after_chars(s: &str, chars: usize) -> (&str, &str) {
+    let at = s
+        .char_indices()
+        .nth(chars)
+        .map_or(s.len(), |(index, _)| index);
+    s.split_at(at)
 }
 
 /// List supported Office formats
 pub fn supported_formats() -> Vec<(&'static str, &'static str, bool, bool)> {
     vec![
         ("xlsx", "Excel (modern)", true, true),
-        ("xls", "Excel (legacy)", true, false),
+        ("xls", "Excel (legacy)", false, false),
         ("csv", "CSV (Comma-separated)", true, true),
         ("docx", "Word (modern)", true, false),
         ("doc", "Word (legacy)", false, false),
@@ -200,5 +260,106 @@ mod tests {
         let formats = supported_formats();
         assert!(!formats.is_empty());
         assert!(formats.iter().any(|(ext, _, _, _)| ext == &"xlsx"));
+    }
+
+    #[test]
+    fn test_supported_formats_marks_legacy_xls_unreadable() {
+        let formats = supported_formats();
+        let xls = formats.iter().find(|(ext, ..)| *ext == "xls").unwrap();
+        assert!(!xls.2, "{xls:?}");
+        assert!(!OfficeFormat::Xls.is_readable());
+    }
+
+    /// The bounds `parse_document` applies to every format.
+    #[cfg(feature = "office-support")]
+    mod bounded_reads {
+        use super::super::test_fixtures::*;
+        use super::*;
+
+        /// Legacy `.xls` was opened with calamine's `.xls` reader, which
+        /// builds every sheet's dense grid as it opens the file.
+        #[test]
+        fn test_parse_document_refuses_legacy_xls() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("legacy.xls");
+            std::fs::write(&path, b"not really a workbook").unwrap();
+            let err = parse_document(&path).unwrap_err();
+            assert!(err.contains("legacy .xls"), "{err}");
+        }
+
+        /// A file over the 10 MiB cap is refused before a parser reads it; a
+        /// CSV used to be read whole, whatever its size.
+        #[test]
+        fn test_parse_document_refuses_a_file_over_the_size_cap() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("big.csv");
+            let file = std::fs::File::create(&path).unwrap();
+            file.set_len(10 * 1024 * 1024 + 1).unwrap();
+            let err = parse_document(&path).unwrap_err();
+            assert!(err.contains("over the 10485760-byte limit"), "{err}");
+        }
+
+        /// A container whose entries inflate past 64 MiB is refused, though
+        /// the one part a Word reader needs is tiny: nothing used to inflate
+        /// the other entries before parsing.
+        #[test]
+        fn test_parse_document_refuses_a_decompression_bomb() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = write_docx_bomb(dir.path(), 64 * 1024 * 1024);
+            assert!(std::fs::metadata(&path).unwrap().len() < 1024 * 1024);
+            let err = parse_document(&path).unwrap_err();
+            assert!(
+                err.contains("inflates to more than 67108864 bytes"),
+                "{err}"
+            );
+        }
+
+        /// Each chunk is the span of `content` one section covers, so a Word
+        /// document's chunks tile its text, ten lines to a chunk.
+        #[test]
+        fn test_parse_document_word_chunks_tile_the_text() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = write_docx_lines(dir.path(), 12);
+            let result = parse_document(&path).unwrap();
+            let lines: Vec<String> = (0..12).map(|i| format!("line {i}\n")).collect();
+            assert_eq!(result.content, lines.concat());
+            assert_eq!(result.chunks.len(), 2);
+            assert_eq!(result.chunks[0].content, lines[..10].concat());
+            assert_eq!(result.chunks[1].content, lines[10..].concat());
+            assert!(result.chunks.iter().all(|c| c.chunk_type == "paragraph"));
+            assert_eq!((result.chunks[0].index, result.chunks[1].index), (0, 1));
+        }
+
+        /// A workbook's chunks are its non-empty sheets' bodies, indexed by
+        /// position in the workbook; a CSV's one chunk is the whole file.
+        #[test]
+        fn test_parse_document_sheet_and_csv_chunks() {
+            let dir = tempfile::tempdir().unwrap();
+            let workbook = write_far_apart_workbook(dir.path());
+            let result = parse_document(&workbook).unwrap();
+            assert_eq!(result.chunks.len(), 1);
+            assert_eq!(result.chunks[0].chunk_type, "sheet");
+            assert_eq!(result.chunks[0].index, 0);
+            assert_eq!(
+                result.content,
+                format!("=== Sheet: Data ===\n{}\n\n", result.chunks[0].content)
+            );
+
+            let csv = dir.path().join("rows.csv");
+            std::fs::write(&csv, "a,b\n1,2\n").unwrap();
+            let result = parse_document(&csv).unwrap();
+            assert_eq!(result.content, "a,b\n1,2\n");
+            assert_eq!(result.metadata.format, "csv");
+            let chunk = &result.chunks[..];
+            assert_eq!(chunk.len(), 1);
+            assert_eq!(
+                (
+                    chunk[0].content.as_str(),
+                    chunk[0].chunk_type.as_str(),
+                    chunk[0].index
+                ),
+                ("a,b\n1,2\n", "csv", 0)
+            );
+        }
     }
 }

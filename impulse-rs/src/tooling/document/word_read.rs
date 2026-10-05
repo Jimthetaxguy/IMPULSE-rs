@@ -8,7 +8,8 @@ use crate::tooling::traits::*;
 
 /// Read Word documents (.docx) and extract text, paragraphs, and tables.
 ///
-/// Delegates to office::word::parse_word for actual parsing.
+/// Delegates to office::word::parse_word, which reads under the bounds in
+/// office::bounded, on the blocking pool.
 pub struct WordReadTool;
 
 #[async_trait]
@@ -63,7 +64,12 @@ impl DynamicTool for WordReadTool {
             .ok_or_else(|| ToolError::InvalidParams("missing 'path' string parameter".into()))?;
         let path = PathBuf::from(path_str);
 
-        match crate::office::word::parse_word(&path) {
+        // Parsing is synchronous, so it runs on the blocking pool; the office
+        // bounds cap how long it can take.
+        let parsed = tokio::task::spawn_blocking(move || crate::office::word::parse_word(&path))
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("word_read parse task failed: {e}")))?;
+        match parsed {
             Ok(result) => {
                 let mut metadata = std::collections::HashMap::new();
                 metadata.insert(
@@ -128,6 +134,21 @@ mod tests {
         let tool = WordReadTool;
         let params = serde_json::json!({"path": "data.xlsx"});
         assert!(tool.validate_params(&params).is_err());
+    }
+
+    /// The parse runs on the blocking pool, so the async runtime keeps
+    /// serving other tasks while a document is read.
+    #[tokio::test]
+    async fn test_execute_parses_off_the_async_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::office::test_fixtures::write_docx_lines(dir.path(), 2);
+        let (result, turns) = super::super::test_support::turns_while_executing(
+            &WordReadTool,
+            serde_json::json!({"path": path}),
+        )
+        .await;
+        assert_eq!(result.unwrap().output["content"], "line 0\nline 1\n");
+        assert!(turns > 0, "the parse ran on the async runtime thread");
     }
 
     #[tokio::test]

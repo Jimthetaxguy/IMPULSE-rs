@@ -1,32 +1,20 @@
 // Excel module - parse and extract data from Excel files
-// Uses calamine for reading Excel files
+// Cells are streamed through calamine's cell reader by `office::bounded`;
+// calamine's dense-grid reader is never used.
 
 #[cfg(not(feature = "office-support"))]
 use crate::office::ExtractionResult;
 use crate::office::SheetInfo;
 #[cfg(feature = "office-support")]
-use crate::office::{ContentChunk, ExtractionMetadata, ExtractionResult};
+use crate::office::{bounded, ExtractionResult};
 
-#[cfg(feature = "office-support")]
-use calamine::{open_workbook, Reader, Xls, Xlsx};
-#[cfg(feature = "office-support")]
-use std::path::Path;
-
-/// Parse an Excel file and extract content
+/// Parse an Excel workbook (`.xlsx`) or CSV file under the bounds in
+/// `office::bounded`. Legacy `.xls` is refused.
 #[cfg(feature = "office-support")]
 pub fn parse_excel(path: &std::path::Path) -> Result<ExtractionResult, String> {
-    let extension = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-
-    match extension.as_str() {
-        "xlsx" => parse_xlsx(path),
-        "xls" => parse_xls(path),
-        "csv" => parse_csv(path),
-        _ => Err(format!("Unsupported Excel format: {}", extension)),
-    }
+    bounded::check_extension(path, &bounded::path_label(path), &["xlsx", "csv"])
+        .map_err(|e| format!("{e:#}"))?;
+    super::read_bounded(path)
 }
 
 #[cfg(not(feature = "office-support"))]
@@ -34,243 +22,75 @@ pub fn parse_excel(_path: &std::path::Path) -> Result<ExtractionResult, String> 
     Err("Office support not enabled. Build with --features office-support".to_string())
 }
 
-#[cfg(feature = "office-support")]
-/// Parse XLSX file using calamine
-fn parse_xlsx(path: &Path) -> Result<ExtractionResult, String> {
-    let mut workbook: Xlsx<_> =
-        open_workbook(path).map_err(|e| format!("Failed to open workbook: {}", e))?;
-
-    extract_xlsx_content(path, &mut workbook)
-}
-
-#[cfg(feature = "office-support")]
-/// Parse XLS file (legacy Excel format)
-fn parse_xls(path: &Path) -> Result<ExtractionResult, String> {
-    let mut workbook: Xls<_> =
-        open_workbook(path).map_err(|e| format!("Failed to open workbook: {}", e))?;
-
-    extract_xls_content(path, &mut workbook)
-}
-
-#[cfg(feature = "office-support")]
-/// Parse CSV file
-fn parse_csv(path: &Path) -> Result<ExtractionResult, String> {
-    let content =
-        std::fs::read_to_string(path).map_err(|e| format!("Failed to read CSV: {}", e))?;
-
-    extract_csv_content(path, &content)
-}
-
-#[cfg(feature = "office-support")]
-/// Extract content from XLSX workbook
-fn extract_xlsx_content(
-    path: &Path,
-    workbook: &mut Xlsx<std::io::BufReader<std::fs::File>>,
-) -> Result<ExtractionResult, String> {
-    let sheet_names = workbook.sheet_names().to_vec();
-    let mut all_content = String::new();
-    let mut chunks = Vec::new();
-
-    for (idx, sheet_name) in sheet_names.iter().enumerate() {
-        if let Ok(range) = workbook.worksheet_range(sheet_name) {
-            // Extract sheet content
-            let sheet_content = range
-                .rows()
-                .map(|row| {
-                    row.iter()
-                        .map(|cell| cell.to_string())
-                        .collect::<Vec<_>>()
-                        .join("\t")
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            if !sheet_content.is_empty() {
-                all_content.push_str(&format!("=== Sheet: {} ===\n", sheet_name));
-                all_content.push_str(&sheet_content);
-                all_content.push_str("\n\n");
-
-                // Create chunk for this sheet
-                chunks.push(ContentChunk {
-                    content: sheet_content,
-                    chunk_type: "sheet".to_string(),
-                    index: idx,
-                });
-            }
-        }
-    }
-
-    let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
-
-    Ok(ExtractionResult {
-        document_type: "excel".to_string(),
-        content: all_content,
-        metadata: ExtractionMetadata {
-            source_path: path.to_string_lossy().to_string(),
-            format: "xlsx".to_string(),
-            size_bytes: metadata.len(),
-            extracted_at: chrono::Utc::now().to_rfc3339(),
-        },
-        chunks,
-    })
-}
-
-#[cfg(feature = "office-support")]
-/// Extract content from XLS workbook
-fn extract_xls_content(
-    path: &Path,
-    workbook: &mut Xls<std::io::BufReader<std::fs::File>>,
-) -> Result<ExtractionResult, String> {
-    let sheet_names = workbook.sheet_names().to_vec();
-    let mut all_content = String::new();
-    let mut chunks = Vec::new();
-
-    for (idx, sheet_name) in sheet_names.iter().enumerate() {
-        if let Ok(range) = workbook.worksheet_range(sheet_name) {
-            // Extract sheet content
-            let sheet_content = range
-                .rows()
-                .map(|row| {
-                    row.iter()
-                        .map(|cell| cell.to_string())
-                        .collect::<Vec<_>>()
-                        .join("\t")
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            if !sheet_content.is_empty() {
-                all_content.push_str(&format!("=== Sheet: {} ===\n", sheet_name));
-                all_content.push_str(&sheet_content);
-                all_content.push_str("\n\n");
-
-                chunks.push(ContentChunk {
-                    content: sheet_content,
-                    chunk_type: "sheet".to_string(),
-                    index: idx,
-                });
-            }
-        }
-    }
-
-    let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
-
-    Ok(ExtractionResult {
-        document_type: "excel".to_string(),
-        content: all_content,
-        metadata: ExtractionMetadata {
-            source_path: path.to_string_lossy().to_string(),
-            format: "xls".to_string(),
-            size_bytes: metadata.len(),
-            extracted_at: chrono::Utc::now().to_rfc3339(),
-        },
-        chunks,
-    })
-}
-
-#[cfg(feature = "office-support")]
-/// Extract content from CSV file
-fn extract_csv_content(path: &Path, content: &str) -> Result<ExtractionResult, String> {
-    let mut chunks = Vec::new();
-
-    if !content.is_empty() {
-        chunks.push(ContentChunk {
-            content: content.to_string(),
-            chunk_type: "csv".to_string(),
-            index: 0,
-        });
-    }
-
-    let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
-
-    Ok(ExtractionResult {
-        document_type: "excel".to_string(),
-        content: content.to_string(),
-        metadata: ExtractionMetadata {
-            source_path: path.to_string_lossy().to_string(),
-            format: "csv".to_string(),
-            size_bytes: metadata.len(),
-            extracted_at: chrono::Utc::now().to_rfc3339(),
-        },
-        chunks,
-    })
-}
-
-/// Get sheet information without full parsing
+/// Lists a workbook's sheets with the extent of their non-empty cells,
+/// which are streamed rather than laid out in a grid, under the file,
+/// container and cell bounds of `office::bounded`. Chart and dialog sheets
+/// hold no cells and are listed with no rows or columns.
 #[cfg(feature = "office-support")]
 pub fn get_sheet_info(path: &std::path::Path) -> Result<Vec<SheetInfo>, String> {
-    use calamine::{open_workbook, Reader, Xlsx};
+    sheet_info(path, &bounded::path_label(path), bounded::MAX_CELLS).map_err(|e| format!("{e:#}"))
+}
 
+/// [`get_sheet_info`] with an explicit cell cap; the test seam.
+#[cfg(feature = "office-support")]
+fn sheet_info(
+    path: &std::path::Path,
+    label: &str,
+    max_cells: u64,
+) -> anyhow::Result<Vec<SheetInfo>> {
+    use calamine::{open_workbook, DataRef, Reader, Xlsx};
+
+    bounded::check_extension(path, label, &["xlsx"])?;
+    bounded::check_source_file(path, label, bounded::MAX_DOCUMENT_BYTES)?;
+    bounded::preflight_container(path, label)?;
     let mut workbook: Xlsx<_> =
-        open_workbook(path).map_err(|e| format!("Failed to open workbook: {}", e))?;
-
-    let sheet_names = workbook.sheet_names().to_vec();
-    let mut sheets = Vec::new();
-
-    for sheet_name in sheet_names {
-        if let Ok(range) = workbook.worksheet_range(&sheet_name) {
-            let cols = range.rows().next().map(|r| r.len()).unwrap_or(0);
-            sheets.push(SheetInfo {
-                name: sheet_name,
-                row_count: range.rows().count(),
-                column_count: cols,
-            });
+        open_workbook(path).map_err(|e| anyhow::anyhow!("{label} could not be parsed: {e}"))?;
+    let names = workbook.sheet_names().to_vec();
+    let mut sheets = Vec::with_capacity(names.len());
+    let mut cells_total: u64 = 0;
+    for name in names {
+        // The first and last row, and column, holding a non-empty cell.
+        let mut rows: Option<(u32, u32)> = None;
+        let mut columns: Option<(u32, u32)> = None;
+        match workbook.worksheet_cells_reader(&name) {
+            Ok(mut reader) => {
+                while let Some(cell) = reader.next_cell().map_err(|e| {
+                    anyhow::anyhow!("{label} could not be parsed: sheet '{name}': {e}")
+                })? {
+                    if matches!(cell.get_value(), DataRef::Empty) {
+                        continue;
+                    }
+                    cells_total += 1;
+                    if cells_total > max_cells {
+                        anyhow::bail!(
+                            "{label} has more than {max_cells} non-empty cells, over the limit"
+                        );
+                    }
+                    let (row, column) = cell.get_position();
+                    rows = Some(
+                        rows.map_or((row, row), |(first, last)| (first.min(row), last.max(row))),
+                    );
+                    columns = Some(columns.map_or((column, column), |(first, last)| {
+                        (first.min(column), last.max(column))
+                    }));
+                }
+            }
+            Err(calamine::XlsxError::NotAWorksheet(_)) => {}
+            Err(e) => anyhow::bail!("{label} could not be parsed: sheet '{name}': {e}"),
         }
+        let extent =
+            |span: Option<(u32, u32)>| span.map_or(0, |(first, last)| (last - first) as usize + 1);
+        sheets.push(SheetInfo {
+            name,
+            row_count: extent(rows),
+            column_count: extent(columns),
+        });
     }
-
     Ok(sheets)
 }
 
 #[cfg(not(feature = "office-support"))]
 pub fn get_sheet_info(_path: &std::path::Path) -> Result<Vec<SheetInfo>, String> {
-    Err("Office support not enabled. Build with --features office-support".to_string())
-}
-
-/// Read specific cell range from Excel file
-#[cfg(feature = "office-support")]
-pub fn read_range(
-    path: &std::path::Path,
-    sheet: &str,
-    start_row: usize,
-    end_row: usize,
-    start_col: usize,
-    end_col: usize,
-) -> Result<Vec<Vec<String>>, String> {
-    use calamine::{open_workbook, Reader, Xlsx};
-
-    let mut workbook: Xlsx<_> =
-        open_workbook(path).map_err(|e| format!("Failed to open workbook: {}", e))?;
-
-    let range = workbook
-        .worksheet_range(sheet)
-        .map_err(|e| format!("Failed to get sheet: {}", e))?;
-
-    let mut result = Vec::new();
-
-    for (row_idx, row) in range.rows().enumerate() {
-        if row_idx >= start_row && row_idx <= end_row {
-            let mut row_data = Vec::new();
-            for (col_idx, cell) in row.iter().enumerate() {
-                if col_idx >= start_col && col_idx <= end_col {
-                    row_data.push(cell.to_string());
-                }
-            }
-            result.push(row_data);
-        }
-    }
-
-    Ok(result)
-}
-
-#[cfg(not(feature = "office-support"))]
-pub fn read_range(
-    _path: &std::path::Path,
-    _sheet: &str,
-    _start_row: usize,
-    _end_row: usize,
-    _start_col: usize,
-    _end_col: usize,
-) -> Result<Vec<Vec<String>>, String> {
     Err("Office support not enabled. Build with --features office-support".to_string())
 }
 
@@ -284,5 +104,71 @@ mod tests {
             super::super::OfficeFormat::from_extension("xlsx"),
             super::super::OfficeFormat::Xlsx
         );
+    }
+
+    #[cfg(feature = "office-support")]
+    mod bounded_reads {
+        use crate::office::test_fixtures::*;
+
+        /// Two cells far apart cost a row marker and a column marker. The
+        /// dense grid this replaced rendered about 900,000 tab-separated
+        /// cells for this sheet, and billions for two cells at opposite
+        /// corners of a sheet.
+        #[test]
+        fn test_parse_excel_streams_far_apart_cells() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = write_far_apart_workbook(dir.path());
+            let result = super::super::parse_excel(&path).unwrap();
+            assert_eq!(
+                result.content,
+                "=== Sheet: Data ===\nstart\n[2999 empty rows]\n[300 empty columns]\tend\n\n"
+            );
+        }
+
+        /// Extents come from the streamed cells: from the first non-empty
+        /// row and column to the last, and none for an empty sheet.
+        #[test]
+        fn test_get_sheet_info_reports_extents_without_a_grid() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = write_far_apart_workbook(dir.path());
+            let sheets = super::super::get_sheet_info(&path).unwrap();
+            let summary: Vec<_> = sheets
+                .iter()
+                .map(|s| (s.name.as_str(), s.row_count, s.column_count))
+                .collect();
+            assert_eq!(summary, [("Data", 3001, 301), ("Empty", 0, 0)]);
+        }
+
+        /// The sheet listing preflights the container before calamine opens
+        /// it, and refuses legacy `.xls`.
+        #[test]
+        fn test_get_sheet_info_preflights_the_container_and_refuses_xls() {
+            let dir = tempfile::tempdir().unwrap();
+            let broken = dir.path().join("broken.xlsx");
+            std::fs::write(&broken, b"not a zip").unwrap();
+            let err = super::super::get_sheet_info(&broken).unwrap_err();
+            assert!(err.contains("not a valid xlsx container"), "{err}");
+
+            let xls = dir.path().join("legacy.xls");
+            std::fs::write(&xls, b"not a zip").unwrap();
+            let err = super::super::get_sheet_info(&xls).unwrap_err();
+            assert!(err.contains("legacy .xls"), "{err}");
+        }
+
+        /// The listing stops at the cell cap instead of counting on.
+        #[test]
+        fn test_sheet_info_refuses_more_cells_than_the_cap() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = write_far_apart_workbook(dir.path());
+            assert_eq!(
+                super::super::sheet_info(&path, "'far'", 2).unwrap().len(),
+                2
+            );
+            let err = super::super::sheet_info(&path, "'far'", 1).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "'far' has more than 1 non-empty cells, over the limit"
+            );
+        }
     }
 }
