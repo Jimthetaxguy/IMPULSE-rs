@@ -435,7 +435,7 @@ Tracks sub-agent delegations detected in coordinator output, depth-limited like 
 - A delegation is completed once. `CompleteDelegation` for a delegation that already completed or failed is an `Error`, and the first result stands.
 - It holds at most 256 delegations. Registering past that drops the oldest finished delegation, or failing that the oldest one pending or in progress for an hour or more (nothing in the protocol cancels a delegation whose worker died); when every slot holds a younger active delegation, the registration is an `Error`.
 - It keeps the first 64 KiB of `context_snapshot` (nothing reads the snapshot back yet).
-- A spec, and a completion's summary plus tool trace, may each weigh at most 256 KiB, counting 64 bytes for every list entry besides its text; a heavier one is an `Error`.
+- A spec, and a completion's summary plus tool trace, may each weigh at most 256 KiB: their text, plus 64 for each target file or restricted tool and 128 for each tool-trace record (what an entry costs in memory, rounded up); a heavier one is an `Error`.
 
 ### Agent Pool
 

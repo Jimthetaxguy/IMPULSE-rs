@@ -25,11 +25,15 @@ pub const MAX_CONTEXT_SNAPSHOT_BYTES: usize = 64 * 1024;
 /// [`DELEGATION_ITEM_BYTES`] for each list entry.
 pub const MAX_DELEGATION_TEXT_BYTES: usize = 256 * 1024;
 
-/// What one list entry (a target file, a restricted tool, a tool-trace
-/// record) counts toward [`MAX_DELEGATION_TEXT_BYTES`] besides its text, so
-/// millions of empty entries can't pass as a few bytes: each costs its
-/// `String` headers and allocations whatever it holds.
+/// What one string list entry (a target file, a restricted tool) counts
+/// toward [`MAX_DELEGATION_TEXT_BYTES`] besides its text, so millions of
+/// empty entries can't pass as a few bytes: each costs a `String` header and
+/// an allocation whatever it holds (40 bytes, rounded up).
 pub const DELEGATION_ITEM_BYTES: usize = 64;
+
+/// What one tool-trace record counts besides its text: three `String`
+/// headers (72 bytes) and up to three allocations, rounded up.
+pub const DELEGATION_TRACE_RECORD_BYTES: usize = 128;
 
 /// How long a delegation may stay pending or in progress before a full
 /// tracker treats it as abandoned. Nothing in the protocol fails or cancels
@@ -44,7 +48,10 @@ pub enum DelegationError {
     DepthExceeded { max: u8 },
     #[error("delegation rejected: all {limit} tracked delegations are still active")]
     TrackerFull { limit: usize },
-    #[error("delegation {part} refused: {bytes} bytes, over the {limit}-byte limit")]
+    #[error(
+        "delegation {part} refused: it weighs {bytes} (its text plus a fixed cost per list \
+         entry), over the {limit} limit"
+    )]
     TooLarge {
         part: &'static str,
         bytes: usize,
@@ -217,7 +224,8 @@ mod tests {
                 limit: 200
             }
             .to_string(),
-            "delegation spec refused: 300 bytes, over the 200-byte limit"
+            "delegation spec refused: it weighs 300 (its text plus a fixed cost per list entry), \
+             over the 200 limit"
         );
         assert_eq!(
             DelegationError::NotFound { id: "del-9".into() }.to_string(),

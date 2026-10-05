@@ -24,6 +24,9 @@ const SEM_TIMEOUT: Duration = Duration::from_secs(30);
 /// `sem --version` answers at once; waiting longer only stalls `sem-status`.
 const SEM_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How many dependency levels `sem impact` follows (its own default).
+const SEM_IMPACT_DEPTH: u32 = 2;
+
 /// Most output `sem diff` may print. Its JSON carries every changed entity's
 /// full source on both sides, and a nested entity repeats its parent's text,
 /// so a session that adds a large generated file can pass the default cap
@@ -211,11 +214,14 @@ pub fn run_semantic_blame(repo_path: &Path, file_path: &str) -> Result<Vec<Seman
 pub fn run_semantic_impact(repo_path: &Path, entity_name: &str) -> Result<ImpactResult> {
     require_sem()?;
 
-    // `--` ends sem's options, so the entity name is never read as one.
+    // `--` ends sem's options, so the entity name is never read as one. The
+    // depth is sem's default, passed so the reach the report names is fixed.
     let mut cmd = sem_command();
     cmd.arg("impact")
         .arg("--format")
         .arg("json")
+        .arg("--depth")
+        .arg(SEM_IMPACT_DEPTH.to_string())
         .arg("--")
         .arg(entity_name)
         .current_dir(repo_path);
@@ -603,7 +609,8 @@ fn parse_sem_blame_output(json_str: &str, file_path: &str) -> Result<Vec<Semanti
 }
 
 /// The parts of `sem impact --format json` the report uses: the entity, its
-/// direct dependents, and how many entities the change reaches in all.
+/// direct dependents, and how many entities the change reaches within
+/// [`SEM_IMPACT_DEPTH`] levels.
 #[derive(Deserialize)]
 struct RawImpact {
     entity: RawSemEntity,
@@ -1063,9 +1070,17 @@ mod tests {
         });
         assert_eq!(
             logged_runs(&log),
-            [
-                ["blame", "--format", "json", "--", "-weird.rs"],
-                ["impact", "--format", "json", "--", "--format=text"],
+            vec![
+                vec!["blame", "--format", "json", "--", "-weird.rs"],
+                vec![
+                    "impact",
+                    "--format",
+                    "json",
+                    "--depth",
+                    "2",
+                    "--",
+                    "--format=text"
+                ],
             ]
         );
     }
@@ -1227,6 +1242,11 @@ mod tests {
             sem_version().unwrap();
         });
         assert_eq!(logged_sem_local(&log), ["SEM_LOCAL=1"; 4]);
+        // The command sets it, whatever the environment has: the fake above
+        // would also see an inherited `SEM_LOCAL=1`.
+        assert!(sem_command()
+            .get_envs()
+            .any(|(key, value)| key == "SEM_LOCAL" && value == Some("1".as_ref())));
     }
 
     /// Verification finding: sem's JSON carries each change's full source,

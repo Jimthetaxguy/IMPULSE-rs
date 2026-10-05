@@ -125,7 +125,11 @@ pub fn handle_sem_impact(entity: String, json: bool) -> Result<()> {
             "Impact analysis for {} ({})",
             result.target.name, result.target.entity_type
         );
-        println!("Blast radius: {} dependents", result.blast_radius);
+        println!(
+            "Blast radius: {} entities within two levels, {} direct dependents",
+            result.blast_radius,
+            result.dependents.len()
+        );
         println!();
         if result.dependents.is_empty() {
             println!("  No dependents found.");

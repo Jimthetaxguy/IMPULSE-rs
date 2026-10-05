@@ -10,8 +10,8 @@ use impulse_ops::{AgentRole, DelegationSummary, DiffSummary, ToolInvocationRecor
 
 use super::types::{
     DelegationError, DelegationSpec, DelegationState, TrackedDelegation, DELEGATION_ITEM_BYTES,
-    MAX_CONTEXT_SNAPSHOT_BYTES, MAX_DELEGATION_DEPTH, MAX_DELEGATION_TEXT_BYTES,
-    MAX_TRACKED_DELEGATIONS, STALE_DELEGATION_SECS,
+    DELEGATION_TRACE_RECORD_BYTES, MAX_CONTEXT_SNAPSHOT_BYTES, MAX_DELEGATION_DEPTH,
+    MAX_DELEGATION_TEXT_BYTES, MAX_TRACKED_DELEGATIONS, STALE_DELEGATION_SECS,
 };
 
 /// Tracks all active and recent delegations.
@@ -39,7 +39,7 @@ impl DelegationTracker {
     /// The context snapshot is cut to [`MAX_CONTEXT_SNAPSHOT_BYTES`].
     pub fn register(
         &mut self,
-        spec: DelegationSpec,
+        mut spec: DelegationSpec,
         coordinator_pane_id: usize,
         mut context_snapshot: String,
         current_depth: u8,
@@ -50,6 +50,9 @@ impl DelegationTracker {
             });
         }
         check_size("spec", spec_bytes(&spec))?;
+        // Parsing grows lists by doubling; the weight counts entries.
+        spec.target_files.shrink_to_fit();
+        spec.restricted_tools.shrink_to_fit();
         if self.delegations.len() >= MAX_TRACKED_DELEGATIONS
             && !self.drop_oldest_finished()
             && !self.drop_oldest_stale()
@@ -155,7 +158,7 @@ impl DelegationTracker {
             .iter()
             .map(|tool| {
                 [
-                    DELEGATION_ITEM_BYTES,
+                    DELEGATION_TRACE_RECORD_BYTES,
                     tool.kind.len(),
                     tool.target.len(),
                     tool.timestamp.as_ref().map_or(0, String::len),
@@ -166,6 +169,9 @@ impl DelegationTracker {
             .fold(summary.len(), usize::saturating_add);
         let d = self.active_mut(id)?;
         check_size("completion", completion_bytes)?;
+        let mut tool_trace = tool_trace;
+        // Parsing grows the list by doubling; the weight counts entries.
+        tool_trace.shrink_to_fit();
         d.state = DelegationState::Completed {
             summary,
             tool_trace,
@@ -648,7 +654,8 @@ mod tests {
             target: String::new(),
             timestamp: None,
         };
-        let trace = vec![empty_record; MAX_DELEGATION_TEXT_BYTES / DELEGATION_ITEM_BYTES + 1];
+        let trace =
+            vec![empty_record; MAX_DELEGATION_TEXT_BYTES / DELEGATION_TRACE_RECORD_BYTES + 1];
         assert!(matches!(
             tracker.complete(&id, String::new(), trace, None),
             Err(DelegationError::TooLarge {
@@ -687,5 +694,33 @@ mod tests {
                 limit: MAX_TRACKED_DELEGATIONS
             })
         );
+    }
+
+    /// Verification finding: the weight counts entries, but parsing leaves
+    /// lists with up to twice the room, which the tracker then kept.
+    #[test]
+    fn test_stored_lists_hold_no_spare_room() {
+        let mut tracker = DelegationTracker::new();
+        let mut spec = sample_spec();
+        spec.target_files = Vec::with_capacity(100);
+        spec.target_files.push("src/a.rs".into());
+        spec.restricted_tools = Vec::with_capacity(100);
+        spec.restricted_tools.push("bash_exec".into());
+        let id = tracker.register(spec, 0, "".into(), 0).unwrap();
+        let stored = &tracker.delegations[&id].spec;
+        assert_eq!(stored.target_files.capacity(), 1);
+        assert_eq!(stored.restricted_tools.capacity(), 1);
+
+        let mut trace = Vec::with_capacity(100);
+        trace.push(ToolInvocationRecord {
+            kind: "edit".into(),
+            target: "src/a.rs".into(),
+            timestamp: None,
+        });
+        tracker.complete(&id, "done".into(), trace, None).unwrap();
+        let DelegationState::Completed { tool_trace, .. } = &tracker.delegations[&id].state else {
+            panic!("completed");
+        };
+        assert_eq!(tool_trace.capacity(), 1);
     }
 }

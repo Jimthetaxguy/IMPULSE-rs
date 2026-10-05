@@ -112,6 +112,32 @@ And these P3s, all fixed:
 - The size error said the delegation was rejected when a completion was refused; it names the
   refused part now.
 
+## Second verification round
+A second reviewer probed the round's four commits (17 probes; the lib suite three times; the
+process and sem tests fifteen times at 16 threads) against sem's source back to v0.5.0 and its
+npm wrapper under node 22. No P1 or P2. Fixed from its P3s:
+- Tool-trace records were weighed like strings (64) though one is three `String` headers (72
+  bytes) plus allocations, and parsed lists kept up to double their room, so a completion could
+  hold about twice the stated 256 KiB. Records now weigh 128, and stored lists are shrunk.
+- The `SEM_LOCAL` test passed against the revert when the environment already exported
+  `SEM_LOCAL=1`; it also checks the command itself now.
+- "Blast radius" was sem's reach within its default two levels, reported as the total; the
+  depth is passed explicitly and the output names it.
+- The weight error said "bytes" for a weight; the test helpers' docs said "whole command line"
+  for a prefix match.
+
+Recorded, not changed:
+- SIGTERM first means a child whose TERM handler signals its own group (`trap 'kill 0' TERM`)
+  signals the caller, which shares that group. None of the programs run this way does; it is in
+  the `run_with_timeout` doc.
+- A leftover that holds a pipe without writing keeps the output its reader had read (up to the
+  cap) as well as the thread, until it exits; the callers are short-lived CLI processes.
+- A full tracker can drop a delegation still being worked on after an hour (the protocol has no
+  way to say it is alive), and its later completion gets `NotFound`. Age is wall-clock time, so
+  a clock stepped back delays staleness.
+- Adding or deleting a JSON file of roughly 40 MB or more can still pass the 128 MiB cap
+  (sem's JSON entities repeat their children's text); parsing from the pipe would remove the cap.
+
 ## Decisions
 - **No process-group isolation for `run_with_timeout`.** Both callers run in CLI processes. A
   child in its own group stops getting the terminal's Ctrl-C, and a secrets manager that prompts

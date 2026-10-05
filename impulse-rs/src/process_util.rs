@@ -59,12 +59,14 @@ const CHUNK_BYTES: usize = 8 * 1024;
 /// Once the call has given up, its readers close their pipes at the next
 /// write rather than draining them, so a leftover process that keeps
 /// writing gets SIGPIPE. One that holds a pipe without writing keeps its
-/// reader thread until it exits.
+/// reader thread, and the output read so far, until it exits.
 ///
 /// The child stays in the caller's process group, so a terminal's Ctrl-C
 /// still reaches it and it can prompt on the terminal (a secrets manager
 /// asking to unlock). In exchange, only the child itself is stopped at the
-/// deadline, not processes it started.
+/// deadline, not processes it started, and a child whose SIGTERM handler
+/// signals its whole group (`trap 'kill 0' TERM`) signals the caller too.
+/// No program run through here does that today.
 pub fn run_with_timeout(command: Command, timeout: Duration) -> io::Result<Output> {
     run_with_limits(command, timeout, MAX_STDOUT_BYTES, MAX_STDERR_BYTES)
 }
@@ -315,7 +317,7 @@ pub(crate) mod test_sleep {
         kill_matching(&format!("sleep {duration}"));
     }
 
-    /// Whether a process whose whole command line is `command` is running.
+    /// Whether a process whose command line starts with `command` is running.
     pub(crate) fn running(command: &str) -> bool {
         std::process::Command::new("pgrep")
             .arg("-f")
@@ -324,7 +326,7 @@ pub(crate) mod test_sleep {
             .is_ok_and(|output| !output.stdout.is_empty())
     }
 
-    /// Kills every process whose whole command line is `command`.
+    /// Kills every process whose command line starts with `command`.
     pub(crate) fn kill_matching(command: &str) {
         let _ = std::process::Command::new("pkill")
             .arg("-f")
