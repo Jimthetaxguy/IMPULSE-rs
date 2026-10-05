@@ -31,7 +31,7 @@ tags: [worktree, lane, handoff, subprocess, semantic-diff, delegation, webhook, 
   `cargo clippy --workspace --all-targets -- -D warnings` (default and `--no-default-features`),
   `cargo fmt --all -- --check`, `python3 docs/validate_docs.py`
 - Latest status: implemented in `e427f87` (process), `31105c5` (sem), `5ea1d25` (delegation)
-  and `e00da7e` (webhook); gated; pushed. Not merged; needs a verification round, then a PR.
+  and `e00da7e` (webhook); verification round fixed on top; gated; pushed. Not merged; needs a PR.
 
 ## Findings fixed
 - P2, `run_with_timeout` (the `sem` runner and the secrets-manager CLI proxy): the deadline only
@@ -71,6 +71,47 @@ every run (16.7 s across three attempts); it now uses a closed loopback port (1.
 protocol doc's delegation examples could not have been sent: the spec lacked the required `task`,
 and `diff_summary` used `insertions` instead of `lines_added`/`lines_removed`.
 
+## Verification round
+A read-only reviewer reran the review's reproductions against these fixes, probed them (26 probe
+tests, the full suite three times, the sem and process tests ten times each) and read sem's source
+for its real output. It confirmed that both P2 claims fell short:
+- The context snapshot was cut but kept its allocation (`String::truncate` frees nothing): a 4 MiB
+  snapshot still held 4 MiB. It is now shrunk after the cut.
+- The size limits counted text only, so 3.3 million empty target files (134 MB once parsed)
+  passed as zero bytes. Every list entry now also counts 64 bytes.
+
+And these P3s, all fixed:
+- One entity with an empty name failed the whole sem diff. sem names a JSON entity by its key,
+  and an npm lockfile's root package is keyed `""`, so adding a lockfile failed every session-end
+  capture. Empty names are kept; a missing name is still refused.
+- `sem blame` and `sem impact` never parsed sem's output, before or after the first round (the
+  first card blamed camelCase; the shapes differ). Blame entries are flat (`name`, `type`,
+  `lines`, a nullable `commit`, `summary`) and impact has an `entity` object, `dependents` and
+  `impact.total`. Both are now read in those shapes, taken from sem's `blame.rs` and `impact.rs`;
+  `SemanticBlameEntry::commit` is an `Option` for uncommitted lines.
+- With a sem cloud login, `sem diff` prints its answer and then runs a relations pass of minutes,
+  past the timeout. Every sem command now sets `SEM_LOCAL=1`, sem's own switch for local runs.
+- sem's JSON carries each change's full source, and nested entities repeat their parent's text,
+  so a complete answer can pass the 32 MiB default cap; `sem diff` now allows 128 MiB.
+- A stopped child got SIGKILL only, which a launcher can't pass on: sem's npm wrapper died and left
+  the real sem running. Children now get SIGTERM, then SIGKILL after 250 ms.
+- After the call gave up, the stderr reader kept draining a backgrounded writer forever (a `yes`
+  ran on at 60% CPU). Readers now close their pipe at the next write, so the writer gets SIGPIPE.
+  A process that holds a pipe without writing still keeps its reader thread until it exits.
+- A tracker full of abandoned delegations refused every new one until the daemon restarted, since
+  nothing in the protocol fails or cancels one. A full tracker now also drops its oldest
+  delegation pending or in progress for an hour or more.
+- The sem-status regression test passed against the old handler, which ignores the test seam and
+  found no `sem` on PATH. It now checks that the fake `sem` ran `--version`.
+- A nested `with_test_sem` reset the outer setting instead of restoring it.
+- The session-end warning printed only the outermost error (`{}`), hiding sem's own message; it
+  prints the chain (`{:#}`) in both modes. Not covered by a test.
+- On Linux a script written and run at once can fail with ETXTBSY while another test's fork holds
+  it; the fake `sem` helper runs each script once first, retrying while busy. Not reproducible on
+  macOS.
+- The size error said the delegation was rejected when a completion was refused; it names the
+  refused part now.
+
 ## Decisions
 - **No process-group isolation for `run_with_timeout`.** Both callers run in CLI processes. A
   child in its own group stops getting the terminal's Ctrl-C, and a secrets manager that prompts
@@ -82,7 +123,7 @@ and `diff_summary` used `insertions` instead of `lines_added`/`lines_removed`.
   environment. sem's output never reaches a model, and it reads its own opt-outs from the
   environment (`SEM_NO_TELEMETRY`, `DO_NOT_TRACK`, `SEM_NO_NETWORK`, `SEM_TELEMETRY`), which an
   allowlist would silently drop, turning telemetry back on. The secrets-manager CLIs need their
-  tokens from the environment for the same reason.
+  tokens from the environment for the same reason. The one addition is `SEM_LOCAL=1`.
 - **The context snapshot is cut, not dropped.** The protocol keeps the field and the tracker keeps
   64 KiB, so a future reader has something to use; a client is not refused for sending more.
 - **Test seam without PATH changes.** sem tests run a fake `sem` script through a `#[cfg(test)]`
@@ -98,18 +139,25 @@ and `diff_summary` used `insertions` instead of `lines_added`/`lines_removed`.
   an empty platform ranked most efficient, and `estimate_message_tokens` overflowing `u32`. The
   module has no production caller, so these are recorded rather than fixed; fix them before
   anything calls it.
-- **`sem blame` and `sem impact` output.** Their typed structs expect snake_case fields; current
-  sem may print camelCase, which would now be a clear parse error rather than wrong data. Not
-  checked against a real sem binary (none is installed, and installing one runs third-party code).
+- **No real `sem` run.** The shapes come from sem's README and source (`blame.rs`, `impact.rs`,
+  `diff`); no sem binary is installed here, and installing one runs third-party code.
 - **Webhook retries.** A redirect or 4xx is retried like a network error (1.5 s of backoff).
 
 ## Evidence
-- Revert proofs: 14 cases, each fix reverted alone; every case fails its tests (one daemon test
-  path was re-run after correcting its filter). The endless-writer test was not run against the
-  uncapped code, since `yes` would fill memory until the deadline.
+- Revert proofs: 14 cases in the first round and 11 in the verification round, each fix reverted
+  alone; every case fails its tests (one daemon test path was re-run after correcting its filter).
+  The endless-writer test was not run against the uncapped code, since `yes` would fill memory
+  until the deadline. The ETXTBSY warm-up and the `{:#}` warnings have no failing test.
 - Gate on `e00da7e` (`CARGO_TARGET_DIR` isolated per lane): build clean; `cargo test --workspace`
   3143 passed, 0 failed, 9 ignored; clippy clean with and without default features; fmt clean;
   `python3 docs/validate_docs.py` 188/188.
+- Gate after the verification round: build clean; `cargo test --workspace` 3155 passed, 0 failed,
+  9 ignored; clippy clean with and without default features; fmt clean; docs 189/189.
+- One end-to-end test passed vacuously during the round: BSD `yes` rewrites its argument area, so
+  a `pgrep` pattern anchored at the end never matched it. The test helpers anchor at the start
+  only, and the test now fails against the reverted fix.
+- The five pending branches merged together (before the verification round) built clean and
+  passed `cargo test --workspace`: 3361 passed, 0 failed, 8 ignored.
 
 ## Handoff
 - Open a PR when James approves; trial-merge against `claude/code-cleanup-20261004` and the
