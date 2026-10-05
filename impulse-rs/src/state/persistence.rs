@@ -196,34 +196,40 @@ impl State {
         session_id: &str,
         summary: String,
     ) -> Result<Option<HistoryEntry>> {
-        let history_entry = {
-            let mut state = self.live_state.write().map_err(lock_err)?;
-            match state.get_session(session_id) {
-                Some(session) => {
-                    let entry = HistoryEntry {
-                        session_id: session.id.clone(),
-                        session_name: session.name.clone(),
-                        platform: session.platform,
-                        started_at: session.created_at,
-                        ended_at: Utc::now(),
-                        summary,
-                        files_touched: session.active_files.clone(),
-                        tools_used: session.recent_tools.clone(),
-                    };
-                    // Record the history first and remove the session only
-                    // once that succeeded: removing it first lost both the
-                    // session and its history entry when the append failed
-                    // (disk full, unwritable file), and a retry then said
-                    // "Session not found". The lock is held across the append
-                    // so two concurrent ends cannot both record the session.
-                    self.storage
-                        .append_jsonl(HISTORY_FILE, &entry)
-                        .context("Failed to append session to history log")?;
-                    state.remove_session(session_id);
-                    Some(entry)
+        // Claim the session under the lock, then write its history without
+        // it: the append syncs to disk, and holding the state's write lock
+        // across that made every state reader wait on the disk. Taking the
+        // session out first still lets only one of two concurrent ends
+        // record it, and a failed append (disk full, unwritable file) puts
+        // it back, so neither the session nor its history is lost and a
+        // retry works.
+        let claimed = self
+            .live_state
+            .write()
+            .map_err(lock_err)?
+            .remove_session(session_id);
+        let history_entry = match claimed {
+            Some(session) => {
+                let entry = HistoryEntry {
+                    session_id: session.id.clone(),
+                    session_name: session.name.clone(),
+                    platform: session.platform,
+                    started_at: session.created_at,
+                    ended_at: Utc::now(),
+                    summary,
+                    files_touched: session.active_files.clone(),
+                    tools_used: session.recent_tools.clone(),
+                };
+                if let Err(error) = self.storage.append_jsonl(HISTORY_FILE, &entry) {
+                    self.live_state
+                        .write()
+                        .map_err(lock_err)?
+                        .add_session(session);
+                    return Err(error).context("Failed to append session to history log");
                 }
-                None => None,
+                Some(entry)
             }
+            None => None,
         };
 
         self.mark_dirty();
@@ -609,6 +615,76 @@ mod tests {
         assert_eq!(
             state.get_config("log_level").unwrap().as_deref(),
             Some("debug")
+        );
+    }
+
+    /// Recorded review item: the state's write lock was held across the
+    /// history append and its fsync, so every state reader waited on the
+    /// disk. A FIFO stands in for a slow disk: nobody reads it, so a history
+    /// line larger than its buffer leaves the append waiting in `write`.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_end_session_does_not_hold_the_state_lock_while_writing_history() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = Arc::new(State::new(dir.path().to_path_buf()).unwrap());
+        let ending = state.create_session("s".to_string(), None).await.unwrap();
+        let other = state.create_session("t".to_string(), None).await.unwrap();
+        let fifo = dir.path().join(HISTORY_FILE);
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success(), "mkfifo failed");
+
+        let ender = Arc::clone(&state);
+        let summary = "x".repeat(1024 * 1024);
+        let end = tokio::spawn(async move { ender.end_session(&ending.id, summary).await });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!end.is_finished(), "the append did not wait on the FIFO");
+
+        // Read another session from a plain thread: a held std lock would
+        // block it, and a runtime thread blocked that way could not time out.
+        let (sent, received) = std::sync::mpsc::channel();
+        let reader = Arc::clone(&state);
+        let other_id = other.id.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let found = runtime.block_on(reader.get_session(&other_id));
+            let _ = sent.send(found.map(|session| session.is_some()).ok());
+        });
+        let readable = received.recv_timeout(std::time::Duration::from_secs(2));
+
+        // Drain the FIFO without ever blocking, so the writer finishes and the
+        // test cannot hang whatever the outcome.
+        let mut drain = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .unwrap();
+        let started = std::time::Instant::now();
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match std::io::Read::read(&mut drain, &mut buf) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if end.is_finished() || started.elapsed() > std::time::Duration::from_secs(10) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => panic!("draining the FIFO: {error}"),
+            }
+        }
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), end).await;
+
+        assert_eq!(
+            readable,
+            Ok(Some(true)),
+            "state blocked while history was written"
         );
     }
 
