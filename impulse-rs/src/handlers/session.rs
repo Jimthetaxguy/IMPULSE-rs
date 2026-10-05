@@ -249,6 +249,7 @@ pub async fn handle_track_write(
     format: Option<OutputFormat>,
 ) -> Result<()> {
     validate::validate_file_arg(&file)?;
+    validate::validate_single_line_text(&file, "file")?;
 
     let structured = matches!(format, Some(OutputFormat::Json | OutputFormat::Ndjson));
     if let Some(sid) = get_session_id(session_id) {
@@ -281,7 +282,7 @@ pub async fn handle_track_tool(
     session_id: Option<String>,
     format: Option<OutputFormat>,
 ) -> Result<()> {
-    validate::reject_control_chars(&tool, "tool")?;
+    validate::validate_single_line_text(&tool, "tool")?;
 
     let structured = matches!(format, Some(OutputFormat::Json | OutputFormat::Ndjson));
     if let Some(sid) = get_session_id(session_id) {

@@ -724,8 +724,7 @@ pub(crate) fn validate_request_fields(
     request: &DaemonRequest,
 ) -> Result<(), crate::validate::ValidationError> {
     use crate::validate::{
-        reject_control_chars, validate_multiline_text, validate_session_id,
-        validate_single_line_text, validate_tool_id,
+        reject_control_chars, validate_session_id, validate_single_line_text, validate_tool_id,
     };
 
     if let DaemonRequest::EndSession { session_id, .. }
@@ -747,7 +746,7 @@ pub(crate) fn validate_request_fields(
         validate_single_line_text(tool_name, "tool_name")?;
     }
     if let DaemonRequest::EndSession { summary, .. } = request {
-        validate_multiline_text(summary, "summary")?;
+        reject_control_chars(summary, "summary")?;
     }
     if let DaemonRequest::DescribeTool { name } | DaemonRequest::InvokeTool { name, .. } = request {
         validate_tool_id(name)?;
@@ -2080,24 +2079,31 @@ pub(crate) async fn handle_agent_request(
     // detect_delegation_events, and aggregate_pane_summaries.
     let coordination = agent.coordinate_full(&insights);
 
-    let full_prompt = match context {
-        Some(ctx) => format!("Context:\n{}\n\nRequest:\n{}", ctx, prompt),
-        None => prompt,
+    let full_prompt = match &context {
+        Some(ctx) => format!("Context:\n{ctx}\n\nRequest:\n{prompt}"),
+        None => prompt.clone(),
     };
 
     // Use query_with_context when insights are available to enrich the prompt
     // with structured cross-pane context from the context lifecycle. The
     // agent-turn mutex remains held so history updates are ordered.
+    // Either way the history remembers the request, not the context block
+    // wrapped around it.
     let result = if insights.is_empty() {
         agent
-            .query(crate::agent::prompts::COORDINATION_SYSTEM, &full_prompt)
+            .query_remembering(
+                crate::agent::prompts::COORDINATION_SYSTEM,
+                &full_prompt,
+                &prompt,
+            )
             .await
     } else {
         agent
-            .query_with_context(
+            .query_with_context_remembering(
                 crate::agent::prompts::COORDINATION_SYSTEM,
                 &full_prompt,
                 &insights,
+                &prompt,
             )
             .await
     };
@@ -3532,6 +3538,16 @@ mod request_validation_tests {
         for request in requests {
             assert!(validate_request_fields(&request).is_err(), "{request:?}");
         }
+    }
+
+    /// Verification round on aebc335: a session name took bidi controls.
+    #[test]
+    fn test_rejects_bidi_controls_in_session_names() {
+        let request = DaemonRequest::CreateSession {
+            name: "build \u{202E}sdrawkcab".to_string(),
+            platform: None,
+        };
+        assert!(validate_request_fields(&request).is_err());
     }
 
     #[test]

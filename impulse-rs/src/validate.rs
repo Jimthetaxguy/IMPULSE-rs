@@ -51,10 +51,11 @@ impl ValidationError {
 
 // ─── Validators ─────────────────────────────────────────────────────────────
 
-/// Reject ASCII control characters (< 0x20 except \n, \r, \t).
+/// Reject control characters (except \n, \r, \t) and Unicode bidi
+/// controls, which make stored text display differently from what it is.
 pub fn reject_control_chars(input: &str, field: &'static str) -> Result<(), ValidationError> {
     for ch in input.chars() {
-        if ch.is_control() && ch != '\n' && ch != '\r' && ch != '\t' {
+        if (ch.is_control() && ch != '\n' && ch != '\r' && ch != '\t') || is_bidi_control(ch) {
             return Err(ValidationError::ControlChars { field });
         }
     }
@@ -74,16 +75,6 @@ pub fn validate_single_line_text(input: &str, field: &'static str) -> Result<(),
         .chars()
         .any(|ch| ch.is_control() || is_bidi_control(ch))
     {
-        return Err(ValidationError::ControlChars { field });
-    }
-    Ok(())
-}
-
-/// [`reject_control_chars`] plus bidi controls: for free text that may span
-/// lines, such as a session summary.
-pub fn validate_multiline_text(input: &str, field: &'static str) -> Result<(), ValidationError> {
-    reject_control_chars(input, field)?;
-    if input.chars().any(is_bidi_control) {
         return Err(ValidationError::ControlChars { field });
     }
     Ok(())

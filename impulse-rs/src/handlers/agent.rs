@@ -28,6 +28,20 @@ pub fn handle_agent_configure(
              (for example ANTHROPIC_API_KEY) or keep it with `impulse-rs credentials set`"
         );
     }
+    // Every value is applied to a copy first, with the same rules
+    // `set_config` uses, so a refused command writes nothing (an invalid
+    // --harness used to leave --provider and --model already saved).
+    let mut check = state.config_snapshot()?;
+    if let Some(p) = &provider {
+        if !check.set("impulse_agent_provider", p) {
+            anyhow::bail!("Invalid provider: {p} (use: anthropic, openai, minimax)");
+        }
+    }
+    if let Some(h) = &harness {
+        if !check.set("impulse_agent_harness", h) {
+            anyhow::bail!("Invalid harness: {h} (use: claude-code, opencode)");
+        }
+    }
     if let Some(ref p) = provider {
         if state.set_config("impulse_agent_provider", p)? {
             println!("Set impulse_agent_provider = {}", p);
@@ -246,6 +260,26 @@ mod tests {
         let config = st.config_snapshot().unwrap();
         // Invalid provider should not be stored
         assert!(config.impulse_agent_provider.is_none());
+    }
+
+    /// Verification round on aebc335: an invalid --harness left the
+    /// provider and model it came with already saved.
+    #[test]
+    fn test_handle_agent_configure_invalid_harness_changes_nothing() {
+        let (_tmp, st) = test_state();
+        let result = handle_agent_configure(
+            &st,
+            Some("openai".to_string()),
+            None,
+            Some("gpt-x".to_string()),
+            Some("bogus-harness".to_string()),
+            false,
+            false,
+        );
+        assert!(result.unwrap_err().to_string().contains("Invalid harness"));
+        let config = st.config_snapshot().unwrap();
+        assert!(config.impulse_agent_provider.is_none());
+        assert!(config.impulse_agent_model.is_none());
     }
 
     /// Refutation review of 99e858a: the provider was saved before

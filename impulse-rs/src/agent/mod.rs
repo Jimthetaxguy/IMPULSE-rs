@@ -814,6 +814,19 @@ impl ImpulseAgent {
         user_prompt: &str,
         insights: &[ExtractedInsight],
     ) -> AgentResult<String> {
+        self.query_with_context_remembering(system_prompt, user_prompt, insights, user_prompt)
+            .await
+    }
+
+    /// [`Self::query_with_context`], recording `remembered` as the turn's
+    /// question; see [`Self::query_remembering`].
+    pub async fn query_with_context_remembering(
+        &mut self,
+        system_prompt: &str,
+        user_prompt: &str,
+        insights: &[ExtractedInsight],
+        remembered: &str,
+    ) -> AgentResult<String> {
         // Build text-enriched prompt (used for both API and --print fallback)
         let context_block = prompts::build_context_prompt(insights);
         let enriched_prompt = if context_block.is_empty() {
@@ -842,13 +855,13 @@ impl ImpulseAgent {
                     )
                     .await?;
 
-                self.record_turn(user_prompt, &resp.content);
+                self.record_turn(remembered, &resp.content);
                 Ok(resp.content)
             }
             _ => {
                 // API and Disabled modes: text-only enrichment, remembering
                 // the question as the harness path above does.
-                self.query_remembering(system_prompt, &enriched_prompt, user_prompt)
+                self.query_remembering(system_prompt, &enriched_prompt, remembered)
                     .await
             }
         }
@@ -1354,6 +1367,26 @@ mod tests {
             "the follow-up must carry the previous question: {}",
             requests[1]
         );
+    }
+
+    /// Verification round on 88fef92: AgentAssist with a context string
+    /// still remembered the wrapper ("Context:"), not the request.
+    #[tokio::test]
+    async fn test_a_follow_up_after_query_with_context_sees_the_request() {
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = ImpulseAgent::with_test_provider(Box::new(ContentRecordingProvider {
+            requests: std::sync::Arc::clone(&requests),
+        }));
+        let wrapped = format!("Context:\n{}\n\nRequest:\nREQUEST-MARKER", "x".repeat(500));
+        agent
+            .query_with_context_remembering("system", &wrapped, &[], "REQUEST-MARKER")
+            .await
+            .expect("first turn");
+        agent
+            .query("system", "a follow-up")
+            .await
+            .expect("second turn");
+        assert!(requests.lock().unwrap()[1].contains("REQUEST-MARKER"));
     }
 
     #[tokio::test]

@@ -70,20 +70,26 @@ pub(crate) fn decide_pre_tool_use(payload: &str, guards: &guardrail::GuardConfig
         "Bash" => ("bash", required("command")),
         "Write" => ("file", required("content")),
         "Edit" => ("file", required("new_string")),
+        // Every edit must carry its new text; one without it is a payload
+        // this guard does not understand.
         "MultiEdit" => (
             "file",
-            input["edits"].as_array().map(|edits| {
+            input["edits"].as_array().and_then(|edits| {
                 edits
                     .iter()
-                    .filter_map(|edit| edit["new_string"].as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                    .map(|edit| edit["new_string"].as_str())
+                    .collect::<Option<Vec<_>>>()
+                    .map(|texts| texts.join("\n"))
             }),
         ),
-        // A cell deletion carries no source; there is nothing to check.
+        // A cell deletion carries no source and there is nothing to check;
+        // a source that is not text is not understood.
         "NotebookEdit" => (
             "file",
-            Some(input["new_source"].as_str().unwrap_or_default().to_string()),
+            match input.get("new_source") {
+                None | Some(serde_json::Value::Null) => Some(String::new()),
+                Some(source) => source.as_str().map(str::to_string),
+            },
         ),
         _ => return HookDecision::allow(None),
     };
@@ -125,6 +131,16 @@ pub fn run_guard_hook(impulse_dir: &Path) -> ! {
 }
 
 fn guard_hook_decision(impulse_dir: &Path) -> HookDecision {
+    // The installed hook names `$CLAUDE_PROJECT_DIR/.impulse`; with that
+    // variable unset it names `/.impulse`, which has no config, and a missing
+    // config used to mean "defaults", dropping the project's own rules.
+    if !impulse_dir.is_dir() {
+        return HookDecision::block(format!(
+            "Impulse guard found no {} (is CLAUDE_PROJECT_DIR set, and has `impulse-rs init` \
+             run?); the call is blocked",
+            impulse_dir.display()
+        ));
+    }
     let config = match storage::Storage::new(impulse_dir.to_path_buf())
         .read_json::<state::Config>("config.json")
     {
@@ -471,6 +487,24 @@ mod tests {
         }
         let read = r#"{"tool_name": "Read", "tool_input": {"file_path": "a.txt"}}"#;
         assert_eq!(decide_pre_tool_use(read, &guards).exit_code, 0);
+    }
+
+    /// Verification round on 385b4ea: these were skipped, not blocked.
+    #[test]
+    fn test_hook_blocks_edits_missing_their_text_and_a_missing_impulse_dir() {
+        let guards = guardrail::GuardConfig::default();
+        for payload in [
+            r#"{"tool_name": "MultiEdit", "tool_input": {"edits": [{"old_string": "a"}]}}"#,
+            r#"{"tool_name": "NotebookEdit", "tool_input": {"new_source": ["x"]}}"#,
+        ] {
+            assert_eq!(
+                decide_pre_tool_use(payload, &guards).exit_code,
+                2,
+                "{payload}"
+            );
+        }
+        let missing = std::path::Path::new("/definitely/not/a/project/.impulse");
+        assert_eq!(guard_hook_decision(missing).exit_code, 2);
     }
 
     #[test]
