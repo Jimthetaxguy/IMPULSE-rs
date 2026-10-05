@@ -221,9 +221,31 @@ impl Storage {
         }
         #[cfg(not(unix))]
         let _ = unix_mode;
-        let mut file = options
+        // `create_new` means a failed open created nothing, so there is no
+        // temp file to clean up yet.
+        let file = options
             .open(&temp_path)
             .with_context(|| format!("Failed to create temp file {:?}", temp_path))?;
+        let written = Self::fill_and_rename(file, &temp_path, path, content, unix_mode);
+        if written.is_err() {
+            // A failed write, sync, or rename used to leave the temp file
+            // behind next to the target.
+            let _ = fs::remove_file(&temp_path);
+        }
+        written
+    }
+
+    /// Writes `content` to the open temp file, syncs it, and renames it over
+    /// `path`. The directory is synced afterwards so the rename itself
+    /// survives a crash; that step is best effort, since some filesystems
+    /// refuse to sync a directory and the rename has already taken effect.
+    fn fill_and_rename(
+        mut file: fs::File,
+        temp_path: &Path,
+        path: &Path,
+        content: &[u8],
+        unix_mode: Option<u32>,
+    ) -> Result<()> {
         #[cfg(unix)]
         if let Some(mode) = unix_mode {
             // `open(mode)` is filtered through the process umask. Tighten or
@@ -231,13 +253,21 @@ impl Storage {
             file.set_permissions(fs::Permissions::from_mode(mode))
                 .with_context(|| format!("Failed to restrict temp file {:?}", temp_path))?;
         }
+        #[cfg(not(unix))]
+        let _ = unix_mode;
         file.write_all(content)
             .with_context(|| format!("Failed to write temp file {:?}", temp_path))?;
         file.sync_all()
             .with_context(|| format!("Failed to sync temp file {:?}", temp_path))?;
         drop(file);
-        fs::rename(&temp_path, path)
+        fs::rename(temp_path, path)
             .with_context(|| format!("Failed to rename {:?} to {:?}", temp_path, path))?;
+        #[cfg(unix)]
+        if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+            if let Ok(dir) = fs::File::open(dir) {
+                let _ = dir.sync_all();
+            }
+        }
         Ok(())
     }
 
@@ -290,6 +320,38 @@ mod tests {
     use super::*;
     use serde::Deserialize;
     use tempfile::TempDir;
+
+    /// Review P3-2: a failed rename left the temp file next to the target.
+    #[test]
+    fn test_atomic_write_path_removes_its_temp_file_when_the_write_fails() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // A non-empty directory where the file should go makes the rename fail.
+        let target = dir.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("keep"), b"x").unwrap();
+
+        assert!(Storage::atomic_write_path(&target, b"content").is_err());
+        let leftovers = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "target")
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn test_atomic_write_path_replaces_the_file_and_leaves_no_temp() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("state.json");
+        fs::write(&target, b"old").unwrap();
+
+        Storage::atomic_write_path(&target, b"new").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 
     #[test]
     fn test_storage_new() {
