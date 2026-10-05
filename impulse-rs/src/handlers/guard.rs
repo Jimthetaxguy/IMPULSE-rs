@@ -125,9 +125,12 @@ pub(crate) fn decide_pre_tool_use(payload: &str, guards: &guardrail::GuardConfig
 /// started in a subdirectory names one that does not exist while the
 /// project's own sits higher up, and the built-in rules alone would skip the
 /// project's custom Block rules, so the nearest enclosing one counts, up to
-/// the repository root (the nearest directory holding `.git`). An `.impulse`
-/// above the repository, such as a user-level one, never counts; outside a
-/// repository only the named directory does.
+/// the repository root (see [`holds_git_repository`]). An `.impulse` above
+/// the repository root never counts, so a user-level one does not either
+/// unless the home directory is itself a repository; outside a repository
+/// only the named directory counts. The nearest one wins, as a nested
+/// project's own config should; a worktree's or submodule's `.git` file ends
+/// the search, since it is a checkout of its own.
 ///
 /// With none found, a set `CLAUDE_PROJECT_DIR` means the project has no rules
 /// of its own yet: the built-in rules apply, so `impulse-rs init` can run.
@@ -144,7 +147,7 @@ fn guard_impulse_dir(
         .file_name()
         .zip(named.parent())
         .and_then(|(name, start)| {
-            let root = start.ancestors().find(|dir| dir.join(".git").exists())?;
+            let root = start.ancestors().find(|dir| holds_git_repository(dir))?;
             start
                 .ancestors()
                 .take_while(|dir| dir.starts_with(root))
@@ -162,6 +165,21 @@ fn guard_impulse_dir(
          and {} does not exist; the call is blocked",
         impulse_dir.display()
     )))
+}
+
+/// Whether `dir` is the root of a git checkout: a `.git` directory with a
+/// `HEAD`, or a `.git` file pointing at one (`gitdir: ...`, as a worktree or
+/// submodule has). Any `.git` entry used to count, so an empty `.git` file in
+/// a subdirectory cut the search short of the project's own `.impulse`.
+fn holds_git_repository(dir: &Path) -> bool {
+    let marker = dir.join(".git");
+    if marker.is_dir() {
+        return marker.join("HEAD").is_file();
+    }
+    let mut prefix = [0u8; 7];
+    std::fs::File::open(&marker)
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut prefix))
+        .is_ok_and(|()| &prefix == b"gitdir:")
 }
 
 /// Runs `impulse-rs guard --hook` and exits. It reads only `config.json`'s
@@ -574,6 +592,7 @@ mod tests {
     fn test_guard_impulse_dir_finds_the_projects_own_from_a_subdirectory() {
         let project = TempDir::new().unwrap();
         std::fs::create_dir(project.path().join(".git")).unwrap();
+        std::fs::write(project.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         std::fs::create_dir(project.path().join(".impulse")).unwrap();
         let deep = project.path().join("src").join("deep");
         std::fs::create_dir_all(&deep).unwrap();
@@ -587,6 +606,29 @@ mod tests {
         assert_eq!(guard_impulse_dir(&named, None).ok(), Some(own));
     }
 
+    /// Round 4 (reviewer A): any `.git` entry ended the search, so an empty
+    /// `.git` file in a subdirectory hid the project's own `.impulse`.
+    #[test]
+    fn test_guard_impulse_dir_needs_a_real_repository_root() {
+        let project = TempDir::new().unwrap();
+        std::fs::create_dir(project.path().join(".git")).unwrap();
+        std::fs::write(project.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir(project.path().join(".impulse")).unwrap();
+        let deep = project.path().join("c").join("deep");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(project.path().join("c/.git"), "").unwrap();
+        let named = deep.join(".impulse");
+        assert_eq!(
+            guard_impulse_dir(&named, deep.to_str()).ok(),
+            Some(project.path().join(".impulse"))
+        );
+        assert!(holds_git_repository(project.path()));
+        assert!(!holds_git_repository(&project.path().join("c")));
+        // A worktree's or submodule's `.git` file does end the search.
+        std::fs::write(project.path().join("c/.git"), "gitdir: /elsewhere\n").unwrap();
+        assert!(holds_git_repository(&project.path().join("c")));
+    }
+
     #[test]
     fn test_guard_impulse_dir_never_looks_past_the_repository_root() {
         // An `.impulse` above the repository, such as a user-level one, is
@@ -597,6 +639,7 @@ mod tests {
         let src = repo.join("src");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::create_dir(repo.join(".git")).unwrap();
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         let named = src.join(".impulse");
         assert_eq!(
             guard_impulse_dir(&named, src.to_str()).ok(),
