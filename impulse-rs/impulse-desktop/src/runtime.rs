@@ -1245,8 +1245,9 @@ impl DesktopRuntime {
             match running {
                 Ok(updated) => {
                     if let Err(validation_error) = validate_running_task(&updated, task) {
+                        // Open the gate before killing (see below).
+                        launch_callback_gate.open();
                         if let Err(termination_error) = backend.kill() {
-                            launch_callback_gate.open();
                             return Err(DesktopBridgeError::GovernedTaskFailed {
                                 message: format!(
                                     "{validation_error}; PTY termination could not be confirmed, so no exit state was recorded: {termination_error}"
@@ -1259,7 +1260,6 @@ impl DesktopRuntime {
                             "daemon returned an invalid running acknowledgment",
                         )
                         .err();
-                        launch_callback_gate.open();
                         return Err(DesktopBridgeError::GovernedTaskFailed {
                             message: match abort_error {
                                 Some(abort_error) => format!(
@@ -1272,8 +1272,13 @@ impl DesktopRuntime {
                     governed_task = Some(updated);
                 }
                 Err(error) => {
+                    // Open the gate before killing. The callbacks parked on
+                    // it find no runtime record (none is installed yet) and
+                    // return, and the reader they release drains the PTY,
+                    // which a killed child may need before it can finish
+                    // exiting; killing first could wait on that forever.
+                    launch_callback_gate.open();
                     if let Err(termination_error) = backend.kill() {
-                        launch_callback_gate.open();
                         return Err(DesktopBridgeError::GovernedTaskFailed {
                             message: format!(
                                 "mark task running after PTY creation: {error}; PTY termination could not be confirmed, so no exit state was recorded: {termination_error}"
@@ -1286,7 +1291,6 @@ impl DesktopRuntime {
                         "runtime started but daemon running acknowledgment failed",
                     )
                     .err();
-                    launch_callback_gate.open();
                     return Err(DesktopBridgeError::GovernedTaskFailed {
                         message: match abort_error {
                             Some(abort_error) => format!(
@@ -1603,18 +1607,32 @@ impl DesktopRuntime {
     }
 
     pub fn close_agent(&self, request: TerminalCloseRequest) -> Result<(), DesktopBridgeError> {
+        // The record leaves the runtime under the ordering lock, so none of
+        // this pane's output is delivered after it, but the kill runs outside
+        // the lock. Every pane's output callback takes that lock, and a kill
+        // takes a while (portable-pty waits up to 200 ms after SIGHUP, longer
+        // for a child that cannot finish exiting), during which output and
+        // lifecycle calls froze in every other pane.
+        let record = {
+            let _lifecycle_guard = self
+                .inner
+                .lifecycle_events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.lock_state().agents.remove(&request.session_id).ok_or(
+                DesktopBridgeError::MissingTerminalSession {
+                    session_id: request.session_id.clone(),
+                },
+            )?
+        };
+        let governed_task = record.governed_task.clone();
+        let killed = record.backend.kill();
         let lifecycle_guard = self
             .inner
             .lifecycle_events
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let record = self.lock_state().agents.remove(&request.session_id).ok_or(
-            DesktopBridgeError::MissingTerminalSession {
-                session_id: request.session_id.clone(),
-            },
-        )?;
-        let governed_task = record.governed_task.clone();
-        if let Err(error) = record.backend.kill() {
+        if let Err(error) = killed {
             self.lock_state()
                 .agents
                 .insert(request.session_id.clone(), record);
@@ -4605,6 +4623,59 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("snapshot and close must not wait on the blocked write");
         assert_eq!(count, 1);
+    }
+
+    /// Review finding: `close_agent` held the lifecycle ordering lock while
+    /// it killed the pane, and every pane's output callback takes that lock,
+    /// so one slow kill froze output and lifecycle calls in every pane.
+    /// portable-pty waits about 200 ms after SIGHUP before it sends SIGKILL,
+    /// so a pane that ignores SIGHUP is a slow kill; closing an ordinary
+    /// pane meanwhile must not wait for it.
+    #[cfg(unix)]
+    #[test]
+    fn test_close_does_not_hold_the_lifecycle_lock_while_killing() {
+        let runtime = DesktopRuntime::default();
+        let mut slow = spawn_request(24, 80, Some("sh"));
+        slow.args = vec!["-c".to_string(), "trap '' HUP; sleep 60".to_string()];
+        runtime
+            .spawn_agent(slow)
+            .expect("spawn a pane that ignores SIGHUP");
+        let mut quick = spawn_request(24, 80, Some("sh"));
+        quick.agent_id = Some("agent-2".to_string());
+        quick.session_id = Some("agent-2-session".to_string());
+        quick.args = vec!["-c".to_string(), "sleep 60".to_string()];
+        runtime.spawn_agent(quick).expect("spawn an ordinary pane");
+        // Let the first shell install its trap.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let (sent, finished) = std::sync::mpsc::channel();
+        let slow_close = {
+            let runtime = runtime.clone();
+            let sent = sent.clone();
+            std::thread::spawn(move || {
+                runtime
+                    .close_agent(TerminalCloseRequest {
+                        session_id: "agent-1".to_string(),
+                    })
+                    .expect("close the slow pane");
+                let _ = sent.send("agent-1");
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        runtime
+            .close_agent(TerminalCloseRequest {
+                session_id: "agent-2".to_string(),
+            })
+            .expect("close the ordinary pane");
+        let _ = sent.send("agent-2");
+        let first = finished
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a close finished");
+        slow_close.join().expect("slow close thread");
+        assert_eq!(
+            first, "agent-2",
+            "closing the ordinary pane waited for the slow kill"
+        );
     }
 
     #[test]
