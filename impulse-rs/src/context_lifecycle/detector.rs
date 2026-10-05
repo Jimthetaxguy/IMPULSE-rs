@@ -22,8 +22,22 @@ impl CompactionDetector {
     /// Scan a screen buffer's text content for compaction patterns.
     /// Returns true if a compaction event was detected.
     pub fn scan(text: &str) -> bool {
-        let lower = text.to_lowercase();
-        COMPACTION_PATTERNS.iter().any(|pat| lower.contains(pat))
+        !Self::compaction_lines(text).is_empty()
+    }
+
+    /// The lines of `text` that announce a compaction. Claude Code's status
+    /// line counting down to one ("Context left until auto-compact: 9%")
+    /// announces nothing yet.
+    fn compaction_lines(text: &str) -> Vec<String> {
+        text.lines()
+            .map(str::trim)
+            .filter(|line| {
+                let lower = line.to_lowercase();
+                !lower.contains("until auto-compact")
+                    && COMPACTION_PATTERNS.iter().any(|pat| lower.contains(pat))
+            })
+            .map(str::to_string)
+            .collect()
     }
 
     /// Check a pane's screen output for compaction, respecting debounce.
@@ -41,7 +55,16 @@ impl CompactionDetector {
         }
         state.last_compaction_scan_at = Some(Instant::now());
 
-        if Self::scan(screen_text) {
+        // A compaction line still on screen from the last scan is the same
+        // compaction seen again; it used to count again on every scan, each
+        // time resetting the estimate and injecting context.
+        let lines = Self::compaction_lines(screen_text);
+        let new_compaction = lines
+            .iter()
+            .any(|line| !state.last_compaction_lines.contains(line));
+        state.last_compaction_lines = lines;
+
+        if new_compaction {
             state.compaction_count += 1;
             // Reset estimated tokens to 10% of window (agent has freed context)
             state.estimated_tokens = window_tokens / 10;
@@ -162,5 +185,44 @@ mod tests {
         let action =
             CompactionDetector::check_pane(&mut state, "compressing prior messages", 200_000);
         assert!(action.is_none());
+    }
+
+    /// Scans `text` as if the debounce had passed.
+    fn scan_after_debounce(state: &mut PaneContextState, text: &str) -> bool {
+        state.last_compaction_scan_at = None;
+        CompactionDetector::check_pane(state, text, 200_000).is_some()
+    }
+
+    /// Review finding: one compaction message left on screen counted again
+    /// on every scan, resetting the token estimate and injecting each time.
+    #[test]
+    fn test_check_pane_counts_each_compaction_line_once() {
+        let mut state = PaneContextState::new(1, AgentKind::ClaudeCode);
+        let screen = "prompt\nCompacted conversation to save space\n";
+        assert!(scan_after_debounce(&mut state, screen));
+        assert!(!scan_after_debounce(&mut state, screen));
+        assert!(!scan_after_debounce(&mut state, screen));
+        assert_eq!(state.compaction_count, 1);
+
+        // A second compaction prints a line that was not there before.
+        let later = "Compacted conversation to save space\nmore work\nauto-compact triggered\n";
+        assert!(scan_after_debounce(&mut state, later));
+        assert_eq!(state.compaction_count, 2);
+    }
+
+    /// The status line counting down to auto-compaction is not a compaction.
+    #[test]
+    fn test_scan_ignores_the_countdown_to_auto_compact() {
+        assert!(!CompactionDetector::scan(
+            "Context left until auto-compact: 9%"
+        ));
+        let mut state = PaneContextState::new(1, AgentKind::ClaudeCode);
+        for _ in 0..3 {
+            assert!(!scan_after_debounce(
+                &mut state,
+                "Context left until auto-compact: 9%"
+            ));
+        }
+        assert_eq!(state.compaction_count, 0);
     }
 }
