@@ -1255,7 +1255,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         handlers::system::install_hook_templates(tmp.path(), "all").unwrap();
         let claude = std::fs::read_to_string(tmp.path().join(".claude/hooks/hooks.json")).unwrap();
-        assert!(claude.contains("impulse-rs guard --hook"), "{claude}");
+        assert!(claude.contains("guard --hook"), "{claude}");
         assert!(tmp.path().join(".opencode/impulse.json").exists());
     }
 

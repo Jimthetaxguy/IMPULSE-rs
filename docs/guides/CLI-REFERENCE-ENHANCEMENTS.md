@@ -122,9 +122,9 @@ impulse-rs orchestrate --task "add feature" --auto-handoff
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash|Write|Edit|MultiEdit",
+        "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit",
         "hooks": [
-          { "type": "command", "command": "impulse-rs guard --hook" }
+          { "type": "command", "command": "impulse-rs -c \"$CLAUDE_PROJECT_DIR/.impulse\" guard --hook" }
         ]
       }
     ]

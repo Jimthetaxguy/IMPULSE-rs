@@ -156,13 +156,16 @@ and sends the call as JSON on stdin, so every call was evaluated as an empty str
 consequence above, "blocking provides real protection", did not hold.
 
 - `impulse-rs guard --hook` reads the PreToolUse payload from stdin, checks Bash commands against
-  `bash` rules and Write, Edit, and MultiEdit content against `file-write` rules, and exits 2 on a
-  Block-tier match with the rule's reason on stderr. Warn-tier matches print and exit 0.
-- It fails closed: a payload it cannot read, or a `config.json` it cannot load, exits 2. It runs
+  `bash` rules and Write, Edit, MultiEdit, and NotebookEdit content against `file-write` rules, and
+  exits 2 on a Block-tier match with the rule's reason on stderr. Warn-tier matches print and exit 0.
+- It fails closed: a payload it cannot read, one with no `tool_name`, a checked tool missing the
+  field it checks, or a `config.json` it cannot load, exits 2. It runs
   before the daemon client and before `State::new`, so neither can turn into an "allow" exit.
 - `impulse-rs guard --action ...` keeps exit 1 for scripts.
-- The generated PreToolUse entry is `impulse-rs guard --hook` with matcher
-  `Bash|Write|Edit|MultiEdit`. `impulse-rs hooks` still writes the template to
+- The generated PreToolUse entry is `impulse-rs -c "$CLAUDE_PROJECT_DIR/.impulse" guard --hook`
+  with matcher `Bash|Write|Edit|MultiEdit|NotebookEdit`. Anchoring on the project matters: Claude
+  Code can run the hook from a subdirectory, where a relative `.impulse` has no `config.json`, so
+  custom rules silently fell back to the built-in set. `impulse-rs hooks` still writes the template to
   `.claude/hooks/hooks.json` and prints the entry to add to `.claude/settings.local.json`; the
   template's session-tracking hooks are not installed, because they also rely on variables Claude
   Code does not set.

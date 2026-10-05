@@ -42,11 +42,14 @@ pub(crate) fn build_claude_hook_config() -> serde_json::Value {
         "hooks": {
             "PreToolUse": [
                 {
-                    "matcher": "Bash|Write|Edit|MultiEdit",
+                    "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit",
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "impulse-rs guard --hook"
+                            // Anchored on the project: Claude Code may run the
+                            // hook from a subdirectory, where a relative
+                            // `.impulse` misses config.json and its custom rules.
+                            "command": "impulse-rs -c \"$CLAUDE_PROJECT_DIR/.impulse\" guard --hook"
                         }
                     ]
                 }
@@ -344,7 +347,7 @@ mod hook_config_tests {
             })
             .expect("PreToolUse must match Bash");
         let matcher = guard["matcher"].as_str().unwrap();
-        for tool in ["Write", "Edit", "MultiEdit"] {
+        for tool in ["Write", "Edit", "MultiEdit", "NotebookEdit"] {
             assert!(
                 matcher.split('|').any(|t| t == tool),
                 "{matcher} misses {tool}"
@@ -354,7 +357,10 @@ mod hook_config_tests {
         // 2; `$INPUT` is not a variable it defines (the old command always
         // evaluated an empty string).
         let guard_cmd = guard["hooks"][0]["command"].as_str().unwrap();
-        assert_eq!(guard_cmd, "impulse-rs guard --hook");
+        assert_eq!(
+            guard_cmd,
+            "impulse-rs -c \"$CLAUDE_PROJECT_DIR/.impulse\" guard --hook"
+        );
         assert!(!serde_json::to_string(pre_tool_use)
             .unwrap()
             .contains("$INPUT"));

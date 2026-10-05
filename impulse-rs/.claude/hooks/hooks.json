@@ -33,11 +33,11 @@
       {
         "hooks": [
           {
-            "command": "impulse-rs guard --hook",
+            "command": "impulse-rs -c \"$CLAUDE_PROJECT_DIR/.impulse\" guard --hook",
             "type": "command"
           }
         ],
-        "matcher": "Bash|Write|Edit|MultiEdit"
+        "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit"
       }
     ],
     "SessionEnd": [

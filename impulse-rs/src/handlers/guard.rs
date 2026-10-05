@@ -43,9 +43,10 @@ impl HookDecision {
 
 /// Decides one PreToolUse call from Claude Code's stdin payload
 /// (`{"tool_name": ..., "tool_input": {...}}`). Bash commands are checked
-/// against `bash` rules; Write, Edit, and MultiEdit content against
-/// `file-write` rules. Other tools pass. The guard fails closed: a payload
-/// it cannot read, or rules it cannot evaluate, block the call.
+/// against `bash` rules; Write, Edit, MultiEdit, and NotebookEdit content
+/// against `file-write` rules. Other tools pass. The guard fails closed: a
+/// payload it cannot read, one with no tool name, a checked tool missing the
+/// field it checks, or rules it cannot evaluate, block the call.
 pub(crate) fn decide_pre_tool_use(payload: &str, guards: &guardrail::GuardConfig) -> HookDecision {
     let call: serde_json::Value = match serde_json::from_str(payload) {
         Ok(call) => call,
@@ -55,26 +56,41 @@ pub(crate) fn decide_pre_tool_use(payload: &str, guards: &guardrail::GuardConfig
             ))
         }
     };
+    let Some(tool_name) = call["tool_name"].as_str() else {
+        return HookDecision::block(
+            "Impulse guard got a PreToolUse payload with no tool_name; the call is blocked"
+                .to_string(),
+        );
+    };
     let input = &call["tool_input"];
-    let text = |field: &str| input[field].as_str().unwrap_or_default().to_string();
-    let (target, action) = match call["tool_name"].as_str().unwrap_or_default() {
-        "Bash" => ("bash", text("command")),
-        "Write" => ("file", text("content")),
-        "Edit" => ("file", text("new_string")),
+    // A checked tool without the field it checks is a payload this guard does
+    // not understand, not an empty one.
+    let required = |field: &str| input[field].as_str().map(str::to_string);
+    let (target, action) = match tool_name {
+        "Bash" => ("bash", required("command")),
+        "Write" => ("file", required("content")),
+        "Edit" => ("file", required("new_string")),
         "MultiEdit" => (
             "file",
-            input["edits"]
-                .as_array()
-                .map(|edits| {
-                    edits
-                        .iter()
-                        .filter_map(|edit| edit["new_string"].as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
-                .unwrap_or_default(),
+            input["edits"].as_array().map(|edits| {
+                edits
+                    .iter()
+                    .filter_map(|edit| edit["new_string"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }),
+        ),
+        // A cell deletion carries no source; there is nothing to check.
+        "NotebookEdit" => (
+            "file",
+            Some(input["new_source"].as_str().unwrap_or_default().to_string()),
         ),
         _ => return HookDecision::allow(None),
+    };
+    let Some(action) = action else {
+        return HookDecision::block(format!(
+            "Impulse guard could not find the {tool_name} input it checks; the call is blocked"
+        ));
     };
     match guardrail::evaluate_action(&action, target, guards) {
         Err(error) => HookDecision::block(format!(
@@ -166,7 +182,13 @@ fn set_rule_enabled(rules: &mut Vec<guardrail::GuardRule>, rule_id: &str, enable
     let builtin = guardrail::defaults::builtin_rules()
         .iter()
         .any(|rule| rule.id == rule_id);
-    if !builtin {
+    // A user's own rule under a built-in id (an override with its own
+    // pattern) is toggled in place too; only the empty placeholder below is
+    // added and removed.
+    let user_rule = rules
+        .iter()
+        .any(|rule| rule.id == rule_id && !rule.pattern.is_empty());
+    if !builtin || user_rule {
         for rule in rules.iter_mut().filter(|rule| rule.id == rule_id) {
             rule.enabled = enabled;
         }
@@ -404,6 +426,67 @@ mod tests {
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].pattern, custom_rule().pattern);
         assert!(blocks(&rules, "sudo rm x"));
+    }
+
+    /// Refutation review of c2afe88: a user's override of a built-in rule
+    /// (same id, own pattern) was deleted by disable then enable.
+    #[test]
+    fn test_disable_then_enable_keeps_a_users_override_of_a_builtin_rule() {
+        let mut rules = vec![guardrail::GuardRule {
+            id: "block-force-push-main".to_string(),
+            pattern: "custom-pattern".to_string(),
+            action: guardrail::GuardAction::Block,
+            target: guardrail::GuardTarget::Bash,
+            reason: "mine".to_string(),
+            suggestion: None,
+            enabled: true,
+            builtin: false,
+        }];
+        set_rule_enabled(&mut rules, "block-force-push-main", false);
+        assert_eq!(rules.len(), 1);
+        assert!(!rules[0].enabled);
+        set_rule_enabled(&mut rules, "block-force-push-main", true);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].pattern, "custom-pattern");
+        assert!(rules[0].enabled);
+    }
+
+    /// Refutation review of c2afe88: these payloads were allowed (exit 0).
+    #[test]
+    fn test_hook_blocks_payloads_it_does_not_understand() {
+        let guards = guardrail::GuardConfig::default();
+        for payload in [
+            "{}",
+            "null",
+            r#"{"name": "Bash", "input": {"command": "ls"}}"#,
+            r#"{"tool_name": 7}"#,
+            r#"{"tool_name": "Bash", "tool_input": {}}"#,
+            r#"{"tool_name": "Write", "tool_input": {"file_path": "a.txt"}}"#,
+        ] {
+            assert_eq!(
+                decide_pre_tool_use(payload, &guards).exit_code,
+                2,
+                "should block: {payload}"
+            );
+        }
+        let read = r#"{"tool_name": "Read", "tool_input": {"file_path": "a.txt"}}"#;
+        assert_eq!(decide_pre_tool_use(read, &guards).exit_code, 0);
+    }
+
+    #[test]
+    fn test_hook_checks_notebook_cell_source() {
+        let guards = guardrail::GuardConfig::default();
+        let secret = format!("api_key = \"{}\"", "sk-live-0123456789abcdefghijklmnop");
+        let payload = serde_json::json!({
+            "tool_name": "NotebookEdit",
+            "tool_input": {"notebook_path": "a.ipynb", "new_source": secret},
+        })
+        .to_string();
+        // The built-in `block-write-secret` rule blocks this content in a
+        // Write; a notebook cell with it used to pass unchecked.
+        assert_eq!(decide_pre_tool_use(&payload, &guards).exit_code, 2);
+        let deletion = r#"{"tool_name": "NotebookEdit", "tool_input": {"notebook_path": "a.ipynb", "edit_mode": "delete"}}"#;
+        assert_eq!(decide_pre_tool_use(deletion, &guards).exit_code, 0);
     }
 
     #[test]
