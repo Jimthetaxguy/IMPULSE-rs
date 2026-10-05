@@ -77,11 +77,14 @@ pub fn known_tools() -> Vec<CliTool> {
             "claude --version",
             "https://docs.anthropic.com/en/docs/claude-code/overview",
         ),
+        // OpenCode ships on npm as `opencode-ai` (opencode.ai/docs). The
+        // PyPI name `opencode` this used is not OpenCode's: installing or
+        // updating would run whatever package someone published there.
         CliTool::new(
             "opencode",
             "OpenCode",
-            "pip install opencode",
-            "pip install --upgrade opencode",
+            "npm install -g opencode-ai",
+            "npm update -g opencode-ai",
             "opencode --version",
             "https://opencode.ai/docs",
         ),

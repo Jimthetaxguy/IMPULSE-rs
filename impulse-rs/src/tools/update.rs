@@ -1,13 +1,15 @@
 // Update CLI tools - update installed tools to latest versions
 
-use super::init::check_tool_installed;
+use super::init::{check_tool_installed, run_tool_command, INSTALL_TIMEOUT};
 use super::{known_tools, CliTool};
 use anyhow::Result;
-use std::process::Command;
 
 /// Update a specific tool to the latest version
 pub fn update_tool(tool: &CliTool, dry_run: bool) -> Result<(bool, String)> {
-    let (installed, version) = check_tool_installed(tool)?;
+    let (installed, version) = match check_tool_installed(tool) {
+        Ok(status) => status,
+        Err(e) => return Ok((false, format!("version check failed: {e:#}"))),
+    };
 
     if !installed {
         return Ok((false, "not installed".to_string()));
@@ -30,13 +32,17 @@ pub fn update_tool(tool: &CliTool, dry_run: bool) -> Result<(bool, String)> {
         version.unwrap_or_default()
     );
 
-    // SAFETY: update_cmd is sourced from compile-time known_tools() only.
-    let output = Command::new("sh").arg("-c").arg(&tool.update_cmd).output();
+    let output = run_tool_command(&tool.update_cmd, INSTALL_TIMEOUT);
 
     match output {
         Ok(out) => {
             if out.status.success() {
-                let new_version = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                // The updater's output is its own log, not a version; ask
+                // the tool again.
+                let new_version = match check_tool_installed(tool) {
+                    Ok((true, Some(version))) => version,
+                    _ => "an unknown version".to_string(),
+                };
                 println!("  ✓ {} updated to {}", tool.name, new_version);
                 Ok((true, format!("updated to {}", new_version)))
             } else {
@@ -77,22 +83,21 @@ pub fn update_tools(
     Ok(results)
 }
 
-/// Get update status for all installed tools
-pub fn check_updates() -> Result<Vec<(String, String, bool)>> {
+/// The installed tools and their versions (or why the version check
+/// failed). Whether a newer version exists is not checked: that needs each
+/// package manager's registry, and every tool used to be reported "up to
+/// date" without it.
+pub fn check_updates() -> Result<Vec<(String, String)>> {
     let tools = known_tools();
     let mut results = Vec::new();
 
     for tool in tools {
-        let (installed, version) = check_tool_installed(&tool)?;
-
-        if installed {
-            // For now, we just report installed status
-            // In a more advanced version, we could check for updates
-            results.push((
-                tool.id,
-                version.unwrap_or_else(|| "unknown".to_string()),
-                true, // Consider up-to-date for now
-            ));
+        match check_tool_installed(&tool) {
+            Ok((true, version)) => {
+                results.push((tool.id, version.unwrap_or_else(|| "unknown".to_string())));
+            }
+            Ok((false, _)) => {}
+            Err(e) => results.push((tool.id, format!("version check failed: {e:#}"))),
         }
     }
 
@@ -108,5 +113,22 @@ mod tests {
         // Should not error even with no tools
         let result = check_updates();
         assert!(result.is_ok());
+    }
+
+    /// Review finding: `tools update` reported the updater's own output as
+    /// the new version ("updated to Successfully installed ...").
+    #[test]
+    fn test_an_update_reports_the_version_the_tool_now_gives() {
+        let tool = CliTool::new(
+            "fake",
+            "Fake",
+            "true",
+            "echo 'changed 1 package in 2s'",
+            "echo 2.0.0",
+            "https://example.invalid",
+        );
+        let (updated, message) = update_tool(&tool, false).unwrap();
+        assert!(updated);
+        assert_eq!(message, "updated to 2.0.0");
     }
 }
