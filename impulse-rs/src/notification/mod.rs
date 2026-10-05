@@ -560,20 +560,21 @@ pub struct WebhookNotifier {
     client: reqwest::Client,
 }
 
-impl Default for WebhookNotifier {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl WebhookNotifier {
-    pub fn new() -> Self {
+    /// A notifier whose requests time out and never follow redirects.
+    ///
+    /// Following one would either re-send the payload to whatever host the
+    /// redirect names (307, 308) or quietly turn the POST into a body-less
+    /// GET whose 200 reads as delivered (301 to 303). The configured URL is
+    /// the destination, so a redirect is reported as a failed delivery.
+    pub fn new() -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(WEBHOOK_REQUEST_TIMEOUT_SECS))
             .connect_timeout(std::time::Duration::from_secs(WEBHOOK_CONNECT_TIMEOUT_SECS))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-        Self { client }
+            .map_err(|e| format!("Failed to build the webhook client: {e}"))?;
+        Ok(Self { client })
     }
 
     /// Send conflict notification to webhook URL with retry logic
@@ -617,12 +618,21 @@ impl WebhookNotifier {
         webhook_url: &str,
         payload: &ConflictWebhookPayload,
     ) -> Result<(), String> {
-        self.client
+        let response = self
+            .client
             .post(webhook_url)
             .json(payload)
             .send()
             .await
-            .map_err(|e| format!("Request failed: {}", e))?
+            .map_err(|e| format!("Request failed: {}", e))?;
+        if response.status().is_redirection() {
+            return Err(format!(
+                "HTTP {}: the webhook redirected, and redirects are not followed; \
+                 set the webhook URL to the final address",
+                response.status()
+            ));
+        }
+        response
             .error_for_status()
             .map_err(|e| format!("HTTP error: {}", e))?;
 
@@ -659,11 +669,15 @@ pub async fn send_conflict_webhook(
     description: &str,
 ) {
     if let Some(url) = webhook_url {
-        let notifier = WebhookNotifier::new();
-        if let Err(e) = notifier
-            .notify_conflict(url, file_path, panes_involved, description)
-            .await
-        {
+        let result = match WebhookNotifier::new() {
+            Ok(notifier) => {
+                notifier
+                    .notify_conflict(url, file_path, panes_involved, description)
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+        if let Err(e) = result {
             tracing::warn!("Failed to send conflict webhook: {}", e);
         }
     }
@@ -797,7 +811,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_webhook_notifier_creates_client() {
-        let notifier = WebhookNotifier::new();
+        let notifier = WebhookNotifier::new().unwrap();
         // Verify the client can be used to build requests
         let _request = notifier
             .client
@@ -821,11 +835,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_webhook_fails_for_invalid_url() {
-        let notifier = WebhookNotifier::new();
+        let notifier = WebhookNotifier::new().unwrap();
+        // A loopback port nothing listens on refuses at once; a `.local`
+        // name went to mDNS and took about 16 s over the three attempts.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/hook", closed.local_addr().unwrap());
+        drop(closed);
 
         let result = notifier
             .notify_conflict(
-                "http://invalid-domain-that-does-not-exist.local",
+                &url,
                 "/test/file.rs",
                 vec!["pane-1".to_string()],
                 "Test conflict",
@@ -913,5 +932,122 @@ mod tests {
         assert_eq!(recovered.severity, notification.severity);
         assert_eq!(recovered.read, notification.read);
         assert_eq!(recovered.agent_ids, notification.agent_ids);
+    }
+
+    /// What a loopback test server saw of one request.
+    #[derive(Debug, Clone)]
+    struct SeenRequest {
+        method: String,
+        body: String,
+    }
+
+    type SeenLog = std::sync::Arc<tokio::sync::Mutex<Vec<SeenRequest>>>;
+
+    /// Answers one request per connection with the next canned response,
+    /// recording each request's method and body.
+    async fn serve(listener: tokio::net::TcpListener, responses: Vec<String>, seen: SeenLog) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        for response in responses {
+            let Ok((socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut reader = BufReader::new(socket);
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).await.is_err() {
+                return;
+            }
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = value.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            let _ = reader.read_exact(&mut body).await;
+            seen.lock().await.push(SeenRequest {
+                method: request_line
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string(),
+                body: String::from_utf8_lossy(&body).into_owned(),
+            });
+            let mut socket = reader.into_inner();
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        }
+    }
+
+    fn sample_payload() -> ConflictWebhookPayload {
+        ConflictWebhookPayload {
+            event_type: "conflict_detected".to_string(),
+            timestamp: Utc::now(),
+            file_path: "src/lib.rs".to_string(),
+            panes_involved: vec!["pane-1".to_string(), "pane-2".to_string()],
+            description: "Multiple agents modifying same file".to_string(),
+        }
+    }
+
+    const OK_200: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+
+    #[tokio::test]
+    async fn test_webhook_posts_the_payload() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/hook", listener.local_addr().unwrap());
+        let seen = SeenLog::default();
+        let server = tokio::spawn(serve(listener, vec![OK_200.to_string()], seen.clone()));
+
+        let result = WebhookNotifier::new()
+            .unwrap()
+            .send_webhook(&url, &sample_payload())
+            .await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server).await;
+
+        assert_eq!(result, Ok(()));
+        let seen = seen.lock().await;
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].method, "POST");
+        assert!(seen[0].body.contains("conflict_detected"), "{seen:?}");
+    }
+
+    /// Review finding: the client followed redirects. A 301-303 turned the
+    /// POST into a body-less GET whose 200 was reported as delivered, and a
+    /// 307 or 308 re-sent the payload to whatever origin it named.
+    #[tokio::test]
+    async fn test_webhook_redirect_is_a_failed_delivery_and_is_not_followed() {
+        for code in ["301 Moved Permanently", "307 Temporary Redirect"] {
+            let hook = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let other = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let hook_url = format!("http://{}/hook", hook.local_addr().unwrap());
+            let redirect = format!(
+                "HTTP/1.1 {code}\r\nLocation: http://{}/collect\r\nContent-Length: 0\r\n\
+                 Connection: close\r\n\r\n",
+                other.local_addr().unwrap()
+            );
+            let hook_seen = SeenLog::default();
+            let other_seen = SeenLog::default();
+            let hook_server = tokio::spawn(serve(hook, vec![redirect], hook_seen.clone()));
+            let other_server =
+                tokio::spawn(serve(other, vec![OK_200.to_string()], other_seen.clone()));
+
+            let result = WebhookNotifier::new()
+                .unwrap()
+                .send_webhook(&hook_url, &sample_payload())
+                .await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), hook_server).await;
+            other_server.abort();
+
+            let err = result.expect_err("a redirect is not a delivery");
+            assert!(err.contains("redirect"), "{code}: {err}");
+            assert_eq!(hook_seen.lock().await.len(), 1, "{code}");
+            assert!(
+                other_seen.lock().await.is_empty(),
+                "{code}: the redirect target received a request"
+            );
+        }
     }
 }
