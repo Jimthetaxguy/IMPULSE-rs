@@ -169,6 +169,13 @@ consequence above, "blocking provides real protection", did not hold.
   `.claude/hooks/hooks.json` and prints the entry to add to `.claude/settings.local.json`; the
   template's session-tracking hooks are not installed, because they also rely on variables Claude
   Code does not set.
+- The hook finds its `.impulse` the way git finds a repository.
+  - It uses the named directory if it exists. Otherwise it uses the nearest `.impulse` up to the
+    repository root, so a session started in a subdirectory still gets the project's own rules. An
+    `.impulse` above the repository, such as a user-level one, never counts.
+  - With none found and `CLAUDE_PROJECT_DIR` set, the built-in rules apply, so `impulse-rs init`
+    can run.
+  - With the variable unset or blank, the hook cannot tell which project it guards and exits 2.
 
 ## Related ADRs
 

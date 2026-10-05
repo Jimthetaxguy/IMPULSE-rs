@@ -32,9 +32,10 @@ tags: [worktree, lane, handoff, cleanup, review]
   `cargo clippy --workspace --all-targets -- -D warnings` (default and `--no-default-features`),
   `cargo fmt --all -- --check`, `python3 docs/validate_docs.py`
 - Latest status: review pass, adversarial refutation round, and two verification rounds
-  complete. 29 fixes and 3 documentation corrections, 11 commits fixing what the refutation round
-  confirmed, 8 from the first verification round and the recorded items, and 6 from the second
-  round and two more recorded items. Behavior changes carry regression tests, nearly all checked
+  complete, and a third on the second round's fixes. 29 fixes and 3 documentation corrections,
+  11 commits fixing what the refutation round confirmed, 8 from the first verification round and
+  the recorded items, 6 from the second round and two more recorded items, and the third round's
+  fixes below. Behavior changes carry regression tests, nearly all checked
   by reverting the fix and watching the test fail. Gate evidence goes in the PR description. Not
   merged; needs a PR and review.
 
@@ -129,6 +130,43 @@ Two more recorded items are fixed:
   `security` output.
 - `ba9c873`: the voice webhook handles at most 64 connections at once and closes the rest.
 
+Third verification round (against `3c0ba8d`):
+- Reviewer C confirmed both of `84493f1`'s fixes with probes:
+  - a 17 MiB write to a reading pane goes through;
+  - eight concurrent large writers to a stalled pane admit one;
+  - pages of 300 and 1200 matches agree with earlier pages;
+  - putting the old pool formula back reproduced the inconsistency.
+
+  Its one cosmetic suspicion is fixed in `6c48541`: a failed writer's error now comes before the
+  byte cap.
+- Reviewer A confirmed every `d2789af` and `d718b92` item. It found one P2 regression in
+  `d2789af`, fixed in `cf901d5`: Claude Code started in a subdirectory sets `CLAUDE_PROJECT_DIR`
+  there, so the hook ran on the built-in rules and skipped the project's custom Block rules. The
+  hook now uses the nearest `.impulse` up to the repository root. It was checked end to end with
+  the built binary. A project outside any git repository, started in a subdirectory, still runs
+  on the built-in rules.
+
+  The same commit:
+  - treats EACCES from `flock` as a held lock;
+  - refuses unknown lock errors;
+  - runs the Keychain `list` non-interactively, like `get`, `set` and `delete`.
+- Reviewer B confirmed:
+  - the benchmark deadline: its repro now stops at 2.04 s instead of running 5.94 s;
+  - the escaped-quote fix;
+  - Ctrl-C after the new wait;
+  - the claimed guard shapes;
+  - that the webhook cap leaks no permits.
+
+  It found:
+  - A P2 regression in `3c0ba8d`, fixed in `bf647d8`. A newline counted as a space inside a
+    command, so pushing main followed by any line with an `-f`-style flag, such as
+    `tail -f build.log`, was blocked.
+  - In the same pattern, three bypasses, all blocked again in `bf647d8`: a redirection right after
+    the ref, brace expansion, and a line continuation between the flag and the ref.
+  - A webhook client with no secret that never finished its headers held a slot for the whole
+    30 s request budget, and could reconnect to keep it. The header read now has a 5 s deadline
+    (`a5b940e`).
+
 Still recorded, not fixed:
 - `file_write`'s check-then-write race against a concurrent same-user process swapping symlinks
   (needs directory-fd opens).
@@ -141,6 +179,16 @@ Still recorded, not fixed:
   a policy choice.
 - sccache setup refuses a config with any multi-line value, including a `[build]` table that
   `25bf884` used to edit (by design since `b283c3f`).
+- The Keychain `list` matches on the server alone, while `get` and `delete` also require the
+  default authentication type. Matching that too needs the approval-gated round-trip test
+  (`#[ignore]`, it writes to the login keychain) to confirm how the attribute reads back.
+- A webhook tool body that never awaits keeps its connection slot and a runtime worker past the
+  request timeout. One example is a long `build_health` walk, whose `dir_size` follows symlinks.
+  Tool bodies need `spawn_blocking`, and the walk needs bounds.
+- A benchmark run that starts just before the deadline still finishes, so the overshoot is up to
+  one run (at most Monty's 5 s budget).
+- The sqlite-vec search pool still follows the page window. Its order is the same for any pool
+  size except between results at exactly the same distance.
 - `wrapper_state` still runs the old `"""` scanner first, so `X = '"""'` before a configured
   wrapper reads as unset and setup asks for a key that is already there (unusual input).
 
