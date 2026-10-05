@@ -48,6 +48,13 @@ const MAX_WEBHOOK_CONNECTIONS: usize = 64;
 /// How long one webhook connection may take to send its request.
 const WEBHOOK_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long a webhook client has to finish its headers, within
+/// `WEBHOOK_REQUEST_TIMEOUT`. Authentication is read from the headers, so
+/// with only the request budget a client with no secret could hold a
+/// connection slot for 30 s by never finishing them, and reconnect to hold it
+/// again.
+const WEBHOOK_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// How the webhook authenticates callers. It is reachable through a public
 /// tunnel in the documented setup, and even read-only tools (`file_read`,
 /// `config_get`) disclose project files, so every route except the health
@@ -291,7 +298,7 @@ impl VoiceServer {
 
     /// The webhook accept loop on an already-bound listener (tests bind port 0).
     async fn serve_webhook_on(&self, listener: TcpListener) -> Result<()> {
-        self.serve_webhook_with_limit(listener, MAX_WEBHOOK_CONNECTIONS)
+        self.serve_webhook_with_limit(listener, MAX_WEBHOOK_CONNECTIONS, WEBHOOK_HEADER_TIMEOUT)
             .await
     }
 
@@ -302,6 +309,7 @@ impl VoiceServer {
         &self,
         listener: TcpListener,
         max_connections: usize,
+        header_timeout: std::time::Duration,
     ) -> Result<()> {
         let slots = Arc::new(tokio::sync::Semaphore::new(max_connections));
         loop {
@@ -325,7 +333,7 @@ impl VoiceServer {
                 let _slot = slot;
                 let handled = tokio::time::timeout(
                     WEBHOOK_REQUEST_TIMEOUT,
-                    handle_http_connection(stream, bridge, auth),
+                    handle_http_connection(stream, bridge, auth, header_timeout),
                 )
                 .await;
                 match handled {
@@ -419,32 +427,63 @@ impl VoiceServer {
     }
 }
 
+/// What reading a request's header block came to.
+enum HeaderBlock {
+    /// The headers end at this offset in the buffer.
+    End(usize),
+    /// The peer closed the connection first.
+    Closed,
+    /// More than `MAX_WEBHOOK_HEADER_BYTES` arrived without an end.
+    TooLarge,
+}
+
+/// Reads into `raw` until the end of the header block, which may arrive in
+/// pieces.
+async fn read_header_block(stream: &mut TcpStream, raw: &mut Vec<u8>) -> Result<HeaderBlock> {
+    let mut chunk = vec![0u8; 8 * 1024];
+    loop {
+        if let Some(position) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+            return Ok(HeaderBlock::End(position));
+        }
+        if raw.len() > MAX_WEBHOOK_HEADER_BYTES {
+            return Ok(HeaderBlock::TooLarge);
+        }
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            return Ok(HeaderBlock::Closed);
+        }
+        raw.extend_from_slice(&chunk[..n]);
+    }
+}
+
 async fn handle_http_connection(
     mut stream: TcpStream,
     bridge: Arc<VoiceToolBridge>,
     auth: WebhookAuth,
+    header_timeout: std::time::Duration,
 ) -> Result<()> {
-    // Read until the end of the header block, which may arrive in pieces.
     let mut raw = Vec::with_capacity(8 * 1024);
-    let mut chunk = vec![0u8; 8 * 1024];
-    let header_end = loop {
-        if let Some(position) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
-            break position;
-        }
-        if raw.len() > MAX_WEBHOOK_HEADER_BYTES {
-            return write_http_response(
-                &mut stream,
-                431,
-                "application/json",
-                br#"{"error":"request headers too large"}"#,
-            )
-            .await;
-        }
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            return Ok(());
-        }
-        raw.extend_from_slice(&chunk[..n]);
+    let header_end = match tokio::time::timeout(
+        header_timeout,
+        read_header_block(&mut stream, &mut raw),
+    )
+    .await
+    {
+        Ok(read) => match read? {
+            HeaderBlock::End(position) => position,
+            HeaderBlock::Closed => return Ok(()),
+            HeaderBlock::TooLarge => {
+                return write_http_response(
+                    &mut stream,
+                    431,
+                    "application/json",
+                    br#"{"error":"request headers too large"}"#,
+                )
+                .await
+            }
+        },
+        // Nothing is answered: the client has not authenticated yet.
+        Err(_) => return Ok(()),
     };
     let header_text = std::str::from_utf8(&raw[..header_end]).unwrap_or("");
     let body = &raw[header_end + 4..];
@@ -490,6 +529,7 @@ async fn handle_http_connection(
     // a declared one let any client make the server buffer up to the limit.
     let content_length = if is_health { 0 } else { content_length };
     let mut body_owned = body.to_vec();
+    let mut chunk = vec![0u8; 8 * 1024];
     while body_owned.len() < content_length {
         let m = stream.read(&mut chunk).await?;
         if m == 0 {
@@ -720,6 +760,38 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     }
 
+    /// Round 3 on ba9c873: the header read had the whole 30 s request
+    /// budget, and auth comes from the headers, so a client with no secret
+    /// that never finished them, and reconnected, held every slot.
+    #[tokio::test]
+    async fn webhook_closes_a_client_that_does_not_finish_its_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = VoiceServer::with_defaults();
+        tokio::spawn(async move {
+            let _ = server
+                .serve_webhook_with_limit(listener, 1, std::time::Duration::from_millis(200))
+                .await;
+        });
+
+        let started = std::time::Instant::now();
+        let mut slow = TcpStream::connect(addr).await.unwrap();
+        slow.write_all(b"POST /tool HTTP/1.1\r\n").await.unwrap();
+        let mut buf = Vec::new();
+        let closed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            slow.read_to_end(&mut buf),
+        )
+        .await
+        .expect("the server closes a client whose headers never finish");
+        assert!(closed.is_err() || buf.is_empty(), "answered: {buf:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+
+        // The slot is free again for the next client.
+        let served = send_raw(addr, &[b"GET /healthz HTTP/1.1\r\n\r\n"]).await;
+        assert!(served.starts_with("HTTP/1.1 200"), "{served}");
+    }
+
     /// Recorded review P3: there was no cap on concurrent connections.
     #[tokio::test]
     async fn webhook_refuses_connections_past_its_cap() {
@@ -727,7 +799,9 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = VoiceServer::with_defaults().with_webhook_auth(WebhookAuth::Unauthenticated);
         tokio::spawn(async move {
-            let _ = server.serve_webhook_with_limit(listener, 1).await;
+            let _ = server
+                .serve_webhook_with_limit(listener, 1, WEBHOOK_HEADER_TIMEOUT)
+                .await;
         });
 
         // Holds the only slot: headers never finish.
