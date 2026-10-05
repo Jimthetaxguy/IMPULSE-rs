@@ -497,7 +497,18 @@ async fn handle_http_connection(
         // Nothing is answered: the client has not authenticated yet.
         Err(_) => return Ok(()),
     };
-    let header_text = std::str::from_utf8(&raw[..header_end]).unwrap_or("");
+    // Read as text. A header block that is not valid UTF-8 used to become
+    // empty here, which skipped every header check and told a correctly
+    // authenticated client its secret was wrong.
+    let Ok(header_text) = std::str::from_utf8(&raw[..header_end]) else {
+        return reply_and_close(
+            &mut stream,
+            400,
+            "application/json",
+            br#"{"error":"request headers are not valid UTF-8"}"#,
+        )
+        .await;
+    };
     if let Some(problem) = malformed_header(header_text) {
         return reply_and_close(&mut stream, 400, "application/json", problem).await;
     }
@@ -598,23 +609,41 @@ enum ChunkedBody {
     Malformed,
 }
 
-/// Header lines RFC 9112 says a server must refuse with 400, each of which a
-/// proxy in front could frame differently from this server: a folded line,
-/// a line without a colon, whitespace in a field name or before its colon,
+/// Request and header lines RFC 9112 says a server must refuse with 400,
+/// each of which a proxy in front could frame differently from this server:
+/// a request line that is not exactly `METHOD SP target SP HTTP/...`, a
+/// control character other than tab (a bare CR inside a line hid a second
+/// header from this server but not from a proxy that breaks lines there), a
+/// folded line, a line without a colon, a field name that is not a token,
 /// and a `Content-Length` that is not plain digits or that repeats with a
 /// different value. They used to be skipped or read leniently. No request
 /// could be smuggled through this server, since every connection closes
 /// after one reply, so this is defense in depth.
 fn malformed_header(header_text: &str) -> Option<&'static [u8]> {
+    let mut lines = header_text.lines();
+    let request_line = lines.next().unwrap_or("");
+    let parts: Vec<&str> = request_line.split(' ').collect();
+    if parts.len() != 3
+        || parts.iter().any(|part| part.is_empty())
+        || !parts[2].starts_with("HTTP/")
+    {
+        return Some(br#"{"error":"malformed request line"}"#);
+    }
+    if header_text
+        .lines()
+        .any(|line| line.chars().any(|c| c.is_ascii_control() && c != '\t'))
+    {
+        return Some(br#"{"error":"control characters in the request head"}"#);
+    }
     let mut length: Option<&str> = None;
-    for line in header_text.lines().skip(1) {
+    for line in lines {
         if line.starts_with([' ', '\t']) {
             return Some(br#"{"error":"folded header lines are not accepted"}"#);
         }
         let Some((name, value)) = line.split_once(':') else {
             return Some(br#"{"error":"header line without a colon"}"#);
         };
-        if name.is_empty() || name.chars().any(char::is_whitespace) {
+        if name.is_empty() || !name.chars().all(is_token_char) {
             return Some(br#"{"error":"malformed header field name"}"#);
         }
         if name.eq_ignore_ascii_case("content-length") {
@@ -629,6 +658,11 @@ fn malformed_header(header_text: &str) -> Option<&'static [u8]> {
         }
     }
     None
+}
+
+/// A character RFC 9110 allows in a field name (`tchar`).
+fn is_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c)
 }
 
 /// How a request frames its body.
@@ -1157,6 +1191,11 @@ mod tests {
             format!("Content-Length: {n}\r\nContent-Length: {}", n + 5),
             format!("Content-Length: +{n}"),
             format!("Content-Length: {n}\r\nno colon here"),
+            // Round 6 (reviewer B): a bare CR inside a line, a NUL, and a
+            // field name that is not a token were still accepted.
+            format!("Content-Length: {n}\r\nX-A: b\rTransfer-Encoding: chunked"),
+            format!("Content-Length: {n}\r\nX-A: b\0c"),
+            format!("Content-Length: {n}\r\nX(A): b"),
         ] {
             let request = format!("POST /voice/tools HTTP/1.1\r\n{headers}\r\n\r\n{body}");
             let response = send_raw(addr, &[request.as_bytes()]).await;
@@ -1165,6 +1204,25 @@ mod tests {
                 "{headers:?}: {response}"
             );
         }
+        // Round 6 (reviewer B): a loose request line, and a header block
+        // that is not UTF-8, which skipped every check.
+        for request_line in [
+            "POST  /voice/tools  HTTP/1.1",
+            " POST /voice/tools HTTP/1.1",
+        ] {
+            let request = format!("{request_line}\r\nContent-Length: {n}\r\n\r\n{body}");
+            let response = send_raw(addr, &[request.as_bytes()]).await;
+            assert!(
+                response.starts_with("HTTP/1.1 400"),
+                "{request_line:?}: {response}"
+            );
+        }
+        let mut latin1 = b"POST /voice/tools HTTP/1.1\r\nUser-Agent: caf\xe9\r\n".to_vec();
+        latin1.extend_from_slice(format!("Content-Length: {n}\r\n\r\n{body}").as_bytes());
+        let response = send_raw(addr, &[&latin1]).await;
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        assert!(response.contains("not valid UTF-8"), "{response}");
+
         // A repeated Content-Length with the same value is still accepted.
         let repeated = format!(
             "POST /voice/tools HTTP/1.1\r\nContent-Length: {0}\r\nContent-Length: {0}\r\n\r\n{body}",
