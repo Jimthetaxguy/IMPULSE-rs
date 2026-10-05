@@ -167,19 +167,31 @@ fn guard_impulse_dir(
     )))
 }
 
-/// Whether `dir` is the root of a git checkout: a `.git` directory with a
-/// `HEAD`, or a `.git` file pointing at one (`gitdir: ...`, as a worktree or
-/// submodule has). Any `.git` entry used to count, so an empty `.git` file in
-/// a subdirectory cut the search short of the project's own `.impulse`.
+/// Whether `dir` is the root of a git checkout, by git's own rules: a `.git`
+/// directory with a `HEAD` file and `objects` and `refs` directories, or a
+/// `.git` file whose `gitdir:` names an existing directory with a `HEAD`, as
+/// a worktree or submodule has. Any `.git` entry used to count, so an empty
+/// `.git` file in a subdirectory, or a `gitdir:` naming nothing, cut the
+/// search short of the project's own `.impulse`.
 fn holds_git_repository(dir: &Path) -> bool {
     let marker = dir.join(".git");
     if marker.is_dir() {
-        return marker.join("HEAD").is_file();
+        return marker.join("HEAD").is_file()
+            && marker.join("objects").is_dir()
+            && marker.join("refs").is_dir();
     }
-    let mut prefix = [0u8; 7];
-    std::fs::File::open(&marker)
-        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut prefix))
-        .is_ok_and(|()| &prefix == b"gitdir:")
+    let mut content = String::new();
+    let read = std::fs::File::open(&marker).and_then(|file| {
+        std::io::Read::read_to_string(&mut std::io::Read::take(file, 4096), &mut content)
+    });
+    if read.is_err() {
+        return false;
+    }
+    // A relative `gitdir:` is relative to `dir`; `join` keeps an absolute one.
+    content
+        .strip_prefix("gitdir:")
+        .map(str::trim)
+        .is_some_and(|target| !target.is_empty() && dir.join(target).join("HEAD").is_file())
 }
 
 /// Runs `impulse-rs guard --hook` and exits. It reads only `config.json`'s
@@ -591,8 +603,7 @@ mod tests {
     #[test]
     fn test_guard_impulse_dir_finds_the_projects_own_from_a_subdirectory() {
         let project = TempDir::new().unwrap();
-        std::fs::create_dir(project.path().join(".git")).unwrap();
-        std::fs::write(project.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        make_git_repository(project.path());
         std::fs::create_dir(project.path().join(".impulse")).unwrap();
         let deep = project.path().join("src").join("deep");
         std::fs::create_dir_all(&deep).unwrap();
@@ -611,8 +622,7 @@ mod tests {
     #[test]
     fn test_guard_impulse_dir_needs_a_real_repository_root() {
         let project = TempDir::new().unwrap();
-        std::fs::create_dir(project.path().join(".git")).unwrap();
-        std::fs::write(project.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        make_git_repository(project.path());
         std::fs::create_dir(project.path().join(".impulse")).unwrap();
         let deep = project.path().join("c").join("deep");
         std::fs::create_dir_all(&deep).unwrap();
@@ -624,9 +634,37 @@ mod tests {
         );
         assert!(holds_git_repository(project.path()));
         assert!(!holds_git_repository(&project.path().join("c")));
+        // Round 5 (reviewer A): a `gitdir:` naming nothing, or a `.git`
+        // holding only `HEAD`, still counted; git rejects both.
+        std::fs::write(project.path().join("c/.git"), "gitdir: nowhere\n").unwrap();
+        assert!(!holds_git_repository(&project.path().join("c")));
+        let only_head = project.path().join("c3");
+        std::fs::create_dir_all(only_head.join(".git")).unwrap();
+        std::fs::write(only_head.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        assert!(!holds_git_repository(&only_head));
         // A worktree's or submodule's `.git` file does end the search.
-        std::fs::write(project.path().join("c/.git"), "gitdir: /elsewhere\n").unwrap();
+        let worktree_git_dir = project.path().join(".git/worktrees/c");
+        std::fs::create_dir_all(&worktree_git_dir).unwrap();
+        std::fs::write(worktree_git_dir.join("HEAD"), "ref: refs/heads/c\n").unwrap();
+        std::fs::write(
+            project.path().join("c/.git"),
+            format!("gitdir: {}\n", worktree_git_dir.display()),
+        )
+        .unwrap();
         assert!(holds_git_repository(&project.path().join("c")));
+        std::fs::write(
+            project.path().join("c/.git"),
+            "gitdir: ../.git/worktrees/c\n",
+        )
+        .unwrap();
+        assert!(holds_git_repository(&project.path().join("c")));
+    }
+
+    /// A `.git` directory as git requires it: `HEAD`, `objects`, `refs`.
+    fn make_git_repository(dir: &Path) {
+        std::fs::create_dir_all(dir.join(".git/objects")).unwrap();
+        std::fs::create_dir_all(dir.join(".git/refs")).unwrap();
+        std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
     }
 
     #[test]
@@ -638,8 +676,7 @@ mod tests {
         let repo = outer.path().join("repo");
         let src = repo.join("src");
         std::fs::create_dir_all(&src).unwrap();
-        std::fs::create_dir(repo.join(".git")).unwrap();
-        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        make_git_repository(&repo);
         let named = src.join(".impulse");
         assert_eq!(
             guard_impulse_dir(&named, src.to_str()).ok(),
