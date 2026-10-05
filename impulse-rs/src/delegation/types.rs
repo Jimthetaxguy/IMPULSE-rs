@@ -20,9 +20,22 @@ pub const MAX_TRACKED_DELEGATIONS: usize = 256;
 /// reads the snapshot back yet, so the rest would only cost memory.
 pub const MAX_CONTEXT_SNAPSHOT_BYTES: usize = 64 * 1024;
 
-/// Most text a delegation's spec may carry, and separately its completion
-/// (summary and tool trace) or failure message.
+/// Most a delegation's spec may weigh, and separately its completion
+/// (summary and tool trace) or failure message: their text, plus
+/// [`DELEGATION_ITEM_BYTES`] for each list entry.
 pub const MAX_DELEGATION_TEXT_BYTES: usize = 256 * 1024;
+
+/// What one list entry (a target file, a restricted tool, a tool-trace
+/// record) counts toward [`MAX_DELEGATION_TEXT_BYTES`] besides its text, so
+/// millions of empty entries can't pass as a few bytes: each costs its
+/// `String` headers and allocations whatever it holds.
+pub const DELEGATION_ITEM_BYTES: usize = 64;
+
+/// How long a delegation may stay pending or in progress before a full
+/// tracker treats it as abandoned. Nothing in the protocol fails or cancels
+/// a delegation, so one whose worker died would otherwise hold its slot
+/// until the daemon restarts.
+pub const STALE_DELEGATION_SECS: i64 = 60 * 60;
 
 /// Why the tracker refused a delegation request.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -31,7 +44,7 @@ pub enum DelegationError {
     DepthExceeded { max: u8 },
     #[error("delegation rejected: all {limit} tracked delegations are still active")]
     TrackerFull { limit: usize },
-    #[error("delegation rejected: its {part} is {bytes} bytes, over the {limit}-byte limit")]
+    #[error("delegation {part} refused: {bytes} bytes, over the {limit}-byte limit")]
     TooLarge {
         part: &'static str,
         bytes: usize,
@@ -204,7 +217,7 @@ mod tests {
                 limit: 200
             }
             .to_string(),
-            "delegation rejected: its spec is 300 bytes, over the 200-byte limit"
+            "delegation spec refused: 300 bytes, over the 200-byte limit"
         );
         assert_eq!(
             DelegationError::NotFound { id: "del-9".into() }.to_string(),

@@ -433,9 +433,9 @@ Tracks sub-agent delegations detected in coordinator output, depth-limited like 
 `spec` takes `task` (required), `target_files`, `constraints`, `max_depth` and `restricted_tools`. The tracker is bounded:
 
 - A delegation is completed once. `CompleteDelegation` for a delegation that already completed or failed is an `Error`, and the first result stands.
-- It holds at most 256 delegations. Registering past that drops the oldest finished delegation; when all 256 are still pending or in progress, the registration is an `Error`.
+- It holds at most 256 delegations. Registering past that drops the oldest finished delegation, or failing that the oldest one pending or in progress for an hour or more (nothing in the protocol cancels a delegation whose worker died); when every slot holds a younger active delegation, the registration is an `Error`.
 - It keeps the first 64 KiB of `context_snapshot` (nothing reads the snapshot back yet).
-- A spec's text, and a completion's summary plus tool trace, may each be at most 256 KiB; a larger one is an `Error`.
+- A spec, and a completion's summary plus tool trace, may each weigh at most 256 KiB, counting 64 bytes for every list entry besides its text; a heavier one is an `Error`.
 
 ### Agent Pool
 

@@ -9,9 +9,9 @@ use chrono::Utc;
 use impulse_ops::{AgentRole, DelegationSummary, DiffSummary, ToolInvocationRecord};
 
 use super::types::{
-    DelegationError, DelegationSpec, DelegationState, TrackedDelegation,
+    DelegationError, DelegationSpec, DelegationState, TrackedDelegation, DELEGATION_ITEM_BYTES,
     MAX_CONTEXT_SNAPSHOT_BYTES, MAX_DELEGATION_DEPTH, MAX_DELEGATION_TEXT_BYTES,
-    MAX_TRACKED_DELEGATIONS,
+    MAX_TRACKED_DELEGATIONS, STALE_DELEGATION_SECS,
 };
 
 /// Tracks all active and recent delegations.
@@ -33,9 +33,10 @@ impl DelegationTracker {
     ///
     /// Refused past the depth limit, for a spec over
     /// [`MAX_DELEGATION_TEXT_BYTES`], or when all [`MAX_TRACKED_DELEGATIONS`]
-    /// held delegations are still active. Otherwise a full tracker drops its
-    /// oldest finished delegation to make room. The context snapshot is cut
-    /// to [`MAX_CONTEXT_SNAPSHOT_BYTES`].
+    /// held delegations are still active and none is older than
+    /// [`STALE_DELEGATION_SECS`]. Otherwise a full tracker drops its oldest
+    /// finished delegation to make room, or failing that its oldest stale one.
+    /// The context snapshot is cut to [`MAX_CONTEXT_SNAPSHOT_BYTES`].
     pub fn register(
         &mut self,
         spec: DelegationSpec,
@@ -49,13 +50,21 @@ impl DelegationTracker {
             });
         }
         check_size("spec", spec_bytes(&spec))?;
-        if self.delegations.len() >= MAX_TRACKED_DELEGATIONS && !self.drop_oldest_finished() {
+        if self.delegations.len() >= MAX_TRACKED_DELEGATIONS
+            && !self.drop_oldest_finished()
+            && !self.drop_oldest_stale()
+        {
             return Err(DelegationError::TrackerFull {
                 limit: MAX_TRACKED_DELEGATIONS,
             });
         }
-        let cut = context_snapshot.floor_char_boundary(MAX_CONTEXT_SNAPSHOT_BYTES);
-        context_snapshot.truncate(cut);
+        if context_snapshot.len() > MAX_CONTEXT_SNAPSHOT_BYTES {
+            let cut = context_snapshot.floor_char_boundary(MAX_CONTEXT_SNAPSHOT_BYTES);
+            context_snapshot.truncate(cut);
+            // `truncate` keeps the whole allocation, which is what the cut is
+            // meant to release.
+            context_snapshot.shrink_to_fit();
+        }
 
         let id = format!("del-{}", self.next_id);
         self.next_id += 1;
@@ -85,6 +94,19 @@ impl DelegationTracker {
             .values()
             .filter(|d| d.is_completed())
             .min_by_key(|d| (d.completed_at, d.created_at))
+            .map(|d| d.id.clone());
+        match oldest {
+            Some(id) => self.delegations.remove(&id).is_some(),
+            None => false,
+        }
+    }
+
+    /// Removes the oldest delegation that has been pending or in progress for
+    /// [`STALE_DELEGATION_SECS`] or more. Returns whether there was one.
+    fn drop_oldest_stale(&mut self) -> bool {
+        let oldest = self
+            .stale_active(STALE_DELEGATION_SECS)
+            .first()
             .map(|d| d.id.clone());
         match oldest {
             Some(id) => self.delegations.remove(&id).is_some(),
@@ -132,7 +154,14 @@ impl DelegationTracker {
         let completion_bytes = tool_trace
             .iter()
             .map(|tool| {
-                tool.kind.len() + tool.target.len() + tool.timestamp.as_ref().map_or(0, String::len)
+                [
+                    DELEGATION_ITEM_BYTES,
+                    tool.kind.len(),
+                    tool.target.len(),
+                    tool.timestamp.as_ref().map_or(0, String::len),
+                ]
+                .into_iter()
+                .fold(0, usize::saturating_add)
             })
             .fold(summary.len(), usize::saturating_add);
         let d = self.active_mut(id)?;
@@ -281,13 +310,19 @@ impl DelegationTracker {
     }
 }
 
-/// The text a spec carries, in bytes.
+/// What a spec weighs: its text, plus [`DELEGATION_ITEM_BYTES`] for each
+/// list entry.
 fn spec_bytes(spec: &DelegationSpec) -> usize {
+    let list_bytes = |list: &[String]| {
+        list.iter()
+            .map(|item| item.len().saturating_add(DELEGATION_ITEM_BYTES))
+            .fold(0, usize::saturating_add)
+    };
     [
         spec.task.len(),
         spec.constraints.as_ref().map_or(0, String::len),
-        spec.target_files.iter().map(String::len).sum(),
-        spec.restricted_tools.iter().map(String::len).sum(),
+        list_bytes(&spec.target_files),
+        list_bytes(&spec.restricted_tools),
     ]
     .into_iter()
     .fold(0, usize::saturating_add)
@@ -554,6 +589,12 @@ mod tests {
         let kept = &tracker.delegations[&id].context_snapshot;
         assert_eq!(kept.len(), MAX_CONTEXT_SNAPSHOT_BYTES - 1);
         assert!(kept.ends_with('é'));
+        // Verification finding: `truncate` alone kept the whole allocation.
+        assert!(
+            kept.capacity() <= MAX_CONTEXT_SNAPSHOT_BYTES,
+            "kept {} bytes of capacity",
+            kept.capacity()
+        );
 
         let small = tracker.register(sample_spec(), 0, "ctx".into(), 0).unwrap();
         assert_eq!(tracker.delegations[&small].context_snapshot, "ctx");
@@ -586,5 +627,65 @@ mod tests {
         ));
         assert!(tracker.delegations[&id].is_active());
         tracker.complete(&id, summary, vec![], None).unwrap();
+    }
+
+    /// Verification finding: the limits counted text only, so a request of
+    /// millions of empty list entries passed as a few bytes and held
+    /// hundreds of megabytes.
+    #[test]
+    fn test_floods_of_empty_entries_are_refused() {
+        let mut tracker = DelegationTracker::new();
+        let mut spec = sample_spec();
+        spec.target_files = vec![String::new(); MAX_DELEGATION_TEXT_BYTES / DELEGATION_ITEM_BYTES];
+        assert!(matches!(
+            tracker.register(spec, 0, "".into(), 0),
+            Err(DelegationError::TooLarge { part: "spec", .. })
+        ));
+
+        let id = tracker.register(sample_spec(), 0, "".into(), 0).unwrap();
+        let empty_record = ToolInvocationRecord {
+            kind: String::new(),
+            target: String::new(),
+            timestamp: None,
+        };
+        let trace = vec![empty_record; MAX_DELEGATION_TEXT_BYTES / DELEGATION_ITEM_BYTES + 1];
+        assert!(matches!(
+            tracker.complete(&id, String::new(), trace, None),
+            Err(DelegationError::TooLarge {
+                part: "completion",
+                ..
+            })
+        ));
+        assert!(tracker.delegations[&id].is_active());
+    }
+
+    /// Verification finding: nothing in the protocol fails or cancels a
+    /// delegation, so a tracker full of abandoned ones refused every new one
+    /// until the daemon restarted.
+    #[test]
+    fn test_a_full_tracker_drops_its_oldest_stale_delegation() {
+        let mut tracker = DelegationTracker::new();
+        let ids: Vec<String> = (0..MAX_TRACKED_DELEGATIONS)
+            .map(|_| tracker.register(sample_spec(), 0, "".into(), 0).unwrap())
+            .collect();
+        let long_ago = Utc::now() - chrono::Duration::seconds(STALE_DELEGATION_SECS + 60);
+        let older = long_ago - chrono::Duration::seconds(60);
+        tracker.delegations.get_mut(&ids[7]).unwrap().created_at = long_ago;
+        tracker.delegations.get_mut(&ids[3]).unwrap().created_at = older;
+
+        let newest = tracker.register(sample_spec(), 0, "".into(), 0).unwrap();
+        assert_eq!(tracker.delegations.len(), MAX_TRACKED_DELEGATIONS);
+        assert!(!tracker.delegations.contains_key(&ids[3]));
+        assert!(tracker.delegations.contains_key(&ids[7]));
+        assert!(tracker.delegations.contains_key(&newest));
+
+        tracker.register(sample_spec(), 0, "".into(), 0).unwrap();
+        assert!(!tracker.delegations.contains_key(&ids[7]));
+        assert_eq!(
+            tracker.register(sample_spec(), 0, "".into(), 0),
+            Err(DelegationError::TrackerFull {
+                limit: MAX_TRACKED_DELEGATIONS
+            })
+        );
     }
 }
