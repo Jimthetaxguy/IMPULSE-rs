@@ -267,7 +267,8 @@ Still recorded, not fixed:
   (`#[ignore]`, it writes to the login keychain) to confirm how the attribute reads back.
 - The office tools still parse synchronously on the runtime thread when called over MCP or the
   daemon; they are not exposed over the webhook. They need their own `spawn_blocking`: a blanket
-  wrapper would break the kill-on-drop cancellation that process tools rely on.
+  wrapper would break the kill-on-drop cancellation that process tools rely on. Addressed on
+  `claude/office-bounds-20261005`.
 - A webhook client that reconnects as soon as it is cut still keeps every slot: the header and
   body deadlines only shorten each hold, and the 2 s drain after a refusal holds one too. This
   needs per-source or accept-rate limits.
@@ -296,10 +297,9 @@ Still recorded, not fixed:
 - **Office tools are unbounded** (`excel_read`, `word_read`, `document_parse`, the `office` CLI,
   plugins; reachable over MCP and the daemon). Calamine's dense `worksheet_range` lets two cells at
   opposite corners of a sheet demand billions of cells; DOCX and XLSX parse with no inflation or
-  file-size cap. Ion's `document_read` already has all three bounds. Recommended: move its bounded
-  reader (`preflight_container`, `extract_workbook`, `extract_word`) from `ion_repl::tool_document`
-  into `office` so both surfaces share one implementation, and refuse legacy `.xls` at these entry
-  points too, since calamine builds every `.xls` sheet's dense grid when it opens the file.
+  file-size cap. Ion's `document_read` already has all three bounds. Addressed on
+  `claude/office-bounds-20261005` (card `2026-10-05-claude-office-bounds.md`), which moves Ion's
+  bounded reader into a shared `office::bounded` and refuses legacy `.xls` at these entry points.
 - **Session hooks pass literal variable names.** The installed SessionStart/SessionEnd templates
   single-quote `$CLAUDE_PROJECT_NAME` and `$CLAUDE_SESSION_SUMMARY`, and Claude Code sets neither;
   its hooks get a JSON payload on stdin. Needs a design for where the session name and summary
