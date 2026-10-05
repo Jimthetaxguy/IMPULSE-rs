@@ -465,12 +465,17 @@ in final-gate evidence instead of copying a moving aggregate into this guide.
 | `MINIMAX_BASE_URL` | Override the Minimax API origin |
 
 Each `*_BASE_URL` override is the API **origin** only (scheme + host + optional port, e.g.
-`http://127.0.0.1:4010`) — the provider appends its own request path. Values that are blank or
-lack an `http://`/`https://` scheme are ignored in favor of the canonical default, so a typo
-degrades to the real API rather than to a silently broken endpoint. Precedence is
-explicit config (`BaseProvider::with_base_url`) > env var > canonical default.
+`http://127.0.0.1:4010`) — the provider appends its own request path. A blank value is unset. A
+value that is not an `http://`/`https://` origin (no scheme, credentials, a path, a query or a
+fragment) is ignored with a warning that names the reason but never the value, in favor of the
+next source, so a typo degrades to the real API rather than to a silently broken endpoint.
+Precedence is explicit config (`BaseProvider::with_base_url`) > env var > canonical default.
+Providers never follow redirects: a 3xx answer is an error naming where it pointed, since
+following one would carry the API key (and, from an https origin, possibly in cleartext) to
+another host.
 
 Accepted risk: any `http(s)` origin is accepted (no host allowlist). An active override is
 logged at provider request time (origin only, never the API key). Cleartext `http://` to a
-non-loopback host is a warning; loopback HTTP (local eval harness) is not. This is a
+non-loopback host is a warning; loopback HTTP (local eval harness) is not. Only `localhost` and
+loopback IP addresses count as loopback (a host like `127.example.com` does not). This is a
 transport override, not a model picker — see ADR-0015.

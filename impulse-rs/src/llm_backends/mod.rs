@@ -233,6 +233,12 @@ pub const DEFAULT_MAX_TOOL_ROUNDS: usize = crate::loop_contract::ION_DEFAULT_MAX
 /// identical batches, and same-error streaks (`AgentError::ToolLoopStalled`).
 pub const DEFAULT_TOOL_LOOP_TIMEOUT: Duration = crate::loop_contract::ION_DEFAULT_WALL_CLOCK;
 
+/// Sampling temperature an [`Agent`] sends unless its owner sets another.
+pub const DEFAULT_TEMPERATURE: f32 = 0.7;
+
+/// Output token cap an [`Agent`] sends unless its owner sets another.
+pub const DEFAULT_MAX_TOKENS: u32 = 4096;
+
 /// Environment variable naming which provider a host builds
 /// (`anthropic`, `openai`, or `minimax`; also the aliases
 /// `ImpulseProvider::parse` accepts). Unset means Anthropic.
@@ -326,6 +332,12 @@ pub struct Agent {
     pub model: String,
     pub system_prompt: Option<String>,
     pub history: Vec<Message>,
+    /// Sampling temperature for every request this agent sends
+    /// ([`DEFAULT_TEMPERATURE`] unless set).
+    pub temperature: f32,
+    /// Output token cap for every request this agent sends
+    /// ([`DEFAULT_MAX_TOKENS`] unless set).
+    pub max_tokens: Option<u32>,
     /// Harness step facts for [`resolve_step_model`]. Defaults to an Ion/API
     /// Worker context with no review/verification state (v0 identity).
     pub step_context: HarnessStepContext,
@@ -363,6 +375,8 @@ impl Agent {
             model,
             system_prompt,
             history: Vec::new(),
+            temperature: DEFAULT_TEMPERATURE,
+            max_tokens: Some(DEFAULT_MAX_TOKENS),
             step_context,
             loop_contract: LoopContract::ion_tool_loop(),
             last_loop_report: None,
@@ -415,8 +429,8 @@ impl Agent {
         let request = ChatRequest {
             model: self.request_model(0),
             messages,
-            temperature: 0.7,
-            max_tokens: Some(4096),
+            temperature: self.temperature,
+            max_tokens: self.max_tokens,
             tools: Vec::new(),
         };
         let response = self.provider.chat(request).await?;
@@ -516,6 +530,7 @@ impl Agent {
             self.provider.as_ref(),
             &step_context,
             &self.system_prompt,
+            (self.temperature, self.max_tokens),
             working,
             tools,
             executor,
@@ -800,6 +815,7 @@ async fn run_tool_loop(
     provider: &dyn LlmProvider,
     step_context: &HarnessStepContext,
     system_prompt: &Option<String>,
+    (temperature, max_tokens): (f32, Option<u32>),
     mut working: Vec<Message>,
     tools: &[ToolDefinition],
     executor: &dyn ToolExecutor,
@@ -837,8 +853,8 @@ async fn run_tool_loop(
         let request = ChatRequest {
             model: resolve_step_model(&ctx, &step_context.current_model, None),
             messages,
-            temperature: 0.7,
-            max_tokens: Some(4096),
+            temperature,
+            max_tokens,
             tools: tools.to_vec(),
         };
         let response = provider.chat(request).await.map_err(LoopExit::Failed)?;
@@ -855,6 +871,7 @@ async fn run_tool_loop(
                 tool_calls: response.tool_calls.len(),
             }));
         }
+        check_tool_calls(provider.name(), &response, &working).map_err(LoopExit::Failed)?;
 
         if response.stop_reason == StopReason::ToolUse && !response.tool_calls.is_empty() {
             working.push(Message::assistant_tool_use(
@@ -897,6 +914,62 @@ async fn run_tool_loop(
         working.push(Message::text(Role::Assistant, response.content.clone()));
         return Ok((response.content, working));
     }
+}
+
+/// Refuses a tool-use turn the loop can't run as asked.
+///
+/// A stop for tool use with no call used to complete as an empty answer, and
+/// calls beside any other stop were silently dropped; both are errors now.
+/// Every call needs an id and a name, and its id may not repeat one in this
+/// batch or anywhere in the history: a result is matched to its call by id,
+/// and compaction records results by id, so a missing or reused id (both
+/// used to execute) would pair results with the wrong calls.
+fn check_tool_calls(
+    provider: &str,
+    response: &ChatResponse,
+    working: &[Message],
+) -> AgentResult<()> {
+    let calls = &response.tool_calls;
+    match (response.stop_reason, calls.is_empty()) {
+        (StopReason::ToolUse, true) => {
+            return Err(AgentError::ApiResponse(format!(
+                "{provider} stopped for tool use but requested no tool"
+            )));
+        }
+        (StopReason::ToolUse, false) => {}
+        (_, true) => return Ok(()),
+        (_, false) => {
+            return Err(AgentError::ApiResponse(format!(
+                "{provider} returned {} tool call(s) without stopping for tool use",
+                calls.len()
+            )));
+        }
+    }
+    let mut seen: std::collections::HashSet<&str> = working
+        .iter()
+        .flat_map(|message| message.tool_calls.iter().map(|call| call.id.as_str()))
+        .collect();
+    for call in calls {
+        if call.id.trim().is_empty() {
+            return Err(AgentError::ApiResponse(format!(
+                "{provider} requested tool '{:.80}' without a call id",
+                call.name
+            )));
+        }
+        if call.name.trim().is_empty() {
+            return Err(AgentError::ApiResponse(format!(
+                "{provider} requested call '{:.80}' without a tool name",
+                call.id
+            )));
+        }
+        if !seen.insert(call.id.as_str()) {
+            return Err(AgentError::ApiResponse(format!(
+                "{provider} reused the tool call id '{:.80}'",
+                call.id
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Why [`run_tool_loop`] returned without a final reply: the contract
@@ -1000,7 +1073,10 @@ mod tests {
     }
 
     /// Always asks the model to call `echo_tool`, every round -- used to
-    /// prove the round cap actually fires instead of looping forever.
+    /// prove the round cap actually fires instead of looping forever. Each
+    /// round's call has its own id, as a real provider's does (the loop
+    /// refuses a reused one); the history grows each round, so its length
+    /// numbers the call.
     struct AlwaysToolUseProvider;
 
     #[async_trait]
@@ -1021,7 +1097,7 @@ mod tests {
                 },
                 stop_reason: StopReason::ToolUse,
                 tool_calls: vec![ToolCall {
-                    id: "call".to_string(),
+                    id: format!("call-{}", request.messages.len()),
                     name: "echo_tool".to_string(),
                     input: serde_json::Value::Null,
                 }],
@@ -1908,12 +1984,12 @@ mod tests {
                 stop_reason: StopReason::ToolUse,
                 tool_calls: vec![
                     ToolCall {
-                        id: "a".to_string(),
+                        id: format!("a-{}", request.messages.len()),
                         name: "file_read".to_string(),
                         input: serde_json::json!({"path": "a"}),
                     },
                     ToolCall {
-                        id: "b".to_string(),
+                        id: format!("b-{}", request.messages.len()),
                         name: "file_read".to_string(),
                         input: serde_json::json!({"path": "b"}),
                     },
@@ -3152,5 +3228,198 @@ mod tests {
             .expect_err("an unconfigured provider must never succeed");
         assert!(matches!(err, AgentError::InvalidRequest(_)), "got: {err:?}");
         assert!(format!("{err}").contains("gemini"), "got: {err}");
+    }
+
+    /// Each request's temperature and token cap, in order.
+    type SamplingLog = std::sync::Arc<std::sync::Mutex<Vec<(f32, Option<u32>)>>>;
+
+    /// Replays one scripted turn per request, then answers "done"; records
+    /// each request's temperature and token cap.
+    struct ScriptedProvider {
+        turns: std::sync::Mutex<std::collections::VecDeque<(StopReason, Vec<ToolCall>)>>,
+        sampling: SamplingLog,
+    }
+
+    impl ScriptedProvider {
+        fn new(turns: Vec<(StopReason, Vec<ToolCall>)>) -> (Self, SamplingLog) {
+            let sampling = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let provider = Self {
+                turns: std::sync::Mutex::new(turns.into()),
+                sampling: std::sync::Arc::clone(&sampling),
+            };
+            (provider, sampling)
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for ScriptedProvider {
+        fn name(&self) -> &str {
+            "scripted-fake"
+        }
+        fn default_model(&self) -> &str {
+            "scripted-fake-model"
+        }
+        async fn chat(&self, request: ChatRequest) -> AgentResult<ChatResponse> {
+            self.sampling
+                .lock()
+                .unwrap()
+                .push((request.temperature, request.max_tokens));
+            let (stop_reason, tool_calls) = self
+                .turns
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or((StopReason::EndTurn, Vec::new()));
+            let content = if tool_calls.is_empty() && stop_reason == StopReason::EndTurn {
+                "done".to_string()
+            } else {
+                String::new()
+            };
+            Ok(ChatResponse {
+                content,
+                model: request.model,
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+                stop_reason,
+                tool_calls,
+            })
+        }
+        fn supported_models(&self) -> Vec<&str> {
+            vec!["scripted-fake-model"]
+        }
+    }
+
+    fn scripted_call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            input: serde_json::json!({}),
+        }
+    }
+
+    async fn run_scripted(
+        turns: Vec<(StopReason, Vec<ToolCall>)>,
+    ) -> (AgentResult<String>, Agent, EchoExecutor) {
+        let (provider, _) = ScriptedProvider::new(turns);
+        let mut agent = test_agent(provider);
+        let executor = EchoExecutor::new();
+        let result = agent.chat_with_tools("go", &[], &executor).await;
+        (result, agent, executor)
+    }
+
+    fn invocations(executor: &EchoExecutor) -> usize {
+        executor.invocations.lock().unwrap().len()
+    }
+
+    /// Review finding: a stop for tool use with no tool block completed as
+    /// an empty answer.
+    #[tokio::test]
+    async fn test_a_tool_use_stop_without_a_call_is_an_error() {
+        let (result, agent, _) = run_scripted(vec![(StopReason::ToolUse, Vec::new())]).await;
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("requested no tool"), "{err}");
+        assert!(agent.history.is_empty());
+    }
+
+    /// Review finding: calls beside an ordinary stop ("stop" on the OpenAI
+    /// wire) were silently dropped and the turn completed empty.
+    #[tokio::test]
+    async fn test_tool_calls_beside_another_stop_are_an_error() {
+        let (result, agent, executor) = run_scripted(vec![(
+            StopReason::EndTurn,
+            vec![scripted_call("c1", "echo_tool")],
+        )])
+        .await;
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("without stopping for tool use"),
+            "{err}"
+        );
+        assert_eq!(invocations(&executor), 0);
+        assert!(agent.history.is_empty());
+    }
+
+    /// Review finding: a call with no id ran and its result went back with
+    /// `tool_use_id: ""`.
+    #[tokio::test]
+    async fn test_a_call_without_an_id_or_name_is_not_run() {
+        let (result, _, executor) = run_scripted(vec![(
+            StopReason::ToolUse,
+            vec![scripted_call("", "echo_tool")],
+        )])
+        .await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("without a call id"));
+        assert_eq!(invocations(&executor), 0);
+
+        let (result, _, executor) =
+            run_scripted(vec![(StopReason::ToolUse, vec![scripted_call("c1", "")])]).await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("without a tool name"));
+        assert_eq!(invocations(&executor), 0);
+    }
+
+    /// Review finding: two calls sharing an id both ran, and compaction,
+    /// which tracks results by id, then skipped every result after the
+    /// first.
+    #[tokio::test]
+    async fn test_a_reused_call_id_is_not_run() {
+        let (result, _, executor) = run_scripted(vec![(
+            StopReason::ToolUse,
+            vec![
+                scripted_call("c1", "echo_tool"),
+                scripted_call("c1", "echo_tool"),
+            ],
+        )])
+        .await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("reused the tool call id"));
+        assert_eq!(invocations(&executor), 0);
+
+        let (result, agent, executor) = run_scripted(vec![
+            (StopReason::ToolUse, vec![scripted_call("c1", "echo_tool")]),
+            (StopReason::ToolUse, vec![scripted_call("c1", "echo_tool")]),
+        ])
+        .await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("reused the tool call id"));
+        assert_eq!(invocations(&executor), 1);
+        assert!(agent.history.is_empty());
+    }
+
+    /// Review finding: every request went out at temperature 0.7 with a
+    /// 4096-token cap, whatever the owner configured.
+    #[tokio::test]
+    async fn test_the_agent_sends_its_own_temperature_and_token_cap() {
+        let (provider, sampling) = ScriptedProvider::new(vec![(
+            StopReason::ToolUse,
+            vec![scripted_call("c1", "echo_tool")],
+        )]);
+        let mut agent = test_agent(provider);
+        agent.temperature = 0.3;
+        agent.max_tokens = Some(2048);
+        agent
+            .chat_with_tools("go", &[], &EchoExecutor::new())
+            .await
+            .unwrap();
+        agent.chat("again").await.unwrap();
+        assert_eq!(*sampling.lock().unwrap(), [(0.3, Some(2048)); 3]);
+    }
+
+    #[test]
+    fn test_a_new_agent_keeps_the_previous_defaults() {
+        let agent = test_agent(FixedReplyProvider { content: "x" });
+        assert_eq!(agent.temperature, DEFAULT_TEMPERATURE);
+        assert_eq!(agent.max_tokens, Some(DEFAULT_MAX_TOKENS));
     }
 }

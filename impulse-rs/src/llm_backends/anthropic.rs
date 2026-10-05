@@ -15,20 +15,83 @@ const HTTP_REQUEST_TIMEOUT_SECS: u64 = 120;
 /// Connection-establishment timeout (fail fast when the endpoint is unreachable).
 const HTTP_CONNECT_TIMEOUT_SECS: u64 = 10;
 
-/// Build the shared HTTP client with bounded defaults. Every provider request
-/// also applies the same request-local timeout, so the fallback client cannot
-/// silently become unbounded if platform TLS/client initialization rejects the
-/// configured builder.
-fn build_http_client() -> Client {
+/// Most of a successful response body read. The largest completion any
+/// supported model returns is a small fraction of this.
+const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+/// Most of an error response body read.
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+/// Most of an error body quoted in the error, which reaches the REPL, logs
+/// and daemon clients.
+const MAX_ERROR_TEXT_CHARS: usize = 2_000;
+
+/// Build the shared HTTP client: bounded timeouts, and no redirects.
+///
+/// A redirect is never followed. reqwest drops `Authorization` on a hop to
+/// another host but not `x-api-key`, so following one sent the Anthropic key
+/// and the whole prompt to whatever host it named (an https-to-http hop would
+/// have sent them in cleartext). The configured origin is the destination; a
+/// 3xx answer is an error naming where it pointed.
+///
+/// A builder failure (TLS initialisation) is kept and returned by every
+/// request rather than replaced with `Client::new()`, which panics in exactly
+/// that case and would have followed redirects.
+fn build_http_client() -> Result<Client, String> {
     Client::builder()
         .timeout(std::time::Duration::from_secs(HTTP_REQUEST_TIMEOUT_SECS))
         .connect_timeout(std::time::Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
-        .unwrap_or_else(|_| Client::new())
+        .map_err(|e| format!("could not build the HTTP client: {e}"))
 }
 
 fn bounded_request(request: RequestBuilder) -> RequestBuilder {
     request.timeout(std::time::Duration::from_secs(HTTP_REQUEST_TIMEOUT_SECS))
+}
+
+/// Reads `response`'s body: `Some` when it fits in `cap` bytes, `None` when
+/// it is longer. Never holds more than `cap` bytes plus one chunk.
+async fn read_capped_body(
+    mut response: reqwest::Response,
+    cap: usize,
+) -> Result<Option<Vec<u8>>, reqwest::Error> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > cap as u64)
+    {
+        return Ok(None);
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > cap {
+            return Ok(None);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Some(body))
+}
+
+/// An error response's body as text: at most [`MAX_ERROR_BODY_BYTES`] read
+/// and [`MAX_ERROR_TEXT_CHARS`] kept, marked with `…` when cut. A failure
+/// while reading ends the text early rather than replacing it.
+async fn error_text(mut response: reqwest::Response) -> String {
+    let mut body = Vec::new();
+    let mut cut = false;
+    while let Ok(Some(chunk)) = response.chunk().await {
+        let room = MAX_ERROR_BODY_BYTES - body.len();
+        if chunk.len() > room {
+            body.extend_from_slice(&chunk[..room]);
+            cut = true;
+            break;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let text = String::from_utf8_lossy(&body);
+    let mut chars = text.chars();
+    let mut quoted: String = chars.by_ref().take(MAX_ERROR_TEXT_CHARS).collect();
+    if cut || chars.next().is_some() {
+        quoted.push('…');
+    }
+    quoted
 }
 
 /// Canonical API origins. Each provider appends its own request path, so these
@@ -50,17 +113,54 @@ const OPENAI_BASE_URL_ENV: &str = "OPENAI_BASE_URL";
 const MINIMAX_BASE_URL_ENV: &str = "MINIMAX_BASE_URL";
 
 /// Resolve a base URL from, in precedence order: explicit config, environment
-/// override, canonical default. An override that is blank or carries no
-/// `http(s)` scheme is discarded rather than used, so a typo degrades to the
-/// real API instead of to an unresolvable endpoint.
+/// override, canonical default. An override that is not an `http(s)` origin
+/// is discarded with a warning (which names the reason, never the value, as
+/// it may hold credentials), so a typo degrades to the real API instead of to
+/// an unresolvable endpoint. A blank one is simply unset.
 fn select_base_url(explicit: Option<&str>, from_env: Option<&str>, default: &str) -> String {
-    explicit
-        .or(from_env)
-        .map(str::trim)
-        .filter(|candidate| candidate.starts_with("http://") || candidate.starts_with("https://"))
-        .unwrap_or(default)
-        .trim_end_matches('/')
-        .to_string()
+    [
+        ("configured base URL", explicit),
+        ("environment override", from_env),
+    ]
+    .into_iter()
+    .find_map(|(source, candidate)| {
+        let candidate = candidate?.trim();
+        if candidate.is_empty() {
+            return None;
+        }
+        match parse_origin(candidate) {
+            Ok(origin) => Some(origin),
+            Err(reason) => {
+                tracing::warn!(source, reason, "LLM provider base-URL override ignored");
+                None
+            }
+        }
+    })
+    .unwrap_or_else(|| default.trim_end_matches('/').to_string())
+}
+
+/// The origin (`scheme://host[:port]`) of a base-URL override, or why it
+/// can't be one. Each provider appends its own path, so a path here would be
+/// doubled (`/v1/v1/...`); credentials would reach the logs and be sent as
+/// Basic auth beside the API key.
+fn parse_origin(candidate: &str) -> Result<String, &'static str> {
+    let url = reqwest::Url::parse(candidate).map_err(|_| "it is not an absolute URL")?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("its scheme is not http or https");
+    }
+    if url.host_str().is_none() {
+        return Err("it names no host");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("it carries credentials");
+    }
+    if url.path() != "/" {
+        return Err("it has a path; give the origin only, each provider adds its own path");
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("it has a query or fragment");
+    }
+    Ok(url.origin().ascii_serialization())
 }
 
 /// How a resolved origin relates to the provider's canonical default.
@@ -76,16 +176,15 @@ enum BaseUrlKind {
     OverrideCleartextHttp,
 }
 
-fn origin_host(origin: &str) -> Option<&str> {
-    let rest = origin.split_once("://")?.1;
-    if let Some(rest) = rest.strip_prefix('[') {
-        return rest.split(']').next();
-    }
-    rest.split([':', '/']).next()
-}
-
+/// Whether a URL host (as `Url::host_str` gives it) is this machine. Only
+/// `localhost` and loopback addresses count: a name like `127.example.com`
+/// is a domain like any other.
 fn host_is_loopback(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost") || host == "::1" || host.starts_with("127.")
+    let unbracketed = host.trim_start_matches('[').trim_end_matches(']');
+    unbracketed.eq_ignore_ascii_case("localhost")
+        || unbracketed
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 fn classify_base_url(resolved: &str, default: &str) -> BaseUrlKind {
@@ -93,16 +192,14 @@ fn classify_base_url(resolved: &str, default: &str) -> BaseUrlKind {
     if resolved == canonical {
         return BaseUrlKind::Canonical;
     }
-    if resolved.starts_with("https://") {
-        return BaseUrlKind::OverrideHttps;
-    }
-    if resolved.starts_with("http://") {
-        if origin_host(resolved).is_some_and(host_is_loopback) {
-            return BaseUrlKind::OverrideLoopbackHttp;
-        }
+    let Ok(url) = reqwest::Url::parse(resolved) else {
         return BaseUrlKind::OverrideCleartextHttp;
+    };
+    match url.scheme() {
+        "https" => BaseUrlKind::OverrideHttps,
+        _ if url.host_str().is_some_and(host_is_loopback) => BaseUrlKind::OverrideLoopbackHttp,
+        _ => BaseUrlKind::OverrideCleartextHttp,
     }
-    BaseUrlKind::Canonical
 }
 
 fn log_base_url_override(provider_name: &str, origin: &str, kind: BaseUrlKind) {
@@ -128,7 +225,9 @@ fn log_base_url_override(provider_name: &str, origin: &str, kind: BaseUrlKind) {
 /// Common provider structure - shared by all LLM providers
 pub struct BaseProvider {
     api_key: String,
-    http_client: Arc<Client>,
+    /// The shared client, or why it could not be built; see
+    /// [`build_http_client`].
+    http_client: Arc<Result<Client, String>>,
     provider_name: &'static str,
     default_model: String,
     base_url: Option<String>,
@@ -196,8 +295,87 @@ impl BaseProvider {
         Ok(())
     }
 
-    pub fn http_client(&self) -> &Client {
-        &self.http_client
+    pub fn http_client(&self) -> AgentResult<&Client> {
+        self.http_client
+            .as_ref()
+            .as_ref()
+            .map_err(|e| AgentError::ApiRequest(e.clone()))
+    }
+
+    /// Sends `request` and decodes a successful reply's JSON body as `T`.
+    ///
+    /// Bodies are read in chunks with a cap: a success past
+    /// [`MAX_RESPONSE_BYTES`] is an error, and an error body is cut to
+    /// [`MAX_ERROR_BODY_BYTES`] and quoted to [`MAX_ERROR_TEXT_CHARS`]. A
+    /// redirect is an error (the client follows none). Transport failures,
+    /// including a timeout while the body arrives, are `ApiRequest` errors
+    /// that name their cause rather than invalid responses.
+    async fn send_json<T: serde::de::DeserializeOwned>(
+        &self,
+        request: RequestBuilder,
+    ) -> AgentResult<T> {
+        let response = bounded_request(request)
+            .send()
+            .await
+            .map_err(|e| self.transport_error(&e))?;
+        let status = response.status();
+        if status.is_redirection() {
+            let target = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|location| location.to_str().ok())
+                .and_then(|location| response.url().join(location).ok())
+                .map(|url| url.origin().ascii_serialization())
+                .unwrap_or_else(|| "an unnamed location".to_string());
+            return Err(AgentError::ApiRequest(format!(
+                "{} answered {status}, redirecting to {target}; redirects are not followed, \
+                 so set the provider's base URL to the final origin",
+                self.provider_name
+            )));
+        }
+        if !status.is_success() {
+            let text = error_text(response).await;
+            return Err(match status.as_u16() {
+                429 => AgentError::RateLimited,
+                401 => AgentError::Authentication(text),
+                _ => AgentError::ApiRequest(format!("{} - {}", status, text)),
+            });
+        }
+        let body = read_capped_body(response, MAX_RESPONSE_BYTES)
+            .await
+            .map_err(|e| self.transport_error(&e))?
+            .ok_or_else(|| {
+                AgentError::ApiResponse(format!(
+                    "the {} response was longer than {MAX_RESPONSE_BYTES} bytes",
+                    self.provider_name
+                ))
+            })?;
+        serde_json::from_slice(&body).map_err(|e| AgentError::ApiResponse(e.to_string()))
+    }
+
+    /// An `ApiRequest` error for a failed send or body read, naming the cause.
+    fn transport_error(&self, error: &reqwest::Error) -> AgentError {
+        if error.is_timeout() {
+            let (what, seconds) = if error.is_connect() {
+                ("could not connect", HTTP_CONNECT_TIMEOUT_SECS)
+            } else {
+                ("request timed out", HTTP_REQUEST_TIMEOUT_SECS)
+            };
+            return AgentError::ApiRequest(format!(
+                "{} {what} within {seconds}s",
+                self.provider_name
+            ));
+        }
+        // reqwest's own message ("error sending request for url (...)")
+        // leaves out why; its source chain says.
+        let mut message = error.to_string();
+        let mut source = std::error::Error::source(error);
+        while let Some(cause) = source {
+            message.push_str(": ");
+            message.push_str(&cause.to_string());
+            source = cause.source();
+        }
+        AgentError::ApiRequest(message)
     }
 
     pub fn api_key(&self) -> &str {
@@ -654,9 +832,13 @@ fn anthropic_chat_response(resp: AnthropicResponse, provider: &str) -> AgentResu
         })
         .collect();
 
+    // As on the OpenAI path, tool-use blocks make a tool-use turn whatever
+    // the stop reason says, except a token-limit stop, which may have cut
+    // them off.
     let stop_reason = match resp.stop_reason.as_deref() {
-        Some("tool_use") => StopReason::ToolUse,
         Some("max_tokens") => StopReason::MaxTokens,
+        _ if !tool_calls.is_empty() => StopReason::ToolUse,
+        Some("tool_use") => StopReason::ToolUse,
         Some("end_turn") | Some("stop_sequence") => StopReason::EndTurn,
         _ => StopReason::Other,
     };
@@ -688,30 +870,15 @@ impl LlmProvider for AnthropicProvider {
 
         let body = build_anthropic_body(&request, self.cache_system_and_tools)?;
 
-        let response = bounded_request(self.base.http_client().post(self.endpoint()))
+        let http_request = self
+            .base
+            .http_client()?
+            .post(self.endpoint())
             .header("x-api-key", self.base.api_key())
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AgentError::ApiRequest(e.to_string()))?;
-
-        // Check status and get error details if failed
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(match status.as_u16() {
-                429 => AgentError::RateLimited,
-                401 => AgentError::Authentication(text),
-                _ => AgentError::ApiRequest(format!("{} - {}", status, text)),
-            });
-        }
-
-        let resp: AnthropicResponse = response
-            .json()
-            .await
-            .map_err(|e| AgentError::ApiResponse(e.to_string()))?;
+            .json(&body);
+        let resp: AnthropicResponse = self.base.send_json(http_request).await?;
 
         anthropic_chat_response(resp, self.name())
     }
@@ -740,12 +907,42 @@ impl LlmProvider for AnthropicProvider {
 /// its own fallback.
 #[derive(Debug, Deserialize)]
 struct OpenAiStyleResponse {
+    /// Absent or null on a failure (MiniMax sends `null` beside its
+    /// `base_resp`); a reply with no choice is an error, never an empty
+    /// answer.
     #[serde(default)]
-    choices: Vec<OpenAiStyleChoice>,
+    choices: Option<Vec<OpenAiStyleChoice>>,
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
     usage: OpenAiStyleUsage,
+    /// MiniMax's status envelope. It reports failures (authentication,
+    /// rate limits, balance) here, often with HTTP 200; `status_code` 0 is
+    /// success.
+    #[serde(default)]
+    base_resp: Option<MinimaxBaseResp>,
+    /// An error some OpenAI-compatible servers put in a 200 reply.
+    #[serde(default)]
+    error: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MinimaxBaseResp {
+    #[serde(default)]
+    status_code: i64,
+    #[serde(default)]
+    status_msg: String,
+}
+
+/// MiniMax `base_resp` codes with a matching [`AgentError`]: 1002 is its
+/// rate limit and 1004 an authentication failure. Others keep their code.
+fn minimax_status_error(base: &MinimaxBaseResp) -> AgentError {
+    let message: String = base.status_msg.chars().take(MAX_ERROR_TEXT_CHARS).collect();
+    match base.status_code {
+        1002 => AgentError::RateLimited,
+        1004 => AgentError::Authentication(message),
+        code => AgentError::ApiRequest(format!("minimax status {code} - {message}")),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -843,7 +1040,28 @@ fn openai_style_chat_response(
     provider: &str,
     fallback_model: &str,
 ) -> AgentResult<ChatResponse> {
-    let choice = resp.choices.first();
+    if let Some(base) = resp.base_resp.as_ref().filter(|base| base.status_code != 0) {
+        return Err(minimax_status_error(base));
+    }
+    if let Some(error) = resp.error.as_ref().filter(|error| !error.is_null()) {
+        let message = error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .or_else(|| error.as_str().map(str::to_string))
+            .unwrap_or_else(|| error.to_string());
+        let message: String = message.chars().take(MAX_ERROR_TEXT_CHARS).collect();
+        return Err(AgentError::ApiResponse(format!(
+            "{provider} returned an error: {message}"
+        )));
+    }
+    let choices = resp.choices.unwrap_or_default();
+    let Some(choice) = choices.first() else {
+        return Err(AgentError::ApiResponse(format!(
+            "{provider} returned no choices"
+        )));
+    };
+    let choice = Some(choice);
     let content = choice
         .and_then(|c| c.message.content.clone())
         .unwrap_or_default();
@@ -898,16 +1116,16 @@ fn openai_style_chat_response(
         }
     }
 
-    // A response that carries tool calls is a tool-use turn even when the
-    // provider omitted `finish_reason` — the calls themselves are the signal
-    // the loop acts on, and `StopReason::ToolUse` is what pairs with them.
+    // A response that carries tool calls is a tool-use turn whatever
+    // `finish_reason` says (some servers send "stop" with calls): the calls
+    // themselves are the signal the loop acts on, and `StopReason::ToolUse`
+    // is what pairs with them. Only a token-limit stop outranks them, since
+    // its calls may be cut off; the loop refuses to run those.
     let stop_reason = match choice.and_then(|c| c.finish_reason.as_deref()) {
-        Some("tool_calls") | Some("function_call") => StopReason::ToolUse,
         Some("length") | Some("max_tokens") => StopReason::MaxTokens,
-        Some("stop") => StopReason::EndTurn,
-        None if !tool_calls.is_empty() => StopReason::ToolUse,
-        None => StopReason::EndTurn,
-        Some(_) if !tool_calls.is_empty() => StopReason::ToolUse,
+        _ if !tool_calls.is_empty() => StopReason::ToolUse,
+        Some("tool_calls") | Some("function_call") => StopReason::ToolUse,
+        Some("stop") | None => StopReason::EndTurn,
         Some(_) => StopReason::Other,
     };
 
@@ -954,28 +1172,14 @@ impl LlmProvider for OpenAiProvider {
 
         let body = build_openai_style_body(&request, None);
 
-        let response = bounded_request(self.0.http_client().post(self.endpoint()))
+        let http_request = self
+            .0
+            .http_client()?
+            .post(self.endpoint())
             .header("Authorization", format!("Bearer {}", self.0.api_key()))
             .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AgentError::ApiRequest(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(match status.as_u16() {
-                429 => AgentError::RateLimited,
-                401 => AgentError::Authentication(text),
-                _ => AgentError::ApiRequest(format!("{} - {}", status, text)),
-            });
-        }
-
-        let resp: OpenAiStyleResponse = response
-            .json()
-            .await
-            .map_err(|e| AgentError::ApiResponse(e.to_string()))?;
+            .json(&body);
+        let resp: OpenAiStyleResponse = self.0.send_json(http_request).await?;
 
         openai_style_chat_response(resp, self.name(), &request.model)
     }
@@ -1033,28 +1237,14 @@ impl LlmProvider for MinimaxProvider {
 
         let body = build_openai_style_body(&request, Some(MINIMAX_DEFAULT_MAX_TOKENS));
 
-        let response = bounded_request(self.0.http_client().post(self.endpoint()))
+        let http_request = self
+            .0
+            .http_client()?
+            .post(self.endpoint())
             .header("Authorization", format!("Bearer {}", self.0.api_key()))
             .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AgentError::ApiRequest(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(match status.as_u16() {
-                429 => AgentError::RateLimited,
-                401 => AgentError::Authentication(text),
-                _ => AgentError::ApiRequest(format!("{} - {}", status, text)),
-            });
-        }
-
-        let resp: OpenAiStyleResponse = response
-            .json()
-            .await
-            .map_err(|e| AgentError::ApiResponse(e.to_string()))?;
+            .json(&body);
+        let resp: OpenAiStyleResponse = self.0.send_json(http_request).await?;
 
         openai_style_chat_response(resp, self.name(), &request.model)
     }
@@ -1481,13 +1671,22 @@ mod tests {
         assert!(format!("{err}").contains("bash_exec"), "got: {err}");
     }
 
+    /// Review finding: a reply with no choice (an empty, missing or null
+    /// list) came back as a successful empty answer.
     #[test]
-    fn test_openai_style_response_with_no_choices_is_an_empty_reply() {
-        let raw = serde_json::json!({"choices": [], "usage": {}});
-        let resp: OpenAiStyleResponse = serde_json::from_value(raw).unwrap();
-        let parsed = openai_style_chat_response(resp, "openai", "m").unwrap();
-        assert_eq!(parsed.content, "");
-        assert!(parsed.tool_calls.is_empty());
+    fn test_openai_style_response_with_no_choices_is_an_error() {
+        for raw in [
+            serde_json::json!({"choices": [], "usage": {}}),
+            serde_json::json!({"usage": {}}),
+            serde_json::json!({"choices": null}),
+        ] {
+            let resp: OpenAiStyleResponse = serde_json::from_value(raw.clone()).unwrap();
+            let err = openai_style_chat_response(resp, "openai", "m").unwrap_err();
+            assert!(
+                format!("{err}").contains("no choices"),
+                "{raw}: got {err:?}"
+            );
+        }
     }
 
     // ---------------------------------------------------------------
@@ -1910,5 +2109,434 @@ mod tests {
         assert_eq!(blocks[0]["tool_use_id"], "call_1");
         assert_eq!(blocks[0]["content"], "Approve");
         assert_eq!(blocks[0]["is_error"], false);
+    }
+}
+
+/// Provider requests against loopback mock servers. Every request goes to
+/// 127.0.0.1 with the fake key `test-key`; each provider is pinned with an
+/// explicit base URL, which outranks any environment override.
+#[cfg(test)]
+mod http_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    const FAKE_KEY: &str = "test-key";
+    const MIB: usize = 1024 * 1024;
+
+    /// What the server saw of one request.
+    #[derive(Debug, Clone)]
+    struct Seen {
+        head: String,
+    }
+
+    enum Reply {
+        Json {
+            status: u16,
+            body: String,
+        },
+        Redirect {
+            status: u16,
+            location: String,
+        },
+        /// `filler` bytes of `A` with a status, sent with a length header
+        /// or, when `sized` is false, until the connection closes.
+        Bulk {
+            status: u16,
+            filler: usize,
+            sized: bool,
+        },
+        /// Accept the request and never answer.
+        Silent,
+    }
+
+    async fn read_request_head(stream: &mut TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        while let Ok(n) = stream.read(&mut chunk).await {
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf[..end]).to_string();
+                let length: usize = head
+                    .lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.trim()
+                            .eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().ok())?
+                    })
+                    .unwrap_or(0);
+                let mut have = buf.len() - end - 4;
+                while have < length {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => have += n,
+                    }
+                }
+                return head;
+            }
+        }
+        String::from_utf8_lossy(&buf).to_string()
+    }
+
+    async fn write_reply(stream: &mut TcpStream, reply: &Reply) {
+        match reply {
+            Reply::Json { status, body } => {
+                let head = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(body.as_bytes()).await;
+            }
+            Reply::Redirect { status, location } => {
+                let head = format!(
+                    "HTTP/1.1 {status} X\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+            }
+            Reply::Bulk {
+                status,
+                filler,
+                sized,
+            } => {
+                let length = if *sized {
+                    format!("content-length: {filler}\r\n")
+                } else {
+                    String::new()
+                };
+                let head = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\n{length}connection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let chunk = vec![b'A'; MIB];
+                let mut left = *filler;
+                while left > 0 {
+                    let n = left.min(chunk.len());
+                    // The client may stop reading; that is the point.
+                    if stream.write_all(&chunk[..n]).await.is_err() {
+                        return;
+                    }
+                    left -= n;
+                }
+            }
+            Reply::Silent => {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+        }
+        let _ = stream.flush().await;
+    }
+
+    /// A loopback server answering one scripted reply per connection.
+    async fn serve(replies: Vec<Reply>) -> (String, Arc<Mutex<Vec<Seen>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
+        tokio::spawn(async move {
+            for reply in replies {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let head = read_request_head(&mut stream).await;
+                record.lock().unwrap().push(Seen { head });
+                write_reply(&mut stream, &reply).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (origin, seen)
+    }
+
+    fn anthropic_at(origin: &str) -> AnthropicProvider {
+        let provider = AnthropicProvider {
+            base: BaseProvider::new("anthropic", FAKE_KEY.to_string(), "claude-sonnet-4-6")
+                .with_base_url(origin),
+            cache_system_and_tools: false,
+        };
+        assert!(provider.endpoint().starts_with("http://127.0.0.1:"));
+        provider
+    }
+
+    fn openai_at(origin: &str) -> OpenAiProvider {
+        let provider = OpenAiProvider(
+            BaseProvider::new("openai", FAKE_KEY.to_string(), "gpt-4o").with_base_url(origin),
+        );
+        assert!(provider.endpoint().starts_with("http://127.0.0.1:"));
+        provider
+    }
+
+    fn minimax_at(origin: &str) -> MinimaxProvider {
+        let provider = MinimaxProvider(
+            BaseProvider::new("minimax", FAKE_KEY.to_string(), "abab6.5s-chat")
+                .with_base_url(origin),
+        );
+        assert!(provider.endpoint().starts_with("http://127.0.0.1:"));
+        provider
+    }
+
+    fn hello() -> ChatRequest {
+        ChatRequest {
+            model: "test-model".to_string(),
+            messages: vec![Message::text(Role::User, "hello")],
+            temperature: 0.0,
+            max_tokens: Some(16),
+            tools: Vec::new(),
+        }
+    }
+
+    /// Review finding: the client followed redirects, and reqwest drops
+    /// `Authorization` but not `x-api-key` on a hop to another host, so a
+    /// 307 delivered the Anthropic key and the prompt to a host nobody
+    /// configured.
+    #[tokio::test]
+    async fn test_a_redirect_is_an_error_and_its_target_gets_nothing() {
+        let (other, other_seen) = serve(vec![Reply::Json {
+            status: 200,
+            body: "{}".to_string(),
+        }])
+        .await;
+        let (origin, seen) = serve(vec![Reply::Redirect {
+            status: 307,
+            location: format!("{other}/collect"),
+        }])
+        .await;
+
+        let err = anthropic_at(&origin).chat(hello()).await.unwrap_err();
+
+        assert!(
+            err.to_string().contains("redirects are not followed"),
+            "{err}"
+        );
+        assert!(err.to_string().contains(&other), "names the target: {err}");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert!(
+            other_seen.lock().unwrap().is_empty(),
+            "the redirect was followed"
+        );
+    }
+
+    /// Review finding: success and error bodies were read whole, however
+    /// large, and error bodies were quoted whole in the error.
+    #[tokio::test]
+    async fn test_bodies_are_read_with_a_cap() {
+        for sized in [true, false] {
+            let (origin, _) = serve(vec![Reply::Bulk {
+                status: 200,
+                filler: MAX_RESPONSE_BYTES + MIB,
+                sized,
+            }])
+            .await;
+            let err = openai_at(&origin).chat(hello()).await.unwrap_err();
+            assert!(
+                err.to_string().contains("longer than"),
+                "sized={sized}: {err}"
+            );
+        }
+
+        let (origin, _) = serve(vec![Reply::Bulk {
+            status: 500,
+            filler: MIB,
+            sized: true,
+        }])
+        .await;
+        let err = openai_at(&origin).chat(hello()).await.unwrap_err();
+        let message = err.to_string();
+        assert!(message.ends_with('…'), "{}", &message[..80]);
+        assert!(
+            message.chars().count() < MAX_ERROR_TEXT_CHARS + 100,
+            "{} chars",
+            message.chars().count()
+        );
+    }
+
+    /// Review finding: MiniMax reports failures in `base_resp` with HTTP
+    /// 200, and those came back as successful empty answers, or, with
+    /// `choices: null`, as a parse error that dropped MiniMax's reason.
+    #[tokio::test]
+    async fn test_minimax_status_errors_are_errors() {
+        let (origin, _) = serve(vec![
+            Reply::Json {
+                status: 200,
+                body: r#"{"base_resp": {"status_code": 1004, "status_msg": "login fail"}}"#
+                    .to_string(),
+            },
+            Reply::Json {
+                status: 200,
+                body: r#"{"choices": null, "base_resp": {"status_code": 1008, "status_msg": "insufficient balance"}}"#
+                    .to_string(),
+            },
+        ])
+        .await;
+        let provider = minimax_at(&origin);
+
+        let err = provider.chat(hello()).await.unwrap_err();
+        assert!(
+            matches!(&err, AgentError::Authentication(message) if message == "login fail"),
+            "{err:?}"
+        );
+        let err = provider.chat(hello()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("1008") && err.to_string().contains("insufficient balance"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_an_error_object_in_a_successful_reply_is_an_error() {
+        let (origin, _) = serve(vec![Reply::Json {
+            status: 200,
+            body: r#"{"error": {"message": "bad key", "type": "invalid_request_error"}}"#
+                .to_string(),
+        }])
+        .await;
+        let err = openai_at(&origin).chat(hello()).await.unwrap_err();
+        assert!(err.to_string().contains("bad key"), "{err}");
+    }
+
+    /// Review finding: `finish_reason: "stop"` beside tool calls made the
+    /// turn an end of turn, and the loop dropped the calls.
+    #[test]
+    fn test_tool_calls_make_a_tool_use_turn_whatever_the_stop_reason() {
+        let resp: OpenAiStyleResponse = serde_json::from_value(serde_json::json!({
+            "choices": [{
+                "message": {"content": null, "tool_calls": [
+                    {"id": "c1", "function": {"name": "echo_tool", "arguments": "{}"}}
+                ]},
+                "finish_reason": "stop"
+            }]
+        }))
+        .unwrap();
+        let parsed = openai_style_chat_response(resp, "openai", "m").unwrap();
+        assert_eq!(parsed.stop_reason, StopReason::ToolUse);
+
+        let resp: AnthropicResponse = serde_json::from_value(serde_json::json!({
+            "id": "msg_1", "model": "m", "stop_reason": "end_turn",
+            "content": [{"type": "tool_use", "id": "t1", "name": "echo_tool", "input": {}}],
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }))
+        .unwrap();
+        let parsed = anthropic_chat_response(resp, "anthropic").unwrap();
+        assert_eq!(parsed.stop_reason, StopReason::ToolUse);
+
+        let resp: AnthropicResponse = serde_json::from_value(serde_json::json!({
+            "id": "msg_1", "model": "m", "stop_reason": "max_tokens",
+            "content": [{"type": "tool_use", "id": "t1", "name": "echo_tool", "input": {}}],
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }))
+        .unwrap();
+        let parsed = anthropic_chat_response(resp, "anthropic").unwrap();
+        assert_eq!(parsed.stop_reason, StopReason::MaxTokens);
+    }
+
+    /// Review finding: a client that failed to build was replaced with
+    /// `Client::new()`, which panics in that case and follows redirects.
+    #[tokio::test]
+    async fn test_a_client_that_could_not_be_built_fails_each_request() {
+        let mut base = BaseProvider::new("anthropic", FAKE_KEY.to_string(), "m");
+        base.http_client = Arc::new(Err("could not build the HTTP client: no TLS".to_string()));
+        let provider = AnthropicProvider {
+            base,
+            cache_system_and_tools: false,
+        };
+        let err = provider.chat(hello()).await.unwrap_err();
+        assert!(err.to_string().contains("could not build"), "{err}");
+    }
+
+    /// Review finding: a timeout read as "invalid response: error decoding
+    /// response body", and every transport failure looked alike.
+    #[tokio::test]
+    async fn test_transport_errors_name_their_cause() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let err = openai_at(&origin).chat(hello()).await.unwrap_err();
+        assert!(
+            err.to_string().to_ascii_lowercase().contains("refused"),
+            "{err}"
+        );
+
+        let (silent, _) = serve(vec![Reply::Silent]).await;
+        let short = Client::builder()
+            .timeout(std::time::Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let timeout = short.get(&silent).send().await.unwrap_err();
+        assert!(timeout.is_timeout());
+        let provider = openai_at(&origin);
+        let mapped = provider.0.transport_error(&timeout);
+        assert!(
+            mapped.to_string().contains("timed out within 120s"),
+            "{mapped}"
+        );
+    }
+
+    /// Review finding: the loopback check matched any host starting with
+    /// `127.`, a credential-bearing override was logged verbatim and had its
+    /// user name taken for the host, a scheme-less override was dropped
+    /// silently, and a path doubled the provider's own path.
+    #[test]
+    fn test_base_url_overrides_must_be_plain_origins() {
+        let default = "https://api.anthropic.com";
+        for refused in [
+            "127.0.0.1:4010",
+            "http://user:pw@127.0.0.1:4010",
+            "http://127.0.0.1@attacker.example",
+            "http://127.0.0.1:4010/v1",
+            "http://127.0.0.1:4010/?debug=1",
+            "ftp://127.0.0.1",
+        ] {
+            assert_eq!(
+                select_base_url(None, Some(refused), default),
+                default,
+                "{refused}"
+            );
+        }
+        assert_eq!(
+            select_base_url(
+                Some("http://user@host"),
+                Some("http://127.0.0.1:9"),
+                default
+            ),
+            "http://127.0.0.1:9",
+            "a refused explicit URL falls back to the environment one"
+        );
+        assert_eq!(
+            classify_base_url("http://127.attacker.example", default),
+            BaseUrlKind::OverrideCleartextHttp
+        );
+        assert_eq!(
+            classify_base_url("http://127.0.0.1:4010", default),
+            BaseUrlKind::OverrideLoopbackHttp
+        );
+        assert_eq!(
+            classify_base_url("http://[::1]:4010", default),
+            BaseUrlKind::OverrideLoopbackHttp
+        );
+        assert_eq!(
+            classify_base_url("http://LOCALHOST:4010", default),
+            BaseUrlKind::OverrideLoopbackHttp
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_successful_reply_still_parses() {
+        let (origin, seen) = serve(vec![Reply::Json {
+            status: 200,
+            body: serde_json::json!({
+                "id": "msg_1", "model": "m", "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "hi"}],
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })
+            .to_string(),
+        }])
+        .await;
+        let reply = anthropic_at(&origin).chat(hello()).await.unwrap();
+        assert_eq!(reply.content, "hi");
+        let head = seen.lock().unwrap()[0].head.to_ascii_lowercase();
+        assert!(head.contains("x-api-key: test-key"), "{head}");
     }
 }

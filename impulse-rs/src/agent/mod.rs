@@ -366,6 +366,8 @@ impl ImpulseAgent {
                     None, // System prompt set per-request
                 );
                 agent.step_context.escalate_model = config.escalate_model.clone();
+                agent.temperature = config.temperature;
+                agent.max_tokens = Some(config.max_tokens);
                 Some(agent)
             }
             AgentMode::Harness { .. } => None, // CLI harness doesn't use Agent
@@ -1918,5 +1920,25 @@ mod tests {
                  survivors: {stray}"
             );
         }
+    }
+
+    /// Review finding: the API agent always sent temperature 0.7 and a
+    /// 4096-token cap, ignoring the configured values.
+    #[test]
+    fn test_api_agent_takes_its_sampling_from_the_config() {
+        let config = ImpulseAgentConfig {
+            mode: AgentMode::Api {
+                provider: ImpulseProvider::Anthropic,
+                model: None,
+            },
+            api_key: Some("test-key".to_string()),
+            temperature: 0.1,
+            max_tokens: 1234,
+            ..ImpulseAgentConfig::default()
+        };
+        let agent = ImpulseAgent::new(config).expect("API agent");
+        let inner = agent.inner.as_ref().expect("API mode has an inner agent");
+        assert_eq!(inner.temperature, 0.1);
+        assert_eq!(inner.max_tokens, Some(1234));
     }
 }
