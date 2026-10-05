@@ -1405,6 +1405,35 @@ mod tests {
         );
     }
 
+    /// Refutation review of dddee6d (suspected): ownership rested on a
+    /// connect() check alone. A held lock now stops a second daemon before it
+    /// touches the socket or reconciles anything.
+    #[tokio::test]
+    async fn test_start_refuses_while_another_daemon_holds_the_lock() {
+        use super::super::{acquire_daemon_lock, Daemon};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let daemon = Daemon::new(state_in_project(&tmp));
+        let lock_path = daemon.socket_path().parent().unwrap().join("daemon.lock");
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let held = acquire_daemon_lock(&lock_path).expect("the first holder gets the lock");
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), daemon.start())
+            .await
+            .expect("start must refuse at once, not run");
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("already running"), "{err}");
+        assert!(
+            !daemon.socket_path().exists(),
+            "a refused daemon must not bind"
+        );
+
+        drop(held);
+        assert!(
+            acquire_daemon_lock(&lock_path).is_ok(),
+            "released with its holder"
+        );
+    }
+
     // ── Stale socket detection tests ─────────────────────
 
     #[tokio::test]

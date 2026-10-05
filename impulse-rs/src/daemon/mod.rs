@@ -127,6 +127,31 @@ fn build_remote_tool_context(
     )
 }
 
+/// Takes the per-project daemon lock, failing at once if another process
+/// holds it. The returned file holds the lock until it is dropped.
+fn acquire_daemon_lock(path: &std::path::Path) -> Result<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("Failed to open daemon lock {}", path.display()))?;
+    // SAFETY: `file` stays open for the whole call, so the descriptor is
+    // valid; flock only takes an advisory lock on it and touches no memory.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            anyhow::bail!(
+                "Another daemon is already running (lock held: {})",
+                path.display()
+            );
+        }
+        return Err(error).with_context(|| format!("Failed to lock {}", path.display()));
+    }
+    Ok(file)
+}
+
 pub struct DaemonConfig {
     pub socket_path: PathBuf,
     pub state: SharedState,
@@ -273,6 +298,14 @@ impl Daemon {
             .await
             .context("Failed to restrict socket directory permissions")?;
 
+        // One daemon per project, enforced by an exclusive lock held for this
+        // daemon's lifetime and taken before the liveness check below. The
+        // check alone raced: two daemons starting together both found no live
+        // socket and both reconciled reservations, and a live daemon whose
+        // connect() failed under load had its socket unlinked. The kernel
+        // drops the lock when the process exits, so a crash never leaves it.
+        let _daemon_lock = acquire_daemon_lock(&socket_dir.join("daemon.lock"))?;
+
         // Stale socket detection: try connecting to distinguish crash residue from running daemon
         let pid_path = self.config.socket_path.with_extension("pid");
         if self.config.socket_path.exists() {
@@ -308,11 +341,8 @@ impl Daemon {
         // The trade: if bind then fails, a capability file is left for a daemon
         // that never listened. That authenticates nothing (a presentation is
         // compared against a *running* daemon's in-memory value) and the next
-        // successful run overwrites it. The one case this is worse than
-        // publishing later is two daemons starting concurrently, where the
-        // loser can clobber the winner's file; that race already exists for the
-        // PID file, is what the liveness check above is there to catch, and
-        // self-corrects on restart.
+        // successful run overwrites it. Two daemons cannot both get here: the
+        // lock above stops the second before it reaches the liveness check.
         let capability_path = self.operator_capability_path();
         let capability = OperatorCapability::generate()
             .context("Failed to mint this daemon run's operator capability")?;
@@ -385,7 +415,10 @@ impl Daemon {
                             });
                         }
                         Err(e) => {
+                            // Out of descriptors (EMFILE) fails every accept;
+                            // retrying at once spun a core and flooded the log.
                             eprintln!("Accept error: {}", e);
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         }
                     }
                 }
