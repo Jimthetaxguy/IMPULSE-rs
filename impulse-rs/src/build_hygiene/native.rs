@@ -619,6 +619,31 @@ mod tests {
         }
     }
 
+    /// Round 7 (reviewer C): a `CACHEDIR.TAG` that is a symbolic link to a
+    /// real tag elsewhere counted, and a non-cargo `target/` was deleted;
+    /// cargo refuses such a tag.
+    #[cfg(unix)]
+    #[test]
+    fn test_native_wipe_skips_a_target_whose_tag_is_a_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_tag_dir = tmp.path().join("real-tag");
+        fs::create_dir_all(&real_tag_dir).unwrap();
+        tag(&real_tag_dir);
+        let proj = tmp.path().join("root").join("p");
+        fs::create_dir_all(proj.join("target")).unwrap();
+        fs::write(proj.join("Cargo.toml"), "[package]\nname = \"test\"\n").unwrap();
+        fs::write(proj.join("target/not_cargo_data.txt"), "keep").unwrap();
+        std::os::unix::fs::symlink(
+            real_tag_dir.join("CACHEDIR.TAG"),
+            proj.join("target/CACHEDIR.TAG"),
+        )
+        .unwrap();
+
+        let wiped = native_wipe(&[tmp.path().join("root")], false).unwrap();
+        assert!(proj.join("target/not_cargo_data.txt").exists());
+        assert_eq!(wiped.projects_cleaned, 0);
+    }
+
     #[test]
     fn test_native_wipe_no_projects() {
         let tmp = tempfile::tempdir().unwrap();

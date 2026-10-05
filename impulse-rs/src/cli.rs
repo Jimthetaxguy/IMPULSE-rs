@@ -435,7 +435,7 @@ pub enum Commands {
         #[arg(long)]
         path: Option<PathBuf>,
     },
-    // Build hygiene: workspace-wide cargo clean
+    // Build hygiene: remove every discovered project's target/
     CleanAll {
         /// Only show what would be cleaned (default: true)
         #[arg(long)]

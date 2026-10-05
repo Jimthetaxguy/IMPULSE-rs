@@ -24,8 +24,9 @@ pub fn handle_verify() -> Result<()> {
 
 /// Handle the `clean-all` command.
 ///
-/// Runs `cargo clean` across all discovered Rust projects under the
-/// configured scan paths. Respects the dry-run flag.
+/// Removes each discovered Rust project's own `target/` under the
+/// configured scan paths (cargo-clean-all runs instead when installed).
+/// Respects the dry-run flag.
 pub fn handle_clean_all(state: &Arc<state::State>, dry_run: Option<bool>) -> Result<()> {
     let config = load_build_hygiene_config(state);
     let dry_run = dry_run.unwrap_or(config.dry_run_default);
@@ -42,7 +43,7 @@ pub fn handle_clean_all(state: &Arc<state::State>, dry_run: Option<bool>) -> Res
         if dry_run {
             "DRY RUN"
         } else {
-            "LIVE \u{2014} will cargo clean all projects!"
+            "LIVE \u{2014} will remove target/ from all projects!"
         }
     );
 

@@ -59,7 +59,7 @@ locally. `—` means the dispatcher prints a direct-mode instruction instead of 
 | `summary` | Yes | — | Quick summary |
 | `sweep` | Yes | — | Sweep stale build artifacts (`--dry-run`, `--path`, `--days`) |
 | `wipe` | Yes | — | Aggressive wipe of target/ dirs (`--dry-run`, `--path`) |
-| `clean-all` | Yes | — | Workspace-wide cargo clean (`--dry-run`) |
+| `clean-all` | Yes | — | Remove every discovered project's `target/` (`--dry-run`) |
 | `sccache-setup` | Yes | — | Setup sccache compilation cache (`--check`, `--json`) |
 | `build-health` | Yes | — | Disk usage report for build artifacts (`--json`) |
 | `tooling-list` | Yes | — | List dynamic tools (`--category`, `--json`) |
