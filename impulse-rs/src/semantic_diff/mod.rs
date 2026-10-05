@@ -18,7 +18,7 @@
 //! ```text
 //! session-end hook
 //!   └─ capture_semantic_diff(session_start_ref, HEAD)
-//!        └─ runs `sem diff --format json <base>..<head>`
+//!        └─ runs `sem diff <base>..<head> --format json`
 //!             └─ parses SemanticDiffReport
 //!                  └─ stored in .impulse/semantic_diffs/<session_id>.json
 //! ```
@@ -26,9 +26,11 @@
 mod runner;
 mod types;
 
+#[cfg(test)]
+pub(crate) use runner::with_test_sem;
 pub use runner::{
     capture_semantic_diff, run_semantic_blame, run_semantic_diff, run_semantic_impact,
-    sem_available,
+    sem_available, sem_version,
 };
 pub use types::{
     ChangeKind, EntityChange, EntityInfo, ImpactResult, SemanticBlameEntry, SemanticDiffReport,
