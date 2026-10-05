@@ -65,7 +65,7 @@ boundary.
 | `unsupported` | `NotImplementedError`, `ModuleNotFoundError` | The code parsed but asks for a Python feature or module the sandbox does not have. `import subprocess` and `import socket` land here (`ModuleNotFoundError`). So do `open()` and `os.getenv()`: with no host handler wired, Monty answers `NotImplementedError: OS function 'open' not implemented with standard execution`. |
 | `runtime` | any other exception | An ordinary uncaught exception; the traceback is in `error`. `__import__` is not a defined name in Monty, so `__import__("os")` is a `NameError` here. |
 | `timeout` | `TimeoutError` raised by `max_feed_duration` | The wall-clock budget was exhausted. |
-| `memory` | `MemoryError` raised by `max_memory` or by the print cap | One allocation Monty sizes up front would exceed the budget, or the print cap was reached. `[0] * (200 * 1024 * 1024)` fails with `memory limit exceeded: 3355443200 bytes > 67108864 bytes` without touching the heap. Growth through many smaller allocations does not raise it (see Consequences). |
+| `memory` | `MemoryError` raised by `max_memory` or by the print cap | An allocation Monty sizes up front and checks would exceed the budget, or the print cap was reached. `[0] * (200 * 1024 * 1024)` fails with `memory limit exceeded: 3355443200 bytes > 67108864 bytes` without touching the heap. Growth through many smaller allocations does not raise it (see Consequences). |
 
 `exit_code` is 0 on success and 1 on any fault, which is what `python3 -c` reported for an uncaught
 exception, so existing callers keep working.
@@ -104,10 +104,11 @@ Costs:
 - **Memory is only partly bounded** (found in review, 2026-10-04). Monty measures live heap through a
   counter that its `monty-alloc` global allocator maintains, and its docs say a configured
   `max_memory` "is silently not enforced" without that allocator. Impulse does not install it, so
-  `max_memory` only refuses a single allocation whose size is known before it happens, such as
-  `[0] * N`. A program that grows a list of 1 MB strings in a loop runs past 64 MiB to completion
-  (100 MB in `test_incremental_growth_is_not_bounded_by_max_memory`); the 5 s budget limits how long
-  it grows, not how far. Closing the gap needs `monty-alloc` as the global allocator, which is
+  `max_memory` only refuses some allocations whose size is known before they happen, such as
+  `[0] * N`; others are built unchecked: `''.join([a] * 12)` over a 50 MB string built 600 MB in
+  91 ms. A program that grows a list of 1 MB strings in a loop also runs past 64 MiB to completion
+  (100 MB in `test_incremental_growth_is_not_bounded_by_max_memory`). The 5 s budget does not bound
+  memory either, since one statement can allocate gigabytes well inside it. Closing the gap needs `monty-alloc` as the global allocator, which is
   process-wide (concurrent runs would share one counter), or `monty-pool` workers under an OS memory
   limit (follow-up 1).
 - Monty implements a subset of Python. Programs that used stdlib modules outside that subset now return

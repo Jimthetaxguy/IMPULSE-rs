@@ -25,7 +25,7 @@ impl DynamicTool for PythonExecTool {
         ToolDescriptor {
             id: "python_exec".into(),
             name: "Python Execute".into(),
-            description: "Execute Python code in a Monty sandbox (no filesystem, network, or process access; 5s wall clock; a single allocation over 64 MiB fails) and return stdout plus a fault class on failure".into(),
+            description: "Execute Python code in a Monty sandbox (no filesystem, network, or process access; 5s wall clock; memory use is not reliably capped) and return stdout plus a fault class on failure".into(),
             version: "0.1.0".into(),
             category: ToolCategory::Utility,
             params: vec![

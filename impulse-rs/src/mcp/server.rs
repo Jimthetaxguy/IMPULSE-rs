@@ -92,7 +92,17 @@ impl McpServer {
         println!("MCP compatibility server listening on {}", addr);
 
         loop {
-            let (socket, _) = listener.accept().await?;
+            // A failed accept (EMFILE, a connection reset before accept)
+            // used to end the server; it now waits briefly and goes on, as
+            // the voice transports do.
+            let socket = match listener.accept().await {
+                Ok((socket, _)) => socket,
+                Err(error) => {
+                    tracing::warn!("MCP TCP accept failed: {error}");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
             let registry = self.registry.clone();
             let ctx = self.ctx.clone();
             tokio::spawn(async move {

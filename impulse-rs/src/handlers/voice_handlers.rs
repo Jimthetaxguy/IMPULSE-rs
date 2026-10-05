@@ -112,23 +112,7 @@ pub async fn handle_voice(_impulse_dir: &Path, subcommand: VoiceCommands) -> Res
                 std::io::stdin()
                     .read_to_string(&mut buf)
                     .context("failed to read stdin for voice tool-call")?;
-                // Accept either client-tool or webhook-shaped JSON.
-                match serde_json::from_str::<ElevenLabsClientToolRequest>(&buf) {
-                    Ok(mut req) => {
-                        if confirmed {
-                            req.confirmed = true;
-                        }
-                        req
-                    }
-                    Err(_) => {
-                        let mut req = parse_webhook_tool_request(buf.as_bytes())
-                            .map_err(|e| anyhow::anyhow!(e))?;
-                        if confirmed {
-                            req.confirmed = true;
-                        }
-                        req
-                    }
-                }
+                stdin_tool_request(&buf, confirmed)?
             } else {
                 let tool = name.context("--name is required unless --stdin is set")?;
                 let params_val: serde_json::Value =
@@ -211,6 +195,19 @@ pub async fn handle_voice(_impulse_dir: &Path, subcommand: VoiceCommands) -> Res
     }
 }
 
+/// A tool call read from stdin, in client-tool or webhook shape.
+/// Confirmation comes from `--confirmed` alone: the payload is written by the
+/// voice agent, and honoring its own `"confirmed": true` let it approve
+/// mutating tools (bash_exec, file_write) itself.
+fn stdin_tool_request(payload: &str, confirmed: bool) -> Result<ElevenLabsClientToolRequest> {
+    let mut request = match serde_json::from_str::<ElevenLabsClientToolRequest>(payload) {
+        Ok(request) => request,
+        Err(_) => parse_webhook_tool_request(payload.as_bytes()).map_err(|e| anyhow::anyhow!(e))?,
+    };
+    request.confirmed = confirmed;
+    Ok(request)
+}
+
 /// The webhook's authentication: the shared secret when set, otherwise only
 /// an explicit `--allow-unauthenticated` (the documented setup exposes the
 /// webhook through a public tunnel).
@@ -229,6 +226,17 @@ fn webhook_auth(secret: Option<&str>, allow_unauthenticated: bool) -> Result<Web
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Refutation review: a stdin payload's own `"confirmed": true` approved
+    /// mutating tools without `--confirmed`.
+    #[test]
+    fn test_stdin_tool_call_confirmation_comes_only_from_the_flag() {
+        let client =
+            r#"{"tool_name": "bash_exec", "parameters": {"command": "true"}, "confirmed": true}"#;
+        assert!(!stdin_tool_request(client, false).unwrap().confirmed);
+        assert!(stdin_tool_request(client, true).unwrap().confirmed);
+        assert!(stdin_tool_request("not json", false).is_err());
+    }
 
     #[test]
     fn test_webhook_auth_requires_a_secret_or_an_explicit_opt_out() {

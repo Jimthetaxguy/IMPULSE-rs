@@ -73,10 +73,14 @@ impl WebhookAuth {
             let Some((name, value)) = line.split_once(':') else {
                 return false;
             };
+            // RFC 7235: the scheme is case-insensitive and any whitespace
+            // may separate it from the token.
+            let mut credentials = value.trim().splitn(2, char::is_whitespace);
+            let scheme = credentials.next().unwrap_or_default();
             name.trim().eq_ignore_ascii_case("authorization")
-                && value
-                    .trim()
-                    .strip_prefix("Bearer ")
+                && scheme.eq_ignore_ascii_case("bearer")
+                && credentials
+                    .next()
                     .is_some_and(|presented| constant_time_eq(secret, presented.trim()))
         })
     }
@@ -457,6 +461,9 @@ async fn handle_http_connection(
         .await;
     }
 
+    // A health check needs no body, and it is unauthenticated, so reading
+    // a declared one let any client make the server buffer up to the limit.
+    let content_length = if is_health { 0 } else { content_length };
     let mut body_owned = body.to_vec();
     while body_owned.len() < content_length {
         let m = stream.read(&mut chunk).await?;
@@ -657,6 +664,34 @@ mod tests {
     async fn webhook_reads_headers_split_across_writes() {
         let addr = spawn_webhook(WebhookAuth::Unauthenticated).await;
         let response = send_raw(addr, &[b"GET /hea", b"lthz HTTP/1.1\r\n", b"\r\n"]).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    }
+
+    /// Refutation review of fbba874: RFC 7235 makes the scheme
+    /// case-insensitive; `bearer` and a tab separator got 401.
+    #[tokio::test]
+    async fn webhook_accepts_the_bearer_scheme_in_any_case() {
+        let addr = spawn_webhook(WebhookAuth::Bearer("s3cret".into())).await;
+        for auth in [
+            "Authorization: bearer s3cret",
+            "authorization: BEARER\ts3cret",
+        ] {
+            let request = format!("GET /voice/schema HTTP/1.1\r\n{auth}\r\n\r\n");
+            let response = send_raw(addr, &[request.as_bytes()]).await;
+            assert!(response.starts_with("HTTP/1.1 200"), "{auth}: {response}");
+        }
+    }
+
+    /// Refutation review of fbba874: an unauthenticated health check that
+    /// declared a body made the server wait for (and buffer) it.
+    #[tokio::test]
+    async fn webhook_health_check_does_not_read_a_declared_body() {
+        let addr = spawn_webhook(WebhookAuth::Bearer("s3cret".into())).await;
+        let response = send_raw(
+            addr,
+            &[b"GET /healthz HTTP/1.1\r\nContent-Length: 1000\r\n\r\n"],
+        )
+        .await;
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     }
 

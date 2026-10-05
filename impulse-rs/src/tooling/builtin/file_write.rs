@@ -98,6 +98,18 @@ impl DynamicTool for FileWriteTool {
         let parent = path.parent().ok_or_else(|| {
             ToolError::ExecutionFailed(format!("path has no parent directory: {path_str}"))
         })?;
+        // The temp file is written in `parent`. For the write root itself (or
+        // `x/..`, which collapses to it) that is outside every root; the old
+        // code wrote the whole content there before the rename failed.
+        if !ctx.is_path_allowed(parent, true) {
+            return Err(ToolError::PathNotAllowed(path.display().to_string()));
+        }
+        if path.is_dir() {
+            return Err(ToolError::InvalidParams(format!(
+                "{} is a directory",
+                path.display()
+            )));
+        }
 
         if create_dirs {
             std::fs::create_dir_all(parent).map_err(|e| {
@@ -166,6 +178,46 @@ impl DynamicTool for FileWriteTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Refutation review of cc062a9: a target equal to the write root, or
+    /// `x/..` collapsing to it, put the temp file in the root's parent.
+    #[tokio::test]
+    async fn test_write_root_and_directories_are_not_targets() {
+        let outside = tempfile::tempdir().unwrap();
+        let root = outside.path().join("root");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let ctx = ToolContext {
+            allowed_write_roots: vec![root.clone()],
+            ..ToolContext::with_all_capabilities()
+        };
+        for (target, outside_root) in [
+            (root.clone(), true),
+            (root.join("x").join(".."), true),
+            (root.join("sub"), false),
+        ] {
+            let params = serde_json::json!({
+                "path": target.display().to_string(),
+                "content": "data",
+            });
+            let err = FileWriteTool.execute(params, &ctx).await.unwrap_err();
+            if outside_root {
+                assert!(
+                    matches!(err, ToolError::PathNotAllowed(_)),
+                    "{target:?}: {err:?}"
+                );
+            } else {
+                assert!(
+                    matches!(err, ToolError::InvalidParams(_)),
+                    "{target:?}: {err:?}"
+                );
+            }
+        }
+        let names: Vec<_> = std::fs::read_dir(outside.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["root"], "nothing may be written beside the root");
+    }
 
     #[test]
     fn test_descriptor() {

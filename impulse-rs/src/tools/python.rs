@@ -23,11 +23,11 @@ use std::time::Duration;
 
 /// Default wall-clock budget for one program (calculator and python_exec).
 pub const DEFAULT_PYTHON_TIMEOUT: Duration = Duration::from_secs(5);
-/// Memory budget for one program. Monty checks it against an allocation it
-/// sizes up front (`[0] * N`), but measuring live heap needs `monty-alloc` as
-/// the global allocator, which is not installed, so growth through many
-/// smaller allocations is not stopped by it; only the time budget ends that.
-/// See ADR-0021.
+/// Memory budget for one program. Monty checks it against some allocations
+/// it sizes up front (`[0] * N`), not all (`str.join` builds its result
+/// unchecked), and measuring live heap needs `monty-alloc` as the global
+/// allocator, which is not installed. So memory is not reliably bounded:
+/// one statement can allocate gigabytes inside the time budget. See ADR-0021.
 pub const DEFAULT_PYTHON_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
 /// Cap on collected `print` output. Exceeding it is a [`fault::MEMORY`] fault.
 pub const DEFAULT_PYTHON_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
