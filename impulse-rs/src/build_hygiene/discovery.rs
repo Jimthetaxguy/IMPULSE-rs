@@ -1,6 +1,7 @@
 // Discovery — find Rust projects by locating Cargo.toml and target/ directories
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -23,12 +24,13 @@ pub struct RustProject {
 /// A Rust project is any directory containing a Cargo.toml with a target/ subdirectory.
 pub fn discover_rust_projects(search_paths: &[PathBuf]) -> Vec<RustProject> {
     let mut projects = Vec::new();
+    let mut visited = HashSet::new();
 
     for search_path in search_paths {
-        if !search_path.exists() {
+        let Ok(root) = search_path.canonicalize() else {
             continue;
-        }
-        discover_recursive(search_path, &mut projects, 0, 5);
+        };
+        discover_recursive(search_path, &root, &mut visited, &mut projects, 0, 5);
     }
 
     // Sort by target size (largest first) for prioritized reporting
@@ -36,8 +38,26 @@ pub fn discover_rust_projects(search_paths: &[PathBuf]) -> Vec<RustProject> {
     projects
 }
 
-fn discover_recursive(dir: &Path, projects: &mut Vec<RustProject>, depth: usize, max_depth: usize) {
+/// Each directory is visited once, by its real path, and only inside the
+/// search root it was reached from. Following directory links as they came,
+/// a link back up the tree listed a project once per path (93 entries for
+/// 2 projects), and a link out of the root reached projects the caller never
+/// named, which `clean-all` then cleaned once per path.
+fn discover_recursive(
+    dir: &Path,
+    root: &Path,
+    visited: &mut HashSet<PathBuf>,
+    projects: &mut Vec<RustProject>,
+    depth: usize,
+    max_depth: usize,
+) {
     if depth > max_depth {
+        return;
+    }
+    let Ok(real) = dir.canonicalize() else {
+        return;
+    };
+    if !real.starts_with(root) || !visited.insert(real) {
         return;
     }
 
@@ -91,15 +111,17 @@ fn discover_recursive(dir: &Path, projects: &mut Vec<RustProject>, depth: usize,
             continue;
         }
 
-        discover_recursive(&path, projects, depth + 1, max_depth);
+        discover_recursive(&path, root, visited, projects, depth + 1, max_depth);
     }
 }
 
-/// Total size of the files under `path`, counted the way `du` counts:
-/// symbolic links inside it count as links and are not followed. Following
+/// Total apparent size of the files under `path`, as `du -A` counts it.
+/// Symbolic links inside it count as links and are not followed: following
 /// them, a link back up the tree (`target/x -> .`) made the walk branch at
 /// every level, and two such links turned one scan into billions of steps.
-/// `path` itself may be a link, such as a `target` kept on another disk.
+/// A file with several hard links counts once; cargo hard-links its final
+/// outputs, and counting each name overstated targets by up to 46%. `path`
+/// itself may be a link, such as a `target` kept on another disk.
 pub fn dir_size(path: &Path) -> u64 {
     if !path.is_dir() {
         return std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
@@ -107,6 +129,8 @@ pub fn dir_size(path: &Path) -> u64 {
 
     let mut total: u64 = 0;
     let mut pending = vec![path.to_path_buf()];
+    #[cfg(unix)]
+    let mut linked_files = HashSet::new();
     while let Some(dir) = pending.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
@@ -115,7 +139,19 @@ pub fn dir_size(path: &Path) -> u64 {
             match entry.file_type() {
                 Ok(kind) if kind.is_dir() => pending.push(entry.path()),
                 // A link's own size: `DirEntry::metadata` does not follow it.
-                Ok(_) => total += entry.metadata().map(|m| m.len()).unwrap_or(0),
+                Ok(_) => {
+                    let Ok(meta) = entry.metadata() else {
+                        continue;
+                    };
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::MetadataExt;
+                        if meta.nlink() > 1 && !linked_files.insert((meta.dev(), meta.ino())) {
+                            continue;
+                        }
+                    }
+                    total += meta.len();
+                }
                 Err(_) => {}
             }
         }
@@ -198,6 +234,39 @@ mod tests {
         std::os::unix::fs::symlink(".", tmp.path().join("loop")).unwrap();
         // The file once, plus the link's own one byte (its target, ".").
         assert_eq!(dir_size(tmp.path()), 4096 + 1);
+    }
+
+    /// Round 4 (reviewer C): every name of a hard-linked file was counted.
+    #[cfg(unix)]
+    #[test]
+    fn test_dir_size_counts_a_hard_linked_file_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("a.bin"), vec![0u8; 4096]).unwrap();
+        fs::hard_link(tmp.path().join("a.bin"), tmp.path().join("b.bin")).unwrap();
+        assert_eq!(dir_size(tmp.path()), 4096);
+    }
+
+    /// Round 4 (reviewer C): directory links were followed, so a link back
+    /// up the tree listed a project once per path, and a link out of the
+    /// search root reached a project the caller never named.
+    #[cfg(unix)]
+    #[test]
+    fn test_discover_lists_each_project_once_and_stays_in_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let outside = tmp.path().join("outside");
+        for project in [root.join("a"), outside.clone()] {
+            fs::create_dir_all(project.join("target")).unwrap();
+            fs::write(project.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        }
+        std::os::unix::fs::symlink(root.join("a"), root.join("dup")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("out")).unwrap();
+        std::os::unix::fs::symlink(".", root.join("loop")).unwrap();
+
+        let projects = discover_rust_projects(std::slice::from_ref(&root));
+        assert_eq!(projects.len(), 1, "{projects:?}");
+        let found = projects[0].path.file_name().unwrap();
+        assert!(found == "a" || found == "dup", "{projects:?}");
     }
 
     #[test]
