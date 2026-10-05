@@ -7,11 +7,13 @@
 use anyhow::{anyhow, Context, Result};
 use std::path::PathBuf;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use crate::daemon::actor_provenance::OperatorCapability;
-use crate::daemon::{DaemonRequest, DaemonResponse};
+use crate::daemon::{
+    read_bounded_line, BoundedLine, DaemonRequest, DaemonResponse, MAX_REQUEST_SIZE,
+};
 
 /// How long to wait for a daemon response before giving up. Generous enough for
 /// slow LLM-backed handlers (the daemon's own LLM calls cap at ~120s) but
@@ -20,15 +22,44 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(180);
 const GOVERNED_VERIFICATION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(21 * 60);
 const ACKNOWLEDGED_REQUEST_ATTEMPTS: usize = 2;
 
+/// Most of one daemon response read. Larger than the daemon's own request
+/// cap, since listings and governed snapshots come back bigger than any
+/// request, but bounded so a misbehaving peer can't grow the client's
+/// memory without limit.
+const MAX_RESPONSE_SIZE: usize = 64 * 1024 * 1024;
+
+/// The daemon did not answer within the caller's budget. It may be hung, or
+/// still working on the request, so the request is not sent again.
+#[derive(Debug)]
+struct DaemonTimedOut {
+    timeout: Duration,
+}
+
+impl std::fmt::Display for DaemonTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Daemon did not respond within {}s (it may be hung, or still working on the request)",
+            self.timeout.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for DaemonTimedOut {}
+
 /// Write one JSON-line request and read exactly one JSON-line response.
 ///
 /// Shared by the capability handshake and the request itself so both use the
-/// same framing and the same hung-daemon timeout.
+/// same framing. The caller bounds the whole exchange in time; the response
+/// is bounded in size by `max_response` ([`MAX_RESPONSE_SIZE`] outside
+/// tests), and a request over the daemon's [`MAX_REQUEST_SIZE`] is refused
+/// here, where the daemon would close the connection while the client was
+/// still writing and leave only a broken pipe to report.
 async fn exchange_line<W, R>(
     writer: &mut W,
     reader: &mut R,
     request: &DaemonRequest,
-    timeout: Duration,
+    max_response: usize,
 ) -> Result<DaemonResponse>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -36,6 +67,12 @@ where
 {
     let request_json =
         serde_json::to_string(request).context("Failed to serialize daemon request")?;
+    if request_json.len() > MAX_REQUEST_SIZE {
+        anyhow::bail!(
+            "The request is {} bytes; the daemon accepts at most {MAX_REQUEST_SIZE} bytes per request",
+            request_json.len()
+        );
+    }
     writer
         .write_all(request_json.as_bytes())
         .await
@@ -49,18 +86,18 @@ where
         .await
         .context("Failed to flush daemon socket")?;
 
-    let mut response_line = String::new();
-    tokio::time::timeout(timeout, reader.read_line(&mut response_line))
+    match read_bounded_line(reader, max_response)
         .await
-        .with_context(|| {
-            format!(
-                "Daemon did not respond within {}s (it may be hung)",
-                timeout.as_secs()
-            )
-        })?
-        .context("Failed to read response from daemon socket")?;
-
-    serde_json::from_str(&response_line).context("Failed to parse daemon response")
+        .context("Failed to read response from daemon socket")?
+    {
+        BoundedLine::Line(line) => {
+            serde_json::from_str(&line).context("Failed to parse daemon response")
+        }
+        BoundedLine::Eof => anyhow::bail!("The daemon closed the connection without a response"),
+        BoundedLine::TooLarge => {
+            anyhow::bail!("The daemon's response was longer than {max_response} bytes")
+        }
+    }
 }
 
 /// Message shown when a capability was found but the daemon refused it.
@@ -187,8 +224,11 @@ impl DaemonClient {
         self.send_with_timeout(request, RESPONSE_TIMEOUT).await
     }
 
-    /// Send a request and await the response, failing if the daemon does not
-    /// reply within `timeout` (so a hung daemon can't hang the caller forever).
+    /// Send a request and await the response, failing if the whole exchange
+    /// (connecting, the capability handshake, writing the request and reading
+    /// the reply) does not finish within `timeout`, so a hung daemon can't
+    /// hang the caller forever. A daemon that stops reading can block a write
+    /// as surely as a read: a Unix socket buffers only a few kilobytes.
     ///
     /// When the request needs operator class and a capability is reachable, it
     /// is presented first on the same connection: the daemon's classification
@@ -198,6 +238,13 @@ impl DaemonClient {
         request: DaemonRequest,
         timeout: Duration,
     ) -> Result<DaemonResponse> {
+        match tokio::time::timeout(timeout, self.send_on_new_connection(request)).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::Error::new(DaemonTimedOut { timeout })),
+        }
+    }
+
+    async fn send_on_new_connection(&self, request: DaemonRequest) -> Result<DaemonResponse> {
         let mut stream = self.connect().await?;
         let (reader, mut writer) = stream.split();
         let mut reader = BufReader::new(reader);
@@ -212,7 +259,7 @@ impl DaemonClient {
                             token: capability.expose().to_string(),
                         },
                     ),
-                    timeout,
+                    MAX_RESPONSE_SIZE,
                 )
                 .await?;
                 if let DaemonResponse::Error { message } = &presentation {
@@ -229,7 +276,7 @@ impl DaemonClient {
             }
         }
 
-        exchange_line(&mut writer, &mut reader, &request, timeout).await
+        exchange_line(&mut writer, &mut reader, &request, MAX_RESPONSE_SIZE).await
     }
 
     pub async fn ping(&self) -> Result<bool> {
@@ -399,7 +446,20 @@ impl DaemonClient {
                     response = Some(value);
                     break;
                 }
-                Err(error) => last_error = Some(error),
+                Err(error) => {
+                    // A request that timed out may still be running in the
+                    // daemon. Sending it again would race that attempt (a
+                    // registration materializing a staged worktree would then
+                    // fail on the first attempt's own checkout), so a timeout
+                    // ends here. Other failures, such as a refused connection
+                    // or a connection closed without a reply, are retried as
+                    // before.
+                    let timed_out = error.downcast_ref::<DaemonTimedOut>().is_some();
+                    last_error = Some(error);
+                    if timed_out {
+                        break;
+                    }
+                }
             }
         }
         let response = response.ok_or_else(|| {
@@ -755,6 +815,7 @@ impl DaemonClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncBufReadExt;
 
     #[test]
     fn test_daemon_client_new_stores_path() {
@@ -992,6 +1053,117 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("agent turn"));
         assert!(message.contains("250ms"));
+    }
+
+    /// Review finding: only the read was under the timeout. A daemon that
+    /// stopped reading blocked the write of any request larger than the
+    /// socket buffers (a few kilobytes on macOS) forever.
+    #[tokio::test]
+    async fn test_a_write_to_a_daemon_that_stops_reading_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("deaf.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _hold = stream;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+
+        let client = DaemonClient::new(sock);
+        let start = std::time::Instant::now();
+        let result = client
+            .send_with_timeout(
+                DaemonRequest::TrackFile {
+                    session_id: "s1".to_string(),
+                    file_path: "x".repeat(2 * 1024 * 1024),
+                },
+                Duration::from_millis(200),
+            )
+            .await;
+        let elapsed = start.elapsed();
+
+        let err = result.expect_err("a daemon that never reads must not hang the client");
+        assert!(err.to_string().contains("did not respond"), "{err}");
+        assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
+    }
+
+    /// Review finding: the reply was read with no size limit.
+    #[tokio::test]
+    async fn test_a_reply_past_the_cap_is_refused() {
+        let (mut writer, _sink) = tokio::io::duplex(1024);
+        let reply = format!("{}\n", "x".repeat(1000));
+        let mut reader = BufReader::new(reply.as_bytes());
+        let err = exchange_line(&mut writer, &mut reader, &DaemonRequest::Ping, 100)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("longer than 100 bytes"), "{err}");
+
+        let mut closed = BufReader::new(&b""[..]);
+        let err = exchange_line(&mut writer, &mut closed, &DaemonRequest::Ping, 100)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("without a response"), "{err}");
+    }
+
+    /// Review finding: a request over the daemon's limit was written anyway;
+    /// the daemon closed the connection mid-write, and the user saw only a
+    /// broken pipe.
+    #[tokio::test]
+    async fn test_a_request_past_the_daemon_limit_is_refused_before_writing() {
+        use tokio::io::AsyncReadExt;
+        let (mut writer, mut sink) = tokio::io::duplex(64 * 1024);
+        // Drained while the exchange runs, so a regression that writes the
+        // request completes and fails the assertions instead of blocking on
+        // a full pipe.
+        let drained = tokio::spawn(async move {
+            let mut written = Vec::new();
+            let _ = sink.read_to_end(&mut written).await;
+            written.len()
+        });
+        let mut reader = BufReader::new(&b"{}\n"[..]);
+        let request = DaemonRequest::TrackFile {
+            session_id: "s1".to_string(),
+            file_path: "x".repeat(MAX_REQUEST_SIZE),
+        };
+        let result = exchange_line(&mut writer, &mut reader, &request, MAX_RESPONSE_SIZE).await;
+        drop(writer);
+        let written = drained.await.unwrap();
+
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("accepts at most"), "{err}");
+        assert_eq!(written, 0, "{written} bytes were written");
+    }
+
+    /// Review finding: a governed request that timed out was sent again
+    /// while the first attempt could still be running in the daemon, which
+    /// for a staged registration then failed on the first attempt's own
+    /// worktree.
+    #[tokio::test]
+    async fn test_a_timed_out_governed_request_is_not_sent_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("slow.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&connections);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let _hold = stream;
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                });
+            }
+        });
+
+        let client = DaemonClient::new(sock);
+        let result: Result<serde_json::Value> = client
+            .governed_response(DaemonRequest::Ping, "probe", Duration::from_millis(200))
+            .await;
+
+        let err = result.expect_err("an unanswered request must fail");
+        assert!(err.to_string().contains("did not respond"), "{err}");
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
