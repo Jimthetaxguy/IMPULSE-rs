@@ -30,7 +30,8 @@ tags: [worktree, lane, handoff, desktop, runtime, review]
 - Verification: `cargo build --workspace`, `cargo test --workspace`,
   `cargo clippy --workspace --all-targets -- -D warnings` (default and `--no-default-features`),
   `cargo fmt --all -- --check`, `python3 docs/validate_docs.py`
-- Latest status: implemented; gate in progress. Not merged; needs a PR after the cleanup branch.
+- Latest status: implemented in `f8afcf6`; gate clean; pushed. Not merged; needs a PR after the
+  cleanup branch.
 
 ## What changed
 - `close_agent` held the lifecycle ordering lock while it killed the pane. Every pane's output
@@ -53,4 +54,7 @@ tags: [worktree, lane, handoff, desktop, runtime, review]
   reproduced elsewhere does not occur. The existing launch-failure tests pass.
 - `impulse-desktop` tests: 177 unit, 83 contract, and the rest pass; clippy clean with default
   features and with `--no-default-features`; fmt clean.
-- Gate: pending.
+- Gate on `f8afcf6`: build clean; `cargo test --workspace` 3272 passed, 0 failed, 8 ignored (the
+  cleanup branch's 3271 plus the new test); clippy clean with default features and with
+  `--no-default-features`; fmt clean. Trial merges are clean with `origin/main`,
+  `claude/office-bounds-20261005` and `claude/term-context-fixes-20261005`.
