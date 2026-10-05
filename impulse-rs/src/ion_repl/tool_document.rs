@@ -258,7 +258,6 @@ impl ReplTool for DocumentReadTool {
     async fn run(&self, args: Value, ctx: &ReplContext) -> Result<ToolOutcome> {
         let request = parse_request(&args)?;
         let path = resolve_document_path(&request.path, ctx)?;
-        preflight_container(&path, &request.path)?;
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
@@ -272,12 +271,14 @@ impl ReplTool for DocumentReadTool {
             let parsed = extract_pdf(&path, &request.path, ExtractBudget::DEFAULT).await?;
             build_window(&request, &path, &parsed)?
         } else {
-            // Parsing is synchronous (calamine, docx-rs). Run it off the
-            // async runtime so the loop contract's wall-clock timeout can
-            // still fire while a large file parses.
+            // The container preflight and the parse are synchronous: run
+            // them off the async runtime so the loop contract's wall-clock
+            // timeout can still fire while a large file inflates or parses.
+            // A PDF is not a zip container, so its path has no preflight.
             let request = request.clone();
             let path = path.clone();
             tokio::task::spawn_blocking(move || -> Result<DocumentWindow> {
+                preflight_container(&path, &request.path)?;
                 let parsed = parse_document_bounded(&path, &request.path, ExtractBudget::DEFAULT)?;
                 build_window(&request, &path, &parsed)
             })
@@ -2679,6 +2680,38 @@ mod tests {
                 .pack(file)
                 .unwrap();
             path
+        }
+
+        /// The container preflight runs on the blocking pool with the
+        /// parse; inflating up to 64 MiB used to hold the async runtime
+        /// first. On this current-thread runtime a ticker task only gets a
+        /// turn if `run` yields before it fails.
+        #[tokio::test]
+        async fn test_run_preflights_the_container_off_the_async_runtime() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            let dir = tempfile::TempDir::new().unwrap();
+            crate::office::test_fixtures::write_docx_bomb(dir.path(), MAX_DECOMPRESSED_BYTES);
+            let turns = std::sync::Arc::new(AtomicUsize::new(0));
+            let counter = std::sync::Arc::clone(&turns);
+            let ticker = tokio::spawn(async move {
+                loop {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                }
+            });
+            let err = DocumentReadTool
+                .run(json!({"path": "bomb.docx"}), &ctx_in(&dir))
+                .await
+                .unwrap_err();
+            let seen = turns.load(Ordering::SeqCst);
+            ticker.abort();
+            assert!(
+                err.to_string()
+                    .starts_with("document_read: 'bomb.docx' inflates to more than"),
+                "{err}"
+            );
+            assert!(seen > 0, "the preflight ran on the async runtime thread");
         }
 
         #[tokio::test]
