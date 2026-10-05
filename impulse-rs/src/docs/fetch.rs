@@ -257,6 +257,13 @@ pub fn fetch_mistral_models() -> Vec<ModelInfo> {
 }
 
 /// Fetch all known models (combines static lists + API calls where available)
+/// The OpenAI key to list models with, if there is one. A blank key (an
+/// exported but empty variable) is none: sending it could only fail, and
+/// the failure now stops the fetch.
+fn usable_openai_key(key: Option<&str>) -> Option<&str> {
+    key.map(str::trim).filter(|key| !key.is_empty())
+}
+
 pub async fn fetch_all_models(openai_api_key: Option<&str>) -> Result<Vec<ModelInfo>> {
     let mut all_models = Vec::new();
 
@@ -272,7 +279,7 @@ pub async fn fetch_all_models(openai_api_key: Option<&str>) -> Result<Vec<ModelI
     // OpenAI models (API call if key provided). A failed call is an error:
     // dropping it reported success, and the caller then cached a list with
     // every OpenAI model gone, marked fresh from the API.
-    if let Some(key) = openai_api_key {
+    if let Some(key) = usable_openai_key(openai_api_key) {
         let models = fetch_openai_models(key).await.context(
             "Failed to list OpenAI models (unset OPENAI_API_KEY to use the built-in list)",
         )?;
@@ -349,6 +356,14 @@ pub fn fetch_docs_url(provider_id: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_a_blank_openai_key_is_no_key() {
+        assert_eq!(usable_openai_key(None), None);
+        assert_eq!(usable_openai_key(Some("")), None);
+        assert_eq!(usable_openai_key(Some("  \n")), None);
+        assert_eq!(usable_openai_key(Some(" test-key\n")), Some("test-key"));
+    }
 
     #[tokio::test]
     async fn test_fetch_all_models() {

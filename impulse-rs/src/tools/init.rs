@@ -48,13 +48,20 @@ fn check_tool_installed_within(
     }
 }
 
-/// Check installation status for all known tools
+/// Check installation status for all known tools. A tool whose check
+/// failed is reported with the reason in `check_error`, not as missing.
 pub fn check_all_tools() -> Vec<CliTool> {
-    let mut tools = known_tools();
+    check_tools_within(known_tools(), VERSION_CHECK_TIMEOUT)
+}
+
+fn check_tools_within(mut tools: Vec<CliTool>, timeout: Duration) -> Vec<CliTool> {
     for tool in &mut tools {
-        if let Ok((installed, version)) = check_tool_installed(tool) {
-            tool.installed = installed;
-            tool.version = version;
+        match check_tool_installed_within(tool, timeout) {
+            Ok((installed, version)) => {
+                tool.installed = installed;
+                tool.version = version;
+            }
+            Err(e) => tool.check_error = Some(format!("{e:#}")),
         }
     }
     tools
@@ -201,6 +208,43 @@ mod tests {
         let err = result.expect_err("a hung check is not an answer");
         assert!(format!("{err:#}").contains("did not finish"), "{err:#}");
         assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
+    }
+
+    /// Review finding: `tools list` showed a check that timed out as "not
+    /// installed".
+    #[test]
+    fn test_a_hung_check_leaves_the_status_unknown() {
+        let duration = format!("31.{:010}", std::process::id());
+        let tools = vec![
+            fake_tool(&format!("sleep {duration}"), "true"),
+            fake_tool("echo 2.0.0", "true"),
+        ];
+        let checked = check_tools_within(tools, Duration::from_millis(300));
+        let _ = Command::new("pkill")
+            .arg("-f")
+            .arg(format!("^sleep {}", duration.replace('.', "\\.")))
+            .status();
+        assert_eq!(checked[0].status_label(), "unknown");
+        assert!(checked[0]
+            .check_error
+            .as_deref()
+            .is_some_and(|error| error.contains("did not finish")));
+        assert_eq!(checked[1].status_label(), "installed");
+        assert_eq!(checked[1].version.as_deref(), Some("2.0.0"));
+    }
+
+    #[test]
+    fn test_cli_tool_round_trips_with_and_without_a_check_error() {
+        let mut tool = fake_tool("echo 1", "true");
+        let plain = serde_json::to_string(&tool).unwrap();
+        assert!(!plain.contains("check_error"));
+        let back: CliTool = serde_json::from_str(&plain).unwrap();
+        assert_eq!(back.check_error, None);
+        assert_eq!(back.id, tool.id);
+        tool.check_error = Some("timed out".to_string());
+        let back: CliTool = serde_json::from_str(&serde_json::to_string(&tool).unwrap()).unwrap();
+        assert_eq!(back.check_error.as_deref(), Some("timed out"));
+        assert_eq!(back.check_cmd, tool.check_cmd);
     }
 
     #[test]

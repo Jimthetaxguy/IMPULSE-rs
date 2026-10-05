@@ -123,6 +123,17 @@ impl DocsCache {
     }
 }
 
+/// How long before `now` the cache was updated, for `docs status`. A stamp
+/// in the future (the clock moved back, or the cache came from another
+/// machine) is said to be one; it used to read "0 seconds ago" beside
+/// "STALE".
+pub fn describe_age(last_updated: std::time::SystemTime, now: std::time::SystemTime) -> String {
+    match now.duration_since(last_updated) {
+        Ok(age) => format!("{} seconds ago", age.as_secs()),
+        Err(_) => "in the future (has the clock moved back?)".to_string(),
+    }
+}
+
 /// Metadata about the cached data
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CacheMetadata {
@@ -204,5 +215,16 @@ mod tests {
             })
             .unwrap();
         assert!(cache.is_stale(Duration::from_secs(86400)));
+    }
+
+    #[test]
+    fn test_describe_age_names_a_future_stamp() {
+        let now = SystemTime::now();
+        assert_eq!(
+            describe_age(now - Duration::from_secs(90), now),
+            "90 seconds ago"
+        );
+        assert_eq!(describe_age(now, now), "0 seconds ago");
+        assert!(describe_age(now + Duration::from_secs(3600), now).starts_with("in the future"));
     }
 }

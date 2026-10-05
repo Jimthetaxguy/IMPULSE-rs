@@ -15,22 +15,15 @@ pub fn update_tool(tool: &CliTool, dry_run: bool) -> Result<(bool, String)> {
         return Ok((false, "not installed".to_string()));
     }
 
+    let current = version.unwrap_or_default();
     if dry_run {
         return Ok((
             true,
-            format!(
-                "would update: {} (current: {})",
-                tool.update_cmd,
-                version.unwrap_or_default()
-            ),
+            format!("would update: {} (current: {})", tool.update_cmd, current),
         ));
     }
 
-    println!(
-        "Updating {} (current: {})...",
-        tool.name,
-        version.unwrap_or_default()
-    );
+    println!("Updating {} (current: {})...", tool.name, current);
 
     let output = run_tool_command(&tool.update_cmd, INSTALL_TIMEOUT);
 
@@ -38,13 +31,15 @@ pub fn update_tool(tool: &CliTool, dry_run: bool) -> Result<(bool, String)> {
         Ok(out) => {
             if out.status.success() {
                 // The updater's output is its own log, not a version; ask
-                // the tool again.
-                let new_version = match check_tool_installed(tool) {
-                    Ok((true, Some(version))) => version,
-                    _ => "an unknown version".to_string(),
+                // the tool again. An updater that found nothing newer still
+                // succeeds, so say when the version didn't move.
+                let message = match check_tool_installed(tool) {
+                    Ok((true, Some(new))) if new == current => format!("unchanged at {new}"),
+                    Ok((true, Some(new))) => format!("updated to {new}"),
+                    _ => "updated; the new version could not be read".to_string(),
                 };
-                println!("  ✓ {} updated to {}", tool.name, new_version);
-                Ok((true, format!("updated to {}", new_version)))
+                println!("  ✓ {}: {}", tool.name, message);
+                Ok((true, message))
             } else {
                 let err = String::from_utf8_lossy(&out.stderr);
                 eprintln!("  ✗ {} update failed: {}", tool.name, err);
@@ -119,16 +114,39 @@ mod tests {
     /// the new version ("updated to Successfully installed ...").
     #[test]
     fn test_an_update_reports_the_version_the_tool_now_gives() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let version_file = dir.path().join("version");
+        std::fs::write(&version_file, "1.0.0").unwrap();
         let tool = CliTool::new(
             "fake",
             "Fake",
             "true",
-            "echo 'changed 1 package in 2s'",
-            "echo 2.0.0",
+            &format!(
+                "printf 2.0.0 > '{}' && echo 'changed 1 package in 2s'",
+                version_file.display()
+            ),
+            &format!("cat '{}'", version_file.display()),
             "https://example.invalid",
         );
         let (updated, message) = update_tool(&tool, false).unwrap();
         assert!(updated);
         assert_eq!(message, "updated to 2.0.0");
+    }
+
+    /// Review finding: an update that found nothing newer said "updated to"
+    /// the version the tool already had.
+    #[test]
+    fn test_an_update_that_changes_nothing_says_so() {
+        let tool = CliTool::new(
+            "fake",
+            "Fake",
+            "true",
+            "echo 'up to date'",
+            "echo 2.0.0",
+            "https://example.invalid",
+        );
+        let (updated, message) = update_tool(&tool, false).unwrap();
+        assert!(updated);
+        assert_eq!(message, "unchanged at 2.0.0");
     }
 }

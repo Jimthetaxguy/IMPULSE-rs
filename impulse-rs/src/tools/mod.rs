@@ -42,6 +42,10 @@ pub struct CliTool {
     pub installed: bool,
     /// Version if installed
     pub version: Option<String>,
+    /// Why the installation check failed (it timed out, say), when it did.
+    /// The tool's status is then unknown, not "not installed".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_error: Option<String>,
 }
 
 impl CliTool {
@@ -62,6 +66,18 @@ impl CliTool {
             docs_url: docs_url.to_string(),
             installed: false,
             version: None,
+            check_error: None,
+        }
+    }
+
+    /// "installed", "not installed", or "unknown" when the check failed.
+    pub fn status_label(&self) -> &'static str {
+        if self.check_error.is_some() {
+            "unknown"
+        } else if self.installed {
+            "installed"
+        } else {
+            "not installed"
         }
     }
 }

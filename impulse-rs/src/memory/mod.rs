@@ -9,12 +9,27 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Impulse GENOME - permanent project decisions and preferences
+///
+/// Reading tolerates two things other writers produce: a decision without
+/// tags (added by hand) and a null or missing `last_updated` (the GUI
+/// scaffold writes null). Either one made the file unreadable, so the TUI
+/// showed an empty genome, `genome_read` found no sections and
+/// `add-decision` failed. The three lists stay required: JSON without them
+/// isn't a genome, and reading it as an empty one would let `add-decision`
+/// write over whatever it holds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Genome {
     pub decisions: Vec<Decision>,
     pub preferences: Vec<Preference>,
     pub constraints: Vec<Constraint>,
+    #[serde(default = "Utc::now", deserialize_with = "now_if_null")]
     pub last_updated: DateTime<Utc>,
+}
+
+fn now_if_null<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<DateTime<Utc>, D::Error> {
+    Ok(Option::<DateTime<Utc>>::deserialize(deserializer)?.unwrap_or_else(Utc::now))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +37,7 @@ pub struct Decision {
     pub date: DateTime<Utc>,
     pub description: String,
     pub rationale: Option<String>,
+    #[serde(default)]
     pub tags: Vec<String>,
 }
 
@@ -166,6 +182,49 @@ pub struct HistoryEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_genome_round_trips() {
+        let mut genome = Genome::new();
+        genome.add_decision(
+            "Use tabs".into(),
+            Some("house style".into()),
+            vec!["fmt".into()],
+        );
+        let json = serde_json::to_string(&genome).unwrap();
+        let back: Genome = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+    }
+
+    /// Review finding: a decision without tags, or a null `last_updated`,
+    /// made the whole genome unreadable.
+    #[test]
+    fn test_genome_reads_a_hand_edited_file() {
+        let before = Utc::now();
+        let genome: Genome = serde_json::from_str(
+            r#"{"decisions":[{"date":"2026-10-05T00:00:00Z","description":"Use tabs","rationale":null}],
+                "preferences":[],"constraints":[],"last_updated":null}"#,
+        )
+        .unwrap();
+        assert_eq!(genome.decisions[0].description, "Use tabs");
+        assert!(genome.decisions[0].tags.is_empty());
+        assert!(genome.last_updated >= before);
+        let scaffold: Genome =
+            serde_json::from_str(r#"{"decisions":[],"preferences":[],"constraints":[]}"#).unwrap();
+        assert!(scaffold.decisions.is_empty());
+        assert!(serde_json::from_str::<Genome>(
+            r#"{"decisions":[],"preferences":[],"constraints":[],"last_updated":"soon"}"#
+        )
+        .is_err());
+    }
+
+    /// JSON without the lists is not a genome; reading it as an empty one
+    /// would let `add-decision` replace it.
+    #[test]
+    fn test_genome_refuses_json_without_its_lists() {
+        assert!(serde_json::from_str::<Genome>("{}").is_err());
+        assert!(serde_json::from_str::<Genome>(r#"{"patterns":["keep me"]}"#).is_err());
+    }
 
     #[test]
     fn test_add_decision_dedup() {

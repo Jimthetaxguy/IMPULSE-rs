@@ -384,9 +384,11 @@ pub async fn handle_docs(
         }
         "status" => {
             let metadata = cache.load_metadata()?;
-            let age = cache.age_seconds().unwrap_or(0);
             println!("Cache Status:");
-            println!("  Last updated: {} seconds ago", age);
+            println!(
+                "  Last updated: {}",
+                cache::describe_age(metadata.last_updated, std::time::SystemTime::now())
+            );
             println!("  Models cached: {}", metadata.model_count);
             println!("  Providers cached: {}", metadata.provider_count);
             println!("  Source: {}", metadata.source);
