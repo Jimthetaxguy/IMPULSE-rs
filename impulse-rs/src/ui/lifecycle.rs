@@ -26,6 +26,7 @@ pub(crate) fn handle_conflict_resolution(
     // Resolve the selected conflict (cycle through if multiple)
     let idx = state.selected_conflict_index % conflict_recommendations.len();
     if let Some(rec) = conflict_recommendations.get(idx) {
+        let resolved_key = recommendation_key(rec);
         let file_path = rec
             .description
             .strip_prefix("Multiple agents modifying: ")
@@ -43,9 +44,7 @@ pub(crate) fn handle_conflict_resolution(
         }
         // Remember the resolution while the coordinator keeps reporting the
         // conflict, so the next tick does not raise it again.
-        state
-            .resolved_conflicts
-            .insert(format!("Multiple agents modifying: {file_path}"));
+        state.resolved_conflicts.insert(resolved_key);
 
         state.status_message = Some(format!(
             "Resolved conflict: {} ({})",
@@ -233,31 +232,29 @@ pub(crate) fn context_lifecycle_tick(state: &mut TuiState) {
             if let Some(ref mut agent) = state.impulse_agent {
                 let coordination = agent.coordinate_full(&all_insights);
                 // The coordinator reports every conflict it sees on every
-                // tick. Announce and keep only recommendations not already
-                // listed, and not conflicts the operator resolved while they
-                // are still reported: announcing all of them re-sent the
-                // notifications and webhook every tick and undid each
-                // resolution.
-                let still_reported: std::collections::HashSet<&str> = coordination
-                    .recommendations
-                    .iter()
-                    .filter(|rec| rec.recommendation_type == RecommendationType::FileConflict)
-                    .map(|rec| rec.description.as_str())
-                    .collect();
+                // tick. Announce each recommendation once while it is still
+                // reported, and never a conflict the operator resolved:
+                // announcing all of them re-sent the notifications and webhook
+                // every tick and undid each resolution. The keys include the
+                // panes, so the same file contested by a new pair is new, and
+                // they are kept apart from the 20-entry display list so a long
+                // list does not re-announce what it dropped.
+                let reported = coordination.recommendations;
+                let reported_keys: std::collections::HashSet<String> =
+                    reported.iter().map(recommendation_key).collect();
                 state
                     .resolved_conflicts
-                    .retain(|description| still_reported.contains(description.as_str()));
-                let new_recs: Vec<_> = coordination
-                    .recommendations
-                    .iter()
+                    .retain(|key| reported_keys.contains(key));
+                state
+                    .announced_recommendations
+                    .retain(|key| reported_keys.contains(key));
+                let new_recs: Vec<_> = reported
+                    .into_iter()
                     .filter(|rec| {
-                        !state.resolved_conflicts.contains(&rec.description)
-                            && !state.mier_recommendations.iter().any(|known| {
-                                known.recommendation_type == rec.recommendation_type
-                                    && known.description == rec.description
-                            })
+                        let key = recommendation_key(rec);
+                        !state.resolved_conflicts.contains(&key)
+                            && state.announced_recommendations.insert(key)
                     })
-                    .cloned()
                     .collect();
                 let notification_bus = state.notification_bus.clone();
                 let state_clone = state.state.clone();
@@ -501,6 +498,19 @@ fn recent_cross_pane_insights(
     insights
 }
 
+/// Identifies one recommendation across ticks: its kind, its text, and the
+/// panes it involves.
+fn recommendation_key(rec: &crate::agent::coordinator::Recommendation) -> String {
+    let mut panes = rec.panes_involved.clone();
+    panes.sort();
+    format!(
+        "{}|{}|{}",
+        rec.recommendation_type.as_str(),
+        rec.description,
+        panes.join(",")
+    )
+}
+
 /// Identifies one extracted insight across ticks.
 fn insight_key(insight: &crate::context_lifecycle::types::ExtractedInsight) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -682,6 +692,85 @@ mod tests {
             .count();
         kill_all(&state);
         assert_eq!(unresolved, 0);
+    }
+
+    /// Verification findings: with more conflicts than the 20-entry list
+    /// holds, the ones it dropped were announced again every tick; and the
+    /// same file contested by a new pair of panes was never announced.
+    #[test]
+    fn test_tick_announces_each_conflict_once_whatever_the_list_holds() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (_dir, mut state) = tui_state(true);
+        let many: String = (0..22)
+            .map(|i| format!("printf 'Write(src/f{i}.rs)\\n'; "))
+            .collect();
+        let script = format!("{many}sleep 30");
+        let a = add_pane(
+            &mut state,
+            "claude-1",
+            &script,
+            (60, 80),
+            AgentKind::ClaudeCode,
+        );
+        let b = add_pane(
+            &mut state,
+            "claude-2",
+            &script,
+            (60, 80),
+            AgentKind::ClaudeCode,
+        );
+        wait_for(&state, a, "f21.rs");
+        wait_for(&state, b, "f21.rs");
+
+        let conflicts = |state: &TuiState| {
+            state
+                .mier_activity_feed
+                .iter()
+                .filter(|entry| entry.message.contains("Multiple agents modifying"))
+                .count()
+        };
+        let mut announced = Vec::new();
+        for _ in 0..3 {
+            context_lifecycle_tick(&mut state);
+            announced.push(conflicts(&state));
+        }
+        assert_eq!(announced, [22, 22, 22]);
+
+        // Pane b ends; pane c then writes one of the same files.
+        let _ = state
+            .pane_manager
+            .as_ref()
+            .unwrap()
+            .find_by_id(b)
+            .unwrap()
+            .kill();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state
+            .pane_manager
+            .as_ref()
+            .unwrap()
+            .find_by_id(b)
+            .unwrap()
+            .is_alive()
+        {
+            assert!(Instant::now() < deadline, "pane b did not exit");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        context_lifecycle_tick(&mut state);
+        let c = add_pane(
+            &mut state,
+            "claude-3",
+            "printf 'Write(src/f0.rs)\\n'; sleep 30",
+            (24, 80),
+            AgentKind::ClaudeCode,
+        );
+        wait_for(&state, c, "Write(");
+        let before = conflicts(&state);
+        context_lifecycle_tick(&mut state);
+        let after = conflicts(&state);
+        kill_all(&state);
+        assert_eq!(after, before + 1, "the new pair was not announced");
     }
 
     /// Review finding: a compaction injected context without waiting for the

@@ -429,26 +429,31 @@ impl TerminalBackend {
         self.kill_within(KILL_REAP_TIMEOUT)
     }
 
-    /// [`Self::kill`] with an explicit reaping deadline; the test seam.
+    /// [`Self::kill`] with an explicit reaping deadline; the test seam. The
+    /// child lock is taken for each poll, not held while waiting, so
+    /// `is_alive()` from a UI thread does not stall for the whole deadline.
     pub fn kill_within(&self, timeout: Duration) -> Result<(), Box<dyn std::error::Error>> {
-        let mut child = self.child.lock();
-        if child.try_wait()?.is_some() {
-            self.alive.store(false, Ordering::Relaxed);
-            return Ok(());
-        }
-        if let Err(kill_error) = child.kill() {
-            // The child may have exited between `try_wait` and `kill`. Confirm
-            // that race before treating the kill error as a live orphan.
+        {
+            let mut child = self.child.lock();
             if child.try_wait()?.is_some() {
                 self.alive.store(false, Ordering::Relaxed);
                 return Ok(());
             }
-            self.alive.store(true, Ordering::Relaxed);
-            return Err(Box::new(kill_error));
+            if let Err(kill_error) = child.kill() {
+                // The child may have exited between `try_wait` and `kill`.
+                // Confirm that race before treating the kill error as a live
+                // orphan.
+                if child.try_wait()?.is_some() {
+                    self.alive.store(false, Ordering::Relaxed);
+                    return Ok(());
+                }
+                self.alive.store(true, Ordering::Relaxed);
+                return Err(Box::new(kill_error));
+            }
         }
         let deadline = Instant::now() + timeout;
         loop {
-            if child.try_wait()?.is_some() {
+            if self.child.lock().try_wait()?.is_some() {
                 self.alive.store(false, Ordering::Relaxed);
                 return Ok(());
             }

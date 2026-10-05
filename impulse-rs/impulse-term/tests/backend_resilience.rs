@@ -167,6 +167,56 @@ fn kill_returns_by_its_deadline_while_output_is_not_drained() {
         .is_ok()));
 }
 
+/// Verification finding: `kill_within` held the child lock while it waited,
+/// so `is_alive()` from a UI thread stalled for the whole deadline.
+#[test]
+fn is_alive_answers_while_kill_waits() {
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let parked = Arc::clone(&gate);
+    let output: OutputCallback = Arc::new(move |_data: &[u8]| {
+        let (open, opened) = &*parked;
+        let mut open = open.lock().unwrap();
+        while !*open {
+            open = opened.wait(open).unwrap();
+        }
+    });
+    let backend = Arc::new(
+        TerminalBackend::spawn_with_callbacks(
+            "sh",
+            &sh_args("seq 1 20000; sleep 30", &[]),
+            None,
+            &[],
+            24,
+            80,
+            Some(1000),
+            Some(output),
+            None,
+        )
+        .expect("spawn sh"),
+    );
+    std::thread::sleep(Duration::from_millis(500));
+
+    let killer = Arc::clone(&backend);
+    let kill = std::thread::spawn(move || killer.kill_within(Duration::from_secs(2)).is_ok());
+    std::thread::sleep(Duration::from_millis(200));
+    let started = Instant::now();
+    let _ = backend.is_alive();
+    let waited = started.elapsed();
+    {
+        let (open, opened) = &*gate;
+        *open.lock().unwrap() = true;
+        opened.notify_all();
+    }
+    let _ = kill.join();
+    assert!(
+        waited < Duration::from_millis(500),
+        "is_alive() waited {waited:?}"
+    );
+    assert!(wait_until(Duration::from_secs(10), || backend
+        .kill_within(Duration::from_secs(1))
+        .is_ok()));
+}
+
 /// Review finding: vt100 0.15 panics on ordinary escape sequences in a
 /// terminal narrower than 3 columns or shorter than 3 rows.
 #[test]

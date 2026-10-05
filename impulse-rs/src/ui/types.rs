@@ -102,7 +102,10 @@ pub struct TuiState {
     /// Keys of the insights already fed to `intent_store`, limited to the
     /// insights the panes still hold, so each insight is fed once.
     pub fed_insight_keys: std::collections::HashSet<u64>,
-    /// File-conflict recommendations the operator resolved, kept while the
+    /// Keys of the recommendations already announced, kept while the
+    /// coordinator still reports them, so each is announced once.
+    pub announced_recommendations: std::collections::HashSet<String>,
+    /// Keys of the file conflicts the operator resolved, kept while the
     /// coordinator still reports them so they are not raised again.
     pub resolved_conflicts: std::collections::HashSet<String>,
 }
@@ -212,6 +215,7 @@ impl TuiState {
             selected_conflict_index: 0,
             intent_store: crate::context_lifecycle::IntentStore::new(),
             fed_insight_keys: std::collections::HashSet::new(),
+            announced_recommendations: std::collections::HashSet::new(),
             resolved_conflicts: std::collections::HashSet::new(),
         }
     }
