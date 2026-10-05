@@ -1992,8 +1992,14 @@ pub(crate) async fn handle_supervisor_request(
             // The agent-turn mutex is held across this bounded query so a
             // second agent request receives Busy instead of forking session
             // history. Unrelated daemon request groups do not acquire it.
+            // The history remembers the operator's request, not the
+            // permission preamble and snapshot wrapped around it.
             let query_result = agent
-                .query(crate::agent::prompts::SUPERVISOR_SYSTEM, &full_prompt)
+                .query_remembering(
+                    crate::agent::prompts::SUPERVISOR_SYSTEM,
+                    &full_prompt,
+                    &prompt,
+                )
                 .await;
 
             match query_result {

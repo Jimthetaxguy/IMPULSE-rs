@@ -846,8 +846,10 @@ impl ImpulseAgent {
                 Ok(resp.content)
             }
             _ => {
-                // API and Disabled modes: text-only enrichment via query()
-                self.query(system_prompt, &enriched_prompt).await
+                // API and Disabled modes: text-only enrichment, remembering
+                // the question as the harness path above does.
+                self.query_remembering(system_prompt, &enriched_prompt, user_prompt)
+                    .await
             }
         }
     }
@@ -861,6 +863,23 @@ impl ImpulseAgent {
     /// [`harness::HarnessRequest`] and as a combined `--print` argument for
     /// backward compatibility.
     pub async fn query(&mut self, system_prompt: &str, user_prompt: &str) -> AgentResult<String> {
+        self.query_remembering(system_prompt, user_prompt, user_prompt)
+            .await
+    }
+
+    /// [`Self::query`], recording `remembered` as the turn's question in the
+    /// session history instead of the whole prompt. Callers that wrap the
+    /// operator's question in context (a permission preamble, a workspace
+    /// snapshot, extracted insights) pass the bare question: the history
+    /// keeps only the first `MAX_HISTORY_PROMPT_LEN` bytes of what it
+    /// records, so recording the wrapped prompt kept the wrapping and lost
+    /// the question, and a follow-up turn never saw it.
+    pub async fn query_remembering(
+        &mut self,
+        system_prompt: &str,
+        user_prompt: &str,
+        remembered: &str,
+    ) -> AgentResult<String> {
         // Prepend session history so the LLM has conversational continuity
         let history_ctx = self.build_history_context();
         let enriched_prompt = if history_ctx.is_empty() {
@@ -899,9 +918,10 @@ impl ImpulseAgent {
             AgentMode::Disabled => Err(AgentError::InvalidRequest("Agent is disabled".to_string())),
         };
 
-        // On success, record the turn (using original user_prompt, not enriched)
+        // On success, record the turn: the caller's question, not the
+        // history-enriched prompt.
         if let Ok(ref response) = result {
-            self.record_turn(user_prompt, response);
+            self.record_turn(remembered, response);
         }
 
         result
@@ -1267,6 +1287,75 @@ mod tests {
 
     /// Review P2: the cached API agent re-sent every past turn on each
     /// query, so requests grew by two messages per turn without bound.
+    struct ContentRecordingProvider {
+        requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for ContentRecordingProvider {
+        fn name(&self) -> &str {
+            "content-recording"
+        }
+        fn default_model(&self) -> &str {
+            "content-default"
+        }
+        async fn chat(
+            &self,
+            request: crate::llm_backends::ChatRequest,
+        ) -> AgentResult<crate::llm_backends::ChatResponse> {
+            let text = request
+                .messages
+                .iter()
+                .map(|message| message.content.clone())
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.requests.lock().unwrap().push(text);
+            Ok(crate::llm_backends::ChatResponse {
+                content: "answer".to_string(),
+                model: request.model,
+                usage: crate::llm_backends::Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+                stop_reason: crate::llm_backends::StopReason::EndTurn,
+                tool_calls: Vec::new(),
+            })
+        }
+        fn supported_models(&self) -> Vec<&str> {
+            vec!["content-default"]
+        }
+    }
+
+    /// Refutation review of 3b8768e: the history kept the first 200 bytes
+    /// of a wrapped prompt (SupervisorChat's permission preamble), so the
+    /// next turn never saw the operator's previous question.
+    #[tokio::test]
+    async fn test_a_follow_up_turn_sees_the_previous_question_not_its_wrapping() {
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = ImpulseAgent::with_test_provider(Box::new(ContentRecordingProvider {
+            requests: std::sync::Arc::clone(&requests),
+        }));
+        let wrapped = format!(
+            "Supervisor permission state:\n{}\n\nOperator request:\nFIRST-QUESTION-MARKER",
+            "x".repeat(500)
+        );
+        agent
+            .query_remembering("system", &wrapped, "FIRST-QUESTION-MARKER")
+            .await
+            .expect("first turn");
+        agent
+            .query("system", "a follow-up")
+            .await
+            .expect("second turn");
+
+        let requests = requests.lock().unwrap();
+        assert!(
+            requests[1].contains("FIRST-QUESTION-MARKER"),
+            "the follow-up must carry the previous question: {}",
+            requests[1]
+        );
+    }
+
     #[tokio::test]
     async fn test_api_query_request_size_stays_bounded() {
         let counts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
