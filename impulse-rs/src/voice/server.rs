@@ -498,6 +498,9 @@ async fn handle_http_connection(
         Err(_) => return Ok(()),
     };
     let header_text = std::str::from_utf8(&raw[..header_end]).unwrap_or("");
+    if let Some(problem) = malformed_header(header_text) {
+        return reply_and_close(&mut stream, 400, "application/json", problem).await;
+    }
     let body = &raw[header_end + 4..];
 
     let mut lines = header_text.lines();
@@ -593,6 +596,39 @@ enum ChunkedBody {
     TooLarge,
     /// Not valid chunked encoding, or the peer closed before the end.
     Malformed,
+}
+
+/// Header lines RFC 9112 says a server must refuse with 400, each of which a
+/// proxy in front could frame differently from this server: a folded line,
+/// a line without a colon, whitespace in a field name or before its colon,
+/// and a `Content-Length` that is not plain digits or that repeats with a
+/// different value. They used to be skipped or read leniently. No request
+/// could be smuggled through this server, since every connection closes
+/// after one reply, so this is defense in depth.
+fn malformed_header(header_text: &str) -> Option<&'static [u8]> {
+    let mut length: Option<&str> = None;
+    for line in header_text.lines().skip(1) {
+        if line.starts_with([' ', '\t']) {
+            return Some(br#"{"error":"folded header lines are not accepted"}"#);
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return Some(br#"{"error":"header line without a colon"}"#);
+        };
+        if name.is_empty() || name.chars().any(char::is_whitespace) {
+            return Some(br#"{"error":"malformed header field name"}"#);
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            let value = value.trim();
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Some(br#"{"error":"Content-Length must be digits"}"#);
+            }
+            if length.is_some_and(|earlier| earlier != value) {
+                return Some(br#"{"error":"conflicting Content-Length values"}"#);
+            }
+            length = Some(value);
+        }
+    }
+    None
 }
 
 /// How a request frames its body.
@@ -1104,6 +1140,38 @@ mod tests {
         )
         .await;
         assert!(gzip.starts_with("HTTP/1.1 501"), "{gzip}");
+    }
+
+    /// Round 5 (reviewer B): header shapes RFC 9112 says to refuse were
+    /// skipped or read leniently, each framed differently by a proxy.
+    #[tokio::test]
+    async fn webhook_refuses_malformed_header_lines() {
+        let addr = spawn_webhook(WebhookAuth::Unauthenticated).await;
+        // Each carries a valid tool call that lenient parsing served with 200,
+        // so only the header check can turn it into a 400.
+        let body = r#"{"tool_name":"system_info","parameters":{"include_env":false}}"#;
+        let n = body.len();
+        for headers in [
+            format!("Transfer-Encoding : chunked\r\nContent-Length: {n}"),
+            format!("Content-Length: {n}\r\n\tX-Folded: yes"),
+            format!("Content-Length: {n}\r\nContent-Length: {}", n + 5),
+            format!("Content-Length: +{n}"),
+            format!("Content-Length: {n}\r\nno colon here"),
+        ] {
+            let request = format!("POST /voice/tools HTTP/1.1\r\n{headers}\r\n\r\n{body}");
+            let response = send_raw(addr, &[request.as_bytes()]).await;
+            assert!(
+                response.starts_with("HTTP/1.1 400"),
+                "{headers:?}: {response}"
+            );
+        }
+        // A repeated Content-Length with the same value is still accepted.
+        let repeated = format!(
+            "POST /voice/tools HTTP/1.1\r\nContent-Length: {0}\r\nContent-Length: {0}\r\n\r\n{body}",
+            body.len()
+        );
+        let response = send_raw(addr, &[repeated.as_bytes()]).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     }
 
     /// Recorded review item: a chunked body, which carries no
