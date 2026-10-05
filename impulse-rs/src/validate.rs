@@ -63,6 +63,34 @@ pub fn reject_control_chars(input: &str, field: &'static str) -> Result<(), Vali
     Ok(())
 }
 
+/// Unicode bidirectional controls, which reorder how text displays
+/// ("Trojan Source"): a path or name can read differently from what it is.
+fn is_bidi_control(ch: char) -> bool {
+    matches!(ch, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Reject any control character, line breaks and tabs included, and bidi
+/// controls: for one-line values such as a file path or a tool name.
+pub fn validate_single_line_text(input: &str, field: &'static str) -> Result<(), ValidationError> {
+    if input
+        .chars()
+        .any(|ch| ch.is_control() || is_bidi_control(ch))
+    {
+        return Err(ValidationError::ControlChars { field });
+    }
+    Ok(())
+}
+
+/// [`reject_control_chars`] plus bidi controls: for free text that may span
+/// lines, such as a session summary.
+pub fn validate_multiline_text(input: &str, field: &'static str) -> Result<(), ValidationError> {
+    reject_control_chars(input, field)?;
+    if input.chars().any(is_bidi_control) {
+        return Err(ValidationError::ControlChars { field });
+    }
+    Ok(())
+}
+
 /// Reject pre-percent-encoded strings when we encode later (avoids double-encode).
 pub fn reject_percent_encoded(input: &str, field: &'static str) -> Result<(), ValidationError> {
     let bytes = input.as_bytes();

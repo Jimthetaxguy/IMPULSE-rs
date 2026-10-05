@@ -365,8 +365,9 @@ impl State {
     }
 
     /// Close any reservation left open by a previous process and note the
-    /// interruption on the governed task's own event chain. Invoked once
-    /// from [`State::new`]; safe to call again (each note is recorded
+    /// interruption on the governed task's own event chain. Invoked by the
+    /// daemon at startup, once it has found no other daemon listening (every
+    /// other process leaves live reservations alone); safe to call again (each note is recorded
     /// through the same idempotent governed-task mutation path keyed by a
     /// deterministic per-reservation request id, so a repeat reconcile does
     /// not duplicate events).

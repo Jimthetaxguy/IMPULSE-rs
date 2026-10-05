@@ -431,46 +431,35 @@ impl ConflictHistory {
         }
     }
 
-    /// One entry per file from detection events: how often it was
-    /// detected, when first and last, and the sessions involved (the one
-    /// that hit the conflict and those it conflicted with). Nothing records
-    /// resolutions yet, so every entry starts unresolved.
+    /// One entry per detection event, with the sessions involved (the one
+    /// that hit the conflict and those it conflicted with). The analytics
+    /// count entries, so totals, per-day counts and the most common files are
+    /// all counts of detections; grouping by file first made three
+    /// detections on one file count as one. Nothing records resolutions
+    /// yet, so every entry is unresolved.
     pub fn from_events(events: &[ConflictEvent]) -> Self {
-        let mut history = Self::new();
-        for event in events {
-            let index = match history
-                .conflict_history
+        Self {
+            conflict_history: events
                 .iter()
-                .position(|e| e.file_path == event.file_path)
-            {
-                Some(index) => {
-                    let entry = &mut history.conflict_history[index];
-                    entry.detection_count += 1;
-                    entry.first_detected = entry.first_detected.min(event.detected_at);
-                    entry.last_detected = entry.last_detected.max(event.detected_at);
-                    index
-                }
-                None => {
-                    history.conflict_history.push(ConflictEntry {
+                .map(|event| {
+                    let mut involved_sessions = vec![event.session_id.clone()];
+                    for session in &event.conflicting_sessions {
+                        if !involved_sessions.contains(session) {
+                            involved_sessions.push(session.clone());
+                        }
+                    }
+                    ConflictEntry {
                         file_path: event.file_path.clone(),
                         detection_count: 1,
                         first_detected: event.detected_at,
                         last_detected: event.detected_at,
-                        involved_sessions: Vec::new(),
+                        involved_sessions,
                         resolution: None,
                         resolved_at: None,
-                    });
-                    history.conflict_history.len() - 1
-                }
-            };
-            let involved = &mut history.conflict_history[index].involved_sessions;
-            for session in std::iter::once(&event.session_id).chain(&event.conflicting_sessions) {
-                if !involved.contains(session) {
-                    involved.push(session.clone());
-                }
-            }
+                    }
+                })
+                .collect(),
         }
-        history
     }
 
     pub fn record_resolution(&mut self, file_path: &str, resolution: &str) {
@@ -609,7 +598,9 @@ mod tests {
     fn test_reads_and_writes_wait_for_a_held_lock_instead_of_failing() {
         let dir = tempfile::TempDir::new().unwrap();
         let state = std::sync::Arc::new(State::new(dir.path().to_path_buf()).unwrap());
-        let held = state.live_state.read().unwrap();
+        // `set_config` writes the config lock; holding it for reading makes
+        // the writer wait (the try-lock version failed at once).
+        let held = state.config.read().unwrap();
         let writer = std::sync::Arc::clone(&state);
         let handle = std::thread::spawn(move || writer.set_config("log_level", "debug"));
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1073,25 +1064,29 @@ mod tests {
         }
     }
 
+    /// Refutation review of 1c74f05: grouping by file counted three
+    /// detections on one file as one conflict.
     #[test]
-    fn test_conflict_history_from_events_groups_by_file() {
+    fn test_conflict_analytics_count_detections() {
         let history = ConflictHistory::from_events(&[
             conflict_event("src/main.rs", "s2", "2026-10-02T10:00:00Z"),
             conflict_event("src/lib.rs", "s1", "2026-10-03T10:00:00Z"),
             conflict_event("src/main.rs", "s1", "2026-10-01T10:00:00Z"),
         ]);
 
-        assert_eq!(history.conflict_history.len(), 2);
-        let main = &history.conflict_history[0];
-        assert_eq!(main.file_path, "src/main.rs");
-        assert_eq!(main.detection_count, 2);
+        assert_eq!(history.conflict_history.len(), 3);
         assert_eq!(
-            main.first_detected.to_rfc3339(),
-            "2026-10-01T10:00:00+00:00"
+            history.conflict_history[0].involved_sessions,
+            ["s2", "other"]
         );
-        assert_eq!(main.last_detected.to_rfc3339(), "2026-10-02T10:00:00+00:00");
-        assert_eq!(main.involved_sessions, ["s2", "other", "s1"]);
-        assert!(main.resolution.is_none());
+        assert!(history.conflict_history[0].resolution.is_none());
+        let analytics = history.get_analytics();
+        assert_eq!(analytics.total_conflicts, 3);
+        assert_eq!(
+            analytics.most_common_files[0],
+            ("src/main.rs".to_string(), 2)
+        );
+        assert_eq!(analytics.conflicts_by_day.len(), 3);
     }
 
     #[test]

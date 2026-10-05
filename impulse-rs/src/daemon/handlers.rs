@@ -723,7 +723,10 @@ pub(crate) struct ProcessRequestContext<'a> {
 pub(crate) fn validate_request_fields(
     request: &DaemonRequest,
 ) -> Result<(), crate::validate::ValidationError> {
-    use crate::validate::{reject_control_chars, validate_session_id, validate_tool_id};
+    use crate::validate::{
+        reject_control_chars, validate_multiline_text, validate_session_id,
+        validate_single_line_text, validate_tool_id,
+    };
 
     if let DaemonRequest::EndSession { session_id, .. }
     | DaemonRequest::GetSession { session_id }
@@ -738,13 +741,13 @@ pub(crate) fn validate_request_fields(
     if let DaemonRequest::TrackFile { file_path, .. }
     | DaemonRequest::CheckConflict { file_path, .. } = request
     {
-        reject_control_chars(file_path, "file_path")?;
+        validate_single_line_text(file_path, "file_path")?;
     }
     if let DaemonRequest::TrackTool { tool_name, .. } = request {
-        reject_control_chars(tool_name, "tool_name")?;
+        validate_single_line_text(tool_name, "tool_name")?;
     }
     if let DaemonRequest::EndSession { summary, .. } = request {
-        reject_control_chars(summary, "summary")?;
+        validate_multiline_text(summary, "summary")?;
     }
     if let DaemonRequest::DescribeTool { name } | DaemonRequest::InvokeTool { name, .. } = request {
         validate_tool_id(name)?;
@@ -3495,6 +3498,33 @@ mod request_validation_tests {
         for request in requests {
             let err = validate_request_fields(&request).unwrap_err();
             assert!(err.to_string().contains("control characters"), "{err}");
+        }
+    }
+
+    /// Refutation review of 7642a49: line breaks in a path or tool name and
+    /// bidi controls anywhere still passed.
+    #[test]
+    fn test_rejects_line_breaks_in_one_line_fields_and_bidi_controls() {
+        let requests = [
+            DaemonRequest::TrackFile {
+                session_id: "s1".to_string(),
+                file_path: "src/main.rs\nfake: line".to_string(),
+            },
+            DaemonRequest::TrackTool {
+                session_id: "s1".to_string(),
+                tool_name: "Read\r".to_string(),
+            },
+            DaemonRequest::TrackFile {
+                session_id: "s1".to_string(),
+                file_path: "src/\u{202E}sr.niam".to_string(),
+            },
+            DaemonRequest::EndSession {
+                session_id: "s1".to_string(),
+                summary: "done \u{2066}hidden\u{2069}".to_string(),
+            },
+        ];
+        for request in requests {
+            assert!(validate_request_fields(&request).is_err(), "{request:?}");
         }
     }
 

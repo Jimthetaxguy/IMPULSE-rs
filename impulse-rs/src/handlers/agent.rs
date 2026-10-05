@@ -17,13 +17,8 @@ pub fn handle_agent_configure(
     auto_review: bool,
     auto_coordinate: bool,
 ) -> Result<()> {
-    if let Some(ref p) = provider {
-        if state.set_config("impulse_agent_provider", p)? {
-            println!("Set impulse_agent_provider = {}", p);
-        } else {
-            anyhow::bail!("Invalid provider: {p} (use: anthropic, openai, minimax)");
-        }
-    }
+    // Checked before anything is written, so a refused command changes
+    // nothing (it used to save --provider and then fail on --api-key).
     if api_key.is_some() {
         // `impulse_agent_api_key` is never written to config.json (it is
         // `skip_serializing`), so this used to report success for a key that
@@ -32,6 +27,13 @@ pub fn handle_agent_configure(
             "--api-key is not stored; set the provider's key in the environment \
              (for example ANTHROPIC_API_KEY) or keep it with `impulse-rs credentials set`"
         );
+    }
+    if let Some(ref p) = provider {
+        if state.set_config("impulse_agent_provider", p)? {
+            println!("Set impulse_agent_provider = {}", p);
+        } else {
+            anyhow::bail!("Invalid provider: {p} (use: anthropic, openai, minimax)");
+        }
     }
     if let Some(ref m) = model {
         let _ = state.set_config("impulse_agent_model", m)?;
@@ -244,6 +246,31 @@ mod tests {
         let config = st.config_snapshot().unwrap();
         // Invalid provider should not be stored
         assert!(config.impulse_agent_provider.is_none());
+    }
+
+    /// Refutation review of 99e858a: the provider was saved before
+    /// --api-key failed the command.
+    #[test]
+    fn test_handle_agent_configure_refused_api_key_changes_nothing() {
+        let (_tmp, st) = test_state();
+        let result = handle_agent_configure(
+            &st,
+            Some("openai".to_string()),
+            Some("sk-test-not-a-real-key".to_string()),
+            None,
+            None,
+            false,
+            false,
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("--api-key is not stored"));
+        assert!(st
+            .config_snapshot()
+            .unwrap()
+            .impulse_agent_provider
+            .is_none());
     }
 
     #[test]

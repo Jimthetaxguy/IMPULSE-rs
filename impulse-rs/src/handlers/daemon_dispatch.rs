@@ -31,9 +31,12 @@ pub async fn dispatch(
         Commands::SessionStart {
             name,
             platform,
-            inject_mode: _,
+            inject_mode,
             inject_explain: _,
         } => {
+            // Daemon mode does not inject, but a mistyped mode is still an
+            // error rather than silently accepted.
+            parse_injection_mode(inject_mode.as_deref())?;
             handle_session_start(client, impulse_dir, name, platform)
                 .await
                 .context("Failed to handle session-start daemon request")?;
@@ -679,7 +682,13 @@ async fn handle_session_end(
             .context("Failed to capture hook evidence for session-end")?;
             println!("Session {} ended", session_id)
         }
-        Err(e) => eprintln!("Error: {}", e),
+        // An unknown session fails open, as in direct mode (hooks must not
+        // break the agent); the daemon reports it as exactly this. Any other
+        // failure, such as the daemon's history write, is a real error.
+        Err(e) if format!("{e:#}").contains("Session not found") => {
+            println!("Session not found: {}", session_id)
+        }
+        Err(e) => return Err(e).context("Failed to end session"),
     }
     Ok(())
 }
@@ -915,6 +924,27 @@ mod tests {
         let client = DaemonClient::new(tmp.path().join("no-daemon.sock"));
         let err = handle_daemon(&client, true).await.unwrap_err();
         assert!(err.to_string().contains("no stop request"), "{err}");
+    }
+
+    /// Refutation review of c19a1dd: daemon mode dropped `--inject-mode`,
+    /// so a mistyped mode was accepted. It fails before the daemon is asked.
+    #[tokio::test]
+    async fn test_daemon_session_start_refuses_an_invalid_inject_mode() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let client = DaemonClient::new(tmp.path().join("no-daemon.sock"));
+        let command = Commands::SessionStart {
+            name: Some("s".to_string()),
+            platform: None,
+            inject_mode: Some("of".to_string()),
+            inject_explain: false,
+        };
+        let err = dispatch(command, tmp.path(), &client, None)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").to_lowercase().contains("inject"),
+            "{err:#}"
+        );
     }
 
     /// Parse plugin options string: valid JSON passes through, invalid wraps as `{"raw": ...}`.
