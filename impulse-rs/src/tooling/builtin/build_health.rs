@@ -10,6 +10,19 @@ use crate::build_hygiene::{self, BuildHygieneConfig};
 use crate::tooling::error::ToolError;
 use crate::tooling::traits::*;
 
+/// Runs synchronous build-hygiene work off the async runtime. These tools
+/// walk directories and run `cargo` and `sccache` with no timeout; on the
+/// runtime's own thread they held it, and a caller's timeout (the voice
+/// webhook's request deadline, an MCP or daemon request) could not stop
+/// them.
+async fn off_runtime<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, ToolError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| ToolError::ExecutionFailed(format!("build hygiene task failed: {e}")))
+}
+
 // ============================================================================
 // Build Health — analyze disk usage
 // ============================================================================
@@ -59,16 +72,12 @@ impl DynamicTool for BuildHealthTool {
         _ctx: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
         let config = parse_hygiene_config(&params);
-        // The walk is synchronous. On the runtime's own thread a long one
-        // held that thread, and the caller's timeout could not stop it (the
-        // voice webhook kept its connection slot past the request deadline).
-        let report = tokio::task::spawn_blocking(move || {
+        let report = off_runtime(move || {
             let paths = config.expanded_scan_paths();
             let projects = build_hygiene::discover_rust_projects(&paths);
             build_hygiene::measurement::generate_report(&projects, config.size_threshold_gb)
         })
-        .await
-        .map_err(|e| ToolError::ExecutionFailed(format!("build health scan failed: {e}")))?;
+        .await?;
         Ok(ToolResult::json(
             serde_json::to_value(&report).map_err(|e| ToolError::ExecutionFailed(e.to_string()))?,
         ))
@@ -158,7 +167,7 @@ impl DynamicTool for SweepTool {
             verbose: false,
         };
 
-        match build_hygiene::sweep::run_sweep(&opts) {
+        match off_runtime(move || build_hygiene::sweep::run_sweep(&opts)).await? {
             Ok(result) => Ok(ToolResult::json(
                 serde_json::to_value(&result)
                     .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?,
@@ -237,7 +246,7 @@ impl DynamicTool for WipeTool {
             include_node_modules: false,
         };
 
-        match build_hygiene::wipe::run_wipe(&opts) {
+        match off_runtime(move || build_hygiene::wipe::run_wipe(&opts)).await? {
             Ok(result) => Ok(ToolResult::json(
                 serde_json::to_value(&result)
                     .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?,
@@ -298,7 +307,9 @@ impl DynamicTool for CleanAllTool {
             .unwrap_or(config.dry_run_default);
         let paths = config.expanded_scan_paths();
 
-        match build_hygiene::clean_all::clean_all_projects(&paths, dry_run) {
+        match off_runtime(move || build_hygiene::clean_all::clean_all_projects(&paths, dry_run))
+            .await?
+        {
             Ok(result) => Ok(ToolResult::json(
                 serde_json::to_value(&result)
                     .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?,
@@ -345,7 +356,7 @@ impl DynamicTool for SccacheStatusTool {
         _params: serde_json::Value,
         _ctx: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
-        let status = build_hygiene::sccache::sccache_status();
+        let status = off_runtime(build_hygiene::sccache::sccache_status).await?;
         Ok(ToolResult::json(
             serde_json::to_value(&status).map_err(|e| ToolError::ExecutionFailed(e.to_string()))?,
         ))
@@ -401,7 +412,7 @@ impl DynamicTool for SccacheSetupTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        match build_hygiene::sccache::sccache_setup(check_only) {
+        match off_runtime(move || build_hygiene::sccache::sccache_setup(check_only)).await? {
             Ok(result) => Ok(ToolResult::json(
                 serde_json::to_value(&result)
                     .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?,
@@ -450,37 +461,40 @@ impl DynamicTool for ToolAvailabilityTool {
         _params: serde_json::Value,
         _ctx: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
-        let tools_status: Vec<serde_json::Value> = vec![
-            (
-                "cargo-sweep",
-                build_hygiene::is_cargo_tool_installed("sweep"),
-            ),
-            ("cargo-wipe", build_hygiene::is_cargo_tool_installed("wipe")),
-            (
-                "cargo-clean-all",
-                build_hygiene::is_cargo_tool_installed("clean-all"),
-            ),
-            (
-                "sccache",
-                build_hygiene::sccache::sccache_status().installed,
-            ),
-            // Host interpreter on PATH, not the embedded sandbox: this list
-            // describes the machine's build toolchain.
-            (
-                "python",
-                which::which("python3")
-                    .or_else(|_| which::which("python"))
-                    .is_ok(),
-            ),
-        ]
-        .into_iter()
-        .map(|(name, installed)| {
-            serde_json::json!({
-                "name": name,
-                "installed": installed,
+        let tools_status: Vec<serde_json::Value> = off_runtime(|| {
+            vec![
+                (
+                    "cargo-sweep",
+                    build_hygiene::is_cargo_tool_installed("sweep"),
+                ),
+                ("cargo-wipe", build_hygiene::is_cargo_tool_installed("wipe")),
+                (
+                    "cargo-clean-all",
+                    build_hygiene::is_cargo_tool_installed("clean-all"),
+                ),
+                (
+                    "sccache",
+                    build_hygiene::sccache::sccache_status().installed,
+                ),
+                // Host interpreter on PATH, not the embedded sandbox: this list
+                // describes the machine's build toolchain.
+                (
+                    "python",
+                    which::which("python3")
+                        .or_else(|_| which::which("python"))
+                        .is_ok(),
+                ),
+            ]
+            .into_iter()
+            .map(|(name, installed)| {
+                serde_json::json!({
+                    "name": name,
+                    "installed": installed,
+                })
             })
+            .collect()
         })
-        .collect();
+        .await?;
 
         Ok(ToolResult::json(
             serde_json::json!({ "tools": tools_status }),
@@ -510,6 +524,25 @@ fn parse_hygiene_config(params: &serde_json::Value) -> BuildHygieneConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Round 3 (reviewer B): the scans and subprocesses ran on the runtime's
+    /// own thread. On a single-threaded runtime, work run inline would hold
+    /// the only thread and the quick task would finish after it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_off_runtime_leaves_the_runtime_free() {
+        let started = std::time::Instant::now();
+        let slow = off_runtime(|| std::thread::sleep(std::time::Duration::from_millis(500)));
+        let quick = async {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            started.elapsed()
+        };
+        let (slow, quick_elapsed) = tokio::join!(slow, quick);
+        slow.unwrap();
+        assert!(
+            quick_elapsed < std::time::Duration::from_millis(400),
+            "the quick task waited {quick_elapsed:?}"
+        );
+    }
 
     #[test]
     fn test_build_health_descriptor() {
