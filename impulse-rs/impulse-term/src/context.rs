@@ -511,10 +511,14 @@ fn extract_file_modified(agent_kind: AgentKind, line: &str) -> Option<String> {
             None
         }
         AgentKind::OpenCode | AgentKind::Codex => {
-            let lower = line.to_lowercase();
-            for prefix in &["wrote ", "modified ", "created "] {
-                if let Some(rest) = lower.strip_prefix(prefix) {
-                    let path = rest.trim();
+            // The prefix matches in any case; the path keeps the case it was
+            // printed in (it used to be lowercased along with the prefix).
+            for prefix in ["wrote ", "modified ", "created "] {
+                let matched = line
+                    .get(..prefix.len())
+                    .is_some_and(|start| start.eq_ignore_ascii_case(prefix));
+                if matched {
+                    let path = line[prefix.len()..].trim();
                     if !path.is_empty() && (path.contains('/') || path.contains('.')) {
                         return Some(path.to_string());
                     }
@@ -526,11 +530,21 @@ fn extract_file_modified(agent_kind: AgentKind, line: &str) -> Option<String> {
     }
 }
 
+/// Whether `lower` reports a failure with `word`. A zero count, as in a
+/// passing `test result: ok. 47 passed; 0 failed`, reports none.
+fn reports_failure(lower: &str, word: &str) -> bool {
+    lower
+        .match_indices(word)
+        .any(|(at, _)| lower[..at].split_whitespace().next_back() != Some("0"))
+}
+
 fn extract_error(agent_kind: AgentKind, line: &str) -> Option<String> {
     let lower = line.to_lowercase();
     match agent_kind {
         AgentKind::ClaudeCode => {
-            if lower.starts_with("error:") || lower.contains("failed") || lower.contains("panicked")
+            if lower.starts_with("error:")
+                || reports_failure(&lower, "failed")
+                || lower.contains("panicked")
             {
                 Some(truncate_insight(line, 120))
             } else {
@@ -538,7 +552,7 @@ fn extract_error(agent_kind: AgentKind, line: &str) -> Option<String> {
             }
         }
         AgentKind::OpenCode | AgentKind::Codex => {
-            if lower.starts_with("error:") || lower.contains("fail") {
+            if lower.starts_with("error:") || reports_failure(&lower, "fail") {
                 Some(truncate_insight(line, 120))
             } else {
                 None
@@ -949,5 +963,34 @@ I recommend we refactor this module."#;
 
         assert!(wrapped.starts_with("# [Impulse Context"));
         assert!(wrapped.contains("test content"));
+    }
+
+    /// Review finding: a passing test summary was recorded as an error.
+    #[test]
+    fn test_extract_error_ignores_a_zero_failure_count() {
+        for kind in [AgentKind::ClaudeCode, AgentKind::Codex] {
+            assert_eq!(
+                extract_error(kind, "test result: ok. 47 passed; 0 failed; 0 ignored"),
+                None
+            );
+            assert!(extract_error(kind, "test result: FAILED. 46 passed; 1 failed").is_some());
+        }
+    }
+
+    /// Review finding: Codex and OpenCode paths came back lowercased.
+    #[test]
+    fn test_extract_file_modified_keeps_the_path_case() {
+        assert_eq!(
+            extract_file_modified(AgentKind::Codex, "Wrote src/MyModule.rs").as_deref(),
+            Some("src/MyModule.rs")
+        );
+        assert_eq!(
+            extract_file_modified(AgentKind::OpenCode, "MODIFIED Docs/README.md").as_deref(),
+            Some("Docs/README.md")
+        );
+        assert_eq!(
+            extract_file_modified(AgentKind::Codex, "\u{4e2d}\u{6587} wrote x.rs"),
+            None
+        );
     }
 }

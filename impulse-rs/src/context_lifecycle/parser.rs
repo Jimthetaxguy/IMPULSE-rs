@@ -425,7 +425,7 @@ fn is_error_line(line: &str) -> bool {
     }
 
     // Contextual: "failed" at word boundary, not inside identifiers
-    if lower.contains(" failed") && !lower.contains("failed=") && !lower.contains("_failed") {
+    if reports_failed(&lower) && !lower.contains("failed=") && !lower.contains("_failed") {
         // Additional check: line should be short-ish (not prose)
         if line.len() < 200 {
             return true;
@@ -433,6 +433,14 @@ fn is_error_line(line: &str) -> bool {
     }
 
     false
+}
+
+/// Whether `lower` reports a failure with the word "failed". A zero count, as
+/// in a passing `test result: ok. 47 passed; 0 failed`, reports none.
+fn reports_failed(lower: &str) -> bool {
+    lower
+        .match_indices(" failed")
+        .any(|(at, _)| lower[..at].split_whitespace().next_back() != Some("0"))
 }
 
 #[cfg(test)]
@@ -728,6 +736,25 @@ mod tests {
         assert_eq!(
             classify_line("   ", AgentKind::ClaudeCode),
             LineClassification::PlainText
+        );
+    }
+
+    /// Review finding: a passing test summary was recorded as an error.
+    #[test]
+    fn test_classify_error_ignores_a_zero_failure_count() {
+        assert_ne!(
+            classify_line(
+                "test result: ok. 47 passed; 0 failed; 0 ignored",
+                AgentKind::Codex
+            ),
+            LineClassification::ErrorLine
+        );
+        assert_eq!(
+            classify_line(
+                "test result: FAILED. 46 passed; 1 failed; 0 ignored",
+                AgentKind::Codex
+            ),
+            LineClassification::ErrorLine
         );
     }
 }

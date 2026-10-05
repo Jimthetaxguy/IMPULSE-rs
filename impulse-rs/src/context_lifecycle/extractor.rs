@@ -33,6 +33,9 @@ impl OutputExtractor {
     pub fn extract(agent_kind: AgentKind, pane_id: usize, text: &str) -> Vec<ExtractedInsight> {
         let mut insights = Vec::new();
         let parsed = parser::parse_output(text, agent_kind);
+        // Indexed below by the parser's line numbers. Walking `text.lines()`
+        // to each one from the start cost time quadratic in the line count.
+        let text_lines: Vec<&str> = text.lines().collect();
 
         // Emit insights from structured parser results
         for (tool_kind, target) in &parsed.tool_invocations {
@@ -105,7 +108,7 @@ impl OutputExtractor {
         // Error lines from parser
         for (i, classification) in parsed.lines.iter().enumerate() {
             if *classification == LineClassification::ErrorLine {
-                if let Some(line) = text.lines().nth(i) {
+                if let Some(line) = text_lines.get(i) {
                     let error_content = truncate_insight(line.trim(), 120);
                     insights.push(ExtractedInsight {
                         pane_id,
@@ -123,7 +126,7 @@ impl OutputExtractor {
         // for decisions and task completions (parser doesn't classify these)
         for (i, classification) in parsed.lines.iter().enumerate() {
             if *classification == LineClassification::PlainText {
-                if let Some(line) = text.lines().nth(i) {
+                if let Some(line) = text_lines.get(i) {
                     let trimmed = line.trim();
                     if trimmed.is_empty() {
                         continue;
