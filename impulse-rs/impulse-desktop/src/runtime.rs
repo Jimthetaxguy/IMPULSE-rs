@@ -467,6 +467,10 @@ impl Drop for DispatchReset<'_> {
 /// How many writes a pane may have queued before `write_agent` reports it
 /// as not reading its input.
 const PANE_INPUT_QUEUE: usize = 256;
+/// How many bytes a pane may have queued; with only a count, a caller
+/// writing large pastes to a pane that is not reading could queue without
+/// bound.
+const PANE_INPUT_BYTES: usize = 16 * 1024 * 1024;
 
 /// A pane's input path: a bounded queue drained by one writer thread, so the
 /// PTY write, which blocks while the child is not reading, never runs on the
@@ -478,6 +482,8 @@ struct PaneInput {
     sender: mpsc::SyncSender<Vec<u8>>,
     /// The writer thread's write error, reported to later callers.
     failure: Arc<Mutex<Option<String>>>,
+    /// Bytes queued and not yet written.
+    queued_bytes: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl PaneInput {
@@ -488,13 +494,17 @@ impl PaneInput {
         let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(PANE_INPUT_QUEUE);
         let failure = Arc::new(Mutex::new(None));
         let thread_failure = Arc::clone(&failure);
+        let queued_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let thread_queued = Arc::clone(&queued_bytes);
         thread::Builder::new()
             .name(format!("pane-input-{agent_id}"))
             .spawn(move || {
                 // Ends when the record, and with it the sender, is dropped,
                 // or when a write fails because the PTY closed.
                 while let Ok(data) = receiver.recv() {
-                    if let Err(error) = write_queue.write_user_input(&data) {
+                    let written = write_queue.write_user_input(&data);
+                    thread_queued.fetch_sub(data.len(), std::sync::atomic::Ordering::SeqCst);
+                    if let Err(error) = written {
                         *thread_failure
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
@@ -503,11 +513,33 @@ impl PaneInput {
                     }
                 }
             })?;
-        Ok(Self { sender, failure })
+        Ok(Self {
+            sender,
+            failure,
+            queued_bytes,
+        })
     }
 
     fn send(&self, data: Vec<u8>) -> Result<(), DesktopBridgeError> {
-        match self.sender.try_send(data) {
+        let len = data.len();
+        let queued = self
+            .queued_bytes
+            .fetch_add(len, std::sync::atomic::Ordering::SeqCst);
+        if queued.saturating_add(len) > PANE_INPUT_BYTES {
+            self.queued_bytes
+                .fetch_sub(len, std::sync::atomic::Ordering::SeqCst);
+            return Err(DesktopBridgeError::TerminalWriteFailed {
+                message: format!(
+                    "the pane is not reading its input; {queued} bytes are already queued"
+                ),
+            });
+        }
+        let sent = self.sender.try_send(data);
+        if sent.is_err() {
+            self.queued_bytes
+                .fetch_sub(len, std::sync::atomic::Ordering::SeqCst);
+        }
+        match sent {
             Ok(()) => Ok(()),
             Err(mpsc::TrySendError::Full(_)) => Err(DesktopBridgeError::TerminalWriteFailed {
                 message: format!(
@@ -4592,6 +4624,38 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
         assert!(
             refused.to_string().contains("not reading its input"),
+            "{refused}"
+        );
+        runtime
+            .close_agent(TerminalCloseRequest {
+                session_id: "agent-1".to_string(),
+            })
+            .expect("close the busy pane");
+    }
+
+    /// Verification round on 0abe1a1: the queue counted writes, not bytes,
+    /// so large pastes to a pane that is not reading could queue without
+    /// bound.
+    #[test]
+    fn test_queued_input_bytes_are_bounded() {
+        let runtime = DesktopRuntime::default();
+        let mut request = spawn_request(24, 80, Some("sh"));
+        request.args = vec!["-c".to_string(), "sleep 60".to_string()];
+        runtime
+            .spawn_agent(request)
+            .expect("spawn a child that never reads");
+        let chunk = vec![b'x'; 4 * 1024 * 1024];
+        let refused = (0..8)
+            .map(|_| {
+                runtime.write_agent(AgentWriteRequest {
+                    agent_id: "agent-1".to_string(),
+                    data: chunk.clone(),
+                })
+            })
+            .find_map(Result::err)
+            .expect("16 MiB of queued input must be refused well before 8 chunks");
+        assert!(
+            refused.to_string().contains("bytes are already queued"),
             "{refused}"
         );
         runtime

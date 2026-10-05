@@ -134,7 +134,14 @@ pub async fn handle_tooling_run(
         get_session_id(None),
     );
 
-    match registry.execute(&tool_id, params_value, &ctx).await {
+    // Tools run in their own process group, which the terminal's Ctrl-C
+    // does not reach; cancelling the call here drops it, and that kills
+    // the tool's whole group.
+    let outcome = tokio::select! {
+        outcome = registry.execute(&tool_id, params_value, &ctx) => outcome,
+        _ = tokio::signal::ctrl_c() => anyhow::bail!("Interrupted; {tool_id} was stopped"),
+    };
+    match outcome {
         Ok(result) => {
             if json {
                 print_json(&serde_json::json!({

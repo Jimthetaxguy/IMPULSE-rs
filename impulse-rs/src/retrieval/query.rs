@@ -173,6 +173,17 @@ fn file_fallback_genome(base_path: &Path, query: &str, limit: usize) -> Vec<Sear
         .collect()
 }
 
+/// The entries semantic search scores, or `None` for all of them. The
+/// keyword prefilter exists to bound scoring on a large corpus, so it applies
+/// only when its candidates fill the pool; with fewer, every vector is
+/// scored. Restricting to a handful of keyword matches dropped entries that
+/// are close in meaning but share no word with the query, which is what
+/// semantic search is for.
+fn candidate_filter(keyword_candidates: Vec<SearchResult>, pool: usize) -> Option<HashSet<String>> {
+    (keyword_candidates.len() >= pool)
+        .then(|| keyword_candidates.into_iter().map(|r| r.id).collect())
+}
+
 fn semantic_history_rust(
     store: &RetrievalStore,
     config: &Config,
@@ -231,11 +242,7 @@ fn semantic_history_rust(
     let keyword_candidates = store
         .history_keyword_candidates(query, candidate_limit)
         .unwrap_or_default();
-    let candidate_ids: Option<HashSet<String>> = if keyword_candidates.is_empty() {
-        None
-    } else {
-        Some(keyword_candidates.into_iter().map(|r| r.id).collect())
-    };
+    let candidate_ids = candidate_filter(keyword_candidates, candidate_limit);
 
     let mut vectors = store.read_history_vectors()?;
     if let Some(ids) = &candidate_ids {
@@ -426,11 +433,7 @@ fn semantic_genome_rust(
     let keyword_candidates = store
         .genome_keyword_candidates(query, candidate_limit)
         .unwrap_or_default();
-    let candidate_ids: Option<HashSet<String>> = if keyword_candidates.is_empty() {
-        None
-    } else {
-        Some(keyword_candidates.into_iter().map(|r| r.id).collect())
-    };
+    let candidate_ids = candidate_filter(keyword_candidates, candidate_limit);
 
     let mut vectors = store.read_genome_vectors()?;
     if let Some(ids) = &candidate_ids {
@@ -885,6 +888,24 @@ pub fn search_genome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Verification round on 388967e: any-word candidates made the prefilter
+    /// apply more often, so close-in-meaning entries without a shared word
+    /// were never scored. Below a full pool, everything is scored.
+    #[test]
+    fn test_candidate_filter_applies_only_when_it_fills_the_pool() {
+        let hit = |id: &str| SearchResult {
+            source: "history".to_string(),
+            id: id.to_string(),
+            title: String::new(),
+            snippet: String::new(),
+            score: 0.0,
+        };
+        assert_eq!(candidate_filter(vec![hit("a")], 10), None);
+        assert_eq!(candidate_filter(Vec::new(), 10), None);
+        let full = candidate_filter((0..10).map(|i| hit(&format!("e{i}"))).collect(), 10);
+        assert_eq!(full.map(|ids| ids.len()), Some(10));
+    }
 
     #[test]
     fn test_cosine_similarity_identical() {
