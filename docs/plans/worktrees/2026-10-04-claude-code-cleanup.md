@@ -28,10 +28,11 @@ tags: [worktree, lane, handoff, cleanup, review]
 - Verification: `cargo build --workspace`, `cargo test --workspace`,
   `cargo clippy --workspace --all-targets -- -D warnings` (default and `--no-default-features`),
   `cargo fmt --all -- --check`, `python3 docs/validate_docs.py`
-- Latest status: review pass and one adversarial refutation round complete. 29 fixes and 3
-  documentation corrections, then 11 commits fixing what the refutation round confirmed. Behavior
-  changes carry regression tests, nearly all checked by reverting the fix and watching the test
-  fail. Gate evidence goes in the PR description. Not merged; needs a PR and review.
+- Latest status: review pass, adversarial refutation round, and verification round complete.
+  29 fixes and 3 documentation corrections, 11 commits fixing what the refutation round
+  confirmed, and 8 more from the verification round and the recorded items. Behavior changes
+  carry regression tests, nearly all checked by reverting the fix and watching the test fail.
+  Gate evidence goes in the PR description. Not merged; needs a PR and review.
 
 ## Fixed on this branch
 | Area | Commits |
@@ -69,11 +70,43 @@ behavior change with a test that fails against the previous code:
 - P3 batches `aebc335`, `19d41f4`, `388967e`, `88fef92`: CLI/daemon/state, tools/voice/MCP/Monty
   docs, retrieval, and the agent's turn history (details in each commit message).
 
-Recorded from the round, not fixed: file_write's check-then-write race against a concurrent
-same-user process swapping symlinks (needs directory-fd opens); no connection cap on the voice
-webhook; daemon ownership rests on a `connect()` check rather than a lock (two daemons starting
-together both reconcile); `end_session` holds the state lock across an fsync; the recursive-delete
-Block rule stays broad (any absolute or home path) because narrowing it is a policy choice.
+Verification round: the same three reviewers reran their probes against the fixes. 26 of 29
+findings were fixed. They found three more regressions in the fixes themselves, each fixed with a
+test:
+
+| Regression | Commit |
+|---|---|
+| sccache key inserted inside a multi-line array; the planner now edits only one-line configs | `b283c3f` |
+| A short write left a torn `MEMORY.jsonl` tail that fails every load; that single-writer log now cuts back on error | `ae147f7` |
+| Guard patterns lost quoted `-C`/`-c` values and `main -f;` | `8fcb200` |
+
+The partial fixes it found are completed in `986ba23` and `af63095`:
+- agent-configure validates everything before writing;
+- bidi controls are refused in every validated field and in direct mode;
+- the guard hook blocks when its `.impulse` is missing, and on edits without text;
+- AgentAssist remembers the request;
+- ProcessTool keeps its process group, with `tooling-run` handling Ctrl-C;
+- the semantic prefilter applies only at a full pool;
+- pane input is capped by bytes.
+
+Also from the recorded items:
+- `021b0f5`: one daemon per project by `flock`, and backoff after accept errors.
+- `b8cee15`: bounded benchmark work; the unused, unsound path validator is deleted.
+- `1fc1e7d`: tools default to the session's impulse dir.
+
+Still recorded, not fixed:
+- `file_write`'s check-then-write race against a concurrent same-user process swapping symlinks
+  (needs directory-fd opens).
+- A write root naming a single file is refused (suspected; every default root is a directory).
+- The voice webhook has no connection cap, answers chunked bodies with 400, and resets after
+  401/413.
+- A manifest tool that reads the terminal is stopped by the OS and ends at its timeout.
+- `end_session` holds the state lock across an fsync.
+- The Keychain provider's `list` never parses `security` output, so `credentials list` and its
+  count are always empty.
+- A bare `git push --force` while on main is not caught (the rule cannot see the current branch).
+- The recursive-delete Block rule stays broad (any absolute or home path) because narrowing it is
+  a policy choice.
 
 ## Recorded, not fixed (each needs a decision or its own lane)
 - **Office tools are unbounded** (`excel_read`, `word_read`, `document_parse`, the `office` CLI,
