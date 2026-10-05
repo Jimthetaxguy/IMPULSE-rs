@@ -59,10 +59,16 @@ impl DynamicTool for BuildHealthTool {
         _ctx: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
         let config = parse_hygiene_config(&params);
-        let paths = config.expanded_scan_paths();
-        let projects = build_hygiene::discover_rust_projects(&paths);
-        let report =
-            build_hygiene::measurement::generate_report(&projects, config.size_threshold_gb);
+        // The walk is synchronous. On the runtime's own thread a long one
+        // held that thread, and the caller's timeout could not stop it (the
+        // voice webhook kept its connection slot past the request deadline).
+        let report = tokio::task::spawn_blocking(move || {
+            let paths = config.expanded_scan_paths();
+            let projects = build_hygiene::discover_rust_projects(&paths);
+            build_hygiene::measurement::generate_report(&projects, config.size_threshold_gb)
+        })
+        .await
+        .map_err(|e| ToolError::ExecutionFailed(format!("build health scan failed: {e}")))?;
         Ok(ToolResult::json(
             serde_json::to_value(&report).map_err(|e| ToolError::ExecutionFailed(e.to_string()))?,
         ))

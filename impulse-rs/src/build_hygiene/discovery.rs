@@ -95,24 +95,29 @@ fn discover_recursive(dir: &Path, projects: &mut Vec<RustProject>, depth: usize,
     }
 }
 
-/// Calculate total size of a directory recursively
+/// Total size of the files under `path`, counted the way `du` counts:
+/// symbolic links inside it count as links and are not followed. Following
+/// them, a link back up the tree (`target/x -> .`) made the walk branch at
+/// every level, and two such links turned one scan into billions of steps.
+/// `path` itself may be a link, such as a `target` kept on another disk.
 pub fn dir_size(path: &Path) -> u64 {
     if !path.is_dir() {
         return std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     }
 
     let mut total: u64 = 0;
-    let entries = match std::fs::read_dir(path) {
-        Ok(e) => e,
-        Err(_) => return 0,
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            total += dir_size(&path);
-        } else {
-            total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => pending.push(entry.path()),
+                // A link's own size: `DirEntry::metadata` does not follow it.
+                Ok(_) => total += entry.metadata().map(|m| m.len()).unwrap_or(0),
+                Err(_) => {}
+            }
         }
     }
     total
@@ -181,6 +186,18 @@ mod tests {
     fn test_dir_size_empty() {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(dir_size(tmp.path()), 0);
+    }
+
+    /// Round 3 (reviewer B): links were followed, so a link back up the
+    /// tree made the walk branch at every level; two such links never ended.
+    #[cfg(unix)]
+    #[test]
+    fn test_dir_size_counts_links_without_following_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("data.bin"), vec![0u8; 4096]).unwrap();
+        std::os::unix::fs::symlink(".", tmp.path().join("loop")).unwrap();
+        // The file once, plus the link's own one byte (its target, ".").
+        assert_eq!(dir_size(tmp.path()), 4096 + 1);
     }
 
     #[test]
