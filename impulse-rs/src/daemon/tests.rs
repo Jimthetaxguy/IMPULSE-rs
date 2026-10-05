@@ -1364,6 +1364,47 @@ mod tests {
         }
     }
 
+    // ── Startup fallbacks (review P3-7) ──────────────────
+
+    fn state_in_project(tmp: &tempfile::TempDir) -> std::sync::Arc<crate::state::State> {
+        let impulse_dir = tmp.path().join(".impulse");
+        std::fs::create_dir_all(&impulse_dir).unwrap();
+        std::sync::Arc::new(crate::state::State::new(impulse_dir).unwrap())
+    }
+
+    /// An invalid manifest in `tools.d` dropped every external tool without
+    /// a word; the reason is now kept for `start` to log.
+    #[tokio::test]
+    async fn test_new_records_why_external_tools_were_not_loaded() {
+        use super::super::Daemon;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tools_dir = tmp.path().join(".impulse").join("tools.d");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        std::fs::write(tools_dir.join("broken.json"), "{ not json").unwrap();
+
+        let daemon = Daemon::new(state_in_project(&tmp));
+        assert!(
+            daemon
+                .startup_warnings()
+                .iter()
+                .any(|w| w.contains("were not loaded") && w.contains("tools.d")),
+            "{:?}",
+            daemon.startup_warnings()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_new_without_fallbacks_has_no_startup_warnings() {
+        use super::super::Daemon;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let daemon = Daemon::new(state_in_project(&tmp));
+        assert!(
+            daemon.startup_warnings().is_empty(),
+            "{:?}",
+            daemon.startup_warnings()
+        );
+    }
+
     // ── Stale socket detection tests ─────────────────────
 
     #[tokio::test]

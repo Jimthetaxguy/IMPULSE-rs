@@ -158,6 +158,11 @@ pub struct Daemon {
     /// an empty cell simply means no connection can reach operator class.
     operator_capability: Arc<std::sync::OnceLock<OperatorCapability>>,
     daemon_uid: u32,
+    /// Fallbacks taken while constructing the daemon (unreadable config,
+    /// external tools not loaded, manifest not refreshed). `start` logs them
+    /// once its tracing subscriber exists; a `tracing::warn!` in `new` would
+    /// go nowhere, and these used to be dropped silently.
+    startup_warnings: Vec<String>,
 }
 
 impl Daemon {
@@ -172,18 +177,30 @@ impl Daemon {
             .base_path()
             .parent()
             .unwrap_or_else(|| state.storage().base_path());
-        let config_snapshot = state.config_snapshot().unwrap_or_default();
+        let mut startup_warnings = Vec::new();
+        let config_snapshot = state.config_snapshot().unwrap_or_else(|err| {
+            startup_warnings.push(format!("could not read config, using defaults: {err:#}"));
+            Default::default()
+        });
         let external_tools_dir = config_snapshot.resolved_external_tools_dir_from(project_root);
+        // One invalid manifest fails the whole directory; the daemon still
+        // starts, with the built-in tools only, and says so.
         let tool_registry = crate::tooling::ToolRegistry::with_runtime(
             state.storage().base_path(),
             &external_tools_dir,
         )
-        .unwrap_or_else(|_| crate::tooling::ToolRegistry::with_defaults());
+        .unwrap_or_else(|err| {
+            startup_warnings.push(format!(
+                "external tools in {} were not loaded ({err}); serving the built-in tools only",
+                external_tools_dir.display()
+            ));
+            crate::tooling::ToolRegistry::with_defaults()
+        });
         if let Err(err) = crate::agent_discovery::write_capabilities_manifest(
             state.storage().base_path(),
             &tool_registry,
         ) {
-            tracing::warn!("failed to refresh capabilities manifest: {}", err);
+            startup_warnings.push(format!("failed to refresh capabilities manifest: {err}"));
         }
         let tool_context = build_remote_tool_context(state.storage().base_path(), &config_snapshot);
 
@@ -210,7 +227,13 @@ impl Daemon {
             cached_agent: Arc::new(tokio::sync::Mutex::new(None)),
             operator_capability: Arc::new(std::sync::OnceLock::new()),
             daemon_uid: actor_provenance::daemon_uid(),
+            startup_warnings,
         }
+    }
+
+    #[cfg(test)]
+    pub fn startup_warnings(&self) -> &[String] {
+        &self.startup_warnings
     }
 
     /// Where this daemon publishes its operator capability.
@@ -234,6 +257,9 @@ impl Daemon {
             .with_target(false)
             .compact()
             .try_init();
+        for warning in &self.startup_warnings {
+            tracing::warn!("{warning}");
+        }
 
         let socket_dir = self
             .config
