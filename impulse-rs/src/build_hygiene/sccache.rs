@@ -164,6 +164,13 @@ fn plan_wrapper_edit(existing: &str) -> Result<WrapperEdit> {
         }
         WrapperState::Unset => {}
     }
+    if !is_simple_config(existing) {
+        bail!(
+            "the cargo config has multi-line values, which this edit cannot place a key \
+             around safely; add rustc-wrapper = \"sccache\" under [build] (or \
+             build.rustc-wrapper = \"sccache\" beside top-level build.* keys) by hand"
+        );
+    }
 
     let lines = scan_lines(existing);
     // The key goes under a `[build]` header if there is one. Otherwise, when
@@ -208,6 +215,53 @@ fn plan_wrapper_edit(existing: &str) -> Result<WrapperEdit> {
         out.push_str(CARGO_CONFIG_ENTRY);
     }
     Ok(WrapperEdit::Write(out))
+}
+
+/// Whether the planner can edit `config` line by line: every line is blank,
+/// a comment, a table header, or a `key = value` whose value ends on that
+/// line. Three review rounds found shapes a line scanner without a TOML
+/// parser placed the key inside (a multi-line array, a `"""` in a literal
+/// string or a comment), and each one made cargo refuse the whole file, so
+/// anything multi-line is now left for a hand edit.
+fn is_simple_config(config: &str) -> bool {
+    config.lines().all(|line| {
+        let trimmed = content_of(line);
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            return true;
+        }
+        if trimmed.starts_with('[') {
+            return table_header(line).is_some() || trimmed.starts_with("[[");
+        }
+        !trimmed.contains(r#"""""#)
+            && !trimmed.contains("'''")
+            && trimmed
+                .split_once('=')
+                .is_some_and(|(_, value)| value_is_complete(value))
+    })
+}
+
+/// A TOML value that closes on its own line: quotes closed, and `[`/`{`
+/// balanced outside strings, stopping at a comment.
+fn value_is_complete(value: &str) -> bool {
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for ch in value.chars() {
+        match quote {
+            Some('"') if escaped => escaped = false,
+            Some('"') if ch == '\\' => escaped = true,
+            Some(open) if ch == open => quote = None,
+            Some(_) => {}
+            None => match ch {
+                '"' | '\'' => quote = Some(ch),
+                '[' | '{' => depth += 1,
+                ']' | '}' => depth -= 1,
+                '#' => break,
+                _ => {}
+            },
+        }
+    }
+    quote.is_none() && depth == 0
 }
 
 /// One line of a config, newline included, and whether it is TOML
@@ -572,16 +626,37 @@ mod tests {
                 "\u{feff}[build]\njobs = 4\n",
                 "\u{feff}[build]\nrustc-wrapper = \"sccache\"\njobs = 4\n",
             ),
-            (
-                "note = \"\"\"\n[build]\n\"\"\"\n",
-                "note = \"\"\"\n[build]\n\"\"\"\n[build]\nrustc-wrapper = \"sccache\"\n",
-            ),
         ] {
             let WrapperEdit::Write(text) = plan_wrapper_edit(existing).unwrap() else {
                 panic!("expected an edit for {existing:?}");
             };
             assert_eq!(text, expected, "{existing:?}");
         }
+    }
+
+    /// Verification round on 25bf884: these were edited into configs cargo
+    /// refuses (the key landed inside a multi-line array, or a `"""` in a
+    /// literal string hid the real `[build]`). Multi-line values are now
+    /// refused and left for a hand edit.
+    #[test]
+    fn test_plan_refuses_configs_with_multi_line_values() {
+        for existing in [
+            "build.rustflags = [\n  \"-C\", \"target-cpu=native\",\n]\n",
+            "X = '\"\"\"'\n[build]\njobs = 4\n",
+            "note = \"\"\"\n[build]\n\"\"\"\n",
+        ] {
+            let error = plan_wrapper_edit(existing).unwrap_err().to_string();
+            assert!(error.contains("by hand"), "{existing:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn test_value_is_complete_tracks_quotes_and_brackets() {
+        assert!(value_is_complete(r#" ["a", "b"] # done"#));
+        assert!(value_is_complete(r#" "x]\"y" "#));
+        assert!(value_is_complete(" { jobs = 4 }"));
+        assert!(!value_is_complete(" ["));
+        assert!(!value_is_complete(r#" "unclosed"#));
     }
 
     /// Refutation review of a42c5d4: any value or comment containing
