@@ -1,7 +1,7 @@
 // Discovery — find Rust projects by locating Cargo.toml and target/ directories
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -24,13 +24,22 @@ pub struct RustProject {
 /// A Rust project is any directory containing a Cargo.toml with a target/ subdirectory.
 pub fn discover_rust_projects(search_paths: &[PathBuf]) -> Vec<RustProject> {
     let mut projects = Vec::new();
-    let mut visited = HashSet::new();
+    let mut visited = HashMap::new();
+    let mut found = HashSet::new();
 
     for search_path in search_paths {
         let Ok(root) = search_path.canonicalize() else {
             continue;
         };
-        discover_recursive(search_path, &root, &mut visited, &mut projects, 0, 5);
+        discover_recursive(
+            search_path,
+            &root,
+            &mut visited,
+            &mut found,
+            &mut projects,
+            0,
+            5,
+        );
     }
 
     // Sort by target size (largest first) for prioritized reporting
@@ -38,15 +47,22 @@ pub fn discover_rust_projects(search_paths: &[PathBuf]) -> Vec<RustProject> {
     projects
 }
 
-/// Each directory is visited once, by its real path, and only inside the
-/// search root it was reached from. Following directory links as they came,
-/// a link back up the tree listed a project once per path (93 entries for
-/// 2 projects), and a link out of the root reached projects the caller never
-/// named, which `clean-all` then cleaned once per path.
+/// Directories are tracked by their real path, and only those inside the
+/// search root they were reached from are walked. Following directory links
+/// as they came, a link back up the tree listed a project once per path (93
+/// entries for 2 projects), and a link out of the root reached projects the
+/// caller never named, which `clean-all` then cleaned once per path.
+///
+/// `visited` keeps the shallowest depth each directory was walked from, and
+/// a directory is walked again when reached with more depth left: a walk
+/// that met it deeper, cut off by the depth limit, did not see below it, and
+/// an overlapping root given second then found nothing there. `found` keeps
+/// each project listed once.
 fn discover_recursive(
     dir: &Path,
     root: &Path,
-    visited: &mut HashSet<PathBuf>,
+    visited: &mut HashMap<PathBuf, usize>,
+    found: &mut HashSet<PathBuf>,
     projects: &mut Vec<RustProject>,
     depth: usize,
     max_depth: usize,
@@ -57,14 +73,19 @@ fn discover_recursive(
     let Ok(real) = dir.canonicalize() else {
         return;
     };
-    if !real.starts_with(root) || !visited.insert(real) {
+    if !real.starts_with(root) || visited.get(&real).is_some_and(|&seen| seen <= depth) {
         return;
     }
+    visited.insert(real.clone(), depth);
 
     let cargo_toml = dir.join("Cargo.toml");
     let target_dir = dir.join("target");
 
     if cargo_toml.exists() && target_dir.exists() {
+        // Listed once, and sized once, however many paths reach it.
+        if !found.insert(real) {
+            return;
+        }
         let target_size = dir_size(&target_dir);
         let last_modified = std::fs::metadata(&target_dir)
             .and_then(|m| m.modified())
@@ -111,7 +132,7 @@ fn discover_recursive(
             continue;
         }
 
-        discover_recursive(&path, root, visited, projects, depth + 1, max_depth);
+        discover_recursive(&path, root, visited, found, projects, depth + 1, max_depth);
     }
 }
 
@@ -267,6 +288,26 @@ mod tests {
         assert_eq!(projects.len(), 1, "{projects:?}");
         let found = projects[0].path.file_name().unwrap();
         assert!(found == "a" || found == "dup", "{projects:?}");
+    }
+
+    /// Round 5 (reviewer C): a root walked first marked directories its
+    /// depth limit cut off as visited, and an overlapping root given second
+    /// then found nothing below them.
+    #[test]
+    fn test_discover_overlapping_roots_find_a_deep_project_in_either_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = tmp.path().join("overlap");
+        let sub = outer.join("l1/l2/l3/l4");
+        let project = sub.join("l5/l6/proj");
+        fs::create_dir_all(project.join("target")).unwrap();
+        fs::write(project.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        for roots in [
+            vec![outer.clone(), sub.clone()],
+            vec![sub.clone(), outer.clone()],
+        ] {
+            let projects = discover_rust_projects(&roots);
+            assert_eq!(projects.len(), 1, "{roots:?}: {projects:?}");
+        }
     }
 
     #[test]
