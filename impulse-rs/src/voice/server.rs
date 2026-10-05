@@ -40,6 +40,11 @@ pub const WEBHOOK_SECRET_ENV: &str = "IMPULSE_VOICE_WEBHOOK_SECRET";
 /// Largest HTTP header block the webhook reads before refusing the request.
 const MAX_WEBHOOK_HEADER_BYTES: usize = 64 * 1024;
 
+/// Webhook connections handled at once. Each may hold up to
+/// `MAX_REQUEST_SIZE` bytes for up to `WEBHOOK_REQUEST_TIMEOUT`, so without a
+/// cap one client opening connections could pin memory and tasks at will.
+const MAX_WEBHOOK_CONNECTIONS: usize = 64;
+
 /// How long one webhook connection may take to send its request.
 const WEBHOOK_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -286,6 +291,19 @@ impl VoiceServer {
 
     /// The webhook accept loop on an already-bound listener (tests bind port 0).
     async fn serve_webhook_on(&self, listener: TcpListener) -> Result<()> {
+        self.serve_webhook_with_limit(listener, MAX_WEBHOOK_CONNECTIONS)
+            .await
+    }
+
+    /// [`Self::serve_webhook_on`] with the connection cap passed in. A
+    /// connection over the cap is closed at once instead of queued, so a
+    /// client holding connections open cannot pin more than the cap.
+    async fn serve_webhook_with_limit(
+        &self,
+        listener: TcpListener,
+        max_connections: usize,
+    ) -> Result<()> {
+        let slots = Arc::new(tokio::sync::Semaphore::new(max_connections));
         loop {
             let stream = match listener.accept().await {
                 Ok((stream, _)) => stream,
@@ -295,9 +313,16 @@ impl VoiceServer {
                     continue;
                 }
             };
+            // Over the cap the connection is closed at once; a written reply
+            // would need a task per refusal to drain the request first.
+            let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
+                drop(stream);
+                continue;
+            };
             let bridge = Arc::clone(&self.bridge);
             let auth = self.webhook_auth.clone();
             tokio::spawn(async move {
+                let _slot = slot;
                 let handled = tokio::time::timeout(
                     WEBHOOK_REQUEST_TIMEOUT,
                     handle_http_connection(stream, bridge, auth),
@@ -693,6 +718,41 @@ mod tests {
         )
         .await;
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    }
+
+    /// Recorded review P3: there was no cap on concurrent connections.
+    #[tokio::test]
+    async fn webhook_refuses_connections_past_its_cap() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = VoiceServer::with_defaults().with_webhook_auth(WebhookAuth::Unauthenticated);
+        tokio::spawn(async move {
+            let _ = server.serve_webhook_with_limit(listener, 1).await;
+        });
+
+        // Holds the only slot: headers never finish.
+        let mut held = TcpStream::connect(addr).await.unwrap();
+        held.write_all(b"GET /healthz HTTP/1.1\r\n").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let mut refused = TcpStream::connect(addr).await.unwrap();
+        let _ = refused.write_all(b"GET /healthz HTTP/1.1\r\n\r\n").await;
+        let mut reply = String::new();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            refused.read_to_string(&mut reply),
+        )
+        .await
+        .expect("an over-cap connection is closed at once, not served later");
+        assert!(
+            read.is_err() || reply.is_empty(),
+            "served past the cap: {reply}"
+        );
+
+        drop(held);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let served = send_raw(addr, &[b"GET /healthz HTTP/1.1\r\n\r\n"]).await;
+        assert!(served.starts_with("HTTP/1.1 200"), "{served}");
     }
 
     #[test]
