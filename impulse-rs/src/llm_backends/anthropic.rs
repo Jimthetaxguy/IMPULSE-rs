@@ -70,6 +70,17 @@ async fn read_capped_body(
     Ok(Some(body))
 }
 
+/// `text` cut to [`MAX_ERROR_TEXT_CHARS`], marked with `…` when cut (or when
+/// `already_cut`).
+fn quote(text: &str, already_cut: bool) -> String {
+    let mut chars = text.chars();
+    let mut quoted: String = chars.by_ref().take(MAX_ERROR_TEXT_CHARS).collect();
+    if already_cut || chars.next().is_some() {
+        quoted.push('…');
+    }
+    quoted
+}
+
 /// An error response's body as text: at most [`MAX_ERROR_BODY_BYTES`] read
 /// and [`MAX_ERROR_TEXT_CHARS`] kept, marked with `…` when cut. A failure
 /// while reading ends the text early rather than replacing it.
@@ -85,13 +96,7 @@ async fn error_text(mut response: reqwest::Response) -> String {
         }
         body.extend_from_slice(&chunk);
     }
-    let text = String::from_utf8_lossy(&body);
-    let mut chars = text.chars();
-    let mut quoted: String = chars.by_ref().take(MAX_ERROR_TEXT_CHARS).collect();
-    if cut || chars.next().is_some() {
-        quoted.push('…');
-    }
-    quoted
+    quote(&String::from_utf8_lossy(&body), cut)
 }
 
 /// Canonical API origins. Each provider appends its own request path, so these
@@ -112,38 +117,43 @@ const ANTHROPIC_BASE_URL_ENV: &str = "ANTHROPIC_BASE_URL";
 const OPENAI_BASE_URL_ENV: &str = "OPENAI_BASE_URL";
 const MINIMAX_BASE_URL_ENV: &str = "MINIMAX_BASE_URL";
 
-/// Resolve a base URL from, in precedence order: explicit config, environment
-/// override, canonical default. An override that is not an `http(s)` origin
-/// is discarded with a warning (which names the reason, never the value, as
-/// it may hold credentials), so a typo degrades to the real API instead of to
-/// an unresolvable endpoint. A blank one is simply unset.
-fn select_base_url(explicit: Option<&str>, from_env: Option<&str>, default: &str) -> String {
-    [
-        ("configured base URL", explicit),
-        ("environment override", from_env),
-    ]
-    .into_iter()
-    .find_map(|(source, candidate)| {
-        let candidate = candidate?.trim();
-        if candidate.is_empty() {
-            return None;
-        }
-        match parse_origin(candidate) {
-            Ok(origin) => Some(origin),
-            Err(reason) => {
-                tracing::warn!(source, reason, "LLM provider base-URL override ignored");
-                None
-            }
-        }
-    })
-    .unwrap_or_else(|| default.trim_end_matches('/').to_string())
+/// Where a base-URL override came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverrideSource {
+    Configured,
+    Environment,
 }
 
-/// The origin (`scheme://host[:port]`) of a base-URL override, or why it
-/// can't be one. Each provider appends its own path, so a path here would be
-/// doubled (`/v1/v1/...`); credentials would reach the logs and be sent as
-/// Basic auth beside the API key.
-fn parse_origin(candidate: &str) -> Result<String, &'static str> {
+/// Resolve a base URL from, in precedence order: explicit config, environment
+/// override, canonical default. A blank override is unset.
+///
+/// An override that is set but can't be used is an error, never a fall back
+/// to the default: the default is a different service, so falling back would
+/// send the API key and the prompt to the public API when the user had
+/// pointed them at a gateway, a proxy or a local model.
+fn select_base_url(
+    explicit: Option<&str>,
+    from_env: Option<&str>,
+    default: &str,
+) -> Result<String, (OverrideSource, &'static str)> {
+    for (source, candidate) in [
+        (OverrideSource::Configured, explicit),
+        (OverrideSource::Environment, from_env),
+    ] {
+        let Some(candidate) = candidate.map(str::trim).filter(|c| !c.is_empty()) else {
+            continue;
+        };
+        return parse_base_url(candidate).map_err(|reason| (source, reason));
+    }
+    Ok(default.trim_end_matches('/').to_string())
+}
+
+/// A usable base URL, or why `candidate` isn't one. Each provider appends its
+/// own path, so the base may carry a path prefix (a gateway's, such as
+/// OpenRouter's `https://openrouter.ai/api`) and credentials (sent as Basic
+/// auth; never logged), but not a query or fragment, which the provider's
+/// path would land after.
+fn parse_base_url(candidate: &str) -> Result<String, &'static str> {
     let url = reqwest::Url::parse(candidate).map_err(|_| "it is not an absolute URL")?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err("its scheme is not http or https");
@@ -151,16 +161,10 @@ fn parse_origin(candidate: &str) -> Result<String, &'static str> {
     if url.host_str().is_none() {
         return Err("it names no host");
     }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err("it carries credentials");
-    }
-    if url.path() != "/" {
-        return Err("it has a path; give the origin only, each provider adds its own path");
-    }
     if url.query().is_some() || url.fragment().is_some() {
         return Err("it has a query or fragment");
     }
-    Ok(url.origin().ascii_serialization())
+    Ok(url.as_str().trim_end_matches('/').to_string())
 }
 
 /// How a resolved origin relates to the provider's canonical default.
@@ -177,14 +181,24 @@ enum BaseUrlKind {
 }
 
 /// Whether a URL host (as `Url::host_str` gives it) is this machine. Only
-/// `localhost` and loopback addresses count: a name like `127.example.com`
-/// is a domain like any other.
+/// `localhost` and loopback addresses count (an IPv4 loopback address may be
+/// written IPv4-mapped): a name like `127.example.com` is a domain like any
+/// other.
 fn host_is_loopback(host: &str) -> bool {
     let unbracketed = host.trim_start_matches('[').trim_end_matches(']');
-    unbracketed.eq_ignore_ascii_case("localhost")
-        || unbracketed
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
+    if unbracketed
+        .trim_end_matches('.')
+        .eq_ignore_ascii_case("localhost")
+    {
+        return true;
+    }
+    match unbracketed.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(ip)) => {
+            ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => false,
+    }
 }
 
 fn classify_base_url(resolved: &str, default: &str) -> BaseUrlKind {
@@ -202,7 +216,13 @@ fn classify_base_url(resolved: &str, default: &str) -> BaseUrlKind {
     }
 }
 
-fn log_base_url_override(provider_name: &str, origin: &str, kind: BaseUrlKind) {
+fn log_base_url_override(provider_name: &str, base: &str, kind: BaseUrlKind) {
+    // The origin only: a base may carry credentials, and its path can name
+    // an account.
+    let origin = reqwest::Url::parse(base)
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_default();
+    let origin = origin.as_str();
     match kind {
         BaseUrlKind::Canonical => {}
         BaseUrlKind::OverrideHttps | BaseUrlKind::OverrideLoopbackHttp => {
@@ -271,19 +291,43 @@ impl BaseProvider {
 
     /// Full request URL for one provider endpoint, honoring the configured or
     /// env-supplied origin. `path` must start with `/`.
-    pub fn endpoint(&self, env_var: &str, default_base_url: &str, path: &str) -> String {
-        let from_env = std::env::var(env_var).ok();
+    /// The request URL for one provider endpoint, from the configured or
+    /// environment base URL, else the canonical one. A set override that
+    /// can't be used (see [`select_base_url`]) fails the request.
+    pub fn endpoint(
+        &self,
+        env_var: &str,
+        default_base_url: &str,
+        path: &str,
+    ) -> AgentResult<String> {
+        let unusable = |source: &str, reason: &str| {
+            AgentError::InvalidRequest(format!(
+                "{source} can't be used as the {} base URL: {reason}; fix or unset it",
+                self.provider_name
+            ))
+        };
+        let from_env = match std::env::var(env_var) {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(unusable(env_var, "it is not valid UTF-8"));
+            }
+        };
         let base = select_base_url(
             self.base_url.as_deref(),
             from_env.as_deref(),
             default_base_url,
-        );
+        )
+        .map_err(|(source, reason)| match source {
+            OverrideSource::Configured => unusable("The configured base URL", reason),
+            OverrideSource::Environment => unusable(env_var, reason),
+        })?;
         log_base_url_override(
             self.provider_name,
             &base,
             classify_base_url(&base, default_base_url),
         );
-        format!("{base}{path}")
+        Ok(format!("{base}{path}"))
     }
 
     pub fn check_api_key(&self) -> AgentResult<()> {
@@ -350,7 +394,10 @@ impl BaseProvider {
                     self.provider_name
                 ))
             })?;
-        serde_json::from_slice(&body).map_err(|e| AgentError::ApiResponse(e.to_string()))
+        // serde quotes an unexpected value in full, which for a string can be
+        // most of the body.
+        serde_json::from_slice(&body)
+            .map_err(|e| AgentError::ApiResponse(quote(&e.to_string(), false)))
     }
 
     /// An `ApiRequest` error for a failed send or body read, naming the cause.
@@ -691,7 +738,7 @@ impl AnthropicProvider {
         self.cache_system_and_tools
     }
 
-    fn endpoint(&self) -> String {
+    fn endpoint(&self) -> AgentResult<String> {
         self.base.endpoint(
             ANTHROPIC_BASE_URL_ENV,
             ANTHROPIC_DEFAULT_BASE_URL,
@@ -836,7 +883,8 @@ fn anthropic_chat_response(resp: AnthropicResponse, provider: &str) -> AgentResu
     // the stop reason says, except a token-limit stop, which may have cut
     // them off.
     let stop_reason = match resp.stop_reason.as_deref() {
-        Some("max_tokens") => StopReason::MaxTokens,
+        // Both mean output was cut off, and tool blocks with it.
+        Some("max_tokens") | Some("model_context_window_exceeded") => StopReason::MaxTokens,
         _ if !tool_calls.is_empty() => StopReason::ToolUse,
         Some("tool_use") => StopReason::ToolUse,
         Some("end_turn") | Some("stop_sequence") => StopReason::EndTurn,
@@ -873,7 +921,7 @@ impl LlmProvider for AnthropicProvider {
         let http_request = self
             .base
             .http_client()?
-            .post(self.endpoint())
+            .post(self.endpoint()?)
             .header("x-api-key", self.base.api_key())
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
@@ -918,30 +966,55 @@ struct OpenAiStyleResponse {
     usage: OpenAiStyleUsage,
     /// MiniMax's status envelope. It reports failures (authentication,
     /// rate limits, balance) here, often with HTTP 200; `status_code` 0 is
-    /// success.
+    /// success. Read loosely (see [`minimax_status`]), since a success must
+    /// not fail on how a server spells it.
     #[serde(default)]
-    base_resp: Option<MinimaxBaseResp>,
-    /// An error some OpenAI-compatible servers put in a 200 reply.
+    base_resp: Option<serde_json::Value>,
+    /// An error some OpenAI-compatible servers put in a 200 reply. Read
+    /// loosely too (see [`reported_error`]).
     #[serde(default)]
     error: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
-struct MinimaxBaseResp {
-    #[serde(default)]
-    status_code: i64,
-    #[serde(default)]
-    status_msg: String,
-}
-
-/// MiniMax `base_resp` codes with a matching [`AgentError`]: 1002 is its
-/// rate limit and 1004 an authentication failure. Others keep their code.
-fn minimax_status_error(base: &MinimaxBaseResp) -> AgentError {
-    let message: String = base.status_msg.chars().take(MAX_ERROR_TEXT_CHARS).collect();
-    match base.status_code {
+/// The failure a MiniMax `base_resp` reports, if any: a nonzero
+/// `status_code`, given as a number or a numeric string. 1002 is its rate
+/// limit and 1004 an authentication failure; others keep their code.
+fn minimax_status(base: &serde_json::Value) -> Option<AgentError> {
+    let code = base.get("status_code").and_then(|code| {
+        code.as_i64()
+            .or_else(|| code.as_str().and_then(|text| text.trim().parse().ok()))
+    })?;
+    if code == 0 {
+        return None;
+    }
+    let message = quote(
+        base.get("status_msg")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("no message"),
+        false,
+    );
+    Some(match code {
         1002 => AgentError::RateLimited,
         1004 => AgentError::Authentication(message),
         code => AgentError::ApiRequest(format!("minimax status {code} - {message}")),
+    })
+}
+
+/// The message of an `error` a reply carries, if it carries one: a
+/// non-empty string, or a non-empty object (its `message` when that is a
+/// string). Null, `false`, `""` and `{}` are no error.
+fn reported_error(error: &serde_json::Value) -> Option<String> {
+    match error {
+        serde_json::Value::String(text) if !text.trim().is_empty() => Some(quote(text, false)),
+        serde_json::Value::Object(fields) if !fields.is_empty() => Some(quote(
+            &fields
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| error.to_string()),
+            false,
+        )),
+        _ => None,
     }
 }
 
@@ -1040,17 +1113,10 @@ fn openai_style_chat_response(
     provider: &str,
     fallback_model: &str,
 ) -> AgentResult<ChatResponse> {
-    if let Some(base) = resp.base_resp.as_ref().filter(|base| base.status_code != 0) {
-        return Err(minimax_status_error(base));
+    if let Some(failure) = resp.base_resp.as_ref().and_then(minimax_status) {
+        return Err(failure);
     }
-    if let Some(error) = resp.error.as_ref().filter(|error| !error.is_null()) {
-        let message = error
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-            .or_else(|| error.as_str().map(str::to_string))
-            .unwrap_or_else(|| error.to_string());
-        let message: String = message.chars().take(MAX_ERROR_TEXT_CHARS).collect();
+    if let Some(message) = resp.error.as_ref().and_then(reported_error) {
         return Err(AgentError::ApiResponse(format!(
             "{provider} returned an error: {message}"
         )));
@@ -1148,7 +1214,7 @@ impl OpenAiProvider {
         Self(BaseProvider::new("openai", api_key, "gpt-4o"))
     }
 
-    fn endpoint(&self) -> String {
+    fn endpoint(&self) -> AgentResult<String> {
         self.0.endpoint(
             OPENAI_BASE_URL_ENV,
             OPENAI_DEFAULT_BASE_URL,
@@ -1175,7 +1241,7 @@ impl LlmProvider for OpenAiProvider {
         let http_request = self
             .0
             .http_client()?
-            .post(self.endpoint())
+            .post(self.endpoint()?)
             .header("Authorization", format!("Bearer {}", self.0.api_key()))
             .header("Content-Type", "application/json")
             .json(&body);
@@ -1213,7 +1279,7 @@ impl MinimaxProvider {
         Self(BaseProvider::new("minimax", api_key, "abab6.5s-chat"))
     }
 
-    fn endpoint(&self) -> String {
+    fn endpoint(&self) -> AgentResult<String> {
         self.0.endpoint(
             MINIMAX_BASE_URL_ENV,
             MINIMAX_DEFAULT_BASE_URL,
@@ -1240,7 +1306,7 @@ impl LlmProvider for MinimaxProvider {
         let http_request = self
             .0
             .http_client()?
-            .post(self.endpoint())
+            .post(self.endpoint()?)
             .header("Authorization", format!("Bearer {}", self.0.api_key()))
             .header("Content-Type", "application/json")
             .json(&body);
@@ -1882,14 +1948,14 @@ mod tests {
     /// against the ones asserting the unset-env defaults.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+    pub(super) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     #[test]
     fn test_select_base_url_falls_back_to_default_when_nothing_set() {
         assert_eq!(
-            select_base_url(None, None, "https://api.anthropic.com"),
+            select_base_url(None, None, "https://api.anthropic.com").unwrap(),
             "https://api.anthropic.com"
         );
     }
@@ -1901,7 +1967,8 @@ mod tests {
                 None,
                 Some("http://127.0.0.1:8080"),
                 "https://api.anthropic.com"
-            ),
+            )
+            .unwrap(),
             "http://127.0.0.1:8080"
         );
     }
@@ -1913,7 +1980,8 @@ mod tests {
                 Some("http://explicit.test"),
                 Some("http://from-env.test"),
                 "https://api.anthropic.com"
-            ),
+            )
+            .unwrap(),
             "http://explicit.test"
         );
     }
@@ -1921,16 +1989,16 @@ mod tests {
     #[test]
     fn test_select_base_url_blank_override_falls_back_to_default() {
         assert_eq!(
-            select_base_url(Some("   "), Some(""), "https://api.anthropic.com"),
+            select_base_url(Some("   "), Some(""), "https://api.anthropic.com").unwrap(),
             "https://api.anthropic.com"
         );
     }
 
     #[test]
-    fn test_select_base_url_override_without_http_scheme_falls_back_to_default() {
+    fn test_select_base_url_override_without_http_scheme_is_refused() {
         assert_eq!(
             select_base_url(None, Some("api.anthropic.com"), "https://api.anthropic.com"),
-            "https://api.anthropic.com"
+            Err((OverrideSource::Environment, "it is not an absolute URL"))
         );
     }
 
@@ -1941,7 +2009,8 @@ mod tests {
                 None,
                 Some("http://127.0.0.1:8080/"),
                 "https://api.anthropic.com"
-            ),
+            )
+            .unwrap(),
             "http://127.0.0.1:8080"
         );
     }
@@ -1992,7 +2061,9 @@ mod tests {
         let var = "IMPULSE_TEST_PROVIDER_BASE_URL";
         std::env::set_var(var, "http://127.0.0.1:9999");
         let provider = BaseProvider::new("test", "api_key".to_string(), "gpt-4");
-        let url = provider.endpoint(var, "https://api.example.com", "/v1/messages");
+        let url = provider
+            .endpoint(var, "https://api.example.com", "/v1/messages")
+            .unwrap();
         std::env::remove_var(var);
         assert_eq!(url, "http://127.0.0.1:9999/v1/messages");
     }
@@ -2004,7 +2075,9 @@ mod tests {
         std::env::set_var(var, "http://from-env.test");
         let provider = BaseProvider::new("test", "api_key".to_string(), "gpt-4")
             .with_base_url("http://explicit.test");
-        let url = provider.endpoint(var, "https://api.example.com", "/v1/messages");
+        let url = provider
+            .endpoint(var, "https://api.example.com", "/v1/messages")
+            .unwrap();
         std::env::remove_var(var);
         assert_eq!(url, "http://explicit.test/v1/messages");
     }
@@ -2014,7 +2087,10 @@ mod tests {
         let _guard = env_guard();
         std::env::remove_var(ANTHROPIC_BASE_URL_ENV);
         let provider = AnthropicProvider::new("test_key".to_string());
-        assert_eq!(provider.endpoint(), "https://api.anthropic.com/v1/messages");
+        assert_eq!(
+            provider.endpoint().unwrap(),
+            "https://api.anthropic.com/v1/messages"
+        );
     }
 
     #[test]
@@ -2022,7 +2098,7 @@ mod tests {
         let _guard = env_guard();
         std::env::set_var(ANTHROPIC_BASE_URL_ENV, "http://127.0.0.1:4010");
         let provider = AnthropicProvider::new("test_key".to_string());
-        let url = provider.endpoint();
+        let url = provider.endpoint().unwrap();
         std::env::remove_var(ANTHROPIC_BASE_URL_ENV);
         assert_eq!(url, "http://127.0.0.1:4010/v1/messages");
     }
@@ -2033,7 +2109,7 @@ mod tests {
         std::env::remove_var(OPENAI_BASE_URL_ENV);
         let provider = OpenAiProvider::new("test_key".to_string());
         assert_eq!(
-            provider.endpoint(),
+            provider.endpoint().unwrap(),
             "https://api.openai.com/v1/chat/completions"
         );
     }
@@ -2043,7 +2119,7 @@ mod tests {
         let _guard = env_guard();
         std::env::set_var(OPENAI_BASE_URL_ENV, "http://127.0.0.1:4011");
         let provider = OpenAiProvider::new("test_key".to_string());
-        let url = provider.endpoint();
+        let url = provider.endpoint().unwrap();
         std::env::remove_var(OPENAI_BASE_URL_ENV);
         assert_eq!(url, "http://127.0.0.1:4011/v1/chat/completions");
     }
@@ -2054,7 +2130,7 @@ mod tests {
         std::env::remove_var(MINIMAX_BASE_URL_ENV);
         let provider = MinimaxProvider::new("test_key".to_string());
         assert_eq!(
-            provider.endpoint(),
+            provider.endpoint().unwrap(),
             "https://api.minimax.chat/v1/text/chatcompletion_v2"
         );
     }
@@ -2064,7 +2140,7 @@ mod tests {
         let _guard = env_guard();
         std::env::set_var(MINIMAX_BASE_URL_ENV, "http://127.0.0.1:4012");
         let provider = MinimaxProvider::new("test_key".to_string());
-        let url = provider.endpoint();
+        let url = provider.endpoint().unwrap();
         std::env::remove_var(MINIMAX_BASE_URL_ENV);
         assert_eq!(url, "http://127.0.0.1:4012/v1/text/chatcompletion_v2");
     }
@@ -2257,7 +2333,10 @@ mod http_tests {
                 .with_base_url(origin),
             cache_system_and_tools: false,
         };
-        assert!(provider.endpoint().starts_with("http://127.0.0.1:"));
+        assert!(provider
+            .endpoint()
+            .unwrap()
+            .starts_with("http://127.0.0.1:"));
         provider
     }
 
@@ -2265,7 +2344,10 @@ mod http_tests {
         let provider = OpenAiProvider(
             BaseProvider::new("openai", FAKE_KEY.to_string(), "gpt-4o").with_base_url(origin),
         );
-        assert!(provider.endpoint().starts_with("http://127.0.0.1:"));
+        assert!(provider
+            .endpoint()
+            .unwrap()
+            .starts_with("http://127.0.0.1:"));
         provider
     }
 
@@ -2274,7 +2356,10 @@ mod http_tests {
             BaseProvider::new("minimax", FAKE_KEY.to_string(), "abab6.5s-chat")
                 .with_base_url(origin),
         );
-        assert!(provider.endpoint().starts_with("http://127.0.0.1:"));
+        assert!(provider
+            .endpoint()
+            .unwrap()
+            .starts_with("http://127.0.0.1:"));
         provider
     }
 
@@ -2475,51 +2560,156 @@ mod http_tests {
     }
 
     /// Review finding: the loopback check matched any host starting with
-    /// `127.`, a credential-bearing override was logged verbatim and had its
-    /// user name taken for the host, a scheme-less override was dropped
-    /// silently, and a path doubled the provider's own path.
+    /// `127.`, and credentials in an override were logged verbatim.
+    /// Verification finding: refusing an override fell back to the public
+    /// API with the key and the prompt, and refused real gateway prefixes
+    /// (OpenRouter's `https://openrouter.ai/api`). An override that can't be
+    /// used now fails instead, and prefixes and credentials are kept.
     #[test]
-    fn test_base_url_overrides_must_be_plain_origins() {
+    fn test_base_url_overrides_fail_closed_and_keep_prefixes() {
         let default = "https://api.anthropic.com";
         for refused in [
             "127.0.0.1:4010",
-            "http://user:pw@127.0.0.1:4010",
-            "http://127.0.0.1@attacker.example",
-            "http://127.0.0.1:4010/v1",
             "http://127.0.0.1:4010/?debug=1",
+            "http://127.0.0.1:4010/#top",
             "ftp://127.0.0.1",
+            "http://[fe80::1%25en0]:8080",
         ] {
-            assert_eq!(
-                select_base_url(None, Some(refused), default),
-                default,
+            assert!(
+                matches!(
+                    select_base_url(None, Some(refused), default),
+                    Err((OverrideSource::Environment, _))
+                ),
                 "{refused}"
             );
         }
-        assert_eq!(
-            select_base_url(
-                Some("http://user@host"),
-                Some("http://127.0.0.1:9"),
-                default
+        assert!(matches!(
+            select_base_url(Some("localhost:4010"), Some("http://127.0.0.1:9"), default),
+            Err((OverrideSource::Configured, _))
+        ));
+        for (kept, base) in [
+            ("https://openrouter.ai/api", "https://openrouter.ai/api"),
+            ("http://127.0.0.1:4010/v1/", "http://127.0.0.1:4010/v1"),
+            (
+                "http://user:pw@127.0.0.1:4010",
+                "http://user:pw@127.0.0.1:4010",
             ),
-            "http://127.0.0.1:9",
-            "a refused explicit URL falls back to the environment one"
-        );
+        ] {
+            assert_eq!(select_base_url(None, Some(kept), default).unwrap(), base);
+        }
         assert_eq!(
             classify_base_url("http://127.attacker.example", default),
             BaseUrlKind::OverrideCleartextHttp
         );
         assert_eq!(
-            classify_base_url("http://127.0.0.1:4010", default),
-            BaseUrlKind::OverrideLoopbackHttp
+            classify_base_url("http://127.0.0.1@attacker.example", default),
+            BaseUrlKind::OverrideCleartextHttp
         );
-        assert_eq!(
-            classify_base_url("http://[::1]:4010", default),
-            BaseUrlKind::OverrideLoopbackHttp
+        for loopback in [
+            "http://127.0.0.1:4010",
+            "http://[::1]:4010",
+            "http://LOCALHOST:4010",
+            "http://localhost.:4010",
+            "http://[::ffff:127.0.0.1]:4010",
+        ] {
+            assert_eq!(
+                classify_base_url(loopback, default),
+                BaseUrlKind::OverrideLoopbackHttp,
+                "{loopback}"
+            );
+        }
+    }
+
+    /// An unusable override is an error naming where it came from. Checked
+    /// on `endpoint()`, which `chat` calls before building a request: were
+    /// this ever to regress into a fall back, a test calling `chat` would
+    /// reach the real API.
+    #[test]
+    fn test_an_unusable_override_is_an_error_naming_its_source() {
+        let provider = AnthropicProvider {
+            base: BaseProvider::new("anthropic", FAKE_KEY.to_string(), "m")
+                .with_base_url("localhost:4010"),
+            cache_system_and_tools: false,
+        };
+        let err = provider.endpoint().unwrap_err();
+        assert!(
+            matches!(&err, AgentError::InvalidRequest(message)
+                if message.contains("configured base URL") && message.contains("fix or unset it")),
+            "{err:?}"
         );
-        assert_eq!(
-            classify_base_url("http://LOCALHOST:4010", default),
-            BaseUrlKind::OverrideLoopbackHttp
+
+        let _guard = super::tests::env_guard();
+        let var = "IMPULSE_TEST_UNUSABLE_BASE_URL";
+        std::env::set_var(var, "localhost:4010");
+        let base = BaseProvider::new("test", FAKE_KEY.to_string(), "m");
+        let result = base.endpoint(var, "https://api.example.com", "/v1/messages");
+        std::env::remove_var(var);
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains(var), "{err}");
+    }
+
+    /// Verification finding: serde quotes an unexpected value in full, so a
+    /// malformed 200 body put megabytes into the error.
+    #[tokio::test]
+    async fn test_a_malformed_success_body_is_quoted_briefly() {
+        let (origin, _) = serve(vec![Reply::Json {
+            status: 200,
+            body: serde_json::json!({ "content": "x".repeat(MIB) }).to_string(),
+        }])
+        .await;
+        let err = anthropic_at(&origin).chat(hello()).await.unwrap_err();
+        assert!(
+            err.to_string().chars().count() < MAX_ERROR_TEXT_CHARS + 100,
+            "{} chars",
+            err.to_string().chars().count()
         );
+    }
+
+    /// Verification finding: a stop at the context window cut tool blocks
+    /// off like a token-limit stop, but they were run.
+    #[test]
+    fn test_a_context_window_stop_is_a_token_limit_stop() {
+        let resp: AnthropicResponse = serde_json::from_value(serde_json::json!({
+            "id": "msg_1", "model": "m", "stop_reason": "model_context_window_exceeded",
+            "content": [{"type": "tool_use", "id": "t1", "name": "bash_exec",
+                         "input": {"command": "rm -rf ./bui"}}],
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }))
+        .unwrap();
+        let parsed = anthropic_chat_response(resp, "anthropic").unwrap();
+        assert_eq!(parsed.stop_reason, StopReason::MaxTokens);
+    }
+
+    /// Verification finding: typing `base_resp` and `error` strictly failed
+    /// otherwise good replies whose envelope was spelled loosely.
+    #[test]
+    fn test_loosely_spelled_envelopes_do_not_fail_a_good_reply() {
+        let good_choice =
+            serde_json::json!([{"message": {"content": "hi"}, "finish_reason": "stop"}]);
+        for envelope in [
+            serde_json::json!({"base_resp": {"status_code": 0, "status_msg": null}}),
+            serde_json::json!({"base_resp": {"status_code": "0", "status_msg": "success"}}),
+            serde_json::json!({"error": {}}),
+            serde_json::json!({"error": ""}),
+            serde_json::json!({"error": false}),
+            serde_json::json!({"error": null, "base_resp": null}),
+        ] {
+            let mut raw = envelope.clone();
+            raw["choices"] = good_choice.clone();
+            let resp: OpenAiStyleResponse = serde_json::from_value(raw).unwrap();
+            let parsed = openai_style_chat_response(resp, "minimax", "m")
+                .unwrap_or_else(|e| panic!("{envelope}: {e:?}"));
+            assert_eq!(parsed.content, "hi");
+        }
+        let resp: OpenAiStyleResponse = serde_json::from_value(serde_json::json!({
+            "choices": good_choice,
+            "base_resp": {"status_code": "1004", "status_msg": "login fail"}
+        }))
+        .unwrap();
+        assert!(matches!(
+            openai_style_chat_response(resp, "minimax", "m"),
+            Err(AgentError::Authentication(_))
+        ));
     }
 
     #[tokio::test]

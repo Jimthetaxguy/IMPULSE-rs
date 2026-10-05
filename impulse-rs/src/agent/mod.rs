@@ -222,7 +222,9 @@ impl Default for ImpulseAgentConfig {
             auto_review: false,
             auto_coordinate: false,
             review_threshold: 5,
-            max_tokens: 2048,
+            // The API agent's requests used 4096 before they honoured this
+            // setting; harness and governed requests had used the setting.
+            max_tokens: 4096,
             temperature: 0.3,
             escalate_model: None,
         }
@@ -392,26 +394,31 @@ impl ImpulseAgent {
     #[cfg(test)]
     pub(crate) fn with_test_provider(provider: Box<dyn LlmProvider>) -> Self {
         let model = provider.default_model().to_string();
-        Self {
-            config: ImpulseAgentConfig {
-                mode: AgentMode::Api {
-                    provider: ImpulseProvider::Anthropic,
-                    // Keep the raw configuration unresolved so governed
-                    // provenance tests exercise the production `model=None`
-                    // path. `Agent::new` owns the resolved model actually sent
-                    // to the provider.
-                    model: None,
-                },
-                ..ImpulseAgentConfig::default()
+        let config = ImpulseAgentConfig {
+            mode: AgentMode::Api {
+                provider: ImpulseProvider::Anthropic,
+                // Keep the raw configuration unresolved so governed
+                // provenance tests exercise the production `model=None`
+                // path. `Agent::new` owns the resolved model actually sent
+                // to the provider.
+                model: None,
             },
+            ..ImpulseAgentConfig::default()
+        };
+        let mut inner = Agent::new(
+            "impulse-agent-test".to_string(),
+            "Impulse Agent Test".to_string(),
+            provider,
+            Some(model),
+            None,
+        );
+        // As `Self::new` does, so tests send what production sends.
+        inner.temperature = config.temperature;
+        inner.max_tokens = Some(config.max_tokens);
+        Self {
+            config,
             harness_command_override: None,
-            inner: Some(Agent::new(
-                "impulse-agent-test".to_string(),
-                "Impulse Agent Test".to_string(),
-                provider,
-                Some(model),
-                None,
-            )),
+            inner: Some(inner),
             recommendations: Vec::new(),
             pane_summaries: Vec::new(),
             session_history: Vec::new(),
@@ -1940,5 +1947,63 @@ mod tests {
         let inner = agent.inner.as_ref().expect("API mode has an inner agent");
         assert_eq!(inner.temperature, 0.1);
         assert_eq!(inner.max_tokens, Some(1234));
+    }
+
+    /// Each request's temperature and token cap, in order.
+    type SamplingLog = std::sync::Arc<std::sync::Mutex<Vec<(f32, Option<u32>)>>>;
+
+    /// Records the sampling of every request.
+    struct SamplingRecorder {
+        sampling: SamplingLog,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for SamplingRecorder {
+        fn name(&self) -> &str {
+            "sampling-recorder"
+        }
+        fn default_model(&self) -> &str {
+            "sampling-recorder-model"
+        }
+        async fn chat(
+            &self,
+            request: crate::llm_backends::ChatRequest,
+        ) -> AgentResult<crate::llm_backends::ChatResponse> {
+            self.sampling
+                .lock()
+                .unwrap()
+                .push((request.temperature, request.max_tokens));
+            Ok(crate::llm_backends::ChatResponse {
+                content: "ok".to_string(),
+                model: request.model,
+                usage: crate::llm_backends::Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+                stop_reason: crate::llm_backends::StopReason::EndTurn,
+                tool_calls: Vec::new(),
+            })
+        }
+        fn supported_models(&self) -> Vec<&str> {
+            vec!["sampling-recorder-model"]
+        }
+    }
+
+    /// Verification finding: the test seam kept sending 0.7 and 4096 after
+    /// `new` started honouring the config, and the config's 2048 default
+    /// halved the API agent's replies.
+    #[tokio::test]
+    async fn test_the_test_seam_sends_the_config_sampling() {
+        let sampling = SamplingLog::default();
+        let mut agent = ImpulseAgent::with_test_provider(Box::new(SamplingRecorder {
+            sampling: std::sync::Arc::clone(&sampling),
+        }));
+        agent.query("system", "question").await.unwrap();
+        let default = ImpulseAgentConfig::default();
+        assert_eq!(default.max_tokens, 4096);
+        assert_eq!(
+            *sampling.lock().unwrap(),
+            [(default.temperature, Some(default.max_tokens))]
+        );
     }
 }

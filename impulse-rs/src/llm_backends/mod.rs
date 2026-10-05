@@ -871,7 +871,9 @@ async fn run_tool_loop(
                 tool_calls: response.tool_calls.len(),
             }));
         }
-        check_tool_calls(provider.name(), &response, &working).map_err(LoopExit::Failed)?;
+        check_tool_calls(provider.name(), &response).map_err(LoopExit::Failed)?;
+        let mut response = response;
+        rename_repeated_call_ids(&mut response.tool_calls, &working);
 
         if response.stop_reason == StopReason::ToolUse && !response.tool_calls.is_empty() {
             working.push(Message::assistant_tool_use(
@@ -920,15 +922,12 @@ async fn run_tool_loop(
 ///
 /// A stop for tool use with no call used to complete as an empty answer, and
 /// calls beside any other stop were silently dropped; both are errors now.
-/// Every call needs an id and a name, and its id may not repeat one in this
-/// batch or anywhere in the history: a result is matched to its call by id,
-/// and compaction records results by id, so a missing or reused id (both
-/// used to execute) would pair results with the wrong calls.
-fn check_tool_calls(
-    provider: &str,
-    response: &ChatResponse,
-    working: &[Message],
-) -> AgentResult<()> {
+/// Every call needs an id and a name, and no two calls in one response may
+/// share an id: a result is matched to its call by id, so a missing or
+/// shared id (both used to execute) would pair results with the wrong calls.
+/// An id that repeats one from an earlier turn is renamed instead; see
+/// [`rename_repeated_call_ids`].
+fn check_tool_calls(provider: &str, response: &ChatResponse) -> AgentResult<()> {
     let calls = &response.tool_calls;
     match (response.stop_reason, calls.is_empty()) {
         (StopReason::ToolUse, true) => {
@@ -945,10 +944,7 @@ fn check_tool_calls(
             )));
         }
     }
-    let mut seen: std::collections::HashSet<&str> = working
-        .iter()
-        .flat_map(|message| message.tool_calls.iter().map(|call| call.id.as_str()))
-        .collect();
+    let mut seen = std::collections::HashSet::new();
     for call in calls {
         if call.id.trim().is_empty() {
             return Err(AgentError::ApiResponse(format!(
@@ -970,6 +966,33 @@ fn check_tool_calls(
         }
     }
     Ok(())
+}
+
+/// Gives each call whose id was already used earlier in the conversation a
+/// fresh one, `{id}-{n}`, so ids stay unique across the history.
+///
+/// Compaction records results by id, so a repeated id would mark a later
+/// result as already compacted. Real providers issue unique ids, but some
+/// compatible servers and mocks reuse one per response (`call_0` every time);
+/// refusing those would fail every tool turn after the first. The renamed id
+/// is what the history keeps and what the result answers, so the provider
+/// sees a consistent conversation.
+fn rename_repeated_call_ids(calls: &mut [ToolCall], working: &[Message]) {
+    let mut used: std::collections::HashSet<String> = working
+        .iter()
+        .flat_map(|message| message.tool_calls.iter().map(|call| call.id.clone()))
+        .collect();
+    let batch: Vec<String> = calls.iter().map(|call| call.id.clone()).collect();
+    for call in calls.iter_mut() {
+        if used.contains(&call.id) {
+            let fresh = (2..)
+                .map(|n| format!("{}-{n}", call.id))
+                .find(|id| !used.contains(id) && !batch.contains(id))
+                .unwrap_or_else(|| call.id.clone());
+            call.id = fresh;
+        }
+        used.insert(call.id.clone());
+    }
 }
 
 /// Why [`run_tool_loop`] returned without a final reply: the contract
@@ -3383,18 +3406,41 @@ mod tests {
             .to_string()
             .contains("reused the tool call id"));
         assert_eq!(invocations(&executor), 0);
+    }
 
+    /// Verification finding: refusing an id seen in an earlier turn wedged a
+    /// session with a server that reuses one id per response: every tool
+    /// turn after the first failed. The repeat is renamed, and its result
+    /// answers the new id.
+    #[tokio::test]
+    async fn test_an_id_from_an_earlier_turn_is_renamed_and_run() {
+        // Different input each time, so the repeated-call detector stays out
+        // of it; only the id repeats.
+        let call = |n: u32| ToolCall {
+            id: "call_0".to_string(),
+            name: "echo_tool".to_string(),
+            input: serde_json::json!({ "n": n }),
+        };
         let (result, agent, executor) = run_scripted(vec![
-            (StopReason::ToolUse, vec![scripted_call("c1", "echo_tool")]),
-            (StopReason::ToolUse, vec![scripted_call("c1", "echo_tool")]),
+            (StopReason::ToolUse, vec![call(1)]),
+            (StopReason::ToolUse, vec![call(2)]),
+            (StopReason::ToolUse, vec![call(3)]),
         ])
         .await;
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("reused the tool call id"));
-        assert_eq!(invocations(&executor), 1);
-        assert!(agent.history.is_empty());
+        assert_eq!(result.unwrap(), "done");
+        assert_eq!(invocations(&executor), 3);
+        let call_ids: Vec<&str> = agent
+            .history
+            .iter()
+            .flat_map(|message| message.tool_calls.iter().map(|call| call.id.as_str()))
+            .collect();
+        assert_eq!(call_ids, ["call_0", "call_0-2", "call_0-3"]);
+        let result_ids: Vec<&str> = agent
+            .history
+            .iter()
+            .flat_map(|message| message.tool_results.iter().map(|r| r.tool_use_id.as_str()))
+            .collect();
+        assert_eq!(result_ids, call_ids);
     }
 
     /// Review finding: every request went out at temperature 0.7 with a
