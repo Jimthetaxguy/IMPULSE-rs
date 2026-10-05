@@ -20,9 +20,11 @@
 //! relying on full inheritance plus a redundant re-add of already-present
 //! vars.
 //!
-//! **Timeouts and output:** the child runs in its own process group and is
-//! killed with it when the call times out or is cancelled (before, a
-//! timed-out tool kept running). Output is read through `tooling::capture`;
+//! **Timeouts and output:** a timed-out or cancelled call kills the tool
+//! (before, it kept running). Outside the CLI the tool runs in its own
+//! process group and everything it started is killed with it; from the CLI
+//! it stays in the CLI's group, so the terminal's Ctrl-C reaches it and it
+//! can read the terminal. Output is read through `tooling::capture`;
 //! stdout beyond `MAX_STDOUT_BYTES` fails the call rather than growing this
 //! process's memory, since a cut prefix would not parse in JSON mode.
 
@@ -36,14 +38,16 @@ use super::capture::wait_with_capped_output;
 use super::env_scrub::scrub_and_allowlist_env;
 use super::error::ToolError;
 use super::traits::{
-    Capability, DynamicTool, ParamType, ToolCategory, ToolContext, ToolDescriptor, ToolParam,
-    ToolResult,
+    Capability, DynamicTool, ExecutionOrigin, ParamType, ToolCategory, ToolContext, ToolDescriptor,
+    ToolParam, ToolResult,
 };
 
 /// Stdout kept from a manifest tool. Far more than the executor ever returns
 /// (`ToolContext::max_output_bytes`, 256 KiB by default), so ordinary output,
-/// including pretty-printed JSON that compacts to fit, is unaffected.
-const MAX_STDOUT_BYTES: usize = 16 * 1024 * 1024;
+/// including pretty-printed JSON that compacts to fit, is unaffected. Kept
+/// well below what JSON mode can afford to parse: a parsed tree costs many
+/// times its text (16 MB of `[0,0,...]` took about 300 MB).
+const MAX_STDOUT_BYTES: usize = 4 * 1024 * 1024;
 /// Stderr kept for the error message of a failed call.
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 
@@ -241,10 +245,14 @@ impl DynamicTool for ProcessTool {
         // A timeout or a cancelled call drops `child`; without this the
         // tool kept running after its caller had given up on it.
         command.kill_on_drop(true);
-        // Its own process group, so the guard below also reaches anything
-        // the tool starts (a wrapper script's children).
+        // Outside the CLI, its own process group, so the guard below also
+        // reaches anything the tool starts (a wrapper script's children).
+        // From the CLI it stays in the CLI's group: a detached group never
+        // sees the terminal's Ctrl-C (the CLI has no handler to forward it)
+        // and is stopped if it reads the terminal.
+        let own_group = ctx.execution_origin != ExecutionOrigin::Cli;
         #[cfg(unix)]
-        {
+        if own_group {
             command.process_group(0);
         }
 
@@ -252,6 +260,10 @@ impl DynamicTool for ProcessTool {
             .spawn()
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
         let mut process_group_guard = crate::process_group::ProcessGroupGuard::new(child.id());
+        if !own_group {
+            // Not a group leader: there is no group of its own to kill.
+            process_group_guard.disarm();
+        }
 
         let timeout_ms = self.spec.timeout_ms.unwrap_or(ctx.timeout_ms).max(1);
         let output = tokio::time::timeout(
@@ -752,8 +764,15 @@ mod tests {
         }
     }
 
+    fn origin_context(execution_origin: ExecutionOrigin) -> ToolContext {
+        ToolContext {
+            execution_origin,
+            ..ToolContext::with_all_capabilities()
+        }
+    }
+
     /// Review P3-9: a timed-out tool was left running, along with anything
-    /// it had started.
+    /// it had started (outside the CLI, which detaches it into its own group).
     #[tokio::test]
     #[cfg(unix)]
     async fn test_execute_timeout_kills_the_tool_and_its_children() {
@@ -766,7 +785,10 @@ mod tests {
         );
         let tool = ProcessTool::new(script_spec(&format!("{pattern} & wait"), 300)).unwrap();
         let result = tool
-            .execute(serde_json::json!({}), &ToolContext::with_all_capabilities())
+            .execute(
+                serde_json::json!({}),
+                &origin_context(ExecutionOrigin::Daemon),
+            )
             .await;
         assert!(matches!(result, Err(ToolError::Timeout(300))), "{result:?}");
         if let Err(stray) = crate::test_support::wait_for_no_matching_process(
@@ -776,6 +798,54 @@ mod tests {
         .await
         {
             panic!("a timed-out tool must not keep running; found pids: {stray}");
+        }
+    }
+
+    /// Refutation review of d76ce7a: a detached group cut CLI tools off from
+    /// the terminal's Ctrl-C. From the CLI the tool shares our group; a
+    /// timeout still kills it.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_cli_tools_share_the_cli_process_group_and_still_time_out() {
+        // SAFETY: getpgrp takes no arguments, cannot fail, and only reads
+        // this process's group id.
+        let ours = unsafe { libc::getpgrp() };
+        for (origin, shares_ours) in [
+            (ExecutionOrigin::Cli, true),
+            (ExecutionOrigin::Daemon, false),
+        ] {
+            let tool = ProcessTool::new(script_spec("ps -o pgid= -p $$", 5_000)).unwrap();
+            let result = tool
+                .execute(serde_json::json!({}), &origin_context(origin))
+                .await
+                .unwrap();
+            let pgid: i32 = result.output.as_str().unwrap().trim().parse().unwrap();
+            assert_eq!(
+                pgid == ours,
+                shares_ours,
+                "{origin:?}: pgid {pgid}, ours {ours}"
+            );
+        }
+
+        let pattern = format!(
+            "sleep 6.{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let tool = ProcessTool::new(script_spec(&format!("exec {pattern}"), 300)).unwrap();
+        let result = tool
+            .execute(serde_json::json!({}), &origin_context(ExecutionOrigin::Cli))
+            .await;
+        assert!(matches!(result, Err(ToolError::Timeout(300))), "{result:?}");
+        if let Err(stray) = crate::test_support::wait_for_no_matching_process(
+            &pattern,
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        {
+            panic!("a timed-out CLI tool must not keep running; found pids: {stray}");
         }
     }
 

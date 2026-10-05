@@ -52,7 +52,8 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 /// How far inside the executor's deadline (`ToolContext::timeout_ms`) this
 /// tool's own deadline sits, so a capped request ends here, with an error
-/// that names the cap, rather than at the executor's bare `Timeout`.
+/// that names the cap, rather than at the executor's bare `Timeout`. At most
+/// a quarter of the limit, so a short configured limit keeps most of itself.
 const TIME_LIMIT_MARGIN_MS: u64 = 250;
 
 /// `ms` as whole seconds (`30s`) when it is one, otherwise in milliseconds.
@@ -155,9 +156,8 @@ impl DynamicTool for BashExecTool {
             .max(1);
         let limit_ms = ctx.timeout_ms.max(1);
         let requested_ms = timeout_secs.saturating_mul(1000);
-        let budget_ms = requested_ms
-            .min(limit_ms.saturating_sub(TIME_LIMIT_MARGIN_MS))
-            .max(1);
+        let margin_ms = TIME_LIMIT_MARGIN_MS.min(limit_ms / 4);
+        let budget_ms = requested_ms.min(limit_ms.saturating_sub(margin_ms)).max(1);
         let timeout_message = if requested_ms > limit_ms {
             format!(
                 "command timed out at this session's {} tool time limit \
@@ -246,16 +246,17 @@ impl DynamicTool for BashExecTool {
             }
         };
 
-        // The kept bytes are already within `MAX_OUTPUT_BYTES`; a cut inside
-        // a multi-byte character becomes U+FFFD, which this trims back off.
-        let stdout = truncate_at_char_boundary(
-            &String::from_utf8_lossy(&output.stdout.bytes),
-            MAX_OUTPUT_BYTES,
-        );
-        let stderr = truncate_at_char_boundary(
-            &String::from_utf8_lossy(&output.stderr.bytes),
-            MAX_OUTPUT_BYTES,
-        );
+        // The kept bytes are within `MAX_OUTPUT_BYTES`, but lossy decoding
+        // turns each invalid byte into a three-byte U+FFFD, so the text can
+        // still need cutting; either kind of cut counts as truncated.
+        let decode = |captured: &crate::tooling::capture::CappedOutput| {
+            let text = String::from_utf8_lossy(&captured.bytes);
+            let kept = truncate_at_char_boundary(&text, MAX_OUTPUT_BYTES);
+            let truncated = captured.truncated() || kept.len() < text.len();
+            (kept, truncated)
+        };
+        let (stdout, stdout_truncated) = decode(&output.stdout);
+        let (stderr, stderr_truncated) = decode(&output.stderr);
 
         Ok(ToolResult::json(serde_json::json!({
             "command": command,
@@ -263,8 +264,8 @@ impl DynamicTool for BashExecTool {
             "success": output.status.success(),
             "stdout": stdout,
             "stderr": stderr,
-            "stdout_truncated": output.stdout.truncated(),
-            "stderr_truncated": output.stderr.truncated(),
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
         })))
     }
 
@@ -524,6 +525,37 @@ mod tests {
                 if message.contains("tool time limit")),
             "{result:?}"
         );
+    }
+
+    /// Refutation review of d76ce7a: a limit under 250 ms left a 1 ms
+    /// budget, so even `true` timed out.
+    #[tokio::test]
+    async fn test_a_short_session_limit_still_leaves_time_to_run() {
+        let ctx = ToolContext {
+            timeout_ms: 200,
+            ..ToolContext::with_all_capabilities()
+        };
+        let result = BashExecTool
+            .execute(serde_json::json!({"command": "true"}), &ctx)
+            .await
+            .expect("`true` fits in a 200 ms limit");
+        assert_eq!(result.output["exit_code"], 0);
+    }
+
+    /// Refutation review of d76ce7a: invalid bytes decode to three-byte
+    /// U+FFFD, so 200 KB of them overflowed the cap after decoding while the
+    /// flag said nothing was cut.
+    #[tokio::test]
+    async fn test_output_cut_after_decoding_is_reported_as_truncated() {
+        let result = BashExecTool
+            .execute(
+                serde_json::json!({"command": "head -c 200000 /dev/zero | tr '\\0' '\\377'"}),
+                &ToolContext::with_all_capabilities(),
+            )
+            .await
+            .expect("command should run");
+        assert!(result.output["stdout"].as_str().unwrap().len() <= MAX_OUTPUT_BYTES);
+        assert_eq!(result.output["stdout_truncated"], true);
     }
 
     #[test]
