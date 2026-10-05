@@ -13,12 +13,16 @@
 //! - an `xlsx`/`docx` zip container is inflated once, entry by entry,
 //!   through [`MAX_DECOMPRESSED_BYTES`] before any parser runs
 //!   ([`preflight_container`]), so a forged central directory cannot hide a
-//!   decompression bomb;
+//!   decompression bomb, and may hold at most [`MAX_CONTAINER_ENTRIES`]
+//!   entries;
 //! - workbooks are streamed cell by cell into text under
 //!   [`MAX_EXTRACTED_CHARS`] and [`MAX_CELLS`] ([`extract_workbook`]); the
 //!   dense-grid parser is never used, so two cells at opposite corners of a
 //!   sheet cost two cells and a gap marker rather than billions of empty
 //!   cells;
+//! - a workbook may list at most [`MAX_SHEETS`] sheets: calamine finds each
+//!   sheet by scanning every sheet and entry name, so the time to read a
+//!   workbook grows with its sheets times its entries;
 //! - Word documents are streamed event by event from `word/document.xml`
 //!   ([`extract_word`]), so the docx object tree is never built;
 //! - `csv` is read whole, which the file cap bounds, and must be UTF-8
@@ -50,6 +54,16 @@ pub const MAX_CELLS: u64 = 2_000_000;
 /// Empty columns inside a row rendered as bare tabs; wider gaps become a
 /// marker so a cell far to the right cannot inflate the text.
 pub const EMPTY_COLUMNS_INLINE: u32 = 8;
+/// Most sheets one workbook may list. calamine finds each sheet by scanning
+/// every sheet name, so without a cap the time to read a workbook grows with
+/// the square of its sheet count, and the inflation cap alone allows about
+/// two million cell-less sheets.
+pub const MAX_SHEETS: usize = 4_096;
+/// Most entries an `xlsx`/`docx` zip container may hold. calamine also
+/// scans every entry name for each sheet it opens, so this and
+/// [`MAX_SHEETS`] together bound that lookup. Real documents hold dozens to
+/// a few thousand entries.
+pub const MAX_CONTAINER_ENTRIES: usize = 16_384;
 
 const SHEET_HEADER_PREFIX: &str = "=== Sheet: ";
 const SHEET_HEADER_SUFFIX: &str = " ===";
@@ -136,6 +150,13 @@ pub fn preflight_container_with_limit(
     let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file)).map_err(|e| {
         anyhow::anyhow!("{label} could not be parsed: not a valid {ext} container ({e})")
     })?;
+    if archive.len() > MAX_CONTAINER_ENTRIES {
+        bail!(
+            "{label} has {} entries in its {ext} container, over the \
+             {MAX_CONTAINER_ENTRIES}-entry limit",
+            archive.len()
+        );
+    }
     let mut inflated_total: u64 = 0;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).map_err(|e| {
@@ -155,6 +176,14 @@ pub fn preflight_container_with_limit(
             );
         }
         inflated_total += inflated;
+    }
+    Ok(())
+}
+
+/// Refuses a workbook listing more than [`MAX_SHEETS`] sheets.
+pub fn check_sheet_count(label: &str, sheets: usize) -> Result<()> {
+    if sheets > MAX_SHEETS {
+        bail!("{label} has {sheets} sheets, over the {MAX_SHEETS}-sheet limit");
     }
     Ok(())
 }
@@ -281,9 +310,10 @@ pub fn read_document(path: &Path, label: &str, budget: ExtractBudget) -> Result<
 }
 
 /// Runs `read`, turning a panic inside a parser into an error for this one
-/// document. With overflow checks on, as in debug and test builds, calamine
-/// panics on some malformed workbooks: an inverted `<dimension
-/// ref="B2:A1">`, or a cell reference whose row or column overflows `u32`.
+/// document. calamine panics on some malformed workbooks: in every build on
+/// a shared-string index past the end of the table, and with overflow
+/// checks on, as in debug and test builds, on an inverted `<dimension
+/// ref="B2:A1">` or a cell reference whose row or column overflows `u32`.
 /// The office CLI and context provider call the readers synchronously,
 /// where that panic would unwind the caller; async callers already contain
 /// it through `spawn_blocking`. The default panic hook still prints the
@@ -312,6 +342,7 @@ pub fn extract_workbook(path: &Path, label: &str, budget: ExtractBudget) -> Resu
     let mut workbook: Xlsx<_> =
         open_workbook(path).map_err(|e| anyhow::anyhow!("{label} could not be parsed: {e}"))?;
     let names = workbook.sheet_names().to_vec();
+    check_sheet_count(label, names.len())?;
     let mut text = String::new();
     let mut cursor = 0usize;
     let mut sections = Vec::new();
@@ -327,9 +358,11 @@ pub fn extract_workbook(path: &Path, label: &str, budget: ExtractBudget) -> Resu
             Err(calamine::XlsxError::NotAWorksheet(_)) => continue,
             Err(e) => bail!("{label} could not be parsed: sheet '{name}': {e}"),
         };
-        // A non-empty sheet adds its header and a closing blank line as
-        // well as its body. All three count against the budget, so a long
-        // sheet name cannot carry the text past it.
+        // A sheet with text adds its header and a closing blank line as
+        // well as its body. All three count against the budget once the
+        // body has text, so a long sheet name cannot carry the text past
+        // it, and a sheet left without text, which is skipped, costs
+        // nothing.
         let header = format!("{SHEET_HEADER_PREFIX}{name}{SHEET_HEADER_SUFFIX}\n");
         let header_chars = header.chars().count();
         let mut body = SheetBodyBuilder::default();
@@ -357,7 +390,7 @@ pub fn extract_workbook(path: &Path, label: &str, budget: ExtractBudget) -> Resu
             }
             let (row, col) = cell.get_position();
             body.push(row, col, &value);
-            if cursor + header_chars + body.chars + 2 > budget.max_chars {
+            if body.chars > 0 && cursor + header_chars + body.chars + 2 > budget.max_chars {
                 bail!(
                     "{label} extracted to more than {} characters, over the limit",
                     budget.max_chars
@@ -1083,6 +1116,94 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "'one' extracted to more than 22 characters, over the limit"
+        );
+    }
+
+    /// A sheet whose only cell renders as an empty string is skipped, so
+    /// its header is not charged against the budget.
+    #[test]
+    fn test_extract_workbook_charges_a_header_only_when_its_sheet_has_text() {
+        use crate::office::test_fixtures::rewrite_zip;
+
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original.xlsx");
+        let mut workbook = rust_xlsxwriter::Workbook::new(original.to_str().unwrap());
+        let sheet = workbook.add_worksheet();
+        sheet.set_name("A").unwrap();
+        sheet.write_string_only(0, 0, "x").unwrap();
+        let blank = workbook.add_worksheet();
+        blank.set_name("Blank").unwrap();
+        blank.write_string_only(0, 0, "y").unwrap();
+        workbook.close().unwrap();
+        // The Blank sheet's one cell becomes a formula whose cached result
+        // is the empty string.
+        let path = dir.path().join("blank.xlsx");
+        rewrite_zip(&original, &path, |entry, xml| {
+            (entry == "xl/worksheets/sheet2.xml").then(|| {
+                let start = xml.find("<c r=\"A1\"").unwrap();
+                let end = start + xml[start..].find("</c>").unwrap() + "</c>".len();
+                format!(
+                    "{}<c r=\"A1\" t=\"str\"><f>\"\"</f><v></v></c>{}",
+                    &xml[..start],
+                    &xml[end..]
+                )
+            })
+        });
+
+        // "=== Sheet: A ===\n", "x" and "\n\n" make 20 characters.
+        let budget = ExtractBudget {
+            max_chars: 20,
+            max_cells: MAX_CELLS,
+        };
+        let parsed = extract_workbook(&path, "'blank'", budget).unwrap();
+        assert_eq!(parsed.text, "=== Sheet: A ===\nx\n\n");
+        assert_eq!(parsed.sheets.len(), 1);
+    }
+
+    /// calamine finds each sheet by scanning every sheet name, so the sheet
+    /// count is capped before any sheet is read.
+    #[test]
+    fn test_extract_workbook_refuses_more_sheets_than_the_cap() {
+        use crate::office::test_fixtures::write_workbook_listing_sheets;
+
+        let dir = tempfile::tempdir().unwrap();
+        let at_cap = write_workbook_listing_sheets(dir.path(), MAX_SHEETS);
+        let parsed = extract_workbook(&at_cap, "'at_cap'", ExtractBudget::DEFAULT).unwrap();
+        assert_eq!(parsed.sheets.len(), MAX_SHEETS);
+
+        let over = write_workbook_listing_sheets(dir.path(), MAX_SHEETS + 1);
+        let err = extract_workbook(&over, "'over'", ExtractBudget::DEFAULT).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "'over' has 4097 sheets, over the 4096-sheet limit"
+        );
+    }
+
+    /// calamine also scans every entry name for each sheet it opens, so the
+    /// preflight caps the entry count.
+    #[test]
+    fn test_preflight_refuses_more_entries_than_the_cap() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, entries: usize| {
+            let path = dir.path().join(name);
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+            for i in 0..entries {
+                zip.start_file(format!("e{i}"), zip::write::FileOptions::default())
+                    .unwrap();
+                zip.write_all(b"x").unwrap();
+            }
+            zip.finish().unwrap();
+            path
+        };
+        let at_cap = write("at_cap.docx", MAX_CONTAINER_ENTRIES);
+        assert!(preflight_container(&at_cap, "'at_cap'").is_ok());
+        let over = write("over.docx", MAX_CONTAINER_ENTRIES + 1);
+        let err = preflight_container(&over, "'over'").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "'over' has 16385 entries in its docx container, over the 16384-entry limit"
         );
     }
 

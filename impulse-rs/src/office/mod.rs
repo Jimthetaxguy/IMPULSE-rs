@@ -314,8 +314,9 @@ mod tests {
             );
         }
 
-        /// With overflow checks on, as in tests, calamine panics on an
-        /// inverted `<dimension>` and on a cell reference whose row
+        /// calamine panics on a shared-string index past the end of the
+        /// table in every build, and with overflow checks on, as in tests,
+        /// on an inverted `<dimension>` and on a cell reference whose row
         /// overflows `u32`. The office CLI and context provider call the
         /// reader synchronously, so the panic must fail the one document
         /// rather than unwind the caller.
@@ -344,6 +345,19 @@ mod tests {
                 let err = result.unwrap_err();
                 assert!(err.contains("the parser panicked"), "{err}");
             }
+
+            // Bounds checks stay on in release, so this one panics there too.
+            let bad_string = write_workbook_with_edited_sheet(dir.path(), "bad_string", |xml| {
+                let start = xml.find("<c r=\"A1\"").unwrap();
+                let end = start + xml[start..].find("</c>").unwrap() + "</c>".len();
+                format!(
+                    "{}<c r=\"A1\" t=\"s\"><v>7</v></c>{}",
+                    &xml[..start],
+                    &xml[end..]
+                )
+            });
+            let err = parse_document(&bad_string).unwrap_err();
+            assert!(err.contains("the parser panicked"), "{err}");
         }
 
         /// Each chunk is the span of `content` one section covers, so a Word

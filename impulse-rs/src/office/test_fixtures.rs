@@ -55,6 +55,42 @@ pub fn write_far_apart_workbook(dir: &Path) -> PathBuf {
     path
 }
 
+/// Copies the zip at `original` to `path`, replacing the text of each entry
+/// for which `edit`, given the entry's name and text, returns new text.
+pub fn rewrite_zip(original: &Path, path: &Path, edit: impl Fn(&str, &str) -> Option<String>) {
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(original).unwrap()).unwrap();
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).unwrap();
+        let name = entry.name().to_string();
+        let mut data = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut data).unwrap();
+        if let Some(text) = std::str::from_utf8(&data)
+            .ok()
+            .and_then(|text| edit(&name, text))
+        {
+            data = text.into_bytes();
+        }
+        zip.start_file(name, zip::write::FileOptions::default())
+            .unwrap();
+        zip.write_all(&data).unwrap();
+    }
+    zip.finish().unwrap();
+}
+
+/// Writes `<stem>.original.xlsx`, a workbook with `x` in A1 of its one
+/// sheet, and returns its path.
+fn one_cell_workbook(dir: &Path, stem: &str) -> PathBuf {
+    let path = dir.join(format!("{stem}.original.xlsx"));
+    let mut workbook = rust_xlsxwriter::Workbook::new(path.to_str().unwrap());
+    workbook
+        .add_worksheet()
+        .write_string_only(0, 0, "x")
+        .unwrap();
+    workbook.close().unwrap();
+    path
+}
+
 /// Writes a one-cell workbook named `<name>.xlsx`, with its first sheet's
 /// XML passed through `edit`, for malformed-input tests.
 pub fn write_workbook_with_edited_sheet(
@@ -62,30 +98,32 @@ pub fn write_workbook_with_edited_sheet(
     name: &str,
     edit: impl Fn(&str) -> String,
 ) -> PathBuf {
-    let original = dir.join(format!("{name}.original.xlsx"));
-    let mut workbook = rust_xlsxwriter::Workbook::new(original.to_str().unwrap());
-    workbook
-        .add_worksheet()
-        .write_string_only(0, 0, "x")
-        .unwrap();
-    workbook.close().unwrap();
-
-    let mut archive = zip::ZipArchive::new(std::fs::File::open(&original).unwrap()).unwrap();
+    let original = one_cell_workbook(dir, name);
     let path = dir.join(format!("{name}.xlsx"));
-    let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
-    for index in 0..archive.len() {
-        let mut entry = archive.by_index(index).unwrap();
-        let entry_name = entry.name().to_string();
-        let mut data = Vec::new();
-        std::io::Read::read_to_end(&mut entry, &mut data).unwrap();
-        if entry_name == "xl/worksheets/sheet1.xml" {
-            data = edit(std::str::from_utf8(&data).unwrap()).into_bytes();
-        }
-        zip.start_file(entry_name, zip::write::FileOptions::default())
-            .unwrap();
-        zip.write_all(&data).unwrap();
-    }
-    zip.finish().unwrap();
+    rewrite_zip(&original, &path, |entry, xml| {
+        (entry == "xl/worksheets/sheet1.xml").then(|| edit(xml))
+    });
+    path
+}
+
+/// Writes a workbook whose `xl/workbook.xml` lists `count` sheets, all of
+/// them the same one-cell sheet part.
+pub fn write_workbook_listing_sheets(dir: &Path, count: usize) -> PathBuf {
+    let stem = format!("listing{count}");
+    let original = one_cell_workbook(dir, &stem);
+    let path = dir.join(format!("{stem}.xlsx"));
+    rewrite_zip(&original, &path, |entry, xml| {
+        (entry == "xl/workbook.xml").then(|| {
+            let start = xml.find("<sheets>").unwrap() + "<sheets>".len();
+            let end = xml.find("</sheets>").unwrap();
+            let id_at = start + xml[start..end].find("r:id=\"").unwrap() + "r:id=\"".len();
+            let id = &xml[id_at..id_at + xml[id_at..].find('"').unwrap()];
+            let sheets: String = (1..=count)
+                .map(|i| format!("<sheet name=\"S{i}\" sheetId=\"{i}\" r:id=\"{id}\"/>"))
+                .collect();
+            format!("{}{sheets}{}", &xml[..start], &xml[end..])
+        })
+    });
     path
 }
 

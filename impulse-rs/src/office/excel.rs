@@ -48,6 +48,7 @@ fn sheet_info(
     let mut workbook: Xlsx<_> =
         open_workbook(path).map_err(|e| anyhow::anyhow!("{label} could not be parsed: {e}"))?;
     let names = workbook.sheet_names().to_vec();
+    bounded::check_sheet_count(label, names.len())?;
     let mut sheets = Vec::with_capacity(names.len());
     let mut cells_total: u64 = 0;
     for name in names {
@@ -155,6 +156,20 @@ mod tests {
             std::fs::write(&xls, b"not a zip").unwrap();
             let err = super::super::get_sheet_info(&xls).unwrap_err();
             assert!(err.contains("legacy .xls"), "{err}");
+        }
+
+        /// The listing refuses a workbook over the sheet cap before it
+        /// opens any sheet.
+        #[test]
+        fn test_get_sheet_info_refuses_more_sheets_than_the_cap() {
+            let dir = tempfile::tempdir().unwrap();
+            let sheets = crate::office::bounded::MAX_SHEETS + 1;
+            let path = write_workbook_listing_sheets(dir.path(), sheets);
+            let err = super::super::get_sheet_info(&path).unwrap_err();
+            assert!(
+                err.ends_with("has 4097 sheets, over the 4096-sheet limit"),
+                "{err}"
+            );
         }
 
         /// The listing stops at the cell cap instead of counting on.

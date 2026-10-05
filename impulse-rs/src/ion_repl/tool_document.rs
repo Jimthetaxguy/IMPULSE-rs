@@ -17,7 +17,8 @@
 //! - the source file is refused above [`MAX_DOCUMENT_BYTES`];
 //! - an `xlsx`/`docx` zip container is inflated once, entry by entry,
 //!   through [`MAX_DECOMPRESSED_BYTES`] before any parser runs, so a forged
-//!   central directory cannot hide a decompression bomb;
+//!   central directory cannot hide a decompression bomb, and may hold at
+//!   most [`MAX_CONTAINER_ENTRIES`] entries;
 //! - workbooks are not handed to the dense-grid parser at all: cells are
 //!   streamed one at a time through calamine's cell reader and written into
 //!   this module's own text under [`MAX_EXTRACTED_CHARS`] and [`MAX_CELLS`],
@@ -25,6 +26,9 @@
 //!   to one huge shared string cost only what they render; a chart or
 //!   dialog sheet holds no cells and is skipped rather than failing the
 //!   whole workbook;
+//! - a workbook may list at most [`MAX_SHEETS`] sheets: calamine finds each
+//!   sheet by scanning every sheet and entry name, so the time to read a
+//!   workbook grows with its sheets times its entries;
 //! - Word documents are likewise streamed: `word/document.xml` is read
 //!   event by event through quick-xml into one line per non-empty
 //!   paragraph and one line per table row, so the docx object tree, which
@@ -112,8 +116,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub use crate::office::bounded::{
-    DocumentSection, ExtractBudget, ParsedDocument, SheetBody, MAX_CELLS, MAX_DECOMPRESSED_BYTES,
-    MAX_DOCUMENT_BYTES, MAX_EXTRACTED_CHARS, MAX_WORD_SECTIONS,
+    DocumentSection, ExtractBudget, ParsedDocument, SheetBody, MAX_CELLS, MAX_CONTAINER_ENTRIES,
+    MAX_DECOMPRESSED_BYTES, MAX_DOCUMENT_BYTES, MAX_EXTRACTED_CHARS, MAX_SHEETS, MAX_WORD_SECTIONS,
 };
 use crate::office::{self, bounded, ExtractionResult};
 
@@ -536,10 +540,12 @@ pub fn extract_word(path: &Path, raw: &str, budget: ExtractBudget) -> Result<Par
 /// `timeout_secs`). `docx`/`xlsx` streaming does not get an equivalent
 /// timer: both are already a bounded function of [`MAX_DOCUMENT_BYTES`]/
 /// [`MAX_DECOMPRESSED_BYTES`] (the source file and its inflated container
-/// are capped before any parser runs), so their wall-clock cost cannot grow
-/// past what those caps already allow -- there is no code path in either
-/// streamer that can loop or recurse on attacker-controlled structure the
-/// way a PDF's Form XObjects can (review round 1, item 3).
+/// are capped before any parser runs) and, for workbooks, of [`MAX_SHEETS`]/
+/// [`MAX_CONTAINER_ENTRIES`] (calamine's lookup of each sheet scans every
+/// sheet and entry name, so before those caps the time grew with the square
+/// of the sheet count), so their wall-clock cost cannot grow past what those
+/// caps allow -- neither streamer recurses on attacker-controlled structure
+/// the way a PDF's Form XObjects can (review round 1, item 3).
 const PDF_CHILD_TIMEOUT_SECS: u64 = 30;
 /// Memory ceiling for the isolated PDF-extraction child, in bytes -- checked
 /// two structurally different ways depending on platform, both enforced
